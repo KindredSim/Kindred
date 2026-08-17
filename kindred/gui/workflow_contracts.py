@@ -95,7 +95,6 @@ class DetailedBalanceCorrectionCommitResult:
 class DetailedBalanceCorrectionRequest:
     """One owner-issued, generation-bound detailed-balance correction request."""
 
-    request_id: str
     origin: str
     tab_id: str
     source: str
@@ -106,7 +105,7 @@ class DetailedBalanceCorrectionRequest:
     source_energy_unit: str = "kJ/mol"
 
     def __post_init__(self) -> None:
-        for field_name in ("request_id", "origin", "tab_id", "issue"):
+        for field_name in ("origin", "tab_id", "issue"):
             if not str(getattr(self, field_name) or "").strip():
                 raise ValueError(f"{field_name} must be nonblank.")
         if str(self.origin).strip().casefold() not in {"run", "fit", "preview"}:
@@ -151,7 +150,6 @@ class DetailedBalanceCorrectionRequest:
 class DetailedBalanceCorrectionOutcome:
     """One immutable owner-fenced result from the correction workflow."""
 
-    request_id: str
     origin: str
     tab_id: str
     source: str
@@ -160,7 +158,7 @@ class DetailedBalanceCorrectionOutcome:
     cancelled: bool
 
     def __post_init__(self) -> None:
-        for field_name in ("request_id", "origin", "tab_id", "source", "issue"):
+        for field_name in ("origin", "tab_id", "source", "issue"):
             if not str(getattr(self, field_name) or "").strip():
                 raise ValueError(f"{field_name} must be nonblank.")
         if str(self.origin).strip().casefold() not in {"run", "fit", "preview"}:

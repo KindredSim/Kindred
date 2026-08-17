@@ -168,7 +168,6 @@ def _format_equations(mechanism: object, *, has_interventions: bool) -> str:
     for species_name, row in zip(structure.species_names, structure.jacobian_expressions, strict=True):
         lines.append(f"{species_name}: {', '.join(row)}")
     lines.append("")
-    lines.append(f"Structure fingerprint: {structure.structure_fingerprint}")
     lines.append(
         "Canonical parameter symbols: "
         + (", ".join(structure.parameter_symbols) or "none")
@@ -186,8 +185,6 @@ def _format_interventions(
         lines = [
             "Declarative schedule payload:",
             json.dumps(parameterized_schedule.to_payload(), indent=2, sort_keys=True),
-            "",
-            f"Declarative schedule fingerprint: {parameterized_schedule.fingerprint or 'none'}",
             "",
             "Typed executable schedule is unavailable until schedule parameters are resolved.",
         ]
@@ -219,8 +216,6 @@ def _format_intervention_execution(
             sort_keys=True,
         ),
         "",
-        f"Declarative schedule fingerprint: {contract.declarative_fingerprint or 'none'}",
-        f"Executable schedule fingerprint: {contract.executable_fingerprint or 'none'}",
     ]
     for label, values in typed_sections:
         lines.extend(

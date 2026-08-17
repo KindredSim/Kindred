@@ -11,13 +11,15 @@ from __future__ import annotations
 import copy
 import logging
 from numbers import Real
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, replace
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Callable, Dict, Iterable, List, Mapping, Optional
 
 import numpy as np
 
 from kindred.core.rate_binding import ForwardRateBinding, RateBinding
+from kindred.core.mechanism import Equilibrium, Mechanism, Reaction
+from kindred.core.species import Species
 from kindred.core.exceptions import (
     FitSimulationError,
     FittingCancelled,
@@ -30,15 +32,15 @@ from kindred.core.mechanism_metadata import (
     MechanismMetadataView,
 )
 from kindred.core.temperature import (
+    TemperatureSchedule,
+    TemperatureScheduleDictProtocol,
     TemperatureScheduleProtocol,
     coerce_temperature_schedule,
-    temperature_schedule_execution_identity,
 )
 from kindred.core.intervention_schedule import (
     InterventionSchedule,
     InterventionScheduleDependencyMetadata,
     InterventionScheduleError,
-    coerce_intervention_schedule,
     intervention_schedule_parameter_dependencies,
     intervention_schedule_parameter_names,
 )
@@ -46,15 +48,12 @@ from kindred.core.intervention_schedule_compiler import (
     InterventionExecutionContract,
     compile_intervention_schedule,
 )
-from kindred.core.runtime_defaults import (
-    WEGSCHEIDER_CYCLICITY_ENABLED_DEFAULT,
-)
+from kindred.core.simulator.parameter_algebra_spec import ParameterAlgebraSpec
 from kindred.core.ode_builder import build_ode_rhs_from_mechanism
 from kindred.core.simulator.solver_types import (
     SimulationRequest,
     SimulationCancellationControl,
 )
-from kindred.core.symbolic.identity import normalize_symbolic_identity_mapping
 from kindred.core.symbolic.jacobian_execution import SymbolicJacobianExecution
 from kindred.core.simulator.parameter_namespace import (
     build_namespace_from_mechanism,
@@ -62,12 +61,6 @@ from kindred.core.simulator.parameter_namespace import (
 from kindred.core.simulator.dsl_parse import (
     DslAnalysis,
     PreparedDslRequestSet,
-)
-from kindred.core.simulator.executable_identity import (
-    BaseExecutableScienceIdentity,
-    TargetExecutableScienceIdentity,
-    compose_target_executable_identity,
-    fingerprint_executable_payload,
 )
 from kindred.core.simulation_preparation_stages import (
     PreparedSolverConfig as _PreparedSolverConfig,
@@ -121,101 +114,219 @@ def _mutable_prepared_value(value: Any) -> Any:
     return value
 
 __all__ = [
-    "BoundMechanism",
-    "SimulationExecutionSnapshot",
     "SimulationExecutionRequest",
-    "PreparedSimulationMetadata",
     "PreparedSimulationRun",
-    "SimulationParameterValuePartition",
     "SimulationPreparationError",
     "build_simulation_request_from_prepared_run",
     "metadata_view_for_mechanism",
-    "prepare_bound_mechanism",
-    "capture_simulation_execution_snapshot",
     "bind_simulation_execution_request_interventions",
     "build_simulation_execution_request",
-    "simulation_execution_request_fingerprint",
     "solver_config_for_execution_settings",
     "prepare_simulation_worker_run",
-    "partition_simulation_parameter_values",
     "resolve_prepared_run_intervention_execution",
-    "canonicalize_request_parameter_names",
     "fit_simulation_error_from_preparation_error",
     "prepare_preparation_failure",
     "raise_unowned_request_parameter_values",
     "reject_requested_algebra_owned_mechanism_parameters_for_fitting",
     "scalar_parameter_is_derived",
+    "simulation_execution_requests_equal",
 ]
 
 
-@dataclass(frozen=True)
-class SimulationParameterValuePartition:
-    """Typed ownership partition for request-time parameter override names."""
+def _simulation_container_values_equal(left: object, right: object) -> bool:
+    """Compare only the plain containers used by retained request values."""
 
-    raw_values: Mapping[str, float]
-    mechanism_parameter_names: frozenset[str] = frozenset()
-    unbound_mechanism_parameter_names: frozenset[str] = frozenset()
-    schedule_parameter_names: frozenset[str] = frozenset()
-    scalar_parameter_names: frozenset[str] = frozenset()
-    unknown_parameter_names: frozenset[str] = frozenset()
-    mechanism_parameter_name_by_raw: Mapping[str, str] = field(default_factory=dict)
-    unbound_mechanism_parameter_name_by_raw: Mapping[str, str] = field(default_factory=dict)
-    schedule_parameter_name_by_raw: Mapping[str, str] = field(default_factory=dict)
-    invalid_parameter_identifier_messages: Mapping[str, str] = field(default_factory=dict)
-
-    def __post_init__(self) -> None:
-        for name in (
-            "raw_values",
-            "mechanism_parameter_name_by_raw",
-            "unbound_mechanism_parameter_name_by_raw",
-            "schedule_parameter_name_by_raw",
-            "invalid_parameter_identifier_messages",
-        ):
-            value = getattr(self, name)
-            if not isinstance(value, Mapping):
-                raise TypeError(f"{name} must be a mapping.")
-            object.__setattr__(self, name, _freeze_prepared_value(value))
-
-    @property
-    def schedule_only_parameter_names(self) -> frozenset[str]:
-        return frozenset(
-            name
-            for name in self.schedule_parameter_names
-            if self.schedule_parameter_name_by_raw.get(name, name) not in self.mechanism_parameter_names
-            and self.schedule_parameter_name_by_raw.get(name, name) not in self.unbound_mechanism_parameter_names
-            and name not in self.scalar_parameter_names
+    if type(left) is not type(right):
+        return False
+    if isinstance(left, np.ndarray):
+        return bool(np.array_equal(left, right))
+    if type(left) is ParameterAlgebraSpec:
+        return _parameter_algebra_specs_equal(left, right)
+    if isinstance(left, (ForwardRateBinding, RateBinding)):
+        return _rate_values_equal(left, right)
+    if isinstance(left, TemperatureSchedule):
+        return _temperature_schedules_equal(left, right)
+    if isinstance(left, Mapping):
+        other = right
+        if len(left) != len(other):  # type: ignore[arg-type]
+            return False
+        return all(
+            key in other  # type: ignore[operator]
+            and _simulation_container_values_equal(value, other[key])  # type: ignore[index]
+            for key, value in left.items()
         )
+    if isinstance(left, tuple):
+        return len(left) == len(right) and all(  # type: ignore[arg-type]
+            _simulation_container_values_equal(item, other)
+            for item, other in zip(left, right, strict=True)  # type: ignore[arg-type]
+        )
+    if isinstance(left, list):
+        return len(left) == len(right) and all(  # type: ignore[arg-type]
+            _simulation_container_values_equal(item, other)
+            for item, other in zip(left, right, strict=True)  # type: ignore[arg-type]
+        )
+    if isinstance(left, (set, frozenset)):
+        return left == right
+    if isinstance(left, (str, bytes, int, float, bool, type(None))):
+        return bool(left == right)
+    return False
 
-    @property
-    def bindable_mechanism_parameter_names(self) -> frozenset[str]:
-        return frozenset(set(self.mechanism_parameter_names) | set(self.unbound_mechanism_parameter_names))
 
-    @property
-    def mechanism_binding_values(self) -> Dict[str, float]:
-        out: Dict[str, float] = {}
-        for raw_name, canonical_name in self.mechanism_parameter_name_by_raw.items():
-            if raw_name in self.raw_values:
-                out[str(canonical_name)] = float(self.raw_values[raw_name])
-        for name in self.scalar_parameter_names:
-            if name in self.raw_values:
-                out[str(name)] = float(self.raw_values[name])
-        return out
+def _rate_values_equal(left: object, right: object) -> bool:
+    """Compare the typed rate holders retained inside copied mechanisms."""
 
-    @property
-    def schedule_resolution_values(self) -> Dict[str, float]:
-        out: Dict[str, float] = {str(name): float(value) for name, value in self.raw_values.items()}
-        for raw_name, canonical_name in {
-            **self.mechanism_parameter_name_by_raw,
-            **self.unbound_mechanism_parameter_name_by_raw,
-        }.items():
-            if raw_name in self.raw_values:
-                out[str(canonical_name)] = float(self.raw_values[raw_name])
-        for schedule_raw_name, owner_name in self.schedule_parameter_name_by_raw.items():
-            if schedule_raw_name in out:
-                continue
-            if owner_name in out:
-                out[str(schedule_raw_name)] = float(out[owner_name])
-        return out
+    if type(left) is not type(right):
+        return False
+    if isinstance(left, ForwardRateBinding):
+        return (
+            left.name == right.name
+            and left.value == right.value
+            and left.reference_temperature_K == right.reference_temperature_K
+            and left.model == right.model
+        )
+    if isinstance(left, RateBinding):
+        return left.name == right.name and left.value == right.value
+    if isinstance(left, (int, float, str, bytes, type(None))):
+        return bool(left == right)
+    return False
+
+
+def _mechanisms_equal(left: object, right: object) -> bool:
+    """Compare mechanism topology, metadata, rates, and copied coordinates."""
+
+    if type(left) is not type(right) or not isinstance(left, Mechanism):
+        return False
+    other = right
+    left_species = tuple(left.species.items())
+    right_species = tuple(other.species.items())
+    if len(left_species) != len(right_species):
+        return False
+    if any(
+        name != other_name
+        or type(species) is not Species
+        or type(other_species) is not Species
+        or species.name != other_species.name
+        or species.initial_conc != other_species.initial_conc
+        for (name, species), (other_name, other_species) in zip(
+            left_species,
+            right_species,
+            strict=True,
+        )
+    ):
+        return False
+    if len(left.reactions) != len(other.reactions) or len(left.equilibria) != len(other.equilibria):
+        return False
+    for reaction, other_reaction in zip(left.reactions, other.reactions, strict=True):
+        if type(reaction) is not Reaction or type(other_reaction) is not Reaction:
+            return False
+        if not (
+            _simulation_container_values_equal(reaction.reactants, other_reaction.reactants)
+            and _simulation_container_values_equal(reaction.products, other_reaction.products)
+            and _simulation_container_values_equal(reaction.rate_orders, other_reaction.rate_orders)
+            and _simulation_container_values_equal(reaction.net_stoich, other_reaction.net_stoich)
+            and _simulation_container_values_equal(reaction.overrides, other_reaction.overrides)
+            and reaction.order == other_reaction.order
+            and _rate_values_equal(reaction.rate, other_reaction.rate)
+        ):
+            return False
+    for equilibrium, other_equilibrium in zip(left.equilibria, other.equilibria, strict=True):
+        if type(equilibrium) is not Equilibrium or type(other_equilibrium) is not Equilibrium:
+            return False
+        if not (
+            _simulation_container_values_equal(equilibrium.stoich_forward, other_equilibrium.stoich_forward)
+            and _simulation_container_values_equal(equilibrium.stoich_back, other_equilibrium.stoich_back)
+            and _rate_values_equal(equilibrium.Keq, other_equilibrium.Keq)
+            and _rate_values_equal(equilibrium.kf, other_equilibrium.kf)
+            and _rate_values_equal(equilibrium.kr, other_equilibrium.kr)
+            and equilibrium.fast == other_equilibrium.fast
+            and _simulation_container_values_equal(equilibrium.metadata, other_equilibrium.metadata)
+        ):
+            return False
+    return _simulation_container_values_equal(left.metadata, other.metadata)
+
+
+def _temperature_schedules_equal(left: object, right: object) -> bool:
+    if left is None or right is None:
+        return left is None and right is None
+    if type(left) is not type(right):
+        return False
+    if isinstance(left, TemperatureSchedule):
+        return _simulation_container_values_equal(left.to_dict(), right.to_dict())  # type: ignore[union-attr]
+    if isinstance(left, TemperatureScheduleDictProtocol):
+        return _simulation_container_values_equal(left.to_dict(), right.to_dict())
+    if isinstance(left, Mapping):
+        return _simulation_container_values_equal(left, right)
+    return False
+
+
+def _intervention_executions_equal(left: object, right: object) -> bool:
+    if left is None or right is None:
+        return left is None and right is None
+    if type(left) is not InterventionExecutionContract or type(right) is not InterventionExecutionContract:
+        return False
+    return (
+        _simulation_container_values_equal(left.declarative_payload, right.declarative_payload)
+        and _simulation_container_values_equal(left.executable_payload, right.executable_payload)
+        and left.instants == right.instants
+        and left.fluxes == right.fluxes
+        and left.holds == right.holds
+        and left.triggers == right.triggers
+        and left.discontinuities == right.discontinuities
+        and left.segment_identity == right.segment_identity
+        and _simulation_container_values_equal(left.protocol_lineage, right.protocol_lineage)
+        and left.trigger_firings == right.trigger_firings
+    )
+
+
+def _parameter_algebra_specs_equal(left: object, right: object) -> bool:
+    if type(left) is not ParameterAlgebraSpec or type(right) is not ParameterAlgebraSpec:
+        return False
+    return (
+        left.param_statements == right.param_statements
+        and left.observable_names == right.observable_names
+        and left.mechanism_namespace == right.mechanism_namespace
+        and left.scalar_input_names == right.scalar_input_names
+        and left.parameter_block == right.parameter_block
+        and left.observable_block == right.observable_block
+        and _simulation_container_values_equal(
+            left.raw_to_canonical_identifiers_by_assignment,
+            right.raw_to_canonical_identifiers_by_assignment,
+        )
+    )
+
+
+def simulation_execution_requests_equal(
+    left: SimulationExecutionRequest,
+    right: SimulationExecutionRequest,
+) -> bool:
+    """Compare every typed field of two complete execution requests."""
+
+    if type(left) is not SimulationExecutionRequest or type(right) is not SimulationExecutionRequest:
+        return False
+    return (
+        left.analysis == right.analysis
+        and _mechanisms_equal(left.mechanism, right.mechanism)
+        and left.species_names == right.species_names
+        and left.y0 == right.y0
+        and _temperature_schedules_equal(left.temperature_schedule, right.temperature_schedule)
+        and _parameter_algebra_specs_equal(left.parameter_algebra_spec, right.parameter_algebra_spec)
+        and _intervention_executions_equal(left.intervention_execution, right.intervention_execution)
+        and left.t_span == right.t_span
+        and type(left.solver_config) is type(right.solver_config)
+        and left.solver_config.solver_input == right.solver_config.solver_input
+        and left.solver_config.solver == right.solver_config.solver
+        and left.solver_config.rtol == right.solver_config.rtol
+        and left.solver_config.atol == right.solver_config.atol
+        and _simulation_container_values_equal(left.solver_config.grid, right.solver_config.grid)
+        and left.solver_config.use_analytic_jacobian == right.solver_config.use_analytic_jacobian
+        and left.solver_config.wegscheider_cyclicity_enabled == right.solver_config.wegscheider_cyclicity_enabled
+        and left.wegscheider_admission_report == right.wegscheider_admission_report
+        and left.parameterized_intervention_schedule == right.parameterized_intervention_schedule
+        and left.requested_parameter_names == right.requested_parameter_names
+        and left.candidate_dependent_intervention_parameter_names == right.candidate_dependent_intervention_parameter_names
+        and _simulation_container_values_equal(left.parameter_overrides, right.parameter_overrides)
+        and left.mechanism_source == right.mechanism_source
+    )
 
 
 def _parameter_override_target_kind(mechanism: Any, name: str) -> str | None:
@@ -229,49 +340,52 @@ def _parameter_override_target_kind(mechanism: Any, name: str) -> str | None:
     return None
 
 
-def partition_simulation_parameter_values(
+def _classify_request_parameter_names(
     *,
     mechanism: Any,
     parameter_overrides: Mapping[str, Any] | None,
     unresolved_intervention_schedule: InterventionSchedule | None,
+    raw_values: dict[str, float],
+    mechanism_names: set[str],
+    unbound_mechanism_names: set[str],
+    schedule_names: set[str],
+    scalar_names: set[str],
+    unknown_names: set[str],
+    mechanism_name_by_raw: dict[str, str],
+    unbound_mechanism_name_by_raw: dict[str, str],
+    schedule_name_by_raw: dict[str, str],
+    invalid_messages: dict[str, str],
     requested_parameter_names: Iterable[str] | None = None,
-    scalar_parameter_names: Iterable[str] | None = None,
+    declared_scalar_names: Iterable[str] | None = None,
     validate_values: bool = True,
-) -> SimulationParameterValuePartition:
-    raw_values = {
-        str(name): float(value)
-        for name, value in _coerce_parameter_override_items(
-            parameter_overrides,
-            require_finite=bool(validate_values),
-        )
-    }
+) -> None:
+    raw_values.update(
+        {
+            str(name): float(value)
+            for name, value in _coerce_parameter_override_items(
+                parameter_overrides,
+                require_finite=bool(validate_values),
+            )
+        }
+    )
     classification_names = list(raw_values)
     for requested_name in requested_parameter_names or ():
         name = str(requested_name or "").strip()
         if name and name not in classification_names:
             classification_names.append(name)
-    schedule_names = frozenset(intervention_schedule_parameter_names(unresolved_intervention_schedule))
+    schedule_names.update(intervention_schedule_parameter_names(unresolved_intervention_schedule))
     for schedule_name in schedule_names:
         name = str(schedule_name or "").strip()
         if name and name not in classification_names:
             classification_names.append(name)
     if not raw_values and not classification_names:
-        return SimulationParameterValuePartition(raw_values={})
+        return
     declared_scalar_names = {
         str(name or "").strip()
-        for name in scalar_parameter_names or ()
+        for name in declared_scalar_names or ()
         if str(name or "").strip()
     }
     mechanism_namespace = build_namespace_from_mechanism(mechanism)
-    mechanism_names: set[str] = set()
-    unbound_mechanism_names: set[str] = set()
-    scalar_names: set[str] = set()
-    unknown_names: set[str] = set()
-    mechanism_name_by_raw: dict[str, str] = {}
-    unbound_mechanism_name_by_raw: dict[str, str] = {}
-    schedule_name_by_raw: dict[str, str] = {}
-    invalid_messages: dict[str, str] = {}
-
     for name in classification_names:
         claimed = False
         resolution = mechanism_namespace.resolve(name)
@@ -325,36 +439,27 @@ def partition_simulation_parameter_values(
         if not claimed:
             unknown_names.add(name)
 
-    return SimulationParameterValuePartition(
-        raw_values=raw_values,
-        mechanism_parameter_names=frozenset(mechanism_names),
-        unbound_mechanism_parameter_names=frozenset(unbound_mechanism_names),
-        schedule_parameter_names=schedule_names,
-        scalar_parameter_names=frozenset(scalar_names),
-        unknown_parameter_names=frozenset(unknown_names),
-        mechanism_parameter_name_by_raw=mechanism_name_by_raw,
-        unbound_mechanism_parameter_name_by_raw=unbound_mechanism_name_by_raw,
-        schedule_parameter_name_by_raw=schedule_name_by_raw,
-        invalid_parameter_identifier_messages=invalid_messages,
-    )
-
-
 def raise_unowned_request_parameter_values(
-    parameter_partition: SimulationParameterValuePartition,
     *,
+    raw_values: Mapping[str, float],
+    mechanism_name_by_raw: Mapping[str, str],
+    unbound_mechanism_name_by_raw: Mapping[str, str],
+    unbound_mechanism_names: Iterable[str],
+    unknown_names: Iterable[str],
+    invalid_messages: Mapping[str, str],
     allow_unbound_mechanism_parameters: bool = False,
 ) -> None:
-    if parameter_partition.invalid_parameter_identifier_messages:
-        first_name = sorted(parameter_partition.invalid_parameter_identifier_messages)[0]
-        raise ValueError(parameter_partition.invalid_parameter_identifier_messages[first_name])
+    if invalid_messages:
+        first_name = sorted(invalid_messages)[0]
+        raise ValueError(invalid_messages[first_name])
     owner_to_raw: dict[str, str] = {}
     for raw_name, owner_name in sorted(
         {
-            **parameter_partition.mechanism_parameter_name_by_raw,
-            **parameter_partition.unbound_mechanism_parameter_name_by_raw,
+            **mechanism_name_by_raw,
+            **unbound_mechanism_name_by_raw,
         }.items()
     ):
-        if raw_name not in parameter_partition.raw_values:
+        if raw_name not in raw_values:
             continue
         owner = str(owner_name)
         previous = owner_to_raw.get(owner)
@@ -363,18 +468,19 @@ def raise_unowned_request_parameter_values(
                 f"Request parameter names {previous!r} and {raw_name!r} both resolve to {owner!r}."
             )
         owner_to_raw[owner] = str(raw_name)
-    unknown_names = sorted(str(name) for name in parameter_partition.unknown_parameter_names)
-    if unknown_names:
+    unknown = sorted(str(name) for name in unknown_names)
+    if unknown:
         raise ValueError(
             "Unknown request parameter(s): "
-            + ", ".join(repr(name) for name in unknown_names)
+            + ", ".join(repr(name) for name in unknown)
             + ". Request parameters must belong to the mechanism, schedule, scalar algebra, or initial-condition namespace."
         )
-    if parameter_partition.unbound_mechanism_parameter_names and not allow_unbound_mechanism_parameters:
-        first_name = sorted(parameter_partition.unbound_mechanism_parameter_names)[0]
+    unbound = frozenset(str(name) for name in unbound_mechanism_names)
+    if unbound and not allow_unbound_mechanism_parameters:
+        first_name = sorted(unbound)[0]
         raw_names = sorted(
             raw_name
-            for raw_name, canonical_name in parameter_partition.unbound_mechanism_parameter_name_by_raw.items()
+            for raw_name, canonical_name in unbound_mechanism_name_by_raw.items()
             if canonical_name == first_name
         )
         raw_clause = f" from request name {raw_names[0]!r}" if raw_names else ""
@@ -382,49 +488,6 @@ def raise_unowned_request_parameter_values(
             f"Request parameter{raw_clause} resolves to mechanism parameter {first_name!r}, "
             "but no prepared execution binding can consume it."
         )
-
-
-def canonicalize_request_parameter_names(
-    parameter_partition: SimulationParameterValuePartition,
-    requested_parameter_names: Iterable[str] | None,
-) -> list[str]:
-    canonical_by_raw = {
-        **parameter_partition.mechanism_parameter_name_by_raw,
-        **parameter_partition.unbound_mechanism_parameter_name_by_raw,
-    }
-    out: list[str] = []
-    owner_to_raw: dict[str, str] = {}
-    for raw_name in requested_parameter_names or ():
-        raw = str(raw_name or "").strip()
-        if not raw:
-            continue
-        owner = str(canonical_by_raw.get(raw, raw))
-        previous = owner_to_raw.get(owner)
-        if previous is not None and previous != raw:
-            raise ValueError(
-                f"Duplicate request parameter names {previous!r} and {raw!r} resolve to {owner!r}."
-            )
-        owner_to_raw[owner] = raw
-        out.append(owner)
-    return out
-
-
-@dataclass
-class BoundMechanism:
-    """Prepared Fit mechanism and its retained typed execution authorities."""
-
-    mechanism: Any
-    species_names: List[str]
-    y0: np.ndarray
-    dsl_analysis: DslAnalysis
-    parameter_algebra_spec: Any
-    base_executable_identity: BaseExecutableScienceIdentity
-    intervention_execution: InterventionExecutionContract | None = None
-    unresolved_intervention_schedule: InterventionSchedule | None = None
-    wegscheider_admission_report: WegscheiderCyclicityReport | None = None
-    wegscheider_executable_report: WegscheiderExecutableSatisfactionReport | None = None
-
-
 class SimulationPreparationError(RuntimeError):
     """
     Error raised when preparing a SimulationWorker run payload/request fails.
@@ -490,7 +553,6 @@ class PreparedSimulationRun:
     parameter_algebra_spec: Any
     intervention_execution: InterventionExecutionContract | None
     symbolic_jacobian: SymbolicJacobianExecution
-    symbolic_wegscheider_identity: Mapping[str, Any] | None
     initials_for_algebra: Optional[Mapping[str, float]]
     warnings: tuple[str, ...]
     solver_config: _PreparedSolverConfig
@@ -499,6 +561,14 @@ class PreparedSimulationRun:
     cancellation_control: SimulationCancellationControl | None = None
     wegscheider_admission_report: WegscheiderCyclicityReport | None = None
     wegscheider_executable_report: WegscheiderExecutableSatisfactionReport | None = None
+    version: int = 1
+    mechanism_text_len: int = 0
+    param_names: tuple[str, ...] = ()
+    t_end: float = 0.0
+    num_points: int = 0
+    temperature_K: float = 0.0
+    initial_prefix: str = "init:"
+    symbolic_jacobian_status: Optional[Mapping[str, Any]] = None
 
     def __post_init__(self) -> None:
         from kindred.core.simulator.wegscheider_symbolic import (
@@ -511,6 +581,8 @@ class PreparedSimulationRun:
         object.__setattr__(self, "y0", y0)
         object.__setattr__(self, "species_names", tuple(self.species_names))
         object.__setattr__(self, "warnings", tuple(str(value) for value in self.warnings))
+        object.__setattr__(self, "param_names", tuple(str(name) for name in self.param_names if str(name).strip()))
+        object.__setattr__(self, "initial_prefix", str(self.initial_prefix or "init:"))
         if not isinstance(self.solver_config, _PreparedSolverConfig):
             raise TypeError("solver_config must be PreparedSolverConfig.")
         if isinstance(self.request, SimulationExecutionRequest):
@@ -552,22 +624,36 @@ class PreparedSimulationRun:
                 "initials_for_algebra",
                 _freeze_prepared_value(self.initials_for_algebra),
             )
-        if self.symbolic_wegscheider_identity is not None:
-            if not isinstance(self.symbolic_wegscheider_identity, Mapping):
-                raise TypeError(
-                    "symbolic_wegscheider_identity must be a mapping or None."
-                )
-            object.__setattr__(
-                self,
-                "symbolic_wegscheider_identity",
-                _freeze_prepared_value(self.symbolic_wegscheider_identity),
-            )
+        if self.symbolic_jacobian_status is not None:
+            if not isinstance(self.symbolic_jacobian_status, Mapping):
+                raise TypeError("symbolic_jacobian_status must be a mapping or None.")
+            object.__setattr__(self, "symbolic_jacobian_status", _freeze_prepared_value(self.symbolic_jacobian_status))
+
+    def to_serializable_dict(self) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {
+            "version": int(self.version),
+            "mechanism_text_len": int(self.mechanism_text_len),
+            "param_names": [str(name) for name in self.param_names],
+            "t_end": float(self.t_end),
+            "num_points": int(self.num_points),
+            "temperature_K": float(self.temperature_K),
+            "solver_requested": self.solver_config.solver_input,
+            "solver_normalized": self.solver_config.solver,
+            "rtol": self.solver_config.rtol,
+            "atol": self.solver_config.atol,
+            "use_analytic_jacobian": self.solver_config.use_analytic_jacobian,
+            MechanismMetadataKeys.WEGSCHEIDER_CYCLICITY_ENABLED: self.solver_config.wegscheider_cyclicity_enabled,
+            "initial_prefix": str(self.initial_prefix),
+        }
+        if self.symbolic_jacobian_status:
+            payload["symbolic_jacobian_status"] = _mutable_prepared_value(self.symbolic_jacobian_status)
+        return payload
 
 
 def resolve_prepared_run_intervention_execution(
     prepared_run: PreparedSimulationRun,
-    parameter_partition: SimulationParameterValuePartition,
     *,
+    parameter_values: Mapping[str, float],
     cancellation_check: Callable[[], bool] | None = None,
 ) -> InterventionExecutionContract:
     """Return the one resolved Run-owned contract consumed by Fit."""
@@ -578,11 +664,6 @@ def resolve_prepared_run_intervention_execution(
     schedule = prepared_run.unresolved_intervention_schedule
     if schedule is None or not schedule.is_parameterized:
         return prepared_run.intervention_execution
-    parameter_values = _schedule_resolution_values_for_request(
-        schedule,
-        parameter_partition,
-        mechanism=prepared_run.mechanism,
-    )
     if cancellation_check is not None and cancellation_check():
         raise FittingCancelled()
     request = prepared_run.request
@@ -593,7 +674,7 @@ def resolve_prepared_run_intervention_execution(
     dependency_metadata = _expanded_intervention_schedule_dependency_metadata(
         schedule,
         mechanism=prepared_run.mechanism,
-        parameter_algebra_spec=request.snapshot.parameter_algebra_spec,
+        parameter_algebra_spec=request.parameter_algebra_spec,
     )
     try:
         resolved_schedule = schedule.resolve_parameters(
@@ -665,9 +746,6 @@ def build_simulation_request_from_prepared_run(
             grid=prepared_solver_config.grid,
             temperature_schedule=prepared_run.temperature_schedule,
             species_names=tuple(prepared_run.species_names),
-            symbolic_wegscheider_identity=(
-                prepared_run.symbolic_wegscheider_identity
-            ),
             cancellation_control=cancellation_control,
         )
     if not isinstance(request, SimulationRequest):
@@ -687,117 +765,15 @@ def build_simulation_request_from_prepared_run(
         grid=prepared_run.solver_config.grid,
         temperature_schedule=request.temperature_schedule,
         species_names=tuple(prepared_run.species_names),
-        symbolic_wegscheider_identity=request.symbolic_wegscheider_identity,
         cancellation_control=cancellation_control,
     )
     _raise_if_cancelled(cancellation_control)
     return result
 
 
-@dataclass(frozen=True)
-class PreparedSimulationMetadata:
-    """Typed metadata attached to prepared simulation closures for fitting workflows."""
-
-    version: int
-    mechanism_text_sha256: str
-    mechanism_text_len: int
-    param_names: tuple[str, ...]
-    t_end: float
-    num_points: int
-    temperature_K: float
-    solver_config: _PreparedSolverConfig
-    initial_prefix: str
-    intervention_schedule_declarative_fingerprint: str = ""
-    intervention_schedule_executable_fingerprint: str = ""
-    symbolic_jacobian_identity: Optional[Mapping[str, Any]] = None
-    symbolic_jacobian_status: Optional[Mapping[str, Any]] = None
-    symbolic_wegscheider_identity: Optional[Mapping[str, Any]] = None
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.solver_config, _PreparedSolverConfig):
-            raise TypeError(
-                "prepared simulation metadata requires PreparedSolverConfig."
-            )
-        object.__setattr__(
-            self,
-            "param_names",
-            tuple(str(name) for name in self.param_names if str(name).strip()),
-        )
-        jacobian_identity = normalize_symbolic_identity_mapping(
-            self.symbolic_jacobian_identity,
-            label="symbolic Jacobian identity",
-        )
-        object.__setattr__(
-            self,
-            "symbolic_jacobian_identity",
-            None
-            if jacobian_identity is None
-            else _freeze_prepared_value(jacobian_identity),
-        )
-        if self.symbolic_jacobian_status is not None:
-            if not isinstance(self.symbolic_jacobian_status, Mapping):
-                raise TypeError("symbolic_jacobian_status must be a mapping or None.")
-            object.__setattr__(
-                self,
-                "symbolic_jacobian_status",
-                _freeze_prepared_value(self.symbolic_jacobian_status),
-            )
-        wegscheider_identity = normalize_symbolic_identity_mapping(
-            self.symbolic_wegscheider_identity,
-            label="symbolic Wegscheider identity",
-        )
-        object.__setattr__(
-            self,
-            "symbolic_wegscheider_identity",
-            None
-            if wegscheider_identity is None
-            else _freeze_prepared_value(wegscheider_identity),
-        )
-
-    def to_serializable_dict(self) -> Dict[str, Any]:
-        payload: Dict[str, Any] = {
-            "version": int(self.version),
-            "mechanism_text_sha256": str(self.mechanism_text_sha256),
-            "mechanism_text_len": int(self.mechanism_text_len),
-            "param_names": [str(name) for name in self.param_names if str(name).strip()],
-            "t_end": float(self.t_end),
-            "num_points": int(self.num_points),
-            "temperature_K": float(self.temperature_K),
-            "solver_requested": self.solver_config.solver_input,
-            "solver_normalized": self.solver_config.solver,
-            "rtol": self.solver_config.rtol,
-            "atol": self.solver_config.atol,
-            "use_analytic_jacobian": (
-                self.solver_config.use_analytic_jacobian
-            ),
-            MechanismMetadataKeys.WEGSCHEIDER_CYCLICITY_ENABLED: (
-                self.solver_config.wegscheider_cyclicity_enabled
-            ),
-            "initial_prefix": str(self.initial_prefix),
-            "intervention_schedule_declarative_fingerprint": str(
-                self.intervention_schedule_declarative_fingerprint or ""
-            ),
-            "intervention_schedule_executable_fingerprint": str(
-                self.intervention_schedule_executable_fingerprint or ""
-            ),
-        }
-        if self.symbolic_jacobian_identity:
-            payload["symbolic_jacobian_identity"] = _mutable_prepared_value(
-                self.symbolic_jacobian_identity
-            )
-        if self.symbolic_jacobian_status:
-            payload["symbolic_jacobian_status"] = _mutable_prepared_value(
-                self.symbolic_jacobian_status
-            )
-        if self.symbolic_wegscheider_identity:
-            payload["symbolic_wegscheider_identity"] = _mutable_prepared_value(
-                self.symbolic_wegscheider_identity
-            )
-        return payload
-
 @dataclass(frozen=True, slots=True)
-class SimulationExecutionSnapshot:
-    """One isolated, typed scientific state captured for direct execution."""
+class SimulationExecutionRequest:
+    """Exact direct request for one isolated simulation target."""
 
     analysis: DslAnalysis
     mechanism: Any
@@ -806,20 +782,20 @@ class SimulationExecutionSnapshot:
     temperature_schedule: TemperatureScheduleProtocol | None
     parameter_algebra_spec: Any
     intervention_execution: InterventionExecutionContract | None
-    base_executable_identity: BaseExecutableScienceIdentity
-    target_executable_identity: TargetExecutableScienceIdentity | None
+    t_span: tuple[float, float]
+    solver_config: _PreparedSolverConfig
     wegscheider_admission_report: WegscheiderCyclicityReport | None = None
     parameterized_intervention_schedule: InterventionSchedule | None = None
     requested_parameter_names: tuple[str, ...] = ()
     candidate_dependent_intervention_parameter_names: frozenset[str] = frozenset()
+    parameter_overrides: Mapping[str, float] | None = None
+    mechanism_source: MechanismAuthoringSource | None = None
 
     def __post_init__(self) -> None:
-        from kindred.core.simulator.wegscheider_symbolic import (
-            WegscheiderCyclicityReport,
-        )
+        from kindred.core.simulator.wegscheider_symbolic import WegscheiderCyclicityReport
 
         if type(self.analysis) is not DslAnalysis:
-            raise TypeError("execution snapshot analysis must be DslAnalysis.")
+            raise TypeError("execution request analysis must be DslAnalysis.")
         species_names = tuple(self.species_names)
         if (
             not species_names
@@ -832,87 +808,44 @@ class SimulationExecutionSnapshot:
             or len(species_names) != len(set(species_names))
         ):
             raise ValueError(
-                "execution snapshot species_names must be unique nonblank strings."
+                "execution request species_names must be unique nonblank strings."
             )
         try:
             y0 = tuple(
-                validate_concentration(value, field="execution snapshot initial concentration")
+                validate_concentration(value, field="execution request initial concentration")
                 for value in self.y0
             )
         except (TypeError, ValueError) as exc:
             raise ValueError(
-                "execution snapshot y0 must contain one admitted concentration "
-                "value per species."
+                "execution request y0 must contain one admitted concentration value per species."
             ) from exc
         if len(y0) != len(species_names):
-            raise ValueError(
-                "execution snapshot y0 must contain one value per species."
-            )
+            raise ValueError("execution request y0 must contain one value per species.")
         if self.temperature_schedule is not None:
             coerce_temperature_schedule(self.temperature_schedule)
         if self.parameter_algebra_spec is None:
-            raise TypeError(
-                "execution snapshot requires its retained parameter algebra spec."
-            )
+            raise TypeError("execution request requires its retained parameter algebra spec.")
         if self.wegscheider_admission_report is not None and not isinstance(
-            self.wegscheider_admission_report,
-            WegscheiderCyclicityReport,
+            self.wegscheider_admission_report, WegscheiderCyclicityReport
         ):
-            raise TypeError(
-                "execution snapshot Wegscheider admission must be a typed report."
-            )
-        if not isinstance(
-            self.base_executable_identity,
-            BaseExecutableScienceIdentity,
-        ):
-            raise TypeError(
-                "execution snapshot requires admitted base executable identity."
-            )
-        if self.base_executable_identity.analysis_identity != self.analysis.identity:
-            raise ValueError(
-                "execution snapshot analysis and base executable identities conflict."
-            )
+            raise TypeError("execution request Wegscheider admission must be a typed report.")
         schedule = self.parameterized_intervention_schedule
         contract = self.intervention_execution
         if schedule is not None:
             if type(schedule) is not InterventionSchedule or not schedule.is_parameterized:
                 raise TypeError(
-                    "execution snapshot declarative intervention state must be "
-                    "an exact parameterized schedule."
+                    "execution request declarative intervention state must be an exact parameterized schedule."
                 )
             if contract is not None:
                 raise ValueError(
-                    "execution snapshot intervention state cannot be both "
-                    "declarative and compiled."
-                )
-            if self.target_executable_identity is not None:
-                raise ValueError(
-                    "unbound execution snapshot cannot carry target identity."
+                    "execution request intervention state cannot be both declarative and compiled."
                 )
         elif not isinstance(contract, InterventionExecutionContract):
-            raise TypeError(
-                "bound execution snapshots require one compiled intervention "
-                "contract."
-            )
-        else:
-            expected_identity = compose_target_executable_identity(
-                self.base_executable_identity,
-                contract,
-            )
-            if self.target_executable_identity != expected_identity:
-                raise ValueError(
-                    "bound execution snapshot target identity conflicts with "
-                    "its admitted base and intervention contract."
-                )
-        requested_names = tuple(
-            str(name).strip() for name in self.requested_parameter_names
-        )
-        if any(not name for name in requested_names) or len(
-            requested_names
-        ) != len(set(requested_names)):
+            raise TypeError("bound execution requests require one compiled intervention contract.")
+        requested_names = tuple(str(name).strip() for name in self.requested_parameter_names)
+        if any(not name for name in requested_names) or len(requested_names) != len(set(requested_names)):
             raise ValueError(
-                "execution snapshot requested parameter names must be unique "
-                "and nonblank."
+                "execution request requested parameter names must be unique and nonblank."
             )
         candidate_dependent_names = frozenset(
             str(name).strip()
@@ -921,44 +854,7 @@ class SimulationExecutionSnapshot:
         )
         if candidate_dependent_names and schedule is None:
             raise ValueError(
-                "candidate-dependent intervention parameters require a "
-                "declarative schedule."
-            )
-        object.__setattr__(self, "species_names", species_names)
-        object.__setattr__(self, "y0", y0)
-        object.__setattr__(self, "requested_parameter_names", requested_names)
-        object.__setattr__(
-            self,
-            "candidate_dependent_intervention_parameter_names",
-            candidate_dependent_names,
-        )
-
-    def isolated_copy(self) -> "SimulationExecutionSnapshot":
-        return replace(
-            self,
-            mechanism=copy.deepcopy(self.mechanism),
-            temperature_schedule=copy.deepcopy(self.temperature_schedule),
-            parameter_algebra_spec=copy.deepcopy(self.parameter_algebra_spec),
-            parameterized_intervention_schedule=copy.deepcopy(
-                self.parameterized_intervention_schedule
-            ),
-        )
-
-
-@dataclass(frozen=True, slots=True)
-class SimulationExecutionRequest:
-    """Exact direct request for one isolated simulation target."""
-
-    snapshot: SimulationExecutionSnapshot
-    t_span: tuple[float, float]
-    solver_config: _PreparedSolverConfig
-    parameter_overrides: Mapping[str, float] | None = None
-    mechanism_source: MechanismAuthoringSource | None = None
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.snapshot, SimulationExecutionSnapshot):
-            raise TypeError(
-                "execution request snapshot must be SimulationExecutionSnapshot."
+                "candidate-dependent intervention parameters require a declarative schedule."
             )
         if type(self.t_span) is not tuple or len(self.t_span) != 2:
             raise TypeError("execution request t_span must be an exact pair.")
@@ -1013,119 +909,38 @@ class SimulationExecutionRequest:
                 )
             if not source_matches_analysis(
                 self.mechanism_source,
-                self.snapshot.analysis,
+                self.analysis,
             ):
                 raise ValueError(
                     "execution request mechanism source does not match its "
                     "admitted analysis."
                 )
+        object.__setattr__(self, "species_names", species_names)
+        object.__setattr__(self, "y0", y0)
+        object.__setattr__(self, "requested_parameter_names", requested_names)
+        object.__setattr__(self, "candidate_dependent_intervention_parameter_names", candidate_dependent_names)
         object.__setattr__(self, "t_span", t_span)
         object.__setattr__(self, "parameter_overrides", overrides)
 
     def isolated_copy(self) -> "SimulationExecutionRequest":
         return type(self)(
-            snapshot=self.snapshot.isolated_copy(),
+            analysis=self.analysis,
+            mechanism=copy.deepcopy(self.mechanism),
+            species_names=self.species_names,
+            y0=self.y0,
+            temperature_schedule=copy.deepcopy(self.temperature_schedule),
+            parameter_algebra_spec=copy.deepcopy(self.parameter_algebra_spec),
+            intervention_execution=self.intervention_execution,
             t_span=self.t_span,
             solver_config=self.solver_config,
+            wegscheider_admission_report=self.wegscheider_admission_report,
+            parameterized_intervention_schedule=copy.deepcopy(self.parameterized_intervention_schedule),
+            requested_parameter_names=self.requested_parameter_names,
+            candidate_dependent_intervention_parameter_names=self.candidate_dependent_intervention_parameter_names,
             parameter_overrides=self.parameter_overrides,
             mechanism_source=self.mechanism_source,
         )
 
-
-def _execution_identity_value(value: Any) -> Any:
-    """Normalize retained immutable values for one exact request fingerprint."""
-
-    if isinstance(value, Mapping):
-        return {
-            str(key): _execution_identity_value(item)
-            for key, item in value.items()
-        }
-    if isinstance(value, (tuple, list)):
-        return [_execution_identity_value(item) for item in value]
-    if isinstance(value, (set, frozenset)):
-        return sorted(_execution_identity_value(item) for item in value)
-    if isinstance(value, np.ndarray):
-        return value.tolist()
-    return value
-
-
-def simulation_execution_request_fingerprint(
-    request: SimulationExecutionRequest,
-) -> str:
-    """Project all admitted Run/Preview execution truth into one exact key hash."""
-
-    from kindred.core.mechanism_source import MechanismAuthoringSource
-
-    if not isinstance(request, SimulationExecutionRequest):
-        raise TypeError("request must be SimulationExecutionRequest.")
-    source = request.mechanism_source
-    if not isinstance(source, MechanismAuthoringSource):
-        raise ValueError(
-            "result identity requires request-retained mechanism authoring source."
-        )
-    snapshot = request.snapshot
-    target_identity = snapshot.target_executable_identity
-    contract = snapshot.intervention_execution
-    if not isinstance(
-        target_identity,
-        TargetExecutableScienceIdentity,
-    ) or not isinstance(contract, InterventionExecutionContract):
-        raise ValueError("result identity requires a bound execution request.")
-    solver = request.solver_config
-    return fingerprint_executable_payload(
-        {
-            "mechanism_source": source.to_payload(),
-            "analysis_identity": snapshot.analysis.identity,
-            "target_executable_identity": {
-                "fingerprint": target_identity.fingerprint,
-                "base_fingerprint": target_identity.base.fingerprint,
-                "intervention_declarative_fingerprint": (
-                    target_identity.intervention_declarative_fingerprint
-                ),
-                "intervention_executable_fingerprint": (
-                    target_identity.intervention_executable_fingerprint
-                ),
-            },
-            "species_initial_values": tuple(
-                zip(snapshot.species_names, snapshot.y0, strict=True)
-            ),
-            "temperature_schedule": _execution_identity_value(
-                temperature_schedule_execution_identity(
-                    snapshot.temperature_schedule
-                )
-            ),
-            "t_span": request.t_span,
-            "solver_config": {
-                "solver_input": solver.solver_input,
-                "solver": solver.solver,
-                "rtol": solver.rtol,
-                "atol": solver.atol,
-                "grid": _execution_identity_value(solver.grid),
-                "use_analytic_jacobian": solver.use_analytic_jacobian,
-                "wegscheider_cyclicity_enabled": (
-                    solver.wegscheider_cyclicity_enabled
-                ),
-            },
-            "parameter_overrides": sorted(
-                (str(name), float(value))
-                for name, value in dict(request.parameter_overrides or {}).items()
-            ),
-            "wegscheider_admission": (
-                None
-                if snapshot.wegscheider_admission_report is None
-                else snapshot.wegscheider_admission_report.symbolic_identity
-            ),
-            "requested_parameter_names": snapshot.requested_parameter_names,
-            "candidate_dependent_intervention_parameter_names": sorted(
-                snapshot.candidate_dependent_intervention_parameter_names
-            ),
-            "intervention_contract": {
-                "declarative_fingerprint": contract.declarative_fingerprint,
-                "executable_fingerprint": contract.executable_fingerprint,
-            },
-        },
-        prefix="simulation-request:",
-    )
 
 _MISSING = object()
 
@@ -1134,7 +949,7 @@ def _fresh_preparation_unresolved_intervention_schedule_for_request(
     execution_request: SimulationExecutionRequest,
 ) -> InterventionSchedule | None:
     return copy.deepcopy(
-        execution_request.snapshot.parameterized_intervention_schedule
+        execution_request.parameterized_intervention_schedule
     )
 
 
@@ -1337,17 +1152,17 @@ def _schedule_parameters_deferred_to_prepared_request(
 ) -> frozenset[str]:
     if not unresolved_intervention_schedule.is_parameterized:
         return frozenset()
-    retained = execution_request.snapshot.candidate_dependent_intervention_parameter_names
+    retained = execution_request.candidate_dependent_intervention_parameter_names
     if retained:
         return retained
-    requested = execution_request.snapshot.requested_parameter_names
+    requested = execution_request.requested_parameter_names
     supplied = set(dict(execution_request.parameter_overrides or {}).keys())
     referenced = set(intervention_schedule_parameter_names(unresolved_intervention_schedule))
     if not requested or not referenced:
         return frozenset()
 
-    mechanism = execution_request.snapshot.mechanism
-    spec = execution_request.snapshot.parameter_algebra_spec
+    mechanism = execution_request.mechanism
+    spec = execution_request.parameter_algebra_spec
     namespace = build_namespace_from_mechanism(mechanism)
 
     def canonical_name(raw_name: object) -> str:
@@ -1385,20 +1200,16 @@ def bind_simulation_execution_request_interventions(
         raise TypeError(
             "intervention binding requires SimulationExecutionRequest."
         )
-    snapshot = request.snapshot
-    unresolved = snapshot.parameterized_intervention_schedule
+    unresolved = request.parameterized_intervention_schedule
     if unresolved is None:
         return request
     deferred = _schedule_parameters_deferred_to_prepared_request(request, unresolved)
     if deferred:
         return replace(
             request,
-            snapshot=replace(
-                snapshot,
-                candidate_dependent_intervention_parameter_names=deferred,
-            ),
+            candidate_dependent_intervention_parameter_names=deferred,
         )
-    mechanism = copy.deepcopy(snapshot.mechanism)
+    mechanism = request.mechanism
     prepared_solver_config = request.solver_config
     metadata = getattr(mechanism, "metadata", None)
     if isinstance(metadata, dict):
@@ -1406,31 +1217,56 @@ def bind_simulation_execution_request_interventions(
             prepared_solver_config.wegscheider_cyclicity_enabled
         )
     _require_wegscheider_admission_for_execution(
-        admission_report=snapshot.wegscheider_admission_report,
+        admission_report=request.wegscheider_admission_report,
         wegscheider_cyclicity_enabled=(
             prepared_solver_config.wegscheider_cyclicity_enabled
         ),
     )
     _apply_execution_parameter_algebra(
         mechanism=mechanism,
-        parameter_algebra_spec=snapshot.parameter_algebra_spec,
+        parameter_algebra_spec=request.parameter_algebra_spec,
         require_mutable=True,
     )
     dependency_metadata = _expanded_intervention_schedule_dependency_metadata(
         unresolved,
         mechanism=mechanism,
-        parameter_algebra_spec=snapshot.parameter_algebra_spec,
+        parameter_algebra_spec=request.parameter_algebra_spec,
     )
     try:
-        parameter_partition = _bind_request_parameter_overrides(
+        _bind_request_parameter_overrides(
             mechanism=mechanism,
-            parameter_algebra_spec=snapshot.parameter_algebra_spec,
+            parameter_algebra_spec=request.parameter_algebra_spec,
             parameter_overrides=request.parameter_overrides,
             unresolved_intervention_schedule=unresolved,
         )
+        raw_values: dict[str, float] = {}
+        mechanism_names: set[str] = set()
+        unbound_mechanism_names: set[str] = set()
+        schedule_names: set[str] = set()
+        scalar_names: set[str] = set()
+        unknown_names: set[str] = set()
+        mechanism_name_by_raw: dict[str, str] = {}
+        unbound_mechanism_name_by_raw: dict[str, str] = {}
+        schedule_name_by_raw: dict[str, str] = {}
+        invalid_messages: dict[str, str] = {}
+        _classify_request_parameter_names(
+            mechanism=mechanism,
+            parameter_overrides=request.parameter_overrides,
+            unresolved_intervention_schedule=unresolved,
+            raw_values=raw_values,
+            mechanism_names=mechanism_names,
+            unbound_mechanism_names=unbound_mechanism_names,
+            schedule_names=schedule_names,
+            scalar_names=scalar_names,
+            unknown_names=unknown_names,
+            mechanism_name_by_raw=mechanism_name_by_raw,
+            unbound_mechanism_name_by_raw=unbound_mechanism_name_by_raw,
+            schedule_name_by_raw=schedule_name_by_raw,
+            invalid_messages=invalid_messages,
+        )
         _validate_bound_wegscheider_for_execution(
             mechanism=mechanism,
-            admission_report=snapshot.wegscheider_admission_report,
+            admission_report=request.wegscheider_admission_report,
             wegscheider_cyclicity_enabled=(
                 prepared_solver_config.wegscheider_cyclicity_enabled
             ),
@@ -1439,13 +1275,16 @@ def bind_simulation_execution_request_interventions(
             unresolved,
             parameter_values=_schedule_resolution_values_for_request(
                 unresolved,
-                parameter_partition,
+                raw_values=raw_values,
+                mechanism_name_by_raw=mechanism_name_by_raw,
+                unbound_mechanism_name_by_raw=unbound_mechanism_name_by_raw,
+                schedule_name_by_raw=schedule_name_by_raw,
                 mechanism=mechanism,
             ),
             dependency_metadata=dependency_metadata,
         )
         if resolved is not None:
-            resolved.validate_species(snapshot.species_names)
+            resolved.validate_species(request.species_names)
         contract = compile_intervention_schedule(
             resolved,
             dependency_metadata=dependency_metadata,
@@ -1466,25 +1305,32 @@ def bind_simulation_execution_request_interventions(
             parameter_names=dependencies,
             details=details,
         ) from exc
-    schedule_only_names = parameter_partition.schedule_only_parameter_names
+    schedule_only_names = {
+        name
+        for name in schedule_names
+        if schedule_name_by_raw.get(name, name) not in mechanism_names
+        and schedule_name_by_raw.get(name, name) not in unbound_mechanism_names
+        and name not in scalar_names
+    }
     remaining_overrides = {
         str(name): float(value)
         for name, value in dict(request.parameter_overrides or {}).items()
         if str(name) not in schedule_only_names
     }
     return SimulationExecutionRequest(
-        snapshot=replace(
-            snapshot,
-            parameterized_intervention_schedule=None,
-            candidate_dependent_intervention_parameter_names=frozenset(),
-            intervention_execution=contract,
-            target_executable_identity=compose_target_executable_identity(
-                snapshot.base_executable_identity,
-                contract,
-            ),
-        ),
+        analysis=request.analysis,
+        mechanism=mechanism,
+        species_names=request.species_names,
+        y0=request.y0,
+        temperature_schedule=request.temperature_schedule,
+        parameter_algebra_spec=request.parameter_algebra_spec,
+        intervention_execution=contract,
         t_span=request.t_span,
         solver_config=request.solver_config,
+        wegscheider_admission_report=request.wegscheider_admission_report,
+        parameterized_intervention_schedule=None,
+        requested_parameter_names=request.requested_parameter_names,
+        candidate_dependent_intervention_parameter_names=frozenset(),
         parameter_overrides=remaining_overrides or None,
         mechanism_source=request.mechanism_source,
     )
@@ -1614,18 +1460,31 @@ def build_simulation_execution_request(
         raise ValueError(
             "prepared DSL nominal temperature does not match tab science."
         )
-    return bind_simulation_execution_request_interventions(
-        SimulationExecutionRequest(
-            snapshot=capture_simulation_execution_snapshot(
-                prepared_dsl,
-                initial_values=normalized_initials,
-            ),
-            t_span=(t_start, t_end),
-            solver_config=solver_config,
-            parameter_overrides=normalized_parameters,
-            mechanism_source=mechanism_source,
+    mechanism = prepared_dsl.mechanism_for_execution()
+    species_names = tuple(str(name) for name in mechanism.species_names())
+    if not species_names:
+        raise ValueError("prepared execution requires at least one species.")
+    if set(normalized_initials) != set(species_names):
+        raise ValueError(
+            "direct execution initial values must cover every accepted species exactly once."
         )
+    request = SimulationExecutionRequest(
+        analysis=prepared_dsl.analysis,
+        mechanism=mechanism,
+        species_names=species_names,
+        y0=tuple(normalized_initials[name] for name in species_names),
+        temperature_schedule=metadata_view_for_mechanism(mechanism).temperature_schedule,
+        parameter_algebra_spec=prepared_dsl.parameter_algebra_spec_for_execution(),
+        intervention_execution=prepared_dsl.intervention_execution_contract(),
+        t_span=(t_start, t_end),
+        solver_config=solver_config,
+        wegscheider_admission_report=prepared_dsl.wegscheider_admission_report(),
+        parameterized_intervention_schedule=prepared_dsl.parameterized_intervention_schedule_for_binding(),
+        requested_parameter_names=(),
+        parameter_overrides=normalized_parameters,
+        mechanism_source=mechanism_source,
     )
+    return bind_simulation_execution_request_interventions(request)
 
 
 def metadata_view_for_mechanism(
@@ -1640,69 +1499,6 @@ def metadata_view_for_mechanism(
         meta_raw = dict(meta_raw)
         meta_raw[MechanismMetadataKeys.TEMPERATURE_SCHEDULE] = temperature_schedule_override
     return MechanismMetadataView.from_metadata(meta_raw)
-
-
-def capture_simulation_execution_snapshot(
-    prepared_dsl: PreparedDslRequestSet,
-    *,
-    initial_values: Mapping[str, float] | None = None,
-    requested_parameter_names: Iterable[str] = (),
-) -> SimulationExecutionSnapshot:
-    """Capture one complete direct execution snapshot from prepared authority."""
-
-    if not isinstance(prepared_dsl, PreparedDslRequestSet):
-        raise TypeError("prepared_dsl must be PreparedDslRequestSet.")
-    mechanism = prepared_dsl.mechanism_for_execution()
-    species_names = tuple(str(name) for name in mechanism.species_names())
-    if not species_names:
-        raise ValueError("prepared execution requires at least one species.")
-    if initial_values is None:
-        values = {
-            name: float(mechanism.species[name].initial_conc)
-            for name in species_names
-        }
-    else:
-        values = {
-            str(name): float(value)
-            for name, value in initial_values.items()
-        }
-        if set(values) != set(species_names):
-            raise ValueError(
-                "direct execution initial values must cover every accepted "
-                "species exactly once."
-            )
-    temperature_schedule = metadata_view_for_mechanism(
-        mechanism
-    ).temperature_schedule
-    base_identity = prepared_dsl.base_executable_identity()
-    intervention_execution = prepared_dsl.intervention_execution_contract()
-    return SimulationExecutionSnapshot(
-        analysis=prepared_dsl.analysis,
-        mechanism=mechanism,
-        species_names=species_names,
-        y0=tuple(values[name] for name in species_names),
-        temperature_schedule=temperature_schedule,
-        parameter_algebra_spec=(
-            prepared_dsl.parameter_algebra_spec_for_execution()
-        ),
-        intervention_execution=intervention_execution,
-        base_executable_identity=base_identity,
-        target_executable_identity=(
-            None
-            if intervention_execution is None
-            else compose_target_executable_identity(
-                base_identity,
-                intervention_execution,
-            )
-        ),
-        wegscheider_admission_report=(
-            prepared_dsl.wegscheider_admission_report()
-        ),
-        parameterized_intervention_schedule=(
-            prepared_dsl.parameterized_intervention_schedule_for_binding()
-        ),
-        requested_parameter_names=tuple(requested_parameter_names),
-    )
 
 
 def prepare_preparation_failure(stage: str, message: object) -> SimulationPreparationError:
@@ -1834,8 +1630,11 @@ def _scalar_schedule_resolution_values_from_mechanism(mechanism: Any) -> Dict[st
 
 def _schedule_resolution_values_for_request(
     unresolved_intervention_schedule: InterventionSchedule | None,
-    parameter_partition: SimulationParameterValuePartition | None,
     *,
+    raw_values: Mapping[str, float] | None = None,
+    mechanism_name_by_raw: Mapping[str, str] | None = None,
+    unbound_mechanism_name_by_raw: Mapping[str, str] | None = None,
+    schedule_name_by_raw: Mapping[str, str] | None = None,
     mechanism: Any | None = None,
 ) -> Dict[str, float] | None:
     values: Dict[str, float] = {}
@@ -1854,8 +1653,17 @@ def _schedule_resolution_values_for_request(
                 }
             )
             values.update(_scalar_schedule_resolution_values_from_mechanism(mechanism))
-    if parameter_partition is not None:
-        values.update(parameter_partition.schedule_resolution_values)
+    if raw_values is not None:
+        values.update({str(name): float(value) for name, value in raw_values.items()})
+        for raw_name, canonical_name in {
+            **dict(mechanism_name_by_raw or {}),
+            **dict(unbound_mechanism_name_by_raw or {}),
+        }.items():
+            if raw_name in raw_values:
+                values[str(canonical_name)] = float(raw_values[raw_name])
+        for raw_name, owner_name in dict(schedule_name_by_raw or {}).items():
+            if raw_name not in values and owner_name in values:
+                values[str(raw_name)] = float(values[owner_name])
         if referenced:
             return values
     return values if values else None
@@ -1926,10 +1734,14 @@ def invalid_request_parameter_identifier_message(mechanism: Any, name: str) -> s
             "keq": ("Keq1",),
         }.get(name_s.lower())
     if bare_step_key_suggestions is not None:
+        canonical_by_fold = {
+            str(canonical).casefold(): str(canonical)
+            for canonical in namespace.canonical_names
+        }
         suggestions = tuple(
             canonical
             for suggestion in bare_step_key_suggestions
-            for canonical in [namespace.canonical_by_lower.get(suggestion.lower())]
+            for canonical in [canonical_by_fold.get(suggestion.casefold())]
             if canonical is not None
         )
         suggestion_text = ", ".join(suggestions)
@@ -1956,17 +1768,44 @@ def _apply_parameter_overrides_to_prepared_mechanism(
     mechanism: Any,
     *,
     parameter_algebra_spec: Any,
-    parameter_partition: SimulationParameterValuePartition,
+    raw_values: Mapping[str, float],
+    mechanism_parameter_name_by_raw: Mapping[str, str],
+    unbound_mechanism_parameter_name_by_raw: Mapping[str, str],
+    mechanism_parameter_names: Iterable[str],
+    unbound_mechanism_parameter_names: Iterable[str],
+    scalar_parameter_names: Iterable[str],
+    schedule_parameter_names: Iterable[str],
+    schedule_parameter_name_by_raw: Mapping[str, str],
+    unknown_parameter_names: Iterable[str],
+    invalid_parameter_identifier_messages: Mapping[str, str],
 ) -> None:
     """Apply slider-style values to one isolated execution mechanism."""
-    partition = parameter_partition
-    raise_unowned_request_parameter_values(partition)
-    if not partition.raw_values:
+    raise_unowned_request_parameter_values(
+        raw_values=raw_values,
+        mechanism_name_by_raw=mechanism_parameter_name_by_raw,
+        unbound_mechanism_name_by_raw=unbound_mechanism_parameter_name_by_raw,
+        unbound_mechanism_names=unbound_mechanism_parameter_names,
+        unknown_names=unknown_parameter_names,
+        invalid_messages=invalid_parameter_identifier_messages,
+    )
+    if not raw_values:
         return
 
+    mechanism_binding_values = {
+        str(canonical_name): float(raw_values[raw_name])
+        for raw_name, canonical_name in mechanism_parameter_name_by_raw.items()
+        if raw_name in raw_values
+    }
+    mechanism_binding_values.update(
+        {
+            str(name): float(raw_values[name])
+            for name in scalar_parameter_names
+            if name in raw_values
+        }
+    )
     mechanism_override_items = sorted(
         (str(name), float(value))
-        for name, value in partition.mechanism_binding_values.items()
+        for name, value in mechanism_binding_values.items()
     )
     if not mechanism_override_items:
         return
@@ -2231,7 +2070,20 @@ def _validate_bound_wegscheider_for_execution(
                 "failed_cycles": failed_cycles,
                 "parameter_names": parameter_names,
                 "value_dependencies": parameter_names,
-                "wegscheider_report": exc.report.symbolic_identity,
+                "wegscheider_report": {
+                    "cycles": tuple(
+                        {
+                            "cycle_id": cycle.cycle_id,
+                            "step_indices": cycle.step_indices,
+                            "equilibrium_indices": cycle.equilibrium_indices,
+                            "coefficients": cycle.coefficients,
+                            "selected_step_stoichiometric_vectors": (
+                                cycle.selected_step_stoichiometric_vectors
+                            ),
+                        }
+                        for cycle in exc.report.admission_report.cycles
+                    )
+                },
             },
         ) from exc
 
@@ -2281,7 +2133,7 @@ def prepare_simulation_worker_run(
     )
     prepared_solver_config = execution_request.solver_config
     try:
-        # Keep direct/manual requests fail-closed before snapshot cloning or
+        # Keep direct/manual requests fail-closed before request isolation or
         # any worker-owned preparation mutates an isolated mechanism.
         build_time_grid(t_span[0], t_span[1], prepared_solver_config.grid)
     except (TypeError, ValueError) as exc:
@@ -2289,14 +2141,14 @@ def prepare_simulation_worker_run(
             "time_grid",
             "execution grid cannot be realized on this time span.",
         ) from exc
-    snapshot = execution_request.snapshot.isolated_copy()
+    execution_request = execution_request.isolated_copy()
     _raise_if_cancelled(cancellation_control)
 
-    mechanism = snapshot.mechanism
+    mechanism = execution_request.mechanism
     rhs: Callable[..., np.ndarray] | None = None
-    species_names = list(snapshot.species_names)
-    y0 = np.asarray(snapshot.y0, dtype=float).reshape(-1).copy()
-    temperature_schedule_override = snapshot.temperature_schedule
+    species_names = list(execution_request.species_names)
+    y0 = np.asarray(execution_request.y0, dtype=float).reshape(-1).copy()
+    temperature_schedule_override = execution_request.temperature_schedule
     require_mutable = True
 
     meta = getattr(mechanism, "metadata", None)
@@ -2306,14 +2158,14 @@ def prepare_simulation_worker_run(
         )
 
     _require_wegscheider_admission_for_execution(
-        admission_report=snapshot.wegscheider_admission_report,
+        admission_report=execution_request.wegscheider_admission_report,
         wegscheider_cyclicity_enabled=(
             prepared_solver_config.wegscheider_cyclicity_enabled
         ),
     )
     _apply_execution_parameter_algebra(
         mechanism=mechanism,
-        parameter_algebra_spec=snapshot.parameter_algebra_spec,
+        parameter_algebra_spec=execution_request.parameter_algebra_spec,
         require_mutable=bool(require_mutable),
     )
     _raise_if_cancelled(cancellation_control)
@@ -2323,7 +2175,16 @@ def prepare_simulation_worker_run(
             execution_request
         )
     )
-    parameter_partition: SimulationParameterValuePartition | None = None
+    raw_values: dict[str, float] = {}
+    mechanism_names: set[str] = set()
+    unbound_mechanism_names: set[str] = set()
+    schedule_names: set[str] = set()
+    scalar_names: set[str] = set()
+    unknown_names: set[str] = set()
+    mechanism_name_by_raw: dict[str, str] = {}
+    unbound_mechanism_name_by_raw: dict[str, str] = {}
+    schedule_name_by_raw: dict[str, str] = {}
+    invalid_messages: dict[str, str] = {}
     if (
         bool(execution_request.parameter_overrides)
         or bool(
@@ -2332,11 +2193,26 @@ def prepare_simulation_worker_run(
         )
     ):
         try:
-            parameter_partition = _bind_request_parameter_overrides(
+            _bind_request_parameter_overrides(
                 mechanism=mechanism,
-                parameter_algebra_spec=snapshot.parameter_algebra_spec,
+                parameter_algebra_spec=execution_request.parameter_algebra_spec,
                 parameter_overrides=execution_request.parameter_overrides,
                 unresolved_intervention_schedule=unresolved_intervention_schedule,
+            )
+            _classify_request_parameter_names(
+                mechanism=mechanism,
+                parameter_overrides=execution_request.parameter_overrides,
+                unresolved_intervention_schedule=unresolved_intervention_schedule,
+                raw_values=raw_values,
+                mechanism_names=mechanism_names,
+                unbound_mechanism_names=unbound_mechanism_names,
+                schedule_names=schedule_names,
+                scalar_names=scalar_names,
+                unknown_names=unknown_names,
+                mechanism_name_by_raw=mechanism_name_by_raw,
+                unbound_mechanism_name_by_raw=unbound_mechanism_name_by_raw,
+                schedule_name_by_raw=schedule_name_by_raw,
+                invalid_messages=invalid_messages,
             )
         except SimulationPreparationError:
             raise
@@ -2344,14 +2220,14 @@ def prepare_simulation_worker_run(
 
     wegscheider_executable_report = _validate_bound_wegscheider_for_execution(
         mechanism=mechanism,
-        admission_report=snapshot.wegscheider_admission_report,
+        admission_report=execution_request.wegscheider_admission_report,
         wegscheider_cyclicity_enabled=(
             prepared_solver_config.wegscheider_cyclicity_enabled
         ),
     )
     _raise_if_cancelled(cancellation_control)
 
-    intervention_execution = snapshot.intervention_execution
+    intervention_execution = execution_request.intervention_execution
     if unresolved_intervention_schedule is not None:
         if _schedule_parameters_deferred_to_prepared_request(
             execution_request,
@@ -2363,13 +2239,16 @@ def prepare_simulation_worker_run(
                 dependency_metadata = _expanded_intervention_schedule_dependency_metadata(
                     unresolved_intervention_schedule,
                     mechanism=mechanism,
-                    parameter_algebra_spec=snapshot.parameter_algebra_spec,
+                    parameter_algebra_spec=execution_request.parameter_algebra_spec,
                 )
                 resolved_schedule = _resolve_intervention_schedule_for_request(
                     unresolved_intervention_schedule,
                     parameter_values=_schedule_resolution_values_for_request(
                         unresolved_intervention_schedule,
-                        parameter_partition,
+                        raw_values=raw_values,
+                        mechanism_name_by_raw=mechanism_name_by_raw,
+                        unbound_mechanism_name_by_raw=unbound_mechanism_name_by_raw,
+                        schedule_name_by_raw=schedule_name_by_raw,
                         mechanism=mechanism,
                     ),
                     dependency_metadata=dependency_metadata,
@@ -2411,7 +2290,7 @@ def prepare_simulation_worker_run(
     _raise_if_cancelled(cancellation_control)
 
     try:
-        prepared_context = build_prepared_run_context(
+        temperature_schedule, runtime_symbolic_jacobian, preparation_warnings = build_prepared_run_context(
             mechanism=mechanism,
             solver_config=prepared_solver_config,
             temperature_schedule=temperature_schedule_override,
@@ -2421,19 +2300,11 @@ def prepare_simulation_worker_run(
         raise SimulationPreparationError("temperature_schedule", str(exc)) from exc
     _raise_if_cancelled(cancellation_control)
 
-    temperature_schedule = prepared_context.temperature_schedule
-    symbolic_wegscheider_identity = (
-        None
-        if wegscheider_executable_report is None
-        else wegscheider_executable_report.symbolic_identity
-    )
-
     try:
         initials_for_algebra = {sp: float(y0[idx]) for idx, sp in enumerate(species_names)}
     except Exception as exc:
         raise SimulationPreparationError("initials_for_algebra", str(exc)) from exc
 
-    runtime_symbolic_jacobian = prepared_context.symbolic_jacobian
     if (
         prepared_solver_config.solver.upper() in {"BDF", "RADAU"}
         and not prepared_solver_config.use_analytic_jacobian
@@ -2441,7 +2312,7 @@ def prepare_simulation_worker_run(
         runtime_symbolic_jacobian = SymbolicJacobianExecution.disabled(
             code="policy-disabled",
             reason="Symbolic Jacobian runtime use disabled by analytic Jacobian policy.",
-            jac_sparsity=prepared_context.symbolic_jacobian.jac_sparsity,
+            jac_sparsity=runtime_symbolic_jacobian.jac_sparsity,
         )
     request: SimulationRequest | SimulationExecutionRequest
     if intervention_execution is None:
@@ -2460,7 +2331,6 @@ def prepare_simulation_worker_run(
             temperature_schedule=temperature_schedule,
             species_names=tuple(species_names),
             progress_callback=progress_callback,
-            symbolic_wegscheider_identity=symbolic_wegscheider_identity,
             cancellation_control=cancellation_control,
         )
 
@@ -2470,17 +2340,16 @@ def prepare_simulation_worker_run(
         y0=np.asarray(y0, dtype=float).reshape(-1),
         species_names=list(species_names),
         temperature_schedule=temperature_schedule,
-        parameter_algebra_spec=snapshot.parameter_algebra_spec,
+        parameter_algebra_spec=execution_request.parameter_algebra_spec,
         intervention_execution=intervention_execution,
         symbolic_jacobian=runtime_symbolic_jacobian,
-        symbolic_wegscheider_identity=symbolic_wegscheider_identity,
         initials_for_algebra=initials_for_algebra,
-        warnings=list(prepared_context.warnings),
+        warnings=list(preparation_warnings),
         solver_config=prepared_solver_config,
         request=request,
         unresolved_intervention_schedule=unresolved_intervention_schedule,
         cancellation_control=cancellation_control,
-        wegscheider_admission_report=snapshot.wegscheider_admission_report,
+        wegscheider_admission_report=execution_request.wegscheider_admission_report,
         wegscheider_executable_report=wegscheider_executable_report,
     )
 
@@ -2651,16 +2520,36 @@ def _bind_request_parameter_overrides(
     parameter_algebra_spec: Any,
     parameter_overrides: Mapping[str, float] | None,
     unresolved_intervention_schedule: Any,
-) -> SimulationParameterValuePartition:
+) -> None:
     """Bind one request through the fixed preparation-owned parameter path."""
 
-    parameter_partition = partition_simulation_parameter_values(
+    raw_values: dict[str, float] = {}
+    mechanism_names: set[str] = set()
+    unbound_mechanism_names: set[str] = set()
+    schedule_names: set[str] = set()
+    scalar_names: set[str] = set()
+    unknown_names: set[str] = set()
+    mechanism_name_by_raw: dict[str, str] = {}
+    unbound_mechanism_name_by_raw: dict[str, str] = {}
+    schedule_name_by_raw: dict[str, str] = {}
+    invalid_messages: dict[str, str] = {}
+    _classify_request_parameter_names(
         mechanism=mechanism,
         parameter_overrides=parameter_overrides,
         unresolved_intervention_schedule=unresolved_intervention_schedule,
+        raw_values=raw_values,
+        mechanism_names=mechanism_names,
+        unbound_mechanism_names=unbound_mechanism_names,
+        schedule_names=schedule_names,
+        scalar_names=scalar_names,
+        unknown_names=unknown_names,
+        mechanism_name_by_raw=mechanism_name_by_raw,
+        unbound_mechanism_name_by_raw=unbound_mechanism_name_by_raw,
+        schedule_name_by_raw=schedule_name_by_raw,
+        invalid_messages=invalid_messages,
     )
     mechanism_override_names = sorted(
-        parameter_partition.bindable_mechanism_parameter_names
+        set(mechanism_names) | set(unbound_mechanism_names)
     )
     internal_names = _internal_parameter_algebra_binding_names(
         mechanism,
@@ -2670,17 +2559,45 @@ def _bind_request_parameter_overrides(
         mechanism,
         sorted(set(mechanism_override_names) | set(internal_names)),
     )
-    parameter_partition = partition_simulation_parameter_values(
+    raw_values.clear()
+    mechanism_names.clear()
+    unbound_mechanism_names.clear()
+    schedule_names.clear()
+    scalar_names.clear()
+    unknown_names.clear()
+    mechanism_name_by_raw.clear()
+    unbound_mechanism_name_by_raw.clear()
+    schedule_name_by_raw.clear()
+    invalid_messages.clear()
+    _classify_request_parameter_names(
         mechanism=mechanism,
         parameter_overrides=parameter_overrides,
         unresolved_intervention_schedule=unresolved_intervention_schedule,
+        raw_values=raw_values,
+        mechanism_names=mechanism_names,
+        unbound_mechanism_names=unbound_mechanism_names,
+        schedule_names=schedule_names,
+        scalar_names=scalar_names,
+        unknown_names=unknown_names,
+        mechanism_name_by_raw=mechanism_name_by_raw,
+        unbound_mechanism_name_by_raw=unbound_mechanism_name_by_raw,
+        schedule_name_by_raw=schedule_name_by_raw,
+        invalid_messages=invalid_messages,
     )
     _apply_parameter_overrides_to_prepared_mechanism(
         mechanism,
         parameter_algebra_spec=parameter_algebra_spec,
-        parameter_partition=parameter_partition,
+        raw_values=raw_values,
+        mechanism_parameter_name_by_raw=mechanism_name_by_raw,
+        unbound_mechanism_parameter_name_by_raw=unbound_mechanism_name_by_raw,
+        mechanism_parameter_names=mechanism_names,
+        unbound_mechanism_parameter_names=unbound_mechanism_names,
+        scalar_parameter_names=scalar_names,
+        schedule_parameter_names=schedule_names,
+        schedule_parameter_name_by_raw=schedule_name_by_raw,
+        unknown_parameter_names=unknown_names,
+        invalid_parameter_identifier_messages=invalid_messages,
     )
-    return parameter_partition
 
 
 def _internal_parameter_algebra_binding_names(
@@ -2743,144 +2660,3 @@ def reject_requested_algebra_owned_mechanism_parameters_for_fitting(
             + ", ".join(algebra_owned)
         ),
     )
-
-
-def prepare_bound_mechanism(
-    prepared_dsl: PreparedDslRequestSet,
-    param_names: List[str],
-    *,
-    wegscheider_cyclicity_enabled: bool = WEGSCHEIDER_CYCLICITY_ENABLED_DEFAULT,
-) -> BoundMechanism:
-    """
-    Bind selected parameters on one retained typed DSL authority.
-
-    Returns a BoundMechanism holding mutable RateBinding objects so callers can
-    update parameter values without parsing or rebuilding the ODE system.
-    """
-    if not isinstance(prepared_dsl, PreparedDslRequestSet):
-        raise TypeError("prepared_dsl must be a PreparedDslRequestSet.")
-    if type(wegscheider_cyclicity_enabled) is not bool:
-        raise TypeError("wegscheider_cyclicity_enabled must be a bool.")
-    mechanism = prepared_dsl.mechanism_for_execution()
-    unresolved_intervention_schedule = coerce_intervention_schedule(
-        prepared_dsl.parameterized_intervention_schedule_for_binding()
-    )
-    spec = prepared_dsl.parameter_algebra_spec_for_execution()
-    meta = getattr(mechanism, "metadata", None)
-    if isinstance(meta, dict):
-        meta[
-            MechanismMetadataKeys.WEGSCHEIDER_CYCLICITY_ENABLED
-        ] = wegscheider_cyclicity_enabled
-    admission_report = prepared_dsl.wegscheider_admission_report()
-    try:
-        _require_wegscheider_admission_for_execution(
-            admission_report=admission_report,
-            wegscheider_cyclicity_enabled=wegscheider_cyclicity_enabled,
-        )
-    except SimulationPreparationError as exc:
-        raise fit_simulation_error_from_preparation_error(exc) from exc
-    species_names = mechanism.species_names()
-    y0 = np.array([mechanism.species[sp].initial_conc for sp in species_names])
-
-    try:
-        mechanism_namespace = build_namespace_from_mechanism(mechanism)
-        namespace_info = mechanism_namespace.info_by_name
-        declared_scalar_names, derived_scalar_names = _parameter_algebra_scalar_authority_names(mechanism, spec)
-        requested_derived_scalar_names = sorted(
-            name for name in (param_names or []) if str(name) in derived_scalar_names
-        )
-        if requested_derived_scalar_names:
-            raise SimulationPreparationError(
-                "parameter_binding",
-                "derived scalar parameter(s) cannot be used as fitting write authority: "
-                + ", ".join(repr(name) for name in requested_derived_scalar_names),
-            )
-        requested_parameter_partition = partition_simulation_parameter_values(
-            mechanism=mechanism,
-            parameter_overrides=None,
-            unresolved_intervention_schedule=unresolved_intervention_schedule,
-            requested_parameter_names=param_names or [],
-            scalar_parameter_names=declared_scalar_names,
-        )
-        raise_unowned_request_parameter_values(
-            requested_parameter_partition,
-            allow_unbound_mechanism_parameters=True,
-        )
-        constrained = {
-            stmt.name
-            for stmt in (spec.param_statements or [])
-            if str(stmt.name) in namespace_info
-        }
-        constrained_keq_targets = {
-            str(name) for name in constrained if namespace_info[str(name)].role == "Keq"
-        }
-        constrained_mutable_targets = set(constrained) - constrained_keq_targets
-        requested = {
-            _canonical_step_override_name(mechanism, str(name))
-            for name in requested_parameter_partition.bindable_mechanism_parameter_names
-            if str(name or "").strip()
-        }
-        requested_dependent_keq = sorted(str(name) for name in (requested & constrained_keq_targets))
-        if requested_dependent_keq:
-            raise SimulationPreparationError(
-                "parameter_algebra",
-                (
-                    "Dependent equilibrium parameter(s) cannot be fitted directly "
-                    "because Wegscheider/algebra constraints overwrite them: "
-                    + ", ".join(requested_dependent_keq)
-                ),
-            )
-        mech_bind_names = sorted(
-            {
-                str(n)
-                for n in (
-                    (requested - constrained_keq_targets)
-                    | constrained_mutable_targets
-                )
-                if str(n) in namespace_info
-            }
-        )
-    except Exception as exc:
-        raise fit_simulation_error_from_preparation_error(
-            prepare_preparation_failure("parameter_algebra", exc)
-        ) from exc
-
-    _bind_parameters_to_mechanism(mechanism, mech_bind_names)
-    try:
-        from kindred.core.simulator.parameter_algebra import (
-            apply_parameter_algebra_spec_to_mechanism,
-        )
-        apply_parameter_algebra_spec_to_mechanism(
-            spec,
-            mechanism=mechanism,
-            require_mutable=True,
-        )
-    except Exception as exc:
-        raise fit_simulation_error_from_preparation_error(
-            prepare_preparation_failure("parameter_algebra", exc)
-        ) from exc
-    try:
-        executable_report = _validate_bound_wegscheider_for_execution(
-            mechanism=mechanism,
-            admission_report=admission_report,
-            wegscheider_cyclicity_enabled=wegscheider_cyclicity_enabled,
-        )
-    except SimulationPreparationError as exc:
-        raise fit_simulation_error_from_preparation_error(exc) from exc
-
-    bound = BoundMechanism(
-        mechanism=mechanism,
-        species_names=species_names,
-        y0=y0,
-        dsl_analysis=prepared_dsl.analysis,
-        parameter_algebra_spec=spec,
-        base_executable_identity=prepared_dsl.base_executable_identity(),
-        intervention_execution=(
-            prepared_dsl.intervention_execution_contract()
-        ),
-        unresolved_intervention_schedule=unresolved_intervention_schedule,
-        wegscheider_admission_report=admission_report,
-        wegscheider_executable_report=executable_report,
-    )
-
-    return bound

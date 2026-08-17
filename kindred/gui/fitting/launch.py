@@ -1056,7 +1056,6 @@ class FitOriginSnapshot:
             payload = {
                 "tab_id": self.tab_id,
             "mechanism_text": self.mechanism_source.reactions_text,
-                "prepared_analysis_identity": self.prepared_dsl.analysis.identity,
                 "scientific_settings": {
                     "temperature": self.scientific_settings.temperature,
                     "rtol": self.scientific_settings.rtol,
@@ -1487,10 +1486,8 @@ class FitExecutionRequest:
         if (
             self.mechanism_source != self.origin.mechanism_source
             or self.prepared_dsl is not self.origin.prepared_dsl
-            or self.prepared_dsl.analysis.identity
-            != self.origin.prepared_dsl.analysis.identity
-            or self.prepared_dsl.base_executable_identity().fingerprint
-            != self.origin.prepared_dsl.base_executable_identity().fingerprint
+            or self.prepared_dsl.analysis
+            != self.origin.prepared_dsl.analysis
         ):
             raise ValueError(
                 "Fit request must retain the captured project source and base science."
@@ -1510,12 +1507,7 @@ class FitExecutionRequest:
                 raise TypeError(
                     "Fit request local admission must be AdmittedAlgebraProgram."
                 )
-            if (
-                admission.base_analysis_identity
-                != self.prepared_dsl.analysis.identity
-                or admission.base_executable_fingerprint
-                != self.prepared_dsl.base_executable_identity().fingerprint
-            ):
+            if admission.base_analysis != self.prepared_dsl.analysis:
                 raise ValueError(
                     "Fit request local admission no longer matches base science."
                 )

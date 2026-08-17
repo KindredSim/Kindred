@@ -6,7 +6,6 @@ from typing import Any, Mapping
 import numpy as np
 
 from .errors import UnsupportedSymbolicExpressionError
-from .identity import normalize_symbolic_identity_mapping
 from .namespaces import symbolic_status_payload
 
 
@@ -31,30 +30,21 @@ def normalize_jacobian_sparsity(value: Any) -> np.ndarray | None:
 class SymbolicJacobianExecution:
     jacobian_func: Any = None
     jac_sparsity: Any = None
-    identity: Mapping[str, Any] | None = None
     status: Mapping[str, Any] | None = None
 
     def __post_init__(self) -> None:
-        identity = _normalize_execution_identity(self.identity)
         status = dict(self.status or {}) if isinstance(self.status, Mapping) else None
         state = str((status or {}).get("state") or "")
         if self.jacobian_func is None:
-            if identity:
-                raise ValueError("Symbolic Jacobian identity requires an executable Jacobian.")
             if state in {"supported", "partially_disabled"}:
                 raise ValueError("Executable symbolic Jacobian state requires a Jacobian callable.")
         else:
-            if not identity:
-                raise ValueError(
-                    "Executable symbolic Jacobian requires an explicit identity."
-                )
             if state in {"unsupported", "disabled"}:
                 raise ValueError(
                     "Unsupported or disabled symbolic Jacobian state cannot carry a callable."
                 )
         jac_sparsity = normalize_jacobian_sparsity(self.jac_sparsity)
         object.__setattr__(self, "jac_sparsity", jac_sparsity)
-        object.__setattr__(self, "identity", identity)
         object.__setattr__(self, "status", status)
 
     @property
@@ -66,13 +56,11 @@ class SymbolicJacobianExecution:
         cls,
         *,
         jacobian_func: Any,
-        identity: Mapping[str, Any],
         jac_sparsity: Any = None,
     ) -> "SymbolicJacobianExecution":
         return cls(
             jacobian_func=jacobian_func,
             jac_sparsity=jac_sparsity,
-            identity=identity,
             status=symbolic_status_payload(
                 kind="jacobian",
                 state="supported",
@@ -141,7 +129,6 @@ class SymbolicJacobianExecution:
         return SymbolicJacobianExecution(
             jacobian_func=self.jacobian_func if state == "partially_disabled" else None,
             jac_sparsity=self.jac_sparsity,
-            identity=dict(self.identity or {}) if state == "partially_disabled" and self.identity else None,
             status=symbolic_status_payload(
                 kind="jacobian",
                 state=state,
@@ -152,7 +139,6 @@ class SymbolicJacobianExecution:
 
     def metadata_kwargs(self) -> dict[str, Any]:
         return {
-            "symbolic_jacobian_identity": dict(self.identity) if self.identity else None,
             "symbolic_jacobian_status": dict(self.status) if self.status else None,
         }
 
@@ -161,12 +147,6 @@ class SymbolicJacobianExecution:
             "symbolic_jacobian": self.has_executable_jacobian,
             "jacobian_sparsity_hint": self.jac_sparsity is not None,
         }
-        if self.identity:
-            payload["symbolic_jacobian_identity"] = dict(self.identity)
         if self.status:
             payload["symbolic_jacobian_status"] = dict(self.status)
         return payload
-
-
-def _normalize_execution_identity(identity: object) -> dict[str, Any] | None:
-    return normalize_symbolic_identity_mapping(identity, label="Symbolic Jacobian execution identity")

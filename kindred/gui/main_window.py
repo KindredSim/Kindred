@@ -65,7 +65,6 @@ from kindred.core.project_presentation_state import (
     SimulationSeriesAxisSelection,
 )
 from kindred.core.result_repository import (
-    ExplicitResultKey,
     ResultRepository,
 )
 from kindred.core.simulator.dsl_parse import (
@@ -779,9 +778,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self._simulation_jobs = SimulationJobOwner(
             gate=self._computation_gate,
             repository_for_tab=self._repository_for_tab,
-            current_explicit_result_key=(
-                self._resolve_current_explicit_result_key
-            ),
             propose_detailed_balance_source=self._propose_detailed_balance_source,
             commit_detailed_balance_source=self._commit_detailed_balance_source,
             user_parallel_maximum=(
@@ -1942,15 +1938,15 @@ class MainWindow(QtWidgets.QMainWindow):
             else (*analysis.species_names, *analysis.observable_names)
         )
         for visible in visible_sets:
-            entries = (
-                repository.preview_entry(visible.set_id),
-                repository.explicit_entry(visible.set_id),
-                repository.reference_entry(visible.set_id),
+            results = (
+                repository.current_result(visible.set_id),
+                repository.reference_result(visible.set_id),
             )
-            for entry in entries:
-                if entry is not None:
-                    simulation_series_names.extend(entry.result.series)
+            for result in results:
+                if result is not None:
+                    simulation_series_names.extend(result.series)
         simulation_series = tuple(dict.fromkeys(simulation_series_names))
+        bundle = self._tab_surfaces.get(tab_id)
         color_by_axis_selection: dict[AxisSeriesSelection, str] = {
             SimulationSeriesAxisSelection(species): (
                 self.config_controller.species_color(
@@ -1993,6 +1989,11 @@ class MainWindow(QtWidgets.QMainWindow):
             selected_y_series=presentation.selected_y_series,
             selected_y_uses_default_all=(
                 presentation.selected_y_uses_default_all
+            ),
+            preview_set_ids=(
+                bundle.slider_binding.active_preview_set_ids
+                if bundle is not None
+                else ()
             ),
         )
 
@@ -2192,37 +2193,6 @@ class MainWindow(QtWidgets.QMainWindow):
             if set_ids:
                 self._simulation_jobs.deauthorize_targets(tab_id, set_ids)
 
-    def _resolve_current_explicit_result_key(
-        self,
-        tab_id: str,
-        set_id: str,
-    ) -> ExplicitResultKey | None:
-        """Build the sole Run target and return its request-projected key."""
-
-        tab = next(
-            (
-                item
-                for item in self._project_session.document.tabs
-                if item.tab_id == str(tab_id)
-            ),
-            None,
-        )
-        if tab is None or not isinstance(tab.prepared_dsl, PreparedDslRequestSet):
-            return None
-        if not tab.mechanism_source.reactions_text.strip():
-            return None
-        if not any(
-            item.set_id == str(set_id)
-            for item in tab.initial_condition_sets
-        ):
-            return None
-        target = self._build_explicit_target_for_tab(
-            tab,
-            str(set_id),
-            publication_generation=0,
-        )
-        return target.key
-
     def _build_explicit_target_for_tab(
         self,
         tab: MechanismTabDocument,
@@ -2230,7 +2200,7 @@ class MainWindow(QtWidgets.QMainWindow):
         *,
         publication_generation: int,
     ):
-        """Build one bound Run target through the sole exact key path."""
+        """Build one bound Run target through the direct request path."""
 
         if not isinstance(tab, MechanismTabDocument):
             raise TypeError("tab must be MechanismTabDocument.")
@@ -2549,16 +2519,23 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         if not changed:
             return
-        preview_entry = self._repository_for_tab(tab_id).preview_entry(set_id)
-        if (
-            preview_entry is not None
-            and self._simulation_jobs.preview_key_is_current(preview_entry.key)
-        ):
-            self.set_status_text("Preview result plotted.")
-            return
-        tab = self._workspace_tab_registry.tab(tab_id)
         try:
-            if not self._simulation_jobs.show_cached(tab.tab_id, set_id):
+            tab = self._workspace_tab_registry.tab(tab_id)
+            target = self._build_explicit_target_for_tab(
+                tab,
+                set_id,
+                publication_generation=(
+                    self._simulation_jobs.explicit_publication_generation(
+                        tab.tab_id,
+                        set_id,
+                    )
+                ),
+            )
+            if not self._simulation_jobs.show_cached(
+                tab_id,
+                set_id,
+                target.execution_request,
+            ):
                 # set_plot_requested() already rendered the changed Plot
                 # membership through the retained tab surface.
                 return

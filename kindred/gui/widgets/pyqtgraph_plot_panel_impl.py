@@ -1351,7 +1351,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
             series=tuple(rendered_series),
             series_axes=block.series_axes,
             x_axis=block.x_axis,
-            result_entry=block.result_entry,
+            result=block.result,
             segment_ids=segment_ids,
             segment_keys=segment_keys,
             discontinuity_ids=discontinuity_ids,
@@ -1435,17 +1435,8 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         self._species_table.update_results(
             canonical_time=block.t,
             species_data=dict(block.series),
-            intervention_execution=(
-                block.result_entry.result.intervention_execution
-            ),
-            presentation_boundaries=(
-                block.result_entry.result.presentation_boundaries
-            ),
-            accepted_result_key=(
-                getattr(block.result_entry, "key", None)
-                if block.result_entry is not None
-                else None
-            ),
+            intervention_execution=block.result.intervention_execution,
+            presentation_boundaries=block.result.presentation_boundaries,
         )
     def _project_completion_warning(
         self,

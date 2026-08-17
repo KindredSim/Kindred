@@ -1,11 +1,10 @@
-"""Owner-authorized result storage and bounded exact-key hydration cache."""
+"""Owner-authorized result storage and bounded exact-request hydration cache."""
 
 from __future__ import annotations
 
-from collections import OrderedDict
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import Any, Iterable, Mapping, TypeAlias
+from typing import Any, Iterable, Mapping
 
 import numpy as np
 
@@ -14,21 +13,10 @@ from kindred.core.simulator.solver_types import SimulationPresentationBoundary
 from kindred.core.simulation_failure import FactualCause
 from kindred.core.simulation_preparation import (
     SimulationExecutionRequest,
-    simulation_execution_request_fingerprint,
 )
 
 __all__ = [
-    "ExplicitResultEntry",
-    "ExplicitResultKey",
-    "explicit_result_key_for_request",
-    "explicit_result_key_is_current",
-    "PreviewResultIdentity",
-    "preview_result_identity_for_request",
-    "PreviewResultEntry",
-    "PreviewResultKey",
-    "ResultEntry",
     "ResultRepository",
-    "SimulationResultProvenance",
     "SimulationResultValue",
 ]
 
@@ -38,40 +26,6 @@ def _required_id(value: object, field: str) -> str:
     if not normalized:
         raise ValueError(f"{field} must be nonblank.")
     return normalized
-
-
-def explicit_result_key_for_request(
-    *,
-    tab_id: str,
-    set_id: str,
-    execution_request: SimulationExecutionRequest,
-) -> "ExplicitResultKey":
-    """Project one admitted request plus Run target coordinates into its key."""
-
-    return ExplicitResultKey(
-        tab_id=tab_id,
-        set_id=set_id,
-        request_fingerprint=simulation_execution_request_fingerprint(
-            execution_request
-        ),
-    )
-
-
-def preview_result_identity_for_request(
-    *,
-    tab_id: str,
-    set_id: str,
-    execution_request: SimulationExecutionRequest,
-) -> "PreviewResultIdentity":
-    """Project one admitted request plus Preview target coordinates."""
-
-    return PreviewResultIdentity(
-        tab_id=tab_id,
-        set_id=set_id,
-        request_fingerprint=simulation_execution_request_fingerprint(
-            execution_request
-        ),
-    )
 
 
 def _frozen_vector(value: object, *, field: str) -> np.ndarray:
@@ -164,9 +118,12 @@ def _validate_discontinuity_regions(
 
 
 def _executed_segment_catalog(
-    provenance: SimulationResultProvenance,
+    provenance: Mapping[str, Any],
 ) -> tuple[tuple[int, str, float, float, bool, bool], ...]:
-    raw_catalog = provenance.solver.get("integration_segments")
+    solver_provenance = provenance.get("solver", provenance)
+    if not isinstance(solver_provenance, Mapping):
+        raise TypeError("solver provenance must be a mapping.")
+    raw_catalog = solver_provenance.get("integration_segments")
     if not isinstance(raw_catalog, (tuple, list)) or not raw_catalog:
         raise ValueError(
             "solver provenance must contain the actual executed segment catalog."
@@ -342,235 +299,9 @@ def _frozen_provenance_mapping(
     )
 
 
-@dataclass(frozen=True, slots=True)
-class ExplicitResultKey:
-    """Lightweight exact projection of one admitted Run request."""
-
-    tab_id: str
-    set_id: str
-    request_fingerprint: str
-
-    def __post_init__(self) -> None:
-        object.__setattr__(self, "tab_id", _required_id(self.tab_id, "tab_id"))
-        object.__setattr__(self, "set_id", _required_id(self.set_id, "set_id"))
-        object.__setattr__(
-            self,
-            "request_fingerprint",
-            _required_id(self.request_fingerprint, "request_fingerprint"),
-        )
-        if not self.request_fingerprint.startswith("simulation-request:"):
-            raise ValueError(
-                "Explicit result key requires a simulation-request fingerprint."
-            )
-
-
-def explicit_result_key_is_current(
-    key: ExplicitResultKey,
-    current_key: ExplicitResultKey | None,
-) -> bool:
-    """Return whether ``key`` is exactly the captured current result key."""
-
-    return (
-        isinstance(key, ExplicitResultKey)
-        and isinstance(current_key, ExplicitResultKey)
-        and key == current_key
-    )
-
-
-@dataclass(frozen=True, slots=True)
-class PreviewResultIdentity:
-    """Generation-free lightweight projection of one admitted Preview request."""
-
-    tab_id: str
-    set_id: str
-    request_fingerprint: str
-
-    def __post_init__(self) -> None:
-        object.__setattr__(self, "tab_id", _required_id(self.tab_id, "tab_id"))
-        object.__setattr__(self, "set_id", _required_id(self.set_id, "set_id"))
-        object.__setattr__(
-            self,
-            "request_fingerprint",
-            _required_id(self.request_fingerprint, "request_fingerprint"),
-        )
-        if not self.request_fingerprint.startswith("simulation-request:"):
-            raise ValueError(
-                "Preview identity requires a simulation-request fingerprint."
-            )
-
-
-@dataclass(frozen=True, slots=True)
-class PreviewResultKey:
-    """Exact latest-only identity minted by ``SimulationJobOwner``."""
-
-    tab_id: str
-    set_id: str
-    request_fingerprint: str
-    generation: int
-    kind: str = "preview"
-
-    def __post_init__(self) -> None:
-        identity = PreviewResultIdentity(
-            tab_id=self.tab_id,
-            set_id=self.set_id,
-            request_fingerprint=self.request_fingerprint,
-        )
-        object.__setattr__(self, "tab_id", identity.tab_id)
-        object.__setattr__(self, "set_id", identity.set_id)
-        object.__setattr__(self, "request_fingerprint", identity.request_fingerprint)
-        if self.kind != "preview":
-            raise ValueError("PreviewResultKey kind must be exactly 'preview'.")
-        if type(self.generation) is not int:
-            raise TypeError("Preview generation must be an int.")
-        generation = self.generation
-        if generation < 0:
-            raise ValueError("Preview generation must be nonnegative.")
-        object.__setattr__(self, "generation", generation)
-
-    @classmethod
-    def from_identity(
-        cls,
-        identity: PreviewResultIdentity,
-        *,
-        generation: int,
-    ) -> PreviewResultKey:
-        if not isinstance(identity, PreviewResultIdentity):
-            raise TypeError("identity must be a PreviewResultIdentity.")
-        return cls(
-            tab_id=identity.tab_id,
-            set_id=identity.set_id,
-            request_fingerprint=identity.request_fingerprint,
-            generation=generation,
-        )
-
-    @property
-    def identity(self) -> PreviewResultIdentity:
-        return PreviewResultIdentity(
-            tab_id=self.tab_id,
-            set_id=self.set_id,
-            request_fingerprint=self.request_fingerprint,
-        )
-
-
-@dataclass(frozen=True, slots=True)
-class SimulationResultProvenance:
-    """Typed immutable provenance retained with one successful result."""
-
-    solver: Mapping[str, Any]
-    preparation_warnings: tuple[str, ...] = ()
-    requested_algebra_outputs: tuple[str, ...] = ()
-    succeeded_algebra_outputs: tuple[str, ...] = ()
-    failed_algebra_outputs: tuple[str, ...] = ()
-    omitted_algebra_outputs: tuple[str, ...] = ()
-    algebra_errors: tuple[FactualCause, ...] = ()
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.solver, Mapping):
-            raise TypeError("solver provenance must be a mapping.")
-        preparation_warnings = tuple(
-            str(value) for value in self.preparation_warnings
-        )
-        requested = self._normalized_algebra_names(
-            self.requested_algebra_outputs,
-            field="requested_algebra_outputs",
-        )
-        succeeded = self._normalized_algebra_names(
-            self.succeeded_algebra_outputs,
-            field="succeeded_algebra_outputs",
-        )
-        failed = self._normalized_algebra_names(
-            self.failed_algebra_outputs,
-            field="failed_algebra_outputs",
-        )
-        omitted = self._normalized_algebra_names(
-            self.omitted_algebra_outputs,
-            field="omitted_algebra_outputs",
-        )
-        requested_set = set(requested)
-        partitions = {
-            "succeeded_algebra_outputs": set(succeeded),
-            "failed_algebra_outputs": set(failed),
-            "omitted_algebra_outputs": set(omitted),
-        }
-        for field, values in partitions.items():
-            unexpected = values.difference(requested_set)
-            if unexpected:
-                raise ValueError(
-                    f"{field} contains unrequested output(s): "
-                    + ", ".join(sorted(unexpected))
-                )
-        overlap = (
-            partitions["succeeded_algebra_outputs"]
-            & partitions["failed_algebra_outputs"]
-        ) | (
-            partitions["succeeded_algebra_outputs"]
-            & partitions["omitted_algebra_outputs"]
-        ) | (
-            partitions["failed_algebra_outputs"]
-            & partitions["omitted_algebra_outputs"]
-        )
-        if overlap:
-            raise ValueError(
-                "algebra output outcome partitions overlap: "
-                + ", ".join(sorted(overlap))
-            )
-        classified = set().union(*partitions.values())
-        missing = requested_set.difference(classified)
-        if missing:
-            raise ValueError(
-                "requested algebra outputs lack a terminal outcome: "
-                + ", ".join(sorted(missing))
-            )
-        if isinstance(self.algebra_errors, Mapping):
-            raise TypeError(
-                "algebra_errors must be a tuple of FactualCause values, "
-                "not a mapping."
-            )
-        errors = tuple(self.algebra_errors)
-        if any(not isinstance(value, FactualCause) for value in errors):
-            raise TypeError("algebra_errors must contain only FactualCause values.")
-        object.__setattr__(
-            self,
-            "solver",
-            _frozen_provenance_mapping(self.solver),
-        )
-        object.__setattr__(
-            self,
-            "preparation_warnings",
-            preparation_warnings,
-        )
-        object.__setattr__(self, "requested_algebra_outputs", requested)
-        object.__setattr__(self, "succeeded_algebra_outputs", succeeded)
-        object.__setattr__(self, "failed_algebra_outputs", failed)
-        object.__setattr__(self, "omitted_algebra_outputs", omitted)
-        object.__setattr__(self, "algebra_errors", errors)
-
-    @staticmethod
-    def _normalized_algebra_names(
-        values: Iterable[str],
-        *,
-        field: str,
-    ) -> tuple[str, ...]:
-        normalized = tuple(_required_id(value, field) for value in values)
-        if len(normalized) != len(set(normalized)):
-            raise ValueError(f"{field} contains duplicate output names.")
-        return normalized
-
-    @property
-    def completed_with_warnings(self) -> bool:
-        """Whether prominent completion warning presentation is required."""
-
-        return bool(
-            self.preparation_warnings
-            or self.failed_algebra_outputs
-            or self.omitted_algebra_outputs
-            or self.algebra_errors
-        )
-
-
 @dataclass(frozen=True, slots=True, eq=False)
 class SimulationResultValue:
-    """Immutable numerical output with executor-issued execution identity."""
+    """Immutable numerical output and its complete execution truth."""
 
     t: np.ndarray
     series: Mapping[str, np.ndarray]
@@ -578,16 +309,20 @@ class SimulationResultValue:
     segment_keys: tuple[str, ...]
     discontinuity_ids: np.ndarray
     intervention_execution: InterventionExecutionContract
-    provenance: SimulationResultProvenance
+    solver_provenance: Mapping[str, Any]
+    preparation_warnings: tuple[str, ...] = ()
+    requested_algebra_outputs: tuple[str, ...] = ()
+    succeeded_algebra_outputs: tuple[str, ...] = ()
+    failed_algebra_outputs: tuple[str, ...] = ()
+    omitted_algebra_outputs: tuple[str, ...] = ()
+    algebra_errors: tuple[FactualCause, ...] = ()
     scalars: Mapping[str, float] = MappingProxyType({})
     parameters: tuple[tuple[str, float, str], ...] = ()
     presentation_boundaries: tuple[SimulationPresentationBoundary, ...] = ()
 
     def __post_init__(self) -> None:
-        if not isinstance(self.provenance, SimulationResultProvenance):
-            raise TypeError(
-                "provenance must be a SimulationResultProvenance."
-            )
+        if not isinstance(self.solver_provenance, Mapping):
+            raise TypeError("solver_provenance must be a mapping.")
         if not isinstance(
             self.intervention_execution, InterventionExecutionContract
         ):
@@ -646,7 +381,7 @@ class SimulationResultValue:
         )
         if len(segment_keys) != time.size:
             raise ValueError("result segment keys must align with result time.")
-        catalog = _executed_segment_catalog(self.provenance)
+        catalog = _executed_segment_catalog(self.solver_provenance)
         _validate_rows_against_executed_segments(
             time=time,
             segment_ids=segment_ids,
@@ -694,6 +429,29 @@ class SimulationResultValue:
             parameter_names.add(name)
             parameters.append((name, value, str(raw_unit or "")))
 
+        def normalized_names(values: Iterable[str], field: str) -> tuple[str, ...]:
+            result = tuple(_required_id(value, field) for value in values)
+            if len(result) != len(set(result)):
+                raise ValueError(f"{field} contains duplicate output names.")
+            return result
+
+        preparation_warnings = tuple(str(value) for value in self.preparation_warnings)
+        requested = normalized_names(self.requested_algebra_outputs, "requested_algebra_outputs")
+        succeeded = normalized_names(self.succeeded_algebra_outputs, "succeeded_algebra_outputs")
+        failed = normalized_names(self.failed_algebra_outputs, "failed_algebra_outputs")
+        omitted = normalized_names(self.omitted_algebra_outputs, "omitted_algebra_outputs")
+        requested_set = set(requested)
+        partitions = (set(succeeded), set(failed), set(omitted))
+        if any(not values <= requested_set for values in partitions):
+            raise ValueError("algebra outcome contains an unrequested output.")
+        if set.intersection(*partitions):
+            raise ValueError("algebra output outcome partitions overlap.")
+        if requested_set.difference(set.union(*partitions)):
+            raise ValueError("requested algebra outputs lack a terminal outcome.")
+        errors = tuple(self.algebra_errors)
+        if any(not isinstance(value, FactualCause) for value in errors):
+            raise TypeError("algebra_errors must contain only FactualCause values.")
+
         object.__setattr__(self, "t", time)
         object.__setattr__(self, "series", MappingProxyType(series))
         object.__setattr__(self, "segment_ids", segment_ids)
@@ -701,6 +459,13 @@ class SimulationResultValue:
         object.__setattr__(self, "discontinuity_ids", discontinuity_ids)
         object.__setattr__(self, "scalars", MappingProxyType(scalars))
         object.__setattr__(self, "parameters", tuple(parameters))
+        object.__setattr__(self, "solver_provenance", _frozen_provenance_mapping(self.solver_provenance))
+        object.__setattr__(self, "preparation_warnings", preparation_warnings)
+        object.__setattr__(self, "requested_algebra_outputs", requested)
+        object.__setattr__(self, "succeeded_algebra_outputs", succeeded)
+        object.__setattr__(self, "failed_algebra_outputs", failed)
+        object.__setattr__(self, "omitted_algebra_outputs", omitted)
+        object.__setattr__(self, "algebra_errors", errors)
         object.__setattr__(
             self,
             "presentation_boundaries",
@@ -708,23 +473,28 @@ class SimulationResultValue:
         )
 
 
-@dataclass(frozen=True, slots=True)
-class ExplicitResultEntry:
-    key: ExplicitResultKey
-    result: SimulationResultValue
+    @property
+    def completed_with_warnings(self) -> bool:
+        return bool(self.preparation_warnings or self.failed_algebra_outputs or self.omitted_algebra_outputs or self.algebra_errors)
 
-
-@dataclass(frozen=True, slots=True)
-class PreviewResultEntry:
-    key: PreviewResultKey
-    result: SimulationResultValue
-
-
-ResultEntry: TypeAlias = ExplicitResultEntry | PreviewResultEntry
+    @property
+    def provenance_export(self) -> Mapping[str, Any]:
+        """Return readable provenance without introducing an identity object."""
+        return MappingProxyType({
+            "solver": self.solver_provenance,
+            "preparation_warnings": self.preparation_warnings,
+            "requested_algebra_outputs": self.requested_algebra_outputs,
+            "succeeded_algebra_outputs": self.succeeded_algebra_outputs,
+            "failed_algebra_outputs": self.failed_algebra_outputs,
+            "omitted_algebra_outputs": self.omitted_algebra_outputs,
+            "algebra_errors": tuple(
+                cause.to_payload() for cause in self.algebra_errors
+            ),
+        })
 
 
 class ResultRepository:
-    """Store completed result values and a bounded exact-key Run cache."""
+    """Store completed result values and a bounded exact-request Run cache."""
 
     def __init__(
         self,
@@ -738,13 +508,18 @@ class ResultRepository:
         self._cache_capacity = cache_capacity
         if cache_capacity < 1:
             raise ValueError("cache_capacity must be at least one.")
-        self._explicit_by_set_id: dict[str, ExplicitResultEntry] = {}
-        self._preview_by_set_id: dict[str, PreviewResultEntry] = {}
-        self._reference_by_set_id: dict[str, ExplicitResultEntry] = {}
-        self._explicit_cache: OrderedDict[
-            ExplicitResultKey,
-            ExplicitResultEntry,
-        ] = OrderedDict()
+        self._current_by_set_id: dict[
+            str,
+            tuple[str, SimulationExecutionRequest, SimulationResultValue],
+        ] = {}
+        self._reference_by_set_id: dict[
+            str,
+            tuple[str, SimulationExecutionRequest, SimulationResultValue],
+        ] = {}
+        self._current_run_set_ids: set[str] = set()
+        self._explicit_cache: list[
+            tuple[str, SimulationExecutionRequest, SimulationResultValue]
+        ] = []
 
     @property
     def tab_id(self) -> str:
@@ -760,86 +535,124 @@ class ResultRepository:
         self._cache_capacity = cache_capacity
         self._trim_explicit_cache()
 
-    def explicit_entry(self, set_id: str) -> ExplicitResultEntry | None:
-        return self._explicit_by_set_id.get(str(set_id or ""))
+    def current_result(self, set_id: str) -> SimulationResultValue | None:
+        entry = self._current_by_set_id.get(str(set_id or ""))
+        return None if entry is None else entry[2]
 
-    def preview_entry(self, set_id: str) -> PreviewResultEntry | None:
-        return self._preview_by_set_id.get(str(set_id or ""))
+    def reference_result(self, set_id: str) -> SimulationResultValue | None:
+        entry = self._reference_by_set_id.get(str(set_id or ""))
+        return None if entry is None else entry[2]
 
-    def reference_entry(self, set_id: str) -> ExplicitResultEntry | None:
-        return self._reference_by_set_id.get(str(set_id or ""))
+    def current_request(self, set_id: str) -> SimulationExecutionRequest | None:
+        entry = self._current_by_set_id.get(str(set_id or ""))
+        return None if entry is None else entry[1]
+
+    def reference_request(self, set_id: str) -> SimulationExecutionRequest | None:
+        entry = self._reference_by_set_id.get(str(set_id or ""))
+        return None if entry is None else entry[1]
 
     def retain_explicit_as_reference(self, set_id: str) -> None:
-        """Move one completed foreground Run to comparison-only storage."""
+        """Retain the current Run unless its Reference is already retained."""
 
         sid = _required_id(set_id, "set_id")
-        explicit = self._explicit_by_set_id.pop(sid, None)
+        if (
+            sid not in self._current_run_set_ids
+            or sid in self._reference_by_set_id
+        ):
+            return
+        explicit = self._current_by_set_id.pop(sid, None)
+        self._current_run_set_ids.discard(sid)
         if explicit is not None:
             self._reference_by_set_id[sid] = explicit
 
-    def store_preview(
-        self,
-        key: PreviewResultKey,
-        result: SimulationResultValue,
-    ) -> PreviewResultEntry:
-        """Store one completed Preview value already accepted by its owner."""
-
-        self._require_preview_key(key)
-        if not isinstance(result, SimulationResultValue):
-            raise TypeError("result must be a SimulationResultValue.")
-        entry = PreviewResultEntry(key=key, result=result)
-        self._preview_by_set_id[key.set_id] = entry
-        self._explicit_by_set_id.pop(key.set_id, None)
-        return entry
-
     def clear_preview(self, set_id: str, *, clear_reference: bool = True) -> None:
         sid = _required_id(set_id, "set_id")
-        self._preview_by_set_id.pop(sid, None)
+        if sid not in self._current_run_set_ids:
+            self._current_by_set_id.pop(sid, None)
         if clear_reference:
             self._reference_by_set_id.pop(sid, None)
 
-    def put_explicit(
+    def publish_run(
         self,
-        key: ExplicitResultKey,
+        set_id: str,
+        execution_request: SimulationExecutionRequest,
         result: SimulationResultValue,
-    ) -> ExplicitResultEntry:
-        self._require_explicit_key(key)
+    ) -> SimulationResultValue:
+        """Publish a completed Run and admit it to the bounded exact cache."""
+
+        sid = _required_id(set_id, "set_id")
+        if not isinstance(execution_request, SimulationExecutionRequest):
+            raise TypeError("execution_request must be a SimulationExecutionRequest.")
         if not isinstance(result, SimulationResultValue):
             raise TypeError("result must be a SimulationResultValue.")
-        entry = ExplicitResultEntry(key=key, result=result)
-        self._explicit_by_set_id[key.set_id] = entry
-        self._preview_by_set_id.pop(key.set_id, None)
-        self._reference_by_set_id.pop(key.set_id, None)
-        self._explicit_cache[key] = entry
-        self._explicit_cache.move_to_end(key)
+        entry = (sid, execution_request.isolated_copy(), result)
+        self._current_by_set_id[sid] = entry
+        self._current_run_set_ids.add(sid)
+        self._reference_by_set_id.pop(sid, None)
+        from kindred.core.simulation_preparation import simulation_execution_requests_equal
+        self._explicit_cache[:] = [
+            cached
+            for cached in self._explicit_cache
+            if cached[0] != sid
+            or not simulation_execution_requests_equal(
+                cached[1],
+                entry[1],
+            )
+        ]
+        self._explicit_cache.append(entry)
         self._trim_explicit_cache()
-        return entry
+        return result
 
-    def hydrate_cached(self, key: ExplicitResultKey) -> ExplicitResultEntry | None:
-        """Hydrate one exact-key cache hit; a miss changes nothing."""
+    def publish_preview(
+        self,
+        set_id: str,
+        execution_request: SimulationExecutionRequest,
+        result: SimulationResultValue,
+    ) -> SimulationResultValue:
+        """Publish a Preview current value without cache admission or Reference changes."""
 
-        self._require_explicit_key(key)
-        entry = self._explicit_cache.get(key)
-        if entry is not None:
-            self._explicit_cache.move_to_end(key)
-        else:
-            entry = self._reference_by_set_id.get(key.set_id)
-            if entry is None:
-                entry = self._explicit_by_set_id.get(key.set_id)
-            if entry is not None and entry.key != key:
-                entry = None
+        sid = _required_id(set_id, "set_id")
+        if not isinstance(execution_request, SimulationExecutionRequest):
+            raise TypeError("execution_request must be a SimulationExecutionRequest.")
+        if not isinstance(result, SimulationResultValue):
+            raise TypeError("result must be a SimulationResultValue.")
+        self._current_by_set_id[sid] = (
+            sid,
+            execution_request.isolated_copy(),
+            result,
+        )
+        self._current_run_set_ids.discard(sid)
+        return result
+
+    def hydrate_cached(self, set_id: str, execution_request: SimulationExecutionRequest) -> SimulationResultValue | None:
+        """Hydrate a structurally equal full request; a miss changes nothing."""
+        from kindred.core.simulation_preparation import simulation_execution_requests_equal
+        sid = _required_id(set_id, "set_id")
+        if not isinstance(execution_request, SimulationExecutionRequest):
+            raise TypeError("execution_request must be a SimulationExecutionRequest.")
+        entry = next(
+            (
+                cached
+                for cached in reversed(self._explicit_cache)
+                if cached[0] == sid
+                and simulation_execution_requests_equal(cached[1], execution_request)
+            ),
+            None,
+        )
         if entry is None:
             return None
-        self._explicit_by_set_id[key.set_id] = entry
-        self._preview_by_set_id.pop(key.set_id, None)
-        self._reference_by_set_id.pop(key.set_id, None)
-        return entry
+        self._explicit_cache.remove(entry)
+        self._explicit_cache.append(entry)
+        self._current_by_set_id[sid] = entry
+        self._current_run_set_ids.add(sid)
+        self._reference_by_set_id.pop(sid, None)
+        return entry[2]
 
     def clear_semantic_set(self, set_id: str) -> None:
         """Clear visible semantic entries while retaining exact cache storage."""
         sid = _required_id(set_id, "set_id")
-        self._explicit_by_set_id.pop(sid, None)
-        self._preview_by_set_id.pop(sid, None)
+        self._current_by_set_id.pop(sid, None)
+        self._current_run_set_ids.discard(sid)
         self._reference_by_set_id.pop(sid, None)
 
     def deauthorize_sets(
@@ -851,7 +664,7 @@ class ResultRepository:
         """Clear foreground values while retaining exact reusable Run cache.
 
         Slider Preview reaches this canonical deauthorization boundary only
-        after constructing its exact request/key candidates. Its established
+        after constructing its exact request candidates. Its established
         Run-to-Reference behavior moves the prior explicit entry separately,
         before this boundary. Deauthorization never manufactures a Reference
         value. An existing Reference may be retained for Preview admission but
@@ -865,14 +678,14 @@ class ResultRepository:
         if not targets:
             return
         for set_id in targets:
-            self._explicit_by_set_id.pop(set_id, None)
+            self._current_by_set_id.pop(set_id, None)
+            self._current_run_set_ids.discard(set_id)
             if not preserve_reference:
                 self._reference_by_set_id.pop(set_id, None)
-            self._preview_by_set_id.pop(set_id, None)
 
     def clear_all_semantic_entries(self) -> None:
-        self._explicit_by_set_id.clear()
-        self._preview_by_set_id.clear()
+        self._current_by_set_id.clear()
+        self._current_run_set_ids.clear()
         self._reference_by_set_id.clear()
 
     def purge_set(self, set_id: str) -> None:
@@ -880,9 +693,9 @@ class ResultRepository:
 
         sid = _required_id(set_id, "set_id")
         self.clear_semantic_set(sid)
-        for key in tuple(self._explicit_cache):
-            if key.set_id == sid:
-                self._explicit_cache.pop(key, None)
+        self._explicit_cache[:] = [
+            entry for entry in self._explicit_cache if entry[0] != sid
+        ]
 
     def purge_sets(self, set_ids: Iterable[str]) -> None:
         for set_id in tuple(set_ids):
@@ -893,23 +706,4 @@ class ResultRepository:
         self._explicit_cache.clear()
 
     def _trim_explicit_cache(self) -> None:
-        while len(self._explicit_cache) > self._cache_capacity:
-            self._explicit_cache.popitem(last=False)
-
-    def _require_explicit_key(self, key: ExplicitResultKey) -> None:
-        if not isinstance(key, ExplicitResultKey):
-            raise TypeError("key must be an ExplicitResultKey.")
-        if key.tab_id != self._tab_id:
-            raise ValueError(
-                f"ExplicitResultKey belongs to tab {key.tab_id!r}, "
-                f"not {self._tab_id!r}."
-            )
-
-    def _require_preview_key(self, key: PreviewResultKey) -> None:
-        if not isinstance(key, PreviewResultKey):
-            raise TypeError("key must be a PreviewResultKey.")
-        if key.tab_id != self._tab_id:
-            raise ValueError(
-                f"PreviewResultKey belongs to tab {key.tab_id!r}, "
-                f"not {self._tab_id!r}."
-            )
+        del self._explicit_cache[:-self._cache_capacity]

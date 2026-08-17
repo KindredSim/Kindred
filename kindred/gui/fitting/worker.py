@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
-import json
 import math
 import time
 from collections.abc import Callable, Mapping, Sequence
@@ -1741,26 +1739,13 @@ def _curves_from_evaluations(
     return tuple(curves)
 
 
-def _array_identity(value: object) -> dict[str, object]:
-    """Describe an array without retaining its scientific contents."""
-
+def _array_value(value: object) -> dict[str, object]:
+    """Retain one readable typed array value for Fit provenance."""
     array = np.asarray(value)
-    if array.dtype.kind in {"O", "U", "S"}:
-        content = json.dumps(
-            array.reshape(-1).tolist(),
-            ensure_ascii=True,
-            separators=(",", ":"),
-        ).encode("utf-8")
-    else:
-        content = np.ascontiguousarray(array).tobytes(order="C")
-    hasher = hashlib.sha256()
-    hasher.update(str(array.dtype).encode("ascii", "replace"))
-    hasher.update(json.dumps(tuple(int(item) for item in array.shape)).encode("ascii"))
-    hasher.update(content)
     return {
         "dtype": str(array.dtype),
         "shape": tuple(int(item) for item in array.shape),
-        "sha256": hasher.hexdigest(),
+        "values": array.reshape(-1).tolist(),
     }
 
 
@@ -1790,7 +1775,7 @@ def _compact_metadata(value: object) -> object:
             "dataset_values": _compact_metadata(value.dataset_values),
         }
     if isinstance(value, np.ndarray):
-        return _array_identity(value)
+        return _array_value(value)
     if isinstance(value, np.generic):
         return _compact_metadata(value.item())
     if isinstance(value, float):
@@ -1813,18 +1798,6 @@ def _compact_metadata(value: object) -> object:
     if isinstance(value, (set, frozenset)):
         return [_compact_metadata(item) for item in sorted(value, key=repr)]
     return value
-
-
-def _metadata_digest(value: object) -> str:
-    normalized = _compact_metadata(value)
-    encoded = json.dumps(
-        normalized,
-        sort_keys=True,
-        separators=(",", ":"),
-        ensure_ascii=True,
-        allow_nan=False,
-    ).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
 
 
 def _primary_outcome_identity(outcome: object) -> object:
@@ -1863,7 +1836,7 @@ def _terminal_extensions_identity(extensions: Sequence[object]) -> list[object]:
     return records
 
 
-def _simulation_result_array_identity(
+def _simulation_result_array_value(
     result: GlobalFitResult,
 ) -> list[dict[str, object]]:
     """Hash canonical terminal simulations without building curve mirrors."""
@@ -1871,14 +1844,14 @@ def _simulation_result_array_identity(
     return [
         {
             "dataset_id": dataset_id,
-            "time": _array_identity(simulation.t),
+            "time": _array_value(simulation.t),
             "series": {
-                name: _array_identity(values)
+                name: _array_value(values)
                 for name, values in sorted(simulation.series.items())
             },
-            "segment_ids": _array_identity(simulation.segment_ids),
-            "segment_keys": _array_identity(simulation.segment_keys),
-            "discontinuity_ids": _array_identity(
+            "segment_ids": _array_value(simulation.segment_ids),
+            "segment_keys": _array_value(simulation.segment_keys),
+            "discontinuity_ids": _array_value(
                 simulation.discontinuity_ids
             ),
         }
@@ -1888,7 +1861,7 @@ def _simulation_result_array_identity(
     ]
 
 
-def _result_array_identity(result: GlobalFitResult) -> list[dict[str, object]]:
+def _result_array_value(result: GlobalFitResult) -> list[dict[str, object]]:
     """Retain dtype-sensitive digests before presentation casts occur."""
 
     rows: list[dict[str, object]] = []
@@ -1901,42 +1874,41 @@ def _result_array_identity(result: GlobalFitResult) -> list[dict[str, object]]:
                 "dataset_id": dataset_id,
                 "series": {
                     series_name: {
-                        "model_x": _array_identity(
+                        "model_x": _array_value(
                             result.model_x_by_species[dataset_id][series_name]
                         ),
-                        "model_y": _array_identity(
+                        "model_y": _array_value(
                             result.model_series[dataset_id][series_name]
                         ),
-                        "segment_ids": _array_identity(
+                        "segment_ids": _array_value(
                             result.model_segment_ids[dataset_id][series_name]
                         ),
-                        "segment_keys": _array_identity(
+                        "segment_keys": _array_value(
                             result.model_segment_keys[dataset_id][series_name]
                         ),
-                        "discontinuity_ids": _array_identity(
+                        "discontinuity_ids": _array_value(
                             result.model_discontinuity_ids[dataset_id][series_name]
                         ),
-                        "selection_provenance": _array_identity(
+                        "selection_provenance": _array_value(
                             result.model_selection_provenance[dataset_id][series_name]
                         ),
-                        "observation_ids": _array_identity(
+                        "observation_ids": _array_value(
                             result.model_observation_ids[dataset_id][series_name]
                         ),
-                        "raw_columns": _array_identity(
+                        "raw_columns": _array_value(
                             result.model_raw_columns[dataset_id][series_name]
                         ),
-                        "source_rows": _array_identity(
+                        "source_rows": _array_value(
                             result.model_source_rows[dataset_id][series_name]
                         ),
                     }
                     for series_name in sorted(result.model_series[dataset_id])
                 },
             }
-        if info is not None and info.x_identity_hash is not None:
+        if info is not None and info.x_point_count:
             row["x_terminal"] = {
-                "identity_hash": info.x_identity_hash,
                 "point_count": int(info.x_point_count),
-                "delta_x": _array_identity(info.x_delta_x),
+                "delta_x": _array_value(info.x_delta_x),
                 "match_kinds": tuple(info.x_match_kinds),
                 "sample_kinds": tuple(info.x_sample_kinds),
                 "weighted_sse": (
@@ -1960,14 +1932,14 @@ def _result_array_identity(result: GlobalFitResult) -> list[dict[str, object]]:
         if projection is not None:
             row["x_projection"] = {
                 "source_rows": projection.source_rows,
-                "observation_time": _array_identity(projection.observation_time),
-                "observed_x": _array_identity(projection.observed_x),
-                "selected_time": _array_identity(projection.selected_time),
-                "selected_model_x": _array_identity(projection.selected_model_x),
-                "delta_x": _array_identity(projection.delta_x),
-                "segment_ids": _array_identity(projection.segment_ids),
+                "observation_time": _array_value(projection.observation_time),
+                "observed_x": _array_value(projection.observed_x),
+                "selected_time": _array_value(projection.selected_time),
+                "selected_model_x": _array_value(projection.selected_model_x),
+                "delta_x": _array_value(projection.delta_x),
+                "segment_ids": _array_value(projection.segment_ids),
                 "segment_keys": projection.segment_keys,
-                "discontinuity_ids": _array_identity(projection.discontinuity_ids),
+                "discontinuity_ids": _array_value(projection.discontinuity_ids),
                 "match_kinds": projection.match_kinds,
                 "sample_kinds": projection.sample_kinds,
                 "model_rows": projection.model_rows,
@@ -1986,7 +1958,7 @@ def _compile_fit_run_identity_payload(
     prepared_ids: Mapping[str, Mapping[str, object]],
     resolved_modes: tuple[tuple[str, str], ...],
 ) -> dict[str, object]:
-    """Build a compact identity; scientific arrays are represented by digests."""
+    """Build a readable typed Fit provenance payload."""
 
     included_ids = {item.dataset_id for item in included}
     included_set_ids = {
@@ -2028,9 +2000,9 @@ def _compile_fit_run_identity_payload(
         observations = {
             name: {
                 "raw_observation_id": series.raw_observation_id,
-                "t": _array_identity(series.t),
-                "y": _array_identity(series.y),
-                "source_rows": _array_identity(series.source_rows),
+                "t": _array_value(series.t),
+                "y": _array_value(series.y),
+                "source_rows": _array_value(series.source_rows),
                 "raw_column": raw_columns[series.raw_observation_id],
             }
             for name, series in item.observations.items()
@@ -2039,13 +2011,13 @@ def _compile_fit_run_identity_payload(
         if item.x_name != "t":
             x_source = item.x_observations
             if x_source is None:
-                raise ValueError("Parametric Fit identity omitted its canonical X capture.")
+                raise ValueError("Parametric Fit omitted its canonical X capture.")
             x_identity = {
                 "raw_observation_id": x_source.raw_observation_id,
                 "raw_column": x_source.raw_column,
-                "t": _array_identity(x_source.t),
-                "x": _array_identity(x_source.y),
-                "source_rows": _array_identity(x_source.source_rows),
+                "t": _array_value(x_source.t),
+                "x": _array_value(x_source.y),
+                "source_rows": _array_value(x_source.source_rows),
                 "retained_source_rows": tuple(item.x_source_rows),
                 "retained_point_count": len(item.x_source_rows),
                 "configured_target_weight": float(item.target_weights[item.x_name]),
@@ -2097,7 +2069,7 @@ def _compile_fit_run_identity_payload(
                     else "fit_internal_regular_grid_union_retained_endpoints"
                 ),
                 "fit_sampling_identity": {
-                    "retained_observation_times": _array_identity(retained_times),
+                    "retained_observation_times": _array_value(retained_times),
                     "retained_observation_count": len(retained_times),
                     "regular_grid_count": max(100, len(retained_times))
                     if local.parametric is not None
@@ -2121,11 +2093,6 @@ def _compile_fit_run_identity_payload(
         "fit_local_admission": None
         if fit_local_admission is None
         else {
-            "identity": fit_local_admission.identity,
-            "base_analysis_identity": fit_local_admission.base_analysis_identity,
-            "base_executable_fingerprint": fit_local_admission.base_executable_fingerprint,
-            "source_text": fit_local_admission.source_text,
-            "dependency_plan": fit_local_admission.dependency_plan,
             "observables": [
             {
                 "name": observable.name,
@@ -2269,7 +2236,7 @@ def _compile_fit_run_identity_payload(
             "wegscheider_policy": bool(request.origin.scientific_settings.wegscheider_policy),
         },
         "prepared_identities": {
-            dataset_id: {"sha256": _metadata_digest(metadata)}
+            dataset_id: _compact_metadata(metadata)
             for dataset_id, metadata in sorted(prepared_ids.items())
             if dataset_id in included_ids
         },
@@ -2279,15 +2246,15 @@ def _compile_fit_run_identity_payload(
         "kind": "global_fit_run_identity",
         "schema_version": 3,
         "request": {
-            "sha256": _metadata_digest(identity_material),
+            "value": _compact_metadata(identity_material),
         },
         "prepared": {
-            dataset_id: {"sha256": _metadata_digest(metadata)}
+            dataset_id: _compact_metadata(metadata)
             for dataset_id, metadata in sorted(prepared_ids.items())
             if dataset_id in included_ids
         },
         "resolved_auto_modes": {
-            "sha256": _metadata_digest(dict(resolved_modes))
+            "value": _compact_metadata(dict(resolved_modes))
         },
     }
 
@@ -2418,7 +2385,7 @@ def _assemble_fit_terminal(
             "Fit terminal prepared identities do not exactly match the included datasets."
         )
     solver_provenance_by_dataset = {
-        str(dataset_id or "").strip(): simulation.provenance.solver
+        str(dataset_id or "").strip(): simulation.solver_provenance
         for dataset_id, simulation in result.simulation_results_by_dataset.items()
     }
     if (
@@ -2461,11 +2428,7 @@ def _assemble_fit_terminal(
             for dataset_id in sorted(effective_dataset_weights)
         },
         "solver_provenance_identity_by_dataset": {
-            dataset_id: {
-                "sha256": _metadata_digest(
-                    solver_provenance_by_dataset[dataset_id]
-                )
-            }
+            dataset_id: _compact_metadata(solver_provenance_by_dataset[dataset_id])
             for dataset_id in sorted(solver_provenance_by_dataset)
         },
         "shared_parameters": {
@@ -2490,9 +2453,9 @@ def _assemble_fit_terminal(
         "terminal_extensions": _terminal_extensions_identity(
             result.completion.terminal_extensions
         ),
-        "result_array_identity": _result_array_identity(result),
-        "simulation_result_array_identity": (
-            _simulation_result_array_identity(result)
+        "result_array_value": _result_array_value(result),
+        "simulation_result_array_value": (
+            _simulation_result_array_value(result)
         ),
     }
     primary_outcome_identity = _primary_outcome_identity(
@@ -2504,7 +2467,7 @@ def _assemble_fit_terminal(
         result.centred_fixed_effects_settlements
     )
     run_identity_payload["result"] = {
-        "sha256": _metadata_digest(terminal_material)
+        "value": _compact_metadata(terminal_material)
     }
     if result.centred_fixed_effects_settlements:
         # Centred identity is self-describing at the terminal boundary: the
@@ -2518,11 +2481,7 @@ def _assemble_fit_terminal(
             }
         )
     run_identity_payload["canonical_replay"] = {
-        dataset_id: {
-            "sha256": _metadata_digest(
-                solver_provenance_by_dataset[dataset_id]
-            )
-        }
+        dataset_id: _compact_metadata(solver_provenance_by_dataset[dataset_id])
         for dataset_id in sorted(solver_provenance_by_dataset)
     }
     run_identity = FitRunIdentity.build(run_identity_payload)
@@ -2814,28 +2773,8 @@ class GlobalFitWorker(QtCore.QThread):
                             "Fit Wegscheider correction lost its exact "
                             "admission report."
                         ) from exc
-                    identity = FitRunIdentity.build(
-                        {
-                            "kind": "detailed_balance_correction",
-                            "schema_version": 1,
-                            "origin_capture_id": request.origin.capture_id,
-                            "tab_id": request.origin.tab_id,
-                            "source_sha256": hashlib.sha256(
-                                request.origin.mechanism_source.reactions_text.encode(
-                                    "utf-8"
-                                )
-                            ).hexdigest(),
-                            "temperature_K": float(science.temperature),
-                            "fit_solver": request.solver,
-                            "wegscheider_cyclicity_enabled": bool(
-                                science.wegscheider_policy
-                            ),
-                            "issue": issue,
-                        }
-                    )
                     raise _DetailedBalanceCorrectionRequired(
                         DetailedBalanceCorrectionRequest(
-                            request_id=identity.short_hash,
                             origin="Fit",
                             tab_id=request.origin.tab_id,
                             source=(
@@ -2861,13 +2800,22 @@ class GlobalFitWorker(QtCore.QThread):
             metadata = evaluator.prepared_metadata
             prepared_ids[local.dataset_id] = {
                 "prepared_simulation": metadata.to_serializable_dict(),
-                "declarative_analysis_identity": (
-                    request.prepared_dsl.analysis.identity
-                ),
-                "fit_local_admission_identity": (
+                "declarative_analysis_source": request.prepared_dsl.analysis.normalized_text,
+                "fit_local_admission": (
                     None
                     if request.fit_local_admission is None
-                    else request.fit_local_admission.identity
+                    else {
+                        "source": request.fit_local_admission.source_text,
+                        "observables": [
+                            {
+                                "name": item.name,
+                                "expression": item.expression,
+                                "scalar_names": item.scalar_names,
+                            }
+                            for item in request.fit_local_admission.observables
+                        ],
+                        "scalar_names": request.fit_local_admission.scalar_names,
+                    }
                 ),
                 "fit_solver": request.solver,
                 "fit_interval": {
@@ -2877,6 +2825,32 @@ class GlobalFitWorker(QtCore.QThread):
                 "fit_sampling_policy": context.fit_sampling_policy,
                 "fit_sampling_identity": context.fit_sampling_identity,
             }
+
+        # Prepare fixed values once, before any optimizer call.  This is an
+        # admission-only preparation boundary: fitted coordinates are omitted
+        # and no starting candidate or numerical trajectory is executed.
+        for local in included:
+            dataset_id = local.dataset_id
+            try:
+                evaluators[dataset_id].preflight_fixed_values(
+                    fixed_by_dataset[dataset_id],
+                )
+            except (FittingCancelled,):
+                raise
+            except FitSimulationError as exc:
+                exc.details.setdefault("fatal", True)
+                exc.details.setdefault("stage", "fixed_preflight")
+                exc.details.setdefault("dataset", dataset_id)
+                raise
+            except Exception as exc:
+                raise FitSimulationError(
+                    f"Dataset {dataset_id!r}: fixed Fit admission failed.",
+                    details={
+                        "fatal": True,
+                        "stage": "fixed_preflight",
+                        "dataset": dataset_id,
+                    },
+                ) from exc
 
         effective_local: dict[str, FitDatasetLocalSettings] = {}
         resolved_mode_items: list[tuple[str, str]] = []

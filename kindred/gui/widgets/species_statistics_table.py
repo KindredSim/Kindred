@@ -42,13 +42,6 @@ class SpeciesStatisticsTable(QtWidgets.QTableWidget):
         """
         super().__init__(parent)
 
-        self._statistics_cache: tuple[
-            object,
-            tuple[str, ...],
-            bool,
-            tuple[tuple[str, ...], ...],
-        ] | None = None
-
         # Configure table
         self.setColumnCount(5)
         self.setHorizontalHeaderLabels([
@@ -87,7 +80,6 @@ class SpeciesStatisticsTable(QtWidgets.QTableWidget):
         *,
         intervention_execution: InterventionExecutionContract,
         presentation_boundaries: tuple[SimulationPresentationBoundary, ...] = (),
-        accepted_result_key: object | None = None,
     ) -> None:
         """
         Update table with simulation results.
@@ -105,9 +97,6 @@ class SpeciesStatisticsTable(QtWidgets.QTableWidget):
         presentation_boundaries : tuple, optional
             Exact intervention pre/post values retained by the primary result;
             these contribute to Max and t@Max without becoming table rows.
-        accepted_result_key : object, optional
-            Accepted-result identity used with the projected species roster
-            for the single-entry statistics cache.
         """
         if not isinstance(
             intervention_execution,
@@ -159,61 +148,42 @@ class SpeciesStatisticsTable(QtWidgets.QTableWidget):
                 )
             normalized[name] = values
         projected_roster = tuple(sorted(normalized))
-        cached = self._statistics_cache
-        if (
-            cached is not None
-            and accepted_result_key is not None
-            and cached[0] == accepted_result_key
-            and cached[1] == projected_roster
-            and cached[2] is ctc_applicable
-        ):
-            rows = cached[3]
-        else:
-            calculated: list[tuple[str, ...]] = []
-            for species_name in projected_roster:
-                concentrations = normalized[species_name]
-                final_conc = concentrations[-1]
-                max_conc = np.max(concentrations)
-                idx_max = np.argmax(concentrations)
-                max_time = time[idx_max]
-                for boundary in boundaries:
-                    for boundary_values in (boundary.pre_state, boundary.post_state):
-                        boundary_value = dict(boundary_values).get(species_name)
-                        if boundary_value is not None and boundary_value > max_conc:
-                            max_conc = boundary_value
-                            max_time = boundary.time
-                ctc_text = "—"
-                if ctc_applicable:
-                    integrand = (
-                        concentrations
-                        if final_conc == 0.0
-                        else np.abs(concentrations - final_conc)
-                    )
-                    ctc = integrate_ctc(time, integrand)
-                    ctc_text = (
-                        f"{ctc.value:.6g}"
-                        if ctc.available
-                        else "Unavailable"
-                    )
-                calculated.append(
-                    (
-                        species_name,
-                        f"{final_conc:.6g}",
-                        f"{max_conc:.6g}",
-                        f"{max_time:.6g}",
-                        ctc_text,
-                    )
+        calculated: list[tuple[str, ...]] = []
+        for species_name in projected_roster:
+            concentrations = normalized[species_name]
+            final_conc = concentrations[-1]
+            max_conc = np.max(concentrations)
+            idx_max = np.argmax(concentrations)
+            max_time = time[idx_max]
+            for boundary in boundaries:
+                for boundary_values in (boundary.pre_state, boundary.post_state):
+                    boundary_value = dict(boundary_values).get(species_name)
+                    if boundary_value is not None and boundary_value > max_conc:
+                        max_conc = boundary_value
+                        max_time = boundary.time
+            ctc_text = "—"
+            if ctc_applicable:
+                integrand = (
+                    concentrations
+                    if final_conc == 0.0
+                    else np.abs(concentrations - final_conc)
                 )
-            rows = tuple(calculated)
-            if accepted_result_key is not None:
-                self._statistics_cache = (
-                    accepted_result_key,
-                    projected_roster,
-                    ctc_applicable,
-                    rows,
+                ctc = integrate_ctc(time, integrand)
+                ctc_text = (
+                    f"{ctc.value:.6g}"
+                    if ctc.available
+                    else "Unavailable"
                 )
-            else:
-                self._statistics_cache = None
+            calculated.append(
+                (
+                    species_name,
+                    f"{final_conc:.6g}",
+                    f"{max_conc:.6g}",
+                    f"{max_time:.6g}",
+                    ctc_text,
+                )
+            )
+        rows = tuple(calculated)
 
         names = tuple(row[0] for row in rows)
         current_names = tuple(

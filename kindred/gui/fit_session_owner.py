@@ -1401,14 +1401,12 @@ class FitSessionOwner(QtCore.QObject):
             pending.generation != self._worker_generation
             or pending.generation == self._publication_fenced_generation
             or (
-                outcome.request_id,
                 outcome.origin,
                 outcome.tab_id,
                 outcome.source,
                 outcome.issue,
             )
             != (
-                request.request_id,
                 request.origin,
                 request.tab_id,
                 request.source,
@@ -1416,7 +1414,7 @@ class FitSessionOwner(QtCore.QObject):
             )
         ):
             self._set_status(
-                "Detailed-balance correction rejected: request identity "
+                "Detailed-balance correction rejected: request currentness "
                 "is no longer current."
             )
             return False

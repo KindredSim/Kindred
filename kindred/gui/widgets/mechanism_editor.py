@@ -146,7 +146,6 @@ def open_detailed_balance_correction_modal(
     accepted = dialog.exec() == QtWidgets.QDialog.DialogCode.Accepted
     corrected = dialog.corrected_source if accepted else None
     return DetailedBalanceCorrectionOutcome(
-        request_id=request.request_id,
         origin=request.origin,
         tab_id=request.tab_id,
         source=request.source,
@@ -1045,7 +1044,6 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
         request: DetailedBalanceCorrectionRequest,
     ) -> DetailedBalanceCorrectionOutcome:
         return DetailedBalanceCorrectionOutcome(
-            request_id=request.request_id,
             origin=request.origin,
             tab_id=request.tab_id,
             source=request.source,

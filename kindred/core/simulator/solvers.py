@@ -30,7 +30,6 @@ from kindred.core.temperature import (
     TemperatureScheduleDictProtocol,
     TemperatureScheduleProtocol,
     coerce_temperature_schedule,
-    temperature_schedule_execution_identity,
 )
 from kindred.core.exceptions import (
     InitialConditionError,
@@ -276,8 +275,6 @@ def _build_provenance(req: _SimulationRequest, *, t_eval: np.ndarray) -> Dict[st
     }
     prov.update(symbolic_jacobian.provenance_fields())
     prov["jacobian_sparsity_hint"] = symbolic_jacobian.jac_sparsity is not None
-    if isinstance(req.symbolic_wegscheider_identity, Mapping) and req.symbolic_wegscheider_identity:
-        prov["symbolic_wegscheider_identity"] = dict(req.symbolic_wegscheider_identity)
     intervention_execution = req.intervention_execution
     prov["has_intervention_schedule"] = not intervention_execution.is_empty
     if not intervention_execution.is_empty:
@@ -287,14 +284,10 @@ def _build_provenance(req: _SimulationRequest, *, t_eval: np.ndarray) -> Dict[st
 
     if req.temperature_schedule is not None:
         temperature_schedule = coerce_temperature_schedule(req.temperature_schedule)
-        schedule_identity = temperature_schedule_execution_identity(
-            temperature_schedule
-        )
-        prov["temperature_schedule"] = (
-            dict(schedule_identity)
-            if schedule_identity is not None
-            else str(temperature_schedule)
-        )
+        if isinstance(temperature_schedule, TemperatureScheduleDictProtocol):
+            prov["temperature_schedule"] = dict(temperature_schedule.to_dict())
+        else:
+            prov["temperature_schedule"] = str(temperature_schedule)
 
     return prov
 
@@ -310,7 +303,6 @@ def _scrub_unused_jacobian_provenance(
         code="non-implicit-solver",
         reason=f"Symbolic Jacobian disabled because solver {method} does not consume Jacobian callables.",
     )
-    prov.pop("symbolic_jacobian_identity", None)
     prov.update(disabled_symbolic_jacobian.provenance_fields())
 
 
@@ -410,7 +402,6 @@ def _execute_scipy(
                     reason=reason,
                 )
             )
-            prov.pop("symbolic_jacobian_identity", None)
             prov.update(runtime_symbolic_jacobian.provenance_fields())
 
     implicit_method = str(method) in {"Radau", "BDF"}
@@ -446,12 +437,33 @@ def _execute_scipy(
     def _looks_like_brentq_sign_error(exc: BaseException) -> bool:
         return "different signs" in str(exc).lower()
 
+    rhs_preflighted = False
+
     def _solve_once(method_name: str):
+        nonlocal rhs_preflighted
         if (
             req.cancellation_control is not None
             and req.cancellation_control.cancel_requested()
         ):
             raise SimulationCancelled()
+        if not rhs_preflighted:
+            rhs_values = np.asarray(
+                rhs(float(t0), np.asarray(y0, dtype=float).reshape(-1).copy()),
+                dtype=float,
+            ).reshape(-1)
+            if not np.all(np.isfinite(rhs_values)):
+                raise _SimulationScientificUnavailabilitySignal(
+                    _SimulationScientificUnavailability(
+                        producer="scipy",
+                        stage="rhs_preflight",
+                        details={
+                            "solver": req.solver,
+                            "time": float(t0),
+                            "segment": segment_identity.to_payload(),
+                        },
+                    )
+                )
+            rhs_preflighted = True
         try:
             solved = _solve_ivp(
                 fun=rhs,

@@ -96,6 +96,8 @@ class ProjectPresentationState:
         self,
         document: ProjectDocument,
         tab: MechanismTabDocument,
+        *,
+        removed_dataset_ids: frozenset[str] = frozenset(),
     ) -> "ProjectPresentationState":
         set_ids = {item.set_id for item in tab.initial_condition_sets}
         datasets = {item.dataset_id: item for item in document.datasets}
@@ -133,6 +135,14 @@ class ProjectPresentationState:
                 "selected_x_series must be a typed simulation or "
                 "experimental axis selection."
             )
+        if (
+            isinstance(selected_x, ExperimentalAxisSelection)
+            and selected_x.dataset_id in removed_dataset_ids
+        ):
+            # A deleted dataset cannot continue to own the X-axis identity.
+            # Overlay gaps for a dataset that still exists intentionally keep
+            # the accepted experimental selection above this boundary.
+            selected_x = SimulationSeriesAxisSelection("t")
         if not isinstance(self.selected_y_series, tuple) or any(
             not isinstance(
                 selection,

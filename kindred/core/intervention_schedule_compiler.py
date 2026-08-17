@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import hashlib
-import json
 import math
 from dataclasses import dataclass, replace
 from types import MappingProxyType
@@ -36,19 +34,6 @@ __all__ = [
     "compile_intervention_schedule",
     "validate_boundary_conflicts",
 ]
-
-
-def _canonical_bytes(value: object) -> bytes:
-    return json.dumps(
-        value,
-        sort_keys=True,
-        separators=(",", ":"),
-        ensure_ascii=True,
-    ).encode("utf-8")
-
-
-def _fingerprint(value: object) -> str:
-    return hashlib.sha256(_canonical_bytes(value)).hexdigest()
 
 
 def _finite_derived(value: object, *, context: str) -> float:
@@ -328,8 +313,6 @@ class TriggerFiring:
 class InterventionExecutionContract:
     declarative_payload: Mapping[str, Any]
     executable_payload: Mapping[str, Any]
-    declarative_fingerprint: str
-    executable_fingerprint: str
     instants: tuple[ExecutableInstant, ...] = ()
     fluxes: tuple[ExecutableFlux, ...] = ()
     holds: tuple[ExecutableHold, ...] = ()
@@ -375,8 +358,6 @@ class InterventionExecutionContract:
 
     def provenance_projection(self) -> dict[str, Any]:
         return {
-            "declarative_fingerprint": self.declarative_fingerprint,
-            "executable_fingerprint": self.executable_fingerprint,
             "declarative": _plain(self.declarative_payload),
             "executable": _plain(self.executable_payload),
             "discontinuities": list(self.discontinuities),
@@ -1125,10 +1106,6 @@ def compile_intervention_schedule(
     return InterventionExecutionContract(
         declarative_payload=declarative_payload,
         executable_payload=executable_payload,
-        declarative_fingerprint=schedule_obj.fingerprint,
-        executable_fingerprint=(
-            "" if not executable_operations else _fingerprint(executable_payload)
-        ),
         instants=tuple(instants),
         fluxes=tuple(fluxes),
         holds=tuple(holds),

@@ -13,7 +13,7 @@ from kindred.core.equilibrium_rate_authority import (
     equilibrium_rate_contract,
 )
 from kindred.core.mechanism_metadata import MechanismMetadataView
-from kindred.core.simulator.dsl_parse import PreparedDslRequestSet
+from kindred.core.simulator.dsl_parse import DslAnalysis, PreparedDslRequestSet
 from kindred.core.simulator.errors import DSLError
 from kindred.core.simulator.parameter_algebra import (
     apply_parameter_algebra_spec_to_mechanism,
@@ -28,14 +28,48 @@ from kindred.core.symbolic.calculator import (
 logger = logging.getLogger(__name__)
 
 
-def _require_executable_fingerprint(value: object) -> str:
-    """Require a stable executable identity on every retained calculator item."""
+def _calculator_input_value(
+    prepared_dsl: PreparedDslRequestSet,
+    source: MechanismAuthoringSource,
+    mechanism: object,
+) -> tuple[object, ...]:
+    """Capture complete admitted calculator input as ordinary typed values."""
 
-    if type(value) is not str or not value.strip():
-        raise ValueError(
-            "Symbolic calculator executable fingerprint must be nonblank."
+    reactions = tuple(
+        (
+            dict(getattr(item, "reactants", {}) or {}),
+            dict(getattr(item, "products", {}) or {}),
+            dict(getattr(item, "rate_orders", {}) or {}),
+            dict(getattr(item, "overrides", {}) or {}),
+            float(getattr(item, "rate")())
+            if callable(getattr(item, "rate", None))
+            else getattr(item, "rate", None),
         )
-    return value
+        for item in tuple(getattr(mechanism, "reactions", ()) or ())
+    )
+    equilibria = tuple(
+        (
+            dict(getattr(item, "stoich_forward", {}) or {}),
+            dict(getattr(item, "stoich_back", {}) or {}),
+            getattr(item, "Keq", None),
+            getattr(item, "kf", None),
+            getattr(item, "kr", None),
+            dict(getattr(item, "metadata", {}) or {}),
+        )
+        for item in tuple(getattr(mechanism, "equilibria", ()) or ())
+    )
+    species = tuple(
+        (str(name), float(getattr(item, "initial_conc", 0.0)))
+        for name, item in dict(getattr(mechanism, "species", {}) or {}).items()
+    )
+    return (
+        source,
+        prepared_dsl.analysis,
+        prepared_dsl.parameter_algebra_spec_for_execution(),
+        species,
+        reactions,
+        equilibria,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -43,23 +77,17 @@ class SymbolicCalculatorHistoryEntry:
     query: str
     result_text: str
     context_text: str
-    base_executable_fingerprint: str
+    admitted_input: object
     is_error: bool = False
-
-    def __post_init__(self) -> None:
-        _require_executable_fingerprint(self.base_executable_fingerprint)
 
 
 @dataclass(frozen=True, slots=True)
 class SymbolicCalculatorSnapshot:
     source: str
     mechanism: object
-    base_executable_fingerprint: str
+    analysis: DslAnalysis
+    admitted_input: object
     equilibrium_summary: tuple[str, ...] = ()
-
-    def __post_init__(self) -> None:
-        _require_executable_fingerprint(self.base_executable_fingerprint)
-
 
 @dataclass(frozen=True, slots=True)
 class SymbolicCalculatorViewState:
@@ -117,8 +145,8 @@ class SymbolicCalculatorOwner:
         Reactions drafts are a temporary authoring state, not a replacement of
         the calculator owner's history.  Clearing the current snapshot makes
         display and copy unavailable until the accepted DSL is rebuilt, while
-        preserving entries that may still match that accepted executable
-        fingerprint after the draft is reverted or accepted.
+        preserving entries that may still match the accepted typed input after
+        the draft is reverted or accepted.
         """
 
         self._snapshot = None
@@ -153,9 +181,7 @@ class SymbolicCalculatorOwner:
                     )
                 ),
                 is_error=True,
-                base_executable_fingerprint=(
-                    self._snapshot.base_executable_fingerprint
-                ),
+                admitted_input=self._snapshot.admitted_input,
             )
         except Exception:
             logger.exception("Unexpected symbolic calculator evaluation failure")
@@ -170,9 +196,7 @@ class SymbolicCalculatorOwner:
                 result_text=str(result.result_text),
                 context_text=str(result.full_context_copy_text()),
                 is_error=False,
-                base_executable_fingerprint=(
-                    self._snapshot.base_executable_fingerprint
-                ),
+                admitted_input=self._snapshot.admitted_input,
             )
         self._retain_latest_entry(entry)
         return self.view_state()
@@ -223,19 +247,17 @@ class SymbolicCalculatorOwner:
     def _latest_entry_for_current_snapshot(self) -> SymbolicCalculatorHistoryEntry | None:
         if self._snapshot is None:
             return None
-        fingerprint = self._snapshot.base_executable_fingerprint
         for entry in reversed(self._history):
-            if entry.base_executable_fingerprint == fingerprint:
+            if entry.admitted_input == self._snapshot.admitted_input:
                 return entry
         return None
 
     def _retain_latest_entry(self, entry: SymbolicCalculatorHistoryEntry) -> None:
-        """Keep one latest evaluation for each accepted executable science."""
+        """Keep one latest evaluation for each accepted typed calculator input."""
         self._history[:] = [
             retained
             for retained in self._history
-            if retained.base_executable_fingerprint
-            != entry.base_executable_fingerprint
+            if retained.admitted_input != entry.admitted_input
         ]
         self._history.append(entry)
 
@@ -256,10 +278,6 @@ class SymbolicCalculatorOwner:
                 False,
                 "Canonical mechanism source and analysis no longer match.",
             )
-        base_executable_fingerprint = (
-            prepared_dsl.base_executable_identity().fingerprint
-        )
-        _require_executable_fingerprint(base_executable_fingerprint)
         try:
             parameterized_interventions = (
                 prepared_dsl.parameterized_intervention_schedule_for_binding()
@@ -294,8 +312,13 @@ class SymbolicCalculatorOwner:
         snapshot = SymbolicCalculatorSnapshot(
             source=source.reactions_text,
             mechanism=mechanism,
+            analysis=prepared_dsl.analysis,
+            admitted_input=_calculator_input_value(
+                prepared_dsl,
+                source,
+                mechanism,
+            ),
             equilibrium_summary=self._equilibrium_summary(mechanism),
-            base_executable_fingerprint=base_executable_fingerprint,
         )
         return snapshot, True, ""
 

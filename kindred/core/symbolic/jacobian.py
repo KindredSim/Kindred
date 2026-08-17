@@ -6,7 +6,7 @@ from typing import Any, Callable, Mapping
 
 import numpy as np
 
-from kindred.core.mechanism import Equilibrium, FrozenDict, Mechanism
+from kindred.core.mechanism import Equilibrium, Mechanism
 from kindred.core.ode_builder import (
     EffectiveRateCoefficientEvaluator,
     build_effective_rate_coefficient_evaluator,
@@ -34,17 +34,10 @@ from kindred.core.simulator.parameter_namespace import (
     canonical_name_for_mechanism_step_parameter,
 )
 
-from .artifacts import SymbolicArtifactIdentity
-from .backend import get_symbolic_backend_metadata, require_sympy
+from .backend import require_sympy
 from .errors import UnsupportedSymbolicExpressionError
 from .identity import symbolic_fingerprint
 from .namespaces import symbolic_status_payload
-
-
-@dataclass(frozen=True, slots=True)
-class SymbolicJacobianArtifact:
-    identity: SymbolicArtifactIdentity
-    jacobian_func: Callable[[float, np.ndarray], np.ndarray]
 
 
 @dataclass(frozen=True, slots=True)
@@ -54,7 +47,6 @@ class SymbolicJacobianStructure:
     rhs_expressions: tuple[str, ...]
     jacobian_expressions: tuple[tuple[str, ...], ...]
     structure_fingerprint: str
-    artifact_fingerprint: str
     _compiled: Callable[..., Any]
     jac_sparsity: tuple[tuple[bool, ...], ...]
 
@@ -63,8 +55,7 @@ class SymbolicJacobianStructure:
         coefficient_evaluator: EffectiveRateCoefficientEvaluator,
         *,
         temperature_schedule: TemperatureScheduleProtocol | None = None,
-        schedule_identity: Mapping[str, object] | None = None,
-    ) -> SymbolicJacobianArtifact:
+    ) -> Callable[[float, np.ndarray], np.ndarray]:
         if not isinstance(
             coefficient_evaluator,
             EffectiveRateCoefficientEvaluator,
@@ -85,37 +76,6 @@ class SymbolicJacobianStructure:
                 coefficient_evaluator.step_kinds
             )
         )
-        execution_payload = FrozenDict(
-            {
-                "kind": "runtime-effective-rate-evaluation",
-                "evaluation_mode": (
-                    "per-call-typed-schedule"
-                    if temperature_schedule is not None
-                    else "nominal-temperature-fallback"
-                ),
-                "nominal_temperature_K": nominal_temperature,
-                "typed_schedule": (
-                    FrozenDict(schedule_identity)
-                    if schedule_identity is not None
-                    else None
-                ),
-                "rate_authority_snapshot": (
-                    coefficient_evaluator.authority_snapshot
-                ),
-                "parameter_symbols": self.parameter_symbols,
-            }
-        )
-        snapshot_fingerprint = symbolic_fingerprint(execution_payload)
-        metadata = get_symbolic_backend_metadata()
-        identity = SymbolicArtifactIdentity.jacobian(
-            metadata,
-            source_fingerprint=self.structure_fingerprint,
-            artifact_fingerprint=self.artifact_fingerprint,
-            structure_fingerprint=self.structure_fingerprint,
-            evaluation_snapshot_fingerprint=snapshot_fingerprint,
-            parameter_symbols=self.parameter_symbols,
-        )
-
         def jacobian_func(t: float, y: np.ndarray) -> np.ndarray:
             values = np.asarray(y, dtype=float).reshape(-1)
             if values.size != len(self.species_names):
@@ -140,10 +100,7 @@ class SymbolicJacobianStructure:
                 dtype=float,
             )
 
-        return SymbolicJacobianArtifact(
-            identity=identity,
-            jacobian_func=jacobian_func,
-        )
+        return jacobian_func
 
 
 @dataclass(frozen=True, slots=True)
@@ -1022,13 +979,6 @@ def build_symbolic_jacobian_structure(mechanism: Mechanism) -> SymbolicJacobianS
     structure_fingerprint = symbolic_jacobian_structure_fingerprint_for_mechanism(
         mechanism
     )
-    artifact_fingerprint = symbolic_fingerprint(
-        {
-            "rhs": rhs_strings,
-            "jacobian": jacobian_strings,
-            "parameter_symbols": list(parameter_symbols),
-        }
-    )
     parameter_sympy_symbols = tuple(
         sympy.Symbol(name)
         for name in coefficient_parameter_symbols
@@ -1040,7 +990,6 @@ def build_symbolic_jacobian_structure(mechanism: Mechanism) -> SymbolicJacobianS
         rhs_expressions=rhs_strings,
         jacobian_expressions=jacobian_strings,
         structure_fingerprint=structure_fingerprint,
-        artifact_fingerprint=artifact_fingerprint,
         _compiled=compiled,
         jac_sparsity=jac_sparsity,
     )

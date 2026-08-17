@@ -31,8 +31,6 @@ Non-goals
 from __future__ import annotations
 
 import copy
-import hashlib
-import json
 import logging
 import math
 from dataclasses import dataclass, field, replace
@@ -70,10 +68,6 @@ from .parameter_algebra_spec import classify_parameter_algebra_declaration
 from .parameter_namespace import build_namespace_from_mechanism
 from .dsl_build_input import DslBuildStep
 from .dsl_parameter_scan import DslParameterAnalysis
-from .executable_identity import (
-    BaseExecutableScienceIdentity,
-    fingerprint_executable_payload,
-)
 from .dsl_derivation import (
     authored_step_origin,
     coordinate_source_parts,
@@ -169,7 +163,7 @@ class DSLIR:
     notes: List[str] = field(default_factory=list)
 
 
-def _dsl_identity_payload(
+def _dsl_admission_payload(
     text: str,
     units: UnitsModel | None,
 ) -> dict[str, object]:
@@ -357,7 +351,6 @@ class DslInitialConditionAdmission:
 class DslAnalysis:
     """Deeply immutable, source-backed public DSL admission evidence."""
 
-    identity: str
     normalized_text: str
     origins: tuple[DslSourceOrigin, ...]
     species_names: tuple[str, ...]
@@ -368,12 +361,6 @@ class DslAnalysis:
     energy_unit: str
 
     def __post_init__(self) -> None:
-        if (
-            type(self.identity) is not str
-            or not self.identity
-            or self.identity != self.identity.strip()
-        ):
-            raise ValueError("DSL analysis identity must be nonempty text.")
         if type(self.normalized_text) is not str:
             raise TypeError("Normalized DSL text must be an exact string.")
         if type(self.origins) is not tuple or any(
@@ -448,166 +435,6 @@ class DslAnalysis:
         object.__setattr__(self, "energy_unit", energy_unit)
 
 
-def _mint_base_executable_science_identity(
-    mechanism: object,
-    parameter_algebra_spec: object,
-    *,
-    analysis_identity: str,
-) -> BaseExecutableScienceIdentity:
-    """Mint admitted executable science once from parser-owned structures."""
-
-    from kindred.core.algebra.printer import algebra_block_to_source
-    from kindred.core.equilibrium_rate_authority import (
-        EquilibriumRateAuthorityKind,
-        normalize_existing_equilibrium_rate_authority,
-    )
-    from kindred.core.kinetics import (
-        EyringRateModel,
-        forward_rate_model_for_equilibrium,
-        forward_rate_model_for_reaction,
-    )
-    from kindred.core.mechanism_metadata import MechanismMetadataView
-    from kindred.core.ode_builder import build_effective_rate_coefficient_evaluator
-    from kindred.core.temperature import temperature_schedule_execution_identity
-
-    metadata = getattr(mechanism, "metadata", {})
-    if not isinstance(metadata, Mapping):
-        raise TypeError("admitted mechanism metadata must be a mapping.")
-    view = MechanismMetadataView.from_metadata(metadata)
-    consumes_c0 = False
-    for reaction in tuple(getattr(mechanism, "reactions", ()) or ()):
-        model = forward_rate_model_for_reaction(
-            reaction,
-            default_standard_conc_M=view.standard_conc_M,
-        )
-        if isinstance(model, EyringRateModel) and model.molecularity != 1.0:
-            consumes_c0 = True
-            break
-    if not consumes_c0:
-        for equilibrium in tuple(getattr(mechanism, "equilibria", ()) or ()):
-            model = forward_rate_model_for_equilibrium(
-                equilibrium,
-                temperature_K=view.temperature_K,
-                default_standard_conc_M=view.standard_conc_M,
-            )
-            if isinstance(model, EyringRateModel) and model.molecularity != 1.0:
-                consumes_c0 = True
-                break
-            authority = normalize_existing_equilibrium_rate_authority(equilibrium)
-            forward_order = math.fsum(
-                float(value)
-                for value in dict(
-                    getattr(equilibrium, "stoich_forward", {})
-                ).values()
-            )
-            reverse_order = math.fsum(
-                float(value)
-                for value in dict(
-                    getattr(equilibrium, "stoich_back", {})
-                ).values()
-            )
-            if (
-                authority.kind == EquilibriumRateAuthorityKind.KEQ
-                and authority.dG_eq_J_per_mol is not None
-                and not authority.has_explicit_keq_param
-                and math.fsum((forward_order, -reverse_order)) != 0.0
-            ):
-                consumes_c0 = True
-                break
-    c0_identity = (
-        f"C0:consumed:{float(view.standard_conc_M).hex()}"
-        if consumes_c0
-        else "C0:inert"
-    )
-
-    def canonical(value: object) -> object:
-        if isinstance(value, Mapping):
-            return {
-                str(key): canonical(item)
-                for key, item in sorted(
-                    value.items(), key=lambda pair: str(pair[0])
-                )
-                if str(key) not in {"algebra_text", "parameter_algebra_spec"}
-            }
-        if isinstance(value, (tuple, list)):
-            return [canonical(item) for item in value]
-        if isinstance(value, bool) or value is None or isinstance(value, str):
-            return value
-        if isinstance(value, (int, float)):
-            return {"float_hex": float(value).hex()}
-        raise TypeError(
-            "base executable identity cannot encode value "
-            f"{value.__class__.__qualname__}."
-        )
-
-    schedule = metadata.get("temperature_schedule")
-    schedule_identity = temperature_schedule_execution_identity(schedule)
-    if schedule is not None and schedule_identity is None:
-        raise TypeError(
-            "base executable identity requires a serializable temperature schedule."
-        )
-    coefficient_authority = build_effective_rate_coefficient_evaluator(mechanism)
-    payload: dict[str, object] = {
-        "species": tuple(
-            str(name)
-            for name in getattr(mechanism, "species_names", lambda: ())()
-        ),
-        "reactions": tuple(
-            {
-                "reactants": canonical(getattr(item, "reactants", {})),
-                "products": canonical(getattr(item, "products", {})),
-                "rate_orders": canonical(getattr(item, "rate_orders", {})),
-            }
-            for item in tuple(getattr(mechanism, "reactions", ()) or ())
-        ),
-        "equilibria": tuple(
-            {
-                "stoich_forward": canonical(
-                    getattr(item, "stoich_forward", {})
-                ),
-                "stoich_back": canonical(getattr(item, "stoich_back", {})),
-            }
-            for item in tuple(getattr(mechanism, "equilibria", ()) or ())
-        ),
-        "coefficient_authority": canonical(
-            coefficient_authority.authority_snapshot
-        ),
-        "temperature_K": canonical(metadata.get("temperature_K", 298.15)),
-        "temperature_schedule": canonical(schedule_identity),
-        "c0": c0_identity,
-    }
-    compiled = getattr(mechanism, "_compiled_algebra_series", None)
-    payload["observable_program"] = (
-        None if compiled is None else algebra_block_to_source(compiled.block)
-    )
-    block = getattr(parameter_algebra_spec, "parameter_block", None)
-    payload["parameter_program"] = (
-        None if block is None else algebra_block_to_source(block)
-    )
-    if c0_identity == "C0:inert":
-        def strip_c0(value: object) -> object:
-            if isinstance(value, Mapping):
-                return {
-                    key: strip_c0(item)
-                    for key, item in value.items()
-                    if str(key).lower()
-                    not in {"standard_conc_m", "c0"}
-                }
-            if isinstance(value, (tuple, list)):
-                return [strip_c0(item) for item in value]
-            return value
-
-        payload = strip_c0(payload)  # type: ignore[assignment]
-    return BaseExecutableScienceIdentity(
-        fingerprint=fingerprint_executable_payload(
-            payload,
-            prefix="science-base:",
-        ),
-        analysis_identity=analysis_identity,
-        standard_concentration_identity=c0_identity,
-    )
-
-
 class PreparedDslRequestSet:
     """Single-parse owner of one immutable analysis and execution structure."""
 
@@ -617,7 +444,6 @@ class PreparedDslRequestSet:
         "__intervention_schedule",
         "__intervention_execution",
         "__parameter_algebra_spec",
-        "__base_executable_identity",
         "__wegscheider_admission_report",
     )
 
@@ -629,7 +455,6 @@ class PreparedDslRequestSet:
         intervention_schedule: InterventionSchedule | None,
         intervention_execution: InterventionExecutionContract | None,
         parameter_algebra_spec: object,
-        base_executable_identity: BaseExecutableScienceIdentity,
         wegscheider_admission_report: WegscheiderCyclicityReport,
     ) -> None:
         from kindred.core.intervention_schedule import InterventionSchedule
@@ -639,87 +464,42 @@ class PreparedDslRequestSet:
 
         if type(analysis) is not DslAnalysis:
             raise TypeError("analysis must be DslAnalysis.")
-        if intervention_schedule is not None and type(
-            intervention_schedule
-        ) is not InterventionSchedule:
-            raise TypeError(
-                "Parameterized intervention authority must be an exact "
-                "InterventionSchedule."
-            )
-        if intervention_execution is not None and not isinstance(
-            intervention_execution,
-            InterventionExecutionContract,
-        ):
-            raise TypeError(
-                "Literal intervention authority must be an "
-                "InterventionExecutionContract."
-            )
+        if intervention_schedule is not None and type(intervention_schedule) is not InterventionSchedule:
+            raise TypeError("Parameterized intervention authority must be an exact InterventionSchedule.")
+        if intervention_execution is not None and not isinstance(intervention_execution, InterventionExecutionContract):
+            raise TypeError("Literal intervention authority must be an InterventionExecutionContract.")
         if intervention_schedule is not None:
             if not intervention_schedule.is_parameterized:
-                raise ValueError(
-                    "Only a parameterized intervention schedule may remain "
-                    "declarative on prepared DSL state."
-                )
+                raise ValueError("Only a parameterized intervention schedule may remain declarative on prepared DSL state.")
             if intervention_execution is not None:
-                raise ValueError(
-                    "Prepared DSL intervention authority cannot be both "
-                    "declarative and compiled."
-                )
+                raise ValueError("Prepared DSL intervention authority cannot be both declarative and compiled.")
         elif intervention_execution is None:
-            raise ValueError(
-                "Literal prepared DSL state requires its compiled intervention "
-                "contract."
-            )
-        if not isinstance(
-            base_executable_identity,
-            BaseExecutableScienceIdentity,
-        ):
-            raise TypeError(
-                "prepared DSL requires parser-minted base executable identity."
-            )
-        from kindred.core.simulator.wegscheider_symbolic import (
-            WegscheiderCyclicityReport,
-        )
-
-        if not isinstance(
-            wegscheider_admission_report,
-            WegscheiderCyclicityReport,
-        ):
-            raise TypeError(
-                "prepared DSL requires its typed Wegscheider admission report."
-            )
+            raise ValueError("Literal prepared DSL state requires its compiled intervention contract.")
+        from kindred.core.simulator.wegscheider_symbolic import WegscheiderCyclicityReport
+        if not isinstance(wegscheider_admission_report, WegscheiderCyclicityReport):
+            raise TypeError("prepared DSL requires its typed Wegscheider admission report.")
         self.analysis = analysis
         self.__mechanism = mechanism
         self.__intervention_schedule = intervention_schedule
         self.__intervention_execution = intervention_execution
         self.__parameter_algebra_spec = parameter_algebra_spec
-        self.__base_executable_identity = base_executable_identity
         self.__wegscheider_admission_report = wegscheider_admission_report
 
     def mechanism_for_execution(self) -> object:
         return copy.deepcopy(self.__mechanism)
 
-    def parameterized_intervention_schedule_for_binding(
-        self,
-    ) -> InterventionSchedule | None:
+    def parameterized_intervention_schedule_for_binding(self) -> InterventionSchedule | None:
         return copy.deepcopy(self.__intervention_schedule)
 
-    def intervention_execution_contract(
-        self,
-    ) -> InterventionExecutionContract | None:
+    def intervention_execution_contract(self) -> InterventionExecutionContract | None:
         return self.__intervention_execution
 
     def parameter_algebra_spec_for_execution(self) -> object:
         return copy.deepcopy(self.__parameter_algebra_spec)
 
-    def base_executable_identity(self) -> BaseExecutableScienceIdentity:
-        return self.__base_executable_identity
-
     def wegscheider_admission_report(self) -> WegscheiderCyclicityReport:
         """Return immutable source-admission truth captured before Algebra."""
-
         return self.__wegscheider_admission_report
-
 # ------------------------------ helpers --------------------------------------
 
 def _norm_key(k: str) -> str:
@@ -2199,7 +1979,7 @@ def prepare_dsl_request_set(
         compile_algebra_observables,
     )
 
-    payload = _dsl_identity_payload(text, units)
+    payload = _dsl_admission_payload(text, units)
     normalized_text = str(payload["dsl"])
     ir = _parse_dsl_ir(text, units=units)
     intervention_schedule = coerce_intervention_schedule(
@@ -2252,17 +2032,7 @@ def prepare_dsl_request_set(
         if parameterized_intervention_schedule is not None
         else compile_intervention_schedule(intervention_schedule)
     )
-    identity = hashlib.sha256(
-        json.dumps(
-            payload,
-            allow_nan=False,
-            ensure_ascii=False,
-            separators=(",", ":"),
-            sort_keys=True,
-        ).encode("utf-8")
-    ).hexdigest()
     analysis = DslAnalysis(
-        identity=f"dsl-analysis:{identity}",
         normalized_text=normalized_text,
         origins=_source_origins(text),
         species_names=species_names,
@@ -2287,11 +2057,6 @@ def prepare_dsl_request_set(
         intervention_schedule=parameterized_intervention_schedule,
         intervention_execution=intervention_execution,
         parameter_algebra_spec=parameter_algebra_spec,
-        base_executable_identity=_mint_base_executable_science_identity(
-            mechanism,
-            parameter_algebra_spec,
-            analysis_identity=analysis.identity,
-        ),
         wegscheider_admission_report=wegscheider_admission_report,
     )
 
@@ -2740,7 +2505,6 @@ def derive_source_with_parameter_updates(
         ),
         intervention_execution=prepared.intervention_execution_contract(),
         parameter_algebra_spec=prepared.parameter_algebra_spec_for_execution(),
-        base_executable_identity=prepared.base_executable_identity(),
         wegscheider_admission_report=prepared.wegscheider_admission_report(),
     )
     return updated_text, result

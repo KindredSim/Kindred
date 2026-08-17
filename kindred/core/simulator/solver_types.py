@@ -174,7 +174,6 @@ class SimulationRequest:
     progress_callback: Optional[Callable[[float, float, float], None]] = None
     temperature_schedule: TemperatureScheduleProtocol | None = None
     species_names: Optional[Tuple[str, ...]] = None
-    symbolic_wegscheider_identity: Optional[Mapping[str, Any]] = None
     cancellation_control: SimulationCancellationControl | None = None
     candidate_evaluation: bool = False
 
@@ -239,13 +238,6 @@ class SimulationRequest:
                 "species_names",
                 tuple(str(name) for name in self.species_names),
             )
-        for name in ("symbolic_wegscheider_identity",):
-            value = getattr(self, name)
-            if value is None:
-                continue
-            if not isinstance(value, Mapping):
-                raise TypeError(f"{name} must be a mapping or None.")
-            object.__setattr__(self, name, _freeze_solver_value(value))
 
 
 @dataclass(frozen=True)

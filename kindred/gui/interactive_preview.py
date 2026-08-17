@@ -8,7 +8,6 @@ import math
 from collections.abc import Mapping
 from typing import Iterable
 
-from kindred.core.result_repository import PreviewResultKey
 from kindred.core.simulation_preparation import SimulationExecutionRequest
 from kindred.core.simulator.dsl_parse import PreparedDslRequestSet
 from kindred.core.simulator.solver_types import SimulationPresentationBoundary
@@ -213,15 +212,14 @@ class InteractivePreviewTerminalOutcome:
     """Explicit exact Preview terminal fact for one batch target.
 
     The display consumes this contract instead of inferring completion from a
-    repository entry changing or disappearing.  ``result_key`` is supplied
-    only for a successful exact publication and remains the repository's
-    immutable completed-result identity.
+    repository entry changing or disappearing.  Successful settlement carries
+    only the publication fact; the canonical result itself is the repository
+    value and has no separate identity token.
     """
 
     batch: InteractivePreviewBatchIdentity
     target_set_id: str
     state: InteractivePreviewTerminalState
-    result_key: PreviewResultKey | None = None
     result_published: bool = False
     message: str = ""
     settles_display: bool = True
@@ -238,28 +236,18 @@ class InteractivePreviewTerminalOutcome:
                 state = InteractivePreviewTerminalState(str(state))
             except ValueError as exc:
                 raise ValueError("invalid Interactive Preview terminal state.") from exc
-        result_key = self.result_key
-        if result_key is not None and not isinstance(result_key, PreviewResultKey):
-            raise TypeError("result_key must be a PreviewResultKey or None.")
-        if result_key is not None and (
-            result_key.tab_id != self.batch.tab_id
-            or result_key.set_id != target
-        ):
-            raise ValueError(
-                "published exact result identity must match its batch target."
-            )
         published = bool(self.result_published)
         settles_display = bool(self.settles_display)
         if state is InteractivePreviewTerminalState.SUCCESS:
-            if result_key is None or not published:
+            if not published:
                 raise ValueError(
-                    "successful exact Preview settlement requires a published result key."
+                    "successful exact Preview settlement requires a published canonical result."
                 )
             if not settles_display:
                 raise ValueError("successful Preview settlement must settle display.")
-        elif result_key is not None or published:
+        elif published:
             raise ValueError(
-                "unsuccessful Preview settlement cannot publish a result key."
+                "unsuccessful Preview settlement cannot publish a result."
             )
         object.__setattr__(self, "target_set_id", target)
         object.__setattr__(self, "state", state)

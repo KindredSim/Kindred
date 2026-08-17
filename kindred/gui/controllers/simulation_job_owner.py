@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
-import hashlib
 from numbers import Real
 import os
 from threading import Event
@@ -27,13 +26,8 @@ from kindred.core.project_document import (
     canonical_initial_values,
 )
 from kindred.core.result_repository import (
-    ExplicitResultKey,
-    PreviewResultIdentity,
-    PreviewResultKey,
     ResultRepository,
     SimulationResultValue,
-    explicit_result_key_for_request,
-    explicit_result_key_is_current,
 )
 from kindred.core.runtime_defaults import MAX_PARALLEL_WORKERS_CEILING
 from kindred.core.simulation_preparation import (
@@ -42,7 +36,6 @@ from kindred.core.simulation_preparation import (
     SimulationExecutionRequest,
     build_simulation_execution_request,
     prepare_simulation_worker_run,
-    simulation_execution_request_fingerprint,
 )
 from kindred.core.simulation_failure import (
     FactualCause,
@@ -169,42 +162,38 @@ def _validated_initial_values(
     return tuple(normalized)
 
 
-def _validate_request_against_result_key(
+def _validate_execution_request(
     request: SimulationExecutionRequest,
-    key: ExplicitResultKey | PreviewResultKey,
     *,
     prepared_dsl: PreparedDslRequestSet,
 ) -> None:
     if not isinstance(prepared_dsl, PreparedDslRequestSet):
         raise TypeError("prepared_dsl must be PreparedDslRequestSet.")
-    if request.snapshot.analysis.identity != prepared_dsl.analysis.identity:
+    if request.analysis != prepared_dsl.analysis:
         raise ValueError(
             "execution request analysis does not match retained prepared DSL."
         )
     if not isinstance(
-        request.snapshot.intervention_execution,
+        request.intervention_execution,
         InterventionExecutionContract,
     ):
         raise ValueError(
             "execution request requires its bound intervention contract."
         )
-    if key.request_fingerprint != simulation_execution_request_fingerprint(request):
-        raise ValueError(
-            "result key does not project its admitted execution request."
-        )
 
 
 @dataclass(frozen=True, slots=True)
 class ExplicitRunTarget:
-    key: ExplicitResultKey
+    tab_id: str
+    set_id: str
     set_name: str
     publication_generation: int
     prepared_dsl: PreparedDslRequestSet
     execution_request: SimulationExecutionRequest
 
     def __post_init__(self) -> None:
-        if not isinstance(self.key, ExplicitResultKey):
-            raise TypeError("ExplicitRunTarget key must be an ExplicitResultKey.")
+        object.__setattr__(self, "tab_id", _required_id(self.tab_id, "tab_id"))
+        object.__setattr__(self, "set_id", _required_id(self.set_id, "set_id"))
         object.__setattr__(self, "set_name", _required_id(self.set_name, "set_name"))
         if type(self.publication_generation) is not int:
             raise TypeError("publication_generation must be an int.")
@@ -217,12 +206,11 @@ class ExplicitRunTarget:
                 "ExplicitRunTarget prepared_dsl must be PreparedDslRequestSet."
             )
         request = _copied_execution_request(self.execution_request)
-        _validate_request_against_result_key(
+        _validate_execution_request(
             request,
-            self.key,
             prepared_dsl=self.prepared_dsl,
         )
-        contract = request.snapshot.intervention_execution
+        contract = request.intervention_execution
         if not isinstance(contract, InterventionExecutionContract):
             raise ValueError("Run target requires a compiled intervention contract.")
         if request.parameter_overrides:
@@ -244,11 +232,11 @@ class ExplicitRunCapture:
         for target in targets:
             if not isinstance(target, ExplicitRunTarget):
                 raise TypeError("Run targets must be ExplicitRunTarget values.")
-            if target.key.tab_id != tab_id:
+            if target.tab_id != tab_id:
                 raise ValueError("every Run target must belong to the capture tab.")
-            if target.key.set_id in set_ids:
-                raise ValueError(f"Run target {target.key.set_id!r} is duplicated.")
-            set_ids.add(target.key.set_id)
+            if target.set_id in set_ids:
+                raise ValueError(f"Run target {target.set_id!r} is duplicated.")
+            set_ids.add(target.set_id)
         object.__setattr__(self, "tab_id", tab_id)
         object.__setattr__(self, "targets", targets)
 
@@ -274,23 +262,26 @@ class _PendingRunDetailedBalanceCorrection:
 
 @dataclass(frozen=True, slots=True)
 class PreviewTarget:
-    key: PreviewResultKey
+    tab_id: str
+    set_id: str
+    generation: int
     set_name: str
     prepared_dsl: PreparedDslRequestSet
     execution_request: SimulationExecutionRequest
 
     def __post_init__(self) -> None:
-        if not isinstance(self.key, PreviewResultKey):
-            raise TypeError("PreviewTarget key must be a PreviewResultKey.")
+        object.__setattr__(self, "tab_id", _required_id(self.tab_id, "tab_id"))
+        object.__setattr__(self, "set_id", _required_id(self.set_id, "set_id"))
+        if type(self.generation) is not int or self.generation <= 0:
+            raise ValueError("Preview target generation must be a positive int.")
         if not isinstance(self.prepared_dsl, PreparedDslRequestSet):
             raise TypeError(
                 "PreviewTarget prepared_dsl must be PreparedDslRequestSet."
             )
         object.__setattr__(self, "set_name", _required_id(self.set_name, "set_name"))
         request = _copied_execution_request(self.execution_request)
-        _validate_request_against_result_key(
+        _validate_execution_request(
             request,
-            self.key,
             prepared_dsl=self.prepared_dsl,
         )
         object.__setattr__(self, "execution_request", request)
@@ -311,11 +302,12 @@ class PreviewIntent:
         for target in targets:
             if not isinstance(target, PreviewTarget):
                 raise TypeError("Preview targets must be PreviewTarget values.")
-            if target.key.tab_id != tab_id:
+            if target.tab_id != tab_id:
                 raise ValueError("every Preview target must belong to the intent tab.")
-            if target.key.set_id in set_ids:
-                raise ValueError(f"Preview target {target.key.set_id!r} is duplicated.")
-            set_ids.add(target.key.set_id)
+            if target.set_id not in set_ids:
+                set_ids.add(target.set_id)
+            else:
+                raise ValueError("Preview target is duplicated.")
         batch = self.interactive_batch
         if batch is not None:
             if not isinstance(batch, InteractivePreviewBatchIdentity):
@@ -327,7 +319,7 @@ class PreviewIntent:
                     "interactive Preview batch must belong to the intent tab."
                 )
             if any(
-                target.key.set_id not in batch.target_set_ids
+                target.set_id not in batch.target_set_ids
                 for target in targets
             ):
                 raise ValueError(
@@ -358,7 +350,7 @@ class SimulationTerminalSummary:
 
 @dataclass(frozen=True, slots=True)
 class _TargetTerminalOutcome:
-    key: ExplicitResultKey | PreviewResultKey
+    target: ExplicitRunTarget | PreviewTarget
     state: Literal["success", "failure", "cancelled"]
     stage: Literal["preparation", "execution"]
     result: SimulationResultValue | None = None
@@ -366,10 +358,8 @@ class _TargetTerminalOutcome:
     cause: FactualCause | None = None
 
     def __post_init__(self) -> None:
-        if not isinstance(self.key, (ExplicitResultKey, PreviewResultKey)):
-            raise TypeError(
-                "terminal outcome key must be an explicit or Preview result key."
-            )
+        if not isinstance(self.target, (ExplicitRunTarget, PreviewTarget)):
+            raise TypeError("terminal outcome target must be an admitted target.")
         if self.state not in {"success", "failure", "cancelled"}:
             raise ValueError(
                 "terminal outcome state must be success, failure, or cancelled."
@@ -536,19 +526,12 @@ def build_explicit_target(
         execution_settings=execution_settings,
         scientific_settings=scientific_settings,
     )
-    intervention_execution = execution_request.snapshot.intervention_execution
+    intervention_execution = execution_request.intervention_execution
     if not isinstance(intervention_execution, InterventionExecutionContract):
         raise ValueError("Run target intervention contract was not compiled.")
-    target_identity = execution_request.snapshot.target_executable_identity
-    if target_identity is None:
-        raise ValueError("Run target has no bound executable science identity.")
-    key = explicit_result_key_for_request(
+    return ExplicitRunTarget(
         tab_id=tab_id,
         set_id=set_id,
-        execution_request=execution_request,
-    )
-    return ExplicitRunTarget(
-        key=key,
         set_name=set_name,
         publication_generation=publication_generation,
         prepared_dsl=prepared_dsl,
@@ -559,12 +542,16 @@ def build_explicit_target(
 def build_preview_target(
     *,
     prepared_dsl: PreparedDslRequestSet,
-    key: PreviewResultKey,
+    tab_id: str,
+    set_id: str,
+    generation: int,
     set_name: str,
     execution_request: SimulationExecutionRequest,
 ) -> PreviewTarget:
     return PreviewTarget(
-        key=key,
+        tab_id=tab_id,
+        set_id=set_id,
+        generation=generation,
         set_name=set_name,
         prepared_dsl=prepared_dsl,
         execution_request=execution_request,
@@ -649,22 +636,21 @@ def _detailed_balance_correction_for_capture(
             str,
         ]
     ] = []
-    reports_by_analysis_identity: dict[
-        str,
-        WegscheiderCyclicityReport,
-    ] = {}
+    reports_by_analysis: list[tuple[object, WegscheiderCyclicityReport]] = []
     for target in capture.targets:
         execution_request = target.execution_request
         if not execution_request.solver_config.wegscheider_cyclicity_enabled:
             continue
-        temperature = float(execution_request.snapshot.analysis.temperature_K)
-        analysis_identity = str(
-            target.prepared_dsl.analysis.identity
+        temperature = float(execution_request.analysis.temperature_K)
+        analysis = target.prepared_dsl.analysis
+        report = next(
+            (candidate_report for candidate_analysis, candidate_report in reports_by_analysis
+             if candidate_analysis == analysis),
+            None,
         )
-        report = reports_by_analysis_identity.get(analysis_identity)
         if report is None:
             report = _detailed_balance_report(target.prepared_dsl)
-            reports_by_analysis_identity[analysis_identity] = report
+            reports_by_analysis.append((analysis, report))
         if report.unresolved_cycles:
             source = execution_request.mechanism_source
             if not isinstance(source, MechanismAuthoringSource):
@@ -725,19 +711,7 @@ def _detailed_balance_correction_for_capture(
         f"{cycle_id} ({', '.join(parameter_names)})"
         for cycle_id, _step_indices, parameter_names in cycle_truth
     )
-    target_identity = "\0".join(
-        f"{target.key.set_id}\0{target.publication_generation}"
-        for target in capture.targets
-    )
-    request_id = hashlib.sha256(
-        (
-            f"Run\0{capture.tab_id}\0{temperature:.17g}\0"
-            f"{source.reactions_text}\0{target_identity}\0"
-            f"{report.symbolic_identity['source_fingerprint']}"
-        ).encode("utf-8")
-    ).hexdigest()[:16]
     return DetailedBalanceCorrectionRequest(
-        request_id=request_id,
         origin="Run",
         tab_id=capture.tab_id,
         source=source.reactions_text,
@@ -835,7 +809,7 @@ class _DirectSimulationWorker(QtCore.QThread):
                     target = futures[future]
                     cancelled = self._cancelled.is_set()
                     outcome = _TargetTerminalOutcome(
-                        key=target.key,
+                        target=target,
                         state="cancelled" if cancelled else "failure",
                         stage="preparation",
                         message=str(exc) or type(exc).__name__,
@@ -852,7 +826,7 @@ class _DirectSimulationWorker(QtCore.QThread):
     ) -> _TargetTerminalOutcome:
         if self._cancelled.is_set():
             return _TargetTerminalOutcome(
-                key=target.key,
+                target=target,
                 state="cancelled",
                 stage="preparation",
                 message="Simulation cancelled before preparation.",
@@ -864,14 +838,14 @@ class _DirectSimulationWorker(QtCore.QThread):
             )
         except SimulationCancelled:
             return _TargetTerminalOutcome(
-                key=target.key,
+                target=target,
                 state="cancelled",
                 stage="preparation",
                 message="Simulation cancelled.",
             )
         except BaseException as exc:  # noqa: BLE001
             return _TargetTerminalOutcome(
-                key=target.key,
+                target=target,
                 state="failure",
                 stage="preparation",
                 message=str(exc) or type(exc).__name__,
@@ -885,21 +859,21 @@ class _DirectSimulationWorker(QtCore.QThread):
             )
         except SimulationCancelled:
             return _TargetTerminalOutcome(
-                key=target.key,
+                target=target,
                 state="cancelled",
                 stage="execution",
                 message="Simulation cancelled.",
             )
         except BaseException as exc:  # noqa: BLE001
             return _TargetTerminalOutcome(
-                key=target.key,
+                target=target,
                 state="failure",
                 stage="execution",
                 message=str(exc) or type(exc).__name__,
                 cause=_simulation_worker_cause(exc),
             )
         return _TargetTerminalOutcome(
-            key=target.key,
+            target=target,
             state="success",
             stage="execution",
             result=result,
@@ -990,10 +964,6 @@ class _InteractivePreviewWorker(QtCore.QThread):
 
 
 RepositoryResolver = Callable[[str], ResultRepository | None]
-CurrentExplicitKeyResolver = Callable[
-    [str, str],
-    ExplicitResultKey | None,
-]
 RawUserParallelMaximum = Callable[[], object]
 
 
@@ -1015,7 +985,6 @@ class SimulationJobOwner(QtCore.QObject):
         *,
         gate: ComputationGate,
         repository_for_tab: RepositoryResolver,
-        current_explicit_result_key: CurrentExplicitKeyResolver,
         propose_detailed_balance_source: Callable[
             [str, MechanismAuthoringSource],
             DetailedBalanceCorrectionProposal | None,
@@ -1033,15 +1002,12 @@ class SimulationJobOwner(QtCore.QObject):
             raise TypeError("gate must be a ComputationGate.")
         if not callable(repository_for_tab):
             raise TypeError("repository_for_tab must be callable.")
-        if not callable(current_explicit_result_key):
-            raise TypeError("current_explicit_result_key must be callable.")
         if not callable(propose_detailed_balance_source):
             raise TypeError("propose_detailed_balance_source must be callable.")
         if not callable(commit_detailed_balance_source):
             raise TypeError("commit_detailed_balance_source must be callable.")
         self._gate = gate
         self._repository_for_tab = repository_for_tab
-        self._current_explicit_result_key = current_explicit_result_key
         self._propose_detailed_balance_source = propose_detailed_balance_source
         self._commit_detailed_balance_source = commit_detailed_balance_source
         self._user_parallel_maximum = user_parallel_maximum or (lambda: None)
@@ -1081,10 +1047,7 @@ class SimulationJobOwner(QtCore.QObject):
         self._explicit_generation_by_target: dict[tuple[str, str], int] = {}
         self._preview_generation_by_target: dict[tuple[str, str], int] = {}
         self._retire_on_settlement: set[tuple[str, str]] = set()
-        self._current_preview_key_by_target: dict[
-            tuple[str, str],
-            PreviewResultKey,
-        ] = {}
+        self._current_preview_generation_by_target: dict[tuple[str, str], int] = {}
         self._application_close_fenced = False
         self._last_application_close_settled = True
         self._gate.changed.connect(self._on_gate_changed)
@@ -1127,7 +1090,6 @@ class SimulationJobOwner(QtCore.QObject):
         target_set_id: str,
         state: InteractivePreviewTerminalState,
         *,
-        result_key: PreviewResultKey | None = None,
         result_published: bool = False,
         message: str = "",
         settles_display: bool = True,
@@ -1158,7 +1120,6 @@ class SimulationJobOwner(QtCore.QObject):
             batch=batch,
             target_set_id=target_set_id,
             state=state,
-            result_key=result_key,
             result_published=result_published,
             message=message,
             settles_display=settles_display,
@@ -1446,9 +1407,9 @@ class SimulationJobOwner(QtCore.QObject):
         }
         awaiting_native_settlement = set(self._retire_on_settlement)
         awaiting_native_settlement.update(
-            (target.key.tab_id, target.key.set_id)
+            (target.tab_id, target.set_id)
             for target in self._targets
-            if target.key not in self._outcomes
+            if target not in self._outcomes
         )
         for target in targets:
             if target in awaiting_native_settlement:
@@ -1482,19 +1443,11 @@ class SimulationJobOwner(QtCore.QObject):
         )
         self._retire_generation_counters(tid, targets)
 
-    def preview_key_is_current(self, key: PreviewResultKey) -> bool:
-        """Authorize publication only for the owner's exact latest Preview key."""
-
-        if not isinstance(key, PreviewResultKey):
-            return False
-        target = (key.tab_id, key.set_id)
+    def preview_target_is_current(self, tab_id: str, set_id: str, generation: int) -> bool:
+        target = (_required_id(tab_id, "tab_id"), _required_id(set_id, "set_id"))
         return bool(
-            self._current_preview_key_by_target.get(target) == key
-            and key.generation
-            == self._preview_publication_generation(
-                key.tab_id,
-                key.set_id,
-            )
+            self._current_preview_generation_by_target.get(target) == generation
+            and generation == self._preview_publication_generation(*target)
         )
 
     def _preview_target_is_active(self, tab_id: str, set_id: str) -> bool:
@@ -1502,9 +1455,9 @@ class SimulationJobOwner(QtCore.QObject):
             _required_id(tab_id, "tab_id"),
             _required_id(set_id, "set_id"),
         )
-        return target in self._current_preview_key_by_target
+        return target in self._current_preview_generation_by_target
 
-    def _retire_preview_keys(
+    def _retire_preview_targets(
         self,
         tab_id: str,
         set_ids: Iterable[str],
@@ -1512,50 +1465,50 @@ class SimulationJobOwner(QtCore.QObject):
         tid = _required_id(tab_id, "tab_id")
         for set_id in set_ids:
             sid = _required_id(set_id, "set_id")
-            self._current_preview_key_by_target.pop(
+            self._current_preview_generation_by_target.pop(
                 (tid, sid),
                 None,
             )
 
-    def _retire_all_preview_keys_for_tab(self, tab_id: str) -> None:
+    def _retire_all_preview_targets_for_tab(self, tab_id: str) -> None:
         tid = _required_id(tab_id, "tab_id")
-        for target in tuple(self._current_preview_key_by_target):
+        for target in tuple(self._current_preview_generation_by_target):
             if target[0] == tid:
-                self._current_preview_key_by_target.pop(target, None)
+                self._current_preview_generation_by_target.pop(target, None)
 
-    def _preview_key_is_pending(self, key: PreviewResultKey) -> bool:
+    def _preview_target_is_pending(self, target: PreviewTarget) -> bool:
         pending = self._pending_preview
         return bool(
             pending is not None
-            and any(target.key == key for target in pending.targets)
+            and any(candidate is target for candidate in pending.targets)
         )
 
-    def _retire_unsuccessful_preview_key(
+    def _retire_unsuccessful_preview_target(
         self,
-        key: PreviewResultKey,
+        target: PreviewTarget,
     ) -> bool:
         """Retire one failed Preview unless its exact intent is pending."""
 
-        if not isinstance(key, PreviewResultKey):
+        if not isinstance(target, PreviewTarget):
             return False
-        target = (key.tab_id, key.set_id)
-        if self._current_preview_key_by_target.get(target) != key:
+        coordinates = (target.tab_id, target.set_id)
+        if not self.preview_target_is_current(coordinates[0], coordinates[1], target.generation):
             return False
-        if self._preview_key_is_pending(key):
+        if self._preview_target_is_pending(target):
             return False
-        self._retire_preview_keys(key.tab_id, (key.set_id,))
+        self._retire_preview_targets(coordinates[0], (target.set_id,))
         self._advance_preview_publication_generations(
-            key.tab_id,
-            (key.set_id,),
+            coordinates[0],
+            (target.set_id,),
         )
         try:
-            self._repository(key.tab_id).clear_preview(
-                key.set_id,
+            self._repository(coordinates[0]).clear_preview(
+                target.set_id,
                 clear_reference=False,
             )
         except LookupError:
             pass
-        self.results_changed.emit(key.tab_id)
+        self.results_changed.emit(coordinates[0])
         return True
 
     def _retire_unsuccessful_preview_intent(
@@ -1563,7 +1516,7 @@ class SimulationJobOwner(QtCore.QObject):
         intent: PreviewIntent,
     ) -> None:
         for target in intent.targets:
-            self._retire_unsuccessful_preview_key(target.key)
+            self._retire_unsuccessful_preview_target(target)
 
     def retire_exact_slider_preview(
         self,
@@ -1607,7 +1560,7 @@ class SimulationJobOwner(QtCore.QObject):
             )
         self._drop_pending_preview_for_targets(tid, targets)
         self._advance_preview_publication_generations(tid, targets)
-        self._retire_preview_keys(tid, targets)
+        self._retire_preview_targets(tid, targets)
         self._prune_preview_terminal_targets()
         self.state_changed.emit()
         return True
@@ -1638,7 +1591,7 @@ class SimulationJobOwner(QtCore.QObject):
             self._retire_interactive_preview_for_targets(tid, targets)
         self._drop_pending_preview_for_targets(tid, targets)
         self._advance_preview_publication_generations(tid, targets)
-        self._retire_preview_keys(tid, targets)
+        self._retire_preview_targets(tid, targets)
         generations = self.advance_explicit_publication_generations(tid, targets)
         repository = self._repository(tid)
         if preserve_reference:
@@ -1653,44 +1606,33 @@ class SimulationJobOwner(QtCore.QObject):
 
     def admit_preview_edits(
         self,
-        identities: Iterable[PreviewResultIdentity],
-    ) -> tuple[PreviewResultKey, ...]:
+        tab_id: str,
+        requests: Iterable[tuple[str, SimulationExecutionRequest]],
+    ) -> tuple[int, ...]:
         """Fence once and install one fully constructed exact Preview batch."""
 
-        captured = tuple(identities)
+        captured = tuple(requests)
         if not captured:
             raise ValueError("Preview admission requires at least one identity.")
         if any(
-            not isinstance(identity, PreviewResultIdentity)
-            for identity in captured
+            not isinstance(set_id, str)
+            or not isinstance(request, SimulationExecutionRequest)
+            for set_id, request in captured
         ):
-            raise TypeError(
-                "Preview admission identities must be PreviewResultIdentity values."
-            )
-        tab_id = captured[0].tab_id
-        if any(identity.tab_id != tab_id for identity in captured):
-            raise ValueError("One Preview admission batch cannot span tabs.")
-        set_ids = tuple(identity.set_id for identity in captured)
+            raise TypeError("Preview admission requires set IDs and full requests.")
+        tab_id = _required_id(tab_id, "tab_id")
+        set_ids = tuple(str(set_id) for set_id, _request in captured)
         if len(set(set_ids)) != len(set_ids):
             raise ValueError("Preview admission targets must be unique.")
         if self._application_close_fenced:
             self.status_changed.emit("Preview rejected: simulation owner is closing.")
             return ()
 
-        # Construct every exact key against the next generation before the
+        # Construct every exact request against the next generation before the
         # existing deauthorization fence changes foreground authority.
-        keys = tuple(
-            PreviewResultKey.from_identity(
-                identity,
-                generation=(
-                    self._preview_publication_generation(
-                        identity.tab_id,
-                        identity.set_id,
-                    )
-                    + 1
-                ),
-            )
-            for identity in captured
+        generations = tuple(
+            self._preview_publication_generation(tab_id, set_id) + 1
+            for set_id in set_ids
         )
         repository = self._repository(tab_id)
         for set_id in set_ids:
@@ -1701,25 +1643,22 @@ class SimulationJobOwner(QtCore.QObject):
             preserve_reference=True,
             preserve_interactive_display=True,
         )
-        for key in keys:
-            if key.generation != self._preview_publication_generation(
-                key.tab_id,
-                key.set_id,
-            ):
+        for set_id, generation in zip(set_ids, generations, strict=True):
+            if generation != self._preview_publication_generation(tab_id, set_id):
                 raise RuntimeError(
                     "Preview admission generation changed during its exact fence."
                 )
-            self._current_preview_key_by_target[(key.tab_id, key.set_id)] = key
+            self._current_preview_generation_by_target[(tab_id, set_id)] = generation
         self._cancel_generation_counter_retirement(tab_id, set_ids)
         self.results_changed.emit(tab_id)
-        return keys
+        return generations
 
     def reconcile_canonical_targets(
         self,
         tab_id: str,
         set_ids: Iterable[str],
     ) -> tuple[tuple[str, bool], ...]:
-        """Restore canonical targets from their retained exact Run keys."""
+        """Restore canonical targets from their retained exact Run requests."""
 
         tid = _required_id(tab_id, "tab_id")
         targets = tuple(
@@ -1733,16 +1672,19 @@ class SimulationJobOwner(QtCore.QObject):
         self._advance_preview_publication_generations(tid, targets)
         hydrated_by_set_id: dict[str, bool] = {}
         for set_id in targets:
-            self._retire_preview_keys(tid, (set_id,))
+            self._retire_preview_targets(tid, (set_id,))
             repository.clear_preview(
                 set_id,
                 clear_reference=False,
             )
-            current_key = self._current_explicit_key(tid, set_id)
+            request = (
+                repository.current_request(set_id)
+                or repository.reference_request(set_id)
+            )
             hydrated = (
                 None
-                if current_key is None
-                else repository.hydrate_cached(current_key)
+                if request is None
+                else repository.hydrate_cached(set_id, request)
             )
             hydrated_by_set_id[set_id] = hydrated is not None
             if hydrated is None:
@@ -1769,13 +1711,13 @@ class SimulationJobOwner(QtCore.QObject):
         self._drop_pending_preview_for_targets(tid, targets)
         target_set = set(targets)
         self._advance_preview_publication_generations(tid, targets)
-        self._retire_preview_keys(tid, targets)
+        self._retire_preview_targets(tid, targets)
         pending_correction = self._pending_detailed_balance
         if (
             pending_correction is not None
             and pending_correction.capture.tab_id == tid
             and any(
-                target.key.set_id in target_set
+                target.set_id in target_set
                 for target in pending_correction.capture.targets
             )
         ):
@@ -1806,7 +1748,7 @@ class SimulationJobOwner(QtCore.QObject):
         self.drop_pending_preview(tid)
         self.retire_interactive_preview(tid)
         self._advance_preview_publication_generations(tid, targets)
-        self._retire_all_preview_keys_for_tab(tid)
+        self._retire_all_preview_targets_for_tab(tid)
         pending_correction = self._pending_detailed_balance
         if (
             pending_correction is not None
@@ -1816,9 +1758,9 @@ class SimulationJobOwner(QtCore.QObject):
                 "Run detailed-balance correction aborted: its tab was deleted."
             )
         admitted_set_ids = {
-            target.key.set_id
+            target.set_id
             for target in self._targets
-            if target.key.tab_id == tid
+            if target.set_id in targets
         }
         deauthorized_set_ids = tuple(dict.fromkeys((*targets, *admitted_set_ids)))
         generations = self.advance_explicit_publication_generations(
@@ -1858,10 +1800,10 @@ class SimulationJobOwner(QtCore.QObject):
             if (
                 target.publication_generation
                 != self.explicit_publication_generation(
-                    target.key.tab_id,
-                    target.key.set_id,
+                    capture.tab_id,
+                    target.set_id,
                 )
-                or not self._explicit_completion_is_live_key(target.key)
+                or not self._explicit_completion_is_current(target)
             ):
                 self.status_changed.emit(
                     f"Run rejected: target {target.set_name!r} capture is stale."
@@ -1937,7 +1879,7 @@ class SimulationJobOwner(QtCore.QObject):
                 # delivery still pending, not a completed dispatch failure.
                 self.run_dispatched.emit(
                     capture.tab_id,
-                    tuple(target.key.set_id for target in capture.targets),
+                    tuple(target.set_id for target in capture.targets),
                 )
                 self.status_changed.emit(
                     "Run startup remains uncertain; worker and computation "
@@ -1957,7 +1899,7 @@ class SimulationJobOwner(QtCore.QObject):
             return False
         self.run_dispatched.emit(
             capture.tab_id,
-            tuple(target.key.set_id for target in capture.targets),
+            tuple(target.set_id for target in capture.targets),
         )
         self.status_changed.emit(
             f"Run started with capacity {capacity.effective}."
@@ -1976,8 +1918,6 @@ class SimulationJobOwner(QtCore.QObject):
         if pending is None:
             return False
         request = pending.correction
-        if outcome.request_id != request.request_id:
-            return False
         if (
             pending.generation != self._detailed_balance_generation
             or (
@@ -1994,7 +1934,7 @@ class SimulationJobOwner(QtCore.QObject):
             )
         ):
             self._abort_pending_detailed_balance(
-                "Run detailed-balance correction aborted: request identity "
+                "Run detailed-balance correction aborted: request currentness "
                 "is no longer exact."
             )
             return False
@@ -2027,7 +1967,7 @@ class SimulationJobOwner(QtCore.QObject):
         if original_source.reactions_text != request.source:
             self._abort_pending_detailed_balance(
                 "Run detailed-balance correction aborted: captured source "
-                "identity changed."
+                "changed."
             )
             return False
         corrected_source = original_source.with_reactions_text(corrected_text)
@@ -2038,7 +1978,7 @@ class SimulationJobOwner(QtCore.QObject):
                 or self._pending_detailed_balance is not pending
                 or not self._gate.is_owned_by(self)
                 or any(
-                    not self._explicit_completion_is_live_key(target.key)
+                    not self._explicit_completion_is_current(target)
                     for target in pending.capture.targets
                 )
             ):
@@ -2089,7 +2029,7 @@ class SimulationJobOwner(QtCore.QObject):
                 or not self._gate.is_owned_by(self)
             ):
                 raise RuntimeError(
-                    "Run correction admission was retired after commit."
+                "Run correction admission was retired after commit."
                 )
             rebased = self._rebind_detailed_balance_run_continuation(
                 pending,
@@ -2157,7 +2097,7 @@ class SimulationJobOwner(QtCore.QObject):
         canonical commit succeeds, that commit's mutation fence advances the
         captured Run generations.  The corrected prepared request remains the
         execution authority; the postcommit resolver contributes only the
-        exact request-projected key used for rebinding.
+        exact request used for rebinding.
         """
 
         if proposal.tab_id != pending.capture.tab_id:
@@ -2171,27 +2111,27 @@ class SimulationJobOwner(QtCore.QObject):
         _verify_detailed_balance_resolved(corrected_prepared)
         rebased_targets: list[ExplicitRunTarget] = []
         for target in pending.capture.targets:
-            proposed_set = proposed_tab.initial_condition_set(target.key.set_id)
+            proposed_set = proposed_tab.initial_condition_set(target.set_id)
             rebased_targets.append(
                 build_explicit_target(
                     prepared_dsl=corrected_prepared,
-                    tab_id=target.key.tab_id,
-                    set_id=target.key.set_id,
+                    tab_id=pending.capture.tab_id,
+                    set_id=target.set_id,
                     set_name=proposed_set.name,
                     mechanism_source=proposed_tab.mechanism_source,
                     initial_values=canonical_initial_values(
                         proposed_tab,
-                        target.key.set_id,
+                        target.set_id,
                     ),
                     execution_settings=(
                         proposed_tab.resolved_execution_settings(
-                            target.key.set_id
+                            target.set_id
                         )
                     ),
                     scientific_settings=proposed_tab.scientific_settings,
                     publication_generation=self.explicit_publication_generation(
-                        target.key.tab_id,
-                        target.key.set_id,
+                        pending.capture.tab_id,
+                        target.set_id,
                     ),
                 )
             )
@@ -2205,7 +2145,7 @@ class SimulationJobOwner(QtCore.QObject):
         pending: _PendingRunDetailedBalanceCorrection,
         prepared_capture: ExplicitRunCapture,
     ) -> ExplicitRunCapture:
-        """Rebind retained corrected targets to the exact postcommit key."""
+        """Rebind retained corrected targets to the exact postcommit request."""
 
         if prepared_capture.tab_id != pending.capture.tab_id:
             raise RuntimeError(
@@ -2213,28 +2153,15 @@ class SimulationJobOwner(QtCore.QObject):
             )
         rebased_targets: list[ExplicitRunTarget] = []
         for target in prepared_capture.targets:
-            current_key = self._current_explicit_key(
-                target.key.tab_id,
-                target.key.set_id,
-            )
-            if current_key is None:
-                raise RuntimeError(
-                    f"Corrected Run target {target.set_name!r} has no "
-                    "canonical postcommit current key."
-                )
-            if current_key != target.key:
-                raise RuntimeError(
-                    f"Corrected Run target {target.set_name!r} is not the "
-                    "exact canonical postcommit target."
-                )
             rebased_targets.append(
                 ExplicitRunTarget(
-                    key=current_key,
+                    tab_id=prepared_capture.tab_id,
+                    set_id=target.set_id,
                     set_name=target.set_name,
                     publication_generation=(
                         self.explicit_publication_generation(
-                            current_key.tab_id,
-                            current_key.set_id,
+                            prepared_capture.tab_id,
+                            target.set_id,
                         )
                     ),
                     prepared_dsl=target.prepared_dsl,
@@ -2959,17 +2886,17 @@ class SimulationJobOwner(QtCore.QObject):
         if current_intent is None:
             self._retire_preview_intent(
                 intent,
-                message="Preview rejected: every exact key is stale.",
+                message="Preview rejected: every exact request is stale.",
             )
-            self.status_changed.emit("Preview rejected: every exact key is stale.")
+            self.status_changed.emit("Preview rejected: every exact request is stale.")
             return False
         if intent.interactive_batch is not None:
-            current_ids = {target.key.set_id for target in current_intent.targets}
+            current_ids = {target.set_id for target in current_intent.targets}
             for target in intent.targets:
-                if target.key.set_id not in current_ids:
+                if target.set_id not in current_ids:
                     self._emit_interactive_preview_terminal(
                         intent.interactive_batch,
-                        target.key.set_id,
+                        target.set_id,
                         InteractivePreviewTerminalState.OBSOLETE,
                         message=(
                             f"Preview target {target.set_name!r} became obsolete "
@@ -3092,15 +3019,15 @@ class SimulationJobOwner(QtCore.QObject):
             return
         targets = {str(value) for value in set_ids}
         if not any(
-            target.key.set_id in targets
+            target.set_id in targets
             for target in pending.targets
         ):
             return
         for target in pending.targets:
-            if target.key.set_id in targets:
+            if target.set_id in targets:
                 self._emit_interactive_preview_terminal(
                     pending.interactive_batch,
-                    target.key.set_id,
+                    target.set_id,
                     InteractivePreviewTerminalState.OBSOLETE,
                     message=(
                         f"Preview target {target.set_name!r} was removed "
@@ -3110,7 +3037,7 @@ class SimulationJobOwner(QtCore.QObject):
         surviving = tuple(
             target
             for target in pending.targets
-            if target.key.set_id not in targets
+            if target.set_id not in targets
         )
         self._pending_preview = (
             PreviewIntent(
@@ -3122,8 +3049,8 @@ class SimulationJobOwner(QtCore.QObject):
             else None
         )
         for target in pending.targets:
-            if target.key.set_id in targets:
-                self._retire_unsuccessful_preview_key(target.key)
+            if target.set_id in targets:
+                self._retire_unsuccessful_preview_target(target)
         self._prune_preview_terminal_targets()
         self.state_changed.emit()
 
@@ -3136,18 +3063,18 @@ class SimulationJobOwner(QtCore.QObject):
         ),
         message: str,
     ) -> None:
-        """Settle one unadmitted intent and retire every exact key it owns."""
+        """Settle one unadmitted intent and retire every exact request it owns."""
 
         for target in intent.targets:
             self._emit_interactive_preview_terminal(
                 intent.interactive_batch,
-                target.key.set_id,
+                target.set_id,
                 state,
                 message=message,
             )
         if self._pending_preview is intent:
-            # Key retirement must see that the scheduler slot no longer owns
-            # the intent; otherwise _preview_key_is_pending() preserves it.
+            # Request retirement must see that the scheduler slot no longer owns
+            # the intent; otherwise the pending-intent check preserves it.
             self._pending_preview = None
         self._retire_unsuccessful_preview_intent(intent)
         self._prune_preview_terminal_targets()
@@ -3271,20 +3198,23 @@ class SimulationJobOwner(QtCore.QObject):
         self._emit_application_close_settlement_if_complete()
         return True
 
-    def show_cached(self, tab_id: str, set_id: str) -> bool:
+    def show_cached(
+        self,
+        tab_id: str,
+        set_id: str,
+        execution_request: SimulationExecutionRequest,
+    ) -> bool:
         tid = _required_id(tab_id, "tab_id")
         sid = _required_id(set_id, "set_id")
+        if not isinstance(execution_request, SimulationExecutionRequest):
+            raise TypeError("execution_request must be a SimulationExecutionRequest.")
         repository = self._repository(tid)
-        current_key = self._current_explicit_key(tid, sid)
-        if (
-            current_key is None
-            or self._preview_target_is_active(tid, sid)
-        ):
+        if self._preview_target_is_active(tid, sid):
             self.status_changed.emit(
                 "Requested result is not currently display-eligible; display unchanged."
             )
             return False
-        if repository.hydrate_cached(current_key) is None:
+        if repository.hydrate_cached(sid, execution_request) is None:
             self.status_changed.emit("Requested result is not cached; display unchanged.")
             return False
         self.results_changed.emit(tid)
@@ -3342,7 +3272,9 @@ class SimulationJobOwner(QtCore.QObject):
                     target
                     for target in admitted_targets
                     if isinstance(target, PreviewTarget)
-                    and self.preview_key_is_current(target.key)
+                    and self.preview_target_is_current(
+                        target.tab_id, target.set_id, target.generation
+                    )
                 )
                 if not admitted_targets:
                     raise RuntimeError(
@@ -3372,7 +3304,7 @@ class SimulationJobOwner(QtCore.QObject):
             worker.start()
             self._cancel_generation_counter_retirement(
                 tab_id,
-                (target.key.set_id for target in admitted_targets),
+                (target.set_id for target in admitted_targets),
             )
         except BaseException as exc:  # noqa: BLE001
             if installed and worker is not None:
@@ -3430,17 +3362,18 @@ class SimulationJobOwner(QtCore.QObject):
             or not isinstance(outcome, _TargetTerminalOutcome)
         ):
             return
-        key = outcome.key
-        if self._target_for_key(key) is None:
+        target = outcome.target
+        if self._target_for_target(target) is None:
             return
-        self._settle_retired_generation_target(key.tab_id, key.set_id)
-        if key in self._outcomes:
+        tab_id = target.tab_id
+        self._settle_retired_generation_target(tab_id, target.set_id)
+        if self._target_token(target) in self._outcomes:
             return
         if outcome.state != "success":
-            if isinstance(key, PreviewResultKey) and self._job_kind == "preview":
+            if isinstance(target, PreviewTarget) and self._job_kind == "preview":
                 state = (
                     InteractivePreviewTerminalState.OBSOLETE
-                    if not self.preview_key_is_current(key)
+                    if not self.preview_target_is_current(tab_id, target.set_id, target.generation)
                     else (
                         InteractivePreviewTerminalState.CANCELLED
                         if outcome.state == "cancelled"
@@ -3449,7 +3382,7 @@ class SimulationJobOwner(QtCore.QObject):
                 )
                 self._emit_interactive_preview_terminal(
                     self._active_preview_batch,
-                    key.set_id,
+                    target.set_id,
                     state,
                     message=(
                         _format_owner_failure_cause(outcome.cause)
@@ -3458,7 +3391,7 @@ class SimulationJobOwner(QtCore.QObject):
                         else outcome.message
                     ),
                 )
-            target_name = self._target_display_name(key)
+            target_name = target.set_name
             detail_message = (
                 _format_owner_failure_cause(outcome.cause)
                 if outcome.state == "failure" and outcome.cause is not None
@@ -3468,109 +3401,108 @@ class SimulationJobOwner(QtCore.QObject):
                 f"{target_name} {outcome.stage} {outcome.state}: "
                 f"{detail_message}"
             )
-            self._record_terminal(key, outcome.state, detail)
+            self._record_terminal(target, outcome.state, detail)
             return
         result = outcome.result
         if not isinstance(result, SimulationResultValue):
-            if isinstance(key, PreviewResultKey) and self._job_kind == "preview":
+            if isinstance(target, PreviewTarget) and self._job_kind == "preview":
                 self._emit_interactive_preview_terminal(
                     self._active_preview_batch,
-                    key.set_id,
+                    target.set_id,
                     (
                         InteractivePreviewTerminalState.OBSOLETE
-                        if not self.preview_key_is_current(key)
+                        if not self.preview_target_is_current(tab_id, target.set_id, target.generation)
                         else InteractivePreviewTerminalState.FAILURE
                     ),
                     message=(
-                        f"{self._target_display_name(key)} execution failed: "
+                        f"{target.set_name} execution failed: "
                         "worker returned no admitted result."
                     ),
                 )
             self._record_terminal(
-                key,
+                target,
                 "failure",
-                f"{self._target_display_name(key)} execution failed: "
+                f"{target.set_name} execution failed: "
                 "worker returned no admitted result.",
             )
             return
         if self._worker.cancelled or self._application_close_fenced:
-            if isinstance(key, PreviewResultKey) and self._job_kind == "preview":
+            if isinstance(target, PreviewTarget) and self._job_kind == "preview":
                 self._emit_interactive_preview_terminal(
                     self._active_preview_batch,
-                    key.set_id,
+                    target.set_id,
                     (
                         InteractivePreviewTerminalState.OBSOLETE
-                        if not self.preview_key_is_current(key)
+                        if not self.preview_target_is_current(tab_id, target.set_id, target.generation)
                         else InteractivePreviewTerminalState.CANCELLED
                     ),
                     message=(
-                        f"Preview result for {self._target_display_name(key)} "
+                        f"Preview result for {target.set_name} "
                         "cancelled before publication."
                     ),
                 )
             self._record_terminal(
-                key,
+                target,
                 "cancelled",
-                f"{self._target_display_name(key)} cancelled before publication.",
+                f"{target.set_name} cancelled before publication.",
             )
             return
-        if isinstance(key, ExplicitResultKey) and self._job_kind == "run":
-            target = self._target_for_key(key)
+        if isinstance(target, ExplicitRunTarget) and self._job_kind == "run":
             if not isinstance(target, ExplicitRunTarget):
                 self._record_discard(
-                    key,
+                    target,
                     "Run result discarded: its captured target is unavailable.",
                 )
                 return
             try:
-                repository = self._repository(key.tab_id)
+                repository = self._repository(tab_id)
             except LookupError:
                 self._record_discard(
-                    key,
+                    target,
                     f"Run result discarded for {target.set_name}: "
                     "the live result repository is unavailable.",
                 )
                 return
             if self._worker.cancelled or self._application_close_fenced:
                 self._record_terminal(
-                    key,
+                    target,
                     "cancelled",
                     f"Run result for {target.set_name} cancelled before publication.",
                 )
                 return
             if not self._explicit_completion_is_current(target):
                 self._record_discard(
-                    key,
+                    target,
                     f"Run result discarded for {target.set_name}: "
                     "the exact live target or publication generation changed.",
                 )
                 return
             try:
-                repository.put_explicit(key, result)
+                repository.publish_run(target.set_id, target.execution_request, result)
             except Exception as exc:
                 self._record_discard(
-                    key,
+                    target,
                     f"Run result discarded for {target.set_name}: "
                     f"repository rejected publication ({type(exc).__name__}: {exc}).",
                 )
                 return
-            if self._preview_target_is_active(key.tab_id, key.set_id):
+            if self._preview_target_is_active(tab_id, target.set_id):
                 self._advance_preview_publication_generations(
-                    key.tab_id,
-                    (key.set_id,),
+                    tab_id,
+                    (target.set_id,),
                 )
-                self._retire_preview_keys(key.tab_id, (key.set_id,))
-            self._record_terminal(key, "success")
-            self.results_changed.emit(key.tab_id)
+                self._retire_preview_targets(tab_id, (target.set_id,))
+            self._record_terminal(target, "success")
+            self.results_changed.emit(tab_id)
             return
-        if isinstance(key, PreviewResultKey) and self._job_kind == "preview":
-            target_name = self._target_display_name(key)
+        if isinstance(target, PreviewTarget) and self._job_kind == "preview":
+            target_name = target.set_name
             try:
-                repository = self._repository(key.tab_id)
+                repository = self._repository(tab_id)
             except LookupError:
                 self._emit_interactive_preview_terminal(
                     self._active_preview_batch,
-                    key.set_id,
+                    target.set_id,
                     InteractivePreviewTerminalState.FAILURE,
                     message=(
                         f"Preview result discarded for {target_name}: "
@@ -3578,40 +3510,44 @@ class SimulationJobOwner(QtCore.QObject):
                     ),
                 )
                 self._record_discard(
-                    key,
+                    target,
                     f"Preview result discarded for {target_name}: "
                     "the live result repository is unavailable.",
                 )
                 return
             if self._worker.cancelled or self._application_close_fenced:
                 self._record_terminal(
-                    key,
+                    target,
                     "cancelled",
                     f"Preview result for {target_name} cancelled before publication.",
                 )
                 return
-            if not self.preview_key_is_current(key):
+            if not self.preview_target_is_current(tab_id, target.set_id, target.generation):
                 self._emit_interactive_preview_terminal(
                     self._active_preview_batch,
-                    key.set_id,
+                    target.set_id,
                     InteractivePreviewTerminalState.OBSOLETE,
                     message=(
                         f"Preview result discarded for {target_name}: "
-                        "the owner generation or exact live key changed."
+                        "the owner generation or exact live request changed."
                     ),
                 )
                 self._record_discard(
-                    key,
+                    target,
                     f"Preview result discarded for {target_name}: "
-                    "the owner generation or exact live key changed.",
+                    "the owner generation or exact live request changed.",
                 )
                 return
             try:
-                repository.store_preview(key, result)
+                repository.publish_preview(
+                    target.set_id,
+                    target.execution_request,
+                    result,
+                )
             except Exception as exc:
                 self._emit_interactive_preview_terminal(
                     self._active_preview_batch,
-                    key.set_id,
+                    target.set_id,
                     InteractivePreviewTerminalState.FAILURE,
                     message=(
                         f"Preview result discarded for {target_name}: "
@@ -3619,25 +3555,24 @@ class SimulationJobOwner(QtCore.QObject):
                     ),
                 )
                 self._record_discard(
-                    key,
+                    target,
                     f"Preview result discarded for {target_name}: "
                     f"repository rejected publication ({type(exc).__name__}: {exc}).",
                 )
                 return
-            self._record_terminal(key, "success")
+            self._record_terminal(target, "success")
             self._emit_interactive_preview_terminal(
                 self._active_preview_batch,
-                key.set_id,
+                target.set_id,
                 InteractivePreviewTerminalState.SUCCESS,
-                result_key=key,
                 result_published=True,
             )
             # Semantic publication is complete before any render attempt,
             # including for inactive tabs and non-plotted targets.
-            self.results_changed.emit(key.tab_id)
+            self.results_changed.emit(tab_id)
             return
         self._record_discard(
-            key,
+            target,
             "Simulation result discarded: its job kind no longer matches.",
         )
 
@@ -3701,8 +3636,8 @@ class SimulationJobOwner(QtCore.QObject):
         worker = self._worker
         for target in self._targets:
             self._settle_retired_generation_target(
-                target.key.tab_id,
-                target.key.set_id,
+                self._origin_tab_id or "",
+                target.set_id,
             )
         self._worker = None
         self._job_kind = None
@@ -3748,7 +3683,7 @@ class SimulationJobOwner(QtCore.QObject):
                 for target in stale_targets:
                     self._emit_interactive_preview_terminal(
                         intent.interactive_batch,
-                        target.key.set_id,
+                        target.set_id,
                         InteractivePreviewTerminalState.OBSOLETE,
                         message=(
                             f"Preview target {target.set_name!r} became stale "
@@ -3768,7 +3703,7 @@ class SimulationJobOwner(QtCore.QObject):
             self.request_preview(current_intent)
         else:
             self.status_changed.emit(
-                "Pending Preview discarded: every exact key changed."
+            "Pending Preview discarded: every exact request changed."
             )
             self.state_changed.emit()
 
@@ -3784,17 +3719,25 @@ class SimulationJobOwner(QtCore.QObject):
             raise LookupError(f"No ResultRepository exists for tab {tab_id!r}.")
         return repository
 
-    def _target_for_key(
+    def _target_for_target(
         self,
-        key: ExplicitResultKey | PreviewResultKey,
+        candidate: ExplicitRunTarget | PreviewTarget,
     ) -> ExplicitRunTarget | PreviewTarget | None:
-        return next((target for target in self._targets if target.key == key), None)
+        return next((target for target in self._targets if target is candidate), None)
 
-    def _target_display_name(self, key: object) -> str:
-        if not isinstance(key, (ExplicitResultKey, PreviewResultKey)):
+    @staticmethod
+    def _target_token(target: ExplicitRunTarget | PreviewTarget) -> tuple[str, str, int]:
+        generation = (
+            target.publication_generation
+            if isinstance(target, ExplicitRunTarget)
+            else target.generation
+        )
+        return (type(target).__name__, target.set_id, int(generation))
+
+    def _target_display_name(self, target: object) -> str:
+        if not isinstance(target, (ExplicitRunTarget, PreviewTarget)):
             return "target"
-        target = self._target_for_key(key)
-        return target.set_name if target is not None else "target"
+        return target.set_name
 
     def _discard_purged_admitted_targets(
         self,
@@ -3809,17 +3752,14 @@ class SimulationJobOwner(QtCore.QObject):
         if worker is None:
             return
         for target in self._targets:
-            key = target.key
-            if key.tab_id != tab_id:
-                continue
-            if set_ids is not None and key.set_id not in set_ids:
+            if set_ids is not None and target.set_id not in set_ids:
                 continue
             self._record_discard(
-                key,
+                target,
                 f"{target.set_name} discarded: {reason}.",
             )
         if not any(
-            target.key not in self._outcomes
+            self._target_token(target) not in self._outcomes
             and self._admitted_target_is_publishable(target)
             for target in self._targets
         ):
@@ -3834,31 +3774,34 @@ class SimulationJobOwner(QtCore.QObject):
         if isinstance(target, ExplicitRunTarget) and self._job_kind == "run":
             return self._explicit_completion_is_current(target)
         if isinstance(target, PreviewTarget) and self._job_kind == "preview":
-            return self.preview_key_is_current(target.key)
+            return self.preview_target_is_current(
+                target.tab_id, target.set_id, target.generation
+            )
         return False
 
-    def _record_discard(self, key: object, detail: str) -> bool:
-        return self._record_terminal(key, "discarded", detail)
+    def _record_discard(self, target: object, detail: str) -> bool:
+        return self._record_terminal(target, "discarded", detail)
 
     def _record_terminal(
         self,
-        key: object,
+        target: object,
         state: str,
         detail: str | None = None,
     ) -> bool:
         if state not in {"success", "failure", "cancelled", "discarded"}:
             raise ValueError(f"unsupported target terminal state {state!r}.")
-        if key in self._outcomes:
+        if not isinstance(target, (ExplicitRunTarget, PreviewTarget)):
+            raise TypeError("a target terminal outcome requires an admitted target.")
+        token = self._target_token(target)
+        if token in self._outcomes:
             return False
-        if not isinstance(key, (ExplicitResultKey, PreviewResultKey)):
-            raise TypeError("a target terminal outcome requires a result key.")
-        if self._target_for_key(key) is None:
+        if self._target_for_target(target) is None:
             raise RuntimeError(
                 "a terminal outcome must belong to the immutable admitted roster."
             )
-        if isinstance(key, PreviewResultKey) and state != "success":
-            self._retire_unsuccessful_preview_key(key)
-        self._outcomes[key] = state
+        if isinstance(target, PreviewTarget) and state != "success":
+            self._retire_unsuccessful_preview_target(target)
+        self._outcomes[token] = state
         if detail is not None:
             message = str(detail)
             self._details.append(message)
@@ -3872,14 +3815,13 @@ class SimulationJobOwner(QtCore.QObject):
             self._worker is not None and self._worker.cancelled
         )
         for target in self._targets:
-            key = target.key
-            if key in self._outcomes:
+            if self._target_token(target) in self._outcomes:
                 continue
             state = "cancelled" if worker_cancelled else "failure"
-            if isinstance(key, PreviewResultKey) and self._job_kind == "preview":
+            if isinstance(target, PreviewTarget) and self._job_kind == "preview":
                 self._emit_interactive_preview_terminal(
                     self._active_preview_batch,
-                    key.set_id,
+                    target.set_id,
                     (
                         InteractivePreviewTerminalState.CANCELLED
                         if worker_cancelled
@@ -3891,40 +3833,18 @@ class SimulationJobOwner(QtCore.QObject):
                     ),
                 )
             self._record_terminal(
-                key,
+                target,
                 state,
                 f"{target.set_name} {state}: worker ended without a terminal signal.",
             )
 
     def _explicit_completion_is_current(self, target: ExplicitRunTarget) -> bool:
-        key = target.key
         if target.publication_generation != self.explicit_publication_generation(
-            key.tab_id,
-            key.set_id,
+            target.tab_id,
+            target.set_id,
         ):
             return False
-        return self._explicit_completion_is_live_key(key)
-
-    def _explicit_completion_is_live_key(self, key: ExplicitResultKey) -> bool:
-        current_key = self._current_explicit_key(key.tab_id, key.set_id)
-        return explicit_result_key_is_current(key, current_key)
-
-    def _current_explicit_key(
-        self,
-        tab_id: str,
-        set_id: str,
-    ) -> ExplicitResultKey | None:
-        """Resolve one current exact key; only deliberate absence returns None."""
-
-        key = self._current_explicit_result_key(
-            _required_id(tab_id, "tab_id"),
-            _required_id(set_id, "set_id"),
-        )
-        if key is not None and not isinstance(key, ExplicitResultKey):
-            raise TypeError(
-                "current explicit-key resolver returned an invalid value."
-            )
-        return key
+        return True
 
     def _current_preview_intent(
         self,
@@ -3933,7 +3853,9 @@ class SimulationJobOwner(QtCore.QObject):
         current_targets = tuple(
             target
             for target in intent.targets
-            if self.preview_key_is_current(target.key)
+            if self.preview_target_is_current(
+                target.tab_id, target.set_id, target.generation
+            )
         )
         if not current_targets:
             return None

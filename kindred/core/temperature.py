@@ -22,7 +22,6 @@ Usage:
 
 from __future__ import annotations
 
-import json
 import logging
 import math
 from dataclasses import dataclass
@@ -257,16 +256,6 @@ class TemperatureSchedule:
         """
         time_value = _coerce_nonnegative_time(t, field="temperature schedule time")
         return coerce_temperature_kelvin(self._T_func(time_value), field="temperature schedule output")
-
-    @property
-    def fingerprint(self) -> str:
-        """
-        Deterministic, serialization-friendly fingerprint for caching/metadata.
-
-        Prefer this over `repr(self)` when building cache keys.
-        """
-        payload = self.to_dict()
-        return json.dumps(payload, sort_keys=True, separators=(",", ":"))
 
     def __reduce__(self):
         """

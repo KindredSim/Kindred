@@ -23,9 +23,6 @@ from kindred.core.project_presentation_state import (
     SimulationSeriesAxisSelection,
 )
 from kindred.core.result_repository import (
-    ExplicitResultEntry,
-    PreviewResultEntry,
-    ResultEntry,
     ResultRepository,
     SimulationResultValue,
 )
@@ -497,16 +494,15 @@ WorkspaceLayerIdentity: TypeAlias = (
 )
 
 
-def _result_warning_details(entry: ResultEntry | None) -> tuple[str, ...]:
-    if not isinstance(entry, (ExplicitResultEntry, PreviewResultEntry)):
-        raise TypeError("warning details require a repository result entry.")
-    provenance = entry.result.provenance
-    details = [f"Preparation: {warning}" for warning in provenance.preparation_warnings]
-    if provenance.failed_algebra_outputs:
+def _result_warning_details(result: SimulationResultValue | None) -> tuple[str, ...]:
+    if not isinstance(result, SimulationResultValue):
+        raise TypeError("warning details require a canonical simulation result.")
+    details = [f"Preparation: {warning}" for warning in result.preparation_warnings]
+    if result.failed_algebra_outputs:
         details.append(
-            "Algebra failed: " + ", ".join(provenance.failed_algebra_outputs)
+            "Algebra failed: " + ", ".join(result.failed_algebra_outputs)
         )
-    for cause in provenance.algebra_errors:
+    for cause in result.algebra_errors:
         if not isinstance(cause, FactualCause):
             raise TypeError("algebra errors must contain FactualCause values.")
         raw_name = cause.details.get("name")
@@ -517,38 +513,33 @@ def _result_warning_details(entry: ResultEntry | None) -> tuple[str, ...]:
             f"{observable_name}: type={cause.type}; code={code}; "
             f"message={cause.message}"
         )
-    if provenance.omitted_algebra_outputs:
+    if result.omitted_algebra_outputs:
         details.append(
-            "Algebra omitted: " + ", ".join(provenance.omitted_algebra_outputs)
+            "Algebra omitted: " + ", ".join(result.omitted_algebra_outputs)
         )
     return tuple(details)
 
 
-def _result_entry_payload(entry: ResultEntry) -> Mapping[str, object]:
-    """Serialize the exact retained entry key and result-owned provenance."""
+def _result_provenance_payload(result: SimulationResultValue) -> Mapping[str, object]:
+    """Serialize readable provenance directly from the canonical result."""
 
-    if not isinstance(entry, (ExplicitResultEntry, PreviewResultEntry)):
-        raise TypeError("result metadata requires a repository result entry.")
-    provenance = entry.result.provenance
+    if not isinstance(result, SimulationResultValue):
+        raise TypeError("result metadata requires a canonical simulation result.")
     return MappingProxyType(
         {
-            "entry_type": (
-                "preview" if isinstance(entry, PreviewResultEntry) else "explicit"
-            ),
-            "key": entry.key,
             "provenance": MappingProxyType(
                 {
-                    "solver": provenance.solver,
-                    "preparation_warnings": provenance.preparation_warnings,
+                    "solver": result.solver_provenance,
+                    "preparation_warnings": result.preparation_warnings,
                     "algebra": MappingProxyType(
                         {
-                            "requested": provenance.requested_algebra_outputs,
-                            "succeeded": provenance.succeeded_algebra_outputs,
-                            "failed": provenance.failed_algebra_outputs,
-                            "omitted": provenance.omitted_algebra_outputs,
+                            "requested": result.requested_algebra_outputs,
+                            "succeeded": result.succeeded_algebra_outputs,
+                            "failed": result.failed_algebra_outputs,
+                            "omitted": result.omitted_algebra_outputs,
                             "errors": tuple(
                                 cause.to_payload()
-                                for cause in provenance.algebra_errors
+                                for cause in result.algebra_errors
                             ),
                         }
                     ),
@@ -566,7 +557,7 @@ class WorkspacePlotLayer:
     t: np.ndarray
     series: tuple[tuple[str, np.ndarray], ...]
     series_axes: tuple[tuple[str, AxisSeriesSelection], ...]
-    result_entry: ResultEntry | None
+    result: SimulationResultValue | None
     segment_ids: np.ndarray | None
     segment_keys: tuple[str, ...] | None
     discontinuity_ids: np.ndarray | None
@@ -627,7 +618,7 @@ class WorkspacePlotLayer:
         axis_identities = tuple(selection for _, selection in series_axes)
         if len(axis_identities) != len(set(axis_identities)):
             raise ValueError("plot series axis identities must be unique.")
-        result_entry = self.result_entry
+        result = self.result
         presentation_boundaries = tuple(self.presentation_boundaries)
         if any(
             not isinstance(boundary, SimulationPresentationBoundary)
@@ -638,7 +629,7 @@ class WorkspacePlotLayer:
                 "SimulationPresentationBoundary values."
             )
         if self.kind is ResultLayerKind.EXPERIMENTAL:
-            if result_entry is not None:
+            if result is not None:
                 raise ValueError(
                     "experimental plot layers prohibit repository entries."
                 )
@@ -660,31 +651,10 @@ class WorkspacePlotLayer:
                     "experimental plot layers prohibit presentation boundaries."
                 )
         else:
-            if not isinstance(
-                result_entry,
-                (ExplicitResultEntry, PreviewResultEntry),
-            ):
-                raise TypeError("simulation plot layers require a repository entry.")
-            if (
-                self.kind is ResultLayerKind.PREVIEW
-                and not isinstance(result_entry, PreviewResultEntry)
-            ) or (
-                self.kind
-                in {
-                    ResultLayerKind.EXPLICIT,
-                    ResultLayerKind.REFERENCE,
-                }
-                and not isinstance(result_entry, ExplicitResultEntry)
-            ):
-                raise TypeError(
-                    "plot layer kind conflicts with its repository entry type."
-                )
+            if not isinstance(result, SimulationResultValue):
+                raise TypeError("simulation plot layers require a canonical result.")
             assert isinstance(layer_id, SimulationResultLayerIdentity)
-            if result_entry.key.set_id != layer_id.set_id:
-                raise ValueError(
-                    "plot layer source must match its repository entry key."
-                )
-            entry_result = result_entry.result
+            entry_result = result
             if presentation_boundaries is not entry_result.presentation_boundaries:
                 raise ValueError(
                     "simulation plot layers must retain their repository "
@@ -804,7 +774,7 @@ class WorkspacePlotLayer:
         object.__setattr__(self, "t", time)
         object.__setattr__(self, "series", tuple(series))
         object.__setattr__(self, "series_axes", series_axes)
-        object.__setattr__(self, "result_entry", result_entry)
+        object.__setattr__(self, "result", result)
         object.__setattr__(self, "segment_ids", segment_ids)
         object.__setattr__(self, "segment_keys", segment_keys)
         object.__setattr__(self, "discontinuity_ids", discontinuity_ids)
@@ -832,7 +802,7 @@ class ResultDataBlock:
     series: tuple[tuple[str, np.ndarray], ...]
     series_axes: tuple[tuple[str, AxisSeriesSelection], ...]
     x_axis: AxisSeriesSelection
-    result_entry: ResultEntry | None
+    result: SimulationResultValue | None
     segment_ids: np.ndarray | None
     segment_keys: tuple[str, ...] | None
     discontinuity_ids: np.ndarray | None
@@ -891,9 +861,9 @@ class ResultDataBlock:
         if len(axis_identities) != len(set(axis_identities)):
             raise ValueError("data series axis identities must be unique.")
         x_axis = _axis_selection(self.x_axis, field="data X axis")
-        result_entry = self.result_entry
+        result = self.result
         if self.kind is ResultLayerKind.EXPERIMENTAL:
-            if result_entry is not None:
+            if result is not None:
                 raise ValueError(
                     "experimental data blocks prohibit repository entries."
                 )
@@ -913,25 +883,8 @@ class ResultDataBlock:
         else:
             if not isinstance(x_axis, SimulationSeriesAxisSelection):
                 raise TypeError("simulation data blocks require a simulation X axis.")
-            if not isinstance(
-                result_entry,
-                (ExplicitResultEntry, PreviewResultEntry),
-            ):
-                raise TypeError("simulation data blocks require a repository entry.")
-            if (
-                self.kind is ResultLayerKind.PREVIEW
-                and not isinstance(result_entry, PreviewResultEntry)
-            ) or (
-                self.kind
-                in {
-                    ResultLayerKind.EXPLICIT,
-                    ResultLayerKind.REFERENCE,
-                }
-                and not isinstance(result_entry, ExplicitResultEntry)
-            ):
-                raise TypeError(
-                    "data block kind conflicts with its repository entry type."
-                )
+            if not isinstance(result, SimulationResultValue):
+                raise TypeError("simulation data blocks require a canonical result.")
             if self.source_row is not None:
                 raise ValueError(
                     "simulation data blocks prohibit observation source_row."
@@ -1018,7 +971,7 @@ class ResultDataBlock:
         object.__setattr__(self, "series", tuple(normalized))
         object.__setattr__(self, "series_axes", series_axes)
         object.__setattr__(self, "x_axis", x_axis)
-        object.__setattr__(self, "result_entry", result_entry)
+        object.__setattr__(self, "result", result)
         object.__setattr__(self, "segment_ids", segment_ids)
         object.__setattr__(self, "segment_keys", segment_keys)
         object.__setattr__(self, "discontinuity_ids", discontinuity_ids)
@@ -1067,13 +1020,6 @@ class WorkspaceResultProjection:
         layers = tuple(self.plot_layers)
         if any(not isinstance(layer, WorkspacePlotLayer) for layer in layers):
             raise TypeError("plot_layers must contain only WorkspacePlotLayer values.")
-        if any(
-            layer.result_entry is not None and layer.result_entry.key.tab_id != tab_id
-            for layer in layers
-        ):
-            raise ValueError(
-                "projected repository entries must belong to projection tab_id."
-            )
         layer_ids = {layer.layer_id for layer in layers}
         if len(layer_ids) != len(layers):
             raise ValueError("plot layer IDs must be unique.")
@@ -1147,7 +1093,7 @@ class WorkspaceResultProjection:
                     primary_statistics.t,
                     primary_layer.t,
                 )
-                or primary_statistics.result_entry is not primary_layer.result_entry
+                or primary_statistics.result is not primary_layer.result
             ):
                 raise ValueError(
                     "primary statistics must use the primary result's "
@@ -1167,7 +1113,7 @@ class WorkspaceResultProjection:
                 for candidate in layers
                 if candidate.layer_id == block.block_id
             )
-            if block.result_entry is not layer.result_entry:
+            if block.result is not layer.result:
                 raise ValueError(
                     "copy block must retain the exact projected repository entry."
                 )
@@ -1299,11 +1245,11 @@ class WorkspaceResultProjection:
         seen: set[int] = set()
         warnings: list[WorkspacePlotLayer] = []
         for layer in self.plot_layers:
-            entry = layer.result_entry
+            entry = layer.result
             if (
                 not layer.visible
-                or entry is None
-                or not entry.result.provenance.completed_with_warnings
+                or not isinstance(entry, SimulationResultValue)
+                or not entry.completed_with_warnings
                 or id(entry) in seen
             ):
                 continue
@@ -1317,7 +1263,7 @@ class WorkspaceResultProjection:
         for layer in self.completion_warnings:
             details = "\n".join(
                 f"  • {detail}"
-                for detail in _result_warning_details(layer.result_entry)
+                for detail in _result_warning_details(layer.result)
             )
             groups.append(f"{layer.label}:\n{details}")
         return "\n\n".join(groups)
@@ -1327,14 +1273,13 @@ def _result_layer(
     *,
     set_id: str,
     label: str,
-    entry: ResultEntry,
+    result: SimulationResultValue,
     kind: ResultLayerKind,
     color_by_axis_selection: Mapping[AxisSeriesSelection, str],
     visible: bool = True,
 ) -> WorkspacePlotLayer:
-    if not isinstance(entry, (ExplicitResultEntry, PreviewResultEntry)):
-        raise TypeError("result layer requires a repository result entry.")
-    result = entry.result
+    if not isinstance(result, SimulationResultValue):
+        raise TypeError("result layer requires a canonical simulation result.")
     if kind is ResultLayerKind.PREVIEW:
         display_label = f"{label} [Preview]"
     elif kind is ResultLayerKind.REFERENCE:
@@ -1352,7 +1297,7 @@ def _result_layer(
         t=result.t,
         series=_series_tuple(result),
         series_axes=series_axes,
-        result_entry=entry,
+        result=result,
         segment_ids=result.segment_ids,
         segment_keys=result.segment_keys,
         discontinuity_ids=result.discontinuity_ids,
@@ -1420,7 +1365,7 @@ def _data_block(
             if name in selected_names
         ),
         x_axis=x_axis,
-        result_entry=layer.result_entry,
+        result=layer.result,
         segment_ids=layer.segment_ids,
         segment_keys=layer.segment_keys,
         discontinuity_ids=layer.discontinuity_ids,
@@ -1460,12 +1405,11 @@ def _statistics_block(
 ) -> ResultDataBlock | None:
     """Build selected-Y statistics against canonical simulation time."""
 
-    entry = layer.result_entry
-    if not isinstance(entry, (ExplicitResultEntry, PreviewResultEntry)):
-        raise TypeError("statistics require a repository result entry.")
-    result = entry.result
+    result = layer.result
+    if not isinstance(result, SimulationResultValue):
+        raise TypeError("statistics require a canonical simulation result.")
     series_axis_map = dict(layer.series_axes)
-    succeeded_algebra_outputs = set(result.provenance.succeeded_algebra_outputs)
+    succeeded_algebra_outputs = set(result.succeeded_algebra_outputs)
     selected = tuple(
         (name, values)
         for name, values in result.series.items()
@@ -1492,7 +1436,7 @@ def _statistics_block(
             if name in selected_names
         ),
         x_axis=SimulationSeriesAxisSelection("t"),
-        result_entry=entry,
+        result=result,
         segment_ids=result.segment_ids,
         segment_keys=result.segment_keys,
         discontinuity_ids=result.discontinuity_ids,
@@ -1554,11 +1498,11 @@ def _export_column_header(
 
 def _unique_result_entries(
     blocks: Sequence[ResultDataBlock],
-) -> tuple[ResultEntry, ...]:
+) -> tuple[SimulationResultValue, ...]:
     seen: set[int] = set()
-    ordered: list[ResultEntry] = []
+    ordered: list[SimulationResultValue] = []
     for block in blocks:
-        entry = block.result_entry
+        entry = block.result
         if entry is None:
             continue
         entry_identity = id(entry)
@@ -2013,6 +1957,7 @@ class WorkspaceResultPresenter:
         selected_x_series: AxisSeriesSelection = SimulationSeriesAxisSelection("t"),
         selected_y_series: Sequence[AxisSeriesSelection] = (),
         selected_y_uses_default_all: bool = True,
+        preview_set_ids: Sequence[str] = (),
     ) -> WorkspaceResultProjection:
         tab_id = _required_id(tab_id, "tab_id")
         if not isinstance(repository, ResultRepository):
@@ -2026,6 +1971,7 @@ class WorkspaceResultPresenter:
             raise ValueError("mechanism species roster must contain unique names.")
         mechanism_species_set = set(mechanism_species_ordered)
         current_id = str(current_set_id or "")
+        preview_ids = {_required_id(value, "preview set_id") for value in preview_set_ids}
         colors = {
             _axis_selection(
                 selection,
@@ -2148,7 +2094,7 @@ class WorkspaceResultPresenter:
             if isinstance(selection, SimulationSeriesAxisSelection):
                 add_axis_candidate(selection, selection.series_name)
         primary_layer_id: SimulationResultLayerIdentity | None = None
-        primary_entry: ResultEntry | None = None
+        primary_entry: SimulationResultValue | None = None
         primary_block: ResultDataBlock | None = None
         annotations: list[Mapping[str, object]] = []
         seen_set_ids: set[str] = set()
@@ -2160,19 +2106,17 @@ class WorkspaceResultPresenter:
                 raise ValueError(f"visible set {visible.set_id!r} is duplicated.")
             seen_set_ids.add(visible.set_id)
 
-            preview = repository.preview_entry(visible.set_id)
-            explicit = repository.explicit_entry(visible.set_id)
-            foreground_entry = preview if preview is not None else explicit
+            foreground_entry = repository.current_result(visible.set_id)
             foreground_kind = (
                 ResultLayerKind.PREVIEW
-                if preview is not None
+                if visible.set_id in preview_ids
                 else ResultLayerKind.EXPLICIT
             )
             if foreground_entry is not None:
                 foreground = _result_layer(
                     set_id=visible.set_id,
                     label=visible.label,
-                    entry=foreground_entry,
+                    result=foreground_entry,
                     kind=foreground_kind,
                     color_by_axis_selection=colors,
                 )
@@ -2199,13 +2143,13 @@ class WorkspaceResultPresenter:
             else:
                 foreground = None
 
-            reference = repository.reference_entry(visible.set_id)
+            reference = repository.reference_result(visible.set_id)
             reference_layer: WorkspacePlotLayer | None = None
             if reference is not None:
                 reference_layer = _result_layer(
                     set_id=visible.set_id,
                     label=visible.label,
-                    entry=reference,
+                    result=reference,
                     kind=ResultLayerKind.REFERENCE,
                     color_by_axis_selection=colors,
                     visible=bool(reference_lines_visible),
@@ -2236,18 +2180,18 @@ class WorkspaceResultPresenter:
                         # the layer visible and account for it in the single
                         # deterministic unavailable-X diagnostic.
                         unavailable_layers.append(reference_layer)
-                    annotations.extend(_annotations_from_execution(reference.result))
+                annotations.extend(_annotations_from_execution(reference))
 
             if foreground is not None:
-                assert foreground.result_entry is not None
+                assert foreground.result is not None
                 annotations.extend(
-                    _annotations_from_execution(foreground.result_entry.result)
+                    _annotations_from_execution(foreground.result)
                 )
             if visible.set_id == current_id:
                 foreground_block = (
                     None
                     if foreground is None
-                    or isinstance(foreground.result_entry, PreviewResultEntry)
+                    or foreground_kind is ResultLayerKind.PREVIEW
                     else _statistics_block(
                         foreground,
                         y_axes=wanted_y,
@@ -2256,24 +2200,21 @@ class WorkspaceResultPresenter:
                 )
                 if (
                     foreground is not None
-                    and not isinstance(
-                        foreground.result_entry,
-                        PreviewResultEntry,
-                    )
+                    and foreground_kind is not ResultLayerKind.PREVIEW
                     and (
                         foreground_block is not None
                         or reference_layer is None
                     )
                 ):
                     primary_layer_id = foreground.layer_id
-                    primary_entry = foreground.result_entry
+                    primary_entry = foreground.result
                     primary_block = foreground_block
                 elif reference_layer is not None:
                     # Pending, cancelled, or failed Preview has no replacement
                     # statistics.  The retained accepted Reference remains the
                     # analysis owner even when no foreground layer is present.
                     primary_layer_id = reference_layer.layer_id
-                    primary_entry = reference_layer.result_entry
+                    primary_entry = reference_layer.result
                     primary_block = _statistics_block(
                         reference_layer,
                         y_axes=wanted_y,
@@ -2345,7 +2286,7 @@ class WorkspaceResultPresenter:
                     ),
                 ),
                 series_axes=((experimental.raw_column, y_axis),),
-                result_entry=None,
+                result=None,
                 segment_ids=None,
                 segment_keys=None,
                 discontinuity_ids=None,
@@ -2375,7 +2316,7 @@ class WorkspaceResultPresenter:
                         series=layer.series,
                         series_axes=layer.series_axes,
                         x_axis=experimental_x_axis,
-                        result_entry=None,
+                        result=None,
                         segment_ids=layer.segment_ids,
                         segment_keys=layer.segment_keys,
                         discontinuity_ids=layer.discontinuity_ids,
@@ -2451,12 +2392,12 @@ class WorkspaceResultPresenter:
             primary_layer_id=primary_layer_id,
             plot_layers=tuple(layers),
             parameters=(
-                tuple(primary_entry.result.parameters)
+                tuple(primary_entry.parameters)
                 if primary_entry is not None
                 else ()
             ),
             scalar_values=(
-                tuple(primary_entry.result.scalars.items())
+                tuple(primary_entry.scalars.items())
                 if primary_entry is not None
                 else ()
             ),
@@ -2581,9 +2522,9 @@ class WorkspaceResultPresenter:
         for entry in result_entries:
             metadata_line = encode_tsv_row(
                 (
-                    "# Kindred repository entry",
+                    "# Kindred canonical result",
                     encode_clipboard_text(
-                        _canonical_json(_result_entry_payload(entry))
+                            _canonical_json(_result_provenance_payload(entry))
                     ),
                 )
             )
@@ -2680,7 +2621,7 @@ class WorkspaceResultPresenter:
         workbook = Workbook(write_only=True)
         used: set[str] = set()
         lineage_rows: list[tuple[str, str, Mapping[str, object]]] = []
-        metadata_rows: list[tuple[str, ResultEntry]] = []
+        metadata_rows: list[tuple[str, SimulationResultValue]] = []
         metadata_ids: set[int] = set()
         data_rows = 0
         archive: ZipFile | None = None
@@ -2744,7 +2685,7 @@ class WorkspaceResultPresenter:
                     for name, provenance in block.series_provenance
                     if provenance
                 )
-                entry = block.result_entry
+                entry = block.result
                 if entry is not None and id(entry) not in metadata_ids:
                     metadata_ids.add(id(entry))
                     metadata_rows.append((title, entry))
@@ -2807,7 +2748,7 @@ class WorkspaceResultPresenter:
                         metadata_sheet,
                         (
                             title,
-                            _canonical_json(_result_entry_payload(entry)),
+                            _canonical_json(_result_provenance_payload(entry)),
                         ),
                     )
                 metadata_sheet.sheet_state = "hidden"

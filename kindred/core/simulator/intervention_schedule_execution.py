@@ -841,7 +841,6 @@ class InterventionScheduleExecutionOwner:
                     reason=status_reason,
                 )
             )
-            provenance.pop("symbolic_jacobian_identity", None)
             provenance.update(runtime_symbolic_jacobian.provenance_fields())
         _publish_direct_result_sample_identity(
             provenance,

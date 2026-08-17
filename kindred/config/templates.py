@@ -212,9 +212,6 @@ class TemplateManager:
         )
 
     def _get_templates_directory(self) -> Path:
-        override = os.environ.get("KINDRED_TEMPLATES_DIR")
-        if override:
-            return Path(str(override)).expanduser().resolve()
         config_dir = QStandardPaths.writableLocation(
             QStandardPaths.StandardLocation.AppDataLocation
         )

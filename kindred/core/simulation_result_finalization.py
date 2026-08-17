@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import Any, Mapping
 
 import numpy as np
@@ -12,7 +11,6 @@ from kindred.core.ode_builder import build_effective_rate_coefficient_evaluator
 from kindred.core.simulation_algebra_policy import SimulationAlgebraPolicy
 from kindred.core.simulation_failure import FactualCause
 from kindred.core.result_repository import (
-    SimulationResultProvenance,
     SimulationResultValue,
 )
 from kindred.core.simulator.parameter_namespace import build_namespace_from_mechanism
@@ -28,7 +26,6 @@ from kindred.core.algebra.simulation_series import (
 )
 
 __all__ = [
-    "FinalizedSimulationResult",
     "build_simulation_row_algebra_context",
     "evaluate_simulation_result_algebra",
     "finalize_simulation_result",
@@ -47,31 +44,6 @@ def _immutable_exact_float_matrix(value: object) -> np.ndarray:
     array = np.array(value, dtype=float, copy=True)
     array.setflags(write=False)
     return array
-
-
-@dataclass(frozen=True)
-class FinalizedSimulationResult:
-    y: np.ndarray
-    species_names: list[str]
-    base_species_count: int
-    algebra_scalars: dict[str, float]
-    algebra_errors: tuple[FactualCause, ...]
-
-    def __post_init__(self) -> None:
-        y = _immutable_exact_float_matrix(self.y)
-        if y.ndim != 2:
-            raise ValueError("finalized simulation matrix must be two-dimensional.")
-        object.__setattr__(self, "y", y)
-        object.__setattr__(self, "species_names", list(self.species_names))
-        object.__setattr__(
-            self,
-            "algebra_scalars",
-            {str(name): float(value) for name, value in self.algebra_scalars.items()},
-        )
-        errors = tuple(self.algebra_errors or ())
-        if any(not isinstance(error, FactualCause) for error in errors):
-            raise TypeError("finalized algebra errors must be FactualCause values.")
-        object.__setattr__(self, "algebra_errors", errors)
 
 
 def _initials_for_algebra(
@@ -255,7 +227,13 @@ def evaluate_simulation_result_algebra(
     temperature_schedule: TemperatureScheduleProtocol | Mapping[str, object] | None,
     parameter_algebra_spec: object,
     algebra_policy: SimulationAlgebraPolicy | str,
-) -> FinalizedSimulationResult:
+) -> tuple[
+    np.ndarray,
+    list[str],
+    int,
+    dict[str, float],
+    tuple[FactualCause, ...],
+]:
     base_species_names = [str(name) for name in species_names]
     if (
         not base_species_names
@@ -281,12 +259,12 @@ def evaluate_simulation_result_algebra(
     algebra_errors: tuple[FactualCause, ...] = ()
 
     if compiled_algebra_for_mechanism(mechanism) is None:
-        return FinalizedSimulationResult(
-            y=result_y,
-            species_names=base_species_names,
-            base_species_count=len(base_species_names),
-            algebra_scalars=algebra_scalars,
-            algebra_errors=algebra_errors,
+        return (
+            result_y,
+            base_species_names,
+            len(base_species_names),
+            algebra_scalars,
+            algebra_errors,
         )
 
     species_series = {
@@ -295,12 +273,12 @@ def evaluate_simulation_result_algebra(
     }
     compiled = compiled_algebra_for_mechanism(mechanism)
     if compiled is None:
-        return FinalizedSimulationResult(
-            y=result_y,
-            species_names=base_species_names,
-            base_species_count=len(base_species_names),
-            algebra_scalars=algebra_scalars,
-            algebra_errors=algebra_errors,
+        return (
+            result_y,
+            base_species_names,
+            len(base_species_names),
+            algebra_scalars,
+            algebra_errors,
         )
     policy = simulation_algebra_policy.coerce_simulation_algebra_policy(
         algebra_policy,
@@ -388,12 +366,12 @@ def evaluate_simulation_result_algebra(
     algebra_scalars = dict(evaluation.scalars)
     algebra_errors = tuple(evaluation.errors)
     if not evaluation.series:
-        return FinalizedSimulationResult(
-            y=result_y,
-            species_names=base_species_names,
-            base_species_count=len(base_species_names),
-            algebra_scalars=algebra_scalars,
-            algebra_errors=algebra_errors,
+        return (
+            result_y,
+            base_species_names,
+            len(base_species_names),
+            algebra_scalars,
+            algebra_errors,
         )
 
     algebra_names = [str(name) for name in evaluation.series.keys()]
@@ -407,12 +385,12 @@ def evaluate_simulation_result_algebra(
         ]
     )
     expanded_y.setflags(write=False)
-    return FinalizedSimulationResult(
-        y=expanded_y,
-        species_names=base_species_names + algebra_names,
-        base_species_count=len(base_species_names),
-        algebra_scalars=algebra_scalars,
-        algebra_errors=algebra_errors,
+    return (
+        expanded_y,
+        base_species_names + algebra_names,
+        len(base_species_names),
+        algebra_scalars,
+        algebra_errors,
     )
 
 
@@ -530,7 +508,13 @@ def finalize_simulation_result(
         raise ValueError(
             "solver result identity must align with unique result rows."
         )
-    finalized = evaluate_simulation_result_algebra(
+    (
+        finalized_y,
+        finalized_species_names,
+        finalized_base_species_count,
+        finalized_algebra_scalars,
+        finalized_algebra_errors,
+    ) = evaluate_simulation_result_algebra(
         mechanism=mechanism,
         result=result,
         species_names=species_names,
@@ -553,13 +537,13 @@ def finalize_simulation_result(
         if compiled_algebra is None
         else tuple(compiled_algebra.observable_names)
     )
-    succeeded_names = set(finalized.algebra_scalars)
+    succeeded_names = set(finalized_algebra_scalars)
     succeeded_names.update(
-        finalized.species_names[finalized.base_species_count :]
+        finalized_species_names[finalized_base_species_count:]
     )
     failed_names = {
         str(error.details.get("name") or "")
-        for error in finalized.algebra_errors
+        for error in finalized_algebra_errors
         if str(error.details.get("name") or "") in requested_algebra_outputs
     }
     succeeded_algebra_outputs = tuple(
@@ -580,23 +564,21 @@ def finalize_simulation_result(
     return SimulationResultValue(
         t=result_time,
         series={
-            str(name): finalized.y[index, :]
-            for index, name in enumerate(finalized.species_names)
+            str(name): finalized_y[index, :]
+            for index, name in enumerate(finalized_species_names)
         },
         segment_ids=segment_ids,
         segment_keys=segment_keys,
         discontinuity_ids=discontinuity_ids,
-        scalars=finalized.algebra_scalars,
+        scalars=finalized_algebra_scalars,
         parameters=parameters,
-        provenance=SimulationResultProvenance(
-            solver=retained_solver_provenance,
-            preparation_warnings=tuple(preparation_warnings),
-            requested_algebra_outputs=requested_algebra_outputs,
-            succeeded_algebra_outputs=succeeded_algebra_outputs,
-            failed_algebra_outputs=failed_algebra_outputs,
-            omitted_algebra_outputs=omitted_algebra_outputs,
-            algebra_errors=tuple(finalized.algebra_errors),
-        ),
+        solver_provenance=retained_solver_provenance,
+        preparation_warnings=tuple(preparation_warnings),
+        requested_algebra_outputs=requested_algebra_outputs,
+        succeeded_algebra_outputs=succeeded_algebra_outputs,
+        failed_algebra_outputs=failed_algebra_outputs,
+        omitted_algebra_outputs=omitted_algebra_outputs,
+        algebra_errors=finalized_algebra_errors,
         intervention_execution=getattr(result, "intervention_execution"),
         presentation_boundaries=result.presentation_boundaries,
     )

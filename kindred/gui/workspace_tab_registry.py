@@ -338,6 +338,15 @@ class WorkspaceTabRegistry:
             previous_document,
             document,
         )
+        previous_dataset_ids = {
+            dataset.dataset_id for dataset in previous_document.datasets
+        }
+        current_dataset_ids = {
+            dataset.dataset_id for dataset in document.datasets
+        }
+        removed_dataset_ids = frozenset(
+            previous_dataset_ids - current_dataset_ids
+        )
         tab_ids = {tab.tab_id for tab in document.tabs}
         next_presentation = {
             tab_id: state
@@ -358,7 +367,11 @@ class WorkspaceTabRegistry:
                 tab.tab_id,
                 default_project_presentation_state(tab),
             )
-            next_presentation[tab.tab_id] = state.reconciled(document, tab)
+            next_presentation[tab.tab_id] = state.reconciled(
+                document,
+                tab,
+                removed_dataset_ids=removed_dataset_ids,
+            )
             runtime = next_runtime.get(tab.tab_id)
             if runtime is None:
                 runtime = self._runtime_factory(tab.tab_id)

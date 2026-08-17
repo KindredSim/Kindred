@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import logging
 import math
-import hashlib
 from dataclasses import dataclass, field, replace
 from types import MappingProxyType
 from typing import Any, Callable, Dict, List, Literal, Mapping, Optional, Sequence, Tuple
@@ -404,7 +403,6 @@ class DatasetFitInfo:
     x_match_kinds: tuple[str, ...] = ()
     x_sample_kinds: tuple[str, ...] = ()
     x_source_rows: tuple[int, ...] = ()
-    x_identity_hash: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "dataset_id", str(self.dataset_id or "").strip())
@@ -435,11 +433,6 @@ class DatasetFitInfo:
         object.__setattr__(self, "x_match_kinds", tuple(str(item) for item in self.x_match_kinds))
         object.__setattr__(self, "x_sample_kinds", tuple(str(item) for item in self.x_sample_kinds))
         object.__setattr__(self, "x_source_rows", tuple(int(item) for item in self.x_source_rows))
-        if self.x_identity_hash is not None:
-            identity = str(self.x_identity_hash).strip()
-            if not identity:
-                raise ValueError("Dataset X identity hash cannot be blank.")
-            object.__setattr__(self, "x_identity_hash", identity)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1226,41 +1219,6 @@ def _payload_x_observations(payload: FitDatasetSpec) -> Dict[str, object]:
         "raw_observation_id": source.raw_observation_id,
         "raw_column": source.raw_column,
     }
-
-
-def _x_target_multiplier(payload: FitDatasetSpec) -> float:
-    if payload.x_name == "t":
-        raise ValueError("Time-X datasets do not have an X objective target.")
-    multipliers = _normalized_target_weight_multipliers(
-        species_list=payload.target_roster,
-        target_weights=dict(payload.target_weights),
-    )
-    return float(multipliers[payload.x_name])
-
-
-def _x_identity_hash(
-    payload: FitDatasetSpec,
-    projection: ParametricXProjection | None,
-    *,
-    dataset_weight: float,
-) -> str | None:
-    """Hash the canonical X roster and terminal projection exactly once."""
-
-    if projection is None or payload.x_observations is None:
-        return None
-    digest = hashlib.sha256()
-    digest.update(str(payload.dataset_id).encode("utf-8"))
-    digest.update(str(payload.x_name).encode("utf-8"))
-    digest.update(repr(tuple(payload.x_source_rows)).encode("ascii"))
-    digest.update(np.asarray(payload.x_values_for_rows(), dtype=np.float64).tobytes())
-    digest.update(repr(float(dataset_weight)).encode("ascii"))
-    digest.update(repr(float(_x_target_multiplier(payload))).encode("ascii"))
-    digest.update(repr(int(projection.size)).encode("ascii"))
-    digest.update(np.asarray(projection.selected_model_x, dtype=np.float64).tobytes())
-    digest.update(np.asarray(projection.delta_x, dtype=np.float64).tobytes())
-    digest.update(repr(projection.match_kinds).encode("utf-8"))
-    digest.update(repr(projection.sample_kinds).encode("utf-8"))
-    return digest.hexdigest()
 
 
 def fit_result_target_values(
@@ -2500,30 +2458,7 @@ class GlobalFitObjective:
                     if x_name == "t":
                         y_sim = selected_rows[1]
                 except CandidateParametricAlignmentError as exc:
-                    # Parametric-X is a candidate result predicate, but its
-                    # settlement still belongs to this optimizer boundary:
-                    # only exact optimizer-origin names may receive penalty.
                     details = dict(getattr(exc, "details", None) or {})
-                    optimizer_names = frozenset(
-                        str(name).strip()
-                        for name, origin in parameter_origins.items()
-                        if str(name).strip()
-                        and origin
-                        in {
-                            FITTING_PARAM_ORIGIN_OPTIMIZER_SHARED,
-                            FITTING_PARAM_ORIGIN_OPTIMIZER_DATASET,
-                        }
-                    )
-                    dependencies = frozenset(
-                        str(name).strip()
-                        for name in (
-                            details.get("value_dependencies", ())
-                            or details.get("parameter_names", ())
-                            or ()
-                        )
-                        if str(name).strip()
-                    )
-                    candidate_dependencies = dependencies.intersection(optimizer_names)
                     candidate_facts = {
                         "values": dict(full_params),
                         "origins": dict(parameter_origins),
@@ -2537,15 +2472,6 @@ class GlobalFitObjective:
                             "candidate_parameter_facts": candidate_facts,
                         }
                     )
-                    if dependencies:
-                        details.update(
-                            {
-                                "value_dependencies": tuple(sorted(dependencies)),
-                                "optimizer_dependencies": tuple(
-                                    sorted(candidate_dependencies)
-                                ),
-                            }
-                        )
                     factual_cause = factual_cause_from_exception(
                         exc,
                         domain="fit",
@@ -3152,11 +3078,6 @@ def _assemble_fit_replay_state(
                 ),
                 x_source_rows=(
                     () if x_projection is None else x_projection.source_rows
-                ),
-                x_identity_hash=_x_identity_hash(
-                    payload,
-                    x_projection,
-                    dataset_weight=weights.get(ds_id, 1.0),
                 ),
             )
         )

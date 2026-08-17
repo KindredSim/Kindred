@@ -27,14 +27,12 @@ from kindred.core.symbolic.structure_cache import (
 from kindred.core.temperature import (
     TemperatureScheduleDictProtocol,
     TemperatureScheduleProtocol,
-    temperature_schedule_execution_identity,
 )
 from kindred.core.time_grid import normalize_time_grid_policy
 
 logger = logging.getLogger(__name__)
 
 __all__ = [
-    "PreparedRunContext",
     "PreparedSolverConfig",
     "build_prepared_run_context",
     "build_solver_config",
@@ -83,15 +81,6 @@ class PreparedSolverConfig:
             "grid",
             MappingProxyType(normalize_time_grid_policy(self.grid)),
         )
-
-
-@dataclass(frozen=True, slots=True)
-class PreparedRunContext:
-    """ODE/Jacobian preparation result owned by one request."""
-
-    temperature_schedule: TemperatureScheduleProtocol | None
-    symbolic_jacobian: SymbolicJacobianExecution
-    warnings: Tuple[str, ...]
 
 
 def build_solver_config(
@@ -185,25 +174,19 @@ def _bind_symbolic_jacobian_for_current_mechanism(
         raise UnsupportedSymbolicExpressionError("symbolic structure is unsupported.")
     from kindred.core.ode_builder import build_effective_rate_coefficient_evaluator
 
-    schedule_identity = None
     if temperature_schedule is not None:
         if not isinstance(temperature_schedule, TemperatureScheduleDictProtocol):
             raise UnsupportedSymbolicExpressionError(
                 "Symbolic Jacobian requires a deterministic typed temperature "
                 "schedule; arbitrary callables are unsupported."
             )
-        schedule_identity = dict(
-            temperature_schedule_execution_identity(temperature_schedule) or {}
-        )
     coefficient_evaluator = build_effective_rate_coefficient_evaluator(mechanism)
-    symbolic_artifact = structure.bind(
+    jacobian_func = structure.bind(
         coefficient_evaluator,
         temperature_schedule=temperature_schedule,
-        schedule_identity=schedule_identity,
     )
     return SymbolicJacobianExecution.supported(
-        jacobian_func=symbolic_artifact.jacobian_func,
-        identity=symbolic_artifact.identity.to_payload(),
+        jacobian_func=jacobian_func,
         jac_sparsity=structure.jac_sparsity,
     )
 
@@ -214,7 +197,11 @@ def build_prepared_run_context(
     solver_config: PreparedSolverConfig,
     temperature_schedule: TemperatureScheduleProtocol | None,
     metadata_view: Callable[..., Any],
-) -> PreparedRunContext:
+) -> tuple[
+    TemperatureScheduleProtocol | None,
+    SymbolicJacobianExecution,
+    Tuple[str, ...],
+]:
     """Prepare temperature, symbolic Jacobian, and ODE metadata as one stage."""
 
     mech_meta = metadata_view(
@@ -243,8 +230,4 @@ def build_prepared_run_context(
             )
             logger.warning("%s", symbolic_message)
             warnings.append(symbolic_message)
-    return PreparedRunContext(
-        temperature_schedule=resolved_temperature_schedule,
-        symbolic_jacobian=symbolic_jacobian,
-        warnings=tuple(warnings),
-    )
+    return resolved_temperature_schedule, symbolic_jacobian, tuple(warnings)

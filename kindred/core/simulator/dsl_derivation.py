@@ -141,10 +141,9 @@ def rewrite_scalar_source_line(
         raise ValueError("expression must be single-line text.")
     before_comment, marker, comment = source_line.partition("#")
     match = re.match(
-        rf"^(?P<prefix>\s*param\s+{re.escape(name)}\s*=\s*)"
+        rf"^(?P<prefix>\s*(?i:param)\s+{re.escape(name)}\s*=\s*)"
         rf"(?P<rhs>.*)$",
         before_comment,
-        flags=re.IGNORECASE,
     )
     if match is None:
         raise ValueError(f"Scalar parameter {name!r} origin is invalid.")
@@ -222,7 +221,7 @@ def scalar_origin(
     """Return the unique retained source origin for one scalar declaration."""
 
     pattern = re.compile(
-        rf"^\s*param\s+{re.escape(name)}\s*=",
+        rf"^\s*(?i:param)\s+{re.escape(name)}\s*=",
     )
     matches = [
         origin

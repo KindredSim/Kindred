@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import hashlib
-import json
 import math
 from dataclasses import dataclass
 from numbers import Real
@@ -171,15 +169,6 @@ _AUTHORED_FLOAT_FIELDS = frozenset(
     }
 )
 _AUTHORED_INTEGER_FIELDS = frozenset({"count", "max_count"})
-
-
-def _canonical_bytes(value: object) -> bytes:
-    return json.dumps(
-        value,
-        sort_keys=True,
-        separators=(",", ":"),
-        ensure_ascii=True,
-    ).encode("utf-8")
 
 
 def _finite(value: object, *, field: str) -> float:
@@ -1179,12 +1168,6 @@ class InterventionSchedule:
 
     def to_payload(self) -> dict[str, Any]:
         return {"operations": [item.to_payload() for item in self.operations]}
-
-    @property
-    def fingerprint(self) -> str:
-        if self.is_empty():
-            return ""
-        return hashlib.sha256(_canonical_bytes(self.to_payload())).hexdigest()
 
     def validate_species(self, species_names: Sequence[str]) -> None:
         available = {str(name) for name in species_names}

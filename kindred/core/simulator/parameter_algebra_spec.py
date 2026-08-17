@@ -24,12 +24,11 @@ from kindred.core.simulator.parameter_namespace import (
     is_protected_indexed_identifier,
 )
 
-_PARAM_STMT_RE = re.compile(r"^\s*param\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.+?)\s*$", re.IGNORECASE)
-_LET_STMT_RE = re.compile(r"^\s*let\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.+?)\s*$", re.IGNORECASE)
+_PARAM_STMT_RE = re.compile(r"^\s*(?i:param)\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.+?)\s*$")
+_LET_STMT_RE = re.compile(r"^\s*(?i:let)\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.+?)\s*$")
 _ASSIGN_RE = re.compile(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=")
 _ARROW_RE = re.compile(r"<->|<=>|->|=>")
 _MECH_PARAM_RE = re.compile(r"^(k|kf|kr|Keq)(\d+)$")
-_MECH_PARAM_CI_RE = re.compile(r"^(?:k|kf|kr|keq)(\d+)$", re.IGNORECASE)
 _PROTECTED_STEP_KEY_IDENTIFIERS = frozenset({"k", "kf", "kr", "keq"})
 _NON_ALGEBRA_ASSIGNMENT_PREFIXES = {
     "energy",
@@ -1077,7 +1076,7 @@ def extract_parameter_assignments_from_algebra_lines(
                     line_number=line_no,
                     line_content=original,
                 )
-            m_mech = _MECH_PARAM_CI_RE.match(raw_name)
+            m_mech = _MECH_PARAM_RE.match(raw_name)
             if m_mech and resolution.canonical_name is None and name not in mechanism_param_names:
                 raise DSLError(
                     f"Unknown mechanism parameter {raw_name!r} in Algebra param statement",

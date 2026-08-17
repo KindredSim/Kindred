@@ -2,14 +2,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import re
-from typing import Iterable, Iterator, Mapping, Sequence
+from typing import Iterator, Mapping, Sequence
 
 from kindred.core.equilibrium_rate_authority import (
     authority_fields_from_step_entry,
 )
 from kindred.core.validation import try_parse_int
 
-_PROTECTED_INDEXED_IDENTIFIER_RE = re.compile(r"^(?:K|k|kf|kr|Keq)([1-9]\d*)$", re.IGNORECASE)
+_PROTECTED_INDEXED_IDENTIFIER_RE = re.compile(r"^(?:k|kf|kr|keq)([1-9]\d*)$")
 
 
 @dataclass(frozen=True)
@@ -48,13 +48,11 @@ class MechanismParameterNamespaceItem:
 @dataclass(frozen=True)
 class MechanismParameterNamespace:
     canonical_names: frozenset[str]
-    canonical_by_lower: Mapping[str, str]
     info_by_name: Mapping[str, MechanismParameterInfo]
     ordered_items: tuple[MechanismParameterNamespaceItem, ...]
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "canonical_names", frozenset(self.canonical_names))
-        object.__setattr__(self, "canonical_by_lower", dict(self.canonical_by_lower))
         object.__setattr__(self, "info_by_name", dict(self.info_by_name))
         object.__setattr__(self, "ordered_items", tuple(self.ordered_items))
 
@@ -62,16 +60,16 @@ class MechanismParameterNamespace:
         return set(self.canonical_names)
 
     def resolve(self, raw_name: str) -> MechanismParameterResolution:
-        direct_match = self.canonical_by_lower.get(str(raw_name).lower())
-        if direct_match is not None:
-            return MechanismParameterResolution(raw_name=str(raw_name), canonical_name=direct_match)
+        name = str(raw_name)
+        if name in self.canonical_names:
+            return MechanismParameterResolution(raw_name=name, canonical_name=name)
 
-        return MechanismParameterResolution(raw_name=str(raw_name))
+        return MechanismParameterResolution(raw_name=name)
 
     def invalid_protected_indexed_identifier(self, raw_name: str) -> InvalidProtectedIndexedIdentifier | None:
         if self.resolve(str(raw_name)).canonical_name is not None:
             return None
-        match = _PROTECTED_INDEXED_IDENTIFIER_RE.match(str(raw_name))
+        match = _protected_indexed_identifier_match(raw_name)
         if match is None:
             return None
         return self._invalid_indexed_identifier_match(raw_name, match.group(1))
@@ -102,7 +100,16 @@ class MechanismParameterNamespace:
         suggestions = tuple(
             name
             for lookup in (f"k{step_index}", f"kf{step_index}", f"kr{step_index}", f"keq{step_index}")
-            for name in [self.canonical_by_lower.get(lookup.lower())]
+            for name in [
+                next(
+                    (
+                        canonical
+                        for canonical in self.canonical_names
+                        if canonical.casefold() == lookup.casefold()
+                    ),
+                    None,
+                )
+            ]
             if name is not None
         )
         return InvalidProtectedIndexedIdentifier(
@@ -127,11 +134,11 @@ class _StepNamespacePolicy:
 
 
 def is_protected_indexed_identifier(raw_name: str) -> bool:
-    return bool(_PROTECTED_INDEXED_IDENTIFIER_RE.fullmatch(str(raw_name or "")))
+    return _protected_indexed_identifier_match(raw_name) is not None
 
 
 def protected_indexed_identifier_step_index(raw_name: str) -> int | None:
-    match = _PROTECTED_INDEXED_IDENTIFIER_RE.fullmatch(str(raw_name or ""))
+    match = _protected_indexed_identifier_match(raw_name)
     if match is None:
         return None
     step_index, ok = try_parse_int(match.group(1))
@@ -140,17 +147,16 @@ def protected_indexed_identifier_step_index(raw_name: str) -> int | None:
     return int(step_index)
 
 
-def _canonical_lookup(names: Iterable[str]) -> dict[str, str]:
-    canonical_by_lower: dict[str, str] = {}
-    for name in names:
-        lowered = str(name).lower()
-        existing = canonical_by_lower.get(lowered)
-        if existing is not None and existing != name:
-            raise ValueError(
-                f"Conflicting mechanism parameter names for case-insensitive lookup: {existing!r} and {name!r}"
-            )
-        canonical_by_lower[lowered] = str(name)
-    return canonical_by_lower
+def _protected_indexed_identifier_match(raw_name: str) -> re.Match[str] | None:
+    """Recognize protected indexed spellings for diagnostics only.
+
+    Resolution itself remains exact-case.  Folding here only lets diagnostics
+    identify a misspelled protected name and offer its exact canonical form.
+    """
+
+    return _PROTECTED_INDEXED_IDENTIFIER_RE.fullmatch(
+        str(raw_name or "").casefold()
+    )
 
 
 def _iter_canonical_items(
@@ -214,11 +220,9 @@ def _build_namespace(descriptors: Sequence[_NamespaceStepDescriptor]) -> Mechani
         seen_names.add(item.canonical_name)
         ordered_names.append(item.canonical_name)
     canonical_names = frozenset(ordered_names)
-    canonical_by_lower = _canonical_lookup(ordered_names)
     info_by_name = {item.canonical_name: item.info for item in ordered_items}
     return MechanismParameterNamespace(
         canonical_names=canonical_names,
-        canonical_by_lower=canonical_by_lower,
         info_by_name=info_by_name,
         ordered_items=ordered_items,
     )

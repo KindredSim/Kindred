@@ -32,8 +32,6 @@ from kindred.core.ode_builder import (
 from kindred.core.rate_binding import ForwardRateBinding, RateBinding
 from kindred.core.simulator.errors import DSLError
 from kindred.core.simulator.step_indexing import get_step_index_map
-from kindred.core.symbolic.backend import get_symbolic_backend_metadata
-from kindred.core.symbolic.identity import symbolic_fingerprint
 from kindred.core.temperature import TemperatureScheduleDictProtocol
 from kindred.core.units import UnitsModel
 
@@ -72,7 +70,9 @@ class WegscheiderCycle:
     authority_parameter_names: tuple[str, ...] = ()
     authority_exponents: tuple[int, ...] = ()
     resolved_by: str | None = None
-    structural_fingerprint: str | None = None
+    selected_step_stoichiometric_vectors: tuple[
+        tuple[tuple[str, Fraction], ...], ...
+    ] = ()
     admission_status: str = "unavailable"
     admission_reason: str | None = None
     admission_log_product: float | None = None
@@ -81,33 +81,14 @@ class WegscheiderCycle:
 
 @dataclass(frozen=True)
 class WegscheiderTopologyReport:
-    """Cycle identity derived only from canonical reversible stoichiometry."""
+    """Readable cycle topology derived from canonical reversible stoichiometry."""
 
     cycles: tuple[WegscheiderCycle, ...]
-
-    @property
-    def topology_fingerprint(self) -> str:
-        return symbolic_fingerprint(
-            {
-                "kind": "wegscheider-topology",
-                "cycles": [
-                    {
-                        "cycle_id": cycle.cycle_id,
-                        "step_indices": cycle.step_indices,
-                        "equilibrium_indices": cycle.equilibrium_indices,
-                        "coefficients": cycle.coefficients,
-                        "structural_fingerprint": cycle.structural_fingerprint,
-                    }
-                    for cycle in self.cycles
-                ],
-            }
-        )
 
 
 @dataclass(frozen=True)
 class WegscheiderCyclicityReport:
     cycles: tuple[WegscheiderCycle, ...]
-    topology_fingerprint: str = ""
 
     @property
     def unresolved_cycles(self) -> tuple[WegscheiderCycle, ...]:
@@ -116,78 +97,6 @@ class WegscheiderCyclicityReport:
     @property
     def is_resolved(self) -> bool:
         return not self.unresolved_cycles
-
-    @property
-    def symbolic_identity(self) -> dict[str, Any]:
-        metadata = get_symbolic_backend_metadata()
-        cycles_payload = [
-            {
-                "cycle_id": str(cycle.cycle_id),
-                "step_indices": list(cycle.step_indices),
-                "equilibrium_indices": list(cycle.equilibrium_indices),
-                "coefficients": list(cycle.coefficients),
-                "parameter_names": list(cycle.parameter_names),
-                "correction_exponents": list(cycle.correction_exponents),
-                "authority_parameter_names": list(
-                    cycle.authority_parameter_names
-                ),
-                "authority_exponents": list(cycle.authority_exponents),
-                "resolved_by": cycle.resolved_by,
-                "structural_fingerprint": cycle.structural_fingerprint,
-                "admission_status": cycle.admission_status,
-                "admission_reason": cycle.admission_reason,
-                "admission_log_product": cycle.admission_log_product,
-                "admission_parameter_values": list(
-                    cycle.admission_parameter_values
-                ),
-            }
-            for cycle in self.cycles
-        ]
-        source_cycles_payload = [
-            {
-                "cycle_id": str(cycle.cycle_id),
-                "step_indices": list(cycle.step_indices),
-                "equilibrium_indices": list(cycle.equilibrium_indices),
-                "coefficients": list(cycle.coefficients),
-                "parameter_names": list(cycle.parameter_names),
-                "correction_exponents": list(cycle.correction_exponents),
-                "authority_parameter_names": list(
-                    cycle.authority_parameter_names
-                ),
-                "authority_exponents": list(cycle.authority_exponents),
-            }
-            for cycle in self.cycles
-        ]
-        payload: dict[str, Any] = {
-            "kind": "wegscheider_cyclicity",
-            "stage": "admission",
-            "backend_name": metadata.backend_name,
-            "backend_version": metadata.backend_version,
-            "profile_version": metadata.profile_version,
-            "cycles": cycles_payload,
-            "resolved": bool(self.is_resolved),
-            "topology_fingerprint": (
-                self.topology_fingerprint
-                or WegscheiderTopologyReport(self.cycles).topology_fingerprint
-            ),
-        }
-        source_payload = {
-            "kind": "wegscheider_cyclicity_source",
-            "cycles": source_cycles_payload,
-        }
-        payload["source_fingerprint"] = symbolic_fingerprint(source_payload)
-        payload["artifact_fingerprint"] = symbolic_fingerprint(
-            {
-                "kind": "wegscheider_cyclicity_admission",
-                "resolved": bool(self.is_resolved),
-                "structural_fingerprints": [
-                    item.get("structural_fingerprint")
-                    for item in cycles_payload
-                ],
-            }
-        )
-        payload["fingerprint"] = symbolic_fingerprint(payload)
-        return payload
 
 @dataclass(frozen=True)
 class WegscheiderExecutableCycleSatisfaction:
@@ -243,43 +152,6 @@ class WegscheiderExecutableSatisfactionReport:
     @property
     def is_satisfied(self) -> bool:
         return not self.failed_cycles
-
-    @property
-    def symbolic_identity(self) -> dict[str, Any]:
-        admission_identity = self.admission_report.symbolic_identity
-        executable_payload = {
-            "kind": "wegscheider-bound-executable",
-            "admission_fingerprint": admission_identity["fingerprint"],
-            "cycles": [
-                {
-                    "cycle_id": cycle.cycle_id,
-                    "status": cycle.status,
-                    "temperatures_K": cycle.temperatures_K,
-                    "log_products": cycle.log_products,
-                    "reason": cycle.reason,
-                    "parameter_names": cycle.parameter_names,
-                    "authority_parameter_names": cycle.authority_parameter_names,
-                }
-                for cycle in self.cycles
-            ],
-        }
-        executable_fingerprint = symbolic_fingerprint(executable_payload)
-        return {
-            "kind": "wegscheider-staged-satisfaction",
-            "topology": admission_identity["topology_fingerprint"],
-            "admission": admission_identity["fingerprint"],
-            "executable": executable_fingerprint,
-            "admission_report": admission_identity,
-            "executable_report": executable_payload,
-            "resolved": bool(self.is_satisfied),
-            "fingerprint": symbolic_fingerprint(
-                {
-                    "topology": admission_identity["topology_fingerprint"],
-                    "admission": admission_identity["fingerprint"],
-                    "executable": executable_fingerprint,
-                }
-            ),
-        }
 
 @dataclass(frozen=True)
 class WegscheiderResolutionUpdate:
@@ -645,7 +517,7 @@ def build_wegscheider_resolution_updates(
         cycle = cycles_by_id.get(str(cycle_id))
         if cycle is None:
             raise ValueError(f"Unknown Wegscheider cycle id {cycle_id!r}.")
-        parameter_key = str(parameter_name).lower()
+        parameter_key = str(parameter_name)
         previous_cycle = requested_parameters.get(parameter_key)
         if previous_cycle is not None:
             raise ValueError(
@@ -654,9 +526,9 @@ def build_wegscheider_resolution_updates(
             )
         requested_parameters[parameter_key] = str(cycle_id)
         terms = _cycle_correction_terms(cycle)
-        is_dg = str(parameter_name).casefold().startswith("dg_eq")
+        is_dg = str(parameter_name).startswith("dG_eq")
         dg_terms = tuple(
-            name.casefold().startswith("dg_eq")
+            name.startswith("dG_eq")
             for name, _coefficient in terms
         )
         if any(dg_terms) and not all(dg_terms):
@@ -703,7 +575,7 @@ def apply_wegscheider_resolution_to_reactions_text(
     if type(units) is not UnitsModel:
         raise TypeError("Detailed-balance correction units must be UnitsModel.")
     normalized_updates = tuple(updates)
-    names = tuple(str(update.parameter_name).casefold() for update in normalized_updates)
+    names = tuple(str(update.parameter_name) for update in normalized_updates)
     if len(names) != len(set(names)):
         raise ValueError("Detailed-balance source updates must have unique targets.")
     if not normalized_updates:
@@ -760,7 +632,7 @@ def _materialize_admitted_canonical_source_updates(
         line_endings = [""]
     origin_positions = origin_line_positions(analysis, dsl_text)
     def source_coordinate_location(name: str) -> tuple[int, str, float]:
-        match = re.fullmatch(r"(kf|kr|keq|dg_eq)(\d+)", str(name).casefold())
+        match = re.fullmatch(r"(kf|kr|Keq|dG_eq)(\d+)", str(name))
         if match is None:
             raise UnsupportedWegscheiderCorrectionError(
                 f"Unsupported native detailed-balance coordinate {name!r}."
@@ -805,12 +677,12 @@ def _materialize_admitted_canonical_source_updates(
         return line_index, source_token, value
 
     coordinate_names: set[str] = {
-        str(update.parameter_name).casefold()
+        str(update.parameter_name)
         for update in updates
     }
     for update in updates:
         coordinate_names.update(
-            str(name).casefold()
+            str(name)
             for name, _factor in update.source_terms
         )
 
@@ -828,7 +700,7 @@ def _materialize_admitted_canonical_source_updates(
         raise ValueError("Admitted DSL source has no energy render unit.")
     materialized_values: dict[str, float] = {}
     for update in updates:
-        target = str(update.parameter_name).casefold()
+        target = str(update.parameter_name)
         coordinate = admitted_coordinates.get(target)
         if coordinate is None:
             raise ValueError(
@@ -837,7 +709,7 @@ def _materialize_admitted_canonical_source_updates(
         if update.source_terms:
             materialized = 0.0
             for source_name, factor in update.source_terms:
-                source_key = str(source_name).casefold()
+                source_key = str(source_name)
                 source = admitted_coordinates.get(source_key)
                 if source is None:
                     raise UnsupportedWegscheiderCorrectionError(
@@ -857,7 +729,7 @@ def _materialize_admitted_canonical_source_updates(
         materialized_values[target] = float(materialized)
 
     for update in updates:
-        target = str(update.parameter_name).casefold()
+        target = str(update.parameter_name)
         line_index, source_token, _value = admitted_coordinates[target]
         line_contents[line_index] = rewrite_coordinate_source_line(
             line_contents[line_index],
@@ -1142,27 +1014,16 @@ def analyze_wegscheider_topology(mechanism: object) -> WegscheiderTopologyReport
         selected_coefficients = tuple(
             int(coefficient) for _step, coefficient in selected
         )
-        structural_fingerprint = symbolic_fingerprint(
-            {
-                "kind": "wegscheider-structural-cycle",
-                "step_indices": tuple(step.step_index for step in selected_steps),
-                "equilibrium_indices": tuple(
-                    step.equilibrium_index for step in selected_steps
-                ),
-                "coefficients": selected_coefficients,
-                "vectors": tuple(
-                    tuple(sorted((name, str(value)) for name, value in step.vector.items()))
-                    for step in selected_steps
-                ),
-            }
-        )
         cycle = WegscheiderCycle(
             cycle_id=f"cycle_{idx}",
             step_indices=tuple(step.step_index for step, _coeff in selected),
             equilibrium_indices=tuple(step.equilibrium_index for step, _coeff in selected),
             coefficients=selected_coefficients,
             parameter_names=(),
-            structural_fingerprint=structural_fingerprint,
+            selected_step_stoichiometric_vectors=tuple(
+                tuple(sorted((str(name), Fraction(value)) for name, value in step.vector.items()))
+                for step in selected_steps
+            ),
         )
         cycles.append(cycle)
     return WegscheiderTopologyReport(cycles=tuple(cycles))
@@ -1258,7 +1119,6 @@ def analyze_wegscheider_cyclicity(
     if not topology.cycles:
         return WegscheiderCyclicityReport(
             cycles=(),
-            topology_fingerprint=topology.topology_fingerprint,
         )
     steps = _reversible_steps(mechanism)
     nominal_temperature_K = float(
@@ -1346,7 +1206,6 @@ def analyze_wegscheider_cyclicity(
         )
     return WegscheiderCyclicityReport(
         cycles=tuple(cycles),
-        topology_fingerprint=topology.topology_fingerprint,
     )
 
 
@@ -1516,11 +1375,23 @@ def analyze_bound_wegscheider_satisfaction(
     if not isinstance(admission_report, WegscheiderCyclicityReport):
         raise TypeError("bound Wegscheider analysis requires its admission report.")
     current_topology = analyze_wegscheider_topology(mechanism)
-    expected_topology = (
-        admission_report.topology_fingerprint
-        or WegscheiderTopologyReport(admission_report.cycles).topology_fingerprint
-    )
-    if current_topology.topology_fingerprint != expected_topology:
+    topology_matches = len(current_topology.cycles) == len(admission_report.cycles)
+    if topology_matches:
+        topology_matches = all(
+            (
+                current.step_indices == admitted.step_indices
+                and current.equilibrium_indices == admitted.equilibrium_indices
+                and current.coefficients == admitted.coefficients
+                and current.selected_step_stoichiometric_vectors
+                == admitted.selected_step_stoichiometric_vectors
+            )
+            for current, admitted in zip(
+                current_topology.cycles,
+                admission_report.cycles,
+                strict=True,
+            )
+        )
+    if not topology_matches:
         raise ValueError(
             "bound mechanism topology does not match its admitted Wegscheider topology."
         )

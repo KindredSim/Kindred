@@ -4,8 +4,6 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-import hashlib
-import json
 from collections.abc import Iterable, Mapping
 
 from kindred.core.algebra.identifier_canonicalization import (
@@ -26,7 +24,7 @@ from kindred.core.algebra.simulation_series import (
     evaluate_compiled_algebra_series_for_simulation,
 )
 from kindred.core.algebra.symbols import SymbolTable
-from kindred.core.simulator.dsl_parse import PreparedDslRequestSet
+from kindred.core.simulator.dsl_parse import DslAnalysis, PreparedDslRequestSet
 from kindred.core.simulator.parameter_algebra_spec import (
     is_protected_step_key_identifier,
 )
@@ -84,8 +82,7 @@ class AdmittedAlgebraProgram:
     policy owns scalar values/scope and supplies those values only at Apply.
     """
 
-    base_analysis_identity: str
-    base_executable_fingerprint: str
+    base_analysis: DslAnalysis
     source_text: str
     observables: tuple[FitLocalObservable, ...]
     scalar_names: tuple[str, ...]
@@ -93,10 +90,8 @@ class AdmittedAlgebraProgram:
     dependency_plan: tuple[tuple[str, tuple[str, ...]], ...]
 
     def __post_init__(self) -> None:
-        if not str(self.base_analysis_identity).strip():
-            raise ValueError("Algebra admission requires a base analysis identity.")
-        if not str(self.base_executable_fingerprint).startswith("science-base:"):
-            raise ValueError("Algebra admission requires a canonical base identity.")
+        if not isinstance(self.base_analysis, DslAnalysis):
+            raise TypeError("Algebra admission requires the complete base analysis.")
         if type(self.source_text) is not str or not self.source_text.strip():
             raise ValueError("Algebra admission requires exact local source text.")
         observables = tuple(self.observables)
@@ -118,8 +113,6 @@ class AdmittedAlgebraProgram:
         )
         if tuple(name for name, _deps in dependencies) != names:
             raise ValueError("Algebra admission dependency plan is incomplete.")
-        object.__setattr__(self, "base_analysis_identity", str(self.base_analysis_identity))
-        object.__setattr__(self, "base_executable_fingerprint", str(self.base_executable_fingerprint))
         object.__setattr__(self, "observables", observables)
         object.__setattr__(self, "scalar_names", scalars)
         object.__setattr__(self, "dependency_plan", dependencies)
@@ -127,19 +120,6 @@ class AdmittedAlgebraProgram:
     @property
     def observable_names(self) -> tuple[str, ...]:
         return tuple(item.name for item in self.observables)
-
-    @property
-    def identity(self) -> str:
-        payload = {
-            "base": self.base_executable_fingerprint,
-            "source": self.source_text,
-            "scalars": self.scalar_names,
-            "dependencies": self.dependency_plan,
-        }
-        digest = hashlib.sha256(
-            json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
-        ).hexdigest()
-        return f"algebra-admission:{digest}"
 
     def reenter(self, base: PreparedDslRequestSet) -> "AdmittedAlgebraProgram":
         return reenter_fit_local_algebra(self, base)
@@ -265,8 +245,7 @@ def _admit_local_block(
         observable_names=tuple(item.name for item in observables),
     )
     return AdmittedAlgebraProgram(
-        base_analysis_identity=base.analysis.identity,
-        base_executable_fingerprint=base.base_executable_identity().fingerprint,
+        base_analysis=base.analysis,
         source_text=source_text,
         observables=observables,
         scalar_names=scalar_names,
@@ -336,8 +315,8 @@ def apply_admitted_algebra(
         raise TypeError("source and base must be exact canonical request values.")
     if not isinstance(admission, AdmittedAlgebraProgram):
         raise TypeError("admission must be an AdmittedAlgebraProgram.")
-    if admission.base_executable_fingerprint != base.base_executable_identity().fingerprint:
-        raise ValueError("Apply admission is bound to a stale canonical base identity.")
+    if admission.base_analysis != base.analysis:
+        raise ValueError("Apply admission is bound to a stale canonical base analysis.")
     if not source_matches_analysis(MechanismAuthoringSource.from_parts(reactions_text=source), base.analysis):
         raise ValueError("Apply source no longer matches the admitted canonical base.")
     values = {str(name): float(value) for name, value in dict(scalar_values).items()}
