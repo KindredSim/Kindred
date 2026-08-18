@@ -49,13 +49,13 @@ class DocumentDeletionResultFence(Protocol):
         self,
         tab_id: str,
         set_ids: Iterable[str],
-    ) -> tuple[tuple[str, int], ...]: ...
+    ) -> None: ...
 
     def purge_tab(
         self,
         tab_id: str,
         set_ids: Iterable[str],
-    ) -> tuple[tuple[str, int], ...]: ...
+    ) -> None: ...
 
 
 CanonicalResultFence = Callable[["ScientificDocumentDelta"], None]
@@ -127,6 +127,7 @@ class WorkspaceTabRegistry:
         *,
         deletion_result_fence: DocumentDeletionResultFence,
         canonical_result_fence: CanonicalResultFence,
+        interactive_preview_fence: Callable[[ScientificDocumentDelta], None],
         runtime_factory: Callable[[str], TabRuntimeState] | None = None,
     ) -> None:
         if not isinstance(session, ProjectSession):
@@ -137,9 +138,12 @@ class WorkspaceTabRegistry:
             )
         if not callable(canonical_result_fence):
             raise TypeError("canonical_result_fence must be callable.")
+        if not callable(interactive_preview_fence):
+            raise TypeError("interactive_preview_fence must be callable.")
         self._session = session
         self._deletion_result_fence = deletion_result_fence
         self._canonical_result_fence = canonical_result_fence
+        self._interactive_preview_fence = interactive_preview_fence
         self._runtime_factory = runtime_factory or (lambda _tab_id: TabRuntimeState())
         self._installed = self.prepare_install(
             document=session.document,
@@ -568,6 +572,7 @@ class WorkspaceTabRegistry:
             # one exact result-owner boundary; callers must not deauthorize
             # this delta after replace_document returns.
             self._canonical_result_fence(delta)
+            self._interactive_preview_fence(delta)
         token = self._session.commit_document_mutation(
             prepared_document,
             expected_token=expected_token,
@@ -594,6 +599,13 @@ class WorkspaceTabRegistry:
                 for initial_set in old_tab.initial_condition_sets
             )
             if current_tab is None:
+                self._interactive_preview_fence(
+                    ScientificDocumentDelta(
+                        affected_targets_by_tab=(
+                            (old_tab.tab_id, old_set_ids),
+                        )
+                    )
+                )
                 self._deletion_result_fence.purge_tab(
                     old_tab.tab_id,
                     old_set_ids,
@@ -607,6 +619,13 @@ class WorkspaceTabRegistry:
                 set_id for set_id in old_set_ids if set_id not in current_set_ids
             )
             if removed_set_ids:
+                self._interactive_preview_fence(
+                    ScientificDocumentDelta(
+                        affected_targets_by_tab=(
+                            (old_tab.tab_id, removed_set_ids),
+                        )
+                    )
+                )
                 self._deletion_result_fence.purge_sets(
                     old_tab.tab_id,
                     removed_set_ids,

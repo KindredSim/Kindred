@@ -171,7 +171,6 @@ class InteractiveDisplayProjection:
     y_label: str
     curves: tuple[InteractiveDisplayCurve, ...]
     target_set_ids: tuple[str, ...]
-    batch_id: str
 
     def __post_init__(self) -> None:
         generation = self.generation
@@ -193,7 +192,6 @@ class InteractiveDisplayProjection:
             raise ValueError("interactive display target roster must be unique.")
         if set_id not in target_set_ids:
             raise ValueError("set_id must belong to the interactive target roster.")
-        batch_id = _required_id(self.batch_id, "batch_id")
         object.__setattr__(self, "tab_id", _required_id(self.tab_id, "tab_id"))
         object.__setattr__(self, "set_id", set_id)
         object.__setattr__(self, "generation", generation)
@@ -201,7 +199,6 @@ class InteractiveDisplayProjection:
         object.__setattr__(self, "y_label", _required_id(self.y_label, "y_label"))
         object.__setattr__(self, "curves", curves)
         object.__setattr__(self, "target_set_ids", target_set_ids)
-        object.__setattr__(self, "batch_id", batch_id)
 
 
 class _XlsxDestination:
@@ -1158,13 +1155,6 @@ def _frame_topology(
     return segments, keys, discontinuities
 
 
-def _frame_batch_id(frame: object) -> str:
-    batch_id = str(getattr(frame, "batch_id", "") or "").strip()
-    if not batch_id:
-        raise ValueError("Interactive Preview frame requires an explicit batch_id.")
-    return _required_id(batch_id, "interactive frame batch_id")
-
-
 def _frame_connectors(
     frame: object,
     *,
@@ -1226,7 +1216,7 @@ def compose_interactive_display(
         return InteractiveDisplayProjection(
             tab_id=frame.tab_id, set_id=frame.set_id, generation=frame.generation,
             x_label=render_input.x_label, y_label=render_input.y_label, curves=(),
-            target_set_ids=frame.target_set_ids, batch_id=_frame_batch_id(frame),
+            target_set_ids=frame.target_set_ids,
         )
 
     if isinstance(selected_x, ExperimentalAxisSelection):
@@ -1287,7 +1277,6 @@ def compose_interactive_display(
         tab_id=frame.tab_id, set_id=frame.set_id, generation=frame.generation,
         x_label=render_input.x_label, y_label=render_input.y_label,
         curves=curves, target_set_ids=frame.target_set_ids,
-        batch_id=_frame_batch_id(frame),
     )
 
 def compose_interactive_display_batch(
@@ -1308,7 +1297,7 @@ def compose_interactive_display_batch(
     if any(
         item.target_set_ids != first.target_set_ids
         or item.generation != first.generation
-        or item.batch_id != first.batch_id
+        or item.tab_id != first.tab_id
         for item in composed[1:]
     ):
         raise ValueError("interactive display batch frames must share generation and roster.")
@@ -1317,7 +1306,7 @@ def compose_interactive_display_batch(
         generation=first.generation, x_label=composed[-1].x_label,
         y_label=composed[-1].y_label,
         curves=tuple(curve for item in composed for curve in item.curves),
-        target_set_ids=first.target_set_ids, batch_id=first.batch_id,
+        target_set_ids=first.target_set_ids,
     )
 
 def compose_result_input(

@@ -119,17 +119,6 @@ class SymbolicCalculatorOwner:
         self._available = False
         self._reason = "Canonical mechanism unavailable."
 
-    def bind_canonical_source_resolvers(
-        self,
-        *,
-        canonical_prepared_dsl: Callable[[], PreparedDslRequestSet | None],
-        canonical_source: Callable[[], MechanismAuthoringSource],
-    ) -> None:
-        """Rebind canonical symbolic inputs to the published document owner."""
-
-        self._canonical_prepared_dsl = canonical_prepared_dsl
-        self._canonical_source = canonical_source
-
     def refresh(self) -> SymbolicCalculatorViewState:
         self._snapshot, self._available, self._reason = self._build_snapshot()
         if not self._available and self._reason == "Symbolic calculator failed unexpectedly.":

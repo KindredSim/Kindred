@@ -15,10 +15,6 @@ from kindred.core.project_presentation_state import (
     ExperimentalAxisSelection,
     SimulationSeriesAxisSelection,
 )
-from kindred.gui.interactive_preview import (
-    InteractivePreviewBatchIdentity,
-    InteractivePreviewPresentedReceipt,
-)
 from kindred.gui.plot_config import PlotPresentationIntent, require_pyqtgraph
 from kindred.gui.widgets.axis_toolbar import AxisToolbar
 from kindred.gui.widgets.interactive_plot_transition import (
@@ -68,7 +64,6 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
     plotPresentationIntentRequested = QtCore.Signal(object)
     resultDiagnostic = QtCore.Signal(str)
     renderFailed = QtCore.Signal(str)
-    interactiveFrameDisposition = QtCore.Signal(object)
 
     def __init__(
         self,
@@ -133,7 +128,6 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         ) = None
         self._interactive_display = InteractiveDisplayController(
             render=self._render_interactive_display,
-            disposition=self.interactiveFrameDisposition.emit,
             request_tick=self._request_interactive_tick,
             cancel_tick=self._interactive_timer.stop,
             render_failed=self.renderFailed.emit,
@@ -286,15 +280,6 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
 
         render_input = self._current_render_input()
         if render_input is None:
-            from kindred.gui.interactive_preview import InteractivePreviewFrame
-
-            if not isinstance(frame, InteractivePreviewFrame):
-                raise TypeError("interactive frame must be an InteractivePreviewFrame.")
-            disposition = InteractiveDisplayController.reject_unrenderable(
-                frame,
-                message="Interactive plot has no current result input.",
-            )
-            self.interactiveFrameDisposition.emit(disposition)
             return
         from kindred.gui.interactive_preview import InteractivePreviewFrame
 
@@ -307,71 +292,6 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         )
         if needs_range and self._interactive_display.has_renderable_frame:
             self._begin_interactive_range_session()
-
-    def apply_interactive_preview_terminal_outcome(self, outcome: object) -> bool:
-        """Route one exact terminal fact into controller settlement."""
-
-        render_input = self._current_render_input()
-        if render_input is None:
-            return False
-        from kindred.gui.interactive_preview import InteractivePreviewTerminalOutcome
-
-        if not isinstance(outcome, InteractivePreviewTerminalOutcome):
-            raise TypeError(
-                "Interactive Preview terminal outcome must be typed."
-            )
-        changed = self._interactive_display.apply_terminal_outcome(
-            outcome,
-            render_input=render_input,
-        )
-        if changed and not self._interactive_display.has_current_batch:
-            self._end_interactive_range_session()
-        return changed
-
-    def interactive_exact_release_batch(
-        self,
-    ) -> InteractivePreviewPresentedReceipt | None:
-        """Consume the controller's post-render receipt for exact release."""
-
-        had_current_batch = self._interactive_display.has_current_batch
-        receipt = self._interactive_display.exact_release_batch()
-        if had_current_batch and not self._interactive_display.has_current_batch:
-            self._end_interactive_range_session()
-        return receipt
-
-    def allocate_interactive_preview_batch(
-        self,
-        *,
-        tab_id: str,
-        document_identity: tuple[int, str],
-        target_set_ids: tuple[str, ...],
-    ) -> InteractivePreviewBatchIdentity:
-        """Mint a controller-owned generation and immutable batch identity."""
-
-        return self._interactive_display.allocate_batch_identity(
-            tab_id=tab_id,
-            document_identity=document_identity,
-            target_set_ids=target_set_ids,
-        )
-
-    def apply_interactive_preview_retirement(self, retirement: object) -> bool:
-        """Apply one lifecycle retirement intent through the controller."""
-
-        from kindred.gui.interactive_preview import InteractivePreviewRetirement
-
-        if not isinstance(retirement, InteractivePreviewRetirement):
-            raise TypeError("Interactive Preview retirement must be typed.")
-        if not self._result_tab_id or retirement.tab_id != self._result_tab_id:
-            return False
-        if retirement.target_set_ids:
-            changed = self._interactive_display.retire_targets(
-                retirement.target_set_ids
-            )
-        else:
-            changed = self._interactive_display.retire(clear_visible=False)
-        if changed:
-            self._end_interactive_range_session()
-        return changed
 
     def stop_interactive_display(self) -> bool:
         """Cancel visual work and freeze the last physically stable display."""
@@ -491,7 +411,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
                 self._restore_interactive_view(self._interactive_locked_view)
 
     def drop_tab_session_state(self) -> None:
-        self._discard_interactive_display()
+        self.discard_interactive_display()
         self._manual_annotations.clear()
         self._scalar_guides.clear()
         self._interaction_mode = "pan"
@@ -502,7 +422,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
     def reset_plot_session_state(self) -> None:
         """Project replacement/reopen resets non-archived Plot session truth."""
 
-        self._discard_interactive_display()
+        self.discard_interactive_display()
         self._manual_annotations.clear()
         self._scalar_guides.clear()
         self._interaction_mode = "pan"
@@ -524,7 +444,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         """Revoke only this physical page's applied result authority."""
 
         self._cancel_copy()
-        self._discard_interactive_display()
+        self.discard_interactive_display()
         for clear in (
             self._clear_plot_items,
             lambda: self._parameter_table.setRowCount(0),
@@ -586,8 +506,8 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         desired_keys: set[tuple[object, ...]] = set()
         for layer_index, layer in enumerate(state.layers):
             projection = layer.projection
-            if not projection.tab_id or not projection.batch_id:
-                raise ValueError("Interactive display projection identity is invalid.")
+            if not projection.tab_id:
+                raise ValueError("Interactive display projection tab is invalid.")
             layer_opacity = float(layer.opacity)
             if not np.isfinite(layer_opacity) or not 0.0 <= layer_opacity <= 1.0:
                 raise ValueError("Interactive display layer opacity is invalid.")
@@ -1011,7 +931,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
             except (RuntimeError, TypeError, ValueError):
                 pass
 
-    def _discard_interactive_display(self) -> None:
+    def discard_interactive_display(self) -> None:
         self._restore_interactive_foreground_items()
         self._interactive_display.clear(reset_currentness=True)
         self._clear_interactive_items()

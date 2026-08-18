@@ -1205,7 +1205,8 @@ class MechanismEditorBinding(QtCore.QObject):
         target = str(tab_id).strip()
         if not target:
             raise ValueError("tab_id must be nonblank.")
-        registry.tab(target)
+        if not callable(getattr(registry, "tab", None)):
+            raise TypeError("registry must provide tab(tab_id).")
         self._tab_id = target
         self._editor = editor
         self._registry = registry
@@ -1222,11 +1223,6 @@ class MechanismEditorBinding(QtCore.QObject):
     @property
     def tab_id(self) -> str:
         return self._tab_id
-
-    def bind_registry(self, registry) -> None:
-        """Rebind this retained editor to the published registry."""
-
-        self._registry = registry
 
     def _detailed_balance_context(self) -> tuple[str, str, float, bool]:
         tab = self._registry.tab(self._tab_id)

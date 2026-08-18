@@ -258,14 +258,6 @@ class DataManagerPanel(QtWidgets.QWidget):
         self._staging.workerCanceled.connect(self._on_import_cancellation)
         self._set_mapping_controls_enabled(False)
 
-    def bind_source_resolver(
-        self,
-        source_resolver: Callable[[str], ImportedSource],
-    ) -> None:
-        """Rebind dataset source lookup to the published document owner."""
-
-        self._source_resolver = source_resolver
-
     def _show_message(
         self,
         icon: QtWidgets.QMessageBox.Icon,

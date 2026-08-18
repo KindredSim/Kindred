@@ -613,7 +613,8 @@ class InitialConditionsTableActions(QtCore.QObject):
         target = str(tab_id).strip()
         if not target:
             raise ValueError("tab_id must be nonblank.")
-        registry.tab(target)
+        if not callable(getattr(registry, "tab", None)):
+            raise TypeError("registry must provide tab(tab_id).")
         self._tab_id = target
         self._registry = registry
         self._model = model
@@ -637,11 +638,6 @@ class InitialConditionsTableActions(QtCore.QObject):
     @property
     def tab_id(self) -> str:
         return self._tab_id
-
-    def bind_registry(self, registry) -> None:
-        """Rebind this retained table owner to the published registry."""
-
-        self._registry = registry
 
     def prepare_render(self) -> _InitialConditionsRenderProjection:
         """Prepare the complete table projection without touching widgets."""

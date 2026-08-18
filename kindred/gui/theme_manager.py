@@ -1,4 +1,4 @@
-"""Direct application and workspace plot-container theme broadcasting."""
+"""Direct application and stable outer-shell theme forwarding."""
 
 from __future__ import annotations
 
@@ -19,15 +19,17 @@ class ThemeManager:
     def __init__(
         self,
         application: QtWidgets.QApplication,
-        plot_container: object,
+        theme_target: object,
         *,
         report_failure: Callable[[str], None] | None = None,
     ) -> None:
         if not isinstance(application, QtWidgets.QApplication):
             raise TypeError("application must be a QApplication.")
-        if not callable(getattr(plot_container, "set_theme", None)):
-            raise TypeError("plot_container must provide set_theme(dark_mode=...).")
-        self._plot_container = plot_container
+        if not callable(getattr(theme_target, "set_theme", None)):
+            raise TypeError(
+                "theme_target must provide stable set_theme(dark_mode=...)."
+            )
+        self._theme_target = theme_target
         self._report_failure = report_failure
         self._applied_dark_mode: bool | None = None
 
@@ -85,7 +87,7 @@ class ThemeManager:
 
     def _apply_physical(self, dark_mode: bool) -> None:
         qdarktheme.setup_theme("dark" if dark_mode else "light")
-        self._plot_container.set_theme(dark_mode=dark_mode)
+        self._theme_target.set_theme(dark_mode=dark_mode)
 
     def _restore_previous_once(
         self,

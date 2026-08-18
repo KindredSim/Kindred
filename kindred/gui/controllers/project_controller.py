@@ -9,7 +9,6 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Protocol, runtime_checkable
 
 from PySide6 import QtCore, QtWidgets
 
@@ -22,6 +21,7 @@ from kindred.core.project_session import (
 )
 from kindred.gui.controllers.config_controller import ConfigController
 from kindred.gui.controllers.simulation_job_owner import SimulationJobOwner
+from kindred.gui.controllers.interactive_preview_owner import InteractivePreviewOwner
 from kindred.gui.dataset_import_staging import DatasetImportStaging
 from kindred.gui.fit_session_owner import (
     FitReplacementDispositionSummary,
@@ -37,43 +37,9 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "AuthoringDiscardMode",
-    "ProjectPhysicalInstallPort",
     "ProjectController",
     "ProjectTransientState",
 ]
-
-
-@runtime_checkable
-class ProjectPhysicalInstallPort(Protocol):
-    """Prepared physical-surface seam for atomic project replacement.
-
-    ``prepare_project_install`` owns all fallible widget, binding, signal,
-    attachment, and plot-resource construction while the old pages, shell,
-    and semantic owners remain current.  It returns opaque prepared custody
-    only after construction is complete; partial preparation must be cleaned
-    by the port itself.  ``publish_project_install`` performs only the fenced
-    physical reference/current-page assignment and then returns old-resource
-    custody for retirement after semantic publication and result-identity
-    purge.
-    """
-
-    def prepare_project_install(
-        self,
-        *,
-        prepared_session: PreparedProjectInstall,
-        prepared_workspace: PreparedWorkspaceInstall,
-    ) -> object: ...
-
-    def publish_project_install(
-        self,
-        prepared: object,
-        *,
-        expected_token: ProjectContentToken,
-    ) -> object: ...
-
-    def discard_project_install(self, prepared: object) -> None: ...
-
-    def retire_project_install(self, retirement: object) -> object: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -196,10 +162,15 @@ class ProjectController(QtCore.QObject):
         archive_store: KinArchiveStore,
         config: ConfigController,
         simulation_jobs: SimulationJobOwner,
+        interactive_preview_owner: InteractivePreviewOwner,
         dataset_imports: DatasetImportStaging,
         fit_session: FitSessionOwner,
         xlsx_exports: object,
-        physical_install: ProjectPhysicalInstallPort,
+        build_workspace: Callable[
+            [ProjectDocument, PreparedWorkspaceInstall],
+            QtWidgets.QWidget,
+        ],
+        swap_workspace: Callable[[QtWidgets.QWidget], None],
         set_status_text: Callable[[str], None],
         settle_execution_candidate: Callable[
             [ProjectContentToken],
@@ -228,16 +199,19 @@ class ProjectController(QtCore.QObject):
             raise TypeError("config must be a ConfigController.")
         if not isinstance(simulation_jobs, SimulationJobOwner):
             raise TypeError("simulation_jobs must be a SimulationJobOwner.")
+        if not isinstance(interactive_preview_owner, InteractivePreviewOwner):
+            raise TypeError("interactive_preview_owner must be an InteractivePreviewOwner.")
         if not isinstance(dataset_imports, DatasetImportStaging):
             raise TypeError("dataset_imports must be a DatasetImportStaging.")
         if not isinstance(fit_session, FitSessionOwner):
             raise TypeError("fit_session must be a FitSessionOwner.")
-        if not isinstance(physical_install, ProjectPhysicalInstallPort):
-            raise TypeError(
-                "physical_install must implement ProjectPhysicalInstallPort."
-            )
+        if not callable(build_workspace):
+            raise TypeError("build_workspace must be callable.")
+        if not callable(swap_workspace):
+            raise TypeError("swap_workspace must be callable.")
         for owner_name, owner in (
             ("simulation_jobs", simulation_jobs),
+            ("interactive_preview_owner", interactive_preview_owner),
             ("dataset_imports", dataset_imports),
             ("fit_session", fit_session),
         ):
@@ -291,10 +265,12 @@ class ProjectController(QtCore.QObject):
         self._archive_store = archive_store
         self._config = config
         self._simulation_jobs = simulation_jobs
+        self._interactive_preview_owner = interactive_preview_owner
         self._dataset_imports = dataset_imports
         self._fit_session = fit_session
         self._xlsx_exports = xlsx_exports
-        self._physical_install = physical_install
+        self._build_workspace = build_workspace
+        self._swap_workspace = swap_workspace
         self._set_status_text = set_status_text
         self._settle_execution_candidate = settle_execution_candidate
         self._prepare_before_save = prepare_before_save
@@ -315,6 +291,9 @@ class ProjectController(QtCore.QObject):
         self._close_timer.setTimerType(QtCore.Qt.TimerType.PreciseTimer)
         self._close_timer.timeout.connect(self._on_application_close_deadline)
         self._simulation_jobs.application_close_settlement_changed.connect(
+            self.notify_close_progress
+        )
+        self._interactive_preview_owner.settled_changed.connect(
             self.notify_close_progress
         )
         self._dataset_imports.application_close_settlement_changed.connect(
@@ -629,6 +608,7 @@ class ProjectController(QtCore.QObject):
         deadline = time.monotonic() + self._replacement_timeout_seconds
         owners = (
             ("Simulation", self._simulation_jobs),
+            ("Interactive Preview", self._interactive_preview_owner),
             ("Dataset import", self._dataset_imports),
             ("Fit", self._fit_session),
             ("XLSX export", self._xlsx_exports),
@@ -678,7 +658,7 @@ class ProjectController(QtCore.QObject):
             return False
         return True
 
-    def _prepare_project_install(
+    def _decode_project_candidate(
         self,
         project: ArchiveProject,
         *,
@@ -697,146 +677,112 @@ class ProjectController(QtCore.QObject):
         )
         return prepared_session, prepared_workspace
 
-    def _commit_project_install(
+    def _replace_project(
         self,
         prepared_session: PreparedProjectInstall,
         prepared_workspace: PreparedWorkspaceInstall,
-        disposition: _DispositionResult,
+        *,
+        action: str,
+        expected_token: ProjectContentToken,
     ) -> tuple[bool, tuple[str, ...]]:
-        """Publish a prepared replacement and return its cleanup outcome.
-
-        The first tuple item distinguishes a failure before publication from a
-        committed replacement.  The second item contains only deduplicated
-        best-effort cleanup failures observed after the new project became
-        authoritative.
-        """
+        """Build, fence, commit and swap one detached project root."""
 
         if not self._content_token_is_current(
-            disposition.content_token,
+            expected_token,
             action="Project replacement",
         ):
             return False, ()
         previous_document = self._session.document
-        prepared_physical: object | None = None
+        workspace: QtWidgets.QWidget | None = None
         try:
-            prepared_physical = self._physical_install.prepare_project_install(
-                prepared_session=prepared_session,
-                prepared_workspace=prepared_workspace,
+            workspace = self._build_workspace(
+                prepared_session.document,
+                prepared_workspace,
             )
         except Exception as exc:
-            logger.exception("Project physical installation preparation failed")
+            logger.exception("Detached project workspace construction failed")
             self._set_status(
-                "Project replacement was not completed because its physical "
-                f"surfaces could not be prepared: {exc}"
+                "Project replacement was not completed because its detached "
+                f"workspace could not be built: {exc}"
             )
             return False, ()
-        if prepared_physical is None:
-            raise TypeError(
-                "physical_install.prepare_project_install() must return "
-                "prepared custody."
-            )
-        # Detached physical preparation is deliberately completed while the
-        # old semantic/runtime/page/active-work owners remain untouched. A
-        # stale token must also abort before cancellation admission is fenced.
+        if not isinstance(workspace, QtWidgets.QWidget):
+            raise TypeError("build_workspace() must return a QWidget.")
+
+        def discard_detached_workspace() -> None:
+            """Release an unpublished root through its one Qt owner."""
+
+            workspace.deleteLater()
+
+        if not self._content_token_is_current(
+            expected_token,
+            action="Project replacement",
+        ):
+            discard_detached_workspace()
+            return False, ()
+
+        # Disposition is resolved only after the candidate root is complete;
+        # cancellation therefore retires one detached root without touching
+        # the current shell or semantic owners.
+        disposition = self._resolve_disposition(
+            action,
+            expected_token=expected_token,
+            project_replacement=True,
+        )
+        if disposition is None:
+            discard_detached_workspace()
+            return False, ()
+        if not self._settle_replacement_workers():
+            discard_detached_workspace()
+            return False, ()
+
         if not self._content_token_is_current(
             disposition.content_token,
             action="Project replacement",
         ):
-            self._physical_install.discard_project_install(prepared_physical)
+            discard_detached_workspace()
+            self._dataset_imports.resume_after_project_replacement()
             return False, ()
-        if not self._settle_replacement_workers():
-            self._physical_install.discard_project_install(prepared_physical)
-            return False, ()
-        physical_published = False
-        session_published = False
+
+        # The old result identities are purged while the old session, registry
+        # and root are still current.  This is intentionally before either
+        # semantic assignment or the one-root shell swap.
+        cleanup_failures = list(
+            self._purge_replaced_project_results(previous_document)
+        )
+
+        swap_invoked = False
         try:
-            if not self._content_token_is_current(
-                disposition.content_token,
-                action="Project replacement",
-            ):
-                self._physical_install.discard_project_install(
-                    prepared_physical
-                )
-                return False, ()
-            # Physical publication is the last fallible phase.  Preparation
-            # already constructed, rendered, attached, and bound every
-            # incoming consumer; this call only fences and assigns the
-            # prepared physical references/selections.  Do not discard old
-            # authoring here: the old project remains semantically current
-            # until both assignment-only semantic commits succeed.
-            retirement = self._physical_install.publish_project_install(
-                prepared_physical,
-                expected_token=disposition.content_token,
-            )
-            physical_published = True
-            if not self._content_token_is_current(
-                disposition.content_token,
-                action="Project replacement",
-            ):
-                self._physical_install.discard_project_install(
-                    prepared_physical
-                )
-                return False, ()
             committed_token = self._session.commit_install(
                 prepared_session,
                 expected_token=disposition.content_token,
             )
             if committed_token is None:
-                self._physical_install.discard_project_install(
-                    prepared_physical
-                )
-                self._content_token_is_current(
-                    disposition.content_token,
-                    action="Project replacement",
-                )
-                return False, ()
-            session_published = True
+                discard_detached_workspace()
+                return False, tuple(dict.fromkeys(cleanup_failures))
             if not self._tabs.commit_install(
                 prepared_workspace,
                 expected_token=committed_token,
             ):
+                discard_detached_workspace()
                 raise RuntimeError(
                     "Workspace replacement registry rejected its current token."
                 )
+            swap_invoked = True
+            try:
+                self._swap_workspace(workspace)
+            except Exception as exc:
+                # Semantic publication has already occurred.  Keep the new
+                # root owned by the callback's shell and surface the failure
+                # without restoring the previous project.
+                logger.exception("Project workspace root swap failed")
+                cleanup_failures.append(f"workspace swap: {exc}")
         except Exception:
-            if physical_published and not session_published:
-                try:
-                    self._physical_install.discard_project_install(
-                        prepared_physical
-                    )
-                except Exception:
-                    logger.exception(
-                        "Prepared project physical custody could not be discarded"
-                    )
-            elif not physical_published:
-                try:
-                    self._physical_install.discard_project_install(
-                        prepared_physical
-                    )
-                except Exception:
-                    logger.exception(
-                        "Prepared project physical custody could not be discarded"
-                    )
+            if not swap_invoked:
+                discard_detached_workspace()
             raise
         finally:
             self._dataset_imports.resume_after_project_replacement()
-        cleanup_failures = list(
-            self._purge_replaced_project_results(previous_document)
-        )
-        try:
-            retirement_failures = self._physical_install.retire_project_install(
-                retirement
-            )
-            if retirement_failures is not None:
-                cleanup_failures.extend(
-                    str(item) for item in retirement_failures
-                )
-        except Exception as exc:
-            # Retirement is deliberately after publication and old-result
-            # purge.  A cleanup defect must be visible, but it cannot turn
-            # the newly published project back into the old one.
-            logger.exception("Old project physical retirement failed")
-            cleanup_failures.append(f"physical retirement: {exc}")
         self.projectStateChanged.emit()
         return True, tuple(dict.fromkeys(cleanup_failures))
 
@@ -877,24 +823,18 @@ class ProjectController(QtCore.QObject):
                 "ConfigController.default_project_document() must return "
                 "ProjectDocument."
             )
-        prepared_session, prepared_workspace = self._prepare_project_install(
+        prepared_session, prepared_workspace = self._decode_project_candidate(
             ArchiveProject(
                 document=candidate,
                 presentation=default_workspace_presentation_state(candidate),
             ),
             path=None,
         )
-        disposition = self._resolve_disposition(
-            "starting a new project",
-            expected_token=operative_token,
-            project_replacement=True,
-        )
-        if disposition is None:
-            return False
-        committed, cleanup_failures = self._commit_project_install(
+        committed, cleanup_failures = self._replace_project(
             prepared_session,
             prepared_workspace,
-            disposition,
+            action="starting a new project",
+            expected_token=operative_token,
         )
         if not committed:
             return False
@@ -983,7 +923,7 @@ class ProjectController(QtCore.QObject):
             return False
         try:
             prepared_session, prepared_workspace = (
-                self._prepare_project_install(
+                self._decode_project_candidate(
                     decoded,
                     path=absolute_path,
                 )
@@ -991,7 +931,7 @@ class ProjectController(QtCore.QObject):
         except Exception as exc:
             self._show_error(
                 "Open Error",
-                f"Failed to prepare project installation:\n\n{exc}",
+                f"Failed to decode and validate the project:\n\n{exc}",
             )
             return False
         if not self._content_token_is_current(
@@ -1002,17 +942,11 @@ class ProjectController(QtCore.QObject):
         operative_token = self._settle_execution_candidate(expected_token)
         if operative_token is None:
             return False
-        disposition = self._resolve_disposition(
-            "opening another project",
-            expected_token=operative_token,
-            project_replacement=True,
-        )
-        if disposition is None:
-            return False
-        committed, cleanup_failures = self._commit_project_install(
+        committed, cleanup_failures = self._replace_project(
             prepared_session,
             prepared_workspace,
-            disposition,
+            action="opening another project",
+            expected_token=operative_token,
         )
         if not committed:
             return False
@@ -1351,6 +1285,12 @@ class ProjectController(QtCore.QObject):
                 "Simulation admission fencing/cancellation failed during Close"
             )
         try:
+            self._interactive_preview_owner.cancel_for_application_close()
+        except Exception:
+            logger.exception(
+                "Interactive Preview admission fencing/cancellation failed during Close"
+            )
+        try:
             self._dataset_imports.cancel_for_application_close()
         except Exception:
             logger.exception(
@@ -1420,6 +1360,7 @@ class ProjectController(QtCore.QObject):
         settled = True
         for owner_label, owner in (
             ("Simulation", self._simulation_jobs),
+            ("Interactive Preview", self._interactive_preview_owner),
             ("Dataset import", self._dataset_imports),
             ("Fit", self._fit_session),
             ("XLSX export", self._xlsx_exports),

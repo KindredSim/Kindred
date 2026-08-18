@@ -55,7 +55,6 @@ from kindred.core.project_document import (
     validate_fit_defaults,
 )
 from kindred.core.project_session import (
-    PreparedProjectInstall,
     ProjectContentToken,
     ProjectSession,
 )
@@ -70,21 +69,14 @@ from kindred.core.result_repository import (
 from kindred.core.simulator.dsl_parse import (
     PreparedDslRequestSet,
 )
-from kindred.gui.app_wiring import (
-    ANALYSIS_DOCK_SPEC,
-    BATCH_DOCK_SPEC,
-    MECHANISM_DOCK_SPEC,
-    RIGHT_DOCK_SPEC,
-    SLIDERS_DOCK_SPEC,
-    SYMBOLIC_CALCULATOR_DOCK_SPEC,
-    build_module_dock,
-    dock_default_area,
-    dock_shell_specs,
-)
+from kindred.gui.app_wiring import dock_shell_specs
 from kindred.gui.computation_gate import ComputationGate
 from kindred.gui.controllers.config_controller import (
     ConfigController,
     ConfigControllerPort,
+)
+from kindred.gui.controllers.interactive_preview_owner import (
+    InteractivePreviewOwner,
 )
 from kindred.gui.controllers.project_controller import (
     AuthoringDiscardMode,
@@ -143,14 +135,11 @@ from kindred.gui.widgets.dataset_overlay_panel import (
     OverlaySelectionIntent,
 )
 from kindred.gui.widgets.editor_panel import EditorPanel
-from kindred.gui.widgets.interactive_plot_transition import (
-    InteractiveDisplayController,
-)
 from kindred.gui.widgets.mechanism_editor import (
     MechanismEditorBinding,
     MechanismEditorTabbed,
 )
-from kindred.gui.widgets.mechanism_workspace import MechanismWorkspaceView
+from kindred.gui.widgets.mechanism_workspace import ProjectWorkspaceWidget
 from kindred.gui.widgets.pyqtgraph_plot_panel_impl import PyQtGraphPlotPanel
 from kindred.gui.widgets.right_panel import RightPanelTabbed
 from kindred.gui.widgets.simulation_panel import SimulationPanel
@@ -222,88 +211,6 @@ class _TabSurfaceBundle:
     editor_binding: MechanismEditorBinding
     initial_actions: InitialConditionsTableActions
     slider_binding: TabSliderBinding
-
-
-class _PreparedPhysicalTabContext:
-    """Read-only prepared values used only during detached construction."""
-
-    def __init__(
-        self,
-        *,
-        prepared_session: PreparedProjectInstall,
-        prepared_workspace: PreparedWorkspaceInstall,
-        identity_generation: int,
-    ) -> None:
-        self._document = prepared_session.document
-        self._path = prepared_session.path
-        self._presentation = dict(prepared_workspace.presentation_by_tab_id)
-        self._runtime = dict(prepared_workspace.runtime_by_tab_id)
-        self._identity_generation = int(identity_generation)
-
-    def tab(self, tab_id: str) -> MechanismTabDocument:
-        return self._document.tab(str(tab_id))
-
-    def tab_runtime(self, tab_id: str):
-        target = str(tab_id)
-        self._document.tab(target)
-        try:
-            return self._runtime[target]
-        except KeyError as exc:
-            raise KeyError(f"Unknown prepared tab ID: {target!r}.") from exc
-
-    def presentation(self, tab_id: str):
-        target = str(tab_id)
-        self._document.tab(target)
-        try:
-            return self._presentation[target]
-        except KeyError as exc:
-            raise KeyError(f"Unknown prepared tab ID: {target!r}.") from exc
-
-    def document_identity(self, tab_id: str) -> tuple[int, str]:
-        target = str(tab_id)
-        self._document.tab(target)
-        return self._identity_generation, target
-
-    @property
-    def document(self) -> ProjectDocument:
-        return self._document
-
-    @property
-    def path(self) -> str | None:
-        """Return the incoming project path without consulting live session state."""
-
-        return self._path
-
-    def imported_source(self, source_id: str):
-        return self._document.imported_source(source_id)
-
-
-@dataclass(slots=True)
-class _PreparedProjectPhysicalInstall:
-    """Prepared Qt custody attached alongside the still-current project."""
-
-    tab_surfaces: dict[str, _TabSurfaceBundle]
-    plots_by_tab_id: dict[str, PyQtGraphPlotPanel]
-    active_tab_id: str
-    preparation_holder: QtWidgets.QWidget
-    prepared_context: _PreparedPhysicalTabContext
-    old_tab_surfaces: dict[str, _TabSurfaceBundle]
-    old_plots_by_tab_id: dict[str, PyQtGraphPlotPanel]
-    old_initial_plot: PyQtGraphPlotPanel | None
-    old_plot_current: QtWidgets.QWidget | None = None
-    old_analysis_current: QtWidgets.QWidget | None = None
-    old_surface_current: tuple[QtWidgets.QWidget | None, ...] = ()
-    old_workspace_active_tab_id: str | None = None
-    old_repositories: dict[str, ResultRepository] = field(default_factory=dict)
-
-
-@dataclass(slots=True)
-class _ProjectPhysicalRetirement:
-    """Old Qt custody held until the controller purges old result identities."""
-
-    tab_surfaces: dict[str, _TabSurfaceBundle]
-    plots_by_tab_id: dict[str, PyQtGraphPlotPanel]
-    initial_plot: PyQtGraphPlotPanel | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -737,16 +644,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self._rendering_workspace = False
         self._recent_menu: QtWidgets.QMenu | None = None
         self._tab_surfaces: dict[str, _TabSurfaceBundle] = {}
-        # During the physical replacement window, old result repositories are
-        # deliberately kept as the cleanup target even when tab IDs are reused
-        # by the incoming project.  The override is populated before semantic
-        # publication and cleared only after old-resource retirement.
-        self._replacement_repository_override: dict[str, ResultRepository] | None = None
-        self._project_replacement_cleanup_active = False
-        # A replacement commits physical references before the semantic
-        # signal updates the tab strip and shell projection.  This flag is
-        # cleared by that one signal or by precommit discard.
-        self._replacement_structure_pending = False
         self._dark_mode_action: QtGui.QAction | None = None
         self._run_action: QtGui.QAction | None = None
         self._xlsx_export_action: QtGui.QAction | None = None
@@ -762,8 +659,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.resize(self._startup_size())
         self.setDockNestingEnabled(True)
 
-        self._workspace = MechanismWorkspaceView(self)
-        self._workspace.setObjectName("mechanismWorkspace")
+        self._workspace = ProjectWorkspaceWidget(self, outer_policy=self)
         self.setCentralWidget(self._workspace)
 
         self._status_label = QtWidgets.QLabel("Ready", self)
@@ -771,7 +667,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self._theme_manager = ThemeManager(
             application,
-            self._workspace,
+            self,
             report_failure=self.set_status_text,
         )
         self.config_controller = ConfigController(self._config_port())
@@ -785,15 +681,24 @@ class MainWindow(QtWidgets.QMainWindow):
             repository_for_tab=self._repository_for_tab,
             propose_detailed_balance_source=self._propose_detailed_balance_source,
             commit_detailed_balance_source=self._commit_detailed_balance_source,
+            capture_current_run=self._capture_current_run,
+            content_token_is_current=(
+                self._project_session.is_content_token_current
+            ),
             user_parallel_maximum=(
                 self.config_controller.run_user_maximum_preference
             ),
+            parent=self,
+        )
+        self._interactive_preview_owner = InteractivePreviewOwner(
+            gate=self._computation_gate,
             parent=self,
         )
         self._workspace_tab_registry = WorkspaceTabRegistry(
             self._project_session,
             deletion_result_fence=self._simulation_jobs,
             canonical_result_fence=self._fence_canonical_result_delta,
+            interactive_preview_fence=self._fence_interactive_preview_delta,
             runtime_factory=self._new_tab_runtime,
         )
         self._dataset_import_staging = DatasetImportStaging(parent=self)
@@ -808,7 +713,8 @@ class MainWindow(QtWidgets.QMainWindow):
             parent=self,
         )
 
-        self._build_physical_shell()
+        self._surface_stacks = self._build_physical_shell(self._workspace)
+        self._set_current_workspace_references(self._workspace)
         for tab in self._project_session.document.tabs:
             self._create_tab_surface(tab.tab_id)
         self._xlsx_export_owner = _XlsxExportOwner(parent=self)
@@ -830,10 +736,12 @@ class MainWindow(QtWidgets.QMainWindow):
             archive_store=self._archive_store,
             config=self.config_controller,
             simulation_jobs=self._simulation_jobs,
+            interactive_preview_owner=self._interactive_preview_owner,
             dataset_imports=self._dataset_import_staging,
             fit_session=self._fit_session_owner,
             xlsx_exports=self._xlsx_export_owner,
-            physical_install=self,
+            build_workspace=self._build_workspace,
+            swap_workspace=self._swap_workspace,
             set_status_text=self.set_status_text,
             settle_execution_candidate=(
                 lambda token: self._settle_execution_candidate(
@@ -881,8 +789,8 @@ class MainWindow(QtWidgets.QMainWindow):
             restore_maximized_state=self.restore_persisted_maximized_state,
             restore_geometry=self.restoreGeometry,
             save_geometry=self.saveGeometry,
-            restore_window_state=self.restoreState,
-            save_window_state=self.saveState,
+            restore_window_state=self._restore_workspace_layout,
+            save_window_state=self._save_workspace_layout,
             schedule_restored_floating_dock_recovery=(
                 self.schedule_restored_floating_dock_recovery
             ),
@@ -906,102 +814,107 @@ class MainWindow(QtWidgets.QMainWindow):
             )
         )
 
-    def _build_physical_shell(self) -> None:
-        self._mechanism_stack = QtWidgets.QStackedWidget(self)
-        self._mechanism_stack.setObjectName("mechanismSurfaceStack")
-        mechanism = build_module_dock(
-            self,
-            spec=MECHANISM_DOCK_SPEC,
-            panel=self._mechanism_stack,
-        )
-        self._mechanism_dock = mechanism
-        self._slider_stack = QtWidgets.QStackedWidget(self)
-        self._slider_stack.setObjectName("sliderSurfaceStack")
-        sliders = build_module_dock(
-            self,
-            spec=SLIDERS_DOCK_SPEC,
-            panel=self._slider_stack,
-        )
-        self._sliders_dock = sliders
+    def _build_physical_shell(
+        self,
+        workspace_root: ProjectWorkspaceWidget,
+    ) -> dict[str, QtWidgets.QStackedWidget]:
+        """Build all page stacks and dock shells beneath one project root."""
 
-        self._initial_conditions_stack = QtWidgets.QStackedWidget(self)
-        self._initial_conditions_stack.setObjectName(
-            "initialConditionsSurfaceStack"
+        stacks = {
+            "mechanism": QtWidgets.QStackedWidget(workspace_root),
+            "interactive_sliders": QtWidgets.QStackedWidget(workspace_root),
+            "batch_initial_conditions": QtWidgets.QStackedWidget(workspace_root),
+            "data": QtWidgets.QStackedWidget(workspace_root),
+            "symbolic_calculator": QtWidgets.QStackedWidget(workspace_root),
+        }
+        object_names = {
+            "mechanism": "mechanismSurfaceStack",
+            "interactive_sliders": "sliderSurfaceStack",
+            "batch_initial_conditions": "initialConditionsSurfaceStack",
+            "data": "dataSurfaceStack",
+            "symbolic_calculator": "symbolicCalculatorSurfaceStack",
+        }
+        for identity, stack in stacks.items():
+            stack.setObjectName(object_names[identity])
+        workspace_root.install_dock_panels(
+            {
+                **stacks,
+                "analysis": workspace_root.main_plot_analysis_widget(),
+            }
         )
-        initials = build_module_dock(
-            self,
-            spec=BATCH_DOCK_SPEC,
-            panel=self._initial_conditions_stack,
-        )
-        self._batch_dock = initials
+        workspace_root._kindred_surface_stacks = stacks
+        return stacks
 
-        self._data_stack = QtWidgets.QStackedWidget(self)
-        self._data_stack.setObjectName("dataSurfaceStack")
-        data = build_module_dock(
-            self,
-            spec=RIGHT_DOCK_SPEC,
-            panel=self._data_stack,
-        )
-        self._right_dock = data
+    def set_theme(self, *, dark_mode: bool) -> None:
+        """Forward application theme changes to the current project root."""
 
-        analysis = build_module_dock(
-            self,
-            spec=ANALYSIS_DOCK_SPEC,
-            panel=self._workspace.main_plot_analysis_widget(),
-        )
-        self._analysis_dock = analysis
+        self._workspace.set_theme(dark_mode=bool(dark_mode))
 
-        self._calculator_stack = QtWidgets.QStackedWidget(self)
-        self._calculator_stack.setObjectName("symbolicCalculatorSurfaceStack")
-        symbolic = build_module_dock(
-            self,
-            spec=SYMBOLIC_CALCULATOR_DOCK_SPEC,
-            panel=self._calculator_stack,
+    def _save_workspace_layout(self) -> QtCore.QByteArray:
+        return self._workspace.save_workspace_state()
+
+    def _restore_workspace_layout(self, state: object) -> bool:
+        return bool(self._workspace.restore_workspace_state(state))
+
+    def _set_current_workspace_references(
+        self,
+        workspace_root: ProjectWorkspaceWidget,
+    ) -> None:
+        """Resolve all shell references from the current nested project root."""
+
+        stacks = getattr(workspace_root, "_kindred_surface_stacks", None)
+        if stacks is None:
+            stacks = self._surface_stacks
+        self._mechanism_stack = stacks["mechanism"]
+        self._slider_stack = stacks["interactive_sliders"]
+        self._initial_conditions_stack = stacks["batch_initial_conditions"]
+        self._data_stack = stacks["data"]
+        self._calculator_stack = stacks["symbolic_calculator"]
+        self._mechanism_dock = workspace_root.dock_for_identity("mechanism")
+        self._sliders_dock = workspace_root.dock_for_identity(
+            "interactive_sliders"
         )
-        self._symbolic_calculator_dock = symbolic
+        self._batch_dock = workspace_root.dock_for_identity(
+            "batch_initial_conditions"
+        )
+        self._right_dock = workspace_root.dock_for_identity("data")
+        self._analysis_dock = workspace_root.dock_for_identity("analysis")
+        self._symbolic_calculator_dock = workspace_root.dock_for_identity(
+            "symbolic_calculator"
+        )
 
     def _create_tab_surface(
         self,
         tab_id: str,
         *,
         registry=None,
-        surface_parent: QtWidgets.QWidget | None = None,
+        workspace_root: ProjectWorkspaceWidget | None = None,
+        surface_stacks: dict[str, QtWidgets.QStackedWidget] | None = None,
         install: bool = True,
         publish_initial_state: bool = True,
-        plot_resolver: Callable[[str], PyQtGraphPlotPanel] | None = None,
     ) -> _TabSurfaceBundle:
-        """Construct one complete tab surface, optionally in detached custody."""
+        """Construct one complete tab surface beneath its project root."""
 
         surface_registry = self._workspace_tab_registry if registry is None else registry
-        target = surface_registry.tab(tab_id).tab_id
+        root = self._workspace if workspace_root is None else workspace_root
+        stacks = self._surface_stacks if surface_stacks is None else surface_stacks
+        target = str(tab_id)
+        if install or publish_initial_state:
+            target = surface_registry.tab(target).tab_id
         if install and target in self._tab_surfaces:
             raise ValueError(f"Tab surface already exists: {target!r}.")
-        if surface_parent is None:
-            editor_parent = self._mechanism_stack
-            simulation_parent = self._initial_conditions_stack
-            data_parent = self
-            overlay_parent = self
-            right_parent = self._data_stack
-            calculator_parent = self._calculator_stack
-        else:
-            editor_parent = surface_parent
-            simulation_parent = surface_parent
-            data_parent = surface_parent
-            overlay_parent = surface_parent
-            right_parent = surface_parent
-            calculator_parent = surface_parent
+        editor_parent = stacks["mechanism"]
+        simulation_parent = stacks["batch_initial_conditions"]
+        data_parent = root
+        overlay_parent = root
+        right_parent = stacks["data"]
+        calculator_parent = stacks["symbolic_calculator"]
 
         editor_panel = EditorPanel(parent=editor_parent)
         editor = editor_panel.editor
         slider_panel = editor.detach_slider_pane_for_dock()
-        if surface_parent is not None:
-            slider_panel.setParent(surface_parent)
-        # During replacement preparation every acquired QObject must already
-        # belong to the disposable detached custody.  The normal live path
-        # retains the historical MainWindow parent until SimulationPanel takes
-        # ownership below; prepared construction uses its holder immediately,
-        # so a failing SimulationPanel constructor cannot orphan the model.
-        model_parent = self if surface_parent is None else surface_parent
+        slider_panel.setParent(stacks["interactive_sliders"])
+        model_parent = root
         batch_model = BatchInitialConditionsTableModel(parent=model_parent)
         simulation_panel = SimulationPanel(
             batch_model=batch_model,
@@ -1012,8 +925,8 @@ class MainWindow(QtWidgets.QMainWindow):
         data_panel = DataManagerPanel(
             self._dataset_import_staging,
             origin_tab_id=target,
-            source_resolver=lambda source_id, captured_registry=surface_registry: (
-                captured_registry.document.imported_source(source_id)
+            source_resolver=lambda source_id: (
+                self._project_session.document.imported_source(source_id)
             ),
             parent=data_parent,
         )
@@ -1032,10 +945,10 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         calculator_owner = SymbolicCalculatorOwner(
             canonical_prepared_dsl=lambda captured=target: (
-                surface_registry.tab(captured).prepared_dsl
+                self._workspace_tab_registry.tab(captured).prepared_dsl
             ),
             canonical_source=lambda captured=target: (
-                surface_registry.tab(captured).mechanism_source
+                self._workspace_tab_registry.tab(captured).mechanism_source
             ),
         )
         calculator_panel = SymbolicCalculatorPanel(
@@ -1069,26 +982,7 @@ class MainWindow(QtWidgets.QMainWindow):
             species_sliders=editor.species_sliders_widget(),
             slider_workspace_owner=editor,
             simulation_jobs=self._simulation_jobs,
-            allocate_interactive_preview_batch=(
-                lambda tab_id, document_identity, target_set_ids, captured=target: (
-                    (
-                        self._workspace.plot_for_tab(captured)
-                        if plot_resolver is None
-                        else plot_resolver(captured)
-                    ).allocate_interactive_preview_batch(
-                        tab_id=tab_id,
-                        document_identity=document_identity,
-                        target_set_ids=target_set_ids,
-                    )
-                )
-            ),
-            interactive_exact_release_batch=(
-                lambda captured=target: (
-                    self._workspace.plot_for_tab(captured)
-                    if plot_resolver is None
-                    else plot_resolver(captured)
-                ).interactive_exact_release_batch()
-            ),
+            interactive_preview_owner=self._interactive_preview_owner,
             preview_preflight=(
                 lambda targets, captured=target: self._preview_preflight(
                     captured,
@@ -1122,11 +1016,11 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         if install:
             self._tab_surfaces[target] = bundle
-            self._mechanism_stack.addWidget(editor_panel)
-            self._slider_stack.addWidget(slider_panel)
-            self._initial_conditions_stack.addWidget(simulation_panel)
-            self._data_stack.addWidget(right_panel)
-            self._calculator_stack.addWidget(calculator_panel)
+            stacks["mechanism"].addWidget(editor_panel)
+            stacks["interactive_sliders"].addWidget(slider_panel)
+            stacks["batch_initial_conditions"].addWidget(simulation_panel)
+            stacks["data"].addWidget(right_panel)
+            stacks["symbolic_calculator"].addWidget(calculator_panel)
         self._connect_tab_surface(
             bundle,
             publish_initial_state=publish_initial_state,
@@ -1310,7 +1204,6 @@ class MainWindow(QtWidgets.QMainWindow):
             (self._calculator_stack, bundle.calculator_panel),
         ):
             stack.removeWidget(widget)
-            widget.setParent(None)
             widget.deleteLater()
 
     def _set_species_color(
@@ -1337,6 +1230,40 @@ class MainWindow(QtWidgets.QMainWindow):
     def _selected_bundle(self) -> _TabSurfaceBundle:
         return self._tab_surfaces[self._workspace_tab_registry.active_tab_id]
 
+    def _connect_workspace_root(
+        self,
+        workspace_root: ProjectWorkspaceWidget,
+        *,
+        surface_ids: Iterable[str] | None = None,
+        connect_shell: bool = True,
+        connect_plots: bool = True,
+    ) -> None:
+        """Connect one root's public signals to the outer policy shell."""
+
+        if connect_shell:
+            workspace_root.tabActivated.connect(self._select_tab)
+            workspace_root.createTabRequested.connect(self._create_tab)
+            workspace_root.renameTabRequested.connect(self._rename_tab)
+            workspace_root.closeTabRequested.connect(self._close_tab)
+        if not connect_plots:
+            return
+        if surface_ids is None:
+            workspace_root.plotCreated.connect(self._connect_workspace_plot)
+        else:
+            workspace_root.plotCreated.connect(
+                lambda tab_id, plot, ids=surface_ids: (
+                    self._connect_workspace_plot(
+                        tab_id,
+                        plot,
+                        surface_ids=(
+                            tuple(ids)
+                            if isinstance(ids, dict)
+                            else ids
+                        ),
+                    )
+                )
+            )
+
     def _connect_application_graph(self) -> None:
         self.project_controller.projectStateChanged.connect(
             self._on_project_state_changed
@@ -1349,10 +1276,7 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         self.project_controller.hardExitAuthorized.connect(self._hard_exit)
 
-        self._workspace.tabActivated.connect(self._select_tab)
-        self._workspace.createTabRequested.connect(self._create_tab)
-        self._workspace.renameTabRequested.connect(self._rename_tab)
-        self._workspace.closeTabRequested.connect(self._close_tab)
+        self._connect_workspace_root(self._workspace)
 
         application = QtWidgets.QApplication.instance()
         if isinstance(application, QtWidgets.QApplication):
@@ -1366,16 +1290,19 @@ class MainWindow(QtWidgets.QMainWindow):
             self._on_run_dispatched
         )
         self._simulation_jobs.results_changed.connect(self._on_results_changed)
-        self._simulation_jobs.interactive_frame_ready.connect(
+        self._interactive_preview_owner.frame_ready.connect(
             self._on_interactive_frame_ready
         )
-        self._simulation_jobs.interactive_preview_terminal.connect(
-            self._on_interactive_preview_terminal
-        )
-        self._simulation_jobs.interactive_preview_retired.connect(
-            self._on_interactive_preview_retired
-        )
         self._simulation_jobs.status_changed.connect(self.set_status_text)
+        self._interactive_preview_owner.state_changed.connect(
+            self._on_simulation_state_changed
+        )
+        self._interactive_preview_owner.status_changed.connect(
+            self.set_status_text
+        )
+        self._interactive_preview_owner.settled_changed.connect(
+            self._refresh_actions
+        )
         self._simulation_jobs.detailed_balance_correction_requested.connect(
             self._present_detailed_balance_correction
         )
@@ -1402,7 +1329,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.config_controller.applicationPlotPreferencesChanged.connect(
             self._refresh_application_plot_preferences
         )
-        self._workspace.plotCreated.connect(self._connect_workspace_plot)
         self.config_controller.mechanismParameterDebounceChanged.connect(
             lambda _value: self._apply_slider_debounce_settings()
         )
@@ -1534,7 +1460,6 @@ class MainWindow(QtWidgets.QMainWindow):
             "plotPresentationIntentRequested",
             "resultDiagnostic",
             "renderFailed",
-            "interactiveFrameDisposition",
         )
         if any(
             not callable(getattr(getattr(plot, name, None), "connect", None))
@@ -1575,9 +1500,6 @@ class MainWindow(QtWidgets.QMainWindow):
                 target,
                 message,
             )
-        )
-        plot.interactiveFrameDisposition.connect(
-            self._simulation_jobs.consume_interactive_frame_disposition
         )
 
     def _refresh_workspace_document(self) -> None:
@@ -1679,7 +1601,7 @@ class MainWindow(QtWidgets.QMainWindow):
             lambda: bundle.simulation_panel.render_run_defaults(
                 tab.run_defaults,
                 run_admitted=self._run_admitted(target),
-                simulation_job_kind=self._simulation_jobs.current_kind,
+                simulation_job_kind=self._current_simulation_job_kind(),
             ),
         )
         slider_projection: ActiveSliderRenderProjection | None = None
@@ -2054,79 +1976,32 @@ class MainWindow(QtWidgets.QMainWindow):
     def _on_results_changed(self, tab_id: str) -> None:
         """Ignore late results from a replaced/closed semantic tab."""
 
-        if self._project_replacement_cleanup_active:
-            return
         target = str(tab_id)
+        try:
+            plot = self._workspace.plot_for_tab(target)
+        except (KeyError, RuntimeError):
+            return
+        plot.discard_interactive_display()
         if target in self._slider_apply_refreshing:
             return
         self._render_results_for_tab(target)
 
     @QtCore.Slot(object)
     def _on_interactive_frame_ready(self, frame: object) -> None:
-        """Project one transient frame only onto its still-active tab plot."""
+        """Project one transient frame onto its owning tab's plot."""
 
         from kindred.gui.interactive_preview import InteractivePreviewFrame
 
         if not isinstance(frame, InteractivePreviewFrame):
             raise TypeError("Interactive Preview must publish a typed frame.")
         target = frame.tab_id
-        plot = None
-        if (
-            target in self._tab_surfaces
-            and target == self._workspace_tab_registry.active_tab_id
-        ):
-            try:
-                plot = self._workspace.plot_for_tab(target)
-            except (KeyError, RuntimeError):
-                pass
-        if plot is None:
-            disposition = InteractiveDisplayController.reject_unrenderable(
-                frame,
-                message="Interactive frame has no active plot surface.",
-            )
-            self._simulation_jobs.consume_interactive_frame_disposition(
-                disposition
-            )
+        if target not in self._tab_surfaces:
+            return
+        try:
+            plot = self._workspace.plot_for_tab(target)
+        except (KeyError, RuntimeError):
             return
         plot.apply_interactive_preview_frame(frame)
-
-    @QtCore.Slot(object)
-    def _on_interactive_preview_terminal(self, outcome: object) -> None:
-        """Route one explicit Preview terminal outcome by its bound tab."""
-
-        from kindred.gui.interactive_preview import InteractivePreviewTerminalOutcome
-
-        if not isinstance(outcome, InteractivePreviewTerminalOutcome):
-            raise TypeError(
-                "Interactive Preview terminal outcome must be typed."
-            )
-        target = outcome.batch.tab_id
-        if target not in self._tab_surfaces:
-            return
-        try:
-            plot = self._workspace.plot_for_tab(target)
-        except (KeyError, RuntimeError):
-            return
-        plot.apply_interactive_preview_terminal_outcome(outcome)
-
-    @QtCore.Slot(object)
-    def _on_interactive_preview_retired(self, retirement: object) -> None:
-        """Retire physical cadence without reviving a removed tab surface."""
-
-        from kindred.gui.interactive_preview import InteractivePreviewRetirement
-
-        if not isinstance(retirement, InteractivePreviewRetirement):
-            raise TypeError(
-                "Interactive Preview retirement intent must be typed."
-            )
-        target = retirement.tab_id
-        if target not in self._tab_surfaces:
-            return
-        try:
-            plot = self._workspace.plot_for_tab(target)
-        except (KeyError, RuntimeError):
-            return
-        plot.apply_interactive_preview_retirement(retirement)
 
     @QtCore.Slot(str, object)
     def _on_run_dispatched(self, tab_id: str, set_ids: object) -> None:
@@ -2162,11 +2037,6 @@ class MainWindow(QtWidgets.QMainWindow):
         return panel.xlsx_export_blocks()
 
     def _repository_for_tab(self, tab_id: str) -> ResultRepository:
-        override = self._replacement_repository_override
-        if override is not None:
-            repository = override.get(str(tab_id))
-            if repository is not None:
-                return repository
         repository = self._workspace_tab_registry.tab_runtime(tab_id).result_repository
         if not isinstance(repository, ResultRepository):
             raise LookupError(f"Tab {tab_id!r} has no ResultRepository.")
@@ -2197,12 +2067,66 @@ class MainWindow(QtWidgets.QMainWindow):
             if set_ids:
                 self._simulation_jobs.deauthorize_targets(tab_id, set_ids)
 
+    def _fence_interactive_preview_delta(
+        self,
+        delta: ScientificDocumentDelta,
+    ) -> None:
+        """Retire transient Preview work before canonical mutation publication."""
+
+        if not isinstance(delta, ScientificDocumentDelta):
+            raise TypeError(
+                "interactive Preview fence requires ScientificDocumentDelta."
+            )
+        for tab_id, set_ids in delta.affected_targets_by_tab:
+            self._interactive_preview_owner.retire(tab_id, set_ids)
+
+    def _capture_current_run(
+        self,
+        tab_id: str,
+        selected_ids: tuple[str, ...],
+    ) -> ExplicitRunCapture | None:
+        """Rebuild the exact Run capture after a canonical correction commit."""
+
+        if (
+            not isinstance(tab_id, str)
+            or not tab_id.strip()
+            or type(selected_ids) is not tuple
+            or not selected_ids
+            or any(
+                type(set_id) is not str or not set_id.strip()
+                for set_id in selected_ids
+            )
+            or len(selected_ids) != len(set(selected_ids))
+        ):
+            return None
+        token = self._project_session.capture_content_token()
+        try:
+            tab = self._workspace_tab_registry.tab(tab_id)
+            if tab.tab_id != tab_id:
+                return None
+            canonical_ids = {
+                initial_set.set_id for initial_set in tab.initial_condition_sets
+            }
+            if any(set_id not in canonical_ids for set_id in selected_ids):
+                return None
+            targets = tuple(
+                self._build_explicit_target_for_tab(tab, set_id)
+                for set_id in selected_ids
+            )
+            if not self._project_session.is_content_token_current(token):
+                return None
+            if tuple(target.set_id for target in targets) != selected_ids:
+                return None
+            if any(target.tab_id != tab_id for target in targets):
+                return None
+            return ExplicitRunCapture(tab_id=tab_id, targets=targets)
+        except Exception:
+            return None
+
     def _build_explicit_target_for_tab(
         self,
         tab: MechanismTabDocument,
         set_id: str,
-        *,
-        publication_generation: int,
     ):
         """Build one bound Run target through the direct request path."""
 
@@ -2218,7 +2142,6 @@ class MainWindow(QtWidgets.QMainWindow):
             initial_values=canonical_initial_values(tab, target.set_id),
             execution_settings=tab.resolved_execution_settings(target.set_id),
             scientific_settings=tab.scientific_settings,
-            publication_generation=publication_generation,
         )
 
     def _render_tab_state(self) -> None:
@@ -2476,7 +2399,7 @@ class MainWindow(QtWidgets.QMainWindow):
             bundle.simulation_panel.render_run_defaults(
                 tab.run_defaults,
                 run_admitted=self._run_admitted(tab_id),
-                simulation_job_kind=self._simulation_jobs.current_kind,
+                simulation_job_kind=self._current_simulation_job_kind(),
             )
             self._refresh_project_state()
         return result.token
@@ -2528,12 +2451,6 @@ class MainWindow(QtWidgets.QMainWindow):
             target = self._build_explicit_target_for_tab(
                 tab,
                 set_id,
-                publication_generation=(
-                    self._simulation_jobs.explicit_publication_generation(
-                        tab.tab_id,
-                        set_id,
-                    )
-                ),
             )
             if not self._simulation_jobs.show_cached(
                 tab_id,
@@ -2581,6 +2498,8 @@ class MainWindow(QtWidgets.QMainWindow):
         bundle = self._tab_surfaces[str(tab_id)]
         selected = bundle.initial_actions.selected_run_set_ids()
         if not selected or not self._computation_gate.is_idle:
+            return False
+        if self._simulation_work_active():
             return False
         if bundle.initial_actions.has_invalid_cells(selected):
             return False
@@ -2866,12 +2785,6 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._build_explicit_target_for_tab(
                     tab,
                     set_id,
-                    publication_generation=(
-                        self._simulation_jobs.explicit_publication_generation(
-                            tab.tab_id,
-                            set_id,
-                        )
-                    ),
                 )
                 for set_id in selected
             )
@@ -2916,9 +2829,7 @@ class MainWindow(QtWidgets.QMainWindow):
             notes_draft=notes_draft,
             invalid_initial_conditions=invalid_initials,
             slider_drafts=slider_drafts,
-            active_run_or_preview=bool(
-                self._simulation_jobs.current_kind is not None
-            ),
+            active_run_or_preview=self._simulation_work_active(),
             active_fit=fit_disposition.active_worker,
             fit_disposition=fit_disposition,
             active_import=bool(self._dataset_import_staging.busy),
@@ -3064,7 +2975,7 @@ class MainWindow(QtWidgets.QMainWindow):
             bundle.simulation_panel.render_run_defaults(
                 tab.run_defaults,
                 run_admitted=self._run_admitted(bundle.tab_id),
-                simulation_job_kind=self._simulation_jobs.current_kind,
+                simulation_job_kind=self._current_simulation_job_kind(),
             )
 
     def _discard_all_slider_drafts(self) -> None:
@@ -4395,24 +4306,10 @@ class MainWindow(QtWidgets.QMainWindow):
         view_menu = bar.addMenu("&View")
         self._view_menu = view_menu
         panels = view_menu.addMenu("Panels")
-        for spec, dock in zip(
-            dock_shell_specs(),
-            self._shell_docks(),
-            strict=True,
-        ):
-            action = dock.toggleViewAction()
-            action.setText(spec.title)
-            action.setObjectName(f"{spec.identity_key}DockToggleAction")
-            panels.addAction(action)
+        self._panels_menu = panels
         analysis_menu = view_menu.addMenu("Analysis Surfaces")
-        for surface in self._workspace.available_analysis_surfaces():
-            self._add_action(
-                analysis_menu,
-                surface,
-                lambda _checked=False, name=surface: self._show_analysis_surface(name),
-                None,
-                f"view{surface}SurfaceAction",
-            )
+        self._analysis_menu = analysis_menu
+        self._rebuild_workspace_view_menus()
         view_menu.addSeparator()
         self._add_action(
             view_menu,
@@ -5129,36 +5026,41 @@ class MainWindow(QtWidgets.QMainWindow):
         )
 
     def _shell_docks(self) -> tuple[QtWidgets.QDockWidget, ...]:
-        return (
-            self._mechanism_dock,
-            self._sliders_dock,
-            self._batch_dock,
-            self._right_dock,
-            self._analysis_dock,
-            self._symbolic_calculator_dock,
-        )
+        return self._workspace.dock_shells()
+
+    def _rebuild_workspace_view_menus(self) -> None:
+        """Derive View actions from the current root's live shells."""
+
+        panels = getattr(self, "_panels_menu", None)
+        if isinstance(panels, QtWidgets.QMenu):
+            panels.clear()
+            for spec, dock in zip(
+                dock_shell_specs(),
+                self._shell_docks(),
+                strict=True,
+            ):
+                action = dock.toggleViewAction()
+                action.setText(spec.title)
+                action.setObjectName(
+                    f"{spec.identity_key}DockToggleAction"
+                )
+                panels.addAction(action)
+        analysis_menu = getattr(self, "_analysis_menu", None)
+        if isinstance(analysis_menu, QtWidgets.QMenu):
+            analysis_menu.clear()
+            for surface in self._workspace.available_analysis_surfaces():
+                self._add_action(
+                    analysis_menu,
+                    surface,
+                    lambda _checked=False, name=surface: (
+                        self._show_analysis_surface(name)
+                    ),
+                    None,
+                    f"view{surface}SurfaceAction",
+                )
 
     def _apply_default_dock_arrangement(self) -> None:
-        for dock in self._shell_docks():
-            dock.setFloating(False)
-            self.addDockWidget(dock_default_area(dock), dock)
-            dock.show()
-        self.splitDockWidget(
-            self._mechanism_dock,
-            self._sliders_dock,
-            Qt.Orientation.Vertical,
-        )
-        self.splitDockWidget(
-            self._batch_dock,
-            self._right_dock,
-            Qt.Orientation.Vertical,
-        )
-        self.tabifyDockWidget(self._right_dock, self._analysis_dock)
-        self.tabifyDockWidget(
-            self._right_dock,
-            self._symbolic_calculator_dock,
-        )
-        self._right_dock.raise_()
+        self._workspace.apply_default_dock_arrangement()
 
     def reset_layout(self) -> None:
         if not self._mutation_input_admitted("Reset Layout"):
@@ -5168,9 +5070,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def redock_shell_dock(self, dock: QtWidgets.QDockWidget) -> None:
         if not self._mutation_input_admitted("Redock Panel"):
             return
-        dock.setFloating(False)
-        self.addDockWidget(dock_default_area(dock), dock)
-        dock.show()
+        self._workspace.redock_dock(dock)
 
     def schedule_restored_floating_dock_recovery(self) -> None:
         QtCore.QTimer.singleShot(0, self._recover_restored_floating_docks)
@@ -5178,13 +5078,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _recover_restored_floating_docks(self) -> None:
         screen = self.screen()
         available = screen.availableGeometry() if screen is not None else QtCore.QRect()
-        for dock in self._shell_docks():
-            if not dock.isFloating():
-                continue
-            geometry = dock.frameGeometry()
-            if available.isValid() and available.intersects(geometry):
-                continue
-            self.redock_shell_dock(dock)
+        self._workspace.recover_floating_docks(available)
 
     def restore_persisted_maximized_state(self) -> None:
         QtCore.QTimer.singleShot(0, self.showMaximized)
@@ -5192,525 +5086,118 @@ class MainWindow(QtWidgets.QMainWindow):
     def _show_analysis_surface(self, name: str) -> bool:
         if not self._mutation_input_admitted("Open Analysis Surface"):
             return False
-        if not self._workspace.focus_analysis_surface(name):
-            return False
-        self._analysis_dock.show()
-        self._analysis_dock.raise_()
-        return True
+        return self._workspace.show_analysis_surface(name)
 
     # ------------------------------------------------------------------
-    # Project-controller physical port and native Close
+    # Project-controller workspace callbacks and native Close
     # ------------------------------------------------------------------
     def set_status_text(self, text: str) -> None:
         self._status_label.setText(str(text))
 
-    def _detach_surface_bundle(self, bundle: _TabSurfaceBundle) -> None:
-        """Remove one surface from live stacks without destroying its custody."""
-
-        for stack, widget in (
-            (self._mechanism_stack, bundle.editor_panel),
-            (self._slider_stack, bundle.slider_panel),
-            (self._initial_conditions_stack, bundle.simulation_panel),
-            (self._data_stack, bundle.right_panel),
-            (self._calculator_stack, bundle.calculator_panel),
-        ):
-            if stack.indexOf(widget) >= 0:
-                stack.removeWidget(widget)
-            widget.setParent(None)
-
-    def _attach_surface_bundle(self, bundle: _TabSurfaceBundle) -> None:
-        """Install one prepared surface into the retained dock stacks."""
-
-        self._mechanism_stack.addWidget(bundle.editor_panel)
-        self._slider_stack.addWidget(bundle.slider_panel)
-        self._initial_conditions_stack.addWidget(bundle.simulation_panel)
-        self._data_stack.addWidget(bundle.right_panel)
-        self._calculator_stack.addWidget(bundle.calculator_panel)
-
-    def _destroy_surface_bundle(
+    def _build_workspace(
         self,
-        bundle: _TabSurfaceBundle,
-    ) -> tuple[str, ...]:
-        """Destroy a detached surface and its binding-owned timer custody."""
-
-        failures: list[str] = []
-        try:
-            bundle.slider_binding.dispose()
-        except Exception as exc:
-            logger.exception(
-                "Prepared Slider binding could not be disposed for tab %s",
-                bundle.tab_id,
-            )
-            failures.append(f"slider disposal for tab {bundle.tab_id}: {exc}")
-        try:
-            self._detach_surface_bundle(bundle)
-        except Exception as exc:
-            logger.exception(
-                "Surface bundle could not be detached for tab %s",
-                bundle.tab_id,
-            )
-            failures.append(f"surface detach for tab {bundle.tab_id}: {exc}")
-        for widget in (
-            bundle.editor_panel,
-            bundle.slider_panel,
-            bundle.simulation_panel,
-            bundle.right_panel,
-            bundle.calculator_panel,
-        ):
-            try:
-                widget.deleteLater()
-            except Exception as exc:
-                logger.exception(
-                    "Surface widget could not be queued for deletion for tab %s",
-                    bundle.tab_id,
-                )
-                failures.append(
-                    f"widget deletion for tab {bundle.tab_id}: {exc}"
-                )
-        return tuple(failures)
-
-    def _detach_plot(self, plot: PyQtGraphPlotPanel) -> None:
-        self._workspace.detach_plot(plot)
-
-    def _destroy_plot(self, plot: PyQtGraphPlotPanel) -> tuple[str, ...]:
-        failures: list[str] = []
-        try:
-            plot.drop_tab_session_state()
-        except Exception as exc:
-            logger.exception("Plot session state could not be retired")
-            failures.append(f"plot state retirement: {exc}")
-        try:
-            self._detach_plot(plot)
-        except Exception as exc:
-            logger.exception("Plot custody could not be detached")
-            failures.append(f"plot detach: {exc}")
-        try:
-            analysis = plot.analysis_tabs()
-        except Exception as exc:
-            logger.exception("Plot analysis surface could not be resolved")
-            failures.append(f"plot analysis lookup: {exc}")
-            analysis = None
-        if analysis is not None:
-            try:
-                analysis.setParent(None)
-            except Exception as exc:
-                logger.exception("Plot analysis surface could not be detached")
-                failures.append(f"plot analysis detach: {exc}")
-            try:
-                analysis.deleteLater()
-            except Exception as exc:
-                logger.exception("Plot analysis surface could not be deleted")
-                failures.append(f"plot analysis deletion: {exc}")
-        try:
-            plot.deleteLater()
-        except Exception as exc:
-            logger.exception("Plot custody could not be deleted")
-            failures.append(f"plot deletion: {exc}")
-        return tuple(failures)
-
-    def _attach_plot(self, plot: PyQtGraphPlotPanel) -> None:
-        self._workspace.attach_plot(plot)
-
-    def _prepare_surface_projection(
-        self,
-        bundle: _TabSurfaceBundle,
-        registry: _PreparedPhysicalTabContext,
-        plot: PyQtGraphPlotPanel,
-    ) -> None:
-        """Render every staged page from prepared values before publication."""
-        previous_rendering = self._rendering_workspace
-        self._rendering_workspace = True
-        try:
-            tab = registry.tab(bundle.tab_id)
-            bundle.editor_binding.apply_render_projection(
-                bundle.editor_binding.prepare_render()
-            )
-            bundle.initial_actions.apply_render_projection(
-                bundle.initial_actions.prepare_render()
-            )
-            slider_projection = bundle.slider_binding.prepare_render()
-            bundle.slider_binding.apply_render_projection(slider_projection)
-            # Do not emit the live-shell draft signal while this bundle is
-            # prepared: its ordinary consumer resolves through the current
-            # tab map, which still belongs to the old project until
-            # publication.  Set the prepared control directly instead.
-            bundle.editor.set_slider_draft_actions_enabled(
-                bundle.slider_binding.has_slider_draft()
-            )
-            bundle.simulation_panel.render_run_defaults(
-                tab.run_defaults,
-                run_admitted=False,
-                simulation_job_kind=self._simulation_jobs.current_kind,
-            )
-            snapshot = build_data_manager_snapshot(
-                document=registry.document,
-                active_tab=tab,
-                presentation=registry.presentation(bundle.tab_id),
-            )
-            bundle.data_panel.render_snapshot(snapshot)
-            bundle.overlay_panel.render_snapshot(
-                records=snapshot.datasets,
-                active_links=snapshot.active_links,
-                known_species=tuple(canonical_observation_target_names(tab)),
-            )
-            target_names = tuple(
-                tab.initial_condition_set(set_id).name
-                for set_id in slider_projection.targets
-            )
-            bundle.editor.set_slider_edit_targets_summary(
-                "Slider edit targets: "
-                + (", ".join(target_names) if target_names else "none")
-            )
-            calculator_state = bundle.calculator_owner.refresh()
-            bundle.calculator_panel.render_state(calculator_state)
-            state = registry.presentation(bundle.tab_id)
-            plot.set_persisted_plot_state(
-                log_x=state.log_x,
-                log_y=state.log_y,
-                legend_visible=state.legend_visible,
-                x_inverted=state.x_inverted,
-                y_inverted=state.y_inverted,
-            )
-            repository = registry.tab_runtime(
-                bundle.tab_id
-            ).result_repository
-            if not isinstance(repository, ResultRepository):
-                raise LookupError(
-                    f"Prepared tab {bundle.tab_id!r} has no ResultRepository."
-                )
-            plot.apply_result_input(
-                self._compose_result_input(
-                    bundle.tab_id,
-                    document=registry.document,
-                    presentation=state,
-                    repository=repository,
-                )
-            )
-        finally:
-            self._rendering_workspace = previous_rendering
-
-    def prepare_project_install(
-        self,
-        *,
-        prepared_session: PreparedProjectInstall,
+        document: ProjectDocument,
         prepared_workspace: PreparedWorkspaceInstall,
-    ) -> object:
-        """Prepare every replacement Qt surface while the old project is live."""
+    ) -> QtWidgets.QWidget:
+        """Build a complete candidate root without touching the current root."""
 
-        if not isinstance(prepared_session, PreparedProjectInstall):
-            raise TypeError("prepared_session must be PreparedProjectInstall.")
+        if not isinstance(document, ProjectDocument):
+            raise TypeError("document must be ProjectDocument.")
         if not isinstance(prepared_workspace, PreparedWorkspaceInstall):
             raise TypeError("prepared_workspace must be PreparedWorkspaceInstall.")
-        document_ids = tuple(tab.tab_id for tab in prepared_session.document.tabs)
-        workspace_ids = tuple(
+        expected_ids = tuple(tab.tab_id for tab in document.tabs)
+        prepared_ids = tuple(
             tab_id for tab_id, _runtime in prepared_workspace.runtime_by_tab_id
         )
-        if document_ids != workspace_ids:
-            raise ValueError(
-                "Prepared project and workspace tab IDs must have identical order."
-            )
-        active_tab_id = str(prepared_workspace.active_tab_id)
-        if active_tab_id not in document_ids:
-            raise ValueError(
-                f"Prepared workspace active tab is unknown: {active_tab_id!r}."
-            )
+        if expected_ids != prepared_ids:
+            raise ValueError("Candidate document and workspace IDs differ.")
+        if prepared_workspace.active_tab_id not in expected_ids:
+            raise ValueError("Candidate workspace active tab is unknown.")
 
-        holder = QtWidgets.QWidget(self)
-        holder.setObjectName("preparedProjectPhysicalInstall")
-        holder.hide()
-        prepared_context = _PreparedPhysicalTabContext(
-            prepared_session=prepared_session,
-            prepared_workspace=prepared_workspace,
-            identity_generation=self._project_session.identity_generation + 1,
-        )
-        surfaces: dict[str, _TabSurfaceBundle] = {}
-        plots: dict[str, PyQtGraphPlotPanel] = {}
-        staged_plot_by_tab_id: dict[str, PyQtGraphPlotPanel] = {}
-        prepared: _PreparedProjectPhysicalInstall | None = None
+        root = ProjectWorkspaceWidget(self, outer_policy=self)
         try:
-            for tab_id in document_ids:
+            stacks = self._build_physical_shell(root)
+            surfaces: dict[str, _TabSurfaceBundle] = {}
+            for tab in document.tabs:
                 bundle = self._create_tab_surface(
-                    tab_id,
-                    registry=prepared_context,
-                    surface_parent=holder,
+                    tab.tab_id,
+                    registry=self._workspace_tab_registry,
+                    workspace_root=root,
+                    surface_stacks=stacks,
                     install=False,
                     publish_initial_state=False,
-                    plot_resolver=lambda target, captured=staged_plot_by_tab_id: (
-                        captured[str(target)]
-                    ),
                 )
-                surfaces[tab_id] = bundle
-            for tab_id in document_ids:
-                plot = self._workspace.new_plot_panel()
-                # Workspace's factory intentionally returns an unparented
-                # panel for ordinary tab installation.  Prepared replacement
-                # custody must be established before any configuration or
-                # signal operation can fail; if the transfer itself raises,
-                # dispose this still-unregistered local immediately.
-                try:
-                    plot.setParent(holder)
-                except Exception:
-                    try:
-                        plot.deleteLater()
-                    except Exception:
-                        logger.exception(
-                            "Unparented prepared plot could not be discarded"
-                        )
-                    raise
-                plots[tab_id] = plot
-                staged_plot_by_tab_id[tab_id] = plot
-                plot.setObjectName("plotPanel")
-                self._connect_workspace_plot(
-                    tab_id,
-                    plot,
-                    surface_ids=surfaces,
+                surfaces[tab.tab_id] = bundle
+                stacks["mechanism"].addWidget(bundle.editor_panel)
+                stacks["interactive_sliders"].addWidget(bundle.slider_panel)
+                stacks["batch_initial_conditions"].addWidget(
+                    bundle.simulation_panel
                 )
-            for bundle in surfaces.values():
-                self._prepare_surface_projection(
-                    bundle,
-                    prepared_context,
-                    plots[bundle.tab_id],
+                stacks["data"].addWidget(bundle.right_panel)
+                stacks["symbolic_calculator"].addWidget(
+                    bundle.calculator_panel
                 )
-            old_surfaces = self._tab_surfaces
-            (
-                old_plots,
-                old_initial_plot,
-                old_workspace_active_tab_id,
-                old_plot_current,
-                old_analysis_current,
-            ) = self._workspace.capture_plot_state()
-            old_surface_current = tuple(
-                stack.currentWidget()
-                for stack in (
-                    self._mechanism_stack,
-                    self._slider_stack,
-                    self._initial_conditions_stack,
-                    self._data_stack,
-                    self._calculator_stack,
-                )
+
+            root._kindred_tab_surfaces = surfaces
+            self._connect_workspace_root(
+                root,
+                surface_ids=surfaces,
+                connect_shell=False,
             )
-            old_repositories = {
-                tab.tab_id: repository
-                for tab in self._project_session.document.tabs
-                for repository in (
-                    self._workspace_tab_registry.tab_runtime(
-                        tab.tab_id
-                    ).result_repository,
-                )
-                if isinstance(repository, ResultRepository)
-            }
-            prepared = _PreparedProjectPhysicalInstall(
-                tab_surfaces=surfaces,
-                plots_by_tab_id=plots,
-                active_tab_id=active_tab_id,
-                preparation_holder=holder,
-                prepared_context=prepared_context,
-                old_tab_surfaces=old_surfaces,
-                old_plots_by_tab_id=old_plots,
-                old_initial_plot=old_initial_plot,
-                old_plot_current=old_plot_current,
-                old_analysis_current=old_analysis_current,
-                old_surface_current=old_surface_current,
-                old_workspace_active_tab_id=old_workspace_active_tab_id,
-                old_repositories=old_repositories,
+            presentation_by_tab_id = dict(
+                prepared_workspace.presentation_by_tab_id
             )
-            # Rendering used the call-local prepared context.  Rebind every
-            # retained consumer to the final registry before any host
-            # attachment; no forwarding context survives this call.
-            self._bind_prepared_surfaces_to_live_registry(prepared)
-            # Add incoming pages and plots beside the current project.  Qt
-            # keeps the existing current widgets selected while these are
-            # added, so old physical custody remains current until publish.
-            for bundle in surfaces.values():
-                self._attach_surface_bundle(bundle)
-            for plot in plots.values():
-                self._attach_plot(plot)
-            # All incoming children now belong to their real hosts; the
-            # temporary custody holder is empty and no longer participates in
-            # publication or discard decisions.
-            holder.deleteLater()
-            return prepared
+            root.render(
+                document,
+                active_tab_id=prepared_workspace.active_tab_id,
+            )
+            for tab in document.tabs:
+                state = presentation_by_tab_id[tab.tab_id]
+                root.plot_for_tab(tab.tab_id).set_persisted_plot_state(
+                    log_x=state.log_x,
+                    log_y=state.log_y,
+                    legend_visible=state.legend_visible,
+                    x_inverted=state.x_inverted,
+                    y_inverted=state.y_inverted,
+                )
+            root.set_theme(dark_mode=self._theme_manager.applied_dark_mode)
+            return root
         except Exception:
-            logger.exception("Prepared project physical construction failed")
-            for plot in plots.values():
-                self._destroy_plot(plot)
-            for bundle in surfaces.values():
-                self._destroy_surface_bundle(bundle)
-            try:
-                holder.deleteLater()
-            except Exception:
-                logger.exception("Prepared project holder could not be retired")
+            root.deleteLater()
             raise
 
-    def _bind_prepared_surfaces_to_live_registry(
-        self,
-        prepared: _PreparedProjectPhysicalInstall,
-    ) -> None:
-        """Rebind rendered consumers directly to the final live registry."""
+    def _swap_workspace(self, widget: QtWidgets.QWidget) -> None:
+        """Install one committed candidate root and retire the previous root."""
 
-        registry = self._workspace_tab_registry
-        for bundle in prepared.tab_surfaces.values():
-            captured = bundle.tab_id
-            bundle.editor_binding.bind_registry(registry)
-            bundle.initial_actions.bind_registry(registry)
-            bundle.slider_binding.bind_registry(registry)
-            bundle.data_panel.bind_source_resolver(
-                lambda source_id, captured_registry=registry: (
-                    captured_registry.document.imported_source(source_id)
-                )
-            )
-            bundle.calculator_owner.bind_canonical_source_resolvers(
-                canonical_prepared_dsl=lambda captured_tab=captured: registry.tab(
-                    captured_tab
-                ).prepared_dsl,
-                canonical_source=lambda captured_tab=captured: registry.tab(
-                    captured_tab
-                ).mechanism_source,
-            )
+        if not isinstance(widget, ProjectWorkspaceWidget):
+            raise TypeError("workspace must be ProjectWorkspaceWidget.")
+        incoming = widget
+        surfaces = getattr(incoming, "_kindred_tab_surfaces", None)
+        stacks = getattr(incoming, "_kindred_surface_stacks", None)
+        if not isinstance(surfaces, dict) or not isinstance(stacks, dict):
+            raise RuntimeError("Candidate root has no complete project surfaces.")
 
-    def publish_project_install(
-        self,
-        prepared: object,
-        *,
-        expected_token: ProjectContentToken,
-    ) -> object:
-        """Fence and publish prepared references plus current selections only."""
-
-        if not isinstance(prepared, _PreparedProjectPhysicalInstall):
-            raise TypeError("prepared must be prepared physical custody.")
-        if not isinstance(expected_token, ProjectContentToken):
-            raise TypeError("expected_token must be ProjectContentToken.")
-        if not self._project_session.is_content_token_current(expected_token):
-            raise RuntimeError(
-                "Prepared physical project assignment rejected a stale token."
-            )
-        # Preparation already attached and bound every incoming surface while
-        # old custody remained current.  Publication is intentionally limited
-        # to the final container/reference assignments and current selections.
-        self._tab_surfaces = prepared.tab_surfaces
-        active_bundle = prepared.tab_surfaces[prepared.active_tab_id]
-        for stack, current in zip(
-            (
-                self._mechanism_stack,
-                self._slider_stack,
-                self._initial_conditions_stack,
-                self._data_stack,
-                self._calculator_stack,
-            ),
-            (
-                active_bundle.editor_panel,
-                active_bundle.slider_panel,
-                active_bundle.simulation_panel,
-                active_bundle.right_panel,
-                active_bundle.calculator_panel,
-            ),
-        ):
-            stack.setCurrentWidget(current)
-        active_plot = prepared.plots_by_tab_id[prepared.active_tab_id]
-        self._workspace.adopt_plot_state(
-            prepared.plots_by_tab_id,
-            None,
-            prepared.active_tab_id,
-            current_plot=active_plot,
-            current_analysis=active_plot.analysis_tabs(),
+        saved_layout = self._save_workspace_layout()
+        if not incoming.restore_workspace_state(saved_layout):
+            incoming.apply_default_dock_arrangement()
+        self.setCentralWidget(incoming)
+        self._workspace = incoming
+        self._surface_stacks = stacks
+        self._tab_surfaces = surfaces
+        self._set_current_workspace_references(incoming)
+        self._connect_workspace_root(
+            incoming,
+            surface_ids=surfaces,
+            connect_shell=True,
+            connect_plots=False,
         )
-        self._replacement_structure_pending = True
-        self._replacement_repository_override = dict(prepared.old_repositories)
-        self._project_replacement_cleanup_active = True
-        return _ProjectPhysicalRetirement(
-            tab_surfaces=prepared.old_tab_surfaces,
-            plots_by_tab_id=prepared.old_plots_by_tab_id,
-            initial_plot=prepared.old_initial_plot,
-        )
-
-    def discard_project_install(self, prepared: object) -> None:
-        """Restore old references/selections and destroy prepared custody."""
-
-        if not isinstance(prepared, _PreparedProjectPhysicalInstall):
-            raise TypeError("prepared must be prepared physical custody.")
-        # A stale token may reject the semantic commit immediately after
-        # publish.  Restore only physical references and selection; the
-        # ProjectSession and registry owners are deliberately not rolled back.
-        if self._tab_surfaces is prepared.tab_surfaces:
-            self._tab_surfaces = prepared.old_tab_surfaces
-        self._workspace.adopt_plot_state(
-            prepared.old_plots_by_tab_id,
-            prepared.old_initial_plot,
-            prepared.old_workspace_active_tab_id,
-            current_plot=prepared.old_plot_current,
-            current_analysis=prepared.old_analysis_current,
-        )
-        for stack, current in zip(
-            (
-                self._mechanism_stack,
-                self._slider_stack,
-                self._initial_conditions_stack,
-                self._data_stack,
-                self._calculator_stack,
-            ),
-            prepared.old_surface_current,
-        ):
-            if current is not None and stack.indexOf(current) >= 0:
-                stack.setCurrentWidget(current)
-        for plot in prepared.plots_by_tab_id.values():
-            self._destroy_plot(plot)
-        for bundle in prepared.tab_surfaces.values():
-            self._destroy_surface_bundle(bundle)
-        self._replacement_repository_override = None
-        self._project_replacement_cleanup_active = False
-        self._replacement_structure_pending = False
-        try:
-            prepared.preparation_holder.deleteLater()
-        except Exception:
-            logger.exception("Prepared project holder could not be retired")
-
-    def retire_project_install(
-        self,
-        retirement: object,
-    ) -> tuple[str, ...]:
-        """Retire old surfaces only after the controller purges old results."""
-
-        if not isinstance(retirement, _ProjectPhysicalRetirement):
-            raise TypeError("retirement must be old physical custody.")
-        failures: list[str] = []
-        try:
-            for bundle in retirement.tab_surfaces.values():
-                try:
-                    failures.extend(self._destroy_surface_bundle(bundle))
-                except Exception as exc:
-                    logger.exception(
-                        "Surface bundle retirement raised for %s",
-                        getattr(bundle, "tab_id", "<unknown>"),
-                    )
-                    failures.append(f"surface retirement: {exc}")
-            for plot in retirement.plots_by_tab_id.values():
-                try:
-                    failures.extend(self._destroy_plot(plot))
-                except Exception as exc:
-                    logger.exception("Plot retirement raised")
-                    failures.append(f"plot retirement: {exc}")
-            if retirement.initial_plot is not None:
-                try:
-                    failures.extend(self._destroy_plot(retirement.initial_plot))
-                except Exception as exc:
-                    logger.exception("Initial plot retirement raised")
-                    failures.append(f"initial plot retirement: {exc}")
-        finally:
-            # Retirement is best-effort cleanup.  It must never roll back or
-            # obscure the newly published semantic/physical state.  The
-            # project-state handler still owns the pending structure refresh.
-            self._replacement_repository_override = None
-            self._project_replacement_cleanup_active = False
-        return tuple(failures)
+        self._rebuild_workspace_view_menus()
+        self._refresh_workspace_document()
 
     @QtCore.Slot()
     def _on_project_state_changed(self) -> None:
-        """Refresh replacement structure after semantic publication."""
+        """Refresh the current root after semantic publication."""
 
-        if self._replacement_structure_pending:
-            self._replacement_structure_pending = False
-            self._refresh_workspace_tab_structure()
-            return
         self._refresh_project_state()
 
     def _refresh_project_state(self) -> None:
@@ -5718,11 +5205,25 @@ class MainWindow(QtWidgets.QMainWindow):
         self._refresh_title()
         self._refresh_actions()
 
+    def _current_simulation_job_kind(self) -> str | None:
+        """Project the two execution owners into the shell's Stop state."""
+
+        direct_kind = self._simulation_jobs.current_kind
+        if direct_kind is not None:
+            return str(direct_kind)
+        return "preview" if self._interactive_preview_owner.busy else None
+
+    def _simulation_work_active(self) -> bool:
+        return bool(
+            self._simulation_jobs.current_kind is not None
+            or self._interactive_preview_owner.busy
+        )
+
     @QtCore.Slot()
     def _on_simulation_state_changed(self) -> None:
         """Project the live simulation kind into every retained panel."""
 
-        job_kind = self._simulation_jobs.current_kind
+        job_kind = self._current_simulation_job_kind()
         for bundle in self._tab_surfaces.values():
             try:
                 bundle.simulation_panel.render_job_state(job_kind)
@@ -5775,7 +5276,7 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         self._stop_action.setEnabled(
             mutation_admitted
-            and self._simulation_jobs.current_kind is not None
+            and self._simulation_work_active()
         )
         self._global_fit_action.setEnabled(
             mutation_admitted and self._computation_gate.is_idle

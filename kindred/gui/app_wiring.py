@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING
 from PySide6 import QtCore
 
 if TYPE_CHECKING:
-    from PySide6.QtWidgets import QDockWidget, QWidget
+    from PySide6.QtWidgets import QDockWidget, QMainWindow, QWidget
 
     from kindred.gui.main_window import MainWindow
 
@@ -105,19 +105,28 @@ def build_shell_dock(main_window: MainWindow, spec: DockShellSpec):
 def build_module_dock(
     main_window: MainWindow,
     *,
+    workspace_root: QMainWindow,
     spec: DockShellSpec,
     panel: QWidget,
 ) -> QDockWidget:
+    """Build one panel shell beneath the detachable project root.
+
+    ``main_window`` remains the outer policy owner for Dock Back and Reset
+    callbacks.  All Qt custody—the dock, floating container and panel
+    content—belongs to the nested ``QMainWindow`` supplied as
+    ``workspace_root``.
+    """
+
     from kindred.gui.widgets.floating_dock_container import FloatingDockContainer
 
-    dock = build_shell_dock(main_window, spec)
+    dock = build_shell_dock(workspace_root, spec)
     container = FloatingDockContainer(
         content=panel,
         dock=dock,
         on_dock_back=lambda: main_window.redock_shell_dock(dock),
         on_reset_layout=main_window.reset_layout,
-        parent=main_window,
+        parent=workspace_root,
     )
     dock.setWidget(container)
-    main_window.addDockWidget(spec.default_area, dock)
+    workspace_root.addDockWidget(spec.default_area, dock)
     return dock

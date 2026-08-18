@@ -1,19 +1,28 @@
-"""Mechanism tab strip above retained tab-local plot surfaces."""
+"""The detachable Qt custody root for one project workspace."""
 
 from __future__ import annotations
+
+from collections.abc import Mapping
 
 from PySide6 import QtCore, QtWidgets
 
 from kindred.core.project_document import ProjectDocument
 from kindred.gui.widgets.pyqtgraph_plot_panel_impl import PyQtGraphPlotPanel
 
-__all__ = ["MechanismWorkspaceView"]
+__all__ = ["ProjectWorkspaceWidget"]
 
 _CREATE_TAB_TOOLTIP = "Create a fresh mechanism tab"
 
 
-class MechanismWorkspaceView(QtWidgets.QWidget):
-    """Physical mechanism selector and tab-local plot host; owns no project truth."""
+class ProjectWorkspaceWidget(QtWidgets.QMainWindow):
+    """One detachable physical project root.
+
+    The root deliberately owns only Qt custody.  Project semantics, result
+    repositories, persistence and replacement policy remain in their existing
+    owners.  The tab strip and plot stack are kept in the central child while
+    the six module panels are installed as ordinary ``QDockWidget`` shells
+    beneath this nested ``QMainWindow``.
+    """
 
     tabActivated = QtCore.Signal(str)
     createTabRequested = QtCore.Signal()
@@ -24,9 +33,20 @@ class MechanismWorkspaceView(QtWidgets.QWidget):
     def __init__(
         self,
         parent: QtWidgets.QWidget | None = None,
+        *,
+        outer_policy: QtWidgets.QWidget | None = None,
+        dock_panels: Mapping[str, QtWidgets.QWidget] | None = None,
     ) -> None:
         super().__init__(parent)
-        layout = QtWidgets.QVBoxLayout(self)
+        self.setObjectName("projectWorkspaceRoot")
+        self.setDockNestingEnabled(True)
+        self._outer_policy = outer_policy
+        self._dock_by_identity: dict[str, QtWidgets.QDockWidget] = {}
+
+        central = QtWidgets.QWidget(self)
+        central.setObjectName("projectWorkspaceCentral")
+        self.setCentralWidget(central)
+        layout = QtWidgets.QVBoxLayout(central)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
 
@@ -55,6 +75,161 @@ class MechanismWorkspaceView(QtWidgets.QWidget):
         self._install_analysis_widget(self._initial_plot)
         layout.addWidget(self._plot_stack, 1)
 
+        if dock_panels is not None:
+            self.install_dock_panels(dock_panels)
+
+    @property
+    def outer_policy(self) -> QtWidgets.QWidget | None:
+        """Return the outer shell used for policy callbacks only."""
+
+        return self._outer_policy
+
+    def install_dock_panels(
+        self,
+        panels: Mapping[str, QtWidgets.QWidget],
+    ) -> tuple[QtWidgets.QDockWidget, ...]:
+        """Install the six module panels under this root.
+
+        ``panels`` is a construction-time mapping.  Replacing a project
+        destroys this root and builds a new one; panels are never reparented
+        between roots.
+        """
+
+        from kindred.gui.app_wiring import (
+            ANALYSIS_DOCK_SPEC,
+            BATCH_DOCK_SPEC,
+            MECHANISM_DOCK_SPEC,
+            RIGHT_DOCK_SPEC,
+            SLIDERS_DOCK_SPEC,
+            SYMBOLIC_CALCULATOR_DOCK_SPEC,
+            build_module_dock,
+        )
+
+        specs = (
+            (MECHANISM_DOCK_SPEC, "mechanism"),
+            (SLIDERS_DOCK_SPEC, "interactive_sliders"),
+            (BATCH_DOCK_SPEC, "batch_initial_conditions"),
+            (RIGHT_DOCK_SPEC, "data"),
+            (ANALYSIS_DOCK_SPEC, "analysis"),
+            (SYMBOLIC_CALCULATOR_DOCK_SPEC, "symbolic_calculator"),
+        )
+        expected = {identity for _spec, identity in specs}
+        supplied = {str(key) for key in panels}
+        if supplied != expected:
+            raise ValueError(
+                "dock_panels must contain exactly the six project module keys."
+            )
+        if self._dock_by_identity:
+            raise RuntimeError("Project workspace docks are already installed.")
+        outer = self._outer_policy
+        if outer is None:
+            raise TypeError(
+                "outer_policy is required before installing project docks."
+            )
+        docks: list[QtWidgets.QDockWidget] = []
+        for spec, identity in specs:
+            dock = build_module_dock(
+                outer,
+                workspace_root=self,
+                spec=spec,
+                panel=panels[identity],
+            )
+            self._dock_by_identity[identity] = dock
+            docks.append(dock)
+        return tuple(docks)
+
+    def dock_for_identity(self, identity: str) -> QtWidgets.QDockWidget:
+        """Return one root-owned dock shell by its stable module identity."""
+
+        try:
+            return self._dock_by_identity[str(identity)]
+        except KeyError as exc:
+            raise KeyError(f"Unknown project dock identity: {identity!r}.") from exc
+
+    def dock_shells(self) -> tuple[QtWidgets.QDockWidget, ...]:
+        """Return the current root's dock shells in canonical order."""
+
+        return tuple(self._dock_by_identity.values())
+
+    def apply_default_dock_arrangement(self) -> None:
+        """Restore the root's default six-dock arrangement."""
+
+        docks = tuple(self._dock_by_identity.values())
+        for dock in docks:
+            dock.setFloating(False)
+            area = dock.property("kindred/defaultDockArea")
+            if area is not None:
+                self.addDockWidget(
+                    QtCore.Qt.DockWidgetArea(int(area)),
+                    dock,
+                )
+            dock.show()
+        if len(docks) != 6:
+            return
+        mechanism = self.dock_for_identity("mechanism")
+        sliders = self.dock_for_identity("interactive_sliders")
+        batch = self.dock_for_identity("batch_initial_conditions")
+        data = self.dock_for_identity("data")
+        analysis = self.dock_for_identity("analysis")
+        calculator = self.dock_for_identity("symbolic_calculator")
+        self.splitDockWidget(
+            mechanism,
+            sliders,
+            QtCore.Qt.Orientation.Vertical,
+        )
+        self.splitDockWidget(
+            batch,
+            data,
+            QtCore.Qt.Orientation.Vertical,
+        )
+        self.tabifyDockWidget(data, analysis)
+        self.tabifyDockWidget(data, calculator)
+        data.raise_()
+
+    def redock_dock(self, dock: QtWidgets.QDockWidget) -> None:
+        """Redock one shell at its root-owned default area."""
+
+        if dock not in self._dock_by_identity.values():
+            raise ValueError("dock must belong to this project workspace root.")
+        dock.setFloating(False)
+        area = dock.property("kindred/defaultDockArea")
+        if area is not None:
+            self.addDockWidget(QtCore.Qt.DockWidgetArea(int(area)), dock)
+        dock.show()
+
+    def recover_floating_docks(self, available: QtCore.QRect) -> None:
+        """Redock only floating shells outside the available screen geometry."""
+
+        for dock in self._dock_by_identity.values():
+            if not dock.isFloating():
+                continue
+            if available.isValid() and available.intersects(dock.frameGeometry()):
+                continue
+            self.redock_dock(dock)
+
+    def show_analysis_surface(self, surface_name: str) -> bool:
+        """Focus and raise one root-owned Analysis surface."""
+
+        if not self.focus_analysis_surface(surface_name):
+            return False
+        analysis = self._dock_by_identity.get("analysis")
+        if analysis is not None:
+            analysis.show()
+            analysis.raise_()
+        return True
+
+    def restore_workspace_state(self, state: object) -> bool:
+        """Restore a saved nested-root layout, returning Qt's result."""
+
+        if state is None:
+            return False
+        return bool(self.restoreState(state))
+
+    def save_workspace_state(self) -> QtCore.QByteArray:
+        """Save only this root's dock layout."""
+
+        return self.saveState()
+
     def _new_plot_panel(self) -> PyQtGraphPlotPanel:
         plot = PyQtGraphPlotPanel(
             enable_axis_inversion_actions=True,
@@ -68,62 +243,6 @@ class MechanismWorkspaceView(QtWidgets.QWidget):
         """Create one unparented plot panel for detached project custody."""
 
         return self._new_plot_panel()
-
-    def capture_plot_state(
-        self,
-    ) -> tuple[
-        dict[str, PyQtGraphPlotPanel],
-        PyQtGraphPlotPanel | None,
-        str | None,
-        QtWidgets.QWidget | None,
-        QtWidgets.QWidget | None,
-    ]:
-        """Capture plot custody and current selection as plain values."""
-
-        return (
-            dict(self._plot_by_tab_id),
-            self._initial_plot,
-            self._active_tab_id,
-            self._plot_stack.currentWidget(),
-            self._analysis_stack.currentWidget(),
-        )
-
-    def adopt_plot_state(
-        self,
-        plots_by_tab_id: dict[str, PyQtGraphPlotPanel],
-        initial_plot: PyQtGraphPlotPanel | None,
-        active_tab_id: str | None,
-        *,
-        current_plot: QtWidgets.QWidget | None = None,
-        current_analysis: QtWidgets.QWidget | None = None,
-    ) -> None:
-        """Adopt plot custody and optionally restore current selections."""
-
-        self._plot_by_tab_id = dict(plots_by_tab_id)
-        self._initial_plot = initial_plot
-        self._active_tab_id = (
-            None if active_tab_id is None else str(active_tab_id)
-        )
-        if current_plot is not None:
-            self._plot_stack.setCurrentWidget(current_plot)
-        if current_analysis is not None:
-            self._analysis_stack.setCurrentWidget(current_analysis)
-
-    def attach_plot(self, plot: PyQtGraphPlotPanel) -> None:
-        """Attach one plot and its analysis surface to the workspace hosts."""
-
-        self._plot_stack.addWidget(plot)
-        self._install_analysis_widget(plot)
-
-    def detach_plot(self, plot: PyQtGraphPlotPanel) -> None:
-        """Detach one plot and its analysis surface from the workspace hosts."""
-
-        analysis = plot.analysis_tabs()
-        if self._plot_stack.indexOf(plot) >= 0:
-            self._plot_stack.removeWidget(plot)
-        if self._analysis_stack.indexOf(analysis) >= 0:
-            self._analysis_stack.removeWidget(analysis)
-        plot.setParent(None)
 
     def _install_analysis_widget(self, plot: PyQtGraphPlotPanel) -> None:
         analysis = plot.analysis_tabs()
@@ -287,8 +406,6 @@ class MechanismWorkspaceView(QtWidgets.QWidget):
         analysis = plot.analysis_tabs()
         self._plot_stack.removeWidget(plot)
         self._analysis_stack.removeWidget(analysis)
-        analysis.setParent(None)
-        plot.setParent(None)
         analysis.deleteLater()
         plot.deleteLater()
         if self._active_tab_id == target:
@@ -304,8 +421,6 @@ class MechanismWorkspaceView(QtWidgets.QWidget):
             initial.reset_plot_session_state()
             analysis = initial.analysis_tabs()
             self._analysis_stack.removeWidget(analysis)
-            analysis.setParent(None)
-            initial.setParent(None)
             analysis.deleteLater()
             initial.deleteLater()
             self._initial_plot = None
