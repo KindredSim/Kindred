@@ -1,4 +1,4 @@
-"""The detachable Qt custody root for one project workspace."""
+"""The permanent Qt custody root for one project workspace."""
 
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ _CREATE_TAB_TOOLTIP = "Create a fresh mechanism tab"
 
 
 class ProjectWorkspaceWidget(QtWidgets.QMainWindow):
-    """One detachable physical project root.
+    """One permanent physical project root.
 
     The root deliberately owns only Qt custody.  Project semantics, result
     repositories, persistence and replacement policy remain in their existing
@@ -35,9 +35,9 @@ class ProjectWorkspaceWidget(QtWidgets.QMainWindow):
         parent: QtWidgets.QWidget | None = None,
         *,
         outer_policy: QtWidgets.QWidget | None = None,
-        dock_panels: Mapping[str, QtWidgets.QWidget] | None = None,
     ) -> None:
         super().__init__(parent)
+        self.setWindowFlags(QtCore.Qt.WindowType.Widget)
         self.setObjectName("projectWorkspaceRoot")
         self.setDockNestingEnabled(True)
         self._outer_policy = outer_policy
@@ -75,9 +75,6 @@ class ProjectWorkspaceWidget(QtWidgets.QMainWindow):
         self._install_analysis_widget(self._initial_plot)
         layout.addWidget(self._plot_stack, 1)
 
-        if dock_panels is not None:
-            self.install_dock_panels(dock_panels)
-
     @property
     def outer_policy(self) -> QtWidgets.QWidget | None:
         """Return the outer shell used for policy callbacks only."""
@@ -88,12 +85,7 @@ class ProjectWorkspaceWidget(QtWidgets.QMainWindow):
         self,
         panels: Mapping[str, QtWidgets.QWidget],
     ) -> tuple[QtWidgets.QDockWidget, ...]:
-        """Install the six module panels under this root.
-
-        ``panels`` is a construction-time mapping.  Replacing a project
-        destroys this root and builds a new one; panels are never reparented
-        between roots.
-        """
+        """Install the six module panels under this permanent root."""
 
         from kindred.gui.app_wiring import (
             ANALYSIS_DOCK_SPEC,
@@ -238,11 +230,6 @@ class ProjectWorkspaceWidget(QtWidgets.QMainWindow):
         )
         plot.set_theme(dark_mode=self._dark_mode)
         return plot
-
-    def new_plot_panel(self) -> PyQtGraphPlotPanel:
-        """Create one unparented plot panel for detached project custody."""
-
-        return self._new_plot_panel()
 
     def _install_analysis_widget(self, plot: PyQtGraphPlotPanel) -> None:
         analysis = plot.analysis_tabs()

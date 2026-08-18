@@ -3,19 +3,16 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import time
 
 import numpy as np
 
-from kindred.core.project_presentation_state import SimulationSeriesAxisSelection
 from kindred.gui.workspace_result_presenter import (
     InteractiveDisplayCurve,
     InteractiveDisplayProjection,
-    ResultDataBlock,
     ResultRenderInput,
     compose_interactive_display,
-    compose_interactive_display_batch,
 )
 
 
@@ -141,15 +138,31 @@ class InteractiveDisplayController:
             return False
         if self._generation is not None and frame.generation < self._generation:
             return False
-        if self._generation != frame.generation:
-            self._frames.clear()
-            self._pending = None
-            self._transition = None
+        frame_targets = tuple(frame.target_set_ids)
+        frame_target_set = set(frame_targets)
+        if self._generation is None:
             self._generation = frame.generation
-            self._target_set_ids = frame.target_set_ids
+            self._target_set_ids = frame_targets
             self._frozen = False
+        elif self._generation != frame.generation:
+            previous_targets = set(self._target_set_ids)
+            removed = previous_targets.difference(frame_target_set)
+            if removed:
+                self._retire_projection_targets(removed)
+            # A successor may reuse unaffected frames from the prior request.
+            # Only targets absent from the successor roster are discarded.
+            self._frames = {
+                set_id: value
+                for set_id, value in self._frames.items()
+                if set_id in frame_target_set
+            }
+            self._generation = frame.generation
+            self._target_set_ids = frame_targets
+            self._frozen = False
+        elif frame.set_id not in set(self._target_set_ids):
+            # A same-generation callback cannot expand the admitted roster.
+            return False
         self._frames[frame.set_id] = frame
-        self._target_set_ids = frame.target_set_ids
         self._recompose()
         return True
 
@@ -166,6 +179,9 @@ class InteractiveDisplayController:
         self._transition = None
         self._pending = None
         self._visible = (InteractiveDisplayLayer(projection, 1.0),)
+        self._generation = projection.generation
+        self._target_set_ids = projection.target_set_ids
+        self._frozen = False
         self._present(InteractiveDisplayState(self._visible, True, self.masking_intent))
         self._last_presented_at = float(self._clock())
 
@@ -202,11 +218,11 @@ class InteractiveDisplayController:
         self._pending = None
         self._transition = None
         self._frames.clear()
+        self._target_set_ids = ()
         self._visible = None
-        self._frozen = bool(reset_currentness)
+        self._frozen = True
         if reset_currentness:
             self._generation = None
-            self._target_set_ids = ()
         self._cancel_scheduled_tick()
         self._present(InteractiveDisplayState((), True))
 
@@ -215,6 +231,7 @@ class InteractiveDisplayController:
         self._pending = None
         self._transition = None
         self._frames.clear()
+        self._target_set_ids = ()
         self._frozen = True
         self._cancel_scheduled_tick()
         if clear_visible:
@@ -223,28 +240,180 @@ class InteractiveDisplayController:
         return changed
 
     def retire_targets(self, target_set_ids: tuple[str, ...]) -> bool:
-        targets = set(target_set_ids)
-        affected = set(self._frames).intersection(targets)
+        targets = {str(value) for value in target_set_ids}
+        if not targets:
+            return False
+        known = set(self._target_set_ids)
+        known.update(self._frames)
+        for layer in self._visible or ():
+            known.update(self._projection_target_ids(layer.projection))
+        known.update(self._projection_target_ids(self._pending))
+        if self._transition is not None:
+            known.update(
+                self._projection_target_ids(self._transition.target)
+            )
+            for layer in self._transition.source:
+                known.update(self._projection_target_ids(layer.projection))
+        affected = targets.intersection(known)
         if not affected:
             return False
+        roster = tuple(self._target_set_ids)
+        if not roster:
+            for frame in self._frames.values():
+                roster = tuple(frame.target_set_ids)
+                if roster:
+                    break
+        if not roster:
+            projection = self._visible or self._pending
+            if projection is not None:
+                roster = tuple(projection.target_set_ids)
+        self._target_set_ids = tuple(
+            set_id for set_id in roster if set_id not in targets
+        )
         for set_id in affected:
             self._frames.pop(set_id, None)
+        self._retire_projection_targets(affected)
+        self._pending = None
+        self._transition = None
+        self._cancel_scheduled_tick()
+        if self._visible is None:
+            if self._frames:
+                self._recompose()
+            else:
+                self._frozen = True
+                self._present(InteractiveDisplayState((), True))
+            return True
+        self._frozen = False
+        self._present(
+            InteractiveDisplayState(
+                self._visible,
+                True,
+                self.masking_intent,
+            )
+        )
         if self._frames:
             self._recompose()
-        else:
-            self.retire(clear_visible=False)
         return True
 
     def _recompose(self) -> None:
         if not self._frames:
             return
-        projection = compose_interactive_display_batch(tuple(self._frames.values()), render_input=self._render_input)
+        projection = self._compose()
         self.offer(projection)
 
     def _compose(self) -> InteractiveDisplayProjection:
         if self._render_input is None or not self._frames:
             raise RuntimeError("interactive display has no current frames")
-        return compose_interactive_display_batch(tuple(self._frames.values()), render_input=self._render_input)
+        frames = tuple(
+            frame
+            for set_id, frame in self._frames.items()
+            if set_id in set(self._target_set_ids)
+        )
+        if not frames:
+            raise RuntimeError("interactive display has no current frames")
+        # Existing composition returns the established immutable projection
+        # type.  Compose each retained frame independently so a successor can
+        # carry an unaffected frame from the prior generation without
+        # transporting or rewriting the owner generation on that frame.
+        composed = tuple(
+            compose_interactive_display(
+                frame,
+                render_input=self._render_input,
+            )
+            for frame in frames
+        )
+        latest = composed[-1]
+        current_set_id = next(
+            (item.set_id for item in frames if item.set_id in self._target_set_ids),
+            frames[0].set_id,
+        )
+        return replace(
+            latest,
+            set_id=current_set_id,
+            generation=self._generation or latest.generation,
+            curves=tuple(curve for projection in composed for curve in projection.curves),
+            target_set_ids=self._target_set_ids or latest.target_set_ids,
+        )
+
+    @staticmethod
+    def _projection_target_ids(
+        projection: InteractiveDisplayProjection | None,
+    ) -> set[str]:
+        if projection is None:
+            return set()
+        return {str(value) for value in projection.target_set_ids}
+
+    @staticmethod
+    def _filter_projection(
+        projection: InteractiveDisplayProjection | None,
+        removed: set[str],
+    ) -> InteractiveDisplayProjection | None:
+        if projection is None:
+            return None
+        target_set_ids = tuple(
+            set_id
+            for set_id in projection.target_set_ids
+            if set_id not in removed
+        )
+        if not target_set_ids:
+            return None
+        curves = tuple(
+            curve
+            for curve in projection.curves
+            if len(curve.key) < 3 or curve.key[2] not in removed
+        )
+        set_id = (
+            projection.set_id
+            if projection.set_id in target_set_ids
+            else target_set_ids[0]
+        )
+        return replace(
+            projection,
+            set_id=set_id,
+            curves=curves,
+            target_set_ids=target_set_ids,
+        )
+
+    def _retire_projection_targets(self, removed: set[str]) -> None:
+        if not removed:
+            return
+        if self._visible is not None:
+            visible = tuple(
+                InteractiveDisplayLayer(filtered, layer.opacity)
+                for layer in self._visible
+                if (
+                    filtered := self._filter_projection(
+                        layer.projection,
+                        removed,
+                    )
+                ) is not None
+            )
+            self._visible = visible or None
+        self._pending = self._filter_projection(self._pending, removed)
+        if self._transition is not None:
+            source = tuple(
+                InteractiveDisplayLayer(filtered, layer.opacity)
+                for layer in self._transition.source
+                if (
+                    filtered := self._filter_projection(
+                        layer.projection,
+                        removed,
+                    )
+                ) is not None
+            )
+            target = self._filter_projection(
+                self._transition.target,
+                removed,
+            )
+            if target is None:
+                self._transition = None
+            else:
+                self._transition = _Transition(
+                    source=source,
+                    target=target,
+                    started_at=self._transition.started_at,
+                    interpolate=False,
+                )
 
     def _present(self, state: InteractiveDisplayState) -> bool:
         try:

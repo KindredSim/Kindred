@@ -166,11 +166,11 @@ class ProjectController(QtCore.QObject):
         dataset_imports: DatasetImportStaging,
         fit_session: FitSessionOwner,
         xlsx_exports: object,
-        build_workspace: Callable[
-            [ProjectDocument, PreparedWorkspaceInstall],
-            QtWidgets.QWidget,
+        dispose_workspace: Callable[[], QtCore.QByteArray],
+        rebuild_workspace: Callable[
+            [ProjectDocument, PreparedWorkspaceInstall, QtCore.QByteArray],
+            None,
         ],
-        swap_workspace: Callable[[QtWidgets.QWidget], None],
         set_status_text: Callable[[str], None],
         settle_execution_candidate: Callable[
             [ProjectContentToken],
@@ -205,10 +205,10 @@ class ProjectController(QtCore.QObject):
             raise TypeError("dataset_imports must be a DatasetImportStaging.")
         if not isinstance(fit_session, FitSessionOwner):
             raise TypeError("fit_session must be a FitSessionOwner.")
-        if not callable(build_workspace):
-            raise TypeError("build_workspace must be callable.")
-        if not callable(swap_workspace):
-            raise TypeError("swap_workspace must be callable.")
+        if not callable(dispose_workspace):
+            raise TypeError("dispose_workspace must be callable.")
+        if not callable(rebuild_workspace):
+            raise TypeError("rebuild_workspace must be callable.")
         for owner_name, owner in (
             ("simulation_jobs", simulation_jobs),
             ("interactive_preview_owner", interactive_preview_owner),
@@ -269,8 +269,8 @@ class ProjectController(QtCore.QObject):
         self._dataset_imports = dataset_imports
         self._fit_session = fit_session
         self._xlsx_exports = xlsx_exports
-        self._build_workspace = build_workspace
-        self._swap_workspace = swap_workspace
+        self._dispose_workspace = dispose_workspace
+        self._rebuild_workspace = rebuild_workspace
         self._set_status_text = set_status_text
         self._settle_execution_candidate = settle_execution_candidate
         self._prepare_before_save = prepare_before_save
@@ -685,102 +685,73 @@ class ProjectController(QtCore.QObject):
         action: str,
         expected_token: ProjectContentToken,
     ) -> tuple[bool, tuple[str, ...]]:
-        """Build, fence, commit and swap one detached project root."""
+        """Fence, commit, and rebuild one project inside the permanent root."""
 
         if not self._content_token_is_current(
             expected_token,
             action="Project replacement",
         ):
             return False, ()
-        previous_document = self._session.document
-        workspace: QtWidgets.QWidget | None = None
-        try:
-            workspace = self._build_workspace(
-                prepared_session.document,
-                prepared_workspace,
-            )
-        except Exception as exc:
-            logger.exception("Detached project workspace construction failed")
-            self._set_status(
-                "Project replacement was not completed because its detached "
-                f"workspace could not be built: {exc}"
-            )
-            return False, ()
-        if not isinstance(workspace, QtWidgets.QWidget):
-            raise TypeError("build_workspace() must return a QWidget.")
 
-        def discard_detached_workspace() -> None:
-            """Release an unpublished root through its one Qt owner."""
-
-            workspace.deleteLater()
-
-        if not self._content_token_is_current(
-            expected_token,
-            action="Project replacement",
-        ):
-            discard_detached_workspace()
-            return False, ()
-
-        # Disposition is resolved only after the candidate root is complete;
-        # cancellation therefore retires one detached root without touching
-        # the current shell or semantic owners.
         disposition = self._resolve_disposition(
             action,
             expected_token=expected_token,
             project_replacement=True,
         )
         if disposition is None:
-            discard_detached_workspace()
             return False, ()
         if not self._settle_replacement_workers():
-            discard_detached_workspace()
             return False, ()
 
         if not self._content_token_is_current(
             disposition.content_token,
             action="Project replacement",
         ):
-            discard_detached_workspace()
+            self._dataset_imports.resume_after_project_replacement()
+            return False, ()
+
+        try:
+            saved_layout = self._dispose_workspace()
+        except Exception as exc:
+            logger.exception("Current project workspace disposal failed")
+            self._set_status(
+                "Project replacement was not completed because its current "
+                f"workspace could not be disposed: {exc}"
+            )
             self._dataset_imports.resume_after_project_replacement()
             return False, ()
 
         # The old result identities are purged while the old session, registry
-        # and root are still current.  This is intentionally before either
-        # semantic assignment or the one-root shell swap.
+        # and root contents are still current.  This is intentionally before
+        # either semantic assignment or the incoming surface rebuild.
+        previous_document = self._session.document
         cleanup_failures = list(
             self._purge_replaced_project_results(previous_document)
         )
 
-        swap_invoked = False
         try:
             committed_token = self._session.commit_install(
                 prepared_session,
                 expected_token=disposition.content_token,
             )
             if committed_token is None:
-                discard_detached_workspace()
                 return False, tuple(dict.fromkeys(cleanup_failures))
             if not self._tabs.commit_install(
                 prepared_workspace,
                 expected_token=committed_token,
             ):
-                discard_detached_workspace()
                 raise RuntimeError(
                     "Workspace replacement registry rejected its current token."
                 )
-            swap_invoked = True
             try:
-                self._swap_workspace(workspace)
+                self._rebuild_workspace(
+                    prepared_session.document,
+                    prepared_workspace,
+                    saved_layout,
+                )
             except Exception as exc:
-                # Semantic publication has already occurred.  Keep the new
-                # root owned by the callback's shell and surface the failure
-                # without restoring the previous project.
-                logger.exception("Project workspace root swap failed")
-                cleanup_failures.append(f"workspace swap: {exc}")
-        except Exception:
-            if not swap_invoked:
-                discard_detached_workspace()
-            raise
+                logger.exception("Project workspace rebuild failed")
+                cleanup_failures.append(f"workspace rebuild: {exc}")
         finally:
             self._dataset_imports.resume_after_project_replacement()
         self.projectStateChanged.emit()

@@ -15,7 +15,6 @@ from kindred.core.project_document import (
     canonical_initial_values,
     canonical_species_names,
 )
-from kindred.core.project_session import ProjectContentToken
 from kindred.core.simulation_preparation import (
     SimulationExecutionRequest,
     build_simulation_execution_request,
@@ -47,7 +46,6 @@ from kindred.gui.workflow_contracts import (
     DetailedBalanceCorrectionOutcome,
     DetailedBalanceCorrectionRequest,
 )
-from kindred.gui.controllers.simulation_job_owner import PreviewTarget, build_preview_target
 from kindred.gui.widgets.mechanism_editor import MechanismEditorTabbed
 
 logger = logging.getLogger(__name__)
@@ -85,16 +83,6 @@ class ActiveSliderRenderProjection:
 
 
 @dataclass(frozen=True, slots=True)
-class _PreviewCapture:
-    tab_id: str
-    content_token: ProjectContentToken
-    prepared_dsl: PreparedDslRequestSet
-    projection: ParameterSliderProjection
-    targets: tuple[tuple[str, str, SimulationExecutionRequest], ...]
-    debounce_kind: str
-
-
-@dataclass(frozen=True, slots=True)
 class _PendingGesture:
     kind: str
     name: str
@@ -114,8 +102,7 @@ class _GestureCapture:
 
 @dataclass(frozen=True, slots=True)
 class _SuspendedPreviewDisposition:
-    capture: _PreviewCapture | None
-    pending_targets: tuple[PreviewTarget, ...] | None
+    tab_id: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -224,7 +211,6 @@ class TabSliderBinding(QtCore.QObject):
         self._projection: ParameterSliderProjection | None = None
         self._tab_snapshot: MechanismTabDocument | None = None
         self._last_targets: tuple[str, ...] = ()
-        self._preview_capture: _PreviewCapture | None = None
         self._suspended_preview_disposition: (
             _SuspendedPreviewDisposition | None
         ) = None
@@ -248,9 +234,7 @@ class TabSliderBinding(QtCore.QObject):
         self._latest_admissible_pending: _PendingGesture | None = None
         self._gesture_admitted = False
         self._last_admitted_sample: tuple[str, str, float] | None = None
-        self._latest_preview_set_ids: set[str] = set()
         self._interactive_stop_fenced = False
-        self._stop_exact_set_ids: tuple[str, ...] = ()
         self._defer_rejected_slider_restore = False
         self._deferred_restore_pending = False
         self._disposed = False
@@ -286,9 +270,11 @@ class TabSliderBinding(QtCore.QObject):
 
     @property
     def active_preview_set_ids(self) -> tuple[str, ...]:
-        """Return the set roster currently admitted as Slider Preview."""
+        """Return semantic exact Preview identities from the owner."""
 
-        return tuple(sorted(self._latest_preview_set_ids))
+        return tuple(
+            self._simulation_jobs.preview_set_ids(self._tab_id)
+        )
 
     def _make_preview_timer(self, interval_ms: int) -> QtCore.QTimer:
         interval = int(interval_ms)
@@ -317,32 +303,6 @@ class TabSliderBinding(QtCore.QObject):
 
     def _stop_preview_timers(self) -> None:
         self._throttle_timer.stop()
-        self._sync_slider_transient_custody()
-
-    def _sync_slider_transient_custody(self) -> None:
-        """Project local gesture/debounce roles into the sole Stop owner."""
-
-        suspended = self._suspended_preview_disposition
-        active = bool(
-            not self._disposed
-            and (
-                self._active_drag is not None
-                or self._throttle_timer.isActive()
-                or self._latest_admissible_pending is not None
-                or self._preview_capture is not None
-                or (
-                    suspended is not None
-                    and (
-                        suspended.capture is not None
-                        or suspended.pending_targets is not None
-                    )
-                )
-            )
-        )
-        # Gesture/debounce custody is local to this binding.  Stop derives it
-        # from this binding and the InteractivePreviewOwner; the direct
-        # computation owner never mirrors transient Slider state.
-        del active
 
     def _clear_gesture_state(
         self,
@@ -356,13 +316,11 @@ class TabSliderBinding(QtCore.QObject):
         self._latest_admissible_pending = None
         self._gesture_admitted = False
         self._last_admitted_sample = None
-        self._sync_slider_transient_custody()
 
     def _start_throttle_if_inactive(self, debounce_kind: str) -> None:
         timer = self._preview_timer(debounce_kind)
         if not timer.isActive():
             timer.start()
-        self._sync_slider_transient_custody()
 
     def _cancel_deferred_restore(self) -> None:
         self._deferred_restore_pending = False
@@ -386,16 +344,14 @@ class TabSliderBinding(QtCore.QObject):
     def _start_gesture(self, kind: str, name: str) -> None:
         """Record raw widget intent without changing publication authority."""
 
-        # A press is only raw widget intent.  It must not discard an already
-        # admitted exact Preview capture/intent or stop its submission timer.
-        # The first accepted numeric sample performs the exact admission fence.
+        # A press is only raw widget intent.  The owner receives exact Preview
+        # only after the release builds a complete request batch.
         self._active_drag = None
         self._gesture_capture = None
         self._latest_admissible_pending = None
         self._gesture_admitted = False
         self._last_admitted_sample = None
         self._active_drag = (str(kind), str(name))
-        self._sync_slider_transient_custody()
 
     @QtCore.Slot(str, float, object)
     def _on_parameter_interaction(
@@ -445,7 +401,7 @@ class TabSliderBinding(QtCore.QObject):
         # display remains plot-local and is not a scientific prerequisite.
         self._active_drag = None
         self._latest_admissible_pending = None
-        accepted = self._accept_and_submit(
+        self._accept_and_submit(
             kind,
             name,
             float(value),
@@ -455,9 +411,7 @@ class TabSliderBinding(QtCore.QObject):
             ),
             gesture_capture=capture,
         )
-        self._clear_gesture_state(
-            stop_preview_timer=(accepted or self._preview_capture is None)
-        )
+        self._clear_gesture_state(stop_preview_timer=True)
 
     def _record_raw_gesture(self, kind: str, name: str, value: float) -> None:
         value_f = float(value)
@@ -561,7 +515,7 @@ class TabSliderBinding(QtCore.QObject):
 
     def _current_preview_generations_are_current(self, kind: str) -> bool:
         targets = self.resolve_target_set_ids()
-        return bool(targets) and set(targets) == self._latest_preview_set_ids
+        return bool(targets)
 
     def _accept_and_submit(
         self,
@@ -574,7 +528,6 @@ class TabSliderBinding(QtCore.QObject):
         gesture_capture: _GestureCapture | None = None,
     ) -> bool:
         self._cancel_deferred_restore()
-        previous_capture = self._preview_capture
         self._defer_rejected_slider_restore = bool(defer_rejected_restore)
         try:
             accepted = (
@@ -594,22 +547,9 @@ class TabSliderBinding(QtCore.QObject):
             )
         finally:
             self._defer_rejected_slider_restore = False
-        if accepted and self._preview_capture is not previous_capture:
-            self._submit_preview()
-        elif defer_rejected_restore:
+        if not accepted and defer_rejected_restore:
             self._queue_rejected_slider_restore()
         return bool(accepted)
-
-    def _replace_preview_capture(
-        self,
-        successor: _PreviewCapture | None,
-        *,
-        message: str,
-    ) -> None:
-        """Replace the one local exact capture with the newest capture."""
-
-        self._preview_capture = successor
-        self._sync_slider_transient_custody()
 
     def resolve_target_set_ids(self) -> tuple[str, ...]:
         tab = self._registry.tab(self._tab_id)
@@ -815,35 +755,13 @@ class TabSliderBinding(QtCore.QObject):
             for set_id in previous
             if set_id not in current and set_id in existing
         )
-        added = tuple(set_id for set_id in current if set_id not in previous)
-        runtime = self._registry.tab_runtime(tab.tab_id)
-        dirty_removed = tuple(
-            set_id
-            for set_id in removed
-            if runtime.slider_parameter_draft
-            or runtime.slider_species_drafts_by_set_id.get(set_id)
-        )
-        clean_removed = tuple(
-            set_id for set_id in removed if set_id not in dirty_removed
-        )
-        dirty_added = tuple(
-            set_id
-            for set_id in added
-            if runtime.slider_parameter_draft
-            or runtime.slider_species_drafts_by_set_id.get(set_id)
-        )
-        dirty_transition = tuple(dict.fromkeys((*dirty_removed, *dirty_added)))
-        if dirty_transition:
-            self._simulation_jobs.deauthorize_targets(
-                tab.tab_id,
-                dirty_transition,
-            )
-            for set_id in dirty_transition:
-                self._latest_preview_set_ids.discard(set_id)
-        if clean_removed:
+        if removed:
+            # Membership is presentation-only.  Remove transient Preview
+            # participation for removed rows and restore retained semantic
+            # Reference/current truth without cancelling an active Run.
             self._simulation_jobs.reconcile_canonical_targets(
                 tab.tab_id,
-                clean_removed,
+                removed,
             )
         return current != previous
 
@@ -868,42 +786,15 @@ class TabSliderBinding(QtCore.QObject):
         self._projection = None
         self._tab_snapshot = None
         self._last_targets = ()
-        self._latest_preview_set_ids.clear()
         self.clear_preview_detailed_balance_block()
 
     def evict_preview_targets(self, set_ids: Iterable[str]) -> None:
-        """Forget Slider Preview keys and captures for deleted targets."""
+        """Retire transient Preview participation for deleted targets."""
 
         targets = {str(set_id) for set_id in set_ids}
         if not targets:
             return
-        for set_id in targets:
-            self._latest_preview_set_ids.discard(set_id)
-        capture = self._preview_capture
-        if capture is None:
-            return
-        surviving = tuple(
-            target
-            for target in capture.targets
-            if target[0] not in targets
-        )
-        if surviving:
-            self._replace_preview_capture(
-                replace(capture, targets=surviving),
-                message=(
-                    "Exact Slider settlement was retired because one of its "
-                    "captured targets was deleted."
-                ),
-            )
-        else:
-            self._replace_preview_capture(
-                None,
-                message=(
-                    "Exact Slider settlement was retired because its target "
-                    "was deleted."
-                ),
-            )
-            self._stop_preview_timers()
+        self._simulation_jobs.retire_preview(self._tab_id, targets)
 
     def _project_species_targets(
         self,
@@ -1076,10 +967,7 @@ class TabSliderBinding(QtCore.QObject):
             if clean_unselected:
                 self._reconcile_canonical_set_ids(tab, clean_unselected)
             if dirty_unselected:
-                self._simulation_jobs.deauthorize_targets(
-                    tab.tab_id,
-                    dirty_unselected,
-                )
+                self._reconcile_canonical_set_ids(tab, dirty_unselected)
         self._emit_draft_state()
         return True
 
@@ -1396,16 +1284,8 @@ class TabSliderBinding(QtCore.QObject):
             if sampling is None:
                 raise RuntimeError(
                     "Interactive Preview construction lost its sampling policy."
-            )
+                )
             self._stop_preview_timers()
-            self._replace_preview_capture(
-                None,
-                message=(
-                    "Exact Slider settlement became obsolete when a newer "
-                    "interactive gesture was admitted."
-                ),
-            )
-            self._latest_preview_set_ids = set(dirty_targets)
             request = InteractivePreviewRequest(
                 tab_id=tab.tab_id,
                 targets=tuple(
@@ -1426,30 +1306,18 @@ class TabSliderBinding(QtCore.QObject):
             self._interactive_preview_owner.request(request)
             return True
 
-        # Construction above is fallible. Only a complete exact batch reaches
-        # the scheduler's single fence/admission transition.
-        previous_capture = self._preview_capture
-        previous_timer_active = self._throttle_timer.isActive()
+        # The binding constructs one raw request batch.  The owner performs
+        # whole-batch validation and owns the sole pending exact intent.
         self._stop_preview_timers()
         try:
             self._interactive_preview_owner.retire(
                 tab.tab_id,
                 dirty_targets,
             )
-            self._simulation_jobs.deauthorize_targets(
+            self._simulation_jobs.request_preview(
                 tab.tab_id,
-                tuple(set_id for set_id, _name, _request in constructed),
-                preserve_reference=True,
-            )
-            admitted_targets = tuple(
-                PreviewTarget(
-                    tab_id=tab.tab_id,
-                    set_id=set_id,
-                    set_name=set_name,
-                    prepared_dsl=prepared_dsl,
-                    execution_request=execution_request,
-                )
-                for set_id, set_name, execution_request in constructed
+                tuple(constructed),
+                prepared_dsl=prepared_dsl,
             )
         except Exception as exc:  # noqa: BLE001
             self._reject(
@@ -1457,48 +1325,8 @@ class TabSliderBinding(QtCore.QObject):
                 f"({type(exc).__name__}: {exc})."
             )
             return False
-        if not admitted_targets:
-            if previous_capture is not None and previous_timer_active:
-                self._start_throttle_if_inactive(
-                    previous_capture.debounce_kind
-                )
-            return False
         if canonical_targets:
             self._reconcile_canonical_set_ids(tab, canonical_targets)
-        if runtime.slider_parameter_draft:
-            admitted_targets = set(dirty_targets)
-            unselected = tuple(
-                item.set_id
-                for item in tab.initial_condition_sets
-                if item.set_id not in admitted_targets
-            )
-            if unselected:
-                # A global parameter Draft becomes publication authority only
-                # after its complete Preview request batch is admitted.
-                self._simulation_jobs.deauthorize_targets(
-                    tab.tab_id,
-                    unselected,
-                )
-        captured = tuple(
-            (set_id, set_name, execution_request)
-            for set_id, set_name, execution_request in constructed
-        )
-        self._latest_preview_set_ids = set(dirty_targets)
-        self._replace_preview_capture(
-            _PreviewCapture(
-                tab_id=tab.tab_id,
-                content_token=self._registry.capture_content_token(),
-                prepared_dsl=prepared_dsl,
-                projection=projection,
-                targets=captured,
-                debounce_kind=str(debounce_kind),
-            ),
-            message=(
-                "Pending exact Slider settlement was replaced by a newer "
-                "exact Preview capture."
-            ),
-        )
-        self._start_throttle_if_inactive(debounce_kind)
         return True
 
     def _preview_timer(self, debounce_kind: str) -> QtCore.QTimer:
@@ -1640,36 +1468,7 @@ class TabSliderBinding(QtCore.QObject):
                     pending.name,
                     pending.value,
                 )
-            self._sync_slider_transient_custody()
             return
-        self._submit_preview()
-
-    @QtCore.Slot()
-    def _submit_preview(self) -> None:
-        self._throttle_timer.stop()
-        if self._suspended_preview_disposition is not None:
-            return
-        capture = self._preview_capture
-        self._preview_capture = None
-        self._sync_slider_transient_custody()
-        if capture is None:
-            return
-        targets = tuple(
-            build_preview_target(
-                prepared_dsl=capture.prepared_dsl,
-                tab_id=capture.tab_id,
-                set_id=set_id,
-                set_name=set_name,
-                execution_request=execution_request,
-            )
-            for set_id, set_name, execution_request in capture.targets
-        )
-        if targets:
-            self._simulation_jobs.request_preview(
-                capture.tab_id,
-                targets,
-                content_token=capture.content_token,
-            )
 
     def has_slider_draft(self) -> bool:
         runtime = self._registry.tab_runtime(self._tab_id)
@@ -1694,41 +1493,30 @@ class TabSliderBinding(QtCore.QObject):
         self._interactive_preview_owner.retire(self._tab_id)
         self._cancel_deferred_restore()
         self._clear_gesture_state()
-        transaction = _SuspendedPreviewDisposition(
-            capture=self._preview_capture,
-            pending_targets=None,
-        )
-        self._preview_capture = None
+        transaction = _SuspendedPreviewDisposition(self._tab_id)
         self._suspended_preview_disposition = transaction
-        self._sync_slider_transient_custody()
         return transaction
 
     def resume_preview_disposition(
         self,
         transaction: _SuspendedPreviewDisposition,
     ) -> None:
-        """Resume the unchanged exact capture only after a modal cancellation."""
+        """Resume the unchanged Slider draft after a modal cancellation."""
 
         if transaction is not self._suspended_preview_disposition:
             raise ValueError("Slider Preview disposition is not current.")
         self._suspended_preview_disposition = None
-        self._preview_capture = transaction.capture
-        self._sync_slider_transient_custody()
-        if transaction.capture is not None:
-            self._start_throttle_if_inactive(transaction.capture.debounce_kind)
 
     def discard_preview_disposition(
         self,
         transaction: _SuspendedPreviewDisposition,
     ) -> None:
-        """End one disposition fence without restoring its Preview capture."""
+        """End one disposition fence without restoring its Preview intent."""
 
         if transaction is not self._suspended_preview_disposition:
             raise ValueError("Slider Preview disposition is not current.")
-        self._simulation_jobs.drop_pending_preview(self._tab_id)
+        self._simulation_jobs.retire_preview(self._tab_id)
         self._suspended_preview_disposition = None
-        self._preview_capture = None
-        self._sync_slider_transient_custody()
 
     def discard_slider_draft(self, *, render: bool = True) -> bool:
         if self._suspended_preview_disposition is not None:
@@ -1757,7 +1545,6 @@ class TabSliderBinding(QtCore.QObject):
         runtime.slider_parameter_draft.clear()
         runtime.slider_species_drafts_by_set_id.clear()
         self.cancel_pending_preview_intent()
-        self._latest_preview_set_ids.clear()
         self.clear_preview_detailed_balance_block()
         self._reconcile_canonical_set_ids(tab, affected)
         if render:
@@ -1770,14 +1557,8 @@ class TabSliderBinding(QtCore.QObject):
 
         self._cancel_deferred_restore()
         self._clear_gesture_state()
-        self._replace_preview_capture(
-            None,
-            message="Interactive Preview exact capture retired.",
-        )
         self._interactive_preview_owner.retire(self._tab_id)
-        self._simulation_jobs.drop_pending_preview(self._tab_id)
-        self._latest_preview_set_ids.clear()
-        self._sync_slider_transient_custody()
+        self._simulation_jobs.retire_preview(self._tab_id)
 
     def fence_stop(self) -> bool:
         """Fence local gesture/capture roles before physical display freeze."""
@@ -1787,26 +1568,18 @@ class TabSliderBinding(QtCore.QObject):
             self._throttle_timer.isActive()
             or self._active_drag is not None
             or self._latest_admissible_pending is not None
-            or self._preview_capture is not None
             or self._simulation_jobs.pending_preview_tab_id == self._tab_id
         )
-        self._stop_exact_set_ids = tuple(sorted(self._latest_preview_set_ids))
         self._cancel_deferred_restore()
         self._clear_gesture_state()
-        self._preview_capture = None
-        self._sync_slider_transient_custody()
         changed = self.clear_preview_detailed_balance_block() or changed
         return changed
 
     def settle_stop(self) -> bool:
         """Ask the operation owner to settle roles after physical freeze."""
 
-        exact_set_ids = self._stop_exact_set_ids
-        self._stop_exact_set_ids = ()
         changed = self._interactive_preview_owner.retire(self._tab_id)
-        self._simulation_jobs.drop_pending_preview(self._tab_id)
-        self._latest_preview_set_ids.clear()
-        self._sync_slider_transient_custody()
+        changed = self._simulation_jobs.retire_preview(self._tab_id) or changed
         return bool(changed)
 
     def apply(self) -> bool:
@@ -1897,7 +1670,6 @@ class TabSliderBinding(QtCore.QObject):
         self.clear_preview_detailed_balance_block()
         runtime.slider_parameter_draft.clear()
         runtime.slider_species_drafts_by_set_id.clear()
-        self._latest_preview_set_ids.clear()
         self._emit_draft_state()
         return True
 
@@ -1923,31 +1695,13 @@ class TabSliderBinding(QtCore.QObject):
                 runtime.slider_species_drafts_by_set_id.pop(set_id, None)
             ) or changed
         self.cancel_pending_preview_intent()
-        self._latest_preview_set_ids.clear()
         self.clear_preview_detailed_balance_block()
         reconciled_targets = (
             tuple(item.set_id for item in tab.initial_condition_sets)
             if parameter_dirty
             else targets
         )
-        remaining_dirty = set(runtime.slider_species_drafts_by_set_id)
-        canonical_targets = tuple(
-            set_id
-            for set_id in reconciled_targets
-            if set_id not in remaining_dirty
-        )
-        still_dirty_targets = tuple(
-            set_id
-            for set_id in reconciled_targets
-            if set_id in remaining_dirty
-        )
-        if canonical_targets:
-            self._reconcile_canonical_set_ids(tab, canonical_targets)
-        if still_dirty_targets:
-            self._simulation_jobs.deauthorize_targets(
-                tab.tab_id,
-                still_dirty_targets,
-            )
+        self._reconcile_canonical_set_ids(tab, reconciled_targets)
         self.render()
         self._emit_draft_state()
         return changed

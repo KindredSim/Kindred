@@ -9,7 +9,7 @@ import stat
 import tempfile
 import time
 import webbrowser
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, replace
 from typing import Callable, Iterable, Sequence
 
 from PySide6 import QtCore, QtGui, QtWidgets
@@ -682,9 +682,6 @@ class MainWindow(QtWidgets.QMainWindow):
             propose_detailed_balance_source=self._propose_detailed_balance_source,
             commit_detailed_balance_source=self._commit_detailed_balance_source,
             capture_current_run=self._capture_current_run,
-            content_token_is_current=(
-                self._project_session.is_content_token_current
-            ),
             user_parallel_maximum=(
                 self.config_controller.run_user_maximum_preference
             ),
@@ -714,7 +711,7 @@ class MainWindow(QtWidgets.QMainWindow):
         )
 
         self._surface_stacks = self._build_physical_shell(self._workspace)
-        self._set_current_workspace_references(self._workspace)
+        self._set_current_workspace_references()
         for tab in self._project_session.document.tabs:
             self._create_tab_surface(tab.tab_id)
         self._xlsx_export_owner = _XlsxExportOwner(parent=self)
@@ -740,8 +737,8 @@ class MainWindow(QtWidgets.QMainWindow):
             dataset_imports=self._dataset_import_staging,
             fit_session=self._fit_session_owner,
             xlsx_exports=self._xlsx_export_owner,
-            build_workspace=self._build_workspace,
-            swap_workspace=self._swap_workspace,
+            dispose_workspace=self._dispose_workspace,
+            rebuild_workspace=self._rebuild_workspace,
             set_status_text=self.set_status_text,
             settle_execution_candidate=(
                 lambda token: self._settle_execution_candidate(
@@ -842,7 +839,6 @@ class MainWindow(QtWidgets.QMainWindow):
                 "analysis": workspace_root.main_plot_analysis_widget(),
             }
         )
-        workspace_root._kindred_surface_stacks = stacks
         return stacks
 
     def set_theme(self, *, dark_mode: bool) -> None:
@@ -858,13 +854,11 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _set_current_workspace_references(
         self,
-        workspace_root: ProjectWorkspaceWidget,
     ) -> None:
-        """Resolve all shell references from the current nested project root."""
+        """Resolve shell references from the permanent project root."""
 
-        stacks = getattr(workspace_root, "_kindred_surface_stacks", None)
-        if stacks is None:
-            stacks = self._surface_stacks
+        workspace_root = self._workspace
+        stacks = self._surface_stacks
         self._mechanism_stack = stacks["mechanism"]
         self._slider_stack = stacks["interactive_sliders"]
         self._initial_conditions_stack = stacks["batch_initial_conditions"]
@@ -886,22 +880,14 @@ class MainWindow(QtWidgets.QMainWindow):
     def _create_tab_surface(
         self,
         tab_id: str,
-        *,
-        registry=None,
-        workspace_root: ProjectWorkspaceWidget | None = None,
-        surface_stacks: dict[str, QtWidgets.QStackedWidget] | None = None,
-        install: bool = True,
-        publish_initial_state: bool = True,
     ) -> _TabSurfaceBundle:
-        """Construct one complete tab surface beneath its project root."""
+        """Construct one complete tab surface beneath the permanent root."""
 
-        surface_registry = self._workspace_tab_registry if registry is None else registry
-        root = self._workspace if workspace_root is None else workspace_root
-        stacks = self._surface_stacks if surface_stacks is None else surface_stacks
-        target = str(tab_id)
-        if install or publish_initial_state:
-            target = surface_registry.tab(target).tab_id
-        if install and target in self._tab_surfaces:
+        surface_registry = self._workspace_tab_registry
+        root = self._workspace
+        stacks = self._surface_stacks
+        target = surface_registry.tab(str(tab_id)).tab_id
+        if target in self._tab_surfaces:
             raise ValueError(f"Tab surface already exists: {target!r}.")
         editor_parent = stacks["mechanism"]
         simulation_parent = stacks["batch_initial_conditions"]
@@ -1014,16 +1000,15 @@ class MainWindow(QtWidgets.QMainWindow):
             initial_actions=initial_actions,
             slider_binding=slider_binding,
         )
-        if install:
-            self._tab_surfaces[target] = bundle
-            stacks["mechanism"].addWidget(editor_panel)
-            stacks["interactive_sliders"].addWidget(slider_panel)
-            stacks["batch_initial_conditions"].addWidget(simulation_panel)
-            stacks["data"].addWidget(right_panel)
-            stacks["symbolic_calculator"].addWidget(calculator_panel)
+        self._tab_surfaces[target] = bundle
+        stacks["mechanism"].addWidget(editor_panel)
+        stacks["interactive_sliders"].addWidget(slider_panel)
+        stacks["batch_initial_conditions"].addWidget(simulation_panel)
+        stacks["data"].addWidget(right_panel)
+        stacks["symbolic_calculator"].addWidget(calculator_panel)
         self._connect_tab_surface(
             bundle,
-            publish_initial_state=publish_initial_state,
+            publish_initial_state=True,
         )
         return bundle
 
@@ -1107,8 +1092,9 @@ class MainWindow(QtWidgets.QMainWindow):
         sliders.draftStateChanged.connect(self._on_draft_state_changed)
         sliders.errorRaised.connect(self.set_status_text)
         sliders.targetSetIdsChanged.connect(
-            lambda _ids, captured=tab_id: self._refresh_slider_target_summary(
-                captured
+            lambda ids, captured=tab_id: self._refresh_slider_target_summary(
+                captured,
+                ids,
             )
         )
         sliders.previewDetailedBalanceCorrectionRequired.connect(
@@ -1232,37 +1218,15 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _connect_workspace_root(
         self,
-        workspace_root: ProjectWorkspaceWidget,
-        *,
-        surface_ids: Iterable[str] | None = None,
-        connect_shell: bool = True,
-        connect_plots: bool = True,
     ) -> None:
-        """Connect one root's public signals to the outer policy shell."""
+        """Connect the permanent root's public signals once."""
 
-        if connect_shell:
-            workspace_root.tabActivated.connect(self._select_tab)
-            workspace_root.createTabRequested.connect(self._create_tab)
-            workspace_root.renameTabRequested.connect(self._rename_tab)
-            workspace_root.closeTabRequested.connect(self._close_tab)
-        if not connect_plots:
-            return
-        if surface_ids is None:
-            workspace_root.plotCreated.connect(self._connect_workspace_plot)
-        else:
-            workspace_root.plotCreated.connect(
-                lambda tab_id, plot, ids=surface_ids: (
-                    self._connect_workspace_plot(
-                        tab_id,
-                        plot,
-                        surface_ids=(
-                            tuple(ids)
-                            if isinstance(ids, dict)
-                            else ids
-                        ),
-                    )
-                )
-            )
+        workspace_root = self._workspace
+        workspace_root.tabActivated.connect(self._select_tab)
+        workspace_root.createTabRequested.connect(self._create_tab)
+        workspace_root.renameTabRequested.connect(self._rename_tab)
+        workspace_root.closeTabRequested.connect(self._close_tab)
+        workspace_root.plotCreated.connect(self._connect_workspace_plot)
 
     def _connect_application_graph(self) -> None:
         self.project_controller.projectStateChanged.connect(
@@ -1276,7 +1240,7 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         self.project_controller.hardExitAuthorized.connect(self._hard_exit)
 
-        self._connect_workspace_root(self._workspace)
+        self._connect_workspace_root()
 
         application = QtWidgets.QApplication.instance()
         if isinstance(application, QtWidgets.QApplication):
@@ -1292,6 +1256,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self._simulation_jobs.results_changed.connect(self._on_results_changed)
         self._interactive_preview_owner.frame_ready.connect(
             self._on_interactive_frame_ready
+        )
+        self._interactive_preview_owner.retire_targets_requested.connect(
+            self._retire_interactive_preview_targets
+        )
+        self._interactive_preview_owner.zero_success_targets.connect(
+            self._retire_interactive_preview_targets
         )
         self._simulation_jobs.status_changed.connect(self.set_status_text)
         self._interactive_preview_owner.state_changed.connect(
@@ -1446,8 +1416,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self,
         tab_id: str,
         plot: PyQtGraphPlotPanel,
-        *,
-        surface_ids: Iterable[str] | None = None,
     ) -> None:
         """Bind one retained plot only to intents from its owning tab."""
 
@@ -1466,12 +1434,7 @@ class MainWindow(QtWidgets.QMainWindow):
             for name in required_signals
         ):
             raise TypeError("Workspace plot must expose the plot intent signals.")
-        valid_surface_ids = (
-            set(self._tab_surfaces)
-            if surface_ids is None
-            else {str(item) for item in surface_ids}
-        )
-        if target not in valid_surface_ids:
+        if target not in self._tab_surfaces:
             raise RuntimeError(
                 f"Workspace plot {target!r} has no matching tab runtime bundle."
             )
@@ -2003,6 +1966,26 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         plot.apply_interactive_preview_frame(frame)
 
+    @QtCore.Slot(str, int, tuple)
+    def _retire_interactive_preview_targets(
+        self,
+        tab_id: str,
+        _generation: int,
+        target_set_ids: tuple,
+    ) -> None:
+        """Retire stale transient targets from their live tab plot."""
+
+        target = str(tab_id)
+        if target not in self._tab_surfaces:
+            return
+        try:
+            plot = self._workspace.plot_for_tab(target)
+        except (KeyError, RuntimeError):
+            return
+        plot.retire_interactive_preview_targets(
+            tuple(str(set_id) for set_id in target_set_ids)
+        )
+
     @QtCore.Slot(str, object)
     def _on_run_dispatched(self, tab_id: str, set_ids: object) -> None:
         target = str(tab_id)
@@ -2175,7 +2158,6 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         bundle.slider_binding.render()
         self._render_results_for_tab(tab_id)
-        self._refresh_slider_target_summary(tab_id)
         self._refresh_project_state()
 
     # ------------------------------------------------------------------
@@ -2322,7 +2304,6 @@ class MainWindow(QtWidgets.QMainWindow):
         ):
             return
         if self._tab_surfaces[tab_id].initial_actions.add_set() is not None:
-            self._refresh_slider_target_summary(tab_id)
             self._refresh_dataset_views((tab_id,))
 
     @QtCore.Slot(int)
@@ -2343,7 +2324,6 @@ class MainWindow(QtWidgets.QMainWindow):
             ).initial_condition_sets
         )
         if after != before:
-            self._refresh_slider_target_summary(tab_id)
             self._refresh_dataset_views((tab_id,))
 
     def _delete_initial_sets(self, tab_id: str) -> None:
@@ -2371,7 +2351,6 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         if bundle.initial_actions.delete_selected():
             bundle.slider_binding.evict_preview_targets(targets)
-            self._refresh_slider_target_summary(tab_id)
             self._refresh_dataset_views((tab_id,))
 
     @QtCore.Slot(object)
@@ -2490,7 +2469,6 @@ class MainWindow(QtWidgets.QMainWindow):
             bundle.initial_actions.render()
         if source_changed or initials_changed:
             bundle.slider_binding.render()
-            self._refresh_slider_target_summary(tab_id)
         self._render_results_for_tab(tab_id)
         self._refresh_project_state()
 
@@ -3016,9 +2994,16 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         bundle.editor.set_slider_draft_actions_enabled(bool(dirty))
 
-    def _refresh_slider_target_summary(self, tab_id: str) -> None:
+    @QtCore.Slot(str, object)
+    def _refresh_slider_target_summary(
+        self,
+        tab_id: str,
+        target_set_ids: object,
+    ) -> None:
         bundle = self._tab_surfaces[str(tab_id)]
-        targets = bundle.slider_binding.resolve_target_set_ids()
+        if not isinstance(target_set_ids, (tuple, list, set, frozenset)):
+            raise TypeError("Slider target IDs must be an iterable payload.")
+        targets = tuple(str(set_id) for set_id in target_set_ids)
         tab = self._workspace_tab_registry.tab(tab_id)
         names = [tab.initial_condition_set(set_id).name for set_id in targets]
         bundle.editor.set_slider_edit_targets_summary(
@@ -3041,6 +3026,10 @@ class MainWindow(QtWidgets.QMainWindow):
         if not accepted:
             return False
         self._refresh_tab_controls(target)
+        self.set_status_text(
+            "Slider values applied. Affected simulation results were "
+            "invalidated; Run to recompute."
+        )
         return True
 
     # ------------------------------------------------------------------
@@ -3909,7 +3898,6 @@ class MainWindow(QtWidgets.QMainWindow):
             bundle = self._tab_surfaces[tab_id]
             bundle.initial_actions.render()
             bundle.slider_binding.render()
-            self._refresh_slider_target_summary(tab_id)
         self._refresh_dataset_views((tab_id,))
 
     def _edit_observation_mapping(
@@ -5094,12 +5082,22 @@ class MainWindow(QtWidgets.QMainWindow):
     def set_status_text(self, text: str) -> None:
         self._status_label.setText(str(text))
 
-    def _build_workspace(
+    def _dispose_workspace(self) -> QtCore.QByteArray:
+        """Dispose current project surfaces while retaining the one root."""
+
+        saved_layout = self._save_workspace_layout()
+        for tab_id in tuple(self._tab_surfaces):
+            self._drop_tab_surface(tab_id)
+        self._workspace.reset_plot_session_state()
+        return saved_layout
+
+    def _rebuild_workspace(
         self,
         document: ProjectDocument,
         prepared_workspace: PreparedWorkspaceInstall,
-    ) -> QtWidgets.QWidget:
-        """Build a complete candidate root without touching the current root."""
+        saved_layout: QtCore.QByteArray,
+    ) -> None:
+        """Rebuild incoming project surfaces inside the permanent root."""
 
         if not isinstance(document, ProjectDocument):
             raise TypeError("document must be ProjectDocument.")
@@ -5110,88 +5108,36 @@ class MainWindow(QtWidgets.QMainWindow):
             tab_id for tab_id, _runtime in prepared_workspace.runtime_by_tab_id
         )
         if expected_ids != prepared_ids:
-            raise ValueError("Candidate document and workspace IDs differ.")
+            raise ValueError("Incoming document and workspace IDs differ.")
         if prepared_workspace.active_tab_id not in expected_ids:
-            raise ValueError("Candidate workspace active tab is unknown.")
+            raise ValueError("Incoming workspace active tab is unknown.")
+        if self._tab_surfaces:
+            raise RuntimeError("Current project surfaces were not disposed.")
 
-        root = ProjectWorkspaceWidget(self, outer_policy=self)
-        try:
-            stacks = self._build_physical_shell(root)
-            surfaces: dict[str, _TabSurfaceBundle] = {}
-            for tab in document.tabs:
-                bundle = self._create_tab_surface(
-                    tab.tab_id,
-                    registry=self._workspace_tab_registry,
-                    workspace_root=root,
-                    surface_stacks=stacks,
-                    install=False,
-                    publish_initial_state=False,
-                )
-                surfaces[tab.tab_id] = bundle
-                stacks["mechanism"].addWidget(bundle.editor_panel)
-                stacks["interactive_sliders"].addWidget(bundle.slider_panel)
-                stacks["batch_initial_conditions"].addWidget(
-                    bundle.simulation_panel
-                )
-                stacks["data"].addWidget(bundle.right_panel)
-                stacks["symbolic_calculator"].addWidget(
-                    bundle.calculator_panel
-                )
+        for tab in document.tabs:
+            self._create_tab_surface(tab.tab_id)
 
-            root._kindred_tab_surfaces = surfaces
-            self._connect_workspace_root(
-                root,
-                surface_ids=surfaces,
-                connect_shell=False,
-            )
-            presentation_by_tab_id = dict(
-                prepared_workspace.presentation_by_tab_id
-            )
-            root.render(
-                document,
-                active_tab_id=prepared_workspace.active_tab_id,
-            )
-            for tab in document.tabs:
-                state = presentation_by_tab_id[tab.tab_id]
-                root.plot_for_tab(tab.tab_id).set_persisted_plot_state(
-                    log_x=state.log_x,
-                    log_y=state.log_y,
-                    legend_visible=state.legend_visible,
-                    x_inverted=state.x_inverted,
-                    y_inverted=state.y_inverted,
-                )
-            root.set_theme(dark_mode=self._theme_manager.applied_dark_mode)
-            return root
-        except Exception:
-            root.deleteLater()
-            raise
-
-    def _swap_workspace(self, widget: QtWidgets.QWidget) -> None:
-        """Install one committed candidate root and retire the previous root."""
-
-        if not isinstance(widget, ProjectWorkspaceWidget):
-            raise TypeError("workspace must be ProjectWorkspaceWidget.")
-        incoming = widget
-        surfaces = getattr(incoming, "_kindred_tab_surfaces", None)
-        stacks = getattr(incoming, "_kindred_surface_stacks", None)
-        if not isinstance(surfaces, dict) or not isinstance(stacks, dict):
-            raise RuntimeError("Candidate root has no complete project surfaces.")
-
-        saved_layout = self._save_workspace_layout()
-        if not incoming.restore_workspace_state(saved_layout):
-            incoming.apply_default_dock_arrangement()
-        self.setCentralWidget(incoming)
-        self._workspace = incoming
-        self._surface_stacks = stacks
-        self._tab_surfaces = surfaces
-        self._set_current_workspace_references(incoming)
-        self._connect_workspace_root(
-            incoming,
-            surface_ids=surfaces,
-            connect_shell=True,
-            connect_plots=False,
+        self._workspace.render(
+            document,
+            active_tab_id=prepared_workspace.active_tab_id,
         )
-        self._rebuild_workspace_view_menus()
+        presentation_by_tab_id = dict(
+            prepared_workspace.presentation_by_tab_id
+        )
+        for tab in document.tabs:
+            state = presentation_by_tab_id[tab.tab_id]
+            self._workspace.plot_for_tab(tab.tab_id).set_persisted_plot_state(
+                log_x=state.log_x,
+                log_y=state.log_y,
+                legend_visible=state.legend_visible,
+                x_inverted=state.x_inverted,
+                y_inverted=state.y_inverted,
+            )
+        self._workspace.set_theme(
+            dark_mode=self._theme_manager.applied_dark_mode
+        )
+        if not self._workspace.restore_workspace_state(saved_layout):
+            self._apply_default_dock_arrangement()
         self._refresh_workspace_document()
 
     @QtCore.Slot()

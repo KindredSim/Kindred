@@ -572,6 +572,36 @@ class ResultRepository:
         if clear_reference:
             self._reference_by_set_id.pop(sid, None)
 
+    def restore_reference_or_current(self, set_id: str) -> bool:
+        """Expose the retained canonical Run without consulting the cache.
+
+        A Preview current value is expected to have been cleared first.  An
+        existing current Run remains current; otherwise an exact retained
+        Reference is promoted directly to current Run authority.  Cache
+        membership and LRU order are deliberately untouched.
+        """
+
+        sid = _required_id(set_id, "set_id")
+        if sid in self._current_run_set_ids:
+            return True
+        reference = self._reference_by_set_id.pop(sid, None)
+        if reference is None:
+            return False
+        self._current_by_set_id[sid] = reference
+        self._current_run_set_ids.add(sid)
+        return True
+
+    def preview_set_ids(self) -> tuple[str, ...]:
+        """Return semantic current values published as exact Preview."""
+
+        return tuple(
+            sorted(
+                set(self._current_by_set_id).difference(
+                    self._current_run_set_ids
+                )
+            )
+        )
+
     def publish_run(
         self,
         set_id: str,

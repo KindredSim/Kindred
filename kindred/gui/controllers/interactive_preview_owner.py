@@ -8,6 +8,8 @@ is current; rendering errors remain local to the physical plot.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import os
 from threading import Event
 
 from PySide6 import QtCore
@@ -24,10 +26,10 @@ from kindred.gui.interactive_preview import (
     InteractivePreviewTarget,
 )
 from kindred.gui.controllers.simulation_job_owner import (
-    _captured_parameter_coordinates,
     _prepare_target,
     _simulation_worker_cause,
     _solve_prepared,
+    resolve_run_parallel_capacity,
 )
 
 
@@ -64,6 +66,15 @@ class _InteractivePreviewWorker(QtCore.QThread):
         self._request = request
         self._control = cancellation_control
         self._cancel_event = cancel_event
+        self._max_parallel = resolve_run_parallel_capacity(
+            cpu_count=os.cpu_count(),
+            user_max=None,
+            target_count=len(request.targets),
+        ).effective
+
+    @property
+    def generation(self) -> int:
+        return self._generation
 
     def cancel(self) -> None:
         self._cancel_event.set()
@@ -74,25 +85,33 @@ class _InteractivePreviewWorker(QtCore.QThread):
         return self._cancel_event.is_set()
 
     def run(self) -> None:
-        for target in self._request.targets:
-            if self.cancelled:
-                outcome = _InteractiveTerminal(
-                    self._generation,
-                    target,
-                    "cancelled",
-                    message="Interactive Preview cancelled before preparation.",
-                )
-            else:
-                outcome = self._execute_target(target)
-            self.target_terminal.emit(self._generation, outcome)
-            if self.cancelled:
-                break
+        with ThreadPoolExecutor(
+            max_workers=self._max_parallel,
+            thread_name_prefix="kindred-preview",
+        ) as pool:
+            futures = {
+                pool.submit(self._execute_target, target): target
+                for target in self._request.targets
+            }
+            for future in as_completed(futures):
+                target = futures[future]
+                try:
+                    outcome = future.result()
+                except BaseException as exc:  # noqa: BLE001
+                    outcome = _InteractiveTerminal(
+                        self._generation,
+                        target,
+                        "cancelled" if self.cancelled else "failure",
+                        message=str(exc) or type(exc).__name__,
+                        cause=None if self.cancelled else _simulation_worker_cause(exc),
+                    )
+                self.target_terminal.emit(self._generation, outcome)
+                if self.cancelled:
+                    for pending in futures:
+                        pending.cancel()
 
     def _execute_target(self, target: InteractivePreviewTarget) -> _InteractiveTerminal:
         try:
-            self._request.sampling.validate_execution_grid(
-                target.execution_request.solver_config.grid
-            )
             prepared, parameters = _prepare_target(
                 target,  # structural target contract; interactive work has no repository key
                 cancellation_control=self._control,
@@ -132,6 +151,8 @@ class InteractivePreviewOwner(QtCore.QObject):
     frame_ready = QtCore.Signal(object)
     status_changed = QtCore.Signal(str)
     settled_changed = QtCore.Signal()
+    retire_targets_requested = QtCore.Signal(str, int, tuple)
+    zero_success_targets = QtCore.Signal(str, int, tuple)
 
     def __init__(
         self,
@@ -150,6 +171,7 @@ class InteractivePreviewOwner(QtCore.QObject):
         self._cancel_event: Event | None = None
         self._cancellation_control: SimulationCancellationControl | None = None
         self._terminal_state: str | None = None
+        self._successful_set_ids: set[str] = set()
         self._close_fenced = False
         self._last_settled = True
         self._gate.changed.connect(self._on_gate_changed)
@@ -157,10 +179,6 @@ class InteractivePreviewOwner(QtCore.QObject):
     @property
     def busy(self) -> bool:
         return bool(self._worker is not None or self._pending_request is not None)
-
-    @property
-    def current_kind(self) -> str | None:
-        return "interactive" if self.busy else None
 
     @property
     def application_close_settled(self) -> bool:
@@ -185,6 +203,17 @@ class InteractivePreviewOwner(QtCore.QObject):
             self.status_changed.emit("Interactive Preview rejected: owner is closing.")
             return False
         self._generation += 1
+        previous = self._current_request or self._pending_request
+        if previous is not None and previous.tab_id == request.tab_id:
+            removed = tuple(
+                set(previous.target_set_ids).difference(request.target_set_ids)
+            )
+            if removed:
+                self.retire_targets_requested.emit(
+                    request.tab_id,
+                    self._generation,
+                    removed,
+                )
         self._pending_request = request
         self._mark_unsettled()
         if self._worker is not None:
@@ -210,6 +239,7 @@ class InteractivePreviewOwner(QtCore.QObject):
         control = SimulationCancellationControl(cancel_event.is_set)
         self._cancel_event = cancel_event
         self._cancellation_control = control
+        self._successful_set_ids.clear()
         generation = self._generation
         worker = _InteractivePreviewWorker(
             generation=generation,
@@ -224,6 +254,12 @@ class InteractivePreviewOwner(QtCore.QObject):
         try:
             worker.start()
         except BaseException as exc:  # noqa: BLE001
+            if self._current_request is not None:
+                self.zero_success_targets.emit(
+                    self._current_request.tab_id,
+                    generation,
+                    self._current_request.target_set_ids,
+                )
             self._terminal_state = "failure"
             self._worker = None
             self._current_request = None
@@ -277,12 +313,35 @@ class InteractivePreviewOwner(QtCore.QObject):
         )
         # The sole currentness comparison is immediately before publication.
         self.frame_ready.emit(frame)
+        self._successful_set_ids.add(target.set_id)
 
     @QtCore.Slot()
     def _on_worker_finished(self) -> None:
         worker = self.sender()
         if worker is not self._worker:
             return
+        generation = worker.generation
+        request = self._current_request
+        if request is not None:
+            pending_ids = set()
+            if (
+                self._pending_request is not None
+                and self._pending_request.tab_id == request.tab_id
+            ):
+                pending_ids = set(self._pending_request.target_set_ids)
+            without_success = tuple(
+                set_id
+                for set_id in request.target_set_ids
+                if set_id not in self._successful_set_ids
+                and set_id not in pending_ids
+            )
+            if without_success:
+                self.zero_success_targets.emit(
+                    request.tab_id,
+                    generation,
+                    without_success,
+                )
+        self._successful_set_ids.clear()
         self._worker = None
         self._current_request = None
         self._cancellation_control = None
@@ -304,6 +363,7 @@ class InteractivePreviewOwner(QtCore.QObject):
         tab = None if tab_id is None else str(tab_id).strip()
         affected = None if set_ids is None else {str(value) for value in set_ids}
         changed = False
+        retire_signals: list[tuple[str, tuple[str, ...]]] = []
         if (
             self._pending_request is not None
             and (tab is None or self._pending_request.tab_id == tab)
@@ -312,7 +372,15 @@ class InteractivePreviewOwner(QtCore.QObject):
                 or affected.intersection(self._pending_request.target_set_ids)
             )
         ):
+            pending_tab = self._pending_request.tab_id
+            pending_ids = tuple(
+                target_id
+                for target_id in self._pending_request.target_set_ids
+                if affected is None or target_id in affected
+            )
             self._pending_request = None
+            if pending_ids:
+                retire_signals.append((pending_tab, pending_ids))
             changed = True
         if (
             self._current_request is not None
@@ -322,10 +390,24 @@ class InteractivePreviewOwner(QtCore.QObject):
                 or affected.intersection(self._current_request.target_set_ids)
             )
         ):
+            current_ids = tuple(
+                target_id
+                for target_id in self._current_request.target_set_ids
+                if affected is None or target_id in affected
+            )
             self._generation += 1
             if self._worker is not None:
                 self._worker.cancel()
+            if current_ids:
+                retire_signals.append((self._current_request.tab_id, current_ids))
             changed = True
+        for signal_tab, signal_ids in retire_signals:
+            if signal_tab:
+                self.retire_targets_requested.emit(
+                    signal_tab,
+                    self._generation,
+                    signal_ids,
+                )
         if changed:
             self.state_changed.emit()
             self._emit_settled_if_complete()

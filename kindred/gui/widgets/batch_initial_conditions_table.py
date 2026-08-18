@@ -571,24 +571,28 @@ def resolve_live_slider_target_set_ids(
     pinned_set_ids: Iterable[str],
     existing_set_ids: Iterable[str],
 ) -> tuple[str, ...]:
-    """Resolve exact pins, else the live model-bound current row, else none."""
+    """Resolve the current row followed by stable valid Slider pins.
+
+    The current row remains the deterministic primary target even when pins
+    exist.  Pinned rows are then appended in authored presentation order,
+    with invalid and duplicate identities discarded at this boundary.
+    """
 
     existing = {str(set_id) for set_id in existing_set_ids}
+    current: tuple[str, ...] = ()
+    model = table.model()
+    if isinstance(model, BatchInitialConditionsTableModel):
+        index = table.currentIndex()
+        if index.isValid() and index.model() is model:
+            set_id = model.set_id_for_live_index(index)
+            if set_id in existing:
+                current = (set_id,)
     pinned = tuple(
         set_id
         for set_id in dict.fromkeys(str(item) for item in pinned_set_ids)
         if set_id in existing
     )
-    if pinned:
-        return pinned
-    model = table.model()
-    if not isinstance(model, BatchInitialConditionsTableModel):
-        return ()
-    index = table.currentIndex()
-    if not index.isValid() or index.model() is not model:
-        return ()
-    set_id = model.set_id_for_live_index(index)
-    return (set_id,) if set_id in existing else ()
+    return tuple(dict.fromkeys((*current, *pinned)))
 
 
 class InitialConditionsTableActions(QtCore.QObject):

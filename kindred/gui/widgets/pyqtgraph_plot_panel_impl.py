@@ -308,6 +308,16 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         self._end_interactive_range_session()
         return True
 
+    def retire_interactive_preview_targets(
+        self,
+        target_set_ids: tuple[str, ...],
+    ) -> bool:
+        """Retire selected transient targets while preserving other curves."""
+
+        return self._interactive_display.retire_targets(
+            tuple(str(value) for value in target_set_ids)
+        )
+
     def apply_application_plot_preferences(
         self,
         *,
@@ -411,7 +421,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
                 self._restore_interactive_view(self._interactive_locked_view)
 
     def drop_tab_session_state(self) -> None:
-        self.discard_interactive_display()
+        self.dispose_project_content()
         self._manual_annotations.clear()
         self._scalar_guides.clear()
         self._interaction_mode = "pan"
@@ -422,7 +432,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
     def reset_plot_session_state(self) -> None:
         """Project replacement/reopen resets non-archived Plot session truth."""
 
-        self.discard_interactive_display()
+        self.dispose_project_content()
         self._manual_annotations.clear()
         self._scalar_guides.clear()
         self._interaction_mode = "pan"
@@ -434,6 +444,15 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         self._axis_toolbar.set_manual_ranges(None, None, None, None)
         self._axis_toolbar.set_auto_range(True)
         self._apply_interaction_mode("pan")
+
+    def dispose_project_content(self) -> None:
+        """Stop plot-owned asynchronous work before project content teardown."""
+
+        self._interactive_timer.stop()
+        self._cancel_copy()
+        self._interactive_display.clear(reset_currentness=True)
+        self._clear_interactive_items()
+        self._end_interactive_range_session()
 
     def clear_result_input(self) -> None:
         """Clear rejected public truth without affecting other tab-local state."""
