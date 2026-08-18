@@ -158,10 +158,13 @@ from kindred.gui.widgets.solver_settings import SimulationSettingsDialog
 from kindred.gui.widgets.symbolic_calculator_panel import SymbolicCalculatorPanel
 from kindred.gui.ui_helpers import setup_scientific_validator
 from kindred.gui.workspace_result_presenter import (
+    ResultDataBlock,
+    ResultRenderInput,
     VisibleResultSet,
-    WorkspaceResultPresenter,
-    WorkspaceResultProjection,
     XlsxExportCompletion,
+    compose_result_input,
+    validate_xlsx_export,
+    write_xlsx,
 )
 from kindred.gui.workflow_contracts import (
     DetailedBalanceCorrectionCommitResult,
@@ -330,15 +333,17 @@ class _XlsxExportWorker(QtCore.QThread):
         self,
         *,
         generation: int,
-        projection: WorkspaceResultProjection,
+        blocks: tuple[ResultDataBlock, ...],
         path: str,
         parent: QtCore.QObject,
     ) -> None:
         super().__init__(parent)
-        if not isinstance(projection, WorkspaceResultProjection):
-            raise TypeError("projection must be WorkspaceResultProjection.")
+        if not isinstance(blocks, tuple) or any(
+            not isinstance(block, ResultDataBlock) for block in blocks
+        ):
+            raise TypeError("blocks must be a tuple of ResultDataBlock values.")
         self._generation = int(generation)
-        self._projection = projection
+        self._blocks = blocks
         self._path = os.path.abspath(os.fspath(path))
         self._commit_started = False
         self._terminal_outcome: (
@@ -394,7 +399,7 @@ class _XlsxExportWorker(QtCore.QThread):
                     f"Export directory does not exist: {parent}"
                 )
             self._check_cancelled()
-            WorkspaceResultPresenter.validate_xlsx_export(self._projection)
+            validate_xlsx_export(self._blocks)
             descriptor, temporary_path = tempfile.mkstemp(
                 prefix=f".{os.path.basename(self._path)}.",
                 suffix=".partial",
@@ -404,14 +409,14 @@ class _XlsxExportWorker(QtCore.QThread):
             with os.fdopen(descriptor, "w+b") as destination:
                 descriptor = -1
                 self._check_cancelled()
-                completion = WorkspaceResultPresenter.write_xlsx(
-                    self._projection,
+                completion = write_xlsx(
+                    self._blocks,
                     destination,
                     cancellation_check=self._check_cancelled,
                 )
                 if not isinstance(completion, XlsxExportCompletion):
                     raise TypeError(
-                        "WorkspaceResultPresenter.write_xlsx() must return "
+                        "write_xlsx() must return "
                         "XlsxExportCompletion."
                 )
                 self._check_cancelled()
@@ -517,7 +522,7 @@ class _XlsxExportOwner(QtCore.QObject):
 
     def start(
         self,
-        projection: WorkspaceResultProjection,
+        blocks: tuple[ResultDataBlock, ...],
         path: str,
     ) -> bool:
         absolute_path = os.path.abspath(os.fspath(path))
@@ -546,7 +551,7 @@ class _XlsxExportOwner(QtCore.QObject):
         generation = self._generation
         worker = _XlsxExportWorker(
             generation=generation,
-            projection=projection,
+            blocks=blocks,
             path=absolute_path,
             parent=self,
         )
@@ -803,7 +808,6 @@ class MainWindow(QtWidgets.QMainWindow):
             parent=self,
         )
 
-        self._result_presenter = WorkspaceResultPresenter()
         self._build_physical_shell()
         for tab in self._project_session.document.tabs:
             self._create_tab_surface(tab.tab_id)
@@ -1902,14 +1906,14 @@ class MainWindow(QtWidgets.QMainWindow):
             y_inverted=state.y_inverted,
         )
 
-    def _compose_result_projection(
+    def _compose_result_input(
         self,
         tab_id: str,
         *,
         document: ProjectDocument | None = None,
         presentation: object | None = None,
         repository: ResultRepository | None = None,
-    ) -> WorkspaceResultProjection:
+    ) -> ResultRenderInput:
         current_document = (
             self._project_session.document if document is None else document
         )
@@ -1967,7 +1971,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 color_name,
                 modeled_species,
             ).name(QtGui.QColor.NameFormat.HexRgb)
-        return self._result_presenter.compose(
+        return compose_result_input(
             tab_id=tab_id,
             current_set_id=presentation.current_set_id,
             visible_sets=visible_sets,
@@ -2006,10 +2010,10 @@ class MainWindow(QtWidgets.QMainWindow):
         if target not in self._tab_surfaces:
             return False
         try:
-            projection = self._compose_result_projection(target)
+            render_input = self._compose_result_input(target)
         except Exception as exc:
             logger.exception("Result render failed for mechanism %s", target)
-            self._invalidate_result_projection(target)
+            self._invalidate_result_input(target)
             self.set_status_text(
                 f"Result display failed for mechanism {target!r}: {exc}"
             )
@@ -2018,7 +2022,7 @@ class MainWindow(QtWidgets.QMainWindow):
         try:
             self._workspace.plot_for_tab(
                 target
-            ).apply_workspace_result_projection(projection)
+            ).apply_result_input(render_input)
         except Exception:
             # The physical panel owns invalidation and the renderFailed report;
             # this caller only stops and refreshes action eligibility.
@@ -2042,7 +2046,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     @QtCore.Slot(str)
     def _on_workspace_result_diagnostic(self, message: str) -> None:
-        """Surface a successful result projection's exact diagnostic."""
+        """Surface a successful result input's exact diagnostic."""
 
         self.set_status_text(str(message))
 
@@ -2135,19 +2139,19 @@ class MainWindow(QtWidgets.QMainWindow):
         self._render_results_for_tab(target)
         self._refresh_project_state()
 
-    def _invalidate_result_projection(self, tab_id: str) -> None:
+    def _invalidate_result_input(self, tab_id: str) -> None:
         """Remove a failed tab's physical result surface without touching others."""
 
         target = str(tab_id)
         try:
-            self._workspace.plot_for_tab(target).clear_workspace_result_projection()
+            self._workspace.plot_for_tab(target).clear_result_input()
         except (KeyError, RuntimeError, TypeError, ValueError):
             logger.exception("Could not clear failed workspace result surface")
 
-    def _active_current_export_projection(
+    def _active_current_export_blocks(
         self,
-    ) -> WorkspaceResultProjection | None:
-        """Return export truth only when the live active panel applied it."""
+    ) -> tuple[ResultDataBlock, ...] | None:
+        """Return export blocks only from the live active panel."""
 
         try:
             panel = self._workspace.plot_for_tab(
@@ -2155,7 +2159,7 @@ class MainWindow(QtWidgets.QMainWindow):
             )
         except (KeyError, RuntimeError):
             return None
-        return panel.xlsx_export_projection()
+        return panel.xlsx_export_blocks()
 
     def _repository_for_tab(self, tab_id: str) -> ResultRepository:
         override = self._replacement_repository_override
@@ -4832,12 +4836,12 @@ class MainWindow(QtWidgets.QMainWindow):
     def _export_xlsx(self) -> None:
         if not self._mutation_input_admitted("Export Results XLSX"):
             return
-        projection = self._active_current_export_projection()
-        if projection is None:
+        blocks = self._active_current_export_blocks()
+        if blocks is None:
             self.set_status_text("No result data is available to export.")
             return
         try:
-            WorkspaceResultPresenter.validate_xlsx_export(projection)
+            validate_xlsx_export(blocks)
         except (TypeError, ValueError) as exc:
             self.set_status_text(str(exc))
             QtWidgets.QMessageBox.critical(
@@ -4879,7 +4883,7 @@ class MainWindow(QtWidgets.QMainWindow):
             if answer != QtWidgets.QMessageBox.StandardButton.Yes:
                 return
         self._remember_export_directory(path)
-        if self._xlsx_export_owner.start(projection, path):
+        if self._xlsx_export_owner.start(blocks, path):
             self.set_status_text(f"Exporting XLSX: {path}")
             self._refresh_actions()
 
@@ -5374,8 +5378,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 raise LookupError(
                     f"Prepared tab {bundle.tab_id!r} has no ResultRepository."
                 )
-            plot.apply_workspace_result_projection(
-                self._compose_result_projection(
+            plot.apply_result_input(
+                self._compose_result_input(
                     bundle.tab_id,
                     document=registry.document,
                     presentation=state,
@@ -5779,7 +5783,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if self._xlsx_export_action is not None:
             self._xlsx_export_action.setEnabled(
                 mutation_admitted
-                and self._active_current_export_projection() is not None
+                and self._active_current_export_blocks() is not None
                 and not self._xlsx_export_owner.is_exporting
             )
 

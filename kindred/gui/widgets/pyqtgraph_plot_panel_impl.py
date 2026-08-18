@@ -1,9 +1,9 @@
-"""PyQtGraph workspace surface for one immutable result projection."""
+"""PyQtGraph workspace surface for one immutable result input."""
 
 from __future__ import annotations
 
 import io
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from collections.abc import Callable, Mapping
 from typing import Any
 
@@ -29,11 +29,10 @@ from kindred.gui.widgets.parameter_statistics_table import ParameterStatisticsTa
 from kindred.gui.widgets.species_statistics_table import SpeciesStatisticsTable
 from kindred.gui.workspace_result_presenter import (
     ResultDataBlock,
+    ResultRenderInput,
     ResultLayerKind,
-    SimulationResultLayerIdentity,
-    WorkspacePlotLayer,
-    WorkspaceResultPresenter,
-    WorkspaceResultProjection,
+    iter_blocks_tsv_chunks,
+    validate_copy,
 )
 
 pg = require_pyqtgraph(context="Kindred GUI")
@@ -85,18 +84,29 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
             enable_reference_layer_toggle_action
         )
         self._enable_copy_visible_data_action = bool(enable_copy_visible_data_action)
-        self._applied_projection: WorkspaceResultProjection | None = None
+        self._result_blocks: tuple[ResultDataBlock, ...] = ()
+        self._result_tab_id = ""
+        self._result_current_set_id = ""
+        self._result_statistics_names: tuple[str, ...] = ()
+        self._result_mapped_overlay_locks: tuple[tuple[ExperimentalAxisSelection, str], ...] = ()
+        self._result_selected_x = SimulationSeriesAxisSelection("t")
+        self._result_selected_y: tuple[AxisSeriesSelection, ...] = ()
+        self._result_selected_y_default = True
+        self._result_x_label = "Time (s)"
+        self._result_y_label = "Value"
+        self._result_axis_candidates = ()
+        self._result_reference_visible = True
+        self._result_annotations: tuple[Mapping[str, object], ...] = ()
+        self._result_annotations_visible = True
+        self._result_unavailable_x: str | None = None
+        self._result_warning_details = ()
         self._rendered_blocks: tuple[ResultDataBlock, ...] = ()
         # A panel is created and destroyed with exactly one mechanism tab by
         # MechanismWorkspaceView.  These presentation/session values are
         # therefore panel-local; retaining tab-keyed maps here only creates a
         # second, stale routing surface inside the tab-owned widget.
         self._sampling_limit: int | None = None
-        self._curve_items: list[object] = []
         self._plot_items_by_key: dict[tuple[object, ...], object] = {}
-        self._physical_items_by_axis: dict[
-            tuple[AxisSeriesSelection, bool], list[object]
-        ] = {}
         self._annotation_items: list[object] = []
         self._manual_annotations: list[tuple[str, float, float]] = []
         self._scalar_guides: list[str] = []
@@ -194,46 +204,73 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
 
         return self._analysis_tabs
 
-    def xlsx_export_projection(self) -> WorkspaceResultProjection | None:
-        """Return this page's export authority, or None when unavailable."""
-
-        projection = self._applied_projection
-        if projection is None:
+    def _current_render_input(self) -> ResultRenderInput | None:
+        if not self._result_tab_id:
             return None
-        if (
-            projection.copy_all_blocks
-            and projection.unavailable_x_diagnostic is None
-        ):
-            return projection
-        return None
+        return ResultRenderInput(
+            tab_id=self._result_tab_id,
+            current_set_id=self._result_current_set_id,
+            blocks=self._result_blocks,
+            statistics_series_names=self._result_statistics_names,
+            selected_x_series=self._result_selected_x,
+            selected_y_series=self._result_selected_y,
+            mapped_overlay_locks=self._result_mapped_overlay_locks,
+            selected_y_uses_default_all=self._result_selected_y_default,
+            x_label=self._result_x_label,
+            y_label=self._result_y_label,
+            axis_candidates=self._result_axis_candidates,
+            reference_lines_visible=self._result_reference_visible,
+            intervention_annotations=self._result_annotations,
+            intervention_annotations_visible=self._result_annotations_visible,
+            unavailable_x_diagnostic=self._result_unavailable_x,
+            completion_warning_details=self._result_warning_details,
+        )
 
-    def apply_workspace_result_projection(
-        self,
-        projection: WorkspaceResultProjection,
-    ) -> None:
-        """Apply one completed projection exactly at its immutable endpoint."""
+    def xlsx_export_blocks(self) -> tuple[ResultDataBlock, ...] | None:
+        """Return the immutable visible block roster required for XLSX."""
 
-        if not isinstance(projection, WorkspaceResultProjection):
-            raise TypeError(
-                "apply_workspace_result_projection requires WorkspaceResultProjection."
-            )
+        if not self._result_tab_id or self._result_unavailable_x is not None:
+            return None
+        blocks = tuple(block for block in self._result_blocks if block.visible)
+        return blocks or None
+
+    def apply_result_input(self, render_input: ResultRenderInput) -> None:
+        """Apply one call-local result input and retain only direct facts."""
+
+        if not isinstance(render_input, ResultRenderInput):
+            raise TypeError("render_input must be a ResultRenderInput.")
+        self._result_blocks = render_input.blocks
+        self._result_tab_id = render_input.tab_id
+        self._result_current_set_id = render_input.current_set_id
+        self._result_statistics_names = render_input.statistics_series_names
+        self._result_mapped_overlay_locks = render_input.mapped_overlay_locks
+        self._result_selected_x = render_input.selected_x_series
+        self._result_selected_y = render_input.selected_y_series
+        self._result_selected_y_default = render_input.selected_y_uses_default_all
+        self._result_x_label = render_input.x_label
+        self._result_y_label = render_input.y_label
+        self._result_axis_candidates = render_input.axis_candidates
+        self._result_reference_visible = render_input.reference_lines_visible
+        self._result_annotations = render_input.intervention_annotations
+        self._result_annotations_visible = render_input.intervention_annotations_visible
+        self._result_unavailable_x = render_input.unavailable_x_diagnostic
+        self._result_warning_details = render_input.completion_warning_details
         self._cancel_copy()
         locked_view = self._interactive_locked_view
         # The controller removes or transfers queued/visible approximation
         # before any exact/base scene can publish.  This also retires a stopped
         # overlay before a new axis/series projection changes its semantics.
-        self._interactive_display.prepare_workspace_projection(projection)
+        self._interactive_display.prepare_result_input(render_input)
         try:
-            rendered = self._render_projection(projection)
+            rendered = self._render_result_scene(render_input)
         except Exception as exc:
             # A failed projection is ordinary unavailability for this panel:
             # never retain a stale scene or export authority.
             self._clear_rejected_result_scene()
             self.renderFailed.emit(str(exc))
             raise
-        self._applied_projection = projection
         self._rendered_blocks = rendered
-        self._interactive_display.commit_workspace_projection(projection)
+        self._interactive_display.commit_result_input(render_input)
         if (
             self._interactive_display.has_visible_frame
             and locked_view is not None
@@ -241,21 +278,21 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
             self._restore_interactive_view(locked_view)
         elif not self._interactive_display.has_current_batch:
             self._end_interactive_range_session()
-        if projection.unavailable_x_diagnostic is not None:
-            self.resultDiagnostic.emit(projection.unavailable_x_diagnostic)
+        if render_input.unavailable_x_diagnostic is not None:
+            self.resultDiagnostic.emit(render_input.unavailable_x_diagnostic)
 
     def apply_interactive_preview_frame(self, frame: object) -> None:
         """Route one frame into the controller-owned physical protocol."""
 
-        projection = self._applied_projection
-        if projection is None:
+        render_input = self._current_render_input()
+        if render_input is None:
             from kindred.gui.interactive_preview import InteractivePreviewFrame
 
             if not isinstance(frame, InteractivePreviewFrame):
                 raise TypeError("interactive frame must be an InteractivePreviewFrame.")
             disposition = InteractiveDisplayController.reject_unrenderable(
                 frame,
-                message="Interactive plot has no applied projection.",
+                message="Interactive plot has no current result input.",
             )
             self.interactiveFrameDisposition.emit(disposition)
             return
@@ -266,7 +303,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         needs_range = not self._interactive_display.has_current_batch
         self._interactive_display.offer_frame(
             frame,
-            projection=projection,
+            render_input=render_input,
         )
         if needs_range and self._interactive_display.has_renderable_frame:
             self._begin_interactive_range_session()
@@ -274,8 +311,8 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
     def apply_interactive_preview_terminal_outcome(self, outcome: object) -> bool:
         """Route one exact terminal fact into controller settlement."""
 
-        projection = self._applied_projection
-        if projection is None:
+        render_input = self._current_render_input()
+        if render_input is None:
             return False
         from kindred.gui.interactive_preview import InteractivePreviewTerminalOutcome
 
@@ -285,7 +322,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
             )
         changed = self._interactive_display.apply_terminal_outcome(
             outcome,
-            projection=projection,
+            render_input=render_input,
         )
         if changed and not self._interactive_display.has_current_batch:
             self._end_interactive_range_session()
@@ -324,8 +361,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
 
         if not isinstance(retirement, InteractivePreviewRetirement):
             raise TypeError("Interactive Preview retirement must be typed.")
-        projection = self._applied_projection
-        if projection is None or retirement.tab_id != projection.tab_id:
+        if not self._result_tab_id or retirement.tab_id != self._result_tab_id:
             return False
         if retirement.target_set_ids:
             changed = self._interactive_display.retire_targets(
@@ -360,79 +396,70 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         experimental_point_size: int,
         experimental_point_opacity: float,
     ) -> None:
-        """Apply committed global plot preferences to existing items only."""
+        """Apply committed global plot preferences to retained result blocks."""
 
-        projection = self._applied_projection
-        if projection is None:
+        render_input = self._current_render_input()
+        if render_input is None:
             return
         try:
             if not callable(color_for_species):
                 raise TypeError("color_for_species must be callable.")
-            provenance_by_axis: dict[AxisSeriesSelection, str] = {}
-            for block in projection.copy_all_blocks:
+            updated_blocks: list[ResultDataBlock] = []
+            for block in render_input.blocks:
                 provenance_by_name = dict(block.series_provenance)
+                updated_colors: list[tuple[str, str]] = []
                 for name, selection in block.series_axes:
-                    if not isinstance(selection, ExperimentalAxisSelection):
-                        continue
-                    provenance = provenance_by_name.get(name)
-                    if provenance is None:
-                        raise ValueError(
-                            "Experimental plot item lacks color provenance."
-                        )
-                    color_name = str(
-                        provenance.get("model_target")
-                        or provenance.get("raw_column")
-                        or ""
-                    )
-                    if not color_name:
-                        raise ValueError(
-                            "Experimental plot item has no color identity."
-                        )
-                    previous = provenance_by_axis.setdefault(
-                        selection,
-                        color_name,
-                    )
-                    if previous != color_name:
-                        raise ValueError(
-                            "Experimental plot item color provenance conflicts."
-                        )
-            view_box = self._plot_widget.getPlotItem().getViewBox()
-            previous_auto_range = view_box.autoRangeEnabled()
-            view_box.state["autoRange"] = [False, False]
-            view_box._autoRangeNeedsUpdate = False
-            try:
-                for (selection, is_experimental_marker), items in tuple(
-                    self._physical_items_by_axis.items()
-                ):
                     if isinstance(selection, SimulationSeriesAxisSelection):
                         color_name = selection.series_name
                     else:
-                        color_name = provenance_by_axis.get(selection, "")
+                        provenance = provenance_by_name.get(name)
+                        if provenance is None:
+                            raise ValueError(
+                                "Experimental plot block lacks color provenance."
+                            )
+                        color_name = str(
+                            provenance.get("model_target")
+                            or provenance.get("raw_column")
+                            or ""
+                        )
                         if not color_name:
                             raise ValueError(
-                                "Experimental plot item lacks applied provenance."
+                                "Experimental plot block has no color identity."
                             )
                     color = color_for_species(color_name, tuple(known_species))
                     if not isinstance(color, QtGui.QColor) or not color.isValid():
                         raise ValueError("Resolved plot color must be a valid QColor.")
-                    for item in items:
-                        self._apply_item_color(item, color)
-                        if is_experimental_marker:
-                            item.setSymbolSize(float(experimental_point_size))
-                            item.setOpacity(float(experimental_point_opacity))
-            finally:
-                # pyqtgraph 0.13.7's public enable/disable methods flush a
-                # pending range when disabling and queue one when enabling.
-                # Restore only the pre-existing capability, never a style-change
-                # bounds update, so prepareForPaint cannot recompose this view.
-                view_box.state["autoRange"] = list(previous_auto_range)
-                view_box._autoRangeNeedsUpdate = False
+                    updated_colors.append((name, color.name(QtGui.QColor.NameFormat.HexRgb)))
+                updated_blocks.append(
+                    replace(
+                        block,
+                        color_by_series=tuple(updated_colors),
+                        point_size=(
+                            float(experimental_point_size)
+                            if block.kind is ResultLayerKind.EXPERIMENTAL
+                            else block.point_size
+                        ),
+                        opacity=(
+                            float(experimental_point_opacity)
+                            if block.kind is ResultLayerKind.EXPERIMENTAL
+                            else block.opacity
+                        ),
+                    )
+                )
+            updated_input = replace(render_input, blocks=tuple(updated_blocks))
+            self._result_blocks = updated_input.blocks
+            locked_view = self._interactive_locked_view
+            physical_view = self._capture_interactive_physical_view()
+            rendered = self._render_result_scene(updated_input)
+            self._restore_interactive_physical_view(physical_view)
+            self._rendered_blocks = rendered
+            self._interactive_display.refresh_result_input(updated_input)
             if self._interactive_display.has_visible_frame:
-                if self._interactive_locked_view is not None:
-                    self._restore_interactive_view(self._interactive_locked_view)
                 self._mask_interactive_foreground_items(
                     set(self._interactive_display.masking_intent)
                 )
+                if locked_view is not None:
+                    self._restore_interactive_view(locked_view)
         except Exception as exc:
             self._clear_rejected_result_scene()
             self.renderFailed.emit(str(exc))
@@ -457,7 +484,8 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
             y_inverted=bool(y_inverted),
         )
         self._presentation = state
-        if self._applied_projection is not None:
+        render_input = self._current_render_input()
+        if render_input is not None:
             self._apply_plot_presentation(state)
             if self._interactive_locked_view is not None:
                 self._restore_interactive_view(self._interactive_locked_view)
@@ -487,7 +515,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         self._axis_toolbar.set_auto_range(True)
         self._apply_interaction_mode("pan")
 
-    def clear_workspace_result_projection(self) -> None:
+    def clear_result_input(self) -> None:
         """Clear rejected public truth without affecting other tab-local state."""
 
         self._clear_rejected_result_scene()
@@ -507,7 +535,14 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
                 clear()
             except Exception:
                 pass
-        self._applied_projection = None
+        self._result_blocks = ()
+        self._result_tab_id = ""
+        self._result_current_set_id = ""
+        self._result_statistics_names = ()
+        self._result_mapped_overlay_locks = ()
+        self._result_axis_candidates = ()
+        self._result_annotations = ()
+        self._result_warning_details = ()
         self._rendered_blocks = ()
 
     def _request_interactive_tick(self, delay_seconds: float) -> None:
@@ -988,156 +1023,82 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         self._completion_warning_badge.setAccessibleDescription("")
         self._completion_warning_badge.setVisible(False)
 
-    def _render_projection(
+    def _render_result_scene(
         self,
-        projection: WorkspaceResultProjection,
+        render_input: ResultRenderInput,
     ) -> tuple[ResultDataBlock, ...]:
         self._restore_interactive_foreground_items()
         existing_items = dict(self._plot_items_by_key)
         self._clear_annotation_items()
-        self._plot_widget.setLabel("bottom", projection.x_label)
-        self._plot_widget.setLabel("left", projection.y_label)
-        block_by_id = {block.block_id: block for block in projection.copy_all_blocks}
+        self._plot_widget.setLabel("bottom", render_input.x_label)
+        self._plot_widget.setLabel("left", render_input.y_label)
         rendered_blocks: list[ResultDataBlock] = []
         rendered_items: dict[tuple[object, ...], object] = {}
-        physical_items: dict[tuple[AxisSeriesSelection, bool], list[object]] = {}
         foreground_items: dict[str, list[object]] = {}
         reference_items: list[object] = []
-        self._curve_items = []
-        for layer in projection.plot_layers:
-            if not layer.visible:
-                continue
-            block = block_by_id.get(layer.layer_id)
-            if block is None:
+        for block in render_input.blocks:
+            if not block.visible:
                 continue
             rendered = self._render_layer(
-                layer,
                 block,
                 sampling_limit=self._sampling_limit,
                 existing_items=existing_items,
                 rendered_items=rendered_items,
-                physical_items=physical_items,
                 foreground_items=foreground_items,
                 reference_items=reference_items,
             )
             if rendered is not None:
                 rendered_blocks.append(rendered)
-
         for item_key, item in existing_items.items():
-            if item_key in rendered_items:
-                continue
-            self._remove_plot_item(item)
-
+            if item_key not in rendered_items:
+                self._remove_plot_item(item)
         self._plot_items_by_key = rendered_items
-        self._physical_items_by_axis = physical_items
         reference_ids = {id(item) for item in reference_items}
         self._interactive_foreground_items_by_set = {
             set_id: tuple(item for item in items if id(item) not in reference_ids)
             for set_id, items in foreground_items.items()
         }
         self._axis_toolbar.set_x_candidates(
-            projection.axis_candidates,
-            selected=projection.selected_x_series,
+            render_input.axis_candidates,
+            selected=render_input.selected_x_series,
         )
         y_candidates = tuple(
-            candidate
-            for candidate in projection.axis_candidates
+            candidate for candidate in render_input.axis_candidates
             if not (
-                isinstance(
-                    candidate.selection,
-                    SimulationSeriesAxisSelection,
-                )
+                isinstance(candidate.selection, SimulationSeriesAxisSelection)
                 and candidate.selection.series_name == "t"
             )
         )
-        derived_overlay_y = set(projection.derived_overlay_y_series)
-        locked_checked: dict[AxisSeriesSelection, str] = {}
-        for layer in projection.plot_layers:
-            if layer.kind is not ResultLayerKind.EXPERIMENTAL:
-                continue
-            provenance_by_name = dict(layer.series_provenance)
-            for name, selection in layer.series_axes:
-                if selection not in derived_overlay_y:
-                    continue
-                mapped_model = str(
-                    provenance_by_name.get(name, {}).get("model_target")
-                    or ""
-                )
-                if not mapped_model:
-                    raise ValueError(
-                        "Derived overlay Y identity lacks mapped-model "
-                        "provenance."
-                    )
-                previous = locked_checked.setdefault(selection, mapped_model)
-                if previous != mapped_model:
-                    raise ValueError(
-                        "Derived overlay Y identity has conflicting "
-                        "mapped-model provenance."
-                    )
-        if set(locked_checked) != derived_overlay_y:
-            raise ValueError(
-                "Derived overlay Y identities must match active projected "
-                "overlay layers."
-            )
+        locked_checked = dict(render_input.mapped_overlay_locks)
         self._axis_toolbar.set_y_candidates(
             [
                 (
                     candidate,
-                    projection.selected_y_uses_default_all
-                    or candidate.selection in projection.selected_y_series
-                    or candidate.selection in derived_overlay_y,
+                    render_input.selected_y_uses_default_all
+                    or candidate.selection in render_input.selected_y_series
+                    or candidate.selection in locked_checked,
                 )
                 for candidate in y_candidates
             ],
             locked_checked=locked_checked,
         )
-        self._axis_toolbar.set_coarse_sampling(
-            self._sampling_limit is not None
-        )
+        self._axis_toolbar.set_coarse_sampling(self._sampling_limit is not None)
         interaction = self._interaction_mode
         self._axis_toolbar.set_interaction_mode(interaction)
         self._apply_interaction_mode(interaction)
         presentation = self._presentation
-        self._render_annotations(projection, presentation)
+        self._render_annotations(render_input, presentation)
         self._render_manual_annotations(presentation)
-        self._render_scalar_guides(projection, presentation)
-        self._render_analysis(projection)
+        self._render_scalar_guides(render_input, presentation)
+        self._render_analysis(render_input)
         axis_range = self._axis_range
-        self._axis_toolbar.set_manual_ranges(
-            axis_range.x_min,
-            axis_range.x_max,
-            axis_range.y_min,
-            axis_range.y_max,
-        )
+        self._axis_toolbar.set_manual_ranges(axis_range.x_min, axis_range.x_max, axis_range.y_min, axis_range.y_max)
         self._axis_toolbar.set_auto_range(axis_range.auto)
-        self._apply_plot_presentation(
-            presentation,
-            axis_range=axis_range,
-            refresh_geometry=False,
-        )
-        self._project_completion_warning(projection)
+        self._apply_plot_presentation(presentation, axis_range=axis_range, refresh_geometry=False)
+        self._project_completion_warning(render_input)
         return tuple(rendered_blocks)
 
-    @staticmethod
-    def _physical_layer_identity(layer: WorkspacePlotLayer) -> object:
-        """Map semantic role changes onto the compatible retained-result slot."""
-
-        identity = layer.layer_id
-        if isinstance(identity, SimulationResultLayerIdentity) and identity.kind in {
-            ResultLayerKind.EXPLICIT,
-            ResultLayerKind.REFERENCE,
-        }:
-            return SimulationResultLayerIdentity(
-                ResultLayerKind.REFERENCE,
-                identity.set_id,
-            )
-        return identity
-
-    def _update_plot_item_legend(
-        self,
-        item: object,
-        name: str | None,
-    ) -> None:
+    def _update_plot_item_legend(self, item: object, name: str | None) -> None:
         set_name = getattr(item, "setName", None)
         if callable(set_name):
             set_name(name)
@@ -1162,101 +1123,56 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
 
     def _render_layer(
         self,
-        layer: WorkspacePlotLayer,
         block: ResultDataBlock,
         *,
         sampling_limit: int | None,
         existing_items: Mapping[tuple[object, ...], object] | None = None,
         rendered_items: dict[tuple[object, ...], object] | None = None,
-        physical_items: dict[tuple[AxisSeriesSelection, bool], list[object]]
-        | None = None,
         foreground_items: dict[str, list[object]] | None = None,
         reference_items: list[object] | None = None,
     ) -> ResultDataBlock | None:
-        if layer.kind is not block.kind:
-            raise ValueError("plot layer and data block kinds must match.")
         sample, chunks = self._sample_and_chunks(block, sampling_limit)
         x = block.t[sample]
         if block.kind is ResultLayerKind.EXPERIMENTAL:
             if block.source_row is None:
                 raise ValueError("experimental plot block lacks source_row.")
-            segment_ids = None
-            segment_keys = None
-            discontinuity_ids = None
+            segment_ids = segment_keys = discontinuity_ids = None
             source_row = block.source_row[sample]
         else:
-            if (
-                block.segment_ids is None
-                or block.segment_keys is None
-                or block.discontinuity_ids is None
-            ):
+            if block.segment_ids is None or block.segment_keys is None or block.discontinuity_ids is None:
                 raise ValueError("simulation plot block lacks executor identity.")
             segment_ids = block.segment_ids[sample]
             segment_keys = tuple(block.segment_keys[int(index)] for index in sample)
             discontinuity_ids = block.discontinuity_ids[sample]
             source_row = None
-        colors = dict(layer.color_by_series)
-        axis_by_series = dict(block.series_axes)
-        rendered_series: list[tuple[str, np.ndarray]] = []
+        colors = dict(block.color_by_series)
         item_store = rendered_items if rendered_items is not None else {}
-        physical_store = physical_items if physical_items is not None else {}
         existing_store = existing_items if existing_items is not None else {}
-        foreground_store = (
-            foreground_items if foreground_items is not None else {}
-        )
-        foreground_set_id = (
-            layer.layer_id.set_id
-            if isinstance(layer.layer_id, SimulationResultLayerIdentity)
-            else None
-        )
-        foreground_layer = layer.kind in {
-            ResultLayerKind.EXPLICIT,
-            ResultLayerKind.PREVIEW,
-        }
+        foreground_store = foreground_items if foreground_items is not None else {}
         reference_store = reference_items if reference_items is not None else []
-        physical_layer_identity = self._physical_layer_identity(layer)
+        role = (block.kind.value, block.block_id)
+        foreground_set_id = str(block.block_id) if block.kind in {ResultLayerKind.EXPLICIT, ResultLayerKind.PREVIEW} else None
         for series_name, values in block.series:
             y = values[sample]
             color = colors[series_name]
-            axis_selection = axis_by_series[series_name]
-            is_experimental_marker = block.kind is ResultLayerKind.EXPERIMENTAL
-            name = f"{layer.label}: {series_name}"
             for chunk_index, (start, end) in enumerate(chunks):
                 singleton = end - start == 1
-                marker = bool(layer.markers or singleton)
-                item_key = (
-                    physical_layer_identity,
-                    series_name,
-                    chunk_index,
-                    "marker" if marker else "line",
-                )
+                marker = bool(block.markers or singleton)
+                item_key = (role, series_name, chunk_index, "marker" if marker else "line")
                 item = existing_store.get(item_key)
+                name = f"{block.label}: {series_name}"
                 if item is None:
                     if marker:
                         item = self._plot_widget.plot(
-                            x[start:end],
-                            y[start:end],
-                            pen=None,
-                            symbol="o",
-                            symbolSize=(layer.point_size if layer.markers else 5.0),
-                            symbolBrush=pg.mkBrush(color),
-                            symbolPen=pg.mkPen(color),
+                            x[start:end], y[start:end], pen=None, symbol="o",
+                            symbolSize=(block.point_size if block.markers else 5.0),
+                            symbolBrush=pg.mkBrush(color), symbolPen=pg.mkPen(color),
                             name=name if chunk_index == 0 else None,
                         )
                     else:
-                        pen = pg.mkPen(
-                            color=color,
-                            width=2,
-                            style=(
-                                QtCore.Qt.PenStyle.DashLine
-                                if layer.dashed
-                                else QtCore.Qt.PenStyle.SolidLine
-                            ),
-                        )
                         item = self._plot_widget.plot(
-                            x[start:end],
-                            y[start:end],
-                            pen=pen,
+                            x[start:end], y[start:end],
+                            pen=pg.mkPen(color=color, width=2, style=(QtCore.Qt.PenStyle.DashLine if block.dashed else QtCore.Qt.PenStyle.SolidLine)),
                             name=name if chunk_index == 0 else None,
                         )
                 else:
@@ -1264,111 +1180,54 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
                     if marker:
                         item.setSymbolBrush(pg.mkBrush(color))
                         item.setSymbolPen(pg.mkPen(color))
-                        item.setSymbolSize(layer.point_size if layer.markers else 5.0)
+                        item.setSymbolSize(block.point_size if block.markers else 5.0)
                     else:
-                        item.setPen(
-                            pg.mkPen(
-                                color=color,
-                                width=2,
-                                style=(
-                                    QtCore.Qt.PenStyle.DashLine
-                                    if layer.dashed
-                                    else QtCore.Qt.PenStyle.SolidLine
-                                ),
-                            )
-                        )
-                self._update_plot_item_legend(
-                    item,
-                    name if chunk_index == 0 else None,
-                )
-                item.setOpacity(layer.opacity)
+                        item.setPen(pg.mkPen(color=color, width=2, style=(QtCore.Qt.PenStyle.DashLine if block.dashed else QtCore.Qt.PenStyle.SolidLine)))
+                self._update_plot_item_legend(item, name if chunk_index == 0 else None)
+                item.setOpacity(block.opacity)
                 item_store[item_key] = item
-                self._curve_items.append(item)
-                if foreground_layer and foreground_set_id is not None:
+                if foreground_set_id is not None:
                     foreground_store.setdefault(foreground_set_id, []).append(item)
-                if layer.kind is ResultLayerKind.REFERENCE:
+                if block.kind is ResultLayerKind.REFERENCE:
                     reference_store.append(item)
-                physical_store.setdefault(
-                    (axis_selection, is_experimental_marker),
-                    [],
-                ).append(item)
-            rendered_series.append((series_name, y))
-        for (
-            boundary_index,
-            species_name,
-            boundary_time,
-            pre_value,
-            post_value,
-        ) in self._intervention_connector_entries(layer, block):
+        for boundary_index, species_name, boundary_time, pre_value, post_value in self._intervention_connector_entries(block):
             color = colors[species_name]
-            item_key = (
-                physical_layer_identity,
-                "intervention-boundary",
-                boundary_index,
-                species_name,
-            )
+            item_key = (role, "intervention-boundary", boundary_index, species_name)
+            pen = pg.mkPen(color=color, width=2, style=(QtCore.Qt.PenStyle.DashLine if block.dashed else QtCore.Qt.PenStyle.SolidLine))
             item = existing_store.get(item_key)
-            pen = pg.mkPen(
-                color=color,
-                width=2,
-                style=(
-                    QtCore.Qt.PenStyle.DashLine
-                    if layer.dashed
-                    else QtCore.Qt.PenStyle.SolidLine
-                ),
-            )
             if item is None:
-                item = self._plot_widget.plot(
-                    [boundary_time, boundary_time],
-                    [pre_value, post_value],
-                    pen=pen,
-                    name=None,
-                )
+                item = self._plot_widget.plot([boundary_time, boundary_time], [pre_value, post_value], pen=pen, name=None)
             else:
-                item.setData(
-                    [boundary_time, boundary_time],
-                    [pre_value, post_value],
-                )
+                item.setData([boundary_time, boundary_time], [pre_value, post_value])
                 item.setPen(pen)
-            item.setOpacity(layer.opacity)
+            item.setOpacity(block.opacity)
             item_store[item_key] = item
-            self._curve_items.append(item)
-            if foreground_layer and foreground_set_id is not None:
+            if foreground_set_id is not None:
                 foreground_store.setdefault(foreground_set_id, []).append(item)
-            if layer.kind is ResultLayerKind.REFERENCE:
+            if block.kind is ResultLayerKind.REFERENCE:
                 reference_store.append(item)
-            physical_store.setdefault(
-                (SimulationSeriesAxisSelection(species_name), False),
-                [],
-            ).append(item)
-        if not rendered_series:
+        if not block.series:
             return None
         return ResultDataBlock(
-            block_id=block.block_id,
-            label=block.label,
-            kind=block.kind,
-            t=x,
-            series=tuple(rendered_series),
-            series_axes=block.series_axes,
-            x_axis=block.x_axis,
-            result=block.result,
-            segment_ids=segment_ids,
-            segment_keys=segment_keys,
-            discontinuity_ids=discontinuity_ids,
-            source_row=source_row,
-            x_name=block.x_name,
-            series_provenance=block.series_provenance,
-            x_provenance=block.x_provenance,
+            block_id=block.block_id, label=block.label, kind=block.kind,
+            t=x, series=tuple((name, values[sample]) for name, values in block.series),
+            series_axes=block.series_axes, x_axis=block.x_axis, result=block.result,
+            segment_ids=segment_ids, segment_keys=segment_keys,
+            discontinuity_ids=discontinuity_ids, source_row=source_row,
+            x_name=block.x_name, series_provenance=block.series_provenance,
+            x_provenance=block.x_provenance, color_by_series=block.color_by_series,
+            visible=block.visible, dashed=block.dashed, opacity=block.opacity,
+            markers=block.markers, point_size=block.point_size,
+            presentation_boundaries=block.presentation_boundaries,
         )
 
     @staticmethod
     def _intervention_connector_entries(
-        layer: WorkspacePlotLayer,
         block: ResultDataBlock,
     ) -> tuple[tuple[int, str, float, float, float], ...]:
         """Return exact vertical connectors for a time-X simulation block."""
 
-        if layer.kind is ResultLayerKind.EXPERIMENTAL:
+        if block.kind is ResultLayerKind.EXPERIMENTAL:
             return ()
         if not (
             isinstance(block.x_axis, SimulationSeriesAxisSelection)
@@ -1377,7 +1236,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
             return ()
         series_names = {name for name, _values in block.series}
         entries: list[tuple[int, str, float, float, float]] = []
-        for boundary_index, boundary in enumerate(layer.presentation_boundaries):
+        for boundary_index, boundary in enumerate(block.presentation_boundaries):
             pre_by_name = dict(boundary.pre_state)
             post_by_name = dict(boundary.post_state)
             for species_name in pre_by_name:
@@ -1424,32 +1283,32 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
             chunks = ((0, sample.size),)
         return sample, chunks
 
-    def _render_analysis(self, projection: WorkspaceResultProjection) -> None:
+    def _render_analysis(self, render_input: ResultRenderInput) -> None:
         self._parameter_table.update_parameters(
-            {name: (value, unit) for name, value, unit in projection.parameters}
+            {name: (value, unit) for name, value, unit in render_input.parameters}
         )
-        block = projection.primary_statistics
-        if block is None:
+        result = render_input.statistics_result
+        if result is None or not render_input.statistics_series_names:
             self._species_table.setRowCount(0)
             return
         self._species_table.update_results(
-            canonical_time=block.t,
-            species_data=dict(block.series),
-            intervention_execution=block.result.intervention_execution,
-            presentation_boundaries=block.result.presentation_boundaries,
+            canonical_time=result.t,
+            species_data={name: result.series[name] for name in render_input.statistics_series_names},
+            intervention_execution=result.intervention_execution,
+            presentation_boundaries=result.presentation_boundaries,
         )
     def _project_completion_warning(
         self,
-        projection: WorkspaceResultProjection,
+        render_input: ResultRenderInput,
     ) -> None:
-        diagnostic = projection.unavailable_x_diagnostic
-        visible = bool(diagnostic or projection.completion_warnings)
+        diagnostic = render_input.unavailable_x_diagnostic
+        visible = bool(diagnostic or render_input.completion_warning_details)
         self._completion_warning_badge.setText(
             "Selected X unavailable"
             if diagnostic is not None
             else "Completed with warnings"
         )
-        warning_details = projection.completion_warning_tooltip
+        warning_details = render_input.completion_warning_tooltip
         details = "\n\n".join(
             detail
             for detail in (diagnostic, warning_details)
@@ -1512,12 +1371,12 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
 
     def _render_annotations(
         self,
-        projection: WorkspaceResultProjection,
+        render_input: ResultRenderInput,
         presentation: _PlotPresentation,
     ) -> None:
-        if not projection.intervention_annotations_visible:
+        if not render_input.intervention_annotations_visible:
             return
-        for annotation in projection.intervention_annotations:
+        for annotation in render_input.intervention_annotations:
             if "start" in annotation and "end" in annotation:
                 start = self._raw_to_view_coordinate(
                     annotation["start"],
@@ -1587,10 +1446,10 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
 
     def _render_scalar_guides(
         self,
-        projection: WorkspaceResultProjection,
+        render_input: ResultRenderInput,
         presentation: _PlotPresentation,
     ) -> None:
-        scalars = dict(projection.scalar_values)
+        scalars = dict(render_input.scalar_values)
         for name in self._scalar_guides:
             if name not in scalars:
                 continue
@@ -1677,8 +1536,12 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
 
     @QtCore.Slot(object)
     def _add_scalar_guide(self, requested_name: object) -> None:
-        projection = self._applied_projection
-        scalars = dict(projection.scalar_values) if projection is not None else {}
+        render_input = self._current_render_input()
+        scalars = (
+            dict(render_input.scalar_values)
+            if render_input is not None
+            else {}
+        )
         if not scalars:
             return
         name = str(requested_name or "")
@@ -1696,14 +1559,13 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
                 return
         if name not in self._scalar_guides:
             self._scalar_guides.append(name)
-        self.apply_workspace_result_projection(projection)
+        if render_input is not None:
+            self.apply_result_input(render_input)
 
     def _clear_plot_items(self) -> None:
         self._restore_interactive_foreground_items()
         self._plot_widget.clear()
-        self._curve_items.clear()
         self._plot_items_by_key.clear()
-        self._physical_items_by_axis.clear()
         self._interactive_foreground_items_by_set.clear()
         self._annotation_items.clear()
         self._legend = self._plot_widget.addLegend()
@@ -1730,48 +1592,31 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
             except Exception:
                 pass
 
-    @staticmethod
-    def _apply_item_color(item: object, color: QtGui.QColor) -> None:
-        options = getattr(item, "opts", {})
-        symbol = options.get("symbol") if isinstance(options, dict) else None
-        if symbol not in {None, "none"}:
-            item.setSymbolBrush(pg.mkBrush(color))
-            item.setSymbolPen(pg.mkPen(color))
-            return
-        pen = options.get("pen") if isinstance(options, dict) else None
-        if pen is None:
-            item.setPen(pg.mkPen(color))
-            return
-        updated_pen = QtGui.QPen(pen)
-        updated_pen.setColor(QtGui.QColor(color))
-        item.setPen(updated_pen)
-
     @QtCore.Slot(str, object)
     def _on_axis_option(self, action: str, value: object) -> None:
         normalized = str(action)
-        projection = self._applied_projection
+        render_input = self._current_render_input()
         if normalized == "clear_scalar_guides":
-            if projection is None:
+            if render_input is None:
                 return
             self._scalar_guides.clear()
-            self.apply_workspace_result_projection(projection)
+            self.apply_result_input(render_input)
             return
         if normalized != "sampling":
             return
-        if projection is None:
+        if render_input is None:
             return
         previous_limit = self._sampling_limit
         self._sampling_limit = 1000 if str(value) == "coarse" else None
         try:
-            self.apply_workspace_result_projection(projection)
+            self.apply_result_input(render_input)
         except Exception:
             self._sampling_limit = previous_limit
             raise
 
     @QtCore.Slot()
     def _apply_axis_range(self) -> None:
-        projection = self._applied_projection
-        if projection is None:
+        if not self._result_tab_id:
             return
         presentation = self._presentation
         x_min, x_max, y_min, y_max = self._axis_toolbar.get_manual_ranges()
@@ -1857,14 +1702,14 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
     @QtCore.Slot(QtCore.QPoint)
     def _show_context_menu(self, position: QtCore.QPoint) -> None:
         menu = QtWidgets.QMenu(self)
-        projection = self._applied_projection
+        render_input = self._current_render_input()
         if self._enable_copy_visible_data_action:
             copy_all = menu.addAction("Copy All")
-            copy_all.setEnabled(self._copy_projection_is_eligible(projection))
+            copy_all.setEnabled(self._copy_input_is_eligible(render_input))
             copy_all.triggered.connect(self._copy_all_to_clipboard)
             copy_rendered = menu.addAction("Copy Rendered Points")
             copy_rendered.setEnabled(
-                self._copy_projection_is_eligible(projection)
+                self._copy_input_is_eligible(render_input)
                 and bool(self._rendered_blocks)
             )
             copy_rendered.triggered.connect(self._copy_rendered_to_clipboard)
@@ -1873,25 +1718,25 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
             reference = menu.addAction("Show Reference")
             reference.setCheckable(True)
             reference.setChecked(
-                bool(projection and projection.reference_lines_visible)
+                bool(render_input and render_input.reference_lines_visible)
             )
             reference.toggled.connect(self.referenceLayerVisibilityRequested)
         annotations = menu.addAction("Show Intervention Annotations")
         annotations.setCheckable(True)
         annotations.setChecked(
-            bool(projection and projection.intervention_annotations_visible)
+            bool(render_input and render_input.intervention_annotations_visible)
         )
         annotations.toggled.connect(self.interventionAnnotationsVisibilityRequested)
         menu.addSeparator()
         add_annotation = menu.addAction("Add Annotation…")
-        add_annotation.setEnabled(projection is not None)
+        add_annotation.setEnabled(render_input is not None)
         add_annotation.triggered.connect(self._add_manual_annotation)
         clear_annotations = menu.addAction("Clear All Annotations")
         clear_annotations.setEnabled(
-            bool(projection and self._manual_annotations)
+            bool(render_input and self._manual_annotations)
         )
         clear_annotations.triggered.connect(self._clear_manual_annotations)
-        state = self._presentation if projection is not None else _PlotPresentation()
+        state = self._presentation if render_input is not None else _PlotPresentation()
         menu.addSeparator()
         for text, option, checked in (
             ("Log X", "log_x", state.log_x),
@@ -1918,8 +1763,8 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
 
     @QtCore.Slot()
     def _add_manual_annotation(self) -> None:
-        projection = self._applied_projection
-        if projection is None:
+        render_input = self._current_render_input()
+        if render_input is None:
             return
         text, accepted = QtWidgets.QInputDialog.getText(
             self,
@@ -1944,25 +1789,24 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         if x is None or y is None:
             return
         self._manual_annotations.append((annotation_text, x, y))
-        self.apply_workspace_result_projection(projection)
+        self.apply_result_input(render_input)
 
     @QtCore.Slot()
     def _clear_manual_annotations(self) -> None:
-        projection = self._applied_projection
-        if projection is None:
+        render_input = self._current_render_input()
+        if render_input is None:
             return
         if not self._manual_annotations:
             return
         self._manual_annotations.clear()
-        self.apply_workspace_result_projection(projection)
+        self.apply_result_input(render_input)
 
     @QtCore.Slot(str)
     def _set_interaction_mode(self, mode: str) -> None:
         normalized = str(mode or "").strip().lower()
         if normalized not in {"pan", "rectangle_zoom"}:
             raise ValueError("Plot interaction mode must be Pan or Rectangle Zoom.")
-        projection = self._applied_projection
-        if projection is not None:
+        if self._result_tab_id:
             self._interaction_mode = normalized
         self._axis_toolbar.set_interaction_mode(normalized)
         self._apply_interaction_mode(normalized)
@@ -2004,21 +1848,21 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         )
         if self._legend is not None:
             self._legend.setVisible(state.legend_visible)
-        projection = self._applied_projection
-        if refresh_geometry and projection is not None:
+        render_input = self._current_render_input()
+        if refresh_geometry and render_input is not None:
             self._clear_annotation_items()
-            self._render_annotations(projection, state)
+            self._render_annotations(render_input, state)
             self._render_manual_annotations(state)
-            self._render_scalar_guides(projection, state)
-        if axis_range is None and projection is not None:
+            self._render_scalar_guides(render_input, state)
+        if axis_range is None and render_input is not None:
             axis_range = self._axis_range
         if axis_range is not None:
             self._apply_axis_range_state(axis_range, state)
 
     @QtCore.Slot()
     def _copy_all_to_clipboard(self) -> None:
-        projection = self._applied_projection
-        if projection is None:
+        render_input = self._current_render_input()
+        if render_input is None:
             QtWidgets.QMessageBox.critical(
                 self,
                 "Copy All",
@@ -2026,32 +1870,30 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
             )
             return
         try:
-            WorkspaceResultPresenter.validate_copy(projection)
+            validate_copy(render_input)
         except Exception as exc:
             QtWidgets.QMessageBox.critical(self, "Copy All", str(exc))
             return
         self._start_responsive_copy(
-            projection.copy_all_blocks,
+            tuple(block for block in render_input.blocks if block.visible),
             title="Copy All",
         )
 
     @QtCore.Slot()
     def _copy_rendered_to_clipboard(self) -> None:
-        projection = self._applied_projection
-        if projection is None:
+        render_input = self._current_render_input()
+        if render_input is None:
             QtWidgets.QMessageBox.critical(
                 self,
                 "Copy Rendered Points",
                 "No current result data is available to copy.",
             )
             return
-        try:
-            WorkspaceResultPresenter.validate_copy(projection)
-        except Exception as exc:
+        if render_input.unavailable_x_diagnostic is not None:
             QtWidgets.QMessageBox.critical(
                 self,
                 "Copy Rendered Points",
-                str(exc),
+                render_input.unavailable_x_diagnostic,
             )
             return
         if not self._rendered_blocks:
@@ -2062,13 +1904,13 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         )
 
     @staticmethod
-    def _copy_projection_is_eligible(
-        projection: WorkspaceResultProjection | None,
+    def _copy_input_is_eligible(
+        render_input: ResultRenderInput | None,
     ) -> bool:
         return bool(
-            projection is not None
-            and projection.copy_all_blocks
-            and projection.unavailable_x_diagnostic is None
+            render_input is not None
+            and any(block.visible for block in render_input.blocks)
+            and render_input.unavailable_x_diagnostic is None
         )
 
     def _start_responsive_copy(
@@ -2081,7 +1923,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         generation = self._copy_generation
         try:
             self._copy_chunks = iter(
-                WorkspaceResultPresenter.iter_blocks_tsv_chunks(
+                iter_blocks_tsv_chunks(
                     tuple(blocks),
                 )
             )
@@ -2145,5 +1987,6 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
             axis = self._plot_widget.getPlotItem().getAxis(axis_name)
             axis.setPen(foreground)
             axis.setTextPen(foreground)
-        if self._applied_projection is not None:
-            self.apply_workspace_result_projection(self._applied_projection)
+        render_input = self._current_render_input()
+        if render_input is not None:
+            self.apply_result_input(render_input)

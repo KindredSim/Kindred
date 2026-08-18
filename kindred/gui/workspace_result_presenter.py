@@ -6,10 +6,10 @@ import io
 import csv
 import json
 import unicodedata
-from dataclasses import dataclass, fields, is_dataclass
+from dataclasses import dataclass, fields, is_dataclass, replace
 from enum import Enum
 from types import MappingProxyType
-from typing import BinaryIO, Callable, Iterator, Mapping, Sequence, TypeAlias
+from typing import BinaryIO, Callable, Iterator, Mapping, Sequence
 from zipfile import ZIP_DEFLATED, ZipFile
 
 import numpy as np
@@ -39,15 +39,18 @@ __all__ = [
     "InteractiveDisplayProjection",
     "ResultDataBlock",
     "ResultLayerKind",
-    "SimulationResultLayerIdentity",
+    "ResultRenderInput",
     "VisibleResultSet",
-    "WorkspaceLayerIdentity",
-    "WorkspacePlotLayer",
-    "WorkspaceResultPresenter",
-    "WorkspaceResultProjection",
     "XlsxExportCompletion",
+    "compose_interactive_display",
+    "compose_interactive_display_batch",
+    "compose_result_input",
     "encode_clipboard_text",
     "encode_tsv_row",
+    "iter_blocks_tsv_chunks",
+    "validate_copy",
+    "validate_xlsx_export",
+    "write_xlsx",
 ]
 
 _MAX_COPY_CELLS = 1_000_000
@@ -452,48 +455,6 @@ def _series_tuple(
     return tuple((name, values) for name, values in result.series.items())
 
 
-@dataclass(frozen=True, slots=True)
-class VisibleResultSet:
-    set_id: str
-    label: str
-
-    def __post_init__(self) -> None:
-        object.__setattr__(self, "set_id", _required_id(self.set_id, "set_id"))
-        object.__setattr__(self, "label", _required_id(self.label, "label"))
-
-
-class ResultLayerKind(Enum):
-    EXPLICIT = "explicit"
-    PREVIEW = "preview"
-    REFERENCE = "reference"
-    EXPERIMENTAL = "experimental"
-
-
-@dataclass(frozen=True, slots=True)
-class SimulationResultLayerIdentity:
-    """Tagged identity for one semantic result role and initial set."""
-
-    kind: ResultLayerKind
-    set_id: str
-
-    def __post_init__(self) -> None:
-        if self.kind not in {
-            ResultLayerKind.EXPLICIT,
-            ResultLayerKind.PREVIEW,
-            ResultLayerKind.REFERENCE,
-        }:
-            raise ValueError(
-                "Simulation result layer identity requires an explicit, "
-                "Preview, or Reference kind."
-            )
-        object.__setattr__(self, "set_id", _required_id(self.set_id, "set_id"))
-
-
-WorkspaceLayerIdentity: TypeAlias = (
-    SimulationResultLayerIdentity | ExperimentalLayerIdentity
-)
-
-
 def _result_warning_details(result: SimulationResultValue | None) -> tuple[str, ...]:
     if not isinstance(result, SimulationResultValue):
         raise TypeError("warning details require a canonical simulation result.")
@@ -550,252 +511,27 @@ def _result_provenance_payload(result: SimulationResultValue) -> Mapping[str, ob
 
 
 @dataclass(frozen=True, slots=True)
-class WorkspacePlotLayer:
-    layer_id: WorkspaceLayerIdentity
+class VisibleResultSet:
+    set_id: str
     label: str
-    kind: ResultLayerKind
-    t: np.ndarray
-    series: tuple[tuple[str, np.ndarray], ...]
-    series_axes: tuple[tuple[str, AxisSeriesSelection], ...]
-    result: SimulationResultValue | None
-    segment_ids: np.ndarray | None
-    segment_keys: tuple[str, ...] | None
-    discontinuity_ids: np.ndarray | None
-    source_row: np.ndarray | None
-    series_provenance: tuple[tuple[str, Mapping[str, object]], ...] = ()
-    color_by_series: tuple[tuple[str, str], ...] = ()
-    visible: bool = True
-    dashed: bool = False
-    opacity: float = 1.0
-    markers: bool = False
-    point_size: float = 6.0
-    presentation_boundaries: tuple[SimulationPresentationBoundary, ...] = ()
 
     def __post_init__(self) -> None:
-        if not isinstance(self.kind, ResultLayerKind):
-            raise TypeError("kind must be a ResultLayerKind.")
-        layer_id = self.layer_id
-        if not isinstance(
-            layer_id,
-            (SimulationResultLayerIdentity, ExperimentalLayerIdentity),
-        ):
-            raise TypeError("layer_id must be a tagged workspace layer identity.")
-        if self.kind is ResultLayerKind.EXPERIMENTAL:
-            if not isinstance(layer_id, ExperimentalLayerIdentity):
-                raise TypeError(
-                    "experimental plot layers require an experimental layer identity."
-                )
-        elif (
-            not isinstance(layer_id, SimulationResultLayerIdentity)
-            or layer_id.kind is not self.kind
-        ):
-            raise ValueError(
-                "simulation plot layer identity must match its semantic kind."
-            )
-        time = _owned_vector(self.t, field="plot time")
-        series: list[tuple[str, np.ndarray]] = []
-        names: set[str] = set()
-        for raw_name, raw_values in self.series:
-            name = _required_id(raw_name, "plot series name")
-            if name in names:
-                raise ValueError(f"plot layer contains duplicate series {name!r}.")
-            values = _owned_vector(raw_values, field=f"plot series {name!r}")
-            if values.size != time.size:
-                raise ValueError(f"plot series {name!r} length does not match time.")
-            names.add(name)
-            series.append((name, values))
-        if not series:
-            raise ValueError("plot layer requires at least one series.")
-        series_axes = tuple(
-            (
-                _required_id(raw_name, "plot axis series name"),
-                _axis_selection(selection, field="plot series axis"),
-            )
-            for raw_name, selection in self.series_axes
-        )
-        if tuple(name for name, _ in series_axes) != tuple(name for name, _ in series):
-            raise ValueError("plot series axes must align exactly with plot series.")
-        axis_identities = tuple(selection for _, selection in series_axes)
-        if len(axis_identities) != len(set(axis_identities)):
-            raise ValueError("plot series axis identities must be unique.")
-        result = self.result
-        presentation_boundaries = tuple(self.presentation_boundaries)
-        if any(
-            not isinstance(boundary, SimulationPresentationBoundary)
-            for boundary in presentation_boundaries
-        ):
-            raise TypeError(
-                "presentation_boundaries must contain only "
-                "SimulationPresentationBoundary values."
-            )
-        if self.kind is ResultLayerKind.EXPERIMENTAL:
-            if result is not None:
-                raise ValueError(
-                    "experimental plot layers prohibit repository entries."
-                )
-            if any(
-                value is not None
-                for value in (
-                    self.segment_ids,
-                    self.segment_keys,
-                    self.discontinuity_ids,
-                )
-            ):
-                raise ValueError("experimental plot layers prohibit solver identity.")
-            source_row = _owned_source_rows(self.source_row, size=time.size)
-            segment_ids = None
-            segment_keys = None
-            discontinuity_ids = None
-            if presentation_boundaries:
-                raise ValueError(
-                    "experimental plot layers prohibit presentation boundaries."
-                )
-        else:
-            if not isinstance(result, SimulationResultValue):
-                raise TypeError("simulation plot layers require a canonical result.")
-            assert isinstance(layer_id, SimulationResultLayerIdentity)
-            entry_result = result
-            if presentation_boundaries is not entry_result.presentation_boundaries:
-                raise ValueError(
-                    "simulation plot layers must retain their repository "
-                    "entry's exact presentation boundaries."
-                )
-            if (
-                time is not entry_result.t
-                or tuple(name for name, _values in series) != tuple(entry_result.series)
-                or any(
-                    values is not entry_result.series[name] for name, values in series
-                )
-            ):
-                raise ValueError(
-                    "simulation plot layers must retain their repository "
-                    "entry's exact result arrays."
-                )
-            if self.source_row is not None:
-                raise ValueError(
-                    "simulation plot layers prohibit observation source_row."
-                )
-            if (
-                self.segment_ids is None
-                or self.segment_keys is None
-                or self.discontinuity_ids is None
-            ):
-                raise ValueError(
-                    "simulation plot layers require complete executor identity."
-                )
-            segment_ids = _owned_identity_vector(
-                self.segment_ids,
-                field="plot segment identity",
-                size=time.size,
-            )
-            segment_keys = _segment_keys(self.segment_keys, size=time.size)
-            discontinuity_ids = _owned_identity_vector(
-                self.discontinuity_ids,
-                field="plot discontinuity identity",
-                size=time.size,
-            )
-            if (
-                segment_ids is not entry_result.segment_ids
-                or segment_keys != entry_result.segment_keys
-                or discontinuity_ids is not entry_result.discontinuity_ids
-            ):
-                raise ValueError(
-                    "simulation plot layers must retain their repository "
-                    "entry's exact executor identity."
-                )
-            source_row = None
-        opacity = float(self.opacity)
-        point_size = float(self.point_size)
-        if not np.isfinite(opacity) or not 0.0 <= opacity <= 1.0:
-            raise ValueError("opacity must be between zero and one.")
-        if not np.isfinite(point_size) or point_size <= 0.0:
-            raise ValueError("point_size must be positive.")
-        colors = tuple(
-            (
-                _required_id(name, "color series name"),
-                _required_id(color, "plot series color"),
-            )
-            for name, color in self.color_by_series
-        )
-        if any(name not in names for name, _color in colors):
-            raise ValueError("plot series colors must reference plot series.")
-        if len(colors) != len({name for name, _ in colors}):
-            raise ValueError("plot series colors must be unique by series.")
-        if {name for name, _color in colors} != names:
-            raise ValueError("plot series colors must cover every plot series.")
-        provenance: list[tuple[str, Mapping[str, object]]] = []
-        provenance_names: set[str] = set()
-        for raw_name, raw_payload in self.series_provenance:
-            name = _required_id(raw_name, "series provenance name")
-            if name not in names:
-                raise ValueError("series provenance must reference a plot series.")
-            if name in provenance_names:
-                raise ValueError(f"plot series provenance duplicates {name!r}.")
-            if not isinstance(raw_payload, Mapping):
-                raise TypeError("plot series provenance must be a mapping.")
-            provenance_names.add(name)
-            provenance.append(
-                (
-                    name,
-                    MappingProxyType(
-                        {
-                            str(key): (
-                                tuple(value)
-                                if isinstance(value, (list, tuple))
-                                else value
-                            )
-                            for key, value in raw_payload.items()
-                        }
-                    ),
-                )
-            )
-        provenance_by_name = dict(provenance)
-        for name, selection in series_axes:
-            if self.kind is ResultLayerKind.EXPERIMENTAL:
-                if not isinstance(selection, ExperimentalAxisSelection):
-                    raise TypeError(
-                        "experimental plot series require experimental axis identity."
-                    )
-                payload = provenance_by_name.get(name)
-                if (
-                    payload is None
-                    or payload.get("dataset_id") != selection.dataset_id
-                    or payload.get("raw_observation_id") != selection.raw_observation_id
-                ):
-                    raise ValueError(
-                        "experimental plot identity must match its raw-ID provenance."
-                    )
-            elif not isinstance(selection, SimulationSeriesAxisSelection):
-                raise TypeError(
-                    "simulation plot series require simulation axis identity."
-                )
-        object.__setattr__(self, "layer_id", layer_id)
+        object.__setattr__(self, "set_id", _required_id(self.set_id, "set_id"))
         object.__setattr__(self, "label", _required_id(self.label, "label"))
-        object.__setattr__(self, "t", time)
-        object.__setattr__(self, "series", tuple(series))
-        object.__setattr__(self, "series_axes", series_axes)
-        object.__setattr__(self, "result", result)
-        object.__setattr__(self, "segment_ids", segment_ids)
-        object.__setattr__(self, "segment_keys", segment_keys)
-        object.__setattr__(self, "discontinuity_ids", discontinuity_ids)
-        object.__setattr__(self, "source_row", source_row)
-        object.__setattr__(self, "series_provenance", tuple(provenance))
-        object.__setattr__(self, "color_by_series", colors)
-        object.__setattr__(self, "visible", bool(self.visible))
-        object.__setattr__(self, "dashed", bool(self.dashed))
-        object.__setattr__(self, "opacity", opacity)
-        object.__setattr__(self, "markers", bool(self.markers))
-        object.__setattr__(self, "point_size", point_size)
-        object.__setattr__(
-            self,
-            "presentation_boundaries",
-            presentation_boundaries,
-        )
+
+
+class ResultLayerKind(Enum):
+    EXPLICIT = "explicit"
+    PREVIEW = "preview"
+    REFERENCE = "reference"
+    EXPERIMENTAL = "experimental"
 
 
 @dataclass(frozen=True, slots=True)
 class ResultDataBlock:
-    block_id: WorkspaceLayerIdentity
+    """One immutable full-resolution result/data table and its render style."""
+
+    block_id: str | ExperimentalLayerIdentity
     label: str
     kind: ResultLayerKind
     t: np.ndarray
@@ -810,28 +546,23 @@ class ResultDataBlock:
     x_name: str = "t"
     series_provenance: tuple[tuple[str, Mapping[str, object]], ...] = ()
     x_provenance: Mapping[str, object] = MappingProxyType({})
+    color_by_series: tuple[tuple[str, str], ...] = ()
+    visible: bool = True
+    dashed: bool = False
+    opacity: float = 1.0
+    markers: bool = False
+    point_size: float = 6.0
+    presentation_boundaries: tuple[SimulationPresentationBoundary, ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.kind, ResultLayerKind):
             raise TypeError("kind must be a ResultLayerKind.")
         block_id = self.block_id
-        if not isinstance(
-            block_id,
-            (SimulationResultLayerIdentity, ExperimentalLayerIdentity),
-        ):
-            raise TypeError("block_id must be a tagged workspace layer identity.")
         if self.kind is ResultLayerKind.EXPERIMENTAL:
             if not isinstance(block_id, ExperimentalLayerIdentity):
-                raise TypeError(
-                    "experimental data blocks require an experimental layer identity."
-                )
-        elif (
-            not isinstance(block_id, SimulationResultLayerIdentity)
-            or block_id.kind is not self.kind
-        ):
-            raise ValueError(
-                "simulation data block identity must match its semantic kind."
-            )
+                raise TypeError("experimental data blocks require an experimental identity.")
+        elif type(block_id) is not str or not block_id.strip():
+            raise TypeError("simulation data blocks require a nonblank set ID.")
         time = _owned_vector(self.t, field="data time")
         normalized: list[tuple[str, np.ndarray]] = []
         names: set[str] = set()
@@ -847,123 +578,83 @@ class ResultDataBlock:
         if not normalized:
             raise ValueError("data block requires at least one series.")
         series_axes = tuple(
-            (
-                _required_id(raw_name, "data axis series name"),
-                _axis_selection(selection, field="data series axis"),
-            )
-            for raw_name, selection in self.series_axes
+            (_required_id(name, "data axis series name"), _axis_selection(selection, field="data series axis"))
+            for name, selection in self.series_axes
         )
-        if tuple(name for name, _ in series_axes) != tuple(
-            name for name, _ in normalized
-        ):
+        if tuple(name for name, _ in series_axes) != tuple(name for name, _ in normalized):
             raise ValueError("data series axes must align exactly with data series.")
-        axis_identities = tuple(selection for _, selection in series_axes)
-        if len(axis_identities) != len(set(axis_identities)):
+        if len({selection for _, selection in series_axes}) != len(series_axes):
             raise ValueError("data series axis identities must be unique.")
         x_axis = _axis_selection(self.x_axis, field="data X axis")
         result = self.result
         if self.kind is ResultLayerKind.EXPERIMENTAL:
             if result is not None:
-                raise ValueError(
-                    "experimental data blocks prohibit repository entries."
-                )
-            if any(
-                value is not None
-                for value in (
-                    self.segment_ids,
-                    self.segment_keys,
-                    self.discontinuity_ids,
-                )
-            ):
+                raise ValueError("experimental data blocks prohibit repository entries.")
+            if any(value is not None for value in (self.segment_ids, self.segment_keys, self.discontinuity_ids)):
                 raise ValueError("experimental data blocks prohibit solver identity.")
             source_row = _owned_source_rows(self.source_row, size=time.size)
-            segment_ids = None
-            segment_keys = None
-            discontinuity_ids = None
+            segment_ids = segment_keys = discontinuity_ids = None
+            boundaries = ()
         else:
             if not isinstance(x_axis, SimulationSeriesAxisSelection):
                 raise TypeError("simulation data blocks require a simulation X axis.")
             if not isinstance(result, SimulationResultValue):
                 raise TypeError("simulation data blocks require a canonical result.")
             if self.source_row is not None:
-                raise ValueError(
-                    "simulation data blocks prohibit observation source_row."
-                )
-            if (
-                self.segment_ids is None
-                or self.segment_keys is None
-                or self.discontinuity_ids is None
-            ):
-                raise ValueError(
-                    "simulation data blocks require complete executor identity."
-                )
-            segment_ids = _owned_identity_vector(
-                self.segment_ids,
-                field="data segment identity",
-                size=time.size,
-            )
+                raise ValueError("simulation data blocks prohibit observation source_row.")
+            if self.segment_ids is None or self.segment_keys is None or self.discontinuity_ids is None:
+                raise ValueError("simulation data blocks require complete executor identity.")
+            segment_ids = _owned_identity_vector(self.segment_ids, field="data segment identity", size=time.size)
             segment_keys = _segment_keys(self.segment_keys, size=time.size)
-            discontinuity_ids = _owned_identity_vector(
-                self.discontinuity_ids,
-                field="data discontinuity identity",
-                size=time.size,
-            )
+            discontinuity_ids = _owned_identity_vector(self.discontinuity_ids, field="data discontinuity identity", size=time.size)
             source_row = None
+            boundaries = tuple(self.presentation_boundaries)
+            if boundaries is not result.presentation_boundaries:
+                raise ValueError("simulation data blocks must retain canonical presentation boundaries.")
         provenance: list[tuple[str, Mapping[str, object]]] = []
         provenance_names: set[str] = set()
         for raw_name, raw_payload in self.series_provenance:
             name = _required_id(raw_name, "data series provenance name")
-            if name not in names:
-                raise ValueError("data series provenance must reference a data series.")
-            if name in provenance_names:
-                raise ValueError(f"data series provenance duplicates {name!r}.")
+            if name not in names or name in provenance_names:
+                raise ValueError("data series provenance must uniquely reference data.")
             if not isinstance(raw_payload, Mapping):
                 raise TypeError("data series provenance must be a mapping.")
             provenance_names.add(name)
-            provenance.append(
-                (
-                    name,
-                    MappingProxyType(
-                        {
-                            str(key): (
-                                tuple(value)
-                                if isinstance(value, (list, tuple))
-                                else value
-                            )
-                            for key, value in raw_payload.items()
-                        }
-                    ),
-                )
-            )
+            provenance.append((name, MappingProxyType({
+                str(key): tuple(value) if isinstance(value, (list, tuple)) else value
+                for key, value in raw_payload.items()
+            })))
         if not isinstance(self.x_provenance, Mapping):
             raise TypeError("x_provenance must be a mapping.")
         provenance_by_name = dict(provenance)
         for name, selection in series_axes:
             if self.kind is ResultLayerKind.EXPERIMENTAL:
                 if not isinstance(selection, ExperimentalAxisSelection):
-                    raise TypeError(
-                        "experimental data series require experimental axis identity."
-                    )
+                    raise TypeError("experimental data series require experimental axis identity.")
                 payload = provenance_by_name.get(name)
-                if (
-                    payload is None
-                    or payload.get("dataset_id") != selection.dataset_id
-                    or payload.get("raw_observation_id") != selection.raw_observation_id
-                ):
-                    raise ValueError(
-                        "experimental data identity must match its raw-ID provenance."
-                    )
+                if payload is None or payload.get("dataset_id") != selection.dataset_id or payload.get("raw_observation_id") != selection.raw_observation_id:
+                    raise ValueError("experimental data identity must match raw-ID provenance.")
             elif not isinstance(selection, SimulationSeriesAxisSelection):
-                raise TypeError(
-                    "simulation data series require simulation axis identity."
-                )
+                raise TypeError("simulation data series require simulation axis identity.")
         if isinstance(x_axis, ExperimentalAxisSelection) and (
             self.x_provenance.get("dataset_id") != x_axis.dataset_id
             or self.x_provenance.get("raw_observation_id") != x_axis.raw_observation_id
         ):
-            raise ValueError(
-                "experimental X identity must match its raw-ID provenance."
-            )
+            raise ValueError("experimental X identity must match raw-ID provenance.")
+        colors = tuple(
+            (_required_id(name, "color series name"), _required_id(color, "data series color"))
+            for name, color in self.color_by_series
+        )
+        if {name for name, _color in colors} != names:
+            raise ValueError("data series colors must cover every data series.")
+        if len(colors) != len({name for name, _color in colors}):
+            raise ValueError("data series colors must be unique by series.")
+        opacity = float(self.opacity)
+        point_size = float(self.point_size)
+        if not np.isfinite(opacity) or not 0.0 <= opacity <= 1.0:
+            raise ValueError("opacity must be between zero and one.")
+        if not np.isfinite(point_size) or point_size <= 0.0:
+            raise ValueError("point_size must be positive.")
         object.__setattr__(self, "block_id", block_id)
         object.__setattr__(self, "label", _required_id(self.label, "label"))
         object.__setattr__(self, "x_name", _required_id(self.x_name, "x_name"))
@@ -977,35 +668,30 @@ class ResultDataBlock:
         object.__setattr__(self, "discontinuity_ids", discontinuity_ids)
         object.__setattr__(self, "source_row", source_row)
         object.__setattr__(self, "series_provenance", tuple(provenance))
-        object.__setattr__(
-            self,
-            "x_provenance",
-            MappingProxyType(
-                {
-                    str(key): (
-                        tuple(value) if isinstance(value, (list, tuple)) else value
-                    )
-                    for key, value in self.x_provenance.items()
-                }
-            ),
-        )
+        object.__setattr__(self, "x_provenance", MappingProxyType({
+            str(key): tuple(value) if isinstance(value, (list, tuple)) else value
+            for key, value in self.x_provenance.items()
+        }))
+        object.__setattr__(self, "color_by_series", colors)
+        object.__setattr__(self, "visible", bool(self.visible))
+        object.__setattr__(self, "dashed", bool(self.dashed))
+        object.__setattr__(self, "opacity", opacity)
+        object.__setattr__(self, "markers", bool(self.markers))
+        object.__setattr__(self, "point_size", point_size)
+        object.__setattr__(self, "presentation_boundaries", boundaries)
 
 
 @dataclass(frozen=True, slots=True)
-class WorkspaceResultProjection:
-    """One immutable semantic projection used by plot, analysis, Copy, and XLSX."""
+class ResultRenderInput:
+    """Call-local render facts; never durable result or export authority."""
 
     tab_id: str
     current_set_id: str
-    primary_layer_id: SimulationResultLayerIdentity | None
-    plot_layers: tuple[WorkspacePlotLayer, ...]
-    parameters: tuple[tuple[str, float, str], ...]
-    scalar_values: tuple[tuple[str, float], ...]
-    primary_statistics: ResultDataBlock | None
-    copy_all_blocks: tuple[ResultDataBlock, ...]
+    blocks: tuple[ResultDataBlock, ...]
+    statistics_series_names: tuple[str, ...] = ()
     selected_x_series: AxisSeriesSelection = SimulationSeriesAxisSelection("t")
     selected_y_series: tuple[AxisSeriesSelection, ...] = ()
-    derived_overlay_y_series: tuple[ExperimentalAxisSelection, ...] = ()
+    mapped_overlay_locks: tuple[tuple[ExperimentalAxisSelection, str], ...] = ()
     selected_y_uses_default_all: bool = True
     x_label: str = "Time (s)"
     y_label: str = "Value"
@@ -1014,262 +700,119 @@ class WorkspaceResultProjection:
     intervention_annotations: tuple[Mapping[str, object], ...] = ()
     intervention_annotations_visible: bool = True
     unavailable_x_diagnostic: str | None = None
+    completion_warning_details: tuple[tuple[str, tuple[str, ...]], ...] = ()
 
     def __post_init__(self) -> None:
-        tab_id = _required_id(self.tab_id, "tab_id")
-        layers = tuple(self.plot_layers)
-        if any(not isinstance(layer, WorkspacePlotLayer) for layer in layers):
-            raise TypeError("plot_layers must contain only WorkspacePlotLayer values.")
-        layer_ids = {layer.layer_id for layer in layers}
-        if len(layer_ids) != len(layers):
-            raise ValueError("plot layer IDs must be unique.")
-        primary = self.primary_layer_id
-        if primary is not None and not isinstance(
-            primary,
-            SimulationResultLayerIdentity,
-        ):
-            raise TypeError(
-                "primary_layer_id must be a simulation result layer identity or None."
-            )
-        if primary is not None and primary not in layer_ids:
-            raise ValueError("primary_layer_id must reference one plot layer.")
-        current_set_id = str(self.current_set_id or "")
-        if primary is not None:
-            primary_layer = next(layer for layer in layers if layer.layer_id == primary)
-            if (
-                not current_set_id
-                or primary.set_id != current_set_id
-                or primary_layer.kind
-                not in {
-                    ResultLayerKind.EXPLICIT,
-                    ResultLayerKind.PREVIEW,
-                    ResultLayerKind.REFERENCE,
-                }
-            ):
-                raise ValueError(
-                    "primary must be an accepted explicit, Preview, or Reference "
-                    "layer for current_set_id."
-                )
-        elif (
-            self.parameters or self.scalar_values or self.primary_statistics is not None
-        ):
-            raise ValueError(
-                "primary analysis truth requires an eligible primary layer."
-            )
-        parameters: list[tuple[str, float, str]] = []
-        parameter_names: set[str] = set()
-        for raw_name, raw_value, raw_unit in self.parameters:
-            name = _required_id(raw_name, "projection parameter name")
-            if name in parameter_names:
-                raise ValueError(f"projection parameters contain duplicate {name!r}.")
-            value = float(raw_value)
-            if not np.isfinite(value):
-                raise ValueError(f"projection parameter {name!r} must be finite.")
-            parameter_names.add(name)
-            parameters.append((name, value, str(raw_unit or "")))
-        scalar_values: list[tuple[str, float]] = []
-        scalar_names: set[str] = set()
-        for raw_name, raw_value in self.scalar_values:
-            name = _required_id(raw_name, "projection scalar name")
-            if name in scalar_names:
-                raise ValueError(f"projection scalars contain duplicate {name!r}.")
-            value = float(raw_value)
-            if not np.isfinite(value):
-                raise ValueError(f"projection scalar {name!r} must be finite.")
-            scalar_names.add(name)
-            scalar_values.append((name, value))
-        primary_statistics = self.primary_statistics
-        if primary_statistics is not None and not isinstance(
-            primary_statistics, ResultDataBlock
-        ):
-            raise TypeError("primary_statistics must be a ResultDataBlock or None.")
-        if primary_statistics is not None:
-            primary_layer = next(layer for layer in layers if layer.layer_id == primary)
-            if (
-                primary_statistics.block_id != primary
-                or not _is_time_selection(primary_statistics.x_axis)
-                or primary_statistics.x_name != "t"
-                or not np.array_equal(
-                    primary_statistics.t,
-                    primary_layer.t,
-                )
-                or primary_statistics.result is not primary_layer.result
-            ):
-                raise ValueError(
-                    "primary statistics must use the primary result's "
-                    "canonical time and repository entry."
-                )
-        copy_blocks = tuple(self.copy_all_blocks)
-        if any(not isinstance(block, ResultDataBlock) for block in copy_blocks):
-            raise TypeError("copy_all_blocks must contain only ResultDataBlock values.")
-        layer_kind_by_id = {layer.layer_id: layer.kind for layer in layers}
-        for block in copy_blocks:
-            if layer_kind_by_id.get(block.block_id) is not block.kind:
-                raise ValueError(
-                    "copy blocks must match one projected layer and its kind."
-                )
-            layer = next(
-                candidate
-                for candidate in layers
-                if candidate.layer_id == block.block_id
-            )
-            if block.result is not layer.result:
-                raise ValueError(
-                    "copy block must retain the exact projected repository entry."
-                )
-            if not layer.visible:
-                raise ValueError(
-                    "copy blocks must not physically project a hidden result layer."
-                )
-        selected_x = _axis_selection(
-            self.selected_x_series,
-            field="selected_x_series",
+        object.__setattr__(self, "tab_id", _required_id(self.tab_id, "tab_id"))
+        object.__setattr__(self, "current_set_id", str(self.current_set_id or ""))
+        blocks = tuple(self.blocks)
+        if any(not isinstance(block, ResultDataBlock) for block in blocks):
+            raise TypeError("blocks must contain ResultDataBlock values.")
+        identities = tuple((block.kind, block.block_id) for block in blocks)
+        if len(identities) != len(set(identities)):
+            raise ValueError("render blocks must have unique semantic identities.")
+        object.__setattr__(self, "blocks", blocks)
+        names = tuple(
+            _required_id(name, "statistics series name")
+            for name in self.statistics_series_names
         )
-        selected_y = tuple(
-            _axis_selection(selection, field="selected_y_series")
-            for selection in self.selected_y_series
-        )
+        if len(names) != len(set(names)):
+            raise ValueError("statistics series names must be unique.")
+        object.__setattr__(self, "statistics_series_names", names)
+        selected_x = _axis_selection(self.selected_x_series, field="selected_x_series")
+        selected_y = tuple(_axis_selection(item, field="selected_y_series") for item in self.selected_y_series)
         if len(selected_y) != len(set(selected_y)):
             raise ValueError("selected_y_series must be unique.")
-        derived_overlay_y = tuple(
-            selection
-            for selection in self.derived_overlay_y_series
-            if isinstance(selection, ExperimentalAxisSelection)
+        overlay_locks = tuple(
+            (axis, _required_id(model_target, "mapped overlay model target"))
+            for axis, model_target in self.mapped_overlay_locks
         )
-        if len(derived_overlay_y) != len(self.derived_overlay_y_series):
-            raise TypeError(
-                "derived_overlay_y_series must contain only experimental "
-                "axis selections."
-            )
-        if len(derived_overlay_y) != len(set(derived_overlay_y)):
-            raise ValueError("derived_overlay_y_series must be unique.")
-        if set(derived_overlay_y).intersection(selected_y):
-            raise ValueError(
-                "derived_overlay_y_series must be distinct from authored "
-                "selected_y_series."
-            )
-        if type(self.x_label) is not str:
-            raise TypeError("x_label must be an exact string.")
-        if type(self.y_label) is not str:
-            raise TypeError("y_label must be an exact string.")
+        if any(not isinstance(axis, ExperimentalAxisSelection) for axis, _ in overlay_locks):
+            raise TypeError("mapped overlay locks must contain experimental axes.")
+        if len({axis for axis, _ in overlay_locks}) != len(overlay_locks):
+            raise ValueError("mapped overlay locks must be unique by axis.")
         candidates = tuple(self.axis_candidates)
         if any(not isinstance(item, AxisSelectionCandidate) for item in candidates):
-            raise TypeError(
-                "axis_candidates must contain AxisSelectionCandidate values."
-            )
+            raise TypeError("axis candidates must contain AxisSelectionCandidate values.")
         candidate_ids = tuple(item.selection for item in candidates)
-        if len(candidate_ids) != len(set(candidate_ids)):
-            raise ValueError("axis candidate identities must be unique.")
-        if selected_x not in candidate_ids:
-            raise ValueError(
-                "selected_x_series must exist in the reconciled axis candidate roster."
-            )
-        if any(selection not in candidate_ids for selection in derived_overlay_y):
-            raise ValueError(
-                "derived_overlay_y_series must exist in the active axis "
-                "candidate roster."
-            )
+        if len(candidate_ids) != len(set(candidate_ids)) or selected_x not in candidate_ids:
+            raise ValueError("axis candidates must be unique and include selected X.")
+        if any(axis not in candidate_ids for axis, _ in overlay_locks):
+            raise ValueError("mapped overlay locks must be axis candidates.")
         annotations = tuple(self.intervention_annotations)
         if any(not isinstance(item, Mapping) for item in annotations):
-            raise TypeError("intervention_annotations must contain only mappings.")
-        unavailable_x_diagnostic = self.unavailable_x_diagnostic
-        if unavailable_x_diagnostic is not None:
-            if type(unavailable_x_diagnostic) is not str:
-                raise TypeError(
-                    "unavailable_x_diagnostic must be an exact string or None."
-                )
-            if not unavailable_x_diagnostic.strip():
-                raise ValueError(
-                    "unavailable_x_diagnostic must be nonblank when present."
-                )
-        object.__setattr__(self, "tab_id", tab_id)
-        object.__setattr__(self, "current_set_id", current_set_id)
-        object.__setattr__(self, "primary_layer_id", primary)
-        object.__setattr__(self, "plot_layers", layers)
-        object.__setattr__(self, "parameters", tuple(parameters))
-        object.__setattr__(self, "scalar_values", tuple(scalar_values))
-        object.__setattr__(self, "primary_statistics", primary_statistics)
-        object.__setattr__(self, "copy_all_blocks", copy_blocks)
-        object.__setattr__(
-            self,
-            "selected_x_series",
-            selected_x,
+            raise TypeError("intervention annotations must be mappings.")
+        diagnostic = self.unavailable_x_diagnostic
+        if diagnostic is not None and (type(diagnostic) is not str or not diagnostic.strip()):
+            raise ValueError("unavailable X diagnostic must be nonblank.")
+        warnings = tuple(
+            (
+                _required_id(label, "completion warning label"),
+                tuple(str(detail) for detail in details),
+            )
+            for label, details in self.completion_warning_details
         )
-        object.__setattr__(
-            self,
-            "selected_y_series",
-            selected_y,
+        if len({label for label, _details in warnings}) != len(warnings):
+            raise ValueError("completion warning labels must be unique.")
+        object.__setattr__(self, "selected_x_series", selected_x)
+        object.__setattr__(self, "selected_y_series", selected_y)
+        object.__setattr__(self, "mapped_overlay_locks", overlay_locks)
+        object.__setattr__(self, "selected_y_uses_default_all", bool(self.selected_y_uses_default_all))
+        object.__setattr__(self, "x_label", str(self.x_label))
+        object.__setattr__(self, "y_label", str(self.y_label))
+        object.__setattr__(self, "axis_candidates", candidates)
+        object.__setattr__(self, "reference_lines_visible", bool(self.reference_lines_visible))
+        object.__setattr__(self, "intervention_annotations", tuple(MappingProxyType(dict(item)) for item in annotations))
+        object.__setattr__(self, "intervention_annotations_visible", bool(self.intervention_annotations_visible))
+        object.__setattr__(self, "unavailable_x_diagnostic", diagnostic)
+        object.__setattr__(self, "completion_warning_details", warnings)
+
+    def _analysis_block(self) -> ResultDataBlock | None:
+        candidates = tuple(
+            block
+            for block in self.blocks
+            if block.block_id == self.current_set_id
+            and block.kind in {
+                ResultLayerKind.EXPLICIT,
+                ResultLayerKind.REFERENCE,
+            }
+            and isinstance(block.result, SimulationResultValue)
         )
-        object.__setattr__(
-            self,
-            "derived_overlay_y_series",
-            derived_overlay_y,
-        )
-        object.__setattr__(
-            self,
-            "selected_y_uses_default_all",
-            bool(self.selected_y_uses_default_all),
-        )
-        object.__setattr__(self, "x_label", self.x_label)
-        object.__setattr__(self, "y_label", self.y_label)
-        object.__setattr__(
-            self,
-            "axis_candidates",
-            candidates,
-        )
-        object.__setattr__(
-            self,
-            "reference_lines_visible",
-            bool(self.reference_lines_visible),
-        )
-        object.__setattr__(
-            self,
-            "intervention_annotations",
-            tuple(MappingProxyType(dict(item)) for item in annotations),
-        )
-        object.__setattr__(
-            self,
-            "intervention_annotations_visible",
-            bool(self.intervention_annotations_visible),
-        )
-        object.__setattr__(
-            self,
-            "unavailable_x_diagnostic",
-            unavailable_x_diagnostic,
+        return next(
+            (item for item in candidates if item.kind is ResultLayerKind.EXPLICIT),
+            next(
+                (item for item in candidates if item.kind is ResultLayerKind.REFERENCE),
+                None,
+            ),
         )
 
     @property
-    def completion_warnings(self) -> tuple[WorkspacePlotLayer, ...]:
-        """Visible result layers requiring a prominent completion warning."""
+    def statistics_result(self) -> SimulationResultValue | None:
+        block = self._analysis_block()
+        return block.result if block is not None else None
 
-        seen: set[int] = set()
-        warnings: list[WorkspacePlotLayer] = []
-        for layer in self.plot_layers:
-            entry = layer.result
-            if (
-                not layer.visible
-                or not isinstance(entry, SimulationResultValue)
-                or not entry.completed_with_warnings
-                or id(entry) in seen
-            ):
-                continue
-            seen.add(id(entry))
-            warnings.append(layer)
-        return tuple(warnings)
+    @property
+    def parameters(self) -> tuple[tuple[str, float, str], ...]:
+        block = self._analysis_block()
+        result = block.result if block is not None else None
+        return tuple(result.parameters) if isinstance(result, SimulationResultValue) else ()
+
+    @property
+    def scalar_values(self) -> tuple[tuple[str, float], ...]:
+        block = self._analysis_block()
+        result = block.result if block is not None else None
+        return tuple(result.scalars.items()) if isinstance(result, SimulationResultValue) else ()
 
     @property
     def completion_warning_tooltip(self) -> str:
-        groups = []
-        for layer in self.completion_warnings:
-            details = "\n".join(
-                f"  • {detail}"
-                for detail in _result_warning_details(layer.result)
-            )
-            groups.append(f"{layer.label}:\n{details}")
-        return "\n\n".join(groups)
+        return "\n\n".join(
+            f"{label}:\n" + "\n".join(f"  • {detail}" for detail in details)
+            for label, details in self.completion_warning_details
+        )
 
 
-def _result_layer(
+
+def _result_block(
     *,
     set_id: str,
     label: str,
@@ -1277,198 +820,126 @@ def _result_layer(
     kind: ResultLayerKind,
     color_by_axis_selection: Mapping[AxisSeriesSelection, str],
     visible: bool = True,
-) -> WorkspacePlotLayer:
+) -> ResultDataBlock:
     if not isinstance(result, SimulationResultValue):
-        raise TypeError("result layer requires a canonical simulation result.")
-    if kind is ResultLayerKind.PREVIEW:
-        display_label = f"{label} [Preview]"
-    elif kind is ResultLayerKind.REFERENCE:
-        display_label = f"{label} [Reference]"
-    else:
-        display_label = label
-    layer_id = SimulationResultLayerIdentity(kind, set_id)
-    series_axes = tuple(
-        (name, SimulationSeriesAxisSelection(name)) for name in result.series
+        raise TypeError("result block requires a canonical simulation result.")
+    display_label = (
+        f"{label} [Preview]"
+        if kind is ResultLayerKind.PREVIEW
+        else f"{label} [Reference]"
+        if kind is ResultLayerKind.REFERENCE
+        else label
     )
-    return WorkspacePlotLayer(
-        layer_id=layer_id,
-        label=display_label,
-        kind=kind,
-        t=result.t,
-        series=_series_tuple(result),
-        series_axes=series_axes,
-        result=result,
-        segment_ids=result.segment_ids,
-        segment_keys=result.segment_keys,
-        discontinuity_ids=result.discontinuity_ids,
-        source_row=None,
+    series_axes = tuple((name, SimulationSeriesAxisSelection(name)) for name in result.series)
+    return ResultDataBlock(
+        block_id=set_id, label=display_label, kind=kind, t=result.t,
+        series=_series_tuple(result), series_axes=series_axes,
+        x_axis=SimulationSeriesAxisSelection("t"), result=result,
+        segment_ids=result.segment_ids, segment_keys=result.segment_keys,
+        discontinuity_ids=result.discontinuity_ids, source_row=None,
         color_by_series=tuple(
             (name, str(color_by_axis_selection[selection]))
             for name, selection in series_axes
         ),
-        visible=visible,
-        dashed=kind is ResultLayerKind.REFERENCE,
+        visible=visible, dashed=kind is ResultLayerKind.REFERENCE,
         opacity=0.42 if kind is ResultLayerKind.REFERENCE else 1.0,
         presentation_boundaries=result.presentation_boundaries,
     )
 
 
 def _data_block(
-    layer: WorkspacePlotLayer,
+    block: ResultDataBlock,
     *,
     x_axis: AxisSeriesSelection,
     y_axes: set[AxisSeriesSelection] | None = None,
     excluded_y_axes: set[AxisSeriesSelection] | None = None,
 ) -> ResultDataBlock | None:
-    series_map = dict(layer.series)
-    series_axis_map = dict(layer.series_axes)
+    series_axis_map = dict(block.series_axes)
     if _is_time_selection(x_axis):
-        x_values = layer.t
-        x_name = "t"
+        x_values, x_name = block.t, "t"
         x_provenance: Mapping[str, object] = MappingProxyType({})
-    elif (
-        isinstance(x_axis, SimulationSeriesAxisSelection)
-        and layer.kind is not ResultLayerKind.EXPERIMENTAL
-    ):
-        x_name = next(
-            (name for name, selection in layer.series_axes if selection == x_axis),
-            "",
-        )
+    elif isinstance(x_axis, SimulationSeriesAxisSelection) and block.kind is not ResultLayerKind.EXPERIMENTAL:
+        x_name = next((name for name, selection in block.series_axes if selection == x_axis), "")
         if not x_name:
             return None
-        x_values = series_map[x_name]
-        x_provenance = dict(layer.series_provenance).get(
-            x_name,
-            MappingProxyType({}),
-        )
+        x_values = dict(block.series)[x_name]
+        x_provenance = dict(block.series_provenance).get(x_name, MappingProxyType({}))
     else:
         return None
     selected = tuple(
         (name, values)
-        for name, values in layer.series
+        for name, values in block.series
         if series_axis_map[name] != x_axis
         and (excluded_y_axes is None or series_axis_map[name] not in excluded_y_axes)
         and (y_axes is None or series_axis_map[name] in y_axes)
     )
     if not selected:
         return None
-    selected_names = {name for name, _ in selected}
+    names = {name for name, _ in selected}
     return ResultDataBlock(
-        block_id=layer.layer_id,
-        label=layer.label,
-        kind=layer.kind,
-        t=x_values,
-        series=selected,
-        series_axes=tuple(
-            (name, selection)
-            for name, selection in layer.series_axes
-            if name in selected_names
-        ),
-        x_axis=x_axis,
-        result=layer.result,
-        segment_ids=layer.segment_ids,
-        segment_keys=layer.segment_keys,
-        discontinuity_ids=layer.discontinuity_ids,
-        source_row=layer.source_row,
+        block_id=block.block_id, label=block.label, kind=block.kind,
+        t=x_values, series=selected,
+        series_axes=tuple((name, selection) for name, selection in block.series_axes if name in names),
+        x_axis=x_axis, result=block.result,
+        segment_ids=block.segment_ids, segment_keys=block.segment_keys,
+        discontinuity_ids=block.discontinuity_ids, source_row=block.source_row,
         x_name=x_name,
-        series_provenance=tuple(
-            (name, payload)
-            for name, payload in layer.series_provenance
-            if name in selected_names
-        ),
+        series_provenance=tuple((name, payload) for name, payload in block.series_provenance if name in names),
         x_provenance=x_provenance,
+        color_by_series=tuple((name, color) for name, color in block.color_by_series if name in names),
+        visible=block.visible, dashed=block.dashed, opacity=block.opacity,
+        markers=block.markers, point_size=block.point_size,
+        presentation_boundaries=block.presentation_boundaries,
     )
 
 
 def _has_selected_y_series(
-    layer: WorkspacePlotLayer,
+    block: ResultDataBlock,
     *,
     y_axes: set[AxisSeriesSelection] | None,
     excluded_y_axes: set[AxisSeriesSelection] | None,
 ) -> bool:
-    """Whether a semantic layer would contribute at least one selected Y."""
-
-    series_names = {name for name, _values in layer.series}
     return any(
-        excluded_y_axes is None or selection not in excluded_y_axes
-        for name, selection in layer.series_axes
-        if name in series_names
+        (excluded_y_axes is None or selection not in excluded_y_axes)
         and (y_axes is None or selection in y_axes)
+        for _name, selection in block.series_axes
     )
 
 
-def _statistics_block(
-    layer: WorkspacePlotLayer,
+def _statistics_series_names(
+    block: ResultDataBlock,
     *,
     y_axes: set[AxisSeriesSelection] | None,
     excluded_y_axes: set[AxisSeriesSelection] | None = None,
-) -> ResultDataBlock | None:
-    """Build selected-Y statistics against canonical simulation time."""
-
-    result = layer.result
-    if not isinstance(result, SimulationResultValue):
+) -> tuple[str, ...]:
+    if not isinstance(block.result, SimulationResultValue):
         raise TypeError("statistics require a canonical simulation result.")
-    series_axis_map = dict(layer.series_axes)
-    succeeded_algebra_outputs = set(result.succeeded_algebra_outputs)
-    selected = tuple(
-        (name, values)
-        for name, values in result.series.items()
-        if (
-            name not in succeeded_algebra_outputs
-            and (
-                excluded_y_axes is None or series_axis_map[name] not in excluded_y_axes
-            )
-            and (y_axes is None or series_axis_map[name] in y_axes)
-        )
-    )
-    if not selected:
-        return None
-    selected_names = {name for name, _ in selected}
-    return ResultDataBlock(
-        block_id=layer.layer_id,
-        label=layer.label,
-        kind=layer.kind,
-        t=result.t,
-        series=selected,
-        series_axes=tuple(
-            (name, selection)
-            for name, selection in layer.series_axes
-            if name in selected_names
-        ),
-        x_axis=SimulationSeriesAxisSelection("t"),
-        result=result,
-        segment_ids=result.segment_ids,
-        segment_keys=result.segment_keys,
-        discontinuity_ids=result.discontinuity_ids,
-        source_row=None,
-        x_name="t",
+    series_axes = dict(block.series_axes)
+    succeeded = set(block.result.succeeded_algebra_outputs)
+    return tuple(
+        name for name in block.result.series
+        if name not in succeeded
+        and (excluded_y_axes is None or series_axes[name] not in excluded_y_axes)
+        and (y_axes is None or series_axes[name] in y_axes)
     )
 
 
 def _selected_x_unavailable_diagnostic(
     selected_x: AxisSeriesSelection,
-    unavailable_layers: Sequence[WorkspacePlotLayer],
+    unavailable_labels: Sequence[str],
 ) -> str | None:
-    """Return one deterministic diagnostic for visible semantic layers lacking X."""
-
-    if _is_time_selection(selected_x):
+    if _is_time_selection(selected_x) or not unavailable_labels:
         return None
-    unavailable = tuple(unavailable_layers)
-    if not unavailable:
-        return None
-    labels = ", ".join(repr(layer.label) for layer in unavailable)
+    labels = ", ".join(repr(str(label)) for label in unavailable_labels)
     selected_identity = (
         f"series {selected_x.series_name!r}"
         if isinstance(selected_x, SimulationSeriesAxisSelection)
-        else (
-            f"raw observation {selected_x.raw_observation_id!r} "
-            f"in dataset {selected_x.dataset_id!r}"
-        )
+        else f"raw observation {selected_x.raw_observation_id!r} in dataset {selected_x.dataset_id!r}"
     )
     return (
-        f"Selected X {selected_identity} is unavailable for "
-        f"result layer(s) {labels}. The semantic result layer(s) are retained, "
-        "but plot, Copy, and XLSX rows cannot be produced without X values."
+        f"Selected X {selected_identity} is unavailable for result layer(s) {labels}. "
+        "The semantic result layer(s) are retained, but plot, Copy, and XLSX rows "
+        "cannot be produced without X values."
     )
 
 
@@ -1565,7 +1036,7 @@ def _planned_xlsx_worksheet_dimensions(
     used: set[str] = set()
     dimensions: list[tuple[str, int, int]] = []
     for block in blocks:
-        title = WorkspaceResultPresenter._worksheet_title(block.label, used)
+        title = _worksheet_title(block.label, used)
         identity_column_count = 2 if block.kind is ResultLayerKind.EXPERIMENTAL else 4
         dimensions.append(
             (
@@ -1577,7 +1048,7 @@ def _planned_xlsx_worksheet_dimensions(
     if lineage_row_count:
         dimensions.append(
             (
-                WorkspaceResultPresenter._worksheet_title(
+                _worksheet_title(
                     "_Kindred Lineage",
                     used,
                 ),
@@ -1588,7 +1059,7 @@ def _planned_xlsx_worksheet_dimensions(
     if result_entry_count:
         dimensions.append(
             (
-                WorkspaceResultPresenter._worksheet_title(
+                _worksheet_title(
                     "_Kindred Result Metadata",
                     used,
                 ),
@@ -1735,1064 +1206,791 @@ def _frame_connectors(
     return tuple(entries)
 
 
-class WorkspaceResultPresenter:
-    """Pure composition plus the two Copy payloads and generated XLSX."""
 
-    @staticmethod
-    def compose_interactive_display(
-        frame: object,
-        *,
-        projection: WorkspaceResultProjection,
-    ) -> InteractiveDisplayProjection:
-        """Replace one foreground visually while retaining completed authority.
+def compose_interactive_display(
+    frame: object,
+    *,
+    render_input: ResultRenderInput,
+) -> InteractiveDisplayProjection:
+    from kindred.gui.interactive_preview import InteractivePreviewFrame
+    if not isinstance(frame, InteractivePreviewFrame):
+        raise TypeError("frame must be an InteractivePreviewFrame.")
+    if not isinstance(render_input, ResultRenderInput):
+        raise TypeError("render_input must be a ResultRenderInput.")
+    if frame.tab_id != render_input.tab_id:
+        raise ValueError("interactive frame belongs to a different tab.")
+    frame_series = {series.series_id: series for series in frame.series}
+    selected_x = render_input.selected_x_series
 
-        ``InteractivePreviewFrame`` stays owned by the execution protocol.  This
-        method consumes it only to form a physical roster; the returned value has
-        no repository entry, statistics, Copy blocks, or export route.
-        """
-
-        from kindred.gui.interactive_preview import InteractivePreviewFrame
-
-        if not isinstance(frame, InteractivePreviewFrame):
-            raise TypeError("frame must be an InteractivePreviewFrame.")
-        if not isinstance(projection, WorkspaceResultProjection):
-            raise TypeError("projection must be a WorkspaceResultProjection.")
-        if frame.tab_id != projection.tab_id:
-            raise ValueError("interactive frame belongs to a different tab.")
-
-        frame_series = {series.series_id: series for series in frame.series}
-        selected_x = projection.selected_x_series
-        if isinstance(selected_x, ExperimentalAxisSelection):
-            # A transient simulation has no raw-observation row identity.  Keep
-            # the completed experimental-X scene visible and publish no overlay.
-            return InteractiveDisplayProjection(
-                tab_id=frame.tab_id,
-                set_id=frame.set_id,
-                generation=frame.generation,
-                x_label=projection.x_label,
-                y_label=projection.y_label,
-                curves=(),
-                target_set_ids=frame.target_set_ids,
-                batch_id=_frame_batch_id(frame),
-            )
-        if selected_x.series_name == "t":
-            x_values = np.asarray(frame.x_values, dtype=float)
-        else:
-            try:
-                x_values = np.asarray(
-                    frame_series[selected_x.series_name].values,
-                    dtype=float,
-                )
-            except KeyError:
-                return InteractiveDisplayProjection(
-                    tab_id=frame.tab_id,
-                    set_id=frame.set_id,
-                    generation=frame.generation,
-                    x_label=projection.x_label,
-                    y_label=projection.y_label,
-                    curves=(),
-                    target_set_ids=frame.target_set_ids,
-                    batch_id=_frame_batch_id(frame),
-                )
-
-        if projection.selected_y_uses_default_all:
-            wanted_y = tuple(
-                name for name in frame_series if name != selected_x.series_name
-            )
-        else:
-            wanted_y = tuple(
-                selection.series_name
-                for selection in projection.selected_y_series
-                if isinstance(selection, SimulationSeriesAxisSelection)
-                and selection.series_name != selected_x.series_name
-            )
-
-        base_layer = next(
-            (
-                layer
-                for layer in projection.plot_layers
-                if isinstance(layer.layer_id, SimulationResultLayerIdentity)
-                and layer.layer_id.set_id == frame.set_id
-                and layer.kind in {ResultLayerKind.EXPLICIT, ResultLayerKind.PREVIEW}
-            ),
-            None,
-        )
-        if base_layer is None or not base_layer.visible:
-            return InteractiveDisplayProjection(
-                tab_id=frame.tab_id,
-                set_id=frame.set_id,
-                generation=frame.generation,
-                x_label=projection.x_label,
-                y_label=projection.y_label,
-                curves=(),
-                target_set_ids=frame.target_set_ids,
-                batch_id=_frame_batch_id(frame),
-            )
-        base_colors = dict(base_layer.color_by_series) if base_layer is not None else {}
-        base_label = base_layer.label if base_layer is not None else frame.set_id
-        plotted_series = {name for name, _values in base_layer.series}
-        topology = _frame_topology(frame, size=x_values.size)
-        connectors = _frame_connectors(
-            frame,
-            selected_x=selected_x,
-            series_names=set(frame_series),
-        )
-        curves: list[InteractiveDisplayCurve] = []
-        for series_id in wanted_y:
-            if series_id not in plotted_series:
-                continue
-            series = frame_series.get(series_id)
-            if series is None:
-                continue
-            curves.append(
-                InteractiveDisplayCurve(
-                    key=(
-                        "simulation",
-                        "foreground",
-                        frame.set_id,
-                        series_id,
-                    ),
-                    label=f"{base_label}: {series.label}",
-                    x=x_values,
-                    y=np.asarray(series.values, dtype=float),
-                    color=(
-                        series.color
-                        or base_colors.get(series_id)
-                        or "#3b82f6"
-                    ),
-                    segment_ids=topology[0],
-                    segment_keys=topology[1],
-                    discontinuity_ids=topology[2],
-                    intervention_connectors=tuple(
-                        (item[0], item[1], item[2], item[3])
-                        for item in connectors
-                        if item[4] == series_id
-                    ),
-                )
-            )
+    def empty() -> InteractiveDisplayProjection:
         return InteractiveDisplayProjection(
-            tab_id=frame.tab_id,
-            set_id=frame.set_id,
-            generation=frame.generation,
-            x_label=projection.x_label,
-            y_label=projection.y_label,
-            curves=tuple(curves),
-            target_set_ids=frame.target_set_ids,
-            batch_id=_frame_batch_id(frame),
+            tab_id=frame.tab_id, set_id=frame.set_id, generation=frame.generation,
+            x_label=render_input.x_label, y_label=render_input.y_label, curves=(),
+            target_set_ids=frame.target_set_ids, batch_id=_frame_batch_id(frame),
         )
 
-    @staticmethod
-    def compose_interactive_display_batch(
-        frames: Sequence[object],
-        *,
-        projection: WorkspaceResultProjection,
-    ) -> InteractiveDisplayProjection:
-        """Compose the latest transient frame for each target into one roster.
-
-        The returned projection remains physical-only.  Completed curves come
-        from the supplied workspace projection; only foreground curves for a
-        target with a successful transient frame are replaced.  This lets a
-        later frame update one target without restoring an earlier target's
-        completed baseline.
-        """
-
-        captured = tuple(frames)
-        if not captured:
-            raise ValueError("interactive display batch requires at least one frame.")
-        composed = tuple(
-            WorkspaceResultPresenter.compose_interactive_display(
-                frame,
-                projection=projection,
-            )
-            for frame in captured
-        )
-        roster = composed[0].target_set_ids
-        generation = composed[0].generation
-        batch_id = composed[0].batch_id
-        if any(
-            item.target_set_ids != roster
-            or item.generation != generation
-            or item.batch_id != batch_id
-            for item in composed[1:]
-        ):
-            raise ValueError(
-                "interactive display batch frames must share generation and roster."
-            )
-        # This projection is an overlay only.  The completed renderer keeps all
-        # unchanged explicit/reference/experimental items visible and owns the
-        # legend, range, Copy, and XLSX scene.  Re-composing those blocks here
-        # would duplicate large unchanged rosters at preview cadence.
-        curves: list[InteractiveDisplayCurve] = []
-        for item in composed:
-            curves.extend(item.curves)
-
-        return InteractiveDisplayProjection(
-            tab_id=composed[-1].tab_id,
-            set_id=composed[-1].set_id,
-            generation=generation,
-            x_label=composed[-1].x_label,
-            y_label=composed[-1].y_label,
-            curves=tuple(curves),
-            target_set_ids=roster,
-            batch_id=batch_id,
-        )
-
-    @staticmethod
-    def compose(
-        *,
-        tab_id: str,
-        current_set_id: str | None,
-        visible_sets: Sequence[VisibleResultSet],
-        repository: ResultRepository,
-        reference_lines_visible: bool,
-        intervention_annotations_visible: bool,
-        mechanism_species: Sequence[str],
-        active_overlay_layers: Sequence[ExperimentalLayerInput] = (),
-        color_by_axis_selection: Mapping[
-            AxisSeriesSelection,
-            str,
-        ] = MappingProxyType({}),
-        experimental_point_size: float = 6.0,
-        experimental_point_opacity: float = 0.85,
-        selected_x_series: AxisSeriesSelection = SimulationSeriesAxisSelection("t"),
-        selected_y_series: Sequence[AxisSeriesSelection] = (),
-        selected_y_uses_default_all: bool = True,
-        preview_set_ids: Sequence[str] = (),
-    ) -> WorkspaceResultProjection:
-        tab_id = _required_id(tab_id, "tab_id")
-        if not isinstance(repository, ResultRepository):
-            raise TypeError("repository must be a ResultRepository.")
-        if repository.tab_id != tab_id:
-            raise ValueError("repository does not belong to the requested tab.")
-        mechanism_species_ordered = tuple(
-            _required_id(name, "mechanism species") for name in mechanism_species
-        )
-        if len(mechanism_species_ordered) != len(set(mechanism_species_ordered)):
-            raise ValueError("mechanism species roster must contain unique names.")
-        mechanism_species_set = set(mechanism_species_ordered)
-        current_id = str(current_set_id or "")
-        preview_ids = {_required_id(value, "preview set_id") for value in preview_set_ids}
-        colors = {
-            _axis_selection(
-                selection,
-                field="configured color axis",
-            ): _required_id(color, "configured axis color")
-            for selection, color in color_by_axis_selection.items()
-        }
-        selected_x = _axis_selection(
-            selected_x_series,
-            field="selected_x_series",
-        )
-        selected_y_ordered = tuple(
-            _axis_selection(selection, field="selected_y_series")
-            for selection in selected_y_series
-        )
-        if len(selected_y_ordered) != len(set(selected_y_ordered)):
-            raise ValueError("selected_y_series must be unique.")
-        point_size = float(experimental_point_size)
-        point_opacity = float(experimental_point_opacity)
-        if not np.isfinite(point_size) or point_size <= 0.0:
-            raise ValueError("experimental_point_size must be positive.")
-        if not np.isfinite(point_opacity) or not 0.0 <= point_opacity <= 1.0:
-            raise ValueError("experimental_point_opacity must be between zero and one.")
-        active_overlay_inputs = tuple(active_overlay_layers)
-        if any(
-            not isinstance(candidate, ExperimentalLayerInput)
-            for candidate in active_overlay_inputs
-        ):
-            raise TypeError(
-                "active_overlay_layers must contain ExperimentalLayerInput values."
-            )
-        experimental_by_axis = {
-            ExperimentalAxisSelection(
-                candidate.dataset_id,
-                candidate.raw_observation_id,
-            ): candidate
-            for candidate in active_overlay_inputs
-        }
-        if len(experimental_by_axis) != len(active_overlay_inputs):
-            raise ValueError(
-                "Active overlay layers duplicate a dataset/raw-observation identity."
-            )
-        selected_model_y = {
+    if isinstance(selected_x, ExperimentalAxisSelection):
+        return empty()
+    if selected_x.series_name == "t":
+        x_values = np.asarray(frame.x_values, dtype=float)
+    else:
+        selected_series = frame_series.get(selected_x.series_name)
+        if selected_series is None:
+            return empty()
+        x_values = np.asarray(selected_series.values, dtype=float)
+    wanted_y = (
+        tuple(name for name in frame_series if name != selected_x.series_name)
+        if render_input.selected_y_uses_default_all
+        else tuple(
             selection.series_name
-            for selection in selected_y_ordered
+            for selection in render_input.selected_y_series
             if isinstance(selection, SimulationSeriesAxisSelection)
-        }
-        derived_overlay_y_values: list[ExperimentalAxisSelection] = []
-        for candidate in active_overlay_inputs:
-            if candidate.model_target is None or not (
-                bool(selected_y_uses_default_all)
-                or candidate.model_target in selected_model_y
-            ):
-                continue
-            selection = ExperimentalAxisSelection(
-                candidate.dataset_id,
-                candidate.raw_observation_id,
-            )
-            if selection not in selected_y_ordered:
-                derived_overlay_y_values.append(selection)
-        derived_overlay_y = tuple(derived_overlay_y_values)
-        effective_y_ordered = tuple(
-            dict.fromkeys((*selected_y_ordered, *derived_overlay_y))
+            and selection.series_name != selected_x.series_name
         )
-        wanted_y = (
-            None
-            if bool(selected_y_uses_default_all)
-            else set(effective_y_ordered)
+    )
+    base_block = next(
+        (
+            block for block in render_input.blocks
+            if block.block_id == frame.set_id
+            and block.kind in {ResultLayerKind.EXPLICIT, ResultLayerKind.PREVIEW}
+            and block.visible
+        ),
+        None,
+    )
+    if base_block is None:
+        return empty()
+    topology = _frame_topology(frame, size=x_values.size)
+    connectors = _frame_connectors(
+        frame, selected_x=selected_x, series_names=set(frame_series)
+    )
+    base_colors = dict(base_block.color_by_series)
+    plotted_series = {name for name, _values in base_block.series}
+    curves = tuple(
+        InteractiveDisplayCurve(
+            key=("simulation", "foreground", frame.set_id, series_id),
+            label=f"{base_block.label}: {series.label}",
+            x=x_values,
+            y=np.asarray(series.values, dtype=float),
+            color=series.color or base_colors.get(series_id) or "#3b82f6",
+            segment_ids=topology[0], segment_keys=topology[1],
+            discontinuity_ids=topology[2],
+            intervention_connectors=tuple(
+                (item[0], item[1], item[2], item[3])
+                for item in connectors if item[4] == series_id
+            ),
         )
-        excluded_simulation_y: set[AxisSeriesSelection] = set()
-        excluded_experimental_y: set[AxisSeriesSelection] = set()
-        selected_x_source: ExperimentalLayerInput | None = None
-        if isinstance(selected_x, SimulationSeriesAxisSelection):
-            excluded_simulation_y.add(selected_x)
-            excluded_experimental_y.update(
-                ExperimentalAxisSelection(
-                    candidate.dataset_id,
-                    candidate.raw_observation_id,
-                )
-                for candidate in active_overlay_inputs
-                if candidate.model_target == selected_x.series_name
+        for series_id in wanted_y
+        if series_id in plotted_series
+        and (series := frame_series.get(series_id)) is not None
+    )
+    return InteractiveDisplayProjection(
+        tab_id=frame.tab_id, set_id=frame.set_id, generation=frame.generation,
+        x_label=render_input.x_label, y_label=render_input.y_label,
+        curves=curves, target_set_ids=frame.target_set_ids,
+        batch_id=_frame_batch_id(frame),
+    )
+
+def compose_interactive_display_batch(
+    frames: Sequence[object],
+    *,
+    render_input: ResultRenderInput,
+) -> InteractiveDisplayProjection:
+    captured = tuple(frames)
+    if not captured:
+        raise ValueError("interactive display batch requires at least one frame.")
+    composed = tuple(
+        compose_interactive_display(
+            frame, render_input=render_input
+        )
+        for frame in captured
+    )
+    first = composed[0]
+    if any(
+        item.target_set_ids != first.target_set_ids
+        or item.generation != first.generation
+        or item.batch_id != first.batch_id
+        for item in composed[1:]
+    ):
+        raise ValueError("interactive display batch frames must share generation and roster.")
+    return InteractiveDisplayProjection(
+        tab_id=composed[-1].tab_id, set_id=composed[-1].set_id,
+        generation=first.generation, x_label=composed[-1].x_label,
+        y_label=composed[-1].y_label,
+        curves=tuple(curve for item in composed for curve in item.curves),
+        target_set_ids=first.target_set_ids, batch_id=first.batch_id,
+    )
+
+def compose_result_input(
+    *,
+    tab_id: str,
+    current_set_id: str | None,
+    visible_sets: Sequence[VisibleResultSet],
+    repository: ResultRepository,
+    reference_lines_visible: bool,
+    intervention_annotations_visible: bool,
+    mechanism_species: Sequence[str],
+    active_overlay_layers: Sequence[ExperimentalLayerInput] = (),
+    color_by_axis_selection: Mapping[AxisSeriesSelection, str] = MappingProxyType({}),
+    experimental_point_size: float = 6.0,
+    experimental_point_opacity: float = 0.85,
+    selected_x_series: AxisSeriesSelection = SimulationSeriesAxisSelection("t"),
+    selected_y_series: Sequence[AxisSeriesSelection] = (),
+    selected_y_uses_default_all: bool = True,
+    preview_set_ids: Sequence[str] = (),
+) -> ResultRenderInput:
+    tab_id = _required_id(tab_id, "tab_id")
+    if not isinstance(repository, ResultRepository):
+        raise TypeError("repository must be a ResultRepository.")
+    if repository.tab_id != tab_id:
+        raise ValueError("repository does not belong to requested tab.")
+    mechanism_species_set = {
+        _required_id(name, "mechanism species") for name in mechanism_species
+    }
+    current_id = str(current_set_id or "")
+    preview_ids = {_required_id(value, "preview set_id") for value in preview_set_ids}
+    colors = {
+        _axis_selection(selection, field="configured color axis"):
+        _required_id(color, "configured axis color")
+        for selection, color in color_by_axis_selection.items()
+    }
+    selected_x = _axis_selection(selected_x_series, field="selected_x_series")
+    selected_y = tuple(_axis_selection(item, field="selected_y_series") for item in selected_y_series)
+    if len(selected_y) != len(set(selected_y)):
+        raise ValueError("selected_y_series must be unique.")
+    point_size = float(experimental_point_size)
+    point_opacity = float(experimental_point_opacity)
+    if not np.isfinite(point_size) or point_size <= 0:
+        raise ValueError("experimental_point_size must be positive.")
+    if not np.isfinite(point_opacity) or not 0 <= point_opacity <= 1:
+        raise ValueError("experimental_point_opacity must be between zero and one.")
+    active = tuple(active_overlay_layers)
+    if any(not isinstance(item, ExperimentalLayerInput) for item in active):
+        raise TypeError("active_overlay_layers must contain ExperimentalLayerInput values.")
+    experimental_by_axis = {
+        ExperimentalAxisSelection(item.dataset_id, item.raw_observation_id): item
+        for item in active
+    }
+    if len(experimental_by_axis) != len(active):
+        raise ValueError("active overlay layers duplicate dataset/raw-observation identity.")
+    selected_model_y = {
+        item.series_name for item in selected_y
+        if isinstance(item, SimulationSeriesAxisSelection)
+    }
+    mapped_overlay_locks = tuple(
+        (
+            ExperimentalAxisSelection(item.dataset_id, item.raw_observation_id),
+            str(item.model_target),
+        )
+        for item in active
+        if item.model_target is not None
+        and (bool(selected_y_uses_default_all) or item.model_target in selected_model_y)
+        and ExperimentalAxisSelection(item.dataset_id, item.raw_observation_id) not in selected_y
+    )
+    effective_y = tuple(
+        dict.fromkeys(
+            (
+                *selected_y,
+                *(axis for axis, _model_target in mapped_overlay_locks),
             )
-        elif isinstance(selected_x, ExperimentalAxisSelection):
-            selected_x_source = experimental_by_axis.get(selected_x)
-            excluded_experimental_y.add(selected_x)
-            if selected_x_source is not None and selected_x_source.model_target:
-                excluded_simulation_y.add(
-                    SimulationSeriesAxisSelection(selected_x_source.model_target)
-                )
-        simulation_x_axis: AxisSeriesSelection = selected_x
-        if (
-            isinstance(selected_x, ExperimentalAxisSelection)
-            and selected_x_source is not None
-            and selected_x_source.model_target is not None
-        ):
-            # Experimental X remains the selected/source-row identity for raw
-            # observations, while simulated and Reference layers consume its
-            # current mapped model-series identity.
-            simulation_x_axis = SimulationSeriesAxisSelection(
-                selected_x_source.model_target
+        )
+    )
+    wanted_y = None if bool(selected_y_uses_default_all) else set(effective_y)
+    excluded_simulation_y: set[AxisSeriesSelection] = set()
+    excluded_experimental_y: set[AxisSeriesSelection] = set()
+    selected_x_source: ExperimentalLayerInput | None = None
+    if isinstance(selected_x, SimulationSeriesAxisSelection):
+        excluded_simulation_y.add(selected_x)
+        excluded_experimental_y.update(
+            ExperimentalAxisSelection(item.dataset_id, item.raw_observation_id)
+            for item in active if item.model_target == selected_x.series_name
+        )
+    elif isinstance(selected_x, ExperimentalAxisSelection):
+        selected_x_source = experimental_by_axis.get(selected_x)
+        excluded_experimental_y.add(selected_x)
+        if selected_x_source is not None and selected_x_source.model_target:
+            excluded_simulation_y.add(SimulationSeriesAxisSelection(selected_x_source.model_target))
+    simulation_x = (
+        SimulationSeriesAxisSelection(selected_x_source.model_target)
+        if isinstance(selected_x, ExperimentalAxisSelection)
+        and selected_x_source is not None
+        and selected_x_source.model_target is not None
+        else selected_x
+    )
+
+    blocks: list[ResultDataBlock] = []
+    unavailable_labels: list[str] = []
+    candidates: list[AxisSelectionCandidate] = []
+    candidate_ids: set[AxisSeriesSelection] = set()
+
+    def add_candidate(selection: AxisSeriesSelection, label: str) -> None:
+        if selection not in candidate_ids:
+            candidate_ids.add(selection)
+            candidates.append(AxisSelectionCandidate(selection, label))
+
+    add_candidate(SimulationSeriesAxisSelection("t"), "t")
+    for selection in colors:
+        if isinstance(selection, SimulationSeriesAxisSelection):
+            add_candidate(selection, selection.series_name)
+    statistics_names: tuple[str, ...] = ()
+    annotations: list[Mapping[str, object]] = []
+    warning_facts: list[tuple[str, tuple[str, ...]]] = []
+    warning_ids: set[int] = set()
+    seen_sets: set[str] = set()
+
+    def add_warning(label: str, result: SimulationResultValue, visible: bool) -> None:
+        if visible and result.completed_with_warnings and id(result) not in warning_ids:
+            warning_ids.add(id(result))
+            warning_facts.append((label, tuple(_result_warning_details(result))))
+
+    for visible in visible_sets:
+        if not isinstance(visible, VisibleResultSet):
+            raise TypeError("visible_sets must contain VisibleResultSet values.")
+        if visible.set_id in seen_sets:
+            raise ValueError(f"visible set {visible.set_id!r} is duplicated.")
+        seen_sets.add(visible.set_id)
+        foreground = repository.current_result(visible.set_id)
+        foreground_kind = ResultLayerKind.PREVIEW if visible.set_id in preview_ids else ResultLayerKind.EXPLICIT
+        semantic: ResultDataBlock | None = None
+        physical: ResultDataBlock | None = None
+        if foreground is not None:
+            semantic = _result_block(
+                set_id=visible.set_id, label=visible.label, result=foreground,
+                kind=foreground_kind, color_by_axis_selection=colors,
             )
-
-        layers: list[WorkspacePlotLayer] = []
-        blocks: list[ResultDataBlock] = []
-        axis_candidates: list[AxisSelectionCandidate] = []
-        axis_candidate_ids: set[AxisSeriesSelection] = set()
-        unavailable_layers: list[WorkspacePlotLayer] = []
-
-        def add_axis_candidate(
-            selection: AxisSeriesSelection,
-            label: str,
-        ) -> None:
-            if selection in axis_candidate_ids:
-                return
-            axis_candidate_ids.add(selection)
-            axis_candidates.append(AxisSelectionCandidate(selection, label))
-
-        add_axis_candidate(SimulationSeriesAxisSelection("t"), "t")
-        for selection in colors:
-            if isinstance(selection, SimulationSeriesAxisSelection):
-                add_axis_candidate(selection, selection.series_name)
-        primary_layer_id: SimulationResultLayerIdentity | None = None
-        primary_entry: SimulationResultValue | None = None
-        primary_block: ResultDataBlock | None = None
-        annotations: list[Mapping[str, object]] = []
-        seen_set_ids: set[str] = set()
-
-        for visible in visible_sets:
-            if not isinstance(visible, VisibleResultSet):
-                raise TypeError("visible_sets must contain VisibleResultSet values.")
-            if visible.set_id in seen_set_ids:
-                raise ValueError(f"visible set {visible.set_id!r} is duplicated.")
-            seen_set_ids.add(visible.set_id)
-
-            foreground_entry = repository.current_result(visible.set_id)
-            foreground_kind = (
-                ResultLayerKind.PREVIEW
-                if visible.set_id in preview_ids
-                else ResultLayerKind.EXPLICIT
+            for name, selection in semantic.series_axes:
+                add_candidate(selection, name)
+            physical = _data_block(
+                semantic, x_axis=simulation_x, y_axes=wanted_y,
+                excluded_y_axes=excluded_simulation_y,
             )
-            if foreground_entry is not None:
-                foreground = _result_layer(
-                    set_id=visible.set_id,
-                    label=visible.label,
-                    result=foreground_entry,
-                    kind=foreground_kind,
-                    color_by_axis_selection=colors,
-                )
-                layers.append(foreground)
-                for name, selection in foreground.series_axes:
-                    add_axis_candidate(selection, name)
-                block = _data_block(
-                    foreground,
-                    x_axis=simulation_x_axis,
+            if physical is not None:
+                blocks.append(physical)
+            else:
+                if _has_selected_y_series(
+                    semantic,
                     y_axes=wanted_y,
                     excluded_y_axes=excluded_simulation_y,
-                )
-                if block is not None:
-                    blocks.append(block)
-                elif (
-                    simulation_x_axis not in dict(foreground.series_axes).values()
-                    and _has_selected_y_series(
-                        foreground,
-                        y_axes=wanted_y,
-                        excluded_y_axes=excluded_simulation_y,
-                    )
                 ):
-                    unavailable_layers.append(foreground)
-            else:
-                foreground = None
-
-            reference = repository.reference_result(visible.set_id)
-            reference_layer: WorkspacePlotLayer | None = None
-            if reference is not None:
-                reference_layer = _result_layer(
-                    set_id=visible.set_id,
-                    label=visible.label,
-                    result=reference,
-                    kind=ResultLayerKind.REFERENCE,
-                    color_by_axis_selection=colors,
-                    visible=bool(reference_lines_visible),
+                    unavailable_labels.append(semantic.label)
+                if visible.set_id == current_id:
+                    blocks.append(replace(semantic, visible=False))
+            add_warning(semantic.label, foreground, True)
+            annotations.extend(_annotations_from_execution(foreground))
+        reference = repository.reference_result(visible.set_id)
+        reference_semantic: ResultDataBlock | None = None
+        if reference is not None:
+            reference_semantic = _result_block(
+                set_id=visible.set_id, label=visible.label, result=reference,
+                kind=ResultLayerKind.REFERENCE,
+                color_by_axis_selection=colors, visible=bool(reference_lines_visible),
+            )
+            for name, selection in reference_semantic.series_axes:
+                add_candidate(selection, name)
+            if reference_lines_visible:
+                reference_physical = _data_block(
+                    reference_semantic, x_axis=simulation_x, y_axes=wanted_y,
+                    excluded_y_axes=excluded_simulation_y,
                 )
-                layers.append(reference_layer)
-                for name, selection in reference_layer.series_axes:
-                    add_axis_candidate(selection, name)
-                if bool(reference_lines_visible):
-                    block = _data_block(
-                        reference_layer,
-                        x_axis=simulation_x_axis,
+                if reference_physical is not None:
+                    blocks.append(reference_physical)
+                else:
+                    if _has_selected_y_series(
+                        reference_semantic,
                         y_axes=wanted_y,
                         excluded_y_axes=excluded_simulation_y,
-                    )
-                    if block is not None:
-                        blocks.append(block)
-                    elif (
-                        simulation_x_axis
-                        not in dict(reference_layer.series_axes).values()
-                        and _has_selected_y_series(
-                            reference_layer,
-                            y_axes=wanted_y,
-                            excluded_y_axes=excluded_simulation_y,
-                        )
                     ):
-                        # Reference is semantic analysis truth even when its
-                        # selected-X physical rows cannot be projected. Keep
-                        # the layer visible and account for it in the single
-                        # deterministic unavailable-X diagnostic.
-                        unavailable_layers.append(reference_layer)
-                annotations.extend(_annotations_from_execution(reference))
-
-            if foreground is not None:
-                assert foreground.result is not None
-                annotations.extend(
-                    _annotations_from_execution(foreground.result)
+                        unavailable_labels.append(reference_semantic.label)
+                    if visible.set_id == current_id:
+                        blocks.append(replace(reference_semantic, visible=False))
+                add_warning(reference_semantic.label, reference, True)
+            elif visible.set_id == current_id:
+                blocks.append(reference_semantic)
+            annotations.extend(_annotations_from_execution(reference))
+        if visible.set_id == current_id:
+            foreground_names = (
+                _statistics_series_names(
+                    semantic, y_axes=wanted_y, excluded_y_axes=excluded_simulation_y
                 )
-            if visible.set_id == current_id:
-                foreground_block = (
-                    None
-                    if foreground is None
-                    or foreground_kind is ResultLayerKind.PREVIEW
-                    else _statistics_block(
-                        foreground,
-                        y_axes=wanted_y,
-                        excluded_y_axes=excluded_simulation_y,
-                    )
-                )
-                if (
-                    foreground is not None
-                    and foreground_kind is not ResultLayerKind.PREVIEW
-                    and (
-                        foreground_block is not None
-                        or reference_layer is None
-                    )
-                ):
-                    primary_layer_id = foreground.layer_id
-                    primary_entry = foreground.result
-                    primary_block = foreground_block
-                elif reference_layer is not None:
-                    # Pending, cancelled, or failed Preview has no replacement
-                    # statistics.  The retained accepted Reference remains the
-                    # analysis owner even when no foreground layer is present.
-                    primary_layer_id = reference_layer.layer_id
-                    primary_entry = reference_layer.result
-                    primary_block = _statistics_block(
-                        reference_layer,
-                        y_axes=wanted_y,
-                        excluded_y_axes=excluded_simulation_y,
-                    )
-
-        for experimental in active_overlay_inputs:
-            y_axis = ExperimentalAxisSelection(
-                experimental.dataset_id,
-                experimental.raw_observation_id,
+                if foreground is not None
+                and foreground_kind is ResultLayerKind.EXPLICIT
+                and semantic is not None
+                else ()
             )
-            candidate_label = f"{experimental.dataset_name}: {experimental.raw_column}"
-            if experimental.model_target:
-                candidate_label = f"{candidate_label} → {experimental.model_target}"
-            add_axis_candidate(y_axis, candidate_label)
-            experimental_x = np.asarray(experimental.t, dtype=float)
-            experimental_y = np.asarray(experimental.y, dtype=float)
-            experimental_x_name = "t"
-            experimental_x_axis: AxisSeriesSelection = SimulationSeriesAxisSelection(
-                "t"
-            )
-            experimental_x_provenance: Mapping[str, object] = MappingProxyType({})
-            selected_source_rows = tuple(experimental.source_rows)
-            unavailable_physical_projection = False
-            if not _is_time_selection(selected_x):
-                if isinstance(selected_x, SimulationSeriesAxisSelection):
-                    x_source = next(
-                        (
-                            candidate
-                            for candidate in active_overlay_inputs
-                            if candidate.dataset_id == experimental.dataset_id
-                            and candidate.model_target == selected_x.series_name
-                        ),
-                        None,
-                    )
-                else:
-                    x_source = selected_x_source
-                if (
-                    x_source is None
-                    or x_source.dataset_id != experimental.dataset_id
-                    or y_axis in excluded_experimental_y
-                ):
-                    if y_axis in excluded_experimental_y:
-                        continue
-                    unavailable_physical_projection = True
-                else:
-                    paired = _same_source_row_values(x_source, experimental)
-                    if paired is None:
-                        unavailable_physical_projection = True
-                    else:
-                        (
-                            experimental_x,
-                            experimental_y,
-                            selected_source_rows,
-                        ) = paired
-                        experimental_x_name = x_source.raw_column
-                        experimental_x_axis = selected_x
-                        experimental_x_provenance = _observation_provenance(x_source)
-            label = candidate_label
-            layer = WorkspacePlotLayer(
-                layer_id=experimental.layer_id,
-                label=label,
-                kind=ResultLayerKind.EXPERIMENTAL,
-                t=experimental_x,
-                series=(
-                    (
-                        experimental.raw_column,
-                        experimental_y,
-                    ),
-                ),
-                series_axes=((experimental.raw_column, y_axis),),
-                result=None,
-                segment_ids=None,
-                segment_keys=None,
-                discontinuity_ids=None,
-                source_row=np.asarray(selected_source_rows, dtype=np.int64),
-                series_provenance=(
-                    (
-                        experimental.raw_column,
-                        _observation_provenance(experimental),
-                    ),
-                ),
-                color_by_series=((experimental.raw_column, colors[y_axis]),),
-                opacity=point_opacity,
-                markers=True,
-                point_size=point_size,
-            )
-            layers.append(layer)
-            if unavailable_physical_projection:
-                if wanted_y is None or y_axis in wanted_y:
-                    unavailable_layers.append(layer)
-            elif wanted_y is None or y_axis in wanted_y:
-                blocks.append(
-                    ResultDataBlock(
-                        block_id=layer.layer_id,
-                        label=layer.label,
-                        kind=layer.kind,
-                        t=experimental_x,
-                        series=layer.series,
-                        series_axes=layer.series_axes,
-                        x_axis=experimental_x_axis,
-                        result=None,
-                        segment_ids=layer.segment_ids,
-                        segment_keys=layer.segment_keys,
-                        discontinuity_ids=layer.discontinuity_ids,
-                        source_row=layer.source_row,
-                        x_name=experimental_x_name,
-                        series_provenance=layer.series_provenance,
-                        x_provenance=experimental_x_provenance,
-                    )
+            if semantic is not None and foreground is not None:
+                statistics_names = foreground_names
+            elif reference is not None and reference_semantic is not None:
+                statistics_names = _statistics_series_names(
+                    reference_semantic, y_axes=wanted_y, excluded_y_axes=excluded_simulation_y
                 )
 
-        unique_annotations: list[Mapping[str, object]] = []
-        annotation_signatures: set[tuple[tuple[str, str], ...]] = set()
-        for annotation in annotations:
-            signature = tuple(
-                sorted((str(name), repr(value)) for name, value in annotation.items())
-            )
-            if signature in annotation_signatures:
-                continue
-            annotation_signatures.add(signature)
-            unique_annotations.append(annotation)
+    for experimental in active:
+        y_axis = ExperimentalAxisSelection(experimental.dataset_id, experimental.raw_observation_id)
+        label = f"{experimental.dataset_name}: {experimental.raw_column}"
+        if experimental.model_target:
+            label = f"{label} → {experimental.model_target}"
+        add_candidate(y_axis, label)
+        x_values = np.asarray(experimental.t, dtype=float)
+        y_values = np.asarray(experimental.y, dtype=float)
+        x_name = "t"
+        x_axis: AxisSeriesSelection = SimulationSeriesAxisSelection("t")
+        x_provenance: Mapping[str, object] = MappingProxyType({})
+        source_rows = tuple(experimental.source_rows)
+        unavailable = False
         if not _is_time_selection(selected_x):
-            unique_annotations.clear()
-
-        if selected_x not in axis_candidate_ids:
-            add_axis_candidate(
-                selected_x,
-                (
-                    selected_x.series_name
-                    if isinstance(selected_x, SimulationSeriesAxisSelection)
-                    else (
-                        f"{selected_x.dataset_id}: "
-                        f"{selected_x.raw_observation_id}"
-                    )
-                ),
-            )
-        selected_x_candidate = next(
-            candidate
-            for candidate in axis_candidates
-            if candidate.selection == selected_x
-        )
-        x_label = (
-            "Time (s)" if _is_time_selection(selected_x) else selected_x_candidate.label
-        )
-
-        effective_y_axes = tuple(
-            selection for block in blocks for _name, selection in block.series_axes
-        )
-
-        def is_concentration(selection: AxisSeriesSelection) -> bool:
-            """Classify units from the canonical mechanism-species roster only."""
-
-            if isinstance(selection, ExperimentalAxisSelection):
-                source = experimental_by_axis.get(selection)
-                return (
-                    source is not None
-                    and source.model_target in mechanism_species_set
+            x_source = (
+                next(
+                    (
+                        item for item in active
+                        if isinstance(selected_x, SimulationSeriesAxisSelection)
+                        and item.dataset_id == experimental.dataset_id
+                        and item.model_target == selected_x.series_name
+                    ),
+                    None,
                 )
-            return (
-                isinstance(selection, SimulationSeriesAxisSelection)
-                and selection.series_name in mechanism_species_set
+                if isinstance(selected_x, SimulationSeriesAxisSelection)
+                else selected_x_source
             )
-
-        y_label = (
-            "Concentration (M)"
-            if effective_y_axes
-            and all(is_concentration(selection) for selection in effective_y_axes)
-            else "Value"
+            if x_source is None or x_source.dataset_id != experimental.dataset_id or y_axis in excluded_experimental_y:
+                if y_axis in excluded_experimental_y:
+                    continue
+                unavailable = True
+            else:
+                paired = _same_source_row_values(x_source, experimental)
+                if paired is None:
+                    unavailable = True
+                else:
+                    x_values, y_values, source_rows = paired
+                    x_name = x_source.raw_column
+                    x_axis = selected_x
+                    x_provenance = _observation_provenance(x_source)
+        if unavailable:
+            if wanted_y is None or y_axis in wanted_y:
+                unavailable_labels.append(label)
+            continue
+        if wanted_y is not None and y_axis not in wanted_y:
+            continue
+        blocks.append(
+            ResultDataBlock(
+                block_id=experimental.layer_id, label=label,
+                kind=ResultLayerKind.EXPERIMENTAL, t=x_values,
+                series=((experimental.raw_column, y_values),),
+                series_axes=((experimental.raw_column, y_axis),),
+                x_axis=x_axis, result=None,
+                segment_ids=None, segment_keys=None, discontinuity_ids=None,
+                source_row=np.asarray(source_rows, dtype=np.int64),
+                x_name=x_name,
+                series_provenance=((experimental.raw_column, _observation_provenance(experimental)),),
+                x_provenance=x_provenance,
+                color_by_series=((experimental.raw_column, colors[y_axis]),),
+                opacity=point_opacity, markers=True, point_size=point_size,
+            )
         )
 
-        return WorkspaceResultProjection(
-            tab_id=tab_id,
-            current_set_id=current_id,
-            primary_layer_id=primary_layer_id,
-            plot_layers=tuple(layers),
-            parameters=(
-                tuple(primary_entry.parameters)
-                if primary_entry is not None
-                else ()
-            ),
-            scalar_values=(
-                tuple(primary_entry.scalars.items())
-                if primary_entry is not None
-                else ()
-            ),
-            primary_statistics=primary_block,
-            copy_all_blocks=tuple(blocks),
-            selected_x_series=selected_x,
-            selected_y_series=selected_y_ordered,
-            derived_overlay_y_series=derived_overlay_y,
-            selected_y_uses_default_all=bool(selected_y_uses_default_all),
-            x_label=x_label,
-            y_label=y_label,
-            axis_candidates=tuple(axis_candidates),
-            reference_lines_visible=bool(reference_lines_visible),
-            intervention_annotations=tuple(unique_annotations),
-            intervention_annotations_visible=bool(
-                intervention_annotations_visible and _is_time_selection(selected_x)
-            ),
-            unavailable_x_diagnostic=_selected_x_unavailable_diagnostic(
-                selected_x,
-                unavailable_layers,
-            ),
+    unique_annotations: list[Mapping[str, object]] = []
+    signatures: set[tuple[tuple[str, str], ...]] = set()
+    for annotation in annotations:
+        signature = tuple(sorted((str(name), repr(value)) for name, value in annotation.items()))
+        if signature not in signatures:
+            signatures.add(signature)
+            unique_annotations.append(annotation)
+    if not _is_time_selection(selected_x):
+        unique_annotations.clear()
+    if selected_x not in candidate_ids:
+        add_candidate(
+            selected_x,
+            selected_x.series_name if isinstance(selected_x, SimulationSeriesAxisSelection)
+            else f"{selected_x.dataset_id}: {selected_x.raw_observation_id}",
         )
+    selected_candidate = next(item for item in candidates if item.selection == selected_x)
+    y_axes = tuple(selection for block in blocks for _name, selection in block.series_axes)
 
-    @staticmethod
-    def validate_copy(
-        projection: WorkspaceResultProjection,
-    ) -> None:
-        """Validate complete Copy availability at the result projection boundary."""
+    def is_concentration(selection: AxisSeriesSelection) -> bool:
+        if isinstance(selection, ExperimentalAxisSelection):
+            item = experimental_by_axis.get(selection)
+            return item is not None and item.model_target in mechanism_species_set
+        return isinstance(selection, SimulationSeriesAxisSelection) and selection.series_name in mechanism_species_set
 
-        if not isinstance(projection, WorkspaceResultProjection):
-            raise TypeError("projection must be a WorkspaceResultProjection.")
-        if projection.unavailable_x_diagnostic is not None:
-            raise ValueError(projection.unavailable_x_diagnostic)
-        if not projection.copy_all_blocks:
-            raise ValueError("No visible result, Reference, or experimental data.")
+    return ResultRenderInput(
+        tab_id=tab_id, current_set_id=current_id, blocks=tuple(blocks),
+        statistics_series_names=statistics_names,
+        selected_x_series=selected_x, selected_y_series=selected_y,
+        mapped_overlay_locks=mapped_overlay_locks,
+        selected_y_uses_default_all=bool(selected_y_uses_default_all),
+        x_label="Time (s)" if _is_time_selection(selected_x) else selected_candidate.label,
+        y_label="Concentration (M)" if y_axes and all(is_concentration(item) for item in y_axes) else "Value",
+        axis_candidates=tuple(candidates),
+        reference_lines_visible=bool(reference_lines_visible),
+        intervention_annotations=tuple(unique_annotations),
+        intervention_annotations_visible=bool(intervention_annotations_visible and _is_time_selection(selected_x)),
+        unavailable_x_diagnostic=_selected_x_unavailable_diagnostic(selected_x, unavailable_labels),
+        completion_warning_details=tuple(warning_facts),
+    )
 
-    @staticmethod
-    def iter_blocks_tsv_chunks(
-        blocks: Sequence[ResultDataBlock],
-        *,
-        rows_per_chunk: int = 2048,
-    ) -> Iterator[str]:
-        block_values = tuple(blocks)
-        columns: list[tuple[str, Sequence[object], str]] = []
-        for block in block_values:
-            if not isinstance(block, ResultDataBlock):
-                raise TypeError("Copy data must contain ResultDataBlock values.")
+def validate_copy(
+    render_input: ResultRenderInput,
+) -> None:
+    """Validate Copy against one call-local render input."""
+
+    if not isinstance(render_input, ResultRenderInput):
+        raise TypeError("render_input must be a ResultRenderInput.")
+    if render_input.unavailable_x_diagnostic is not None:
+        raise ValueError(render_input.unavailable_x_diagnostic)
+    if not any(block.visible for block in render_input.blocks):
+        raise ValueError("No visible result, Reference, or experimental data.")
+
+def iter_blocks_tsv_chunks(
+    blocks: Sequence[ResultDataBlock],
+    *,
+    rows_per_chunk: int = 2048,
+) -> Iterator[str]:
+    block_values = tuple(blocks)
+    columns: list[tuple[str, Sequence[object], str]] = []
+    for block in block_values:
+        if not isinstance(block, ResultDataBlock):
+            raise TypeError("Copy data must contain ResultDataBlock values.")
+        columns.append(
+            (
+                _export_column_header(
+                    block,
+                    block.x_name,
+                    block.x_provenance,
+                ),
+                block.t,
+                "float",
+            )
+        )
+        if block.kind is ResultLayerKind.EXPERIMENTAL:
+            if block.source_row is None:
+                raise ValueError("experimental Copy block lacks source_row.")
             columns.append(
                 (
-                    _export_column_header(
-                        block,
-                        block.x_name,
-                        block.x_provenance,
-                    ),
-                    block.t,
-                    "float",
+                    encode_clipboard_text(f"{block.label} — source_row"),
+                    block.source_row,
+                    "int",
                 )
             )
-            if block.kind is ResultLayerKind.EXPERIMENTAL:
-                if block.source_row is None:
-                    raise ValueError("experimental Copy block lacks source_row.")
-                columns.append(
+        else:
+            if (
+                block.segment_ids is None
+                or block.segment_keys is None
+                or block.discontinuity_ids is None
+            ):
+                raise ValueError("simulation Copy block lacks executor identity.")
+            columns.extend(
+                (
                     (
-                        encode_clipboard_text(f"{block.label} — source_row"),
-                        block.source_row,
+                        encode_clipboard_text(f"{block.label} — segment_id"),
+                        block.segment_ids,
                         "int",
+                    ),
+                    (
+                        encode_clipboard_text(f"{block.label} — segment_key"),
+                        block.segment_keys,
+                        "text",
+                    ),
+                    (
+                        encode_clipboard_text(f"{block.label} — discontinuity_id"),
+                        block.discontinuity_ids,
+                        "int",
+                    ),
+                )
+            )
+        provenance_by_name = dict(block.series_provenance)
+        columns.extend(
+            (
+                _export_column_header(
+                    block,
+                    name,
+                    provenance_by_name.get(name, MappingProxyType({})),
+                ),
+                values,
+                "float",
+            )
+            for name, values in block.series
+        )
+    if not columns:
+        raise ValueError("No visible result, Reference, or experimental data.")
+    row_count = max(len(values) for _header, values, _kind in columns)
+    result_entries = _unique_result_entries(block_values)
+    cell_count = (row_count + 1) * len(columns) + 2 * len(result_entries)
+    if cell_count > _MAX_COPY_CELLS:
+        raise ValueError(
+            "Copy payload exceeds the bounded full-resolution cell limit "
+            f"({_MAX_COPY_CELLS:,})."
+        )
+    chunk_size = int(rows_per_chunk)
+    if chunk_size < 1:
+        raise ValueError("rows_per_chunk must be positive.")
+    total_characters = 0
+    for entry in result_entries:
+        metadata_line = encode_tsv_row(
+            (
+                "# Kindred canonical result",
+                encode_clipboard_text(
+                        _canonical_json(_result_provenance_payload(entry))
+                ),
+            )
+        )
+        total_characters += len(metadata_line)
+        if total_characters > _MAX_COPY_CHARACTERS:
+            raise ValueError(
+                "Copy payload exceeds the bounded output-size limit "
+                f"({_MAX_COPY_CHARACTERS // (1024 * 1024)} MiB)."
+            )
+        yield metadata_line
+    header = encode_tsv_row(tuple(header for header, _values, _kind in columns))
+    total_characters += len(header)
+    if total_characters > _MAX_COPY_CHARACTERS:
+        raise ValueError(
+            "Copy payload exceeds the bounded output-size limit "
+            f"({_MAX_COPY_CHARACTERS // (1024 * 1024)} MiB)."
+        )
+    yield header
+    for start in range(0, row_count, chunk_size):
+        output = io.StringIO()
+        for index in range(start, min(start + chunk_size, row_count)):
+            output.write(
+                encode_tsv_row(
+                    tuple(
+                        (
+                            f"{float(values[index]):.17g}"
+                            if kind == "float"
+                            else (
+                                str(int(values[index]))
+                                if kind == "int"
+                                else encode_clipboard_text(str(values[index]))
+                            )
+                        )
+                        if index < len(values)
+                        else ""
+                        for _header, values, kind in columns
                     )
                 )
+            )
+        chunk = output.getvalue()
+        total_characters += len(chunk)
+        if total_characters > _MAX_COPY_CHARACTERS:
+            raise ValueError(
+                "Copy payload exceeds the bounded output-size limit "
+                f"({_MAX_COPY_CHARACTERS // (1024 * 1024)} MiB)."
+            )
+        yield chunk
+
+def validate_xlsx_export(
+    blocks: Sequence[ResultDataBlock],
+) -> None:
+    """Validate the immutable visible block roster before writing."""
+
+    block_values = tuple(blocks)
+    if not block_values:
+        raise ValueError("No visible result, Reference, or experimental data.")
+    if any(not isinstance(block, ResultDataBlock) for block in block_values):
+        raise TypeError(
+            "XLSX export blocks must contain only ResultDataBlock values."
+        )
+    if any(not block.visible for block in block_values):
+        raise ValueError("XLSX export blocks must all be visible.")
+    lineage_row_count = sum(
+        int(bool(block.x_provenance))
+        + sum(bool(provenance) for _, provenance in block.series_provenance)
+        for block in block_values
+    )
+    result_entry_count = len(_unique_result_entries(block_values))
+    dimensions = _planned_xlsx_worksheet_dimensions(
+        block_values,
+        lineage_row_count=lineage_row_count,
+        result_entry_count=result_entry_count,
+    )
+    _validate_xlsx_worksheet_dimensions(dimensions)
+
+def write_xlsx(
+    blocks: Sequence[ResultDataBlock],
+    destination: BinaryIO,
+    *,
+    cancellation_check: Callable[[], None] | None = None,
+) -> XlsxExportCompletion:
+    """Write full-resolution worksheets directly to the destination."""
+
+    block_values = tuple(blocks)
+    validate_xlsx_export(block_values)
+    output = _XlsxDestination(
+        destination,
+        cancellation_check=cancellation_check,
+    )
+    workbook = Workbook(write_only=True)
+    used: set[str] = set()
+    lineage_rows: list[tuple[str, str, Mapping[str, object]]] = []
+    metadata_rows: list[tuple[str, SimulationResultValue]] = []
+    metadata_ids: set[int] = set()
+    data_rows = 0
+    archive: ZipFile | None = None
+    original_failure: BaseException | None = None
+    try:
+        for block in block_values:
+            if cancellation_check is not None:
+                cancellation_check()
+            title = _worksheet_title(block.label, used)
+            sheet = workbook.create_sheet(title=title)
+            if block.kind is ResultLayerKind.EXPERIMENTAL:
+                if block.source_row is None:
+                    raise ValueError("experimental XLSX block lacks source_row.")
+                identity_headers = ["source_row"]
             else:
                 if (
                     block.segment_ids is None
                     or block.segment_keys is None
                     or block.discontinuity_ids is None
                 ):
-                    raise ValueError("simulation Copy block lacks executor identity.")
-                columns.extend(
-                    (
-                        (
-                            encode_clipboard_text(f"{block.label} — segment_id"),
-                            block.segment_ids,
-                            "int",
-                        ),
-                        (
-                            encode_clipboard_text(f"{block.label} — segment_key"),
-                            block.segment_keys,
-                            "text",
-                        ),
-                        (
-                            encode_clipboard_text(f"{block.label} — discontinuity_id"),
-                            block.discontinuity_ids,
-                            "int",
-                        ),
+                    raise ValueError(
+                        "simulation XLSX block lacks executor identity."
                     )
-                )
-            provenance_by_name = dict(block.series_provenance)
-            columns.extend(
+                identity_headers = [
+                    "segment_id",
+                    "segment_key",
+                    "discontinuity_id",
+                ]
+            _append_xlsx_row(
+                sheet,
                 (
-                    _export_column_header(
-                        block,
-                        name,
-                        provenance_by_name.get(name, MappingProxyType({})),
-                    ),
-                    values,
-                    "float",
-                )
-                for name, values in block.series
+                    block.x_name,
+                    *identity_headers,
+                    *(name for name, _values in block.series),
+                ),
             )
-        if not columns:
-            raise ValueError("No visible result, Reference, or experimental data.")
-        row_count = max(len(values) for _header, values, _kind in columns)
-        result_entries = _unique_result_entries(block_values)
-        cell_count = (row_count + 1) * len(columns) + 2 * len(result_entries)
-        if cell_count > _MAX_COPY_CELLS:
-            raise ValueError(
-                "Copy payload exceeds the bounded full-resolution cell limit "
-                f"({_MAX_COPY_CELLS:,})."
-            )
-        chunk_size = int(rows_per_chunk)
-        if chunk_size < 1:
-            raise ValueError("rows_per_chunk must be positive.")
-        total_characters = 0
-        for entry in result_entries:
-            metadata_line = encode_tsv_row(
-                (
-                    "# Kindred canonical result",
-                    encode_clipboard_text(
-                            _canonical_json(_result_provenance_payload(entry))
-                    ),
-                )
-            )
-            total_characters += len(metadata_line)
-            if total_characters > _MAX_COPY_CHARACTERS:
-                raise ValueError(
-                    "Copy payload exceeds the bounded output-size limit "
-                    f"({_MAX_COPY_CHARACTERS // (1024 * 1024)} MiB)."
-                )
-            yield metadata_line
-        header = encode_tsv_row(tuple(header for header, _values, _kind in columns))
-        total_characters += len(header)
-        if total_characters > _MAX_COPY_CHARACTERS:
-            raise ValueError(
-                "Copy payload exceeds the bounded output-size limit "
-                f"({_MAX_COPY_CHARACTERS // (1024 * 1024)} MiB)."
-            )
-        yield header
-        for start in range(0, row_count, chunk_size):
-            output = io.StringIO()
-            for index in range(start, min(start + chunk_size, row_count)):
-                output.write(
-                    encode_tsv_row(
-                        tuple(
-                            (
-                                f"{float(values[index]):.17g}"
-                                if kind == "float"
-                                else (
-                                    str(int(values[index]))
-                                    if kind == "int"
-                                    else encode_clipboard_text(str(values[index]))
-                                )
-                            )
-                            if index < len(values)
-                            else ""
-                            for _header, values, kind in columns
-                        )
-                    )
-                )
-            chunk = output.getvalue()
-            total_characters += len(chunk)
-            if total_characters > _MAX_COPY_CHARACTERS:
-                raise ValueError(
-                    "Copy payload exceeds the bounded output-size limit "
-                    f"({_MAX_COPY_CHARACTERS // (1024 * 1024)} MiB)."
-                )
-            yield chunk
-
-    @staticmethod
-    def validate_xlsx_export(
-        projection: WorkspaceResultProjection,
-    ) -> None:
-        """Validate XLSX worksheet planning before destination creation."""
-
-        if not isinstance(projection, WorkspaceResultProjection):
-            raise TypeError("projection must be a WorkspaceResultProjection.")
-        if projection.unavailable_x_diagnostic is not None:
-            raise ValueError(projection.unavailable_x_diagnostic)
-        blocks = tuple(projection.copy_all_blocks)
-        if not blocks:
-            raise ValueError("No visible result, Reference, or experimental data.")
-        if any(not isinstance(block, ResultDataBlock) for block in blocks):
-            raise TypeError(
-                "XLSX export blocks must contain only ResultDataBlock values."
-            )
-        lineage_row_count = sum(
-            int(bool(block.x_provenance))
-            + sum(bool(provenance) for _, provenance in block.series_provenance)
-            for block in blocks
-        )
-        result_entry_count = len(_unique_result_entries(blocks))
-        dimensions = _planned_xlsx_worksheet_dimensions(
-            blocks,
-            lineage_row_count=lineage_row_count,
-            result_entry_count=result_entry_count,
-        )
-        _validate_xlsx_worksheet_dimensions(dimensions)
-
-    @staticmethod
-    def write_xlsx(
-        projection: WorkspaceResultProjection,
-        destination: BinaryIO,
-        *,
-        cancellation_check: Callable[[], None] | None = None,
-    ) -> XlsxExportCompletion:
-        """Write full-resolution worksheets directly to the destination."""
-
-        WorkspaceResultPresenter.validate_xlsx_export(projection)
-        blocks = projection.copy_all_blocks
-        output = _XlsxDestination(
-            destination,
-            cancellation_check=cancellation_check,
-        )
-        workbook = Workbook(write_only=True)
-        used: set[str] = set()
-        lineage_rows: list[tuple[str, str, Mapping[str, object]]] = []
-        metadata_rows: list[tuple[str, SimulationResultValue]] = []
-        metadata_ids: set[int] = set()
-        data_rows = 0
-        archive: ZipFile | None = None
-        original_failure: BaseException | None = None
-        try:
-            for block in blocks:
-                if cancellation_check is not None:
+            for index in range(block.t.size):
+                if cancellation_check is not None and index % 256 == 0:
                     cancellation_check()
-                title = WorkspaceResultPresenter._worksheet_title(block.label, used)
-                sheet = workbook.create_sheet(title=title)
                 if block.kind is ResultLayerKind.EXPERIMENTAL:
-                    if block.source_row is None:
-                        raise ValueError("experimental XLSX block lacks source_row.")
-                    identity_headers = ["source_row"]
+                    identity_values: list[object] = [int(block.source_row[index])]
                 else:
-                    if (
-                        block.segment_ids is None
-                        or block.segment_keys is None
-                        or block.discontinuity_ids is None
-                    ):
-                        raise ValueError(
-                            "simulation XLSX block lacks executor identity."
-                        )
-                    identity_headers = [
-                        "segment_id",
-                        "segment_key",
-                        "discontinuity_id",
+                    identity_values = [
+                        int(block.segment_ids[index]),
+                        block.segment_keys[index],
+                        int(block.discontinuity_ids[index]),
                     ]
                 _append_xlsx_row(
                     sheet,
                     (
-                        block.x_name,
-                        *identity_headers,
-                        *(name for name, _values in block.series),
+                        float(block.t[index]),
+                        *identity_values,
+                        *(float(values[index]) for _name, values in block.series),
                     ),
                 )
-                for index in range(block.t.size):
-                    if cancellation_check is not None and index % 256 == 0:
-                        cancellation_check()
-                    if block.kind is ResultLayerKind.EXPERIMENTAL:
-                        identity_values: list[object] = [int(block.source_row[index])]
-                    else:
-                        identity_values = [
-                            int(block.segment_ids[index]),
-                            block.segment_keys[index],
-                            int(block.discontinuity_ids[index]),
-                        ]
-                    _append_xlsx_row(
-                        sheet,
-                        (
-                            float(block.t[index]),
-                            *identity_values,
-                            *(float(values[index]) for _name, values in block.series),
-                        ),
-                    )
-                    data_rows += 1
-                if block.x_provenance:
-                    lineage_rows.append((title, block.x_name, block.x_provenance))
-                lineage_rows.extend(
-                    (title, name, provenance)
-                    for name, provenance in block.series_provenance
-                    if provenance
+                data_rows += 1
+            if block.x_provenance:
+                lineage_rows.append((title, block.x_name, block.x_provenance))
+            lineage_rows.extend(
+                (title, name, provenance)
+                for name, provenance in block.series_provenance
+                if provenance
+            )
+            entry = block.result
+            if entry is not None and id(entry) not in metadata_ids:
+                metadata_ids.add(id(entry))
+                metadata_rows.append((title, entry))
+        if lineage_rows:
+            if cancellation_check is not None:
+                cancellation_check()
+            lineage_sheet = workbook.create_sheet(
+                    title=_worksheet_title(
+                    "_Kindred Lineage",
+                    used,
                 )
-                entry = block.result
-                if entry is not None and id(entry) not in metadata_ids:
-                    metadata_ids.add(id(entry))
-                    metadata_rows.append((title, entry))
-            if lineage_rows:
+            )
+            _append_xlsx_row(
+                lineage_sheet,
+                (
+                    "worksheet",
+                    "series",
+                    "dataset_id",
+                    "raw_observation_id",
+                    "dataset_name",
+                    "raw_column",
+                    "model_target",
+                    "set_id",
+                ),
+            )
+            for title, name, provenance in lineage_rows:
                 if cancellation_check is not None:
                     cancellation_check()
-                lineage_sheet = workbook.create_sheet(
-                    title=WorkspaceResultPresenter._worksheet_title(
-                        "_Kindred Lineage",
-                        used,
-                    )
-                )
                 _append_xlsx_row(
                     lineage_sheet,
                     (
-                        "worksheet",
-                        "series",
-                        "dataset_id",
-                        "raw_observation_id",
-                        "dataset_name",
-                        "raw_column",
-                        "model_target",
-                        "set_id",
+                        title,
+                        name,
+                        str(provenance.get("dataset_id") or ""),
+                        str(provenance.get("raw_observation_id") or ""),
+                        str(provenance.get("dataset_name") or ""),
+                        str(provenance.get("raw_column") or ""),
+                        str(provenance.get("model_target") or ""),
+                        str(provenance.get("set_id") or ""),
                     ),
                 )
-                for title, name, provenance in lineage_rows:
-                    if cancellation_check is not None:
-                        cancellation_check()
-                    _append_xlsx_row(
-                        lineage_sheet,
-                        (
-                            title,
-                            name,
-                            str(provenance.get("dataset_id") or ""),
-                            str(provenance.get("raw_observation_id") or ""),
-                            str(provenance.get("dataset_name") or ""),
-                            str(provenance.get("raw_column") or ""),
-                            str(provenance.get("model_target") or ""),
-                            str(provenance.get("set_id") or ""),
-                        ),
-                    )
-                lineage_sheet.sheet_state = "hidden"
-            if metadata_rows:
-                if cancellation_check is not None:
-                    cancellation_check()
-                metadata_sheet = workbook.create_sheet(
-                    title=WorkspaceResultPresenter._worksheet_title(
-                        "_Kindred Result Metadata",
-                        used,
-                    )
-                )
-                _append_xlsx_row(
-                    metadata_sheet,
-                    ("worksheet", "repository_entry"),
-                )
-                for title, entry in metadata_rows:
-                    if cancellation_check is not None:
-                        cancellation_check()
-                    _append_xlsx_row(
-                        metadata_sheet,
-                        (
-                            title,
-                            _canonical_json(_result_provenance_payload(entry)),
-                        ),
-                    )
-                metadata_sheet.sheet_state = "hidden"
+            lineage_sheet.sheet_state = "hidden"
+        if metadata_rows:
             if cancellation_check is not None:
                 cancellation_check()
-            archive = ZipFile(
-                output,
-                "w",
-                ZIP_DEFLATED,
-                allowZip64=True,
+            metadata_sheet = workbook.create_sheet(
+                    title=_worksheet_title(
+                    "_Kindred Result Metadata",
+                    used,
+                )
             )
-            ExcelWriter(workbook, archive).save()
-            return XlsxExportCompletion(
-                worksheet_count=len(used),
-                data_row_count=data_rows,
-                bytes_written=output.bytes_written,
+            _append_xlsx_row(
+                metadata_sheet,
+                ("worksheet", "repository_entry"),
             )
-        except BaseException as exc:
-            original_failure = exc
-            raise
-        finally:
-            cleanup_failures: list[BaseException] = []
-            if archive is not None:
-                try:
-                    archive.close()
-                except BaseException as exc:
-                    cleanup_failures.append(exc)
-            cleanup_failures.extend(_cleanup_write_only_workbook(workbook))
-            if original_failure is None and cleanup_failures:
-                raise cleanup_failures[0]
+            for title, entry in metadata_rows:
+                if cancellation_check is not None:
+                    cancellation_check()
+                _append_xlsx_row(
+                    metadata_sheet,
+                    (
+                        title,
+                        _canonical_json(_result_provenance_payload(entry)),
+                    ),
+                )
+            metadata_sheet.sheet_state = "hidden"
+        if cancellation_check is not None:
+            cancellation_check()
+        archive = ZipFile(
+            output,
+            "w",
+            ZIP_DEFLATED,
+            allowZip64=True,
+        )
+        ExcelWriter(workbook, archive).save()
+        return XlsxExportCompletion(
+            worksheet_count=len(used),
+            data_row_count=data_rows,
+            bytes_written=output.bytes_written,
+        )
+    except BaseException as exc:
+        original_failure = exc
+        raise
+    finally:
+        cleanup_failures: list[BaseException] = []
+        if archive is not None:
+            try:
+                archive.close()
+            except BaseException as exc:
+                cleanup_failures.append(exc)
+        cleanup_failures.extend(_cleanup_write_only_workbook(workbook))
+        if original_failure is None and cleanup_failures:
+            raise cleanup_failures[0]
 
-    @staticmethod
-    def _worksheet_title(label: str, used: set[str]) -> str:
-        invalid = set("[]:*?/\\")
-        base = "".join(
-            "_" if char in invalid or ord(char) < 32 else char for char in str(label)
-        ).strip()
-        base = base.strip("'") or "Result"
-        base = base[:31]
-        candidate = base
-        suffix_index = 2
-        while candidate.casefold() in used:
-            suffix = f" ({suffix_index})"
-            candidate = f"{base[: 31 - len(suffix)]}{suffix}"
-            suffix_index += 1
-        used.add(candidate.casefold())
-        return candidate
+def _worksheet_title(label: str, used: set[str]) -> str:
+    invalid = set("[]:*?/\\")
+    base = "".join(
+        "_" if char in invalid or ord(char) < 32 else char for char in str(label)
+    ).strip()
+    base = base.strip("'") or "Result"
+    base = base[:31]
+    candidate = base
+    suffix_index = 2
+    while candidate.casefold() in used:
+        suffix = f" ({suffix_index})"
+        candidate = f"{base[: 31 - len(suffix)]}{suffix}"
+        suffix_index += 1
+    used.add(candidate.casefold())
+    return candidate

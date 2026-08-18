@@ -9,6 +9,8 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from kindred.core.project_presentation_state import SimulationSeriesAxisSelection
+
 from kindred.gui.interactive_preview import (
     InteractivePreviewBatchIdentity,
     InteractivePreviewFrame,
@@ -21,9 +23,12 @@ from kindred.gui.interactive_preview import (
 from kindred.gui.workspace_result_presenter import (
     InteractiveDisplayCurve,
     InteractiveDisplayProjection,
-    WorkspaceResultPresenter,
-    WorkspaceResultProjection,
+    ResultDataBlock,
+    ResultRenderInput,
+    compose_interactive_display,
+    compose_interactive_display_batch,
 )
+from kindred.gui.plot_config import AxisSelectionCandidate
 
 
 _DISPLAY_EPSILON = 1e-9
@@ -176,7 +181,13 @@ class InteractiveDisplayController:
         self._presented_receipt: InteractivePreviewPresentedReceipt | None = None
         self._next_generation = 0
         self._generation_floor: int | None = None
-        self._workspace_projection: WorkspaceResultProjection | None = None
+        self._render_blocks: tuple[ResultDataBlock, ...] = ()
+        self._render_tab_id = ""
+        self._render_selected_x = SimulationSeriesAxisSelection("t")
+        self._render_selected_y: tuple[object, ...] = ()
+        self._render_selected_y_default = True
+        self._render_x_label = "Time (s)"
+        self._render_y_label = "Value"
         self._frames_by_set: dict[str, InteractivePreviewFrame] = {}
         self._target_dispositions: dict[
             str,
@@ -210,17 +221,49 @@ class InteractiveDisplayController:
 
         return self._batch is not None and not self._retired
 
+    def _accept_render_input(self, render_input: ResultRenderInput) -> None:
+        """Retain only direct facts needed by later frame recomposition."""
+
+        if not isinstance(render_input, ResultRenderInput):
+            raise TypeError("render_input must be a ResultRenderInput.")
+        self._render_blocks = render_input.blocks
+        self._render_tab_id = render_input.tab_id
+        self._render_selected_x = render_input.selected_x_series
+        self._render_selected_y = render_input.selected_y_series
+        self._render_selected_y_default = render_input.selected_y_uses_default_all
+        self._render_x_label = render_input.x_label
+        self._render_y_label = render_input.y_label
+
+    def _call_render_input(self) -> ResultRenderInput:
+        """Build one short-lived input for exactly one frame composition."""
+
+        return ResultRenderInput(
+            tab_id=self._render_tab_id,
+            current_set_id="",
+            blocks=self._render_blocks,
+            selected_x_series=self._render_selected_x,
+            selected_y_series=self._render_selected_y,
+            selected_y_uses_default_all=self._render_selected_y_default,
+            x_label=self._render_x_label,
+            y_label=self._render_y_label,
+            axis_candidates=(
+                AxisSelectionCandidate(
+                    self._render_selected_x,
+                    self._render_x_label,
+                ),
+            ),
+        )
+
     @property
     def has_renderable_frame(self) -> bool:
         """Whether current raw custody can project at least one curve."""
 
-        projection = self._workspace_projection
-        if self._batch is None or projection is None:
+        if self._batch is None or not self._render_blocks:
             return False
         return any(
-            WorkspaceResultPresenter.compose_interactive_display(
+            compose_interactive_display(
                 frame,
-                projection=projection,
+                render_input=self._call_render_input(),
             ).curves
             for frame in self._frames_by_set.values()
         )
@@ -411,7 +454,7 @@ class InteractiveDisplayController:
         self,
         frame: InteractivePreviewFrame,
         *,
-        projection: WorkspaceResultProjection,
+        render_input: ResultRenderInput,
     ) -> InteractivePreviewFrameDisposition | None:
         """Admit one emitted frame and settle it exactly once.
 
@@ -423,9 +466,10 @@ class InteractiveDisplayController:
 
         if not isinstance(frame, InteractivePreviewFrame):
             raise TypeError("frame must be an InteractivePreviewFrame.")
-        if not isinstance(projection, WorkspaceResultProjection):
-            raise TypeError("projection must be a WorkspaceResultProjection.")
-        if frame.tab_id != projection.tab_id:
+        if not isinstance(render_input, ResultRenderInput):
+            raise TypeError("render_input must be a ResultRenderInput.")
+        self._accept_render_input(render_input)
+        if frame.tab_id != render_input.tab_id:
             return self._settle_frame(
                 frame,
                 InteractivePreviewFrameDispositionKind.REJECTED_UNRENDERABLE,
@@ -454,11 +498,10 @@ class InteractiveDisplayController:
                 InteractivePreviewFrameDispositionKind.REJECTED_STALE,
                 message="Interactive target was already terminal.",
             )
-        self._workspace_projection = projection
         try:
-            target = WorkspaceResultPresenter.compose_interactive_display(
+            target = compose_interactive_display(
                 frame,
-                projection=projection,
+                render_input=self._call_render_input(),
             )
         except Exception as exc:
             settled = self._settle_frame(
@@ -482,11 +525,11 @@ class InteractiveDisplayController:
             return settled
         if self._visible is None:
             baseline = InteractiveDisplayProjection(
-                tab_id=projection.tab_id,
+                tab_id=render_input.tab_id,
                 set_id=target.set_id,
                 generation=target.generation,
-                x_label=projection.x_label,
-                y_label=projection.y_label,
+                x_label=render_input.x_label,
+                y_label=render_input.y_label,
                 curves=(),
                 target_set_ids=batch.target_set_ids,
                 batch_id=batch.batch_id,
@@ -496,7 +539,7 @@ class InteractiveDisplayController:
                 # A renderer failure during baseline installation already
                 # emitted the frame's negative disposition and sealed custody.
                 return None
-        self.offer(self._compose_current_projection(projection))
+        self.offer(self._compose_current_projection())
         return None
 
     def offer(self, projection: InteractiveDisplayProjection) -> None:
@@ -646,7 +689,8 @@ class InteractiveDisplayController:
         self._seal_batch()
         self._cancel_scheduled_tick()
         self._present(InteractiveDisplayState((), settled=True), settle_frames=False)
-        self._workspace_projection = None
+        self._render_blocks = ()
+        self._render_tab_id = ""
         if reset_currentness:
             self._issued_batch = None
             self._next_generation = 0
@@ -660,7 +704,7 @@ class InteractiveDisplayController:
         self,
         outcome: InteractivePreviewTerminalOutcome,
         *,
-        projection: WorkspaceResultProjection,
+        render_input: ResultRenderInput,
     ) -> bool:
         """Settle one target's exact terminal fact against current custody."""
 
@@ -668,14 +712,15 @@ class InteractiveDisplayController:
             raise TypeError(
                 "outcome must be InteractivePreviewTerminalOutcome."
             )
-        if not isinstance(projection, WorkspaceResultProjection):
-            raise TypeError("projection must be a WorkspaceResultProjection.")
+        if not isinstance(render_input, ResultRenderInput):
+            raise TypeError("render_input must be a ResultRenderInput.")
+        self._accept_render_input(render_input)
         batch = self._batch
         if (
             batch is None
             or self._retired
             or outcome.batch != batch
-            or projection.tab_id != batch.tab_id
+            or render_input.tab_id != batch.tab_id
         ):
             return False
         state = self._batch_targets.get(outcome.target_set_id)
@@ -700,32 +745,30 @@ class InteractiveDisplayController:
             )
         self._frames_by_set.pop(target, None)
         state.frame = None
-        self._workspace_projection = projection
-        self._reconcile_current_frames(projection)
+        self._reconcile_current_frames()
         self._maybe_seal_batch()
         return True
 
-    def prepare_workspace_projection(
+    def prepare_result_input(
         self,
-        projection: WorkspaceResultProjection,
+        render_input: ResultRenderInput,
     ) -> None:
         """Clear old-semantics resources before exact/base publication.
 
         Successful exact targets transfer out of approximate custody here,
         before the panel is allowed to publish their exact projection.  Active
         sibling frames remain raw controller custody and are reprojected by
-        :meth:`commit_workspace_projection` after the base render succeeds.
+        :meth:`commit_result_input` after the base render succeeds.
         A stopped overlay is retired rather than combined with new semantics.
         """
 
-        if not isinstance(projection, WorkspaceResultProjection):
-            raise TypeError("projection must be a WorkspaceResultProjection.")
+        if not isinstance(render_input, ResultRenderInput):
+            raise TypeError("render_input must be a ResultRenderInput.")
+        self._accept_render_input(render_input)
         if self._batch is None and self._visible is None:
-            self._workspace_projection = projection
             return
         if (self._frozen and not self._exact_release_fenced) or self._retired:
             self.retire(clear_visible=True)
-            self._workspace_projection = projection
             return
         for set_id, state in tuple(self._batch_targets.items()):
             if state.terminal is not InteractivePreviewTerminalState.SUCCESS:
@@ -744,22 +787,45 @@ class InteractiveDisplayController:
         self._visible = None
         self._cancel_scheduled_tick()
         self._present(InteractiveDisplayState((), settled=True), settle_frames=False)
-        self._workspace_projection = projection
         self._maybe_seal_batch()
 
-    def commit_workspace_projection(
+    def commit_result_input(
         self,
-        projection: WorkspaceResultProjection,
+        render_input: ResultRenderInput,
     ) -> None:
         """Reproject retained active frames only after the base scene exists."""
 
-        if not isinstance(projection, WorkspaceResultProjection):
-            raise TypeError("projection must be a WorkspaceResultProjection.")
-        self._workspace_projection = projection
+        if not isinstance(render_input, ResultRenderInput):
+            raise TypeError("render_input must be a ResultRenderInput.")
+        self._accept_render_input(render_input)
         if self._batch is None or self._retired or not self._frames_by_set:
             return
-        target = self._compose_current_projection(projection)
+        target = self._compose_current_projection()
         self.synchronize(target)
+
+    def refresh_result_input(
+        self,
+        render_input: ResultRenderInput,
+    ) -> None:
+        """Refresh canonical block/style facts without changing lifecycle state."""
+
+        if not isinstance(render_input, ResultRenderInput):
+            raise TypeError("render_input must be a ResultRenderInput.")
+        self._accept_render_input(render_input)
+        self._pending = None
+        self._transition = None
+        self._cancel_scheduled_tick()
+        if self._batch is None or not self._frames_by_set:
+            return
+        target = self._compose_current_projection()
+        visible = (InteractiveDisplayLayer(target, 1.0),)
+        state = InteractiveDisplayState(
+            visible,
+            settled=True,
+            masked_set_ids=self._masked_set_ids(visible),
+        )
+        if self._present(state, settle_frames=False):
+            self._visible = visible
 
     def retire(self, *, clear_visible: bool = False) -> bool:
         """Retire cadence/currentness, optionally removing the stable overlay."""
@@ -826,15 +892,14 @@ class InteractiveDisplayController:
             self._frames_by_set.pop(set_id, None)
             state.frame = None
             state.terminal = InteractivePreviewTerminalState.OBSOLETE
-        projection = self._workspace_projection
-        if projection is None or not self._frames_by_set:
+        if not self._render_blocks or not self._frames_by_set:
             self._visible = None
             self._pending = None
             self._transition = None
             self._present(InteractiveDisplayState((), settled=True), settle_frames=False)
             self._maybe_seal_batch()
             return True
-        self._reconcile_current_frames(projection)
+        self._reconcile_current_frames()
         return True
 
     @staticmethod
@@ -917,7 +982,6 @@ class InteractiveDisplayController:
 
     def _compose_current_projection(
         self,
-        projection: WorkspaceResultProjection,
     ) -> InteractiveDisplayProjection:
         batch = self._batch
         if batch is None:
@@ -929,14 +993,13 @@ class InteractiveDisplayController:
         )
         if not frames:
             raise RuntimeError("interactive display batch has no frame custody.")
-        return WorkspaceResultPresenter.compose_interactive_display_batch(
+        return compose_interactive_display_batch(
             frames,
-            projection=projection,
+            render_input=self._call_render_input(),
         )
 
     def _reconcile_current_frames(
         self,
-        projection: WorkspaceResultProjection,
     ) -> None:
         if self._batch is None:
             return
@@ -953,7 +1016,7 @@ class InteractiveDisplayController:
             self._present(InteractiveDisplayState((), settled=True), settle_frames=False)
             self._maybe_seal_batch()
             return
-        target = self._compose_current_projection(projection)
+        target = self._compose_current_projection()
         self._pending = None
         self._transition = None
         self._visible = (InteractiveDisplayLayer(target, 1.0),)
