@@ -233,6 +233,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
 
         if not isinstance(render_input, ResultRenderInput):
             raise TypeError("render_input must be a ResultRenderInput.")
+        self._retire_replaced_interactive_targets(render_input.blocks)
         self._result_blocks = render_input.blocks
         self._result_tab_id = render_input.tab_id
         self._result_current_set_id = render_input.current_set_id
@@ -274,6 +275,42 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
             self._end_interactive_range_session()
         if render_input.unavailable_x_diagnostic is not None:
             self.resultDiagnostic.emit(render_input.unavailable_x_diagnostic)
+
+    def _retire_replaced_interactive_targets(
+        self,
+        incoming_blocks: tuple[ResultDataBlock, ...],
+    ) -> None:
+        """Retire transient curves whose base result authority changed."""
+
+        previous = {
+            str(block.block_id): block
+            for block in self._result_blocks
+            if block.kind in {ResultLayerKind.EXPLICIT, ResultLayerKind.PREVIEW}
+        }
+        incoming = {
+            str(block.block_id): block
+            for block in incoming_blocks
+            if block.kind in {ResultLayerKind.EXPLICIT, ResultLayerKind.PREVIEW}
+        }
+        reference_only = {
+            str(block.block_id)
+            for block in incoming_blocks
+            if block.kind is ResultLayerKind.REFERENCE
+            and str(block.block_id) not in incoming
+        }
+        retired = tuple(
+            set_id
+            for set_id, previous_block in previous.items()
+            if (
+                (current_block := incoming.get(set_id)) is None
+                or not current_block.visible
+                or current_block.kind is not previous_block.kind
+                or current_block.result is not previous_block.result
+            )
+        )
+        self.retire_interactive_preview_targets(
+            tuple(dict.fromkeys((*retired, *reference_only)))
+        )
 
     def apply_interactive_preview_frame(self, frame: object) -> None:
         """Route one frame into the controller-owned physical protocol."""

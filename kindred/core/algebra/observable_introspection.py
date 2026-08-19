@@ -166,9 +166,7 @@ def _admit_local_block(
 ) -> AdmittedAlgebraProgram:
     """Admit local source against the canonical base namespace exactly once."""
 
-    if type(base) is not PreparedDslRequestSet:
-        raise TypeError("base must be an exact PreparedDslRequestSet.")
-    mechanism = base.mechanism_for_execution()
+    mechanism = base.accepted_mechanism_for_structure()
     namespace = build_namespace_from_mechanism(mechanism)
     base_spec = base.parameter_algebra_spec_for_execution()
     occupied = (
@@ -286,10 +284,6 @@ def reenter_fit_local_algebra(
 ) -> AdmittedAlgebraProgram:
     """Re-admit exact local source against a new base, failing closed on drift."""
 
-    if not isinstance(admission, AdmittedAlgebraProgram):
-        raise TypeError("admission must be an AdmittedAlgebraProgram.")
-    if type(base) is not PreparedDslRequestSet:
-        raise TypeError("base must be an exact PreparedDslRequestSet.")
     return _admit_local_block(
         base=base,
         source_text=admission.source_text,
@@ -311,10 +305,6 @@ def apply_admitted_algebra(
     from kindred.core.simulator.dsl_parse import prepare_dsl_request_set
     from kindred.core.units import UnitsModel
 
-    if type(source) is not str or type(base) is not PreparedDslRequestSet:
-        raise TypeError("source and base must be exact canonical request values.")
-    if not isinstance(admission, AdmittedAlgebraProgram):
-        raise TypeError("admission must be an AdmittedAlgebraProgram.")
     if admission.base_analysis != base.analysis:
         raise ValueError("Apply admission is bound to a stale canonical base analysis.")
     if not source_matches_analysis(MechanismAuthoringSource.from_parts(reactions_text=source), base.analysis):
@@ -328,7 +318,7 @@ def apply_admitted_algebra(
     rendered = source + sep + newline.join(scalar_lines + tuple(
         line for line in admission.source_text.splitlines() if line.strip() and not line.lstrip().startswith("#")
     ))
-    metadata = getattr(base.mechanism_for_execution(), "metadata", {})
+    metadata = getattr(base.accepted_mechanism_for_structure(), "metadata", {})
     standard_conc = float(getattr(metadata, "standard_conc_M", 1.0)) if not isinstance(metadata, Mapping) else float(metadata.get("standard_conc_M", 1.0))
     prepared = prepare_dsl_request_set(
         rendered,
@@ -364,8 +354,6 @@ def fit_observable_names(
 ) -> tuple[str, ...]:
     """Return named algebra series available to the Fit evaluator."""
 
-    if not isinstance(prepared_dsl, PreparedDslRequestSet):
-        raise TypeError("prepared_dsl must be a PreparedDslRequestSet.")
     return tuple(sorted(str(name) for name in prepared_dsl.analysis.observable_names))
 
 
@@ -374,8 +362,6 @@ def fit_scalar_names(
 ) -> tuple[str, ...]:
     """Return retained canonical scalar assignments in the Fit namespace."""
 
-    if not isinstance(prepared_dsl, PreparedDslRequestSet):
-        raise TypeError("prepared_dsl must be a PreparedDslRequestSet.")
     spec = prepared_dsl.parameter_algebra_spec_for_execution()
     return tuple(sorted(str(name) for name in spec.param_assignment_names()))
 
@@ -398,9 +384,7 @@ def validate_fit_local_observable(
     if not expression_source:
         raise ValueError("Observable expression must be nonblank.")
 
-    if not isinstance(prepared_dsl, PreparedDslRequestSet):
-        raise TypeError("prepared_dsl must be a PreparedDslRequestSet.")
-    mechanism = prepared_dsl.mechanism_for_execution()
+    mechanism = prepared_dsl.accepted_mechanism_for_structure()
     namespace = build_namespace_from_mechanism(mechanism)
     species = set(prepared_dsl.analysis.species_names)
     retained_scalars = set(fit_scalar_names(prepared_dsl)) | {

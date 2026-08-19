@@ -1941,10 +1941,9 @@ class MainWindow(QtWidgets.QMainWindow):
 
         target = str(tab_id)
         try:
-            plot = self._workspace.plot_for_tab(target)
+            self._workspace.plot_for_tab(target)
         except (KeyError, RuntimeError):
             return
-        plot.discard_interactive_display()
         if target in self._slider_apply_refreshing:
             return
         self._render_results_for_tab(target)
@@ -3026,10 +3025,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if not accepted:
             return False
         self._refresh_tab_controls(target)
-        self.set_status_text(
-            "Slider values applied. Affected simulation results were "
-            "invalidated; Run to recompute."
-        )
+        self.set_status_text("Slider values applied; exact Preview promoted to current results.")
         return True
 
     # ------------------------------------------------------------------

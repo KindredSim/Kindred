@@ -30,10 +30,10 @@ Non-goals
 
 from __future__ import annotations
 
-import copy
 import logging
 import math
 from dataclasses import dataclass, field, replace
+from threading import Lock
 from typing import Dict, List, Mapping, Optional, Tuple, TYPE_CHECKING
 
 import re
@@ -445,6 +445,10 @@ class PreparedDslRequestSet:
         "__intervention_execution",
         "__parameter_algebra_spec",
         "__wegscheider_admission_report",
+        "__compiled_ode_topology",
+        "__symbolic_jacobian_structure",
+        "__symbolic_structure_initialized",
+        "__structure_lock",
     )
 
     def __init__(
@@ -484,18 +488,124 @@ class PreparedDslRequestSet:
         self.__intervention_execution = intervention_execution
         self.__parameter_algebra_spec = parameter_algebra_spec
         self.__wegscheider_admission_report = wegscheider_admission_report
+        self.__compiled_ode_topology = None
+        self.__symbolic_jacobian_structure = None
+        self.__symbolic_structure_initialized = False
+        self.__structure_lock = Lock()
 
-    def mechanism_for_execution(self) -> object:
-        return copy.deepcopy(self.__mechanism)
+    def mutable_mechanism_shell(self) -> object:
+        from collections.abc import Mapping
+
+        from kindred.core.mechanism import Mechanism
+        from kindred.core.rate_binding import ForwardRateBinding, RateBinding
+
+        def clone_binding(value: object) -> object:
+            if isinstance(value, ForwardRateBinding):
+                return ForwardRateBinding(
+                    name=value.name,
+                    model=value.model,
+                    reference_temperature_K=value.reference_temperature_K,
+                )
+            if isinstance(value, RateBinding):
+                return RateBinding(name=value.name, value=float(value.value))
+            if isinstance(value, Mapping):
+                return {key: clone_binding(item) for key, item in value.items()}
+            if isinstance(value, list):
+                return [clone_binding(item) for item in value]
+            if isinstance(value, tuple):
+                return tuple(clone_binding(item) for item in value)
+            if isinstance(value, (set, frozenset)):
+                return type(value)(clone_binding(item) for item in value)
+            return value
+
+        shell = Mechanism()
+        shell.species = self.__mechanism.species
+        shell.metadata = clone_binding(
+            getattr(self.__mechanism, "metadata", {}) or {}
+        )
+        shell.reactions = [
+            replace(
+                reaction,
+                rate=clone_binding(reaction.rate),
+                overrides=clone_binding(reaction.overrides),
+            )
+            for reaction in self.__mechanism.reactions
+        ]
+        shell.equilibria = [
+            replace(
+                equilibrium,
+                Keq=clone_binding(equilibrium.Keq),
+                kf=clone_binding(equilibrium.kf),
+                kr=clone_binding(equilibrium.kr),
+                metadata=clone_binding(equilibrium.metadata),
+            )
+            for equilibrium in self.__mechanism.equilibria
+        ]
+        compiled_series = getattr(self.__mechanism, "_compiled_algebra_series", None)
+        if compiled_series is not None:
+            setattr(shell, "_compiled_algebra_series", compiled_series)
+        return shell
+
+    def accepted_mechanism_for_structure(self) -> object:
+        """Return the privately retained accepted mechanism for read-only use."""
+
+        return self.__mechanism
+
+    def compiled_ode_topology(self) -> object:
+        """Lazily retain one immutable ODE topology for this accepted owner."""
+
+        topology = self.__compiled_ode_topology
+        if topology is None:
+            with self.__structure_lock:
+                topology = self.__compiled_ode_topology
+                if topology is None:
+                    from kindred.core.ode_builder import CompiledOdeTopology
+
+                    topology = CompiledOdeTopology.from_mechanism(
+                        self.__mechanism
+                    )
+                    self.__compiled_ode_topology = topology
+        return topology
+
+    def symbolic_jacobian_structure(self) -> object:
+        """Lazily retain the canonical global-cache symbolic structure."""
+
+        structure = self.__symbolic_jacobian_structure
+        if not self.__symbolic_structure_initialized:
+            with self.__structure_lock:
+                if not self.__symbolic_structure_initialized:
+                    from kindred.core.simulation_preparation_stages import (
+                        _symbolic_jacobian_structure_for_mechanism,
+                    )
+
+                    structure = _symbolic_jacobian_structure_for_mechanism(
+                        mechanism=self.__mechanism
+                    )
+                    self.__symbolic_jacobian_structure = structure
+                    self.__symbolic_structure_initialized = True
+                structure = self.__symbolic_jacobian_structure
+        return structure
+
+    def ensure_scientific_structures(self) -> tuple[object, object]:
+        """Build common scientific structures before target-local execution."""
+
+        return self.compiled_ode_topology(), self.symbolic_jacobian_structure()
+
+    def temperature_schedule_for_execution(self) -> object:
+        from kindred.core.mechanism_metadata import MechanismMetadataView
+
+        return MechanismMetadataView.from_metadata(
+            getattr(self.__mechanism, "metadata", {}) or {}
+        ).temperature_schedule
 
     def parameterized_intervention_schedule_for_binding(self) -> InterventionSchedule | None:
-        return copy.deepcopy(self.__intervention_schedule)
+        return self.__intervention_schedule
 
     def intervention_execution_contract(self) -> InterventionExecutionContract | None:
         return self.__intervention_execution
 
     def parameter_algebra_spec_for_execution(self) -> object:
-        return copy.deepcopy(self.__parameter_algebra_spec)
+        return self.__parameter_algebra_spec
 
     def wegscheider_admission_report(self) -> WegscheiderCyclicityReport:
         """Return immutable source-admission truth captured before Algebra."""
@@ -2126,22 +2236,10 @@ def derive_source_with_parameter_updates(
         lookup_step_param_target,
     )
 
-    if type(base) is not PreparedDslRequestSet:
-        raise TypeError("base must be exact PreparedDslRequestSet.")
-    if type(source_text) is not str:
-        raise TypeError("source_text must be an exact str.")
     if base.analysis.inline_initial_conditions.has_declarations:
         raise ValueError(
             "Typed parameter derivation requires canonical materialized "
             "initial conditions."
-        )
-    if type(updates) is not tuple or any(
-        type(item) is not DslParameterCoordinateUpdate
-        for item in updates
-    ):
-        raise TypeError(
-            "updates must be an exact tuple of "
-            "DslParameterCoordinateUpdate values."
         )
     if type(wegscheider_cyclicity_enabled) is not bool:
         raise TypeError(
@@ -2158,7 +2256,7 @@ def derive_source_with_parameter_updates(
     if len(names) != len(set(names)):
         raise ValueError("DSL parameter update names must be unique.")
 
-    mechanism = base.mechanism_for_execution()
+    mechanism = base.mutable_mechanism_shell()
     initials = {
         str(name): float(species.initial_conc)
         for name, species in getattr(mechanism, "species", {}).items()
@@ -2491,7 +2589,7 @@ def derive_source_with_parameter_updates(
             standard_conc_M=metadata_view.standard_conc_M,
         ),
     )
-    admitted_mechanism = prepared.mechanism_for_execution()
+    admitted_mechanism = prepared.mutable_mechanism_shell()
     admitted_metadata = getattr(admitted_mechanism, "metadata", None)
     if isinstance(admitted_metadata, dict):
         admitted_metadata[

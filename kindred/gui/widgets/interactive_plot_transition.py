@@ -257,6 +257,12 @@ class InteractiveDisplayController:
         affected = targets.intersection(known)
         if not affected:
             return False
+        # Retiring a target is a local currentness fence as well as a
+        # projection removal. Any callback from the retired frame generation
+        # must be rejected even when the execution owner has not yet issued a
+        # successor request.
+        if self._generation is not None:
+            self._generation += 1
         roster = tuple(self._target_set_ids)
         if not roster:
             for frame in self._frames.values():

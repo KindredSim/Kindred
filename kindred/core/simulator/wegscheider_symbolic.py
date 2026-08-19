@@ -5,7 +5,7 @@ from fractions import Fraction
 from math import exp, gcd, isclose, isfinite, log
 from functools import reduce
 import re
-from typing import Any, Mapping, Sequence
+from typing import Mapping, Sequence
 
 from kindred.core.constants import R
 from kindred.core.equilibrium_rate_authority import (

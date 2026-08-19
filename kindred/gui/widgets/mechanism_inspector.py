@@ -21,7 +21,6 @@ from kindred.core.simulator.parameter_algebra import (
     apply_parameter_algebra_spec_to_mechanism,
 )
 from kindred.core.simulator.step_indexing import get_step_index_map, iter_canonical_parameters
-from kindred.core.symbolic.jacobian import build_symbolic_jacobian_structure
 
 __all__ = ["MechanismInspectorDialog", "MechanismInspectorSections", "build_mechanism_inspector_sections"]
 
@@ -37,14 +36,17 @@ def build_mechanism_inspector_sections(
     prepared_dsl: PreparedDslRequestSet,
 ) -> MechanismInspectorSections:
     """Build read-only inspector sections from the same core authorities used at runtime."""
-    if not isinstance(prepared_dsl, PreparedDslRequestSet):
-        raise TypeError("prepared_dsl must be a PreparedDslRequestSet.")
-    mechanism = prepared_dsl.mechanism_for_execution()
-    apply_parameter_algebra_spec_to_mechanism(
-        prepared_dsl.parameter_algebra_spec_for_execution(),
-        mechanism=mechanism,
-        require_mutable=False,
-    )
+    accepted_mechanism = prepared_dsl.accepted_mechanism_for_structure()
+    parameter_spec = prepared_dsl.parameter_algebra_spec_for_execution()
+    if parameter_spec.param_statements:
+        mechanism = prepared_dsl.mutable_mechanism_shell()
+        apply_parameter_algebra_spec_to_mechanism(
+            parameter_spec,
+            mechanism=mechanism,
+            require_mutable=False,
+        )
+    else:
+        mechanism = accepted_mechanism
     parameterized_schedule = prepared_dsl.parameterized_intervention_schedule_for_binding()
     intervention_execution = prepared_dsl.intervention_execution_contract()
     return MechanismInspectorSections(
@@ -55,7 +57,7 @@ def build_mechanism_inspector_sections(
         equations_text=_safe_format_section(
             "equations",
             lambda: _format_equations(
-                mechanism,
+                prepared_dsl.symbolic_jacobian_structure(),
                 has_interventions=(
                     parameterized_schedule is not None
                     or bool(intervention_execution and intervention_execution.declarative_payload.get("operations"))
@@ -151,8 +153,7 @@ def _rate_authority_for_step(
     return snapshot if isinstance(snapshot, Mapping) else None
 
 
-def _format_equations(mechanism: object, *, has_interventions: bool) -> str:
-    structure = build_symbolic_jacobian_structure(mechanism)
+def _format_equations(structure: object, *, has_interventions: bool) -> str:
     lines = ["Canonical symbolic RHS equations:"]
     if has_interventions:
         lines.append("Note: intervention schedules are compiled execution inputs; equations here are the base unscheduled mechanism RHS.")

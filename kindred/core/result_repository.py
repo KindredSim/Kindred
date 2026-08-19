@@ -615,7 +615,7 @@ class ResultRepository:
             raise TypeError("execution_request must be a SimulationExecutionRequest.")
         if not isinstance(result, SimulationResultValue):
             raise TypeError("result must be a SimulationResultValue.")
-        entry = (sid, execution_request.isolated_copy(), result)
+        entry = (sid, execution_request, result)
         self._current_by_set_id[sid] = entry
         self._current_run_set_ids.add(sid)
         self._reference_by_set_id.pop(sid, None)
@@ -648,7 +648,7 @@ class ResultRepository:
             raise TypeError("result must be a SimulationResultValue.")
         self._current_by_set_id[sid] = (
             sid,
-            execution_request.isolated_copy(),
+            execution_request,
             result,
         )
         self._current_run_set_ids.discard(sid)

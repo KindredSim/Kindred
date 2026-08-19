@@ -13,7 +13,7 @@ from __future__ import annotations
 import math
 import logging
 from dataclasses import dataclass
-from typing import Callable, List, Mapping, Optional, Tuple
+from typing import Callable, Mapping, Optional
 
 import numpy as np
 
@@ -45,10 +45,10 @@ from .kinetics import (
 logger = logging.getLogger(__name__)
 
 __all__ = [
+    "CompiledOdeTopology",
     "EffectiveRateCoefficients",
     "EffectiveRateCoefficientEvaluator",
     "build_effective_rate_coefficient_evaluator",
-    "build_ode_rhs_from_mechanism",
 ]
 
 
@@ -425,8 +425,110 @@ def build_effective_rate_coefficient_evaluator(
     )
 
 
-def build_ode_rhs_from_mechanism(
-    mechanism: Mechanism
+@dataclass(frozen=True, slots=True)
+class CompiledOdeTopology:
+    """Mechanism-invariant numerical lowering shared by execution targets.
+
+    The arrays in this value are structural and read-only.  ``bind_target``
+    creates a target-local coefficient evaluator and RHS closure; none of the
+    mutable solver workspace or rate bindings is retained here.
+    """
+
+    species_names: tuple[str, ...]
+    step_kinds: tuple[str, ...]
+    stoichiometry: np.ndarray
+    forward_exponents: np.ndarray
+    reverse_exponents: np.ndarray
+    forward_mask: np.ndarray
+    reverse_mask: np.ndarray
+    fractional_forward_mask: np.ndarray
+    fractional_reverse_mask: np.ndarray
+    reaction_count: int
+
+    @classmethod
+    def from_mechanism(cls, mechanism: Mechanism) -> "CompiledOdeTopology":
+        species_names = tuple(mechanism.species_names())
+        n_species = len(species_names)
+        species_index = {name: idx for idx, name in enumerate(species_names)}
+        steps: list[tuple[str, Reaction | Equilibrium]] = [
+            *(("reaction", rxn) for rxn in mechanism.reactions),
+            *(("equilibrium", eq) for eq in mechanism.equilibria),
+        ]
+        n_steps = len(steps)
+        stoichiometry = np.zeros((n_species, n_steps), dtype=float)
+        forward_exponents = np.zeros((n_steps, n_species), dtype=float)
+        reverse_exponents = np.zeros((n_steps, n_species), dtype=float)
+        step_kinds: list[str] = []
+        for index, (kind, step) in enumerate(steps):
+            step_kinds.append(kind)
+            if kind == "reaction":
+                reaction = step
+                stoichiometry[:, index] = reaction.net_stoich_vector(species_names)
+                for name, order in reaction.rate_orders.items():
+                    forward_exponents[index, species_index[name]] = float(order)
+            else:
+                equilibrium = step
+                stoichiometry[:, index] = np.asarray(
+                    equilibrium.back_vector(species_names), dtype=float
+                ) - np.asarray(equilibrium.forward_vector(species_names), dtype=float)
+                for name, coefficient in equilibrium.stoich_forward.items():
+                    forward_exponents[index, species_index[name]] = float(coefficient)
+                for name, coefficient in equilibrium.stoich_back.items():
+                    reverse_exponents[index, species_index[name]] = float(coefficient)
+        forward_mask = forward_exponents != 0.0
+        reverse_mask = reverse_exponents != 0.0
+        fractional_forward_mask = forward_mask & (
+            forward_exponents != np.rint(forward_exponents)
+        )
+        fractional_reverse_mask = reverse_mask & (
+            reverse_exponents != np.rint(reverse_exponents)
+        )
+        arrays = (
+            stoichiometry,
+            forward_exponents,
+            reverse_exponents,
+            forward_mask,
+            reverse_mask,
+            fractional_forward_mask,
+            fractional_reverse_mask,
+        )
+        for array in arrays:
+            array.setflags(write=False)
+        return cls(
+            species_names=species_names,
+            step_kinds=tuple(step_kinds),
+            stoichiometry=stoichiometry,
+            forward_exponents=forward_exponents,
+            reverse_exponents=reverse_exponents,
+            forward_mask=forward_mask,
+            reverse_mask=reverse_mask,
+            fractional_forward_mask=fractional_forward_mask,
+            fractional_reverse_mask=fractional_reverse_mask,
+            reaction_count=len(mechanism.reactions),
+        )
+
+    def bind_target(
+        self,
+        mechanism: Mechanism,
+    ) -> tuple[EffectiveRateCoefficientEvaluator, Callable[..., np.ndarray]]:
+        """Bind one target's rate authority and mutable RHS workspace."""
+
+        if tuple(mechanism.species_names()) != self.species_names:
+            raise ValueError("Target mechanism species order conflicts with compiled ODE topology.")
+        if len(mechanism.reactions) + len(mechanism.equilibria) != len(self.step_kinds):
+            raise ValueError("Target mechanism step order conflicts with compiled ODE topology.")
+        coefficient_evaluator = build_effective_rate_coefficient_evaluator(mechanism)
+        return coefficient_evaluator, _build_bound_ode_rhs(
+            self,
+            mechanism,
+            coefficient_evaluator,
+        )
+
+
+def _build_bound_ode_rhs(
+    topology: CompiledOdeTopology,
+    mechanism: Mechanism,
+    coefficient_evaluator: EffectiveRateCoefficientEvaluator,
 ) -> Callable[..., np.ndarray]:
     """
     Build ODE right-hand side function from a Mechanism.
@@ -451,60 +553,21 @@ def build_ode_rhs_from_mechanism(
       (stoichiometry is not duplicated into two irreversible columns).
     - Stoichiometry determines species changes via a BLAS-free reduction.
     """
-    species_names = mechanism.species_names()
+    species_names = topology.species_names
     n_species = len(species_names)
-    species_index = {name: idx for idx, name in enumerate(species_names)}
-    coefficient_evaluator = build_effective_rate_coefficient_evaluator(
-        mechanism
-    )
     default_temperature = float(
         coefficient_evaluator.nominal_temperature_K
     )
 
-    # Build list of all steps (irreversible reactions + equilibria)
-    steps: List[Tuple[str, Reaction | Equilibrium]] = []
-    for rxn in mechanism.reactions:
-        steps.append(("reaction", rxn))
-    for eq in mechanism.equilibria:
-        steps.append(("equilibrium", eq))
-
-    n_steps = len(steps)
-    n_reactions = len(mechanism.reactions)
-    S = np.zeros((n_species, n_steps))
-    exp_forward = np.zeros((n_steps, n_species), dtype=float)
-    exp_reverse = np.zeros((n_steps, n_species), dtype=float)
-
-    for i_step, (step_type, step_obj) in enumerate(steps):
-        if step_type == "reaction":
-            rxn = step_obj  # type: ignore[assignment]
-            vec = rxn.net_stoich_vector(species_names)
-            S[:, i_step] = vec
-
-            for sp_name, order in rxn.rate_orders.items():
-                idx = species_index[sp_name]
-                exp_forward[i_step, idx] = float(order)
-
-        elif step_type == "equilibrium":
-            eq = step_obj  # type: ignore[assignment]
-            fwd_vec = np.array(eq.forward_vector(species_names))
-            back_vec = np.array(eq.back_vector(species_names))
-            S[:, i_step] = back_vec - fwd_vec
-
-            for sp_name, stoich_coef in eq.stoich_forward.items():
-                exp_forward[i_step, species_index[sp_name]] = stoich_coef
-            for sp_name, stoich_coef in eq.stoich_back.items():
-                exp_reverse[i_step, species_index[sp_name]] = stoich_coef
-        else:
-            raise ValueError(f"Unknown step type: {step_type}")
-
-    forward_mask = exp_forward != 0.0
-    reverse_mask = exp_reverse != 0.0
-    fractional_forward_mask = forward_mask & (
-        exp_forward != np.rint(exp_forward)
-    )
-    fractional_reverse_mask = reverse_mask & (
-        exp_reverse != np.rint(exp_reverse)
-    )
+    n_steps = len(topology.step_kinds)
+    n_reactions = topology.reaction_count
+    S = topology.stoichiometry
+    exp_forward = topology.forward_exponents
+    exp_reverse = topology.reverse_exponents
+    forward_mask = topology.forward_mask
+    reverse_mask = topology.reverse_mask
+    fractional_forward_mask = topology.fractional_forward_mask
+    fractional_reverse_mask = topology.fractional_reverse_mask
     forward_buffer = np.ones_like(exp_forward)
     forward_power_bases = np.empty_like(exp_forward)
     reverse_buffer = np.ones_like(exp_reverse)
@@ -531,16 +594,16 @@ def build_ode_rhs_from_mechanism(
         step_names: list[str] = []
         for index in selected:
             idx = int(index)
-            if 0 <= idx < len(steps):
-                step_type, _step = steps[idx]
+            if 0 <= idx < len(topology.step_kinds):
+                step_type = topology.step_kinds[idx]
                 step_names.append(f"{step_type}{idx}")
                 if step_type == "reaction":
-                    binding = getattr(_step, "rate", None)
+                    binding = getattr(mechanism.reactions[idx], "rate", None)
                     binding_name = getattr(binding, "name", None)
                     if binding_name is not None:
                         names.append(str(binding_name))
                 else:
-                    equilibrium = _step
+                    equilibrium = mechanism.equilibria[idx - n_reactions]
                     for binding in (
                         getattr(equilibrium, "kf", None),
                         getattr(equilibrium, "kr", None),

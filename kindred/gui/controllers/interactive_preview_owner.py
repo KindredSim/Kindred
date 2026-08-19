@@ -17,6 +17,7 @@ from PySide6 import QtCore
 from kindred.core.exceptions import SimulationCancelled
 from kindred.core.result_repository import SimulationResultValue
 from kindred.core.simulation_failure import FactualCause
+from kindred.core.simulator.dsl_parse import PreparedDslRequestSet
 from kindred.core.simulator.solver_types import SimulationCancellationControl
 from kindred.gui.computation_gate import ComputationGate
 from kindred.gui.interactive_preview import (
@@ -85,6 +86,37 @@ class _InteractivePreviewWorker(QtCore.QThread):
         return self._cancel_event.is_set()
 
     def run(self) -> None:
+        owners: dict[int, PreparedDslRequestSet] = {}
+        for target in self._request.targets:
+            owners.setdefault(id(target.prepared_dsl), target.prepared_dsl)
+        try:
+            for prepared_dsl in owners.values():
+                prepared_dsl.ensure_scientific_structures()
+        except BaseException as exc:  # noqa: BLE001
+            for target in self._request.targets:
+                self.target_terminal.emit(
+                    self._generation,
+                    _InteractiveTerminal(
+                        self._generation,
+                        target,
+                        "failure",
+                        message=str(exc) or type(exc).__name__,
+                        cause=_simulation_worker_cause(exc),
+                    ),
+                )
+            return
+        if self.cancelled:
+            for target in self._request.targets:
+                self.target_terminal.emit(
+                    self._generation,
+                    _InteractiveTerminal(
+                        self._generation,
+                        target,
+                        "cancelled",
+                        message="Interactive Preview cancelled.",
+                    ),
+                )
+            return
         with ThreadPoolExecutor(
             max_workers=self._max_parallel,
             thread_name_prefix="kindred-preview",

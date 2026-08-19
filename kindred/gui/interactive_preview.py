@@ -77,11 +77,8 @@ class InteractivePreviewTarget:
     def __post_init__(self) -> None:
         object.__setattr__(self, "set_id", _required_text(self.set_id, "set_id"))
         object.__setattr__(self, "set_name", _required_text(self.set_name, "set_name"))
-        if not isinstance(self.prepared_dsl, PreparedDslRequestSet):
-            raise TypeError("prepared_dsl must be a PreparedDslRequestSet.")
-        if not isinstance(self.execution_request, SimulationExecutionRequest):
-            raise TypeError("execution_request must be a SimulationExecutionRequest.")
-        object.__setattr__(self, "execution_request", self.execution_request.isolated_copy())
+        if self.execution_request.prepared_dsl is not self.prepared_dsl:
+            raise ValueError("Interactive Preview request must retain its accepted prepared owner.")
 
 
 @dataclass(frozen=True, slots=True)

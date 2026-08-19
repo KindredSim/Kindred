@@ -700,6 +700,7 @@ class ProjectController(QtCore.QObject):
         )
         if disposition is None:
             return False, ()
+        self._discard_slider_drafts()
         if not self._settle_replacement_workers():
             return False, ()
 

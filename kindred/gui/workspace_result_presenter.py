@@ -1242,8 +1242,14 @@ def compose_interactive_display(
         (
             block for block in render_input.blocks
             if block.block_id == frame.set_id
-            and block.kind in {ResultLayerKind.EXPLICIT, ResultLayerKind.PREVIEW}
-            and block.visible
+            and (
+                (
+                    block.kind
+                    in {ResultLayerKind.EXPLICIT, ResultLayerKind.PREVIEW}
+                    and block.visible
+                )
+                or block.kind is ResultLayerKind.REFERENCE
+            )
         ),
         None,
     )
@@ -1492,7 +1498,11 @@ def compose_result_input(
                     if visible.set_id == current_id:
                         blocks.append(replace(reference_semantic, visible=False))
                 add_warning(reference_semantic.label, reference, True)
-            elif visible.set_id == current_id:
+            else:
+                # Retain the semantic Reference block even when its ordinary
+                # line is hidden. Interactive Preview needs this authority as
+                # its foreground base, and the physical renderer honors the
+                # block's invisible presentation flag.
                 blocks.append(reference_semantic)
             annotations.extend(_annotations_from_execution(reference))
         if visible.set_id == current_id:

@@ -41,13 +41,13 @@ from kindred.core.intervention_schedule import coerce_intervention_schedule
 from kindred.core.simulation_preparation import (
     SimulationExecutionRequest,
     PreparedSimulationRun,
-    _bind_parameters_to_mechanism,
+    _apply_execution_parameter_algebra,
+    _bind_request_parameter_overrides,
     _canonical_step_override_name,
     _classify_request_parameter_names,
     _parameter_algebra_scalar_authority_names,
     _require_wegscheider_admission_for_execution,
     _schedule_resolution_values_for_request,
-    _validate_bound_wegscheider_for_execution,
     fit_simulation_error_from_preparation_error,
     prepare_preparation_failure,
     raise_unowned_request_parameter_values,
@@ -434,7 +434,7 @@ def prepare_fitting_execution_context(
         and cancellation_control.cancel_requested()
     ):
         raise FittingCancelled()
-    mechanism = prepared_dsl.mechanism_for_execution()
+    mechanism = prepared_dsl.accepted_mechanism_for_structure()
     unresolved_intervention_schedule = coerce_intervention_schedule(
         prepared_dsl.parameterized_intervention_schedule_for_binding()
     )
@@ -533,7 +533,6 @@ def prepare_fitting_execution_context(
         constrained_keq_targets = {
             name for name in constrained if namespace_info[name].role == "Keq"
         }
-        constrained_mutable_targets = set(constrained) - constrained_keq_targets
         requested = {
             _canonical_step_override_name(mechanism, str(name))
             for name in (set(mechanism_names) | set(unbound_mechanism_names))
@@ -547,28 +546,6 @@ def prepare_fitting_execution_context(
                 "Wegscheider/algebra constraints overwrite them: "
                 + ", ".join(requested_dependent_keq),
             )
-        mech_bind_names = sorted(
-            {
-                str(name)
-                for name in (
-                    (requested - constrained_keq_targets)
-                    | constrained_mutable_targets
-                )
-                if str(name) in namespace_info
-            }
-        )
-        _bind_parameters_to_mechanism(mechanism, mech_bind_names)
-        from kindred.core.simulator.parameter_algebra import apply_parameter_algebra_spec_to_mechanism
-        apply_parameter_algebra_spec_to_mechanism(
-            parameter_algebra_spec,
-            mechanism=mechanism,
-            require_mutable=True,
-        )
-        _validate_bound_wegscheider_for_execution(
-            mechanism=mechanism,
-            admission_report=admission_report,
-            wegscheider_cyclicity_enabled=prepared_solver_config.wegscheider_cyclicity_enabled,
-        )
     except SimulationPreparationError as exc:
         raise fit_simulation_error_from_preparation_error(exc) from exc
     except ValueError as exc:
@@ -577,10 +554,10 @@ def prepare_fitting_execution_context(
         ) from exc
     execution_request = SimulationExecutionRequest(
         analysis=prepared_dsl.analysis,
-        mechanism=mechanism,
+        prepared_dsl=prepared_dsl,
         species_names=species_names,
         y0=tuple(float(value) for value in y0),
-        temperature_schedule=metadata_view_for_mechanism(mechanism).temperature_schedule,
+        temperature_schedule=prepared_dsl.temperature_schedule_for_execution(),
         parameter_algebra_spec=parameter_algebra_spec,
         intervention_execution=prepared_dsl.intervention_execution_contract(),
         t_span=(float(t_start), float(t_end)),
@@ -597,6 +574,7 @@ def prepare_fitting_execution_context(
         and cancellation_control.cancel_requested()
     ):
         raise FittingCancelled()
+    prepared_dsl.ensure_scientific_structures()
     prepared_run = prepare_simulation_worker_run(
         execution_request=execution_request,
         cancellation_control=cancellation_control,
@@ -669,6 +647,18 @@ class SerialFittingEvaluator:
             raise FitSimulationError("Fit prepared run must retain a typed request.")
         typed_schedule = typed_request.parameterized_intervention_schedule
         try:
+            preflight_mechanism = typed_request.prepared_dsl.mutable_mechanism_shell()
+            _apply_execution_parameter_algebra(
+                mechanism=preflight_mechanism,
+                parameter_algebra_spec=typed_request.parameter_algebra_spec,
+                require_mutable=True,
+            )
+            _bind_request_parameter_overrides(
+                mechanism=preflight_mechanism,
+                parameter_algebra_spec=typed_request.parameter_algebra_spec,
+                parameter_overrides=non_initial_parameters,
+                unresolved_intervention_schedule=typed_schedule,
+            )
             raw_values: dict[str, float] = {}
             mechanism_names: set[str] = set()
             unbound_mechanism_names: set[str] = set()
@@ -680,7 +670,7 @@ class SerialFittingEvaluator:
             schedule_name_by_raw: dict[str, str] = {}
             invalid_messages: dict[str, str] = {}
             _classify_request_parameter_names(
-                mechanism=typed_request.mechanism,
+                mechanism=preflight_mechanism,
                 parameter_overrides=non_initial_parameters,
                 unresolved_intervention_schedule=typed_schedule,
                 raw_values=raw_values,
@@ -919,6 +909,18 @@ class SerialFittingEvaluator:
             raise FitSimulationError("Fit prepared run must retain a typed request.")
         typed_schedule = typed_request.parameterized_intervention_schedule
         try:
+            preflight_mechanism = typed_request.prepared_dsl.mutable_mechanism_shell()
+            _apply_execution_parameter_algebra(
+                mechanism=preflight_mechanism,
+                parameter_algebra_spec=typed_request.parameter_algebra_spec,
+                require_mutable=True,
+            )
+            _bind_request_parameter_overrides(
+                mechanism=preflight_mechanism,
+                parameter_algebra_spec=typed_request.parameter_algebra_spec,
+                parameter_overrides=non_initial_parameters,
+                unresolved_intervention_schedule=typed_schedule,
+            )
             preflight_raw_values: dict[str, float] = {}
             preflight_mechanism_names: set[str] = set()
             preflight_unbound_mechanism_names: set[str] = set()
@@ -930,7 +932,7 @@ class SerialFittingEvaluator:
             preflight_schedule_name_by_raw: dict[str, str] = {}
             preflight_invalid_messages: dict[str, str] = {}
             _classify_request_parameter_names(
-                mechanism=typed_request.mechanism,
+                mechanism=preflight_mechanism,
                 parameter_overrides=non_initial_parameters,
                 unresolved_intervention_schedule=typed_schedule,
                 raw_values=preflight_raw_values,

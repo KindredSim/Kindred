@@ -8,7 +8,6 @@ preparation, and RHS compilation for the execution paths that consume them.
 
 from __future__ import annotations
 
-import copy
 import logging
 from numbers import Real
 from dataclasses import dataclass, replace
@@ -18,8 +17,6 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, Iterable, List, Mapping, 
 import numpy as np
 
 from kindred.core.rate_binding import ForwardRateBinding, RateBinding
-from kindred.core.mechanism import Equilibrium, Mechanism, Reaction
-from kindred.core.species import Species
 from kindred.core.exceptions import (
     FitSimulationError,
     FittingCancelled,
@@ -49,7 +46,6 @@ from kindred.core.intervention_schedule_compiler import (
     compile_intervention_schedule,
 )
 from kindred.core.simulator.parameter_algebra_spec import ParameterAlgebraSpec
-from kindred.core.ode_builder import build_ode_rhs_from_mechanism
 from kindred.core.simulator.solver_types import (
     SimulationRequest,
     SimulationCancellationControl,
@@ -142,8 +138,6 @@ def _simulation_container_values_equal(left: object, right: object) -> bool:
         return bool(np.array_equal(left, right))
     if type(left) is ParameterAlgebraSpec:
         return _parameter_algebra_specs_equal(left, right)
-    if isinstance(left, (ForwardRateBinding, RateBinding)):
-        return _rate_values_equal(left, right)
     if isinstance(left, TemperatureSchedule):
         return _temperature_schedules_equal(left, right)
     if isinstance(left, Mapping):
@@ -170,79 +164,6 @@ def _simulation_container_values_equal(left: object, right: object) -> bool:
     if isinstance(left, (str, bytes, int, float, bool, type(None))):
         return bool(left == right)
     return False
-
-
-def _rate_values_equal(left: object, right: object) -> bool:
-    """Compare the typed rate holders retained inside copied mechanisms."""
-
-    if type(left) is not type(right):
-        return False
-    if isinstance(left, ForwardRateBinding):
-        return (
-            left.name == right.name
-            and left.value == right.value
-            and left.reference_temperature_K == right.reference_temperature_K
-            and left.model == right.model
-        )
-    if isinstance(left, RateBinding):
-        return left.name == right.name and left.value == right.value
-    if isinstance(left, (int, float, str, bytes, type(None))):
-        return bool(left == right)
-    return False
-
-
-def _mechanisms_equal(left: object, right: object) -> bool:
-    """Compare mechanism topology, metadata, rates, and copied coordinates."""
-
-    if type(left) is not type(right) or not isinstance(left, Mechanism):
-        return False
-    other = right
-    left_species = tuple(left.species.items())
-    right_species = tuple(other.species.items())
-    if len(left_species) != len(right_species):
-        return False
-    if any(
-        name != other_name
-        or type(species) is not Species
-        or type(other_species) is not Species
-        or species.name != other_species.name
-        or species.initial_conc != other_species.initial_conc
-        for (name, species), (other_name, other_species) in zip(
-            left_species,
-            right_species,
-            strict=True,
-        )
-    ):
-        return False
-    if len(left.reactions) != len(other.reactions) or len(left.equilibria) != len(other.equilibria):
-        return False
-    for reaction, other_reaction in zip(left.reactions, other.reactions, strict=True):
-        if type(reaction) is not Reaction or type(other_reaction) is not Reaction:
-            return False
-        if not (
-            _simulation_container_values_equal(reaction.reactants, other_reaction.reactants)
-            and _simulation_container_values_equal(reaction.products, other_reaction.products)
-            and _simulation_container_values_equal(reaction.rate_orders, other_reaction.rate_orders)
-            and _simulation_container_values_equal(reaction.net_stoich, other_reaction.net_stoich)
-            and _simulation_container_values_equal(reaction.overrides, other_reaction.overrides)
-            and reaction.order == other_reaction.order
-            and _rate_values_equal(reaction.rate, other_reaction.rate)
-        ):
-            return False
-    for equilibrium, other_equilibrium in zip(left.equilibria, other.equilibria, strict=True):
-        if type(equilibrium) is not Equilibrium or type(other_equilibrium) is not Equilibrium:
-            return False
-        if not (
-            _simulation_container_values_equal(equilibrium.stoich_forward, other_equilibrium.stoich_forward)
-            and _simulation_container_values_equal(equilibrium.stoich_back, other_equilibrium.stoich_back)
-            and _rate_values_equal(equilibrium.Keq, other_equilibrium.Keq)
-            and _rate_values_equal(equilibrium.kf, other_equilibrium.kf)
-            and _rate_values_equal(equilibrium.kr, other_equilibrium.kr)
-            and equilibrium.fast == other_equilibrium.fast
-            and _simulation_container_values_equal(equilibrium.metadata, other_equilibrium.metadata)
-        ):
-            return False
-    return _simulation_container_values_equal(left.metadata, other.metadata)
 
 
 def _temperature_schedules_equal(left: object, right: object) -> bool:
@@ -299,13 +220,12 @@ def simulation_execution_requests_equal(
     left: SimulationExecutionRequest,
     right: SimulationExecutionRequest,
 ) -> bool:
-    """Compare every typed field of two complete execution requests."""
+    """Compare one accepted owner identity and its typed target values."""
 
     if type(left) is not SimulationExecutionRequest or type(right) is not SimulationExecutionRequest:
         return False
     return (
-        left.analysis == right.analysis
-        and _mechanisms_equal(left.mechanism, right.mechanism)
+        left.prepared_dsl is right.prepared_dsl
         and left.species_names == right.species_names
         and left.y0 == right.y0
         and _temperature_schedules_equal(left.temperature_schedule, right.temperature_schedule)
@@ -773,10 +693,10 @@ def build_simulation_request_from_prepared_run(
 
 @dataclass(frozen=True, slots=True)
 class SimulationExecutionRequest:
-    """Exact direct request for one isolated simulation target."""
+    """Exact direct request for one target of an accepted prepared owner."""
 
     analysis: DslAnalysis
-    mechanism: Any
+    prepared_dsl: PreparedDslRequestSet
     species_names: tuple[str, ...]
     y0: tuple[float, ...]
     temperature_schedule: TemperatureScheduleProtocol | None
@@ -796,6 +716,10 @@ class SimulationExecutionRequest:
 
         if type(self.analysis) is not DslAnalysis:
             raise TypeError("execution request analysis must be DslAnalysis.")
+        if type(self.prepared_dsl) is not PreparedDslRequestSet:
+            raise TypeError("execution request prepared_dsl must be PreparedDslRequestSet.")
+        if self.analysis != self.prepared_dsl.analysis:
+            raise ValueError("execution request analysis must be the accepted owner analysis.")
         species_names = tuple(self.species_names)
         if (
             not species_names
@@ -922,35 +846,13 @@ class SimulationExecutionRequest:
         object.__setattr__(self, "t_span", t_span)
         object.__setattr__(self, "parameter_overrides", overrides)
 
-    def isolated_copy(self) -> "SimulationExecutionRequest":
-        return type(self)(
-            analysis=self.analysis,
-            mechanism=copy.deepcopy(self.mechanism),
-            species_names=self.species_names,
-            y0=self.y0,
-            temperature_schedule=copy.deepcopy(self.temperature_schedule),
-            parameter_algebra_spec=copy.deepcopy(self.parameter_algebra_spec),
-            intervention_execution=self.intervention_execution,
-            t_span=self.t_span,
-            solver_config=self.solver_config,
-            wegscheider_admission_report=self.wegscheider_admission_report,
-            parameterized_intervention_schedule=copy.deepcopy(self.parameterized_intervention_schedule),
-            requested_parameter_names=self.requested_parameter_names,
-            candidate_dependent_intervention_parameter_names=self.candidate_dependent_intervention_parameter_names,
-            parameter_overrides=self.parameter_overrides,
-            mechanism_source=self.mechanism_source,
-        )
-
-
 _MISSING = object()
 
 
 def _fresh_preparation_unresolved_intervention_schedule_for_request(
     execution_request: SimulationExecutionRequest,
 ) -> InterventionSchedule | None:
-    return copy.deepcopy(
-        execution_request.parameterized_intervention_schedule
-    )
+    return execution_request.parameterized_intervention_schedule
 
 
 def _parameter_algebra_dependency_graph(
@@ -1161,7 +1063,7 @@ def _schedule_parameters_deferred_to_prepared_request(
     if not requested or not referenced:
         return frozenset()
 
-    mechanism = execution_request.mechanism
+    mechanism = execution_request.prepared_dsl.accepted_mechanism_for_structure()
     spec = execution_request.parameter_algebra_spec
     namespace = build_namespace_from_mechanism(mechanism)
 
@@ -1194,7 +1096,7 @@ def _schedule_parameters_deferred_to_prepared_request(
 def bind_simulation_execution_request_interventions(
     request: SimulationExecutionRequest,
 ) -> SimulationExecutionRequest:
-    """Bind and compile one parameterized direct target exactly once."""
+    """Retain declarative target schedules for worker-local resolution."""
 
     if not isinstance(request, SimulationExecutionRequest):
         raise TypeError(
@@ -1209,131 +1111,7 @@ def bind_simulation_execution_request_interventions(
             request,
             candidate_dependent_intervention_parameter_names=deferred,
         )
-    mechanism = request.mechanism
-    prepared_solver_config = request.solver_config
-    metadata = getattr(mechanism, "metadata", None)
-    if isinstance(metadata, dict):
-        metadata[MechanismMetadataKeys.WEGSCHEIDER_CYCLICITY_ENABLED] = (
-            prepared_solver_config.wegscheider_cyclicity_enabled
-        )
-    _require_wegscheider_admission_for_execution(
-        admission_report=request.wegscheider_admission_report,
-        wegscheider_cyclicity_enabled=(
-            prepared_solver_config.wegscheider_cyclicity_enabled
-        ),
-    )
-    _apply_execution_parameter_algebra(
-        mechanism=mechanism,
-        parameter_algebra_spec=request.parameter_algebra_spec,
-        require_mutable=True,
-    )
-    dependency_metadata = _expanded_intervention_schedule_dependency_metadata(
-        unresolved,
-        mechanism=mechanism,
-        parameter_algebra_spec=request.parameter_algebra_spec,
-    )
-    try:
-        _bind_request_parameter_overrides(
-            mechanism=mechanism,
-            parameter_algebra_spec=request.parameter_algebra_spec,
-            parameter_overrides=request.parameter_overrides,
-            unresolved_intervention_schedule=unresolved,
-        )
-        raw_values: dict[str, float] = {}
-        mechanism_names: set[str] = set()
-        unbound_mechanism_names: set[str] = set()
-        schedule_names: set[str] = set()
-        scalar_names: set[str] = set()
-        unknown_names: set[str] = set()
-        mechanism_name_by_raw: dict[str, str] = {}
-        unbound_mechanism_name_by_raw: dict[str, str] = {}
-        schedule_name_by_raw: dict[str, str] = {}
-        invalid_messages: dict[str, str] = {}
-        _classify_request_parameter_names(
-            mechanism=mechanism,
-            parameter_overrides=request.parameter_overrides,
-            unresolved_intervention_schedule=unresolved,
-            raw_values=raw_values,
-            mechanism_names=mechanism_names,
-            unbound_mechanism_names=unbound_mechanism_names,
-            schedule_names=schedule_names,
-            scalar_names=scalar_names,
-            unknown_names=unknown_names,
-            mechanism_name_by_raw=mechanism_name_by_raw,
-            unbound_mechanism_name_by_raw=unbound_mechanism_name_by_raw,
-            schedule_name_by_raw=schedule_name_by_raw,
-            invalid_messages=invalid_messages,
-        )
-        _validate_bound_wegscheider_for_execution(
-            mechanism=mechanism,
-            admission_report=request.wegscheider_admission_report,
-            wegscheider_cyclicity_enabled=(
-                prepared_solver_config.wegscheider_cyclicity_enabled
-            ),
-        )
-        resolved = _resolve_intervention_schedule_for_request(
-            unresolved,
-            parameter_values=_schedule_resolution_values_for_request(
-                unresolved,
-                raw_values=raw_values,
-                mechanism_name_by_raw=mechanism_name_by_raw,
-                unbound_mechanism_name_by_raw=unbound_mechanism_name_by_raw,
-                schedule_name_by_raw=schedule_name_by_raw,
-                mechanism=mechanism,
-            ),
-            dependency_metadata=dependency_metadata,
-        )
-        if resolved is not None:
-            resolved.validate_species(request.species_names)
-        contract = compile_intervention_schedule(
-            resolved,
-            dependency_metadata=dependency_metadata,
-        )
-    except SimulationPreparationError:
-        raise
-    except (InterventionScheduleError, ValueError) as exc:
-        details = dict(getattr(exc, "details", {}) or {})
-        dependencies = tuple(
-            getattr(exc, "value_dependencies", ())
-            or details.get("value_dependencies", ())
-        )
-        if dependencies:
-            details["value_dependencies"] = dependencies
-        raise SimulationPreparationError(
-            "intervention_schedule",
-            str(exc),
-            parameter_names=dependencies,
-            details=details,
-        ) from exc
-    schedule_only_names = {
-        name
-        for name in schedule_names
-        if schedule_name_by_raw.get(name, name) not in mechanism_names
-        and schedule_name_by_raw.get(name, name) not in unbound_mechanism_names
-        and name not in scalar_names
-    }
-    remaining_overrides = {
-        str(name): float(value)
-        for name, value in dict(request.parameter_overrides or {}).items()
-        if str(name) not in schedule_only_names
-    }
-    return SimulationExecutionRequest(
-        analysis=request.analysis,
-        mechanism=mechanism,
-        species_names=request.species_names,
-        y0=request.y0,
-        temperature_schedule=request.temperature_schedule,
-        parameter_algebra_spec=request.parameter_algebra_spec,
-        intervention_execution=contract,
-        t_span=request.t_span,
-        solver_config=request.solver_config,
-        wegscheider_admission_report=request.wegscheider_admission_report,
-        parameterized_intervention_schedule=None,
-        requested_parameter_names=request.requested_parameter_names,
-        candidate_dependent_intervention_parameter_names=frozenset(),
-        parameter_overrides=remaining_overrides or None,
-        mechanism_source=request.mechanism_source,
-    )
+    return request
 
 
 def solver_config_for_execution_settings(
@@ -1460,8 +1238,7 @@ def build_simulation_execution_request(
         raise ValueError(
             "prepared DSL nominal temperature does not match tab science."
         )
-    mechanism = prepared_dsl.mechanism_for_execution()
-    species_names = tuple(str(name) for name in mechanism.species_names())
+    species_names = tuple(str(name) for name in prepared_dsl.analysis.species_names)
     if not species_names:
         raise ValueError("prepared execution requires at least one species.")
     if set(normalized_initials) != set(species_names):
@@ -1470,10 +1247,10 @@ def build_simulation_execution_request(
         )
     request = SimulationExecutionRequest(
         analysis=prepared_dsl.analysis,
-        mechanism=mechanism,
+        prepared_dsl=prepared_dsl,
         species_names=species_names,
         y0=tuple(normalized_initials[name] for name in species_names),
-        temperature_schedule=metadata_view_for_mechanism(mechanism).temperature_schedule,
+        temperature_schedule=prepared_dsl.temperature_schedule_for_execution(),
         parameter_algebra_spec=prepared_dsl.parameter_algebra_spec_for_execution(),
         intervention_execution=prepared_dsl.intervention_execution_contract(),
         t_span=(t_start, t_end),
@@ -2133,18 +1910,19 @@ def prepare_simulation_worker_run(
     )
     prepared_solver_config = execution_request.solver_config
     try:
-        # Keep direct/manual requests fail-closed before request isolation or
-        # any worker-owned preparation mutates an isolated mechanism.
+        # Validate the target grid before worker-owned preparation mutates its
+        # one execution shell.
         build_time_grid(t_span[0], t_span[1], prepared_solver_config.grid)
     except (TypeError, ValueError) as exc:
         raise SimulationPreparationError(
             "time_grid",
             "execution grid cannot be realized on this time span.",
         ) from exc
-    execution_request = execution_request.isolated_copy()
+    topology = execution_request.prepared_dsl.compiled_ode_topology()
+    symbolic_structure = execution_request.prepared_dsl.symbolic_jacobian_structure()
     _raise_if_cancelled(cancellation_control)
 
-    mechanism = execution_request.mechanism
+    mechanism = execution_request.prepared_dsl.mutable_mechanism_shell()
     rhs: Callable[..., np.ndarray] | None = None
     species_names = list(execution_request.species_names)
     y0 = np.asarray(execution_request.y0, dtype=float).reshape(-1).copy()
@@ -2284,7 +2062,7 @@ def prepare_simulation_worker_run(
 
     if rhs is None:
         try:
-            rhs = build_ode_rhs_from_mechanism(mechanism)
+            _coefficient_evaluator, rhs = topology.bind_target(mechanism)
         except Exception as exc:
             raise SimulationPreparationError("ode_build", str(exc)) from exc
     _raise_if_cancelled(cancellation_control)
@@ -2295,6 +2073,8 @@ def prepare_simulation_worker_run(
             solver_config=prepared_solver_config,
             temperature_schedule=temperature_schedule_override,
             metadata_view=metadata_view_for_mechanism,
+            symbolic_structure=symbolic_structure,
+            coefficient_evaluator=_coefficient_evaluator,
         )
     except Exception as exc:
         raise SimulationPreparationError("temperature_schedule", str(exc)) from exc

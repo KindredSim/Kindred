@@ -108,10 +108,6 @@ class SymbolicCalculatorOwner:
         canonical_prepared_dsl: Callable[[], PreparedDslRequestSet | None],
         canonical_source: Callable[[], MechanismAuthoringSource],
     ) -> None:
-        if not callable(canonical_prepared_dsl):
-            raise TypeError("canonical_prepared_dsl must be callable.")
-        if not callable(canonical_source):
-            raise TypeError("canonical_source must be callable.")
         self._canonical_prepared_dsl = canonical_prepared_dsl
         self._canonical_source = canonical_source
         self._snapshot: SymbolicCalculatorSnapshot | None = None
@@ -147,7 +143,11 @@ class SymbolicCalculatorOwner:
         query_s = str(query or "").strip()
         if not query_s:
             return self.view_state()
-        self.refresh()
+        # Accepted-source reconciliation explicitly refreshes this owner.  A
+        # query must reuse the one target-local projection for that accepted
+        # snapshot instead of rebuilding a mechanism shell for every query.
+        if self._snapshot is None:
+            self.refresh()
         if not self._available or self._snapshot is None:
             return self.view_state()
         try:
@@ -254,13 +254,7 @@ class SymbolicCalculatorOwner:
         prepared_dsl = self._canonical_prepared_dsl()
         if prepared_dsl is None:
             return None, False, "Canonical mechanism is empty."
-        if not isinstance(prepared_dsl, PreparedDslRequestSet):
-            raise TypeError(
-                "Canonical symbolic input must be PreparedDslRequestSet or None."
-            )
         source = self._canonical_source()
-        if not isinstance(source, MechanismAuthoringSource):
-            raise TypeError("canonical_source must return MechanismAuthoringSource.")
         if not source_matches_analysis(source, prepared_dsl.analysis):
             return (
                 None,
@@ -284,7 +278,7 @@ class SymbolicCalculatorOwner:
                     "Symbolic calculator is unavailable for mechanisms with "
                     "scheduled interventions.",
                 )
-            mechanism = prepared_dsl.mechanism_for_execution()
+            mechanism = prepared_dsl.mutable_mechanism_shell()
             apply_parameter_algebra_spec_to_mechanism(
                 prepared_dsl.parameter_algebra_spec_for_execution(),
                 mechanism=mechanism,

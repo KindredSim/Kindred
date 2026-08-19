@@ -164,12 +164,18 @@ def _bind_symbolic_jacobian_for_current_mechanism(
     mechanism: Any,
     prepared_solver_config: PreparedSolverConfig,
     temperature_schedule: TemperatureScheduleProtocol | None,
+    symbolic_structure: Any = None,
+    coefficient_evaluator: Any = None,
 ) -> SymbolicJacobianExecution:
     if prepared_solver_config.solver.upper() not in {"BDF", "RADAU"}:
         raise UnsupportedSymbolicExpressionError(
             "Symbolic Jacobian requires BDF or Radau."
         )
-    structure = _symbolic_jacobian_structure_for_mechanism(mechanism=mechanism)
+    structure = (
+        symbolic_structure
+        if symbolic_structure is not None
+        else _symbolic_jacobian_structure_for_mechanism(mechanism=mechanism)
+    )
     if structure is None:
         raise UnsupportedSymbolicExpressionError("symbolic structure is unsupported.")
     from kindred.core.ode_builder import build_effective_rate_coefficient_evaluator
@@ -180,7 +186,8 @@ def _bind_symbolic_jacobian_for_current_mechanism(
                 "Symbolic Jacobian requires a deterministic typed temperature "
                 "schedule; arbitrary callables are unsupported."
             )
-    coefficient_evaluator = build_effective_rate_coefficient_evaluator(mechanism)
+    if coefficient_evaluator is None:
+        coefficient_evaluator = build_effective_rate_coefficient_evaluator(mechanism)
     jacobian_func = structure.bind(
         coefficient_evaluator,
         temperature_schedule=temperature_schedule,
@@ -197,6 +204,8 @@ def build_prepared_run_context(
     solver_config: PreparedSolverConfig,
     temperature_schedule: TemperatureScheduleProtocol | None,
     metadata_view: Callable[..., Any],
+    symbolic_structure: Any = None,
+    coefficient_evaluator: Any = None,
 ) -> tuple[
     TemperatureScheduleProtocol | None,
     SymbolicJacobianExecution,
@@ -220,6 +229,8 @@ def build_prepared_run_context(
                 mechanism=mechanism,
                 prepared_solver_config=solver_config,
                 temperature_schedule=resolved_temperature_schedule,
+                symbolic_structure=symbolic_structure,
+                coefficient_evaluator=coefficient_evaluator,
             )
         except UnsupportedSymbolicExpressionError as exc:
             symbolic_jacobian = _symbolic_jacobian_for_bind_failure(mechanism, exc)

@@ -194,8 +194,6 @@ def enumerate_parameter_coordinates(
 ) -> tuple[GuiParameterCoordinate, ...]:
     """Enumerate writable coordinates from one accepted typed DSL authority."""
 
-    if not isinstance(prepared_dsl, PreparedDslRequestSet):
-        raise TypeError("prepared_dsl must be a PreparedDslRequestSet.")
     temperature = float(prepared_dsl.analysis.temperature_K)
     temperature = validate_temperature(
         temperature,
@@ -203,7 +201,7 @@ def enumerate_parameter_coordinates(
     )
     if type(wegscheider_cyclicity_enabled) is not bool:
         raise TypeError("wegscheider_cyclicity_enabled must be a bool.")
-    mechanism = prepared_dsl.mechanism_for_execution()
+    mechanism = prepared_dsl.mutable_mechanism_shell()
     metadata = getattr(mechanism, "metadata", {}) or {}
     if isinstance(metadata, dict):
         metadata[MechanismMetadataKeys.WEGSCHEIDER_CYCLICITY_ENABLED] = bool(
