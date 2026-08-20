@@ -292,11 +292,24 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
             for block in incoming_blocks
             if block.kind in {ResultLayerKind.EXPLICIT, ResultLayerKind.PREVIEW}
         }
-        reference_only = {
-            str(block.block_id)
+        previous_reference = {
+            str(block.block_id): block
+            for block in self._result_blocks
+            if block.kind is ResultLayerKind.REFERENCE
+        }
+        incoming_reference = {
+            str(block.block_id): block
             for block in incoming_blocks
             if block.kind is ResultLayerKind.REFERENCE
-            and str(block.block_id) not in incoming
+        }
+        reference_only = {
+            set_id for set_id in (*previous_reference, *incoming_reference)
+            if set_id not in incoming
+            and (
+                (previous_block := previous_reference.get(set_id)) is None
+                or (current_block := incoming_reference.get(set_id)) is None
+                or previous_block.result is not current_block.result
+            )
         }
         retired = tuple(
             set_id
@@ -306,6 +319,19 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
                 or not current_block.visible
                 or current_block.kind is not previous_block.kind
                 or current_block.result is not previous_block.result
+            )
+        )
+        retired = tuple(
+            dict.fromkeys(
+                (
+                    *retired,
+                    *(
+                        set_id
+                        for set_id in incoming
+                        if set_id not in previous
+                        and set_id in previous_reference
+                    ),
+                )
             )
         )
         self.retire_interactive_preview_targets(

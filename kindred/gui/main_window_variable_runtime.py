@@ -18,6 +18,7 @@ from kindred.core.project_document import (
 from kindred.core.simulation_preparation import (
     SimulationExecutionRequest,
     build_simulation_execution_request,
+    simulation_execution_requests_equal,
 )
 from kindred.core.species import validate_concentration
 from kindred.core.simulator.dsl_parse import (
@@ -1195,8 +1196,6 @@ class TabSliderBinding(QtCore.QObject):
                 scientific_settings=tab.scientific_settings,
                 parameter_values=dict(parameter_values),
             )
-            if execution_request.intervention_execution is None:
-                raise ValueError("Preview intervention schedule did not bind to one exact execution contract.")
             constructed.append(
                 (
                     set_id,
@@ -1205,6 +1204,60 @@ class TabSliderBinding(QtCore.QObject):
                 )
             )
         return tuple(constructed)
+
+    def _construct_candidate_tab(
+        self,
+        tab: MechanismTabDocument,
+        targets: tuple[str, ...],
+    ) -> MechanismTabDocument:
+        """Materialize the exact tab represented by the current Slider draft."""
+
+        runtime = self._registry.tab_runtime(tab.tab_id)
+        parameter_updates = dict(runtime.slider_parameter_draft)
+        species_updates = {
+            set_id: dict(values)
+            for set_id, values in runtime.slider_species_drafts_by_set_id.items()
+            if set_id in targets and values
+        }
+        source = tab.mechanism_source
+        candidate_prepared_dsl = tab.prepared_dsl
+        if parameter_updates:
+            prepared_dsl = tab.prepared_dsl
+            if not isinstance(prepared_dsl, PreparedDslRequestSet):
+                raise ValueError(
+                    "Slider candidate requires retained DSL analysis."
+                )
+            derived_source, candidate_prepared_dsl = (
+                derive_source_with_parameter_updates(
+                    source.reactions_text,
+                    prepared_dsl,
+                    tuple(
+                        DslParameterCoordinateUpdate(
+                            name=str(name),
+                            value=float(value),
+                        )
+                        for name, value in parameter_updates.items()
+                    ),
+                    wegscheider_cyclicity_enabled=bool(
+                        tab.scientific_settings.wegscheider_policy
+                    ),
+                )
+            )
+            source = source.with_reactions_text(derived_source)
+        candidate_sets = []
+        for initial_set in tab.initial_condition_sets:
+            updates = species_updates.get(initial_set.set_id)
+            if not updates:
+                candidate_sets.append(initial_set)
+                continue
+            values = initial_set.values_dict()
+            values.update(updates)
+            candidate_sets.append(initial_set.with_values(values))
+        return replace(
+            tab,
+            mechanism_source=source,
+            prepared_dsl=candidate_prepared_dsl,
+        ).with_initial_condition_sets(tuple(candidate_sets))
 
     def _begin_preview_cycle(
         self,
@@ -1240,7 +1293,19 @@ class TabSliderBinding(QtCore.QObject):
                 preserve_reference=True,
             )
             return True
-        prepared_dsl = tab.prepared_dsl
+        preview_tab = tab
+        preview_projection = projection
+        if interaction is not SliderInteractionKind.INTERACTIVE_DRAG_SAMPLE:
+            try:
+                preview_tab = self._construct_candidate_tab(tab, roster)
+            except (LookupError, TypeError, ValueError) as exc:
+                self._reject(
+                    "Preview candidate construction failed before admission "
+                    f"({type(exc).__name__}: {exc})."
+                )
+                return False
+            preview_projection = None
+        prepared_dsl = preview_tab.prepared_dsl
         if not isinstance(prepared_dsl, PreparedDslRequestSet):
             self._reject(
                 "Preview requires accepted Reactions with retained DSL analysis."
@@ -1254,8 +1319,8 @@ class TabSliderBinding(QtCore.QObject):
                 else None
             )
             constructed = self._construct_preview_requests(
-                tab,
-                projection,
+                preview_tab,
+                preview_projection,
                 roster,
                 sampling=sampling,
             )
@@ -1295,8 +1360,8 @@ class TabSliderBinding(QtCore.QObject):
             self._interactive_preview_owner.request(request)
             return True
 
-        # The binding constructs one raw request batch.  The owner performs
-        # whole-batch validation and owns the sole pending exact intent.
+        # The binding constructs one candidate request batch.  The owner
+        # performs whole-batch admission and owns the sole pending exact intent.
         self._stop_preview_timers()
         try:
             self._interactive_preview_owner.retire(
@@ -1577,13 +1642,11 @@ class TabSliderBinding(QtCore.QObject):
         self._interactive_stop_fenced = True
         self._clear_gesture_state()
         runtime = self._registry.tab_runtime(self._tab_id)
-        parameter_updates = dict(runtime.slider_parameter_draft)
-        species_updates = {
-            set_id: dict(values)
-            for set_id, values in runtime.slider_species_drafts_by_set_id.items()
-            if values
-        }
-        if not parameter_updates and not species_updates:
+        roster = self.resolve_target_set_ids()
+        if not runtime.slider_parameter_draft and not any(
+            runtime.slider_species_drafts_by_set_id.get(set_id)
+            for set_id in roster
+        ):
             self.publish_slider_draft_state()
             return False
         if runtime.reactions_draft is not None:
@@ -1592,75 +1655,26 @@ class TabSliderBinding(QtCore.QObject):
             )
         tab = self._registry.tab(self._tab_id)
         expected_token = self._registry.capture_content_token()
-        roster = self.resolve_target_set_ids()
-        try:
-            prepared_dsl = tab.prepared_dsl
-            if not isinstance(prepared_dsl, PreparedDslRequestSet):
-                raise ValueError(
-                    "Slider Apply requires accepted Reactions with retained DSL analysis."
-                )
-            _projection = build_parameter_slider_projection(
-                prepared_dsl,
-                wegscheider_cyclicity_enabled=(
-                    tab.scientific_settings.wegscheider_policy
-                ),
-            )
-        except (TypeError, ValueError) as exc:
-            return self._reject(f"Slider Apply failed before admission ({exc}).")
         if not roster or not self._preview_inputs_valid(roster):
             return False
-        try:
-            preview_requests = self._construct_preview_requests(
-                tab,
-                _projection,
-                roster,
+        if self._interactive_preview_owner.busy:
+            return self._reject(
+                "Slider Apply requires a settled exact Preview; interactive Preview is still active."
             )
-        except Exception as exc:  # noqa: BLE001
-            return self._reject(f"Slider Apply failed before admission ({exc}).")
-        source = tab.mechanism_source
-        candidate_prepared_dsl = tab.prepared_dsl
-        if parameter_updates:
-            try:
-                prepared_dsl = tab.prepared_dsl
-                if not isinstance(prepared_dsl, PreparedDslRequestSet):
-                    raise TypeError(
-                        "Slider Apply requires retained DSL analysis."
-                    )
-                derived_source, candidate_prepared_dsl = (
-                    derive_source_with_parameter_updates(
-                        source.reactions_text,
-                        prepared_dsl,
-                        tuple(
-                            DslParameterCoordinateUpdate(
-                                name=str(name),
-                                value=float(value),
-                            )
-                            for name, value in parameter_updates.items()
-                        ),
-                        wegscheider_cyclicity_enabled=bool(
-                            tab.scientific_settings.wegscheider_policy
-                        ),
-                    )
-                )
-                source = source.with_reactions_text(derived_source)
-            except (LookupError, TypeError, ValueError) as exc:
-                return self._reject(f"Slider Apply failed ({exc}).")
-        candidate_sets = []
-        for initial_set in tab.initial_condition_sets:
-            updates = species_updates.get(initial_set.set_id)
-            if not updates:
-                candidate_sets.append(initial_set)
-                continue
-            values = initial_set.values_dict()
-            values.update(updates)
-            candidate_sets.append(initial_set.with_values(values))
-        candidate = replace(
-            tab,
-            mechanism_source=source,
-            prepared_dsl=candidate_prepared_dsl,
-        ).with_initial_condition_sets(tuple(candidate_sets))
+        preview_pairs = self._simulation_jobs.capture_preview_pairs_for_apply(
+            tab.tab_id,
+            roster,
+        )
+        if preview_pairs is None:
+            return self._reject(
+                "Slider Apply requires one complete, settled exact Preview for the current draft and target roster."
+            )
+
         try:
-            canonical_requests = tuple(
+            candidate = self._construct_candidate_tab(tab, roster)
+            prepared_dsl = preview_pairs[0][1].prepared_dsl
+            candidate = replace(candidate, prepared_dsl=prepared_dsl)
+            candidate_requests = tuple(
                 (set_id, request)
                 for set_id, _name, request in self._construct_preview_requests(
                     candidate,
@@ -1670,16 +1684,17 @@ class TabSliderBinding(QtCore.QObject):
             )
         except Exception as exc:  # noqa: BLE001
             return self._reject(f"Slider Apply failed before admission ({exc}).")
-        if self._interactive_preview_owner.busy:
-            return self._reject(
-                "Slider Apply requires a settled exact Preview; interactive Preview is still active."
+        if any(
+            not simulation_execution_requests_equal(
+                request,
+                preview_request,
             )
-        results = self._simulation_jobs.capture_preview_results_for_apply(
-            tab.tab_id,
-            preview_requests,
-            canonical_requests,
-        )
-        if results is None:
+            for (_set_id, request), (
+                _preview_set_id,
+                preview_request,
+                _result,
+            ) in zip(candidate_requests, preview_pairs)
+        ):
             return self._reject(
                 "Slider Apply requires one complete, settled exact Preview for the current draft and target roster."
             )
@@ -1691,16 +1706,15 @@ class TabSliderBinding(QtCore.QObject):
         )
         if result is None:
             return False
-        self._simulation_jobs.publish_preview_results_as_run(
+        self._simulation_jobs.publish_preview_pairs_as_run(
             tab.tab_id,
-            canonical_requests,
-            results,
+            preview_pairs,
         )
         live_runtime = self._registry.tab_runtime(self._tab_id)
         live_runtime.slider_parameter_draft.clear()
-        live_runtime.slider_species_drafts_by_set_id.clear()
+        for set_id in roster:
+            live_runtime.slider_species_drafts_by_set_id.pop(set_id, None)
         self.clear_preview_detailed_balance_block()
-        self._emit_draft_state()
         return True
 
     def reset(self) -> bool:

@@ -2424,6 +2424,25 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         if not changed:
             return
+        slider_binding = self._tab_surfaces[tab_id].slider_binding
+        slider_targets = slider_binding.resolve_target_set_ids()
+        if set_id in slider_targets:
+            runtime = self._workspace_tab_registry.tab_runtime(tab_id)
+            protected_slider_state = bool(
+                runtime.slider_parameter_draft
+                or any(
+                    runtime.slider_species_drafts_by_set_id.get(target_set_id)
+                    for target_set_id in slider_targets
+                )
+                or slider_binding.active_preview_set_ids
+                or self._simulation_jobs.pending_preview_tab_id == tab_id
+                or (
+                    self._simulation_jobs.current_kind == "preview"
+                    and self._simulation_jobs.origin_tab_id == tab_id
+                )
+            )
+            if protected_slider_state:
+                return
         try:
             tab = self._workspace_tab_registry.tab(tab_id)
             target = self._build_explicit_target_for_tab(

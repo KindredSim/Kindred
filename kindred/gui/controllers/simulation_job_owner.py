@@ -618,47 +618,44 @@ class SimulationJobOwner(QtCore.QObject):
             self.run_dispatched.emit(str(tab_id), tuple(target.set_id for target in targets))
         return True
 
-    def capture_preview_results_for_apply(
+    def capture_preview_pairs_for_apply(
         self,
         tab_id: str,
-        preview_requests: tuple[tuple[str, str, SimulationExecutionRequest], ...],
-        canonical_requests: tuple[tuple[str, SimulationExecutionRequest], ...],
-    ) -> tuple[SimulationResultValue, ...] | None:
+        roster_set_ids: tuple[str, ...],
+    ) -> tuple[
+        tuple[str, SimulationExecutionRequest, SimulationResultValue], ...
+    ] | None:
         if (
             self._worker is not None
+            or self._operation is not None
             or self._pending_preview is not None
             or self._pending_detailed_balance is not None
             or not self._gate.is_idle
         ):
             return None
-        preview_ids = tuple(set_id for set_id, _name, _request in preview_requests)
-        canonical_ids = tuple(set_id for set_id, _request in canonical_requests)
-        if not preview_ids:
-            return None
-        if len(preview_ids) != len(set(preview_ids)):
-            return None
-        if preview_ids != canonical_ids:
-            return None
         repository = self._repository(tab_id)
-        if set(repository.preview_set_ids()) != set(preview_ids):
+        if set(repository.preview_set_ids()) != set(roster_set_ids):
             return None
-        captured: list[SimulationResultValue] = []
-        for set_id, _name, request in preview_requests:
+        captured: list[
+            tuple[str, SimulationExecutionRequest, SimulationResultValue]
+        ] = []
+        for set_id in roster_set_ids:
             current_request = repository.current_request(set_id)
             result = repository.current_result(set_id)
-            if current_request is None or result is None or not simulation_execution_requests_equal(current_request, request):
+            if current_request is None or result is None:
                 return None
-            captured.append(result)
+            captured.append((set_id, current_request, result))
         return tuple(captured)
 
-    def publish_preview_results_as_run(
+    def publish_preview_pairs_as_run(
         self,
         tab_id: str,
-        canonical_requests: tuple[tuple[str, SimulationExecutionRequest], ...],
-        results: tuple[SimulationResultValue, ...],
+        preview_pairs: tuple[
+            tuple[str, SimulationExecutionRequest, SimulationResultValue], ...
+        ],
     ) -> None:
         repository = self._repository(tab_id)
-        for (set_id, request), result in zip(canonical_requests, results):
+        for set_id, request, result in preview_pairs:
             repository.publish_run(set_id, request, result)
         self.results_changed.emit(str(tab_id))
 
