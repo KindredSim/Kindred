@@ -231,7 +231,6 @@ def _validate_model(
 
 def _intervals(
     t: np.ndarray,
-    x: np.ndarray,
     segments: np.ndarray,
     keys: tuple[str, ...],
     discontinuities: np.ndarray,
@@ -288,7 +287,7 @@ def align_parametric_x(
         dataset_label=dataset_label,
         x_name=x_name,
     )
-    intervals = _intervals(t, x, segments, keys, discontinuities)
+    intervals = _intervals(t, segments, keys, discontinuities)
     if not intervals:
         raise DeterministicParametricResolutionError(
             f"Dataset {dataset_label!r}: no uninterrupted model interval can resolve X.",

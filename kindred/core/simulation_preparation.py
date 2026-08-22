@@ -1548,11 +1548,8 @@ def _apply_parameter_overrides_to_prepared_mechanism(
     raw_values: Mapping[str, float],
     mechanism_parameter_name_by_raw: Mapping[str, str],
     unbound_mechanism_parameter_name_by_raw: Mapping[str, str],
-    mechanism_parameter_names: Iterable[str],
     unbound_mechanism_parameter_names: Iterable[str],
     scalar_parameter_names: Iterable[str],
-    schedule_parameter_names: Iterable[str],
-    schedule_parameter_name_by_raw: Mapping[str, str],
     unknown_parameter_names: Iterable[str],
     invalid_parameter_identifier_messages: Mapping[str, str],
 ) -> None:
@@ -2366,11 +2363,8 @@ def _bind_request_parameter_overrides(
         raw_values=raw_values,
         mechanism_parameter_name_by_raw=mechanism_name_by_raw,
         unbound_mechanism_parameter_name_by_raw=unbound_mechanism_name_by_raw,
-        mechanism_parameter_names=mechanism_names,
         unbound_mechanism_parameter_names=unbound_mechanism_names,
         scalar_parameter_names=scalar_names,
-        schedule_parameter_names=schedule_names,
-        schedule_parameter_name_by_raw=schedule_name_by_raw,
         unknown_parameter_names=unknown_names,
         invalid_parameter_identifier_messages=invalid_messages,
     )

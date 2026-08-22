@@ -596,7 +596,6 @@ def fit_global(
         objective = _fit_execution.GlobalFitObjective(
             fit_evaluators=evaluators,
             payloads=payloads,
-            shared_params=shared_params,
             dataset_params=fixed_dataset_params,
             weights=weights_norm,
             layout=layout,
@@ -713,7 +712,6 @@ def fit_global(
         terminal_objective = _fit_execution.GlobalFitObjective(
             fit_evaluators=evaluators,
             payloads=payloads,
-            shared_params=shared_params,
             dataset_params=fixed_dataset_params,
             weights=weights_norm,
             layout=layout,

@@ -72,13 +72,6 @@ def dock_shell_specs() -> tuple[DockShellSpec, ...]:
     return _DOCK_SHELL_SPECS
 
 
-def dock_default_area(dock: QDockWidget):
-    stored = dock.property(_DEFAULT_DOCK_AREA_PROPERTY)
-    if stored is None:
-        return QtCore.Qt.DockWidgetArea.NoDockWidgetArea
-    return QtCore.Qt.DockWidgetArea(int(stored))
-
-
 def build_shell_dock(main_window: MainWindow, spec: DockShellSpec):
     from PySide6 import QtWidgets
 

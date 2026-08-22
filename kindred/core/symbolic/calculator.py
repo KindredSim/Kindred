@@ -196,7 +196,7 @@ def evaluate_symbolic_query(
     if isinstance(expr_or_lines, tuple):
         result_text = "\n".join(str(line) for line in expr_or_lines)
     else:
-        result_text = _render_expr(context, expr_or_lines)
+        result_text = str(expr_or_lines)
     return SymbolicCalculatorResult(
         query=query_s,
         result_text=result_text,
@@ -335,14 +335,14 @@ def _mechanism_species_names(mechanism: Any) -> tuple[str, ...]:
 def _evaluate_zero_arg_query(context: _CalculatorContext, name: str) -> tuple[str, ...]:
     if name == "odes":
         return tuple(
-            f"d{name}/dt = {_render_expr(context, context.rhs_by_species[name])}"
+            f"d{name}/dt = {str(context.rhs_by_species[name])}"
             for name in context.species_names
         )
     if name == "jacobian":
         rows: list[str] = []
         for row_name in context.species_names:
             rendered = [
-                _render_expr(context, context.jacobian_by_species[(row_name, col_name)])
+                str(context.jacobian_by_species[(row_name, col_name)])
                 for col_name in context.species_names
             ]
             rows.append("[" + ", ".join(rendered) + "]")
@@ -1010,10 +1010,6 @@ def _translate_let_node(node: Any, *, context: _CalculatorContext, stack: Sequen
     if isinstance(node, CallNode):
         raise SymbolicCalculatorError("Unsupported let expression function call.")
     raise SymbolicCalculatorError(f"Unsupported let expression node {type(node).__name__}.")
-
-
-def _render_expr(context: _CalculatorContext, expr: Any) -> str:
-    return str(expr)
 
 
 def _require_species(context: _CalculatorContext, name: str) -> str:

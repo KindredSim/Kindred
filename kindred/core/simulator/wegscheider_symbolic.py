@@ -822,7 +822,6 @@ def _step_log_temperature_relation(
     mechanism: object,
     step: _ReversibleStep,
     *,
-    evaluator: EffectiveRateCoefficientEvaluator,
     nominal_temperature_K: float,
     nominal_ratio: float,
 ) -> _LogTemperatureRelation | None:
@@ -941,7 +940,6 @@ def _combined_cycle_relation(
     cycle: WegscheiderCycle,
     selected_steps: Sequence[_ReversibleStep],
     *,
-    evaluator: EffectiveRateCoefficientEvaluator,
     nominal_temperature_K: float,
     nominal_ratios: Mapping[int, float],
 ) -> tuple[_LogTemperatureRelation, tuple[_LogTemperatureRelation, ...]] | None:
@@ -950,7 +948,6 @@ def _combined_cycle_relation(
         relation = _step_log_temperature_relation(
             mechanism,
             step,
-            evaluator=evaluator,
             nominal_temperature_K=nominal_temperature_K,
             nominal_ratio=nominal_ratios[step.equilibrium_index],
         )
@@ -1318,7 +1315,6 @@ def _continuum_executable_cycle_satisfaction(
         mechanism,
         cycle,
         selected_steps,
-        evaluator=evaluator,
         nominal_temperature_K=nominal_temperature_K,
         nominal_ratios={key: float(value) for key, value in nominal_ratios.items() if value is not None},
     )

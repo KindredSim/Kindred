@@ -448,9 +448,6 @@ class TabSliderBinding(QtCore.QObject):
         if previous == pending:
             return
         self._latest_admissible_pending = pending
-        self._arm_gesture_throttle(debounce_kind)
-
-    def _arm_gesture_throttle(self, debounce_kind: str) -> None:
         self._start_throttle_if_inactive(str(debounce_kind))
 
     def _gesture_debounce_kind(self, kind: str, name: str) -> str:
@@ -664,11 +661,6 @@ class TabSliderBinding(QtCore.QObject):
                     self._begin_preview_cycle(
                         (current_tab, prepared.projection),
                         prepared.targets,
-                        debounce_kind=(
-                            "parameter"
-                            if runtime.slider_parameter_draft
-                            else "species"
-                        ),
                     )
 
     def render(self, *, preserve_visibility: bool = True) -> bool:
@@ -926,20 +918,11 @@ class TabSliderBinding(QtCore.QObject):
                 (tab, projection),
                 targets,
                 interaction=_interaction,
-
-                debounce_kind=(
-                    "equilibrium" if coordinate.role == "Keq"
-                    else "parameter"
-                ),
             )
         preview_admitted = self._begin_preview_cycle(
             (tab, projection),
             targets,
             interaction=_interaction,
-
-            debounce_kind=(
-                "equilibrium" if coordinate.role == "Keq" else "parameter"
-            ),
         )
         if not preview_admitted:
             runtime.slider_parameter_draft.clear()
@@ -1041,15 +1024,11 @@ class TabSliderBinding(QtCore.QObject):
                 (tab, projection),
                 targets,
                 interaction=_interaction,
-
-                debounce_kind="species",
             )
         preview_admitted = self._begin_preview_cycle(
             (tab, projection),
             targets,
             interaction=_interaction,
-
-            debounce_kind="species",
         )
         if not preview_admitted:
             for set_id, snapshot in before.items():
@@ -1270,7 +1249,6 @@ class TabSliderBinding(QtCore.QObject):
         interaction: SliderInteractionKind = (
             SliderInteractionKind.EXACT_TYPED_COMMIT
         ),
-        debounce_kind: str,
     ) -> bool:
         if self._suspended_preview_disposition is not None:
             return False

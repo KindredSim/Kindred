@@ -6,7 +6,6 @@ import math
 
 from kindred.core.algebra.grammar import ASSOCIATIVITY, PRECEDENCE
 from kindred.core.algebra.parser import (
-    AlgebraBlock,
     BinaryNode,
     CallNode,
     ExprNode,
@@ -78,10 +77,3 @@ def expression_to_source(expr: ExprNode) -> str:
         args = ", ".join(expression_to_source(arg) for arg in expr.args)
         return f"{expr.name}({args})"
     return str(expr)
-
-
-def algebra_block_to_source(block: AlgebraBlock) -> str:
-    lines = ["# Algebra"]
-    for stmt in block.lines:
-        lines.append(f"let {stmt.name} = {expression_to_source(stmt.expr)}")
-    return "\n".join(lines) + "\n"

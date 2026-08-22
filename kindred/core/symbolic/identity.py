@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
-from typing import Any, Mapping
+from typing import Mapping
 
 from .errors import UnsupportedSymbolicExpressionError
 
@@ -47,16 +47,3 @@ def symbolic_identity_json(payload: object) -> bytes:
 
 def symbolic_fingerprint(payload: object) -> str:
     return hashlib.sha256(symbolic_identity_json(payload)).hexdigest()
-
-
-def normalize_symbolic_identity_mapping(identity: object, *, label: str) -> dict[str, Any] | None:
-    if identity is None:
-        return None
-    if not isinstance(identity, Mapping):
-        raise UnsupportedSymbolicExpressionError(f"{label} must be a JSON-safe mapping.")
-    if not identity:
-        return None
-    normalized = normalize_symbolic_identity_payload(dict(identity))
-    if not isinstance(normalized, dict) or not normalized:
-        return None
-    return normalized

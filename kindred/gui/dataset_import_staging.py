@@ -899,7 +899,6 @@ class DatasetImportStaging(QtCore.QObject):
         except (IndexError, TypeError, ValueError) as exc:
             self._record_failure(
                 active,
-                registration,
                 request,
                 f"{type(exc).__name__}: {exc}",
             )
@@ -924,7 +923,7 @@ class DatasetImportStaging(QtCore.QObject):
         owned = self._lookup_worker_callback(request, worker)
         if owned is None:
             return False
-        active, _registration = owned
+        active = owned[0]
         if active.terminal_outcome is not None:
             return False
         progress = max(0, min(100, int(percent)))
@@ -978,10 +977,10 @@ class DatasetImportStaging(QtCore.QObject):
         owned = self._lookup_worker_callback(request, worker)
         if owned is None:
             return False
-        active, registration = owned
+        active = owned[0]
         if active.terminal_outcome is not None:
             return False
-        self._record_failure(active, registration, request, message)
+        self._record_failure(active, request, message)
         return True
 
     def _worker_canceled(
@@ -993,7 +992,7 @@ class DatasetImportStaging(QtCore.QObject):
         owned = self._lookup_worker_callback(request, worker)
         if owned is None:
             return False
-        active, registration = owned
+        active = owned[0]
         if active.terminal_outcome is None:
             ordinals = self._unsettled_ordinals(active, request)
             event = DatasetImportCancellation(
@@ -1205,7 +1204,6 @@ class DatasetImportStaging(QtCore.QObject):
     def _record_failure(
         self,
         active: _ActiveImport,
-        registration: _RegisteredWorker,
         request: DatasetImportWorkerRequest,
         message: str,
     ) -> None:

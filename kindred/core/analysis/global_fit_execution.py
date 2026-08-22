@@ -2391,7 +2391,6 @@ class GlobalFitObjective:
         *,
         fit_evaluators: Mapping[str, object],
         payloads: List[FitDatasetSpec],
-        shared_params: Dict[str, float],
         dataset_params: Dict[str, Dict[str, float]],
         weights: Dict[str, float],
         layout: FitParameterLayout,
