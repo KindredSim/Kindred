@@ -25,7 +25,6 @@ from typing import (
 
 import numpy as np
 from kindred.core.scipy_integrate import load_scipy_integrate
-from kindred.core.symbolic.jacobian_execution import SymbolicJacobianExecution
 from kindred.core.temperature import (
     TemperatureScheduleDictProtocol,
     TemperatureScheduleProtocol,
@@ -292,20 +291,6 @@ def _build_provenance(req: _SimulationRequest, *, t_eval: np.ndarray) -> Dict[st
     return prov
 
 
-def _scrub_unused_jacobian_provenance(
-    prov: Dict[str, object],
-    *,
-    method: str,
-) -> None:
-    if str(method) in {"Radau", "BDF"}:
-        return
-    disabled_symbolic_jacobian = SymbolicJacobianExecution.disabled(
-        code="non-implicit-solver",
-        reason=f"Symbolic Jacobian disabled because solver {method} does not consume Jacobian callables.",
-    )
-    prov.update(disabled_symbolic_jacobian.provenance_fields())
-
-
 def _guard_runtime_symbolic_jacobian(
     jacobian_func: Callable[[float, np.ndarray], np.ndarray],
     cancellation_control: _SimulationCancellationControl | None,
@@ -404,34 +389,22 @@ def _execute_scipy(
             )
             prov.update(runtime_symbolic_jacobian.provenance_fields())
 
-    implicit_method = str(method) in {"Radau", "BDF"}
-    if (
-        implicit_method
-        and jac_callable is not None
-        and symbolic_jacobian.has_executable_jacobian
-    ):
+    if jac_callable is not None and symbolic_jacobian.has_executable_jacobian:
         jac_callable = _guard_runtime_symbolic_jacobian(
             jac_callable,
             req.cancellation_control,
         )
-    prov["symbolic_jacobian"] = bool(
-        implicit_method and jac_callable is not None
-    )
+    prov["symbolic_jacobian"] = bool(jac_callable is not None)
     prov["jacobian_sparsity_hint"] = bool(
-        implicit_method
-        and jac_callable is None
-        and jac_sparsity is not None
+        jac_callable is None and jac_sparsity is not None
     )
     def _kwargs_for_method(method_name: str) -> Dict[str, Any]:
         kwargs = dict(base_kwargs)
         kwargs["method"] = method_name
-        if method_name in ("Radau", "BDF") and jac_callable is not None:
+        if jac_callable is not None:
             kwargs["jac"] = jac_callable
-        elif method_name in ("Radau", "BDF") and jac_sparsity is not None:
+        elif jac_sparsity is not None:
             kwargs["jac_sparsity"] = jac_sparsity
-        else:
-            kwargs.pop("jac", None)
-            kwargs.pop("jac_sparsity", None)
         return kwargs
 
     def _looks_like_brentq_sign_error(exc: BaseException) -> bool:
@@ -674,7 +647,6 @@ def solve_ode(req: _SimulationRequest) -> _SimulationOutput | _SimulationExecuti
     prov = _build_provenance(req, t_eval=t_eval)
 
     method = normalize_solver_name(req.solver)
-    _scrub_unused_jacobian_provenance(prov, method=method)
     try:
         output = InterventionScheduleExecutionOwner(_run_scipy_segment).execute(
             ScheduleExecutionRequest(

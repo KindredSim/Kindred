@@ -14,9 +14,6 @@ from typing import Any, Callable, Dict, Mapping, Optional, Tuple
 import numpy as np
 
 from kindred.core.analysis.fit_statistics import finite_sum_of_squares
-from kindred.core.analysis.fit_evaluation_outcome import (
-    FitEvaluationOutcome,
-)
 from kindred.core.exceptions import (
     FittingCancelled,
     FitSimulationError,
@@ -50,84 +47,6 @@ def _is_cancelled_error(exc: BaseException) -> bool:
     return isinstance(exc, (KeyboardInterrupt, FittingCancelled, SimulationCancelled))
 
 
-def _canonical_terminal_evaluation(
-    objective: object,
-    parameters: np.ndarray,
-    *,
-    optimizer_success: bool,
-    optimizer_nfev: int,
-) -> tuple[np.ndarray, FitEvaluationOutcome, int]:
-    """Run exactly one terminal evaluation at the optimizer's returned point."""
-
-    vector = np.asarray(parameters, dtype=float).reshape(-1)
-    evaluator = getattr(objective, "evaluate_outcome", None)
-    if callable(evaluator):
-        outcome = evaluator(vector)
-        if not isinstance(outcome, FitEvaluationOutcome):
-            raise TypeError("Fit objective evaluate_outcome() returned an invalid DTO.")
-        transport = outcome.transport_residuals
-        if transport is None:
-            transport = outcome.residuals
-        if transport is None:
-            raise OptimizationError(
-                "Canonical terminal Fit evaluation omitted optimizer transport residuals."
-            )
-        residuals = np.asarray(transport, dtype=float).reshape(-1)
-        terminal_status = (
-            "nonconverged"
-            if outcome.status == "converged" and not optimizer_success
-            else outcome.status
-        )
-        unavailability = outcome.unavailability
-        if outcome.status == "scientific_unavailable" and unavailability is None:
-            raise OptimizationError(
-                "Scientific-unavailability terminal replay omitted its result."
-            )
-        outcome = FitEvaluationOutcome(
-            terminal_status,
-            residuals=outcome.residuals,
-            transport_residuals=residuals,
-            cause=outcome.cause,
-            unavailability=unavailability,
-            provenance={
-                **dict(outcome.provenance),
-                "stage": "optimizer_terminal_replay",
-                "canonical_replay": True,
-                "optimizer_reported_convergence": bool(optimizer_success),
-                "optimizer_nfev": int(optimizer_nfev),
-                "terminal_replay_count": 1,
-                "scipy_nfev": int(optimizer_nfev),
-            },
-        )
-        return residuals, outcome, 1
-
-    residuals = np.asarray(objective(vector), dtype=float).reshape(-1)
-    if residuals.size == 0 or not np.all(np.isfinite(residuals)):
-        raise OptimizationError(
-            "Canonical terminal Fit evaluation returned empty or non-finite residuals."
-        )
-    outcome = (
-        FitEvaluationOutcome.converged(
-            residuals,
-            provenance={
-                "stage": "optimizer_terminal_replay",
-                "canonical_replay": True,
-                "optimizer_reported_convergence": bool(optimizer_success),
-            },
-        )
-        if optimizer_success
-        else FitEvaluationOutcome.nonconverged(
-            residuals,
-            provenance={
-                "stage": "optimizer_terminal_replay",
-                "canonical_replay": True,
-                "optimizer_reported_convergence": False,
-            },
-        )
-    )
-    return residuals, outcome, 1
-
-
 @dataclass
 class FitResult:
     """Results from parameter fitting."""
@@ -136,10 +55,8 @@ class FitResult:
     parameters: Dict[object, float]
     message: str
     scipy_nfev: int | None = None
-    terminal_replay_count: int = 0
     objective_call_count: int | None = None
     identifiability_warning: Optional[str] = None
-    evaluation: FitEvaluationOutcome | None = None
 
     def __post_init__(self) -> None:
         self.parameters = {
@@ -148,18 +65,11 @@ class FitResult:
         if self.scipy_nfev is None:
             raise ValueError("FitResult requires the exact SciPy nfev count.")
         self.scipy_nfev = int(self.scipy_nfev)
-        self.terminal_replay_count = int(self.terminal_replay_count)
-        if self.terminal_replay_count < 0:
-            raise ValueError("FitResult terminal replay count cannot be negative.")
         if self.objective_call_count is not None:
             self.objective_call_count = int(self.objective_call_count)
             if self.objective_call_count < 0:
                 raise ValueError("FitResult objective-call count cannot be negative.")
         self.success = bool(self.success)
-        if self.evaluation is None:
-            raise ValueError("FitResult requires its typed terminal evaluation outcome.")
-        elif not isinstance(self.evaluation, FitEvaluationOutcome):
-            raise TypeError("FitResult.evaluation requires FitEvaluationOutcome.")
 
 
 def fit_parameters_with_fixed(
@@ -234,19 +144,12 @@ def fit_parameters_with_fixed(
     if not free:
         if cancellation_check is not None and cancellation_check():
             raise FittingCancelled()
-        residuals, evaluation, _nfev = _canonical_terminal_evaluation(
-            objective_func,
-            full_vector({}),
-            optimizer_success=True,
-            optimizer_nfev=0,
-        )
         return FitResult(
-            success=evaluation.status == "converged",
+            success=True,
             parameters={name: fixed[name] for name in names},
             message="All optimizer coordinates were fixed.",
             scipy_nfev=0,
-            terminal_replay_count=1,
-            evaluation=evaluation,
+            objective_call_count=getattr(objective_func, "objective_calls", None),
         )
 
     def reduced_objective(vector: np.ndarray) -> np.ndarray:
@@ -255,23 +158,6 @@ def fit_parameters_with_fixed(
             for index, name in enumerate(free)
         }
         return objective_func(full_vector(values))
-
-    def reduced_evaluate_outcome(vector: np.ndarray) -> FitEvaluationOutcome:
-        values = {
-            name: float(vector[index])
-            for index, name in enumerate(free)
-        }
-        full = full_vector(values)
-        evaluator = getattr(objective_func, "evaluate_outcome", None)
-        if callable(evaluator):
-            outcome = evaluator(full)
-            if not isinstance(outcome, FitEvaluationOutcome):
-                raise TypeError("Fit objective evaluate_outcome() returned an invalid DTO.")
-            return outcome
-        residuals = np.asarray(objective_func(full), dtype=float).reshape(-1)
-        return FitEvaluationOutcome.converged(residuals)
-
-    reduced_objective.evaluate_outcome = reduced_evaluate_outcome  # type: ignore[attr-defined]
 
     reduced = fit_parameters(
         reduced_objective,
@@ -294,10 +180,8 @@ def fit_parameters_with_fixed(
         },
         message=reduced.message,
         scipy_nfev=reduced.scipy_nfev,
-        terminal_replay_count=reduced.terminal_replay_count,
         objective_call_count=reduced.objective_call_count,
         identifiability_warning=reduced.identifiability_warning,
-        evaluation=reduced.evaluation,
     )
 
 
@@ -355,8 +239,6 @@ def fit_parameters(
 
     de_evaluation_budget: DifferentialEvolutionEvaluationBudget | None = None
     identifiability_warning: Optional[str] = None
-    terminal_outcome: FitEvaluationOutcome | None = None
-    terminal_replay_count = 0
     optimizer_evaluation_count = 0
 
     def wrapped_objective(params):
@@ -385,8 +267,6 @@ def fit_parameters(
 
             effective_penalty = float(de_penalty) if de_penalty is not None else 1e12
             de_evaluation_budget = DifferentialEvolutionEvaluationBudget(max_nfev)
-            best_de_params: np.ndarray | None = None
-            best_de_score = np.inf
 
             def evaluate_de_residuals(
                 params: np.ndarray,
@@ -400,7 +280,6 @@ def fit_parameters(
                 return residuals
 
             def de_objective(params):
-                nonlocal best_de_params, best_de_score
                 try:
                     residuals = evaluate_de_residuals(params, reserve=1)
                 except FittingCancelled:
@@ -413,15 +292,11 @@ def fit_parameters(
                             "Fit objective returned empty or non-finite residuals."
                         )
                     finite_score = finite_sum_of_squares(residuals)
-                    score = (
+                    return (
                         float(effective_penalty)
                         if finite_score is None
                         else float(finite_score)
                     )
-                if score < best_de_score:
-                    best_de_score = score
-                    best_de_params = np.asarray(params, dtype=float).copy()
-                return score
 
             dim = max(1, len(x0))
             result = None
@@ -451,9 +326,7 @@ def fit_parameters(
                 message = str(result.message)
             else:
                 x_opt = (
-                    best_de_params
-                    if best_de_params is not None
-                    else np.asarray(x0, dtype=float).copy()
+                    np.asarray(x0, dtype=float).copy()
                 )
                 success = False
                 message = (
@@ -461,13 +334,6 @@ def fit_parameters(
                     f"budget ({de_evaluation_budget.limit})."
                 )
 
-            residuals, terminal_outcome, replay_count = _canonical_terminal_evaluation(
-                objective_func,
-                x_opt,
-                optimizer_success=success,
-                optimizer_nfev=de_evaluation_budget.nfev,
-            )
-            terminal_replay_count = replay_count
             scipy_nfev = int(de_evaluation_budget.nfev)
         else:
             least_squares, _de = scipy_loader()
@@ -490,14 +356,6 @@ def fit_parameters(
             success = bool(result.success)
             message = str(result.message)
             scipy_nfev = int(result.nfev)
-            residuals, terminal_outcome, replay_count = _canonical_terminal_evaluation(
-                objective_func,
-                x_opt,
-                optimizer_success=success,
-                optimizer_nfev=int(result.nfev),
-            )
-            terminal_replay_count = replay_count
-
             try:
                 J = result.jac
                 param_count = len(x_opt)
@@ -534,11 +392,7 @@ def fit_parameters(
 
     fitted_params = {name: val for name, val in zip(param_names, x_opt)}
 
-    terminal_success = bool(success and terminal_outcome.status == "converged")
-    if terminal_outcome.status == "scientific_unavailable":
-        message = (
-            f"{message}; terminal candidate had scientifically unavailable results"
-        )
+    terminal_success = bool(success)
 
     objective_call_count = getattr(objective_func, "objective_calls", None)
     if objective_call_count is not None:
@@ -548,8 +402,6 @@ def fit_parameters(
         parameters=fitted_params,
         message=message,
         scipy_nfev=scipy_nfev,
-        terminal_replay_count=terminal_replay_count,
         objective_call_count=objective_call_count,
         identifiability_warning=identifiability_warning,
-        evaluation=terminal_outcome,
     )

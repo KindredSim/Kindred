@@ -1,8 +1,8 @@
 """
-Shared serial fitting evaluation boundary.
+Shared per-dataset fitting evaluation boundary.
 
 This module owns the fitting-side execution seam below the optimizer and above
-the solver. It builds a serial evaluator from structured execution-request data
+the solver. It builds one evaluator per dataset from structured execution-request data
 so the GUI/global-fit path no longer depends on the mutable prepared closure as
 its architectural contract.
 """
@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field, replace
-from typing import Dict, Iterable, List, Mapping, Optional, Protocol, Sequence
+from typing import Dict, List, Mapping, Optional, Sequence
 
 import numpy as np
 
@@ -26,7 +26,6 @@ from kindred.core.exceptions import (
 from kindred.core.analysis.fit_evaluation_outcome import (
     ScientificUnavailable,
 )
-from kindred.core.analysis import fit_evaluation_outcome as _fit_outcome
 from kindred.core.algebra.errors import (
     AlgebraError,
 )
@@ -41,8 +40,6 @@ from kindred.core.intervention_schedule import coerce_intervention_schedule
 from kindred.core.simulation_preparation import (
     SimulationExecutionRequest,
     PreparedSimulationRun,
-    _apply_execution_parameter_algebra,
-    _bind_request_parameter_overrides,
     _canonical_step_override_name,
     _classify_request_parameter_names,
     _parameter_algebra_scalar_authority_names,
@@ -79,16 +76,11 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "FITTING_PARAM_ORIGIN_CONFIGURED_DATASET",
-    "FITTING_PARAM_ORIGIN_CONFIGURED_EVALUATOR",
     "FITTING_PARAM_ORIGIN_OPTIMIZER_DATASET",
     "FITTING_PARAM_ORIGIN_OPTIMIZER_SHARED",
-    "PreparedFittingExecutionContext",
-    "SerialFittingEvaluator",
-    "evaluate_fitting_series",
+    "FittingEvaluator",
     "prepare_fitting_execution_context",
 ]
-
-_FittingSeriesOutcome = _fit_outcome.FittingSeriesOutcome
 
 FITTING_PARAM_ORIGIN_OPTIMIZER_SHARED = "optimizer_shared"
 FITTING_PARAM_ORIGIN_OPTIMIZER_DATASET = "optimizer_dataset"
@@ -237,45 +229,6 @@ def _fatal_evaluation_error(
     )
 
 
-class FittingSeriesEvaluator(Protocol):
-    """Exact evaluator contract consumed by the Fit optimizer."""
-
-    def evaluate_series_outcome_with_parameter_origins(
-        self,
-        params: Mapping[str, float],
-        origins: Optional[Mapping[str, str]] = None,
-        *,
-        failed_params: Optional[Dict[str, float]] = None,
-    ) -> _FittingSeriesOutcome: ...
-
-
-def evaluate_fitting_series(
-    evaluator: FittingSeriesEvaluator,
-    params: Mapping[str, float],
-    *,
-    origins: Optional[Mapping[str, str]] = None,
-    failed_params: Optional[Dict[str, float]] = None,
-) -> _FittingSeriesOutcome:
-    outcome_evaluator = getattr(
-        evaluator,
-        "evaluate_series_outcome_with_parameter_origins",
-        None,
-    )
-    if not callable(outcome_evaluator):
-        raise TypeError(
-            "Fit evaluator must implement "
-            "evaluate_series_outcome_with_parameter_origins(...)."
-        )
-    outcome = outcome_evaluator(
-        dict(params or {}),
-        dict(origins or {}),
-        failed_params=failed_params,
-    )
-    if not isinstance(outcome, _FittingSeriesOutcome):
-        raise TypeError("Fit evaluator must return a FittingSeriesOutcome.")
-    return outcome
-
-
 @dataclass(frozen=True)
 class PreparedFittingExecutionContext:
     """Typed fitting request, fixed policy, and preparation metadata."""
@@ -350,7 +303,7 @@ def prepare_fitting_execution_context(
     fit_local_admission: AdmittedAlgebraProgram | None = None,
     cancellation_control: SimulationCancellationControl | None = None,
 ) -> PreparedFittingExecutionContext:
-    """Prepare structured execution data for serial fitting evaluation."""
+    """Prepare structured execution data for one per-dataset evaluator."""
 
     if not isinstance(prepared_dsl, PreparedDslRequestSet):
         raise TypeError("prepared_dsl must be a PreparedDslRequestSet.")
@@ -601,8 +554,8 @@ def prepare_fitting_execution_context(
     )
 
 
-class SerialFittingEvaluator:
-    """Serial in-process evaluator built from structured fitting execution data."""
+class FittingEvaluator:
+    """Per-dataset in-process evaluator built from admitted execution data."""
 
     def __init__(
         self,
@@ -615,109 +568,10 @@ class SerialFittingEvaluator:
     def prepared_metadata(self) -> PreparedSimulationRun:
         return self._context.prepared_run
 
-    def preflight_fixed_values(
-        self,
-        params: Mapping[str, float],
-    ) -> None:
-        """Prepare fixed Fit values without executing a candidate simulation.
-
-        This is the admission-only boundary used before optimizer startup.
-        Fitted coordinates are intentionally absent from ``params``; the
-        preparation request therefore cannot substitute a starting candidate.
-        """
-
-        self._raise_if_cancel_requested()
-        param_map = {
-            str(raw_name): raw_value
-            for raw_name, raw_value in dict(params or {}).items()
-            if str(raw_name).strip()
-        }
-        non_initial_parameters = {
-            name: _coerce_consumed_parameter_value(
-                name=name,
-                raw_value=raw_value,
-                origins=None,
-                failed_params=None,
-            )
-            for name, raw_value in param_map.items()
-            if not name.startswith(self._context.prepared_run.initial_prefix)
-        }
-        typed_request = self._context.prepared_run.request
-        if not isinstance(typed_request, SimulationExecutionRequest):
-            raise FitSimulationError("Fit prepared run must retain a typed request.")
-        typed_schedule = typed_request.parameterized_intervention_schedule
-        try:
-            preflight_mechanism = typed_request.prepared_dsl.mutable_mechanism_shell()
-            _apply_execution_parameter_algebra(
-                mechanism=preflight_mechanism,
-                parameter_algebra_spec=typed_request.parameter_algebra_spec,
-                require_mutable=True,
-            )
-            _bind_request_parameter_overrides(
-                mechanism=preflight_mechanism,
-                parameter_algebra_spec=typed_request.parameter_algebra_spec,
-                parameter_overrides=non_initial_parameters,
-                unresolved_intervention_schedule=typed_schedule,
-            )
-            raw_values: dict[str, float] = {}
-            mechanism_names: set[str] = set()
-            unbound_mechanism_names: set[str] = set()
-            schedule_names: set[str] = set()
-            scalar_names: set[str] = set()
-            unknown_names: set[str] = set()
-            mechanism_name_by_raw: dict[str, str] = {}
-            unbound_mechanism_name_by_raw: dict[str, str] = {}
-            schedule_name_by_raw: dict[str, str] = {}
-            invalid_messages: dict[str, str] = {}
-            _classify_request_parameter_names(
-                mechanism=preflight_mechanism,
-                parameter_overrides=non_initial_parameters,
-                unresolved_intervention_schedule=typed_schedule,
-                raw_values=raw_values,
-                mechanism_names=mechanism_names,
-                unbound_mechanism_names=unbound_mechanism_names,
-                schedule_names=schedule_names,
-                scalar_names=scalar_names,
-                unknown_names=unknown_names,
-                mechanism_name_by_raw=mechanism_name_by_raw,
-                unbound_mechanism_name_by_raw=unbound_mechanism_name_by_raw,
-                schedule_name_by_raw=schedule_name_by_raw,
-                invalid_messages=invalid_messages,
-                validate_values=False,
-            )
-            raise_unowned_request_parameter_values(
-                raw_values=raw_values,
-                mechanism_name_by_raw=mechanism_name_by_raw,
-                unbound_mechanism_name_by_raw=unbound_mechanism_name_by_raw,
-                unbound_mechanism_names=unbound_mechanism_names,
-                unknown_names=unknown_names,
-                invalid_messages=invalid_messages,
-            )
-        except SimulationPreparationError as exc:
-            raise fit_simulation_error_from_preparation_error(exc) from exc
-        except ValueError as exc:
-            raise FitSimulationError(
-                str(exc),
-                details={"fatal": True, "stage": "fixed_preflight"},
-            ) from exc
-        try:
-            prepare_simulation_worker_run(
-                execution_request=replace(
-                    typed_request,
-                    parameter_overrides=non_initial_parameters or None,
-                ),
-                cancellation_control=self._cancellation_control,
-            )
-        except SimulationPreparationError as exc:
-            raise fit_simulation_error_from_preparation_error(exc) from exc
-        except SimulationCancelled as exc:
-            raise FittingCancelled() from exc
-        self._raise_if_cancel_requested()
-
     def set_cancellation_control(
         self,
         cancellation_control: SimulationCancellationControl | None,
-    ) -> "SerialFittingEvaluator":
+    ) -> "FittingEvaluator":
         if cancellation_control is not None and not isinstance(
             cancellation_control,
             SimulationCancellationControl,
@@ -735,65 +589,19 @@ class SerialFittingEvaluator:
         ):
             raise FittingCancelled()
 
-    def _raise_unrequested_schedule_candidate_authority(
-        self,
-        candidate_parameter_names: set[str],
-        *,
-        schedule_names: Iterable[str],
-        schedule_name_by_raw: Mapping[str, str],
-        mechanism_name_by_raw: Mapping[str, str],
-        unbound_mechanism_name_by_raw: Mapping[str, str],
-    ) -> None:
-        if not candidate_parameter_names:
-            return
-        schedule_names = {
-            str(name)
-            for name in schedule_names
-            if str(name).strip()
-        }
-        if not schedule_names:
-            return
-        requested_names = {
-            str(name)
-            for name in (self._context.prepared_run.param_names or ())
-            if str(name).strip()
-        }
-        owner_by_raw = {
-            **dict(mechanism_name_by_raw),
-            **dict(unbound_mechanism_name_by_raw),
-        }
-        schedule_owner_by_raw = {
-            raw_name: str(schedule_name_by_raw.get(raw_name, raw_name))
-            for raw_name in schedule_names
-        }
-        for candidate_name in sorted(str(name) for name in candidate_parameter_names if str(name).strip()):
-            candidate_owner = str(owner_by_raw.get(candidate_name, candidate_name))
-            for schedule_raw_name, schedule_owner in sorted(schedule_owner_by_raw.items()):
-                if candidate_name != schedule_raw_name and candidate_owner != schedule_owner:
-                    continue
-                if (
-                    candidate_name in requested_names
-                    or candidate_owner in requested_names
-                    or schedule_raw_name in requested_names
-                    or schedule_owner in requested_names
-                ):
-                    continue
-                raise FitSimulationError(
-                    (
-                        f"Unrequested intervention schedule parameter {candidate_name!r} "
-                        "cannot be used as fitting candidate authority."
-                    ),
-                    details={"fatal": True, "stage": "parameter_binding"},
-                )
-
-    def evaluate_series_outcome_with_parameter_origins(
+    def evaluate_series_with_parameter_origins(
         self,
         params: Mapping[str, float],
         origins: Optional[Mapping[str, str]] = None,
         *,
         failed_params: Optional[Dict[str, float]] = None,
-    ) -> _FittingSeriesOutcome:
-        """Return the producer-owned per-dataset semantic status."""
+    ) -> SimulationResultValue | ScientificUnavailable:
+        """Evaluate one candidate, returning only natural scientific values.
+
+        Cancellation and fatal causes remain factual exceptions.  Candidate
+        domain and solver scientific-unavailability facts are returned
+        directly, so no per-series outcome transport is needed.
+        """
 
         try:
             result = self._evaluate_series(
@@ -802,21 +610,15 @@ class SerialFittingEvaluator:
                 failed_params=failed_params,
             )
         except (FittingCancelled, SimulationCancelled) as exc:
-            return _FittingSeriesOutcome.cancelled(exc)
+            raise FittingCancelled() from exc
         except Exception as exc:
             unavailable = _known_candidate_unavailability(
                 exc,
                 failed_params=failed_params,
             )
             if unavailable is not None:
-                return _FittingSeriesOutcome.scientific_unavailable(
-                    unavailable,
-                    provenance={"stage": "serial_fitting_evaluator"},
-                )
-            return _FittingSeriesOutcome.fatal(
-                exc,
-                provenance={"stage": "serial_fitting_evaluator"},
-            )
+                return unavailable
+            raise
         if isinstance(result, SimulationExecutionOutcome):
             if result.status != "scientific_unavailable":
                 raise RuntimeError("Unsupported simulation execution outcome status.")
@@ -829,13 +631,10 @@ class SerialFittingEvaluator:
                 stage=unavailability.stage,
                 failed_params=failed_params,
             )
-            return _FittingSeriesOutcome.scientific_unavailable(
-                unavailable,
-                provenance={"stage": "solver"},
-            )
+            return unavailable
         if not isinstance(result, SimulationResultValue):
             raise TypeError("Fit evaluator must return a SimulationResultValue.")
-        return _FittingSeriesOutcome.available(result)
+        return result
 
     def _evaluate_series(
         self,
@@ -874,20 +673,6 @@ class SerialFittingEvaluator:
             for name in local_scalar_names
         }
         initial_overrides: Dict[str, float] = {}
-        candidate_parameter_names = {
-            str(name)
-            for name in dict(params or {})
-            if (
-                str(name).strip()
-                and not str(name).startswith(self._context.prepared_run.initial_prefix)
-                and str(name) not in local_scalar_names
-                and _parameter_origin_for(str(name), origin_map)
-                in {
-                    FITTING_PARAM_ORIGIN_OPTIMIZER_SHARED,
-                    FITTING_PARAM_ORIGIN_OPTIMIZER_DATASET,
-                }
-            )
-        }
         non_initial_parameters = {
             str(name): value
             for name, value in param_map.items()
@@ -908,68 +693,6 @@ class SerialFittingEvaluator:
         if not isinstance(typed_request, SimulationExecutionRequest):
             raise FitSimulationError("Fit prepared run must retain a typed request.")
         typed_schedule = typed_request.parameterized_intervention_schedule
-        try:
-            preflight_mechanism = typed_request.prepared_dsl.mutable_mechanism_shell()
-            _apply_execution_parameter_algebra(
-                mechanism=preflight_mechanism,
-                parameter_algebra_spec=typed_request.parameter_algebra_spec,
-                require_mutable=True,
-            )
-            _bind_request_parameter_overrides(
-                mechanism=preflight_mechanism,
-                parameter_algebra_spec=typed_request.parameter_algebra_spec,
-                parameter_overrides=non_initial_parameters,
-                unresolved_intervention_schedule=typed_schedule,
-            )
-            preflight_raw_values: dict[str, float] = {}
-            preflight_mechanism_names: set[str] = set()
-            preflight_unbound_mechanism_names: set[str] = set()
-            preflight_schedule_names: set[str] = set()
-            preflight_scalar_names: set[str] = set()
-            preflight_unknown_names: set[str] = set()
-            preflight_mechanism_name_by_raw: dict[str, str] = {}
-            preflight_unbound_mechanism_name_by_raw: dict[str, str] = {}
-            preflight_schedule_name_by_raw: dict[str, str] = {}
-            preflight_invalid_messages: dict[str, str] = {}
-            _classify_request_parameter_names(
-                mechanism=preflight_mechanism,
-                parameter_overrides=non_initial_parameters,
-                unresolved_intervention_schedule=typed_schedule,
-                raw_values=preflight_raw_values,
-                mechanism_names=preflight_mechanism_names,
-                unbound_mechanism_names=preflight_unbound_mechanism_names,
-                schedule_names=preflight_schedule_names,
-                scalar_names=preflight_scalar_names,
-                unknown_names=preflight_unknown_names,
-                mechanism_name_by_raw=preflight_mechanism_name_by_raw,
-                unbound_mechanism_name_by_raw=preflight_unbound_mechanism_name_by_raw,
-                schedule_name_by_raw=preflight_schedule_name_by_raw,
-                invalid_messages=preflight_invalid_messages,
-                validate_values=False,
-            )
-            raise_unowned_request_parameter_values(
-                raw_values=preflight_raw_values,
-                mechanism_name_by_raw=preflight_mechanism_name_by_raw,
-                unbound_mechanism_name_by_raw=preflight_unbound_mechanism_name_by_raw,
-                unbound_mechanism_names=preflight_unbound_mechanism_names,
-                unknown_names=preflight_unknown_names,
-                invalid_messages=preflight_invalid_messages,
-            )
-            self._raise_unrequested_schedule_candidate_authority(
-                candidate_parameter_names,
-                schedule_names=preflight_schedule_names,
-                schedule_name_by_raw=preflight_schedule_name_by_raw,
-                mechanism_name_by_raw=preflight_mechanism_name_by_raw,
-                unbound_mechanism_name_by_raw=preflight_unbound_mechanism_name_by_raw,
-            )
-        except SimulationPreparationError as exc:
-            raise fit_simulation_error_from_preparation_error(exc) from exc
-        except ValueError as exc:
-            raise FitSimulationError(
-                str(exc),
-                failed_params=failed_params,
-                details={"fatal": True, "stage": "parameter_binding"},
-            ) from exc
         try:
             # Every candidate, including the first, receives a fresh isolated
             # request and one canonical preparation.  A rejected candidate can
@@ -1047,13 +770,6 @@ class SerialFittingEvaluator:
                 unbound_mechanism_names=unbound_mechanism_names,
                 unknown_names=unknown_names,
                 invalid_messages=invalid_messages,
-            )
-            self._raise_unrequested_schedule_candidate_authority(
-                candidate_parameter_names,
-                schedule_names=schedule_names,
-                schedule_name_by_raw=schedule_name_by_raw,
-                mechanism_name_by_raw=mechanism_name_by_raw,
-                unbound_mechanism_name_by_raw=unbound_mechanism_name_by_raw,
             )
         except SimulationPreparationError as exc:
             raise fit_simulation_error_from_preparation_error(exc) from exc

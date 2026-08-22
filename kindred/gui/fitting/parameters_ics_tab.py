@@ -33,21 +33,15 @@ from kindred.core.project_document import (
     validate_fit_defaults,
 )
 from kindred.gui.fitting.launch import (
-    FitAdvancedAnalysisSetupEdit,
-    FitDefaultsSetupEdit,
-    FitInitialScopeSetupEdit,
     FitInitialGlobalVariable,
     FitMappedDatasetSnapshot,
     FitOriginSnapshot,
     FitObservationSnapshot,
-    FitParameterScopeSetupEdit,
     FitParameterConfiguration,
-    FitParameterSetupEdit,
-    FitParameterVarySetupEdit,
     FitParameterVariable,
     FitSetupSnapshot,
-    FitSolverSetupEdit,
     fit_uncertainty_coordinates,
+    _replace_fit_parameter,
 )
 from kindred.gui.fitting.constants import (
     CENTRED_FIXED_EFFECTS_SCOPE_LABEL,
@@ -696,7 +690,7 @@ class _ResidualBootstrapDialog(QtWidgets.QDialog):
 class ParametersIcsTab(QtWidgets.QWidget):
     """Presentation-only parameter, IC-scope, and optimizer panel."""
 
-    setupEditsRequested = QtCore.Signal(object)
+    setupSnapshotRequested = QtCore.Signal(object)
     addObservableRequested = QtCore.Signal(str, str, object, str)
     resetRequested = QtCore.Signal(str)
     viewStepsRequested = QtCore.Signal()
@@ -725,8 +719,6 @@ class ParametersIcsTab(QtWidgets.QWidget):
             tuple[str, ...], _InvalidNumericDraft
         ] = {}
         self._projecting = False
-        self._defaults_backing: FitDefaults | None = None
-        self._default_changed_fields: set[str] = set()
         self._running = False
         self._set_parameter_choices(parameter_choices or {})
         self._build_ui()
@@ -740,7 +732,7 @@ class ParametersIcsTab(QtWidgets.QWidget):
     def set_origin(self, origin: FitOriginSnapshot) -> None:
         if not isinstance(origin, FitOriginSnapshot):
             raise TypeError("origin must be FitOriginSnapshot.")
-        if self._origin is not None and self._origin.capture_id != origin.capture_id:
+        if self._origin is not None and self._origin is not origin:
             self._retire_numeric_drafts()
         self._origin = origin
 
@@ -771,7 +763,7 @@ class ParametersIcsTab(QtWidgets.QWidget):
 
 
     # ------------------------------------------------------------------
-    # Parameter presentation and intents
+    # Parameter presentation and complete snapshot replacements
     # ------------------------------------------------------------------
 
 
@@ -796,7 +788,7 @@ class ParametersIcsTab(QtWidgets.QWidget):
         if not selection:
             return
         # Window/owner handoff: name, expression, exact selected snapshot
-        # roster (in selected-dataset order), and scalar scope.  No intent DTO
+        # roster (in selected-dataset order), and scalar scope.  No edit object
         # or raw-observation reconstruction crosses this boundary.
         name, expression, observations, scalar_scope = selection
         self.addObservableRequested.emit(
@@ -853,15 +845,20 @@ class ParametersIcsTab(QtWidgets.QWidget):
                     "The selected species has no retained Local configuration."
                 )
                 return
-        self.setupEditsRequested.emit(
-            (
-                FitInitialScopeSetupEdit(
-                    origin_tab_id=setup.origin_tab_id,
-                    origin_capture_id=setup.origin_capture_id,
-                    species=species_name,
-                    scope=scope,
-                    global_initial=configured,
-                ),
+        scope_map = dict(setup.initial_scopes)
+        scope_map[species_name] = scope
+        global_initials = tuple(
+            item for item in setup.global_initials if item.species != species_name
+        )
+        if configured is not None:
+            global_initials = (*global_initials, configured)
+            global_initials = tuple(sorted(global_initials, key=lambda item: item.species))
+        self.setupSnapshotRequested.emit(
+            replace(
+                setup,
+                initial_scopes=tuple(scope_map.items()),
+                global_initials=global_initials,
+                shared_refit_promotions=(),
             )
         )
 
@@ -1138,20 +1135,20 @@ class ParametersIcsTab(QtWidgets.QWidget):
         layout.addWidget(self._analysis_cards_host)
 
         # Signals are attached after construction so projection can use one
-        # coherent blocker set and cannot author half a typed intent.
+        # coherent blocker set and cannot author a half-formed snapshot.
         self._solver_combo.currentIndexChanged.connect(self._emit_solver_edit)
         self._method_combo.currentIndexChanged.connect(
-            lambda *_args: self._emit_defaults_edit(changed_field="method")
+            self._emit_defaults_edit
         )
         self._max_eval_spin.valueChanged.connect(
-            lambda *_args: self._emit_defaults_edit(changed_field="max_nfev")
+            self._emit_defaults_edit
         )
         self._seed_check.toggled.connect(self._seed_spin.setEnabled)
         self._seed_check.toggled.connect(
-            lambda *_args: self._emit_defaults_edit(changed_field="use_seed")
+            self._emit_defaults_edit
         )
         self._seed_spin.valueChanged.connect(
-            lambda *_args: self._emit_defaults_edit(changed_field="seed")
+            self._emit_defaults_edit
         )
         self._profile_enabled.toggled.connect(self._on_profile_toggled)
         self._bootstrap_enabled.toggled.connect(self._on_bootstrap_toggled)
@@ -1177,8 +1174,7 @@ class ParametersIcsTab(QtWidgets.QWidget):
         if not isinstance(snapshot, FitSetupSnapshot):
             raise TypeError("snapshot must be FitSetupSnapshot.")
         if self._origin is not None and (
-            snapshot.origin_tab_id != self._origin.tab_id
-            or snapshot.origin_capture_id != self._origin.capture_id
+            snapshot.origin is not self._origin
         ):
             raise ValueError("Fit snapshot does not match this origin.")
 
@@ -1238,8 +1234,6 @@ class ParametersIcsTab(QtWidgets.QWidget):
     def project_setup_snapshot(self, snapshot: FitSetupSnapshot) -> None:
         self._check_snapshot(snapshot)
         self._projected_setup = snapshot
-        self._defaults_backing = snapshot.defaults
-        self._default_changed_fields.clear()
         blocker = QtCore.QSignalBlocker(self._param_table)
         self._projecting = True
         try:
@@ -1260,24 +1254,6 @@ class ParametersIcsTab(QtWidgets.QWidget):
         else:
             self._clear_selected_editor()
         self._project_last_fit_columns()
-
-    def project_setup_delta(
-        self,
-        snapshot: FitSetupSnapshot,
-        intents: Sequence[object],
-    ) -> None:
-        self._check_snapshot(snapshot)
-        if not isinstance(intents, tuple):
-            raise TypeError("Fit setup delta must carry a tuple of intents.")
-        accepted_parameter_names = {
-            intent.parameter.name
-            for intent in intents
-            if isinstance(intent, FitParameterSetupEdit)
-        }
-        self._retire_numeric_drafts(accepted_parameter_names)
-        # Owner acknowledgement is the accepted truth.  Reprojecting that
-        # truth is atomic for this view and never changes retained Last Fit.
-        self.project_setup_snapshot(snapshot)
 
     def set_last_fit_reset_available(self, snapshot: FitSetupSnapshot | None) -> None:
         if snapshot is not None:
@@ -1782,13 +1758,40 @@ class ParametersIcsTab(QtWidgets.QWidget):
             return False
         setup = self._projected_setup
         self._reproject_vary_truth(parameter.name)
-        intent = FitParameterVarySetupEdit(
-            origin_tab_id=setup.origin_tab_id,
-            origin_capture_id=setup.origin_capture_id,
-            parameter_name=parameter.name,
-            desired_fit=desired,
+        replacement = _replace_fit_parameter(parameter, fit=desired)
+        profile = setup.profile_likelihood
+        bootstrap = setup.residual_bootstrap
+        if not desired:
+            available = set(fit_uncertainty_coordinates(setup.parameters, setup.datasets))
+
+            def without_parameter_coordinates(configuration: object):
+                if configuration is None:
+                    return None
+                remaining = tuple(
+                    coordinate
+                    for coordinate in configuration.parameter_names
+                    if not (
+                        isinstance(coordinate, FitCoordinate)
+                        and coordinate in available
+                        and coordinate.name == parameter.name
+                    )
+                )
+                return None if not remaining else replace(configuration, parameter_names=remaining)
+
+            profile = without_parameter_coordinates(profile)
+            bootstrap = without_parameter_coordinates(bootstrap)
+        self.setupSnapshotRequested.emit(
+            replace(
+                setup,
+                parameters=tuple(
+                    replacement if item.name == replacement.name else item
+                    for item in setup.parameters
+                ),
+                profile_likelihood=profile,
+                residual_bootstrap=bootstrap,
+                shared_refit_promotions=(),
+            )
         )
-        self.setupEditsRequested.emit((intent,))
         return True
 
     def _emit_selected_parameter_vary_edit(self, desired_fit: bool) -> bool:
@@ -1805,16 +1808,20 @@ class ParametersIcsTab(QtWidgets.QWidget):
             return False
         try:
             edited = self._parameter_projection_for_change(parameter)
-            intent = FitParameterSetupEdit(
-                origin_tab_id=self._projected_setup.origin_tab_id,
-                origin_capture_id=self._projected_setup.origin_capture_id,
-                parameter=edited,
-            )
         except (TypeError, ValueError, OverflowError) as exc:
             self.statusMessage.emit(f"Fit parameter edit is invalid: {exc}")
             self._store_parameter_editor_draft(parameter, str(exc))
             return False
-        self.setupEditsRequested.emit((intent,))
+        updated = replace(
+            self._projected_setup,
+            parameters=tuple(
+                edited if item.name == edited.name else item
+                for item in self._projected_setup.parameters
+            ),
+            shared_refit_promotions=(),
+        )
+        self._retire_numeric_drafts({parameter.name})
+        self.setupSnapshotRequested.emit(updated)
         return True
 
     def _on_scope_changed(self, _index: int) -> None:
@@ -1835,14 +1842,32 @@ class ParametersIcsTab(QtWidgets.QWidget):
             return
         if desired == parameter.scope:
             return
-        self.setupEditsRequested.emit(
-            (
-                FitParameterScopeSetupEdit(
-                    origin_tab_id=self._projected_setup.origin_tab_id,
-                    origin_capture_id=self._projected_setup.origin_capture_id,
-                    parameter_name=parameter.name,
-                    scope=desired,
+        if desired not in {"shared", "per_dataset", "centred_fixed_effects"}:
+            self._restore_scope(parameter.scope)
+            return
+        replacement = replace(parameter, scope=desired)
+        if desired == "centred_fixed_effects" and parameter.scope == "shared":
+            config = parameter.shared_config
+            if config is None:
+                self._restore_scope(parameter.scope)
+                return
+            dataset_ids = tuple(item.dataset_id for item in self._projected_setup.datasets)
+            replacement = replace(
+                parameter,
+                scope=desired,
+                per_dataset_config=replace(
+                    config,
+                    dataset_values=tuple((dataset_id, config.value) for dataset_id in dataset_ids),
                 ),
+            )
+        self.setupSnapshotRequested.emit(
+            replace(
+                self._projected_setup,
+                parameters=tuple(
+                    replacement if item.name == replacement.name else item
+                    for item in self._projected_setup.parameters
+                ),
+                shared_refit_promotions=(),
             )
         )
 
@@ -1896,8 +1921,6 @@ class ParametersIcsTab(QtWidgets.QWidget):
         return value
 
     def _project_defaults(self, defaults: FitDefaults) -> None:
-        self._defaults_backing = defaults
-        self._default_changed_fields.clear()
         blocker = [
             QtCore.QSignalBlocker(control)
             for control in (
@@ -1926,49 +1949,46 @@ class ParametersIcsTab(QtWidgets.QWidget):
         ftol: float | None = None,
         xtol: float | None = None,
     ) -> FitDefaults:
-        if self._defaults_backing is None:
+        if self._projected_setup is None:
             raise ValueError("Fit defaults are not available.")
+        defaults = self._projected_setup.defaults
         return validate_fit_defaults(
             replace(
-                self._defaults_backing,
+                defaults,
                 method=str(self._method_combo.currentData() or "trf"),
                 max_nfev=self._max_eval_spin.value(),
-                ftol=self._defaults_backing.ftol if ftol is None else ftol,
-                xtol=self._defaults_backing.xtol if xtol is None else xtol,
+                ftol=defaults.ftol if ftol is None else ftol,
+                xtol=defaults.xtol if xtol is None else xtol,
                 use_seed=self._seed_check.isChecked(),
                 seed=self._seed_spin.value(),
             )
         )
 
-    def _emit_defaults_edit(self, *_args: object, changed_field: str | None = None) -> None:
+    def _emit_defaults_edit(self, *_args: object) -> None:
         if self._projecting or self._running or self._projected_setup is None:
             return
-        if changed_field:
-            self._default_changed_fields.add(changed_field)
         try:
-            edit = FitDefaultsSetupEdit(
-                origin_tab_id=self._projected_setup.origin_tab_id,
-                origin_capture_id=self._projected_setup.origin_capture_id,
+            snapshot = replace(
+                self._projected_setup,
                 defaults=self._defaults_projection(),
             )
         except (TypeError, ValueError, OverflowError) as exc:
             self.statusMessage.emit(f"Fit defaults are invalid: {exc}")
             return
-        self.setupEditsRequested.emit((edit,))
+        self.setupSnapshotRequested.emit(snapshot)
 
     def _emit_solver_edit(self, *_args: object) -> None:
         if self._projecting or self._running or self._projected_setup is None:
             return
         try:
-            edit = FitSolverSetupEdit(
-                origin_tab_id=self._projected_setup.origin_tab_id,
-                origin_capture_id=self._projected_setup.origin_capture_id,
+            snapshot = replace(
+                self._projected_setup,
                 solver=str(self._solver_combo.currentData() or "BDF"),
             )
         except (TypeError, ValueError, OverflowError) as exc:
             self.statusMessage.emit(f"Fit solver edit is invalid: {exc}")
             return
-        self.setupEditsRequested.emit((edit,))
+        self.setupSnapshotRequested.emit(snapshot)
 
     def _project_advanced_analysis(self, snapshot: FitSetupSnapshot) -> None:
         profile = snapshot.profile_likelihood
@@ -2008,27 +2028,28 @@ class ParametersIcsTab(QtWidgets.QWidget):
             )
         return f"Enabled · {detail} · {FIT_METHOD_LABELS.get(method, method)}"
 
-    def _analysis_intent(
+    def _analysis_snapshot(
         self,
         *,
         profile: ProfileLikelihoodConfig | None,
         bootstrap: ResidualBootstrapConfig | None,
-    ) -> FitAdvancedAnalysisSetupEdit:
+    ) -> FitSetupSnapshot:
         setup = self._projected_setup
         if setup is None:
             raise ValueError("Fit setup is unavailable.")
-        return FitAdvancedAnalysisSetupEdit(
-            origin_tab_id=setup.origin_tab_id,
-            origin_capture_id=setup.origin_capture_id,
+        return replace(
+            setup,
             profile_likelihood=profile,
             residual_bootstrap=bootstrap,
-            shared_refit_promotions=setup.shared_refit_promotions,
         )
 
     def _open_convergence_dialog(self) -> None:
-        if self._projecting or self._running or self._defaults_backing is None:
+        if self._projecting or self._running or self._projected_setup is None:
             return
-        dialog = _ConvergenceDialog(self._defaults_backing, parent=self)
+        dialog = _ConvergenceDialog(
+            self._projected_setup.defaults,
+            parent=self,
+        )
         if dialog.exec() != QtWidgets.QDialog.DialogCode.Accepted:
             return
         values = dialog.values()
@@ -2038,15 +2059,14 @@ class ParametersIcsTab(QtWidgets.QWidget):
             setup = self._projected_setup
             if setup is None:
                 return
-            intent = FitDefaultsSetupEdit(
-                origin_tab_id=setup.origin_tab_id,
-                origin_capture_id=setup.origin_capture_id,
+            snapshot = replace(
+                setup,
                 defaults=self._defaults_projection(ftol=values[0], xtol=values[1]),
             )
         except (TypeError, ValueError, OverflowError) as exc:
             self.statusMessage.emit(f"Advanced Fit settings are invalid: {exc}")
             return
-        self.setupEditsRequested.emit((intent,))
+        self.setupSnapshotRequested.emit(snapshot)
 
     def _available_analysis_coordinates(self) -> tuple[FitCoordinate, ...]:
         setup = self._projected_setup
@@ -2075,17 +2095,13 @@ class ParametersIcsTab(QtWidgets.QWidget):
         )
         if dialog.exec() != QtWidgets.QDialog.DialogCode.Accepted:
             if setup.profile_likelihood is None:
-                blocker = QtCore.QSignalBlocker(self._profile_enabled)
                 self._profile_enabled.setChecked(False)
-                del blocker
             return
         try:
-            self.setupEditsRequested.emit(
-                (
-                    self._analysis_intent(
-                        profile=dialog.configuration(),
-                        bootstrap=setup.residual_bootstrap,
-                    ),
+            self.setupSnapshotRequested.emit(
+                self._analysis_snapshot(
+                    profile=dialog.configuration(),
+                    bootstrap=setup.residual_bootstrap,
                 )
             )
         except (TypeError, ValueError, OverflowError) as exc:
@@ -2106,17 +2122,13 @@ class ParametersIcsTab(QtWidgets.QWidget):
         )
         if dialog.exec() != QtWidgets.QDialog.DialogCode.Accepted:
             if setup.residual_bootstrap is None:
-                blocker = QtCore.QSignalBlocker(self._bootstrap_enabled)
                 self._bootstrap_enabled.setChecked(False)
-                del blocker
             return
         try:
-            self.setupEditsRequested.emit(
-                (
-                    self._analysis_intent(
-                        profile=setup.profile_likelihood,
-                        bootstrap=dialog.configuration(),
-                    ),
+            self.setupSnapshotRequested.emit(
+                self._analysis_snapshot(
+                    profile=setup.profile_likelihood,
+                    bootstrap=dialog.configuration(),
                 )
             )
         except (TypeError, ValueError, OverflowError) as exc:
@@ -2129,7 +2141,7 @@ class ParametersIcsTab(QtWidgets.QWidget):
         if setup is None:
             return
         # The checkbox is a projection of the accepted owner snapshot.  Keep
-        # it there while a dialog/intent is pending; acknowledgements reproject
+        # it there while a dialog is pending; the accepted snapshot reprojects
         # the new value atomically.
         blocker = QtCore.QSignalBlocker(self._profile_enabled)
         self._profile_enabled.setChecked(setup.profile_likelihood is not None)
@@ -2138,12 +2150,10 @@ class ParametersIcsTab(QtWidgets.QWidget):
             self._open_profile_dialog()
             return
         try:
-            self.setupEditsRequested.emit(
-                (
-                    self._analysis_intent(
-                        profile=None,
-                        bootstrap=setup.residual_bootstrap,
-                    ),
+            self.setupSnapshotRequested.emit(
+                self._analysis_snapshot(
+                    profile=None,
+                    bootstrap=setup.residual_bootstrap,
                 )
             )
         except (TypeError, ValueError, OverflowError) as exc:
@@ -2162,12 +2172,10 @@ class ParametersIcsTab(QtWidgets.QWidget):
             self._open_bootstrap_dialog()
             return
         try:
-            self.setupEditsRequested.emit(
-                (
-                    self._analysis_intent(
-                        profile=setup.profile_likelihood,
-                        bootstrap=None,
-                    ),
+            self.setupSnapshotRequested.emit(
+                self._analysis_snapshot(
+                    profile=setup.profile_likelihood,
+                    bootstrap=None,
                 )
             )
         except (TypeError, ValueError, OverflowError) as exc:
@@ -2194,38 +2202,6 @@ class ParametersIcsTab(QtWidgets.QWidget):
         self._add_button.setEnabled(not self._running)
 
     def clear_pending_setup_edits(self) -> None:
-        self._default_changed_fields.clear()
         self._retire_numeric_drafts()
         if self._projected_setup is not None:
             self.project_setup_snapshot(self._projected_setup)
-
-    def reject_setup_edits(
-        self,
-        intents: Sequence[object],
-        message: str = "Fit setup edit was rejected.",
-    ) -> None:
-        """Keep rejected parameter text as a local draft over accepted truth.
-
-        The Fit window calls this with the same typed intent tuple it received
-        from the owner.  No accepted setup is retained by this widget.
-        """
-
-        if not isinstance(intents, tuple):
-            raise TypeError("Fit setup rejection must carry a tuple.")
-        rejected_names = {
-            intent.parameter.name
-            for intent in intents
-            if isinstance(intent, FitParameterSetupEdit)
-        }
-        rejected_vary_names = {
-            intent.parameter_name
-            for intent in intents
-            if isinstance(intent, FitParameterVarySetupEdit)
-        }
-        if rejected_vary_names and self._projected_setup is not None:
-            # A semantic Vary rejection is not numeric authoring.  Restore
-            # accepted checkbox/roster truth without creating a draft.
-            self.project_setup_snapshot(self._projected_setup)
-        selected = self._selected_parameter()
-        if selected is not None and selected.name in rejected_names:
-            self._store_parameter_editor_draft(selected, str(message))

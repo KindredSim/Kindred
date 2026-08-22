@@ -2070,7 +2070,6 @@ def prepare_simulation_worker_run(
     try:
         temperature_schedule, runtime_symbolic_jacobian, preparation_warnings = build_prepared_run_context(
             mechanism=mechanism,
-            solver_config=prepared_solver_config,
             temperature_schedule=temperature_schedule_override,
             metadata_view=metadata_view_for_mechanism,
             symbolic_structure=symbolic_structure,
@@ -2085,10 +2084,7 @@ def prepare_simulation_worker_run(
     except Exception as exc:
         raise SimulationPreparationError("initials_for_algebra", str(exc)) from exc
 
-    if (
-        prepared_solver_config.solver.upper() in {"BDF", "RADAU"}
-        and not prepared_solver_config.use_analytic_jacobian
-    ):
+    if not prepared_solver_config.use_analytic_jacobian:
         runtime_symbolic_jacobian = SymbolicJacobianExecution.disabled(
             code="policy-disabled",
             reason="Symbolic Jacobian runtime use disabled by analytic Jacobian policy.",

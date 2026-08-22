@@ -10,7 +10,6 @@ import numpy as np
 
 __all__ = [
     "FitMetric",
-    "FitErrorMetrics",
     "finite_positive_mean_normalize",
     "finite_sum_of_squares",
     "fit_error_metrics",

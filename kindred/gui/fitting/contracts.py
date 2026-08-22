@@ -1,23 +1,16 @@
-"""Typed Fit-local setup, transition, snapshot, and identity contracts."""
+"""Small typed contracts used by the Fit presentation surfaces."""
 
 from __future__ import annotations
 
-import hashlib
-import json
-import math
 from dataclasses import dataclass, replace
-from types import MappingProxyType
-from typing import Literal, Mapping
+from typing import Literal
 
 FitResolvedXMode = Literal["monotone", "time_guided"]
 
 __all__ = [
     "FitParametricSettings",
-    "FitRunIdentity",
     "FitTargetSelection",
     "copy_target_selection",
-    "FitProjectionAvailability",
-    "FitPublicationBundle",
 ]
 
 
@@ -26,13 +19,6 @@ def _name(value: object, field: str) -> str:
     if not text:
         raise ValueError(f"{field} must be nonblank.")
     return text
-
-
-def _finite(value: object, field: str) -> float:
-    number = float(value)
-    if not math.isfinite(number):
-        raise ValueError(f"{field} must be finite.")
-    return number
 
 
 @dataclass(frozen=True, slots=True)
@@ -78,6 +64,7 @@ class FitTargetSelection:
         object.__setattr__(self, "eligible_targets", eligible)
         object.__setattr__(self, "selected_targets", selected)
 
+
 def copy_target_selection(
     source: FitTargetSelection,
     destinations: tuple[FitTargetSelection, ...],
@@ -116,173 +103,3 @@ def copy_target_selection(
             copied.append(destination)
             unmatched += 1
     return tuple(copied), matched, unmatched
-
-
-FitProjectionState = Literal["available", "unavailable"]
-
-
-@dataclass(frozen=True, slots=True)
-class FitProjectionAvailability:
-    """Typed settlement for one independent terminal projection."""
-
-    name: str
-    state: FitProjectionState
-    reason: str | None = None
-
-    def __post_init__(self) -> None:
-        name = _name(self.name, "Fit projection name")
-        state = str(self.state or "").strip().lower()
-        if state not in {"available", "unavailable"}:
-            raise ValueError("Fit projection state must be available or unavailable.")
-        reason = str(self.reason or "").strip() or None
-        if state == "unavailable" and reason is None:
-            raise ValueError("Unavailable Fit projection requires a reason.")
-        if state == "available" and reason is not None:
-            raise ValueError("Available Fit projection cannot carry a reason.")
-        object.__setattr__(self, "name", name)
-        object.__setattr__(self, "state", state)
-        object.__setattr__(self, "reason", reason)
-
-    @property
-    def available(self) -> bool:
-        return self.state == "available"
-
-
-@dataclass(frozen=True, slots=True)
-class FitPublicationBundle:
-    """One immutable owner-settled semantic/physical Fit publication.
-
-    Values are intentionally opaque at this contracts layer so the owner of
-    terminal science remains the only producer of reports, candidates, and
-    curves.  Presentation consumes the bundle atomically and never recreates
-    terminal truth from a partial projection.
-    """
-
-    candidate: object
-    report: object | None
-    curves: tuple[object, ...]
-    report_availability: FitProjectionAvailability
-    curve_availability: FitProjectionAvailability
-    semantic_copy_availability: FitProjectionAvailability
-    apply_available_scopes: frozenset[str]
-    apply_unavailable_reasons: Mapping[str, str]
-
-    def __post_init__(self) -> None:
-        if self.candidate is None:
-            raise ValueError("Fit publication bundle requires candidate custody.")
-        for field_name in (
-            "report_availability",
-            "curve_availability",
-            "semantic_copy_availability",
-        ):
-            if not isinstance(getattr(self, field_name), FitProjectionAvailability):
-                raise TypeError(f"{field_name} must be FitProjectionAvailability.")
-        curves = tuple(self.curves)
-        if self.curve_availability.available and not curves:
-            raise ValueError("Available curve projection requires curves.")
-        if not self.curve_availability.available and curves:
-            raise ValueError("Unavailable curve projection cannot carry curves.")
-        if self.report_availability.available and self.report is None:
-            raise ValueError("Available report projection requires a report.")
-        if not self.report_availability.available and self.report is not None:
-            raise ValueError("Unavailable report projection cannot carry a report.")
-        if self.semantic_copy_availability.available and not self.report_availability.available:
-            raise ValueError("Semantic Copy requires an available report projection.")
-        available = frozenset(str(scope).strip() for scope in self.apply_available_scopes)
-        if any(not scope for scope in available):
-            raise ValueError("Fit Apply scope identities must be nonblank.")
-        reasons = MappingProxyType(
-            {
-                str(scope): str(reason or "").strip()
-                for scope, reason in dict(self.apply_unavailable_reasons).items()
-            }
-        )
-        if any(not scope or not reason for scope, reason in reasons.items()):
-            raise ValueError("Fit Apply unavailable reasons must be nonblank.")
-        if available.intersection(reasons):
-            raise ValueError("Fit Apply scope cannot be available and unavailable.")
-        object.__setattr__(self, "curves", curves)
-        object.__setattr__(self, "apply_available_scopes", available)
-        object.__setattr__(self, "apply_unavailable_reasons", reasons)
-
-
-def _json_value(value: object) -> object:
-    if value is None or isinstance(value, (bool, int, str)):
-        return value
-    if isinstance(value, float):
-        if not math.isfinite(value):
-            raise ValueError("Fit run identity contains a non-finite number.")
-        return value
-    if isinstance(value, Mapping):
-        return {
-            str(key): _json_value(item)
-            for key, item in value.items()
-        }
-    if isinstance(value, (tuple, list)):
-        return [_json_value(item) for item in value]
-    raise TypeError(
-        f"Fit run identity contains unsupported value {type(value).__name__}."
-    )
-
-
-def _freeze_json(value: object) -> object:
-    if isinstance(value, dict):
-        return MappingProxyType(
-            {
-                str(key): _freeze_json(item)
-                for key, item in value.items()
-            }
-        )
-    if isinstance(value, list):
-        return tuple(_freeze_json(item) for item in value)
-    return value
-
-
-def _plain_json(value: object) -> object:
-    if isinstance(value, Mapping):
-        return {
-            str(key): _plain_json(item)
-            for key, item in value.items()
-        }
-    if isinstance(value, tuple):
-        return [_plain_json(item) for item in value]
-    return value
-
-
-@dataclass(frozen=True, slots=True)
-class FitRunIdentity:
-    """Deeply immutable compact scientific run identity.
-
-    The identity retains only scalar metadata and digest descriptors.  The
-    canonical bytes used to derive ``short_hash`` are intentionally transient;
-    verbose export is a presentation concern and is assembled on demand.
-    """
-
-    payload: Mapping[str, object]
-    short_hash: str
-
-    @classmethod
-    def build(cls, payload: Mapping[str, object]) -> "FitRunIdentity":
-        normalized = _json_value(payload)
-        if not isinstance(normalized, dict):
-            raise TypeError("Fit run identity must be a JSON object.")
-        encoded = json.dumps(
-            normalized,
-            sort_keys=True,
-            separators=(",", ":"),
-            ensure_ascii=True,
-            allow_nan=False,
-        ).encode("ascii")
-        return cls(
-            payload=_freeze_json(normalized),
-            short_hash=hashlib.sha256(encoded).hexdigest()[:12],
-        )
-
-    def readable_json(self) -> str:
-        return json.dumps(
-            _plain_json(self.payload),
-            sort_keys=True,
-            indent=2,
-            ensure_ascii=True,
-            allow_nan=False,
-        )

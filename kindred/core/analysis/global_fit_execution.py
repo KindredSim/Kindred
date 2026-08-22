@@ -1,8 +1,8 @@
 """
 Global fitting execution boundary.
 
-This module owns serial multi-dataset candidate evaluation, final replay,
-diagnostics, and result/completion assembly. Public API composition remains in
+This module owns concurrent canonical-order multi-dataset candidate evaluation, final replay,
+diagnostics, and canonical result assembly. Public API composition remains in
 ``global_fitting.fit_global``.
 """
 
@@ -10,9 +10,22 @@ from __future__ import annotations
 
 import logging
 import math
+import time
+from concurrent.futures import Executor
 from dataclasses import dataclass, field, replace
 from types import MappingProxyType
-from typing import Any, Callable, Dict, List, Literal, Mapping, Optional, Sequence, Tuple
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Dict,
+    List,
+    Literal,
+    Mapping,
+    Optional,
+    Sequence,
+    Tuple,
+)
 
 import numpy as np
 
@@ -29,10 +42,7 @@ from kindred.core.analysis.dataset_parameter_overrides import (
     FitDatasetParameterOverrides,
 )
 from kindred.core.analysis.fit_dataset_payload import FitDatasetSpec
-from kindred.core.analysis.fit_evaluation_outcome import (
-    FitEvaluationOutcome,
-    ScientificUnavailable,
-)
+from kindred.core.analysis.fit_evaluation_outcome import ScientificUnavailable
 from kindred.core.analysis.fit_statistics import (
     FitMetric,
     finite_positive_mean_normalize,
@@ -46,17 +56,10 @@ from kindred.core.exceptions import (
     FitSimulationError,
     SimulationCancelled,
 )
-from kindred.core.fitting_completion import (
-    FitDiagnostic,
-    FitTerminalExtension,
-    FitPrimaryOutcome,
-    GlobalFitCompletion,
-)
 from kindred.core.fitting_evaluation import (
     FITTING_PARAM_ORIGIN_CONFIGURED_DATASET,
     FITTING_PARAM_ORIGIN_OPTIMIZER_DATASET,
     FITTING_PARAM_ORIGIN_OPTIMIZER_SHARED,
-    evaluate_fitting_series,
 )
 from kindred.core.objective import ObjectiveContext
 from kindred.core.result_repository import SimulationResultValue
@@ -66,39 +69,45 @@ from kindred.core.simulation_failure import (
     factual_cause_from_exception,
 )
 
+if TYPE_CHECKING:
+    from kindred.core.analysis.fit_uncertainty import (
+        ProfileLikelihoodResult,
+        ResidualBootstrapResult,
+    )
+
 logger = logging.getLogger(__name__)
+_DATASET_DEADLINE_SECONDS = 10.0
 
 
-class _ObjectiveTransport(np.ndarray):
-    """Optimizer-compatible vector carrying its same-call typed outcome."""
+def _freeze_result_value(value: object) -> object:
+    """Freeze a small factual field graph owned by ``GlobalFitResult``."""
 
-    def __new__(
-        cls,
-        values: object,
-        outcome: FitEvaluationOutcome,
-    ) -> "_ObjectiveTransport":
-        array = np.asarray(values, dtype=float).reshape(-1).view(cls)
-        array.outcome = outcome  # type: ignore[attr-defined]
+    if isinstance(value, Mapping):
+        return MappingProxyType(
+            {str(name): _freeze_result_value(item) for name, item in value.items()}
+        )
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return tuple(_freeze_result_value(item) for item in value)
+    if isinstance(value, np.ndarray):
+        array = np.asarray(value).copy()
+        array.setflags(write=False)
         return array
+    return value
+
 
 __all__ = [
     "FitCoordinate",
-    "CentredFixedEffectsDeviation",
     "CentredFixedEffectsSettlement",
-    "FitCandidateCompleteness",
     "FitProgress",
     "DatasetFitInfo",
     "GlobalFitResult",
     "FitParameterLayout",
     "ObjectiveDatasetInput",
-    "DatasetSimulationEvaluation",
     "GlobalFitObjective",
     "build_parameter_layout_for_dataset_ids",
     "normalize_weights",
     "evaluate_dataset_simulation",
-    "evaluate_dataset_simulations",
     "fit_result_target_values",
-    "dataset_evaluation_is_fatal",
 ]
 
 
@@ -385,7 +394,13 @@ class FitProgress:
 
 @dataclass(frozen=True, slots=True)
 class DatasetFitInfo:
-    """Fit statistics for a single dataset within global fit."""
+    """Complete direct scientific evaluation for one included dataset.
+
+    The direct dataset operation returns this natural owner.  It carries the
+    canonical simulation together with the aligned model rows and residual
+    blocks that objective and terminal replay consume immediately; no opaque
+    positional fact bundle is needed between those owners.
+    """
     dataset_id: str  # Identifier for this dataset
     r_squared_by_series: Dict[str, FitMetric]  # Ordinary, unweighted R² by series
     weighted_residual_sse: FitMetric  # Exact contribution to the objective
@@ -394,6 +409,19 @@ class DatasetFitInfo:
     weighted_mae: FitMetric
     n_points: int  # Number of data points
     weight: float  # Weight used in global objective
+    simulation_result: SimulationResultValue
+    residuals: np.ndarray
+    weighted_residuals: np.ndarray
+    model_series: Mapping[str, np.ndarray]
+    model_x_by_species: Mapping[str, np.ndarray]
+    model_segment_ids: Mapping[str, np.ndarray]
+    model_segment_keys: Mapping[str, tuple[str, ...]]
+    model_discontinuity_ids: Mapping[str, np.ndarray]
+    model_selection_provenance: Mapping[str, tuple[str, ...]]
+    model_observation_ids: Mapping[str, tuple[str, ...]]
+    model_raw_columns: Mapping[str, tuple[str, ...]]
+    model_source_rows: Mapping[str, tuple[int, ...]]
+    x_projection: ParametricXProjection | None
     x_point_count: int = 0
     x_weighted_residual_sse: FitMetric | None = None
     x_weighted_residual_mse: FitMetric | None = None
@@ -418,6 +446,74 @@ class DatasetFitInfo:
         )
         object.__setattr__(self, "n_points", int(self.n_points))
         object.__setattr__(self, "weight", float(self.weight))
+        if not isinstance(self.simulation_result, SimulationResultValue):
+            raise TypeError("Dataset fit information requires its canonical simulation result.")
+        residuals = np.asarray(self.residuals, dtype=float).reshape(-1).copy()
+        weighted_residuals = np.asarray(self.weighted_residuals, dtype=float).reshape(-1).copy()
+        if (
+            residuals.size == 0
+            or weighted_residuals.size != residuals.size
+            or not np.all(np.isfinite(residuals))
+            or not np.all(np.isfinite(weighted_residuals))
+        ):
+            raise ValueError("Dataset fit residuals must be finite and shape-aligned.")
+        residuals.setflags(write=False)
+        weighted_residuals.setflags(write=False)
+        object.__setattr__(self, "residuals", residuals)
+        object.__setattr__(self, "weighted_residuals", weighted_residuals)
+
+        def freeze_array_map(
+            values: Mapping[str, np.ndarray],
+            *,
+            dtype: object = float,
+        ) -> Mapping[str, np.ndarray]:
+            frozen: dict[str, np.ndarray] = {}
+            for raw_name, raw_values in values.items():
+                array = np.asarray(raw_values, dtype=dtype).reshape(-1).copy()
+                array.setflags(write=False)
+                frozen[str(raw_name)] = array
+            return MappingProxyType(frozen)
+
+        def freeze_tuple_map(
+            values: Mapping[str, Sequence[object]],
+        ) -> Mapping[str, tuple[object, ...]]:
+            return MappingProxyType(
+                {
+                    str(raw_name): tuple(values_for_name)
+                    for raw_name, values_for_name in values.items()
+                }
+            )
+
+        object.__setattr__(self, "model_series", freeze_array_map(self.model_series))
+        object.__setattr__(self, "model_x_by_species", freeze_array_map(self.model_x_by_species))
+        object.__setattr__(
+            self,
+            "model_segment_ids",
+            freeze_array_map(self.model_segment_ids, dtype=np.int64),
+        )
+        object.__setattr__(self, "model_segment_keys", freeze_tuple_map(self.model_segment_keys))
+        object.__setattr__(
+            self,
+            "model_discontinuity_ids",
+            freeze_array_map(self.model_discontinuity_ids, dtype=np.int64),
+        )
+        object.__setattr__(
+            self,
+            "model_selection_provenance",
+            freeze_tuple_map(self.model_selection_provenance),
+        )
+        object.__setattr__(self, "model_observation_ids", freeze_tuple_map(self.model_observation_ids))
+        object.__setattr__(self, "model_raw_columns", freeze_tuple_map(self.model_raw_columns))
+        object.__setattr__(
+            self,
+            "model_source_rows",
+            freeze_tuple_map(self.model_source_rows),
+        )
+        if self.x_projection is not None and not isinstance(
+            self.x_projection,
+            ParametricXProjection,
+        ):
+            raise TypeError("Dataset fit X projection requires a ParametricXProjection.")
         object.__setattr__(self, "x_point_count", int(self.x_point_count))
         if self.x_point_count < 0:
             raise ValueError("Dataset X point count cannot be negative.")
@@ -463,8 +559,15 @@ class GlobalFitResult:
     weighted_residual_mse: FitMetric
     dataset_info: List[DatasetFitInfo]
     message: str
-    completion: GlobalFitCompletion
     optimizer_vector: np.ndarray | None
+    status: Literal["ok", "warn"]
+    optimizer_converged: bool
+    optimizer_diagnostic: FactualCause | None = None
+    diagnostic_only: bool = False
+    profile_likelihood_result: ProfileLikelihoodResult | None = None
+    residual_bootstrap_result: ResidualBootstrapResult | None = None
+    primary_model: Literal["ordinary", "centred_fixed_effects"] = "ordinary"
+    primary_model_details: Mapping[str, object] = field(default_factory=dict)
     centred_fixed_effects_settlements: tuple[CentredFixedEffectsSettlement, ...] = ()
     scipy_nfev: int | None = None
     terminal_replay_count: int = 0
@@ -487,8 +590,36 @@ class GlobalFitResult:
     )
 
     def __post_init__(self) -> None:
-        if not isinstance(self.completion, GlobalFitCompletion):
-            raise TypeError("GlobalFitResult.completion must be a GlobalFitCompletion")
+        status = str(self.status or "")
+        if status not in {"ok", "warn"}:
+            raise ValueError(f"Unsupported GlobalFitResult status: {status!r}")
+        optimizer_converged = bool(self.optimizer_converged)
+        diagnostic_only = bool(self.diagnostic_only)
+        optimizer_diagnostic = self.optimizer_diagnostic
+        if optimizer_diagnostic is not None and not isinstance(
+            optimizer_diagnostic, FactualCause
+        ):
+            raise TypeError("GlobalFitResult optimizer diagnostic must be a FactualCause.")
+        if status == "ok" and (not optimizer_converged or optimizer_diagnostic is not None):
+            raise ValueError("A successful GlobalFitResult requires convergence and no diagnostic.")
+        if status == "warn" and optimizer_converged and optimizer_diagnostic is None:
+            raise ValueError("A warning GlobalFitResult requires a diagnostic when converged.")
+        if diagnostic_only != (not optimizer_converged):
+            raise ValueError(
+                "GlobalFitResult diagnostic-only classification must match convergence."
+            )
+        primary_model = str(self.primary_model or "ordinary")
+        if primary_model not in {"ordinary", "centred_fixed_effects"}:
+            raise ValueError(f"Unsupported GlobalFitResult primary model: {primary_model!r}")
+        object.__setattr__(self, "status", status)
+        object.__setattr__(self, "optimizer_converged", optimizer_converged)
+        object.__setattr__(self, "diagnostic_only", diagnostic_only)
+        object.__setattr__(self, "primary_model", primary_model)
+        object.__setattr__(
+            self,
+            "primary_model_details",
+            _freeze_result_value(dict(self.primary_model_details or {})),
+        )
         if not (
             isinstance(self.weighted_residual_sse, FitMetric)
             and isinstance(self.weighted_residual_mse, FitMetric)
@@ -511,10 +642,8 @@ class GlobalFitResult:
         settlements = tuple(self.centred_fixed_effects_settlements or ())
         if any(not isinstance(item, CentredFixedEffectsSettlement) for item in settlements):
             raise TypeError("GlobalFitResult centred settlements require typed DTOs.")
-        expected_primary_model = (
-            "centred_fixed_effects" if settlements else "ordinary"
-        )
-        if self.completion.primary_model != expected_primary_model:
+        expected_primary_model = "centred_fixed_effects" if settlements else "ordinary"
+        if self.primary_model != expected_primary_model:
             raise ValueError(
                 "GlobalFitResult primary model must match its centred settlement roster."
             )
@@ -777,6 +906,18 @@ class GlobalFitResult:
             MappingProxyType(projections),
         )
 
+    @property
+    def cost(self) -> FitMetric:
+        """Return factual terminal cost, never an optimizer penalty."""
+
+        return self.weighted_residual_sse
+
+    @property
+    def classification(self) -> Literal["converged", "nonconverged"]:
+        """Classify the retained candidate for presentation and Apply guards."""
+
+        return "converged" if self.optimizer_converged else "nonconverged"
+
 
 @dataclass(frozen=True, slots=True)
 class _FitReplayState:
@@ -788,7 +929,9 @@ class _FitReplayState:
     weighted_residual_mse: FitMetric
     dataset_info: tuple[DatasetFitInfo, ...]
     message: str
-    completion: GlobalFitCompletion
+    status: Literal["ok", "warn"]
+    optimizer_converged: bool
+    optimizer_diagnostic: FactualCause | None
     optimizer_vector: np.ndarray
     scipy_nfev: int
     terminal_replay_count: int
@@ -804,6 +947,9 @@ class _FitReplayState:
     model_source_rows: Mapping[str, Mapping[str, tuple[int, ...]]]
     model_x_projection_by_dataset: Mapping[str, ParametricXProjection]
     simulation_results_by_dataset: Mapping[str, SimulationResultValue]
+    weighted_residuals: np.ndarray
+    profile_likelihood_result: ProfileLikelihoodResult | None = None
+    residual_bootstrap_result: ResidualBootstrapResult | None = None
     centred_fixed_effects_settlements: tuple[CentredFixedEffectsSettlement, ...] = ()
 
     def __post_init__(self) -> None:
@@ -815,20 +961,22 @@ class _FitReplayState:
             raise ValueError("Fit replay state requires a nonempty finite optimizer vector.")
         vector.setflags(write=False)
         object.__setattr__(self, "optimizer_vector", vector)
+        residuals = np.asarray(self.weighted_residuals, dtype=float).reshape(-1).copy()
+        if residuals.size == 0 or not np.all(np.isfinite(residuals)):
+            raise ValueError("Fit replay weighted residuals must be finite and nonempty.")
+        residuals.setflags(write=False)
+        object.__setattr__(self, "weighted_residuals", residuals)
 
 
 def _construct_global_fit_result(
     state: _FitReplayState,
     *,
-    terminal_extensions: Sequence[FitTerminalExtension] = (),
     shared_refit_provenance: Mapping[str, object] | None = None,
-    primary_outcome: FitPrimaryOutcome | None = None,
 ) -> GlobalFitResult:
     """Construct the sole immutable publishable result after settlement."""
 
     if not isinstance(state, _FitReplayState):
         raise TypeError("Global Fit publication requires private replay state.")
-    base = state.completion
     settlements = tuple(state.centred_fixed_effects_settlements or ())
     if settlements:
         primary_model = "centred_fixed_effects"
@@ -845,15 +993,6 @@ def _construct_global_fit_result(
     else:
         primary_model = "ordinary"
         primary_model_details = {}
-    completion = GlobalFitCompletion(
-        status=base.status,
-        optimizer_converged=base.optimizer_converged,
-        optimizer_diagnostic=base.optimizer_diagnostic,
-        terminal_extensions=tuple(terminal_extensions),
-        primary_model=primary_model,
-        primary_model_details=primary_model_details,
-        primary_outcome=primary_outcome,
-    )
     return GlobalFitResult(
         shared_params=dict(state.shared_params),
         dataset_params={
@@ -864,8 +1003,15 @@ def _construct_global_fit_result(
         weighted_residual_mse=state.weighted_residual_mse,
         dataset_info=list(state.dataset_info),
         message=state.message,
-        completion=completion,
         optimizer_vector=state.optimizer_vector,
+        status=state.status,
+        optimizer_converged=state.optimizer_converged,
+        optimizer_diagnostic=state.optimizer_diagnostic,
+        diagnostic_only=not state.optimizer_converged,
+        profile_likelihood_result=state.profile_likelihood_result,
+        residual_bootstrap_result=state.residual_bootstrap_result,
+        primary_model=primary_model,
+        primary_model_details=primary_model_details,
         centred_fixed_effects_settlements=settlements,
         scipy_nfev=int(state.scipy_nfev),
         terminal_replay_count=int(state.terminal_replay_count),
@@ -922,57 +1068,25 @@ def _compact_failure_message(failure: FactualCause) -> str:
     return " ".join(part.strip() for part in str(raw_message).splitlines() if part.strip())
 
 
-def build_fit_diagnostic_from_failure(
-    failure: object,
-    *,
-    phase: str,
-    dataset_id: Optional[str] = None,
-) -> FitDiagnostic:
-    if not isinstance(failure, FactualCause):
-        raise TypeError("Fit diagnostic failure must be a FactualCause.")
-    return FitDiagnostic(
-        phase=phase,
-        dataset_id=dataset_id,
-        failure=failure,
-    )
-
-
-def build_fit_diagnostic_from_exception(
-    exc: BaseException,
-    *,
-    phase: str,
-    dataset_id: Optional[str] = None,
-) -> FitDiagnostic:
-    failure = factual_cause_from_exception(
-        exc,
-        domain="fit",
-        origin=f"diagnostic_{phase}",
-    )
-    return FitDiagnostic(
-        phase=phase,
-        dataset_id=dataset_id,
-        failure=failure,
-    )
-
-
-def completion_result_message(
+def fit_result_message(
     *,
     base_message: str,
-    completion: GlobalFitCompletion,
-    optimizer_diagnostic: Optional[FitDiagnostic],
+    status: Literal["ok", "warn"],
+    optimizer_converged: bool,
+    optimizer_diagnostic: FactualCause | None,
 ) -> str:
-    if completion.status == "ok":
+    if status == "ok":
         return str(base_message)
-    if completion.status == "warn":
+    if status == "warn":
         warning_parts: list[str] = []
-        if not completion.optimizer_converged:
+        if not optimizer_converged:
             fallback = str(base_message or "").strip()
             if fallback and "success" not in fallback.lower():
                 warning_parts.append(fallback)
             else:
                 warning_parts.append("optimizer did not report convergence")
         if optimizer_diagnostic is not None:
-            detail = _compact_failure_message(optimizer_diagnostic.failure)
+            detail = _compact_failure_message(optimizer_diagnostic)
             if detail:
                 warning_parts.append(detail)
         if warning_parts:
@@ -981,7 +1095,7 @@ def completion_result_message(
         if fallback and "success" not in fallback.lower():
             return fallback
         return "Global fit completed with warnings."
-    raise AssertionError(f"Unsupported completed Fit status: {completion.status!r}")
+    raise AssertionError(f"Unsupported completed Fit status: {status!r}")
 
 
 def normalize_weights(payloads: List[FitDatasetSpec], weights: Optional[Dict[str, float]]) -> Dict[str, float]:
@@ -1845,7 +1959,6 @@ def build_parameter_layout_for_dataset_ids(
 
 @dataclass(frozen=True)
 class ObjectiveDatasetInput:
-    index: int
     payload: FitDatasetSpec
     full_params: Dict[str, float]
     parameter_origins: Dict[str, str]
@@ -1857,47 +1970,281 @@ class ObjectiveDatasetInput:
         object.__setattr__(self, "failed_param_snapshot", dict(self.failed_param_snapshot))
 
 
-@dataclass(frozen=True)
-class DatasetSimulationEvaluation:
-    index: int
-    status: Literal["available", "scientific_unavailable", "cancelled", "fatal"]
-    result: Optional[SimulationResultValue] = None
-    error: Optional[BaseException] = None
-    unavailability: Optional[ScientificUnavailable] = None
-    error_provenance: Optional[Dict[str, Any]] = None
+class _DatasetFitUnavailable(Exception):
+    """Call-local bridge from the direct evaluator to its caller."""
 
-    def __post_init__(self) -> None:
-        status = str(self.status or "")
-        if status not in {"available", "scientific_unavailable", "cancelled", "fatal"}:
-            raise ValueError(f"Unsupported dataset evaluation status: {status!r}")
-        if status == "available" and self.result is None:
-            raise ValueError(
-                "Successful Fit evaluations require a canonical simulation result."
+    def __init__(self, result: ScientificUnavailable) -> None:
+        self.result = result
+        super().__init__(result.stage)
+
+
+def _is_dataset_deadline_unavailable(
+    result: ScientificUnavailable,
+) -> bool:
+    """Classify the direct evaluator's cooperative deadline result."""
+
+    return bool(dict(result.details).get("deadline")) or result.stage == "dataset_deadline"
+
+
+def _dataset_deadline_cause(
+    dataset_ids: Sequence[str],
+) -> FactualCause:
+    """Build the fit-owned factual cause for one or more timed-out datasets."""
+
+    roster = tuple(sorted({str(dataset_id) for dataset_id in dataset_ids}))
+    if not roster:
+        raise ValueError("Dataset deadline causes require a nonempty dataset roster.")
+    cause_details: dict[str, object] = {
+        "datasets": roster,
+        "deadline": True,
+        "deadline_seconds": _DATASET_DEADLINE_SECONDS,
+    }
+    if len(roster) == 1:
+        cause_details["dataset"] = roster[0]
+    return FactualCause(
+        domain="fit",
+        origin="dataset_deadline",
+        code=None,
+        type="DatasetEvaluationDeadline",
+        message="Fit dataset evaluation exceeded its deadline.",
+        details=cause_details,
+    )
+
+
+def _aggregate_dataset_deadline_unavailability(
+    items: Sequence[ObjectiveDatasetInput],
+    evaluations: Sequence[DatasetFitInfo | ScientificUnavailable],
+) -> ScientificUnavailable | None:
+    """Aggregate timed-out dataset facts in canonical sorted order."""
+
+    timed_out_dataset_ids = tuple(
+        sorted(
+            {
+                item.payload.dataset_id
+                for item, evaluation in zip(items, evaluations, strict=True)
+                if isinstance(evaluation, ScientificUnavailable)
+                and _is_dataset_deadline_unavailable(evaluation)
+            }
+        )
+    )
+    if not timed_out_dataset_ids:
+        return None
+    return ScientificUnavailable(
+        producer="fit_dataset_deadline",
+        stage="dataset_deadline",
+        details={
+            "deadline": True,
+            "deadline_seconds": _DATASET_DEADLINE_SECONDS,
+            "datasets": timed_out_dataset_ids,
+        },
+        factual_cause=_dataset_deadline_cause(timed_out_dataset_ids),
+    )
+
+
+def _build_dataset_fit_info(
+    item: ObjectiveDatasetInput,
+    simulation: SimulationResultValue,
+    *,
+    weights: Mapping[str, float],
+    cancellation_control: SimulationCancellationControl | None = None,
+) -> DatasetFitInfo:
+    """Project one simulation and build direct weighted residual facts.
+
+    The returned ``DatasetFitInfo`` is the natural owner of every per-dataset
+    scientific fact consumed by objective and terminal replay.
+    """
+
+    _raise_if_fitting_cancel_requested(cancellation_control)
+    payload = item.payload
+    dataset_id = payload.dataset_id
+    observations = _payload_observations(payload)
+    x_name = payload.x_name
+    x_projection: ParametricXProjection | None = None
+    sim_time = np.asarray(simulation.t, dtype=float)
+    segment_ids = np.asarray(simulation.segment_ids, dtype=np.int64)
+    segment_keys = tuple(simulation.segment_keys)
+    discontinuity_ids = np.asarray(simulation.discontinuity_ids, dtype=np.int64)
+    if x_name != "t":
+        x_observations = _payload_x_observations(payload)
+        try:
+            x_projection = align_parametric_x(
+                observation_time=x_observations["t"],
+                observed_x=x_observations["x"],
+                source_rows=x_observations["source_rows"],
+                model_time=sim_time,
+                model_x=fit_result_target_values(simulation, x_name),
+                segment_ids=segment_ids,
+                segment_keys=segment_keys,
+                discontinuity_ids=discontinuity_ids,
+                mode=payload.x_mode,
+                dataset_label=dataset_id,
+                x_name=x_name,
             )
-        if status != "available" and self.result is not None:
-            raise ValueError("Failed Fit evaluations cannot publish a partial result.")
-        if status == "scientific_unavailable":
-            if self.unavailability is None or self.error is not None:
-                raise ValueError(
-                    "Scientific-unavailability evaluations require their typed result."
-                )
-        elif self.unavailability is not None:
-            raise ValueError("Only unavailable evaluations may carry unavailability.")
-        if status == "fatal" and self.error is None:
-            raise ValueError("Fatal Fit evaluations require their exception.")
-        if status != "fatal" and self.error is not None:
-            raise ValueError("Only fatal evaluations may carry an exception.")
-        if status == "available" and not isinstance(self.result, SimulationResultValue):
-            raise TypeError(
-                "Successful Fit evaluations require a SimulationResultValue."
+        except CandidateParametricAlignmentError as exc:
+            raise _DatasetFitUnavailable(ScientificUnavailable(
+                producer="parametric_alignment",
+                stage="parametric_x_alignment",
+                details={"dataset": dataset_id, **dict(getattr(exc, "details", None) or {})},
+                factual_cause=factual_cause_from_exception(
+                    exc, domain="fit", origin="parametric_x_alignment"
+                ),
+            )) from exc
+    _raise_if_fitting_cancel_requested(cancellation_control)
+
+    target_multipliers = _normalized_target_weight_multipliers(
+        species_list=payload.target_roster,
+        target_weights=dict(payload.target_weights),
+    )
+    dataset_weight = _objective_dataset_weight_multiplier(weights.get(dataset_id, 1.0))
+    raw_blocks: list[np.ndarray] = []
+    weighted_blocks: list[np.ndarray] = []
+    model_series: dict[str, np.ndarray] = {}
+    model_x: dict[str, np.ndarray] = {}
+    model_segment: dict[str, np.ndarray] = {}
+    model_keys: dict[str, tuple[str, ...]] = {}
+    model_discontinuity: dict[str, np.ndarray] = {}
+    model_selection: dict[str, tuple[str, ...]] = {}
+    model_observation: dict[str, tuple[str, ...]] = {}
+    model_raw_columns: dict[str, tuple[str, ...]] = {}
+    model_source_rows: dict[str, tuple[int, ...]] = {}
+    r_squared: dict[str, FitMetric] = {}
+    for species_name in sorted(payload.species_list):
+        _raise_if_fitting_cancel_requested(cancellation_control)
+        species_obs = observations[species_name]
+        obs_t = np.asarray(species_obs["t"], dtype=float).reshape(-1)
+        y_exp = np.asarray(species_obs["y"], dtype=float).reshape(-1)
+        model_values = fit_result_target_values(simulation, species_name)
+        if x_name == "t":
+            selected = _select_fit_rows(
+                model_y=np.asarray(model_values, dtype=float),
+                sim_time=sim_time,
+                observation_time=obs_t,
+                observation_id=species_obs["raw_observation_id"],
+                raw_column=species_obs["raw_column"],
+                source_rows=species_obs["source_rows"],
+                segment_ids=segment_ids,
+                segment_keys=segment_keys,
+                discontinuity_ids=discontinuity_ids,
             )
-        object.__setattr__(self, "status", status)
-        if self.error_provenance is not None:
-            object.__setattr__(self, "error_provenance", dict(self.error_provenance))
+        else:
+            assert x_projection is not None
+            y_projection = x_projection.subset(species_obs["source_rows"])
+            y_sim = project_parametric_y(
+                projection=y_projection,
+                model_time=sim_time,
+                model_y=np.asarray(model_values, dtype=float),
+                segment_ids=segment_ids,
+                segment_keys=segment_keys,
+                discontinuity_ids=discontinuity_ids,
+            )
+            selected = (
+                y_projection.selected_model_x,
+                y_sim,
+                y_projection.segment_ids,
+                y_projection.segment_keys,
+                y_projection.discontinuity_ids,
+                y_projection.sample_kinds,
+                tuple(species_obs["raw_observation_id"] for _ in species_obs["source_rows"]),
+                tuple(species_obs["raw_column"] for _ in species_obs["source_rows"]),
+                tuple(int(row) for row in species_obs["source_rows"]),
+            )
+        y_sim = np.asarray(selected[1], dtype=float).reshape(-1)
+        if y_sim.size != y_exp.size or not np.all(np.isfinite(y_sim)):
+            raise _DatasetFitUnavailable(ScientificUnavailable(
+                producer="global_fit_objective",
+                stage="objective_residual_arithmetic",
+                details={"dataset": dataset_id, "species": species_name},
+            ))
+        raw_residual = y_sim - y_exp
+        multiplier = dataset_weight * float(target_multipliers.get(species_name, 1.0))
+        weighted = multiplier * raw_residual
+        if not np.all(np.isfinite(raw_residual)) or not np.all(np.isfinite(weighted)):
+            raise _DatasetFitUnavailable(ScientificUnavailable(
+                producer="global_fit_objective",
+                stage="objective_residual_arithmetic",
+                details={"dataset": dataset_id, "species": species_name},
+            ))
+        raw_blocks.append(raw_residual)
+        weighted_blocks.append(weighted)
+        model_series[species_name] = y_sim
+        model_x[species_name] = np.asarray(selected[0], dtype=float)
+        model_segment[species_name] = np.asarray(selected[2], dtype=np.int64)
+        model_keys[species_name] = tuple(selected[3])
+        model_discontinuity[species_name] = np.asarray(selected[4], dtype=np.int64)
+        model_selection[species_name] = tuple(selected[5])
+        model_observation[species_name] = tuple(selected[6])
+        model_raw_columns[species_name] = tuple(selected[7])
+        model_source_rows[species_name] = tuple(selected[8])
+        r_squared[str(species_name)] = r_squared_metric(y_exp, raw_residual)
 
-
-def dataset_evaluation_is_fatal(result: DatasetSimulationEvaluation) -> bool:
-    return result.status == "fatal"
+    if x_projection is not None:
+        x_multiplier = dataset_weight * float(target_multipliers[payload.x_name])
+        x_raw = np.asarray(x_projection.delta_x, dtype=float).reshape(-1)
+        x_weighted = x_multiplier * x_raw
+        if not np.all(np.isfinite(x_weighted)) or finite_sum_of_squares(x_weighted) is None:
+            raise _DatasetFitUnavailable(ScientificUnavailable(
+                producer="global_fit_objective",
+                stage="objective_residual_arithmetic",
+                details={"dataset": dataset_id, "target": payload.x_name},
+            ))
+        raw_blocks.append(x_raw)
+        weighted_blocks.append(x_weighted)
+    _raise_if_fitting_cancel_requested(cancellation_control)
+    residuals = np.concatenate(raw_blocks)
+    weighted_residuals = np.concatenate(weighted_blocks)
+    residuals.setflags(write=False)
+    weighted_residuals.setflags(write=False)
+    x_count = 0 if x_projection is None else int(x_projection.size)
+    x_weighted = (
+        np.asarray([], dtype=float)
+        if x_projection is None
+        else dataset_weight
+        * float(target_multipliers[payload.x_name])
+        * np.asarray(x_projection.delta_x, dtype=float)
+    )
+    dataset_metrics = fit_error_metrics(weighted_residuals)
+    return DatasetFitInfo(
+        dataset_id=dataset_id,
+        r_squared_by_series=r_squared,
+        weighted_residual_sse=dataset_metrics.weighted_sse,
+        weighted_residual_mse=dataset_metrics.weighted_mse,
+        weighted_rmse=dataset_metrics.weighted_rmse,
+        weighted_mae=dataset_metrics.weighted_mae,
+        n_points=int(residuals.size),
+        weight=weights.get(dataset_id, 1.0),
+        simulation_result=simulation,
+        residuals=residuals,
+        weighted_residuals=weighted_residuals,
+        model_series=model_series,
+        model_x_by_species=model_x,
+        model_segment_ids=model_segment,
+        model_segment_keys=model_keys,
+        model_discontinuity_ids=model_discontinuity,
+        model_selection_provenance=model_selection,
+        model_observation_ids=model_observation,
+        model_raw_columns=model_raw_columns,
+        model_source_rows=model_source_rows,
+        x_projection=x_projection,
+        x_point_count=x_count,
+        x_weighted_residual_sse=(
+            None if x_count == 0 else fit_error_metrics(x_weighted).weighted_sse
+        ),
+        x_weighted_residual_mse=(
+            None if x_count == 0 else fit_error_metrics(x_weighted).weighted_mse
+        ),
+        x_weighted_rmse=(
+            None if x_count == 0 else fit_error_metrics(x_weighted).weighted_rmse
+        ),
+        x_weighted_mae=(
+            None if x_count == 0 else fit_error_metrics(x_weighted).weighted_mae
+        ),
+        x_delta_x=(
+            () if x_projection is None else tuple(float(v) for v in x_projection.delta_x)
+        ),
+        x_match_kinds=(() if x_projection is None else x_projection.match_kinds),
+        x_sample_kinds=(() if x_projection is None else x_projection.sample_kinds),
+        x_source_rows=(() if x_projection is None else x_projection.source_rows),
+    )
 
 
 def evaluate_dataset_simulation(
@@ -1905,72 +2252,94 @@ def evaluate_dataset_simulation(
     item: ObjectiveDatasetInput,
     *,
     cancellation_control: SimulationCancellationControl | None = None,
-) -> DatasetSimulationEvaluation:
+    weights: Mapping[str, float] | None = None,
+) -> DatasetFitInfo | ScientificUnavailable:
+    """Bind, simulate, align, weight, and evaluate one dataset directly.
+
+    A successful call returns its complete ``DatasetFitInfo`` owner.  Candidate
+    scientific unavailability is returned directly; timeout is represented by
+    ``ScientificUnavailable`` and is settled into a penalty block only by the
+    optimizer objective.  Every other exception remains a factual cancellation
+    or fatal route.
+    """
     ds_id = item.payload.dataset_id
+    started = time.monotonic()
+    deadline = started + _DATASET_DEADLINE_SECONDS
+    worker_cancel = cancellation_control
+    task_control = SimulationCancellationControl(
+        lambda: (
+            worker_cancel is not None
+            and worker_cancel.cancel_requested()
+        )
+        or time.monotonic() >= deadline
+    )
+
+    def deadline_unavailable() -> ScientificUnavailable:
+        # Recheck whole-worker cancellation immediately before settling a
+        # timeout so Stop/Close wins a simultaneous deadline race.
+        _raise_if_fitting_cancel_requested(worker_cancel)
+        return ScientificUnavailable(
+            producer="fit_dataset_deadline",
+            stage="dataset_deadline",
+            details={
+                "dataset": ds_id,
+                "deadline": True,
+                "deadline_seconds": _DATASET_DEADLINE_SECONDS,
+            },
+            factual_cause=_dataset_deadline_cause((ds_id,)),
+        )
+
     try:
-        _raise_if_fitting_cancel_requested(cancellation_control)
+        _raise_if_fitting_cancel_requested(worker_cancel)
         evaluator = fit_evaluators.get(ds_id)
         if evaluator is None:
             raise FitSimulationError(
                 f"No fitting evaluator exists for dataset {ds_id!r}.",
                 details={"fatal": True, "stage": "fit_capture"},
             )
-        series_outcome = evaluate_fitting_series(
-            evaluator,
+        setter = getattr(evaluator, "set_cancellation_control", None)
+        if callable(setter):
+            setter(task_control)
+        series_result = evaluator.evaluate_series_with_parameter_origins(
             item.full_params,
             origins=item.parameter_origins,
             failed_params=item.failed_param_snapshot,
         )
-        _raise_if_fitting_cancel_requested(cancellation_control)
-        if series_outcome.status == "available":
-            if not isinstance(series_outcome.result, SimulationResultValue):
-                raise TypeError("Available fitting series outcome omitted its result.")
-            return DatasetSimulationEvaluation(
-                index=int(item.index),
-                status="available",
-                result=series_outcome.result,
-            )
-        if series_outcome.status == "scientific_unavailable":
-            return DatasetSimulationEvaluation(
-                index=int(item.index),
-                status="scientific_unavailable",
-                unavailability=series_outcome.unavailability,
-                error_provenance={
-                    "dataset": ds_id,
-                    "provenance": dict(series_outcome.provenance),
-                },
-            )
-        if series_outcome.status == "cancelled":
-            return DatasetSimulationEvaluation(
-                index=int(item.index),
-                status="cancelled",
-                error_provenance={"dataset": ds_id},
-            )
-        return DatasetSimulationEvaluation(
-            index=int(item.index),
-            status="fatal",
-            error=series_outcome.cause,
-            error_provenance={
-                "dataset": ds_id,
-                "provenance": dict(series_outcome.provenance),
-            },
+        _raise_if_fitting_cancel_requested(worker_cancel)
+        if time.monotonic() >= deadline:
+            return deadline_unavailable()
+        if isinstance(series_result, ScientificUnavailable):
+            return series_result
+        fit_info = _build_dataset_fit_info(
+            item,
+            series_result,
+            weights=weights or {},
+            cancellation_control=task_control,
         )
-    except FitSimulationError as exc:
-        return DatasetSimulationEvaluation(
-            index=int(item.index),
-            status="fatal",
-            error=exc,
-            error_provenance={"dataset": ds_id, "provenance": getattr(exc, "provenance", None)},
-        )
+        _raise_if_fitting_cancel_requested(worker_cancel)
+        if time.monotonic() >= deadline:
+            return deadline_unavailable()
+        return fit_info
+    except _DatasetFitUnavailable as unavailable:
+        _raise_if_fitting_cancel_requested(worker_cancel)
+        if time.monotonic() >= deadline:
+            return deadline_unavailable()
+        return unavailable.result
+    except FitSimulationError:
+        _raise_if_fitting_cancel_requested(worker_cancel)
+        if time.monotonic() >= deadline:
+            return deadline_unavailable()
+        raise
     except Exception as exc:
         if isinstance(exc, (FittingCancelled, SimulationCancelled)):
+            _raise_if_fitting_cancel_requested(worker_cancel)
+            if time.monotonic() >= deadline:
+                return deadline_unavailable()
             raise FittingCancelled() from exc
-        return DatasetSimulationEvaluation(
-            index=int(item.index),
-            status="fatal",
-            error=exc,
-            error_provenance={"dataset": ds_id},
-        )
+        _raise_if_fitting_cancel_requested(worker_cancel)
+        if time.monotonic() >= deadline:
+            return deadline_unavailable()
+        raise
 
 def evaluate_dataset_simulations(
     fit_evaluators: Mapping[str, object],
@@ -1978,24 +2347,41 @@ def evaluate_dataset_simulations(
     *,
     cancellation_check: Optional[Callable[[], bool]] = None,
     cancellation_control: SimulationCancellationControl | None = None,
-    stop_on_fatal: bool = True,
-) -> List[DatasetSimulationEvaluation]:
+    executor: Executor,
+    weights: Mapping[str, float] | None = None,
+) -> list[DatasetFitInfo | ScientificUnavailable]:
+    if executor is None:
+        raise TypeError("Multi-dataset Fit evaluation requires a borrowed executor.")
     if not items:
         return []
-    results = []
-    for item in items:
-        _raise_if_fitting_cancelled(cancellation_check)
-        _raise_if_fitting_cancel_requested(cancellation_control)
-        result = evaluate_dataset_simulation(
+    ordered = tuple(items)
+    _raise_if_fitting_cancelled(cancellation_check)
+    _raise_if_fitting_cancel_requested(cancellation_control)
+    futures = [
+        executor.submit(
+            evaluate_dataset_simulation,
             fit_evaluators,
             item,
             cancellation_control=cancellation_control,
+            weights=weights,
         )
+        for item in ordered
+    ]
+    results: list[DatasetFitInfo | ScientificUnavailable] = []
+    first_exception: BaseException | None = None
+    for future in futures:
+        try:
+            result = future.result()
+        except BaseException as exc:
+            # Every submitted task is joined before propagating cancellation or
+            # a worker exception; the owning executor must never abandon native
+            # solver work behind an early return.
+            if first_exception is None:
+                first_exception = exc
+            continue
         results.append(result)
-        if result.status == "cancelled":
-            raise FittingCancelled()
-        if stop_on_fatal and dataset_evaluation_is_fatal(result):
-            break
+    if first_exception is not None:
+        raise first_exception
     return results
 
 
@@ -2014,7 +2400,10 @@ class GlobalFitObjective:
         progress_callback: Optional[Callable[[FitProgress], None]],
         cancellation_check: Optional[Callable[[], bool]],
         cancellation_control: SimulationCancellationControl | None = None,
+        executor: Executor,
     ) -> None:
+        if executor is None:
+            raise TypeError("Global Fit objective requires a borrowed executor.")
         self._fit_evaluators = dict(fit_evaluators)
         payload_roster = tuple(payloads)
         if any(not isinstance(item, FitDatasetSpec) for item in payload_roster):
@@ -2053,9 +2442,11 @@ class GlobalFitObjective:
         self._progress_callback = progress_callback
         self._cancellation_check = cancellation_check
         self._cancellation_control = cancellation_control
+        self._executor = executor
 
         self._objective_calls = 0
         self._best_cost = float("inf")
+        self._best_vector: np.ndarray | None = None
         self._warned_objective_keys: set[tuple[str, str, str]] = set()
 
     @property
@@ -2064,14 +2455,31 @@ class GlobalFitObjective:
 
         return int(self._objective_calls)
 
-    def evaluate_outcome(self, params: np.ndarray) -> FitEvaluationOutcome:
-        """Evaluate one candidate and return scientific status, never a penalty."""
+    def evaluate_scientific_residuals(
+        self,
+        params: np.ndarray,
+    ) -> np.ndarray | None:
+        """Evaluate one candidate and refuse penalty residuals as evidence.
 
-        transport = self(np.asarray(params, dtype=float))
-        outcome = getattr(transport, "outcome", None)
-        if not isinstance(outcome, FitEvaluationOutcome):
-            raise RuntimeError("Fit objective omitted its typed evaluation outcome.")
-        return outcome
+        The optimizer-facing call necessarily returns finite penalty residuals
+        for scientifically unavailable candidates.  Profile likelihood uses
+        this call-local route so it can distinguish that settlement from a
+        scientific residual vector without introducing a second result store.
+        """
+
+        residuals = self(np.asarray(params, dtype=float))
+        if self._ctx.last_error is not None:
+            return None
+        values = np.asarray(residuals, dtype=float).reshape(-1)
+        return values if values.size and np.all(np.isfinite(values)) else None
+
+    @property
+    def best_complete_vector(self) -> np.ndarray | None:
+        """Return the sole retained complete candidate vector, if any."""
+
+        if self._best_vector is None:
+            return None
+        return np.asarray(self._best_vector, dtype=float).copy()
 
     @staticmethod
     def format_params(params_map: Dict[str, float]) -> Dict[str, float]:
@@ -2150,6 +2558,37 @@ class GlobalFitObjective:
                 else np.asarray([], dtype=float)
             )
 
+        def dataset_penalty_residuals(payload: FitDatasetSpec) -> np.ndarray:
+            target_multipliers = _normalized_target_weight_multipliers(
+                species_list=payload.target_roster,
+                target_weights=dict(payload.target_weights),
+            )
+            dataset_weight = _objective_dataset_weight_multiplier(
+                self._weights.get(payload.dataset_id, 1.0)
+            )
+            observations = _payload_observations(payload)
+            blocks = [
+                np.full(
+                    np.asarray(observations[name]["y"], dtype=float).size,
+                    dataset_weight
+                    * float(target_multipliers.get(name, 1.0))
+                    * self._penalty_value,
+                    dtype=float,
+                )
+                for name in sorted(payload.species_list)
+            ]
+            if payload.x_name != "t":
+                blocks.append(
+                    np.full(
+                        len(payload.x_source_rows),
+                        dataset_weight
+                        * float(target_multipliers[payload.x_name])
+                        * self._penalty_value,
+                        dtype=float,
+                    )
+                )
+            return np.concatenate(blocks) if blocks else np.asarray([], dtype=float)
+
         def finalize_candidate(
             *,
             optimizer_vector: np.ndarray,
@@ -2161,6 +2600,7 @@ class GlobalFitObjective:
             self._objective_calls += 1
             if improved:
                 self._best_cost = float(cost)
+                self._best_vector = np.asarray(optimizer_vector, dtype=float).reshape(-1).copy()
             if self._progress_callback is None:
                 return
             progress_vector = np.asarray(optimizer_vector, dtype=float).reshape(-1)
@@ -2194,11 +2634,6 @@ class GlobalFitObjective:
             optimizer_vector: np.ndarray,
         ) -> np.ndarray:
             penalty = candidate_penalty_residuals()
-            outcome = FitEvaluationOutcome.scientific_unavailable(
-                unavailability,
-                transport_residuals=penalty,
-                provenance=dict(provenance) if isinstance(provenance, Mapping) else {},
-            )
             context_error = FitSimulationError(
                 "Fit candidate scientific result was unavailable.",
                 details={
@@ -2228,7 +2663,7 @@ class GlobalFitObjective:
                 best_results={},
                 publish_every_call=True,
             )
-            return _ObjectiveTransport(penalty, outcome)
+            return penalty
 
         try:
             self._layout.validate_optimizer_vector(params)
@@ -2246,7 +2681,7 @@ class GlobalFitObjective:
         all_residuals: List[float] = []
         dataset_inputs: List[ObjectiveDatasetInput] = []
 
-        for index, payload in enumerate(self._payloads):
+        for payload in self._payloads:
             _raise_if_fitting_cancel_requested(self._cancellation_control)
 
             ds_id = payload.dataset_id
@@ -2299,7 +2734,6 @@ class GlobalFitObjective:
             )
             dataset_inputs.append(
                 ObjectiveDatasetInput(
-                    index=int(index),
                     payload=payload,
                     full_params=full_params,
                     parameter_origins=parameter_origins,
@@ -2307,267 +2741,69 @@ class GlobalFitObjective:
                 )
             )
 
-        simulation_evaluations = {
-            int(result.index): result
-            for result in evaluate_dataset_simulations(
+        simulation_evaluations = tuple(
+            evaluate_dataset_simulations(
                 self._fit_evaluators,
                 dataset_inputs,
                 cancellation_check=self._cancellation_check,
                 cancellation_control=self._cancellation_control,
+                executor=self._executor,
+                weights=self._weights,
             )
-        }
+        )
 
-        for evaluation in simulation_evaluations.values():
-            if not dataset_evaluation_is_fatal(evaluation):
-                continue
-            exc = evaluation.error
-            if exc is None:
-                raise RuntimeError("Fatal Fit evaluation omitted its exception.")
-            self._ctx.set_error(exc, evaluation.error_provenance)
-            raise exc
-
-        for evaluation in simulation_evaluations.values():
-            if evaluation.status == "scientific_unavailable":
-                if evaluation.unavailability is None:
-                    raise RuntimeError("Unavailable Fit evaluation omitted its result.")
+        timeout_unavailability = _aggregate_dataset_deadline_unavailability(
+            dataset_inputs,
+            simulation_evaluations,
+        )
+        timed_out_dataset_roster = (
+            tuple(timeout_unavailability.details["datasets"])
+            if timeout_unavailability is not None
+            else ()
+        )
+        timed_out_dataset_ids = set(timed_out_dataset_roster)
+        for item, evaluation in zip(dataset_inputs, simulation_evaluations, strict=True):
+            if isinstance(evaluation, ScientificUnavailable):
+                if _is_dataset_deadline_unavailable(evaluation):
+                    continue
                 return reject_candidate(
-                    evaluation.unavailability,
-                    evaluation.error_provenance,
+                    evaluation,
+                    {"dataset": item.payload.dataset_id},
                     optimizer_vector=params,
                 )
 
-        for item in dataset_inputs:
+        if timeout_unavailability is not None:
+            timeout_error = FitSimulationError(
+                "Fit candidate dataset evaluation exceeded its deadline.",
+                details={
+                    "scientific_unavailable": True,
+                    "stage": "dataset_deadline",
+                    "datasets": timed_out_dataset_roster,
+                },
+            )
+            timeout_error.factual_cause = timeout_unavailability.factual_cause
+            self._ctx.set_error(
+                timeout_error,
+                {"datasets": timed_out_dataset_roster, "stage": "dataset_deadline"},
+            )
+
+        for item, evaluation in zip(dataset_inputs, simulation_evaluations, strict=True):
             _raise_if_fitting_cancel_requested(self._cancellation_control)
 
-            payload = item.payload
-            ds_id = payload.dataset_id
-            species_list = payload.species_list
-            observations = _payload_observations(payload)
-            x_name = payload.x_name
-            x_observations = _payload_x_observations(payload)
-            x_mode = payload.x_mode
-            weight = self._weights.get(ds_id, 1.0)
-            target_weights = dict(payload.target_weights)
-            target_multipliers = _normalized_target_weight_multipliers(
-                species_list=payload.target_roster,
-                target_weights=target_weights,
-            )
-            failed_param_snapshot = item.failed_param_snapshot
-            evaluation = simulation_evaluations.get(int(item.index))
-            if evaluation is None:
-                raise RuntimeError(f"Missing fitting simulation result for dataset '{ds_id}'.")
-
-            if evaluation.error is not None:
-                exc = evaluation.error
-                self._ctx.set_error(exc, evaluation.error_provenance)
-                raise exc
-
-            simulation = evaluation.result
-            if simulation is None:
-                raise FitSimulationError(
-                    f"Dataset {ds_id!r}: Fit simulation lost its canonical result.",
-                    failed_params=failed_param_snapshot,
+            if item.payload.dataset_id in timed_out_dataset_ids:
+                all_residuals.extend(dataset_penalty_residuals(item.payload).tolist())
+                continue
+            if isinstance(evaluation, ScientificUnavailable):
+                return reject_candidate(
+                    evaluation,
+                    {"dataset": item.payload.dataset_id},
+                    optimizer_vector=params,
                 )
-            sim_time = simulation.t
-            segment_ids = simulation.segment_ids
-            segment_keys = simulation.segment_keys
-            discontinuity_ids = simulation.discontinuity_ids
+            if evaluation.dataset_id != item.payload.dataset_id:
+                raise RuntimeError("Fit evaluation order no longer matches its admitted dataset roster.")
+            all_residuals.extend(np.asarray(evaluation.weighted_residuals, dtype=float).tolist())
+            continue
 
-            x_projection: ParametricXProjection | None = None
-            if x_name != "t":
-                try:
-                    x_projection = align_parametric_x(
-                        observation_time=x_observations["t"],
-                        observed_x=x_observations["x"],
-                        source_rows=x_observations["source_rows"],
-                        model_time=np.asarray(sim_time, dtype=float),
-                        model_x=fit_result_target_values(simulation, x_name),
-                        segment_ids=np.asarray(segment_ids, dtype=np.int64),
-                        segment_keys=tuple(segment_keys),
-                        discontinuity_ids=np.asarray(discontinuity_ids, dtype=np.int64),
-                        mode=x_mode,
-                        dataset_label=ds_id,
-                        x_name=x_name,
-                    )
-                except CandidateParametricAlignmentError as exc:
-                    details = dict(getattr(exc, "details", None) or {})
-                    details.update({"dataset": ds_id, "stage": "parametric_x_alignment"})
-                    return reject_candidate(
-                        ScientificUnavailable(
-                            producer="parametric_alignment",
-                            stage="parametric_x_alignment",
-                            details=details,
-                            factual_cause=factual_cause_from_exception(
-                                exc,
-                                domain="fit",
-                                origin="parametric_x_alignment",
-                            ),
-                        ),
-                        {"dataset": ds_id, "stage": "parametric_x_alignment"},
-                        optimizer_vector=params,
-                    )
-                if x_projection.size != len(payload.x_source_rows):
-                    raise RuntimeError("Parametric X projection roster changed during evaluation.")
-
-            for species_name in sorted(species_list):
-                _raise_if_fitting_cancelled(self._cancellation_check)
-                species_obs = observations[species_name]
-                obs_t = np.asarray(species_obs["t"], dtype=float).reshape(-1)
-                y_exp = np.asarray(species_obs["y"], dtype=float).reshape(-1)
-                target_weight = float(target_multipliers.get(str(species_name), 1.0))
-                effective_weight = _objective_dataset_weight_multiplier(weight) * float(target_weight)
-                try:
-                    model_series = fit_result_target_values(
-                        simulation,
-                        species_name,
-                    )
-                    if x_name == "t":
-                        selected_rows = _select_fit_rows(
-                            model_y=np.asarray(model_series, dtype=float),
-                            sim_time=np.asarray(sim_time, dtype=float),
-                            observation_time=obs_t,
-                            observation_id=species_obs["raw_observation_id"],
-                            raw_column=species_obs["raw_column"],
-                            source_rows=species_obs["source_rows"],
-                            segment_ids=np.asarray(segment_ids, dtype=np.int64),
-                            segment_keys=segment_keys,
-                            discontinuity_ids=np.asarray(discontinuity_ids, dtype=np.int64),
-                        )
-                    else:
-                        assert x_projection is not None
-                        y_projection = x_projection.subset(species_obs["source_rows"])
-                        y_sim = project_parametric_y(
-                            projection=y_projection,
-                            model_time=np.asarray(sim_time, dtype=float),
-                            model_y=np.asarray(model_series, dtype=float),
-                            segment_ids=np.asarray(segment_ids, dtype=np.int64),
-                            segment_keys=tuple(segment_keys),
-                            discontinuity_ids=np.asarray(discontinuity_ids, dtype=np.int64),
-                        )
-                        selected_rows = (
-                            y_projection.selected_model_x,
-                            y_sim,
-                            y_projection.segment_ids,
-                            y_projection.segment_keys,
-                            y_projection.discontinuity_ids,
-                            y_projection.sample_kinds,
-                            tuple(species_obs["raw_observation_id"] for _ in species_obs["source_rows"]),
-                            tuple(species_obs["raw_column"] for _ in species_obs["source_rows"]),
-                            tuple(int(row) for row in species_obs["source_rows"]),
-                        )
-                    if x_name == "t":
-                        y_sim = selected_rows[1]
-                except CandidateParametricAlignmentError as exc:
-                    details = dict(getattr(exc, "details", None) or {})
-                    candidate_facts = {
-                        "values": dict(full_params),
-                        "origins": dict(parameter_origins),
-                        "failed_params": dict(failed_param_snapshot),
-                    }
-                    details.update(
-                        {
-                            "producer": "parametric_alignment",
-                            "stage": "parametric_x_alignment",
-                            "dataset": ds_id,
-                            "candidate_parameter_facts": candidate_facts,
-                        }
-                    )
-                    factual_cause = factual_cause_from_exception(
-                        exc,
-                        domain="fit",
-                        origin="parametric_x_alignment",
-                    )
-                    factual_cause = replace(
-                        factual_cause,
-                        details={**dict(factual_cause.details), **details},
-                    )
-                    return reject_candidate(
-                        ScientificUnavailable(
-                            producer="parametric_alignment",
-                            stage="parametric_x_alignment",
-                            details=details,
-                            factual_cause=factual_cause,
-                        ),
-                        {"dataset": ds_id, "stage": "parametric_x_alignment"},
-                        optimizer_vector=params,
-                    )
-                except FitSimulationError:
-                    raise
-                except Exception as exc:
-                    if isinstance(exc, (FittingCancelled, SimulationCancelled)):
-                        raise FittingCancelled() from exc
-                    err = FitSimulationError(
-                        f"Failed to align species '{species_name}' for dataset '{ds_id}': {exc}",
-                        failed_params=failed_param_snapshot,
-                        details=dict(getattr(exc, "details", None) or {}),
-                        context=getattr(exc, "context", None),
-                    )
-                    self._ctx.set_error(err, {"dataset": ds_id})
-                    raise err from exc
-
-                if not np.all(np.isfinite(y_sim)):
-                    return reject_candidate(
-                        ScientificUnavailable(
-                            producer="global_fit_objective",
-                            stage="objective_nonfinite",
-                            details={"dataset": ds_id, "species": species_name},
-                        ),
-                        {"dataset": ds_id},
-                        optimizer_vector=params,
-                    )
-
-                with np.errstate(over="ignore", invalid="ignore"):
-                    residual_vector = effective_weight * (
-                        np.asarray(y_sim, dtype=float).reshape(-1)
-                        - np.asarray(y_exp, dtype=float).reshape(-1)
-                    )
-                if not np.all(np.isfinite(residual_vector)):
-                    return reject_candidate(
-                        ScientificUnavailable(
-                            producer="global_fit_objective",
-                            stage="objective_residual_arithmetic",
-                            details={"dataset": ds_id, "species": species_name},
-                        ),
-                        {"dataset": ds_id},
-                        optimizer_vector=params,
-                    )
-                if finite_sum_of_squares(residual_vector) is None:
-                    return reject_candidate(
-                        ScientificUnavailable(
-                            producer="global_fit_objective",
-                            stage="objective_residual_arithmetic",
-                            details={"dataset": ds_id, "species": species_name},
-                        ),
-                        {"dataset": ds_id},
-                        optimizer_vector=params,
-                    )
-                all_residuals.extend(np.asarray(residual_vector, dtype=float).reshape(-1))
-
-            if x_projection is not None:
-                x_weight = (
-                    _objective_dataset_weight_multiplier(weight)
-                    * float(target_multipliers[payload.x_name])
-                )
-                with np.errstate(over="ignore", invalid="ignore"):
-                    x_residual = x_weight * np.asarray(x_projection.delta_x, dtype=float)
-                if (
-                    not np.all(np.isfinite(x_residual))
-                    or finite_sum_of_squares(x_residual) is None
-                ):
-                    return reject_candidate(
-                        ScientificUnavailable(
-                            producer="global_fit_objective",
-                            stage="objective_residual_arithmetic",
-                            details={
-                                "dataset": ds_id,
-                                "target": payload.x_name,
-                                "point_count": int(x_projection.size),
-                            },
-                        ),
-                        {"dataset": ds_id, "target": payload.x_name},
-                        optimizer_vector=params,
-                    )
-                all_residuals.extend(np.asarray(x_residual, dtype=float).reshape(-1))
 
         residuals = np.asarray(all_residuals, dtype=float).ravel()
 
@@ -2584,14 +2820,9 @@ class GlobalFitObjective:
             )
         cost = float(finite_cost)
         candidate_evaluations = {
-            item.payload.dataset_id: evaluation.result
-            for item in dataset_inputs
-            if (
-                (evaluation := simulation_evaluations.get(int(item.index)))
-                is not None
-                and evaluation.error is None
-                and evaluation.result is not None
-            )
+            evaluation.dataset_id: evaluation.simulation_result
+            for evaluation in simulation_evaluations
+            if isinstance(evaluation, DatasetFitInfo)
         }
         complete_evaluations = len(candidate_evaluations) == len(dataset_inputs)
         improved = complete_evaluations and cost < self._best_cost
@@ -2603,12 +2834,7 @@ class GlobalFitObjective:
         )
         _raise_if_fitting_cancelled(self._cancellation_check)
 
-        outcome = FitEvaluationOutcome.converged(
-            residuals,
-            provenance={"stage": "objective", "objective_calls": self._objective_calls},
-        )
-
-        return _ObjectiveTransport(residuals, outcome)
+        return residuals
 
 
 def _raise_final_replay_candidate_error(
@@ -2619,8 +2845,7 @@ def _raise_final_replay_candidate_error(
 ) -> None:
     """Raise one factual final-replay error.
 
-    Scientific-unavailability remains tagged as such; the composition
-    boundary settles it into a typed FitEvaluationOutcome.
+    Scientific-unavailability remains tagged as such at the replay boundary.
     """
 
     if isinstance(exc, ScientificUnavailable):
@@ -2681,11 +2906,13 @@ def _assemble_fit_replay_state(
     success: bool,
     message: str,
     scipy_nfev: int,
-    terminal_replay_count: int = 1,
     objective_call_count: int | None = None,
-    optimizer_diagnostic: Optional[FitDiagnostic] = None,
+    optimizer_diagnostic: FactualCause | None = None,
     cancellation_control: SimulationCancellationControl | None = None,
+    executor: Executor,
 ) -> _FitReplayState:
+    if executor is None:
+        raise TypeError("Final Fit replay requires a borrowed executor.")
     layout.validate_optimizer_vector(candidate_vector)
     candidate_vector = np.asarray(candidate_vector, dtype=float).reshape(-1).copy()
     candidate_vector.setflags(write=False)
@@ -2714,7 +2941,7 @@ def _assemble_fit_replay_state(
     simulation_results_by_dataset: Dict[str, SimulationResultValue] = {}
 
     dataset_inputs: List[ObjectiveDatasetInput] = []
-    for index, payload in enumerate(payloads):
+    for payload in payloads:
         ds_id = payload.dataset_id
         _raise_if_fitting_cancelled(cancellation_check)
         _raise_if_fitting_cancel_requested(cancellation_control)
@@ -2757,7 +2984,6 @@ def _assemble_fit_replay_state(
         )
         dataset_inputs.append(
             ObjectiveDatasetInput(
-                index=int(index),
                 payload=payload,
                 full_params=full_params,
                 parameter_origins=parameter_origins,
@@ -2765,325 +2991,65 @@ def _assemble_fit_replay_state(
             )
         )
 
-    simulation_evaluations = {
-        int(result.index): result
-        for result in evaluate_dataset_simulations(
+    simulation_evaluations = tuple(
+        evaluate_dataset_simulations(
             fit_evaluators,
             dataset_inputs,
             cancellation_check=cancellation_check,
             cancellation_control=cancellation_control,
+            executor=executor,
+            weights=weights,
         )
-    }
-    for evaluation in simulation_evaluations.values():
-        if evaluation.status == "scientific_unavailable":
-            if evaluation.unavailability is None:
-                raise RuntimeError("Unavailable final replay omitted its result.")
-            _raise_final_replay_candidate_error(
-                evaluation.unavailability,
-                stage="final_replay_simulation",
-            )
-        if evaluation.error is not None:
-            raise evaluation.error
-    expected_evaluation_indexes = set(range(len(dataset_inputs)))
-    if set(simulation_evaluations) != expected_evaluation_indexes:
+    )
+    if len(simulation_evaluations) != len(dataset_inputs):
         raise RuntimeError(
             "Final Fit replay did not evaluate every included dataset."
         )
+    timeout_unavailability = _aggregate_dataset_deadline_unavailability(
+        dataset_inputs,
+        simulation_evaluations,
+    )
+    if timeout_unavailability is not None:
+        _raise_final_replay_candidate_error(
+            timeout_unavailability,
+            stage="final_replay_simulation",
+        )
+    for evaluation in simulation_evaluations:
+        if isinstance(evaluation, ScientificUnavailable):
+            _raise_final_replay_candidate_error(
+                evaluation,
+                stage="final_replay_simulation",
+            )
 
-    for item in dataset_inputs:
+    for item, evaluation in zip(dataset_inputs, simulation_evaluations, strict=True):
         payload = item.payload
         ds_id = payload.dataset_id
-        species_list = payload.species_list
-        observations = _payload_observations(payload)
-        x_name = payload.x_name
-        x_observations = _payload_x_observations(payload)
-        x_mode = payload.x_mode
-        failed_param_snapshot = item.failed_param_snapshot
         _raise_if_fitting_cancelled(cancellation_check)
         _raise_if_fitting_cancel_requested(cancellation_control)
 
-        evaluation = simulation_evaluations.get(int(item.index))
-        if evaluation is None:
-            raise RuntimeError(f"Missing fitting simulation result for dataset '{ds_id}'.")
-        simulation = evaluation.result
-        if simulation is None:
+        if isinstance(evaluation, ScientificUnavailable):
             raise RuntimeError(
-                f"Final Fit replay omitted the canonical result for dataset {ds_id!r}."
+                f"Final Fit replay omitted direct facts for dataset {ds_id!r}."
             )
-        simulation_results_by_dataset[ds_id] = simulation
-        sim_time = simulation.t
-        segment_ids = simulation.segment_ids
-        segment_keys = simulation.segment_keys
-        discontinuity_ids = simulation.discontinuity_ids
-
-        x_projection: ParametricXProjection | None = None
-        if x_name != "t":
-            try:
-                x_projection = align_parametric_x(
-                    observation_time=x_observations["t"],
-                    observed_x=x_observations["x"],
-                    source_rows=x_observations["source_rows"],
-                    model_time=np.asarray(sim_time, dtype=float),
-                    model_x=fit_result_target_values(simulation, x_name),
-                    segment_ids=np.asarray(segment_ids, dtype=np.int64),
-                    segment_keys=tuple(segment_keys),
-                    discontinuity_ids=np.asarray(discontinuity_ids, dtype=np.int64),
-                    mode=x_mode,
-                    dataset_label=ds_id,
-                    x_name=x_name,
-                )
-            except CandidateParametricAlignmentError as exc:
-                raise FitSimulationError(
-                    "Final Fit replay could not settle parametric-X alignment.",
-                    failed_params=failed_param_snapshot,
-                    details={
-                        "stage": "final_replay_alignment",
-                        "scientific_unavailable": True,
-                        **dict(getattr(exc, "details", None) or {}),
-                    },
-                ) from exc
-            model_x_projection_map[ds_id] = x_projection
-
-        residual_blocks: List[np.ndarray] = []
-        weighted_residual_blocks: List[np.ndarray] = []
-        x_residual_blocks: List[np.ndarray] = []
-        weighted_x_residual_blocks: List[np.ndarray] = []
-        r_squared_by_series: Dict[str, FitMetric] = {}
-        for species_name in species_list:
-            species_obs = observations[species_name]
-            obs_t = np.asarray(species_obs["t"], dtype=float).reshape(-1)
-            y_exp = np.asarray(species_obs["y"], dtype=float).reshape(-1)
-            model_series = fit_result_target_values(
-                simulation,
-                species_name,
-            )
-            try:
-                if x_name == "t":
-                    selected_rows = _select_fit_rows(
-                        model_y=np.asarray(model_series, dtype=float),
-                        sim_time=np.asarray(sim_time, dtype=float),
-                        observation_time=obs_t,
-                        observation_id=species_obs["raw_observation_id"],
-                        raw_column=species_obs["raw_column"],
-                        source_rows=species_obs["source_rows"],
-                        segment_ids=np.asarray(segment_ids, dtype=np.int64),
-                        segment_keys=tuple(segment_keys),
-                        discontinuity_ids=np.asarray(discontinuity_ids, dtype=np.int64),
-                    )
-                else:
-                    assert x_projection is not None
-                    y_projection = x_projection.subset(species_obs["source_rows"])
-                    y_sim = project_parametric_y(
-                        projection=y_projection,
-                        model_time=np.asarray(sim_time, dtype=float),
-                        model_y=np.asarray(model_series, dtype=float),
-                        segment_ids=np.asarray(segment_ids, dtype=np.int64),
-                        segment_keys=tuple(segment_keys),
-                        discontinuity_ids=np.asarray(discontinuity_ids, dtype=np.int64),
-                    )
-                    selected_rows = (
-                        y_projection.selected_model_x,
-                        y_sim,
-                        y_projection.segment_ids,
-                        y_projection.segment_keys,
-                        y_projection.discontinuity_ids,
-                        y_projection.sample_kinds,
-                        tuple(species_obs["raw_observation_id"] for _ in species_obs["source_rows"]),
-                        tuple(species_obs["raw_column"] for _ in species_obs["source_rows"]),
-                        tuple(int(row) for row in species_obs["source_rows"]),
-                    )
-            except FitSimulationError as exc:
-                _raise_final_replay_candidate_error(
-                    exc,
-                    stage="final_replay_alignment",
-                    failed_params=failed_param_snapshot,
-                )
-            y_sim_resid = selected_rows[1]
-            model_series_map.setdefault(ds_id, {})[species_name] = np.asarray(
-                selected_rows[1], dtype=float
-            )
-            model_x_by_species_map.setdefault(ds_id, {})[species_name] = np.asarray(
-                selected_rows[0], dtype=float
-            )
-            model_segment_ids_map.setdefault(ds_id, {})[species_name] = np.asarray(
-                selected_rows[2], dtype=np.int64
-            )
-            model_segment_keys_map.setdefault(ds_id, {})[species_name] = tuple(
-                selected_rows[3]
-            )
-            model_discontinuity_ids_map.setdefault(ds_id, {})[species_name] = np.asarray(
-                selected_rows[4], dtype=np.int64
-            )
-            model_selection_provenance_map.setdefault(ds_id, {})[species_name] = tuple(
-                selected_rows[5]
-            )
-            model_observation_ids_map.setdefault(ds_id, {})[species_name] = tuple(
-                selected_rows[6]
-            )
-            model_raw_columns_map.setdefault(ds_id, {})[species_name] = tuple(
-                selected_rows[7]
-            )
-            model_source_rows_map.setdefault(ds_id, {})[species_name] = tuple(
-                selected_rows[8]
-            )
-
-            if not np.all(np.isfinite(y_sim_resid)):
-                cause = ScientificUnavailable(
-                    producer="global_fit_replay",
-                    stage="parametric_x_alignment",
-                    details={"dataset": ds_id, "species": species_name},
-                )
-                _raise_final_replay_candidate_error(
-                    cause,
-                    stage="final_replay_alignment",
-                    failed_params=failed_param_snapshot,
-                )
-            with np.errstate(over="ignore", invalid="ignore"):
-                raw_residual = np.asarray(y_sim_resid, dtype=float) - y_exp
-            if not np.all(np.isfinite(raw_residual)):
-                cause = ScientificUnavailable(
-                    producer="global_fit_replay",
-                    stage="objective_residual_arithmetic",
-                    details={"dataset": ds_id, "species": species_name},
-                )
-                _raise_final_replay_candidate_error(
-                    cause,
-                    stage="final_replay_metrics",
-                    failed_params=failed_param_snapshot,
-                )
-            residual_blocks.append(raw_residual)
-            r_squared_by_series[str(species_name)] = r_squared_metric(
-                y_exp,
-                raw_residual,
-            )
-            target_multiplier = float(
-                _normalized_target_weight_multipliers(
-                    species_list=species_list,
-                    target_weights=dict(payload.target_weights),
-                )[species_name]
-            )
-            with np.errstate(over="ignore", invalid="ignore"):
-                weighted_residual = (
-                    _objective_dataset_weight_multiplier(
-                        weights.get(ds_id, 1.0)
-                    )
-                    * target_multiplier
-                    * raw_residual
-                )
-            if not np.all(np.isfinite(weighted_residual)):
-                cause = ScientificUnavailable(
-                    producer="global_fit_replay",
-                    stage="objective_residual_arithmetic",
-                    details={"dataset": ds_id, "species": species_name},
-                )
-                _raise_final_replay_candidate_error(
-                    cause,
-                    stage="final_replay_metrics",
-                    failed_params=failed_param_snapshot,
-                )
-            weighted_residual_blocks.append(weighted_residual)
-
-        if x_projection is not None:
-            x_weight = (
-                _objective_dataset_weight_multiplier(weights.get(ds_id, 1.0))
-                * float(
-                    _normalized_target_weight_multipliers(
-                        species_list=payload.target_roster,
-                        target_weights=dict(payload.target_weights),
-                    )[payload.x_name]
-                )
-            )
-            with np.errstate(over="ignore", invalid="ignore"):
-                raw_x_residual = np.asarray(x_projection.delta_x, dtype=float)
-                weighted_x_residual = x_weight * raw_x_residual
-            if (
-                not np.all(np.isfinite(weighted_x_residual))
-                or finite_sum_of_squares(weighted_x_residual) is None
-            ):
-                raise FitSimulationError(
-                    "Final Fit replay produced non-finite X residuals.",
-                    failed_params=failed_param_snapshot,
-                    details={"stage": "final_replay_metrics", "target": payload.x_name},
-                )
-            x_residual_blocks.append(raw_x_residual)
-            weighted_x_residual_blocks.append(weighted_x_residual)
-
-        residuals = np.concatenate(residual_blocks) if residual_blocks else np.asarray([], dtype=float)
-        if x_residual_blocks:
-            residuals = np.concatenate([residuals, *x_residual_blocks])
-        weighted_residuals = (
-            np.concatenate(weighted_residual_blocks)
-            if weighted_residual_blocks
-            else np.asarray([], dtype=float)
+        if evaluation.dataset_id != ds_id:
+            raise RuntimeError("Final Fit replay order no longer matches its admitted dataset roster.")
+        simulation_results_by_dataset[ds_id] = evaluation.simulation_result
+        model_series_map[ds_id] = dict(evaluation.model_series)
+        model_x_by_species_map[ds_id] = dict(evaluation.model_x_by_species)
+        model_segment_ids_map[ds_id] = dict(evaluation.model_segment_ids)
+        model_segment_keys_map[ds_id] = dict(evaluation.model_segment_keys)
+        model_discontinuity_ids_map[ds_id] = dict(evaluation.model_discontinuity_ids)
+        model_selection_provenance_map[ds_id] = dict(evaluation.model_selection_provenance)
+        model_observation_ids_map[ds_id] = dict(evaluation.model_observation_ids)
+        model_raw_columns_map[ds_id] = dict(evaluation.model_raw_columns)
+        model_source_rows_map[ds_id] = dict(evaluation.model_source_rows)
+        if evaluation.x_projection is not None:
+            model_x_projection_map[ds_id] = evaluation.x_projection
+        dataset_info.append(evaluation)
+        global_weighted_residual_blocks.append(
+            np.asarray(evaluation.weighted_residuals, dtype=float)
         )
-        if weighted_x_residual_blocks:
-            weighted_residuals = np.concatenate(
-                [weighted_residuals, *weighted_x_residual_blocks]
-            )
-        if residuals.size == 0 or weighted_residuals.size != residuals.size:
-            raise FitSimulationError(
-                f"Final Fit replay produced incomplete residuals for dataset '{ds_id}'.",
-                failed_params=failed_param_snapshot,
-                details={"fatal": True, "stage": "final_replay_metrics"},
-            )
-        metrics = fit_error_metrics(weighted_residuals)
-
-        dataset_info.append(
-            DatasetFitInfo(
-                dataset_id=ds_id,
-                r_squared_by_series=dict(r_squared_by_series),
-                weighted_residual_sse=metrics.weighted_sse,
-                weighted_residual_mse=metrics.weighted_mse,
-                weighted_rmse=metrics.weighted_rmse,
-                weighted_mae=metrics.weighted_mae,
-                n_points=int(residuals.size),
-                weight=weights.get(ds_id, 1.0),
-                x_point_count=0 if x_projection is None else int(x_projection.size),
-                x_weighted_residual_sse=(
-                    None
-                    if not weighted_x_residual_blocks
-                    else fit_error_metrics(
-                        np.concatenate(weighted_x_residual_blocks)
-                    ).weighted_sse
-                ),
-                x_weighted_residual_mse=(
-                    None
-                    if not weighted_x_residual_blocks
-                    else fit_error_metrics(
-                        np.concatenate(weighted_x_residual_blocks)
-                    ).weighted_mse
-                ),
-                x_weighted_rmse=(
-                    None
-                    if not weighted_x_residual_blocks
-                    else fit_error_metrics(
-                        np.concatenate(weighted_x_residual_blocks)
-                    ).weighted_rmse
-                ),
-                x_weighted_mae=(
-                    None
-                    if not weighted_x_residual_blocks
-                    else fit_error_metrics(
-                        np.concatenate(weighted_x_residual_blocks)
-                    ).weighted_mae
-                ),
-                x_delta_x=(
-                    () if x_projection is None else tuple(float(item) for item in x_projection.delta_x)
-                ),
-                x_match_kinds=(
-                    () if x_projection is None else x_projection.match_kinds
-                ),
-                x_sample_kinds=(
-                    () if x_projection is None else x_projection.sample_kinds
-                ),
-                x_source_rows=(
-                    () if x_projection is None else x_projection.source_rows
-                ),
-            )
-        )
-
-        global_weighted_residual_blocks.append(weighted_residuals)
-        total_points += int(residuals.size)
+        total_points += int(evaluation.residuals.size)
 
     if total_points <= 0:
         raise FitSimulationError(
@@ -3104,42 +3070,29 @@ def _assemble_fit_replay_state(
             "Final Fit result rosters must exactly match the included datasets."
         )
     optimizer_converged = bool(success)
-    completion_optimizer_diagnostic = optimizer_diagnostic
+    factual_optimizer_diagnostic = optimizer_diagnostic
     if (
         optimizer_converged
-        and completion_optimizer_diagnostic is not None
-        and not bool(
-            (
-                completion_optimizer_diagnostic.failure.details
-                if isinstance(completion_optimizer_diagnostic.failure, FactualCause)
-                else {}
-            ).get("final_report_warning")
-        )
+        and factual_optimizer_diagnostic is not None
+        and not bool(factual_optimizer_diagnostic.details.get("final_report_warning"))
     ):
-        completion_optimizer_diagnostic = None
-    if (not optimizer_converged) or completion_optimizer_diagnostic is not None:
-        completion_status = "warn"
+        factual_optimizer_diagnostic = None
+    if (not optimizer_converged) or factual_optimizer_diagnostic is not None:
+        result_status: Literal["ok", "warn"] = "warn"
     else:
-        completion_status = "ok"
+        result_status = "ok"
 
-    if completion_status == "ok":
-        completion_optimizer_diagnostic = None
-
-    completion = GlobalFitCompletion(
-        status=completion_status,
-        optimizer_converged=optimizer_converged,
-        optimizer_diagnostic=completion_optimizer_diagnostic,
-    )
-    completion_message = completion_result_message(
+    result_message = fit_result_message(
         base_message=message,
-        completion=completion,
-        optimizer_diagnostic=completion_optimizer_diagnostic,
+        status=result_status,
+        optimizer_converged=optimizer_converged,
+        optimizer_diagnostic=factual_optimizer_diagnostic,
     )
 
-    if completion.status == "ok":
+    if result_status == "ok":
         logger.info("Global fit complete with typed weighted metrics.")
-    elif completion.status == "warn":
-        logger.warning("Global fit complete with warnings: %s", completion_message)
+    elif result_status == "warn":
+        logger.warning("Global fit complete with warnings: %s", result_message)
     for info in dataset_info:
         logger.debug(
             "  %s: weighted SSE=%s, weighted RMSE=%s",
@@ -3159,12 +3112,14 @@ def _assemble_fit_replay_state(
         weighted_residual_sse=aggregate_metrics.weighted_sse,
         weighted_residual_mse=aggregate_metrics.weighted_mse,
         dataset_info=tuple(dataset_info),
-        message=completion_message,
+        message=result_message,
+        status=result_status,
+        optimizer_converged=optimizer_converged,
+        optimizer_diagnostic=factual_optimizer_diagnostic,
         optimizer_vector=candidate_vector,
         scipy_nfev=scipy_nfev,
-        terminal_replay_count=terminal_replay_count,
+        terminal_replay_count=1,
         objective_call_count=objective_call_count,
-        completion=completion,
         model_series=model_series_map,
         model_x_by_species=model_x_by_species_map,
         model_segment_ids=model_segment_ids_map,
@@ -3176,5 +3131,8 @@ def _assemble_fit_replay_state(
         model_source_rows=model_source_rows_map,
         model_x_projection_by_dataset=model_x_projection_map,
         simulation_results_by_dataset=simulation_results_by_dataset,
+        weighted_residuals=np.concatenate(global_weighted_residual_blocks),
+        profile_likelihood_result=None,
+        residual_bootstrap_result=None,
         centred_fixed_effects_settlements=centred_settlements,
     )

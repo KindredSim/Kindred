@@ -162,15 +162,10 @@ def _symbolic_jacobian_for_bind_failure(
 def _bind_symbolic_jacobian_for_current_mechanism(
     *,
     mechanism: Any,
-    prepared_solver_config: PreparedSolverConfig,
     temperature_schedule: TemperatureScheduleProtocol | None,
     symbolic_structure: Any = None,
     coefficient_evaluator: Any = None,
 ) -> SymbolicJacobianExecution:
-    if prepared_solver_config.solver.upper() not in {"BDF", "RADAU"}:
-        raise UnsupportedSymbolicExpressionError(
-            "Symbolic Jacobian requires BDF or Radau."
-        )
     structure = (
         symbolic_structure
         if symbolic_structure is not None
@@ -201,7 +196,6 @@ def _bind_symbolic_jacobian_for_current_mechanism(
 def build_prepared_run_context(
     *,
     mechanism: Any,
-    solver_config: PreparedSolverConfig,
     temperature_schedule: TemperatureScheduleProtocol | None,
     metadata_view: Callable[..., Any],
     symbolic_structure: Any = None,
@@ -220,14 +214,10 @@ def build_prepared_run_context(
     resolved_temperature_schedule = mech_meta.temperature_schedule
     warnings: list[str] = []
     symbolic_jacobian = SymbolicJacobianExecution()
-    if (
-        not symbolic_jacobian.has_executable_jacobian
-        and solver_config.solver.upper() in {"RADAU", "BDF"}
-    ):
+    if not symbolic_jacobian.has_executable_jacobian:
         try:
             symbolic_jacobian = _bind_symbolic_jacobian_for_current_mechanism(
                 mechanism=mechanism,
-                prepared_solver_config=solver_config,
                 temperature_schedule=resolved_temperature_schedule,
                 symbolic_structure=symbolic_structure,
                 coefficient_evaluator=coefficient_evaluator,

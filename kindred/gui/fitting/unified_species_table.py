@@ -2,7 +2,7 @@
 
 The table is deliberately a view/editor surface.  Accepted Fit setup remains
 owned by :class:`FitSessionOwner`; this widget only renders the owner supplied
-snapshot and emits existing typed setup intents for user edits.
+snapshot and emits complete setup replacements for user edits.
 """
 
 from __future__ import annotations
@@ -22,9 +22,6 @@ from kindred.gui.display_name_policy import (
 from kindred.gui.fitting.contracts import FitTargetSelection, copy_target_selection
 from kindred.gui.fitting.launch import (
     FitDatasetLocalSettings,
-    FitDatasetSetupEdit,
-    FitDatasetWeightModeSetupEdit,
-    FitInitialSetupEdit,
     FitInitialVariable,
     FitMappedDatasetSnapshot,
     FitObservationSnapshot,
@@ -156,12 +153,11 @@ class _ValidationCellDelegate(QtWidgets.QStyledItemDelegate):
 
 
 class UnifiedSpeciesTable(QtWidgets.QWidget):
-    """Historical target/weight/initial presentation with typed edit hooks."""
+    """Target/weight/initial presentation with complete-snapshot hooks."""
 
-    # The payload is the tuple already consumed by FittingWindow's
-    # setupEditsRequested signal. The table owns pending target/weight drafts
-    # locally; accepted-state acknowledgement comes only from the owner.
-    setupEditsRequested = Signal(object)
+    # Every valid edit is submitted as one complete accepted-snapshot
+    # replacement. Invalid numeric text remains in the table's local draft.
+    setupSnapshotRequested = Signal(object)
     validityChanged = Signal()
     statusMessage = Signal(str)
 
@@ -351,7 +347,7 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
 
         if not isinstance(origin, FitOriginSnapshot):
             raise TypeError("origin must be FitOriginSnapshot.")
-        if origin.capture_id != self._origin.capture_id and not preserve_drafts:
+        if origin is not self._origin and not preserve_drafts:
             self._pending_target_selections.clear()
             self._pending_target_weights.clear()
             self._pending_dataset_weights.clear()
@@ -374,10 +370,7 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
 
         if not isinstance(snapshot, FitSetupSnapshot):
             raise TypeError("snapshot must be FitSetupSnapshot.")
-        if (
-            snapshot.origin_tab_id != self._origin.tab_id
-            or snapshot.origin_capture_id != self._origin.capture_id
-        ):
+        if snapshot.origin is not self._origin:
             raise ValueError("Fit snapshot does not match this origin.")
 
         available_ids = tuple(item.dataset_id for item in snapshot.datasets)
@@ -847,9 +840,7 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
                 )
                 if previous_mode not in {value for _label, value, _tip in _VARY_IC_CHOICES}:
                     previous_mode = "disabled"
-            blocker = QtCore.QSignalBlocker(combo)
             combo.setCurrentIndex(max(0, combo.findData(previous_mode)))
-            del blocker
             self._set_vary_ic_combo_tooltip(combo)
             self._set_footer_error(_ZERO_IC_PERCENT_MESSAGE)
             self.statusMessage.emit(_ZERO_IC_PERCENT_MESSAGE)
@@ -1336,7 +1327,7 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
         )
 
     def _apply_presentation_edits(self) -> None:
-        """Overlay owned fields on latest rows and emit one atomic edit tuple."""
+        """Overlay owned fields and emit one complete snapshot replacement."""
 
         if self._invalid_raw or self._invalid_initial_raw:
             self._refresh_footer_validity()
@@ -1353,40 +1344,46 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
             for overlay in (self._dataset_overlay(dataset.dataset_id),)
             if overlay is not None
         )
-        dataset_intents = tuple(
-            FitDatasetSetupEdit(
-                origin_tab_id=self._origin.tab_id,
-                origin_capture_id=self._origin.capture_id,
-                dataset=overlay,
-            )
-            for overlay in overlays
-        )
         setup = self._current_setup()
         current_initials = {
             (item.set_id, item.species): item
             for item in (setup.initials if setup is not None else ())
         }
-        initial_intents = tuple(
-            FitInitialSetupEdit(
-                origin_tab_id=self._origin.tab_id,
-                origin_capture_id=self._origin.capture_id,
-                initial=replace(
-                    current_initials[key],
-                    initial=float(self._pending_initial_values[key]["initial"]),
-                    tolerance=self._pending_initial_values[key]["tolerance"],
-                    log10=bool(self._pending_initial_values[key]["log10"]),
-                ),
+        updated_initials = {
+            key: replace(
+                current_initials[key],
+                initial=float(self._pending_initial_values[key]["initial"]),
+                tolerance=self._pending_initial_values[key]["tolerance"],
+                log10=bool(self._pending_initial_values[key]["log10"]),
             )
-            for key, raw in self._pending_initial_rows.items()
+            for key in self._pending_initial_rows
             if key in current_initials and key in self._pending_initial_values
-        )
-        intents = (*dataset_intents, *initial_intents)
-        if not intents:
+        }
+        if not overlays and not updated_initials:
             self.set_status("No pending Fit target, weight, or IC changes.")
             return
-        self.setupEditsRequested.emit(intents)
-        if self._acknowledge_applied_intents(intents):
-            self.set_status("Fit target, weight, and IC edits applied.")
+        replacement = replace(
+            setup,
+            datasets=tuple(
+                next(
+                    (overlay for overlay in overlays if overlay.dataset_id == item.dataset_id),
+                    item,
+                )
+                for item in setup.datasets
+            ),
+            initials=tuple(
+                updated_initials.get((item.set_id, item.species), item)
+                for item in setup.initials
+            ),
+            shared_refit_promotions=(),
+        )
+        self._pending_target_selections.clear()
+        self._pending_target_weights.clear()
+        self._pending_dataset_weights.clear()
+        self._pending_initial_rows.clear()
+        self._pending_initial_values.clear()
+        self.setupSnapshotRequested.emit(replacement)
+        self.set_status("Fit target, weight, and IC edits submitted.")
         self._refresh_visible_presentation()
 
     def _revert_presentation_edits(self) -> None:
@@ -1604,43 +1601,6 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
             f"{skipped} skipped."
         )
 
-    def _acknowledge_applied_intents(self, intents: tuple[object, ...]) -> bool:
-        setup = self._current_setup()
-        if setup is None:
-            return False
-        datasets = {item.dataset_id: item for item in setup.datasets}
-        if any(
-            isinstance(intent, FitDatasetSetupEdit)
-            and datasets.get(intent.dataset.dataset_id) != intent.dataset
-            for intent in intents
-        ):
-            return False
-        for intent in intents:
-            if isinstance(intent, FitDatasetSetupEdit):
-                dataset_id = intent.dataset.dataset_id
-                self._pending_target_selections.pop(dataset_id, None)
-                self._pending_dataset_weights.pop(dataset_id, None)
-                for key in tuple(self._pending_target_weights):
-                    if key[0] == dataset_id:
-                        self._pending_target_weights.pop(key, None)
-            elif isinstance(intent, FitInitialSetupEdit):
-                key = (intent.initial.set_id, intent.initial.species)
-                current = next(
-                    (
-                        item
-                        for item in (self._current_setup().initials if self._current_setup() else ())
-                        if (item.set_id, item.species) == key
-                    ),
-                    None,
-                )
-                if current == intent.initial:
-                    self._pending_initial_rows.pop(key, None)
-                    self._pending_initial_values.pop(key, None)
-                    for invalid_key in tuple(self._invalid_initial_raw):
-                        if invalid_key[:2] == key:
-                            self._invalid_initial_raw.pop(invalid_key, None)
-        return True
-
     # ------------------------------------------------------------------
     # Weight-mode and validation presentation
     # ------------------------------------------------------------------
@@ -1651,12 +1611,13 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
         if mode == self._current_setup().dataset_weight_mode:
             self._refresh_dataset_weight_editor()
             return
-        intent = FitDatasetWeightModeSetupEdit(
-            origin_tab_id=self._origin.tab_id,
-            origin_capture_id=self._origin.capture_id,
-            dataset_weight_mode=mode,
+        self.setupSnapshotRequested.emit(
+            replace(
+                self._current_setup(),
+                dataset_weight_mode=mode,
+                shared_refit_promotions=(),
+            )
         )
-        self.setupEditsRequested.emit((intent,))
         self._refresh_dataset_weight_editor()
 
     def _refresh_dataset_weight_editor(self) -> None:

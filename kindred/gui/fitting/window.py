@@ -2,51 +2,31 @@
 
 from __future__ import annotations
 
-import logging
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import replace
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
 from kindred.gui.fitting.contracts import (
     FitParametricSettings,
-    FitPublicationBundle,
-    FitRunIdentity,
 )
 from kindred.core.simulation_failure import FactualCause
 from kindred.gui.fitting.data_tab import DataTab
 from kindred.gui.fitting.data_targets_tab import DataTargetsTab
 from kindred.gui.fitting.launch import (
-    FitDatasetSetupEdit,
-    FitDatasetWeightModeSetupEdit,
-    FitDefaultsSetupEdit,
-    FitInitialSetupEdit,
-    FitApplySelection,
-    FitAdvancedAnalysisSetupEdit,
     FitInitialApplyProposal,
-    FitInitialScopeSetupEdit,
     FitOriginSnapshot,
     FitDatasetLocalSettings,
-    FitParameterSetupEdit,
-    FitParameterVarySetupEdit,
-    FitParameterScopeSetupEdit,
     FitSetupSnapshot,
     fit_setup_readiness,
-    FitSolverSetupEdit,
     selected_observations,
 )
 from kindred.gui.fitting.parameters_ics_tab import ParametersIcsTab
-from kindred.gui.fitting.reporting import (
-    FitTerminalReport,
-)
 from kindred.gui.fitting.run_results_tab import RunResultsTab
 from kindred.gui.fitting.unified_species_table import UnifiedSpeciesTable
-from kindred.gui.fitting.worker import FitCandidate, FitCurveDataset, FitLiveUpdate
+from kindred.gui.fitting.worker import FitCurveDataset, FitLiveUpdate
 
 __all__ = ["FittingWindow"]
-
-logger = logging.getLogger(__name__)
-
 
 class FittingWindow(QtWidgets.QDialog):
     """Historical executable Fit shell with current owner-facing contracts.
@@ -54,18 +34,22 @@ class FittingWindow(QtWidgets.QDialog):
     This object is deliberately a presentation boundary.  The owner retains
     accepted setup, request construction, worker lifetime, result authority,
     and project mutation; the child views only render snapshots and emit
-    intents.
+    complete setup replacements.
     """
 
     executeRequested = QtCore.Signal()
     cancelRequested = QtCore.Signal()
     pauseRequested = QtCore.Signal()
     resumeRequested = QtCore.Signal()
-    applyRequested = QtCore.Signal(object)
+    applyRequested = QtCore.Signal(tuple, tuple)
     addObservableRequested = QtCore.Signal(str, str, object, str)
-    setupEditsRequested = QtCore.Signal(object)
+    setupSnapshotRequested = QtCore.Signal(object)
     resetRequested = QtCore.Signal(str)
     projectDefaultsRequested = QtCore.Signal(object)
+    copyHashRequested = QtCore.Signal()
+    copyRunJsonRequested = QtCore.Signal()
+    resultsSummaryRequested = QtCore.Signal()
+    sharedRefitRequested = QtCore.Signal(tuple, str)
 
     def __init__(
         self,
@@ -73,34 +57,20 @@ class FittingWindow(QtWidgets.QDialog):
         *,
         close_handler: Callable[[], bool],
         color_resolver: Callable[[str], object] | None = None,
-        shared_refit_handler: Callable[[object], object] | None = None,
         parent: QtWidgets.QWidget | None = None,
     ) -> None:
         super().__init__(parent)
         if not isinstance(origin, FitOriginSnapshot):
             raise TypeError("origin must be FitOriginSnapshot.")
-        if not callable(close_handler):
-            raise TypeError("close_handler must be callable.")
-        if color_resolver is not None and not callable(color_resolver):
-            raise TypeError("color_resolver must be callable.")
-        if shared_refit_handler is not None and not callable(shared_refit_handler):
-            raise TypeError("shared_refit_handler must be callable.")
-
         self._origin = origin
         self._close_handler = close_handler
         self._color_resolver = color_resolver
-        self._shared_refit_handler = shared_refit_handler
         self._closing = False
         self._closing_after_cleanup = False
         self._paused = False
         self._projected_setup: FitSetupSnapshot | None = None
-        self._invalid_setup_edits: set[tuple[str, ...]] = set()
-        self._run_identity: FitRunIdentity | None = None
         self._executing = False
         self._setup_projecting = False
-        self._candidate_publication_message = ""
-        self._available_apply_scopes: frozenset[str] = frozenset()
-        self._initial_apply_proposal: FitInitialApplyProposal | None = None
 
         self.setAttribute(QtCore.Qt.WidgetAttribute.WA_DeleteOnClose, True)
         self.setWindowModality(QtCore.Qt.WindowModality.ApplicationModal)
@@ -146,7 +116,6 @@ class FittingWindow(QtWidgets.QDialog):
         self._run_results_tab = RunResultsTab(
             parent=self,
             color_resolver=self._color_resolver,
-            shared_refit_handler=self._shared_refit_handler,
         )
         self._project_result_identity_labels()
         self._run_results_tab.set_dark_mode(self._current_results_dark_mode())
@@ -240,7 +209,7 @@ class FittingWindow(QtWidgets.QDialog):
         )
         self._results_summary_button.setEnabled(False)
         self._results_summary_button.clicked.connect(
-            self._run_results_tab.open_results_summary_dialog
+            self.resultsSummaryRequested
         )
         actions.addWidget(self._results_summary_button)
 
@@ -252,7 +221,7 @@ class FittingWindow(QtWidgets.QDialog):
         actions.addWidget(self._copy_button)
         self._copy_run_json = QtWidgets.QPushButton("Copy Run JSON", footer)
         self._copy_run_json.setEnabled(False)
-        self._copy_run_json.clicked.connect(self._copy_run_identity_json)
+        self._copy_run_json.clicked.connect(self.copyRunJsonRequested)
         actions.addWidget(self._copy_run_json)
 
         self._apply_parameters = QtWidgets.QCheckBox("Shared Parameters", footer)
@@ -295,8 +264,8 @@ class FittingWindow(QtWidgets.QDialog):
         self._data_tab.fitSettingsApplied.connect(self._on_data_settings_applied)
         self._data_tab.statusMessage.connect(self.set_status)
         self._data_tab.validityChanged.connect(self._refresh_setup_validity)
-        self._params_ics_tab.setupEditsRequested.connect(
-            self._on_leaf_setup_edits
+        self._params_ics_tab.setupSnapshotRequested.connect(
+            self._on_leaf_snapshot
         )
         self._params_ics_tab.resetRequested.connect(
             self.resetRequested
@@ -316,10 +285,21 @@ class FittingWindow(QtWidgets.QDialog):
         self._run_results_tab.copyAvailableChanged.connect(
             self._set_copy_available
         )
+        self._run_results_tab.copyHashRequested.connect(self.copyHashRequested)
+        self._run_results_tab.copyRunJsonRequested.connect(
+            self.copyRunJsonRequested
+        )
+        self._run_results_tab.resultsSummaryRequested.connect(
+            self.resultsSummaryRequested
+        )
+        self._run_results_tab.sharedRefitRequested.connect(
+            self.sharedRefitRequested
+        )
+        self._run_results_tab.applyRequested.connect(self.applyRequested)
 
     def _connect_origin_dependent_leaf_signals(self) -> None:
-        self._species_table.setupEditsRequested.connect(
-            self._on_leaf_setup_edits
+        self._species_table.setupSnapshotRequested.connect(
+            self._on_leaf_snapshot
         )
         self._species_table.validityChanged.connect(
             self._refresh_setup_validity
@@ -389,7 +369,7 @@ class FittingWindow(QtWidgets.QDialog):
         self._connect_origin_dependent_leaf_signals()
 
     # ------------------------------------------------------------------
-    # Typed projection and setup-intent boundary
+    # Typed projection and complete-snapshot boundary
     # ------------------------------------------------------------------
 
     def rebase(
@@ -403,7 +383,6 @@ class FittingWindow(QtWidgets.QDialog):
         self._check_snapshot_origin(setup, origin)
         if origin is not self._origin:
             self._replace_origin_dependent_presentation(origin)
-            self._invalid_setup_edits.clear()
             self._clear_resolved_auto_modes()
         self._origin = origin
         self._params_ics_tab.set_origin(origin)
@@ -432,23 +411,9 @@ class FittingWindow(QtWidgets.QDialog):
         )
 
     def clear_parameters_pending_edits(self) -> None:
-        """Clear Parameters-owned drafts and their window validity markers."""
+        """Clear Parameters-owned drafts and refresh leaf validity."""
 
         self._params_ics_tab.clear_pending_setup_edits()
-        self._invalid_setup_edits.difference_update(
-            key
-            for key in tuple(self._invalid_setup_edits)
-            if key[0]
-            in {
-                "parameter",
-                "parameter_scope",
-                "initial",
-                "initial_global",
-                "initial_scope",
-                "defaults",
-                "solver",
-            }
-        )
         self._species_table.refresh_validity_ui()
         self._refresh_setup_validity()
 
@@ -483,175 +448,20 @@ class FittingWindow(QtWidgets.QDialog):
         self._species_table.refresh_validity_ui()
         self._refresh_setup_validity()
 
-    def accept_setup_edits(
-        self,
-        snapshot: FitSetupSnapshot,
-        intents: tuple[object, ...],
-    ) -> None:
-        if not isinstance(intents, tuple):
-            raise TypeError("Fit setup acknowledgement must carry a tuple.")
-        self._projected_setup = snapshot
-        self._invalid_setup_edits.difference_update(
-            self._intent_key(intent) for intent in intents
-        )
-        # Leaf projections update accepted baselines.  Unrelated keyed raw
-        # overlays survive; the exact acknowledged parameter draft is retired
-        # by the Parameters leaf during this owner callback.
-        self._project_accepted_setup(snapshot, intents)
+    def _on_leaf_snapshot(self, snapshot: object) -> None:
+        """Forward one complete leaf-authored setup snapshot."""
 
-    def _project_accepted_setup(
-        self,
-        snapshot: FitSetupSnapshot,
-        intents: tuple[object, ...],
-    ) -> None:
-        """Dispatch an acknowledgement to only the affected presentation rows."""
-
-        self._check_snapshot(snapshot)
-        self._projected_setup = snapshot
-        parameter_intents = tuple(
-            intent
-            for intent in intents
-            if isinstance(
-                intent,
-                (
-                    FitParameterSetupEdit,
-                    FitParameterVarySetupEdit,
-                    FitParameterScopeSetupEdit,
-                    FitDefaultsSetupEdit,
-                    FitSolverSetupEdit,
-                    FitAdvancedAnalysisSetupEdit,
-                ),
-            )
-        )
-        dataset_projection = any(
-            isinstance(
-                intent,
-                (
-                    FitDatasetSetupEdit,
-                    FitDatasetWeightModeSetupEdit,
-                    FitInitialSetupEdit,
-                    FitInitialScopeSetupEdit,
-                ),
-            )
-            for intent in intents
-        )
-        self._setup_projecting = True
+        if self._closing or self._setup_projecting:
+            return
+        if not isinstance(snapshot, FitSetupSnapshot):
+            self.set_status("Fit setup snapshot is not typed.")
+            return
         try:
-            self._params_ics_tab.project_setup_delta(
-                snapshot,
-                parameter_intents,
-            )
-            self._params_ics_tab.set_selected_dataset_ids(
-                self._included_dataset_ids(snapshot)
-            )
-            if dataset_projection:
-                self._populate_dataset_list(snapshot)
-                selected_dataset_id = (
-                    self._data_targets_tab.unified_list.selected_dataset_id()
-                )
-                self._species_table.project_setup_snapshot(
-                    snapshot,
-                    dataset_id=selected_dataset_id,
-                )
-                if selected_dataset_id:
-                    self._data_tab.select_dataset(
-                        selected_dataset_id,
-                        self._data_targets_tab.unified_list.dataset_display_name(
-                            selected_dataset_id
-                        ),
-                    )
-        finally:
-            self._setup_projecting = False
-        if dataset_projection:
-            self._species_table.refresh_validity_ui()
-        self._refresh_setup_validity()
-
-    def reject_setup_edits(
-        self,
-        intents: tuple[object, ...],
-        message: str,
-    ) -> None:
-        if not isinstance(intents, tuple):
-            raise TypeError("Fit setup rejection must carry a tuple.")
-        restorable_scope_intents = tuple(
-            intent
-            for intent in intents
-            if isinstance(
-                intent,
-                (FitParameterScopeSetupEdit, FitInitialScopeSetupEdit),
-            )
-        )
-        self._invalid_setup_edits.update(
-            self._intent_key(intent)
-            for intent in intents
-            if not isinstance(
-                intent,
-                (
-                    FitParameterSetupEdit,
-                    FitParameterVarySetupEdit,
-                    FitParameterScopeSetupEdit,
-                    FitInitialScopeSetupEdit,
-                ),
-            )
-        )
-        self._invalid_setup_edits.difference_update(
-            self._intent_key(intent) for intent in restorable_scope_intents
-        )
-        # Parameters owns rejected parameter text as a local invalid draft;
-        # the accepted setup remains untouched and this window observes the
-        # leaf's validity signal instead of creating a parallel rejection key.
-        self._params_ics_tab.reject_setup_edits(intents, message)
-        if restorable_scope_intents and self._projected_setup is not None:
-            # A rejected scope selection is not editable scientific text. Put
-            # the presentation straight back on accepted truth and retain no
-            # invalid marker that could outlive the transient intent.
-            self._project_accepted_setup(
-                self._projected_setup,
-                restorable_scope_intents,
-            )
-        self.set_status(str(message))
-        self._species_table.refresh_validity_ui()
-        self._refresh_setup_validity()
-
-    @property
-    def has_invalid_setup_edits(self) -> bool:
-        setup = self._projected_setup
-        data_tab_errors = (
-            ()
-            if setup is None
-            else self._data_tab.active_validation_errors(
-                self._included_dataset_ids(setup)
-            )
-        )
-        return bool(
-            self._invalid_setup_edits
-            or data_tab_errors
-            or self._species_table.invalid_editor_keys
-            or self._species_table.has_pending_initial_changes
-            or self._params_ics_tab.has_invalid_edits
-        )
-
-    @staticmethod
-    def _intent_key(intent: object) -> tuple[str, ...]:
-        if isinstance(intent, FitDatasetSetupEdit):
-            return ("dataset", intent.dataset.dataset_id)
-        if isinstance(intent, FitDatasetWeightModeSetupEdit):
-            return ("dataset_weight_mode",)
-        if isinstance(intent, FitParameterSetupEdit):
-            return ("parameter", intent.parameter.name)
-        if isinstance(intent, FitParameterVarySetupEdit):
-            return ("parameter_vary", intent.parameter_name)
-        if isinstance(intent, FitParameterScopeSetupEdit):
-            return ("parameter_scope", intent.parameter_name)
-        if isinstance(intent, FitInitialSetupEdit):
-            return ("initial", intent.initial.set_id, intent.initial.species)
-        if isinstance(intent, FitInitialScopeSetupEdit):
-            return ("initial_scope", intent.species)
-        if isinstance(intent, FitDefaultsSetupEdit):
-            return ("defaults",)
-        if isinstance(intent, FitSolverSetupEdit):
-            return ("solver",)
-        return ("unknown", type(intent).__name__)
+            self._check_snapshot(snapshot)
+        except (TypeError, ValueError) as exc:
+            self.set_status(f"Fit setup snapshot rejected: {exc}")
+            return
+        self.setupSnapshotRequested.emit(snapshot)
 
     def _check_snapshot(self, snapshot: FitSetupSnapshot) -> None:
         self._check_snapshot_origin(snapshot, self._origin)
@@ -663,21 +473,25 @@ class FittingWindow(QtWidgets.QDialog):
     ) -> None:
         if not isinstance(snapshot, FitSetupSnapshot):
             raise TypeError("snapshot must be FitSetupSnapshot.")
-        if (
-            snapshot.origin_tab_id != origin.tab_id
-            or snapshot.origin_capture_id != origin.capture_id
-        ):
+        if snapshot.origin is not origin:
             raise ValueError("Fit snapshot does not match this origin.")
 
-    def _on_leaf_setup_edits(self, intents: object) -> None:
-        if self._closing:
-            return
-        if self._setup_projecting:
-            return
-        if not isinstance(intents, tuple) or not intents:
-            self.set_status("Fit setup edits must be a nonempty tuple.")
-            return
-        self.setupEditsRequested.emit(intents)
+    @property
+    def has_invalid_setup_edits(self) -> bool:
+        setup = self._projected_setup
+        data_errors = (
+            ()
+            if setup is None
+            else self._data_tab.active_validation_errors(
+                self._included_dataset_ids(setup)
+            )
+        )
+        return bool(
+            data_errors
+            or self._species_table.invalid_editor_keys
+            or self._species_table.has_pending_initial_changes
+            or self._params_ics_tab.has_invalid_edits
+        )
 
     def _refresh_setup_validity(self) -> None:
         invalid = self.has_invalid_setup_edits
@@ -939,12 +753,13 @@ class FittingWindow(QtWidgets.QDialog):
         )
         if current is None:
             return
-        self._on_leaf_setup_edits(
-            (
-                FitDatasetSetupEdit(
-                    origin_tab_id=self._origin.tab_id,
-                    origin_capture_id=self._origin.capture_id,
-                    dataset=replace(current, included=bool(included)),
+        self._on_leaf_snapshot(
+            replace(
+                setup,
+                datasets=tuple(
+                    replace(item, included=bool(included))
+                    if item.dataset_id == dataset_id else item
+                    for item in setup.datasets
                 ),
             )
         )
@@ -972,15 +787,17 @@ class FittingWindow(QtWidgets.QDialog):
             return
         try:
             edited = self._project_dataset_settings(current, config)
-            intent = FitDatasetSetupEdit(
-                origin_tab_id=self._origin.tab_id,
-                origin_capture_id=self._origin.capture_id,
-                dataset=edited,
+            snapshot = replace(
+                setup,
+                datasets=tuple(
+                    edited if item.dataset_id == edited.dataset_id else item
+                    for item in setup.datasets
+                ),
             )
         except (TypeError, ValueError, OverflowError) as exc:
             self.set_status(f"Data settings edit is invalid: {exc}")
             return
-        self._on_leaf_setup_edits((intent,))
+        self._on_leaf_snapshot(snapshot)
 
     @staticmethod
     def _parametric_from_config(
@@ -1166,60 +983,57 @@ class FittingWindow(QtWidgets.QDialog):
     def _clear_resolved_auto_modes(self) -> None:
         self._data_tab.set_resolved_auto_modes(())
 
-    def set_run_identity(self, identity: FitRunIdentity) -> None:
-        if not isinstance(identity, FitRunIdentity):
-            raise TypeError("identity must be a FitRunIdentity.")
-        self._run_identity = identity
-        self._run_results_tab.set_run_identity(identity)
-        # Identity custody alone does not imply a semantic report.  The
-        # publication bundle below settles these report-dependent controls.
-        self._copy_run_json.setEnabled(False)
-        self._results_summary_button.setEnabled(False)
+    def set_copy_hash(self, copy_hash: str) -> None:
+        """Render one call-local Copy hash in the physical Results view."""
 
-    def publish_publication_bundle(self, bundle: FitPublicationBundle) -> bool:
-        """Atomically publish owner-settled semantic and physical Fit views."""
+        self._run_results_tab.set_copy_hash(copy_hash)
 
-        if not isinstance(bundle, FitPublicationBundle):
-            raise TypeError("Fit publication requires FitPublicationBundle.")
-        candidate = bundle.candidate
-        if not isinstance(candidate, FitCandidate):
-            raise TypeError("Fit publication candidate must be FitCandidate.")
-        self._candidate_publication_message = (
-            bundle.report.publication.message if isinstance(bundle.report, FitTerminalReport) else ""
+    def set_terminal_presentation(
+        self,
+        projection: Mapping[str, object] | None,
+        *,
+        copy_hash: str | None = None,
+        report_text: str | None = None,
+        report_failure: str | None = None,
+        curves: tuple[FitCurveDataset, ...] = (),
+        curve_failure: str | None = None,
+        apply_labels: Mapping[str, str] | None = None,
+        enabled_scopes: Sequence[str] = (),
+        initial_proposal: FitInitialApplyProposal | None = None,
+        older_retained_state: bool = False,
+    ) -> bool:
+        """Consume call-local owner projections into physical widgets."""
+
+        rendered = self._run_results_tab.set_terminal_presentation(
+            projection,
+            copy_hash=copy_hash,
+            report_text=report_text,
+            report_failure=report_failure,
+            curves=curves,
+            curve_failure=curve_failure,
         )
-        available = bundle.apply_available_scopes
-        reasons = bundle.apply_unavailable_reasons
-        self._run_identity = candidate.run_identity
-        self.set_candidate_apply_availability(available, reasons)
-        self.set_resolved_auto_modes(candidate.resolved_auto_modes)
-        self._copy_run_json.setEnabled(
-            bundle.semantic_copy_availability.available
-        )
-        self._results_summary_button.setEnabled(
-            bundle.report_availability.available
-        )
-        self.set_last_fit_presentation(older_retained_state=False)
-        rendered = self._run_results_tab.publish_publication_bundle(bundle)
-        self._set_copy_available(self._run_results_tab.copy_eligible())
+        self.set_apply_display(apply_labels or {}, enabled_scopes)
+        self.set_initial_apply_proposal(initial_proposal)
+        has_projection = projection is not None
+        self._copy_run_json.setEnabled(has_projection)
+        self._results_summary_button.setEnabled(has_projection)
+        resolved_auto_modes = ()
+        if projection is not None:
+            resolved_auto_modes = tuple(
+                (str(entry["dataset_id"]), str(entry["mode"]))
+                for entry in projection.get("resolved_auto_modes", ())
+            )
+        self.set_resolved_auto_modes(resolved_auto_modes)
+        self.set_last_fit_presentation(older_retained_state=older_retained_state)
         self._tabs.setCurrentIndex(2)
         return bool(rendered)
 
     def clear_candidate(self) -> None:
-        # Clear actionable Copy/view authority first.  A physical plot teardown
-        # is fallible and must never leave stale controls enabled.
-        self._run_identity = None
-        self._candidate_publication_message = ""
-        self._available_apply_scopes = frozenset()
-        self._initial_apply_proposal = None
         self._clear_resolved_auto_modes()
-        for checkbox, _scope in self._apply_controls():
-            checkbox.setChecked(False)
-            checkbox.setEnabled(False)
-            checkbox.setToolTip("")
-        self._apply_button.setEnabled(False)
         self._copy_button.setEnabled(False)
         self._copy_run_json.setEnabled(False)
         self._results_summary_button.setEnabled(False)
+        self.set_apply_display({}, ())
         self.set_last_fit_presentation(older_retained_state=False)
         self._run_results_tab.clear_candidate()
 
@@ -1234,21 +1048,24 @@ class FittingWindow(QtWidgets.QDialog):
             FitInitialApplyProposal,
         ):
             raise TypeError("IC Apply proposal must be typed or None.")
-        if proposal is not None and (
-            proposal.origin_tab_id != self._origin.tab_id
-            or proposal.origin_capture_id != self._origin.capture_id
-        ):
+        if proposal is not None and proposal.origin is not self._origin:
             raise ValueError("IC Apply proposal belongs to a stale Fit origin.")
-        self._initial_apply_proposal = proposal
         self._run_results_tab.set_initial_apply_proposal(proposal)
-        available = (
-            "initial_concentrations" in self._available_apply_scopes
-            and proposal is not None
-            and bool(proposal.cells)
+
+    def render_results_summary(
+        self,
+        summary: Mapping[str, object],
+        *,
+        identity: str,
+        copy_hash_requested: Callable[[], object],
+        copy_json_requested: Callable[[], object],
+    ) -> None:
+        self._run_results_tab.render_results_summary(
+            summary,
+            identity=identity,
+            copy_hash_requested=copy_hash_requested,
+            copy_json_requested=copy_json_requested,
         )
-        self._apply_initials.setEnabled(available)
-        self._apply_initials.setChecked(available)
-        self._refresh_apply_button()
 
     def set_terminal_failure(self, failure: FactualCause) -> None:
         """Present a worker failure while retaining its factual cause chain."""
@@ -1285,51 +1102,30 @@ class FittingWindow(QtWidgets.QDialog):
         self.set_status(f"Fit result scientifically unavailable: {cause.message}")
         self._tabs.setCurrentIndex(2)
 
-    def set_shared_refit_source_publication(
+    def set_apply_display(
         self,
-        bundle: FitPublicationBundle,
+        scope_labels: Mapping[str, str],
+        enabled_scopes: Sequence[str] = (),
     ) -> None:
-        """Restore retry controls from a typed source publication bundle."""
+        """Render owner-provided Apply facts as physical widget state."""
 
-        if not isinstance(bundle, FitPublicationBundle):
-            raise TypeError("Shared-refit source requires FitPublicationBundle.")
-        if not isinstance(bundle.candidate, FitCandidate):
-            raise TypeError("Shared-refit source bundle requires FitCandidate.")
-        self._run_results_tab.set_shared_refit_source_publication(bundle)
-
-    def set_candidate_apply_availability(
-        self,
-        available_scopes: frozenset[str],
-        unavailable_reasons: Mapping[str, str],
-    ) -> None:
-        """Project retained owner Apply scopes without requiring a result view."""
-
-        available = frozenset(str(scope) for scope in available_scopes)
-        self._available_apply_scopes = available
-        reasons = {
-            str(scope): str(reason or "")
-            for scope, reason in unavailable_reasons.items()
-        }
+        available = frozenset(str(scope) for scope in enabled_scopes)
+        reasons = {str(scope): str(reason or "") for scope, reason in scope_labels.items()}
         for checkbox, scope in self._apply_controls():
             scope_available = scope in available
-            if scope == "initial_concentrations":
-                scope_available = bool(
-                    scope_available
-                    and self._initial_apply_proposal is not None
-                    and self._initial_apply_proposal.cells
-                )
             checkbox.setEnabled(scope_available)
             checkbox.setChecked(scope_available)
             tooltip = reasons.get(scope, "")
-            if (
-                scope == "parameters"
-                and scope in available
-                and self._candidate_publication_message
-            ):
-                tooltip = self._candidate_publication_message
             checkbox.setToolTip(tooltip)
         self._refresh_apply_button()
-        self._run_results_tab.set_apply_availability(available, reasons)
+        display = {
+            scope: reasons.get(
+                scope,
+                "Available" if scope in available else "Unavailable",
+            )
+            for _checkbox, scope in self._apply_controls()
+        }
+        self._run_results_tab.set_apply_display(display, available)
 
     def _apply_controls(self):
         return (
@@ -1361,14 +1157,7 @@ class FittingWindow(QtWidgets.QDialog):
                 "Conditions cell when that scope is selected."
             )
             return
-        self.applyRequested.emit(
-            FitApplySelection(
-                origin_tab_id=self._origin.tab_id,
-                origin_capture_id=self._origin.capture_id,
-                scopes=scopes,
-                initial_keys=initial_keys,
-            )
-        )
+        self.applyRequested.emit(tuple(scopes), tuple(initial_keys))
 
     def _refresh_apply_button(self, *_args: object) -> None:
         selected_available = any(
@@ -1392,22 +1181,6 @@ class FittingWindow(QtWidgets.QDialog):
         setup = self._projected_setup
         if setup is not None:
             self.projectDefaultsRequested.emit(setup.defaults)
-
-    def _copy_run_identity_json(self) -> None:
-        if self._run_identity is None:
-            self.set_status("No completed Fit run is available to copy.")
-            return
-        try:
-            self._run_results_tab.copy_run_identity_json()
-        except Exception as exc:
-            logger.exception(
-                "Failed to copy Fit run JSON (%s): %s",
-                type(exc).__name__,
-                exc,
-            )
-            self.set_status("Failed to copy Fit run JSON.")
-            return
-        self.set_status("Copied the complete Fit run JSON.")
 
     def _set_copy_available(self, available: bool) -> None:
         self._copy_button.setEnabled(bool(available) and not self._executing)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from concurrent.futures import Executor
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import InitVar, dataclass, field, replace
 from types import MappingProxyType
@@ -20,11 +21,12 @@ from kindred.core.analysis.fit_dataset_payload import FitDatasetSpec
 from kindred.core.analysis.fit_uncertainty import (
     bootstrap_de_seed,
     ProfileLikelihoodConfig,
+    ProfileLikelihoodResult,
     ResidualBootstrapConfig,
-    profile_likelihood_extension,
-    residual_bootstrap_extension,
+    ResidualBootstrapResult,
+    profile_likelihood_result,
+    residual_bootstrap_result,
 )
-from kindred.core.analysis.fit_evaluation_outcome import FitEvaluationOutcome
 from kindred.core.analysis import global_fit_execution as _fit_execution
 from kindred.core.exceptions import (
     FitSimulationError,
@@ -32,10 +34,7 @@ from kindred.core.exceptions import (
     SimulationCancelled,
 )
 from kindred.core.fitting_optimization import fit_parameters
-from kindred.core.fitting_completion import (
-    FitExtensionProgress,
-    FitTerminalExtension,
-)
+from kindred.core.fitting_completion import FitExtensionProgress
 from kindred.core.objective import ObjectiveContext
 from kindred.core.fitting_method_policy import validate_fit_method
 from kindred.core.species import validate_evaluation_count
@@ -326,56 +325,6 @@ def _shared_refit_provenance(
     }
 
 
-def _validate_shared_refit_replay(
-    *,
-    shared_params: Mapping[str, float],
-    dataset_params: Mapping[str, Mapping[str, float]],
-    terminal_replay_count: int,
-    completion: object,
-    execution: SharedRefitExecution,
-    terminal_route: Literal[
-        "optimizer_terminal",
-        "user_stop_best_valid_bounded_replay",
-    ],
-) -> None:
-    """Validate replay custody before the sole result construction."""
-
-    if tuple(dataset_params) != execution.dataset_ids:
-        raise ValueError("Shared-refit replay dataset roster differs from admission.")
-    expected_shared = set(execution.optimizer_layout.param_names)
-    if set(shared_params) != expected_shared:
-        raise ValueError("Shared-refit replay Shared routes differ from admission.")
-    expected_dataset = {
-        dataset_id: {
-            *(item.name for item in override.variable_params),
-            *(
-                item.parameter_name
-                for item in execution.coupled_variables
-                if dataset_id in item.dataset_ids
-            ),
-        }
-        for dataset_id, override in zip(
-            execution.dataset_ids,
-            execution.dataset_overrides,
-            strict=True,
-        )
-    }
-    if any(
-        set(dataset_params[dataset_id]) != expected_dataset[dataset_id]
-        for dataset_id in execution.dataset_ids
-    ):
-        raise ValueError("Shared-refit replay dataset routes differ from admission.")
-    if int(terminal_replay_count) != 1:
-        raise ValueError("A publishable Shared-refit replay requires one replay.")
-    if terminal_route == "user_stop_best_valid_bounded_replay" and (
-        getattr(completion, "status", None) != "warn"
-        or bool(getattr(completion, "optimizer_converged", False))
-    ):
-        raise ValueError("User-Stop Shared-refit replay semantics are invalid.")
-
-
-
-
 def _validate_run_inputs(
     *,
     fit_evaluators: Mapping[str, object],
@@ -434,6 +383,122 @@ def _validate_run_inputs(
 
 
 
+def _stopped_profile_result(
+    *,
+    config: ProfileLikelihoodConfig,
+    replay_state: _fit_execution._FitReplayState,
+    cause: FactualCause,
+) -> ProfileLikelihoodResult:
+    """Settle a requested Profile analysis that a primary Stop prevented."""
+
+    return ProfileLikelihoodResult(
+        status="stopped",
+        method="profile likelihood with nuisance reoptimization",
+        requested_parameters=tuple(
+            str(item.display_name) for item in config.parameter_names
+        ),
+        confidence_level=config.confidence_level,
+        likelihood_ratio_threshold=float(config.likelihood_ratio_threshold),
+        likelihood_model="weighted Gaussian residuals with profiled variance",
+        likelihood_ratio_transport="finite log likelihood ratio",
+        fixed_coordinate_policy="selected coordinate fixed; all others reoptimized",
+        warm_start_policy="inner_successful_refit",
+        optimizer_method=config.optimizer_method,
+        max_bracketing_steps_per_side=config.max_bracketing_steps_per_side,
+        max_nfev_per_point=config.max_nfev_per_point,
+        observation_count=int(replay_state.weighted_residuals.size),
+        terminal_weighted_residual_sse=float(
+            replay_state.weighted_residual_sse.value
+        ),
+        intervals={},
+        diagnostic=cause,
+        provenance={
+            "settlement": "stopped",
+            "primary_fit_preserved": True,
+        },
+    )
+
+
+def _stopped_bootstrap_result(
+    *,
+    config: ResidualBootstrapConfig,
+    cause: FactualCause,
+    settlement: str,
+) -> ResidualBootstrapResult:
+    """Settle a requested Bootstrap analysis that did not start or stopped."""
+
+    required_successes = max(
+        config.minimum_successful_replicates,
+        int(np.ceil(config.replicates * config.minimum_success_fraction)),
+    )
+    return ResidualBootstrapResult(
+        status="stopped",
+        method="stratified residual bootstrap with full refits",
+        requested_parameters=tuple(
+            str(item.display_name) for item in config.parameter_names
+        ),
+        seed=config.seed,
+        replicates=config.replicates,
+        confidence_level=config.confidence_level,
+        resampling="within each dataset/target residual stratum",
+        stratum_manifest_version=1,
+        stratum_manifest={},
+        draw_recipe_version=2,
+        draw_algorithm="numpy.default_rng(seed) residual-index draws",
+        residual_centering=(
+            "independent arithmetic mean subtraction within each dataset/target stratum"
+        ),
+        replay_authority="seed plus versioned draw algorithm and stratum manifest",
+        preserved_fields=(
+            "time",
+            "X",
+            "source-row",
+            "dataset weight",
+            "target weight",
+            "full-refit",
+        ),
+        replicate_execution="full global refit",
+        refit_validity="only explicitly converged scientific refits count",
+        minimum_successful_replicates=config.minimum_successful_replicates,
+        minimum_success_fraction=config.minimum_success_fraction,
+        required_successes=required_successes,
+        successful_replicates=0,
+        failed_replicates=0,
+        interval_construction="equal-tailed percentile",
+        intervals={},
+        replicate_roster=(),
+        diagnostic=cause,
+        provenance={
+            "settlement": settlement,
+            "primary_fit_preserved": True,
+        },
+    )
+
+
+def _mark_late_stop(
+    result: _fit_execution.GlobalFitResult,
+    *,
+    cause: FactualCause,
+) -> _fit_execution.GlobalFitResult:
+    """Mark an already replayed result diagnostic-only without replaying it."""
+
+    if not result.optimizer_converged and result.diagnostic_only:
+        return result
+    return replace(
+        result,
+        message=_fit_execution.fit_result_message(
+            base_message="Stopped by user after primary Fit settlement.",
+            status="warn",
+            optimizer_converged=False,
+            optimizer_diagnostic=cause,
+        ),
+        status="warn",
+        optimizer_converged=False,
+        optimizer_diagnostic=cause,
+        diagnostic_only=True,
+    )
+
+
 def fit_global(
     *,
     fit_evaluators: Mapping[str, object],
@@ -453,6 +518,8 @@ def fit_global(
     ] = None,
     cancellation_check: Optional[Callable[[], bool]] = None,
     cancellation_control: SimulationCancellationControl | None = None,
+    stop_best_requested: Callable[[], bool] | None = None,
+    stopped_replay_control: SimulationCancellationControl | None = None,
     profile_likelihood: ProfileLikelihoodConfig | None = None,
     residual_bootstrap: ResidualBootstrapConfig | None = None,
     extension_progress_callback: Optional[
@@ -460,9 +527,12 @@ def fit_global(
     ] = None,
     shared_refit_provenance: Mapping[str, object] | None = None,
     optimizer_layout: _fit_execution.FitParameterLayout,
- ) -> tuple[_fit_execution.GlobalFitResult | None, FitEvaluationOutcome]:
+    executor: Executor,
+) -> _fit_execution.GlobalFitResult | ScientificUnavailable:
     """Fit immutable dataset captures through one evaluator per dataset."""
 
+    if executor is None:
+        raise TypeError("Global Fit requires a borrowed executor.")
     method = validate_fit_method(method)
     max_nfev = validate_evaluation_count(
         max_nfev,
@@ -535,6 +605,7 @@ def fit_global(
             progress_callback=progress_callback,
             cancellation_check=cancellation_check,
             cancellation_control=cancellation_control,
+            executor=executor,
         )
         de_penalty = (
             float((penalty_value**2) * max(1, objective_total_points))
@@ -553,65 +624,59 @@ def fit_global(
             cancellation_check=cancellation_check,
             de_penalty=de_penalty,
         )
-        optimizer_evaluation = optimizer_result.evaluation
-        if not isinstance(optimizer_evaluation, FitEvaluationOutcome):
-            raise TypeError("Fit optimizer omitted its typed terminal evaluation outcome.")
-        if optimizer_evaluation.status == "cancelled":
-            cause = optimizer_evaluation.cause
-            if isinstance(cause, (FittingCancelled, SimulationCancelled)):
-                raise FittingCancelled() from cause
-            raise FittingCancelled()
-        if optimizer_evaluation.status == "fatal":
-            cause = optimizer_evaluation.cause
-            if isinstance(cause, BaseException):
-                raise cause
-            raise RuntimeError("Fatal Fit evaluation omitted its typed cause.")
-        if optimizer_evaluation.status == "scientific_unavailable":
-            unavailability = optimizer_evaluation.unavailability
-            if unavailability is None:
-                raise RuntimeError(
-                    "Scientific-unavailability terminal replay omitted its result."
-                )
-            return None, optimizer_evaluation
-        success = bool(
-            optimizer_result.success
-            and optimizer_evaluation.status == "converged"
-        )
+        success = bool(optimizer_result.success)
         message = str(optimizer_result.message)
-        diagnostic = None
+        optimizer_diagnostic: FactualCause | None = None
         identifiability = str(
             optimizer_result.identifiability_warning or ""
         ).strip()
         if identifiability:
-            diagnostic = _fit_execution.build_fit_diagnostic_from_failure(
-                FactualCause(
-                    domain="fit",
-                    origin="identifiability",
-                    code=None,
-                    type="FittingIdentifiability",
-                    message=identifiability,
-                    details={"final_report_warning": True},
-                ),
-                phase="optimizer",
+            optimizer_diagnostic = FactualCause(
+                domain="fit",
+                origin="identifiability",
+                code=None,
+                type="FittingIdentifiability",
+                message=identifiability,
+                details={"final_report_warning": True},
             )
-        if context.last_error is not None and diagnostic is None:
+        if context.last_error is not None and optimizer_diagnostic is None:
             provenance = context.last_error_provenance
             dataset_id = (
                 str(provenance.get("dataset"))
-                if isinstance(provenance, dict) and provenance.get("dataset") is not None
+                if isinstance(provenance, Mapping) and provenance.get("dataset") is not None
                 else None
             )
-            diagnostic = _fit_execution.build_fit_diagnostic_from_exception(
+            optimizer_diagnostic = factual_cause_from_exception(
                 context.last_error,
-                phase="optimizer",
-                dataset_id=dataset_id,
+                domain="fit",
+                origin="optimizer",
             )
+            if dataset_id is not None:
+                optimizer_diagnostic = replace(
+                    optimizer_diagnostic,
+                    details={
+                        **dict(optimizer_diagnostic.details),
+                        "dataset": dataset_id,
+                    },
+                )
         keys = layout.opt_param_keys()
         vector = np.asarray(
             [optimizer_result.parameters[key] for key in keys],
             dtype=float,
         )
+        retained_best = objective.best_complete_vector
+        if retained_best is not None:
+            vector = np.asarray(retained_best, dtype=float).reshape(-1)
         layout.validate_optimizer_vector(vector)
+        replay_cancellation_check = cancellation_check
+        replay_cancellation_control = cancellation_control
+        if callable(stop_best_requested):
+            def replay_cancellation_check() -> bool:
+                # A user Stop is settled by this one terminal replay.  The
+                # ordinary control still owns Close and dataset deadlines.
+                return False
+            if stopped_replay_control is not None:
+                replay_cancellation_control = stopped_replay_control
         try:
             replay_state = _fit_execution._assemble_fit_replay_state(
                 fit_evaluators=evaluators,
@@ -620,29 +685,28 @@ def fit_global(
                 candidate_vector=vector,
                 fixed_dataset_params=fixed_dataset_params,
                 weights=weights_norm,
-                cancellation_check=cancellation_check,
-                cancellation_control=cancellation_control,
+                cancellation_check=replay_cancellation_check,
+                cancellation_control=replay_cancellation_control,
                 success=success,
                 message=message,
                 scipy_nfev=int(optimizer_result.scipy_nfev),
-                terminal_replay_count=int(optimizer_result.terminal_replay_count),
                 objective_call_count=int(objective.objective_calls),
-                optimizer_diagnostic=diagnostic,
+                optimizer_diagnostic=optimizer_diagnostic,
+                executor=executor,
             )
         except FitSimulationError as exc:
             details = dict(getattr(exc, "details", None) or {})
             if not details.get("scientific_unavailable"):
                 raise
-            outcome = FitEvaluationOutcome.scientific_unavailable(
-                ScientificUnavailable(
-                    producer=str(details.get("producer", "global_fit_replay")),
-                    stage=str(details.get("stage", "final_replay")),
-                    details=details,
-                    factual_cause=getattr(exc, "factual_cause", None),
-                ),
-                provenance={"stage": "optimizer_terminal_replay"},
+            return ScientificUnavailable(
+                producer=str(details.get("producer", "global_fit_replay")),
+                stage=str(details.get("stage", "final_replay")),
+                details=details,
+                factual_cause=getattr(exc, "factual_cause", None),
             )
-            return None, outcome
+        stop_during_primary_replay = bool(
+            callable(stop_best_requested) and stop_best_requested()
+        )
         # Post-fit methods receive a fresh objective without progress emission.
         # It retains the same evaluators, candidate/fatal taxonomy, coordinates,
         # normalized weights, cancellation owner, and immutable captures.
@@ -658,9 +722,11 @@ def fit_global(
             progress_callback=None,
             cancellation_check=cancellation_check,
             cancellation_control=cancellation_control,
+            executor=executor,
         )
-        extensions: list[FitTerminalExtension] = []
-        extension_pipeline_stopped = False
+        profile_result: ProfileLikelihoodResult | None = None
+        bootstrap_result: ResidualBootstrapResult | None = None
+        optional_analysis_stopped = False
         terminal_parameters = {
             key: float(vector[index])
             for index, key in enumerate(keys)
@@ -674,59 +740,93 @@ def fit_global(
                 ),
             )
             try:
-                extension = profile_likelihood_extension(
+                profile_result = profile_likelihood_result(
                     objective=terminal_objective,
                     initial_parameters=terminal_parameters,
                     bounds=layout.bounds_dict(),
                     config=profile_config,
                     decode_coordinate=layout.decode_coordinate,
+                    base_residuals=replay_state.weighted_residuals,
                     cancellation_check=cancellation_check,
-                    terminal_converged=(
-                        optimizer_evaluation.status == "converged"
-                    ),
+                    terminal_converged=replay_state.optimizer_converged,
                     progress_callback=extension_progress_callback,
                 )
             except (FittingCancelled, SimulationCancelled) as exc:
-                extension_pipeline_stopped = True
+                optional_analysis_stopped = True
                 stop_cause = factual_cause_from_exception(
                     exc,
                     domain="fit",
                     origin="profile_likelihood",
                 )
-                extension = FitTerminalExtension(
-                    kind="profile_likelihood",
+                profile_result = ProfileLikelihoodResult(
                     status="stopped",
                     method="profile likelihood with nuisance reoptimization",
+                    requested_parameters=tuple(
+                        str(item.display_name)
+                        for item in profile_config.parameter_names
+                    ),
+                    confidence_level=profile_config.confidence_level,
+                    likelihood_ratio_threshold=float(
+                        profile_config.likelihood_ratio_threshold
+                    ),
+                    likelihood_model="weighted Gaussian residuals with profiled variance",
+                    likelihood_ratio_transport="finite log likelihood ratio",
+                    fixed_coordinate_policy="selected coordinate fixed; all others reoptimized",
+                    warm_start_policy="inner_successful_refit",
+                    optimizer_method=profile_config.optimizer_method,
+                    max_bracketing_steps_per_side=profile_config.max_bracketing_steps_per_side,
+                    max_nfev_per_point=profile_config.max_nfev_per_point,
+                    observation_count=int(replay_state.weighted_residuals.size),
+                    terminal_weighted_residual_sse=float(
+                        replay_state.weighted_residual_sse.value
+                    ),
+                    intervals={},
+                    diagnostic=stop_cause,
                     provenance={
                         "settlement": "stopped",
                         "primary_fit_preserved": True,
                     },
-                    details={"primary_fit_preserved": True},
-                    cause=stop_cause,
                 )
             except Exception as exc:
-                extension = FitTerminalExtension(
-                    kind="profile_likelihood",
+                profile_result = ProfileLikelihoodResult(
                     status="failed",
                     method="weighted-Gaussian profile likelihood",
-                    provenance={
-                        "settlement": "failed",
-                        "primary_fit_preserved": True,
-                    },
-                    details={"primary_fit_preserved": True},
-                    cause=factual_cause_from_exception(
+                    requested_parameters=tuple(
+                        str(item.display_name)
+                        for item in profile_config.parameter_names
+                    ),
+                    confidence_level=profile_config.confidence_level,
+                    likelihood_ratio_threshold=float(
+                        profile_config.likelihood_ratio_threshold
+                    ),
+                    likelihood_model="weighted Gaussian residuals with profiled variance",
+                    likelihood_ratio_transport="finite log likelihood ratio",
+                    fixed_coordinate_policy="selected coordinate fixed; all others reoptimized",
+                    warm_start_policy="inner_successful_refit",
+                    optimizer_method=profile_config.optimizer_method,
+                    max_bracketing_steps_per_side=profile_config.max_bracketing_steps_per_side,
+                    max_nfev_per_point=profile_config.max_nfev_per_point,
+                    observation_count=int(replay_state.weighted_residuals.size),
+                    terminal_weighted_residual_sse=float(
+                        replay_state.weighted_residual_sse.value
+                    ),
+                    intervals={},
+                    diagnostic=factual_cause_from_exception(
                         exc,
                         domain="fit",
                         origin="profile_likelihood",
                     ),
+                    provenance={
+                        "settlement": "failed",
+                        "primary_fit_preserved": True,
+                    },
                 )
-            extensions.append(extension)
 
         if residual_bootstrap is not None:
             def refit_bootstrap(
                 synthetic_payloads: Sequence[FitDatasetSpec],
                 replicate_index: int,
-            ) -> tuple[_fit_execution.GlobalFitResult | None, FitEvaluationOutcome]:
+            ) -> _fit_execution.GlobalFitResult | ScientificUnavailable:
                 replicate_seed = (
                     bootstrap_de_seed(
                         residual_bootstrap.seed,
@@ -755,19 +855,52 @@ def fit_global(
                     cancellation_check=cancellation_check,
                     cancellation_control=cancellation_control,
                     optimizer_layout=layout,
+                    executor=executor,
                 )
 
-            if extension_pipeline_stopped:
-                extension = FitTerminalExtension(
-                    kind="bootstrap",
+            if optional_analysis_stopped:
+                required_successes = max(
+                    residual_bootstrap.minimum_successful_replicates,
+                    int(
+                        np.ceil(
+                            residual_bootstrap.replicates
+                            * residual_bootstrap.minimum_success_fraction
+                        )
+                    ),
+                )
+                bootstrap_result = ResidualBootstrapResult(
                     status="stopped",
                     method="stratified residual bootstrap with full refits",
+                    requested_parameters=tuple(
+                        str(item.display_name)
+                        for item in residual_bootstrap.parameter_names
+                    ),
+                    seed=residual_bootstrap.seed,
+                    replicates=residual_bootstrap.replicates,
+                    confidence_level=residual_bootstrap.confidence_level,
+                    resampling="within each dataset/target residual stratum",
+                    stratum_manifest_version=1,
+                    stratum_manifest={},
+                    draw_recipe_version=2,
+                    draw_algorithm="numpy.default_rng(seed) residual-index draws",
+                    residual_centering="independent arithmetic mean subtraction within each dataset/target stratum",
+                    replay_authority="seed plus versioned draw algorithm and stratum manifest",
+                    preserved_fields=("time", "X", "source-row", "dataset weight", "target weight", "full-refit"),
+                    replicate_execution="full global refit",
+                    refit_validity="only explicitly converged scientific refits count",
+                    minimum_successful_replicates=residual_bootstrap.minimum_successful_replicates,
+                    minimum_success_fraction=residual_bootstrap.minimum_success_fraction,
+                    required_successes=required_successes,
+                    successful_replicates=0,
+                    failed_replicates=0,
+                    interval_construction="equal-tailed percentile",
+                    intervals={},
+                    replicate_roster=(),
                     provenance={
                         "settlement": "not_started_after_stop",
                         "primary_fit_preserved": True,
                     },
-                    details={"primary_fit_preserved": True},
-                    cause=factual_cause_from_exception(
+                    diagnostic=factual_cause_from_exception(
                         FittingCancelled(
                             "Bootstrap was not started after post-fit processing stopped."
                         ),
@@ -777,54 +910,137 @@ def fit_global(
                 )
             else:
                 try:
-                    extension = residual_bootstrap_extension(
+                    bootstrap_result = residual_bootstrap_result(
                         terminal_result=replay_state,
-                        terminal_outcome=optimizer_evaluation,
                         payloads=payloads,
                         config=residual_bootstrap,
                         refit=refit_bootstrap,
                         cancellation_check=cancellation_check,
                         progress_callback=extension_progress_callback,
                     )
+                    optional_analysis_stopped = bootstrap_result.status == "stopped"
                 except (FittingCancelled, SimulationCancelled) as exc:
-                    extension_pipeline_stopped = True
-                    extension = FitTerminalExtension(
-                        kind="bootstrap",
+                    optional_analysis_stopped = True
+                    bootstrap_result = ResidualBootstrapResult(
                         status="stopped",
                         method="stratified residual bootstrap with full refits",
+                        requested_parameters=tuple(
+                            str(item.display_name)
+                            for item in residual_bootstrap.parameter_names
+                        ),
+                        seed=residual_bootstrap.seed,
+                        replicates=residual_bootstrap.replicates,
+                        confidence_level=residual_bootstrap.confidence_level,
+                        resampling="within each dataset/target residual stratum",
+                        stratum_manifest_version=1,
+                        stratum_manifest={},
+                        draw_recipe_version=2,
+                        draw_algorithm="numpy.default_rng(seed) residual-index draws",
+                        residual_centering="independent arithmetic mean subtraction within each dataset/target stratum",
+                        replay_authority="seed plus versioned draw algorithm and stratum manifest",
+                        preserved_fields=("time", "X", "source-row", "dataset weight", "target weight", "full-refit"),
+                        replicate_execution="full global refit",
+                        refit_validity="only explicitly converged scientific refits count",
+                        minimum_successful_replicates=residual_bootstrap.minimum_successful_replicates,
+                        minimum_success_fraction=residual_bootstrap.minimum_success_fraction,
+                        required_successes=max(
+                            residual_bootstrap.minimum_successful_replicates,
+                            int(
+                                np.ceil(
+                                    residual_bootstrap.replicates
+                                    * residual_bootstrap.minimum_success_fraction
+                                )
+                            ),
+                        ),
+                        successful_replicates=0,
+                        failed_replicates=0,
+                        interval_construction="equal-tailed percentile",
+                        intervals={},
+                        replicate_roster=(),
                         provenance={
                             "settlement": "stopped",
                             "primary_fit_preserved": True,
                         },
-                        details={"primary_fit_preserved": True},
-                        cause=factual_cause_from_exception(
+                        diagnostic=factual_cause_from_exception(
                             exc, domain="fit", origin="bootstrap"
                         ),
                     )
                 except Exception as exc:
-                    extension = FitTerminalExtension(
-                        kind="bootstrap",
+                    bootstrap_result = ResidualBootstrapResult(
                         status="failed",
                         method="stratified residual bootstrap with full refits",
-                        provenance={
-                            "settlement": "failed",
-                            "primary_fit_preserved": True,
-                        },
-                        details={"primary_fit_preserved": True},
-                        cause=factual_cause_from_exception(
+                        requested_parameters=tuple(
+                            str(item.display_name)
+                            for item in residual_bootstrap.parameter_names
+                        ),
+                        seed=residual_bootstrap.seed,
+                        replicates=residual_bootstrap.replicates,
+                        confidence_level=residual_bootstrap.confidence_level,
+                        resampling="within each dataset/target residual stratum",
+                        stratum_manifest_version=1,
+                        stratum_manifest={},
+                        draw_recipe_version=2,
+                        draw_algorithm="numpy.default_rng(seed) residual-index draws",
+                        residual_centering="independent arithmetic mean subtraction within each dataset/target stratum",
+                        replay_authority="seed plus versioned draw algorithm and stratum manifest",
+                        preserved_fields=("time", "X", "source-row", "dataset weight", "target weight", "full-refit"),
+                        replicate_execution="full global refit",
+                        refit_validity="only explicitly converged scientific refits count",
+                        minimum_successful_replicates=residual_bootstrap.minimum_successful_replicates,
+                        minimum_success_fraction=residual_bootstrap.minimum_success_fraction,
+                        required_successes=max(
+                            residual_bootstrap.minimum_successful_replicates,
+                            int(
+                                np.ceil(
+                                    residual_bootstrap.replicates
+                                    * residual_bootstrap.minimum_success_fraction
+                                )
+                            ),
+                        ),
+                        successful_replicates=0,
+                        failed_replicates=0,
+                        interval_construction="equal-tailed percentile",
+                        intervals={},
+                        replicate_roster=(),
+                        diagnostic=factual_cause_from_exception(
                             exc,
                             domain="fit",
                             origin="bootstrap",
                         ),
+                        provenance={
+                            "settlement": "failed",
+                            "primary_fit_preserved": True,
+                        },
                     )
-            extensions.append(extension)
 
+        replay_state = replace(
+            replay_state,
+            profile_likelihood_result=profile_result,
+            residual_bootstrap_result=bootstrap_result,
+        )
         result = _fit_execution._construct_global_fit_result(
             replay_state,
-            terminal_extensions=extensions,
             shared_refit_provenance=shared_refit_provenance,
         )
-        return result, optimizer_evaluation
+        if (
+            callable(stop_best_requested)
+            and stop_best_requested()
+            and (
+                stop_during_primary_replay
+                or not optional_analysis_stopped
+            )
+        ):
+            result = _mark_late_stop(
+                result,
+                cause=factual_cause_from_exception(
+                    FittingCancelled(
+                        "Stopped by user after primary Fit settlement."
+                    ),
+                    domain="fit",
+                    origin="user_stop",
+                ),
+            )
+        return result
 
     except FittingCancelled as exc:
         if not hasattr(exc, "scipy_nfev"):
@@ -836,6 +1052,157 @@ def fit_global(
             calls = getattr(active_objective, "objective_calls", None)
             if calls is not None:
                 setattr(exc, "objective_call_count", int(calls))
+        existing_replay_state = locals().get("replay_state")
+        if (
+            callable(stop_best_requested)
+            and stop_best_requested()
+            and existing_replay_state is not None
+            and hasattr(existing_replay_state, "weighted_residuals")
+        ):
+            stop_cause = factual_cause_from_exception(
+                exc,
+                domain="fit",
+                origin="user_stop",
+            )
+            settled_profile = locals().get("profile_result")
+            if profile_likelihood is not None and settled_profile is None:
+                settled_profile_config = replace(
+                    profile_likelihood,
+                    parameter_names=tuple(
+                        layout.coordinate_identity(name)
+                        for name in profile_likelihood.parameter_names
+                    ),
+                )
+                settled_profile = _stopped_profile_result(
+                    config=settled_profile_config,
+                    replay_state=existing_replay_state,
+                    cause=stop_cause,
+                )
+            settled_bootstrap = locals().get("bootstrap_result")
+            if residual_bootstrap is not None and settled_bootstrap is None:
+                settled_bootstrap = _stopped_bootstrap_result(
+                    config=residual_bootstrap,
+                    cause=stop_cause,
+                    settlement="not_started_after_stop",
+                )
+            settled_state = replace(
+                existing_replay_state,
+                profile_likelihood_result=settled_profile,
+                residual_bootstrap_result=settled_bootstrap,
+            )
+            settled_provenance = shared_refit_provenance
+            if settled_provenance is not None:
+                settled_provenance = {
+                    **dict(settled_provenance),
+                    "terminal_route": "user_stop_best_valid_bounded_replay",
+                }
+            return _fit_execution._construct_global_fit_result(
+                settled_state,
+                shared_refit_provenance=settled_provenance,
+            )
+        active_objective = locals().get("objective")
+        if (
+            callable(stop_best_requested)
+            and stop_best_requested()
+            and stopped_replay_control is not None
+            and active_objective is not None
+        ):
+            retained_best = getattr(active_objective, "best_complete_vector", None)
+            if callable(retained_best):
+                retained_best = retained_best()
+            if retained_best is not None:
+                scipy_nfev = getattr(exc, "scipy_nfev", None)
+                objective_call_count = getattr(exc, "objective_call_count", None)
+                if scipy_nfev is None or objective_call_count is None:
+                    raise RuntimeError(
+                        "Stopped Fit lost its exact optimizer/objective counters."
+                    )
+                stop_cause = factual_cause_from_exception(
+                    exc,
+                    domain="fit",
+                    origin="user_stop",
+                )
+                try:
+                    stopped_state = _fit_execution._assemble_fit_replay_state(
+                        fit_evaluators=evaluators,
+                        payloads=payloads,
+                        layout=layout,
+                        candidate_vector=np.asarray(retained_best, dtype=float),
+                        fixed_dataset_params=fixed_dataset_params,
+                        weights=weights_norm,
+                        cancellation_check=None,
+                        cancellation_control=stopped_replay_control,
+                        success=False,
+                        message=(
+                            "Stopped by user; published the best fully evaluated "
+                            "valid candidate."
+                        ),
+                        scipy_nfev=int(scipy_nfev),
+                        objective_call_count=int(objective_call_count),
+                        optimizer_diagnostic=stop_cause,
+                        executor=executor,
+                    )
+                except FitSimulationError as replay_error:
+                    replay_details = dict(
+                        getattr(replay_error, "details", None) or {}
+                    )
+                    if not replay_details.get("scientific_unavailable"):
+                        raise
+                    return ScientificUnavailable(
+                        producer=str(
+                            replay_details.get("producer", "fit_stopped_replay")
+                        ),
+                        stage=str(
+                            replay_details.get("stage", "stopped_replay")
+                        ),
+                        details=replay_details,
+                        factual_cause=getattr(
+                            replay_error, "factual_cause", None
+                        ),
+                    )
+                if not stop_best_requested():
+                    raise FittingCancelled()
+                stopped_profile = None
+                if profile_likelihood is not None:
+                    stopped_profile = replace(
+                        profile_likelihood,
+                        parameter_names=tuple(
+                            layout.coordinate_identity(name)
+                            for name in profile_likelihood.parameter_names
+                        ),
+                    )
+                stopped_bootstrap = residual_bootstrap
+                stopped_state = replace(
+                    stopped_state,
+                    profile_likelihood_result=(
+                        None
+                        if stopped_profile is None
+                        else _stopped_profile_result(
+                            config=stopped_profile,
+                            replay_state=stopped_state,
+                            cause=stop_cause,
+                        )
+                    ),
+                    residual_bootstrap_result=(
+                        None
+                        if stopped_bootstrap is None
+                        else _stopped_bootstrap_result(
+                            config=stopped_bootstrap,
+                            cause=stop_cause,
+                            settlement="not_started_after_stop",
+                        )
+                    ),
+                )
+                stopped_provenance = shared_refit_provenance
+                if stopped_provenance is not None:
+                    stopped_provenance = {
+                        **dict(stopped_provenance),
+                        "terminal_route": "user_stop_best_valid_bounded_replay",
+                    }
+                return _fit_execution._construct_global_fit_result(
+                    stopped_state,
+                    shared_refit_provenance=stopped_provenance,
+                )
         raise
     except SimulationCancelled as exc:
         cancellation = FittingCancelled()
@@ -863,12 +1230,15 @@ def fit_global_shared_refit(
     progress_callback: Optional[Callable[[_fit_execution.FitProgress], None]] = None,
     cancellation_check: Optional[Callable[[], bool]] = None,
     cancellation_control: SimulationCancellationControl | None = None,
+    stop_best_requested: Callable[[], bool] | None = None,
+    stopped_replay_control: SimulationCancellationControl | None = None,
     profile_likelihood: ProfileLikelihoodConfig | None = None,
     residual_bootstrap: ResidualBootstrapConfig | None = None,
     extension_progress_callback: Optional[
         Callable[[FitExtensionProgress], None]
     ] = None,
-) -> tuple[_fit_execution.GlobalFitResult | None, FitEvaluationOutcome]:
+    executor: Executor,
+) -> _fit_execution.GlobalFitResult | ScientificUnavailable:
     """Execute one pre-dispatch-admitted exact Shared refit.
 
     Promotion seeds, source provenance, final parameter routes, and optimizer
@@ -878,12 +1248,14 @@ def fit_global_shared_refit(
 
     if not isinstance(execution, SharedRefitExecution):
         raise TypeError("Shared refit requires its admitted execution.")
+    if executor is None:
+        raise TypeError("Shared refit requires a borrowed executor.")
     dataset_ids = tuple(item.dataset_id for item in datasets)
     if dataset_ids != execution.dataset_ids:
         raise ValueError(
             "Shared-refit fitted datasets must exactly match its admitted roster."
         )
-    result = fit_global(
+    return fit_global(
         fit_evaluators=fit_evaluators,
         datasets=datasets,
         shared_variables=execution.shared_variables,
@@ -898,6 +1270,8 @@ def fit_global_shared_refit(
         progress_callback=progress_callback,
         cancellation_check=cancellation_check,
         cancellation_control=cancellation_control,
+        stop_best_requested=stop_best_requested,
+        stopped_replay_control=stopped_replay_control,
         profile_likelihood=profile_likelihood,
         residual_bootstrap=residual_bootstrap,
         extension_progress_callback=extension_progress_callback,
@@ -906,5 +1280,5 @@ def fit_global_shared_refit(
             terminal_route="optimizer_terminal",
         ),
         optimizer_layout=execution.optimizer_layout,
+        executor=executor,
     )
-    return result
