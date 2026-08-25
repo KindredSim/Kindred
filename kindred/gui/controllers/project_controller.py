@@ -13,25 +13,23 @@ from enum import Enum
 from PySide6 import QtCore, QtWidgets
 
 from kindred.core.project_document import ProjectDocument
-from kindred.core.project_presentation_state import default_workspace_presentation_state
+from kindred.core.project_presentation_state import (
+    WorkspacePresentationState,
+    default_workspace_presentation_state,
+)
 from kindred.core.project_session import (
-    PreparedProjectInstall,
     ProjectContentToken,
     ProjectSession,
 )
 from kindred.gui.controllers.config_controller import ConfigController
 from kindred.gui.controllers.simulation_job_owner import SimulationJobOwner
-from kindred.gui.controllers.interactive_preview_owner import InteractivePreviewOwner
 from kindred.gui.dataset_import_staging import DatasetImportStaging
 from kindred.gui.fit_session_owner import (
     FitReplacementDispositionSummary,
     FitSessionOwner,
 )
-from kindred.gui.workspace_tab_registry import (
-    PreparedWorkspaceInstall,
-    WorkspaceTabRegistry,
-)
-from kindred.io.kin_archive_store import ArchiveProject, KinArchiveStore
+from kindred.gui.workspace_tab_registry import WorkspaceTabRegistry
+from kindred.io.kin_archive_store import KinArchiveStore
 
 logger = logging.getLogger(__name__)
 
@@ -118,7 +116,6 @@ class _ProjectDispositionRequest:
     action: str
     archive_dirty: bool
     transient: ProjectTransientState
-    project_replacement: bool = False
     application_close: bool = False
 
 
@@ -139,6 +136,8 @@ class AuthoringDiscardMode(Enum):
 class _DispositionResult:
     content_token: ProjectContentToken
     clean_idle: bool = False
+    save_requested: bool = False
+    save_discard_invalid_initial_conditions: bool = False
     discard_all_authoring: bool = False
     discard_slider_drafts: bool = False
 
@@ -162,15 +161,9 @@ class ProjectController(QtCore.QObject):
         archive_store: KinArchiveStore,
         config: ConfigController,
         simulation_jobs: SimulationJobOwner,
-        interactive_preview_owner: InteractivePreviewOwner,
         dataset_imports: DatasetImportStaging,
         fit_session: FitSessionOwner,
         xlsx_exports: object,
-        dispose_workspace: Callable[[], QtCore.QByteArray],
-        rebuild_workspace: Callable[
-            [ProjectDocument, PreparedWorkspaceInstall, QtCore.QByteArray],
-            None,
-        ],
         set_status_text: Callable[[str], None],
         settle_execution_candidate: Callable[
             [ProjectContentToken],
@@ -185,6 +178,12 @@ class ProjectController(QtCore.QObject):
         discard_authoring: Callable[[AuthoringDiscardMode], None],
         discard_slider_drafts: Callable[[], None],
         replacement_timeout_seconds: float,
+        prepare_project_workspace: Callable[
+            [ProjectDocument, WorkspacePresentationState],
+            object,
+        ],
+        publish_project_workspace: Callable[[object], None],
+        dispose_project_workspace: Callable[[object], None],
     ) -> None:
         if not isinstance(parent_widget, QtWidgets.QWidget):
             raise TypeError("parent_widget must be a QWidget.")
@@ -199,19 +198,12 @@ class ProjectController(QtCore.QObject):
             raise TypeError("config must be a ConfigController.")
         if not isinstance(simulation_jobs, SimulationJobOwner):
             raise TypeError("simulation_jobs must be a SimulationJobOwner.")
-        if not isinstance(interactive_preview_owner, InteractivePreviewOwner):
-            raise TypeError("interactive_preview_owner must be an InteractivePreviewOwner.")
         if not isinstance(dataset_imports, DatasetImportStaging):
             raise TypeError("dataset_imports must be a DatasetImportStaging.")
         if not isinstance(fit_session, FitSessionOwner):
             raise TypeError("fit_session must be a FitSessionOwner.")
-        if not callable(dispose_workspace):
-            raise TypeError("dispose_workspace must be callable.")
-        if not callable(rebuild_workspace):
-            raise TypeError("rebuild_workspace must be callable.")
         for owner_name, owner in (
             ("simulation_jobs", simulation_jobs),
-            ("interactive_preview_owner", interactive_preview_owner),
             ("dataset_imports", dataset_imports),
             ("fit_session", fit_session),
         ):
@@ -259,18 +251,21 @@ class ProjectController(QtCore.QObject):
             raise TypeError("discard_authoring must be callable.")
         if not callable(discard_slider_drafts):
             raise TypeError("discard_slider_drafts must be callable.")
+        if not callable(prepare_project_workspace):
+            raise TypeError("prepare_project_workspace must be callable.")
+        if not callable(publish_project_workspace):
+            raise TypeError("publish_project_workspace must be callable.")
+        if not callable(dispose_project_workspace):
+            raise TypeError("dispose_project_workspace must be callable.")
         self._parent_widget = parent_widget
         self._session = session
         self._tabs = tabs
         self._archive_store = archive_store
         self._config = config
         self._simulation_jobs = simulation_jobs
-        self._interactive_preview_owner = interactive_preview_owner
         self._dataset_imports = dataset_imports
         self._fit_session = fit_session
         self._xlsx_exports = xlsx_exports
-        self._dispose_workspace = dispose_workspace
-        self._rebuild_workspace = rebuild_workspace
         self._set_status_text = set_status_text
         self._settle_execution_candidate = settle_execution_candidate
         self._prepare_before_save = prepare_before_save
@@ -278,6 +273,9 @@ class ProjectController(QtCore.QObject):
         self._inspect_transient_state = inspect_transient_state
         self._discard_authoring = discard_authoring
         self._discard_slider_drafts = discard_slider_drafts
+        self._prepare_project_workspace = prepare_project_workspace
+        self._publish_project_workspace = publish_project_workspace
+        self._dispose_project_workspace = dispose_project_workspace
         self._replacement_timeout_seconds = self._positive_timeout(
             replacement_timeout_seconds,
             "replacement_timeout_seconds",
@@ -286,14 +284,12 @@ class ProjectController(QtCore.QObject):
         self._close_pending = False
         self._close_deadline: float | None = None
         self._close_authorization: str | None = None
+        self._replacement_fence_held = False
         self._close_timer = QtCore.QTimer(self)
         self._close_timer.setSingleShot(True)
         self._close_timer.setTimerType(QtCore.Qt.TimerType.PreciseTimer)
         self._close_timer.timeout.connect(self._on_application_close_deadline)
         self._simulation_jobs.application_close_settlement_changed.connect(
-            self.notify_close_progress
-        )
-        self._interactive_preview_owner.settled_changed.connect(
             self.notify_close_progress
         )
         self._dataset_imports.application_close_settlement_changed.connect(
@@ -320,21 +316,6 @@ class ProjectController(QtCore.QObject):
 
     def _set_status(self, text: str) -> None:
         self._set_status_text(str(text))
-
-    def _set_replacement_success_status(
-        self,
-        success_text: str,
-        cleanup_failures: tuple[str, ...],
-    ) -> None:
-        """Publish exactly one terminal status for a committed replacement."""
-
-        if cleanup_failures:
-            self._set_status(
-                f"{success_text}, but cleanup reported: "
-                + "; ".join(cleanup_failures)
-            )
-            return
-        self._set_status(success_text)
 
     @property
     def mutation_admitted(self) -> bool:
@@ -381,7 +362,7 @@ class ProjectController(QtCore.QObject):
         action: str,
         *,
         expected_token: ProjectContentToken,
-        project_replacement: bool = False,
+        defer_save: bool = False,
         application_close: bool = False,
     ) -> _DispositionResult | None:
         if not self._content_token_is_current(
@@ -395,7 +376,6 @@ class ProjectController(QtCore.QObject):
                 self._tabs.workspace_presentation()
             ),
             transient=self._transient_state(),
-            project_replacement=bool(project_replacement),
             application_close=bool(application_close),
         )
         if not request.archive_dirty and not request.transient.has_any:
@@ -415,6 +395,15 @@ class ProjectController(QtCore.QObject):
         }:
             return None
         if choice is _DispositionChoice.SAVE:
+            if defer_save:
+                return _DispositionResult(
+                    content_token=expected_token,
+                    save_requested=True,
+                    save_discard_invalid_initial_conditions=(
+                        request.transient.invalid_initial_conditions
+                    ),
+                    discard_slider_drafts=request.transient.slider_drafts,
+                )
             saved_token = self._save_project_from_token(
                 expected_token,
                 discard_invalid_initial_conditions=(
@@ -488,10 +477,6 @@ class ProjectController(QtCore.QObject):
             details.append("A dataset import is still active.")
         if transient.active_xlsx_export:
             details.append("An XLSX export is still active.")
-        if request.project_replacement and transient.has_active_work:
-            details.append(
-                "Continuing with this project replacement will stop active work."
-            )
         details.append(f"Choose once how to proceed before {request.action}.")
 
         dialog = QtWidgets.QMessageBox(self._parent_widget)
@@ -566,12 +551,6 @@ class ProjectController(QtCore.QObject):
                 )
             else:
                 discard_label = f"Discard {discard_subject} and Close"
-        elif request.project_replacement and transient.has_active_work:
-            discard_label = (
-                f"Discard {discard_subject}, Stop Active Work, and Continue"
-                if discard_subject
-                else "Stop Active Work and Continue"
-            )
         else:
             discard_label = (
                 f"Discard {discard_subject} and Continue"
@@ -604,11 +583,27 @@ class ProjectController(QtCore.QObject):
         if result.discard_slider_drafts:
             self._discard_slider_drafts()
 
+    def _acquire_replacement_fence(self) -> None:
+        """Fence dataset-import admission for one replacement attempt."""
+
+        if self._replacement_fence_held:
+            return
+        acquired = self._dataset_imports.fence_for_project_replacement()
+        self._replacement_fence_held = bool(acquired)
+
+    def _release_replacement_fence(self) -> None:
+        """Release the replacement fence exactly once when it is held."""
+
+        if not self._replacement_fence_held:
+            return
+        self._replacement_fence_held = False
+        self._dataset_imports.resume_after_project_replacement()
+
     def _settle_replacement_workers(self) -> bool:
+        self._acquire_replacement_fence()
         deadline = time.monotonic() + self._replacement_timeout_seconds
         owners = (
             ("Simulation", self._simulation_jobs),
-            ("Interactive Preview", self._interactive_preview_owner),
             ("Dataset import", self._dataset_imports),
             ("Fit", self._fit_session),
             ("XLSX export", self._xlsx_exports),
@@ -654,283 +649,270 @@ class ProjectController(QtCore.QObject):
                 "Project replacement was not completed because transient work "
                 "did not stop before the deadline."
             )
-            self._dataset_imports.resume_after_project_replacement()
             return False
         return True
 
-    def _decode_project_candidate(
+    def _dispose_prepared_project_workspace(self, workspace: object) -> None:
+        self._dispose_project_workspace(workspace)
+
+    def _prepare_project_review(
         self,
-        project: ArchiveProject,
+        document: ProjectDocument,
+        presentation: WorkspacePresentationState,
         *,
         path: str | None,
-    ) -> tuple[PreparedProjectInstall, PreparedWorkspaceInstall]:
-        if not isinstance(project, ArchiveProject):
-            raise TypeError("project must be ArchiveProject.")
-        prepared_session = self._session.prepare_install(
-            project.document,
-            project.presentation,
-            path=path,
-        )
-        prepared_workspace = self._tabs.prepare_install(
-            document=prepared_session.document,
-            presentation=prepared_session.saved_baseline.presentation,
-        )
-        return prepared_session, prepared_workspace
-
-    def _replace_project(
-        self,
-        prepared_session: PreparedProjectInstall,
-        prepared_workspace: PreparedWorkspaceInstall,
-        *,
         action: str,
+        review: Callable[
+            [
+                ProjectContentToken,
+                ProjectDocument,
+                WorkspacePresentationState,
+                str | None,
+                object,
+            ],
+            None,
+        ],
+    ) -> bool:
+        """Admit and prepare one candidate for a caller-owned review."""
+
+        if self._reject_mutation_during_close(action):
+            return False
+        entry_token = self._session.capture_content_token()
+        disposition = self._resolve_disposition(
+            action,
+            expected_token=entry_token,
+            defer_save=True,
+        )
+        if disposition is None:
+            return False
+
+        prepared_workspace: object
+        try:
+            prepared_workspace = self._prepare_project_workspace(
+                document,
+                presentation,
+            )
+            if prepared_workspace is None:
+                raise RuntimeError(
+                    "Project workspace preparation returned no workspace."
+                )
+        except Exception as exc:
+            logger.exception("Prepared project workspace construction failed")
+            self._show_error(
+                f"{action} Error",
+                f"Could not prepare the incoming project workspace:\n\n{exc}",
+            )
+            return False
+
+        try:
+            if disposition.save_requested:
+                saved_token = self._save_project_from_token(
+                    disposition.content_token,
+                    discard_invalid_initial_conditions=(
+                        disposition.save_discard_invalid_initial_conditions
+                    ),
+                )
+                if saved_token is None:
+                    self._dispose_prepared_project_workspace(prepared_workspace)
+                    return False
+                disposition = _DispositionResult(
+                    content_token=saved_token,
+                    discard_all_authoring=disposition.discard_all_authoring,
+                    discard_slider_drafts=disposition.discard_slider_drafts,
+                )
+            self._apply_discard(disposition)
+            if not self._content_token_is_current(
+                disposition.content_token,
+                action=action,
+            ):
+                self._dispose_prepared_project_workspace(prepared_workspace)
+                return False
+        except Exception as exc:
+            self._dispose_prepared_project_workspace(prepared_workspace)
+            logger.exception("Project disposition continuation failed")
+            self._show_error(
+                f"{action} Error",
+                f"Could not continue project disposition:\n\n{exc}",
+            )
+            return False
+
+        try:
+            review(
+                disposition.content_token,
+                document,
+                presentation,
+                path,
+                prepared_workspace,
+            )
+        except Exception as exc:
+            self._dispose_prepared_project_workspace(prepared_workspace)
+            logger.exception("Project review continuation failed")
+            self._show_error(
+                f"{action} Error",
+                f"Could not continue project review:\n\n{exc}",
+            )
+            return False
+        return True
+
+    def install_project_replacement(
+        self,
+        document: ProjectDocument,
+        presentation: WorkspacePresentationState,
+        prepared_workspace: object,
+        *,
+        path: str | None,
         expected_token: ProjectContentToken,
-    ) -> tuple[bool, tuple[str, ...]]:
-        """Fence, commit, and rebuild one project inside the permanent root."""
+        baseline_document: ProjectDocument,
+    ) -> bool:
+        """Settle and publish one caller-confirmed prepared project once."""
 
         if not self._content_token_is_current(
             expected_token,
             action="Project replacement",
         ):
-            return False, ()
+            self._dispose_prepared_project_workspace(prepared_workspace)
+            return False
 
-        disposition = self._resolve_disposition(
-            action,
-            expected_token=expected_token,
-            project_replacement=True,
-        )
-        if disposition is None:
-            return False, ()
-        self._discard_slider_drafts()
-        if not self._settle_replacement_workers():
-            return False, ()
-
-        if not self._content_token_is_current(
-            disposition.content_token,
-            action="Project replacement",
-        ):
-            self._dataset_imports.resume_after_project_replacement()
-            return False, ()
-
+        # Cancellation is one-way.  If settlement fails, only the prepared
+        # incoming physical state is disposed; the installed project remains
+        # untouched and no cancelled owner is restarted.
         try:
-            saved_layout = self._dispose_workspace()
-        except Exception as exc:
-            logger.exception("Current project workspace disposal failed")
-            self._set_status(
-                "Project replacement was not completed because its current "
-                f"workspace could not be disposed: {exc}"
-            )
-            self._dataset_imports.resume_after_project_replacement()
-            return False, ()
-
-        # The old result identities are purged while the old session, registry
-        # and root contents are still current.  This is intentionally before
-        # either semantic assignment or the incoming surface rebuild.
-        previous_document = self._session.document
-        cleanup_failures = list(
-            self._purge_replaced_project_results(previous_document)
-        )
-
+            settled = self._settle_replacement_workers()
+        except Exception:
+            logger.exception("Project replacement settlement failed")
+            settled = False
+        if not settled:
+            self._dispose_prepared_project_workspace(prepared_workspace)
+            self._release_replacement_fence()
+            return False
+        semantic_published = False
         try:
-            committed_token = self._session.commit_install(
-                prepared_session,
-                expected_token=disposition.content_token,
-            )
-            if committed_token is None:
-                return False, tuple(dict.fromkeys(cleanup_failures))
-            if not self._tabs.commit_install(
-                prepared_workspace,
-                expected_token=committed_token,
+            if not self._content_token_is_current(
+                expected_token,
+                action="Project replacement",
             ):
-                raise RuntimeError(
-                    "Workspace replacement registry rejected its current token."
-                )
-            try:
-                self._rebuild_workspace(
-                    prepared_session.document,
-                    prepared_workspace,
-                    saved_layout,
-                )
-            except Exception as exc:
-                logger.exception("Project workspace rebuild failed")
-                cleanup_failures.append(f"workspace rebuild: {exc}")
+                self._dispose_prepared_project_workspace(prepared_workspace)
+                return False
+
+            result = self._tabs.replace_project(
+                document,
+                presentation=presentation,
+                path=path,
+                expected_token=expected_token,
+                baseline_document=baseline_document,
+            )
+            if result is None:
+                self._dispose_prepared_project_workspace(prepared_workspace)
+                return False
+            semantic_published = True
+
+            self._publish_project_workspace(prepared_workspace)
+            recent_error: Exception | None = None
+            if path is not None:
+                try:
+                    self._config.record_recent_project(path)
+                except Exception as exc:
+                    recent_error = exc
+                    logger.warning("Recent-project update failed", exc_info=True)
+            if path is None:
+                status = "Created new project."
+            else:
+                status = f"Loaded project: {path}"
+            if recent_error is not None:
+                status += f"; recent-project persistence failed: {recent_error}"
+            self._set_status(status)
+            self.projectStateChanged.emit()
+            return True
+        except Exception as exc:
+            logger.exception("Project replacement publication failed")
+            if not semantic_published:
+                self._dispose_prepared_project_workspace(prepared_workspace)
+            self._set_status(f"Project replacement failed: {exc}")
+            return False
         finally:
-            self._dataset_imports.resume_after_project_replacement()
-        self.projectStateChanged.emit()
-        return True, tuple(dict.fromkeys(cleanup_failures))
+            self._release_replacement_fence()
 
-    def _purge_replaced_project_results(
+    def new_project(
         self,
-        previous_document: ProjectDocument,
-    ) -> tuple[str, ...]:
-        """Drop old result identities only after both prepared installs commit."""
+        review: Callable[
+            [
+                ProjectContentToken,
+                ProjectDocument,
+                WorkspacePresentationState,
+                str | None,
+                object,
+            ],
+            None,
+        ],
+    ) -> bool:
+        """Admit a default project and hand it to one call-local review."""
 
-        failures: list[str] = []
-        for tab in previous_document.tabs:
-            set_ids = tuple(
-                initial_set.set_id
-                for initial_set in tab.initial_condition_sets
-            )
-            try:
-                self._simulation_jobs.purge_tab(tab.tab_id, set_ids)
-            except Exception as exc:
-                logger.exception(
-                    "Old Simulation result state could not be purged for tab %s",
-                    tab.tab_id,
-                )
-                failures.append(
-                    f"result purge for tab {tab.tab_id}: {exc}"
-                )
-        return tuple(failures)
-
-    def new_project(self) -> bool:
-        if self._reject_mutation_during_close("New Project"):
-            return False
-        entry_token = self._session.capture_content_token()
-        operative_token = self._settle_execution_candidate(entry_token)
-        if operative_token is None:
-            return False
-        candidate = self._config.default_project_document()
-        if not isinstance(candidate, ProjectDocument):
-            raise TypeError(
-                "ConfigController.default_project_document() must return "
-                "ProjectDocument."
-            )
-        prepared_session, prepared_workspace = self._decode_project_candidate(
-            ArchiveProject(
-                document=candidate,
-                presentation=default_workspace_presentation_state(candidate),
-            ),
+        document = self._config.default_project_document()
+        presentation = default_workspace_presentation_state(document)
+        return self._prepare_project_review(
+            document,
+            presentation,
             path=None,
+            action="New Project",
+            review=review,
         )
-        committed, cleanup_failures = self._replace_project(
-            prepared_session,
-            prepared_workspace,
-            action="starting a new project",
-            expected_token=operative_token,
-        )
-        if not committed:
-            return False
-        self._set_replacement_success_status(
-            "New project",
-            cleanup_failures,
-        )
-        return True
 
-    def load_project(self) -> bool:
-        if self._reject_mutation_during_close("Open Project"):
-            return False
-        entry_token = self._session.capture_content_token()
+    def load_project(
+        self,
+        review: Callable[
+            [
+                ProjectContentToken,
+                ProjectDocument,
+                WorkspacePresentationState,
+                str | None,
+                object,
+            ],
+            None,
+        ],
+    ) -> bool:
+        """Choose and admit one archive for a call-local review."""
+
         path, _selected_filter = QtWidgets.QFileDialog.getOpenFileName(
             self._parent_widget,
             "Open Project",
-            "",
+            self._session.current_path or "",
             "Kindred Project (*.kin)",
         )
         if not path:
             return False
-        if not self._content_token_is_current(
-            entry_token,
-            action="Open Project",
-        ):
-            return False
-        return self._open_project_candidate(
-            path,
-            remove_missing_recent=False,
-            expected_token=entry_token,
-        )
+        return self.load_recent_project(path, review)
 
-    def load_recent_project(self, path: str) -> bool:
-        if self._reject_mutation_during_close("Open Recent Project"):
-            return False
-        entry_token = self._session.capture_content_token()
-        return self._open_project_candidate(
-            path,
-            remove_missing_recent=True,
-            expected_token=entry_token,
-        )
-
-    def _open_project_candidate(
+    def load_recent_project(
         self,
-        path: str,
-        *,
-        remove_missing_recent: bool,
-        expected_token: ProjectContentToken,
+        path: str | os.PathLike[str],
+        review: Callable[
+            [
+                ProjectContentToken,
+                ProjectDocument,
+                WorkspacePresentationState,
+                str | None,
+                object,
+            ],
+            None,
+        ],
     ) -> bool:
+        """Admit one selected archive for a call-local review."""
+
         if self._reject_mutation_during_close("Open Project"):
             return False
-        absolute_path = os.path.abspath(os.fsdecode(os.fspath(path)))
-        if remove_missing_recent and not os.path.isfile(absolute_path):
-            try:
-                self._config.remove_recent_project(absolute_path)
-            except Exception:
-                logger.warning(
-                    "Stale recent-project removal failed",
-                    exc_info=True,
-                )
-            QtWidgets.QMessageBox.warning(
-                self._parent_widget,
-                "File Not Found",
-                f"File no longer exists:\n{absolute_path}",
-            )
-            return False
-        if self._same_canonical_path(
-            absolute_path,
-            self._session.current_path,
-        ):
-            self._set_status(f"Project is already open: {absolute_path}")
-            try:
-                self._config.record_recent_project(absolute_path)
-            except Exception:
-                logger.warning("Recent-project promotion failed", exc_info=True)
-            return True
         try:
-            decoded = self._archive_store.load(absolute_path)
+            archive = self._archive_store.load(path)
         except Exception as exc:
-            self._show_error("Open Error", f"Failed to open project:\n\n{exc}")
+            logger.exception("Project archive load failed")
+            self._show_error("Open Project Error", f"Could not open project:\n\n{exc}")
             return False
-        if not self._content_token_is_current(
-            expected_token,
+        return self._prepare_project_review(
+            archive.document,
+            archive.presentation,
+            path=os.path.abspath(os.fsdecode(os.fspath(path))),
             action="Open Project",
-        ):
-            return False
-        try:
-            prepared_session, prepared_workspace = (
-                self._decode_project_candidate(
-                    decoded,
-                    path=absolute_path,
-                )
-            )
-        except Exception as exc:
-            self._show_error(
-                "Open Error",
-                f"Failed to decode and validate the project:\n\n{exc}",
-            )
-            return False
-        if not self._content_token_is_current(
-            expected_token,
-            action="Open Project",
-        ):
-            return False
-        operative_token = self._settle_execution_candidate(expected_token)
-        if operative_token is None:
-            return False
-        committed, cleanup_failures = self._replace_project(
-            prepared_session,
-            prepared_workspace,
-            action="opening another project",
-            expected_token=operative_token,
+            review=review,
         )
-        if not committed:
-            return False
-        self._set_replacement_success_status(
-            f"Opened project: {absolute_path}",
-            cleanup_failures,
-        )
-        try:
-            self._config.record_recent_project(absolute_path)
-        except Exception:
-            logger.warning("Recent-project promotion failed", exc_info=True)
-        return True
 
     @staticmethod
     def _same_canonical_path(
@@ -1176,11 +1158,16 @@ class ProjectController(QtCore.QObject):
             )
             return None
         self._discard_authoring(AuthoringDiscardMode.ALL_UNACCEPTED)
-        self._set_status(f"Saved project: {absolute_path}")
+        recent_error: Exception | None = None
         try:
             self._config.record_recent_project(absolute_path)
-        except Exception:
+        except Exception as exc:
+            recent_error = exc
             logger.warning("Recent-project update failed", exc_info=True)
+        status = f"Saved project: {absolute_path}"
+        if recent_error is not None:
+            status += f"; recent-project persistence failed: {recent_error}"
+        self._set_status(status)
         self.projectStateChanged.emit()
         return committed_token
 
@@ -1257,12 +1244,6 @@ class ProjectController(QtCore.QObject):
                 "Simulation admission fencing/cancellation failed during Close"
             )
         try:
-            self._interactive_preview_owner.cancel_for_application_close()
-        except Exception:
-            logger.exception(
-                "Interactive Preview admission fencing/cancellation failed during Close"
-            )
-        try:
             self._dataset_imports.cancel_for_application_close()
         except Exception:
             logger.exception(
@@ -1332,7 +1313,6 @@ class ProjectController(QtCore.QObject):
         settled = True
         for owner_label, owner in (
             ("Simulation", self._simulation_jobs),
-            ("Interactive Preview", self._interactive_preview_owner),
             ("Dataset import", self._dataset_imports),
             ("Fit", self._fit_session),
             ("XLSX export", self._xlsx_exports),

@@ -40,25 +40,6 @@ _CUSTOM_COLUMN_WIDTH = 72
 _RUN_GEAR_COLUMN_WIDTH = 36
 
 
-def _admit_initial_condition_set_candidate(
-    candidate: InitialConditionSet,
-) -> InitialConditionSet:
-    """Validate one complete Batch candidate before canonical replacement."""
-
-    if not isinstance(candidate, InitialConditionSet):
-        raise TypeError("Initial-condition candidate must be typed.")
-    # ``values_dict`` is the core model's single materialization boundary. It
-    # rejects forged/malformed carriers and duplicate species before the GUI
-    # performs any projection or canonical replacement.
-    candidate.values_dict()
-    for species, value in candidate.values:
-        validate_concentration(
-            value,
-            field=f"initial concentration for {species}",
-        )
-    return candidate
-
-
 @dataclass(frozen=True, slots=True)
 class _InitialConditionsRenderProjection:
     tab: MechanismTabDocument
@@ -125,10 +106,7 @@ class BatchInitialConditionsTableModel(QtCore.QAbstractTableModel):
             species = tuple(
                 dict.fromkeys(str(item) for item in species_names if str(item))
             )
-        admitted_sets = tuple(
-            _admit_initial_condition_set_candidate(initial_set)
-            for initial_set in tab.initial_condition_sets
-        )
+        admitted_sets = tab.initial_condition_sets
         override_ids = {
             set_id for set_id, _settings in tab.run_overrides_by_set_id
         }
@@ -807,15 +785,13 @@ class InitialConditionsTableActions(QtCore.QObject):
             self.activeSnapshotChanged.emit()
             return False
 
-        values = initial_set.values_dict()
+        values = dict(initial_set.values)
         canonical = float(values.get(str(species), 0.0))
         changed = value != canonical
         result: CanonicalMutationResult | None = None
         if changed:
             values[str(species)] = value
-            candidate = _admit_initial_condition_set_candidate(
-                initial_set.with_values(values)
-            )
+            candidate = initial_set.with_values(values)
             result = self._registry.replace_initial_condition_set(
                 self._tab_id,
                 candidate,
@@ -883,7 +859,7 @@ class InitialConditionsTableActions(QtCore.QObject):
         for row_offset, values_to_paste in enumerate(parsed):
             row_index = start_row + row_offset
             initial_set = candidate_sets[row_index]
-            values = initial_set.values_dict()
+            values = dict(initial_set.values)
             row_changed = False
             for column_offset, value in enumerate(values_to_paste):
                 species = species_names[start_column + column_offset - 1]
@@ -892,9 +868,7 @@ class InitialConditionsTableActions(QtCore.QObject):
                     values[species] = value
                     row_changed = True
             if row_changed:
-                candidate_sets[row_index] = _admit_initial_condition_set_candidate(
-                    initial_set.with_values(values)
-                )
+                candidate_sets[row_index] = initial_set.with_values(values)
                 changed_ids.append(initial_set.set_id)
 
         result: CanonicalMutationResult | None = None

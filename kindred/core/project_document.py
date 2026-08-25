@@ -9,6 +9,9 @@ from numbers import Real
 from typing import Callable, Iterable, Mapping, Sequence
 
 from kindred.core.authored_source_errors import AuthoredSourceError
+from kindred.core.equilibrium_rate_authority import (
+    normalize_existing_equilibrium_rate_authority,
+)
 from kindred.core.datasets import foundation as dataset_foundation
 from kindred.core.mechanism_source import (
     MechanismAuthoringSource,
@@ -22,8 +25,21 @@ from kindred.core.simulator.dsl_parse import (
     PreparedDslRequestSet,
     prepare_dsl_request_set,
 )
-from kindred.core.simulator.wegscheider_symbolic import (
-    WegscheiderCyclicityReport,
+from kindred.core.simulator.dsl_derivation import (
+    authored_step_origin,
+    coordinate_source_parts,
+    coordinate_token_matches,
+    insert_scalar_source_declarations,
+)
+from kindred.core.simulator.exact_constraint_composition import (
+    compose_exact_constraints,
+)
+from kindred.core.simulator.parameter_namespace import build_namespace_from_mechanism
+from kindred.core.simulator.step_indexing import get_step_index_map
+from kindred.core.simulator.source_correction import (
+    CorrectionTarget,
+    build_correction_expressions,
+    plan_correction_basis,
 )
 from kindred.core.simulator.solvers import normalize_solver_name
 from kindred.core.units import UnitsModel
@@ -43,7 +59,6 @@ from kindred.core.species import (
 
 __all__ = [
     "DatasetLink",
-    "DetailedBalanceAdmission",
     "FitDefaults",
     "InitialConditionSet",
     "MechanismSourceCollision",
@@ -76,6 +91,7 @@ __all__ = [
     "canonical_species_names",
     "retained_tab_mechanism_source",
     "reconcile_tab_mechanism_source",
+    "reconcile_tab_exact_correction",
     "resolve_simulation_execution_settings",
     "validate_fit_defaults",
     "validate_project_document",
@@ -118,17 +134,6 @@ def new_dataset_id() -> str:
 
 def new_project_id() -> str:
     return _new_id("project")
-
-
-def _values_dict_rejecting_duplicates(
-    values: object,
-    *,
-    context: str,
-) -> dict[str, float]:
-    """Materialize species values only after one structural preflight."""
-
-    validated = _validate_initial_condition_values(values, context=context)
-    return dict(validated)
 
 
 def _require_name(value: object, label: str) -> str:
@@ -267,7 +272,6 @@ class TabScientificSettings:
     rtol: float = 1e-6
     atol: float = 1e-12
     analytic_jacobian_policy: bool = True
-    wegscheider_policy: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -300,10 +304,7 @@ class InitialConditionSet:
         object.__setattr__(self, "values", validated)
 
     def values_dict(self) -> dict[str, float]:
-        return _values_dict_rejecting_duplicates(
-            self.values,
-            context=f"initial-condition set {self.set_id!r}",
-        )
+        return dict(self.values)
 
     def with_values(
         self,
@@ -357,10 +358,6 @@ def _validate_initial_condition_set_carriers(
                 f"Duplicate initial-condition set name {item.name!r} "
                 f"in {context}."
             )
-        _values_dict_rejecting_duplicates(
-            item.values,
-            context=f"initial-condition set {item.set_id!r}",
-        )
         seen_ids.add(set_id)
         seen_names.add(name_key)
         validated.append(item)
@@ -763,33 +760,8 @@ class ProjectDocument:
 
 
 @dataclass(frozen=True, slots=True)
-class DetailedBalanceAdmission:
-    """Typed detailed-balance truth derived from one prepared DSL request."""
-
-    report: WegscheiderCyclicityReport
-    policy_enabled: bool
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.report, WegscheiderCyclicityReport):
-            raise TypeError("report must be a WegscheiderCyclicityReport.")
-        if type(self.policy_enabled) is not bool:
-            raise TypeError("policy_enabled must be a bool.")
-
-    @property
-    def requires_correction(self) -> bool:
-        return bool(self.policy_enabled and self.report.unresolved_cycles)
-
-    @property
-    def resolved(self) -> bool:
-        return not self.report.unresolved_cycles
-
-
-@dataclass(frozen=True, slots=True)
 class MechanismSourceReconciliation:
     proposed_document: ProjectDocument
-    inline_initial_conditions: DslInitialConditionAdmission
-    prepared_dsl: PreparedDslRequestSet | None
-    detailed_balance: DetailedBalanceAdmission
     materialized_set_ids: tuple[str, ...] = ()
 
 
@@ -960,10 +932,6 @@ def validate_tab_scientific_settings(
         settings.analytic_jacobian_policy,
         f"{label}.analytic_jacobian_policy",
     )
-    _require_bool(
-        settings.wegscheider_policy,
-        f"{label}.wegscheider_policy",
-    )
     return settings
 
 
@@ -1013,8 +981,8 @@ def validate_fit_defaults(defaults: FitDefaults) -> FitDefaults:
 def _prepare_authored_source_admission(
     source: MechanismAuthoringSource,
     scientific_settings: TabScientificSettings,
-) -> tuple[PreparedDslRequestSet | None, DetailedBalanceAdmission]:
-    """Admit user source through parsing and complete executable validation."""
+) -> PreparedDslRequestSet | None:
+    """Admit user source through canonical parsing."""
 
     try:
         prepared_dsl = (
@@ -1028,15 +996,11 @@ def _prepare_authored_source_admission(
                 ),
             )
         )
-        detailed_balance = _detailed_balance_admission(
-            prepared_dsl,
-            policy_enabled=scientific_settings.wegscheider_policy,
-        )
     except AuthoredSourceError:
         raise
     except (DSLError, ValueError, OverflowError) as exc:
         raise AuthoredSourceError(str(exc)) from exc
-    return prepared_dsl, detailed_balance
+    return prepared_dsl
 
 
 def canonical_species_names(tab: MechanismTabDocument) -> tuple[str, ...]:
@@ -1084,21 +1048,6 @@ def canonical_initial_values(
     )
 
 
-def _detailed_balance_admission(
-    prepared_dsl: PreparedDslRequestSet | None,
-    *,
-    policy_enabled: bool,
-) -> DetailedBalanceAdmission:
-    if prepared_dsl is None:
-        report = WegscheiderCyclicityReport(cycles=())
-    else:
-        report = prepared_dsl.wegscheider_admission_report()
-    return DetailedBalanceAdmission(
-        report=report,
-        policy_enabled=bool(policy_enabled),
-    )
-
-
 def _prepared_dsl_matches_tab(tab: MechanismTabDocument) -> bool:
     prepared = tab.prepared_dsl
     if prepared is None:
@@ -1136,14 +1085,6 @@ def retained_tab_mechanism_source(
         )
     return MechanismSourceReconciliation(
         proposed_document=document,
-        inline_initial_conditions=DslInitialConditionAdmission(
-            materialized_source=tab.mechanism_source.reactions_text,
-        ),
-        prepared_dsl=tab.prepared_dsl,
-        detailed_balance=_detailed_balance_admission(
-            tab.prepared_dsl,
-            policy_enabled=tab.scientific_settings.wegscheider_policy,
-        ),
     )
 
 
@@ -1161,11 +1102,9 @@ def reconcile_tab_mechanism_source(
     if not isinstance(visible_source, MechanismAuthoringSource):
         raise TypeError("visible_source must be MechanismAuthoringSource.")
     tab = document.tab(tab_id)
-    admitted_dsl, admitted_detailed_balance = (
-        _prepare_authored_source_admission(
-            visible_source,
-            tab.scientific_settings,
-        )
+    admitted_dsl = _prepare_authored_source_admission(
+        visible_source,
+        tab.scientific_settings,
     )
     admission = (
         DslInitialConditionAdmission(
@@ -1206,10 +1145,7 @@ def reconcile_tab_mechanism_source(
     )
     reconciled_sets: list[InitialConditionSet] = []
     for initial_set in admitted_initial_sets:
-        source_values = _values_dict_rejecting_duplicates(
-            initial_set.values,
-            context=f"initial-condition set {initial_set.set_id!r}",
-        )
+        source_values = initial_set.values_dict()
         values = {
             species: value
             for species, value in source_values.items()
@@ -1304,13 +1240,10 @@ def reconcile_tab_mechanism_source(
             target_name = str(declaration.source_name)
             target_index = index_by_name.get(target_name.casefold())
             values = {species: 0.0 for species in new_species}
-            declaration_values = _values_dict_rejecting_duplicates(
-                tuple(
-                    (assignment.species, assignment.value)
-                    for assignment in declaration.assignments
-                ),
-                context=f"inline initial-condition set {target_name!r}",
-            )
+            declaration_values = {
+                assignment.species: assignment.value
+                for assignment in declaration.assignments
+            }
             values.update(declaration_values)
             if target_index is None:
                 target = InitialConditionSet(
@@ -1354,21 +1287,15 @@ def reconcile_tab_mechanism_source(
                         "during admission."
                     )
             materialized_ids.append(anonymous_target.set_id)
-        anonymous_values = _values_dict_rejecting_duplicates(
-            anonymous_target.values,
-            context=f"initial-condition set {anonymous_target.set_id!r}",
-        )
+        anonymous_values = anonymous_target.values_dict()
         values = {
             species: float(anonymous_values.get(species, 0.0))
             for species in new_species
         }
-        declaration_values = _values_dict_rejecting_duplicates(
-            tuple(
-                (assignment.species, assignment.value)
-                for assignment in declaration.assignments
-            ),
-            context="inline initial-condition declaration",
-        )
+        declaration_values = {
+            assignment.species: assignment.value
+            for assignment in declaration.assignments
+        }
         values.update(declaration_values)
         anonymous_target = replace(
             anonymous_target,
@@ -1386,13 +1313,12 @@ def reconcile_tab_mechanism_source(
         )
     )
     if admission.has_declarations:
-        prepared_dsl, detailed_balance = _prepare_authored_source_admission(
+        prepared_dsl = _prepare_authored_source_admission(
             accepted_source,
             tab.scientific_settings,
         )
     else:
         prepared_dsl = admitted_dsl
-        detailed_balance = admitted_detailed_balance
     if (
         prepared_dsl is not None
         and prepared_dsl.analysis.inline_initial_conditions.has_declarations
@@ -1437,15 +1363,246 @@ def reconcile_tab_mechanism_source(
     )
     reconciliation = MechanismSourceReconciliation(
         proposed_document=proposed_document,
-        inline_initial_conditions=admission,
-        prepared_dsl=prepared_dsl,
-        detailed_balance=detailed_balance,
         materialized_set_ids=tuple(dict.fromkeys(materialized_ids)),
     )
     if collisions:
         return MechanismSourceCollision(
             existing_names=tuple(dict.fromkeys(collisions)),
             replacement=reconciliation,
+        )
+    return reconciliation
+
+
+def _retained_algebra_dependencies(spec: object) -> dict[str, tuple[str, ...]]:
+    """Read canonical parameter dependencies from the admitted Algebra AST."""
+
+    block = getattr(spec, "parameter_block", None)
+    statements = (
+        block.statements_in_evaluation_order()
+        if block is not None
+        and callable(getattr(block, "statements_in_evaluation_order", None))
+        else ()
+    )
+
+    def identifiers(node: object) -> tuple[str, ...]:
+        if type(node).__name__ == "IdentNode":
+            return (str(getattr(node, "name", "")),)
+        names: list[str] = []
+        for attribute in ("lhs", "rhs", "args"):
+            child = getattr(node, attribute, None)
+            children = child if isinstance(child, tuple) else (child,)
+            for item in children:
+                if item is None:
+                    continue
+                names.extend(identifiers(item))
+        return tuple(dict.fromkeys(name for name in names if name))
+
+    dependencies: dict[str, tuple[str, ...]] = {}
+    for statement in statements:
+        name = str(getattr(statement, "name", ""))
+        if name:
+            dependencies[name] = tuple(
+                dependency
+                for dependency in identifiers(getattr(statement, "expr", None))
+                if dependency != name
+            )
+    return dependencies
+
+
+def _admitted_correction_targets(
+    tab: MechanismTabDocument,
+) -> tuple[CorrectionTarget, ...]:
+    """Derive the complete authored source-coordinate roster from admission."""
+
+    prepared = tab.prepared_dsl
+    if prepared is None:
+        raise ValueError("Correction requires admitted prepared DSL.")
+    mechanism = prepared.accepted_mechanism_for_structure()
+    namespace = build_namespace_from_mechanism(mechanism)
+    spec = prepared.parameter_algebra_spec_for_execution()
+    dependencies_by_name = _retained_algebra_dependencies(spec)
+    assignment_names = set(dependencies_by_name)
+    admitted_dependency_names = (
+        set(namespace.canonical_names)
+        | set(namespace.source_coordinate_names)
+        | assignment_names
+    )
+    dependencies_by_name = {
+        name: tuple(
+            dependency
+            for dependency in dependencies
+            if dependency in admitted_dependency_names
+        )
+        for name, dependencies in dependencies_by_name.items()
+    }
+    admitted: list[CorrectionTarget] = []
+    seen_names: set[str] = set()
+
+    for entry in get_step_index_map(mechanism):
+        try:
+            step_index = int(entry["step_index"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("Admitted source step has no valid step index.") from exc
+        kind = str(entry.get("kind") or "")
+        if kind not in {"reaction", "equilibrium"}:
+            raise ValueError(f"Admitted source step has invalid kind {kind!r}.")
+        raw_coordinates = entry.get("source_coordinates") or {}
+        if not isinstance(raw_coordinates, Mapping):
+            raise ValueError("Admitted source-coordinate map is invalid.")
+        source_coordinates = {
+            str(role): str(name)
+            for role, name in raw_coordinates.items()
+        }
+        expected: list[tuple[str, str]] = list(source_coordinates.items())
+        rate_roles = ("k",) if kind == "reaction" else ("kf", "kr", "Keq")
+        expected.extend(
+            (role, f"{role}{step_index}")
+            for role in rate_roles
+            if f"{role}{step_index}" in namespace.canonical_names
+        )
+        if len({name for _role, name in expected}) != len(expected):
+            raise ValueError("Admitted source-coordinate roster has duplicate identity.")
+        for role, name in source_coordinates.items():
+            if name not in namespace.source_coordinate_names:
+                raise ValueError(
+                    f"Source coordinate {name!r} is absent from the admitted namespace."
+                )
+
+        origin = authored_step_origin(prepared.analysis, step_index=step_index)
+        tokens = coordinate_source_parts(origin.source_text)[1]
+        matched: dict[str, tuple[str, str]] = {}
+        for role, name in expected:
+            matches = [
+                token
+                for token in tokens
+                if coordinate_token_matches(token[0], role)
+            ]
+            if len(matches) > 1:
+                raise ValueError(
+                    f"Correction coordinate {name!r} has duplicate authored tokens."
+                )
+            if name in source_coordinates and not matches:
+                raise ValueError(
+                    f"Correction coordinate {name!r} has no unique authored token."
+                )
+            if matches:
+                matched[name] = (role, str(matches[0][0]))
+
+        equilibria = tuple(getattr(mechanism, "equilibria", ()) or ())
+        authority = None
+        if kind == "equilibrium":
+            try:
+                authority = normalize_existing_equilibrium_rate_authority(
+                    equilibria[int(entry["equilibrium_index"])]
+                )
+            except (KeyError, IndexError, TypeError, ValueError) as exc:
+                raise ValueError("Admitted equilibrium source authority is invalid.") from exc
+
+        for token in tokens:
+            candidates = [
+                (role, name)
+                for role, name in expected
+                if coordinate_token_matches(token[0], role)
+            ]
+            if not candidates:
+                continue
+            if len(candidates) != 1:
+                raise ValueError(
+                    f"Authored source token {token[0]!r} has ambiguous identity."
+                )
+            role, name = candidates[0]
+            if name in seen_names:
+                raise ValueError(
+                    f"Correction coordinate {name!r} has duplicate admitted identity."
+                )
+            if name not in matched:
+                raise ValueError(
+                    f"Correction coordinate {name!r} has no unique authored token."
+                )
+            editable = not bool(entry.get("locked", False))
+            derived = False
+            if authority is not None:
+                editable = authority.authored_role_is_editable(role)
+                derived = authority.authored_role_is_derived(role)
+            admitted.append(
+                CorrectionTarget(
+                    name=name,
+                    family=role,
+                    source_backed=True,
+                    editable=editable,
+                    locked=bool(entry.get("locked", False)),
+                    algebra_owned=name in assignment_names,
+                    derived=derived,
+                    dependencies=dependencies_by_name.get(name, ()),
+                    canonical_identity=(name, role),
+                    source_origin=origin.source_text,
+                )
+            )
+            seen_names.add(name)
+    return tuple(admitted)
+
+
+def reconcile_tab_exact_correction(
+    document: ProjectDocument,
+    tab_id: str,
+) -> MechanismSourceReconciliation | MechanismSourceCollision:
+    """Plan, visibly insert, and canonically re-admit one exact correction.
+
+    ProjectDocument derives the complete source roster from retained admitted
+    mechanism order and AST facts.  No caller-owned target facts or coordinate
+    mirror participate in planning.
+    """
+
+    if not isinstance(document, ProjectDocument):
+        raise TypeError("document must be a ProjectDocument.")
+    tab = document.tab(tab_id)
+    prepared = tab.prepared_dsl
+    if prepared is None:
+        raise ValueError(f"Mechanism tab {tab.tab_id!r} has no admitted prepared DSL.")
+    composition = compose_exact_constraints(
+        prepared.accepted_mechanism_for_structure(),
+        parameter_algebra_spec=prepared.parameter_algebra_spec_for_execution(),
+    )
+    admitted_targets = _admitted_correction_targets(tab)
+    plan = plan_correction_basis(composition, admitted_targets)
+    if not plan.available:
+        details = "; ".join(
+            f"{item.cycle_id}: {item.expression}"
+            for item in composition.constraints
+        )
+        reason = plan.reason or "Exact correction is unavailable."
+        raise ValueError(f"{reason}; constraints: {details}")
+    corrections = build_correction_expressions(composition, plan)
+    updated_source = insert_scalar_source_declarations(
+        tab.mechanism_source.reactions_text,
+        corrections,
+    )
+    reconciliation = reconcile_tab_mechanism_source(
+        document,
+        tab_id,
+        MechanismAuthoringSource.from_parts(reactions_text=updated_source),
+    )
+    proposed_document = (
+        reconciliation.replacement.proposed_document
+        if isinstance(reconciliation, MechanismSourceCollision)
+        else reconciliation.proposed_document
+    )
+    proposed_tab = proposed_document.tab(tab_id)
+    proposed_prepared = proposed_tab.prepared_dsl
+    if proposed_prepared is None:
+        raise ValueError("Exact correction proposal has no admitted prepared DSL.")
+    proposed_composition = compose_exact_constraints(
+        proposed_prepared.accepted_mechanism_for_structure(),
+        parameter_algebra_spec=proposed_prepared.parameter_algebra_spec_for_execution(),
+    )
+    if any(item.status != "resolved" for item in proposed_composition.constraints):
+        details = "; ".join(
+            f"{item.cycle_id}: {item.expression}"
+            for item in proposed_composition.constraints
+        )
+        raise ValueError(
+            "Exact correction did not resolve every admitted constraint; "
+            f"constraints: {details}"
         )
     return reconciliation
 
@@ -1584,23 +1741,13 @@ def validate_project_document(document: ProjectDocument) -> ProjectDocument:
             )
         try:
             if not _prepared_dsl_matches_tab(tab):
-                prepared_dsl, _detailed_balance = (
-                    _prepare_authored_source_admission(
-                        tab.mechanism_source,
-                        tab.scientific_settings,
-                    )
+                prepared_dsl = _prepare_authored_source_admission(
+                    tab.mechanism_source,
+                    tab.scientific_settings,
                 )
                 tab = replace(
                     tab,
                     prepared_dsl=prepared_dsl,
-                )
-            else:
-                # Matching retained state is no longer user-authored input.
-                # Validate it without translating structural/programming
-                # failures into AuthoredSourceError.
-                _detailed_balance_admission(
-                    tab.prepared_dsl,
-                    policy_enabled=tab.scientific_settings.wegscheider_policy,
                 )
             analysis = tab.dsl_analysis
             if (
@@ -1654,26 +1801,7 @@ def validate_project_document(document: ProjectDocument) -> ProjectDocument:
             key=lambda value: str(value).casefold(),
         )
         for item in admitted_initial_sets:
-            _validate_unique(
-                (
-                    _require_name(
-                        species,
-                        "initial-condition species name",
-                    )
-                    for species, _ in item.values
-                ),
-                f"species in initial-condition set {item.set_id!r}",
-            )
-            for species, value in item.values:
-                validate_concentration(
-                    value,
-                    field=(
-                        "initial concentration for "
-                        f"tab {tab.tab_id!r} ({tab.name!r}), "
-                        f"set {item.set_id!r} ({item.name!r}), "
-                        f"species {species!r}"
-                    ),
-                )
+            for species, _value in item.values:
                 if species not in mechanism_species_set:
                     raise ValueError(
                         f"Initial-condition set {item.set_id!r} references "

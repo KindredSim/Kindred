@@ -42,6 +42,7 @@ import math
 import re
 from dataclasses import dataclass
 from collections.abc import Iterable, Mapping
+from fractions import Fraction
 from typing import Dict, List, Literal, Optional, Tuple
 
 from .errors import (
@@ -130,6 +131,15 @@ class ExprNode:
 @dataclass(frozen=True)
 class NumberNode(ExprNode):
     value: float
+    literal: str | None = None
+
+    @property
+    def exact_value(self) -> Fraction | None:
+        """Return the retained literal exactly when it is a finite rational."""
+        try:
+            return Fraction(self.literal if self.literal is not None else str(self.value))
+        except (TypeError, ValueError, ZeroDivisionError, OverflowError):
+            return None
 
     def is_static(self) -> bool:
         return True
@@ -568,7 +578,7 @@ class Parser:
                     col=t.col,
                     line_text=t.line_text,
                 )
-            return NumberNode(val)
+            return NumberNode(val, t.text)
 
         # Species refs: "[" IDENT "]" [ "_0" ]
         if self._match(TokenKind.LBRACK):

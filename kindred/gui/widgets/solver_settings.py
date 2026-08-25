@@ -163,10 +163,6 @@ class SimulationSettingsDialog(QtWidgets.QDialog):
             "Use analytic Jacobian",
             science_box,
         )
-        self.wegscheider_check = QtWidgets.QCheckBox(
-            "Enforce Wegscheider cyclicity",
-            science_box,
-        )
         self.scientific_defaults_check = QtWidgets.QCheckBox(
             "Use these settings as defaults for new projects and tabs.",
             science_box,
@@ -176,7 +172,6 @@ class SimulationSettingsDialog(QtWidgets.QDialog):
         science_form.addRow("Relative tolerance", self.rtol_edit)
         science_form.addRow("Absolute tolerance", self.atol_edit)
         science_form.addRow("", self.analytic_jacobian_check)
-        science_form.addRow("", self.wegscheider_check)
         science_form.addRow("", self.scientific_defaults_check)
         layout.addWidget(science_box)
 
@@ -279,7 +274,6 @@ class SimulationSettingsDialog(QtWidgets.QDialog):
         self.rtol_edit.setText(repr(float(settings.rtol)))
         self.atol_edit.setText(repr(float(settings.atol)))
         self.analytic_jacobian_check.setChecked(settings.analytic_jacobian_policy)
-        self.wegscheider_check.setChecked(settings.wegscheider_policy)
 
     def scientific_settings(self) -> TabScientificSettings:
         try:
@@ -292,7 +286,6 @@ class SimulationSettingsDialog(QtWidgets.QDialog):
             rtol=rtol,
             atol=atol,
             analytic_jacobian_policy=bool(self.analytic_jacobian_check.isChecked()),
-            wegscheider_policy=bool(self.wegscheider_check.isChecked()),
         )
         return validate_tab_scientific_settings(candidate)
 

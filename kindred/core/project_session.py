@@ -3,75 +3,25 @@
 from __future__ import annotations
 
 import os
-from collections.abc import Callable
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 
-from kindred.core.project_document import (
-    ProjectDocument,
-    validate_project_document,
-)
+from kindred.core.project_document import ProjectDocument
 from kindred.core.project_presentation_state import (
     WorkspacePresentationState,
     default_workspace_presentation_state,
-    reconcile_workspace_presentation_state,
-    validate_workspace_presentation_state,
 )
 
 __all__ = [
     "ProjectContentToken",
-    "PreparedDocumentMutation",
-    "PreparedProjectInstall",
     "ProjectSession",
     "SavedArchiveBaseline",
 ]
-
-
-def _validate_canonical_document(document: ProjectDocument) -> ProjectDocument:
-    """Validate project truth and canonicalize initial-condition zero."""
-
-    candidate = validate_project_document(document)
-    tabs = tuple(
-        replace(
-            tab,
-            initial_condition_sets=tuple(
-                replace(
-                    initial_set,
-                    values=tuple(
-                        (
-                            species,
-                            0.0 if value == 0.0 else value,
-                        )
-                        for species, value in initial_set.values
-                    ),
-                )
-                for initial_set in tab.initial_condition_sets
-            ),
-        )
-        for tab in candidate.tabs
-    )
-    return replace(candidate, tabs=tabs)
 
 
 @dataclass(frozen=True, slots=True)
 class SavedArchiveBaseline:
     document: ProjectDocument
     presentation: WorkspacePresentationState
-
-
-@dataclass(frozen=True, slots=True)
-class PreparedProjectInstall:
-    """Fully validated values for one fallible-free session install."""
-
-    document: ProjectDocument
-    path: str | None
-    saved_baseline: SavedArchiveBaseline
-
-
-@dataclass(frozen=True, slots=True)
-class PreparedDocumentMutation:
-    """A fully validated canonical document ready for non-fallible commit."""
-
-    document: ProjectDocument
 
 
 @dataclass(frozen=True, slots=True)
@@ -91,22 +41,16 @@ class ProjectSession:
         *,
         presentation: WorkspacePresentationState | None = None,
     ) -> None:
-        validated_document = _validate_canonical_document(document)
         initial_presentation = (
-            default_workspace_presentation_state(validated_document)
+            default_workspace_presentation_state(document)
             if presentation is None
-            else reconcile_workspace_presentation_state(
-                validated_document,
-                presentation,
-            )
+            else presentation
         )
-        self._state = PreparedProjectInstall(
-            document=validated_document,
-            path=None,
-            saved_baseline=SavedArchiveBaseline(
-                document=validated_document,
-                presentation=initial_presentation,
-            ),
+        self._document = document
+        self._current_path: str | None = None
+        self._saved_baseline = SavedArchiveBaseline(
+            document=document,
+            presentation=initial_presentation,
         )
         self._identity_generation = 0
         self._content_revision = 0
@@ -114,15 +58,15 @@ class ProjectSession:
 
     @property
     def document(self) -> ProjectDocument:
-        return self._state.document
+        return self._document
 
     @property
     def current_path(self) -> str | None:
-        return self._state.path
+        return self._current_path
 
     @property
     def saved_baseline(self) -> SavedArchiveBaseline:
-        return self._state.saved_baseline
+        return self._saved_baseline
 
     @property
     def identity_generation(self) -> int:
@@ -160,11 +104,7 @@ class ProjectSession:
         self,
         presentation: WorkspacePresentationState,
     ) -> bool:
-        candidate = validate_workspace_presentation_state(
-            self.document,
-            presentation,
-        )
-        return candidate != self.saved_baseline.presentation
+        return presentation != self.saved_baseline.presentation
 
     def is_dirty(
         self,
@@ -174,46 +114,51 @@ class ProjectSession:
             presentation
         )
 
-    def prepare_document_mutation(
+    def replace_document(
         self,
         document: ProjectDocument,
-    ) -> PreparedDocumentMutation:
-        """Validate one proposed canonical document without publishing it."""
-
-        return PreparedDocumentMutation(
-            document=_validate_canonical_document(document),
-        )
-
-    def commit_document_mutation(
-        self,
-        prepared: PreparedDocumentMutation,
         *,
         expected_token: ProjectContentToken,
-        fence_deletions: Callable[
-            [ProjectDocument, ProjectDocument],
-            None,
-        ],
     ) -> ProjectContentToken | None:
-        """Conditionally fence and publish one prepared document value.
+        """Publish one admitted document directly under the current token.
 
         ``None`` means a newer canonical document or presentation superseded
         the caller.  An unchanged document is an accepted no-op and returns
         the still-current token.
         """
 
-        if not isinstance(prepared, PreparedDocumentMutation):
-            raise TypeError("prepared must be PreparedDocumentMutation.")
-        if not callable(fence_deletions):
-            raise TypeError("fence_deletions must be callable.")
         if not self.is_content_token_current(expected_token):
             return None
-        candidate = prepared.document
-        if candidate == self.document:
+        if document == self.document:
             return self.capture_content_token()
-        fence_deletions(self.document, candidate)
+        self._document = document
+        return self._advance_content_revision()
+
+    def replace_project(
+        self,
+        document: ProjectDocument,
+        presentation: WorkspacePresentationState,
+        *,
+        path: str | None,
+        expected_token: ProjectContentToken,
+        baseline_document: ProjectDocument,
+    ) -> ProjectContentToken | None:
+        """Replace canonical project identity and saved baseline once.
+
+        The incoming archive and presentation have already crossed their
+        external admission boundaries.  This owner assigns both directly
+        after the caller's result fences have run.
+        """
+
         if not self.is_content_token_current(expected_token):
             return None
-        self._state = replace(self._state, document=candidate)
+        self._document = document
+        self._current_path = path
+        self._saved_baseline = SavedArchiveBaseline(
+            document=baseline_document,
+            presentation=presentation,
+        )
+        self._identity_generation += 1
         return self._advance_content_revision()
 
     def record_presentation_change(
@@ -223,60 +168,8 @@ class ProjectSession:
     ) -> ProjectContentToken:
         """Advance currentness after one accepted presentation mutation."""
 
-        before = validate_workspace_presentation_state(
-            self.document,
-            previous,
-        )
-        after = validate_workspace_presentation_state(
-            self.document,
-            current,
-        )
-        if before == after:
+        if previous == current:
             return self.capture_content_token()
-        return self._advance_content_revision()
-
-    def prepare_install(
-        self,
-        document: ProjectDocument,
-        presentation: WorkspacePresentationState,
-        *,
-        path: str | os.PathLike[str] | None,
-    ) -> PreparedProjectInstall:
-        """Validate every incoming session value without mutating live state."""
-
-        candidate = _validate_canonical_document(document)
-        candidate_presentation = validate_workspace_presentation_state(
-            candidate,
-            presentation,
-        )
-        normalized_path = (
-            None
-            if path is None
-            else os.path.abspath(os.fsdecode(os.fspath(path)))
-        )
-        return PreparedProjectInstall(
-            document=candidate,
-            path=normalized_path,
-            saved_baseline=SavedArchiveBaseline(
-                document=candidate,
-                presentation=candidate_presentation,
-            ),
-        )
-
-    def commit_install(
-        self,
-        prepared: PreparedProjectInstall,
-        *,
-        expected_token: ProjectContentToken,
-    ) -> ProjectContentToken | None:
-        """Conditionally commit one already-prepared project replacement."""
-
-        if not isinstance(prepared, PreparedProjectInstall):
-            raise TypeError("prepared must be PreparedProjectInstall.")
-        if not self.is_content_token_current(expected_token):
-            return None
-        self._state = prepared
-        self._identity_generation += 1
         return self._advance_content_revision()
 
     def mark_saved(
@@ -290,17 +183,10 @@ class ProjectSession:
 
         if not self.is_content_token_current(expected_token):
             return False
-        candidate_presentation = validate_workspace_presentation_state(
-            self.document,
-            presentation,
-        )
         normalized_path = os.path.abspath(os.fsdecode(os.fspath(path)))
-        self._state = PreparedProjectInstall(
+        self._current_path = normalized_path
+        self._saved_baseline = SavedArchiveBaseline(
             document=self.document,
-            path=normalized_path,
-            saved_baseline=SavedArchiveBaseline(
-                document=self.document,
-                presentation=candidate_presentation,
-            ),
+            presentation=presentation,
         )
         return True

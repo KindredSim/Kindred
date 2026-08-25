@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from types import MappingProxyType
-from typing import Any, Callable, Iterable, Literal, Mapping, Optional, Protocol, Tuple
+from typing import Any, Callable, Iterable, Mapping, Optional, Protocol, Tuple
 
 import numpy as np
 
@@ -303,31 +303,3 @@ class SimulationOutput:
             _freeze_solver_value(self.provenance),
         )
         object.__setattr__(self, "presentation_boundaries", boundaries)
-
-
-@dataclass(frozen=True, slots=True)
-class SimulationExecutionOutcome:
-    """Candidate-aware solver boundary transport.
-
-    Ordinary simulation callers still receive ``SimulationOutput``.  A fitting
-    request receives this envelope only when a producer-owned scientific
-    unavailability was normalized at the solver boundary.
-    """
-
-    status: Literal["available", "scientific_unavailable"]
-    output: SimulationOutput | None = None
-    unavailability: SimulationScientificUnavailability | None = None
-
-    def __post_init__(self) -> None:
-        status = str(self.status or "")
-        if status == "available":
-            if self.output is None or self.unavailability is not None:
-                raise ValueError("Available simulation outcomes require only output.")
-        elif status == "scientific_unavailable":
-            if self.output is not None or self.unavailability is None:
-                raise ValueError(
-                    "Unavailable simulation outcomes require only unavailability."
-                )
-        else:
-            raise ValueError(f"Unsupported simulation outcome status: {status!r}")
-        object.__setattr__(self, "status", status)

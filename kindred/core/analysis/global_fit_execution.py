@@ -309,33 +309,6 @@ def _raise_if_fitting_cancel_requested(
 
 
 @dataclass(frozen=True, slots=True)
-class FitCandidateCompleteness:
-    """Typed proof that a compact candidate has one valid result per dataset."""
-
-    expected_dataset_ids: tuple[str, ...]
-    evaluated_dataset_ids: tuple[str, ...]
-
-    def __post_init__(self) -> None:
-        expected = tuple(str(value or "").strip() for value in self.expected_dataset_ids)
-        evaluated = tuple(str(value or "").strip() for value in self.evaluated_dataset_ids)
-        if (
-            not expected
-            or any(not value for value in expected)
-            or len(expected) != len(set(expected))
-            or any(not value for value in evaluated)
-            or len(evaluated) != len(set(evaluated))
-            or not set(evaluated).issubset(expected)
-        ):
-            raise ValueError("Fit candidate completeness proof has an invalid roster.")
-        object.__setattr__(self, "expected_dataset_ids", expected)
-        object.__setattr__(self, "evaluated_dataset_ids", evaluated)
-
-    @property
-    def is_complete(self) -> bool:
-        return set(self.expected_dataset_ids) == set(self.evaluated_dataset_ids)
-
-
-@dataclass(frozen=True, slots=True)
 class FitProgress:
     """Compact optimizer progress; simulation curves are callback-transient only."""
 
@@ -343,7 +316,6 @@ class FitProgress:
     cost: float
     optimizer_vector: np.ndarray
     improved: bool = False
-    completeness: FitCandidateCompleteness | None = None
     transient_simulation_results_by_dataset: Mapping[str, SimulationResultValue] = field(
         default_factory=dict
     )
@@ -381,10 +353,6 @@ class FitProgress:
             "transient_simulation_results_by_dataset",
             MappingProxyType(transient),
         )
-        if self.completeness is not None and not isinstance(
-            self.completeness, FitCandidateCompleteness
-        ):
-            raise TypeError("Fit progress completeness must be typed evidence.")
 
     def compact(self) -> "FitProgress":
         """Drop callback-transient curves before retaining best-candidate custody."""
@@ -2610,18 +2578,12 @@ class GlobalFitObjective:
                 return
             if not (publish_every_call or improved or self._objective_calls % 10 == 0):
                 return
-            expected_ids = tuple(item.dataset_id for item in self._payloads)
-            evaluated_ids = tuple(sorted(best_results)) if improved else ()
             self._progress_callback(
                 FitProgress(
                     objective_calls=self._objective_calls,
                     cost=float(cost),
                     optimizer_vector=progress_vector,
                     improved=bool(improved),
-                    completeness=FitCandidateCompleteness(
-                        expected_dataset_ids=expected_ids,
-                        evaluated_dataset_ids=evaluated_ids,
-                    ),
                     transient_simulation_results_by_dataset=best_results,
                 )
             )

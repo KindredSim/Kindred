@@ -240,7 +240,6 @@ def _encode_science(
         "rtol": settings.rtol,
         "atol": settings.atol,
         "analytic_jacobian_policy": settings.analytic_jacobian_policy,
-        "wegscheider_policy": settings.wegscheider_policy,
     }
 
 
@@ -256,7 +255,6 @@ def _decode_science(
             "rtol",
             "atol",
             "analytic_jacobian_policy",
-            "wegscheider_policy",
         },
     )
     return TabScientificSettings(
@@ -269,10 +267,6 @@ def _decode_science(
         analytic_jacobian_policy=_boolean(
             data["analytic_jacobian_policy"],
             f"{label}.analytic_jacobian_policy",
-        ),
-        wegscheider_policy=_boolean(
-            data["wegscheider_policy"],
-            f"{label}.wegscheider_policy",
         ),
     )
 

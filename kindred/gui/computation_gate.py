@@ -30,10 +30,6 @@ class ComputationGate(QtCore.QObject):
         self._require_thread()
         return self._kind
 
-    def is_owned_by(self, owner: object) -> bool:
-        self._require_thread()
-        return self._active_owner is owner
-
     def try_acquire(self, owner: object, kind: ComputationKind) -> bool:
         self._require_thread()
         if owner is None:

@@ -317,6 +317,7 @@ def equilibrium_rate_symbolic_relations(
     standard_conc_M: float,
     literal: Callable[[float], object],
     exponential: Callable[[object], object],
+    source_coordinate: Callable[[str], object] | None = None,
 ) -> EquilibriumRateSymbolicRelations:
     """Project accepted equilibrium authority without choosing a backend.
 
@@ -329,6 +330,8 @@ def equilibrium_rate_symbolic_relations(
         raise TypeError("literal must be callable.")
     if not callable(exponential):
         raise TypeError("exponential must be callable.")
+    if source_coordinate is not None and not callable(source_coordinate):
+        raise TypeError("source_coordinate must be callable when provided.")
 
     def finite_scalar(
         value: object,
@@ -354,7 +357,11 @@ def equilibrium_rate_symbolic_relations(
             label="equilibrium kr",
             positive=True,
         )
-        reverse_relation = literal(reverse_value)
+        reverse_relation = (
+            source_coordinate("kr")
+            if source_coordinate is not None
+            else literal(reverse_value)
+        )
         return EquilibriumRateSymbolicRelations(
             kf=forward_relation,
             kr=reverse_relation,
@@ -387,11 +394,15 @@ def equilibrium_rate_symbolic_relations(
         raise ValueError("equilibrium standard-state exponent must be finite.")
 
     if authority.has_explicit_keq_param:
-        keq_relation = literal(
-            finite_scalar(
-                authority.Keq,
-                label="equilibrium Keq",
-                positive=True,
+        keq_relation = (
+            source_coordinate("Keq")
+            if source_coordinate is not None
+            else literal(
+                finite_scalar(
+                    authority.Keq,
+                    label="equilibrium Keq",
+                    positive=True,
+                )
             )
         )
     elif authority.dG_eq_J_per_mol is not None:
@@ -401,17 +412,21 @@ def equilibrium_rate_symbolic_relations(
             positive=False,
         )
         keq_relation = exponential(
-            -literal(delta_g)
+            -(source_coordinate("dG_eq") if source_coordinate is not None else literal(delta_g))
             / (literal(float(R)) * temperature)  # type: ignore[operator]
         )
         if delta_n != 0.0:
             keq_relation *= literal(standard) ** literal(delta_n)  # type: ignore[operator]
     else:
-        keq_relation = literal(
-            finite_scalar(
-                authority.Keq,
-                label="equilibrium Keq",
-                positive=True,
+        keq_relation = (
+            source_coordinate("Keq")
+            if source_coordinate is not None
+            else literal(
+                finite_scalar(
+                    authority.Keq,
+                    label="equilibrium Keq",
+                    positive=True,
+                )
             )
         )
 

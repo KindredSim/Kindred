@@ -5,28 +5,25 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass, replace
 import math
-from typing import Callable, Iterable
+from typing import Callable, Iterable, Literal
 
 from PySide6 import QtCore
 
+from kindred.core.mechanism_source import MechanismAuthoringSource
 from kindred.core.project_document import (
-    MechanismSourceReconciliation,
     MechanismTabDocument,
     canonical_initial_values,
     canonical_species_names,
 )
+from kindred.core.project_session import ProjectContentToken
 from kindred.core.simulation_preparation import (
     SimulationExecutionRequest,
     build_simulation_execution_request,
-    simulation_execution_requests_equal,
 )
 from kindred.core.species import validate_concentration
 from kindred.core.simulator.dsl_parse import (
-    DslParameterCoordinateUpdate,
     PreparedDslRequestSet,
-    derive_source_with_parameter_updates,
 )
-from kindred.core.simulator.wegscheider_symbolic import WegscheiderCyclicityReport
 from kindred.gui.parameter_enumeration import (
     GuiParameterCoordinate,
     admit_gui_parameter_value,
@@ -38,14 +35,15 @@ from kindred.gui.interactive_preview import (
     InteractivePreviewTarget,
     SliderInteractionKind,
 )
+from kindred.gui.controllers.simulation_job_owner import (
+    PreviewCapture,
+    PreviewTarget,
+    build_explicit_target,
+)
 from kindred.gui.widgets.batch_initial_conditions_table import (
     BatchInitialConditionsTableModel,
     BatchInitialConditionsTableView,
     resolve_live_slider_target_set_ids,
-)
-from kindred.gui.workflow_contracts import (
-    DetailedBalanceCorrectionOutcome,
-    DetailedBalanceCorrectionRequest,
 )
 from kindred.gui.widgets.mechanism_editor import MechanismEditorTabbed
 
@@ -54,9 +52,11 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "TabSliderBinding",
     "ActiveSliderRenderProjection",
-    "ParameterSliderProjection",
-    "build_parameter_slider_projection",
+    "ExactPreviewCapture",
 ]
+
+
+SourceProvenance = Literal["canonical", "draft"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -113,10 +113,16 @@ class _PreviewPreflight:
     targets: tuple[str, ...]
 
 
+@dataclass(frozen=True, slots=True)
+class ExactPreviewCapture:
+    """Exact Slider Preview admission facts consumed by one Apply."""
+
+    capture: PreviewCapture
+    candidate_tab: MechanismTabDocument
+
+
 def build_parameter_slider_projection(
     prepared_dsl: PreparedDslRequestSet,
-    *,
-    wegscheider_cyclicity_enabled: bool,
 ) -> ParameterSliderProjection:
     """Project one accepted typed DSL authority into stable Slider values."""
 
@@ -126,9 +132,6 @@ def build_parameter_slider_projection(
         coordinate
         for coordinate in enumerate_parameter_coordinates(
             prepared_dsl,
-            wegscheider_cyclicity_enabled=bool(
-                wegscheider_cyclicity_enabled
-            ),
         )
         if coordinate.writable and not coordinate.derived
     )
@@ -169,9 +172,6 @@ class TabSliderBinding(QtCore.QObject):
     draftStateChanged = QtCore.Signal(str, bool)
     sliderDraftStateChanged = QtCore.Signal(str, bool)
     targetSetIdsChanged = QtCore.Signal(object)
-    previewDetailedBalanceCorrectionRequired = QtCore.Signal(object)
-    previewDetailedBalanceCommitRequested = QtCore.Signal(object)
-    previewDetailedBalanceBlockCleared = QtCore.Signal(str)
     errorRaised = QtCore.Signal(str)
 
     def __init__(
@@ -184,8 +184,8 @@ class TabSliderBinding(QtCore.QObject):
         species_sliders,
         slider_workspace_owner: MechanismEditorTabbed,
         simulation_jobs,
-        interactive_preview_owner,
-        preview_preflight: Callable[[tuple[str, ...]], object] | None = None,
+        exact_preview_reviewer: Callable[[ExactPreviewCapture], object],
+        interactive_preview_reviewer: Callable[[InteractivePreviewRequest], object],
         parameter_preview_debounce_ms: int = 80,
         equilibrium_preview_debounce_ms: int = 150,
         parent: QtCore.QObject | None = None,
@@ -207,17 +207,19 @@ class TabSliderBinding(QtCore.QObject):
         self._species_sliders = species_sliders
         self._slider_workspace_owner = slider_workspace_owner
         self._simulation_jobs = simulation_jobs
-        self._interactive_preview_owner = interactive_preview_owner
-        self._preview_preflight = preview_preflight
+        if not callable(exact_preview_reviewer):
+            raise TypeError("exact_preview_reviewer must be callable.")
+        if not callable(interactive_preview_reviewer):
+            raise TypeError("interactive_preview_reviewer must be callable.")
+        self._exact_preview_reviewer = exact_preview_reviewer
+        self._interactive_preview_reviewer = interactive_preview_reviewer
         self._projection: ParameterSliderProjection | None = None
         self._tab_snapshot: MechanismTabDocument | None = None
         self._last_targets: tuple[str, ...] = ()
         self._suspended_preview_disposition: (
             _SuspendedPreviewDisposition | None
         ) = None
-        self._pending_detailed_balance_request: (
-            DetailedBalanceCorrectionRequest | None
-        ) = None
+        self._exact_preview_capture: ExactPreviewCapture | None = None
         self._rendering = False
         self._parameter_preview_debounce_ms = int(
             parameter_preview_debounce_ms
@@ -461,9 +463,6 @@ class TabSliderBinding(QtCore.QObject):
                 try:
                     projection = build_parameter_slider_projection(
                         prepared_dsl,
-                        wegscheider_cyclicity_enabled=bool(
-                            tab.scientific_settings.wegscheider_policy
-                        ),
                     )
                 except (TypeError, ValueError):
                     projection = None
@@ -545,9 +544,6 @@ class TabSliderBinding(QtCore.QObject):
             if tab.prepared_dsl is None
             else build_parameter_slider_projection(
                 tab.prepared_dsl,
-                wegscheider_cyclicity_enabled=(
-                    tab.scientific_settings.wegscheider_policy
-                ),
             )
         )
         parameter_values = projection.values_dict()
@@ -753,15 +749,20 @@ class TabSliderBinding(QtCore.QObject):
             else:
                 runtime.slider_species_drafts_by_set_id.pop(set_id, None)
         if removed:
-            self._interactive_preview_owner.retire(tab.tab_id, removed)
             self._simulation_jobs.reconcile_canonical_targets(
                 tab.tab_id,
                 removed,
             )
         return current != previous
 
-    def dispose(self) -> None:
-        """Disconnect and forget Slider-owned captures idempotently."""
+    def dispose(self, *, project_replacement_settled: bool = False) -> None:
+        """Disconnect and forget Slider-owned captures idempotently.
+
+        Project replacement calls this after the semantic owners and registry
+        have already settled and the new document is installed.  That path
+        only tears down the old physical binding; ordinary tab disposal still
+        retires the binding's live Preview roles here.
+        """
 
         if self._disposed:
             return
@@ -774,14 +775,16 @@ class TabSliderBinding(QtCore.QObject):
                     "Slider binding signal disconnection failed for tab %s",
                     self._tab_id,
                 )
-        self._interactive_preview_owner.retire(self._tab_id)
-        self._cancel_deferred_restore()
-        self._clear_gesture_state()
-        self.cancel_pending_preview_intent()
+        if project_replacement_settled:
+            self._cancel_deferred_restore()
+            self._interactive_stop_fenced = True
+            self._clear_gesture_state()
+        else:
+            self.cancel_pending_preview_intent()
+        self._exact_preview_capture = None
         self._projection = None
         self._tab_snapshot = None
         self._last_targets = ()
-        self.clear_preview_detailed_balance_block()
 
     def evict_preview_targets(self, set_ids: Iterable[str]) -> None:
         """Retire transient Preview participation for deleted targets."""
@@ -1075,40 +1078,14 @@ class TabSliderBinding(QtCore.QObject):
         tab = self._registry.tab(self._tab_id)
         runtime = self._registry.tab_runtime(self._tab_id)
         visible_prepared: PreparedDslRequestSet | None = tab.prepared_dsl
-        callback_result: object = True
-        callback = self._preview_preflight
         admitted_targets = tuple(targets)
-        if callback is not None:
-            callback_result = callback(targets)
-            if isinstance(callback_result, MechanismSourceReconciliation):
-                tab = self._registry.tab(self._tab_id)
-                visible_prepared = callback_result.prepared_dsl
-                admitted_targets = self.resolve_target_set_ids()
-                if callback_result.detailed_balance.requires_correction:
-                    prospective_tab = callback_result.proposed_document.tab(
-                        self._tab_id
-                    )
-                    request = self._preview_detailed_balance_request(
-                        prospective_tab,
-                        callback_result.detailed_balance.report,
-                        prepared_dsl=visible_prepared,
-                        reactions_text=(
-                            prospective_tab.mechanism_source.reactions_text
-                        ),
-                    )
-                    self._pending_detailed_balance_request = request
-                    self.previewDetailedBalanceCorrectionRequired.emit(request)
-                    return None
-            elif not bool(callback_result):
-                return None
-        else:
-            if runtime.reactions_draft is not None:
-                self.errorRaised.emit(
-                    "Preview requires visible Reactions to be accepted first."
-                )
-                return None
-            if not self._preview_inputs_valid(targets):
-                return None
+        if runtime.reactions_draft is not None:
+            self.errorRaised.emit(
+                "Preview requires visible Reactions to be accepted first."
+            )
+            return None
+        if not self._preview_inputs_valid(targets):
+            return None
         tab = self._registry.tab(self._tab_id)
         runtime = self._registry.tab_runtime(self._tab_id)
         try:
@@ -1118,9 +1095,6 @@ class TabSliderBinding(QtCore.QObject):
                 )
             projection = build_parameter_slider_projection(
                 visible_prepared,
-                wegscheider_cyclicity_enabled=(
-                    tab.scientific_settings.wegscheider_policy
-                ),
             )
         except (TypeError, ValueError) as exc:
             self.errorRaised.emit(f"Preview parameter projection failed: {exc}")
@@ -1136,29 +1110,33 @@ class TabSliderBinding(QtCore.QObject):
             return None
         self._projection = projection
         self._tab_snapshot = tab
-        self.clear_preview_detailed_balance_block()
         return _PreviewPreflight(tab, projection, admitted_targets)
 
     def _construct_preview_requests(
         self,
         tab: MechanismTabDocument,
-        projection: ParameterSliderProjection | None,
         targets: tuple[str, ...],
         *,
         sampling: InteractivePreviewSampling | None = None,
     ) -> tuple[tuple[str, str, SimulationExecutionRequest], ...]:
         prepared_dsl = tab.prepared_dsl
+        runtime = self._registry.tab_runtime(tab.tab_id)
+        parameter_values = {
+            str(name): float(value)
+            for name, value in runtime.slider_parameter_draft.items()
+        }
         constructed: list[tuple[str, str, SimulationExecutionRequest]] = []
         for set_id in targets:
-            if projection is not None:
-                parameter_values, initial_values = self._preview_values(
-                    tab,
-                    projection,
-                    set_id,
-                )
-            else:
-                parameter_values = {}
-                initial_values = canonical_initial_values(tab, set_id)
+            initial_values = dict(canonical_initial_values(tab, set_id))
+            initial_values.update(
+                {
+                    str(name): float(value)
+                    for name, value in runtime.slider_species_drafts_by_set_id.get(
+                        set_id,
+                        {},
+                    ).items()
+                }
+            )
             execution_settings = tab.resolved_execution_settings(set_id)
             if sampling is not None:
                 execution_settings = replace(
@@ -1173,7 +1151,7 @@ class TabSliderBinding(QtCore.QObject):
                 initial_values=initial_values,
                 execution_settings=execution_settings,
                 scientific_settings=tab.scientific_settings,
-                parameter_values=dict(parameter_values),
+                parameter_values=parameter_values or None,
             )
             constructed.append(
                 (
@@ -1184,59 +1162,234 @@ class TabSliderBinding(QtCore.QObject):
             )
         return tuple(constructed)
 
-    def _construct_candidate_tab(
+    def _capture_preview_batch(
         self,
         tab: MechanismTabDocument,
         targets: tuple[str, ...],
-    ) -> MechanismTabDocument:
-        """Materialize the exact tab represented by the current Slider draft."""
-
+        *,
+        content_token: ProjectContentToken | None,
+        source: MechanismAuthoringSource | None,
+        source_provenance: SourceProvenance | None,
+    ) -> tuple[
+        ProjectContentToken,
+        MechanismAuthoringSource,
+        SourceProvenance,
+        MechanismTabDocument,
+        tuple[tuple[str, str], ...],
+    ]:
+        if tab.tab_id != self._tab_id:
+            raise ValueError("Preview capture tab does not belong to this binding.")
         runtime = self._registry.tab_runtime(tab.tab_id)
-        parameter_updates = dict(runtime.slider_parameter_draft)
-        species_updates = {
-            set_id: dict(values)
-            for set_id, values in runtime.slider_species_drafts_by_set_id.items()
-            if set_id in targets and values
-        }
-        source = tab.mechanism_source
-        candidate_prepared_dsl = tab.prepared_dsl
-        if parameter_updates:
-            prepared_dsl = tab.prepared_dsl
-            if not isinstance(prepared_dsl, PreparedDslRequestSet):
-                raise ValueError(
-                    "Slider candidate requires retained DSL analysis."
-                )
-            derived_source, candidate_prepared_dsl = (
-                derive_source_with_parameter_updates(
-                    source.reactions_text,
-                    prepared_dsl,
-                    tuple(
-                        DslParameterCoordinateUpdate(
-                            name=str(name),
-                            value=float(value),
-                        )
-                        for name, value in parameter_updates.items()
-                    ),
-                    wegscheider_cyclicity_enabled=bool(
-                        tab.scientific_settings.wegscheider_policy
-                    ),
+        token = (
+            self._registry.capture_content_token()
+            if content_token is None
+            else content_token
+        )
+        visible_source = (
+            runtime.reactions_draft or tab.mechanism_source
+            if source is None
+            else source
+        )
+        provenance = (
+            ("draft" if runtime.reactions_draft is not None else "canonical")
+            if source_provenance is None
+            else source_provenance
+        )
+        target_specs = tuple(
+            (
+                set_id,
+                tab.initial_condition_set(set_id).name,
+            )
+            for set_id in targets
+        )
+        return token, visible_source, provenance, tab, target_specs
+
+    def capture_exact_preview(
+        self,
+        targets: Iterable[str],
+        *,
+        tab: MechanismTabDocument | None = None,
+        content_token: ProjectContentToken | None = None,
+        source: MechanismAuthoringSource | None = None,
+        source_provenance: SourceProvenance | None = None,
+    ) -> ExactPreviewCapture | None:
+        """Capture one exact Preview before any external review continuation."""
+
+        if self._suspended_preview_disposition is not None:
+            return None
+        roster = tuple(str(value) for value in targets)
+        base_tab = self._registry.tab(self._tab_id) if tab is None else tab
+        try:
+            token, visible_source, provenance, admitted_tab, target_specs = (
+                self._capture_preview_batch(
+                    base_tab,
+                    roster,
+                    content_token=content_token,
+                    source=source,
+                    source_provenance=source_provenance,
                 )
             )
-            source = source.with_reactions_text(derived_source)
-        candidate_sets = []
-        for initial_set in tab.initial_condition_sets:
-            updates = species_updates.get(initial_set.set_id)
-            if not updates:
-                candidate_sets.append(initial_set)
-                continue
-            values = initial_set.values_dict()
-            values.update(updates)
-            candidate_sets.append(initial_set.with_values(values))
+            constructed = self._construct_preview_requests(admitted_tab, roster)
+            canonical_targets = tuple(
+                build_explicit_target(
+                    prepared_dsl=admitted_tab.prepared_dsl,
+                    tab_id=admitted_tab.tab_id,
+                    set_id=set_id,
+                    set_name=set_name,
+                    mechanism_source=admitted_tab.mechanism_source,
+                    initial_values=canonical_initial_values(admitted_tab, set_id),
+                    execution_settings=admitted_tab.resolved_execution_settings(
+                        set_id
+                    ),
+                    scientific_settings=admitted_tab.scientific_settings,
+                )
+                for set_id, set_name, _execution_request in constructed
+            )
+            capture = PreviewCapture(
+                tab_id=base_tab.tab_id,
+                content_token=token,
+                source=visible_source,
+                source_provenance=provenance,
+                targets=tuple(
+                    PreviewTarget(
+                        tab_id=base_tab.tab_id,
+                        set_id=set_id,
+                        set_name=set_name,
+                        execution_request=execution_request,
+                        canonical_run_target=canonical_target,
+                    )
+                    for (set_id, set_name), (_, _, execution_request), canonical_target in zip(
+                        target_specs,
+                        constructed,
+                        canonical_targets,
+                        strict=True,
+                    )
+                ),
+            )
+            return ExactPreviewCapture(capture=capture, candidate_tab=admitted_tab)
+        except Exception as exc:  # noqa: BLE001
+            self._reject(
+                "Preview construction failed before admission "
+                f"({type(exc).__name__}: {exc})."
+            )
+            return None
+
+    def capture_interactive_preview(
+        self,
+        targets: Iterable[str],
+        *,
+        sampling: InteractivePreviewSampling | None = None,
+        tab: MechanismTabDocument | None = None,
+    ) -> InteractivePreviewRequest | None:
+        """Prepare one admitted Interactive Preview request."""
+
+        if self._suspended_preview_disposition is not None:
+            return None
+        roster = tuple(str(value) for value in targets)
+        base_tab = self._registry.tab(self._tab_id) if tab is None else tab
+        try:
+            sampling = sampling or InteractivePreviewSampling()
+            constructed = self._construct_preview_requests(
+                base_tab,
+                roster,
+                sampling=sampling,
+            )
+            return InteractivePreviewRequest(
+                tab_id=base_tab.tab_id,
+                targets=tuple(
+                    InteractivePreviewTarget(
+                        set_id=set_id,
+                        set_name=set_name,
+                        execution_request=execution_request,
+                    )
+                    for set_id, set_name, execution_request in constructed
+                ),
+                sampling=sampling,
+            )
+        except Exception as exc:  # noqa: BLE001
+            self._reject(
+                "Preview construction failed before admission "
+                f"({type(exc).__name__}: {exc})."
+            )
+            return None
+
+    @staticmethod
+    def _with_confirmed_currentness(
+        capture: PreviewCapture,
+        *,
+        content_token: ProjectContentToken | None,
+        source: MechanismAuthoringSource | None,
+        source_provenance: SourceProvenance | None,
+    ) -> PreviewCapture:
+        values = (content_token, source, source_provenance)
+        if any(value is not None for value in values) and any(
+            value is None for value in values
+        ):
+            raise ValueError(
+                "confirmed token, source, and provenance must be supplied together."
+            )
+        if content_token is None:
+            return capture
         return replace(
-            tab,
-            mechanism_source=source,
-            prepared_dsl=candidate_prepared_dsl,
-        ).with_initial_condition_sets(tuple(candidate_sets))
+            capture,
+            content_token=content_token,
+            source=source,
+            source_provenance=source_provenance,
+        )
+
+    def continue_exact_preview(
+        self,
+        capture: ExactPreviewCapture,
+        *,
+        candidate_tab: MechanismTabDocument | None = None,
+        content_token: ProjectContentToken | None = None,
+        source: MechanismAuthoringSource | None = None,
+        source_provenance: SourceProvenance | None = None,
+    ) -> bool:
+        """Continue one capture with caller-confirmed currentness facts."""
+
+        if not isinstance(capture, ExactPreviewCapture):
+            raise TypeError("capture must be ExactPreviewCapture.")
+        if content_token is not None and candidate_tab is None:
+            raise ValueError(
+                "confirmed Preview currentness requires the corrected candidate tab."
+            )
+        current = self._with_confirmed_currentness(
+            capture.capture,
+            content_token=content_token,
+            source=source,
+            source_provenance=source_provenance,
+        )
+        admitted = replace(capture, capture=current)
+        if self._suspended_preview_disposition is not None:
+            return False
+        self._stop_preview_timers()
+        try:
+            started = self._simulation_jobs.request_preview(admitted.capture)
+        except Exception as exc:  # noqa: BLE001
+            self._reject(
+                "Preview admission failed "
+                f"({type(exc).__name__}: {exc})."
+            )
+            return False
+        self._exact_preview_capture = admitted
+        return bool(
+            started
+            or self._simulation_jobs.pending_preview_tab_id == admitted.capture.tab_id
+        )
+
+    def continue_interactive_preview(
+        self,
+        request: InteractivePreviewRequest,
+    ) -> bool:
+        """Start one already-prepared Interactive Preview request."""
+
+        if self._suspended_preview_disposition is not None:
+            return False
+        self._stop_preview_timers()
+        self._exact_preview_capture = None
+        started = self._simulation_jobs.request_interactive_preview(request)
+        return bool(started or self._simulation_jobs.interactive_preview_busy)
 
     def _begin_preview_cycle(
         self,
@@ -1252,7 +1405,7 @@ class TabSliderBinding(QtCore.QObject):
     ) -> bool:
         if self._suspended_preview_disposition is not None:
             return False
-        tab, projection = transaction
+        tab, _projection = transaction
         runtime = self._registry.tab_runtime(tab.tab_id)
         roster = tuple(targets)
         has_draft = bool(
@@ -1271,92 +1424,20 @@ class TabSliderBinding(QtCore.QObject):
                 preserve_reference=True,
             )
             return True
-        preview_tab = tab
-        preview_projection = projection
-        if interaction is not SliderInteractionKind.INTERACTIVE_DRAG_SAMPLE:
-            try:
-                preview_tab = self._construct_candidate_tab(tab, roster)
-            except (LookupError, TypeError, ValueError) as exc:
-                self._reject(
-                    "Preview candidate construction failed before admission "
-                    f"({type(exc).__name__}: {exc})."
-                )
-                return False
-            preview_projection = None
-        prepared_dsl = preview_tab.prepared_dsl
-        if not isinstance(prepared_dsl, PreparedDslRequestSet):
-            self._reject(
-                "Preview requires accepted Reactions with retained DSL analysis."
-            )
-            return False
-
-        try:
-            sampling = (
-                InteractivePreviewSampling()
-                if interaction is SliderInteractionKind.INTERACTIVE_DRAG_SAMPLE
-                else None
-            )
-            constructed = self._construct_preview_requests(
-                preview_tab,
-                preview_projection,
-                roster,
-                sampling=sampling,
-            )
-        except Exception as exc:  # noqa: BLE001
-            self._reject(
-                "Preview construction failed before admission "
-                f"({type(exc).__name__}: {exc})."
-            )
-            return False
-
         if interaction is SliderInteractionKind.INTERACTIVE_DRAG_SAMPLE:
-            # The first admitted motion sample fences every older exact Slider
-            # capture/intent. Completed Run/reference truth remains untouched.
-            if sampling is None:
-                raise RuntimeError(
-                    "Interactive Preview construction lost its sampling policy."
-                )
-            self._stop_preview_timers()
-            request = InteractivePreviewRequest(
-                tab_id=tab.tab_id,
-                targets=tuple(
-                    InteractivePreviewTarget(
-                        set_id=set_id,
-                        set_name=set_name,
-                        prepared_dsl=prepared_dsl,
-                        execution_request=execution_request,
-                    )
-                    for set_id, set_name, execution_request in constructed
-                ),
-                sampling=sampling,
-            )
-            self._simulation_jobs.retire_preview(
-                tab.tab_id,
+            request = self.capture_interactive_preview(
                 roster,
-                preserve_reference=True,
+                sampling=InteractivePreviewSampling(),
+                tab=tab,
             )
-            self._interactive_preview_owner.request(request)
+            if request is None:
+                return False
+            self._interactive_preview_reviewer(request)
             return True
-
-        # The binding constructs one candidate request batch.  The owner
-        # performs whole-batch admission and owns the sole pending exact intent.
-        self._stop_preview_timers()
-        try:
-            self._interactive_preview_owner.retire(
-                tab.tab_id,
-                roster,
-            )
-            self._simulation_jobs.request_preview(
-                tab.tab_id,
-                tuple(constructed),
-                prepared_dsl=prepared_dsl,
-            )
-        except Exception as exc:  # noqa: BLE001
-            self._reject(
-                "Preview admission failed "
-                f"({type(exc).__name__}: {exc})."
-            )
+        capture = self.capture_exact_preview(roster, tab=tab)
+        if capture is None:
             return False
+        self._exact_preview_reviewer(capture)
         return True
 
     def _preview_timer(self, debounce_kind: str) -> QtCore.QTimer:
@@ -1372,97 +1453,6 @@ class TabSliderBinding(QtCore.QObject):
             )
         self._throttle_timer.setInterval(interval)
         return self._throttle_timer
-
-    @staticmethod
-    def _preview_detailed_balance_request(
-        tab: MechanismTabDocument,
-        report: WegscheiderCyclicityReport,
-        *,
-        prepared_dsl: PreparedDslRequestSet,
-        reactions_text: str,
-    ) -> DetailedBalanceCorrectionRequest:
-        source = str(reactions_text)
-        unresolved = report.unresolved_cycles
-        if not unresolved:
-            raise ValueError("Preview detailed-balance admission is already resolved.")
-        issue = "Unresolved detailed-balance cycle"
-        if len(unresolved) != 1:
-            issue += "s"
-        issue += ": " + "; ".join(
-            f"{cycle.cycle_id} ({', '.join(cycle.parameter_names)})"
-            for cycle in unresolved
-        )
-        source_energy_unit = str(prepared_dsl.analysis.energy_unit)
-        return DetailedBalanceCorrectionRequest(
-            origin="Preview",
-            tab_id=tab.tab_id,
-            source=source,
-            issue=issue,
-            temperature_K=float(tab.scientific_settings.temperature),
-            report=report,
-            accepted_analysis=prepared_dsl.analysis,
-            source_energy_unit=str(source_energy_unit),
-        )
-
-    def complete_preview_detailed_balance_correction(
-        self,
-        outcome: DetailedBalanceCorrectionOutcome,
-    ) -> bool:
-        """Accept one typed modal outcome without resubmitting Preview."""
-
-        if not isinstance(outcome, DetailedBalanceCorrectionOutcome):
-            raise TypeError("outcome must be DetailedBalanceCorrectionOutcome.")
-        pending = self._pending_detailed_balance_request
-        if pending is None:
-            return False
-        if (
-            outcome.origin,
-            outcome.tab_id,
-            outcome.source,
-            outcome.issue,
-        ) != (
-            pending.origin,
-            pending.tab_id,
-            pending.source,
-            pending.issue,
-        ):
-            self.errorRaised.emit(
-                "Preview detailed-balance outcome is no longer current."
-            )
-            return False
-        if outcome.cancelled:
-            # Cancellation aborts this correction attempt but deliberately
-            # retains the blocked request so Fix can be invoked again.
-            return True
-        corrected = outcome.corrected_source
-        if corrected is None:
-            raise ValueError("Accepted correction has no corrected source.")
-        current_visible_source = (
-            self._registry.tab_runtime(self._tab_id).reactions_draft
-            or self._registry.tab(self._tab_id).mechanism_source
-        )
-        if (
-            self._tab_id != pending.tab_id
-            or current_visible_source.reactions_text
-            not in {pending.source, corrected}
-        ):
-            self.errorRaised.emit(
-                "Preview detailed-balance source is no longer current."
-            )
-            return False
-        self._pending_detailed_balance_request = None
-        # Integration commits this exact typed outcome. No Preview request is
-        # scheduled here or by the editor modal.
-        self.previewDetailedBalanceCommitRequested.emit(outcome)
-        return True
-
-    def clear_preview_detailed_balance_block(self) -> bool:
-        pending = self._pending_detailed_balance_request
-        if pending is None:
-            return False
-        self._pending_detailed_balance_request = None
-        self.previewDetailedBalanceBlockCleared.emit(pending.tab_id)
-        return True
 
     def _preview_inputs_valid(self, targets: tuple[str, ...]) -> bool:
         runtime = self._registry.tab_runtime(self._tab_id)
@@ -1513,7 +1503,6 @@ class TabSliderBinding(QtCore.QObject):
 
         if self._suspended_preview_disposition is not None:
             raise RuntimeError("A Slider Preview disposition is already active.")
-        self._interactive_preview_owner.retire(self._tab_id)
         self._cancel_deferred_restore()
         self._interactive_stop_fenced = True
         self._clear_gesture_state()
@@ -1542,6 +1531,7 @@ class TabSliderBinding(QtCore.QObject):
         targets = self.resolve_target_set_ids()
         self._simulation_jobs.retire_preview(self._tab_id, targets)
         self._suspended_preview_disposition = None
+        self._exact_preview_capture = None
 
     def discard_slider_draft(self, *, render: bool = True) -> bool:
         if self._suspended_preview_disposition is not None:
@@ -1566,7 +1556,6 @@ class TabSliderBinding(QtCore.QObject):
         runtime.slider_parameter_draft.clear()
         runtime.slider_species_drafts_by_set_id.clear()
         self.cancel_pending_preview_intent(targets)
-        self.clear_preview_detailed_balance_block()
         if render:
             self.render()
         self._emit_draft_state()
@@ -1583,12 +1572,12 @@ class TabSliderBinding(QtCore.QObject):
         self._cancel_deferred_restore()
         self._interactive_stop_fenced = True
         self._clear_gesture_state()
-        self._interactive_preview_owner.retire(self._tab_id, set_ids)
         self._simulation_jobs.retire_preview(
             self._tab_id,
             set_ids,
             preserve_reference=preserve_reference,
         )
+        self._exact_preview_capture = None
 
     def fence_stop(self) -> bool:
         """Fence local gesture/capture roles before physical display freeze."""
@@ -1602,15 +1591,14 @@ class TabSliderBinding(QtCore.QObject):
         )
         self._cancel_deferred_restore()
         self._clear_gesture_state()
-        changed = self.clear_preview_detailed_balance_block() or changed
         return changed
 
     def settle_stop(self) -> bool:
         """Ask the operation owner to settle roles after physical freeze."""
 
         targets = self.resolve_target_set_ids()
-        changed = self._interactive_preview_owner.retire(self._tab_id, targets)
-        changed = self._simulation_jobs.retire_preview(self._tab_id, targets) or changed
+        changed = self._simulation_jobs.retire_preview(self._tab_id, targets)
+        self._exact_preview_capture = None
         return bool(changed)
 
     def apply(self) -> bool:
@@ -1631,56 +1619,48 @@ class TabSliderBinding(QtCore.QObject):
             return self._reject(
                 "Slider Apply requires a settled exact Preview for the accepted Reactions."
             )
+        capture = self._exact_preview_capture
+        if capture is None or capture.candidate_tab.tab_id != self._tab_id:
+            return self._reject(
+                "Slider Apply requires one complete, settled exact Preview for the current draft and target roster."
+            )
+        if tuple(target.set_id for target in capture.capture.targets) != roster:
+            return self._reject(
+                "Slider Apply requires one complete, settled exact Preview for the current draft and target roster."
+            )
         tab = self._registry.tab(self._tab_id)
-        expected_token = self._registry.capture_content_token()
+        visible_source = runtime.reactions_draft or tab.mechanism_source
+        visible_provenance = (
+            "draft" if runtime.reactions_draft is not None else "canonical"
+        )
+        if (
+            visible_source != capture.capture.source
+            or visible_provenance != capture.capture.source_provenance
+        ):
+            return False
         if not roster or not self._preview_inputs_valid(roster):
             return False
-        if self._interactive_preview_owner.busy:
+        if self._simulation_jobs.interactive_preview_busy:
             return self._reject(
                 "Slider Apply requires a settled exact Preview; interactive Preview is still active."
             )
         preview_pairs = self._simulation_jobs.capture_preview_pairs_for_apply(
             tab.tab_id,
             roster,
+            expected_requests=tuple(
+                (target.set_id, target.execution_request)
+                for target in capture.capture.targets
+            ),
         )
         if preview_pairs is None:
             return self._reject(
                 "Slider Apply requires one complete, settled exact Preview for the current draft and target roster."
             )
 
-        try:
-            candidate = self._construct_candidate_tab(tab, roster)
-            prepared_dsl = preview_pairs[0][1].prepared_dsl
-            candidate = replace(candidate, prepared_dsl=prepared_dsl)
-            candidate_requests = tuple(
-                (set_id, request)
-                for set_id, _name, request in self._construct_preview_requests(
-                    candidate,
-                    None,
-                    roster,
-                )
-            )
-        except Exception as exc:  # noqa: BLE001
-            return self._reject(f"Slider Apply failed before admission ({exc}).")
-        if any(
-            not simulation_execution_requests_equal(
-                request,
-                preview_request,
-            )
-            for (_set_id, request), (
-                _preview_set_id,
-                preview_request,
-                _result,
-            ) in zip(candidate_requests, preview_pairs)
-        ):
-            return self._reject(
-                "Slider Apply requires one complete, settled exact Preview for the current draft and target roster."
-            )
-
         result = self._registry.replace_tab(
             self._tab_id,
-            candidate,
-            expected_token=expected_token,
+            capture.candidate_tab,
+            expected_token=capture.capture.content_token,
         )
         if result is None:
             return False
@@ -1692,7 +1672,7 @@ class TabSliderBinding(QtCore.QObject):
         live_runtime.slider_parameter_draft.clear()
         for set_id in roster:
             live_runtime.slider_species_drafts_by_set_id.pop(set_id, None)
-        self.clear_preview_detailed_balance_block()
+        self._exact_preview_capture = None
         return True
 
     def reset(self) -> bool:
@@ -1716,28 +1696,9 @@ class TabSliderBinding(QtCore.QObject):
             changed = bool(
                 runtime.slider_species_drafts_by_set_id.pop(set_id, None)
             ) or changed
-        self.clear_preview_detailed_balance_block()
         self.render()
         self._emit_draft_state()
         return changed
-
-    def _preview_values(
-        self,
-        tab: MechanismTabDocument,
-        projection: ParameterSliderProjection,
-        set_id: str,
-    ) -> tuple[tuple[tuple[str, float], ...], tuple[tuple[str, float], ...]]:
-        runtime = self._registry.tab_runtime(tab.tab_id)
-        parameter_values = projection.values_dict()
-        parameter_values.update(runtime.slider_parameter_draft)
-        initial_values = dict(canonical_initial_values(tab, set_id))
-        initial_values.update(
-            runtime.slider_species_drafts_by_set_id.get(set_id, {})
-        )
-        return (
-            tuple(parameter_values.items()),
-            tuple(initial_values.items()),
-        )
 
     def _emit_draft_state(self) -> None:
         self.draftStateChanged.emit(

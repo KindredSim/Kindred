@@ -61,9 +61,6 @@ from kindred.core.project_document import (
 from kindred.core.species import TIME_MAX_S, validate_concentration
 from kindred.core.time_grid import build_time_grid
 from kindred.core.simulator.dsl_parse import PreparedDslRequestSet
-from kindred.core.simulator.wegscheider_symbolic import (
-    require_wegscheider_admission_satisfied,
-)
 from kindred.core.simulation_preparation_stages import (
     PreparedSolverConfig,
     build_solver_config,
@@ -84,7 +81,6 @@ __all__ = [
     "FitExecutionRequest",
     "FitPreparedDatasetConfig",
     "FitPhysicalCoordinatePolicy",
-    "FitApplySelection",
     "FitInitialApplyCellProposal",
     "FitInitialApplyProposal",
     "FitInitialGlobalVariable",
@@ -98,7 +94,6 @@ __all__ = [
     "build_fit_execution_request",
     "capture_fit_origin",
     "create_initial_fit_setup",
-    "fit_origin_science_matches",
     "revalidate_fit_request_inclusions",
     "selected_observations",
     "fit_execution_span",
@@ -695,35 +690,6 @@ class FitInitialApplyProposal:
 
 
 @dataclass(frozen=True, slots=True)
-class FitApplySelection:
-    """One atomic Apply request including independently selected IC cells."""
-
-    origin: FitOriginSnapshot
-    scopes: tuple[str, ...]
-    initial_keys: tuple[tuple[str, str], ...] = ()
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.origin, FitOriginSnapshot):
-            raise TypeError("Apply selection origin must be FitOriginSnapshot.")
-        scopes = tuple(str(item or "").strip() for item in self.scopes)
-        allowed = {"parameters", "initial_concentrations", "observable_definitions"}
-        if not scopes or len(scopes) != len(set(scopes)) or not set(scopes) <= allowed:
-            raise ValueError("Apply selection contains invalid or repeated scopes.")
-        keys = tuple(
-            (_required(set_id, "set ID"), _required(species, "species"))
-            for set_id, species in self.initial_keys
-        )
-        if len(keys) != len(set(keys)):
-            raise ValueError("Apply selection repeats an IC cell.")
-        if "initial_concentrations" in scopes and not keys:
-            raise ValueError("Initial Conditions Apply requires selected cells.")
-        if "initial_concentrations" not in scopes and keys:
-            raise ValueError("IC cells require the Initial Conditions Apply scope.")
-        object.__setattr__(self, "scopes", scopes)
-        object.__setattr__(self, "initial_keys", keys)
-
-
-@dataclass(frozen=True, slots=True)
 class FitInitialGlobalVariable:
     """One immutable species-level Global IC optimizer configuration."""
 
@@ -1105,8 +1071,6 @@ class _FitDispatchCompilation:
 @dataclass(frozen=True, slots=True)
 class FitExecutionRequest:
     origin: FitOriginSnapshot
-    mechanism_source: MechanismAuthoringSource
-    prepared_dsl: PreparedDslRequestSet
     solver: FitSolver
     fit_local_admission: AdmittedAlgebraProgram | None
     datasets: tuple[FitDatasetLocalSettings, ...]
@@ -1128,26 +1092,6 @@ class FitExecutionRequest:
     ) -> None:
         if not isinstance(self.origin, FitOriginSnapshot):
             raise TypeError("origin must be FitOriginSnapshot.")
-        if not isinstance(self.mechanism_source, MechanismAuthoringSource):
-            raise TypeError("mechanism_source must be MechanismAuthoringSource.")
-        if not isinstance(self.prepared_dsl, PreparedDslRequestSet):
-            raise TypeError("prepared_dsl must be a PreparedDslRequestSet.")
-        if not source_matches_analysis(
-            self.mechanism_source,
-            self.prepared_dsl.analysis,
-        ):
-            raise ValueError(
-                "Fit request prepared DSL must exactly match its captured source."
-            )
-        if (
-            self.mechanism_source != self.origin.mechanism_source
-            or self.prepared_dsl is not self.origin.prepared_dsl
-            or self.prepared_dsl.analysis
-            != self.origin.prepared_dsl.analysis
-        ):
-            raise ValueError(
-                "Fit request must retain the captured project source and base science."
-            )
         if not isinstance(self.defaults, FitDefaults):
             raise TypeError("defaults must be FitDefaults.")
         object.__setattr__(self, "solver", validate_fit_solver(self.solver))
@@ -1163,7 +1107,7 @@ class FitExecutionRequest:
                 raise TypeError(
                     "Fit request local admission must be AdmittedAlgebraProgram."
                 )
-            if admission.base_analysis != self.prepared_dsl.analysis:
+            if admission.base_analysis != self.origin.prepared_dsl.analysis:
                 raise ValueError(
                     "Fit request local admission no longer matches base science."
                 )
@@ -1479,12 +1423,7 @@ def _scan_parameters(tab: MechanismTabDocument) -> tuple[FitParameterVariable, .
     variables: list[FitParameterVariable] = []
     if not isinstance(tab.prepared_dsl, PreparedDslRequestSet):
         raise ValueError("Fit requires an accepted prepared mechanism.")
-    coordinates = enumerate_parameter_coordinates(
-        tab.prepared_dsl,
-        wegscheider_cyclicity_enabled=bool(
-            tab.scientific_settings.wegscheider_policy
-        ),
-    )
+    coordinates = enumerate_parameter_coordinates(tab.prepared_dsl)
     for coordinate in coordinates:
         name = _required(coordinate.name, "parameter name")
         value = _finite(coordinate.value, f"parameter {name}")
@@ -1614,85 +1553,6 @@ def create_initial_fit_setup(origin: FitOriginSnapshot) -> FitSetupSnapshot:
         defaults=origin.fit_defaults,
         local_observables=(),
         dataset_weight_mode="implicit",
-    )
-
-
-def fit_origin_science_matches(
-    captured: FitOriginSnapshot,
-    current: FitOriginSnapshot,
-    *,
-    included_dataset_ids: Iterable[str] | None = None,
-) -> bool:
-    """Compare only science that entered the active Fit dataset roster."""
-
-    if not isinstance(captured, FitOriginSnapshot) or not isinstance(
-        current,
-        FitOriginSnapshot,
-    ):
-        raise TypeError("Fit origin comparison requires FitOriginSnapshot values.")
-
-    active_ids = frozenset(
-        str(dataset_id)
-        for dataset_id in (
-            included_dataset_ids
-            if included_dataset_ids is not None
-            else (
-                item.dataset_id
-                for item in captured.mapped_datasets
-                if item.included_at_launch
-            )
-        )
-        if str(dataset_id).strip()
-    )
-
-    def dataset_science(
-        item: FitMappedDatasetSnapshot,
-    ) -> tuple[object, ...]:
-        return (
-            item.dataset_id,
-            item.set_id,
-            item.initial_values,
-            item.resolved_t_start,
-            tuple(
-                (
-                    observation.raw_observation_id,
-                    observation.model_target,
-                    observation.t,
-                    observation.y,
-                    observation.source_rows,
-                )
-                for observation in item.observations
-            ),
-        )
-
-    return bool(
-        captured.tab_id == current.tab_id
-        and captured.mechanism_source == current.mechanism_source
-        and captured.prepared_dsl is current.prepared_dsl
-        and captured.scientific_settings == current.scientific_settings
-        and tuple(
-            dataset_science(item)
-            for item in sorted(
-                captured.mapped_datasets,
-                key=lambda value: value.dataset_id,
-            )
-            if item.dataset_id in active_ids
-        )
-        == tuple(
-            dataset_science(item)
-            for item in sorted(
-                current.mapped_datasets,
-                key=lambda value: value.dataset_id,
-            )
-            if item.dataset_id in active_ids
-        )
-        and active_ids.issubset(
-            item.dataset_id for item in captured.mapped_datasets
-        )
-        and active_ids.issubset(
-            item.dataset_id for item in current.mapped_datasets
-        )
-        and captured.parameter_defaults == current.parameter_defaults
     )
 
 
@@ -2024,18 +1884,44 @@ def revalidate_fit_request_inclusions(
             if request.fit_local_admission is None
             else request.fit_local_admission.observables
         )
-    } | set(fit_observable_names(request.prepared_dsl))
-    for local in request.datasets:
-        if not local.included:
-            continue
-        dataset = dataset_foundation.validate_raw_dataset_record(
-            document.dataset(local.dataset_id)
+    } | set(fit_observable_names(request.origin.prepared_dsl))
+    captured_link_facts = tuple(
+        sorted(
+            (item.dataset_id, bool(item.included_at_launch))
+            for item in request.origin.mapped_datasets
         )
+    )
+    current_link_facts = tuple(
+        sorted(
+            (dataset_id, bool(link.include_in_fit))
+            for dataset_id, link in tab.dataset_links
+            if link.set_id is not None
+        )
+    )
+    if current_link_facts != captured_link_facts:
+        raise ValueError(
+            "Fit dataset links or inclusion changed after capture."
+        )
+    for local in request.datasets:
+        captured = mapped_by_id.get(local.dataset_id)
+        if captured is None:
+            raise ValueError(
+                f"Dataset {local.dataset_id!r} is not part of the captured Fit roster."
+            )
         link = tab.dataset_link(local.dataset_id)
         if link is None:
             raise ValueError(
                 f"Dataset {local.dataset_id!r} is no longer linked in the active tab."
             )
+        if bool(link.include_in_fit) != bool(captured.included_at_launch):
+            raise ValueError(
+                f"Dataset {captured.display_name!r} changed Fit inclusion after capture."
+            )
+        if not local.included:
+            continue
+        dataset = dataset_foundation.validate_raw_dataset_record(
+            document.dataset(local.dataset_id)
+        )
         initial_set = tab.initial_condition_set(link.set_id)
         validated = dataset_foundation.validate_fit_inclusion(
             dataset=dataset,
@@ -2050,7 +1936,6 @@ def revalidate_fit_request_inclusions(
                 label=f"Fit inclusion for dataset {dataset.dataset_id!r}",
             ),
         )
-        captured = mapped_by_id[local.dataset_id]
         if validated.set_id != captured.set_id:
             raise ValueError(
                 f"Dataset {captured.display_name!r} changed mapped set."
@@ -2386,7 +2271,6 @@ def _compile_fit_dispatch(
                     atol=science.atol,
                     grid={"N": grid_points},
                     use_analytic_jacobian=science.analytic_jacobian_policy,
-                    wegscheider_cyclicity_enabled=science.wegscheider_policy,
                 ),
             )
         )
@@ -2427,8 +2311,6 @@ def _compile_fit_dispatch(
 def build_fit_execution_request(
     *,
     origin: FitOriginSnapshot,
-    mechanism_source: MechanismAuthoringSource,
-    prepared_dsl: PreparedDslRequestSet,
     solver: FitSolver = "BDF",
     local_observables: Iterable[FitLocalObservable],
     fit_local_admission: AdmittedAlgebraProgram | None = None,
@@ -2445,14 +2327,6 @@ def build_fit_execution_request(
     shared_refit_source_result: GlobalFitResult | None = None,
 ) -> FitExecutionRequest:
     """Validate a complete owner-built Fit request at the execution boundary."""
-    # Detailed-balance admission belongs to request construction.  A worker
-    # must never be created for a mechanism that still needs source
-    # correction; callers can use the typed unresolved exception to present
-    # the existing correction dialog and recapture the origin.
-    if bool(origin.scientific_settings.wegscheider_policy):
-        require_wegscheider_admission_satisfied(
-            prepared_dsl.wegscheider_admission_report()
-        )
     observable_items = tuple(local_observables)
     dataset_items = tuple(datasets)
     parameter_items = tuple(parameters)
@@ -2472,7 +2346,7 @@ def build_fit_execution_request(
     admission = fit_local_admission
     if admission is None:
         admission = build_fit_local_admission(
-            prepared_dsl,
+            origin.prepared_dsl,
             observable_items,
             parameter_items,
         )
@@ -2482,8 +2356,6 @@ def build_fit_execution_request(
         raise ValueError("Fit-local admission declarations do not match request.")
     request = FitExecutionRequest(
         origin=origin,
-        mechanism_source=mechanism_source,
-        prepared_dsl=prepared_dsl,
         solver=solver,
         fit_local_admission=admission,
         datasets=dataset_items,

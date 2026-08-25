@@ -24,7 +24,6 @@ class MechanismMetadataKeys:
     STANDARD_CONC_M = "standard_conc_M"
     ENERGY_UNIT = "energy_unit"
     TEMPERATURE_SCHEDULE = "temperature_schedule"
-    WEGSCHEIDER_CYCLICITY_ENABLED = "wegscheider_cyclicity_enabled"
 
 
 class EquilibriumMetadataKeys:

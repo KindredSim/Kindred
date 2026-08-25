@@ -43,7 +43,6 @@ from kindred.core.simulation_preparation import (
     _canonical_step_override_name,
     _classify_request_parameter_names,
     _parameter_algebra_scalar_authority_names,
-    _require_wegscheider_admission_for_execution,
     _schedule_resolution_values_for_request,
     fit_simulation_error_from_preparation_error,
     prepare_preparation_failure,
@@ -65,7 +64,7 @@ from kindred.core.simulation_result_finalization import (
 )
 from kindred.core.simulator.solver_types import (
     SimulationCancellationControl,
-    SimulationExecutionOutcome,
+    SimulationScientificUnavailability,
 )
 from kindred.core.simulator.solvers import solve_ode
 from kindred.core.simulator.dsl_parse import PreparedDslRequestSet
@@ -179,7 +178,8 @@ def _known_candidate_unavailability(
 
     Only the explicit candidate-domain exception owns candidate rejection here.
     Preparation, Algebra, kinetic, and wrapped failures remain fatal; the
-    solver's typed ``SimulationExecutionOutcome`` is settled separately below.
+    solver's typed ``SimulationScientificUnavailability`` is settled separately
+    below.
     """
 
     if isinstance(exc, FitCandidateDomainError):
@@ -259,8 +259,6 @@ class PreparedFittingExecutionContext:
         )
         sample_times = tuple(float(value) for value in self.requested_sample_times)
         request = prepared_run.request
-        if not isinstance(request, SimulationExecutionRequest):
-            raise TypeError("Fit prepared run must retain its typed execution request.")
         t_start, t_end = request.t_span
         if (
             not sample_times
@@ -392,14 +390,6 @@ def prepare_fitting_execution_context(
         prepared_dsl.parameterized_intervention_schedule_for_binding()
     )
     parameter_algebra_spec = prepared_dsl.parameter_algebra_spec_for_execution()
-    admission_report = prepared_dsl.wegscheider_admission_report()
-    try:
-        _require_wegscheider_admission_for_execution(
-            admission_report=admission_report,
-            wegscheider_cyclicity_enabled=prepared_solver_config.wegscheider_cyclicity_enabled,
-        )
-    except SimulationPreparationError as exc:
-        raise fit_simulation_error_from_preparation_error(exc) from exc
     species_names = tuple(mechanism.species_names())
     y0 = np.asarray([mechanism.species[sp].initial_conc for sp in species_names], dtype=float)
     if (
@@ -496,7 +486,7 @@ def prepare_fitting_execution_context(
             raise SimulationPreparationError(
                 "parameter_algebra",
                 "Dependent equilibrium parameter(s) cannot be fitted directly because "
-                "Wegscheider/algebra constraints overwrite them: "
+                "Algebra constraints overwrite them: "
                 + ", ".join(requested_dependent_keq),
             )
     except SimulationPreparationError as exc:
@@ -506,18 +496,12 @@ def prepare_fitting_execution_context(
             prepare_preparation_failure("parameter_binding", exc)
         ) from exc
     execution_request = SimulationExecutionRequest(
-        analysis=prepared_dsl.analysis,
         prepared_dsl=prepared_dsl,
         species_names=species_names,
         y0=tuple(float(value) for value in y0),
-        temperature_schedule=prepared_dsl.temperature_schedule_for_execution(),
-        parameter_algebra_spec=parameter_algebra_spec,
-        intervention_execution=prepared_dsl.intervention_execution_contract(),
         t_span=(float(t_start), float(t_end)),
         solver_config=prepared_solver_config,
-        parameterized_intervention_schedule=unresolved_intervention_schedule,
         requested_parameter_names=tuple(canonical_requested_param_names),
-        wegscheider_admission_report=admission_report,
     )
     execution_request = bind_simulation_execution_request_interventions(
         execution_request
@@ -534,7 +518,6 @@ def prepare_fitting_execution_context(
     )
     prepared_run = replace(
         prepared_run,
-        request=execution_request,
         version=1,
         mechanism_text_len=len(prepared_dsl.analysis.normalized_text),
         param_names=tuple(sorted({*(str(x) for x in canonical_requested_param_names if str(x).strip()), *local_scalar_names})),
@@ -619,12 +602,8 @@ class FittingEvaluator:
             if unavailable is not None:
                 return unavailable
             raise
-        if isinstance(result, SimulationExecutionOutcome):
-            if result.status != "scientific_unavailable":
-                raise RuntimeError("Unsupported simulation execution outcome status.")
-            unavailability = result.unavailability
-            if unavailability is None:
-                raise RuntimeError("Simulation outcome omitted its unavailability result.")
+        if isinstance(result, SimulationScientificUnavailability):
+            unavailability = result
             unavailable = _scientific_unavailability_from_exception(
                 unavailability,
                 producer=unavailability.producer,
@@ -642,7 +621,7 @@ class FittingEvaluator:
         origins: Optional[Mapping[str, str]] = None,
         *,
         failed_params: Optional[Dict[str, float]] = None,
-    ) -> SimulationResultValue | SimulationExecutionOutcome:
+    ) -> SimulationResultValue | SimulationScientificUnavailability:
         self._raise_if_cancel_requested()
         param_map = {
             str(name): raw_value
@@ -689,17 +668,15 @@ class FittingEvaluator:
             )
             for name, value in non_initial_parameters.items()
         }
-        typed_request = self._context.prepared_run.request
-        if not isinstance(typed_request, SimulationExecutionRequest):
-            raise FitSimulationError("Fit prepared run must retain a typed request.")
-        typed_schedule = typed_request.parameterized_intervention_schedule
+        prepared_request = self._context.prepared_run.request
+        typed_schedule = prepared_request.prepared_dsl.parameterized_intervention_schedule_for_binding()
         try:
             # Every candidate, including the first, receives a fresh isolated
             # request and one canonical preparation.  A rejected candidate can
             # therefore never contaminate the next candidate.
             prepared_run = prepare_simulation_worker_run(
                 execution_request=replace(
-                    typed_request,
+                    prepared_request,
                     parameter_overrides=non_initial_parameters or None,
                 ),
                 cancellation_control=self._cancellation_control,
@@ -919,7 +896,7 @@ class FittingEvaluator:
                 stage="solver",
                 failed_params=failed_params,
             ) from exc
-        if isinstance(result, SimulationExecutionOutcome):
+        if isinstance(result, SimulationScientificUnavailability):
             return result
         self._raise_if_cancel_requested()
 

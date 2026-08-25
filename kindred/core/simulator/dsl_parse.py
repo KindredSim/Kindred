@@ -71,6 +71,7 @@ from .dsl_parameter_scan import DslParameterAnalysis
 from .dsl_derivation import (
     authored_step_origin,
     coordinate_source_parts,
+    coordinate_token_matches,
     origin_line_positions,
     rewrite_coordinate_source_line,
     rewrite_scalar_source_line,
@@ -81,7 +82,6 @@ if TYPE_CHECKING:
     from ..intervention_schedule import InterventionSchedule
     from ..intervention_schedule_compiler import InterventionExecutionContract
     from ..temperature import TemperatureScheduleProtocol
-    from .wegscheider_symbolic import WegscheiderCyclicityReport
 
 logger = logging.getLogger(__name__)
 
@@ -444,7 +444,6 @@ class PreparedDslRequestSet:
         "__intervention_schedule",
         "__intervention_execution",
         "__parameter_algebra_spec",
-        "__wegscheider_admission_report",
         "__compiled_ode_topology",
         "__symbolic_jacobian_structure",
         "__symbolic_structure_initialized",
@@ -459,7 +458,6 @@ class PreparedDslRequestSet:
         intervention_schedule: InterventionSchedule | None,
         intervention_execution: InterventionExecutionContract | None,
         parameter_algebra_spec: object,
-        wegscheider_admission_report: WegscheiderCyclicityReport,
     ) -> None:
         from kindred.core.intervention_schedule import InterventionSchedule
         from kindred.core.intervention_schedule_compiler import (
@@ -479,15 +477,11 @@ class PreparedDslRequestSet:
                 raise ValueError("Prepared DSL intervention authority cannot be both declarative and compiled.")
         elif intervention_execution is None:
             raise ValueError("Literal prepared DSL state requires its compiled intervention contract.")
-        from kindred.core.simulator.wegscheider_symbolic import WegscheiderCyclicityReport
-        if not isinstance(wegscheider_admission_report, WegscheiderCyclicityReport):
-            raise TypeError("prepared DSL requires its typed Wegscheider admission report.")
         self.analysis = analysis
         self.__mechanism = mechanism
         self.__intervention_schedule = intervention_schedule
         self.__intervention_execution = intervention_execution
         self.__parameter_algebra_spec = parameter_algebra_spec
-        self.__wegscheider_admission_report = wegscheider_admission_report
         self.__compiled_ode_topology = None
         self.__symbolic_jacobian_structure = None
         self.__symbolic_structure_initialized = False
@@ -607,9 +601,7 @@ class PreparedDslRequestSet:
     def parameter_algebra_spec_for_execution(self) -> object:
         return self.__parameter_algebra_spec
 
-    def wegscheider_admission_report(self) -> WegscheiderCyclicityReport:
-        """Return immutable source-admission truth captured before Algebra."""
-        return self.__wegscheider_admission_report
+
 # ------------------------------ helpers --------------------------------------
 
 def _norm_key(k: str) -> str:
@@ -2101,19 +2093,21 @@ def prepare_dsl_request_set(
             initials=initials,
         )
     )
-    from kindred.core.simulator.wegscheider_symbolic import (
-        analyze_wegscheider_cyclicity,
-    )
-
-    # Capture admission from canonical parsed coefficient/equilibrium authority
-    # before Algebra compilation, request overrides, bindings, or runtime state
-    # can mutate the executable mechanism.
-    wegscheider_admission_report = analyze_wegscheider_cyclicity(mechanism)
     mechanism_namespace = build_namespace_from_mechanism(mechanism)
     parameter_algebra_spec = parse_parameter_algebra_spec_from_dsl_text(
         text,
         mechanism_namespace=mechanism_namespace,
     )
+    source_coordinate_names = mechanism_namespace.source_coordinate_names
+    algebra_coordinate_collisions = source_coordinate_names.intersection(
+        parameter_algebra_spec.param_assignment_names()
+    )
+    if algebra_coordinate_collisions:
+        names = ", ".join(sorted(algebra_coordinate_collisions))
+        raise _DSLError(
+            "Algebra declarations cannot shadow admitted reaction-local "
+            f"source coordinates: {names}."
+        )
     # The retained spec is the sole admitted Algebra program.  Compile the
     # observable partition from its retained ASTs; passing raw source here (or
     # in the builder) would reparse the same Algebra text and violate the
@@ -2167,69 +2161,81 @@ def prepare_dsl_request_set(
         intervention_schedule=parameterized_intervention_schedule,
         intervention_execution=intervention_execution,
         parameter_algebra_spec=parameter_algebra_spec,
-        wegscheider_admission_report=wegscheider_admission_report,
     )
 
 
-def _forward_model_payload(model: object) -> dict[str, object]:
-    from kindred.core.kinetics import (
-        ArrheniusRateModel,
-        ConstantRateModel,
-        EyringRateModel,
-    )
+def _lookup_physical_source_coordinate(
+    mechanism: object,
+    analysis: DslAnalysis,
+    name: str,
+) -> tuple[str, int, str, Mapping[str, object], str] | None:
+    """Resolve one unique authored kinetic/thermodynamic source coordinate."""
 
-    if isinstance(model, ConstantRateModel):
-        return {"type": "Constant", "k": float(model.k)}
-    if isinstance(model, ArrheniusRateModel):
-        return {
-            "type": "Arrhenius",
-            "A": float(model.A),
-            "Ea_J_per_mol": float(model.Ea_J_per_mol),
+    from kindred.core.simulator.step_indexing import get_step_index_map
+
+    candidates: list[tuple[str, int, str, Mapping[str, object], str]] = []
+    for entry in get_step_index_map(mechanism):
+        kind = str(entry.get("kind") or "")
+        try:
+            step_index = int(entry.get("step_index"))
+        except (TypeError, ValueError):
+            continue
+        source_coordinates = {
+            str(role): str(canonical_name)
+            for role, canonical_name in dict(
+                entry.get("source_coordinates") or {}
+            ).items()
         }
-    if isinstance(model, EyringRateModel):
-        return {
-            "type": "Eyring",
-            "dG_act_J_per_mol": float(model.dG_act_J_per_mol),
-            "degeneracy": int(model.degeneracy),
-            "kappa": float(model.kappa),
-            "standard_conc_M": float(model.standard_conc_M),
-        }
-    raise TypeError("Coordinate update lost its typed rate family.")
-
-
-def _reaction_model_overrides(model: object) -> dict[str, object]:
-    payload = _forward_model_payload(model)
-    family = str(payload.pop("type"))
-    payload.pop("k", None)
-    return {"model": family, **payload}
+        matching_roles = [
+            role for role, canonical_name in source_coordinates.items()
+            if canonical_name == str(name)
+        ]
+        if len(matching_roles) != 1:
+            continue
+        origin = authored_step_origin(analysis, step_index=step_index)
+        tokens = coordinate_source_parts(origin.source_text)[1]
+        role = matching_roles[0]
+        matches = [
+            str(token[0])
+            for token in tokens
+            if coordinate_token_matches(token[0], role)
+        ]
+        if len(matches) != 1:
+            raise ValueError(
+                f"Physical source coordinate {name!r} has no unique authored token."
+            )
+        index_key = "reaction_index" if kind == "reaction" else "equilibrium_index"
+        try:
+            index = int(entry.get(index_key))
+        except (TypeError, ValueError):
+            continue
+        candidates.append((kind, index, role, entry, matches[0]))
+    if len(candidates) > 1:
+        raise ValueError(
+            f"Physical source coordinate {name!r} is ambiguous across admitted steps."
+        )
+    return candidates[0] if candidates else None
 
 
 def derive_source_with_parameter_updates(
     source_text: str,
     base: PreparedDslRequestSet,
     updates: tuple[DslParameterCoordinateUpdate, ...],
-    *,
-    wegscheider_cyclicity_enabled: bool,
-) -> tuple[str, PreparedDslRequestSet]:
-    """Apply typed updates to exact source and return both authorities."""
+) -> str:
+    """Authenticate typed coordinates and rewrite the visible source bytes."""
 
     from kindred.core.equilibrium_rate_authority import (
         EquilibriumRateAuthorityKind,
-        effective_equilibrium_keq,
-        effective_reverse_rate_from_keq,
         normalize_existing_equilibrium_rate_authority,
     )
     from kindred.core.kinetics import (
         ArrheniusRateModel,
         EyringRateModel,
-        forward_rate_at_temperature,
         forward_rate_model_for_equilibrium,
         forward_rate_model_for_reaction,
         write_reference_rate,
     )
     from kindred.core.mechanism_metadata import (
-        EquilibriumMetadataKeys,
-        MechanismMetadataKeys,
         MechanismMetadataView,
     )
     from kindred.core.simulator.step_indexing import (
@@ -2240,10 +2246,6 @@ def derive_source_with_parameter_updates(
         raise ValueError(
             "Typed parameter derivation requires canonical materialized "
             "initial conditions."
-        )
-    if type(wegscheider_cyclicity_enabled) is not bool:
-        raise TypeError(
-            "wegscheider_cyclicity_enabled must be an exact bool."
         )
     if not updates:
         raise ValueError("Typed DSL parameter derivation requires updates.")
@@ -2256,18 +2258,11 @@ def derive_source_with_parameter_updates(
     if len(names) != len(set(names)):
         raise ValueError("DSL parameter update names must be unique.")
 
-    mechanism = base.mutable_mechanism_shell()
-    initials = {
-        str(name): float(species.initial_conc)
-        for name, species in getattr(mechanism, "species", {}).items()
-    }
+    mechanism = base.accepted_mechanism_for_structure()
     spec = base.parameter_algebra_spec_for_execution()
     metadata = getattr(mechanism, "metadata", None)
-    if not isinstance(metadata, dict):
-        raise TypeError("Prepared DSL mechanism metadata must be mutable.")
-    metadata[
-        MechanismMetadataKeys.WEGSCHEIDER_CYCLICITY_ENABLED
-    ] = wegscheider_cyclicity_enabled
+    if not isinstance(metadata, Mapping):
+        raise TypeError("Prepared DSL mechanism metadata must be a mapping.")
     metadata_view = MechanismMetadataView.from_metadata(metadata)
     temperature = float(base.analysis.temperature_K)
     if temperature != metadata_view.temperature_K:
@@ -2284,6 +2279,7 @@ def derive_source_with_parameter_updates(
         for statement in spec.param_statements
         if lookup_step_param_target(mechanism, str(statement.name)) is not None
     }
+    algebra_owned_names = {str(statement.name) for statement in spec.param_statements}
     authored_source = source_text
     raw_lines = authored_source.splitlines(keepends=True)
     line_contents = [line.rstrip("\r\n") for line in raw_lines]
@@ -2297,22 +2293,57 @@ def derive_source_with_parameter_updates(
     source_lines = line_contents
     origin_positions = origin_line_positions(base.analysis, authored_source)
     updated_origin_lines: dict[int, str] = {}
-    scalar_values = metadata.get("scalar_params")
-    if not isinstance(scalar_values, dict):
-        scalar_values = {}
-        metadata["scalar_params"] = scalar_values
-
     for update in updates:
         target = lookup_step_param_target(mechanism, update.name)
+        physical_target = (
+            None
+            if target is not None
+            else _lookup_physical_source_coordinate(
+                mechanism,
+                base.analysis,
+                str(update.name),
+            )
+        )
         definition = parameter_by_name.get(update.name)
         scalar_statement_known = any(
             statement.name == update.name
             for statement in spec.param_statements
         )
-        if target is None and not scalar_statement_known:
+        if target is None and physical_target is None and not scalar_statement_known:
             raise LookupError(
                 f"Parameter {update.name!r} is absent from retained DSL."
             )
+        if physical_target is not None:
+            if update.name in algebra_owned_names:
+                raise ValueError(
+                    f"Parameter {update.name!r} is Algebra-owned and not writable."
+                )
+            _kind, _index, _source_token_role, entry, source_token = physical_target
+            if bool(entry.get("locked", False)):
+                raise ValueError(
+                    f"Parameter {update.name!r} is locked and not writable."
+                )
+            if (
+                _kind == "reaction"
+                and f"k{int(entry['step_index'])}" in algebra_owned_names
+            ):
+                raise ValueError(
+                    f"Parameter {update.name!r} is owned by its admitted Algebra rate."
+                )
+            origin = authored_step_origin(
+                base.analysis,
+                step_index=int(entry["step_index"]),
+            )
+            old_line = updated_origin_lines.get(
+                origin.authored_ordinal,
+                source_lines[origin_positions[origin.authored_ordinal]],
+            )
+            updated_origin_lines[origin.authored_ordinal] = rewrite_coordinate_source_line(
+                old_line,
+                token=source_token,
+                value=float(update.value),
+            )
+            continue
         if (
             target is not None
             and (
@@ -2337,19 +2368,6 @@ def derive_source_with_parameter_updates(
                 raise ValueError(
                     f"Scalar parameter {update.name!r} is not writable."
                 )
-            statements = list(spec.param_statements)
-            statement_index = next(
-                (
-                    index
-                    for index, statement in enumerate(statements)
-                    if statement.name == update.name
-                ),
-                None,
-            )
-            if statement_index is None:
-                raise LookupError(
-                    f"Scalar parameter {update.name!r} has no typed declaration."
-                )
             origin = scalar_origin(
                 base.analysis,
                 name=update.name,
@@ -2364,45 +2382,6 @@ def derive_source_with_parameter_updates(
                 expression=repr(float(update.value)),
             )
             updated_origin_lines[origin.authored_ordinal] = new_line
-            statement = statements[statement_index]
-            from kindred.core.algebra.parser import AlgebraBlock, LetStatement, NumberNode
-
-            replacement_expr = NumberNode(float(update.value))
-            statements[statement_index] = replace(
-                statement,
-                expr_src=repr(float(update.value)),
-                line_content=new_line,
-                expr_ast=replacement_expr,
-            )
-            retained_parameter_block = getattr(spec, "parameter_block", None)
-            if not isinstance(retained_parameter_block, AlgebraBlock):
-                raise ValueError(
-                    f"Scalar parameter {update.name!r} has no retained parameter block."
-                )
-            retained_lines = tuple(
-                LetStatement(
-                    name=retained_statement.name,
-                    expr=replacement_expr,
-                    line=retained_statement.line,
-                    col=retained_statement.col,
-                    line_text=new_line,
-                )
-                if retained_statement.name == update.name
-                else retained_statement
-                for retained_statement in retained_parameter_block.lines
-            )
-            retained_static_values = retained_parameter_block.static_value_map()
-            retained_static_values[update.name] = float(update.value)
-            spec = replace(
-                spec,
-                param_statements=statements,
-                parameter_block=AlgebraBlock(
-                    lines=retained_lines,
-                    ast=tuple(item.expr for item in retained_lines),
-                    static_values=retained_static_values,
-                ),
-            )
-            scalar_values[update.name] = update.value
             continue
 
         kind, index, role, entry = target
@@ -2429,12 +2408,6 @@ def derive_source_with_parameter_updates(
                 reference_rate=update.value,
                 reference_temperature_K=temperature,
             )
-            rate = forward_rate_at_temperature(rewritten, temperature)
-            mechanism.reactions[index] = replace(
-                reaction,
-                rate=rate,
-                overrides=_reaction_model_overrides(rewritten),
-            )
             if isinstance(rewritten, ArrheniusRateModel):
                 source_token = "Ea"
                 source_value = UnitsModel(
@@ -2459,7 +2432,6 @@ def derive_source_with_parameter_updates(
                 source_token = authored_forward_tokens[0]
         elif kind == "equilibrium":
             equilibrium = mechanism.equilibria[index]
-            equilibrium_metadata = dict(equilibrium.metadata)
             authority = normalize_existing_equilibrium_rate_authority(
                 equilibrium
             )
@@ -2473,30 +2445,6 @@ def derive_source_with_parameter_updates(
                     model,
                     reference_rate=update.value,
                     reference_temperature_K=temperature,
-                )
-                kf = forward_rate_at_temperature(rewritten, temperature)
-                equilibrium_metadata[
-                    EquilibriumMetadataKeys.FORWARD_MODEL
-                ] = _forward_model_payload(rewritten)
-                kr = equilibrium.kr
-                if authority.kind == EquilibriumRateAuthorityKind.KEQ:
-                    keq = effective_equilibrium_keq(
-                        equilibrium,
-                        temperature_K=temperature,
-                    )
-                    if keq is None:
-                        raise ValueError(
-                            f"Parameter {update.name!r} lost Keq authority."
-                        )
-                    kr = effective_reverse_rate_from_keq(
-                        kf,
-                        keq,
-                    )
-                mechanism.equilibria[index] = replace(
-                    equilibrium,
-                    kf=kf,
-                    kr=kr,
-                    metadata=equilibrium_metadata,
                 )
                 source_energy_unit = metadata_view.energy_unit
                 if isinstance(rewritten, ArrheniusRateModel):
@@ -2526,11 +2474,6 @@ def derive_source_with_parameter_updates(
                     raise ValueError(
                         f"Parameter {update.name!r} is derived, not writable."
                     )
-                mechanism.equilibria[index] = replace(
-                    equilibrium,
-                    kr=update.value,
-                    metadata=equilibrium_metadata,
-                )
                 source_token = "kr"
             elif role == "Keq":
                 if not authority.has_explicit_keq_param:
@@ -2541,19 +2484,6 @@ def derive_source_with_parameter_updates(
                     raise ValueError(
                         f"Parameter {update.name!r} must be positive."
                     )
-                kf = float(equilibrium.kf)
-                equilibrium_metadata[
-                    EquilibriumMetadataKeys.KEQ_INPUT
-                ] = update.value
-                mechanism.equilibria[index] = replace(
-                    equilibrium,
-                    Keq=update.value,
-                    kr=effective_reverse_rate_from_keq(
-                        kf,
-                        update.value,
-                    ),
-                    metadata=equilibrium_metadata,
-                )
                 source_token = "Keq"
             else:
                 raise ValueError(
@@ -2577,32 +2507,4 @@ def derive_source_with_parameter_updates(
         content + ending
         for content, ending in zip(source_lines, line_endings)
     )
-    # Publish only the typed state admitted from the exact rendered source.
-    # The in-loop mechanism is deliberately not returned: its calculated
-    # values may retain precision that the source token cannot represent.
-    prepared = prepare_dsl_request_set(
-        updated_text,
-        initials=initials,
-        units=UnitsModel(
-            energy_unit=base.analysis.energy_unit,
-            temperature_K=base.analysis.temperature_K,
-            standard_conc_M=metadata_view.standard_conc_M,
-        ),
-    )
-    admitted_mechanism = prepared.mutable_mechanism_shell()
-    admitted_metadata = getattr(admitted_mechanism, "metadata", None)
-    if isinstance(admitted_metadata, dict):
-        admitted_metadata[
-            MechanismMetadataKeys.WEGSCHEIDER_CYCLICITY_ENABLED
-        ] = wegscheider_cyclicity_enabled
-    result = PreparedDslRequestSet(
-        analysis=prepared.analysis,
-        mechanism=admitted_mechanism,
-        intervention_schedule=(
-            prepared.parameterized_intervention_schedule_for_binding()
-        ),
-        intervention_execution=prepared.intervention_execution_contract(),
-        parameter_algebra_spec=prepared.parameter_algebra_spec_for_execution(),
-        wegscheider_admission_report=prepared.wegscheider_admission_report(),
-    )
-    return updated_text, result
+    return updated_text

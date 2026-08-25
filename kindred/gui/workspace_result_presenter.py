@@ -28,10 +28,7 @@ from kindred.core.result_repository import (
 )
 from kindred.core.simulation_failure import FactualCause
 from kindred.core.simulator.solver_types import SimulationPresentationBoundary
-from kindred.gui.dataset_payload_snapshot import (
-    ExperimentalLayerIdentity,
-    ExperimentalLayerInput,
-)
+from kindred.gui.dataset_payload_snapshot import ExperimentalLayerInput
 from kindred.gui.plot_config import AxisSelectionCandidate
 
 __all__ = [
@@ -43,7 +40,6 @@ __all__ = [
     "VisibleResultSet",
     "XlsxExportCompletion",
     "compose_interactive_display",
-    "compose_interactive_display_batch",
     "compose_result_input",
     "encode_clipboard_text",
     "encode_tsv_row",
@@ -58,6 +54,14 @@ _MAX_COPY_CHARACTERS = 64 * 1024 * 1024
 _MAX_XLSX_STRING_LENGTH = 32_767
 _EXCEL_MAX_ROWS = 1_048_576
 _EXCEL_MAX_COLUMNS = 16_384
+
+
+def _readonly_display_array(value: object) -> np.ndarray:
+    """Retain one admitted transient display array without copying it."""
+
+    array = np.asarray(value)
+    array.setflags(write=False)
+    return array
 
 
 @dataclass(frozen=True, slots=True)
@@ -82,82 +86,29 @@ class InteractiveDisplayCurve:
     intervention_connectors: tuple[tuple[int, float, float, float], ...] = ()
 
     def __post_init__(self) -> None:
-        key = tuple(_required_id(value, "interactive curve key") for value in self.key)
-        if not key:
-            raise ValueError("interactive curve key must not be empty.")
-        x = _owned_vector(self.x, field="interactive curve X")
-        y = _owned_vector(self.y, field="interactive curve Y")
-        if x.size != y.size:
-            raise ValueError("interactive curve X and Y must have equal length.")
-        point_size = float(self.point_size)
-        opacity = float(self.opacity)
-        if not np.isfinite(point_size) or point_size <= 0.0:
-            raise ValueError("interactive curve point size must be positive.")
-        if not np.isfinite(opacity) or not 0.0 <= opacity <= 1.0:
-            raise ValueError("interactive curve opacity must be between zero and one.")
-        segment_ids = None
-        segment_keys = None
-        discontinuity_ids = None
-        if self.segment_ids is not None:
-            segment_ids = _owned_identity_vector(
-                self.segment_ids,
-                field="interactive curve segment identity",
-                size=x.size,
-            )
-            if self.segment_keys is None or self.discontinuity_ids is None:
-                raise ValueError(
-                    "interactive curve topology requires segment keys and "
-                    "discontinuity identity."
-                )
-            segment_keys = tuple(
-                _required_id(value, "interactive curve segment key")
-                for value in self.segment_keys
-            )
-            if len(segment_keys) != x.size:
-                raise ValueError(
-                    "interactive curve segment keys must align with X values."
-                )
-            discontinuity_ids = _owned_identity_vector(
-                self.discontinuity_ids,
-                field="interactive curve discontinuity identity",
-                size=x.size,
-            )
-        elif self.segment_keys is not None or self.discontinuity_ids is not None:
-            raise ValueError(
-                "interactive curve topology must provide segment IDs, keys, "
-                "and discontinuity IDs together."
-            )
-        connectors = tuple(
-            (
-                int(boundary_index),
-                float(boundary_time),
-                float(pre_value),
-                float(post_value),
-            )
-            for boundary_index, boundary_time, pre_value, post_value in
-            self.intervention_connectors
+        x = _readonly_display_array(self.x)
+        y = _readonly_display_array(self.y)
+        segment_ids = (
+            None
+            if self.segment_ids is None
+            else _readonly_display_array(self.segment_ids)
         )
-        if any(
-            not np.all(np.isfinite(values[1:]))
-            for values in connectors
-        ):
-            raise ValueError("interactive intervention connectors must be finite.")
-        color = _required_id(self.color, "interactive curve color")
-        object.__setattr__(self, "key", key)
-        object.__setattr__(
-            self, "label", _required_id(self.label, "interactive curve label")
+        discontinuity_ids = (
+            None
+            if self.discontinuity_ids is None
+            else _readonly_display_array(self.discontinuity_ids)
         )
+        object.__setattr__(self, "key", tuple(self.key))
+        object.__setattr__(self, "label", self.label)
         object.__setattr__(self, "x", x)
         object.__setattr__(self, "y", y)
-        object.__setattr__(self, "color", color)
-        object.__setattr__(self, "dashed", bool(self.dashed))
-        object.__setattr__(self, "markers", bool(self.markers))
-        object.__setattr__(self, "point_size", point_size)
-        object.__setattr__(self, "opacity", opacity)
+        object.__setattr__(self, "color", self.color)
+        object.__setattr__(self, "point_size", float(self.point_size))
+        object.__setattr__(self, "opacity", float(self.opacity))
         object.__setattr__(self, "segment_ids", segment_ids)
-        object.__setattr__(self, "segment_keys", segment_keys)
+        object.__setattr__(self, "segment_keys", self.segment_keys)
         object.__setattr__(self, "discontinuity_ids", discontinuity_ids)
-        object.__setattr__(self, "intervention_connectors", connectors)
+        object.__setattr__(self, "intervention_connectors", tuple(self.intervention_connectors))
 
 
 @dataclass(frozen=True, slots=True)
@@ -173,32 +124,8 @@ class InteractiveDisplayProjection:
     target_set_ids: tuple[str, ...]
 
     def __post_init__(self) -> None:
-        generation = self.generation
-        if type(generation) is not int or generation <= 0:
-            raise ValueError("interactive display generation must be positive.")
-        curves = tuple(self.curves)
-        if any(not isinstance(curve, InteractiveDisplayCurve) for curve in curves):
-            raise TypeError("curves must contain InteractiveDisplayCurve values.")
-        keys = tuple(curve.key for curve in curves)
-        if len(keys) != len(set(keys)):
-            raise ValueError("interactive display curve keys must be unique.")
-        set_id = _required_id(self.set_id, "set_id")
-        target_set_ids = tuple(
-            _required_id(value, "target_set_id") for value in self.target_set_ids
-        )
-        if not target_set_ids:
-            raise ValueError("interactive display target roster is required.")
-        if len(set(target_set_ids)) != len(target_set_ids):
-            raise ValueError("interactive display target roster must be unique.")
-        if set_id not in target_set_ids:
-            raise ValueError("set_id must belong to the interactive target roster.")
-        object.__setattr__(self, "tab_id", _required_id(self.tab_id, "tab_id"))
-        object.__setattr__(self, "set_id", set_id)
-        object.__setattr__(self, "generation", generation)
-        object.__setattr__(self, "x_label", _required_id(self.x_label, "x_label"))
-        object.__setattr__(self, "y_label", _required_id(self.y_label, "y_label"))
-        object.__setattr__(self, "curves", curves)
-        object.__setattr__(self, "target_set_ids", target_set_ids)
+        object.__setattr__(self, "curves", tuple(self.curves))
+        object.__setattr__(self, "target_set_ids", tuple(self.target_set_ids))
 
 
 class _XlsxDestination:
@@ -360,92 +287,6 @@ def _canonical_json(value: object) -> str:
     )
 
 
-def _owned_vector(value: object, *, field: str) -> np.ndarray:
-    candidate = np.asarray(value, dtype=float)
-    if candidate.ndim != 1:
-        raise ValueError(f"{field} must be one-dimensional.")
-    array = (
-        value
-        if (
-            isinstance(value, np.ndarray)
-            and value.dtype == np.dtype(float)
-            and value.ndim == 1
-            and not value.flags.writeable
-        )
-        else candidate.copy()
-    )
-    if array.size == 0 or np.any(~np.isfinite(array)):
-        raise ValueError(f"{field} must contain finite values.")
-    array.setflags(write=False)
-    return array
-
-
-def _owned_identity_vector(
-    value: object,
-    *,
-    field: str,
-    size: int,
-) -> np.ndarray:
-    raw = np.asarray(value)
-    if raw.ndim != 1 or raw.dtype.kind not in {"i", "u"}:
-        raise ValueError(f"{field} must be a one-dimensional integer array.")
-    candidate = raw.astype(np.int64, copy=False)
-    array = (
-        value
-        if (
-            isinstance(value, np.ndarray)
-            and value.dtype == np.dtype(np.int64)
-            and value.ndim == 1
-            and not value.flags.writeable
-        )
-        else candidate.copy()
-    )
-    if array.size != int(size):
-        raise ValueError(f"{field} must align with layer time.")
-    if np.any(array < 0) or np.any(np.diff(array) < 0):
-        raise ValueError(f"{field} must be ordered and nonnegative.")
-    array.setflags(write=False)
-    return array
-
-
-def _owned_source_rows(
-    value: object,
-    *,
-    size: int,
-) -> np.ndarray:
-    raw = np.asarray(value)
-    if raw.ndim != 1 or raw.dtype.kind not in {"i", "u"}:
-        raise ValueError("source_row must be a one-dimensional integer array.")
-    candidate = raw.astype(np.int64, copy=False)
-    array = (
-        value
-        if (
-            isinstance(value, np.ndarray)
-            and value.dtype == np.dtype(np.int64)
-            and value.ndim == 1
-            and not value.flags.writeable
-        )
-        else candidate.copy()
-    )
-    if array.size != int(size):
-        raise ValueError("source_row must align with layer time.")
-    if np.any(array <= 0) or np.unique(array).size != array.size:
-        raise ValueError("source_row must contain unique positive row numbers.")
-    array.setflags(write=False)
-    return array
-
-
-def _segment_keys(
-    values: Sequence[str],
-    *,
-    size: int,
-) -> tuple[str, ...]:
-    keys = tuple(_required_id(value, "segment key") for value in values)
-    if len(keys) != int(size):
-        raise ValueError("segment keys must align with layer time.")
-    return keys
-
-
 def _series_tuple(
     result: SimulationResultValue,
 ) -> tuple[tuple[str, np.ndarray], ...]:
@@ -528,7 +369,7 @@ class ResultLayerKind(Enum):
 class ResultDataBlock:
     """One immutable full-resolution result/data table and its render style."""
 
-    block_id: str | ExperimentalLayerIdentity
+    block_id: str | ExperimentalAxisSelection
     label: str
     kind: ResultLayerKind
     t: np.ndarray
@@ -556,18 +397,20 @@ class ResultDataBlock:
             raise TypeError("kind must be a ResultLayerKind.")
         block_id = self.block_id
         if self.kind is ResultLayerKind.EXPERIMENTAL:
-            if not isinstance(block_id, ExperimentalLayerIdentity):
-                raise TypeError("experimental data blocks require an experimental identity.")
-        elif type(block_id) is not str or not block_id.strip():
+            if not isinstance(block_id, ExperimentalAxisSelection):
+                raise TypeError("experimental data blocks require an experimental axis.")
+        elif (
+            type(block_id) is not str or not block_id.strip()
+        ):
             raise TypeError("simulation data blocks require a nonblank set ID.")
-        time = _owned_vector(self.t, field="data time")
+        time = self.t
         normalized: list[tuple[str, np.ndarray]] = []
         names: set[str] = set()
         for raw_name, raw_values in self.series:
             name = _required_id(raw_name, "data series name")
             if name in names:
                 raise ValueError(f"data block contains duplicate series {name!r}.")
-            values = _owned_vector(raw_values, field=f"data series {name!r}")
+            values = raw_values
             if values.size != time.size:
                 raise ValueError(f"data series {name!r} length does not match time.")
             names.add(name)
@@ -589,7 +432,7 @@ class ResultDataBlock:
                 raise ValueError("experimental data blocks prohibit repository entries.")
             if any(value is not None for value in (self.segment_ids, self.segment_keys, self.discontinuity_ids)):
                 raise ValueError("experimental data blocks prohibit solver identity.")
-            source_row = _owned_source_rows(self.source_row, size=time.size)
+            source_row = self.source_row
             segment_ids = segment_keys = discontinuity_ids = None
             boundaries = ()
         else:
@@ -601,9 +444,9 @@ class ResultDataBlock:
                 raise ValueError("simulation data blocks prohibit observation source_row.")
             if self.segment_ids is None or self.segment_keys is None or self.discontinuity_ids is None:
                 raise ValueError("simulation data blocks require complete executor identity.")
-            segment_ids = _owned_identity_vector(self.segment_ids, field="data segment identity", size=time.size)
-            segment_keys = _segment_keys(self.segment_keys, size=time.size)
-            discontinuity_ids = _owned_identity_vector(self.discontinuity_ids, field="data discontinuity identity", size=time.size)
+            segment_ids = self.segment_ids
+            segment_keys = self.segment_keys
+            discontinuity_ids = self.discontinuity_ids
             source_row = None
             boundaries = tuple(self.presentation_boundaries)
             if boundaries is not result.presentation_boundaries:
@@ -623,21 +466,12 @@ class ResultDataBlock:
             })))
         if not isinstance(self.x_provenance, Mapping):
             raise TypeError("x_provenance must be a mapping.")
-        provenance_by_name = dict(provenance)
         for name, selection in series_axes:
             if self.kind is ResultLayerKind.EXPERIMENTAL:
                 if not isinstance(selection, ExperimentalAxisSelection):
                     raise TypeError("experimental data series require experimental axis identity.")
-                payload = provenance_by_name.get(name)
-                if payload is None or payload.get("dataset_id") != selection.dataset_id or payload.get("raw_observation_id") != selection.raw_observation_id:
-                    raise ValueError("experimental data identity must match raw-ID provenance.")
             elif not isinstance(selection, SimulationSeriesAxisSelection):
                 raise TypeError("simulation data series require simulation axis identity.")
-        if isinstance(x_axis, ExperimentalAxisSelection) and (
-            self.x_provenance.get("dataset_id") != x_axis.dataset_id
-            or self.x_provenance.get("raw_observation_id") != x_axis.raw_observation_id
-        ):
-            raise ValueError("experimental X identity must match raw-ID provenance.")
         colors = tuple(
             (_required_id(name, "color series name"), _required_id(color, "data series color"))
             for name, color in self.color_by_series
@@ -1071,8 +905,8 @@ def _observation_provenance(
     source: ExperimentalLayerInput,
 ) -> Mapping[str, object]:
     payload: dict[str, object] = {
-        "dataset_id": source.dataset_id,
-        "raw_observation_id": source.raw_observation_id,
+        "dataset_id": source.axis.dataset_id,
+        "raw_observation_id": source.axis.raw_observation_id,
         "dataset_name": source.dataset_name,
         "raw_column": source.raw_column,
     }
@@ -1086,32 +920,30 @@ def _observation_provenance(
 def _same_source_row_values(
     x_source: ExperimentalLayerInput,
     y_source: ExperimentalLayerInput,
-) -> tuple[np.ndarray, np.ndarray, tuple[int, ...]] | None:
-    """Pair experimental X/Y only by their immutable physical source row."""
+) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
+    """Pair experimental X/Y by the admitted physical source-row facts."""
 
-    if x_source.dataset_id != y_source.dataset_id:
+    if x_source.axis.dataset_id != y_source.axis.dataset_id:
         return None
-    x_by_row = {
-        int(row): float(value)
-        for row, value in zip(x_source.source_rows, x_source.y, strict=True)
-    }
+    x_by_row = dict(zip(x_source.source_rows, x_source.y, strict=True))
     x_values: list[float] = []
     y_values: list[float] = []
     paired_rows: list[int] = []
     for row, value in zip(y_source.source_rows, y_source.y, strict=True):
-        source_row = int(row)
-        if source_row not in x_by_row:
+        if row not in x_by_row:
             continue
-        x_values.append(x_by_row[source_row])
+        x_values.append(float(x_by_row[row]))
         y_values.append(float(value))
-        paired_rows.append(source_row)
+        paired_rows.append(int(row))
     if not x_values:
         return None
-    return (
-        np.asarray(x_values, dtype=float),
-        np.asarray(y_values, dtype=float),
-        tuple(paired_rows),
-    )
+    paired_x = np.asarray(x_values, dtype=float)
+    paired_y = np.asarray(y_values, dtype=float)
+    paired_source_rows = np.asarray(paired_rows, dtype=np.int64)
+    paired_x.setflags(write=False)
+    paired_y.setflags(write=False)
+    paired_source_rows.setflags(write=False)
+    return paired_x, paired_y, paired_source_rows
 
 
 def _annotations_from_execution(
@@ -1123,40 +955,20 @@ def _annotations_from_execution(
     )
 
 
-def _frame_topology(
-    frame: object,
-    *,
-    size: int,
+def _result_topology(
+    result: SimulationResultValue,
 ) -> tuple[np.ndarray, tuple[str, ...], np.ndarray]:
-    """Read executor-issued topology carried by the transient frame.
+    """Read executor-issued topology from the admitted canonical result."""
 
-    The protocol owner is required to populate all three fields for an admitted
-    preview result.  Silently treating a missing topology as one continuous
-    curve would reintroduce the old boundary-loss failure.
-    """
-
-    segment_ids = getattr(frame, "segment_ids", None)
-    segment_keys = getattr(frame, "segment_keys", None)
-    discontinuity_ids = getattr(frame, "discontinuity_ids", None)
-    if segment_ids is None:
-        raise ValueError(
-            "Interactive Preview frame is missing executor-issued topology."
-        )
-    if segment_keys is None or discontinuity_ids is None:
-        raise ValueError(
-            "Interactive Preview topology must include segment IDs, keys, "
-            "and discontinuity IDs."
-        )
-    segments = np.asarray(segment_ids, dtype=np.int64).reshape(-1)
-    discontinuities = np.asarray(discontinuity_ids, dtype=np.int64).reshape(-1)
-    keys = tuple(_required_id(value, "interactive frame segment key") for value in segment_keys)
-    if segments.size != size or discontinuities.size != size or len(keys) != size:
-        raise ValueError("Interactive Preview topology must align with frame values.")
-    return segments, keys, discontinuities
+    segments = _readonly_display_array(result.segment_ids).reshape(-1)
+    discontinuities = _readonly_display_array(result.discontinuity_ids).reshape(-1)
+    segments.setflags(write=False)
+    discontinuities.setflags(write=False)
+    return segments, tuple(result.segment_keys), discontinuities
 
 
-def _frame_connectors(
-    frame: object,
+def _result_connectors(
+    result: SimulationResultValue,
     *,
     selected_x: AxisSeriesSelection,
     series_names: set[str],
@@ -1168,15 +980,11 @@ def _frame_connectors(
         and selected_x.series_name == "t"
     ):
         return ()
-    if not hasattr(frame, "presentation_boundaries"):
-        raise ValueError(
-            "Interactive Preview frame is missing presentation boundaries."
-        )
-    boundaries = getattr(frame, "presentation_boundaries")
+    boundaries = result.presentation_boundaries
     entries: list[tuple[int, float, float, float, str]] = []
     for boundary_index, boundary in enumerate(tuple(boundaries or ())):
-        pre_by_name = dict(getattr(boundary, "pre_state", ()))
-        post_by_name = dict(getattr(boundary, "post_state", ()))
+        pre_by_name = dict(boundary.pre_state)
+        post_by_name = dict(boundary.post_state)
         for name, pre_value in pre_by_name.items():
             if name not in series_names:
                 continue
@@ -1198,38 +1006,35 @@ def _frame_connectors(
 
 
 def compose_interactive_display(
-    frame: object,
+    result: SimulationResultValue,
     *,
+    tab_id: str,
+    set_id: str,
+    generation: int,
+    target_set_ids: tuple[str, ...],
     render_input: ResultRenderInput,
 ) -> InteractiveDisplayProjection:
-    from kindred.gui.interactive_preview import InteractivePreviewFrame
-    if not isinstance(frame, InteractivePreviewFrame):
-        raise TypeError("frame must be an InteractivePreviewFrame.")
-    if not isinstance(render_input, ResultRenderInput):
-        raise TypeError("render_input must be a ResultRenderInput.")
-    if frame.tab_id != render_input.tab_id:
-        raise ValueError("interactive frame belongs to a different tab.")
-    frame_series = {series.series_id: series for series in frame.series}
+    result_series = result.series
     selected_x = render_input.selected_x_series
 
     def empty() -> InteractiveDisplayProjection:
         return InteractiveDisplayProjection(
-            tab_id=frame.tab_id, set_id=frame.set_id, generation=frame.generation,
+            tab_id=tab_id, set_id=set_id, generation=generation,
             x_label=render_input.x_label, y_label=render_input.y_label, curves=(),
-            target_set_ids=frame.target_set_ids,
+            target_set_ids=target_set_ids,
         )
 
     if isinstance(selected_x, ExperimentalAxisSelection):
         return empty()
     if selected_x.series_name == "t":
-        x_values = np.asarray(frame.x_values, dtype=float)
+        x_values = _readonly_display_array(result.t)
     else:
-        selected_series = frame_series.get(selected_x.series_name)
+        selected_series = result_series.get(selected_x.series_name)
         if selected_series is None:
             return empty()
-        x_values = np.asarray(selected_series.values, dtype=float)
+        x_values = _readonly_display_array(selected_series)
     wanted_y = (
-        tuple(name for name in frame_series if name != selected_x.series_name)
+        tuple(name for name in result_series if name != selected_x.series_name)
         if render_input.selected_y_uses_default_all
         else tuple(
             selection.series_name
@@ -1241,7 +1046,7 @@ def compose_interactive_display(
     base_block = next(
         (
             block for block in render_input.blocks
-            if block.block_id == frame.set_id
+            if block.block_id == set_id
             and (
                 (
                     block.kind
@@ -1255,19 +1060,19 @@ def compose_interactive_display(
     )
     if base_block is None:
         return empty()
-    topology = _frame_topology(frame, size=x_values.size)
-    connectors = _frame_connectors(
-        frame, selected_x=selected_x, series_names=set(frame_series)
+    topology = _result_topology(result)
+    connectors = _result_connectors(
+        result, selected_x=selected_x, series_names=set(result_series)
     )
     base_colors = dict(base_block.color_by_series)
     plotted_series = {name for name, _values in base_block.series}
     curves = tuple(
         InteractiveDisplayCurve(
-            key=("simulation", "foreground", frame.set_id, series_id),
-            label=f"{base_block.label}: {series.label}",
+            key=("simulation", "foreground", set_id, series_id),
+            label=f"{base_block.label}: {series_id}",
             x=x_values,
-            y=np.asarray(series.values, dtype=float),
-            color=series.color or base_colors.get(series_id) or "#3b82f6",
+            y=_readonly_display_array(series_values),
+            color=base_colors.get(series_id) or "#3b82f6",
             segment_ids=topology[0], segment_keys=topology[1],
             discontinuity_ids=topology[2],
             intervention_connectors=tuple(
@@ -1277,42 +1082,12 @@ def compose_interactive_display(
         )
         for series_id in wanted_y
         if series_id in plotted_series
-        and (series := frame_series.get(series_id)) is not None
+        and (series_values := result_series.get(series_id)) is not None
     )
     return InteractiveDisplayProjection(
-        tab_id=frame.tab_id, set_id=frame.set_id, generation=frame.generation,
+        tab_id=tab_id, set_id=set_id, generation=generation,
         x_label=render_input.x_label, y_label=render_input.y_label,
-        curves=curves, target_set_ids=frame.target_set_ids,
-    )
-
-def compose_interactive_display_batch(
-    frames: Sequence[object],
-    *,
-    render_input: ResultRenderInput,
-) -> InteractiveDisplayProjection:
-    captured = tuple(frames)
-    if not captured:
-        raise ValueError("interactive display batch requires at least one frame.")
-    composed = tuple(
-        compose_interactive_display(
-            frame, render_input=render_input
-        )
-        for frame in captured
-    )
-    first = composed[0]
-    if any(
-        item.target_set_ids != first.target_set_ids
-        or item.generation != first.generation
-        or item.tab_id != first.tab_id
-        for item in composed[1:]
-    ):
-        raise ValueError("interactive display batch frames must share generation and roster.")
-    return InteractiveDisplayProjection(
-        tab_id=composed[-1].tab_id, set_id=composed[-1].set_id,
-        generation=first.generation, x_label=composed[-1].x_label,
-        y_label=composed[-1].y_label,
-        curves=tuple(curve for item in composed for curve in item.curves),
-        target_set_ids=first.target_set_ids,
+        curves=curves, target_set_ids=target_set_ids,
     )
 
 def compose_result_input(
@@ -1359,27 +1134,19 @@ def compose_result_input(
     if not np.isfinite(point_opacity) or not 0 <= point_opacity <= 1:
         raise ValueError("experimental_point_opacity must be between zero and one.")
     active = tuple(active_overlay_layers)
-    if any(not isinstance(item, ExperimentalLayerInput) for item in active):
-        raise TypeError("active_overlay_layers must contain ExperimentalLayerInput values.")
-    experimental_by_axis = {
-        ExperimentalAxisSelection(item.dataset_id, item.raw_observation_id): item
-        for item in active
-    }
+    experimental_by_axis = {item.axis: item for item in active}
     if len(experimental_by_axis) != len(active):
-        raise ValueError("active overlay layers duplicate dataset/raw-observation identity.")
+        raise ValueError("active overlay layers duplicate experimental axis identity.")
     selected_model_y = {
         item.series_name for item in selected_y
         if isinstance(item, SimulationSeriesAxisSelection)
     }
     mapped_overlay_locks = tuple(
-        (
-            ExperimentalAxisSelection(item.dataset_id, item.raw_observation_id),
-            str(item.model_target),
-        )
+        (item.axis, str(item.model_target))
         for item in active
         if item.model_target is not None
         and (bool(selected_y_uses_default_all) or item.model_target in selected_model_y)
-        and ExperimentalAxisSelection(item.dataset_id, item.raw_observation_id) not in selected_y
+        and item.axis not in selected_y
     )
     effective_y = tuple(
         dict.fromkeys(
@@ -1396,14 +1163,15 @@ def compose_result_input(
     if isinstance(selected_x, SimulationSeriesAxisSelection):
         excluded_simulation_y.add(selected_x)
         excluded_experimental_y.update(
-            ExperimentalAxisSelection(item.dataset_id, item.raw_observation_id)
-            for item in active if item.model_target == selected_x.series_name
+            item.axis for item in active if item.model_target == selected_x.series_name
         )
     elif isinstance(selected_x, ExperimentalAxisSelection):
         selected_x_source = experimental_by_axis.get(selected_x)
         excluded_experimental_y.add(selected_x)
         if selected_x_source is not None and selected_x_source.model_target:
-            excluded_simulation_y.add(SimulationSeriesAxisSelection(selected_x_source.model_target))
+            excluded_simulation_y.add(
+                SimulationSeriesAxisSelection(selected_x_source.model_target)
+            )
     simulation_x = (
         SimulationSeriesAxisSelection(selected_x_source.model_target)
         if isinstance(selected_x, ExperimentalAxisSelection)
@@ -1523,17 +1291,20 @@ def compose_result_input(
                 )
 
     for experimental in active:
-        y_axis = ExperimentalAxisSelection(experimental.dataset_id, experimental.raw_observation_id)
+        y_axis = experimental.axis
         label = f"{experimental.dataset_name}: {experimental.raw_column}"
         if experimental.model_target:
             label = f"{label} → {experimental.model_target}"
         add_candidate(y_axis, label)
-        x_values = np.asarray(experimental.t, dtype=float)
-        y_values = np.asarray(experimental.y, dtype=float)
+        x_values = np.array(experimental.t, dtype=float, copy=True)
+        y_values = np.array(experimental.y, dtype=float, copy=True)
         x_name = "t"
         x_axis: AxisSeriesSelection = SimulationSeriesAxisSelection("t")
         x_provenance: Mapping[str, object] = MappingProxyType({})
-        source_rows = tuple(experimental.source_rows)
+        source_rows = np.array(experimental.source_rows, dtype=np.int64, copy=True)
+        x_values.setflags(write=False)
+        y_values.setflags(write=False)
+        source_rows.setflags(write=False)
         unavailable = False
         if not _is_time_selection(selected_x):
             x_source = (
@@ -1541,7 +1312,7 @@ def compose_result_input(
                     (
                         item for item in active
                         if isinstance(selected_x, SimulationSeriesAxisSelection)
-                        and item.dataset_id == experimental.dataset_id
+                        and item.axis.dataset_id == experimental.axis.dataset_id
                         and item.model_target == selected_x.series_name
                     ),
                     None,
@@ -1549,7 +1320,11 @@ def compose_result_input(
                 if isinstance(selected_x, SimulationSeriesAxisSelection)
                 else selected_x_source
             )
-            if x_source is None or x_source.dataset_id != experimental.dataset_id or y_axis in excluded_experimental_y:
+            if (
+                x_source is None
+                or x_source.axis.dataset_id != experimental.axis.dataset_id
+                or y_axis in excluded_experimental_y
+            ):
                 if y_axis in excluded_experimental_y:
                     continue
                 unavailable = True
@@ -1570,18 +1345,27 @@ def compose_result_input(
             continue
         blocks.append(
             ResultDataBlock(
-                block_id=experimental.layer_id, label=label,
-                kind=ResultLayerKind.EXPERIMENTAL, t=x_values,
+                block_id=experimental.axis,
+                label=label,
+                kind=ResultLayerKind.EXPERIMENTAL,
+                t=x_values,
                 series=((experimental.raw_column, y_values),),
                 series_axes=((experimental.raw_column, y_axis),),
-                x_axis=x_axis, result=None,
-                segment_ids=None, segment_keys=None, discontinuity_ids=None,
-                source_row=np.asarray(source_rows, dtype=np.int64),
+                x_axis=x_axis,
+                result=None,
+                segment_ids=None,
+                segment_keys=None,
+                discontinuity_ids=None,
+                source_row=source_rows,
                 x_name=x_name,
-                series_provenance=((experimental.raw_column, _observation_provenance(experimental)),),
+                series_provenance=(
+                    (experimental.raw_column, _observation_provenance(experimental)),
+                ),
                 x_provenance=x_provenance,
                 color_by_series=((experimental.raw_column, colors[y_axis]),),
-                opacity=point_opacity, markers=True, point_size=point_size,
+                opacity=point_opacity,
+                markers=True,
+                point_size=point_size,
             )
         )
 
@@ -1630,8 +1414,6 @@ def validate_copy(
 ) -> None:
     """Validate Copy against one call-local render input."""
 
-    if not isinstance(render_input, ResultRenderInput):
-        raise TypeError("render_input must be a ResultRenderInput.")
     if render_input.unavailable_x_diagnostic is not None:
         raise ValueError(render_input.unavailable_x_diagnostic)
     if not any(block.visible for block in render_input.blocks):
@@ -1641,12 +1423,21 @@ def iter_blocks_tsv_chunks(
     blocks: Sequence[ResultDataBlock],
     *,
     rows_per_chunk: int = 2048,
+    row_indices_by_block: Mapping[int, np.ndarray] | None = None,
 ) -> Iterator[str]:
     block_values = tuple(blocks)
     columns: list[tuple[str, Sequence[object], str]] = []
     for block in block_values:
-        if not isinstance(block, ResultDataBlock):
-            raise TypeError("Copy data must contain ResultDataBlock values.")
+        indices = (
+            None
+            if row_indices_by_block is None
+            else row_indices_by_block.get(id(block))
+        )
+        def select_rows(values: Sequence[object]) -> Sequence[object]:
+            if indices is None:
+                return values
+            return values[indices]
+
         columns.append(
             (
                 _export_column_header(
@@ -1654,7 +1445,7 @@ def iter_blocks_tsv_chunks(
                     block.x_name,
                     block.x_provenance,
                 ),
-                block.t,
+                select_rows(block.t),
                 "float",
             )
         )
@@ -1664,7 +1455,7 @@ def iter_blocks_tsv_chunks(
             columns.append(
                 (
                     encode_clipboard_text(f"{block.label} — source_row"),
-                    block.source_row,
+                    select_rows(block.source_row),
                     "int",
                 )
             )
@@ -1679,17 +1470,21 @@ def iter_blocks_tsv_chunks(
                 (
                     (
                         encode_clipboard_text(f"{block.label} — segment_id"),
-                        block.segment_ids,
+                        select_rows(block.segment_ids),
                         "int",
                     ),
                     (
                         encode_clipboard_text(f"{block.label} — segment_key"),
-                        block.segment_keys,
+                        (
+                            block.segment_keys
+                            if indices is None
+                            else tuple(block.segment_keys[int(index)] for index in indices)
+                        ),
                         "text",
                     ),
                     (
                         encode_clipboard_text(f"{block.label} — discontinuity_id"),
-                        block.discontinuity_ids,
+                        select_rows(block.discontinuity_ids),
                         "int",
                     ),
                 )
@@ -1702,7 +1497,7 @@ def iter_blocks_tsv_chunks(
                     name,
                     provenance_by_name.get(name, MappingProxyType({})),
                 ),
-                values,
+                select_rows(values),
                 "float",
             )
             for name, values in block.series

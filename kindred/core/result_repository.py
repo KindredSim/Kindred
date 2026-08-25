@@ -476,23 +476,6 @@ class SimulationResultValue:
     @property
     def completed_with_warnings(self) -> bool:
         return bool(self.preparation_warnings or self.failed_algebra_outputs or self.omitted_algebra_outputs or self.algebra_errors)
-
-    @property
-    def provenance_export(self) -> Mapping[str, Any]:
-        """Return readable provenance without introducing an identity object."""
-        return MappingProxyType({
-            "solver": self.solver_provenance,
-            "preparation_warnings": self.preparation_warnings,
-            "requested_algebra_outputs": self.requested_algebra_outputs,
-            "succeeded_algebra_outputs": self.succeeded_algebra_outputs,
-            "failed_algebra_outputs": self.failed_algebra_outputs,
-            "omitted_algebra_outputs": self.omitted_algebra_outputs,
-            "algebra_errors": tuple(
-                cause.to_payload() for cause in self.algebra_errors
-            ),
-        })
-
-
 class ResultRepository:
     """Store completed result values and a bounded exact-request Run cache."""
 

@@ -55,7 +55,6 @@ from .solver_types import (
     ODERhsWithTemp as _ODERhsWithTemp,
     Rhs2 as _Rhs2,
     SimulationCancellationControl as _SimulationCancellationControl,
-    SimulationExecutionOutcome as _SimulationExecutionOutcome,
     SimulationOutput as _SimulationOutput,
     SimulationScientificUnavailability as _SimulationScientificUnavailability,
     _SimulationScientificUnavailabilitySignal,
@@ -618,7 +617,9 @@ def _normal_event_provenance(
             continue
     return out
 
-def solve_ode(req: _SimulationRequest) -> _SimulationOutput | _SimulationExecutionOutcome:
+def solve_ode(
+    req: _SimulationRequest,
+) -> _SimulationOutput | _SimulationScientificUnavailability:
     if not isinstance(req, _SimulationRequest):
         raise TypeError(f"solve_ode expects SimulationRequest, got {type(req)!r}")
     if (
@@ -668,10 +669,7 @@ def solve_ode(req: _SimulationRequest) -> _SimulationOutput | _SimulationExecuti
         ):
             raise SimulationCancelled() from exc
         if req.candidate_evaluation:
-            return _SimulationExecutionOutcome(
-                status="scientific_unavailable",
-                unavailability=exc.outcome,
-            )
+            return exc.outcome
         raise create_solver_error(
             req.solver,
             t0,

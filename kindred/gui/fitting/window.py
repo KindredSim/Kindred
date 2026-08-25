@@ -11,6 +11,7 @@ from kindred.gui.fitting.contracts import (
     FitParametricSettings,
 )
 from kindred.core.simulation_failure import FactualCause
+from kindred.core.analysis.fit_evaluation_outcome import ScientificUnavailable
 from kindred.gui.fitting.data_tab import DataTab
 from kindred.gui.fitting.data_targets_tab import DataTargetsTab
 from kindred.gui.fitting.launch import (
@@ -286,12 +287,6 @@ class FittingWindow(QtWidgets.QDialog):
             self._set_copy_available
         )
         self._run_results_tab.copyHashRequested.connect(self.copyHashRequested)
-        self._run_results_tab.copyRunJsonRequested.connect(
-            self.copyRunJsonRequested
-        )
-        self._run_results_tab.resultsSummaryRequested.connect(
-            self.resultsSummaryRequested
-        )
         self._run_results_tab.sharedRefitRequested.connect(
             self.sharedRefitRequested
         )
@@ -923,11 +918,6 @@ class FittingWindow(QtWidgets.QDialog):
         self._refresh_setup_validity()
         self._refresh_apply_button()
 
-    def set_detailed_balance_correction_pending(self) -> None:
-        self.set_executing(True)
-        self._pause_button.setEnabled(False)
-        self._cancel_button.setEnabled(True)
-
     def set_progress(self, value: int, text: str) -> None:
         self._progress.setValue(max(0, min(100, int(value))))
         self.set_status(text)
@@ -948,15 +938,6 @@ class FittingWindow(QtWidgets.QDialog):
             rendered = rendered.replace(mapped.dataset_id, mapped.display_name)
             rendered = rendered.replace(mapped.set_id, mapped.set_name)
         return rendered
-
-    def show_origin_conflict(self, requested_tab_name: str) -> None:
-        self.set_status(
-            f"This modal Fit belongs to {self._origin.tab_name}; "
-            f"close it before fitting {requested_tab_name}."
-        )
-        self.show()
-        self.raise_()
-        self.activateWindow()
 
     def set_live_best(self, update: FitLiveUpdate) -> None:
         if not isinstance(update, FitLiveUpdate):
@@ -1070,22 +1051,18 @@ class FittingWindow(QtWidgets.QDialog):
     def set_terminal_failure(self, failure: FactualCause) -> None:
         """Present a worker failure while retaining its factual cause chain."""
 
-        if not isinstance(failure, FactualCause):
-            raise TypeError("Terminal Fit failure must be FactualCause.")
         self._run_results_tab.set_terminal_failure(failure)
         self.set_status(f"Fit failed: {failure.message}")
         self._tabs.setCurrentIndex(2)
 
     def set_terminal_unavailable(
         self,
-        cause: FactualCause,
+        cause: ScientificUnavailable,
         *,
         older_retained_last_fit: bool = False,
     ) -> None:
         """Present scientific unavailability without classifying it as failure."""
 
-        if not isinstance(cause, FactualCause):
-            raise TypeError("Scientific-unavailability cause must be FactualCause.")
         if not older_retained_last_fit:
             # A scientifically unavailable attempt has no terminal candidate
             # of its own.  Clear any direct-call stale presentation before
@@ -1099,7 +1076,11 @@ class FittingWindow(QtWidgets.QDialog):
             cause,
             older_retained_last_fit=older_retained_last_fit,
         )
-        self.set_status(f"Fit result scientifically unavailable: {cause.message}")
+        factual = cause.factual_cause
+        self.set_status(
+            "Fit result scientifically unavailable: "
+            + (factual.message if factual is not None else cause.stage)
+        )
         self._tabs.setCurrentIndex(2)
 
     def set_apply_display(

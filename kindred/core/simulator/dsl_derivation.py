@@ -9,6 +9,7 @@ for Fit or another explicitly admitted consumer.
 from __future__ import annotations
 
 import re
+from collections.abc import Mapping
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -21,6 +22,7 @@ __all__ = [
     "origin_line_positions",
     "rewrite_coordinate_source_line",
     "rewrite_scalar_source_line",
+    "insert_scalar_source_declarations",
     "scalar_origin",
 ]
 
@@ -43,6 +45,7 @@ _SOURCE_COORDINATE_ALIASES = {
     "δg°": "dg_eq",
     "a": "a",
 }
+_DSL_IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
 def _canonical_source_coordinate_name(name: str) -> str:
@@ -159,6 +162,48 @@ def rewrite_scalar_source_line(
         + trailing
         + (f"{marker}{comment}" if marker else "")
     )
+
+
+def insert_scalar_source_declarations(
+    source_text: str,
+    corrections: "Mapping[str, str]",
+) -> str:
+    """Insert visible scalar declarations while preserving all authored bytes."""
+
+    if type(source_text) is not str:
+        raise TypeError("source_text must be an exact str.")
+    if not isinstance(corrections, Mapping):
+        raise TypeError("Visible scalar corrections must be a mapping.")
+    if not corrections:
+        return source_text
+    # Pick the first authored line ending for the inserted block.  Existing
+    # source bytes are never normalized; this only supplies bytes belonging to
+    # the deliberate insertion itself.
+    newline_match = re.search(r"\r\n|\r|\n", source_text)
+    ending = newline_match.group(0) if newline_match is not None else "\n"
+    if any(
+        type(name) is not str
+        or name != name.strip()
+        or _DSL_IDENTIFIER_RE.fullmatch(name) is None
+        or "\r" in str(name)
+        or "\n" in str(name)
+        or type(expression) is not str
+        or not str(expression).strip()
+        or "\r" in str(expression)
+        or "\n" in str(expression)
+        for name, expression in corrections.items()
+    ):
+        raise ValueError("Visible scalar corrections must be single-line exact text.")
+    had_final_ending = source_text.endswith(("\n", "\r"))
+    if not source_text:
+        prefix = ""
+    else:
+        prefix = source_text if had_final_ending else source_text + ending
+    declarations = ending.join(
+        f"param {name} = {expression}"
+        for name, expression in corrections.items()
+    )
+    return prefix + declarations + (ending if had_final_ending else "")
 
 
 def origin_line_positions(

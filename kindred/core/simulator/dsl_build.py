@@ -18,7 +18,10 @@ from ..mechanism import Mechanism
 from ..mechanism_metadata import MechanismMetadataKeys, MechanismMetadataView, EquilibriumMetadataView
 from .dsl_format import format_stoichiometry_side as _fmt_side
 from .dsl_build_input import DslMechanismBuildInput
-from .parameter_namespace import _namespace_policy_from_step
+from .parameter_namespace import (
+    _namespace_policy_from_step,
+    canonical_source_coordinate_name,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -187,13 +190,42 @@ def build_mechanism_from_ir(
             "kind": namespace_policy.step_kind,
             "context": context,
         }
+        # Retain the source-backed identity of each physical coordinate at
+        # admission.  The typed builder values tell us which coordinates were
+        # genuinely authored; a derived nominal value must never be promoted
+        # into a writable, unindexed global.  Names are local to the authored
+        # step (A1/Ea1, dG_act1, dG_eq1, ...), so repeated reactions remain
+        # distinct throughout downstream projections.
+        source_coordinates: dict[str, str] = {}
+        if model == "Arrhenius":
+            if step.arrhenius_A is not None:
+                source_coordinates["A"] = canonical_source_coordinate_name(
+                    authored_step_no,
+                    "A",
+                )
+            if step.arrhenius_Ea_J_per_mol is not None:
+                source_coordinates["Ea"] = canonical_source_coordinate_name(
+                    authored_step_no,
+                    "Ea",
+                )
+        elif model == "Eyring" and step.eyring_dG_act_J_per_mol is not None:
+            source_coordinates["dG_act"] = canonical_source_coordinate_name(
+                authored_step_no,
+                "dG_act",
+            )
         if is_equilibrium_step:
             entry["equilibrium_index"] = int(eq_index)
             entry.update(authority.step_map_fields())
             entry["user_provided_kf"] = step.user_kf_explicit
             entry["user_provided_kr"] = step.user_kr_explicit
+            if step.dG_eq_J_per_mol is not None:
+                source_coordinates["dG_eq"] = canonical_source_coordinate_name(
+                    authored_step_no,
+                    "dG_eq",
+                )
         else:
             entry["reaction_index"] = int(rxn_index)
+        entry["source_coordinates"] = source_coordinates
         step_index_map.append(entry)
 
     mechanism.metadata["step_index_map"] = step_index_map

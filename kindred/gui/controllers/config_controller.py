@@ -1,16 +1,14 @@
-"""Application configuration, defaults, layout, and recent-project ownership."""
+"""Application configuration, defaults, and recent-project persistence."""
 
 from __future__ import annotations
 
 import logging
 import math
 import os
-from collections.abc import Callable, Iterable, Mapping, Sequence
-from dataclasses import dataclass
+from collections.abc import Iterable, Mapping, Sequence
 from types import MappingProxyType
 
-from PySide6 import QtCore, QtGui, QtWidgets
-from shiboken6 import isValid
+from PySide6 import QtCore, QtGui
 
 from kindred.core.runtime_defaults import MAX_PARALLEL_WORKERS_CEILING
 from kindred.core.project_document import (
@@ -32,7 +30,6 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "ConfigController",
-    "ConfigControllerPort",
 ]
 
 _RECENT_PROJECTS_KEY = "recent_files"
@@ -50,7 +47,6 @@ _SCIENTIFIC_SETTINGS_KEYS = {
     "rtol": "simulation/rtol",
     "atol": "simulation/atol",
     "analytic_jacobian_policy": "simulation/use_analytic_jacobian",
-    "wegscheider_policy": "simulation/wegscheider_cyclicity_enabled",
 }
 _FIT_SETTINGS_KEYS = {
     "method": "fitting/method",
@@ -87,48 +83,27 @@ _BASE_SPECIES_RGB: tuple[tuple[int, int, int], ...] = (
 )
 
 
-@dataclass(frozen=True, slots=True)
-class ConfigControllerPort:
-    """Physical UI callbacks used by the configuration owner."""
-
-    parent: QtCore.QObject
-    settings: Callable[[], object]
-    is_maximized: Callable[[], bool]
-    restore_maximized_state: Callable[[], None]
-    restore_geometry: Callable[[object], object]
-    save_geometry: Callable[[], object]
-    restore_window_state: Callable[[object], object]
-    save_window_state: Callable[[], object]
-    schedule_restored_floating_dock_recovery: Callable[[], None]
-    dark_mode_action: Callable[[], object | None]
-    apply_theme: Callable[[bool, Callable[[bool], None] | None], bool]
-    actual_dark_mode: Callable[[], bool]
-    set_status_text: Callable[[str], None]
-    recent_menu: Callable[[], object | None]
-    load_recent_project: Callable[[str], None]
-
-
 class ConfigController(QtCore.QObject):
-    """The sole QSettings-backed owner of application configuration."""
+    """The sole QSettings-backed owner of admitted application settings."""
 
     applicationPlotPreferencesChanged = QtCore.Signal()
+    recentProjectsChanged = QtCore.Signal()
     resultCacheCapacityChanged = QtCore.Signal(int)
     mechanismParameterDebounceChanged = QtCore.Signal(int)
     equilibriumKDebounceChanged = QtCore.Signal(int)
 
-    def __init__(self, ui: ConfigControllerPort):
-        super().__init__(ui.parent)
-        self._ui = ui
+    def __init__(self, settings: QtCore.QSettings):
+        super().__init__()
+        if not isinstance(settings, QtCore.QSettings):
+            raise TypeError(
+                "settings must be QSettings, "
+                f"got {type(settings).__name__}."
+            )
+        self._settings_store = settings
         self._species_palette = self._build_species_palette()
 
     def _settings(self) -> QtCore.QSettings:
-        settings = self._ui.settings()
-        if not isinstance(settings, QtCore.QSettings):
-            raise TypeError(
-                "ConfigControllerPort.settings() must return QSettings, "
-                f"got {type(settings).__name__}."
-            )
-        return settings
+        return self._settings_store
 
     @staticmethod
     def _parsed_int(value: object) -> int | None:
@@ -374,14 +349,6 @@ class ConfigController(QtCore.QObject):
                         bool,
                     )
                 ),
-                wegscheider_policy=bool(
-                    self._setting(
-                        settings,
-                        _SCIENTIFIC_SETTINGS_KEYS["wegscheider_policy"],
-                        factory.wegscheider_policy,
-                        bool,
-                    )
-                ),
             )
             return validate_tab_scientific_settings(
                 candidate,
@@ -493,71 +460,10 @@ class ConfigController(QtCore.QObject):
         )
         return accepted
 
-    def load_settings(self) -> None:
-        """Apply fixed layout and theme preferences."""
-        settings = self._settings()
-        restore_maximized = bool(
-            self._setting(settings, "window/is_maximized", False, bool)
-        )
-        self._restore_state(
-            settings,
-            "window/geometry",
-            self._ui.restore_geometry,
-            "window geometry",
-        )
-        if self._restore_state(
-            settings,
-            "window/dock_state",
-            self._ui.restore_window_state,
-            "window dock state",
-        ):
-            self._ui.schedule_restored_floating_dock_recovery()
-        if restore_maximized:
-            self._ui.restore_maximized_state()
-
-        requested_dark = bool(self._setting(settings, _THEME_KEY, True, bool))
-        self._ui.apply_theme(requested_dark, None)
-        action = self._ui.dark_mode_action()
-        if action is not None:
-            action.setChecked(self._actual_dark_mode())
-
-    def save_settings(self) -> bool:
-        """Save physical layout preferences without copying project state."""
-        try:
-            settings = self._settings()
-            settings.setValue("window/is_maximized", self._ui.is_maximized())
-            settings.setValue("window/geometry", self._ui.save_geometry())
-            settings.setValue("window/dock_state", self._ui.save_window_state())
-            if not self._sync_or_report(settings, "layout preferences"):
-                return False
-        except Exception as exc:
-            logger.warning("Could not save layout preferences: %s", exc)
-            return False
-        return True
-
     def persist_theme(self, dark_mode: bool) -> None:
         settings = self._settings()
         settings.setValue(_THEME_KEY, bool(dark_mode))
         self._sync_or_report(settings, "theme")
-
-    def toggle_theme(self) -> bool:
-        action = self._ui.dark_mode_action()
-        if action is None:
-            return False
-        requested = bool(action.isChecked())
-        try:
-            applied = self._ui.apply_theme(requested, self.persist_theme)
-        finally:
-            action.setChecked(self._actual_dark_mode())
-        return applied
-
-    def _actual_dark_mode(self) -> bool:
-        actual = self._ui.actual_dark_mode()
-        if type(actual) is not bool:
-            raise TypeError(
-                "ConfigControllerPort.actual_dark_mode() must return bool."
-            )
-        return actual
 
     def _sync_or_report(
         self,
@@ -565,49 +471,19 @@ class ConfigController(QtCore.QObject):
         label: str,
         *,
         success_message: str | None = None,
-    ) -> bool:
+    ) -> None:
         try:
             settings.sync()
-            if settings.status() != QtCore.QSettings.Status.NoError:
-                raise RuntimeError(f"Could not persist {label}.")
         except Exception as exc:
             logger.warning("Could not persist %s: %s", label, exc)
-            self._ui.set_status_text(
-                f"Could not save {label}; the new value remains active "
-                "for this session."
-            )
-            return False
+            raise
+        status = settings.status()
+        if status != QtCore.QSettings.Status.NoError:
+            error = RuntimeError(f"Could not persist {label}: {status}.")
+            logger.warning("Could not persist %s: %s", label, error)
+            raise error
         if success_message is not None:
-            self._ui.set_status_text(success_message)
-        return True
-
-    @staticmethod
-    def _discard_invalid_state(settings: QtCore.QSettings, key: str) -> None:
-        try:
-            settings.remove(key)
-            settings.sync()
-        except (RuntimeError, TypeError):
-            logger.exception("Could not discard invalid GUI state %s.", key)
-
-    def _restore_state(
-        self,
-        settings: QtCore.QSettings,
-        key: str,
-        restore: Callable[[object], object],
-        label: str,
-    ) -> bool:
-        try:
-            state = settings.value(key)
-            if not state:
-                return False
-            result = restore(state)
-            if result is False:
-                raise ValueError("restore rejected stored state")
-            return True
-        except (EOFError, RuntimeError, TypeError, ValueError) as exc:
-            logger.warning("Ignoring invalid persisted %s: %s", label, exc)
-            self._discard_invalid_state(settings, key)
-            return False
+            logger.info(success_message)
 
     def recent_projects(self) -> tuple[str, ...]:
         raw = self._settings().value(_RECENT_PROJECTS_KEY, [])
@@ -645,67 +521,11 @@ class ConfigController(QtCore.QObject):
         self._persist_recent_projects(result)
         return result
 
-    def remove_recent_project(self, filepath: str) -> tuple[str, ...]:
-        raw_path = str(filepath).strip()
-        if not raw_path:
-            return self.recent_projects()
-        identity = os.path.normcase(os.path.abspath(os.path.expanduser(raw_path)))
-        result = tuple(
-            item
-            for item in self.recent_projects()
-            if os.path.normcase(os.path.abspath(item)) != identity
-        )
-        self._persist_recent_projects(result)
-        return result
-
     def _persist_recent_projects(self, projects: Sequence[str]) -> None:
         settings = self._settings()
         settings.setValue(_RECENT_PROJECTS_KEY, list(projects))
         self._sync_or_report(settings, "recent projects")
-        self.update_recent_files_menu()
-
-    def populate_recent_menu(self, menu: QtWidgets.QMenu) -> None:
-        if not isinstance(menu, QtWidgets.QMenu) or not isValid(menu):
-            raise TypeError("menu must be a live QMenu.")
-        menu.clear()
-        projects = self.recent_projects()
-        if not projects:
-            empty = menu.addAction("No recent projects")
-            empty.setEnabled(False)
-            empty.setToolTip(
-                "No projects have been opened recently. "
-                "Load a project to populate this list."
-            )
-            return
-
-        for path in projects:
-            action = menu.addAction(os.path.basename(path) or path)
-            action.setData(path)
-            action.setToolTip(path)
-            action.triggered.connect(
-                lambda _checked=False, current=action: self._open_recent_action(current)
-            )
-        menu.addSeparator()
-        clear_action = menu.addAction("Clear Recent Projects")
-        clear_action.triggered.connect(self.clear_recent_files)
-
-    def _open_recent_action(self, action: QtGui.QAction) -> None:
-        path = action.data()
-        if not isinstance(path, str) or not path.strip():
-            self._ui.set_status_text("Recent project entry has no valid path.")
-            return
-        self._ui.load_recent_project(path)
-
-    def get_recent_menu(self) -> QtWidgets.QMenu | None:
-        existing = self._ui.recent_menu()
-        if isinstance(existing, QtWidgets.QMenu) and isValid(existing):
-            return existing
-        return None
-
-    def update_recent_files_menu(self) -> None:
-        menu = self.get_recent_menu()
-        if menu is not None:
-            self.populate_recent_menu(menu)
+        self.recentProjectsChanged.emit()
 
     def clear_recent_files(self) -> None:
         self._persist_recent_projects(())

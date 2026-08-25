@@ -10,6 +10,20 @@ from kindred.core.equilibrium_rate_authority import (
 from kindred.core.validation import try_parse_int
 
 _PROTECTED_INDEXED_IDENTIFIER_RE = re.compile(r"^(?:k|kf|kr|keq)([1-9]\d*)$")
+_SOURCE_COORDINATE_ROLES = frozenset({"A", "Ea", "dG_act", "dG_eq"})
+
+
+def canonical_source_coordinate_name(step_index: int, role: str) -> str:
+    """Return the one reaction-local name for an authored physical role."""
+
+    try:
+        index = int(step_index)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Source coordinate step index must be an integer.") from exc
+    normalized_role = str(role)
+    if index <= 0 or normalized_role not in _SOURCE_COORDINATE_ROLES:
+        raise ValueError("Source coordinate identity is not an admitted local role.")
+    return f"{normalized_role}{index}"
 
 
 @dataclass(frozen=True)
@@ -22,13 +36,20 @@ class MechanismParameterInfo:
 
 
 @dataclass(frozen=True)
+class MechanismSourceCoordinateInfo:
+    """One authored physical coordinate with reaction-local identity."""
+
+    canonical_name: str
+    step_index: int
+    step_kind: str
+    role: str
+    source_index: int | None = None
+
+
+@dataclass(frozen=True)
 class MechanismParameterResolution:
     raw_name: str
     canonical_name: str | None = None
-
-    @property
-    def is_resolved(self) -> bool:
-        return self.canonical_name is not None
 
 
 @dataclass(frozen=True)
@@ -50,11 +71,17 @@ class MechanismParameterNamespace:
     canonical_names: frozenset[str]
     info_by_name: Mapping[str, MechanismParameterInfo]
     ordered_items: tuple[MechanismParameterNamespaceItem, ...]
+    source_coordinates: tuple[MechanismSourceCoordinateInfo, ...] = ()
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "canonical_names", frozenset(self.canonical_names))
         object.__setattr__(self, "info_by_name", dict(self.info_by_name))
         object.__setattr__(self, "ordered_items", tuple(self.ordered_items))
+        object.__setattr__(self, "source_coordinates", tuple(self.source_coordinates))
+
+    @property
+    def source_coordinate_names(self) -> frozenset[str]:
+        return frozenset(item.canonical_name for item in self.source_coordinates)
 
     def flat_names(self) -> set[str]:
         return set(self.canonical_names)
@@ -125,6 +152,7 @@ class _NamespaceStepDescriptor:
     step_kind: str
     has_explicit_keq: bool
     source_index: int | None = None
+    source_coordinates: tuple[tuple[str, str], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -221,10 +249,25 @@ def _build_namespace(descriptors: Sequence[_NamespaceStepDescriptor]) -> Mechani
         ordered_names.append(item.canonical_name)
     canonical_names = frozenset(ordered_names)
     info_by_name = {item.canonical_name: item.info for item in ordered_items}
+    source_coordinates = tuple(
+        MechanismSourceCoordinateInfo(
+            canonical_name=str(canonical_name),
+            step_index=int(descriptor.step_index),
+            step_kind=str(descriptor.step_kind),
+            role=str(role),
+            source_index=descriptor.source_index,
+        )
+        for descriptor in descriptors
+        for role, canonical_name in descriptor.source_coordinates
+    )
+    source_names = [item.canonical_name for item in source_coordinates]
+    if len(source_names) != len(set(source_names)):
+        raise ValueError("Duplicate reaction-local source coordinate identity.")
     return MechanismParameterNamespace(
         canonical_names=canonical_names,
         info_by_name=info_by_name,
         ordered_items=ordered_items,
+        source_coordinates=source_coordinates,
     )
 
 
@@ -277,12 +320,32 @@ def _mechanism_step_descriptors(mechanism: object) -> list[_NamespaceStepDescrip
                     f"Mechanism equilibrium step_index_map entry {source_index} is missing equilibrium_authority."
             )
             has_explicit_keq = bool(authority.get("has_explicit_keq_param"))
+        raw_source_coordinates = raw_entry.get("source_coordinates") or {}
+        if not isinstance(raw_source_coordinates, Mapping):
+            raise ValueError(
+                f"Mechanism step_index_map entry {source_index} has invalid source coordinates."
+            )
+        source_coordinates: list[tuple[str, str]] = []
+        for raw_role, raw_name in raw_source_coordinates.items():
+            role = str(raw_role)
+            name = str(raw_name)
+            if role not in {"A", "Ea", "dG_act", "dG_eq"}:
+                raise ValueError(
+                    f"Mechanism step_index_map entry {source_index} has an invalid source coordinate role {role!r}."
+                )
+            expected_name = canonical_source_coordinate_name(step_index, role)
+            if name != expected_name:
+                raise ValueError(
+                    f"Mechanism step_index_map entry {source_index} has a non-local source identity {name!r}; expected {expected_name!r}."
+                )
+            source_coordinates.append((role, name))
         descriptors.append(
             _NamespaceStepDescriptor(
                 step_index=step_index,
                 step_kind=step_kind,
                 has_explicit_keq=has_explicit_keq,
                 source_index=source_index,
+                source_coordinates=tuple(source_coordinates),
             )
         )
     return descriptors

@@ -96,6 +96,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         self._result_unavailable_x: str | None = None
         self._result_warning_details = ()
         self._rendered_blocks: tuple[ResultDataBlock, ...] = ()
+        self._rendered_row_indices: dict[int, np.ndarray] = {}
         # A panel is created and destroyed with exactly one mechanism tab by
         # MechanismWorkspaceView.  These presentation/session values are
         # therefore panel-local; retaining tab-keyed maps here only creates a
@@ -231,8 +232,6 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
     def apply_result_input(self, render_input: ResultRenderInput) -> None:
         """Apply one call-local result input and retain only direct facts."""
 
-        if not isinstance(render_input, ResultRenderInput):
-            raise TypeError("render_input must be a ResultRenderInput.")
         self._retire_replaced_interactive_targets(render_input.blocks)
         self._result_blocks = render_input.blocks
         self._result_tab_id = render_input.tab_id
@@ -264,7 +263,10 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
             self._clear_rejected_result_scene()
             self.renderFailed.emit(str(exc))
             raise
-        self._rendered_blocks = rendered
+        self._rendered_blocks = tuple(block for block, _indices in rendered)
+        self._rendered_row_indices = {
+            id(block): indices for block, indices in rendered
+        }
         self._interactive_display.commit_result_input(render_input)
         if (
             self._interactive_display.has_visible_frame
@@ -338,30 +340,33 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
             tuple(dict.fromkeys((*retired, *reference_only)))
         )
 
-    def apply_interactive_preview_frame(self, frame: object) -> None:
-        """Route one frame into the controller-owned physical protocol."""
+    def apply_interactive_preview_result(
+        self,
+        tab_id: str,
+        set_id: str,
+        generation: int,
+        request: object,
+        result: object,
+    ) -> None:
+        """Route one canonical computation result into physical rendering."""
 
         render_input = self._current_render_input()
         if render_input is None:
             return
-        from kindred.gui.interactive_preview import InteractivePreviewFrame
-
-        if not isinstance(frame, InteractivePreviewFrame):
-            raise TypeError("interactive frame must be an InteractivePreviewFrame.")
-        needs_range = not self._interactive_display.has_current_batch
-        self._interactive_display.offer_frame(
-            frame,
+        self._interactive_display.offer_result(
+            result,
+            set_id=str(set_id),
+            generation=int(generation),
+            target_set_ids=tuple(request.target_set_ids),
             render_input=render_input,
         )
-        if needs_range and self._interactive_display.has_renderable_frame:
-            self._begin_interactive_range_session()
 
     def stop_interactive_display(self) -> bool:
         """Cancel visual work and freeze the last physically stable display."""
 
         if (
             not self._interactive_display.has_visible_frame
-            and not self._interactive_display.has_current_batch
+            and not self._interactive_display.has_pending_batch
         ):
             return False
         self._interactive_display.stop()
@@ -374,11 +379,14 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
     def retire_interactive_preview_targets(
         self,
         target_set_ids: tuple[str, ...],
+        *,
+        generation: int | None = None,
     ) -> bool:
-        """Retire selected transient targets while preserving other curves."""
+        """Retire selected transient targets at an admitted generation."""
 
         return self._interactive_display.retire_targets(
-            tuple(str(value) for value in target_set_ids)
+            tuple(str(value) for value in target_set_ids),
+            generation=generation,
         )
 
     def apply_application_plot_preferences(
@@ -445,7 +453,10 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
             physical_view = self._capture_interactive_physical_view()
             rendered = self._render_result_scene(updated_input)
             self._restore_interactive_physical_view(physical_view)
-            self._rendered_blocks = rendered
+            self._rendered_blocks = tuple(block for block, _indices in rendered)
+            self._rendered_row_indices = {
+                id(block): indices for block, indices in rendered
+            }
             self._interactive_display.refresh_result_input(updated_input)
             if self._interactive_display.has_visible_frame:
                 self._mask_interactive_foreground_items(
@@ -546,6 +557,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         self._result_annotations = ()
         self._result_warning_details = ()
         self._rendered_blocks = ()
+        self._rendered_row_indices = {}
 
     def _request_interactive_tick(self, delay_seconds: float) -> None:
         milliseconds = max(0, int(np.ceil(float(delay_seconds) * 1000.0)))
@@ -553,7 +565,13 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
 
     @QtCore.Slot()
     def _advance_interactive_display(self) -> None:
+        had_rendered_frame = self._interactive_display.has_renderable_frame
         self._interactive_display.tick()
+        if (
+            not had_rendered_frame
+            and self._interactive_display.has_renderable_frame
+        ):
+            self._begin_interactive_range_session()
 
     def _begin_interactive_range_session(self) -> None:
         view_box = self._plot_widget.getPlotItem().getViewBox()
@@ -581,15 +599,13 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
     def _render_interactive_display(
         self,
         state: InteractiveDisplayState,
-    ) -> None:
+    ) -> bool:
         # Prevalidate the complete desired roster before touching masks, plot
         # items, or the view.  This keeps malformed second items from turning
         # into a partial physical commit.
         desired_keys: set[tuple[object, ...]] = set()
         for layer_index, layer in enumerate(state.layers):
             projection = layer.projection
-            if not projection.tab_id:
-                raise ValueError("Interactive display projection tab is invalid.")
             layer_opacity = float(layer.opacity)
             if not np.isfinite(layer_opacity) or not 0.0 <= layer_opacity <= 1.0:
                 raise ValueError("Interactive display layer opacity is invalid.")
@@ -603,6 +619,9 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
                 curve_opacity = float(curve.opacity)
                 if not np.isfinite(curve_opacity) or not 0.0 <= curve_opacity <= 1.0:
                     raise ValueError("Interactive curve opacity is invalid.")
+                point_size = float(curve.point_size)
+                if not np.isfinite(point_size) or point_size <= 0.0:
+                    raise ValueError("Interactive curve point size is invalid.")
                 x_values = np.asarray(curve.x)
                 y_values = np.asarray(curve.y)
                 if x_values.ndim != 1 or y_values.ndim != 1:
@@ -640,6 +659,11 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
                     if item_key in desired_keys:
                         raise ValueError("Interactive display item roster contains duplicates.")
                     desired_keys.add(item_key)
+
+        # An empty projection is not a render publication.  Leave the current
+        # physical frame and its range custody intact until a real item exists.
+        if state.layers and not desired_keys:
+            return False
 
         existing = dict(self._interactive_items)
         old_masked = dict(self._interactive_masked_items)
@@ -800,6 +824,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
             self._restore_interactive_physical_view(old_view)
             self._interactive_items = existing
             raise
+        return bool(rendered)
 
     @staticmethod
     def _snapshot_interactive_plot_item(item: object) -> dict[str, object]:
@@ -931,15 +956,15 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
     ) -> tuple[tuple[int, int], ...]:
         """Split a transient curve at every executor-issued topology change."""
 
-        x = getattr(curve, "x")
+        x = curve.x
         count = int(x.size)
         if count == 0:
             return ()
-        segment_ids = getattr(curve, "segment_ids", None)
-        segment_keys = getattr(curve, "segment_keys", None)
-        discontinuities = getattr(curve, "discontinuity_ids", None)
+        segment_ids = curve.segment_ids
+        segment_keys = curve.segment_keys
+        discontinuities = curve.discontinuity_ids
         if segment_ids is None or segment_keys is None or discontinuities is None:
-            return ((0, count),)
+            raise ValueError("Interactive curve is missing executor topology.")
         starts = [0]
         starts.extend(
             index
@@ -1028,20 +1053,20 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
     def _render_result_scene(
         self,
         render_input: ResultRenderInput,
-    ) -> tuple[ResultDataBlock, ...]:
+    ) -> tuple[tuple[ResultDataBlock, np.ndarray], ...]:
         self._restore_interactive_foreground_items()
         existing_items = dict(self._plot_items_by_key)
         self._clear_annotation_items()
         self._plot_widget.setLabel("bottom", render_input.x_label)
         self._plot_widget.setLabel("left", render_input.y_label)
-        rendered_blocks: list[ResultDataBlock] = []
+        rendered_blocks: list[tuple[ResultDataBlock, np.ndarray]] = []
         rendered_items: dict[tuple[object, ...], object] = {}
         foreground_items: dict[str, list[object]] = {}
         reference_items: list[object] = []
         for block in render_input.blocks:
             if not block.visible:
                 continue
-            rendered = self._render_layer(
+            indices = self._render_layer(
                 block,
                 sampling_limit=self._sampling_limit,
                 existing_items=existing_items,
@@ -1049,8 +1074,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
                 foreground_items=foreground_items,
                 reference_items=reference_items,
             )
-            if rendered is not None:
-                rendered_blocks.append(rendered)
+            rendered_blocks.append((block, indices))
         for item_key, item in existing_items.items():
             if item_key not in rendered_items:
                 self._remove_plot_item(item)
@@ -1132,21 +1156,9 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         rendered_items: dict[tuple[object, ...], object] | None = None,
         foreground_items: dict[str, list[object]] | None = None,
         reference_items: list[object] | None = None,
-    ) -> ResultDataBlock | None:
+    ) -> np.ndarray:
         sample, chunks = self._sample_and_chunks(block, sampling_limit)
         x = block.t[sample]
-        if block.kind is ResultLayerKind.EXPERIMENTAL:
-            if block.source_row is None:
-                raise ValueError("experimental plot block lacks source_row.")
-            segment_ids = segment_keys = discontinuity_ids = None
-            source_row = block.source_row[sample]
-        else:
-            if block.segment_ids is None or block.segment_keys is None or block.discontinuity_ids is None:
-                raise ValueError("simulation plot block lacks executor identity.")
-            segment_ids = block.segment_ids[sample]
-            segment_keys = tuple(block.segment_keys[int(index)] for index in sample)
-            discontinuity_ids = block.discontinuity_ids[sample]
-            source_row = None
         colors = dict(block.color_by_series)
         item_store = rendered_items if rendered_items is not None else {}
         existing_store = existing_items if existing_items is not None else {}
@@ -1208,20 +1220,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
                 foreground_store.setdefault(foreground_set_id, []).append(item)
             if block.kind is ResultLayerKind.REFERENCE:
                 reference_store.append(item)
-        if not block.series:
-            return None
-        return ResultDataBlock(
-            block_id=block.block_id, label=block.label, kind=block.kind,
-            t=x, series=tuple((name, values[sample]) for name, values in block.series),
-            series_axes=block.series_axes, x_axis=block.x_axis, result=block.result,
-            segment_ids=segment_ids, segment_keys=segment_keys,
-            discontinuity_ids=discontinuity_ids, source_row=source_row,
-            x_name=block.x_name, series_provenance=block.series_provenance,
-            x_provenance=block.x_provenance, color_by_series=block.color_by_series,
-            visible=block.visible, dashed=block.dashed, opacity=block.opacity,
-            markers=block.markers, point_size=block.point_size,
-            presentation_boundaries=block.presentation_boundaries,
-        )
+        return sample
 
     @staticmethod
     def _intervention_connector_entries(
@@ -1903,6 +1902,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         self._start_responsive_copy(
             self._rendered_blocks,
             title="Copy Rendered Points",
+            row_indices_by_block=self._rendered_row_indices,
         )
 
     @staticmethod
@@ -1920,6 +1920,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         blocks: tuple[ResultDataBlock, ...],
         *,
         title: str,
+        row_indices_by_block: Mapping[int, np.ndarray] | None = None,
     ) -> None:
         self._cancel_copy()
         generation = self._copy_generation
@@ -1927,6 +1928,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
             self._copy_chunks = iter(
                 iter_blocks_tsv_chunks(
                     tuple(blocks),
+                    row_indices_by_block=row_indices_by_block,
                 )
             )
             self._copy_output = io.StringIO()

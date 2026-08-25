@@ -402,8 +402,6 @@ class RunResultsTab(QtWidgets.QWidget):
     copyAvailableChanged = Signal(bool)
     initialSelectionChanged = Signal()
     copyHashRequested = Signal()
-    copyRunJsonRequested = Signal()
-    resultsSummaryRequested = Signal()
     sharedRefitRequested = Signal(tuple, str)
     applyRequested = Signal(tuple, tuple)
 
@@ -413,16 +411,12 @@ class RunResultsTab(QtWidgets.QWidget):
         *,
         color_resolver: ColorResolver | None = None,
         copy_hash_requested: ActionCallback | None = None,
-        copy_run_json_requested: ActionCallback | None = None,
-        results_summary_requested: ActionCallback | None = None,
         shared_refit_handler: SharedRefitCallback | None = None,
         apply_handler: ApplyCallback | None = None,
     ) -> None:
         super().__init__(parent)
         self._color_resolver = color_resolver
         self._hash_action = copy_hash_requested
-        self._json_action = copy_run_json_requested
-        self._summary_action = results_summary_requested
         self._shared_refit_handler = shared_refit_handler
         self._apply_handler = apply_handler
         self._initial_apply_checkboxes: dict[tuple[str, str], QtWidgets.QCheckBox] = {}
@@ -582,20 +576,6 @@ class RunResultsTab(QtWidgets.QWidget):
             self._hash_action()
         else:
             self.copyHashRequested.emit()
-
-    def request_copy_run_json(self) -> None:
-        if self._json_action is not None:
-            self._json_action()
-        else:
-            self.copyRunJsonRequested.emit()
-
-    def request_results_summary(self) -> None:
-        if self._summary_action is not None:
-            value = self._summary_action()
-            if isinstance(value, Mapping):
-                self.render_results_summary(value)
-        else:
-            self.resultsSummaryRequested.emit()
 
     def set_apply_display(
         self,
@@ -813,16 +793,13 @@ class RunResultsTab(QtWidgets.QWidget):
             str(identity),
             summary,
             copy_hash_requested=copy_hash_requested or self._hash_action,
-            copy_json_requested=copy_json_requested or self._json_action,
+            copy_json_requested=copy_json_requested,
             parent=self,
         )
         dialog.statusMessage.connect(self.statusMessage)
         dialog.destroyed.connect(lambda: setattr(self, "_summary_dialog", None))
         self._summary_dialog = dialog
         dialog.show()
-
-    def open_results_summary_dialog(self) -> None:
-        self.request_results_summary()
 
     def clear_candidate(self) -> None:
         """Clear only physical result widgets; the owner controls custody."""

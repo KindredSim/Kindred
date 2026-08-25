@@ -49,7 +49,6 @@ class PreparedSolverConfig:
     atol: float
     grid: Mapping[str, Any]
     use_analytic_jacobian: bool
-    wegscheider_cyclicity_enabled: bool
 
     def __post_init__(self) -> None:
         if type(self.solver_input) is not str or not self.solver_input.strip():
@@ -70,8 +69,6 @@ class PreparedSolverConfig:
             raise TypeError("Prepared solver grid must be a mapping.")
         if type(self.use_analytic_jacobian) is not bool:
             raise TypeError("use_analytic_jacobian must be a bool.")
-        if type(self.wegscheider_cyclicity_enabled) is not bool:
-            raise TypeError("wegscheider_cyclicity_enabled must be a bool.")
         object.__setattr__(self, "solver_input", solver_input)
         object.__setattr__(self, "solver", solver)
         object.__setattr__(self, "rtol", rtol)
@@ -90,7 +87,6 @@ def build_solver_config(
     atol: Real,
     grid: Mapping[str, Any],
     use_analytic_jacobian: bool,
-    wegscheider_cyclicity_enabled: bool,
 ) -> PreparedSolverConfig:
     """Validate and normalize one typed solver policy."""
 
@@ -105,7 +101,6 @@ def build_solver_config(
         atol=atol,
         grid=grid,
         use_analytic_jacobian=use_analytic_jacobian,
-        wegscheider_cyclicity_enabled=wegscheider_cyclicity_enabled,
     )
 
 

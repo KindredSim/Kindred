@@ -1086,15 +1086,21 @@ class DatasetImportStaging(QtCore.QObject):
         self.fence_application_close_admission()
         self.cancel_active(outcome="application_close")
 
-    def fence_for_project_replacement(self) -> None:
+    def fence_for_project_replacement(self) -> bool:
         """Temporarily reject import admission during project replacement."""
 
+        if self._project_replacement_admission_fenced:
+            return False
         self._project_replacement_admission_fenced = True
+        return True
 
-    def resume_after_project_replacement(self) -> None:
+    def resume_after_project_replacement(self) -> bool:
         """Release only the reversible project-replacement fence."""
 
+        if not self._project_replacement_admission_fenced:
+            return False
         self._project_replacement_admission_fenced = False
+        return True
 
     def request_project_replacement_cancellation(self) -> None:
         """Fence admission and request cancellation without waiting.

@@ -234,17 +234,3 @@ class FitDatasetSpec:
             for row in series.source_rows
         }
         return tuple(row for row in self.x_observations.source_rows if row in retained)
-
-    def x_values_for_rows(self, rows: Sequence[int] | None = None) -> np.ndarray:
-        """Resolve captured X values by physical source-row identity."""
-
-        if self.x_name == "t" or self.x_observations is None:
-            return np.asarray([], dtype=float)
-        requested = self.x_source_rows if rows is None else tuple(int(row) for row in rows)
-        by_row = dict(zip(self.x_observations.source_rows, self.x_observations.y, strict=True))
-        try:
-            values = np.asarray([by_row[row] for row in requested], dtype=float)
-        except KeyError as exc:
-            raise ValueError(f"Dataset {self.dataset_id!r} has an unknown X source row.") from exc
-        values.setflags(write=False)
-        return values

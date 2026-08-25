@@ -413,6 +413,7 @@ def forward_rate_symbolic_relation(
     temperature: object,
     literal: Callable[[float], object],
     exponential: Callable[[object], object],
+    source_coordinate: Callable[[str], object] | None = None,
 ) -> object:
     """Project one accepted typed rate model onto a symbolic backend.
 
@@ -425,6 +426,8 @@ def forward_rate_symbolic_relation(
         raise TypeError("literal must be callable.")
     if not callable(exponential):
         raise TypeError("exponential must be callable.")
+    if source_coordinate is not None and not callable(source_coordinate):
+        raise TypeError("source_coordinate must be callable when provided.")
 
     def exact(value: object, *, field: str) -> object:
         number = _numeric_float(value, field=field)
@@ -432,10 +435,17 @@ def forward_rate_symbolic_relation(
             raise ValueError(f"{field} must be finite.")
         return literal(float(number))
 
+    def coordinate(role: str, value: float) -> object:
+        """Use a canonical authored coordinate, or the admitted literal."""
+
+        if source_coordinate is not None:
+            return source_coordinate(role)
+        return literal(float(value))
+
     if isinstance(model, ConstantRateModel):
         value = _numeric_float(model.k, field="Constant k")
         admit_rate(value, field="Constant k", allow_zero=True)
-        return literal(float(value))
+        return coordinate("kf", value)
     if isinstance(model, ArrheniusRateModel):
         prefactor = _numeric_float(model.A, field="Arrhenius A")
         activation = _numeric_float(
@@ -447,8 +457,8 @@ def forward_rate_symbolic_relation(
             activation,
             field="Arrhenius Ea_J_per_mol",
         )
-        return literal(float(prefactor)) * exponential(  # type: ignore[operator]
-            -literal(float(activation))
+        return coordinate("A", prefactor) * exponential(  # type: ignore[operator]
+            -coordinate("Ea", activation)
             / (exact(R, field="R") * temperature)  # type: ignore[operator]
         )
     if isinstance(model, EyringRateModel):
@@ -483,7 +493,7 @@ def forward_rate_symbolic_relation(
             * temperature
             / exact(h, field="h")
             * exponential(
-                -literal(float(barrier))
+                -coordinate("dG_act", barrier)
                 / (exact(R, field="R") * temperature)  # type: ignore[operator]
             )
         )

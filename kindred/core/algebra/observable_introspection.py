@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable
 
 from kindred.core.algebra.identifier_canonicalization import (
     canonicalize_algebra_block,
@@ -37,7 +37,6 @@ __all__ = [
     "AdmittedAlgebraProgram",
     "FitLocalObservable",
     "admit_fit_local_algebra",
-    "apply_admitted_algebra",
     "fit_observable_names",
     "fit_scalar_names",
     "reenter_fit_local_algebra",
@@ -77,9 +76,9 @@ class FitLocalObservable:
 class AdmittedAlgebraProgram:
     """Immutable request-local Algebra admission bound to one canonical base.
 
-    The source text and retained AST are the sole local-program authority.  A
-    program is transient until :func:`apply_admitted_algebra` is called; Fit
-    policy owns scalar values/scope and supplies those values only at Apply.
+    The source text and retained AST are the sole local-program authority.
+    Fit owns scalar values and scope for the lifetime of the request; project
+    publication is performed by the canonical reconciliation owner.
     """
 
     base_analysis: DslAnalysis
@@ -290,46 +289,6 @@ def reenter_fit_local_algebra(
         observables=admission.observables,
         scalar_names=admission.scalar_names,
     )
-
-
-def apply_admitted_algebra(
-    *,
-    source: str,
-    base: PreparedDslRequestSet,
-    admission: AdmittedAlgebraProgram,
-    scalar_values: Mapping[str, float] = {},
-) -> tuple[str, PreparedDslRequestSet]:
-    """Materialize local source and perform exactly one final canonical admission."""
-
-    from kindred.core.mechanism_source import MechanismAuthoringSource, source_matches_analysis
-    from kindred.core.simulator.dsl_parse import prepare_dsl_request_set
-    from kindred.core.units import UnitsModel
-
-    if admission.base_analysis != base.analysis:
-        raise ValueError("Apply admission is bound to a stale canonical base analysis.")
-    if not source_matches_analysis(MechanismAuthoringSource.from_parts(reactions_text=source), base.analysis):
-        raise ValueError("Apply source no longer matches the admitted canonical base.")
-    values = {str(name): float(value) for name, value in dict(scalar_values).items()}
-    if set(values) != set(admission.scalar_names):
-        raise ValueError("Apply scalar values must exactly cover local scalar names.")
-    scalar_lines = tuple(f"param {name} = {values[name]:.17g}" for name in admission.scalar_names)
-    newline = "\r\n" if "\r\n" in source else "\n"
-    sep = "" if source.endswith(("\n", "\r")) else newline
-    rendered = source + sep + newline.join(scalar_lines + tuple(
-        line for line in admission.source_text.splitlines() if line.strip() and not line.lstrip().startswith("#")
-    ))
-    metadata = getattr(base.accepted_mechanism_for_structure(), "metadata", {})
-    standard_conc = float(getattr(metadata, "standard_conc_M", 1.0)) if not isinstance(metadata, Mapping) else float(metadata.get("standard_conc_M", 1.0))
-    prepared = prepare_dsl_request_set(
-        rendered,
-        initials={},
-        units=UnitsModel(
-            energy_unit=base.analysis.energy_unit,
-            temperature_K=base.analysis.temperature_K,
-            standard_conc_M=standard_conc,
-        ),
-    )
-    return rendered, prepared
 
 
 def _species_refs(expr: ExprNode) -> set[str]:

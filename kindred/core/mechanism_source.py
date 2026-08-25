@@ -72,9 +72,3 @@ class MechanismAuthoringSource:
 
     def to_payload(self) -> dict[str, str]:
         return {"reactions_text": self.reactions_text}
-
-    def with_reactions_text(
-        self,
-        reactions_text: str,
-    ) -> "MechanismAuthoringSource":
-        return type(self).from_parts(reactions_text=reactions_text)

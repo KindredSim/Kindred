@@ -37,7 +37,6 @@ __all__ = [
     "fit_action_projection_profile_lines",
     "fit_action_projection_bootstrap_lines",
     "fit_action_projection_primary_model_lines",
-    "fit_metric_text",
     "fit_bound_state",
 ]
 
@@ -87,18 +86,6 @@ def _plain(value: object) -> object:
             for field in dataclasses.fields(value)
         }
     return str(value)
-
-
-def fit_metric_text(metric: FitMetric, *, precision: int = 6) -> str:
-    """Format one canonical metric without inventing an unavailable value."""
-
-    if not isinstance(metric, FitMetric):
-        raise TypeError("Fit metric presentation requires FitMetric.")
-    return (
-        f"{metric.value:.{int(precision)}g}"
-        if metric.available
-        else f"unavailable ({metric.unavailable_reason})"
-    )
 
 
 def fit_bound_state(value: float, minimum: float, maximum: float) -> FitBoundState:
@@ -896,7 +883,7 @@ def _known_input_context(candidate: FitCandidate) -> dict[str, object]:
     return {
         "temperature_K": float(settings.temperature), "relative_tolerance": float(settings.rtol),
         "absolute_tolerance": float(settings.atol), "analytic_jacobian_policy": bool(settings.analytic_jacobian_policy),
-        "wegscheider_policy": bool(settings.wegscheider_policy), "solver": str(request.solver),
+        "solver": str(request.solver),
         "included_dataset_ids": list(request.dispatch.included_dataset_ids),
         "dataset_conditions": [
             {"dataset_id": item.dataset_id, "included": bool(item.included), "resolved_t_start": float(item.t_start), "data_range_min": float(item.data_range_min), "data_range_max": float(item.data_range_max)}
@@ -1179,7 +1166,6 @@ def fit_action_projection_report_text(projection: Mapping[str, object]) -> str:
             "relative_tolerance",
             "absolute_tolerance",
             "analytic_jacobian_policy",
-            "wegscheider_policy",
             "solver",
             "included_dataset_ids",
         ):

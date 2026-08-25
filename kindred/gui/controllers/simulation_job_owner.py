@@ -17,6 +17,7 @@ from kindred.core.project_document import (
     SimulationExecutionSettings,
     TabScientificSettings,
 )
+from kindred.core.project_session import ProjectContentToken
 from kindred.core.result_repository import ResultRepository, SimulationResultValue
 from kindred.core.runtime_defaults import MAX_PARALLEL_WORKERS_CEILING
 from kindred.core.simulation_algebra_policy import SimulationAlgebraPolicy
@@ -25,33 +26,28 @@ from kindred.core.simulation_preparation import (
     PreparedSimulationRun,
     SimulationExecutionRequest,
     SimulationPreparationError,
+    build_simulation_request_from_prepared_run,
     build_simulation_execution_request,
     prepare_simulation_worker_run,
+    resolve_prepared_run_intervention_execution,
     simulation_execution_requests_equal,
 )
 from kindred.core.simulation_result_finalization import finalize_simulation_result
 from kindred.core.simulator.dsl_parse import PreparedDslRequestSet
 from kindred.core.simulator.solvers import solve_ode
 from kindred.core.simulator.solver_types import SimulationCancellationControl
-from kindred.core.simulator.wegscheider_symbolic import WegscheiderCyclicityReport
 from kindred.gui.computation_gate import ComputationGate
-from kindred.gui.parameter_enumeration import enumerate_parameter_coordinates
-from kindred.gui.workflow_contracts import (
-    DetailedBalanceCorrectionCommitResult,
-    DetailedBalanceCorrectionOutcome,
-    DetailedBalanceCorrectionProposal,
-    DetailedBalanceCorrectionRequest,
+from kindred.gui.interactive_preview import (
+    InteractivePreviewRequest,
+    InteractivePreviewTarget,
 )
+from kindred.gui.parameter_enumeration import enumerate_parameter_coordinates
 
 __all__ = [
     "ExplicitRunCapture",
-    "ExplicitRunTarget",
-    "PreviewTarget",
-    "RunParallelCapacity",
+    "PreviewCapture",
     "SimulationJobOwner",
-    "SimulationTerminalSummary",
     "build_explicit_target",
-    "resolve_run_parallel_capacity",
 ]
 
 
@@ -83,7 +79,6 @@ class ExplicitRunTarget:
     tab_id: str
     set_id: str
     set_name: str
-    prepared_dsl: PreparedDslRequestSet
     execution_request: SimulationExecutionRequest
 
     def __post_init__(self) -> None:
@@ -91,8 +86,6 @@ class ExplicitRunTarget:
         object.__setattr__(self, "set_id", _required_id(self.set_id, "set_id"))
         object.__setattr__(self, "set_name", _required_id(self.set_name, "set_name"))
         request = self.execution_request
-        if request.prepared_dsl is not self.prepared_dsl:
-            raise ValueError("execution request must retain the target's accepted prepared DSL owner.")
         if request.parameter_overrides:
             raise ValueError("explicit Run targets cannot carry Preview values.")
         object.__setattr__(self, "execution_request", request)
@@ -101,10 +94,19 @@ class ExplicitRunTarget:
 @dataclass(frozen=True, slots=True)
 class ExplicitRunCapture:
     tab_id: str
+    content_token: ProjectContentToken
+    source: MechanismAuthoringSource
+    source_provenance: Literal["canonical", "draft"]
     targets: tuple[ExplicitRunTarget, ...]
 
     def __post_init__(self) -> None:
         tab = _required_id(self.tab_id, "tab_id")
+        if not isinstance(self.content_token, ProjectContentToken):
+            raise TypeError("content_token must be ProjectContentToken.")
+        if not isinstance(self.source, MechanismAuthoringSource):
+            raise TypeError("source must be MechanismAuthoringSource.")
+        if self.source_provenance not in {"canonical", "draft"}:
+            raise ValueError("source_provenance must be canonical or draft.")
         targets = tuple(self.targets)
         if not targets or any(not isinstance(target, ExplicitRunTarget) for target in targets):
             raise TypeError("Run requires ExplicitRunTarget values.")
@@ -122,17 +124,43 @@ class PreviewTarget:
     tab_id: str
     set_id: str
     set_name: str
-    prepared_dsl: PreparedDslRequestSet
-    execution_request: SimulationExecutionRequest
+    execution_request: SimulationExecutionRequest | None
+    canonical_run_target: ExplicitRunTarget
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "tab_id", _required_id(self.tab_id, "tab_id"))
         object.__setattr__(self, "set_id", _required_id(self.set_id, "set_id"))
         object.__setattr__(self, "set_name", _required_id(self.set_name, "set_name"))
-        request = self.execution_request
-        if request.prepared_dsl is not self.prepared_dsl:
-            raise ValueError("execution request must retain the target's accepted prepared DSL owner.")
 
+
+@dataclass(frozen=True, slots=True)
+class PreviewCapture:
+    """One exact Preview action, before or after B request admission."""
+
+    tab_id: str
+    content_token: ProjectContentToken
+    source: MechanismAuthoringSource
+    source_provenance: Literal["canonical", "draft"]
+    targets: tuple[PreviewTarget, ...]
+
+    def __post_init__(self) -> None:
+        tab = _required_id(self.tab_id, "tab_id")
+        if not isinstance(self.content_token, ProjectContentToken):
+            raise TypeError("content_token must be ProjectContentToken.")
+        if not isinstance(self.source, MechanismAuthoringSource):
+            raise TypeError("source must be MechanismAuthoringSource.")
+        if self.source_provenance not in {"canonical", "draft"}:
+            raise ValueError("source_provenance must be canonical or draft.")
+        targets = tuple(self.targets)
+        if not targets or any(not isinstance(item, PreviewTarget) for item in targets):
+            raise TypeError("Preview requires PreviewTarget values.")
+        if any(item.tab_id != tab for item in targets):
+            raise ValueError("every Preview target must belong to the capture tab.")
+        ids = tuple(item.set_id for item in targets)
+        if len(ids) != len(set(ids)):
+            raise ValueError("Preview target set IDs must be unique.")
+        object.__setattr__(self, "tab_id", tab)
+        object.__setattr__(self, "targets", targets)
 
 @dataclass(frozen=True, slots=True)
 class SimulationTerminalSummary:
@@ -146,15 +174,8 @@ class SimulationTerminalSummary:
 
 
 @dataclass(frozen=True, slots=True)
-class _PendingRunDetailedBalanceCorrection:
-    generation: int
-    correction: DetailedBalanceCorrectionRequest
-    capture: ExplicitRunCapture
-
-
-@dataclass(frozen=True, slots=True)
 class _TargetTerminalOutcome:
-    target: ExplicitRunTarget | PreviewTarget
+    target: ExplicitRunTarget | PreviewTarget | InteractivePreviewTarget
     state: Literal["success", "failure", "cancelled"]
     stage: Literal["preparation", "execution"]
     result: SimulationResultValue | None = None
@@ -174,10 +195,6 @@ def _simulation_worker_cause(exc: BaseException) -> FactualCause:
     )
 
 
-def _format_owner_failure_cause(cause: FactualCause) -> str:
-    return str(cause.message or "simulation failed")
-
-
 def build_explicit_target(*, prepared_dsl: PreparedDslRequestSet, tab_id: str, set_id: str, set_name: str,
                           mechanism_source: MechanismAuthoringSource, initial_values: Iterable[tuple[str, float]],
                           execution_settings: SimulationExecutionSettings, scientific_settings: TabScientificSettings) -> ExplicitRunTarget:
@@ -186,31 +203,59 @@ def build_explicit_target(*, prepared_dsl: PreparedDslRequestSet, tab_id: str, s
         initial_values=initial_values,
         execution_settings=execution_settings, scientific_settings=scientific_settings,
     )
-    return ExplicitRunTarget(tab_id, set_id, set_name, prepared_dsl, execution_request)
+    return ExplicitRunTarget(tab_id, set_id, set_name, execution_request)
 
 
-def _captured_parameter_coordinates(request: SimulationExecutionRequest, *, prepared_dsl: PreparedDslRequestSet) -> tuple[tuple[str, float, str], ...]:
-    coordinates = enumerate_parameter_coordinates(prepared_dsl, wegscheider_cyclicity_enabled=request.solver_config.wegscheider_cyclicity_enabled)
+def _captured_parameter_coordinates(request: SimulationExecutionRequest) -> tuple[tuple[str, float, str], ...]:
+    coordinates = enumerate_parameter_coordinates(request.prepared_dsl)
     by_name = {coordinate.name: coordinate for coordinate in coordinates}
     overrides = {str(name): float(value) for name, value in dict(request.parameter_overrides or {}).items()}
     for name in overrides:
-        if name not in by_name:
+        coordinate = by_name.get(name)
+        if coordinate is None:
             raise ValueError(f"Preview parameter {name!r} is not a direct GUI coordinate.")
+        if not coordinate.writable or coordinate.derived:
+            raise ValueError(
+                f"Preview parameter {name!r} is owned by retained Algebra."
+            )
     return tuple((coordinate.name, overrides.get(coordinate.name, float(coordinate.value)), coordinate.unit) for coordinate in coordinates)
 
 
-def _prepare_target(target: ExplicitRunTarget | PreviewTarget, *, cancellation_control: SimulationCancellationControl) -> tuple[PreparedSimulationRun, tuple[tuple[str, float, str], ...]]:
+def _prepare_target(
+    target: ExplicitRunTarget | PreviewTarget | InteractivePreviewTarget,
+    *,
+    cancellation_control: SimulationCancellationControl,
+) -> tuple[PreparedSimulationRun, tuple[tuple[str, float, str], ...]]:
     if cancellation_control.cancel_requested():
         raise SimulationCancelled()
-    parameters = _captured_parameter_coordinates(target.execution_request, prepared_dsl=target.prepared_dsl)
-    prepared = prepare_simulation_worker_run(execution_request=target.execution_request, cancellation_control=cancellation_control)
+    request = target.execution_request
+    parameters = _captured_parameter_coordinates(request)
+    prepared = prepare_simulation_worker_run(
+        execution_request=request,
+        cancellation_control=cancellation_control,
+    )
     return prepared, parameters
 
 
 def _solve_prepared(prepared: PreparedSimulationRun, *, parameters: tuple[tuple[str, float, str], ...], cancellation_control: SimulationCancellationControl) -> SimulationResultValue:
     if cancellation_control.cancel_requested():
         raise SimulationCancelled()
-    solved = solve_ode(prepared.request)
+    intervention_execution = prepared.intervention_execution
+    if intervention_execution is None:
+        intervention_execution = resolve_prepared_run_intervention_execution(
+            prepared,
+            parameter_values={name: value for name, value, _unit in parameters},
+            cancellation_check=cancellation_control.cancel_requested,
+        )
+    solved = solve_ode(
+        build_simulation_request_from_prepared_run(
+            prepared,
+            y0=prepared.y0,
+            intervention_execution=intervention_execution,
+            symbolic_jacobian=prepared.symbolic_jacobian,
+            cancellation_control=cancellation_control,
+        )
+    )
     if cancellation_control.cancel_requested():
         raise SimulationCancelled()
     result = finalize_simulation_result(
@@ -227,9 +272,19 @@ def _solve_prepared(prepared: PreparedSimulationRun, *, parameters: tuple[tuple[
 class _DirectSimulationWorker(QtCore.QThread):
     target_terminal = QtCore.Signal(int, object)
 
-    def __init__(self, *, generation: int, targets: tuple[ExplicitRunTarget | PreviewTarget, ...],
-                 max_parallel: int, cancellation_control: SimulationCancellationControl,
-                 cancel_event: Event, parent: QtCore.QObject) -> None:
+    def __init__(
+        self,
+        *,
+        generation: int,
+        targets: tuple[
+            ExplicitRunTarget | PreviewTarget | InteractivePreviewTarget,
+            ...,
+        ],
+        max_parallel: int,
+        cancellation_control: SimulationCancellationControl,
+        cancel_event: Event,
+        parent: QtCore.QObject,
+    ) -> None:
         super().__init__(parent)
         self._generation = int(generation)
         self._targets = tuple(targets)
@@ -246,25 +301,6 @@ class _DirectSimulationWorker(QtCore.QThread):
         return self._cancel_event.is_set()
 
     def run(self) -> None:
-        owners: dict[int, PreparedDslRequestSet] = {}
-        for target in self._targets:
-            owners.setdefault(id(target.prepared_dsl), target.prepared_dsl)
-        try:
-            for prepared_dsl in owners.values():
-                prepared_dsl.ensure_scientific_structures()
-        except BaseException as exc:  # noqa: BLE001
-            for target in self._targets:
-                self.target_terminal.emit(
-                    self._generation,
-                    _TargetTerminalOutcome(
-                        target=target,
-                        state="failure",
-                        stage="preparation",
-                        message=str(exc) or type(exc).__name__,
-                        cause=_simulation_worker_cause(exc),
-                    ),
-                )
-            return
         if self.cancelled:
             for target in self._targets:
                 self.target_terminal.emit(
@@ -294,7 +330,10 @@ class _DirectSimulationWorker(QtCore.QThread):
                     for pending in futures:
                         pending.cancel()
 
-    def _execute_target(self, target: ExplicitRunTarget | PreviewTarget) -> _TargetTerminalOutcome:
+    def _execute_target(
+        self,
+        target: ExplicitRunTarget | PreviewTarget | InteractivePreviewTarget,
+    ) -> _TargetTerminalOutcome:
         if self.cancelled:
             return _TargetTerminalOutcome(target, "cancelled", "preparation", message="Simulation cancelled.")
         try:
@@ -314,38 +353,28 @@ class _DirectSimulationWorker(QtCore.QThread):
 
 RepositoryResolver = Callable[[str], ResultRepository | None]
 RawUserParallelMaximum = Callable[[], object]
-CurrentRunCaptureResolver = Callable[
-    [str, tuple[str, ...]], ExplicitRunCapture | None
-]
 class SimulationJobOwner(QtCore.QObject):
-    """Own Run and exact Preview, which share the direct worker boundary."""
+    """Own Run, exact Preview, and interactive Preview computation."""
 
     state_changed = QtCore.Signal()
     application_close_settlement_changed = QtCore.Signal()
     status_changed = QtCore.Signal(str)
     results_changed = QtCore.Signal(str)
     run_dispatched = QtCore.Signal(str, object)
-    detailed_balance_correction_requested = QtCore.Signal(object)
+    interactive_result_ready = QtCore.Signal(str, str, int, object, object)
+    interactive_targets_retired = QtCore.Signal(str, int, tuple)
 
     def __init__(self, *, gate: ComputationGate, repository_for_tab: RepositoryResolver,
-                 propose_detailed_balance_source: Callable[[str, MechanismAuthoringSource], DetailedBalanceCorrectionProposal | None],
-                 commit_detailed_balance_source: Callable[[DetailedBalanceCorrectionProposal], DetailedBalanceCorrectionCommitResult],
-                 capture_current_run: CurrentRunCaptureResolver,
                  user_parallel_maximum: RawUserParallelMaximum | None = None,
                  cpu_count: Callable[[], object] | None = None,
                  parent: QtCore.QObject | None = None) -> None:
         super().__init__(parent)
         if not isinstance(gate, ComputationGate):
             raise TypeError("gate must be a ComputationGate.")
-        if not callable(repository_for_tab) or not callable(propose_detailed_balance_source) or not callable(commit_detailed_balance_source):
-            raise TypeError("Simulation owner callbacks must be callable.")
+        if not callable(repository_for_tab):
+            raise TypeError("repository_for_tab must be callable.")
         self._gate = gate
         self._repository_for_tab = repository_for_tab
-        self._propose_detailed_balance_source = propose_detailed_balance_source
-        self._commit_detailed_balance_source = commit_detailed_balance_source
-        if not callable(capture_current_run):
-            raise TypeError("capture_current_run must be callable.")
-        self._capture_current_run = capture_current_run
         self._user_parallel_maximum = user_parallel_maximum or (lambda: None)
         self._cpu_count = cpu_count or os.cpu_count
         self._generation = 0
@@ -354,8 +383,8 @@ class SimulationJobOwner(QtCore.QObject):
         self._cancel_event: Event | None = None
         self._cancellation_control: SimulationCancellationControl | None = None
         self._terminal_state: str | None = None
-        self._pending_preview: tuple[str, tuple[PreviewTarget, ...]] | None = None
-        self._pending_detailed_balance: _PendingRunDetailedBalanceCorrection | None = None
+        self._pending_preview: PreviewCapture | None = None
+        self._pending_interactive_preview: InteractivePreviewRequest | None = None
         self._close_fenced = False
         self._last_close_settled = True
         self._gate.changed.connect(self._on_gate_changed)
@@ -366,29 +395,49 @@ class SimulationJobOwner(QtCore.QObject):
             self._worker is None
             and self._operation is None
             and self._pending_preview is None
-            and self._pending_detailed_balance is None
+            and self._pending_interactive_preview is None
+        )
+
+    @property
+    def busy(self) -> bool:
+        return bool(
+            self._worker is not None
+            or self._operation is not None
+            or self._pending_preview is not None
+            or self._pending_interactive_preview is not None
+        )
+
+    @property
+    def interactive_preview_busy(self) -> bool:
+        return bool(
+            self._pending_interactive_preview is not None
+            or (
+                self._operation is not None
+                and self._operation["kind"] == "preview"
+                and self._operation["purpose"] == "interactive-preview"
+            )
         )
 
     @property
     def current_kind(self) -> str | None:
-        if self._pending_detailed_balance is not None:
-            return "run"
         if self._operation is not None:
             return str(self._operation["kind"])
+        if self._pending_interactive_preview is not None:
+            return "preview"
         return "preview" if self._pending_preview is not None else None
 
     @property
     def origin_tab_id(self) -> str | None:
-        if self._pending_detailed_balance is not None:
-            return self._pending_detailed_balance.capture.tab_id
         operation = self._operation
         if operation is not None:
             return str(operation["tab_id"])
-        return None if self._pending_preview is None else self._pending_preview[0]
+        if self._pending_interactive_preview is not None:
+            return self._pending_interactive_preview.tab_id
+        return None if self._pending_preview is None else self._pending_preview.tab_id
 
     @property
     def pending_preview_tab_id(self) -> str | None:
-        return None if self._pending_preview is None else self._pending_preview[0]
+        return None if self._pending_preview is None else self._pending_preview.tab_id
 
     def preview_set_ids(self, tab_id: str) -> tuple[str, ...]:
         """Return semantic exact Preview identities for one tab."""
@@ -424,20 +473,6 @@ class SimulationJobOwner(QtCore.QObject):
         ids = {_required_id(value, "set_id") for value in set_ids}
         if not ids:
             return False
-        pending_correction = self._pending_detailed_balance if include_run else None
-        if (
-            pending_correction is not None
-            and pending_correction.capture.tab_id == tab
-            and ids.intersection(
-                target.set_id for target in pending_correction.capture.targets
-            )
-        ):
-            self._generation += 1
-            self._pending_detailed_balance = None
-            self._terminal_state = "cancelled"
-            if self._gate.is_owned_by(self):
-                self._gate.release(self)
-            return True
         operation = self._operation
         if operation is None or str(operation["tab_id"]) != tab:
             return False
@@ -457,13 +492,13 @@ class SimulationJobOwner(QtCore.QObject):
         set_ids: Iterable[str],
     ) -> bool:
         pending = self._pending_preview
-        if pending is None or pending[0] != str(tab_id):
+        if pending is None or pending.tab_id != str(tab_id):
             return False
         ids = {
             _required_id(value, "set_id")
             for value in set_ids
         }
-        if not ids.intersection(target.set_id for target in pending[1]):
+        if not ids.intersection(target.set_id for target in pending.targets):
             return False
         self._pending_preview = None
         return True
@@ -479,6 +514,7 @@ class SimulationJobOwner(QtCore.QObject):
         if not ids:
             return
         self._retire_if_affected(tab_id, ids)
+        interactive_changed = self.retire_interactive_preview(tab_id, ids)
         pending_changed = self._retire_pending_preview_if_affected(tab_id, ids)
         repository = self._repository(tab_id)
         if preserve_reference:
@@ -486,13 +522,14 @@ class SimulationJobOwner(QtCore.QObject):
         else:
             repository.deauthorize_sets(ids)
         self.results_changed.emit(str(tab_id))
-        if pending_changed:
+        if pending_changed and not interactive_changed:
             self.state_changed.emit()
             self._emit_settled_if_complete()
 
     def reconcile_canonical_targets(self, tab_id: str, set_ids: Iterable[str], *, clear_pending: bool = True) -> tuple[tuple[str, bool], ...]:
         ids = tuple(dict.fromkeys(_required_id(value, "set_id") for value in set_ids))
         self._retire_if_affected(tab_id, ids, include_run=False)
+        interactive_changed = self.retire_interactive_preview(tab_id, ids)
         pending_changed = clear_pending and self._retire_pending_preview_if_affected(tab_id, ids)
         repository = self._repository(tab_id)
         restored: list[tuple[str, bool]] = []
@@ -501,7 +538,7 @@ class SimulationJobOwner(QtCore.QObject):
             restored_value = repository.restore_reference_or_current(set_id)
             restored.append((set_id, restored_value))
         self.results_changed.emit(str(tab_id))
-        if pending_changed:
+        if pending_changed and not interactive_changed:
             self.state_changed.emit()
             self._emit_settled_if_complete()
         return tuple(restored)
@@ -509,10 +546,11 @@ class SimulationJobOwner(QtCore.QObject):
     def purge_sets(self, tab_id: str, set_ids: Iterable[str]) -> None:
         ids = tuple(dict.fromkeys(_required_id(value, "set_id") for value in set_ids))
         self._retire_if_affected(tab_id, ids)
+        interactive_changed = self.retire_interactive_preview(tab_id, ids)
         pending_changed = self._retire_pending_preview_if_affected(tab_id, ids)
         self._repository(tab_id).purge_sets(ids)
         self.results_changed.emit(str(tab_id))
-        if pending_changed:
+        if pending_changed and not interactive_changed:
             self.state_changed.emit()
             self._emit_settled_if_complete()
 
@@ -520,7 +558,8 @@ class SimulationJobOwner(QtCore.QObject):
         tab = _required_id(tab_id, "tab_id")
         ids = tuple(_required_id(value, "set_id") for value in set_ids)
         self._retire_if_affected(tab, ids)
-        pending_changed = self._pending_preview is not None and self._pending_preview[0] == tab
+        interactive_changed = self.retire_interactive_preview(tab, ids)
+        pending_changed = self._pending_preview is not None and self._pending_preview.tab_id == tab
         if pending_changed:
             self._pending_preview = None
         try:
@@ -528,27 +567,20 @@ class SimulationJobOwner(QtCore.QObject):
         except LookupError:
             pass
         self.results_changed.emit(tab)
-        if pending_changed:
+        if pending_changed and not interactive_changed:
             self.state_changed.emit()
             self._emit_settled_if_complete()
 
     def start_run(self, capture: ExplicitRunCapture) -> bool:
-        if not isinstance(capture, ExplicitRunCapture):
-            raise TypeError("capture must be ExplicitRunCapture.")
-        if self._close_fenced or self._worker is not None or self._pending_detailed_balance is not None or not self._gate.is_idle:
+        if self._close_fenced or self._worker is not None or not self._gate.is_idle:
             self.status_changed.emit("Run rejected: another computation is active.")
             return False
-        correction = self._detailed_balance_correction(capture)
-        if correction is not None:
-            if not self._gate.try_acquire(self, "run"):
-                return False
-            self._mark_unsettled()
-            self._generation += 1
-            self._pending_detailed_balance = _PendingRunDetailedBalanceCorrection(self._generation, correction, capture)
-            self.detailed_balance_correction_requested.emit(correction)
-            self.state_changed.emit()
-            return True
-        return self._start(capture.tab_id, "run", capture.targets, max_parallel=self._capacity(len(capture.targets)))
+        return self._start(
+            capture.tab_id,
+            "run",
+            capture.targets,
+            max_parallel=self._capacity(len(capture.targets)),
+        )
 
     def _capacity(self, count: int) -> int:
         return resolve_run_parallel_capacity(cpu_count=self._cpu_count(), user_max=self._user_parallel_maximum(), target_count=count).effective
@@ -571,10 +603,14 @@ class SimulationJobOwner(QtCore.QObject):
         self,
         tab_id: str,
         kind: str,
-        targets: tuple[ExplicitRunTarget | PreviewTarget, ...],
+        targets: tuple[
+            ExplicitRunTarget | PreviewTarget | InteractivePreviewTarget,
+            ...,
+        ],
         *,
         max_parallel: int,
         purpose: str = "ordinary",
+        payload: object | None = None,
     ) -> bool:
         if self._worker is not None or not targets:
             return False
@@ -586,7 +622,16 @@ class SimulationJobOwner(QtCore.QObject):
         event = Event()
         control = SimulationCancellationControl(event.is_set)
         worker = _DirectSimulationWorker(generation=generation, targets=targets, max_parallel=max_parallel, cancellation_control=control, cancel_event=event, parent=self)
-        self._operation = {"generation": generation, "kind": kind, "purpose": purpose, "tab_id": str(tab_id), "targets": targets, "outcomes": [], "details": []}
+        self._operation = {
+            "generation": generation,
+            "kind": kind,
+            "purpose": purpose,
+            "tab_id": str(tab_id),
+            "targets": targets,
+            "outcomes": [],
+            "details": [],
+            "payload": payload,
+        }
         self._worker = worker
         self._cancel_event = event
         self._cancellation_control = control
@@ -595,7 +640,7 @@ class SimulationJobOwner(QtCore.QObject):
         worker.finished.connect(self._on_worker_finished)
         try:
             worker.start()
-            if kind == "preview":
+            if kind == "preview" and purpose != "interactive-preview":
                 self._promote_preview_targets(
                     str(tab_id),
                     tuple(targets),
@@ -622,6 +667,8 @@ class SimulationJobOwner(QtCore.QObject):
         self,
         tab_id: str,
         roster_set_ids: tuple[str, ...],
+        *,
+        expected_requests: tuple[tuple[str, SimulationExecutionRequest], ...] | None = None,
     ) -> tuple[
         tuple[str, SimulationExecutionRequest, SimulationResultValue], ...
     ] | None:
@@ -629,7 +676,6 @@ class SimulationJobOwner(QtCore.QObject):
             self._worker is not None
             or self._operation is not None
             or self._pending_preview is not None
-            or self._pending_detailed_balance is not None
             or not self._gate.is_idle
         ):
             return None
@@ -644,6 +690,10 @@ class SimulationJobOwner(QtCore.QObject):
             result = repository.current_result(set_id)
             if current_request is None or result is None:
                 return None
+            if expected_requests is not None:
+                expected = dict(expected_requests).get(str(set_id))
+                if expected is None or current_request is not expected:
+                    return None
             captured.append((set_id, current_request, result))
         return tuple(captured)
 
@@ -659,52 +709,28 @@ class SimulationJobOwner(QtCore.QObject):
             repository.publish_run(set_id, request, result)
         self.results_changed.emit(str(tab_id))
 
-    @staticmethod
-    def _build_preview_targets(
-        tab_id: str,
-        requests: Iterable[
-            tuple[str, str, SimulationExecutionRequest]
-        ],
-        *,
-        prepared_dsl: PreparedDslRequestSet,
-    ) -> tuple[PreviewTarget, ...]:
-        captured = tuple(requests)
-        tab = _required_id(tab_id, "tab_id")
-        return tuple(
-            PreviewTarget(
-                tab_id=tab,
-                set_id=set_id,
-                set_name=set_name,
-                prepared_dsl=prepared_dsl,
-                execution_request=request,
-            )
-            for set_id, set_name, request in captured
-        )
-
     def request_preview(
         self,
-        tab_id: str,
-        requests: Iterable[
-            tuple[str, str, SimulationExecutionRequest]
-        ],
-        *,
-        prepared_dsl: PreparedDslRequestSet,
+        capture: PreviewCapture,
     ) -> bool:
-        tab = _required_id(tab_id, "tab_id")
-        captured = self._build_preview_targets(
-            tab,
-            requests,
-            prepared_dsl=prepared_dsl,
-        )
+        tab = capture.tab_id
         if self._close_fenced:
             return False
-        self._pending_preview = (tab, captured)
+        pending_interactive = self._pending_interactive_preview
+        if pending_interactive is not None and pending_interactive.tab_id == tab:
+            self._pending_interactive_preview = None
+            self.interactive_targets_retired.emit(
+                tab,
+                self._generation,
+                pending_interactive.target_set_ids,
+            )
+        self._pending_preview = capture
         self._mark_unsettled()
         operation = self._operation
         if operation is None or operation["purpose"] != "preview-prerequisite":
             self._retire_if_affected(
                 tab,
-                (target.set_id for target in captured),
+                (target.set_id for target in capture.targets),
             )
         if self._worker is not None or not self._gate.is_idle:
             self.status_changed.emit("Preview pending: latest exact request retained.")
@@ -713,39 +739,26 @@ class SimulationJobOwner(QtCore.QObject):
         return self._redrive_pending_preview()
 
     def _redrive_pending_preview(self) -> bool:
-        pending = self._pending_preview
-        if pending is None or self._worker is not None or not self._gate.is_idle or self._close_fenced:
+        capture = self._pending_preview
+        if capture is None or self._worker is not None or not self._gate.is_idle or self._close_fenced:
             return False
-        tab_id, targets = pending
+        tab_id = capture.tab_id
+        targets = capture.targets
         set_ids = tuple(target.set_id for target in targets)
-        try:
-            capture = self._capture_current_run(tab_id, set_ids)
-        except Exception:  # noqa: BLE001
-            capture = None
-        if (
-            not isinstance(capture, ExplicitRunCapture)
-            or capture.tab_id != tab_id
-            or tuple(target.set_id for target in capture.targets) != set_ids
-        ):
-            self._pending_preview = None
-            self.reconcile_canonical_targets(tab_id, set_ids)
-            self.status_changed.emit("Preview baseline could not be captured.")
-            self.state_changed.emit()
-            self._emit_settled_if_complete()
-            return False
 
         repository = self._repository(tab_id)
         preview_ids = set(repository.preview_set_ids())
         matching: set[str] = set()
-        for target in capture.targets:
+        for target in targets:
             reference_request = repository.reference_request(target.set_id)
             reference_result = repository.reference_result(target.set_id)
+            canonical_target = target.canonical_run_target
             if (
                 reference_request is not None
                 and reference_result is not None
                 and simulation_execution_requests_equal(
                     reference_request,
-                    target.execution_request,
+                    canonical_target.execution_request,
                 )
             ):
                 matching.add(target.set_id)
@@ -759,20 +772,20 @@ class SimulationJobOwner(QtCore.QObject):
                 and current_result is not None
                 and simulation_execution_requests_equal(
                     current_request,
-                    target.execution_request,
+                    canonical_target.execution_request,
                 )
             ):
                 matching.add(target.set_id)
         missing_targets = tuple(
             target
-            for target in capture.targets
+            for target in targets
             if target.set_id not in matching
         )
         if missing_targets:
             started = self._start(
                 tab_id,
                 "run",
-                missing_targets,
+                tuple(target.canonical_run_target for target in missing_targets),
                 max_parallel=self._capacity(len(missing_targets)),
                 purpose="preview-prerequisite",
             )
@@ -783,10 +796,121 @@ class SimulationJobOwner(QtCore.QObject):
             return True
 
         self._pending_preview = None
-        started = self._start(tab_id, "preview", targets, max_parallel=1)
+        started = self._start(
+            tab_id,
+            "preview",
+            targets,
+            max_parallel=1,
+        )
         if not started:
-            self._pending_preview = pending
+            self._pending_preview = capture
         return started
+
+    def request_interactive_preview(
+        self,
+        request: InteractivePreviewRequest,
+    ) -> bool:
+        """Run one admitted transient Slider Preview through this owner."""
+
+        if self._close_fenced:
+            return False
+        if (
+            self._pending_preview is not None
+            and self._pending_preview.tab_id == request.tab_id
+        ):
+            self._pending_preview = None
+        self._pending_interactive_preview = request
+        self._mark_unsettled()
+        self._retire_if_affected(
+            request.tab_id,
+            request.target_set_ids,
+        )
+        if self._worker is not None or not self._gate.is_idle:
+            self.status_changed.emit(
+                "Interactive Preview pending: latest request retained."
+            )
+            self.state_changed.emit()
+            return False
+        return self._redrive_pending_interactive_preview()
+
+    def _redrive_pending_interactive_preview(self) -> bool:
+        request = self._pending_interactive_preview
+        if (
+            request is None
+            or self._worker is not None
+            or not self._gate.is_idle
+            or self._close_fenced
+        ):
+            return False
+        self._pending_interactive_preview = None
+        started = self._start(
+            request.tab_id,
+            "preview",
+            request.targets,
+            max_parallel=self._capacity(len(request.targets)),
+            purpose="interactive-preview",
+            payload=request,
+        )
+        if not started:
+            self._pending_interactive_preview = request
+        return started
+
+    def retire_interactive_preview(
+        self,
+        tab_id: str | None = None,
+        set_ids: Iterable[str] | None = None,
+    ) -> bool:
+        """Retire transient Slider Preview computation and display targets."""
+
+        tab = None if tab_id is None else _required_id(tab_id, "tab_id")
+        ids = None if set_ids is None else {
+            _required_id(value, "set_id") for value in set_ids
+        }
+        changed = False
+        operation = self._operation
+        if (
+            operation is not None
+            and str(operation["kind"]) == "preview"
+            and str(operation["purpose"]) == "interactive-preview"
+            and (tab is None or str(operation["tab_id"]) == tab)
+        ):
+            operation_ids = tuple(target.set_id for target in operation["targets"])
+            affected = operation_ids if ids is None else tuple(
+                set_id for set_id in operation_ids if set_id in ids
+            )
+            if affected:
+                changed = self._retire_if_affected(
+                    str(operation["tab_id"]),
+                    affected,
+                )
+                if changed:
+                    operation.setdefault("retired_ids", set()).update(affected)
+                    self.interactive_targets_retired.emit(
+                        str(operation["tab_id"]),
+                        self._generation,
+                        tuple(affected),
+                    )
+        pending = self._pending_interactive_preview
+        if (
+            pending is not None
+            and (tab is None or pending.tab_id == tab)
+        ):
+            pending_ids = tuple(target.set_id for target in pending.targets)
+            affected = pending_ids if ids is None else tuple(
+                set_id for set_id in pending_ids if set_id in ids
+            )
+            if affected:
+                self._pending_interactive_preview = None
+                changed = True
+                self.interactive_targets_retired.emit(
+                    pending.tab_id,
+                    self._generation,
+                    tuple(affected),
+                )
+        if changed:
+            self.state_changed.emit()
+            self._emit_settled_if_complete()
+        return changed
 
     def retire_preview(
         self,
@@ -801,21 +925,29 @@ class SimulationJobOwner(QtCore.QObject):
         ids = None if set_ids is None else tuple(
             dict.fromkeys(_required_id(value, "set_id") for value in set_ids)
         )
-        changed = False
+        interactive_changed = self.retire_interactive_preview(tab, ids)
+        changed = interactive_changed
         restore_ids: tuple[str, ...] = ()
         operation = self._operation
-        if operation is not None and str(operation["kind"]) == "preview":
+        if (
+            operation is not None
+            and str(operation["kind"]) == "preview"
+            and str(operation["purpose"]) != "interactive-preview"
+        ):
             operation_ids = tuple(
                 target.set_id for target in operation["targets"]
             )
             affected = operation_ids if ids is None else ids
             restore_ids = tuple(value for value in affected if value in operation_ids)
-            changed = self._retire_if_affected(tab, restore_ids, include_run=False)
+            changed = (
+                self._retire_if_affected(tab, restore_ids, include_run=False)
+                or changed
+            )
             if preserve_reference and changed:
                 operation["purpose"] = "interactive-successor"
         pending = self._pending_preview
-        if pending is not None and pending[0] == tab:
-            pending_ids = tuple(target.set_id for target in pending[1])
+        if pending is not None and pending.tab_id == tab:
+            pending_ids = tuple(target.set_id for target in pending.targets)
             affected = pending_ids if ids is None else ids
             pending_restore_ids = tuple(value for value in affected if value in pending_ids)
             if pending_restore_ids:
@@ -847,16 +979,24 @@ class SimulationJobOwner(QtCore.QObject):
         return changed
 
     def cancel_current(self) -> bool:
-        changed = bool(self._worker is not None or self._pending_preview is not None or self._pending_detailed_balance is not None)
+        changed = bool(
+            self._worker is not None
+            or self._pending_preview is not None
+            or self._pending_interactive_preview is not None
+        )
         self._generation += 1
         if self._worker is not None:
             self._worker.cancel()
         self._pending_preview = None
-        if self._pending_detailed_balance is not None:
-            self._pending_detailed_balance = None
-            if self._gate.is_owned_by(self):
-                self._gate.release(self)
+        pending_interactive = self._pending_interactive_preview
+        self._pending_interactive_preview = None
         self._terminal_state = "cancelled"
+        if pending_interactive is not None:
+            self.interactive_targets_retired.emit(
+                pending_interactive.tab_id,
+                self._generation,
+                pending_interactive.target_set_ids,
+            )
         if changed:
             self.state_changed.emit()
             self._emit_settled_if_complete()
@@ -907,10 +1047,26 @@ class SimulationJobOwner(QtCore.QObject):
                 operation["details"].append(f"{target.set_name}: {outcome.message}")
             self._terminal_state = state
             return
-        # The one direct publication gate: compare owner operation generation
-        # immediately before touching the canonical repository.
+        # The worker operation sequence fences late terminal events immediately
+        # before direct repository publication; action currentness is carried by
+        # the admitted capture consumed by its initiating owner.
         if self._close_fenced:
             operation["outcomes"].append((target, "discarded"))
+            return
+        if (
+            operation["kind"] == "preview"
+            and operation["purpose"] == "interactive-preview"
+        ):
+            request = operation["payload"]
+            self.interactive_result_ready.emit(
+                str(operation["tab_id"]),
+                target.set_id,
+                int(generation),
+                request,
+                outcome.result,
+            )
+            operation["outcomes"].append((target, "success"))
+            self._terminal_state = "success"
             return
         try:
             repository = self._repository(str(operation["tab_id"]))
@@ -953,10 +1109,10 @@ class SimulationJobOwner(QtCore.QObject):
                     target_ids = tuple(
                         target.set_id for target in operation["targets"]
                     )
-                    if pending is not None and pending[0] == str(operation["tab_id"]):
+                    if pending is not None and pending.tab_id == str(operation["tab_id"]):
                         target_ids = tuple(
                             dict.fromkeys(
-                                (*target_ids, *(target.set_id for target in pending[1]))
+                                (*target_ids, *(target.set_id for target in pending.targets))
                             )
                         )
                     self.reconcile_canonical_targets(
@@ -964,7 +1120,11 @@ class SimulationJobOwner(QtCore.QObject):
                         target_ids,
                     )
 
-            elif str(operation["kind"]) == "preview" and summary.state != "success":
+            elif (
+                str(operation["kind"]) == "preview"
+                and str(operation["purpose"]) != "interactive-preview"
+                and summary.state != "success"
+            ):
                 target_ids = tuple(
                     target.set_id for target in operation["targets"]
                 )
@@ -978,6 +1138,31 @@ class SimulationJobOwner(QtCore.QObject):
                         str(operation["tab_id"]),
                         target_ids,
                         clear_pending=False,
+                    )
+            elif (
+                str(operation["kind"]) == "preview"
+                and str(operation["purpose"]) == "interactive-preview"
+            ):
+                pending = self._pending_interactive_preview
+                pending_ids = (
+                    set(pending.target_set_ids)
+                    if pending is not None
+                    and pending.tab_id == str(operation["tab_id"])
+                    else set()
+                )
+                retired_ids = tuple(
+                    target.set_id
+                    for target, target_state in operation["outcomes"]
+                    if target_state != "success"
+                    and target.set_id not in pending_ids
+                    and target.set_id
+                    not in set(operation.get("retired_ids", set()))
+                )
+                if retired_ids:
+                    self.interactive_targets_retired.emit(
+                        str(operation["tab_id"]),
+                        int(operation["generation"]),
+                        tuple(dict.fromkeys(retired_ids)),
                     )
         else:
             summary = SimulationTerminalSummary("run", "cancelled", 0, 0, 1, 0)
@@ -998,14 +1183,34 @@ class SimulationJobOwner(QtCore.QObject):
                     + ("cancelled" if summary.state == "cancelled" else "failed")
                     + "; draft and stable results were preserved."
                 )
+                if self._pending_interactive_preview is not None:
+                    QtCore.QTimer.singleShot(
+                        0,
+                        self._redrive_pending_interactive_preview,
+                    )
             elif operation is not None and operation["purpose"] == "preview-prerequisite":
                 self.status_changed.emit(
                     "Preview baseline ready; starting exact Preview."
                 )
                 QtCore.QTimer.singleShot(0, self._redrive_pending_preview)
+            elif operation is not None and operation["purpose"] == "interactive-preview":
+                self.status_changed.emit(self._terminal_status(summary))
+                if self._pending_interactive_preview is not None:
+                    QtCore.QTimer.singleShot(
+                        0,
+                        self._redrive_pending_interactive_preview,
+                    )
+                elif self._pending_preview is not None:
+                    QtCore.QTimer.singleShot(0, self._redrive_pending_preview)
             else:
                 self.status_changed.emit(self._terminal_status(summary))
-                QtCore.QTimer.singleShot(0, self._redrive_pending_preview)
+                if self._pending_preview is not None:
+                    QtCore.QTimer.singleShot(0, self._redrive_pending_preview)
+                elif self._pending_interactive_preview is not None:
+                    QtCore.QTimer.singleShot(
+                        0,
+                        self._redrive_pending_interactive_preview,
+                    )
         self._emit_settled_if_complete()
 
     @staticmethod
@@ -1014,103 +1219,11 @@ class SimulationJobOwner(QtCore.QObject):
 
     @QtCore.Slot()
     def _on_gate_changed(self) -> None:
-        if self._gate.is_idle and self._worker is None and self._pending_preview is not None:
-            QtCore.QTimer.singleShot(0, self._redrive_pending_preview)
-
-    def _detailed_balance_correction(self, capture: ExplicitRunCapture) -> DetailedBalanceCorrectionRequest | None:
-        unresolved: list[tuple[MechanismAuthoringSource, float, WegscheiderCyclicityReport, str]] = []
-        for target in capture.targets:
-            request = target.execution_request
-            if not request.solver_config.wegscheider_cyclicity_enabled:
-                continue
-            report = target.prepared_dsl.wegscheider_admission_report()
-            if report.unresolved_cycles:
-                source = request.mechanism_source
-                if not isinstance(source, MechanismAuthoringSource):
-                    raise ValueError("Run detailed-balance correction requires retained source.")
-                unresolved.append((source, float(request.analysis.temperature_K), report, str(target.prepared_dsl.analysis.energy_unit)))
-        if not unresolved:
-            return None
-        source, temperature, report, unit = unresolved[0]
-        cycles = tuple((cycle.cycle_id, cycle.step_indices, cycle.parameter_names) for cycle in report.unresolved_cycles)
-        return DetailedBalanceCorrectionRequest(
-            origin="Run", tab_id=capture.tab_id, source=source.reactions_text,
-            issue="Unresolved detailed-balance cycle(s): " + "; ".join(cycle_id for cycle_id, _steps, _names in cycles),
-            temperature_K=temperature, report=report, source_energy_unit=unit,
-            accepted_analysis=capture.targets[0].prepared_dsl.analysis,
-        )
-
-    def _fail_detailed_balance_continuation(self, message: str) -> bool:
-        """Close a committed correction when current Run capture is unavailable."""
-
-        self._pending_detailed_balance = None
-        self._terminal_state = "failure"
-        if self._gate.is_owned_by(self):
-            self._gate.release(self)
-        self.status_changed.emit(str(message))
-        self.state_changed.emit()
-        self._emit_settled_if_complete()
-        return False
-
-    def complete_detailed_balance_correction(self, outcome: DetailedBalanceCorrectionOutcome) -> bool:
-        pending = self._pending_detailed_balance
-        if pending is None:
-            return False
-        if not isinstance(outcome, DetailedBalanceCorrectionOutcome) or outcome.cancelled:
-            self._pending_detailed_balance = None
-            self._gate.release(self)
-            self.state_changed.emit()
-            return True
-        if outcome.source != pending.correction.source or outcome.issue != pending.correction.issue:
-            self._pending_detailed_balance = None
-            self._gate.release(self)
-            return False
-        source = pending.capture.targets[0].execution_request.mechanism_source
-        if not isinstance(source, MechanismAuthoringSource) or outcome.corrected_source is None:
-            return False
-        proposal = self._propose_detailed_balance_source(pending.capture.tab_id, source.with_reactions_text(outcome.corrected_source))
-        if not isinstance(proposal, DetailedBalanceCorrectionProposal):
-            return False
-        commit = self._commit_detailed_balance_source(proposal)
-        if not isinstance(commit, DetailedBalanceCorrectionCommitResult) or not commit.committed:
-            return False
-        resolver = self._capture_current_run
-        requested_ids = tuple(target.set_id for target in pending.capture.targets)
-        try:
-            fresh_capture = resolver(pending.capture.tab_id, requested_ids)
-        except Exception as exc:  # noqa: BLE001
-            return self._fail_detailed_balance_continuation(
-                "Run correction committed, but current Run inputs are invalid: "
-                f"{exc}"
-            )
-        if not isinstance(fresh_capture, ExplicitRunCapture):
-            return self._fail_detailed_balance_continuation(
-                "Run correction committed, but current Run inputs could not be rebuilt."
-            )
-        fresh_ids = tuple(target.set_id for target in fresh_capture.targets)
-        if (
-            fresh_capture.tab_id != pending.capture.tab_id
-            or fresh_ids != requested_ids
-        ):
-            return self._fail_detailed_balance_continuation(
-                "Run correction committed, but selected Run inputs are no longer current."
-            )
-        try:
-            if self._detailed_balance_correction(fresh_capture) is not None:
-                return self._fail_detailed_balance_continuation(
-                    "Run correction committed, but corrected Run inputs remain invalid."
+        if self._gate.is_idle and self._worker is None:
+            if self._pending_preview is not None:
+                QtCore.QTimer.singleShot(0, self._redrive_pending_preview)
+            elif self._pending_interactive_preview is not None:
+                QtCore.QTimer.singleShot(
+                    0,
+                    self._redrive_pending_interactive_preview,
                 )
-        except Exception as exc:  # noqa: BLE001
-            return self._fail_detailed_balance_continuation(
-                "Run correction committed, but corrected Run inputs are invalid: "
-                f"{exc}"
-            )
-        self._pending_detailed_balance = None
-        if self._gate.is_owned_by(self):
-            self._gate.release(self)
-        return self._start(
-            fresh_capture.tab_id,
-            "run",
-            fresh_capture.targets,
-            max_parallel=self._capacity(len(fresh_capture.targets)),
-        )

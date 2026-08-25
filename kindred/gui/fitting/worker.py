@@ -83,7 +83,6 @@ __all__ = [
     "FitCurveDataset",
     "FitCurveYSemantic",
     "FitLiveUpdate",
-    "FitWorkerTerminal",
     "GlobalFitWorker",
     "project_fit_candidate_curves",
 ]
@@ -604,68 +603,6 @@ class FitCandidate:
             dispatch=self.request.dispatch,
             effective_datasets=effective,
             initial_values_by_set=self.initial_values_by_set,
-        )
-
-
-@dataclass(frozen=True, slots=True)
-class FitWorkerTerminal:
-    """Immutable worker-to-owner factual terminal contract."""
-
-    candidate: FitCandidate | None
-    failure: FactualCause | None = None
-    unavailable: ScientificUnavailable | None = None
-    lifecycle_cause: str = "failed"
-
-    def __post_init__(self) -> None:
-        if self.candidate is not None and not isinstance(self.candidate, FitCandidate):
-            raise TypeError("Fit worker candidate must be FitCandidate.")
-        if self.failure is not None and not isinstance(self.failure, FactualCause):
-            raise TypeError("Fit worker failure must be FactualCause.")
-        if self.failure is not None and self.candidate is not None:
-            raise ValueError("Fit worker failure cannot carry a candidate.")
-        if self.unavailable is not None and not isinstance(self.unavailable, ScientificUnavailable):
-            raise TypeError("Fit worker unavailable cause must be ScientificUnavailable.")
-        if self.lifecycle_cause not in {
-            "completed", "user_stop", "cancelled", "failed", "scientific_unavailable",
-        }:
-            raise ValueError("Fit worker lifecycle cause is invalid.")
-        if self.lifecycle_cause == "failed" and self.failure is None:
-            raise ValueError("Failed Fit terminal requires a factual failure.")
-        if self.lifecycle_cause == "scientific_unavailable":
-            if self.candidate is not None or self.failure is not None:
-                raise ValueError("Scientifically unavailable Fit terminal cannot publish a candidate or failure.")
-            if self.unavailable is None:
-                raise ValueError("Scientifically unavailable Fit terminal requires its cause.")
-        elif self.unavailable is not None:
-            raise ValueError("Scientific-unavailability cause requires its dedicated terminal lifecycle.")
-        if self.lifecycle_cause in {"completed", "user_stop"} and self.candidate is None:
-            raise ValueError(
-                f"Fit terminal {self.lifecycle_cause!r} requires a candidate."
-            )
-        if self.lifecycle_cause in {"completed", "user_stop"} and self.failure is not None:
-            raise ValueError(
-                f"Fit terminal {self.lifecycle_cause!r} cannot carry a failure."
-            )
-
-    @property
-    def message(self) -> str:
-        """Compact status text; structured facts remain in ``failure``."""
-
-        if self.failure is not None:
-            return self.failure.message
-        if self.lifecycle_cause == "scientific_unavailable":
-            cause = None if self.unavailable is None else self.unavailable.factual_cause
-            return (
-                "Fit result scientifically unavailable"
-                if cause is None
-                else f"Fit result scientifically unavailable: {cause.message}"
-            )
-        return (
-            "Fit stopped by user."
-            if self.lifecycle_cause == "user_stop"
-            else "Fit cancelled."
-            if self.lifecycle_cause == "cancelled"
-            else ""
         )
 
 
@@ -1429,7 +1366,7 @@ def _curves_from_live(
             _construct_fit_curve_dataset(
                 dataset_id=dataset_id,
                 display_name=mapped.display_name,
-                y_semantics=_fit_curve_y_semantics(request.prepared_dsl, model_names),
+                y_semantics=_fit_curve_y_semantics(request.origin.prepared_dsl, model_names),
                 model_x=model_x,
                 model_y=model_y,
                 observed_x=observed_x,
@@ -1567,7 +1504,7 @@ def _curves_from_terminal(
             _construct_fit_curve_dataset(
                 dataset_id=dataset_id,
                 display_name=mapped.display_name,
-                y_semantics=_fit_curve_y_semantics(request.prepared_dsl, model_names),
+                y_semantics=_fit_curve_y_semantics(request.origin.prepared_dsl, model_names),
                 model_x=model_x,
                 model_y=model_y,
                 observed_x=observed_x,
@@ -1830,6 +1767,14 @@ class GlobalFitWorker(QtCore.QThread):
     auto_modes_resolved = QtCore.Signal(object)
     best_updated = QtCore.Signal(object)
     curves_updated = QtCore.Signal(object)
+    # Terminal values cross the trusted Qt boundary in their ordinary owned
+    # type.  There is deliberately no terminal/outcome envelope: exactly one
+    # of these signals is emitted after all borrowed evaluator work has
+    # drained.
+    candidate_ready = QtCore.Signal(object)
+    factual_failure = QtCore.Signal(object)
+    scientific_unavailable = QtCore.Signal(object)
+    cancelled = QtCore.Signal()
 
     def __init__(
         self,
@@ -1851,7 +1796,6 @@ class GlobalFitWorker(QtCore.QThread):
         self._last_best_emit = 0.0
         self._last_curve_emit = 0.0
         self._resolved_auto_modes: tuple[tuple[str, str], ...] = ()
-        self._terminal_result: FitWorkerTerminal | None = None
         self._terminal_unavailable: ScientificUnavailable | None = None
         self._publish_best_on_cancel = False
         self._executor: ThreadPoolExecutor | None = None
@@ -1869,12 +1813,6 @@ class GlobalFitWorker(QtCore.QThread):
         """Return the immutable request held by this worker."""
 
         return self._request
-
-    @property
-    def terminal_result(self) -> FitWorkerTerminal | None:
-        """Return the retained terminal after the worker's ``run`` exits."""
-
-        return self._terminal_result
 
     def resume(self) -> None:
         with self._pause_condition:
@@ -1897,48 +1835,6 @@ class GlobalFitWorker(QtCore.QThread):
             self._paused = False
             self._pause_condition.notify_all()
         self.requestInterruption()
-
-    def _build_terminal(
-        self,
-        *,
-        candidate: FitCandidate | None,
-        failure: FactualCause | None = None,
-        unavailable: ScientificUnavailable | None = None,
-    ) -> FitWorkerTerminal:
-        """Settle only factual candidate, failure, and lifecycle custody."""
-
-        if unavailable is not None:
-            lifecycle = "scientific_unavailable"
-            failure = None
-            candidate = None
-        elif failure is not None:
-            lifecycle = "failed"
-            candidate = None
-        elif self._cancelled.is_set():
-            lifecycle = (
-                "user_stop"
-                if (
-                    not self._close_requested.is_set()
-                    and self._publish_best_on_cancel
-                    and candidate is not None
-                )
-                else "cancelled"
-            )
-        elif candidate is not None:
-            lifecycle = "completed"
-        else:
-            lifecycle = "failed"
-            failure = factual_cause_from_exception(
-                RuntimeError("Fit worker exited without a candidate or failure."),
-                domain="fit",
-                origin="fit_worker",
-            )
-        return FitWorkerTerminal(
-            candidate=candidate,
-            failure=failure,
-            unavailable=unavailable,
-            lifecycle_cause=lifecycle,
-        )
 
     def _checkpoint(self) -> bool:
         with self._pause_condition:
@@ -1978,19 +1874,25 @@ class GlobalFitWorker(QtCore.QThread):
             if executor is not None:
                 executor.shutdown(wait=True)
 
-        # No terminal signal/property is published until all borrowed dataset
-        # work has drained and the worker-owned executor has shut down.
-        if failure is not None or cancelled:
-            terminal = self._build_terminal(
-                candidate=None,
-                failure=failure,
-            )
+        # Publish one direct typed terminal only after every worker-owned
+        # evaluator and executor has settled.  The owner receives the exact
+        # candidate/cause/unavailability value; cancellation has no payload.
+        if failure is not None:
+            self.factual_failure.emit(failure)
+        elif cancelled:
+            self.cancelled.emit()
+        elif unavailable is not None:
+            self.scientific_unavailable.emit(unavailable)
+        elif candidate is not None:
+            self.candidate_ready.emit(candidate)
         else:
-            terminal = self._build_terminal(
-                candidate=candidate,
-                unavailable=unavailable,
+            self.factual_failure.emit(
+                factual_cause_from_exception(
+                    RuntimeError("Fit worker exited without a terminal value."),
+                    domain="fit",
+                    origin="fit_worker",
+                )
             )
-        self._terminal_result = terminal
 
     def _execute(
         self,
@@ -2022,7 +1924,7 @@ class GlobalFitWorker(QtCore.QThread):
             dataset_context = prepared_datasets[local.dataset_id]
             try:
                 context = prepare_fitting_execution_context(
-                    prepared_dsl=request.prepared_dsl,
+                    prepared_dsl=request.origin.prepared_dsl,
                     param_names=candidate_names,
                     t_start=dataset_context.execution_t_start,
                     t_end=dataset_context.execution_t_end,
@@ -2047,7 +1949,7 @@ class GlobalFitWorker(QtCore.QThread):
             metadata = evaluator.prepared_metadata
             prepared_ids[local.dataset_id] = {
                 "prepared_simulation": metadata.to_serializable_dict(),
-                "declarative_analysis_source": request.prepared_dsl.analysis.normalized_text,
+                "declarative_analysis_source": request.origin.prepared_dsl.analysis.normalized_text,
                 "fit_local_admission": (
                     None
                     if request.fit_local_admission is None

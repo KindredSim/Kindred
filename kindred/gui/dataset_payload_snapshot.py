@@ -3,14 +3,16 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-import math
 
 from kindred.core.project_document import (
     MechanismTabDocument,
     ProjectDocument,
 )
 from kindred.core.datasets.foundation import RawDatasetRecord
-from kindred.core.project_presentation_state import ProjectPresentationState
+from kindred.core.project_presentation_state import (
+    ExperimentalAxisSelection,
+    ProjectPresentationState,
+)
 
 
 @dataclass(frozen=True)
@@ -35,35 +37,10 @@ class DataManagerSnapshot:
 
 
 @dataclass(frozen=True, slots=True)
-class ExperimentalLayerIdentity:
-    """Tagged immutable identity for one dataset-local raw observation."""
-
-    dataset_id: str
-    raw_observation_id: str
-
-    def __post_init__(self) -> None:
-        for value, label in (
-            (self.dataset_id, "dataset"),
-            (self.raw_observation_id, "raw observation"),
-        ):
-            if (
-                not isinstance(value, str)
-                or not value
-                or value != value.strip()
-            ):
-                raise ValueError(
-                    f"Experimental layer {label} ID must be a nonblank "
-                    "edge-normalized string."
-                )
-
-
-@dataclass(frozen=True, slots=True)
 class ExperimentalLayerInput:
-    """One immutable selected raw series with separate mapped-model identity."""
+    """One immutable selected raw series with mapped-model provenance."""
 
-    layer_id: ExperimentalLayerIdentity
-    dataset_id: str
-    raw_observation_id: str
+    axis: ExperimentalAxisSelection
     dataset_name: str
     raw_column: str
     model_target: str | None
@@ -73,13 +50,11 @@ class ExperimentalLayerInput:
     set_id: str | None = None
 
     def __post_init__(self) -> None:
-        if not isinstance(self.layer_id, ExperimentalLayerIdentity):
+        if not isinstance(self.axis, ExperimentalAxisSelection):
             raise TypeError(
-                "Experimental layer_id must be an ExperimentalLayerIdentity."
+                "Experimental axis must be an ExperimentalAxisSelection."
             )
         for value, label in (
-            (self.dataset_id, "dataset"),
-            (self.raw_observation_id, "raw observation"),
             (self.dataset_name, "dataset name"),
             (self.raw_column, "raw column"),
         ):
@@ -92,13 +67,6 @@ class ExperimentalLayerInput:
                     f"Experimental {label} identity must be a nonblank "
                     "edge-normalized string."
                 )
-        if self.layer_id != ExperimentalLayerIdentity(
-            self.dataset_id,
-            self.raw_observation_id,
-        ):
-            raise ValueError(
-                "Experimental layer identity must match its dataset/raw IDs."
-            )
         if self.model_target is not None and (
             not isinstance(self.model_target, str)
             or not self.model_target
@@ -117,27 +85,7 @@ class ExperimentalLayerInput:
                 "Experimental mapped set identity must be None or a "
                 "nonblank edge-normalized string."
             )
-        if (
-            type(self.t) is not tuple
-            or type(self.y) is not tuple
-            or type(self.source_rows) is not tuple
-            or not self.t
-            or len(self.t) != len(self.y)
-            or len(self.t) != len(self.source_rows)
-            or any(
-                type(value) is not float or not math.isfinite(value)
-                for value in (*self.t, *self.y)
-            )
-            or any(
-                type(row) is not int or row <= 0
-                for row in self.source_rows
-            )
-            or len(set(self.source_rows)) != len(self.source_rows)
-        ):
-            raise ValueError(
-                "Experimental layer values require immutable aligned finite "
-                "float t/y tuples and unique positive physical source rows."
-            )
+
 
 def build_data_manager_snapshot(
     *,
@@ -227,12 +175,10 @@ def build_experimental_layer_inputs(
                 continue
             layers.append(
                 ExperimentalLayerInput(
-                    layer_id=ExperimentalLayerIdentity(
+                    axis=ExperimentalAxisSelection(
                         record.dataset_id,
-                        series.raw_observation_id,
+                        raw_observation_id,
                     ),
-                    dataset_id=record.dataset_id,
-                    raw_observation_id=raw_observation_id,
                     dataset_name=record.display_name,
                     raw_column=raw_column,
                     model_target=mapping.get(raw_observation_id),
