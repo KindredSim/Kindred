@@ -1375,7 +1375,6 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
                 updated_initials.get((item.set_id, item.species), item)
                 for item in setup.initials
             ),
-            shared_refit_promotions=(),
         )
         self._pending_target_selections.clear()
         self._pending_target_weights.clear()
@@ -1615,7 +1614,6 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
             replace(
                 self._current_setup(),
                 dataset_weight_mode=mode,
-                shared_refit_promotions=(),
             )
         )
         self._refresh_dataset_weight_editor()

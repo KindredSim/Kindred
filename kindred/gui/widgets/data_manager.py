@@ -6,7 +6,7 @@ from __future__ import annotations
 import html
 import logging
 from dataclasses import dataclass
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from PySide6 import QtCore, QtWidgets
 from PySide6.QtCore import Qt
@@ -46,7 +46,11 @@ from kindred.gui.dataset_payload_snapshot import (
     ActiveDatasetLinkSnapshot,
     DataManagerSnapshot,
 )
-from kindred.core.datasets.foundation import ImportedSource, RawDatasetRecord, thaw_json_value
+from kindred.core.datasets.foundation import (
+    RawDatasetRecord,
+    thaw_json_value,
+)
+from kindred.core.project_document import ProjectDocument
 from kindred.gui.display_name_policy import DATASET_LIST_LABEL_MAX_CHARS, compact_dataset_label
 
 logger = logging.getLogger(__name__)
@@ -142,7 +146,6 @@ class DataManagerPanel(QtWidgets.QWidget):
         staging: DatasetImportStaging,
         *,
         origin_tab_id: str,
-        source_resolver: Callable[[str], ImportedSource],
         parent: Optional[QtWidgets.QWidget] = None,
     ):
         """
@@ -165,13 +168,8 @@ class DataManagerPanel(QtWidgets.QWidget):
                 "DataManagerPanel requires one stable edge-normalized origin "
                 "tab ID."
             )
-        if not callable(source_resolver):
-            raise TypeError(
-                "DataManagerPanel requires a callable dataset source resolver."
-            )
         self._staging = staging
         self._origin_tab_id = origin_tab_id
-        self._source_resolver = source_resolver
 
         layout = QtWidgets.QVBoxLayout(self)
 
@@ -298,7 +296,11 @@ class DataManagerPanel(QtWidgets.QWidget):
         """Programmatically invoke the load dialog (mirrors Load button)."""
         self._load_dataset()
 
-    def render_snapshot(self, snapshot: DataManagerSnapshot) -> None:
+    def render_snapshot(
+        self,
+        snapshot: DataManagerSnapshot,
+        document: ProjectDocument,
+    ) -> None:
         """Render one global-catalog/active-tab snapshot without retaining truth."""
         if not isinstance(snapshot, DataManagerSnapshot):
             raise TypeError("DataManagerPanel requires a DataManagerSnapshot.")
@@ -319,6 +321,9 @@ class DataManagerPanel(QtWidgets.QWidget):
             )
             item.setData(Qt.UserRole, str(record.dataset_id))
             item.setData(Qt.UserRole + 1, compact.full)
+            source = document.imported_source(record.source_id)
+            item.setData(Qt.UserRole + 2, str(source.original_filename))
+            item.setData(Qt.UserRole + 3, str(source.original_format))
             self._dataset_list.addItem(item)
             if str(record.dataset_id) == selected_id:
                 selected_row = row
@@ -565,8 +570,6 @@ class DataManagerPanel(QtWidgets.QWidget):
 
     def _on_import_progress(self, event: DatasetImportProgress) -> None:
         """Render one staging-owned aggregate progress event."""
-        if not isinstance(event, DatasetImportProgress):
-            raise TypeError("Dataset import progress event has the wrong type.")
         if event.request is not self._initiating_import_request:
             return
         if self._progress_dialog:
@@ -574,8 +577,6 @@ class DataManagerPanel(QtWidgets.QWidget):
 
     def _on_import_failure(self, event: DatasetImportFailure) -> None:
         """Present one staging-owned typed worker failure."""
-        if not isinstance(event, DatasetImportFailure):
-            raise TypeError("Dataset import failure event has the wrong type.")
         if not self._owns_worker_request(event.request):
             return
         self._show_message(
@@ -589,8 +590,6 @@ class DataManagerPanel(QtWidgets.QWidget):
         event: DatasetImportCancellation,
     ) -> None:
         """Observe one staging-owned typed worker cancellation."""
-        if not isinstance(event, DatasetImportCancellation):
-            raise TypeError("Dataset import cancellation event has the wrong type.")
         if not self._owns_worker_request(event.request):
             return
         logger.info("Dataset import canceled: %s", event.source_label)
@@ -675,9 +674,8 @@ class DataManagerPanel(QtWidgets.QWidget):
         thawed_metadata = thaw_json_value(record.source_metadata)
         metadata = dict(thawed_metadata) if isinstance(thawed_metadata, dict) else {}
         mapping_source = escape(metadata.get("mapping_source", "normalized"))
-        source = self._source_resolver(record.source_id)
-        source_filename = escape(source.original_filename)
-        source_format = escape(source.original_format)
+        source_filename = escape(current.data(Qt.UserRole + 2) or "")
+        source_format = escape(current.data(Qt.UserRole + 3) or "")
         time_column = escape(metadata.get("time_column", "unknown"))
         preview = f"<b>{name}</b><br>"
         preview += (

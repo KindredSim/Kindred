@@ -9,10 +9,10 @@ outside it.
 from __future__ import annotations
 
 import math
-import secrets
 import sys
 from dataclasses import dataclass, replace
 from collections.abc import Mapping, Sequence
+import numpy as np
 from PySide6 import QtCore, QtGui, QtWidgets
 
 from kindred.core.analysis.fit_uncertainty import (
@@ -638,7 +638,13 @@ class _ResidualBootstrapDialog(QtWidgets.QDialog):
         bootstrap_seed = (
             configuration.seed
             if configuration is not None
-            else secrets.randbelow(2_000_000_001)
+            else int(
+                np.random.default_rng().integers(
+                    BOOTSTRAP_SEED_RANGE[0],
+                    BOOTSTRAP_SEED_RANGE[1],
+                    endpoint=True,
+                )
+            )
         )
         self._seed.setValue(bootstrap_seed)
         self._method = QtWidgets.QComboBox(self)
@@ -710,7 +716,6 @@ class ParametersIcsTab(QtWidgets.QWidget):
         self._origin = origin
         self._projected_setup: FitSetupSnapshot | None = None
         self._last_fit_parameters: dict[str, FitParameterVariable] = {}
-        self._last_fit_is_older_retained_state = False
         self._can_reset_initial = False
         self._can_reset_last_fit = False
         self._selected_dataset_ids: tuple[str, ...] = ()
@@ -858,7 +863,6 @@ class ParametersIcsTab(QtWidgets.QWidget):
                 setup,
                 initial_scopes=tuple(scope_map.items()),
                 global_initials=global_initials,
-                shared_refit_promotions=(),
             )
         )
 
@@ -1268,27 +1272,11 @@ class ParametersIcsTab(QtWidgets.QWidget):
         self._project_last_fit_columns()
         self._render_selected_parameter()
 
-    def set_last_fit_presentation(self, *, older_retained_state: bool) -> None:
-        """Label retained Last Fit values without changing their ownership.
+    def set_last_fit_presentation(self) -> None:
+        """Label retained Last Fit values without changing their ownership."""
 
-        A new scientifically unavailable attempt must not make the retained
-        values look like evidence from that attempt.  This is presentation
-        state only: the owner still controls the retained setup snapshot and
-        values.
-        """
-
-        self._last_fit_is_older_retained_state = bool(older_retained_state)
-        title = (
-            "Last Fit (older retained state)"
-            if self._last_fit_is_older_retained_state
-            else "Last Fit"
-        )
-        self._last_fit_group.setTitle(title)
-        header = (
-            "Last result (older retained)"
-            if self._last_fit_is_older_retained_state
-            else "Last result"
-        )
+        self._last_fit_group.setTitle("Last Fit")
+        header = "Last result"
         self._param_table.setHorizontalHeaderItem(
             2,
             QtWidgets.QTableWidgetItem(header),
@@ -1789,7 +1777,6 @@ class ParametersIcsTab(QtWidgets.QWidget):
                 ),
                 profile_likelihood=profile,
                 residual_bootstrap=bootstrap,
-                shared_refit_promotions=(),
             )
         )
         return True
@@ -1818,7 +1805,6 @@ class ParametersIcsTab(QtWidgets.QWidget):
                 edited if item.name == edited.name else item
                 for item in self._projected_setup.parameters
             ),
-            shared_refit_promotions=(),
         )
         self._retire_numeric_drafts({parameter.name})
         self.setupSnapshotRequested.emit(updated)
@@ -1867,7 +1853,6 @@ class ParametersIcsTab(QtWidgets.QWidget):
                     replacement if item.name == replacement.name else item
                     for item in self._projected_setup.parameters
                 ),
-                shared_refit_promotions=(),
             )
         )
 

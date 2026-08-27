@@ -239,6 +239,7 @@ class PreparedFittingExecutionContext:
     fit_sampling_policy: str = "fit_internal_regular_grid"
     fit_sampling_identity: Mapping[str, object] = field(default_factory=dict)
     fit_local_admission: AdmittedAlgebraProgram | None = None
+    initial_prefix: str = "init:"
 
     def __post_init__(self) -> None:
         prepared_run = self.prepared_run
@@ -285,6 +286,7 @@ class PreparedFittingExecutionContext:
         admission = self.fit_local_admission
         if admission is not None and not isinstance(admission, AdmittedAlgebraProgram):
             raise TypeError("Fit-local admission must be a typed value.")
+        object.__setattr__(self, "initial_prefix", str(self.initial_prefix or "init:"))
 
 def prepare_fitting_execution_context(
     *,
@@ -358,7 +360,6 @@ def prepare_fitting_execution_context(
         build_time_grid(t_start, t_end, prepared_solver_config.grid)
     except (TypeError, ValueError) as exc:
         raise ValueError("Fit regular grid cannot be realized on this time span.") from exc
-    temperature_K = float(prepared_dsl.analysis.temperature_K)
     objective_times = np.asarray(tuple(objective_sample_times), dtype=float).reshape(-1)
     if (
         np.any(~np.isfinite(objective_times))
@@ -516,17 +517,6 @@ def prepare_fitting_execution_context(
         execution_request=execution_request,
         cancellation_control=cancellation_control,
     )
-    prepared_run = replace(
-        prepared_run,
-        version=1,
-        mechanism_text_len=len(prepared_dsl.analysis.normalized_text),
-        param_names=tuple(sorted({*(str(x) for x in canonical_requested_param_names if str(x).strip()), *local_scalar_names})),
-        t_end=float(t_end),
-        num_points=grid_n,
-        temperature_K=float(temperature_K),
-        initial_prefix=str(initial_prefix),
-        symbolic_jacobian_status=prepared_run.symbolic_jacobian.status,
-    )
     return PreparedFittingExecutionContext(
         prepared_run=prepared_run,
         algebra_policy=SimulationAlgebraPolicy.FITTING_STRICT,
@@ -534,6 +524,7 @@ def prepare_fitting_execution_context(
         fit_sampling_policy=str(fit_sampling_policy or "fit_internal_regular_grid"),
         fit_sampling_identity=dict(fit_sampling_identity or {}),
         fit_local_admission=fit_local_admission,
+        initial_prefix=str(initial_prefix),
     )
 
 
@@ -546,10 +537,6 @@ class FittingEvaluator:
     ) -> None:
         self._context = context
         self._cancellation_control: SimulationCancellationControl | None = None
-
-    @property
-    def prepared_metadata(self) -> PreparedSimulationRun:
-        return self._context.prepared_run
 
     def set_cancellation_control(
         self,
@@ -655,7 +642,7 @@ class FittingEvaluator:
         non_initial_parameters = {
             str(name): value
             for name, value in param_map.items()
-            if not str(name).startswith(self._context.prepared_run.initial_prefix)
+            if not str(name).startswith(self._context.initial_prefix)
             and str(name) not in local_scalar_names
         }
 
@@ -701,14 +688,6 @@ class FittingEvaluator:
             ) from exc
 
         symbolic_jacobian = prepared_run.symbolic_jacobian
-        metadata_updates: dict[str, object] = {}
-        if symbolic_jacobian.status:
-            metadata_updates.update(symbolic_jacobian.metadata_kwargs())
-        if metadata_updates:
-            self._context = replace(
-                self._context,
-                prepared_run=replace(self._context.prepared_run, **metadata_updates),
-            )
 
         species_index = {
             name: idx for idx, name in enumerate(prepared_run.species_names)
@@ -757,7 +736,9 @@ class FittingEvaluator:
                 details={"fatal": True, "stage": "parameter_binding"},
             ) from exc
 
-        requested_parameter_names = set(self._context.prepared_run.param_names or ())
+        requested_parameter_names = set(
+            self._context.prepared_run.request.requested_parameter_names
+        )
         consumed_parameter_names = {
             *mechanism_names,
             *unbound_mechanism_names,
@@ -772,8 +753,8 @@ class FittingEvaluator:
         }
         for key, raw_val in param_map.items():
             name = str(key)
-            if name.startswith(self._context.prepared_run.initial_prefix):
-                species_name = name[len(self._context.prepared_run.initial_prefix) :]
+            if name.startswith(self._context.initial_prefix):
+                species_name = name[len(self._context.initial_prefix) :]
                 if species_name not in species_index:
                     continue
                 initial_overrides[species_name] = _coerce_consumed_parameter_value(
@@ -809,7 +790,7 @@ class FittingEvaluator:
                             invalid_messages[name],
                             details={"fatal": True, "stage": "parameter_binding"},
                         )
-                    if name in set(self._context.prepared_run.param_names or ()):
+                    if name in requested_parameter_names:
                         raise FitSimulationError(
                             (
                                 f"Requested fitting parameter {name!r} is unavailable after preparation; "
@@ -865,9 +846,6 @@ class FittingEvaluator:
             intervention_execution=intervention_execution,
             symbolic_jacobian=symbolic_jacobian,
             cancellation_control=self._cancellation_control,
-        )
-        request = replace(
-            request,
             t_eval=np.asarray(
                 self._context.requested_sample_times,
                 dtype=float,

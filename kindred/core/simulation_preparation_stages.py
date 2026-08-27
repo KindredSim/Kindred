@@ -20,10 +20,6 @@ from kindred.core.simulator.solvers import normalize_solver_name
 from kindred.core.symbolic.errors import UnsupportedSymbolicExpressionError
 from kindred.core.symbolic.jacobian_execution import SymbolicJacobianExecution
 from kindred.core.symbolic.namespaces import symbolic_status_payload
-from kindred.core.symbolic.structure_cache import (
-    get_or_build_symbolic_jacobian_structure,
-    symbolic_jacobian_structure_cache_key,
-)
 from kindred.core.temperature import (
     TemperatureScheduleDictProtocol,
     TemperatureScheduleProtocol,
@@ -104,31 +100,6 @@ def build_solver_config(
     )
 
 
-def _symbolic_jacobian_structure_for_mechanism(*, mechanism: Any) -> Any:
-    from kindred.core.symbolic.jacobian import (
-        build_symbolic_jacobian_structure,
-        symbolic_jacobian_structure_fingerprint_for_mechanism,
-    )
-
-    try:
-        structure_fingerprint = symbolic_jacobian_structure_fingerprint_for_mechanism(
-            mechanism
-        )
-    except UnsupportedSymbolicExpressionError:
-        return None
-    key = symbolic_jacobian_structure_cache_key(
-        structure_fingerprint=structure_fingerprint,
-    )
-
-    def build_structure() -> Any:
-        return build_symbolic_jacobian_structure(mechanism)
-
-    try:
-        return get_or_build_symbolic_jacobian_structure(key, build_structure)
-    except UnsupportedSymbolicExpressionError:
-        return None
-
-
 def _symbolic_jacobian_status_for_mechanism(mechanism: Any) -> Dict[str, Any]:
     from kindred.core.symbolic.jacobian import classify_symbolic_jacobian_support
 
@@ -161,11 +132,7 @@ def _bind_symbolic_jacobian_for_current_mechanism(
     symbolic_structure: Any = None,
     coefficient_evaluator: Any = None,
 ) -> SymbolicJacobianExecution:
-    structure = (
-        symbolic_structure
-        if symbolic_structure is not None
-        else _symbolic_jacobian_structure_for_mechanism(mechanism=mechanism)
-    )
+    structure = symbolic_structure
     if structure is None:
         raise UnsupportedSymbolicExpressionError("symbolic structure is unsupported.")
     from kindred.core.ode_builder import build_effective_rate_coefficient_evaluator

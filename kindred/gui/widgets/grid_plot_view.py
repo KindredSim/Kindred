@@ -62,9 +62,6 @@ def _fit_y_axis_label(
 class GridPlotView(QtWidgets.QWidget):
     """Render immutable live and terminal Fit curves in the Fit-local plot."""
 
-    renderFailed = QtCore.Signal(str)
-    renderStateChanged = QtCore.Signal(bool)
-
     def __init__(
         self,
         *,
@@ -86,7 +83,6 @@ class GridPlotView(QtWidgets.QWidget):
         self._selected_species_list: list[str] = []
         self._available_species_cache: tuple[str, ...] = ()
         self._seen_nonempty_payload = False
-        self._render_succeeded = False
         self._plot_items: list[object] = []
         self._plot_series_items: list[dict[str, object]] = []
         self._plot_legends: list[object | None] = []
@@ -204,7 +200,6 @@ class GridPlotView(QtWidgets.QWidget):
         )
         self._dataset_presentation = normalized_presentation
         self._curves = values
-        self._render_succeeded = False
         if not values:
             self._seen_nonempty_payload = False
             self._selected_species_list = []
@@ -212,9 +207,9 @@ class GridPlotView(QtWidgets.QWidget):
         return self._redraw()
 
     def copy_eligible(self) -> bool:
-        """Whether this Fit-local panel owns a rendered Copy projection."""
+        """Whether this Fit-local panel has immutable curves to copy."""
 
-        return bool(self._curves and self._render_succeeded)
+        return bool(self._curves)
 
     def copy_projection_to_clipboard(
         self,
@@ -225,8 +220,8 @@ class GridPlotView(QtWidgets.QWidget):
         values = tuple(curves)
         if any(not isinstance(item, FitCurveDataset) for item in values):
             raise TypeError("curves must contain FitCurveDataset values.")
-        if not values or not self._render_succeeded:
-            raise ValueError("No rendered Fit curves are available to copy.")
+        if not values:
+            raise ValueError("No Fit curves are available to copy.")
         if self._copy_timer.isActive():
             return
         self._copy_chunks = iter(self._iter_copy_chunks(values))
@@ -234,7 +229,7 @@ class GridPlotView(QtWidgets.QWidget):
         self._copy_timer.start()
 
     def _cancel_copy(self) -> None:
-        """Cancel one stale asynchronous full-resolution Copy operation."""
+        """Cancel one pending asynchronous full-resolution Copy operation."""
 
         self._copy_timer.stop()
         self._copy_chunks = None
@@ -379,33 +374,6 @@ class GridPlotView(QtWidgets.QWidget):
                 "Copy Fit Data",
                 str(exc),
             )
-
-    def _reject_render_failure(self, error: BaseException) -> None:
-        """Revoke one failed physical presentation and its Copy authority."""
-
-        self._render_succeeded = False
-        self._cancel_copy()
-        self._curves = ()
-        self._color_by_species = MappingProxyType({})
-        self._dataset_presentation = MappingProxyType({})
-        self._seen_nonempty_payload = False
-        self._selected_species_list = []
-        self._available_species_cache = ()
-        try:
-            self._canvas.clear()
-        except Exception:
-            pass
-        self._plot_items.clear()
-        self._plot_series_items.clear()
-        self._plot_legends.clear()
-        self._structure_key = None
-        self.renderStateChanged.emit(False)
-        self.renderFailed.emit(str(error))
-
-    def reject_projection(self, error: BaseException) -> None:
-        """Contain an outer presentation failure at this physical view."""
-
-        self._reject_render_failure(error)
 
     @staticmethod
     def _dataset_structure_key(
@@ -986,16 +954,10 @@ class GridPlotView(QtWidgets.QWidget):
         self._restore_locked_view_ranges()
 
     def _redraw(self) -> bool:
-        try:
-            self._update_species_selector()
-            self._update_grid()
-            self._render_succeeded = bool(
-                self._curves
-                and len(self._plot_items) == len(self._curves)
-                and len(self._plot_series_items) == len(self._curves)
-            )
-            self.renderStateChanged.emit(self._render_succeeded)
-            return self._render_succeeded
-        except Exception as exc:
-            self._reject_render_failure(exc)
-            return False
+        self._update_species_selector()
+        self._update_grid()
+        return bool(
+            self._curves
+            and len(self._plot_items) == len(self._curves)
+            and len(self._plot_series_items) == len(self._curves)
+        )

@@ -23,7 +23,6 @@ __all__ = [
 class WegscheiderCycle:
     cycle_id: str
     step_indices: tuple[int, ...]
-    equilibrium_indices: tuple[int, ...]
     coefficients: tuple[int, ...]
 
 
@@ -51,7 +50,6 @@ class WegscheiderConstraintReport:
 @dataclass(frozen=True)
 class _ReversibleStep:
     step_index: int
-    equilibrium_index: int
     vector: Mapping[str, Fraction]
 
 
@@ -233,7 +231,6 @@ def _reversible_steps(mechanism: object) -> tuple[_ReversibleStep, ...]:
         steps.append(
             _ReversibleStep(
                 step_index=step_index,
-                equilibrium_index=equilibrium_index,
                 vector=vector,
             )
         )
@@ -339,9 +336,6 @@ def analyze_wegscheider_topology(mechanism: object) -> WegscheiderTopologyReport
         cycle = WegscheiderCycle(
             cycle_id=f"cycle_{idx}",
             step_indices=tuple(step.step_index for step, _coeff in selected),
-            equilibrium_indices=tuple(
-                step.equilibrium_index for step, _coeff in selected
-            ),
             coefficients=selected_coefficients,
         )
         cycles.append(cycle)

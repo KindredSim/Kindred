@@ -8,6 +8,7 @@ equilibrium constants, and scalar values) with automatic simulation updates.
 from __future__ import annotations
 
 from functools import partial
+from dataclasses import dataclass
 import logging
 import math
 import sys
@@ -28,6 +29,14 @@ from ..ui_helpers import (
 logger = logging.getLogger(__name__)
 
 __all__ = ["VariableSliders"]
+
+
+@dataclass(slots=True)
+class _SliderPress:
+    """Single physical press record owned by one Slider widget."""
+
+    start_position: int
+    moved: bool = False
 
 _LOG_SLIDER_VALUE_MIN = 1e-12
 _LOG_SLIDER_EXP_MIN = -12.0
@@ -207,7 +216,7 @@ class VariableSliders(QtWidgets.QWidget):
         self._visibility_scope_signature: object | None = None
         self._placeholder: QtWidgets.QLabel | None = None
         self._hidden_placeholder: QtWidgets.QLabel | None = None
-        self._active_drag_names: set[str] = set()
+        self._active_presses: Dict[str, _SliderPress] = {}
         self._editor_pre_edit_values: Dict[str, float] = {}
         self._editor_pre_edit_text: Dict[str, str] = {}
         self._last_committed_editor_text: Dict[str, str] = {}
@@ -340,7 +349,7 @@ class VariableSliders(QtWidgets.QWidget):
         self._slider_scales.clear()
         self._metadata.clear()
         self._last_valid_values.clear()
-        self._active_drag_names.clear()
+        self._active_presses.clear()
         self._editor_pre_edit_values.clear()
         self._editor_pre_edit_text.clear()
         self._last_committed_editor_text.clear()
@@ -512,13 +521,18 @@ class VariableSliders(QtWidgets.QWidget):
         self._apply_variable_visibility(name)
 
     def _on_slider_pressed(self, name: str) -> None:
-        self._active_drag_names.add(str(name))
+        name_s = str(name)
+        slider = self._sliders.get(name_s)
+        if slider is not None:
+            self._active_presses[name_s] = _SliderPress(
+                start_position=int(slider.sliderPosition()),
+            )
 
     def _on_slider_released(self, name: str) -> None:
         name_s = str(name)
-        self._active_drag_names.discard(name_s)
+        press = self._active_presses.pop(name_s, None)
         value = self._variables.get(name_s)
-        if value is not None:
+        if value is not None and press is not None and press.moved:
             self.interactionRequested.emit(
                 name_s,
                 float(value),
@@ -593,10 +607,24 @@ class VariableSliders(QtWidgets.QWidget):
             )
             return
 
+        slider = self._sliders.get(name)
+        physically_pressed = str(name) in self._active_presses
+        if physically_pressed:
+            press = self._active_presses.get(str(name))
+            if press is not None and int(slider_pos) != press.start_position:
+                press.moved = True
+            if press is not None and not press.moved:
+                self._set_value_projection(
+                    name,
+                    value,
+                    editor_text=None,
+                    emit=False,
+                )
+                return
         interaction = (
             SliderInteractionKind.INTERACTIVE_DRAG_SAMPLE
-            if str(name) in self._active_drag_names
-            else SliderInteractionKind.EXACT_DRAG_RELEASE
+            if physically_pressed
+            else SliderInteractionKind.EXACT_DIRECT_CHANGE
         )
         self._set_value_projection(
             name,
@@ -667,7 +695,7 @@ class VariableSliders(QtWidgets.QWidget):
                 preserve_visibility=preserve_visibility,
             )
             for name, value in normalized_variables.items():
-                if name in self._active_drag_names:
+                if name in self._active_presses:
                     self.update_variable_readout(name, value)
                 elif self._editor_has_focus(name):
                     continue

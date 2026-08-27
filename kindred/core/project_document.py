@@ -35,11 +35,13 @@ from kindred.core.simulator.exact_constraint_composition import (
     compose_exact_constraints,
 )
 from kindred.core.simulator.parameter_namespace import build_namespace_from_mechanism
-from kindred.core.simulator.step_indexing import get_step_index_map
 from kindred.core.simulator.source_correction import (
     CorrectionTarget,
     build_correction_expressions,
     plan_correction_basis,
+)
+from kindred.core.simulator.step_indexing import (
+    get_step_index_map,
 )
 from kindred.core.simulator.solvers import normalize_solver_name
 from kindred.core.units import UnitsModel
@@ -982,7 +984,7 @@ def _prepare_authored_source_admission(
     source: MechanismAuthoringSource,
     scientific_settings: TabScientificSettings,
 ) -> PreparedDslRequestSet | None:
-    """Admit user source through canonical parsing."""
+    """Admit user source through canonical parsing and exact consistency."""
 
     try:
         prepared_dsl = (
@@ -996,11 +998,44 @@ def _prepare_authored_source_admission(
                 ),
             )
         )
+        _validate_exact_source_constraints(prepared_dsl)
     except AuthoredSourceError:
         raise
     except (DSLError, ValueError, OverflowError) as exc:
         raise AuthoredSourceError(str(exc)) from exc
     return prepared_dsl
+
+
+def _validate_exact_source_constraints(
+    prepared_dsl: PreparedDslRequestSet | None,
+) -> None:
+    """Reject every admitted reversible cycle that is not an exact identity."""
+
+    if prepared_dsl is None:
+        return
+    composition = compose_exact_constraints(
+        prepared_dsl.accepted_mechanism_for_structure(),
+        parameter_algebra_spec=prepared_dsl.parameter_algebra_spec_for_execution(),
+    )
+    invalid = tuple(
+        constraint
+        for constraint in composition.constraints
+        if constraint.status in {"unsatisfied", "unresolved"}
+    )
+    if not invalid:
+        return
+    details = "; ".join(
+        f"{constraint.cycle_id}: {constraint.expression}"
+        + (
+            f" ({constraint.reason})"
+            if constraint.reason
+            else ""
+        )
+        for constraint in invalid
+    )
+    raise AuthoredSourceError(
+        "Authored reversible-cycle consistency failed: " + details
+    )
 
 
 def canonical_species_names(tab: MechanismTabDocument) -> tuple[str, ...]:
@@ -1083,6 +1118,7 @@ def retained_tab_mechanism_source(
         raise ValueError(
             f"Mechanism tab {tab.tab_id!r} has no matching retained prepared DSL."
         )
+    _validate_exact_source_constraints(tab.prepared_dsl)
     return MechanismSourceReconciliation(
         proposed_document=document,
     )
@@ -1229,11 +1265,11 @@ def reconcile_tab_mechanism_source(
                 )
 
     mutable_sets = list(reconciled_sets)
+    materialized_ids: list[str] = []
     index_by_name = {
         item.name.casefold(): index
         for index, item in enumerate(mutable_sets)
     }
-    materialized_ids: list[str] = []
     anonymous_target: InitialConditionSet | None = None
     for declaration in admission.declarations:
         if declaration.source_kind == "named":
@@ -1373,162 +1409,105 @@ def reconcile_tab_mechanism_source(
     return reconciliation
 
 
-def _retained_algebra_dependencies(spec: object) -> dict[str, tuple[str, ...]]:
-    """Read canonical parameter dependencies from the admitted Algebra AST."""
+def _retained_algebra_dependencies(spec: object | None) -> Mapping[str, tuple[str, ...]]:
+    """Return dependencies from the already admitted Algebra statements."""
 
+    if spec is None:
+        return {}
     block = getattr(spec, "parameter_block", None)
-    statements = (
-        block.statements_in_evaluation_order()
-        if block is not None
-        and callable(getattr(block, "statements_in_evaluation_order", None))
-        else ()
-    )
-
-    def identifiers(node: object) -> tuple[str, ...]:
-        if type(node).__name__ == "IdentNode":
-            return (str(getattr(node, "name", "")),)
-        names: list[str] = []
-        for attribute in ("lhs", "rhs", "args"):
-            child = getattr(node, attribute, None)
-            children = child if isinstance(child, tuple) else (child,)
-            for item in children:
-                if item is None:
-                    continue
-                names.extend(identifiers(item))
-        return tuple(dict.fromkeys(name for name in names if name))
-
+    statements_method = getattr(block, "statements_in_evaluation_order", None)
+    if block is None or not callable(statements_method):
+        return {}
     dependencies: dict[str, tuple[str, ...]] = {}
-    for statement in statements:
+
+    def names_in(node: object, result: set[str]) -> None:
+        if node is None:
+            return
+        if type(node).__name__ == "IdentNode":
+            result.add(str(getattr(node, "name", "")))
+            return
+        for attribute in ("lhs", "rhs"):
+            names_in(getattr(node, attribute, None), result)
+        arguments = getattr(node, "args", ())
+        for argument in arguments or ():
+            names_in(argument, result)
+
+    for statement in statements_method():
         name = str(getattr(statement, "name", ""))
-        if name:
-            dependencies[name] = tuple(
-                dependency
-                for dependency in identifiers(getattr(statement, "expr", None))
-                if dependency != name
-            )
+        found: set[str] = set()
+        names_in(getattr(statement, "expr", None), found)
+        found.discard(name)
+        dependencies[name] = tuple(sorted(found))
     return dependencies
 
 
 def _admitted_correction_targets(
     tab: MechanismTabDocument,
+    composition: object,
 ) -> tuple[CorrectionTarget, ...]:
-    """Derive the complete authored source-coordinate roster from admission."""
+    """Derive every source-backed correction candidate from admitted state."""
 
     prepared = tab.prepared_dsl
     if prepared is None:
         raise ValueError("Correction requires admitted prepared DSL.")
     mechanism = prepared.accepted_mechanism_for_structure()
     namespace = build_namespace_from_mechanism(mechanism)
-    spec = prepared.parameter_algebra_spec_for_execution()
-    dependencies_by_name = _retained_algebra_dependencies(spec)
-    assignment_names = set(dependencies_by_name)
-    admitted_dependency_names = (
-        set(namespace.canonical_names)
-        | set(namespace.source_coordinate_names)
-        | assignment_names
-    )
-    dependencies_by_name = {
-        name: tuple(
-            dependency
-            for dependency in dependencies
-            if dependency in admitted_dependency_names
-        )
-        for name, dependencies in dependencies_by_name.items()
-    }
-    admitted: list[CorrectionTarget] = []
-    seen_names: set[str] = set()
-
-    for entry in get_step_index_map(mechanism):
-        try:
-            step_index = int(entry["step_index"])
-        except (KeyError, TypeError, ValueError) as exc:
-            raise ValueError("Admitted source step has no valid step index.") from exc
-        kind = str(entry.get("kind") or "")
-        if kind not in {"reaction", "equilibrium"}:
-            raise ValueError(f"Admitted source step has invalid kind {kind!r}.")
+    source_coordinates: dict[str, tuple[Mapping[str, object], str]] = {}
+    step_entries = tuple(get_step_index_map(mechanism))
+    for entry in step_entries:
         raw_coordinates = entry.get("source_coordinates") or {}
         if not isinstance(raw_coordinates, Mapping):
             raise ValueError("Admitted source-coordinate map is invalid.")
-        source_coordinates = {
-            str(role): str(name)
-            for role, name in raw_coordinates.items()
-        }
-        expected: list[tuple[str, str]] = list(source_coordinates.items())
-        rate_roles = ("k",) if kind == "reaction" else ("kf", "kr", "Keq")
-        expected.extend(
-            (role, f"{role}{step_index}")
-            for role in rate_roles
-            if f"{role}{step_index}" in namespace.canonical_names
-        )
-        if len({name for _role, name in expected}) != len(expected):
-            raise ValueError("Admitted source-coordinate roster has duplicate identity.")
-        for role, name in source_coordinates.items():
-            if name not in namespace.source_coordinate_names:
-                raise ValueError(
-                    f"Source coordinate {name!r} is absent from the admitted namespace."
-                )
-
+        for raw_role, raw_name in raw_coordinates.items():
+            role, name = str(raw_role), str(raw_name)
+            if name in source_coordinates:
+                raise ValueError(f"Source coordinate {name!r} has duplicate admitted identity.")
+            source_coordinates[name] = (entry, role)
+    spec = prepared.parameter_algebra_spec_for_execution()
+    assignment_method = getattr(spec, "param_assignment_names", None)
+    assignment_names = (
+        {str(name) for name in assignment_method()}
+        if callable(assignment_method)
+        else set()
+    )
+    dependencies_by_name = _retained_algebra_dependencies(spec)
+    powers = {
+        str(name)
+        for item in getattr(composition, "constraints", ())
+        for name, _power in item.powers
+    }
+    admitted: list[CorrectionTarget] = []
+    seen: set[str] = set()
+    equilibria = tuple(getattr(mechanism, "equilibria", ()) or ())
+    for entry in step_entries:
+        kind = str(entry.get("kind") or "")
+        step_index = int(entry.get("step_index"))
         origin = authored_step_origin(prepared.analysis, step_index=step_index)
-        tokens = coordinate_source_parts(origin.source_text)[1]
-        matched: dict[str, tuple[str, str]] = {}
-        for role, name in expected:
+        _prefix, tokens, _comment = coordinate_source_parts(origin.source_text)
+        roles = ("k",) if kind == "reaction" else ("kf", "kr", "Keq")
+        role_entries = tuple((role, f"{role}{step_index}") for role in roles)
+        for role, name in role_entries:
+            if name not in namespace.canonical_names or name not in powers:
+                continue
             matches = [
                 token
                 for token in tokens
-                if coordinate_token_matches(token[0], role)
+                if coordinate_token_matches(token[0], "k" if role == "k" else role)
             ]
-            if len(matches) > 1:
-                raise ValueError(
-                    f"Correction coordinate {name!r} has duplicate authored tokens."
-                )
-            if name in source_coordinates and not matches:
-                raise ValueError(
-                    f"Correction coordinate {name!r} has no unique authored token."
-                )
-            if matches:
-                matched[name] = (role, str(matches[0][0]))
-
-        equilibria = tuple(getattr(mechanism, "equilibria", ()) or ())
-        authority = None
-        if kind == "equilibrium":
-            try:
-                authority = normalize_existing_equilibrium_rate_authority(
-                    equilibria[int(entry["equilibrium_index"])]
-                )
-            except (KeyError, IndexError, TypeError, ValueError) as exc:
-                raise ValueError("Admitted equilibrium source authority is invalid.") from exc
-
-        for token in tokens:
-            candidates = [
-                (role, name)
-                for role, name in expected
-                if coordinate_token_matches(token[0], role)
-            ]
-            if not candidates:
+            if len(matches) != 1 or name in seen:
                 continue
-            if len(candidates) != 1:
-                raise ValueError(
-                    f"Authored source token {token[0]!r} has ambiguous identity."
+            editable, derived = True, False
+            item_index = entry.get("equilibrium_index")
+            if kind == "equilibrium" and item_index is not None:
+                authority = normalize_existing_equilibrium_rate_authority(
+                    equilibria[int(item_index)]
                 )
-            role, name = candidates[0]
-            if name in seen_names:
-                raise ValueError(
-                    f"Correction coordinate {name!r} has duplicate admitted identity."
-                )
-            if name not in matched:
-                raise ValueError(
-                    f"Correction coordinate {name!r} has no unique authored token."
-                )
-            editable = not bool(entry.get("locked", False))
-            derived = False
-            if authority is not None:
                 editable = authority.authored_role_is_editable(role)
                 derived = authority.authored_role_is_derived(role)
             admitted.append(
                 CorrectionTarget(
                     name=name,
                     family=role,
-                    source_backed=True,
                     editable=editable,
                     locked=bool(entry.get("locked", False)),
                     algebra_owned=name in assignment_names,
@@ -1538,7 +1517,37 @@ def _admitted_correction_targets(
                     source_origin=origin.source_text,
                 )
             )
-            seen_names.add(name)
+            seen.add(name)
+        for raw_role, raw_name in (entry.get("source_coordinates") or {}).items():
+            role, name = str(raw_role), str(raw_name)
+            if name not in namespace.source_coordinate_names or name not in powers or name in seen:
+                continue
+            matches = [token for token in tokens if coordinate_token_matches(token[0], role)]
+            if len(matches) != 1:
+                continue
+            editable = not bool(entry.get("locked", False))
+            derived = False
+            item_index = entry.get("equilibrium_index")
+            if kind == "equilibrium" and role == "dG_eq" and item_index is not None:
+                authority = normalize_existing_equilibrium_rate_authority(
+                    equilibria[int(item_index)]
+                )
+                editable = editable and authority.authored_role_is_editable(role)
+                derived = authority.authored_role_is_derived(role)
+            admitted.append(
+                CorrectionTarget(
+                    name=name,
+                    family=role,
+                    editable=editable,
+                    locked=bool(entry.get("locked", False)),
+                    algebra_owned=name in assignment_names,
+                    derived=derived,
+                    dependencies=dependencies_by_name.get(name, ()),
+                    canonical_identity=(name, role),
+                    source_origin=origin.source_text,
+                )
+            )
+            seen.add(name)
     return tuple(admitted)
 
 
@@ -1546,12 +1555,7 @@ def reconcile_tab_exact_correction(
     document: ProjectDocument,
     tab_id: str,
 ) -> MechanismSourceReconciliation | MechanismSourceCollision:
-    """Plan, visibly insert, and canonically re-admit one exact correction.
-
-    ProjectDocument derives the complete source roster from retained admitted
-    mechanism order and AST facts.  No caller-owned target facts or coordinate
-    mirror participate in planning.
-    """
+    """Plan, insert, and ordinarily re-admit one exact source correction."""
 
     if not isinstance(document, ProjectDocument):
         raise TypeError("document must be a ProjectDocument.")
@@ -1563,48 +1567,20 @@ def reconcile_tab_exact_correction(
         prepared.accepted_mechanism_for_structure(),
         parameter_algebra_spec=prepared.parameter_algebra_spec_for_execution(),
     )
-    admitted_targets = _admitted_correction_targets(tab)
+    admitted_targets = _admitted_correction_targets(tab, composition)
     plan = plan_correction_basis(composition, admitted_targets)
     if not plan.available:
-        details = "; ".join(
-            f"{item.cycle_id}: {item.expression}"
-            for item in composition.constraints
-        )
-        reason = plan.reason or "Exact correction is unavailable."
-        raise ValueError(f"{reason}; constraints: {details}")
-    corrections = build_correction_expressions(composition, plan)
+        details = "; ".join(f"{item.cycle_id}: {item.expression}" for item in composition.constraints)
+        raise ValueError(f"{plan.reason or 'Exact correction is unavailable.'}; constraints: {details}")
     updated_source = insert_scalar_source_declarations(
         tab.mechanism_source.reactions_text,
-        corrections,
+        build_correction_expressions(composition, plan),
     )
-    reconciliation = reconcile_tab_mechanism_source(
+    return reconcile_tab_mechanism_source(
         document,
         tab_id,
         MechanismAuthoringSource.from_parts(reactions_text=updated_source),
     )
-    proposed_document = (
-        reconciliation.replacement.proposed_document
-        if isinstance(reconciliation, MechanismSourceCollision)
-        else reconciliation.proposed_document
-    )
-    proposed_tab = proposed_document.tab(tab_id)
-    proposed_prepared = proposed_tab.prepared_dsl
-    if proposed_prepared is None:
-        raise ValueError("Exact correction proposal has no admitted prepared DSL.")
-    proposed_composition = compose_exact_constraints(
-        proposed_prepared.accepted_mechanism_for_structure(),
-        parameter_algebra_spec=proposed_prepared.parameter_algebra_spec_for_execution(),
-    )
-    if any(item.status != "resolved" for item in proposed_composition.constraints):
-        details = "; ".join(
-            f"{item.cycle_id}: {item.expression}"
-            for item in proposed_composition.constraints
-        )
-        raise ValueError(
-            "Exact correction did not resolve every admitted constraint; "
-            f"constraints: {details}"
-        )
-    return reconciliation
 
 
 def validate_project_document(document: ProjectDocument) -> ProjectDocument:
@@ -1749,6 +1725,8 @@ def validate_project_document(document: ProjectDocument) -> ProjectDocument:
                     tab,
                     prepared_dsl=prepared_dsl,
                 )
+            else:
+                _validate_exact_source_constraints(tab.prepared_dsl)
             analysis = tab.dsl_analysis
             if (
                 analysis is not None

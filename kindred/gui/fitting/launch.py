@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from dataclasses import InitVar, dataclass, field, replace
+from dataclasses import dataclass, field, replace
 from typing import Iterable, Literal
 
 import numpy as np
@@ -12,15 +12,9 @@ from kindred.core.analysis.fit_uncertainty import (
     ProfileLikelihoodConfig,
     ResidualBootstrapConfig,
 )
-from kindred.core.analysis.global_fitting import (
-    SharedRefitExecution,
-    SharedRefitPromotion,
-    SharedRefitPromotionAdmission,
-)
 from kindred.core.analysis.global_fit_execution import FitCoordinate
 from kindred.core.analysis.global_fit_execution import (
     FitParameterLayout,
-    GlobalFitResult,
     build_parameter_layout_for_dataset_ids,
 )
 from kindred.core.analysis.dataset_parameter_overrides import (
@@ -81,8 +75,6 @@ __all__ = [
     "FitExecutionRequest",
     "FitPreparedDatasetConfig",
     "FitPhysicalCoordinatePolicy",
-    "FitInitialApplyCellProposal",
-    "FitInitialApplyProposal",
     "FitInitialGlobalVariable",
     "FitInitialVariable",
     "FitMappedDatasetSnapshot",
@@ -618,78 +610,6 @@ class FitInitialVariable:
 
 
 @dataclass(frozen=True, slots=True)
-class FitInitialApplyCellProposal:
-    """One independently selectable canonical IC mutation."""
-
-    set_id: str
-    species: str
-    dataset_ids: tuple[str, ...]
-    captured_value: float
-    nominal_value: float
-    fitted_value: float
-    minimum: float
-    maximum: float
-    log10: bool
-    unit: str = "model concentration"
-
-    def __post_init__(self) -> None:
-        object.__setattr__(self, "set_id", _required(self.set_id, "set ID"))
-        object.__setattr__(self, "species", _required(self.species, "species"))
-        dataset_ids = tuple(_required(item, "dataset ID") for item in self.dataset_ids)
-        if len(dataset_ids) != len(set(dataset_ids)):
-            raise ValueError("IC Apply proposal repeats a dataset ID.")
-        object.__setattr__(self, "dataset_ids", dataset_ids)
-        for field_name in (
-            "captured_value",
-            "nominal_value",
-            "fitted_value",
-            "minimum",
-            "maximum",
-        ):
-            object.__setattr__(
-                self,
-                field_name,
-                validate_concentration(
-                    _finite(getattr(self, field_name), field_name),
-                    field=field_name,
-                ),
-            )
-        if (
-            self.minimum >= self.maximum
-            or not self.minimum <= self.nominal_value <= self.maximum
-        ):
-            raise ValueError("IC Apply proposal values or bounds are invalid.")
-        object.__setattr__(self, "log10", bool(self.log10))
-        object.__setattr__(self, "unit", _required(self.unit, "IC unit"))
-
-    @property
-    def key(self) -> tuple[str, str]:
-        return self.set_id, self.species
-
-
-@dataclass(frozen=True, slots=True)
-class FitInitialApplyProposal:
-    origin: FitOriginSnapshot
-    cells: tuple[FitInitialApplyCellProposal, ...]
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.origin, FitOriginSnapshot):
-            raise TypeError("IC Apply proposal origin must be FitOriginSnapshot.")
-        cells = tuple(self.cells)
-        if any(not isinstance(item, FitInitialApplyCellProposal) for item in cells):
-            raise TypeError("IC Apply proposal cells must be typed.")
-        if len({item.key for item in cells}) != len(cells):
-            raise ValueError("IC Apply proposal repeats a set/species identity.")
-        object.__setattr__(self, "cells", cells)
-
-    @property
-    def selected_keys(self) -> tuple[tuple[str, str], ...]:
-        """Initial UI selection: every valid fitted cell."""
-
-        return tuple(item.key for item in self.cells)
-
-
-@dataclass(frozen=True, slots=True)
 class FitInitialGlobalVariable:
     """One immutable species-level Global IC optimizer configuration."""
 
@@ -886,7 +806,6 @@ def _validate_advanced_analysis_setup(
     parameters: tuple[FitParameterVariable, ...],
     profile_likelihood: ProfileLikelihoodConfig | None,
     residual_bootstrap: ResidualBootstrapConfig | None,
-    shared_refit_promotions: Iterable[SharedRefitPromotion],
 ) -> None:
     if profile_likelihood is not None and not isinstance(
         profile_likelihood,
@@ -898,19 +817,6 @@ def _validate_advanced_analysis_setup(
         ResidualBootstrapConfig,
     ):
         raise TypeError("Residual bootstrap configuration must be typed.")
-    promotions = tuple(shared_refit_promotions)
-    if any(not isinstance(item, SharedRefitPromotion) for item in promotions):
-        raise TypeError("Shared-refit promotions must be typed.")
-    by_name = {item.name: item for item in parameters}
-    if promotions and (profile_likelihood is not None or residual_bootstrap is not None):
-        raise ValueError("Shared refit must complete before uncertainty setup.")
-    if promotions and any(
-        item.scope == FIT_SCOPE_CENTRED_FIXED_EFFECTS for item in parameters
-    ):
-        raise ValueError(
-            "Shared refit is unavailable while centred fixed-effects parameters "
-            "are selected."
-        )
     allowed_coordinates = fit_uncertainty_coordinates(parameters, datasets)
     allowed_set = set(allowed_coordinates)
     allowed_display = {item.display_name for item in allowed_coordinates}
@@ -950,18 +856,6 @@ def _validate_advanced_analysis_setup(
             resolved.append(coordinate)
         if len(resolved) != len(set(resolved)):
             raise ValueError("Uncertainty coordinates repeat a typed identity.")
-    promotion_names = [item.parameter_name for item in promotions]
-    if len(promotion_names) != len(set(promotion_names)):
-        raise ValueError("Shared-refit setup repeats a promotion.")
-    if any(
-        name not in by_name
-        or by_name[name].scope != "per_dataset"
-        or not by_name[name].selected_config.fit
-        for name in promotion_names
-    ):
-        raise ValueError(
-            "Shared-refit promotions require fitted Per-dataset parameters."
-        )
 
 
 def fit_uncertainty_coordinates(
@@ -1058,7 +952,6 @@ class _FitDispatchCompilation:
     included_dataset_ids: tuple[str, ...]
     prepared_datasets: tuple[FitPreparedDatasetConfig, ...]
     ordinary_shared_variables: tuple[FitSharedVariableParamSpec, ...]
-    shared_refit_execution: SharedRefitExecution | None
     ordinary_coupled_variables: tuple[FitCoupledVariableParamSpec, ...]
     fixed_by_dataset: tuple[tuple[str, tuple[tuple[str, float], ...]], ...]
     ordinary_dataset_overrides: tuple[FitDatasetParameterOverrides, ...]
@@ -1082,14 +975,9 @@ class FitExecutionRequest:
     dataset_weight_mode: FitDatasetWeightMode
     profile_likelihood: ProfileLikelihoodConfig | None = None
     residual_bootstrap: ResidualBootstrapConfig | None = None
-    shared_refit_promotions: tuple[SharedRefitPromotion, ...] = ()
-    shared_refit_source_result: InitVar[GlobalFitResult | None] = None
     dispatch: _FitDispatchCompilation = field(init=False, repr=False)
 
-    def __post_init__(
-        self,
-        shared_refit_source_result: GlobalFitResult | None,
-    ) -> None:
+    def __post_init__(self) -> None:
         if not isinstance(self.origin, FitOriginSnapshot):
             raise TypeError("origin must be FitOriginSnapshot.")
         if not isinstance(self.defaults, FitDefaults):
@@ -1219,20 +1107,11 @@ class FitExecutionRequest:
             parameters=parameters,
             profile_likelihood=self.profile_likelihood,
             residual_bootstrap=self.residual_bootstrap,
-            shared_refit_promotions=self.shared_refit_promotions,
-        )
-        object.__setattr__(
-            self,
-            "shared_refit_promotions",
-            tuple(self.shared_refit_promotions),
         )
         object.__setattr__(
             self,
             "dispatch",
-            _compile_fit_dispatch(
-                self,
-                shared_refit_source_result=shared_refit_source_result,
-            ),
+            _compile_fit_dispatch(self),
         )
 
 
@@ -1252,8 +1131,6 @@ class FitSetupSnapshot:
     dataset_weight_mode: FitDatasetWeightMode
     profile_likelihood: ProfileLikelihoodConfig | None = None
     residual_bootstrap: ResidualBootstrapConfig | None = None
-    shared_refit_promotions: tuple[SharedRefitPromotion, ...] = ()
-
     def __post_init__(self) -> None:
         if not isinstance(self.origin, FitOriginSnapshot):
             raise TypeError("snapshot origin must be FitOriginSnapshot.")
@@ -1372,39 +1249,6 @@ class FitSetupSnapshot:
             parameters=parameters,
             profile_likelihood=self.profile_likelihood,
             residual_bootstrap=self.residual_bootstrap,
-            shared_refit_promotions=self.shared_refit_promotions,
-        )
-        object.__setattr__(
-            self,
-            "shared_refit_promotions",
-            tuple(self.shared_refit_promotions),
-        )
-
-    @classmethod
-    def from_request(
-        cls,
-        request: FitExecutionRequest,
-    ) -> "FitSetupSnapshot":
-        if not isinstance(request, FitExecutionRequest):
-            raise TypeError("request must be FitExecutionRequest.")
-        return cls(
-            origin=request.origin,
-            solver=request.solver,
-            datasets=request.datasets,
-            parameters=request.parameters,
-            initials=request.initials,
-            global_initials=request.global_initials,
-            initial_scopes=request.initial_scopes,
-            defaults=request.defaults,
-            local_observables=(
-                ()
-                if request.fit_local_admission is None
-                else request.fit_local_admission.observables
-            ),
-            dataset_weight_mode=request.dataset_weight_mode,
-            profile_likelihood=request.profile_likelihood,
-            residual_bootstrap=request.residual_bootstrap,
-            shared_refit_promotions=request.shared_refit_promotions,
         )
 
 @dataclass(frozen=True, slots=True)
@@ -1977,8 +1821,6 @@ def revalidate_fit_request_inclusions(
 
 def _compile_fit_dispatch(
     request: FitExecutionRequest,
-    *,
-    shared_refit_source_result: GlobalFitResult | None,
 ) -> _FitDispatchCompilation:
     """Complete all static Fit facts before a worker can be constructed."""
 
@@ -2131,99 +1973,18 @@ def _compile_fit_dispatch(
         )
         for dataset_id in included_ids
     )
-    promotion_admissions: list[SharedRefitPromotionAdmission] = []
-    shared_refit_execution: SharedRefitExecution | None = None
-    promotions = tuple(request.shared_refit_promotions)
-    if promotions:
-        if not isinstance(shared_refit_source_result, GlobalFitResult):
-            raise ValueError(
-                "Shared refit dispatch requires its canonical source result."
-            )
-        if set(shared_refit_source_result.dataset_params) != set(included_ids):
-            raise ValueError(
-                "Shared refit source result roster does not match included datasets."
-            )
-        promoted_names = {item.parameter_name for item in promotions}
-        for promotion in promotions:
-            try:
-                source_values = tuple(
-                    (
-                        dataset_id,
-                        shared_refit_source_result.dataset_params[dataset_id][
-                            promotion.parameter_name
-                        ],
-                    )
-                    for dataset_id in included_ids
-                )
-            except KeyError as exc:
-                raise ValueError(
-                    "Previous Fit omitted Per-dataset estimate "
-                    f"{promotion.parameter_name!r}."
-                ) from exc
-            admission = SharedRefitPromotionAdmission(
-                promotion=promotion,
-                source_values=source_values,
-            )
-            promotion_admissions.append(admission)
-        overrides = tuple(
-            replace(
-                item,
-                variable_params=tuple(
-                    value for value in item.variable_params
-                    if value.name not in promoted_names
-                ),
-                fixed_params=tuple(
-                    value for value in item.fixed_params
-                    if value[0] not in promoted_names
-                ),
-            )
-            for item in overrides
-        )
-        coupled_variables = [
-            item for item in coupled_variables
-            if item.parameter_name not in promoted_names
-        ]
-        physical_policies = [
-            item for item in physical_policies
-            if item.parameter_name not in promoted_names
-        ]
-        parameter_by_name = {item.name: item for item in request.parameters}
-        for promotion in promotions:
-            parameter = parameter_by_name[promotion.parameter_name]
-            physical_policies.append(
-                FitPhysicalCoordinatePolicy(
-                    parameter_name=promotion.parameter_name,
-                    dataset_id=None,
-                    scientific_category=parameter.scientific_category,
-                    allow_exact_zero=parameter.allow_exact_zero,
-                    minimum=promotion.minimum,
-                    maximum=promotion.maximum,
-                )
-            )
-        shared_refit_execution = SharedRefitExecution(
-            dataset_ids=included_ids,
-            promotion_admissions=promotion_admissions,
-            existing_shared_variables=shared_variables,
-            dataset_overrides=overrides,
-            coupled_variables=coupled_variables,
-        )
-        shared_variables = list(shared_refit_execution.shared_variables)
-        overrides = shared_refit_execution.dataset_overrides
-        coupled_variables = list(shared_refit_execution.coupled_variables)
-        layout = shared_refit_execution.optimizer_layout
-    else:
-        layout = build_parameter_layout_for_dataset_ids(
-            dataset_ids=included_ids,
-            shared_params={item.name: item.initial for item in shared_variables},
-            dataset_overrides=overrides,
-            coupled_variables=tuple(coupled_variables),
-            centred_variables=tuple(centred_variables),
-            bounds={
-                item.name: (item.minimum, item.maximum)
-                for item in shared_variables
-            },
-            log10_params={item.name: item.log10 for item in shared_variables},
-        )
+    layout = build_parameter_layout_for_dataset_ids(
+        dataset_ids=included_ids,
+        shared_params={item.name: item.initial for item in shared_variables},
+        dataset_overrides=overrides,
+        coupled_variables=tuple(coupled_variables),
+        centred_variables=tuple(centred_variables),
+        bounds={
+            item.name: (item.minimum, item.maximum)
+            for item in shared_variables
+        },
+        log10_params={item.name: item.log10 for item in shared_variables},
+    )
     science = request.origin.scientific_settings
     prepared_datasets: list[FitPreparedDatasetConfig] = []
     for local in included:
@@ -2277,23 +2038,14 @@ def _compile_fit_dispatch(
     return _FitDispatchCompilation(
         included_dataset_ids=included_ids,
         prepared_datasets=tuple(prepared_datasets),
-        ordinary_shared_variables=(
-            tuple(shared_variables) if shared_refit_execution is None else ()
-        ),
-        shared_refit_execution=shared_refit_execution,
-        ordinary_coupled_variables=(
-            tuple(coupled_variables) if shared_refit_execution is None else ()
-        ),
+        ordinary_shared_variables=tuple(shared_variables),
+        ordinary_coupled_variables=tuple(coupled_variables),
         fixed_by_dataset=tuple(
             (item.dataset_id, item.fixed_params)
             for item in overrides
         ),
-        ordinary_dataset_overrides=(
-            overrides if shared_refit_execution is None else ()
-        ),
-        ordinary_centred_variables=(
-            tuple(centred_variables) if shared_refit_execution is None else ()
-        ),
+        ordinary_dataset_overrides=overrides,
+        ordinary_centred_variables=tuple(centred_variables),
         candidate_names=tuple(
             sorted(
                 parameter.name
@@ -2302,9 +2054,7 @@ def _compile_fit_dispatch(
             )
         ),
         physical_coordinate_policies=tuple(physical_policies),
-        ordinary_optimizer_layout=(
-            layout if shared_refit_execution is None else None
-        ),
+        ordinary_optimizer_layout=layout,
     )
 
 
@@ -2323,8 +2073,6 @@ def build_fit_execution_request(
     defaults: FitDefaults | None = None,
     profile_likelihood: ProfileLikelihoodConfig | None = None,
     residual_bootstrap: ResidualBootstrapConfig | None = None,
-    shared_refit_promotions: Iterable[SharedRefitPromotion] = (),
-    shared_refit_source_result: GlobalFitResult | None = None,
 ) -> FitExecutionRequest:
     """Validate a complete owner-built Fit request at the execution boundary."""
     observable_items = tuple(local_observables)
@@ -2367,8 +2115,6 @@ def build_fit_execution_request(
         dataset_weight_mode=dataset_weight_mode,
         profile_likelihood=profile_likelihood,
         residual_bootstrap=residual_bootstrap,
-        shared_refit_promotions=tuple(shared_refit_promotions),
-        shared_refit_source_result=shared_refit_source_result,
     )
     mapped_by_id = {item.dataset_id: item for item in origin.mapped_datasets}
     requested_ids = [item.dataset_id for item in request.datasets]

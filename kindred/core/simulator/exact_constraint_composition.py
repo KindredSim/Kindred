@@ -8,7 +8,6 @@ from fractions import Fraction
 
 from kindred.core.constants import R, h, k_B
 from kindred.core.equilibrium_rate_authority import equilibrium_rate_symbolic_relations
-from kindred.core.kinetics import forward_rate_model_for_equilibrium, forward_rate_symbolic_relation
 from kindred.core.simulator.step_indexing import get_step_index_map
 from kindred.core.simulator.wegscheider_symbolic import WegscheiderConstraintReport, analyze_wegscheider_constraints
 
@@ -79,31 +78,6 @@ class ExactMonomial:
         for argument in self.exponentials:
             result[f"exp({_render_monomial(argument)})"] = Fraction(1)
         return result
-
-    def coordinate_power_map(self) -> dict[str, Fraction]:
-        """Return every source coordinate occurring in this expression.
-
-        Exponential arguments remain structured in :meth:`power_map` for
-        exact rendering.  This parallel projection is only the canonical
-        dependency view used to establish rank and participation; it walks
-        the already-built expression tree and never reparses rendered text.
-        """
-
-        result = dict(self.powers)
-
-        def visit(value: ExactMonomial) -> None:
-            for name, power in value.powers:
-                result[name] = result.get(name, Fraction(0)) + power
-            for argument in value.exponentials:
-                visit(argument)
-            for term in value.sum_terms:
-                visit(term)
-
-        for argument in self.exponentials:
-            visit(argument)
-        for term in self.sum_terms:
-            visit(term)
-        return {name: power for name, power in result.items() if power}
 
     def scale(self, factor: Fraction) -> "ExactMonomial":
         """Scale a scalar expression by an exact factor.
@@ -365,22 +339,6 @@ class ExactConstraint:
     status: str = "resolved"
     reason: str | None = None
     coefficient: Fraction = Fraction(1)
-    # Source-coordinate powers are kept separately from the fully substituted
-    # exact residual.  Numeric authored literals can therefore prove an exact
-    # identity while an unsatisfied row still exposes the genuine editable
-    # coordinates needed by the correction planner.
-    source_powers: tuple[tuple[str, Fraction], ...] = ()
-    # Structured source factors retain exponential grouping for exact
-    # correction rendering; source_powers above is the dependency projection
-    # used only for rank and target participation.
-    source_factors: tuple[tuple[str, Fraction], ...] = ()
-    source_coefficient: Fraction = Fraction(1)
-
-    def source_power_map(self) -> dict[str, Fraction]:
-        return dict(self.source_powers or self.powers)
-
-    def source_factor_map(self) -> dict[str, Fraction]:
-        return dict(self.source_factors or self.source_powers or self.powers)
 
 
 @dataclass(frozen=True, slots=True)
@@ -413,23 +371,6 @@ def _canonical_names(mechanism: object, spec: object | None, report: Wegscheider
     return names
 
 
-def _canonical_step_names(mechanism: object) -> set[str]:
-    """Return only admitted mechanism coordinates, excluding arbitrary Algebra names."""
-
-    names: set[str] = set()
-    for entry in get_step_index_map(mechanism):
-        step = entry.get("step_index")
-        kind = str(entry.get("kind") or "")
-        if kind == "equilibrium":
-            names.update({f"kf{step}", f"kr{step}", f"Keq{step}"})
-        elif kind == "reaction":
-            names.add(f"k{step}")
-        source_coordinates = entry.get("source_coordinates") or {}
-        if isinstance(source_coordinates, Mapping):
-            names.update(str(name) for name in source_coordinates.values())
-    return names
-
-
 def _render_monomial(value: ExactMonomial) -> str:
     if value.sum_terms:
         return "(" + " + ".join(_render_monomial(term) for term in value.sum_terms) + ")"
@@ -454,12 +395,20 @@ def _render_monomial(value: ExactMonomial) -> str:
 def _mechanism_relations(
     mechanism: object,
     names: set[str],
-    *,
-    preserve_coordinates: bool = False,
 ) -> dict[str, ExactMonomial]:
+    """Build only source-coordinate symbolic equilibrium relations.
+
+    Equilibrium authority is lowered from admitted ``kf``/``kr``/``Keq`` or
+    thermodynamic source coordinates.  Numeric rate bindings are downstream
+    simulation state and are intentionally not consulted here.
+    """
+
     relations: dict[str, ExactMonomial] = {}
     equilibria = tuple(getattr(mechanism, "equilibria", ()) or ())
-    standard_conc = (getattr(mechanism, "metadata", {}) or {}).get("standard_conc_M", 1.0)
+    metadata = getattr(mechanism, "metadata", {}) or {}
+    standard_conc = metadata.get("standard_conc_M")
+    if standard_conc is None:
+        return relations
     temperature = ExactMonomial(Fraction(1), (("T", Fraction(1)),))
 
     def literal(value: float) -> ExactMonomial:
@@ -483,38 +432,43 @@ def _mechanism_relations(
             continue
         source_coordinates = {
             str(role): str(canonical_name)
-            for role, canonical_name in dict(entry.get("source_coordinates") or {}).items()
+            for role, canonical_name in dict(
+                entry.get("source_coordinates") or {}
+            ).items()
         }
 
+        authority = entry.get("equilibrium_authority")
+        authority = authority if isinstance(authority, Mapping) else {}
+        has_authored_kf = bool(entry.get("user_provided_kf"))
+        has_authored_kr = bool(entry.get("user_provided_kr"))
+        has_authored_keq = bool(authority.get("has_explicit_keq_param"))
+
         def source_coordinate(role: str) -> ExactMonomial:
-            # The canonical step map carries reaction-local source identity.
-            # Never collapse repeated authored physical coordinates back to
-            # role globals such as ``A`` or ``dG_eq``.
             name = source_coordinates.get(role)
-            if name is None and role in {"kf", "kr", "Keq"}:
-                name = f"{role}{step}"
+            # Only independently authored roles may become source symbols.
+            # Derived nominal values are never promoted from typed state.
+            if name is None and role == "kf" and has_authored_kf:
+                name = f"kf{step}"
+            elif name is None and role == "kr" and has_authored_kr:
+                name = f"kr{step}"
+            elif name is None and role == "Keq" and has_authored_keq:
+                name = f"Keq{step}"
             if name is None:
-                # A missing source coordinate means the accepted relation is
-                # literal/derived for this role.  The caller only supplies a
-                # callback when a physical source coordinate is present; this
-                # guard keeps malformed maps fail-closed rather than inventing
-                # an unindexed coordinate.
-                raise ValueError(f"missing canonical source coordinate for {role!r}")
+                raise ValueError(
+                    f"missing canonical source coordinate for {role!r}"
+                )
             return ExactMonomial(Fraction(1), ((name, Fraction(1)),))
 
+        if not has_authored_kf:
+            continue
+        # Equilibrium DSL authority always authors kf directly.  Keep it as a
+        # source coordinate; numeric bindings and kinetic model projections
+        # belong to downstream simulation preparation, not this analysis.
         try:
-            forward_model = forward_rate_model_for_equilibrium(
-                equilibria[index],
-                temperature_K=None,
-                default_standard_conc_M=standard_conc,
-            )
-            projected = forward_rate_symbolic_relation(
-                forward_model,
-                temperature=temperature,
-                literal=literal,
-                exponential=exponential,
-                source_coordinate=source_coordinate if preserve_coordinates else None,
-            )
+            projected = source_coordinate("kf")
+        except ValueError:
+            continue
+        try:
             equilibrium_relations = equilibrium_rate_symbolic_relations(
                 equilibria[index],
                 forward_relation=projected,
@@ -522,7 +476,7 @@ def _mechanism_relations(
                 standard_conc_M=standard_conc,
                 literal=literal,
                 exponential=exponential,
-                source_coordinate=source_coordinate if preserve_coordinates else None,
+                source_coordinate=source_coordinate,
             )
         except (TypeError, ValueError, ZeroDivisionError, OverflowError):
             continue
@@ -531,8 +485,8 @@ def _mechanism_relations(
             (kr, equilibrium_relations.kr),
             (keq, equilibrium_relations.Keq),
         ):
-            # A canonical coordinate with no defining relation is a free
-            # source factor.  Leaving that identity out lets substitution
+            # A canonical coordinate with no defining relation is free.
+            # Leaving that identity out lets substitution
             # terminate at the retained coordinate instead of recursing
             # into ``kf1 = kf1`` (and likewise for kr/Keq).
             if relation != ExactMonomial(Fraction(1), ((name, Fraction(1)),)):
@@ -547,7 +501,25 @@ def _algebra_relations(spec: object | None, names: set[str]) -> tuple[dict[str, 
     allowed = set(names) | {str(statement.name) for statement in statements}
     relations: dict[str, ExactMonomial] = {}
     unresolved: set[str] = set()
+
+    def identifiers(node: object) -> set[str]:
+        if node is None:
+            return set()
+        if type(node).__name__ == "IdentNode":
+            return {str(getattr(node, "name", ""))}
+        found: set[str] = set()
+        for attribute in ("lhs", "rhs"):
+            found.update(identifiers(getattr(node, attribute, None)))
+        for argument in getattr(node, "args", ()) or ():
+            found.update(identifiers(argument))
+        return found
+
     for statement in statements:
+        # A literal-only Algebra declaration is an independent authored
+        # coordinate.  Its numeric default is not a symbolic relation and
+        # must never decide whether a cycle is balanced.
+        if not identifiers(statement.expr):
+            continue
         value = exact_monomial_from_ast(statement.expr, canonical_names=allowed)
         if value is None:
             unresolved.add(str(statement.name))
@@ -659,6 +631,9 @@ def _rebind_equilibrium_relations(
     inspect rendered source or evaluate a numerical residual.
     """
 
+    def identity(name: str) -> ExactMonomial:
+        return ExactMonomial(Fraction(1), ((name, Fraction(1)),))
+
     for entry in get_step_index_map(mechanism):
         if str(entry.get("kind") or "") != "equilibrium":
             continue
@@ -667,22 +642,22 @@ def _rebind_equilibrium_relations(
         except (TypeError, ValueError):
             continue
         kf, kr, keq = f"kf{step}", f"kr{step}", f"Keq{step}"
-        if kf not in relations or kr not in relations:
-            continue
         authority = entry.get("equilibrium_authority")
         if not isinstance(authority, Mapping):
             continue
         kind = str(authority.get("kind") or "")
         if kind == "kr_authoritative":
-            derived = relations[kf].divide(relations[kr])
+            derived = relations.get(kf, identity(kf)).divide(
+                relations.get(kr, identity(kr))
+            )
             if derived is not None:
                 relations[keq] = derived
             continue
         if kind != "Keq_authoritative":
             continue
-        if keq not in relations:
-            continue
-        derived = relations[kf].divide(relations[keq])
+        derived = relations.get(kf, identity(kf)).divide(
+            relations.get(keq, identity(keq))
+        )
         if derived is not None:
             relations[kr] = derived
 
@@ -693,29 +668,18 @@ def compose_exact_constraints(
     parameter_algebra_spec: object | None = None,
     constraint_report: WegscheiderConstraintReport | None = None,
 ) -> ExactConstraintComposition:
-    """Compose exact cycle products using retained AST and canonical relations."""
+    """Compose exact cycle products using one symbolic relation graph."""
 
     report = constraint_report or analyze_wegscheider_constraints(mechanism)
     names = _canonical_names(mechanism, parameter_algebra_spec, report)
     relations = _mechanism_relations(mechanism, names)
-    source_relations = _mechanism_relations(
-        mechanism,
-        names,
-        preserve_coordinates=True,
-    )
     algebra, unresolved = _algebra_relations(parameter_algebra_spec, names)
     relations.update(algebra)
     _rebind_equilibrium_relations(mechanism, relations)
-    unsupported_canonical = unresolved.intersection(_canonical_step_names(mechanism))
     result: list[ExactConstraint] = []
     for constraint in report.constraints:
         initial = ExactMonomial(Fraction(1), tuple((name, Fraction(power)) for name, power in constraint.terms))
-        composed = (
-            None
-            if unsupported_canonical
-            else _substitute(initial, relations, unresolved)
-        )
-        source_composed = _substitute(initial, source_relations, unresolved)
+        composed = _substitute(initial, relations, unresolved)
         if composed is None:
             result.append(
                 ExactConstraint(
@@ -724,20 +688,12 @@ def compose_exact_constraints(
                     constraint.expression,
                     "unresolved",
                     "constraint depends on an unsupported, cyclic, or unprovable relation",
-                    Fraction(1),
-                    tuple(source_composed.coordinate_power_map().items())
-                    if source_composed is not None
-                    else initial.powers,
-                    tuple(source_composed.power_map().items())
-                    if source_composed is not None
-                    else initial.powers,
-                    source_composed.coefficient if source_composed is not None else Fraction(1),
                 )
             )
             continue
         if composed.coefficient != 1:
             status = "unsatisfied"
-            reason = "exact multiplicative product requires correction"
+            reason = "exact multiplicative product is not an identity"
         elif composed.powers or composed.exponentials or composed.sum_terms:
             status = "unsatisfied"
             reason = "exact symbolic product is not an identity"
@@ -752,13 +708,6 @@ def compose_exact_constraints(
                 status,
                 reason,
                 composed.coefficient,
-                tuple(sorted(source_composed.coordinate_power_map().items()))
-                if source_composed is not None
-                else initial.powers,
-                tuple(sorted(source_composed.power_map().items()))
-                if source_composed is not None
-                else initial.powers,
-                source_composed.coefficient if source_composed is not None else Fraction(1),
             )
         )
     return ExactConstraintComposition(tuple(result))

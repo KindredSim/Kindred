@@ -6,7 +6,6 @@ from contextlib import closing
 from dataclasses import dataclass, field
 import itertools
 import logging
-import time
 
 from PySide6 import QtCore
 
@@ -522,17 +521,6 @@ def build_raw_record_batch_proposal(
     Optional active-tab mapping remains a later transaction over committed raw
     records.
     """
-    if not isinstance(completion, DatasetImportCompletion):
-        raise TypeError(
-            "Raw dataset batch proposal requires a dataset import completion."
-        )
-    if type(existing_records) is not tuple or any(
-        not isinstance(record, RawDatasetRecord)
-        for record in existing_records
-    ):
-        raise TypeError(
-            "Existing raw datasets must be an exact RawDatasetRecord tuple."
-        )
     used_names = {record.display_name.casefold() for record in existing_records}
     candidates: list[RawDatasetRecord] = []
     sources_by_id: dict[str, ImportedSource] = {}
@@ -626,7 +614,6 @@ class DatasetImportStaging(QtCore.QObject):
         self._next_worker_id = 1
         self._active: _ActiveImport | None = None
         self._application_close_settled = True
-        self._project_replacement_admission_fenced = False
         self._application_close_fenced = False
 
     @property
@@ -640,10 +627,7 @@ class DatasetImportStaging(QtCore.QObject):
         roster: tuple[DatasetImportWorkerAdmission, ...],
     ) -> DatasetImportRequest:
         """Admit one complete immutable source/plan roster in user order."""
-        if (
-            self._application_close_fenced
-            or self._project_replacement_admission_fenced
-        ):
+        if self._application_close_fenced:
             raise DatasetImportAdmissionError("Dataset import admission is fenced.")
         if self.busy:
             raise DatasetImportAdmissionError("A dataset import is already active or awaiting commit.")
@@ -709,11 +693,7 @@ class DatasetImportStaging(QtCore.QObject):
         active = self._require_active(import_request.import_id)
         if active.request is not import_request:
             raise DatasetImportStateError("Dataset import request is stale.")
-        if (
-            self._application_close_fenced
-            or self._project_replacement_admission_fenced
-            or active.terminal_outcome is not None
-        ):
+        if self._application_close_fenced or active.terminal_outcome is not None:
             raise DatasetImportAdmissionError(
                 "Dataset import start is fenced."
             )
@@ -1085,57 +1065,6 @@ class DatasetImportStaging(QtCore.QObject):
 
         self.fence_application_close_admission()
         self.cancel_active(outcome="application_close")
-
-    def fence_for_project_replacement(self) -> bool:
-        """Temporarily reject import admission during project replacement."""
-
-        if self._project_replacement_admission_fenced:
-            return False
-        self._project_replacement_admission_fenced = True
-        return True
-
-    def resume_after_project_replacement(self) -> bool:
-        """Release only the reversible project-replacement fence."""
-
-        if not self._project_replacement_admission_fenced:
-            return False
-        self._project_replacement_admission_fenced = False
-        return True
-
-    def request_project_replacement_cancellation(self) -> None:
-        """Fence admission and request cancellation without waiting.
-
-        Project replacement broadcasts this operation to every active owner
-        before it settles any one owner.  Keeping the request separate from
-        settlement prevents an import from being left running while another
-        owner's worker consumes the shared replacement deadline.
-        """
-
-        self.fence_for_project_replacement()
-        self.cancel_active(outcome="project_replacement")
-
-    def settle_project_replacement(self, deadline: float) -> bool:
-        """Settle the already-cancelled import by one common deadline."""
-
-        active = self._active
-        if active is None:
-            return True
-        for registration in tuple(active.workers.values()):
-            worker = registration.worker
-            remaining = max(0.0, float(deadline) - time.monotonic())
-            if remaining <= 0.0:
-                return False
-            try:
-                settled = bool(
-                    worker.wait(max(1, int(remaining * 1000.0)))
-                )
-            except RuntimeError:
-                settled = False
-            if not settled:
-                return False
-            self._worker_finished(registration.request, worker)
-        settled = self._active is None
-        return settled
 
     def _finish_if_ready(self) -> None:
         active = self._active

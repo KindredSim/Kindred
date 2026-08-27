@@ -19,10 +19,7 @@ from kindred.core.analysis.fit_dataset_payload import (
     FitDatasetSpec,
     FitObservationSeries,
 )
-from kindred.core.analysis.global_fitting import (
-    fit_global,
-    fit_global_shared_refit,
-)
+from kindred.core.analysis.global_fitting import fit_global
 from kindred.core.analysis.global_fit_execution import (
     FitCoordinate,
     DatasetFitInfo,
@@ -423,6 +420,7 @@ class FitCandidate:
 
     request: FitExecutionRequest
     result: GlobalFitResult
+    setup_snapshot: FitSetupSnapshot
     resolved_auto_modes: tuple[tuple[str, str], ...]
 
     def __post_init__(self) -> None:
@@ -430,7 +428,7 @@ class FitCandidate:
             raise TypeError("Fit candidate request must be retained.")
         if not isinstance(self.result, GlobalFitResult):
             raise TypeError("Fit candidate result must be canonical.")
-        nominal_setup = FitSetupSnapshot.from_request(self.request)
+        nominal_setup = self.setup_snapshot
         dispatch = self.request.dispatch
         resolved_auto_modes = tuple(
             (str(dataset_id or "").strip(), str(mode or "").strip())
@@ -447,40 +445,6 @@ class FitCandidate:
         if set(dispatch.included_dataset_ids) != expected_dataset_ids:
             raise ValueError(
                 "Fit candidate dispatch roster must match its terminal setup."
-            )
-        refit_execution = dispatch.shared_refit_execution
-        admissions = (
-            ()
-            if refit_execution is None
-            else refit_execution.promotion_admissions
-        )
-        admission_names = {
-            item.shared_variable.name for item in admissions
-        }
-        result_refit_provenance = self.result.shared_refit_provenance
-        result_promotions = (
-            result_refit_provenance.get("promotions")
-            if isinstance(result_refit_provenance, Mapping)
-            else None
-        )
-        if admission_names:
-            if (
-                result_refit_provenance.get("execution")
-                != "Promote to Shared and Refit"
-                or not isinstance(result_promotions, Mapping)
-                or set(result_promotions) != admission_names
-                or any(
-                    result_promotions.get(item.shared_variable.name)
-                    != item.provenance
-                    for item in admissions
-                )
-            ):
-                raise ValueError(
-                    "Fit candidate lost its admitted Shared-refit provenance."
-                )
-        elif result_refit_provenance:
-            raise ValueError(
-                "Ordinary Fit candidate cannot carry Shared-refit provenance."
             )
         scalar_dataset_ids = {
             dataset_id
@@ -532,78 +496,20 @@ class FitCandidate:
         return self.request.origin
 
     @property
-    def nominal_setup_snapshot(self) -> FitSetupSnapshot:
-        return FitSetupSnapshot.from_request(self.request)
-
-    @property
-    def parameters(self) -> tuple[tuple[str, float], ...]:
-        """Project shared fitted values solely from the canonical result."""
-
-        return _finite_items(self.result.shared_params, field="Fit parameters")
-
-    @property
-    def scalar_values_by_dataset(
-        self,
-    ) -> tuple[tuple[str, tuple[tuple[str, float], ...]], ...]:
-        """Project dataset scalar values solely from the canonical result."""
-
-        return tuple(
-            (
-                dataset_id,
-                _finite_items(
-                    {
-                        name: value for name, value in values.items()
-                        if not name.startswith(INITIAL_PREFIX)
-                    },
-                    field=f"Fit scalar values {dataset_id}",
-                ),
-            )
-            for dataset_id, values in sorted(self.result.dataset_params.items())
-        )
-
-    @property
     def initial_values_by_set(
         self,
     ) -> tuple[tuple[str, tuple[tuple[str, float], ...]], ...]:
         """Project fitted initial concentrations solely from the result."""
 
         return _initial_values_from_result(
-            self.nominal_setup_snapshot,
+            self.setup_snapshot,
             self.origin,
             self.result,
         )
 
     @property
     def local_observables(self) -> tuple[FitLocalObservable, ...]:
-        return self.nominal_setup_snapshot.local_observables
-
-    @property
-    def setup_snapshot(self) -> FitSetupSnapshot:
-        """Build the post-terminal next-run projection from result authority."""
-
-        resolved = dict(self.resolved_auto_modes)
-        effective = {
-            item.dataset_id: (
-                replace(
-                    item,
-                    parametric=replace(
-                        item.parametric,
-                        resolved_mode=resolved[item.dataset_id],
-                    ),
-                )
-                if item.dataset_id in resolved and item.parametric is not None
-                else item
-            )
-            for item in self.nominal_setup_snapshot.datasets
-        }
-        return _terminal_setup_snapshot(
-            self.nominal_setup_snapshot,
-            origin=self.origin,
-            result=self.result,
-            dispatch=self.request.dispatch,
-            effective_datasets=effective,
-            initial_values_by_set=self.initial_values_by_set,
-        )
+        return self.setup_snapshot.local_observables
 
 
 def _observed_curve_parts(
@@ -896,19 +802,6 @@ def _terminal_setup_snapshot(
         parameter.name: parameter
         for parameter in setup_snapshot.parameters
     }
-    refit_execution = dispatch.shared_refit_execution
-    promotions = {
-        item.shared_variable.name: item
-        for item in (
-            ()
-            if refit_execution is None
-            else refit_execution.promotion_admissions
-        )
-    }
-    if not set(promotions).issubset(request_parameters):
-        raise ValueError(
-            "Fit terminal dispatch references an unknown promoted parameter."
-        )
     parameters = []
     for parameter in setup_snapshot.parameters:
         requested = request_parameters.get(parameter.name)
@@ -952,35 +845,6 @@ def _terminal_setup_snapshot(
                         ),
                     )
                 )
-            continue
-        admission = promotions.get(parameter.name)
-        if admission is not None:
-            if requested.scope != "per_dataset":
-                raise ValueError(
-                    "Shared-refit promotion source must remain Per-dataset."
-                )
-            if parameter.name not in shared_results:
-                raise ValueError(
-                    f"Shared refit omitted promoted parameter {parameter.name!r}."
-                )
-            value = shared_results[parameter.name]
-            if not math.isfinite(value):
-                raise ValueError(
-                    f"Shared refit contains non-finite promoted parameter "
-                    f"{parameter.name!r}."
-                )
-            parameters.append(
-                _replace_fit_parameter(
-                    parameter,
-                    scope="shared",
-                    initial=value,
-                    minimum=admission.shared_variable.minimum,
-                    maximum=admission.shared_variable.maximum,
-                    fit=True,
-                    log10=admission.shared_variable.log10,
-                    dataset_values=(),
-                )
-            )
             continue
         if requested.scope == "shared":
             if parameter.name not in shared_results:
@@ -1031,17 +895,9 @@ def _terminal_setup_snapshot(
             (dataset_id, fitted_by_id[dataset_id])
             for dataset_id, _value in requested_config.dataset_values
         ]
-        fitted_unique_values = {
-            value for _dataset_id, value in fitted_values
-        }
         parameters.append(
             _replace_fit_parameter(
                 parameter,
-                initial=(
-                    fitted_unique_values.pop()
-                    if len(fitted_unique_values) == 1
-                    else parameter.selected_config.value
-                ),
                 dataset_values=tuple(fitted_values),
             )
         )
@@ -1106,7 +962,6 @@ def _terminal_setup_snapshot(
         global_initials=global_initials,
         initial_scopes=setup_snapshot.initial_scopes,
         local_observables=setup_snapshot.local_observables,
-        shared_refit_promotions=(),
     )
 
 
@@ -1554,22 +1409,17 @@ def _assemble_fit_terminal(
     setup_snapshot: FitSetupSnapshot,
     resolved_modes: tuple[tuple[str, str], ...],
     evaluators: Mapping[str, FittingEvaluator],
-    prepared_ids: dict[str, dict[str, object]],
 ) -> FitCandidate:
     """Validate terminal provenance and build the sole retained candidate."""
 
-    admitted_layout = (
-        request.dispatch.ordinary_optimizer_layout
-        if request.dispatch.shared_refit_execution is None
-        else request.dispatch.shared_refit_execution.optimizer_layout
-    )
+    admitted_layout = request.dispatch.ordinary_optimizer_layout
     if not isinstance(admitted_layout, FitParameterLayout):
         raise ValueError("Fit terminal omitted its admitted optimizer layout.")
     if not isinstance(result.optimizer_vector, np.ndarray):
         raise TypeError("Fit terminal optimizer vector must be a NumPy array.")
     admitted_layout.validate_optimizer_vector(result.optimizer_vector)
     if result.optimizer_vector.flags.writeable:
-        raise ValueError("Fit terminal optimizer vector must be read-only custody.")
+        raise ValueError("Fit terminal optimizer vector must be read-only.")
 
     effective_dataset_weights: dict[str, float] = {}
     for info in result.dataset_info:
@@ -1599,21 +1449,12 @@ def _assemble_fit_terminal(
         (item.dataset_id, item.parameter_name): item
         for item in request.dispatch.physical_coordinate_policies
     }
-    refit_execution = request.dispatch.shared_refit_execution
-    promoted_names = {
-        item.shared_variable.name
-        for item in (
-            ()
-            if refit_execution is None
-            else refit_execution.promotion_admissions
-        )
-    }
     fixed_by_dataset = {
         dataset_id: dict(values)
         for dataset_id, values in request.dispatch.fixed_by_dataset
     }
     for parameter in request.parameters:
-        if parameter.scope == "shared" or parameter.name in promoted_names:
+        if parameter.scope == "shared":
             values = (
                 (result.shared_params[parameter.name],)
                 if parameter.selected_config.fit
@@ -1663,7 +1504,7 @@ def _assemble_fit_terminal(
                         f"Terminal fitted {dataset_id!r} {parameter.name!r} "
                         "violates retained bounds."
                     )
-    if set(evaluators) != included_id_set or set(prepared_ids) != included_id_set:
+    if set(evaluators) != included_id_set:
         raise ValueError(
             "Fit terminal prepared identities do not exactly match the included datasets."
         )
@@ -1684,7 +1525,7 @@ def _assemble_fit_terminal(
         request.origin,
         result,
     )
-    _terminal_setup_snapshot(
+    terminal_setup = _terminal_setup_snapshot(
         setup_snapshot,
         origin=request.origin,
         result=result,
@@ -1695,6 +1536,7 @@ def _assemble_fit_terminal(
     candidate = FitCandidate(
         request=request,
         result=result,
+        setup_snapshot=terminal_setup,
         resolved_auto_modes=resolved_modes,
     )
     return candidate
@@ -1714,7 +1556,7 @@ def _execute_global_fit_model(
     stopped_replay_control: SimulationCancellationControl,
     executor: ThreadPoolExecutor,
 ) -> GlobalFitResult | ScientificUnavailable:
-    """Dispatch one exact normal, advanced, or promotion Fit execution."""
+    """Dispatch one exact ordinary or advanced Fit execution."""
 
     common = {
         "fit_evaluators": evaluators,
@@ -1739,22 +1581,15 @@ def _execute_global_fit_model(
         "residual_bootstrap": request.residual_bootstrap,
     }
     dispatch = request.dispatch
-    refit_execution = dispatch.shared_refit_execution
-    if refit_execution is None:
-        layout = dispatch.ordinary_optimizer_layout
-        if not isinstance(layout, FitParameterLayout):
-            raise RuntimeError("Ordinary Fit omitted its admitted optimizer layout.")
-        return fit_global(
-            shared_variables=dispatch.ordinary_shared_variables,
-            dataset_overrides=dispatch.ordinary_dataset_overrides,
-            coupled_variables=dispatch.ordinary_coupled_variables,
-            centred_variables=dispatch.ordinary_centred_variables,
-            optimizer_layout=layout,
-            executor=executor,
-            **common,
-        )
-    return fit_global_shared_refit(
-        execution=refit_execution,
+    layout = dispatch.ordinary_optimizer_layout
+    if not isinstance(layout, FitParameterLayout):
+        raise RuntimeError("Ordinary Fit omitted its admitted optimizer layout.")
+    return fit_global(
+        shared_variables=dispatch.ordinary_shared_variables,
+        dataset_overrides=dispatch.ordinary_dataset_overrides,
+        coupled_variables=dispatch.ordinary_coupled_variables,
+        centred_variables=dispatch.ordinary_centred_variables,
+        optimizer_layout=layout,
         executor=executor,
         **common,
     )
@@ -1779,6 +1614,7 @@ class GlobalFitWorker(QtCore.QThread):
     def __init__(
         self,
         request: FitExecutionRequest,
+        setup: FitSetupSnapshot,
         *,
         parent: QtCore.QObject | None = None,
     ) -> None:
@@ -1786,6 +1622,7 @@ class GlobalFitWorker(QtCore.QThread):
         if not isinstance(request, FitExecutionRequest):
             raise TypeError("request must be FitExecutionRequest.")
         self._request = request
+        self._setup = setup
         self._cancelled = Event()
         self._close_requested = Event()
         self._cancellation_control = SimulationCancellationControl(
@@ -1803,16 +1640,6 @@ class GlobalFitWorker(QtCore.QThread):
     def pause(self) -> None:
         with self._pause_condition:
             self._paused = True
-
-    @property
-    def resolved_auto_modes(self) -> tuple[tuple[str, str], ...]:
-        return self._resolved_auto_modes
-
-    @property
-    def request(self) -> FitExecutionRequest:
-        """Return the immutable request held by this worker."""
-
-        return self._request
 
     def resume(self) -> None:
         with self._pause_condition:
@@ -1917,7 +1744,6 @@ class GlobalFitWorker(QtCore.QThread):
         if set(prepared_datasets) != set(included_ids):
             raise RuntimeError("Fit worker lost an admitted dataset solver policy.")
         evaluators: dict[str, FittingEvaluator] = {}
-        prepared_ids: dict[str, dict[str, object]] = {}
         for local in included:
             if self._checkpoint():
                 raise FittingCancelled()
@@ -1946,34 +1772,6 @@ class GlobalFitWorker(QtCore.QThread):
             )
             evaluator.set_cancellation_control(self._cancellation_control)
             evaluators[local.dataset_id] = evaluator
-            metadata = evaluator.prepared_metadata
-            prepared_ids[local.dataset_id] = {
-                "prepared_simulation": metadata.to_serializable_dict(),
-                "declarative_analysis_source": request.origin.prepared_dsl.analysis.normalized_text,
-                "fit_local_admission": (
-                    None
-                    if request.fit_local_admission is None
-                    else {
-                        "source": request.fit_local_admission.source_text,
-                        "observables": [
-                            {
-                                "name": item.name,
-                                "expression": item.expression,
-                                "scalar_names": item.scalar_names,
-                            }
-                            for item in request.fit_local_admission.observables
-                        ],
-                        "scalar_names": request.fit_local_admission.scalar_names,
-                    }
-                ),
-                "fit_solver": request.solver,
-                "fit_interval": {
-                    "t_start": float(local.t_start),
-                    "data_range_max": float(local.data_range_max),
-                },
-                "fit_sampling_policy": context.fit_sampling_policy,
-                "fit_sampling_identity": context.fit_sampling_identity,
-            }
 
         self._executor = ThreadPoolExecutor(
             max_workers=min(len(included), os.cpu_count() or 1),
@@ -1983,15 +1781,9 @@ class GlobalFitWorker(QtCore.QThread):
         effective_local: dict[str, FitDatasetLocalSettings] = {}
         resolved_mode_items: list[tuple[str, str]] = []
         starting_evaluations = {}
-        refit_execution = dispatch.shared_refit_execution
-        if refit_execution is None:
-            execution_shared_variables = dispatch.ordinary_shared_variables
-            execution_dataset_overrides = dispatch.ordinary_dataset_overrides
-            execution_coupled_variables = dispatch.ordinary_coupled_variables
-        else:
-            execution_shared_variables = refit_execution.shared_variables
-            execution_dataset_overrides = refit_execution.dataset_overrides
-            execution_coupled_variables = refit_execution.coupled_variables
+        execution_shared_variables = dispatch.ordinary_shared_variables
+        execution_dataset_overrides = dispatch.ordinary_dataset_overrides
+        execution_coupled_variables = dispatch.ordinary_coupled_variables
         fitted_shared_names = {
             item.name for item in execution_shared_variables
         }
@@ -2087,9 +1879,6 @@ class GlobalFitWorker(QtCore.QThread):
                 raise TypeError("Fit evaluator did not return DatasetFitInfo.")
             if fit_info is not None:
                 starting_evaluations[dataset_id] = fit_info.simulation_result
-                prepared_ids[dataset_id]["validated_executable_schedule"] = (
-                    fit_info.simulation_result.intervention_execution.provenance_projection()
-                )
             if (
                 local.parametric is not None
                 and local.parametric.requested_mode == "auto"
@@ -2323,16 +2112,14 @@ class GlobalFitWorker(QtCore.QThread):
         if not isinstance(result_or_unavailable, GlobalFitResult):
             raise TypeError("Fit core returned an unsupported terminal value.")
         result = result_or_unavailable
-        setup_snapshot = FitSetupSnapshot.from_request(request)
         candidate = _assemble_fit_terminal(
             request=request,
             result=result,
             included_ids=included_ids,
             effective_local=effective_local,
-            setup_snapshot=setup_snapshot,
+            setup_snapshot=self._setup,
             resolved_modes=resolved_modes,
             evaluators=evaluators,
-            prepared_ids=prepared_ids,
         )
         if self._checkpoint() and not stop_best_requested():
             raise FittingCancelled()
@@ -2345,11 +2132,7 @@ class GlobalFitWorker(QtCore.QThread):
     def _live_update(self, best_progress: FitProgress) -> FitLiveUpdate:
         """Build one transient presentation directly from callback-local progress."""
         dispatch = self._request.dispatch
-        layout = (
-            dispatch.ordinary_optimizer_layout
-            if dispatch.shared_refit_execution is None
-            else dispatch.shared_refit_execution.optimizer_layout
-        )
+        layout = dispatch.ordinary_optimizer_layout
         if not isinstance(layout, FitParameterLayout):
             raise RuntimeError("Live Fit update omitted its admitted optimizer layout.")
         vector = np.asarray(best_progress.optimizer_vector, dtype=float).reshape(-1)

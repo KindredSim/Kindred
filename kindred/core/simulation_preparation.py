@@ -77,22 +77,6 @@ def _freeze_prepared_value(value: Any) -> Any:
     return value
 
 
-def _mutable_prepared_value(value: Any) -> Any:
-    """Project a retained value back to ordinary serializable containers."""
-
-    if isinstance(value, Mapping):
-        return {
-            str(key): _mutable_prepared_value(item)
-            for key, item in value.items()
-        }
-    if isinstance(value, (list, tuple)):
-        return [_mutable_prepared_value(item) for item in value]
-    if isinstance(value, np.ndarray):
-        return value.tolist()
-    if isinstance(value, (set, frozenset)):
-        return [_mutable_prepared_value(item) for item in value]
-    return value
-
 __all__ = [
     "SimulationExecutionRequest",
     "PreparedSimulationRun",
@@ -399,14 +383,6 @@ class PreparedSimulationRun:
     request: SimulationExecutionRequest
     unresolved_intervention_schedule: InterventionSchedule | None = None
     cancellation_control: SimulationCancellationControl | None = None
-    version: int = 1
-    mechanism_text_len: int = 0
-    param_names: tuple[str, ...] = ()
-    t_end: float = 0.0
-    num_points: int = 0
-    temperature_K: float = 0.0
-    initial_prefix: str = "init:"
-    symbolic_jacobian_status: Optional[Mapping[str, Any]] = None
 
     def __post_init__(self) -> None:
         y0 = np.asarray(self.y0, dtype=float).reshape(-1).copy()
@@ -414,8 +390,6 @@ class PreparedSimulationRun:
         object.__setattr__(self, "y0", y0)
         object.__setattr__(self, "species_names", tuple(self.species_names))
         object.__setattr__(self, "warnings", tuple(str(value) for value in self.warnings))
-        object.__setattr__(self, "param_names", tuple(str(name) for name in self.param_names if str(name).strip()))
-        object.__setattr__(self, "initial_prefix", str(self.initial_prefix or "init:"))
         if not isinstance(self.solver_config, _PreparedSolverConfig):
             raise TypeError("solver_config must be PreparedSolverConfig.")
         if self.request.solver_config != self.solver_config:
@@ -430,31 +404,6 @@ class PreparedSimulationRun:
                 "initials_for_algebra",
                 _freeze_prepared_value(self.initials_for_algebra),
             )
-        if self.symbolic_jacobian_status is not None:
-            if not isinstance(self.symbolic_jacobian_status, Mapping):
-                raise TypeError("symbolic_jacobian_status must be a mapping or None.")
-            object.__setattr__(self, "symbolic_jacobian_status", _freeze_prepared_value(self.symbolic_jacobian_status))
-
-    def to_serializable_dict(self) -> Dict[str, Any]:
-        payload: Dict[str, Any] = {
-            "version": int(self.version),
-            "mechanism_text_len": int(self.mechanism_text_len),
-            "param_names": [str(name) for name in self.param_names],
-            "t_end": float(self.t_end),
-            "num_points": int(self.num_points),
-            "temperature_K": float(self.temperature_K),
-            "solver_requested": self.solver_config.solver_input,
-            "solver_normalized": self.solver_config.solver,
-            "rtol": self.solver_config.rtol,
-            "atol": self.solver_config.atol,
-            "use_analytic_jacobian": self.solver_config.use_analytic_jacobian,
-            "initial_prefix": str(self.initial_prefix),
-        }
-        if self.symbolic_jacobian_status:
-            payload["symbolic_jacobian_status"] = _mutable_prepared_value(self.symbolic_jacobian_status)
-        return payload
-
-
 def resolve_prepared_run_intervention_execution(
     prepared_run: PreparedSimulationRun,
     *,
@@ -525,6 +474,8 @@ def build_simulation_request_from_prepared_run(
     intervention_execution: InterventionExecutionContract,
     symbolic_jacobian: SymbolicJacobianExecution,
     cancellation_control: SimulationCancellationControl | None = None,
+    t_eval: np.ndarray | None = None,
+    candidate_evaluation: bool = False,
 ) -> SimulationRequest:
     request = prepared_run.request
     cancellation_control = (
@@ -546,6 +497,8 @@ def build_simulation_request_from_prepared_run(
         temperature_schedule=prepared_run.temperature_schedule,
         species_names=tuple(prepared_run.species_names),
         cancellation_control=cancellation_control,
+        t_eval=t_eval,
+        candidate_evaluation=candidate_evaluation,
     )
     _raise_if_cancelled(cancellation_control)
     return result

@@ -21,62 +21,33 @@ from kindred.core.simulator.errors import DSLError
 
 AUTHORITY_ERROR = "equilibrium requires kf and exactly one of kr or Keq/dG_eq"
 
-
-@dataclass(frozen=True, slots=True)
-class EquilibriumRateContract:
-    """Published concentration-form values and directional units."""
-
-    kf: float | None
-    kr: float | None
-    Keq: float | None
-    delta_n: float
-    kf_unit: str
-    kr_unit: str
-    Keq_unit: str
-
-
-def equilibrium_delta_n(equilibrium: object) -> float:
-    forward = math.fsum(
-        float(value)
-        for value in dict(getattr(equilibrium, "stoich_forward", {}) or {}).values()
-    )
-    reverse = math.fsum(
-        float(value)
-        for value in dict(getattr(equilibrium, "stoich_back", {}) or {}).values()
-    )
-    delta_n = float(reverse - forward)
-    if not math.isfinite(delta_n):
-        raise ValueError("equilibrium delta_n must be finite")
-    return delta_n
-
-
-def equilibrium_rate_contract(
-    equilibrium: object,
-    *,
-    temperature_K: float = 298.15,
-) -> EquilibriumRateContract:
-    """Return one public ``Keq``/directional-rate DTO for an accepted step."""
-    delta_n = equilibrium_delta_n(equilibrium)
-    forward_order = math.fsum(
-        float(value)
-        for value in dict(getattr(equilibrium, "stoich_forward", {}) or {}).values()
-    )
-    reverse_order = math.fsum(
-        float(value)
-        for value in dict(getattr(equilibrium, "stoich_back", {}) or {}).values()
-    )
-    kf = effective_equilibrium_forward_rate(equilibrium, temperature_K=temperature_K)
-    kr = effective_equilibrium_reverse_rate(equilibrium, temperature_K=temperature_K)
-    keq = effective_equilibrium_keq(equilibrium, temperature_K=temperature_K)
-    return EquilibriumRateContract(
-        kf=kf,
-        kr=kr,
-        Keq=keq,
-        delta_n=delta_n,
-        kf_unit=rate_constant_unit(forward_order),
-        kr_unit=rate_constant_unit(reverse_order),
-        Keq_unit=equilibrium_constant_unit(delta_n),
-    )
+__all__ = [
+    "equilibrium_constant_unit",
+    "rate_constant_unit",
+    "choose_fast_equilibrium_rate",
+    "admit_explicit_directional_rate_pair",
+    "derived_equilibrium_ratio_from_directional_rates",
+    "FastEquilibriumRates",
+    "derive_fast_equilibrium_rates",
+    "EquilibriumRateAuthorityKind",
+    "EquilibriumRateInputContext",
+    "EquilibriumRateAuthority",
+    "EquilibriumRateSymbolicRelations",
+    "equilibrium_rate_symbolic_relations",
+    "effective_reverse_rate_from_keq",
+    "json_safe_equilibrium_authority_payload",
+    "plain_finite_float_or_none",
+    "effective_equilibrium_forward_rate",
+    "effective_equilibrium_keq",
+    "effective_equilibrium_reverse_rate",
+    "validate_equilibrium_rate_authority_flags",
+    "normalize_equilibrium_rate_authority",
+    "normalize_existing_equilibrium_rate_authority",
+    "authority_fields_from_step_entry",
+    "step_entry_authored_role_is_editable",
+    "require_step_entry_authored_role_is_editable",
+    "step_entry_authored_role_is_derived",
+]
 
 
 def _positive_finite(value: object, *, label: str, allow_zero: bool = False) -> float:

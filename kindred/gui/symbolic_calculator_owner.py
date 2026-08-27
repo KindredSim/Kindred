@@ -8,11 +8,6 @@ from kindred.core.mechanism_source import (
     MechanismAuthoringSource,
     source_matches_analysis,
 )
-from kindred.core.equilibrium_rate_authority import (
-    EquilibriumRateContract,
-    equilibrium_rate_contract,
-)
-from kindred.core.mechanism_metadata import MechanismMetadataView
 from kindred.core.simulator.dsl_parse import DslAnalysis, PreparedDslRequestSet
 from kindred.core.simulator.errors import DSLError
 from kindred.core.simulator.parameter_algebra import (
@@ -87,7 +82,6 @@ class SymbolicCalculatorSnapshot:
     mechanism: object
     analysis: DslAnalysis
     admitted_input: object
-    equilibrium_summary: tuple[str, ...] = ()
 
 @dataclass(frozen=True, slots=True)
 class SymbolicCalculatorViewState:
@@ -98,7 +92,6 @@ class SymbolicCalculatorViewState:
     latest_is_error: bool = False
     can_copy_result: bool = False
     can_copy_context: bool = False
-    equilibrium_summary: tuple[str, ...] = ()
 
 
 class SymbolicCalculatorOwner:
@@ -213,11 +206,6 @@ class SymbolicCalculatorOwner:
             latest_is_error=False if latest is None else bool(latest.is_error),
             can_copy_result=can_copy,
             can_copy_context=can_copy,
-            equilibrium_summary=(
-                ()
-                if not self._available or self._snapshot is None
-                else self._snapshot.equilibrium_summary
-            ),
         )
 
     def _display_entry(self) -> SymbolicCalculatorHistoryEntry | None:
@@ -301,43 +289,5 @@ class SymbolicCalculatorOwner:
                 source,
                 mechanism,
             ),
-            equilibrium_summary=self._equilibrium_summary(mechanism),
         )
         return snapshot, True, ""
-
-    @staticmethod
-    def _equilibrium_summary(mechanism: object) -> tuple[str, ...]:
-        equilibria = tuple(getattr(mechanism, "equilibria", ()) or ())
-        temperature_K = MechanismMetadataView.from_metadata(
-            getattr(mechanism, "metadata", {})
-        ).temperature_K
-        summaries: list[str] = []
-        for index, equilibrium in enumerate(equilibria, start=1):
-            contract = equilibrium_rate_contract(
-                equilibrium,
-                temperature_K=temperature_K,
-            )
-            summaries.append(_format_equilibrium_summary(index, contract))
-        return tuple(summaries)
-
-
-def _format_equilibrium_summary(
-    index: int,
-    contract: EquilibriumRateContract,
-) -> str:
-    """Render the canonical equilibrium DTO without re-deriving science."""
-
-    return "; ".join(
-        (
-            f"Equilibrium {index}",
-            _format_contract_value("Keq", contract.Keq, contract.Keq_unit),
-            _format_contract_value("kf", contract.kf, contract.kf_unit),
-            _format_contract_value("kr", contract.kr, contract.kr_unit),
-        )
-    )
-
-
-def _format_contract_value(label: str, value: float | None, unit: str) -> str:
-    if value is None:
-        return f"{label} unavailable [{unit}]"
-    return f"{label} = {value:.12g} [{unit}]"

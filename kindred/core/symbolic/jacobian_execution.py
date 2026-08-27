@@ -137,11 +137,6 @@ class SymbolicJacobianExecution:
             ),
         )
 
-    def metadata_kwargs(self) -> dict[str, Any]:
-        return {
-            "symbolic_jacobian_status": dict(self.status) if self.status else None,
-        }
-
     def provenance_fields(self) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "symbolic_jacobian": self.has_executable_jacobian,

@@ -39,13 +39,6 @@ class SymbolicCalculatorPanel(QtWidgets.QWidget):
         self._status_label.setWordWrap(True)
         layout.addWidget(self._status_label)
 
-        self._equilibrium_summary_label = QtWidgets.QLabel("", self)
-        self._equilibrium_summary_label.setObjectName(
-            "symbolicCalculatorEquilibriumSummaryLabel"
-        )
-        self._equilibrium_summary_label.setWordWrap(True)
-        layout.addWidget(self._equilibrium_summary_label)
-
         query_row = QtWidgets.QHBoxLayout()
         query_row.setSpacing(6)
         self._query_edit = QtWidgets.QLineEdit(self)
@@ -115,9 +108,6 @@ class SymbolicCalculatorPanel(QtWidgets.QWidget):
         self._copy_context_button.setEnabled(available and state.can_copy_context)
         reason = state.reason
         self._status_label.setText("" if available else reason)
-        self._equilibrium_summary_label.setText(
-            "\n".join(state.equilibrium_summary) if available else ""
-        )
         if self._latest_result_text:
             prefix = "Error" if self._latest_is_error else "Result"
             query = self._latest_query

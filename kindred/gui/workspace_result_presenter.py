@@ -113,19 +113,14 @@ class InteractiveDisplayCurve:
 
 @dataclass(frozen=True, slots=True)
 class InteractiveDisplayProjection:
-    """Transient physical roster composed independently of result authority."""
-
     tab_id: str
     set_id: str
-    generation: int
     x_label: str
     y_label: str
     curves: tuple[InteractiveDisplayCurve, ...]
-    target_set_ids: tuple[str, ...]
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "curves", tuple(self.curves))
-        object.__setattr__(self, "target_set_ids", tuple(self.target_set_ids))
 
 
 class _XlsxDestination:
@@ -1010,28 +1005,19 @@ def compose_interactive_display(
     *,
     tab_id: str,
     set_id: str,
-    generation: int,
-    target_set_ids: tuple[str, ...],
     render_input: ResultRenderInput,
-) -> InteractiveDisplayProjection:
+) -> InteractiveDisplayProjection | None:
     result_series = result.series
     selected_x = render_input.selected_x_series
 
-    def empty() -> InteractiveDisplayProjection:
-        return InteractiveDisplayProjection(
-            tab_id=tab_id, set_id=set_id, generation=generation,
-            x_label=render_input.x_label, y_label=render_input.y_label, curves=(),
-            target_set_ids=target_set_ids,
-        )
-
     if isinstance(selected_x, ExperimentalAxisSelection):
-        return empty()
+        return None
     if selected_x.series_name == "t":
         x_values = _readonly_display_array(result.t)
     else:
         selected_series = result_series.get(selected_x.series_name)
         if selected_series is None:
-            return empty()
+            return None
         x_values = _readonly_display_array(selected_series)
     wanted_y = (
         tuple(name for name in result_series if name != selected_x.series_name)
@@ -1043,36 +1029,59 @@ def compose_interactive_display(
             and selection.series_name != selected_x.series_name
         )
     )
-    base_block = next(
+    live_block = next(
         (
-            block for block in render_input.blocks
+            block
+            for block in render_input.blocks
             if block.block_id == set_id
-            and (
-                (
-                    block.kind
-                    in {ResultLayerKind.EXPLICIT, ResultLayerKind.PREVIEW}
-                    and block.visible
-                )
-                or block.kind is ResultLayerKind.REFERENCE
-            )
+            and block.kind in {ResultLayerKind.EXPLICIT, ResultLayerKind.PREVIEW}
+            and isinstance(block.result, SimulationResultValue)
+            and block.visible
         ),
         None,
     )
-    if base_block is None:
-        return empty()
+    reference_block = next(
+        (
+            block
+            for block in render_input.blocks
+            if block.block_id == set_id
+            and block.kind is ResultLayerKind.REFERENCE
+            and isinstance(block.result, SimulationResultValue)
+        ),
+        None,
+    )
+    explicit_block = next(
+        (
+            block
+            for block in render_input.blocks
+            if block.block_id == set_id
+            and block.kind is ResultLayerKind.EXPLICIT
+            and isinstance(block.result, SimulationResultValue)
+        ),
+        None,
+    )
+    baseline_block = reference_block or explicit_block
+    if live_block is None:
+        return None
     topology = _result_topology(result)
     connectors = _result_connectors(
         result, selected_x=selected_x, series_names=set(result_series)
     )
-    base_colors = dict(base_block.color_by_series)
-    plotted_series = {name for name, _values in base_block.series}
+    live_colors = dict(live_block.color_by_series) if live_block is not None else {}
+    baseline_colors = (
+        dict(baseline_block.color_by_series)
+        if baseline_block is not None
+        else live_colors
+    )
+    live_label = live_block.label
+    plotted_series = {name for name, _values in live_block.series}
     curves = tuple(
         InteractiveDisplayCurve(
             key=("simulation", "foreground", set_id, series_id),
-            label=f"{base_block.label}: {series_id}",
+            label=f"{live_label}: {series_id}",
             x=x_values,
             y=_readonly_display_array(series_values),
-            color=base_colors.get(series_id) or "#3b82f6",
+            color=live_colors.get(series_id) or "#3b82f6",
             segment_ids=topology[0], segment_keys=topology[1],
             discontinuity_ids=topology[2],
             intervention_connectors=tuple(
@@ -1082,13 +1091,71 @@ def compose_interactive_display(
         )
         for series_id in wanted_y
         if series_id in plotted_series
+        and x_values.size
         and (series_values := result_series.get(series_id)) is not None
+        and series_values.size
     )
+    if baseline_block is not None:
+        baseline_result = baseline_block.result
+        if not isinstance(baseline_result, SimulationResultValue):
+            baseline_result = None
+    else:
+        baseline_result = None
+    if baseline_result is not None:
+        if selected_x.series_name == "t":
+            baseline_x = _readonly_display_array(baseline_result.t)
+        else:
+            baseline_series = baseline_result.series.get(selected_x.series_name)
+            baseline_x = (
+                None
+                if baseline_series is None
+                else _readonly_display_array(baseline_series)
+            )
+        if baseline_x is not None:
+            baseline_topology = _result_topology(baseline_result)
+            baseline_series_map = baseline_result.series
+            baseline_connectors = _result_connectors(
+                baseline_result,
+                selected_x=selected_x,
+                series_names=set(baseline_series_map),
+            )
+            curves += tuple(
+                InteractiveDisplayCurve(
+                    key=("simulation", "ghost", set_id, series_id),
+                    label=f"{baseline_block.label}: {series_id}",
+                    x=baseline_x,
+                    y=_readonly_display_array(series_values),
+                    color=baseline_colors.get(series_id) or "#3b82f6",
+                    dashed=True,
+                    opacity=0.42,
+                    segment_ids=baseline_topology[0],
+                    segment_keys=baseline_topology[1],
+                    discontinuity_ids=baseline_topology[2],
+                    intervention_connectors=tuple(
+                        (item[0], item[1], item[2], item[3])
+                        for item in baseline_connectors
+                        if item[4] == series_id
+                    ),
+                )
+                for series_id in wanted_y
+                if baseline_x.size
+                if (series_values := baseline_series_map.get(series_id)) is not None
+                and series_values.size
+            )
+    if not any(
+        len(curve.key) >= 2
+        and curve.key[0:2] == ("simulation", "foreground")
+        for curve in curves
+    ):
+        return None
     return InteractiveDisplayProjection(
-        tab_id=tab_id, set_id=set_id, generation=generation,
-        x_label=render_input.x_label, y_label=render_input.y_label,
-        curves=curves, target_set_ids=target_set_ids,
+        tab_id=tab_id,
+        set_id=set_id,
+        x_label=render_input.x_label,
+        y_label=render_input.y_label,
+        curves=curves,
     )
+
 
 def compose_result_input(
     *,
@@ -1283,7 +1350,11 @@ def compose_result_input(
                 and semantic is not None
                 else ()
             )
-            if semantic is not None and foreground is not None:
+            if (
+                semantic is not None
+                and foreground is not None
+                and foreground_kind is ResultLayerKind.EXPLICIT
+            ):
                 statistics_names = foreground_names
             elif reference is not None and reference_semantic is not None:
                 statistics_names = _statistics_series_names(
@@ -1423,21 +1494,10 @@ def iter_blocks_tsv_chunks(
     blocks: Sequence[ResultDataBlock],
     *,
     rows_per_chunk: int = 2048,
-    row_indices_by_block: Mapping[int, np.ndarray] | None = None,
 ) -> Iterator[str]:
     block_values = tuple(blocks)
     columns: list[tuple[str, Sequence[object], str]] = []
     for block in block_values:
-        indices = (
-            None
-            if row_indices_by_block is None
-            else row_indices_by_block.get(id(block))
-        )
-        def select_rows(values: Sequence[object]) -> Sequence[object]:
-            if indices is None:
-                return values
-            return values[indices]
-
         columns.append(
             (
                 _export_column_header(
@@ -1445,7 +1505,7 @@ def iter_blocks_tsv_chunks(
                     block.x_name,
                     block.x_provenance,
                 ),
-                select_rows(block.t),
+                block.t,
                 "float",
             )
         )
@@ -1455,7 +1515,7 @@ def iter_blocks_tsv_chunks(
             columns.append(
                 (
                     encode_clipboard_text(f"{block.label} — source_row"),
-                    select_rows(block.source_row),
+                    block.source_row,
                     "int",
                 )
             )
@@ -1470,21 +1530,17 @@ def iter_blocks_tsv_chunks(
                 (
                     (
                         encode_clipboard_text(f"{block.label} — segment_id"),
-                        select_rows(block.segment_ids),
+                        block.segment_ids,
                         "int",
                     ),
                     (
                         encode_clipboard_text(f"{block.label} — segment_key"),
-                        (
-                            block.segment_keys
-                            if indices is None
-                            else tuple(block.segment_keys[int(index)] for index in indices)
-                        ),
+                        block.segment_keys,
                         "text",
                     ),
                     (
                         encode_clipboard_text(f"{block.label} — discontinuity_id"),
-                        select_rows(block.discontinuity_ids),
+                        block.discontinuity_ids,
                         "int",
                     ),
                 )
@@ -1497,7 +1553,7 @@ def iter_blocks_tsv_chunks(
                     name,
                     provenance_by_name.get(name, MappingProxyType({})),
                 ),
-                select_rows(values),
+                values,
                 "float",
             )
             for name, values in block.series

@@ -52,7 +52,6 @@ class ProjectSession:
             document=document,
             presentation=initial_presentation,
         )
-        self._identity_generation = 0
         self._content_revision = 0
         self._content_token_owner = object()
 
@@ -67,12 +66,6 @@ class ProjectSession:
     @property
     def saved_baseline(self) -> SavedArchiveBaseline:
         return self._saved_baseline
-
-    @property
-    def identity_generation(self) -> int:
-        """Session-only generation for real project identity replacement."""
-
-        return self._identity_generation
 
     def capture_content_token(self) -> ProjectContentToken:
         """Capture the exact current revision for conditional publication."""
@@ -139,37 +132,25 @@ class ProjectSession:
         document: ProjectDocument,
         presentation: WorkspacePresentationState,
         *,
-        path: str | None,
-        expected_token: ProjectContentToken,
+        path: str | os.PathLike[str] | None,
         baseline_document: ProjectDocument,
+        expected_token: ProjectContentToken,
     ) -> ProjectContentToken | None:
-        """Replace canonical project identity and saved baseline once.
-
-        The incoming archive and presentation have already crossed their
-        external admission boundaries.  This owner assigns both directly
-        after the caller's result fences have run.
-        """
+        """Publish one admitted project identity and its saved baseline."""
 
         if not self.is_content_token_current(expected_token):
             return None
+        normalized_path = (
+            None
+            if path is None
+            else os.path.abspath(os.fsdecode(os.fspath(path)))
+        )
         self._document = document
-        self._current_path = path
+        self._current_path = normalized_path
         self._saved_baseline = SavedArchiveBaseline(
             document=baseline_document,
             presentation=presentation,
         )
-        self._identity_generation += 1
-        return self._advance_content_revision()
-
-    def record_presentation_change(
-        self,
-        previous: WorkspacePresentationState,
-        current: WorkspacePresentationState,
-    ) -> ProjectContentToken:
-        """Advance currentness after one accepted presentation mutation."""
-
-        if previous == current:
-            return self.capture_content_token()
         return self._advance_content_revision()
 
     def mark_saved(

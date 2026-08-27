@@ -17,13 +17,10 @@ from kindred.core.project_session import ProjectContentToken, ProjectSession
 from kindred.core.project_presentation_state import (
     ProjectPresentationState,
     WorkspacePresentationState,
-    default_workspace_presentation_state,
+    default_project_presentation_state,
     reconcile_workspace_presentation_state,
     validate_project_presentation_state,
-)
-from kindred.gui.parameter_enumeration import (
-    GuiParameterCoordinate,
-    enumerate_parameter_coordinates,
+    validate_workspace_presentation_state,
 )
 
 if TYPE_CHECKING:
@@ -31,7 +28,6 @@ if TYPE_CHECKING:
 
 __all__ = [
     "CanonicalResultFence",
-    "CanonicalMutationResult",
     "ScientificDocumentDelta",
     "TabRuntimeState",
     "WorkspaceTabRegistry",
@@ -67,25 +63,18 @@ class TabRuntimeState:
             or self.slider_species_drafts_by_set_id
         )
 
+
 @dataclass(frozen=True, slots=True)
 class ScientificDocumentDelta:
-    """Affected existing targets from one accepted canonical document delta."""
+    """The surviving and retired targets in one canonical document delta.
+
+    ``affected_targets_by_tab`` is deliberately limited to set identities that
+    survive in the replacement document.  ``removed_targets_by_tab`` contains
+    identities that must be retired from the old physical result owners.
+    """
 
     affected_targets_by_tab: tuple[tuple[str, tuple[str, ...]], ...] = ()
-
-@dataclass(frozen=True, slots=True)
-class CanonicalMutationResult:
-    """One accepted exact-revision document mutation and its result fence."""
-
-    token: ProjectContentToken
-    changed: bool
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.token, ProjectContentToken):
-            raise TypeError("token must be ProjectContentToken.")
-        if type(self.changed) is not bool:
-            raise TypeError("changed must be bool.")
-
+    removed_targets_by_tab: tuple[tuple[str, tuple[str, ...]], ...] = ()
 
 class WorkspaceTabRegistry:
     """Sole live active-tab ID plus presentation and transient tab state."""
@@ -144,39 +133,6 @@ class WorkspaceTabRegistry:
             runtime_items.append((tab.tab_id, runtime))
         self._runtime_by_tab_id = tuple(runtime_items)
 
-    def _workspace_state_for(
-        self,
-        document: ProjectDocument,
-        presentation: WorkspacePresentationState | None = None,
-    ) -> WorkspacePresentationState:
-        if presentation is not None:
-            return presentation
-        defaults = default_workspace_presentation_state(document)
-        default_by_tab_id = dict(defaults.presentation_by_tab_id)
-        existing_by_tab_id = dict(self._presentation_by_tab_id)
-        active_tab_id = (
-            self.active_tab_id
-            if any(tab.tab_id == self.active_tab_id for tab in document.tabs)
-            else defaults.active_tab_id
-        )
-        candidate = WorkspacePresentationState(
-            active_tab_id=active_tab_id,
-            presentation_by_tab_id=tuple(
-                (
-                    tab.tab_id,
-                    existing_by_tab_id.get(
-                        tab.tab_id,
-                        default_by_tab_id[tab.tab_id],
-                    ),
-                )
-                for tab in document.tabs
-            ),
-        )
-        return reconcile_workspace_presentation_state(
-            document,
-            candidate,
-        )
-
     @property
     def active_tab_id(self) -> str:
         return self._active_tab_id
@@ -194,12 +150,6 @@ class WorkspaceTabRegistry:
 
     def capture_content_token(self) -> ProjectContentToken:
         return self._session.capture_content_token()
-
-    def document_identity(self, tab_id: str) -> tuple[int, str]:
-        """Return the native-editor history identity for exactly one tab."""
-
-        target = self.tab(tab_id).tab_id
-        return self._session.identity_generation, target
 
     def presentation(self, tab_id: str) -> ProjectPresentationState:
         target = str(tab_id)
@@ -226,34 +176,6 @@ class WorkspaceTabRegistry:
             presentation_by_tab_id=self.presentation_items(),
         )
 
-    @staticmethod
-    def _slider_coordinates(
-        tab: MechanismTabDocument | None,
-    ) -> dict[str, GuiParameterCoordinate]:
-        """Return typed writable Slider identity, including retained scalars."""
-
-        if tab is None or tab.prepared_dsl is None:
-            return {}
-        coordinates = enumerate_parameter_coordinates(
-            tab.prepared_dsl,
-        )
-        return {
-            item.name: item
-            for item in coordinates
-            if item.writable and not item.derived
-        }
-
-    def _prepare_replacement_runtime(
-        self,
-        document: ProjectDocument,
-    ) -> tuple[tuple[str, TabRuntimeState], ...]:
-        """Construct incoming transient owners before semantic publication."""
-
-        return tuple(
-            (tab.tab_id, self._runtime_factory(tab.tab_id))
-            for tab in document.tabs
-        )
-
     def replace_project(
         self,
         document: ProjectDocument,
@@ -262,116 +184,129 @@ class WorkspaceTabRegistry:
         path: str | None,
         baseline_document: ProjectDocument,
         expected_token: ProjectContentToken,
-    ) -> CanonicalMutationResult | None:
-        """Install one fully prepared project by direct assignment."""
+    ) -> ProjectContentToken | None:
+        """Commit one admitted complete project and its workspace state."""
 
         if not self._session.is_content_token_current(expected_token):
             return None
-        previous = self._session.document
-        prepared_runtime = self._prepare_replacement_runtime(document)
-        delta = self.scientific_document_delta(previous, document)
-        self._publish_document_delta(previous, document, delta)
+        runtime_by_tab_id = tuple(
+            (tab.tab_id, self._runtime_factory(tab.tab_id))
+            for tab in document.tabs
+        )
         token = self._session.replace_project(
             document,
             presentation,
             path=path,
-            expected_token=expected_token,
             baseline_document=baseline_document,
+            expected_token=expected_token,
         )
         if token is None:
             return None
         self._assign_workspace_state(
-            self._session.document,
+            document,
             presentation,
             retain_runtime=False,
-            runtime_by_tab_id=prepared_runtime,
+            runtime_by_tab_id=runtime_by_tab_id,
         )
-        return CanonicalMutationResult(token=token, changed=True)
+        return token
 
     def replace_document(
         self,
         document: ProjectDocument,
         *,
         expected_token: ProjectContentToken,
-    ) -> CanonicalMutationResult | None:
+    ) -> ProjectContentToken | None:
         """Publish one admitted document mutation directly."""
 
         if not self._session.is_content_token_current(expected_token):
             return None
         previous = self._session.document
         changed = document != previous
-        next_workspace = self._workspace_state_for(document)
+        existing_presentation = dict(self._presentation_by_tab_id)
+        active_tab_id = (
+            self.active_tab_id
+            if any(tab.tab_id == self.active_tab_id for tab in document.tabs)
+            else document.tabs[0].tab_id
+        )
+        next_workspace = WorkspacePresentationState(
+            active_tab_id=active_tab_id,
+            presentation_by_tab_id=tuple(
+                (
+                    tab.tab_id,
+                    (
+                        existing_presentation[tab.tab_id].reconciled(
+                            document,
+                            tab,
+                        )
+                        if tab.tab_id in existing_presentation
+                        else default_project_presentation_state(tab)
+                    ),
+                )
+                for tab in document.tabs
+            ),
+        )
+        next_workspace = reconcile_workspace_presentation_state(
+            document,
+            next_workspace,
+        )
+        next_workspace = validate_workspace_presentation_state(
+            document,
+            next_workspace,
+        )
+        existing_runtime = dict(self._runtime_by_tab_id)
+        next_runtime = tuple(
+            (
+                tab.tab_id,
+                existing_runtime[tab.tab_id]
+                if tab.tab_id in existing_runtime
+                else self._runtime_factory(tab.tab_id),
+            )
+            for tab in document.tabs
+        )
         delta = self.scientific_document_delta(previous, document)
         if changed:
-            self._publish_document_delta(previous, document, delta)
+            self._fence_document_delta(delta)
         token = self._session.replace_document(
             document,
             expected_token=expected_token,
         )
         if token is None:
             return None
-        if changed:
-            self._assign_workspace_state(self._session.document, next_workspace)
-        return CanonicalMutationResult(token=token, changed=changed)
+        self._assign_workspace_state(
+            document,
+            next_workspace,
+            runtime_by_tab_id=next_runtime,
+        )
+        return token
 
-    def _publish_document_delta(
+    def _fence_document_delta(
         self,
-        previous: ProjectDocument,
-        current: ProjectDocument,
         delta: ScientificDocumentDelta,
     ) -> None:
-        """Fence result owners before the session publishes the document."""
+        """Fence computation before canonical session publication."""
 
-        self._canonical_result_fence(delta)
-        self._interactive_preview_fence(delta)
-        self._fence_document_deletions(previous, current)
-
-    def _fence_document_deletions(
-        self,
-        previous: ProjectDocument,
-        current: ProjectDocument,
-    ) -> None:
-        """Fence and purge deletion deltas before canonical document mutation."""
-
-        current_tabs = {tab.tab_id: tab for tab in current.tabs}
-        for old_tab in previous.tabs:
-            current_tab = current_tabs.get(old_tab.tab_id)
-            old_set_ids = tuple(
-                initial_set.set_id
-                for initial_set in old_tab.initial_condition_sets
-            )
-            if current_tab is None:
-                self._interactive_preview_fence(
-                    ScientificDocumentDelta(
-                        affected_targets_by_tab=(
-                            (old_tab.tab_id, old_set_ids),
-                        )
+        self._deletion_result_fence._begin_document_delta_fence()
+        try:
+            self._canonical_result_fence(delta)
+            self._interactive_preview_fence(delta)
+            for tab_id, set_ids in delta.affected_targets_by_tab:
+                if not set_ids:
+                    continue
+                repository = self.tab_runtime(tab_id).result_repository
+                if repository is not None:
+                    repository.deauthorize_sets(set_ids)
+            if delta.removed_targets_by_tab:
+                for tab_id, set_ids in delta.removed_targets_by_tab:
+                    self._deletion_result_fence._fence_document_targets(
+                        tab_id,
+                        set_ids,
                     )
-                )
-                self._deletion_result_fence.purge_tab(
-                    old_tab.tab_id,
-                    old_set_ids,
-                )
-                continue
-            current_set_ids = {
-                initial_set.set_id
-                for initial_set in current_tab.initial_condition_sets
-            }
-            removed_set_ids = tuple(
-                set_id for set_id in old_set_ids if set_id not in current_set_ids
-            )
-            if removed_set_ids:
-                self._interactive_preview_fence(
-                    ScientificDocumentDelta(
-                        affected_targets_by_tab=(
-                            (old_tab.tab_id, removed_set_ids),
-                        )
-                    )
-                )
-                self._deletion_result_fence.purge_sets(
-                    old_tab.tab_id,
-                    removed_set_ids,
-                )
+                    runtime = self.tab_runtime(tab_id)
+                    repository = runtime.result_repository
+                    if repository is not None:
+                        repository.purge_sets(set_ids)
+        finally:
+            self._deletion_result_fence._end_document_delta_fence()
 
     def select_tab(
         self,
@@ -385,12 +320,8 @@ class WorkspaceTabRegistry:
             return None
         if target == self.active_tab_id:
             return self._session.capture_content_token()
-        previous = self.workspace_presentation()
         self._active_tab_id = target
-        return self._session.record_presentation_change(
-            previous,
-            self.workspace_presentation(),
-        )
+        return self._session.capture_content_token()
 
     def set_presentation(
         self,
@@ -412,15 +343,11 @@ class WorkspaceTabRegistry:
         current = self.presentation(tab.tab_id)
         if candidate == current:
             return self._session.capture_content_token()
-        previous = self.workspace_presentation()
         self._presentation_by_tab_id = tuple(
                 (current_id, candidate if current_id == tab.tab_id else current)
                 for current_id, current in self._presentation_by_tab_id
             )
-        return self._session.record_presentation_change(
-            previous,
-            self.workspace_presentation(),
-        )
+        return self._session.capture_content_token()
 
     def create_tab(
         self,
@@ -428,21 +355,19 @@ class WorkspaceTabRegistry:
         run_defaults: SimulationExecutionSettings,
         scientific_settings: TabScientificSettings,
         expected_token: ProjectContentToken,
-    ) -> tuple[MechanismTabDocument, CanonicalMutationResult] | None:
+    ) -> MechanismTabDocument | None:
         candidate = self._session.document.add_tab(
             run_defaults=run_defaults,
             scientific_settings=scientific_settings,
         )
         created = candidate.tabs[-1]
-        result = self.replace_document(
+        if self.replace_document(
             candidate,
             expected_token=expected_token,
-        )
-        if result is None:
+        ) is None:
             return None
         self._active_tab_id = created.tab_id
-        self.workspace_presentation()
-        return created, result
+        return created
 
     def rename_tab(
         self,
@@ -450,7 +375,7 @@ class WorkspaceTabRegistry:
         name: str,
         *,
         expected_token: ProjectContentToken,
-    ) -> CanonicalMutationResult | None:
+    ) -> ProjectContentToken | None:
         candidate = self._session.document.rename_tab(tab_id, name)
         return self.replace_document(candidate, expected_token=expected_token)
 
@@ -459,8 +384,11 @@ class WorkspaceTabRegistry:
         tab_id: str,
         *,
         expected_token: ProjectContentToken,
-    ) -> CanonicalMutationResult | None:
-        """Close an already-confirmed eligible tab and return the new active ID."""
+    ) -> ProjectContentToken | None:
+        """Close an eligible tab and return its successor content token.
+
+        Return ``None`` when the expected project content is no longer current.
+        """
         document = self._session.document
         target = str(tab_id)
         index = next(
@@ -481,7 +409,6 @@ class WorkspaceTabRegistry:
             self._active_tab_id = candidate.tabs[
                 min(index, len(candidate.tabs) - 1)
             ].tab_id
-            self.workspace_presentation()
         return result
 
     def tab_has_content_or_drafts(
@@ -513,7 +440,7 @@ class WorkspaceTabRegistry:
         tab: MechanismTabDocument,
         *,
         expected_token: ProjectContentToken,
-    ) -> CanonicalMutationResult | None:
+    ) -> ProjectContentToken | None:
         target = self.tab(tab_id).tab_id
         if tab.tab_id != target:
             raise ValueError("Replacement tab must match the captured tab ID.")
@@ -526,7 +453,7 @@ class WorkspaceTabRegistry:
         mutation: Callable[[MechanismTabDocument], MechanismTabDocument],
         *,
         expected_token: ProjectContentToken,
-    ) -> CanonicalMutationResult | None:
+    ) -> ProjectContentToken | None:
         if not callable(mutation):
             raise TypeError("mutation must be callable.")
         target = self.tab(tab_id)
@@ -545,7 +472,7 @@ class WorkspaceTabRegistry:
         initial_set: InitialConditionSet,
         *,
         expected_token: ProjectContentToken,
-    ) -> CanonicalMutationResult | None:
+    ) -> ProjectContentToken | None:
         tab = self.tab(tab_id)
         candidate = tab.replace_initial_condition_set(initial_set)
         return self.replace_tab(
@@ -560,7 +487,7 @@ class WorkspaceTabRegistry:
         settings: SimulationExecutionSettings,
         *,
         expected_token: ProjectContentToken,
-    ) -> CanonicalMutationResult | None:
+    ) -> ProjectContentToken | None:
         tab = self.tab(tab_id)
         return self.replace_tab(
             tab.tab_id,
@@ -575,7 +502,7 @@ class WorkspaceTabRegistry:
         settings: SimulationExecutionSettings | None,
         *,
         expected_token: ProjectContentToken,
-    ) -> CanonicalMutationResult | None:
+    ) -> ProjectContentToken | None:
         tab = self.tab(tab_id)
         target = tab.initial_condition_set(set_id).set_id
         return self.replace_tab(
@@ -590,7 +517,7 @@ class WorkspaceTabRegistry:
         settings: TabScientificSettings,
         *,
         expected_token: ProjectContentToken,
-    ) -> CanonicalMutationResult | None:
+    ) -> ProjectContentToken | None:
         tab = self.tab(tab_id)
         return self.replace_tab(
             tab.tab_id,
@@ -604,15 +531,12 @@ class WorkspaceTabRegistry:
         set_ids: Iterable[str],
         *,
         expected_token: ProjectContentToken,
-    ) -> CanonicalMutationResult | None:
+    ) -> ProjectContentToken | None:
         targets = tuple(dict.fromkeys(str(set_id) for set_id in set_ids))
         if not targets:
             if not self._session.is_content_token_current(expected_token):
                 return None
-            return CanonicalMutationResult(
-                token=self._session.capture_content_token(),
-                changed=False,
-            )
+            return self._session.capture_content_token()
         tab = self.tab(tab_id)
         candidate = tab.without_initial_condition_sets(targets)
         return self.replace_tab(
@@ -672,6 +596,30 @@ class WorkspaceTabRegistry:
                         tuple(dict.fromkeys(changed)),
                     )
                 )
+        current_tab_ids = {tab.tab_id for tab in current.tabs}
+        removed_by_tab: list[tuple[str, tuple[str, ...]]] = []
+        for old_tab in previous.tabs:
+            old_set_ids = tuple(
+                initial_set.set_id
+                for initial_set in old_tab.initial_condition_sets
+            )
+            if old_tab.tab_id not in current_tab_ids:
+                if old_set_ids:
+                    removed_by_tab.append((old_tab.tab_id, old_set_ids))
+                continue
+            current_tab = next(
+                tab for tab in current.tabs if tab.tab_id == old_tab.tab_id
+            )
+            current_set_ids = {
+                initial_set.set_id
+                for initial_set in current_tab.initial_condition_sets
+            }
+            removed_set_ids = tuple(
+                set_id for set_id in old_set_ids if set_id not in current_set_ids
+            )
+            if removed_set_ids:
+                removed_by_tab.append((old_tab.tab_id, removed_set_ids))
         return ScientificDocumentDelta(
             affected_targets_by_tab=tuple(affected_by_tab),
+            removed_targets_by_tab=tuple(removed_by_tab),
         )

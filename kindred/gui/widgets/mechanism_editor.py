@@ -29,11 +29,12 @@ __all__ = [
 
 @dataclass(frozen=True, slots=True)
 class _MechanismEditorRenderProjection:
+    """Prepared editor values for one admitted tab snapshot."""
+
     source: object
     notes: str
     reactions_draft: bool
     accepted_reactions: bool
-    document_identity: tuple[int, str]
 
 
 class _PersistentToggleMenu(QtWidgets.QMenu):
@@ -902,8 +903,9 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
         super().focusInEvent(event)
         self._emit_native_history_availability()
 
+
 class MechanismEditorBinding(QtCore.QObject):
-    """Bind one retained editor to one immutable mechanism-tab identity."""
+    """Live binding for one published mechanism-tab editor."""
 
     draftStateChanged = QtCore.Signal(str, bool)
 
@@ -919,13 +921,15 @@ class MechanismEditorBinding(QtCore.QObject):
         target = str(tab_id).strip()
         if not target:
             raise ValueError("tab_id must be nonblank.")
+        if not isinstance(editor, MechanismEditorTabbed):
+            raise TypeError("editor must be MechanismEditorTabbed.")
         if not callable(getattr(registry, "tab", None)):
             raise TypeError("registry must provide tab(tab_id).")
         self._tab_id = target
         self._editor = editor
         self._registry = registry
         self._rendering = False
-        self._rendered_document_identity: tuple[int, str] | None = None
+        self._rendered_token = None
         editor.sourceDraftEdited.connect(self._on_source_draft)
         editor.reactionsRevertRequested.connect(self.revert_reactions_draft)
         editor.notesEdited.connect(self._on_notes_edited)
@@ -935,19 +939,11 @@ class MechanismEditorBinding(QtCore.QObject):
         return self._tab_id
 
     def prepare_render(self) -> _MechanismEditorRenderProjection:
-        """Prepare every fallible authoring projection before widget mutation."""
+        """Capture the current published document into a view projection."""
 
         tab = self._registry.tab(self._tab_id)
         runtime = self._registry.tab_runtime(self._tab_id)
         source = runtime.reactions_draft or tab.mechanism_source
-        document_identity = self._registry.document_identity(self._tab_id)
-        if (
-            type(document_identity) is not tuple
-            or len(document_identity) != 2
-        ):
-            raise TypeError(
-                "document_identity must be (generation, tab_id)."
-            )
         return _MechanismEditorRenderProjection(
             source=source,
             notes=(
@@ -957,22 +953,18 @@ class MechanismEditorBinding(QtCore.QObject):
             ),
             reactions_draft=runtime.reactions_draft is not None,
             accepted_reactions=tab.prepared_dsl is not None,
-            document_identity=document_identity,
         )
 
     def apply_render_projection(
         self,
         projection: _MechanismEditorRenderProjection,
     ) -> None:
-        """Apply one fully prepared authoring projection."""
-
         if not isinstance(projection, _MechanismEditorRenderProjection):
             raise TypeError(
                 "projection must be _MechanismEditorRenderProjection."
             )
-        identity_changed = (
-            projection.document_identity != self._rendered_document_identity
-        )
+        current_token = self._registry.capture_content_token()
+        token_changed = current_token != self._rendered_token
         self._rendering = True
         try:
             self._editor.render_authoring_snapshot(
@@ -983,9 +975,9 @@ class MechanismEditorBinding(QtCore.QObject):
                 has_draft=projection.reactions_draft,
                 has_accepted_reactions=projection.accepted_reactions,
             )
-            if identity_changed:
+            if token_changed:
                 self._editor.clear_native_text_history()
-            self._rendered_document_identity = projection.document_identity
+            self._rendered_token = current_token
         finally:
             self._rendering = False
 
@@ -1024,7 +1016,7 @@ class MechanismEditorBinding(QtCore.QObject):
         visible: MechanismAuthoringSource,
         accepted: MechanismAuthoringSource,
     ) -> bool:
-        """Keep deterministic parser rewrites inside native Reactions history."""
+        """Keep deterministic parser rewrites inside native editor history."""
 
         from kindred.core.mechanism_source import MechanismAuthoringSource
 
@@ -1039,7 +1031,7 @@ class MechanismEditorBinding(QtCore.QObject):
 
     @QtCore.Slot()
     def revert_reactions_draft(self) -> bool:
-        """Restore canonical source as one parse-free native undoable edit."""
+        """Restore canonical source as one native undoable edit."""
 
         tab = self._registry.tab(self._tab_id)
         runtime = self._registry.tab_runtime(self._tab_id)

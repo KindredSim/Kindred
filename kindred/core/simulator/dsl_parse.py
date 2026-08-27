@@ -562,19 +562,25 @@ class PreparedDslRequestSet:
         return topology
 
     def symbolic_jacobian_structure(self) -> object:
-        """Lazily retain the canonical global-cache symbolic structure."""
+        """Lazily retain one symbolic structure for this accepted mechanism."""
 
         structure = self.__symbolic_jacobian_structure
         if not self.__symbolic_structure_initialized:
             with self.__structure_lock:
                 if not self.__symbolic_structure_initialized:
-                    from kindred.core.simulation_preparation_stages import (
-                        _symbolic_jacobian_structure_for_mechanism,
+                    from kindred.core.symbolic.errors import (
+                        UnsupportedSymbolicExpressionError,
+                    )
+                    from kindred.core.symbolic.jacobian import (
+                        build_symbolic_jacobian_structure,
                     )
 
-                    structure = _symbolic_jacobian_structure_for_mechanism(
-                        mechanism=self.__mechanism
-                    )
+                    try:
+                        structure = build_symbolic_jacobian_structure(
+                            self.__mechanism
+                        )
+                    except UnsupportedSymbolicExpressionError:
+                        structure = None
                     self.__symbolic_jacobian_structure = structure
                     self.__symbolic_structure_initialized = True
                 structure = self.__symbolic_jacobian_structure

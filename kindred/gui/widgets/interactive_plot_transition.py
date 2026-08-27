@@ -29,8 +29,6 @@ class InteractiveDisplayLayer:
 @dataclass(frozen=True, slots=True)
 class InteractiveDisplayState:
     layers: tuple[InteractiveDisplayLayer, ...]
-    settled: bool
-    masked_set_ids: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True, slots=True)
@@ -41,7 +39,12 @@ class _Transition:
     interpolate: bool
 
 
-def _same_topology(left: InteractiveDisplayCurve, right: InteractiveDisplayCurve) -> bool:
+def _same_topology(
+    left: InteractiveDisplayCurve,
+    right: InteractiveDisplayCurve,
+) -> bool:
+    """Return whether two curves can share one physical interpolation item."""
+
     if left.segment_ids is None or right.segment_ids is None:
         return left.segment_ids is None and right.segment_ids is None
     return bool(
@@ -53,21 +56,29 @@ def _same_topology(left: InteractiveDisplayCurve, right: InteractiveDisplayCurve
 
 
 class InteractiveDisplayController:
-    """Own only physical cadence and transient plot state."""
+    """Own the admitted interactive batch and transient physical state.
 
-    def __init__(self, *, render: Callable[[InteractiveDisplayState], bool],
-                 request_tick: Callable[[float], None] | None = None,
-                 cancel_tick: Callable[[], None] | None = None,
-                 render_failed: Callable[[str], None] | None = None,
-                 clock: Callable[[], float] = time.monotonic,
-                 cadence_seconds: float = 1.0 / 30.0,
-                 transition_seconds: float = 0.12) -> None:
+    The request roster and generation live here, at the boundary where a
+    callback is admitted. Individual results carry no copied roster or
+    competing generation fact; the result map is only the retained result
+    payload for the one current batch.
+    """
+
+    def __init__(
+        self,
+        *,
+        render: Callable[[InteractiveDisplayState], bool],
+        request_tick: Callable[[float], None] | None = None,
+        cancel_tick: Callable[[], None] | None = None,
+        clock: Callable[[], float] = time.monotonic,
+        cadence_seconds: float = 1.0 / 30.0,
+        transition_seconds: float = 0.12,
+    ) -> None:
         if not callable(render):
             raise TypeError("render must be callable.")
         self._render = render
         self._request_tick = request_tick
         self._cancel_tick_callback = cancel_tick
-        self._render_failed = render_failed
         self._clock = clock
         self._cadence = float(cadence_seconds)
         self._duration = float(transition_seconds)
@@ -75,13 +86,11 @@ class InteractiveDisplayController:
             raise ValueError("cadence_seconds must be positive and finite.")
         if not np.isfinite(self._duration) or self._duration <= 0:
             raise ValueError("transition_seconds must be positive and finite.")
+
         self._visible: tuple[InteractiveDisplayLayer, ...] | None = None
         self._transition: _Transition | None = None
         self._pending: InteractiveDisplayProjection | None = None
-        self._results: dict[
-            str,
-            tuple[SimulationResultValue, int, tuple[str, ...]],
-        ] = {}
+        self._results: dict[str, SimulationResultValue] = {}
         self._generation: int | None = None
         self._target_set_ids: tuple[str, ...] = ()
         self._render_input: ResultRenderInput | None = None
@@ -89,7 +98,6 @@ class InteractiveDisplayController:
         self._tick_requested = False
         self._frozen = False
         self._rendered_frame = False
-        self._published_generation: int | None = None
 
     @property
     def cadence_seconds(self) -> float:
@@ -97,15 +105,9 @@ class InteractiveDisplayController:
 
     @property
     def has_visible_frame(self) -> bool:
-        return bool(self._visible and any(layer.projection.curves for layer in self._visible))
-
-    @property
-    def has_current_batch(self) -> bool:
         return bool(
-            self._rendered_frame
-            and self._generation is not None
-            and self._published_generation == self._generation
-            and not self._frozen
+            self._visible
+            and any(layer.projection.curves for layer in self._visible)
         )
 
     @property
@@ -116,31 +118,35 @@ class InteractiveDisplayController:
     def has_pending_batch(self) -> bool:
         return bool(self._results or self._pending or self._transition)
 
-    @property
-    def masking_intent(self) -> frozenset[str]:
-        return frozenset(
-            str(curve.key[2])
-            for layer in self._visible or ()
-            for curve in layer.projection.curves
-            if len(curve.key) >= 3 and curve.key[0:2] == ("simulation", "foreground")
-        )
-
     def _accept_input(self, render_input: ResultRenderInput) -> None:
         self._render_input = render_input
 
     def prepare_result_input(self, render_input: ResultRenderInput) -> None:
+        """Release transient custody before a static result scene changes.
+
+        A static input is repository projection authority.  It must never
+        inherit an admitted interactive batch, including one that is stopped
+        or waiting for a cadence tick.  Keep this fence at the controller
+        boundary so callers cannot accidentally render the static scene and
+        then recompose the old transient results.
+        """
+
+        self.clear(reset_currentness=True)
         self._accept_input(render_input)
         self._pending = None
         self._transition = None
         self._cancel_scheduled_tick()
 
     def commit_result_input(self, render_input: ResultRenderInput) -> None:
-        self._accept_input(render_input)
-        if self._results:
-            self._recompose()
+        """Retain the static input without reviving transient results.
 
-    def refresh_result_input(self, render_input: ResultRenderInput) -> None:
-        self.commit_result_input(render_input)
+        ``prepare_result_input`` has already retired the prior transient
+        batch.  This commit only records the input used by subsequent Slider
+        admissions; static publication itself remains the repository-backed
+        plot scene.
+        """
+
+        self._accept_input(render_input)
 
     def offer_result(
         self,
@@ -151,34 +157,43 @@ class InteractiveDisplayController:
         target_set_ids: tuple[str, ...],
         render_input: ResultRenderInput,
     ) -> bool:
+        """Admit one result into the current request and queue its projection."""
+
         self._accept_input(render_input)
+        set_id = str(set_id)
+        generation = int(generation)
         if self._generation is not None and generation < self._generation:
             return False
-        result_targets = tuple(target_set_ids)
-        result_target_set = set(result_targets)
+        if self._frozen and self._generation is not None and generation <= self._generation:
+            return False
+        roster = tuple(dict.fromkeys(str(value) for value in target_set_ids))
+        if set_id not in roster:
+            return False
+
+        if self._compose_result(result, set_id=set_id) is None:
+            # A result with no foreground curves is not a publication and
+            # cannot replace a previously displayed frame.
+            return False
+
         if self._generation is None:
             self._generation = generation
-            self._target_set_ids = result_targets
+            self._target_set_ids = roster
             self._frozen = False
-        elif self._generation != generation:
-            previous_targets = set(self._target_set_ids)
-            removed = previous_targets.difference(result_target_set)
-            if removed:
-                self._retire_projection_targets(removed)
-            # A successor may reuse unaffected frames from the prior request.
-            # Only targets absent from the successor roster are discarded.
+        elif generation > self._generation:
+            # Preserve retained insertion order. Removing a target from the
+            # successor roster must never reintroduce its old physical curve.
+            allowed = set(roster)
             self._results = {
-                set_id: value
-                for set_id, value in self._results.items()
-                if set_id in result_target_set
+                target: value
+                for target, value in self._results.items()
+                if target in allowed
             }
             self._generation = generation
-            self._target_set_ids = result_targets
+            self._target_set_ids = roster
             self._frozen = False
-        elif set_id not in set(self._target_set_ids):
-            # A same-generation callback cannot expand the admitted roster.
+        elif set_id not in self._target_set_ids:
             return False
-        self._results[set_id] = (result, generation, result_targets)
+        self._results[set_id] = result
         self._recompose()
         return True
 
@@ -193,7 +208,12 @@ class InteractiveDisplayController:
             target = self._pending
             self._pending = None
             source = self._visible or ()
-            self._transition = _Transition(source, target, now, self._can_interpolate(source, target))
+            self._transition = _Transition(
+                source,
+                target,
+                now,
+                self._can_interpolate(source, target),
+            )
         state = self._materialize(now)
         if state is None:
             return None
@@ -205,27 +225,38 @@ class InteractiveDisplayController:
         return state
 
     def stop(self) -> InteractiveDisplayState | None:
+        """Freeze the last physically stable frame without retiring it."""
+
         self._frozen = True
         self._pending = None
         self._transition = None
         self._cancel_scheduled_tick()
         if self._visible is None:
             return None
-        state = InteractiveDisplayState(self._visible, True, self.masking_intent)
+        state = InteractiveDisplayState(self._visible)
         self._present(state)
         return state
 
     def clear(self, *, reset_currentness: bool = False) -> None:
+        """Release transient custody once, then forget the admitted batch."""
+
+        had_physical_state = bool(
+            self._visible or self._rendered_frame or self._pending or self._transition
+        )
+        if had_physical_state:
+            if not self._present(InteractiveDisplayState(())):
+                return
+            self._visible = None
+            self._rendered_frame = False
+            self._last_presented_at = None
         self._pending = None
         self._transition = None
         self._results.clear()
         self._target_set_ids = ()
-        self._visible = None
         self._frozen = True
         if reset_currentness:
             self._generation = None
         self._cancel_scheduled_tick()
-        self._present(InteractiveDisplayState((), True))
 
     def retire_targets(
         self,
@@ -233,129 +264,105 @@ class InteractiveDisplayController:
         *,
         generation: int | None = None,
     ) -> bool:
-        """Retire targets only when the physical frame owns that generation."""
+        """Retire targets only after their physical frame publishes successfully."""
 
-        if generation is not None and self._published_generation != int(generation):
+        if generation is not None and self._generation != int(generation):
             return False
         targets = {str(value) for value in target_set_ids}
         if not targets:
             return False
+
         known = set(self._target_set_ids)
         known.update(self._results)
         for layer in self._visible or ():
             known.update(self._projection_target_ids(layer.projection))
         known.update(self._projection_target_ids(self._pending))
         if self._transition is not None:
-            known.update(
-                self._projection_target_ids(self._transition.target)
-            )
+            known.update(self._projection_target_ids(self._transition.target))
             for layer in self._transition.source:
                 known.update(self._projection_target_ids(layer.projection))
         affected = targets.intersection(known)
-        if generation is not None:
-            physically_visible = set()
-            for layer in self._visible or ():
-                physically_visible.update(
-                    self._projection_target_ids(layer.projection)
-                )
-            affected.intersection_update(physically_visible)
         if not affected:
-            return False
-        # Retiring a target is a local currentness fence as well as a
-        # projection removal. Any callback from the retired result generation
-        # must be rejected even when the execution owner has not yet issued a
-        # successor request.
-        if self._generation is not None:
-            self._generation += 1
-        roster = tuple(self._target_set_ids)
-        if not roster:
-            for _result, _generation, result_targets in self._results.values():
-                roster = tuple(result_targets)
-                if roster:
-                    break
-        if not roster:
-            projection = self._visible or self._pending
-            if projection is not None:
-                roster = tuple(projection.target_set_ids)
-        self._target_set_ids = tuple(
-            set_id for set_id in roster if set_id not in targets
+            # An already absent target owns no physical custody. Treat this
+            # idempotent retirement as success so a static replacement is not
+            # declined merely because no transient batch was admitted.
+            return True
+
+        visible = tuple(
+            InteractiveDisplayLayer(filtered, layer.opacity)
+            for layer in self._visible or ()
+            if (
+                filtered := self._filter_projection(layer.projection, affected)
+            )
+            is not None
         )
-        for set_id in affected:
-            self._results.pop(set_id, None)
-        self._retire_projection_targets(affected)
+        # Publish the filtered state before retiring the admitted result facts.
+        state = InteractiveDisplayState(visible)
+        if not self._present(state):
+            return False
+
+        self._visible = visible or None
         self._pending = None
         self._transition = None
         self._cancel_scheduled_tick()
-        if self._visible is None:
-            if self._results:
-                self._recompose()
-            else:
-                self._frozen = True
-                self._present(InteractiveDisplayState((), True))
-            return True
-        self._frozen = False
-        self._present(
-            InteractiveDisplayState(
-                self._visible,
-                True,
-                self.masking_intent,
-            )
+        self._results = {
+            set_id: result
+            for set_id, result in self._results.items()
+            if set_id not in affected
+        }
+        self._target_set_ids = tuple(
+            set_id for set_id in self._target_set_ids if set_id not in affected
         )
+        if self._generation is not None:
+            # Local retirement fencing rejects late callbacks from the retired
+            # request even when the computation owner has not started a
+            # successor request yet.
+            self._generation += 1
+        self._frozen = not bool(self._results or self._visible)
+        self._rendered_frame = bool(self._visible)
         if self._results:
             self._recompose()
-        if generation is not None and self._rendered_frame:
-            self._published_generation = int(generation)
         return True
 
     def _recompose(self) -> None:
         if not self._results:
             return
         projection = self._compose()
-        self.offer(projection)
+        if projection is not None:
+            self.offer(projection)
 
-    def _compose(self) -> InteractiveDisplayProjection:
+    def _compose(self) -> InteractiveDisplayProjection | None:
         if self._render_input is None or not self._results:
-            raise RuntimeError("interactive display has no current results")
-        results = tuple(
-            (set_id, result, generation, target_set_ids)
-            for set_id, (result, generation, target_set_ids) in self._results.items()
-            if set_id in set(self._target_set_ids)
-        )
-        if not results:
-            raise RuntimeError("interactive display has no current results")
-        # Compose each retained result independently so a successor can carry
-        # an unaffected result from the prior generation without transporting
-        # or rewriting owner generation facts.  Accumulate only the curves
-        # needed by the final physical projection.
-        latest = compose_interactive_display(
-            results[0][1],
+            return None
+        curves: list[InteractiveDisplayCurve] = []
+        latest: InteractiveDisplayProjection | None = None
+        # Dict insertion order is the admitted result order. Filtering a
+        # successor roster therefore preserves unaffected physical results.
+        for set_id, result in self._results.items():
+            if set_id not in self._target_set_ids:
+                continue
+            projection = self._compose_result(result, set_id=set_id)
+            if projection is None:
+                continue
+            latest = projection
+            curves.extend(projection.curves)
+        if latest is None or not curves:
+            return None
+        return replace(latest, curves=tuple(curves))
+
+    def _compose_result(
+        self,
+        result: SimulationResultValue,
+        *,
+        set_id: str,
+    ) -> InteractiveDisplayProjection | None:
+        if self._render_input is None:
+            return None
+        return compose_interactive_display(
+            result,
             tab_id=self._render_input.tab_id,
-            set_id=results[0][0],
-            generation=results[0][2],
-            target_set_ids=results[0][3],
+            set_id=set_id,
             render_input=self._render_input,
-        )
-        curves: list[InteractiveDisplayCurve] = list(latest.curves)
-        for set_id, result, generation, target_set_ids in results[1:]:
-            latest = compose_interactive_display(
-                result,
-                tab_id=self._render_input.tab_id,
-                set_id=set_id,
-                generation=generation,
-                target_set_ids=target_set_ids,
-                render_input=self._render_input,
-            )
-            curves.extend(latest.curves)
-        current_set_id = next(
-            (set_id for set_id, _result, _generation, _targets in results if set_id in self._target_set_ids),
-            results[0][0],
-        )
-        return replace(
-            latest,
-            set_id=current_set_id,
-            generation=self._generation or latest.generation,
-            curves=tuple(curves),
-            target_set_ids=self._target_set_ids or latest.target_set_ids,
         )
 
     @staticmethod
@@ -364,116 +371,72 @@ class InteractiveDisplayController:
     ) -> set[str]:
         if projection is None:
             return set()
-        return {str(value) for value in projection.target_set_ids}
+        return {
+            str(curve.key[2])
+            for curve in projection.curves
+            if len(curve.key) >= 3
+        }
 
     @staticmethod
     def _filter_projection(
-        projection: InteractiveDisplayProjection | None,
+        projection: InteractiveDisplayProjection,
         removed: set[str],
     ) -> InteractiveDisplayProjection | None:
-        if projection is None:
-            return None
-        target_set_ids = tuple(
-            set_id
-            for set_id in projection.target_set_ids
-            if set_id not in removed
-        )
-        if not target_set_ids:
-            return None
         curves = tuple(
             curve
             for curve in projection.curves
-            if len(curve.key) < 3 or curve.key[2] not in removed
+            if len(curve.key) < 3 or str(curve.key[2]) not in removed
         )
-        set_id = (
-            projection.set_id
-            if projection.set_id in target_set_ids
-            else target_set_ids[0]
-        )
-        return replace(
-            projection,
-            set_id=set_id,
-            curves=curves,
-            target_set_ids=target_set_ids,
-        )
-
-    def _retire_projection_targets(self, removed: set[str]) -> None:
-        if not removed:
-            return
-        if self._visible is not None:
-            visible = tuple(
-                InteractiveDisplayLayer(filtered, layer.opacity)
-                for layer in self._visible
-                if (
-                    filtered := self._filter_projection(
-                        layer.projection,
-                        removed,
-                    )
-                ) is not None
-            )
-            self._visible = visible or None
-        self._pending = self._filter_projection(self._pending, removed)
-        if self._transition is not None:
-            source = tuple(
-                InteractiveDisplayLayer(filtered, layer.opacity)
-                for layer in self._transition.source
-                if (
-                    filtered := self._filter_projection(
-                        layer.projection,
-                        removed,
-                    )
-                ) is not None
-            )
-            target = self._filter_projection(
-                self._transition.target,
-                removed,
-            )
-            if target is None:
-                self._transition = None
-            else:
-                self._transition = _Transition(
-                    source=source,
-                    target=target,
-                    started_at=self._transition.started_at,
-                    interpolate=False,
-                )
+        if not curves:
+            return None
+        return replace(projection, curves=curves)
 
     def _present(self, state: InteractiveDisplayState) -> bool:
-        try:
-            published = bool(self._render(state))
-        except Exception as exc:  # presentation failure stays panel-local
-            if self._render_failed is not None:
-                self._render_failed(str(exc))
-            return False
+        published = bool(self._render(state))
         if published:
-            has_curves = bool(
-                state.layers
-                and any(layer.projection.curves for layer in state.layers)
+            self._rendered_frame = bool(
+                state.layers and any(layer.projection.curves for layer in state.layers)
             )
-            self._rendered_frame = has_curves
-            self._published_generation = self._generation if has_curves else None
         return published
 
     def _materialize(self, now: float) -> InteractiveDisplayState | None:
         if self._transition is None:
             if self._visible is None:
                 return None
-            return InteractiveDisplayState(self._visible, self._pending is None, self.masking_intent)
+            return InteractiveDisplayState(self._visible)
         transition = self._transition
-        progress = min(1.0, max(0.0, (now - transition.started_at) / self._duration))
+        progress = min(
+            1.0,
+            max(0.0, (now - transition.started_at) / self._duration),
+        )
         eased = progress * progress * (3.0 - 2.0 * progress)
         if transition.interpolate:
-            projection = self._interpolate_projection(transition.source[0].projection, transition.target, eased)
+            projection = self._interpolate_projection(
+                transition.source[0].projection,
+                transition.target,
+                eased,
+            )
             layers = (InteractiveDisplayLayer(projection, 1.0),)
         else:
-            layers = tuple(InteractiveDisplayLayer(item.projection, item.opacity * (1.0 - eased)) for item in transition.source if item.opacity * (1.0 - eased) > _EPSILON)
-            layers = (*layers, InteractiveDisplayLayer(transition.target, eased)) if eased > _EPSILON else layers
+            layers = tuple(
+                InteractiveDisplayLayer(
+                    item.projection,
+                    item.opacity * (1.0 - eased),
+                )
+                for item in transition.source
+                if item.opacity * (1.0 - eased) > _EPSILON
+            )
+            if eased > _EPSILON:
+                layers = (
+                    *layers,
+                    InteractiveDisplayLayer(transition.target, eased),
+                )
             if not layers:
                 layers = (InteractiveDisplayLayer(transition.target, 1.0),)
         if progress >= 1.0:
             layers = (InteractiveDisplayLayer(transition.target, 1.0),)
             self._transition = None
-        return InteractiveDisplayState(layers, self._transition is None, self._masked(layers))
+        return InteractiveDisplayState(layers)
 
     def _schedule_tick(self) -> None:
         if self._tick_requested:
@@ -488,23 +451,50 @@ class InteractiveDisplayController:
             self._cancel_tick_callback()
 
     def _cadence_due(self, now: float) -> bool:
-        return self._last_presented_at is None or now - self._last_presented_at >= self._cadence - _EPSILON
+        return (
+            self._last_presented_at is None
+            or now - self._last_presented_at >= self._cadence - _EPSILON
+        )
 
     @staticmethod
-    def _masked(layers: tuple[InteractiveDisplayLayer, ...]) -> frozenset[str]:
-        return frozenset(str(curve.key[2]) for layer in layers for curve in layer.projection.curves if len(curve.key) >= 3 and curve.key[0:2] == ("simulation", "foreground"))
-
-    @staticmethod
-    def _can_interpolate(source: tuple[InteractiveDisplayLayer, ...], target: InteractiveDisplayProjection) -> bool:
+    def _can_interpolate(
+        source: tuple[InteractiveDisplayLayer, ...],
+        target: InteractiveDisplayProjection,
+    ) -> bool:
         if len(source) != 1 or source[0].opacity < 1.0 - _EPSILON:
             return False
-        return tuple(curve.key for curve in source[0].projection.curves) == tuple(curve.key for curve in target.curves) and all(left.markers == right.markers and _same_topology(left, right) for left, right in zip(source[0].projection.curves, target.curves, strict=True))
+        source_curves = source[0].projection.curves
+        target_curves = target.curves
+        if tuple(curve.key for curve in source_curves) != tuple(
+            curve.key for curve in target_curves
+        ):
+            return False
+        return all(
+            left.markers == right.markers
+            and left.x.shape == right.x.shape
+            and left.y.shape == right.y.shape
+            and np.array_equal(left.x, right.x)
+            and _same_topology(left, right)
+            for left, right in zip(source_curves, target_curves, strict=True)
+        )
 
     @classmethod
-    def _interpolate_projection(cls, source: InteractiveDisplayProjection, target: InteractiveDisplayProjection, progress: float) -> InteractiveDisplayProjection:
-        curves = tuple(cls._interpolate_curve(left, right, progress) for left, right in zip(source.curves, target.curves, strict=True))
-        return InteractiveDisplayProjection(target.tab_id, target.set_id, target.generation, target.x_label, target.y_label, curves, target.target_set_ids)
+    def _interpolate_projection(
+        cls,
+        source: InteractiveDisplayProjection,
+        target: InteractiveDisplayProjection,
+        progress: float,
+    ) -> InteractiveDisplayProjection:
+        curves = tuple(
+            cls._interpolate_curve(left, right, progress)
+            for left, right in zip(source.curves, target.curves, strict=True)
+        )
+        return replace(target, curves=curves)
 
     @staticmethod
-    def _interpolate_curve(left: InteractiveDisplayCurve, right: InteractiveDisplayCurve, progress: float) -> InteractiveDisplayCurve:
-        return InteractiveDisplayCurve(key=right.key, label=right.label, x=right.x, y=left.y + (right.y - left.y) * progress, color=right.color, dashed=right.dashed, markers=right.markers, point_size=right.point_size, opacity=right.opacity, segment_ids=right.segment_ids, segment_keys=right.segment_keys, discontinuity_ids=right.discontinuity_ids, intervention_connectors=right.intervention_connectors)
+    def _interpolate_curve(
+        left: InteractiveDisplayCurve,
+        right: InteractiveDisplayCurve,
+        progress: float,
+    ) -> InteractiveDisplayCurve:
+        return replace(right, y=left.y + (right.y - left.y) * progress)

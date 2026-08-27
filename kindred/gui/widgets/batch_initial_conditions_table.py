@@ -20,7 +20,6 @@ from kindred.core.project_presentation_state import ProjectPresentationState
 from kindred.core.project_session import ProjectContentToken
 from kindred.core.species import validate_concentration
 from kindred.gui.widgets.solver_settings import SolverSettingsDialog
-from kindred.gui.workspace_tab_registry import CanonicalMutationResult
 
 __all__ = [
     "BatchInitialConditionsTableModel",
@@ -38,10 +37,16 @@ _SLIDER_COLUMN_WIDTH = 72
 _PLOT_COLUMN_WIDTH = 56
 _CUSTOM_COLUMN_WIDTH = 72
 _RUN_GEAR_COLUMN_WIDTH = 36
+_INVALID_EDITOR_STYLE = (
+    "QLineEdit { background-color: rgb(255, 210, 210); "
+    "color: rgb(80, 0, 0); }"
+)
 
 
 @dataclass(frozen=True, slots=True)
 class _InitialConditionsRenderProjection:
+    """Prepared incoming values for one admitted tab snapshot."""
+
     tab: MechanismTabDocument
     presentation: ProjectPresentationState
     invalid_raw_by_set: tuple[tuple[str, tuple[tuple[str, str], ...]], ...]
@@ -77,16 +82,12 @@ class BatchInitialConditionsTableModel(QtCore.QAbstractTableModel):
     sliderPinChangeRequested = QtCore.Signal(str, bool)
     customRunSettingsToggleRequested = QtCore.Signal(str, bool)
     runSettingsEditRequested = QtCore.Signal(str)
-    snapshotRendered = QtCore.Signal()
 
     def __init__(self, parent: QtCore.QObject | None = None) -> None:
         super().__init__(parent)
         self._rows: tuple[_ProjectedRow, ...] = ()
         self._species: tuple[str, ...] = ()
         self._binding_generation = 1
-        self._snapshot_render_timer = QtCore.QTimer(self)
-        self._snapshot_render_timer.setSingleShot(True)
-        self._snapshot_render_timer.timeout.connect(self.snapshotRendered)
 
     def render_snapshot(
         self,
@@ -148,7 +149,6 @@ class BatchInitialConditionsTableModel(QtCore.QAbstractTableModel):
             previous_rows = self._rows
             self._rows = rows
             self._emit_nonstructural_changes(previous_rows, rows)
-        self._snapshot_render_timer.start(0)
 
     def _emit_nonstructural_changes(
         self,
@@ -391,11 +391,84 @@ class BatchInitialConditionsTableModel(QtCore.QAbstractTableModel):
         return True
 
 
+class _InitialConditionsItemDelegate(QtWidgets.QStyledItemDelegate):
+    """Keep invalid numeric drafts in their active editor."""
+
+    def createEditor(  # noqa: N802 - Qt override
+        self,
+        parent: QtWidgets.QWidget,
+        option: QtWidgets.QStyleOptionViewItem,
+        index: QtCore.QModelIndex,
+    ) -> QtWidgets.QWidget:
+        editor = super().createEditor(parent, option, index)
+        if isinstance(editor, QtWidgets.QLineEdit):
+            editor.textChanged.connect(
+                lambda _text, target=editor: self._update_editor_style(target)
+            )
+            self._update_editor_style(editor)
+        return editor
+
+    def eventFilter(  # noqa: N802 - Qt override
+        self,
+        editor: QtCore.QObject,
+        event: QtCore.QEvent,
+    ) -> bool:
+        if (
+            isinstance(editor, QtWidgets.QLineEdit)
+            and event.type() == QtCore.QEvent.Type.KeyPress
+            and isinstance(event, QtGui.QKeyEvent)
+            and event.key()
+            in (QtCore.Qt.Key.Key_Return, QtCore.Qt.Key.Key_Enter)
+        ):
+            index = self._index_for_editor(editor)
+            model = index.model()
+            if (
+                index.isValid()
+                and isinstance(model, BatchInitialConditionsTableModel)
+                and model.is_numeric_column(index.column())
+                and not self._is_valid_concentration(editor.text())
+            ):
+                self.commitData.emit(editor)
+                self._update_editor_style(editor)
+                event.accept()
+                return True
+        return super().eventFilter(editor, event)
+
+    @staticmethod
+    def _is_valid_concentration(text: str) -> bool:
+        try:
+            validate_concentration(
+                float(text),
+                field="initial concentration",
+            )
+        except (TypeError, ValueError, OverflowError):
+            return False
+        return True
+
+    def _index_for_editor(
+        self,
+        editor: QtWidgets.QLineEdit,
+    ) -> QtCore.QModelIndex:
+        view = self.parent()
+        if not isinstance(view, BatchInitialConditionsTableView):
+            return QtCore.QModelIndex()
+        center = editor.mapTo(view.viewport(), editor.rect().center())
+        return view.indexAt(center)
+
+    def _update_editor_style(self, editor: QtWidgets.QLineEdit) -> None:
+        editor.setStyleSheet(
+            _INVALID_EDITOR_STYLE
+            if not self._is_valid_concentration(editor.text())
+            else ""
+        )
+
+
 class BatchInitialConditionsTableView(QtWidgets.QTableView):
     pasteRequested = QtCore.Signal(int, int, str)
 
     def __init__(self, parent: QtWidgets.QWidget | None = None) -> None:
         super().__init__(parent)
+        self.setItemDelegate(_InitialConditionsItemDelegate(self))
         self.setSelectionBehavior(
             QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows
         )
@@ -572,12 +645,11 @@ def resolve_live_slider_target_set_ids(
     )
     return tuple(dict.fromkeys((*current, *pinned)))
 
-
 class InitialConditionsTableActions(QtCore.QObject):
     """Own IC intents for one immutable mechanism-tab identity."""
 
     errorRaised = QtCore.Signal(str)
-    activeSnapshotChanged = QtCore.Signal()
+    invalidDraftStateChanged = QtCore.Signal(str, bool)
     selectedRunSetIdsChanged = QtCore.Signal(object)
 
     def __init__(
@@ -587,7 +659,6 @@ class InitialConditionsTableActions(QtCore.QObject):
         registry,
         model: BatchInitialConditionsTableModel,
         table: BatchInitialConditionsTableView,
-        simulation_jobs,
         species_for_tab: Callable[[MechanismTabDocument], Sequence[str]] | None = None,
         parent: QtCore.QObject | None = None,
     ) -> None:
@@ -601,14 +672,12 @@ class InitialConditionsTableActions(QtCore.QObject):
         self._registry = registry
         self._model = model
         self._table = table
-        self._simulation_jobs = simulation_jobs
         self._species_for_tab = species_for_tab or canonical_species_names
         self._rendering = False
         self._editor_settlement_expected_token: ProjectContentToken | None = None
         self._editor_settlement_successor_token: ProjectContentToken | None = None
         model.initialValueEditRequested.connect(self.accept_value_edit)
         model.setNameEditRequested.connect(self.accept_name_edit)
-        model.sliderPinChangeRequested.connect(self.set_slider_pinned)
         model.customRunSettingsToggleRequested.connect(
             self.toggle_custom_run_settings
         )
@@ -732,13 +801,13 @@ class InitialConditionsTableActions(QtCore.QObject):
 
     def _carry_editor_mutation(
         self,
-        result: CanonicalMutationResult | None,
+        result: ProjectContentToken | None,
     ) -> None:
         if (
             result is not None
             and self._editor_settlement_expected_token is not None
         ):
-            self._editor_settlement_successor_token = result.token
+            self._editor_settlement_successor_token = result
 
     def selected_run_set_ids(self) -> tuple[str, ...]:
         return tuple(
@@ -775,20 +844,18 @@ class InitialConditionsTableActions(QtCore.QObject):
         invalid = self._registry.tab_runtime(
             self._tab_id
         ).invalid_initial_text_by_set_id
-        was_invalid = species in invalid.get(set_id, {})
         if value is None:
-            raw = str(raw_text)
-            if invalid.get(set_id, {}).get(species) == raw:
+            if invalid.get(set_id, {}).get(species) == str(raw_text):
                 return False
             invalid.setdefault(set_id, {})[species] = str(raw_text)
             self.render()
-            self.activeSnapshotChanged.emit()
+            self.invalidDraftStateChanged.emit(self._tab_id, True)
             return False
 
         values = dict(initial_set.values)
         canonical = float(values.get(str(species), 0.0))
         changed = value != canonical
-        result: CanonicalMutationResult | None = None
+        result: ProjectContentToken | None = None
         if changed:
             values[str(species)] = value
             candidate = initial_set.with_values(values)
@@ -800,13 +867,13 @@ class InitialConditionsTableActions(QtCore.QObject):
             if result is None:
                 return False
             self._carry_editor_mutation(result)
-            self._consume_document_delta(result)
         invalid_cleared = self._clear_invalid_value(set_id, species)
-        if was_invalid and not changed:
-            self._reconcile_canonical_sets(tab, (set_id,))
         self.render()
-        if result is None and invalid_cleared:
-            self.activeSnapshotChanged.emit()
+        if invalid_cleared:
+            self.invalidDraftStateChanged.emit(
+                self._tab_id,
+                self.has_invalid_cells(),
+            )
         return changed
 
     @QtCore.Slot(int, int, str)
@@ -845,13 +912,6 @@ class InitialConditionsTableActions(QtCore.QObject):
             )
 
         tab = self._registry.tab(self._tab_id)
-        invalid_before = {
-            set_id: frozenset(values)
-            for set_id, values
-            in self._registry.tab_runtime(
-                self._tab_id
-            ).invalid_initial_text_by_set_id.items()
-        }
         candidate_sets = list(tab.initial_condition_sets)
         changed_ids: list[str] = []
         cleared_cells: list[tuple[str, str]] = []
@@ -871,7 +931,7 @@ class InitialConditionsTableActions(QtCore.QObject):
                 candidate_sets[row_index] = initial_set.with_values(values)
                 changed_ids.append(initial_set.set_id)
 
-        result: CanonicalMutationResult | None = None
+        result: ProjectContentToken | None = None
         if changed_ids:
             result = self._registry.replace_tab(
                 self._tab_id,
@@ -880,26 +940,18 @@ class InitialConditionsTableActions(QtCore.QObject):
             )
             if result is None:
                 return False
-            self._consume_document_delta(result)
         invalid_cleared = False
         for set_id, species in cleared_cells:
             invalid_cleared = (
                 self._clear_invalid_value(set_id, species)
                 or invalid_cleared
             )
-        canonical_recovery_ids = tuple(
-            dict.fromkeys(
-                set_id
-                for set_id, species in cleared_cells
-                if species in invalid_before.get(set_id, ())
-                and set_id not in changed_ids
-            )
-        )
-        if canonical_recovery_ids:
-            self._reconcile_canonical_sets(tab, canonical_recovery_ids)
         self.render()
-        if result is None and invalid_cleared:
-            self.activeSnapshotChanged.emit()
+        if invalid_cleared:
+            self.invalidDraftStateChanged.emit(
+                self._tab_id,
+                self.has_invalid_cells(),
+            )
         return bool(result is not None or invalid_cleared)
 
     @QtCore.Slot(str, str)
@@ -923,7 +975,7 @@ class InitialConditionsTableActions(QtCore.QObject):
             expected_token=self._editor_mutation_token(),
         )
         self._carry_editor_mutation(result)
-        accepted = self._consume_document_delta(result)
+        accepted = result is not None
         self.render()
         return accepted
 
@@ -941,7 +993,7 @@ class InitialConditionsTableActions(QtCore.QObject):
             lambda current: current.add_initial_condition_set(created),
             expected_token=self._registry.capture_content_token(),
         )
-        accepted = self._consume_document_delta(result)
+        accepted = result is not None
         self.render()
         return created if accepted else None
 
@@ -971,12 +1023,11 @@ class InitialConditionsTableActions(QtCore.QObject):
                 ordered[row], ordered[destination] = ordered[destination], ordered[row]
                 active.remove(row)
                 active.add(destination)
-        mutation_result = self._registry.mutate_tab(
+        self._registry.mutate_tab(
             self._tab_id,
             lambda current: current.with_initial_condition_sets(tuple(ordered)),
             expected_token=self._registry.capture_content_token(),
         )
-        self._consume_document_delta(mutation_result)
         self.render()
         return tuple(ordered[row].set_id for row in sorted(active))
 
@@ -990,7 +1041,7 @@ class InitialConditionsTableActions(QtCore.QObject):
             targets,
             expected_token=self._registry.capture_content_token(),
         )
-        accepted = self._consume_document_delta(result)
+        accepted = result is not None
         self.render()
         return accepted
 
@@ -1011,7 +1062,6 @@ class InitialConditionsTableActions(QtCore.QObject):
         if token is None:
             return False
         self.render()
-        self.activeSnapshotChanged.emit()
         return True
 
     @QtCore.Slot(object)
@@ -1048,7 +1098,6 @@ class InitialConditionsTableActions(QtCore.QObject):
         if token is None:
             return False
         self.render()
-        self.activeSnapshotChanged.emit()
         return True
 
     def set_workspace_run_defaults(
@@ -1056,13 +1105,12 @@ class InitialConditionsTableActions(QtCore.QObject):
         settings: SimulationExecutionSettings,
         *,
         expected_token: ProjectContentToken,
-    ) -> CanonicalMutationResult | None:
+    ) -> ProjectContentToken | None:
         result = self._registry.set_run_defaults(
             self._tab_id,
             settings,
             expected_token=expected_token,
         )
-        self._consume_document_delta(result)
         self.render()
         return result
 
@@ -1078,7 +1126,7 @@ class InitialConditionsTableActions(QtCore.QObject):
             settings,
             expected_token=self._registry.capture_content_token(),
         )
-        accepted = self._consume_document_delta(result)
+        accepted = result is not None
         self.render()
         return accepted
 
@@ -1147,7 +1195,7 @@ class InitialConditionsTableActions(QtCore.QObject):
             settings,
             expected_token=self._registry.capture_content_token(),
         )
-        accepted = self._consume_document_delta(result)
+        accepted = result is not None
         self.render()
         return accepted
 
@@ -1159,7 +1207,10 @@ class InitialConditionsTableActions(QtCore.QObject):
         selected = tuple(
             set_id for set_id in self._table.selected_set_ids() if set_id in valid
         )
-        self._registry.tab_runtime(self._tab_id).selected_run_set_ids = selected
+        runtime = self._registry.tab_runtime(self._tab_id)
+        if tuple(runtime.selected_run_set_ids) == selected:
+            return
+        runtime.selected_run_set_ids = selected
         self.selectedRunSetIdsChanged.emit(selected)
 
     @QtCore.Slot()
@@ -1171,13 +1222,11 @@ class InitialConditionsTableActions(QtCore.QObject):
             return
         state = self._registry.presentation(self._tab_id)
         if state.current_set_id != set_id:
-            token = self._registry.set_presentation(
+            self._registry.set_presentation(
                 self._tab_id,
                 replace(state, current_set_id=set_id),
                 expected_token=self._registry.capture_content_token(),
             )
-            if token is not None:
-                self.activeSnapshotChanged.emit()
 
     def _clear_invalid_value(self, set_id: str, species: str) -> bool:
         invalid = self._registry.tab_runtime(
@@ -1190,30 +1239,6 @@ class InitialConditionsTableActions(QtCore.QObject):
         if not set_values:
             invalid.pop(set_id, None)
         return True
-
-    def _consume_document_delta(
-        self,
-        result: CanonicalMutationResult | None,
-    ) -> bool:
-        if result is None:
-            return False
-        if not isinstance(result, CanonicalMutationResult):
-            raise TypeError("result must be CanonicalMutationResult.")
-        self.activeSnapshotChanged.emit()
-        return result.changed
-
-    def _reconcile_canonical_sets(
-        self,
-        tab: MechanismTabDocument,
-        set_ids: Iterable[str],
-    ) -> None:
-        targets = tuple(
-            dict.fromkeys(str(item) for item in set_ids)
-        )
-        self._simulation_jobs.reconcile_canonical_targets(
-            tab.tab_id,
-            targets,
-        )
 
     def _reject(self, message: str) -> bool:
         self.errorRaised.emit(str(message))

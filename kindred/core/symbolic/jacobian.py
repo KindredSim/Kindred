@@ -36,7 +36,6 @@ from kindred.core.simulator.parameter_namespace import (
 
 from .backend import require_sympy
 from .errors import UnsupportedSymbolicExpressionError
-from .identity import symbolic_fingerprint
 from .namespaces import symbolic_status_payload
 
 
@@ -46,7 +45,6 @@ class SymbolicJacobianStructure:
     parameter_symbols: tuple[str, ...]
     rhs_expressions: tuple[str, ...]
     jacobian_expressions: tuple[tuple[str, ...], ...]
-    structure_fingerprint: str
     _compiled: Callable[..., Any]
     jac_sparsity: tuple[tuple[bool, ...], ...]
 
@@ -527,53 +525,6 @@ def classify_symbolic_jacobian_support(mechanism: Mechanism) -> SymbolicJacobian
     )
 
 
-def _structure_identity_payload(
-    mechanism: Mechanism,
-    species_names: tuple[str, ...],
-    parameter_symbols: tuple[str, ...],
-) -> dict[str, Any]:
-    reactions_payload = []
-    for idx, rxn in enumerate(getattr(mechanism, "reactions", []) or [], start=1):
-        reactions_payload.append(
-            {
-                "index": idx,
-                "reactants": dict(getattr(rxn, "reactants", {}) or {}),
-                "products": dict(getattr(rxn, "products", {}) or {}),
-                "rate_orders": dict(getattr(rxn, "rate_orders", {}) or {}),
-                "net_stoich": dict(getattr(rxn, "net_stoich", {}) or {}),
-                "forward_coefficient": _coefficient_parameter_name(
-                    idx - 1,
-                    "forward",
-                ),
-            }
-        )
-    equilibria_payload = []
-    reaction_count = len(reactions_payload)
-    for idx, eq in enumerate(getattr(mechanism, "equilibria", []) or [], start=1):
-        step_index = reaction_count + idx - 1
-        equilibria_payload.append(
-            {
-                "index": idx,
-                "stoich_forward": dict(getattr(eq, "stoich_forward", {}) or {}),
-                "stoich_back": dict(getattr(eq, "stoich_back", {}) or {}),
-                "forward_coefficient": _coefficient_parameter_name(
-                    step_index,
-                    "forward",
-                ),
-                "reverse_coefficient": _coefficient_parameter_name(
-                    step_index,
-                    "reverse",
-                ),
-            }
-        )
-    return {
-        "species_names": species_names,
-        "parameter_symbols": list(parameter_symbols),
-        "reactions": reactions_payload,
-        "equilibria": equilibria_payload,
-    }
-
-
 def _coefficient_public_parameter_names(
     mechanism: Mechanism,
 ) -> tuple[str, ...]:
@@ -634,36 +585,6 @@ def _canonical_public_parameter_symbols(
         str(item.canonical_name)
         for item in namespace.ordered_items
     )
-
-
-def symbolic_jacobian_structure_fingerprint_for_mechanism(mechanism: Mechanism) -> str:
-    support = classify_symbolic_jacobian_support(mechanism)
-    support.raise_if_unsupported()
-    species_names_func = getattr(mechanism, "species_names", None)
-    if not callable(species_names_func):
-        raise UnsupportedSymbolicExpressionError(
-            "Symbolic Jacobian requires a Kindred mechanism with species_names()."
-        )
-    species_names = tuple(str(name) for name in species_names_func())
-    if not species_names:
-        raise UnsupportedSymbolicExpressionError("Symbolic Jacobian requires at least one species.")
-    parameter_symbols = _symbolic_coefficient_parameter_symbols(mechanism)
-    identity_payload = _structure_identity_payload(
-        mechanism,
-        species_names,
-        parameter_symbols,
-    )
-    identity_payload["public_parameter_symbols"] = list(
-        _canonical_public_parameter_symbols(mechanism)
-    )
-    identity_payload["coefficient_public_projection"] = list(
-        zip(
-            parameter_symbols,
-            _coefficient_public_parameter_names(mechanism),
-            strict=True,
-        )
-    )
-    return symbolic_fingerprint(identity_payload)
 
 
 def _build_symbolic_mechanism_expression_model(
@@ -976,9 +897,6 @@ def build_symbolic_jacobian_structure(mechanism: Mechanism) -> SymbolicJacobianS
     )
     coefficient_parameter_symbols = model.parameter_symbols
     parameter_symbols = projection.parameter_symbols
-    structure_fingerprint = symbolic_jacobian_structure_fingerprint_for_mechanism(
-        mechanism
-    )
     parameter_sympy_symbols = tuple(
         sympy.Symbol(name)
         for name in coefficient_parameter_symbols
@@ -989,7 +907,6 @@ def build_symbolic_jacobian_structure(mechanism: Mechanism) -> SymbolicJacobianS
         parameter_symbols=parameter_symbols,
         rhs_expressions=rhs_strings,
         jacobian_expressions=jacobian_strings,
-        structure_fingerprint=structure_fingerprint,
         _compiled=compiled,
         jac_sparsity=jac_sparsity,
     )

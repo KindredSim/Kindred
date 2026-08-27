@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Mapping
 from dataclasses import replace
 
 from PySide6 import QtCore, QtGui, QtWidgets
@@ -15,7 +15,6 @@ from kindred.core.analysis.fit_evaluation_outcome import ScientificUnavailable
 from kindred.gui.fitting.data_tab import DataTab
 from kindred.gui.fitting.data_targets_tab import DataTargetsTab
 from kindred.gui.fitting.launch import (
-    FitInitialApplyProposal,
     FitOriginSnapshot,
     FitDatasetLocalSettings,
     FitSetupSnapshot,
@@ -25,7 +24,7 @@ from kindred.gui.fitting.launch import (
 from kindred.gui.fitting.parameters_ics_tab import ParametersIcsTab
 from kindred.gui.fitting.run_results_tab import RunResultsTab
 from kindred.gui.fitting.unified_species_table import UnifiedSpeciesTable
-from kindred.gui.fitting.worker import FitCurveDataset, FitLiveUpdate
+from kindred.gui.fitting.worker import FitCandidate, FitCurveDataset, FitLiveUpdate
 
 __all__ = ["FittingWindow"]
 
@@ -39,18 +38,16 @@ class FittingWindow(QtWidgets.QDialog):
     """
 
     executeRequested = QtCore.Signal()
+    applyRequested = QtCore.Signal()
+    sharedSeedRequested = QtCore.Signal(str)
     cancelRequested = QtCore.Signal()
     pauseRequested = QtCore.Signal()
     resumeRequested = QtCore.Signal()
-    applyRequested = QtCore.Signal(tuple, tuple)
     addObservableRequested = QtCore.Signal(str, str, object, str)
     setupSnapshotRequested = QtCore.Signal(object)
     resetRequested = QtCore.Signal(str)
     projectDefaultsRequested = QtCore.Signal(object)
-    copyHashRequested = QtCore.Signal()
-    copyRunJsonRequested = QtCore.Signal()
     resultsSummaryRequested = QtCore.Signal()
-    sharedRefitRequested = QtCore.Signal(tuple, str)
 
     def __init__(
         self,
@@ -118,11 +115,7 @@ class FittingWindow(QtWidgets.QDialog):
             parent=self,
             color_resolver=self._color_resolver,
         )
-        self._project_result_identity_labels()
         self._run_results_tab.set_dark_mode(self._current_results_dark_mode())
-        self._run_results_tab.initialSelectionChanged.connect(
-            self._refresh_apply_button
-        )
 
         self._tabs = QtWidgets.QTabBar(self)
         self._tabs.setObjectName("global_fit_top_tabs")
@@ -220,31 +213,21 @@ class FittingWindow(QtWidgets.QDialog):
             self._run_results_tab.copy_all_to_clipboard
         )
         actions.addWidget(self._copy_button)
-        self._copy_run_json = QtWidgets.QPushButton("Copy Run JSON", footer)
-        self._copy_run_json.setEnabled(False)
-        self._copy_run_json.clicked.connect(self.copyRunJsonRequested)
-        actions.addWidget(self._copy_run_json)
-
-        self._apply_parameters = QtWidgets.QCheckBox("Shared Parameters", footer)
-        self._apply_initials = QtWidgets.QCheckBox(
-            "Initial Conditions", footer
-        )
-        self._apply_observables = QtWidgets.QCheckBox(
-            "Observable Definitions", footer
-        )
-        for checkbox in (
-            self._apply_parameters,
-            self._apply_initials,
-            self._apply_observables,
-        ):
-            checkbox.setEnabled(False)
-            checkbox.toggled.connect(self._refresh_apply_button)
-            actions.addWidget(checkbox)
-        self._apply_button = QtWidgets.QPushButton("Apply to Project", footer)
+        self._apply_button = QtWidgets.QPushButton("Apply Fit to Project", footer)
         self._apply_button.setEnabled(False)
-        self._apply_button.clicked.connect(self._emit_apply)
+        self._apply_button.clicked.connect(self.applyRequested)
         actions.addWidget(self._apply_button)
-
+        self._shared_seed_combo = QtWidgets.QComboBox(footer)
+        self._shared_seed_combo.addItem("Arithmetic mean", "arithmetic")
+        self._shared_seed_combo.addItem("Geometric mean", "geometric")
+        self._shared_seed_combo.setEnabled(False)
+        actions.addWidget(self._shared_seed_combo)
+        self._shared_seed_button = QtWidgets.QPushButton(
+            "Configure Shared Fit", footer
+        )
+        self._shared_seed_button.setEnabled(False)
+        self._shared_seed_button.clicked.connect(self._request_shared_seed)
+        actions.addWidget(self._shared_seed_button)
         self._project_defaults_button = QtWidgets.QPushButton(
             "Save Optimizer Settings as Project Defaults", footer
         )
@@ -286,11 +269,6 @@ class FittingWindow(QtWidgets.QDialog):
         self._run_results_tab.copyAvailableChanged.connect(
             self._set_copy_available
         )
-        self._run_results_tab.copyHashRequested.connect(self.copyHashRequested)
-        self._run_results_tab.sharedRefitRequested.connect(
-            self.sharedRefitRequested
-        )
-        self._run_results_tab.applyRequested.connect(self.applyRequested)
 
     def _connect_origin_dependent_leaf_signals(self) -> None:
         self._species_table.setupSnapshotRequested.connect(
@@ -304,18 +282,6 @@ class FittingWindow(QtWidgets.QDialog):
         dataset_list.datasetIncludeChanged.connect(
             self._on_dataset_include_changed
         )
-    def _project_result_identity_labels(self) -> None:
-        self._run_results_tab.set_identity_labels(
-            dataset_labels={
-                item.dataset_id: item.display_name
-                for item in self._origin.mapped_datasets
-            },
-            set_labels={
-                item.set_id: item.set_name
-                for item in self._origin.mapped_datasets
-            },
-        )
-
     def _parameter_choices_for_origin(self) -> dict[str, object]:
         return {
             "dataset_ids": tuple(
@@ -332,61 +298,6 @@ class FittingWindow(QtWidgets.QDialog):
             self,
         ).exec()
 
-    def _replace_origin_dependent_presentation(
-        self,
-        origin: FitOriginSnapshot,
-    ) -> None:
-        """Replace the one visible data page when its captured origin changes."""
-
-        current_index = self._current_tab_stack.currentIndex()
-        old_page = self._data_targets_tab
-        self._current_tab_stack.removeWidget(old_page)
-        old_page.deleteLater()
-
-        self._species_table = UnifiedSpeciesTable(
-            origin=origin,
-            mechanism_species=tuple(
-                dict.fromkeys(
-                    species
-                    for mapped in origin.mapped_datasets
-                    for species, _value in mapped.initial_values
-                )
-            ),
-            parent=self,
-        )
-        self._data_targets_tab = DataTargetsTab(
-            data_settings_panel=self._data_tab,
-            species_table=self._species_table,
-            parent=self,
-        )
-        self._current_tab_stack.insertWidget(0, self._data_targets_tab)
-        self._current_tab_stack.setCurrentIndex(max(0, current_index))
-        self._connect_origin_dependent_leaf_signals()
-
-    # ------------------------------------------------------------------
-    # Typed projection and complete-snapshot boundary
-    # ------------------------------------------------------------------
-
-    def rebase(
-        self,
-        origin: FitOriginSnapshot,
-        *,
-        setup: FitSetupSnapshot,
-    ) -> None:
-        if not isinstance(origin, FitOriginSnapshot):
-            raise TypeError("origin must be FitOriginSnapshot.")
-        self._check_snapshot_origin(setup, origin)
-        if origin is not self._origin:
-            self._replace_origin_dependent_presentation(origin)
-            self._clear_resolved_auto_modes()
-        self._origin = origin
-        self._params_ics_tab.set_origin(origin)
-        self._params_ics_tab.set_parameter_choices(
-            **self._parameter_choices_for_origin()
-        )
-        self._project_result_identity_labels()
-        self.project_setup_snapshot(setup)
-
     def set_initial_reset_available(self, snapshot: FitSetupSnapshot) -> None:
         self._check_snapshot(snapshot)
         self._params_ics_tab.set_initial_reset_available(snapshot)
@@ -398,12 +309,10 @@ class FittingWindow(QtWidgets.QDialog):
             self._check_snapshot(snapshot)
         self._params_ics_tab.set_last_fit_reset_available(snapshot)
 
-    def set_last_fit_presentation(self, *, older_retained_state: bool) -> None:
-        """Label retained Last Fit values as ordinary or older state."""
+    def set_last_fit_presentation(self) -> None:
+        """Label retained Last Fit values as ordinary state."""
 
-        self._params_ics_tab.set_last_fit_presentation(
-            older_retained_state=older_retained_state,
-        )
+        self._params_ics_tab.set_last_fit_presentation()
 
     def clear_parameters_pending_edits(self) -> None:
         """Clear Parameters-owned drafts and refresh leaf validity."""
@@ -443,18 +352,10 @@ class FittingWindow(QtWidgets.QDialog):
         self._species_table.refresh_validity_ui()
         self._refresh_setup_validity()
 
-    def _on_leaf_snapshot(self, snapshot: object) -> None:
+    def _on_leaf_snapshot(self, snapshot: FitSetupSnapshot) -> None:
         """Forward one complete leaf-authored setup snapshot."""
 
         if self._closing or self._setup_projecting:
-            return
-        if not isinstance(snapshot, FitSetupSnapshot):
-            self.set_status("Fit setup snapshot is not typed.")
-            return
-        try:
-            self._check_snapshot(snapshot)
-        except (TypeError, ValueError) as exc:
-            self.set_status(f"Fit setup snapshot rejected: {exc}")
             return
         self.setupSnapshotRequested.emit(snapshot)
 
@@ -529,7 +430,6 @@ class FittingWindow(QtWidgets.QDialog):
             reason = structural
         self._run_block_reason_label.setVisible(bool(reason))
         self._run_block_reason_label.setText(reason)
-        self._refresh_apply_button()
 
     def _populate_dataset_list(self, snapshot: FitSetupSnapshot) -> None:
         by_id = {item.dataset_id: item for item in self._origin.mapped_datasets}
@@ -903,6 +803,8 @@ class FittingWindow(QtWidgets.QDialog):
             self._run_results_tab.set_view_autorange_locked(True)
             self._run_results_tab.set_live_curves(())
             self._copy_button.setEnabled(False)
+            self._apply_button.setEnabled(False)
+            self.set_shared_seed_available(False)
         else:
             self._paused = False
             self._run_results_tab.set_view_autorange_locked(False)
@@ -916,7 +818,6 @@ class FittingWindow(QtWidgets.QDialog):
         self._data_tab.setEnabled(not self._executing)
         self._project_defaults_button.setEnabled(not self._executing)
         self._refresh_setup_validity()
-        self._refresh_apply_button()
 
     def set_progress(self, value: int, text: str) -> None:
         self._progress.setValue(max(0, min(100, int(value))))
@@ -964,88 +865,61 @@ class FittingWindow(QtWidgets.QDialog):
     def _clear_resolved_auto_modes(self) -> None:
         self._data_tab.set_resolved_auto_modes(())
 
-    def set_copy_hash(self, copy_hash: str) -> None:
-        """Render one call-local Copy hash in the physical Results view."""
-
-        self._run_results_tab.set_copy_hash(copy_hash)
-
     def set_terminal_presentation(
         self,
-        projection: Mapping[str, object] | None,
+        candidate: FitCandidate | None,
         *,
-        copy_hash: str | None = None,
-        report_text: str | None = None,
-        report_failure: str | None = None,
         curves: tuple[FitCurveDataset, ...] = (),
         curve_failure: str | None = None,
-        apply_labels: Mapping[str, str] | None = None,
-        enabled_scopes: Sequence[str] = (),
-        initial_proposal: FitInitialApplyProposal | None = None,
-        older_retained_state: bool = False,
     ) -> bool:
-        """Consume call-local owner projections into physical widgets."""
+        """Consume one call-local typed candidate presentation."""
 
         rendered = self._run_results_tab.set_terminal_presentation(
-            projection,
-            copy_hash=copy_hash,
-            report_text=report_text,
-            report_failure=report_failure,
+            candidate,
             curves=curves,
             curve_failure=curve_failure,
         )
-        self.set_apply_display(apply_labels or {}, enabled_scopes)
-        self.set_initial_apply_proposal(initial_proposal)
-        has_projection = projection is not None
-        self._copy_run_json.setEnabled(has_projection)
-        self._results_summary_button.setEnabled(has_projection)
-        resolved_auto_modes = ()
-        if projection is not None:
-            resolved_auto_modes = tuple(
-                (str(entry["dataset_id"]), str(entry["mode"]))
-                for entry in projection.get("resolved_auto_modes", ())
-            )
+        self._results_summary_button.setEnabled(candidate is not None)
+        self._apply_button.setEnabled(candidate is not None and not self._executing)
+        resolved_auto_modes = () if candidate is None else tuple(
+            (str(dataset_id), str(mode))
+            for dataset_id, mode in candidate.resolved_auto_modes
+        )
         self.set_resolved_auto_modes(resolved_auto_modes)
-        self.set_last_fit_presentation(older_retained_state=older_retained_state)
+        self.set_last_fit_presentation()
         self._tabs.setCurrentIndex(2)
         return bool(rendered)
+
+    def set_apply_available(self, available: bool) -> None:
+        self._apply_button.setEnabled(bool(available) and not self._executing)
+
+    def set_shared_seed_available(self, available: bool) -> None:
+        enabled = bool(available) and not self._executing
+        self._shared_seed_combo.setEnabled(enabled)
+        self._shared_seed_button.setEnabled(enabled)
+
+    def _request_shared_seed(self) -> None:
+        if self._closing or self._executing:
+            return
+        self.sharedSeedRequested.emit(
+            str(self._shared_seed_combo.currentData() or "arithmetic")
+        )
 
     def clear_candidate(self) -> None:
         self._clear_resolved_auto_modes()
         self._copy_button.setEnabled(False)
-        self._copy_run_json.setEnabled(False)
+        self._apply_button.setEnabled(False)
+        self.set_shared_seed_available(False)
         self._results_summary_button.setEnabled(False)
-        self.set_apply_display({}, ())
-        self.set_last_fit_presentation(older_retained_state=False)
+        self.set_last_fit_presentation()
         self._run_results_tab.clear_candidate()
-
-    def set_initial_apply_proposal(
-        self,
-        proposal: FitInitialApplyProposal | None,
-    ) -> None:
-        """Project the owner's exact independently selectable IC mutations."""
-
-        if proposal is not None and not isinstance(
-            proposal,
-            FitInitialApplyProposal,
-        ):
-            raise TypeError("IC Apply proposal must be typed or None.")
-        if proposal is not None and proposal.origin is not self._origin:
-            raise ValueError("IC Apply proposal belongs to a stale Fit origin.")
-        self._run_results_tab.set_initial_apply_proposal(proposal)
 
     def render_results_summary(
         self,
         summary: Mapping[str, object],
-        *,
-        identity: str,
-        copy_hash_requested: Callable[[], object],
-        copy_json_requested: Callable[[], object],
     ) -> None:
         self._run_results_tab.render_results_summary(
             summary,
-            identity=identity,
-            copy_hash_requested=copy_hash_requested,
-            copy_json_requested=copy_json_requested,
         )
 
     def set_terminal_failure(self, failure: FactualCause) -> None:
@@ -1058,23 +932,12 @@ class FittingWindow(QtWidgets.QDialog):
     def set_terminal_unavailable(
         self,
         cause: ScientificUnavailable,
-        *,
-        older_retained_last_fit: bool = False,
     ) -> None:
         """Present scientific unavailability without classifying it as failure."""
 
-        if not older_retained_last_fit:
-            # A scientifically unavailable attempt has no terminal candidate
-            # of its own.  Clear any direct-call stale presentation before
-            # showing its typed factual cause; Shared-refit callers pass the
-            # explicit older-state flag after restoring source custody.
-            self.clear_candidate()
-        self.set_last_fit_presentation(
-            older_retained_state=older_retained_last_fit,
-        )
+        self.clear_candidate()
         self._run_results_tab.set_terminal_unavailable(
             cause,
-            older_retained_last_fit=older_retained_last_fit,
         )
         factual = cause.factual_cause
         self.set_status(
@@ -1082,79 +945,6 @@ class FittingWindow(QtWidgets.QDialog):
             + (factual.message if factual is not None else cause.stage)
         )
         self._tabs.setCurrentIndex(2)
-
-    def set_apply_display(
-        self,
-        scope_labels: Mapping[str, str],
-        enabled_scopes: Sequence[str] = (),
-    ) -> None:
-        """Render owner-provided Apply facts as physical widget state."""
-
-        available = frozenset(str(scope) for scope in enabled_scopes)
-        reasons = {str(scope): str(reason or "") for scope, reason in scope_labels.items()}
-        for checkbox, scope in self._apply_controls():
-            scope_available = scope in available
-            checkbox.setEnabled(scope_available)
-            checkbox.setChecked(scope_available)
-            tooltip = reasons.get(scope, "")
-            checkbox.setToolTip(tooltip)
-        self._refresh_apply_button()
-        display = {
-            scope: reasons.get(
-                scope,
-                "Available" if scope in available else "Unavailable",
-            )
-            for _checkbox, scope in self._apply_controls()
-        }
-        self._run_results_tab.set_apply_display(display, available)
-
-    def _apply_controls(self):
-        return (
-            (self._apply_parameters, "parameters"),
-            (self._apply_initials, "initial_concentrations"),
-            (self._apply_observables, "observable_definitions"),
-        )
-
-    def _emit_apply(self) -> None:
-        if self._closing:
-            return
-        scopes = tuple(
-            scope
-            for checkbox, scope in self._apply_controls()
-            if checkbox.isEnabled() and checkbox.isChecked()
-        )
-        initial_keys = (
-            self._run_results_tab.selected_initial_keys()
-            if "initial_concentrations" in scopes
-            else ()
-        )
-        if "initial_concentrations" in scopes and not initial_keys:
-            scopes = tuple(
-                scope for scope in scopes if scope != "initial_concentrations"
-            )
-        if not scopes:
-            self.set_status(
-                "Select at least one Apply scope and at least one Initial "
-                "Conditions cell when that scope is selected."
-            )
-            return
-        self.applyRequested.emit(tuple(scopes), tuple(initial_keys))
-
-    def _refresh_apply_button(self, *_args: object) -> None:
-        selected_available = any(
-            checkbox.isEnabled()
-            and checkbox.isChecked()
-            and (
-                scope != "initial_concentrations"
-                or bool(self._run_results_tab.selected_initial_keys())
-            )
-            for checkbox, scope in self._apply_controls()
-        )
-        self._apply_button.setEnabled(
-            selected_available
-            and not self._executing
-            and not self.has_pending_target_changes
-        )
 
     def _emit_project_defaults(self) -> None:
         if self._closing:
@@ -1218,10 +1008,8 @@ class FittingWindow(QtWidgets.QDialog):
         self._resume_button.setEnabled(False)
         self._results_summary_button.setEnabled(False)
         self._copy_button.setEnabled(False)
-        self._copy_run_json.setEnabled(False)
-        for checkbox, _scope in self._apply_controls():
-            checkbox.setEnabled(False)
         self._apply_button.setEnabled(False)
+        self.set_shared_seed_available(False)
         self._project_defaults_button.setEnabled(False)
         self._close_button.setEnabled(False)
 

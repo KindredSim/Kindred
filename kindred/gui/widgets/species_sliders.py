@@ -17,6 +17,14 @@ from kindred.gui.species_sliders_logic import (
 __all__ = ["BatchSpeciesSliders", "format_slider_value"]
 
 
+@dataclass(slots=True)
+class _SliderPress:
+    """Single physical press record owned by one concentration Slider."""
+
+    start_position: int
+    moved: bool = False
+
+
 def format_slider_value(value: float) -> str:
     value_f = float(value)
     if value_f == 0.0:
@@ -115,7 +123,7 @@ class BatchSpeciesSliders(QtWidgets.QWidget):
         self._hidden_species: set[str] = set()
         self._scope_signature: object | None = None
         self._target_set_ids: tuple[str, ...] = ()
-        self._active_drag_species: set[str] = set()
+        self._active_presses: dict[str, _SliderPress] = {}
         self._editor_pre_edit_values: dict[str, float] = {}
         self._editor_pre_edit_text: dict[str, str] = {}
         self._last_committed_editor_text: dict[str, str] = {}
@@ -262,7 +270,7 @@ class BatchSpeciesSliders(QtWidgets.QWidget):
             self._content_layout.removeWidget(row.container)
             row.container.deleteLater()
         self._rows.clear()
-        self._active_drag_species.clear()
+        self._active_presses.clear()
         self._editor_pre_edit_values.clear()
         self._editor_pre_edit_text.clear()
         self._last_committed_editor_text.clear()
@@ -343,27 +351,42 @@ class BatchSpeciesSliders(QtWidgets.QWidget):
         if row is None or not self._target_set_ids:
             return
         value = float(position) / 10_000.0 * row.maximum
-        interaction = (
-            SliderInteractionKind.INTERACTIVE_DRAG_SAMPLE
-            if str(species) in self._active_drag_species
-            else SliderInteractionKind.EXACT_DRAG_RELEASE
-        )
+        press = self._active_presses.get(str(species))
+        if press is not None and int(position) != press.start_position:
+            press.moved = True
+        if press is not None and not press.moved:
+            self._set_value_projection(
+                species,
+                value,
+                editor_text=None,
+                emit=False,
+            )
+            return
         self._set_value_projection(
             species,
             value,
             editor_text=None,
             emit=True,
-            interaction=interaction,
+            interaction=(
+                SliderInteractionKind.INTERACTIVE_DRAG_SAMPLE
+                if str(species) in self._active_presses
+                else SliderInteractionKind.EXACT_DIRECT_CHANGE
+            ),
         )
 
     def _on_slider_pressed(self, species: str) -> None:
-        self._active_drag_species.add(str(species))
+        species_s = str(species)
+        row = self._rows.get(species_s)
+        if row is not None:
+            self._active_presses[species_s] = _SliderPress(
+                start_position=int(row.slider.sliderPosition()),
+            )
 
     def _on_slider_released(self, species: str) -> None:
         species_s = str(species)
-        self._active_drag_species.discard(species_s)
+        press = self._active_presses.pop(species_s, None)
         value = self._values.get(species_s)
-        if value is not None:
+        if value is not None and press is not None and press.moved:
             self.interactionRequested.emit(
                 species_s,
                 float(value),
@@ -455,7 +478,7 @@ class BatchSpeciesSliders(QtWidgets.QWidget):
             )
             row.maximum_label.setText(format_slider_value(row.maximum))
         self._values[species_s] = value_f
-        if species_s not in self._active_drag_species:
+        if species_s not in self._active_presses:
             blocker = QtCore.QSignalBlocker(row.slider)
             try:
                 row.slider.setValue(self._value_to_position(value_f, row.maximum))

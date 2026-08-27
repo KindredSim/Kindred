@@ -23,7 +23,6 @@ from kindred.core.project_document import (
     ProjectDocument,
     SimulationExecutionSettings,
     TabScientificSettings,
-    validate_project_document,
 )
 from kindred.core.datasets.foundation import (
     ImportedSource,
@@ -1316,11 +1315,9 @@ def _decode_project(
             f"Unsupported project format {project_format!r}; "
             f"expected {CURRENT_PROJECT_FORMAT!r}."
         )
-    document = validate_project_document(
-        _decode_document(
-            root["document"],
-            source_bytes_by_member,
-        )
+    document = _decode_document(
+        root["document"],
+        source_bytes_by_member,
     )
     workspace = _exact_fields(
         root["workspace"],
@@ -1382,6 +1379,8 @@ class KinArchiveStore:
     """Read and write the sole current Kindred project archive schema."""
 
     def load(self, path: str | os.PathLike[str]) -> ArchiveProject:
+        """Decode one archive; final document admission belongs to its caller."""
+
         archive_path = os.path.abspath(os.fspath(path))
         try:
             with zipfile.ZipFile(archive_path, mode="r") as archive:

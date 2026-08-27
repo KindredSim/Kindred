@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from fractions import Fraction
@@ -49,9 +50,8 @@ class CorrectionTarget:
             and not self.derived
             and self.canonical_identity is not None
             and self.canonical_identity[0] == self.name
-            and self.canonical_identity[1] in {
-                "A", "Ea", "dG_act", "dG_eq", "kf", "kr", "kf+kr", "Keq", "k"
-            }
+            and self.canonical_identity[1]
+            in {"A", "Ea", "dG_act", "dG_eq", "kf", "kr", "kf+kr", "Keq", "k"}
             and isinstance(self.source_origin, str)
             and bool(self.source_origin)
             and "\n" not in self.source_origin
@@ -74,7 +74,10 @@ def _rank(rows: Sequence[Sequence[Fraction]]) -> int:
     width = len(matrix[0]) if matrix else 0
     rank = 0
     for column in range(width):
-        pivot = next((row for row in range(rank, len(matrix)) if matrix[row][column]), None)
+        pivot = next(
+            (row for row in range(rank, len(matrix)) if matrix[row][column]),
+            None,
+        )
         if pivot is None:
             continue
         matrix[rank], matrix[pivot] = matrix[pivot], matrix[rank]
@@ -84,14 +87,19 @@ def _rank(rows: Sequence[Sequence[Fraction]]) -> int:
             if row == rank or not matrix[row][column]:
                 continue
             factor = matrix[row][column]
-            matrix[row] = [value - factor * pivot for value, pivot in zip(matrix[row], matrix[rank])]
+            matrix[row] = [
+                value - factor * pivot_value
+                for value, pivot_value in zip(matrix[row], matrix[rank])
+            ]
         rank += 1
         if rank == len(matrix):
             break
     return rank
 
 
-def _inverse(matrix: Sequence[Sequence[Fraction]]) -> tuple[tuple[Fraction, ...], ...] | None:
+def _inverse(
+    matrix: Sequence[Sequence[Fraction]],
+) -> tuple[tuple[Fraction, ...], ...] | None:
     size = len(matrix)
     if not size or any(len(row) != size for row in matrix):
         return None
@@ -101,7 +109,10 @@ def _inverse(matrix: Sequence[Sequence[Fraction]]) -> tuple[tuple[Fraction, ...]
         for row_index, row in enumerate(matrix)
     ]
     for column in range(size):
-        pivot = next((row for row in range(column, size) if augmented[row][column]), None)
+        pivot = next(
+            (row for row in range(column, size) if augmented[row][column]),
+            None,
+        )
         if pivot is None:
             return None
         augmented[column], augmented[pivot] = augmented[pivot], augmented[column]
@@ -111,22 +122,19 @@ def _inverse(matrix: Sequence[Sequence[Fraction]]) -> tuple[tuple[Fraction, ...]
             if row == column or not augmented[row][column]:
                 continue
             factor = augmented[row][column]
-            augmented[row] = [value - factor * pivot for value, pivot in zip(augmented[row], augmented[column])]
+            augmented[row] = [
+                value - factor * pivot_value
+                for value, pivot_value in zip(augmented[row], augmented[column])
+            ]
     return tuple(tuple(row[size:]) for row in augmented)
 
 
 def _preference(target: CorrectionTarget, source_index: int) -> tuple[int, int, int]:
-    """Rank correction families, then retain authenticated source order.
-
-    Source order is supplied by ProjectDocument from the admitted authored
-    mechanism.  It is deliberately not reconstructed from a coordinate name:
-    ``k2`` and ``k10`` are distinct identities whose stable tie break is their
-    authored order.
-    """
+    """Rank correction families, then retain authenticated source order."""
 
     family = str(target.family)
     if family in {"kf+kr", "kf", "kr"}:
-        return (0, 1 if target.name.startswith("kf") else 0, source_index)
+        return (0, 0 if family == "kr" else 1, source_index)
     if family == "Keq":
         return (1, 0, source_index)
     if family == "dG_eq":
@@ -147,16 +155,85 @@ def _correction_constraints(
         if item.status in {"resolved", "unsatisfied"}
         and (
             item.status == "unsatisfied"
-            or bool(item.source_power_map())
-            or bool(item.source_factor_map())
+            or bool(item.powers)
         )
     )
+
+
+def _direct_source_power(item: object, target_name: str) -> Fraction:
+    """Return only a multiplicative authored factor's power."""
+
+    return Fraction(dict(item.powers).get(str(target_name), Fraction(0)))
+
+
+def _has_unsupported_source_factor(item: object) -> bool:
+    """Reject factors that cannot be authored as a static correction RHS."""
+
+    if item.coefficient == 0:
+        return True
+    return any(
+        (
+            str(name).startswith("exp(")
+            or str(name) == "T"
+            or re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", str(name)) is None
+        )
+        for name, _power in item.powers
+    )
+
+
+def _solve_correction_factors(
+    composition: ExactConstraintComposition,
+    basis: Sequence[str],
+) -> tuple[
+    tuple[tuple[Fraction, ...], ...],
+    tuple[dict[tuple[str, str | Fraction], Fraction], ...],
+] | None:
+    """Solve one basis and aggregate its exact generated RHS factors."""
+
+    constraints = _correction_constraints(composition)
+    inverse = _inverse(
+        [
+            tuple(_direct_source_power(item, name) for name in basis)
+            for item in constraints
+        ]
+    )
+    if inverse is None:
+        return None
+    selected_names = {str(name) for name in basis}
+    generated: list[dict[tuple[str, str | Fraction], Fraction]] = []
+    for target_index in range(len(basis)):
+        factors: dict[tuple[str, str | Fraction], Fraction] = {}
+        for row_index, constraint in enumerate(constraints):
+            exponent = inverse[target_index][row_index]
+            if not exponent:
+                continue
+            constraint_coefficient = Fraction(constraint.coefficient)
+            if constraint_coefficient != 1:
+                key = ("coefficient", constraint_coefficient)
+                factors[key] = factors.get(key, Fraction(0)) - exponent
+            for name, power in constraint.powers:
+                if not power:
+                    continue
+                key = ("symbol", str(name))
+                factors[key] = factors.get(key, Fraction(0)) - Fraction(power) * exponent
+        generated.append(
+            {
+                key: power
+                for key, power in factors.items()
+                if power and not (key[0] == "symbol" and key[1] in selected_names)
+            }
+        )
+    return inverse, tuple(generated)
 
 
 class CorrectionPlanner:
     """Choose one acyclic, source-backed, full-rank global basis."""
 
-    def __init__(self, composition: ExactConstraintComposition, targets: Mapping[str, CorrectionTarget] | Sequence[CorrectionTarget]) -> None:
+    def __init__(
+        self,
+        composition: ExactConstraintComposition,
+        targets: Mapping[str, CorrectionTarget] | Sequence[CorrectionTarget],
+    ) -> None:
         self.composition = composition
         raw_targets = targets.values() if isinstance(targets, Mapping) else targets
         admitted: dict[str, CorrectionTarget] = {}
@@ -183,7 +260,9 @@ class CorrectionPlanner:
         unsatisfied = tuple(
             item for item in constraints if item.status == "unsatisfied"
         )
-        if any(not item.source_powers for item in unsatisfied):
+        if not unsatisfied:
+            return CorrectionPlan((), (), True)
+        if any(not item.powers for item in unsatisfied):
             return CorrectionPlan(
                 (),
                 (),
@@ -197,13 +276,7 @@ class CorrectionPlanner:
                 False,
                 "exact source correction requires an unsupported non-multiplicative inverse",
             )
-        if not constraints:
-            return CorrectionPlan((), (), True)
-        eligible = [
-            target
-            for target in self.targets.values()
-            if target.eligible
-        ]
+        eligible = [target for target in self.targets.values() if target.eligible]
         eligible.sort(
             key=lambda target: _preference(
                 target,
@@ -217,133 +290,154 @@ class CorrectionPlanner:
         if _rank(rows) != len(constraints):
             return CorrectionPlan((), (), False, "exact constraints are rank-deficient")
         selected: tuple[CorrectionTarget, ...] | None = None
-        # Search combinations in preference order.  Greedy selection can
-        # choose a cyclic tempting coordinate and incorrectly reject a later
-        # acyclic full-rank basis.
+        cycle_reason: str | None = None
         for candidate in combinations(eligible, len(constraints)):
             candidate_rows = [
-                tuple(_direct_source_power(item, item_target.name) for item_target in candidate)
+                tuple(
+                    _direct_source_power(item, item_target.name)
+                    for item_target in candidate
+                )
                 for item in constraints
             ]
             if _rank(candidate_rows) != len(constraints):
                 continue
+            solution = _solve_correction_factors(
+                self.composition,
+                tuple(target.name for target in candidate),
+            )
+            if solution is None:
+                continue
+            _inverse_matrix, generated_factors = solution
             selected_names = {target.name for target in candidate}
-            visiting: set[str] = set()
+            generated_by_target = dict(
+                zip(
+                    (target.name for target in candidate),
+                    generated_factors,
+                    strict=True,
+                )
+            )
+            dependency_graph = {
+                target.name: tuple(
+                    dict.fromkeys(
+                        (
+                            tuple(str(dependency) for dependency in target.dependencies)
+                            + (
+                                tuple(
+                                    str(value)
+                                    for (kind, value), power in generated_by_target[target.name].items()
+                                    if kind == "symbol" and power
+                                )
+                                if target.name in selected_names
+                                else ()
+                            )
+                        )
+                    )
+                )
+                for target in self.targets.values()
+            }
+            visiting: list[str] = []
             visited: set[str] = set()
 
-            def visit(name: str) -> bool:
+            def visit(name: str) -> str | None:
+                if name not in dependency_graph:
+                    # Symbols outside the admitted target set are ordinary
+                    # authored leaves, not dependency edges owned here.
+                    return None
                 if name in visiting:
-                    return False
+                    start = visiting.index(name)
+                    return " -> ".join((*visiting[start:], name))
                 if name in visited:
-                    return True
-                visiting.add(name)
-                for dependency in self.targets[name].dependencies:
-                    dependency = str(dependency)
-                    if dependency not in self.targets:
-                        return False
-                    if not visit(dependency):
-                        return False
-                visiting.remove(name)
+                    return None
+                visiting.append(name)
+                for dependency in dependency_graph[name]:
+                    cycle = visit(dependency)
+                    if cycle is not None:
+                        return cycle
+                visiting.pop()
                 visited.add(name)
-                return True
+                return None
 
-            if all(visit(name) for name in selected_names):
+            cycle: str | None = None
+            for name in (target.name for target in candidate):
+                cycle = visit(name)
+                if cycle is not None:
+                    break
+            if cycle is None:
                 selected = candidate
                 break
+            cycle_reason = cycle
         if selected is None:
+            if cycle_reason is not None:
+                return CorrectionPlan(
+                    (),
+                    (),
+                    False,
+                    f"generated correction dependency cycle: {cycle_reason}",
+                )
             return CorrectionPlan(
                 (),
                 (),
                 False,
-                "no source-backed editable unlocked global full-rank acyclic basis is available",
+                "no source-backed editable unlocked global full-rank generated-expression-acyclic basis is available",
             )
-        matrix = [
-            tuple(_direct_source_power(item, target.name) for target in selected)
-            for item in constraints
-        ]
-        if _inverse(matrix) is None:
-            return CorrectionPlan((), (), False, "selected correction basis is not invertible")
         return CorrectionPlan(
             basis=tuple(target.name for target in selected),
-            assignments=tuple((constraint.cycle_id, target.name) for target, constraint in zip(selected, constraints, strict=True)),
+            assignments=tuple(
+                (constraint.cycle_id, target.name)
+                for target, constraint in zip(selected, constraints, strict=True)
+            ),
             available=True,
         )
 
 
-def plan_correction_basis(composition: ExactConstraintComposition, targets: Mapping[str, CorrectionTarget] | Sequence[CorrectionTarget]) -> CorrectionPlan:
+def plan_correction_basis(
+    composition: ExactConstraintComposition,
+    targets: Mapping[str, CorrectionTarget] | Sequence[CorrectionTarget],
+) -> CorrectionPlan:
     return CorrectionPlanner(composition, targets).plan()
 
 
 def _render_fraction(value: Fraction) -> str:
     value = Fraction(value)
-    return str(value.numerator) if value.denominator == 1 else f"({value.numerator}/{value.denominator})"
+    return (
+        str(value.numerator)
+        if value.denominator == 1
+        else f"({value.numerator}/{value.denominator})"
+    )
 
 
 def _render_factor(name: str, power: Fraction) -> str:
     return name if power == 1 else f"{name}**({_render_fraction(power)})"
 
 
-def _direct_source_power(item: object, target_name: str) -> Fraction:
-    """Return only a multiplicative authored factor's power.
-
-    A coordinate appearing solely inside ``exp(...)`` cannot be solved by
-    multiplying factors.  Treating its dependency projection as a monomial
-    power creates self-referential or dynamically invalid source edits, so
-    such a target is deliberately unavailable until a canonical inverse is
-    admitted.
-    """
-
-    source_factors = tuple(getattr(item, "source_factors", ()) or ())
-    if source_factors:
-        return Fraction(dict(source_factors).get(str(target_name), Fraction(0)))
-    return Fraction(getattr(item, "source_power_map")().get(str(target_name), Fraction(0)))
-
-
-def _has_unsupported_source_factor(item: object) -> bool:
-    """Reject factors that cannot be authored as a static correction RHS."""
-
-    return any(
-        str(name).startswith("exp(") or str(name) == "T"
-        for name, _power in item.source_factor_map().items()
-    )
-
-
-def build_correction_expressions(composition: ExactConstraintComposition, plan: CorrectionPlan) -> dict[str, str]:
+def build_correction_expressions(
+    composition: ExactConstraintComposition,
+    plan: CorrectionPlan,
+) -> dict[str, str]:
     """Render the exact coupled solution for the selected global basis."""
+
     if not plan.available or not plan.basis:
         return {}
     constraints = _correction_constraints(composition)
     if any(_has_unsupported_source_factor(item) for item in constraints):
         raise ValueError("Exact source correction cannot invert an exponential factor.")
     basis = tuple(plan.basis)
-    inverse = _inverse(
-        [
-            tuple(_direct_source_power(item, name) for name in basis)
-            for item in constraints
-        ]
-    )
-    if inverse is None:
+    solution = _solve_correction_factors(composition, basis)
+    if solution is None:
         raise ValueError("Correction basis is not invertible.")
+    _inverse_matrix, generated_factors = solution
     assignment_map = dict(plan.assignments)
     if tuple(assignment_map.get(item.cycle_id) for item in constraints) != basis:
         raise ValueError("Correction plan assignments do not match its global basis.")
     output: dict[str, str] = {}
     for target_index, target_name in enumerate(basis):
         factors: list[str] = []
-        for row_index, constraint in enumerate(constraints):
-            exponent = inverse[target_index][row_index]
-            if not exponent:
-                continue
-            # The source-coordinate row is already the exact authored
-            # equation.  ``constraint.coefficient`` belongs to the fully
-            # substituted residual and must not be substituted into this
-            # symbolic solve a second time; doing so applies the current
-            # residual twice (for example 36/25 instead of 6/5).
-            source_coefficient = Fraction(constraint.source_coefficient)
-            if source_coefficient != 1:
-                factors.append(_render_factor(_render_fraction(source_coefficient), -exponent))
-            for name, power in constraint.source_factor_map().items():
-                if name not in basis and power:
-                    factors.append(_render_factor(name, -power * exponent))
+        for (kind, value), power in generated_factors[target_index].items():
+            rendered_name = (
+                _render_fraction(value)
+                if kind == "coefficient"
+                else str(value)
+            )
+            factors.append(_render_factor(rendered_name, power))
         output[target_name] = " * ".join(factors) if factors else "1"
     return output

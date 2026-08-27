@@ -5,9 +5,8 @@ from __future__ import annotations
 import logging
 from concurrent.futures import Executor
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import InitVar, dataclass, field, replace
-from types import MappingProxyType
-from typing import Literal, Optional
+from dataclasses import replace
+from typing import Optional
 
 import numpy as np
 
@@ -48,281 +47,8 @@ from kindred.core.simulator.solver_types import SimulationCancellationControl
 logger = logging.getLogger(__name__)
 
 __all__ = [
-    "SharedRefitExecution",
-    "SharedRefitPromotionAdmission",
-    "SharedRefitPromotion",
     "fit_global",
-    "fit_global_shared_refit",
 ]
-
-
-@dataclass(frozen=True, slots=True)
-class SharedRefitPromotion:
-    """One Per-dataset coordinate promoted into a new Shared refit."""
-
-    parameter_name: str
-    minimum: float
-    maximum: float
-    log10: bool = False
-    seed_statistic: Literal["arithmetic_mean", "geometric_mean"] = "arithmetic_mean"
-
-    def __post_init__(self) -> None:
-        name = str(self.parameter_name or "").strip()
-        minimum = float(self.minimum)
-        maximum = float(self.maximum)
-        if not name:
-            raise ValueError("Shared-refit parameter name must be nonblank.")
-        if not np.isfinite(minimum) or not np.isfinite(maximum) or minimum >= maximum:
-            raise ValueError("Shared-refit promotion requires finite minimum < maximum.")
-        if self.log10 and minimum <= 0.0:
-            raise ValueError("Log10 Shared-refit promotion requires positive bounds.")
-        if self.seed_statistic not in {"arithmetic_mean", "geometric_mean"}:
-            raise ValueError("Shared-refit seed statistic must be arithmetic or geometric.")
-        object.__setattr__(self, "parameter_name", name)
-        object.__setattr__(self, "minimum", minimum)
-        object.__setattr__(self, "maximum", maximum)
-        object.__setattr__(self, "log10", bool(self.log10))
-
-
-@dataclass(frozen=True, slots=True)
-class SharedRefitPromotionAdmission:
-    """One pre-dispatch promotion with its exact admitted seed and provenance."""
-
-    promotion: InitVar[SharedRefitPromotion]
-    source_values: InitVar[Sequence[tuple[str, float]]]
-    shared_variable: FitSharedVariableParamSpec = field(init=False)
-    provenance: Mapping[str, object] = field(init=False)
-
-    def __post_init__(
-        self,
-        promotion: SharedRefitPromotion,
-        source_values: Sequence[tuple[str, float]],
-    ) -> None:
-        if not isinstance(promotion, SharedRefitPromotion):
-            raise TypeError("Shared-refit admission requires a typed promotion.")
-        source_values = tuple(
-            (str(dataset_id or "").strip(), float(value))
-            for dataset_id, value in source_values
-        )
-        dataset_ids = tuple(dataset_id for dataset_id, _value in source_values)
-        values = np.asarray(
-            [value for _dataset_id, value in source_values],
-            dtype=float,
-        )
-        if (
-            not source_values
-            or any(not dataset_id for dataset_id in dataset_ids)
-            or len(dataset_ids) != len(set(dataset_ids))
-        ):
-            raise ValueError(
-                "Shared-refit admission requires distinct source dataset values."
-            )
-        if not np.all(np.isfinite(values)):
-            raise ValueError("Shared-refit seeds require finite Per-dataset estimates.")
-        if promotion.seed_statistic == "geometric_mean":
-            if np.any(values <= 0.0):
-                raise ValueError(
-                    f"Geometric Shared-refit seed for {promotion.parameter_name!r} "
-                    "requires positive estimates."
-                )
-            seed_value = float(np.exp(np.mean(np.log(values))))
-        else:
-            seed_value = float(np.mean(values))
-        if not promotion.minimum <= seed_value <= promotion.maximum:
-            raise ValueError(
-                f"{promotion.parameter_name!r} central-tendency seed lies outside "
-                "the new Shared bounds."
-            )
-        shared_variable = FitSharedVariableParamSpec(
-            name=promotion.parameter_name,
-            initial=seed_value,
-            minimum=promotion.minimum,
-            maximum=promotion.maximum,
-            log10=promotion.log10,
-        )
-        provenance = MappingProxyType(
-            {
-                "seed_statistic": promotion.seed_statistic,
-                "seed_value": seed_value,
-                "source_values": tuple(float(value) for value in values),
-                "source_dataset_ids": dataset_ids,
-                "source_scope": "per_dataset",
-                "seed_authority": "pre-dispatch Shared-refit admission",
-            }
-        )
-        object.__setattr__(self, "shared_variable", shared_variable)
-        object.__setattr__(self, "provenance", provenance)
-
-
-@dataclass(frozen=True, slots=True, init=False)
-class SharedRefitExecution:
-    """One admitted, immutable Shared-refit parameter execution.
-
-    Promoted specifications are derived exclusively from their admissions and
-    the optimizer layout is built exclusively from the resulting final
-    parameter routes.  Callers therefore cannot supply either fact twice.
-    """
-
-    dataset_ids: tuple[str, ...]
-    promotion_admissions: tuple[SharedRefitPromotionAdmission, ...]
-    shared_variables: tuple[FitSharedVariableParamSpec, ...]
-    dataset_overrides: tuple[FitDatasetParameterOverrides, ...]
-    coupled_variables: tuple[FitCoupledVariableParamSpec, ...]
-    optimizer_layout: _fit_execution.FitParameterLayout
-
-    def __init__(
-        self,
-        *,
-        dataset_ids: Sequence[str],
-        promotion_admissions: Sequence[SharedRefitPromotionAdmission],
-        existing_shared_variables: Sequence[FitSharedVariableParamSpec] = (),
-        dataset_overrides: Sequence[FitDatasetParameterOverrides] = (),
-        coupled_variables: Sequence[FitCoupledVariableParamSpec] = (),
-    ) -> None:
-        roster = tuple(str(value or "").strip() for value in dataset_ids)
-        if (
-            not roster
-            or any(not value for value in roster)
-            or len(roster) != len(set(roster))
-        ):
-            raise ValueError(
-                "Shared-refit execution requires a distinct fitted dataset roster."
-            )
-        admitted = tuple(promotion_admissions)
-        if not admitted or any(
-            not isinstance(item, SharedRefitPromotionAdmission)
-            for item in admitted
-        ):
-            raise ValueError(
-                "Shared-refit execution requires typed promotion admissions."
-            )
-        promoted_names = tuple(item.shared_variable.name for item in admitted)
-        if len(promoted_names) != len(set(promoted_names)):
-            raise ValueError("Shared-refit execution repeats a promoted parameter.")
-        for item in admitted:
-            source_ids = tuple(item.provenance.get("source_dataset_ids", ()))
-            if source_ids != roster:
-                raise ValueError(
-                    "Shared-refit admission source datasets must exactly match "
-                    "the fitted dataset roster."
-                )
-
-        existing = tuple(existing_shared_variables)
-        if any(
-            not isinstance(item, FitSharedVariableParamSpec) for item in existing
-        ):
-            raise TypeError(
-                "Shared-refit existing Shared parameters must use typed specs."
-            )
-        existing_names = tuple(item.name for item in existing)
-        if (
-            len(existing_names) != len(set(existing_names))
-            or set(existing_names).intersection(promoted_names)
-        ):
-            raise ValueError(
-                "Shared-refit promoted and existing Shared parameter routes overlap."
-            )
-        shared = (*existing, *(item.shared_variable for item in admitted))
-        supplied_overrides = tuple(dataset_overrides)
-        if any(
-            not isinstance(item, FitDatasetParameterOverrides)
-            for item in supplied_overrides
-        ):
-            raise TypeError(
-                "Shared-refit dataset routes must use typed override records."
-            )
-        override_ids = tuple(item.dataset_id for item in supplied_overrides)
-        if (
-            len(override_ids) != len(set(override_ids))
-            or set(override_ids) - set(roster)
-        ):
-            raise ValueError(
-                "Shared-refit dataset routes must belong uniquely to its roster."
-            )
-        overrides_by_id = {
-            item.dataset_id: item for item in supplied_overrides
-        }
-        overrides = tuple(
-            overrides_by_id.get(
-                dataset_id,
-                FitDatasetParameterOverrides(dataset_id=dataset_id),
-            )
-            for dataset_id in roster
-        )
-        coupled = tuple(coupled_variables)
-        if any(
-            not isinstance(item, FitCoupledVariableParamSpec) for item in coupled
-        ):
-            raise TypeError(
-                "Shared-refit coupled routes must use typed specifications."
-            )
-        stale_dataset_routes = set(promoted_names).intersection(
-            name
-            for override in overrides
-            for name in (
-                *(item.name for item in override.variable_params),
-                *(item[0] for item in override.fixed_params),
-            )
-        )
-        stale_coupled_routes = set(promoted_names).intersection(
-            item.parameter_name for item in coupled
-        )
-        if stale_dataset_routes or stale_coupled_routes:
-            raise ValueError(
-                "Shared-refit execution retained an obsolete promoted parameter route."
-            )
-        shared_params = {item.name: item.initial for item in shared}
-        shared_bounds = {
-            item.name: (item.minimum, item.maximum) for item in shared
-        }
-        shared_log10 = {item.name: item.log10 for item in shared}
-        layout = _fit_execution.build_parameter_layout_for_dataset_ids(
-            dataset_ids=roster,
-            shared_params=shared_params,
-            dataset_overrides=overrides,
-            coupled_variables=coupled,
-            bounds=shared_bounds,
-            log10_params=shared_log10,
-        )
-        object.__setattr__(self, "dataset_ids", roster)
-        object.__setattr__(self, "promotion_admissions", admitted)
-        object.__setattr__(self, "shared_variables", tuple(shared))
-        object.__setattr__(self, "dataset_overrides", overrides)
-        object.__setattr__(self, "coupled_variables", coupled)
-        object.__setattr__(self, "optimizer_layout", layout)
-
-
-def _shared_refit_provenance(
-    execution: SharedRefitExecution,
-    *,
-    terminal_route: Literal[
-        "optimizer_terminal",
-        "user_stop_best_valid_bounded_replay",
-    ],
-) -> Mapping[str, object]:
-    """Return admitted Shared-refit provenance for sole result construction."""
-
-    if not isinstance(execution, SharedRefitExecution):
-        raise TypeError("Shared-refit terminal requires its admitted execution.")
-    admitted = execution.promotion_admissions
-    names = tuple(item.shared_variable.name for item in admitted)
-    if len(names) != len(set(names)):
-        raise ValueError("Shared-refit terminal admissions repeat a parameter.")
-    if terminal_route not in {
-        "optimizer_terminal",
-        "user_stop_best_valid_bounded_replay",
-    }:
-        raise ValueError("Shared-refit terminal route is invalid.")
-    return {
-        "execution": "Promote to Shared and Refit",
-        "terminal_route": terminal_route,
-        "promotions": {
-            item.shared_variable.name: item.provenance
-            for item in admitted
-        },
-        "starting_value_authority": "shared_refit_execution",
-        "terminal_value_authority": "result.shared_params",
-    }
 
 
 def _validate_run_inputs(
@@ -525,7 +251,6 @@ def fit_global(
     extension_progress_callback: Optional[
         Callable[[FitExtensionProgress], None]
     ] = None,
-    shared_refit_provenance: Mapping[str, object] | None = None,
     optimizer_layout: _fit_execution.FitParameterLayout,
     executor: Executor,
 ) -> _fit_execution.GlobalFitResult | ScientificUnavailable:
@@ -1016,10 +741,7 @@ def fit_global(
             profile_likelihood_result=profile_result,
             residual_bootstrap_result=bootstrap_result,
         )
-        result = _fit_execution._construct_global_fit_result(
-            replay_state,
-            shared_refit_provenance=shared_refit_provenance,
-        )
+        result = _fit_execution._construct_global_fit_result(replay_state)
         if (
             callable(stop_best_requested)
             and stop_best_requested()
@@ -1088,16 +810,7 @@ def fit_global(
                 profile_likelihood_result=settled_profile,
                 residual_bootstrap_result=settled_bootstrap,
             )
-            settled_provenance = shared_refit_provenance
-            if settled_provenance is not None:
-                settled_provenance = {
-                    **dict(settled_provenance),
-                    "terminal_route": "user_stop_best_valid_bounded_replay",
-                }
-            return _fit_execution._construct_global_fit_result(
-                settled_state,
-                shared_refit_provenance=settled_provenance,
-            )
+            return _fit_execution._construct_global_fit_result(settled_state)
         active_objective = locals().get("objective")
         if (
             callable(stop_best_requested)
@@ -1191,16 +904,7 @@ def fit_global(
                         )
                     ),
                 )
-                stopped_provenance = shared_refit_provenance
-                if stopped_provenance is not None:
-                    stopped_provenance = {
-                        **dict(stopped_provenance),
-                        "terminal_route": "user_stop_best_valid_bounded_replay",
-                    }
-                return _fit_execution._construct_global_fit_result(
-                    stopped_state,
-                    shared_refit_provenance=stopped_provenance,
-                )
+                return _fit_execution._construct_global_fit_result(stopped_state)
         raise
     except SimulationCancelled as exc:
         cancellation = FittingCancelled()
@@ -1212,71 +916,3 @@ def fit_global(
         if calls is not None:
             setattr(cancellation, "objective_call_count", int(calls))
         raise cancellation from exc
-
-
-def fit_global_shared_refit(
-    *,
-    execution: SharedRefitExecution,
-    fit_evaluators: Mapping[str, object],
-    datasets: Sequence[FitDatasetSpec],
-    weights: Optional[Mapping[str, float]] = None,
-    method: str,
-    max_nfev: int = 1000,
-    ftol: float = 1e-10,
-    xtol: float = 1e-10,
-    seed: Optional[int] = None,
-    progress_callback: Optional[Callable[[_fit_execution.FitProgress], None]] = None,
-    cancellation_check: Optional[Callable[[], bool]] = None,
-    cancellation_control: SimulationCancellationControl | None = None,
-    stop_best_requested: Callable[[], bool] | None = None,
-    stopped_replay_control: SimulationCancellationControl | None = None,
-    profile_likelihood: ProfileLikelihoodConfig | None = None,
-    residual_bootstrap: ResidualBootstrapConfig | None = None,
-    extension_progress_callback: Optional[
-        Callable[[FitExtensionProgress], None]
-    ] = None,
-    executor: Executor,
-) -> _fit_execution.GlobalFitResult | ScientificUnavailable:
-    """Execute one pre-dispatch-admitted exact Shared refit.
-
-    Promotion seeds, source provenance, final parameter routes, and optimizer
-    layout have one owner in ``execution``.  Canonical terminal values still
-    come exclusively from the completed Shared refit.
-    """
-
-    if not isinstance(execution, SharedRefitExecution):
-        raise TypeError("Shared refit requires its admitted execution.")
-    if executor is None:
-        raise TypeError("Shared refit requires a borrowed executor.")
-    dataset_ids = tuple(item.dataset_id for item in datasets)
-    if dataset_ids != execution.dataset_ids:
-        raise ValueError(
-            "Shared-refit fitted datasets must exactly match its admitted roster."
-        )
-    return fit_global(
-        fit_evaluators=fit_evaluators,
-        datasets=datasets,
-        shared_variables=execution.shared_variables,
-        dataset_overrides=execution.dataset_overrides,
-        coupled_variables=execution.coupled_variables,
-        weights=weights,
-        method=method,
-        max_nfev=max_nfev,
-        ftol=ftol,
-        xtol=xtol,
-        seed=seed,
-        progress_callback=progress_callback,
-        cancellation_check=cancellation_check,
-        cancellation_control=cancellation_control,
-        stop_best_requested=stop_best_requested,
-        stopped_replay_control=stopped_replay_control,
-        profile_likelihood=profile_likelihood,
-        residual_bootstrap=residual_bootstrap,
-        extension_progress_callback=extension_progress_callback,
-        shared_refit_provenance=_shared_refit_provenance(
-            execution,
-            terminal_route="optimizer_terminal",
-        ),
-        optimizer_layout=execution.optimizer_layout,
-        executor=executor,
-    )

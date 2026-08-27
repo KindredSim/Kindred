@@ -540,7 +540,6 @@ class GlobalFitResult:
     scipy_nfev: int | None = None
     terminal_replay_count: int = 0
     objective_call_count: int | None = None
-    shared_refit_provenance: Mapping[str, object] = field(default_factory=dict)
     model_series: Dict[str, Dict[str, np.ndarray]] = field(default_factory=dict)
     model_x_by_species: Dict[str, Dict[str, np.ndarray]] = field(default_factory=dict)
     model_segment_ids: Dict[str, Dict[str, np.ndarray]] = field(default_factory=dict)
@@ -660,27 +659,6 @@ class GlobalFitResult:
             if objective_call_count < 0:
                 raise ValueError("GlobalFitResult objective-call count cannot be negative.")
             object.__setattr__(self, "objective_call_count", objective_call_count)
-        def freeze_provenance(value: object) -> object:
-            if isinstance(value, Mapping):
-                return MappingProxyType(
-                    {
-                        str(name): freeze_provenance(item)
-                        for name, item in value.items()
-                    }
-                )
-            if isinstance(value, (list, tuple, set, frozenset)):
-                return tuple(freeze_provenance(item) for item in value)
-            if isinstance(value, np.ndarray):
-                array = np.asarray(value).copy()
-                array.setflags(write=False)
-                return array
-            return value
-
-        object.__setattr__(
-            self,
-            "shared_refit_provenance",
-            freeze_provenance(dict(self.shared_refit_provenance or {})),
-        )
         simulation_results: Dict[str, SimulationResultValue] = {}
         for raw_dataset_id, simulation in self.simulation_results_by_dataset.items():
             dataset_id = str(raw_dataset_id or "").strip()
@@ -882,7 +860,7 @@ class GlobalFitResult:
 
     @property
     def classification(self) -> Literal["converged", "nonconverged"]:
-        """Classify the retained candidate for presentation and Apply guards."""
+        """Classify the retained candidate for presentation."""
 
         return "converged" if self.optimizer_converged else "nonconverged"
 
@@ -938,8 +916,6 @@ class _FitReplayState:
 
 def _construct_global_fit_result(
     state: _FitReplayState,
-    *,
-    shared_refit_provenance: Mapping[str, object] | None = None,
 ) -> GlobalFitResult:
     """Construct the sole immutable publishable result after settlement."""
 
@@ -984,7 +960,6 @@ def _construct_global_fit_result(
         scipy_nfev=int(state.scipy_nfev),
         terminal_replay_count=int(state.terminal_replay_count),
         objective_call_count=state.objective_call_count,
-        shared_refit_provenance=dict(shared_refit_provenance or {}),
         model_series={
             str(dataset_id): dict(values)
             for dataset_id, values in state.model_series.items()

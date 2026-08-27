@@ -7,6 +7,7 @@ from collections.abc import Mapping
 from PySide6 import QtCore, QtWidgets
 
 from kindred.core.project_document import ProjectDocument
+from kindred.core.project_presentation_state import WorkspacePresentationState
 from kindred.gui.widgets.pyqtgraph_plot_panel_impl import PyQtGraphPlotPanel
 
 __all__ = ["ProjectWorkspaceWidget"]
@@ -33,16 +34,12 @@ class ProjectWorkspaceWidget(QtWidgets.QMainWindow):
     def __init__(
         self,
         parent: QtWidgets.QWidget | None = None,
-        *,
-        outer_policy: QtWidgets.QWidget | None = None,
     ) -> None:
         super().__init__(parent)
         self.setWindowFlags(QtCore.Qt.WindowType.Widget)
         self.setObjectName("projectWorkspaceRoot")
         self.setDockNestingEnabled(True)
-        self._outer_policy = outer_policy
         self._dock_by_identity: dict[str, QtWidgets.QDockWidget] = {}
-
         central = QtWidgets.QWidget(self)
         central.setObjectName("projectWorkspaceCentral")
         self.setCentralWidget(central)
@@ -75,17 +72,11 @@ class ProjectWorkspaceWidget(QtWidgets.QMainWindow):
         self._install_analysis_widget(self._initial_plot)
         layout.addWidget(self._plot_stack, 1)
 
-    @property
-    def outer_policy(self) -> QtWidgets.QWidget | None:
-        """Return the outer shell used for policy callbacks only."""
-
-        return self._outer_policy
-
     def install_dock_panels(
         self,
         panels: Mapping[str, QtWidgets.QWidget],
     ) -> tuple[QtWidgets.QDockWidget, ...]:
-        """Install the six module panels under this permanent root."""
+        """Install the six root-local physical module shells."""
 
         from kindred.gui.app_wiring import (
             ANALYSIS_DOCK_SPEC,
@@ -113,16 +104,10 @@ class ProjectWorkspaceWidget(QtWidgets.QMainWindow):
             )
         if self._dock_by_identity:
             raise RuntimeError("Project workspace docks are already installed.")
-        outer = self._outer_policy
-        if outer is None:
-            raise TypeError(
-                "outer_policy is required before installing project docks."
-            )
         docks: list[QtWidgets.QDockWidget] = []
         for spec, identity in specs:
             dock = build_module_dock(
-                outer,
-                workspace_root=self,
+                self,
                 spec=spec,
                 panel=panels[identity],
             )
@@ -131,30 +116,23 @@ class ProjectWorkspaceWidget(QtWidgets.QMainWindow):
         return tuple(docks)
 
     def dock_for_identity(self, identity: str) -> QtWidgets.QDockWidget:
-        """Return one root-owned dock shell by its stable module identity."""
-
         try:
             return self._dock_by_identity[str(identity)]
         except KeyError as exc:
             raise KeyError(f"Unknown project dock identity: {identity!r}.") from exc
 
     def dock_shells(self) -> tuple[QtWidgets.QDockWidget, ...]:
-        """Return the current root's dock shells in canonical order."""
-
         return tuple(self._dock_by_identity.values())
 
     def apply_default_dock_arrangement(self) -> None:
-        """Restore the root's default six-dock arrangement."""
+        """Restore the root-owned default six-dock arrangement."""
 
         docks = tuple(self._dock_by_identity.values())
         for dock in docks:
             dock.setFloating(False)
             area = dock.property("kindred/defaultDockArea")
             if area is not None:
-                self.addDockWidget(
-                    QtCore.Qt.DockWidgetArea(int(area)),
-                    dock,
-                )
+                self.addDockWidget(QtCore.Qt.DockWidgetArea(int(area)), dock)
             dock.show()
         if len(docks) != 6:
             return
@@ -164,23 +142,13 @@ class ProjectWorkspaceWidget(QtWidgets.QMainWindow):
         data = self.dock_for_identity("data")
         analysis = self.dock_for_identity("analysis")
         calculator = self.dock_for_identity("symbolic_calculator")
-        self.splitDockWidget(
-            mechanism,
-            sliders,
-            QtCore.Qt.Orientation.Vertical,
-        )
-        self.splitDockWidget(
-            batch,
-            data,
-            QtCore.Qt.Orientation.Vertical,
-        )
+        self.splitDockWidget(mechanism, sliders, QtCore.Qt.Orientation.Vertical)
+        self.splitDockWidget(batch, data, QtCore.Qt.Orientation.Vertical)
         self.tabifyDockWidget(data, analysis)
         self.tabifyDockWidget(data, calculator)
         data.raise_()
 
     def redock_dock(self, dock: QtWidgets.QDockWidget) -> None:
-        """Redock one shell at its root-owned default area."""
-
         if dock not in self._dock_by_identity.values():
             raise ValueError("dock must belong to this project workspace root.")
         dock.setFloating(False)
@@ -190,8 +158,6 @@ class ProjectWorkspaceWidget(QtWidgets.QMainWindow):
         dock.show()
 
     def recover_floating_docks(self, available: QtCore.QRect) -> None:
-        """Redock only floating shells outside the available screen geometry."""
-
         for dock in self._dock_by_identity.values():
             if not dock.isFloating():
                 continue
@@ -199,35 +165,64 @@ class ProjectWorkspaceWidget(QtWidgets.QMainWindow):
                 continue
             self.redock_dock(dock)
 
-    def show_analysis_surface(self, surface_name: str) -> bool:
-        """Focus and raise one root-owned Analysis surface."""
+    def restore_dock_layout(self, state: object) -> bool:
+        """Restore one persisted Qt dock state, falling back when invalid."""
 
-        if not self.focus_analysis_surface(surface_name):
+        if isinstance(state, QtCore.QByteArray):
+            payload = state
+        elif isinstance(state, (bytes, bytearray)):
+            payload = QtCore.QByteArray(bytes(state))
+        else:
+            self.apply_default_dock_arrangement()
             return False
-        analysis = self._dock_by_identity.get("analysis")
-        if analysis is not None:
-            analysis.show()
-            analysis.raise_()
-        return True
-
-    def restore_workspace_state(self, state: object) -> bool:
-        """Restore a saved nested-root layout, returning Qt's result."""
-
-        if state is None:
+        if payload.isEmpty():
+            self.apply_default_dock_arrangement()
             return False
-        return bool(self.restoreState(state))
+        try:
+            restored = bool(self.restoreState(payload))
+        except (RuntimeError, TypeError, ValueError):
+            restored = False
+        if not restored:
+            self.apply_default_dock_arrangement()
+        return restored
 
-    def save_workspace_state(self) -> QtCore.QByteArray:
-        """Save only this root's dock layout."""
+    def reveal_dock(
+        self,
+        identity: str,
+        *,
+        available_geometry: QtCore.QRect | None = None,
+    ) -> QtWidgets.QDockWidget:
+        """Show and raise a named dock, repinning it when floating off-screen."""
 
-        return self.saveState()
+        dock = self.dock_for_identity(identity)
+        if dock.isFloating():
+            available = available_geometry
+            if available is None or not available.isValid():
+                screen = dock.screen() or self.screen()
+                if screen is None:
+                    application = QtWidgets.QApplication.instance()
+                    screen = (
+                        application.primaryScreen()
+                        if isinstance(application, QtWidgets.QApplication)
+                        else None
+                    )
+                available = (
+                    screen.availableGeometry() if screen is not None else None
+                )
+            if (
+                available is not None
+                and available.isValid()
+                and not available.intersects(dock.frameGeometry())
+            ):
+                self.redock_dock(dock)
+        dock.show()
+        dock.raise_()
+        if dock.isFloating():
+            dock.activateWindow()
+        return dock
 
     def _new_plot_panel(self) -> PyQtGraphPlotPanel:
-        plot = PyQtGraphPlotPanel(
-            enable_axis_inversion_actions=True,
-            enable_reference_layer_toggle_action=True,
-            enable_copy_visible_data_action=True,
-        )
+        plot = PyQtGraphPlotPanel()
         plot.set_theme(dark_mode=self._dark_mode)
         return plot
 
@@ -270,104 +265,120 @@ class ProjectWorkspaceWidget(QtWidgets.QMainWindow):
             raise KeyError(f"Unknown mechanism plot tab ID: {target!r}.") from exc
 
     def main_plot_analysis_widget(self) -> QtWidgets.QStackedWidget:
+        """Return the physical analysis stack used by the Analysis dock."""
+
         return self._analysis_stack
 
-    def available_analysis_surfaces(self) -> list[str]:
-        widget = self.active_plot().analysis_tabs()
-        return [str(widget.tabText(index)) for index in range(widget.count())]
+    def render(
+        self,
+        document: ProjectDocument,
+        *,
+        active_tab_id: str | None = None,
+        presentation: WorkspacePresentationState | None = None,
+    ) -> None:
+        """Render one document directly into this workspace root.
 
-    def focus_analysis_surface(self, surface_name: str) -> bool:
-        widget = self.active_plot().analysis_tabs()
-        target = str(surface_name).strip()
-        for index in range(widget.count()):
-            if widget.tabText(index) != target:
-                continue
-            widget.setCurrentIndex(index)
-            current = widget.currentWidget()
-            (current or widget).setFocus()
-            return True
-        return False
+        Rendering is intentionally limited to tab/plot custody.  It reads the
+        document and optional presentation snapshot, and never looks up a
+        registry or connects a live callback.
+        """
 
-    def render(self, document: ProjectDocument, *, active_tab_id: str) -> None:
-        document.tab(active_tab_id)
-        current_tab_ids = {tab.tab_id for tab in document.tabs}
-        for tab in document.tabs:
-            self._ensure_plot(tab.tab_id)
-        for tab_id in tuple(self._plot_by_tab_id):
-            if tab_id not in current_tab_ids:
-                self.drop_tab_session_state(tab_id)
-
-        previous = self._tab_bar.blockSignals(True)
         try:
-            for index in range(self._tab_bar.count() - 1, -1, -1):
-                rendered_tab_id = self._tab_bar.tabData(index)
-                if (
-                    rendered_tab_id is not None
-                    and rendered_tab_id not in current_tab_ids
-                ):
-                    self._tab_bar.removeTab(index)
-
-            plus_indexes = [
-                index
-                for index in range(self._tab_bar.count())
-                if self._tab_bar.tabData(index) is None
-            ]
-            if plus_indexes:
-                plus_index = plus_indexes[0]
-                for index in reversed(plus_indexes[1:]):
-                    self._tab_bar.removeTab(index)
-            else:
-                plus_index = self._tab_bar.addTab("+")
-
-            for desired_index, tab in enumerate(document.tabs):
-                try:
-                    current_index = self._index_for_tab_id(tab.tab_id)
-                except KeyError:
-                    current_index = self._tab_bar.insertTab(
-                        desired_index,
-                        tab.name,
+            if not isinstance(document, ProjectDocument):
+                raise TypeError("document must be a ProjectDocument.")
+            if presentation is not None:
+                if not isinstance(presentation, WorkspacePresentationState):
+                    raise TypeError(
+                        "presentation must be WorkspacePresentationState."
                     )
-                    self._tab_bar.setTabData(current_index, tab.tab_id)
-                if current_index != desired_index:
-                    self._tab_bar.moveTab(current_index, desired_index)
-                    current_index = desired_index
-                dirty = self._tab_bar.tabText(current_index).endswith(" *")
-                self._tab_bar.setTabText(
-                    current_index,
-                    f"{tab.name} *" if dirty else tab.name,
+                incoming_active = presentation.active_tab_id
+                if (
+                    active_tab_id is not None
+                    and str(active_tab_id) != incoming_active
+                ):
+                    raise ValueError("active_tab_id disagrees with presentation.")
+                active_tab_id = incoming_active
+            if active_tab_id is None:
+                raise ValueError("active_tab_id or presentation is required.")
+            target_active = str(active_tab_id)
+            document.tab(target_active)
+            current_tab_ids = {tab.tab_id for tab in document.tabs}
+            for tab in document.tabs:
+                self._ensure_plot(tab.tab_id)
+            for tab_id in tuple(self._plot_by_tab_id):
+                if tab_id not in current_tab_ids:
+                    self.drop_tab_session_state(tab_id)
+
+            previous = self._tab_bar.blockSignals(True)
+            try:
+                for index in range(self._tab_bar.count() - 1, -1, -1):
+                    rendered_tab_id = self._tab_bar.tabData(index)
+                    if (
+                        rendered_tab_id is not None
+                        and rendered_tab_id not in current_tab_ids
+                    ):
+                        self._tab_bar.removeTab(index)
+
+                plus_indexes = [
+                    index
+                    for index in range(self._tab_bar.count())
+                    if self._tab_bar.tabData(index) is None
+                ]
+                if plus_indexes:
+                    plus_index = plus_indexes[0]
+                    for index in reversed(plus_indexes[1:]):
+                        self._tab_bar.removeTab(index)
+                else:
+                    plus_index = self._tab_bar.addTab("+")
+
+                for desired_index, tab in enumerate(document.tabs):
+                    try:
+                        current_index = self._index_for_tab_id(tab.tab_id)
+                    except KeyError:
+                        current_index = self._tab_bar.insertTab(
+                            desired_index, tab.name
+                        )
+                        self._tab_bar.setTabData(current_index, tab.tab_id)
+                    if current_index != desired_index:
+                        self._tab_bar.moveTab(current_index, desired_index)
+                        current_index = desired_index
+                    dirty = self._tab_bar.tabText(current_index).endswith(" *")
+                    self._tab_bar.setTabText(
+                        current_index,
+                        f"{tab.name} *" if dirty else tab.name,
+                    )
+                    self._tab_bar.setTabToolTip(current_index, tab.name)
+
+                plus_index = next(
+                    index
+                    for index in range(self._tab_bar.count())
+                    if self._tab_bar.tabData(index) is None
                 )
-                self._tab_bar.setTabToolTip(current_index, tab.name)
+                if plus_index != self._tab_bar.count() - 1:
+                    self._tab_bar.moveTab(plus_index, self._tab_bar.count() - 1)
+                plus_index = self._tab_bar.count() - 1
+                self._tab_bar.setTabText(plus_index, "+")
+                self._tab_bar.setTabData(plus_index, None)
+                self._tab_bar.setTabToolTip(plus_index, _CREATE_TAB_TOOLTIP)
+                self._tab_bar.setTabButton(
+                    plus_index,
+                    QtWidgets.QTabBar.ButtonPosition.RightSide,
+                    None,
+                )
+                active_index = self._index_for_tab_id(target_active)
+                self._tab_bar.setCurrentIndex(active_index)
+            finally:
+                self._tab_bar.blockSignals(previous)
 
-            plus_index = next(
-                index
-                for index in range(self._tab_bar.count())
-                if self._tab_bar.tabData(index) is None
-            )
-            if plus_index != self._tab_bar.count() - 1:
-                self._tab_bar.moveTab(plus_index, self._tab_bar.count() - 1)
-            plus_index = self._tab_bar.count() - 1
-            self._tab_bar.setTabText(plus_index, "+")
-            self._tab_bar.setTabData(plus_index, None)
-            self._tab_bar.setTabToolTip(plus_index, _CREATE_TAB_TOOLTIP)
-            self._tab_bar.setTabButton(
-                plus_index,
-                QtWidgets.QTabBar.ButtonPosition.RightSide,
-                None,
-            )
-            active_index = self._index_for_tab_id(active_tab_id)
-            self._tab_bar.setCurrentIndex(active_index)
-        finally:
-            self._tab_bar.blockSignals(previous)
-
-        active_plot = self._ensure_plot(active_tab_id)
-        self._active_tab_id = str(active_tab_id)
-        self._plot_stack.setCurrentWidget(active_plot)
-        analysis = active_plot.analysis_tabs()
-        self._analysis_stack.setCurrentWidget(analysis)
+            active_plot = self._ensure_plot(target_active)
+            self._active_tab_id = target_active
+            self._plot_stack.setCurrentWidget(active_plot)
+            self._analysis_stack.setCurrentWidget(active_plot.analysis_tabs())
+        except Exception:
+            self.dispose()
+            raise
 
     def select_tab_surface(self, tab_id: str) -> None:
-        """Switch to an already-rendered tab surface without rebuilding it."""
-
         target = str(tab_id or "").strip()
         if not target:
             raise ValueError("tab_id must be nonblank.")
@@ -412,6 +423,18 @@ class ProjectWorkspaceWidget(QtWidgets.QMainWindow):
             initial.deleteLater()
             self._initial_plot = None
         self._active_tab_id = None
+
+    def dispose(self) -> None:
+        """Best-effort child cleanup with unconditional root teardown."""
+
+        try:
+            self.reset_plot_session_state()
+        except Exception:
+            # The root remains the final Qt custody owner; even a damaged plot
+            # child must not prevent the root from being retired.
+            pass
+        finally:
+            self.deleteLater()
 
     def set_theme(self, *, dark_mode: bool) -> None:
         self._dark_mode = bool(dark_mode)

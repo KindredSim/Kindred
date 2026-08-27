@@ -45,6 +45,9 @@ _SOURCE_COORDINATE_ALIASES = {
     "δg°": "dg_eq",
     "a": "a",
 }
+
+# Keep the former derivation-local spelling rule.  The parser owns semantic
+# admission; this helper only needs the same lexical guard before insertion.
 _DSL_IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
@@ -168,7 +171,7 @@ def insert_scalar_source_declarations(
     source_text: str,
     corrections: "Mapping[str, str]",
 ) -> str:
-    """Insert visible scalar declarations while preserving all authored bytes."""
+    """Insert one deterministic scalar block without rewriting authored bytes."""
 
     if type(source_text) is not str:
         raise TypeError("source_text must be an exact str.")
@@ -176,32 +179,41 @@ def insert_scalar_source_declarations(
         raise TypeError("Visible scalar corrections must be a mapping.")
     if not corrections:
         return source_text
-    # Pick the first authored line ending for the inserted block.  Existing
-    # source bytes are never normalized; this only supplies bytes belonging to
-    # the deliberate insertion itself.
     newline_match = re.search(r"\r\n|\r|\n", source_text)
     ending = newline_match.group(0) if newline_match is not None else "\n"
-    if any(
-        type(name) is not str
-        or name != name.strip()
-        or _DSL_IDENTIFIER_RE.fullmatch(name) is None
-        or "\r" in str(name)
-        or "\n" in str(name)
-        or type(expression) is not str
-        or not str(expression).strip()
-        or "\r" in str(expression)
-        or "\n" in str(expression)
-        for name, expression in corrections.items()
-    ):
-        raise ValueError("Visible scalar corrections must be single-line exact text.")
+    for name, expression in corrections.items():
+        if (
+            type(name) is not str
+            or name != name.strip()
+            or _DSL_IDENTIFIER_RE.fullmatch(name) is None
+            or type(expression) is not str
+            or not expression.strip()
+            or "\r" in name
+            or "\n" in name
+            or "\r" in expression
+            or "\n" in expression
+        ):
+            raise ValueError(
+                "Visible scalar corrections must be single-line exact text."
+            )
+    existing = {
+        str(match.group("name"))
+        for line in source_text.splitlines()
+        for match in [
+            re.match(r"^\s*(?i:param)\s+(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*=", line)
+        ]
+        if match is not None
+    }
+    duplicates = tuple(sorted(set(corrections).intersection(existing)))
+    if duplicates:
+        raise ValueError(
+            "Scalar correction declaration already exists: "
+            + ", ".join(duplicates)
+        )
     had_final_ending = source_text.endswith(("\n", "\r"))
-    if not source_text:
-        prefix = ""
-    else:
-        prefix = source_text if had_final_ending else source_text + ending
+    prefix = source_text if not source_text or had_final_ending else source_text + ending
     declarations = ending.join(
-        f"param {name} = {expression}"
-        for name, expression in corrections.items()
+        f"param {name} = {expression}" for name, expression in corrections.items()
     )
     return prefix + declarations + (ending if had_final_ending else "")
 

@@ -5,8 +5,7 @@ Control-surface contract
 ------------------------
 - X dropdown: typed simulation or experimental identity, with `t` by default.
 - Y multi-select: all time-varying species and algebra series. Scalars disabled.
-- Add Guide from Scalar (exposed via Options menu stub entry).
-- Options: sampling choice for plotting and guide management.
+- Options: sampling choice for plotting.
 
 This widget provides a deterministic, fully functional control strip with:
 - A labeled X combobox
@@ -17,8 +16,7 @@ Signals emitted
 --------------
 xChanged(selection: SimulationSeriesAxisSelection | ExperimentalAxisSelection)
 ySelectionChanged(selected: tuple[AxisSeriesSelection, ...])
-addGuideRequested(from_scalar: str | None)   # None means show chooser upstream
-optionsRequested(action: str, data: object)  # generic hook (e.g. "sampling", ...)
+optionsRequested(action: str, data: object)  # e.g. "sampling"
 
 Public API
 ----------
@@ -60,7 +58,6 @@ class AxisToolbar(QtWidgets.QWidget):
     # High-level signals
     xChanged = QtCore.Signal(object)
     ySelectionChanged = QtCore.Signal(object)
-    addGuideRequested = QtCore.Signal(object)          # scalar name or None
     optionsRequested = QtCore.Signal(str, object)      # action, data
     axisRangeChanged = QtCore.Signal()                 # axis range manually changed
     interactionModeRequested = QtCore.Signal(str)
@@ -156,11 +153,6 @@ class AxisToolbar(QtWidgets.QWidget):
         self._action_downsampling.setCheckable(True)
         self._action_downsampling.setChecked(False)
         self._menu.addSeparator()
-        self._action_add_guide = self._menu.addAction("Add Guide from Scalar…")
-        self._action_clear_guides = self._menu.addAction(
-            "Clear Scalar Guides"
-        )
-        self._menu.addSeparator()
         self._presentation_actions: dict[str, QtGui.QAction] = {}
         for text, key, checked in (
             ("Log X", "log_x", False),
@@ -230,21 +222,12 @@ class AxisToolbar(QtWidgets.QWidget):
         self._action_downsampling.toggled.connect(
             lambda on: self._emit_option("sampling", "coarse" if on else "dense")
         )
-        self._action_add_guide.triggered.connect(lambda: self.addGuideRequested.emit(None))
-        self._action_clear_guides.triggered.connect(
-            lambda: self._emit_option("clear_scalar_guides", None)
-        )
 
         # Range control wiring
         self._auto_range.toggled.connect(self._on_auto_range_toggled)
-        # Connect both returnPressed (Enter key) and editingFinished (focus loss)
-        self._x_min.returnPressed.connect(self._on_range_changed)
         self._x_min.editingFinished.connect(self._on_range_changed)
-        self._x_max.returnPressed.connect(self._on_range_changed)
         self._x_max.editingFinished.connect(self._on_range_changed)
-        self._y_min.returnPressed.connect(self._on_range_changed)
         self._y_min.editingFinished.connect(self._on_range_changed)
-        self._y_max.returnPressed.connect(self._on_range_changed)
         self._y_max.editingFinished.connect(self._on_range_changed)
 
         # Sensible defaults
