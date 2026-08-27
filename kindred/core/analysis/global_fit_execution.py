@@ -401,19 +401,56 @@ class DatasetFitInfo:
     x_source_rows: tuple[int, ...] = ()
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "dataset_id", str(self.dataset_id or "").strip())
+        dataset_id = self.dataset_id
+        if (
+            type(dataset_id) is not str
+            or not dataset_id
+            or dataset_id != dataset_id.strip()
+        ):
+            raise ValueError("Dataset fit information requires a nonblank dataset ID.")
+        object.__setattr__(self, "dataset_id", dataset_id)
+        if not isinstance(self.r_squared_by_series, Mapping):
+            raise TypeError("Dataset fit metrics require a mapping by series.")
+        if any(
+            type(name) is not str or not name or name != name.strip()
+            for name in self.r_squared_by_series
+        ):
+            raise ValueError("Dataset fit metric series identities must be exact strings.")
         object.__setattr__(
             self,
             "r_squared_by_series",
             MappingProxyType(
                 {
-                    str(name): value
+                    name: value
                     for name, value in self.r_squared_by_series.items()
                 }
             ),
         )
+        if any(
+            not isinstance(value, FitMetric)
+            for value in self.r_squared_by_series.values()
+        ):
+            raise TypeError("Dataset fit R-squared values require typed FitMetric values.")
+        if not all(
+            isinstance(value, FitMetric)
+            for value in (
+                self.weighted_residual_sse,
+                self.weighted_residual_mse,
+                self.weighted_rmse,
+                self.weighted_mae,
+            )
+        ):
+            raise TypeError("Dataset fit metrics require typed FitMetric values.")
+        if isinstance(self.n_points, (bool, np.bool_)) or not isinstance(
+            self.n_points, (int, np.integer)
+        ):
+            raise TypeError("Dataset fit n_points must be an exact integer.")
         object.__setattr__(self, "n_points", int(self.n_points))
         object.__setattr__(self, "weight", float(self.weight))
+        if self.n_points <= 0:
+            raise ValueError("Dataset fit information requires positive n_points.")
+        if not math.isfinite(self.weight) or self.weight <= 0.0:
+            raise ValueError("Dataset fit weight must be finite and positive.")
         if not isinstance(self.simulation_result, SimulationResultValue):
             raise TypeError("Dataset fit information requires its canonical simulation result.")
         residuals = np.asarray(self.residuals, dtype=float).reshape(-1).copy()
@@ -429,41 +466,86 @@ class DatasetFitInfo:
         weighted_residuals.setflags(write=False)
         object.__setattr__(self, "residuals", residuals)
         object.__setattr__(self, "weighted_residuals", weighted_residuals)
+        if residuals.size != self.n_points:
+            raise ValueError("Dataset fit n_points must equal the residual count.")
 
         def freeze_array_map(
             values: Mapping[str, np.ndarray],
             *,
             dtype: object = float,
         ) -> Mapping[str, np.ndarray]:
+            if not isinstance(values, Mapping):
+                raise TypeError("Dataset fit model facts require mappings by series.")
             frozen: dict[str, np.ndarray] = {}
             for raw_name, raw_values in values.items():
+                if (
+                    type(raw_name) is not str
+                    or not raw_name
+                    or raw_name != raw_name.strip()
+                ):
+                    raise ValueError("Dataset fit series identities must be exact strings.")
                 array = np.asarray(raw_values, dtype=dtype).reshape(-1).copy()
                 array.setflags(write=False)
-                frozen[str(raw_name)] = array
+                frozen[raw_name] = array
+            return MappingProxyType(frozen)
+
+        def freeze_integer_array_map(
+            values: Mapping[str, np.ndarray],
+        ) -> Mapping[str, np.ndarray]:
+            if not isinstance(values, Mapping):
+                raise TypeError("Dataset fit identity facts require mappings by series.")
+            frozen: dict[str, np.ndarray] = {}
+            for raw_name, raw_values in values.items():
+                if (
+                    type(raw_name) is not str
+                    or not raw_name
+                    or raw_name != raw_name.strip()
+                ):
+                    raise ValueError("Dataset fit series identities must be exact strings.")
+                raw_array = np.asarray(raw_values)
+                if raw_array.dtype.kind not in {"i", "u"}:
+                    raise ValueError("Dataset fit integer identity arrays must retain integer dtype.")
+                if raw_array.dtype.kind == "u" and np.any(
+                    raw_array > np.iinfo(np.int64).max
+                ):
+                    raise ValueError("Dataset fit integer identity exceeds its supported range.")
+                array = raw_array.astype(np.int64, copy=True).reshape(-1)
+                array.setflags(write=False)
+                frozen[raw_name] = array
             return MappingProxyType(frozen)
 
         def freeze_tuple_map(
             values: Mapping[str, Sequence[object]],
         ) -> Mapping[str, tuple[object, ...]]:
-            return MappingProxyType(
-                {
-                    str(raw_name): tuple(values_for_name)
-                    for raw_name, values_for_name in values.items()
-                }
-            )
+            if not isinstance(values, Mapping):
+                raise TypeError("Dataset fit identity facts require mappings by series.")
+            frozen: dict[str, tuple[object, ...]] = {}
+            for raw_name, values_for_name in values.items():
+                if (
+                    type(raw_name) is not str
+                    or not raw_name
+                    or raw_name != raw_name.strip()
+                ):
+                    raise ValueError("Dataset fit series identities must be exact strings.")
+                if isinstance(values_for_name, (str, bytes)):
+                    raise TypeError(
+                        "Dataset fit tuple-map facts require typed sequences, not scalar text."
+                    )
+                frozen[raw_name] = tuple(values_for_name)
+            return MappingProxyType(frozen)
 
         object.__setattr__(self, "model_series", freeze_array_map(self.model_series))
         object.__setattr__(self, "model_x_by_species", freeze_array_map(self.model_x_by_species))
         object.__setattr__(
             self,
             "model_segment_ids",
-            freeze_array_map(self.model_segment_ids, dtype=np.int64),
+            freeze_integer_array_map(self.model_segment_ids),
         )
         object.__setattr__(self, "model_segment_keys", freeze_tuple_map(self.model_segment_keys))
         object.__setattr__(
             self,
             "model_discontinuity_ids",
-            freeze_array_map(self.model_discontinuity_ids, dtype=np.int64),
+            freeze_integer_array_map(self.model_discontinuity_ids),
         )
         object.__setattr__(
             self,
@@ -477,11 +559,99 @@ class DatasetFitInfo:
             "model_source_rows",
             freeze_tuple_map(self.model_source_rows),
         )
+        model_names = tuple(self.model_series)
+        if not model_names or any(not str(name or "").strip() for name in model_names):
+            raise ValueError("Dataset fit information requires model series.")
+        if set(self.r_squared_by_series) != set(model_names):
+            raise ValueError("Dataset fit metrics must match the complete model roster.")
+        identity_maps = (
+            self.model_x_by_species,
+            self.model_segment_ids,
+            self.model_segment_keys,
+            self.model_discontinuity_ids,
+            self.model_selection_provenance,
+            self.model_observation_ids,
+            self.model_raw_columns,
+            self.model_source_rows,
+        )
+        if any(set(mapping) != set(model_names) for mapping in identity_maps):
+            raise ValueError("Dataset fit model identity must be complete by series.")
+        model_point_count = 0
+        raw_observation_ids: set[str] = set()
+        for name in model_names:
+            model_values = self.model_series[name]
+            model_x = self.model_x_by_species[name]
+            segment_ids = self.model_segment_ids[name]
+            segment_keys = self.model_segment_keys[name]
+            discontinuity_ids = self.model_discontinuity_ids[name]
+            selection = self.model_selection_provenance[name]
+            observation_ids = self.model_observation_ids[name]
+            raw_columns = self.model_raw_columns[name]
+            source_rows = self.model_source_rows[name]
+            size = model_values.size
+            aligned = (
+                model_x,
+                segment_ids,
+                segment_keys,
+                discontinuity_ids,
+                selection,
+                observation_ids,
+                raw_columns,
+                source_rows,
+            )
+            if size == 0 or any(len(item) != size for item in aligned):
+                raise ValueError("Dataset fit model rows require complete paired identity.")
+            if (
+                not np.all(np.isfinite(model_values))
+                or not np.all(np.isfinite(model_x))
+                or np.any(segment_ids < 0)
+                or any(
+                    type(value) is not str
+                    or not value
+                    or value != value.strip()
+                    for value in segment_keys
+                )
+                or np.any(discontinuity_ids < 0)
+                or any(
+                    type(value) is not str
+                    or value not in {"direct", "interpolated"}
+                    for value in selection
+                )
+                or any(
+                    type(value) is not str
+                    or not value
+                    or value != value.strip()
+                    for value in observation_ids
+                )
+                or len(set(observation_ids)) != 1
+                or any(
+                    type(value) is not str
+                    or not value
+                    or value != value.strip()
+                    for value in raw_columns
+                )
+                or any(
+                    isinstance(value, (bool, np.bool_))
+                    or not isinstance(value, (int, np.integer))
+                    or value <= 0
+                    for value in source_rows
+                )
+                or len(set(source_rows)) != len(source_rows)
+            ):
+                raise ValueError("Dataset fit model row identity is malformed.")
+            raw_observation_ids.add(observation_ids[0])
+            model_point_count += size
+        if len(raw_observation_ids) != len(model_names):
+            raise ValueError("Dataset fit series must retain unique raw observation IDs.")
         if self.x_projection is not None and not isinstance(
             self.x_projection,
             ParametricXProjection,
         ):
             raise TypeError("Dataset fit X projection requires a ParametricXProjection.")
+        if isinstance(self.x_point_count, (bool, np.bool_)) or not isinstance(
+            self.x_point_count, (int, np.integer)
+        ):
+            raise TypeError("Dataset X point count must be an exact integer.")
         object.__setattr__(self, "x_point_count", int(self.x_point_count))
         if self.x_point_count < 0:
             raise ValueError("Dataset X point count cannot be negative.")
@@ -493,10 +663,62 @@ class DatasetFitInfo:
         )
         if any(item is not None and not isinstance(item, FitMetric) for item in x_metrics):
             raise TypeError("Dataset X metrics require typed FitMetric values.")
+        if any(
+            isinstance(item, (bool, np.bool_))
+            or not isinstance(item, (int, float, np.integer, np.floating))
+            for item in self.x_delta_x
+        ):
+            raise TypeError("Dataset X delta values must be exact numeric values.")
+        if any(
+            type(item) is not str
+            or not item
+            or item != item.strip()
+            for item in (*self.x_match_kinds, *self.x_sample_kinds)
+        ):
+            raise ValueError("Dataset X sampling identities must be exact strings.")
+        if any(
+            isinstance(item, (bool, np.bool_))
+            or not isinstance(item, (int, np.integer))
+            for item in self.x_source_rows
+        ):
+            raise TypeError("Dataset X source rows must be exact integers.")
         object.__setattr__(self, "x_delta_x", tuple(float(item) for item in self.x_delta_x))
-        object.__setattr__(self, "x_match_kinds", tuple(str(item) for item in self.x_match_kinds))
-        object.__setattr__(self, "x_sample_kinds", tuple(str(item) for item in self.x_sample_kinds))
+        object.__setattr__(self, "x_match_kinds", tuple(self.x_match_kinds))
+        object.__setattr__(self, "x_sample_kinds", tuple(self.x_sample_kinds))
         object.__setattr__(self, "x_source_rows", tuple(int(item) for item in self.x_source_rows))
+        if self.x_projection is None:
+            if (
+                self.x_point_count != 0
+                or any(item is not None for item in x_metrics)
+                or bool(
+                    self.x_delta_x
+                    or self.x_match_kinds
+                    or self.x_sample_kinds
+                    or self.x_source_rows
+                )
+            ):
+                raise ValueError("Dataset X facts must be empty without an X projection.")
+        else:
+            projection = self.x_projection
+            if self.x_point_count != projection.size:
+                raise ValueError("Dataset X point count must match its projection.")
+            if self.x_point_count <= 0:
+                raise ValueError("Dataset X projection requires positive point count.")
+            if (
+                len(self.x_delta_x) != self.x_point_count
+                or len(self.x_match_kinds) != self.x_point_count
+                or len(self.x_sample_kinds) != self.x_point_count
+                or self.x_source_rows != projection.source_rows
+                or self.x_delta_x != tuple(float(value) for value in projection.delta_x)
+                or tuple(self.x_match_kinds) != projection.match_kinds
+                or tuple(self.x_sample_kinds) != projection.sample_kinds
+                or any(not math.isfinite(value) for value in self.x_delta_x)
+            ):
+                raise ValueError("Dataset X identity facts must match its projection.")
+            if any(item is None for item in x_metrics):
+                raise ValueError("Dataset X metrics must be complete when X is fitted.")
+        if model_point_count + self.x_point_count != self.n_points:
+            raise ValueError("Dataset fit n_points must match model and X rows exactly.")
 
 
 @dataclass(frozen=True, slots=True)
@@ -540,21 +762,6 @@ class GlobalFitResult:
     scipy_nfev: int | None = None
     terminal_replay_count: int = 0
     objective_call_count: int | None = None
-    model_series: Dict[str, Dict[str, np.ndarray]] = field(default_factory=dict)
-    model_x_by_species: Dict[str, Dict[str, np.ndarray]] = field(default_factory=dict)
-    model_segment_ids: Dict[str, Dict[str, np.ndarray]] = field(default_factory=dict)
-    model_segment_keys: Dict[str, Dict[str, tuple[str, ...]]] = field(default_factory=dict)
-    model_discontinuity_ids: Dict[str, Dict[str, np.ndarray]] = field(default_factory=dict)
-    model_selection_provenance: Dict[str, Dict[str, tuple[str, ...]]] = field(default_factory=dict)
-    model_observation_ids: Dict[str, Dict[str, tuple[str, ...]]] = field(default_factory=dict)
-    model_raw_columns: Dict[str, Dict[str, tuple[str, ...]]] = field(default_factory=dict)
-    model_source_rows: Dict[str, Dict[str, tuple[int, ...]]] = field(default_factory=dict)
-    model_x_projection_by_dataset: Dict[str, ParametricXProjection] = field(
-        default_factory=dict
-    )
-    simulation_results_by_dataset: Dict[str, SimulationResultValue] = field(
-        default_factory=dict
-    )
 
     def __post_init__(self) -> None:
         status = str(self.status or "")
@@ -619,8 +826,19 @@ class GlobalFitResult:
             str(name): float(value)
             for name, value in self.shared_params.items()
         }
+        if not isinstance(self.dataset_params, Mapping):
+            raise TypeError("GlobalFitResult dataset parameters require a mapping by dataset.")
+        if any(
+            type(dataset_id) is not str
+            or not dataset_id
+            or dataset_id != dataset_id.strip()
+            for dataset_id in self.dataset_params
+        ):
+            raise ValueError(
+                "GlobalFitResult dataset parameter identities must be exact nonblank strings."
+            )
         dataset_params = {
-            str(dataset_id): {
+            dataset_id: {
                 str(name): float(value)
                 for name, value in values.items()
             }
@@ -659,198 +877,21 @@ class GlobalFitResult:
             if objective_call_count < 0:
                 raise ValueError("GlobalFitResult objective-call count cannot be negative.")
             object.__setattr__(self, "objective_call_count", objective_call_count)
-        simulation_results: Dict[str, SimulationResultValue] = {}
-        for raw_dataset_id, simulation in self.simulation_results_by_dataset.items():
-            dataset_id = str(raw_dataset_id or "").strip()
-            if not dataset_id or dataset_id in simulation_results:
-                raise ValueError(
-                    "Fit simulation results require distinct stable dataset IDs."
-                )
-            if not isinstance(simulation, SimulationResultValue):
-                raise TypeError(
-                    "Fit simulation result entries must be SimulationResultValue values."
-                )
-            simulation_results[dataset_id] = simulation
-        object.__setattr__(
-            self,
-            "simulation_results_by_dataset",
-            MappingProxyType(simulation_results),
-        )
-        info_ids = [str(info.dataset_id or "").strip() for info in self.dataset_info]
-        included_dataset_ids = set(dataset_params)
+        if not self.dataset_info:
+            raise ValueError("GlobalFitResult requires a nonempty dataset roster.")
+        if any(not isinstance(info, DatasetFitInfo) for info in self.dataset_info):
+            raise TypeError("GlobalFitResult dataset roster requires typed DatasetFitInfo entries.")
+        info_ids = tuple(info.dataset_id for info in self.dataset_info)
+        dataset_param_ids = tuple(dataset_params)
         if (
-            not included_dataset_ids
-            or any(not dataset_id for dataset_id in info_ids)
-            or len(info_ids) != len(set(info_ids))
-            or set(info_ids) != included_dataset_ids
-            or set(simulation_results) != included_dataset_ids
-            or set(self.model_series) != included_dataset_ids
+            any(not dataset_id for dataset_id in dataset_param_ids)
+            or len(dataset_param_ids) != len(set(dataset_param_ids))
+            or info_ids != dataset_param_ids
         ):
             raise ValueError(
-                "GlobalFitResult rosters must exactly match completed included datasets."
+                "GlobalFitResult rosters must exactly match the ordered included datasets."
             )
-        for info in self.dataset_info:
-            if (
-                int(info.n_points) <= 0
-                or not all(
-                    isinstance(value, FitMetric)
-                    for value in (
-                        info.weighted_residual_sse,
-                        info.weighted_residual_mse,
-                        info.weighted_rmse,
-                        info.weighted_mae,
-                    )
-                )
-                or not all(
-                    isinstance(value, FitMetric)
-                    for value in info.r_squared_by_series.values()
-                )
-                or not np.isfinite(float(info.weight))
-                or float(info.weight) <= 0.0
-            ):
-                raise ValueError(
-                    "GlobalFitResult requires typed per-dataset metrics and finite weights."
-                )
-        identity_maps = (
-            self.model_x_by_species,
-            self.model_segment_ids,
-            self.model_segment_keys,
-            self.model_discontinuity_ids,
-            self.model_selection_provenance,
-            self.model_observation_ids,
-            self.model_raw_columns,
-            self.model_source_rows,
-        )
-        if self.model_series and any(
-            set(mapping) != set(self.model_series) for mapping in identity_maps
-        ):
-            raise ValueError("Fit objective model identity must be complete by dataset.")
-        for dataset_id, series_by_name in self.model_series.items():
-            expected_names = set(series_by_name)
-            if any(
-                set(mapping[dataset_id]) != expected_names
-                for mapping in identity_maps
-            ):
-                raise ValueError(
-                    "Fit objective model identity must be complete by series."
-                )
-            stable_raw_ids: set[str] = set()
-            for series_name, values in series_by_name.items():
-                expected_size = np.asarray(values, dtype=float).reshape(-1).size
-                aligned = (
-                    self.model_x_by_species[dataset_id][series_name],
-                    self.model_segment_ids[dataset_id][series_name],
-                    self.model_segment_keys[dataset_id][series_name],
-                    self.model_discontinuity_ids[dataset_id][series_name],
-                    self.model_selection_provenance[dataset_id][series_name],
-                    self.model_observation_ids[dataset_id][series_name],
-                    self.model_raw_columns[dataset_id][series_name],
-                    self.model_source_rows[dataset_id][series_name],
-                )
-                if expected_size == 0 or any(
-                    len(item) != expected_size for item in aligned
-                ):
-                    raise ValueError(
-                        "Fit objective model rows require complete paired identity."
-                    )
-                selection = self.model_selection_provenance[dataset_id][series_name]
-                observation_ids = self.model_observation_ids[
-                    dataset_id
-                ][series_name]
-                if (
-                    not np.all(
-                        np.isfinite(
-                            np.asarray(values, dtype=float).reshape(-1)
-                        )
-                    )
-                    or not np.all(
-                        np.isfinite(
-                            np.asarray(
-                                self.model_x_by_species[dataset_id][series_name],
-                                dtype=float,
-                            ).reshape(-1)
-                        )
-                    )
-                    or np.any(
-                        np.asarray(
-                            self.model_segment_ids[dataset_id][series_name],
-                            dtype=np.int64,
-                        )
-                        < 0
-                    )
-                    or any(
-                        not str(value or "").strip()
-                        for value in self.model_segment_keys[dataset_id][series_name]
-                    )
-                    or np.any(
-                        np.asarray(
-                            self.model_discontinuity_ids[dataset_id][series_name],
-                            dtype=np.int64,
-                        )
-                        < 0
-                    )
-                    or any(
-                        not str(value or "").strip()
-                        for value in observation_ids
-                    )
-                    or len(set(observation_ids)) != 1
-                    or any(
-                        not str(value or "").strip()
-                        for value in self.model_raw_columns[dataset_id][series_name]
-                    )
-                    or any(
-                        int(value) <= 0
-                        for value in self.model_source_rows[dataset_id][series_name]
-                    )
-                    or any(value not in {"direct", "interpolated"} for value in selection)
-                ):
-                    raise ValueError("Fit objective row selection provenance is invalid.")
-                stable_raw_ids.add(observation_ids[0])
-            if len(stable_raw_ids) != len(series_by_name):
-                raise ValueError(
-                    "Fit objective series must retain unique dataset-local "
-                    "raw observation IDs."
-                )
-        def freeze_array(value: object, *, dtype: object = float) -> np.ndarray:
-            array = np.asarray(value, dtype=dtype).reshape(-1).copy()
-            array.setflags(write=False)
-            return array
-
-        def freeze_nested_mapping(value: Mapping[str, Mapping[str, object]], *, dtype: object = float) -> Mapping[str, Mapping[str, object]]:
-            return MappingProxyType(
-                {
-                    str(dataset_id): MappingProxyType(
-                        {
-                            str(name): freeze_array(item, dtype=dtype)
-                            if isinstance(item, np.ndarray) or dtype is not object
-                            else item
-                            for name, item in values.items()
-                        }
-                    )
-                    for dataset_id, values in value.items()
-                }
-            )
-
-        object.__setattr__(self, "model_series", freeze_nested_mapping(self.model_series))
-        object.__setattr__(self, "model_x_by_species", freeze_nested_mapping(self.model_x_by_species))
-        object.__setattr__(self, "model_segment_ids", freeze_nested_mapping(self.model_segment_ids, dtype=np.int64))
-        object.__setattr__(self, "model_segment_keys", freeze_nested_mapping(self.model_segment_keys, dtype=object))
-        object.__setattr__(self, "model_discontinuity_ids", freeze_nested_mapping(self.model_discontinuity_ids, dtype=np.int64))
-        object.__setattr__(self, "model_selection_provenance", freeze_nested_mapping(self.model_selection_provenance, dtype=object))
-        object.__setattr__(self, "model_observation_ids", freeze_nested_mapping(self.model_observation_ids, dtype=object))
-        object.__setattr__(self, "model_raw_columns", freeze_nested_mapping(self.model_raw_columns, dtype=object))
-        object.__setattr__(self, "model_source_rows", freeze_nested_mapping(self.model_source_rows, dtype=np.int64))
-        projections = {
-            str(dataset_id): projection
-            for dataset_id, projection in self.model_x_projection_by_dataset.items()
-        }
-        if any(not isinstance(item, ParametricXProjection) for item in projections.values()):
-            raise TypeError("Fit X projections require immutable ParametricXProjection values.")
-        object.__setattr__(
-            self,
-            "model_x_projection_by_dataset",
-            MappingProxyType(projections),
-        )
+        object.__setattr__(self, "dataset_info", tuple(self.dataset_info))
 
     @property
     def cost(self) -> FitMetric:
@@ -882,17 +923,6 @@ class _FitReplayState:
     scipy_nfev: int
     terminal_replay_count: int
     objective_call_count: int | None
-    model_series: Mapping[str, Mapping[str, np.ndarray]]
-    model_x_by_species: Mapping[str, Mapping[str, np.ndarray]]
-    model_segment_ids: Mapping[str, Mapping[str, np.ndarray]]
-    model_segment_keys: Mapping[str, Mapping[str, tuple[str, ...]]]
-    model_discontinuity_ids: Mapping[str, Mapping[str, np.ndarray]]
-    model_selection_provenance: Mapping[str, Mapping[str, tuple[str, ...]]]
-    model_observation_ids: Mapping[str, Mapping[str, tuple[str, ...]]]
-    model_raw_columns: Mapping[str, Mapping[str, tuple[str, ...]]]
-    model_source_rows: Mapping[str, Mapping[str, tuple[int, ...]]]
-    model_x_projection_by_dataset: Mapping[str, ParametricXProjection]
-    simulation_results_by_dataset: Mapping[str, SimulationResultValue]
     weighted_residuals: np.ndarray
     profile_likelihood_result: ProfileLikelihoodResult | None = None
     residual_bootstrap_result: ResidualBootstrapResult | None = None
@@ -960,47 +990,6 @@ def _construct_global_fit_result(
         scipy_nfev=int(state.scipy_nfev),
         terminal_replay_count=int(state.terminal_replay_count),
         objective_call_count=state.objective_call_count,
-        model_series={
-            str(dataset_id): dict(values)
-            for dataset_id, values in state.model_series.items()
-        },
-        model_x_by_species={
-            str(dataset_id): dict(values)
-            for dataset_id, values in state.model_x_by_species.items()
-        },
-        model_segment_ids={
-            str(dataset_id): dict(values)
-            for dataset_id, values in state.model_segment_ids.items()
-        },
-        model_segment_keys={
-            str(dataset_id): dict(values)
-            for dataset_id, values in state.model_segment_keys.items()
-        },
-        model_discontinuity_ids={
-            str(dataset_id): dict(values)
-            for dataset_id, values in state.model_discontinuity_ids.items()
-        },
-        model_selection_provenance={
-            str(dataset_id): dict(values)
-            for dataset_id, values in state.model_selection_provenance.items()
-        },
-        model_observation_ids={
-            str(dataset_id): dict(values)
-            for dataset_id, values in state.model_observation_ids.items()
-        },
-        model_raw_columns={
-            str(dataset_id): dict(values)
-            for dataset_id, values in state.model_raw_columns.items()
-        },
-        model_source_rows={
-            str(dataset_id): dict(values)
-            for dataset_id, values in state.model_source_rows.items()
-        },
-        model_x_projection_by_dataset={
-            str(dataset_id): projection
-            for dataset_id, projection in state.model_x_projection_by_dataset.items()
-        },
-        simulation_results_by_dataset=dict(state.simulation_results_by_dataset),
     )
 
 
@@ -2864,17 +2853,6 @@ def _assemble_fit_replay_state(
     dataset_info = []
     total_points = 0
     global_weighted_residual_blocks: List[np.ndarray] = []
-    model_series_map: Dict[str, Dict[str, np.ndarray]] = {}
-    model_x_by_species_map: Dict[str, Dict[str, np.ndarray]] = {}
-    model_segment_ids_map: Dict[str, Dict[str, np.ndarray]] = {}
-    model_segment_keys_map: Dict[str, Dict[str, tuple[str, ...]]] = {}
-    model_discontinuity_ids_map: Dict[str, Dict[str, np.ndarray]] = {}
-    model_selection_provenance_map: Dict[str, Dict[str, tuple[str, ...]]] = {}
-    model_observation_ids_map: Dict[str, Dict[str, tuple[str, ...]]] = {}
-    model_raw_columns_map: Dict[str, Dict[str, tuple[str, ...]]] = {}
-    model_source_rows_map: Dict[str, Dict[str, tuple[int, ...]]] = {}
-    model_x_projection_map: Dict[str, ParametricXProjection] = {}
-    simulation_results_by_dataset: Dict[str, SimulationResultValue] = {}
 
     dataset_inputs: List[ObjectiveDatasetInput] = []
     for payload in payloads:
@@ -2969,18 +2947,6 @@ def _assemble_fit_replay_state(
             )
         if evaluation.dataset_id != ds_id:
             raise RuntimeError("Final Fit replay order no longer matches its admitted dataset roster.")
-        simulation_results_by_dataset[ds_id] = evaluation.simulation_result
-        model_series_map[ds_id] = dict(evaluation.model_series)
-        model_x_by_species_map[ds_id] = dict(evaluation.model_x_by_species)
-        model_segment_ids_map[ds_id] = dict(evaluation.model_segment_ids)
-        model_segment_keys_map[ds_id] = dict(evaluation.model_segment_keys)
-        model_discontinuity_ids_map[ds_id] = dict(evaluation.model_discontinuity_ids)
-        model_selection_provenance_map[ds_id] = dict(evaluation.model_selection_provenance)
-        model_observation_ids_map[ds_id] = dict(evaluation.model_observation_ids)
-        model_raw_columns_map[ds_id] = dict(evaluation.model_raw_columns)
-        model_source_rows_map[ds_id] = dict(evaluation.model_source_rows)
-        if evaluation.x_projection is not None:
-            model_x_projection_map[ds_id] = evaluation.x_projection
         dataset_info.append(evaluation)
         global_weighted_residual_blocks.append(
             np.asarray(evaluation.weighted_residuals, dtype=float)
@@ -2999,7 +2965,6 @@ def _assemble_fit_replay_state(
     included_dataset_ids = {payload.dataset_id for payload in payloads}
     if (
         set(combined_dataset_params) != included_dataset_ids
-        or set(simulation_results_by_dataset) != included_dataset_ids
         or {info.dataset_id for info in dataset_info} != included_dataset_ids
     ):
         raise RuntimeError(
@@ -3056,17 +3021,6 @@ def _assemble_fit_replay_state(
         scipy_nfev=scipy_nfev,
         terminal_replay_count=1,
         objective_call_count=objective_call_count,
-        model_series=model_series_map,
-        model_x_by_species=model_x_by_species_map,
-        model_segment_ids=model_segment_ids_map,
-        model_segment_keys=model_segment_keys_map,
-        model_discontinuity_ids=model_discontinuity_ids_map,
-        model_selection_provenance=model_selection_provenance_map,
-        model_observation_ids=model_observation_ids_map,
-        model_raw_columns=model_raw_columns_map,
-        model_source_rows=model_source_rows_map,
-        model_x_projection_by_dataset=model_x_projection_map,
-        simulation_results_by_dataset=simulation_results_by_dataset,
         weighted_residuals=np.concatenate(global_weighted_residual_blocks),
         profile_likelihood_result=None,
         residual_bootstrap_result=None,

@@ -299,7 +299,7 @@ class RunResultsTab(QtWidgets.QWidget):
         self._install_plot_projection(curves, plot_presentation or {})
         if curve_failure is not None:
             self._render_diagnostic_label.setText(
-                "Fitted values are unavailable: " + str(curve_failure)
+                "Fit curves unavailable: " + str(curve_failure)
             )
             self._render_diagnostic_label.show()
         return self.copy_eligible()
@@ -458,7 +458,18 @@ class RunResultsTab(QtWidgets.QWidget):
         self._dataset_presentation = MappingProxyType(dict(presentation))
         if values:
             self._ensure_subtabs(values)
-        rendered = self._refresh_active_plot_view()
+            rendered = self._refresh_active_plot_view()
+        else:
+            # Terminal curve failure can leave the existing dataset tabs in
+            # place while Summary and Apply remain valid. Clear every
+            # physical view so an inactive tab cannot reveal its old curves.
+            for plot_view in self._dataset_plot_views.values():
+                plot_view.set_projection((), self._dataset_presentation)
+            if self._all_datasets_plot_view is not None:
+                self._all_datasets_plot_view.set_projection(
+                    (), self._dataset_presentation
+                )
+            rendered = False
         self.copyAvailableChanged.emit(self.copy_eligible())
         return rendered
 

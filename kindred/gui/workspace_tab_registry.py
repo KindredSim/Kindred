@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Callable, Iterable
 
 from kindred.core.mechanism_source import MechanismAuthoringSource
@@ -12,6 +12,7 @@ from kindred.core.project_document import (
     ProjectDocument,
     SimulationExecutionSettings,
     TabScientificSettings,
+    prepare_tab_scientific_settings,
 )
 from kindred.core.project_session import ProjectContentToken, ProjectSession
 from kindred.core.project_presentation_state import (
@@ -519,9 +520,10 @@ class WorkspaceTabRegistry:
         expected_token: ProjectContentToken,
     ) -> ProjectContentToken | None:
         tab = self.tab(tab_id)
-        return self.replace_tab(
-            tab.tab_id,
-            replace(tab, scientific_settings=settings),
+        candidate_tab = prepare_tab_scientific_settings(tab, settings)
+        candidate_document = self._session.document.replace_tab(candidate_tab)
+        return self.replace_document(
+            candidate_document,
             expected_token=expected_token,
         )
 

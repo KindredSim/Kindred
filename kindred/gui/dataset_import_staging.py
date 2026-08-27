@@ -80,25 +80,6 @@ class DatasetImportCompletion:
     origin_tab_id: str
     units: tuple[DatasetImportUnit, ...]
 
-    def __post_init__(self) -> None:
-        if (
-            type(self.origin_tab_id) is not str
-            or not self.origin_tab_id
-            or self.origin_tab_id != self.origin_tab_id.strip()
-        ):
-            raise ValueError(
-                "Dataset import completion origin tab ID must be nonblank and "
-                "edge-normalized."
-            )
-        if type(self.units) is not tuple or not self.units:
-            raise ValueError(
-                "Dataset import completion requires a nonempty typed unit tuple."
-            )
-        if any(not isinstance(unit, DatasetImportUnit) for unit in self.units):
-            raise TypeError(
-                "Dataset import completion units must be DatasetImportUnit values."
-            )
-
 
 @dataclass(frozen=True, slots=True)
 class RawDatasetBatchProposal:
@@ -109,28 +90,6 @@ class RawDatasetBatchProposal:
     records: tuple[RawDatasetRecord, ...]
 
     def __post_init__(self) -> None:
-        if (
-            type(self.origin_tab_id) is not str
-            or not self.origin_tab_id
-            or self.origin_tab_id != self.origin_tab_id.strip()
-        ):
-            raise ValueError(
-                "Raw dataset batch origin tab ID must be nonblank and "
-                "edge-normalized."
-            )
-        if type(self.sources) is not tuple or any(
-            not isinstance(source, ImportedSource)
-            for source in self.sources
-        ):
-            raise TypeError("Raw dataset batch sources must be an exact ImportedSource tuple.")
-        if type(self.records) is not tuple or any(
-            not isinstance(record, RawDatasetRecord)
-            for record in self.records
-        ):
-            raise TypeError(
-                "Raw dataset batch records must be an exact "
-                "RawDatasetRecord tuple."
-            )
         source_ids = tuple(source.source_id for source in self.sources)
         if len(source_ids) != len(set(source_ids)):
             raise ValueError("Raw dataset batch source IDs must be unique.")
@@ -147,23 +106,6 @@ class DatasetImportRequest:
     origin_tab_id: str
     expected_units: int
 
-    def __post_init__(self) -> None:
-        if type(self.import_id) is not int or self.import_id <= 0:
-            raise ValueError("Dataset import ID must be a positive integer.")
-        if (
-            type(self.origin_tab_id) is not str
-            or not self.origin_tab_id
-            or self.origin_tab_id != self.origin_tab_id.strip()
-        ):
-            raise ValueError(
-                "Dataset import origin tab ID must be nonblank and "
-                "edge-normalized."
-            )
-        if type(self.expected_units) is not int or self.expected_units <= 0:
-            raise ValueError(
-                "Dataset import expected_units must be a positive integer."
-            )
-
 
 @dataclass(frozen=True, slots=True)
 class DatasetImportWorkerAdmission:
@@ -171,23 +113,6 @@ class DatasetImportWorkerAdmission:
 
     source: ImportSourceSnapshot
     admitted_plans: tuple[ResolvedSheetPlan, ...]
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.source, ImportSourceSnapshot):
-            raise TypeError(
-                "Dataset import admission source must be ImportSourceSnapshot."
-            )
-        plans = self.admitted_plans
-        if type(plans) is not tuple or any(
-            not isinstance(plan, ResolvedSheetPlan) for plan in plans
-        ):
-            raise TypeError(
-                "Dataset import admission plans must be an exact typed tuple."
-            )
-        if not plans:
-            raise ValueError(
-                "Dataset import admission requires at least one resolved plan."
-            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -200,29 +125,7 @@ class DatasetImportWorkerRequest:
     admitted_ordinals: tuple[int, ...]
 
     def __post_init__(self) -> None:
-        if not isinstance(self.import_request, DatasetImportRequest):
-            raise TypeError(
-                "Dataset import worker requires DatasetImportRequest."
-            )
-        if type(self.worker_id) is not int or self.worker_id <= 0:
-            raise ValueError("Dataset import worker ID must be a positive integer.")
-        if not isinstance(self.source, ImportSourceSnapshot):
-            raise TypeError(
-                "Dataset import worker source must be ImportSourceSnapshot."
-            )
-        if type(self.expected_units) is not int or self.expected_units <= 0:
-            raise ValueError(
-                "Dataset import worker expected_units must be a positive integer."
-            )
         plans = self.admitted_plans
-        if type(plans) is not tuple or any(
-            not isinstance(plan, ResolvedSheetPlan)
-            for plan in plans
-        ):
-            raise TypeError(
-                "Dataset import worker admitted plans must be an exact "
-                "ResolvedSheetPlan tuple."
-            )
         if len(plans) != self.expected_units:
             raise ValueError(
                 "A dataset import worker must retain one typed plan per "
@@ -230,29 +133,13 @@ class DatasetImportWorkerRequest:
             )
         ordinals = self.admitted_ordinals
         if (
-            type(ordinals) is not tuple
-            or len(ordinals) != self.expected_units
-            or any(type(ordinal) is not int or ordinal < 0 for ordinal in ordinals)
+            len(ordinals) != self.expected_units
             or tuple(range(ordinals[0], ordinals[0] + len(ordinals))) != ordinals
             or ordinals[-1] >= self.import_request.expected_units
         ):
             raise ValueError(
                 "A dataset import worker requires one contiguous admitted "
                 "ordinal per expected result."
-            )
-        if self.source.file_type == "csv":
-            if len(plans) != 1 or plans[0].sheet_name is not None:
-                raise ValueError(
-                    "A CSV import worker must admit exactly one non-sheet plan."
-                )
-            return
-        if any(
-            plan.sheet_name is None
-            for plan in plans
-        ):
-            raise ValueError(
-                "Every admitted XLSX plan must identify one worksheet in the "
-                "worker source."
             )
 
     @property
@@ -265,16 +152,6 @@ class DatasetImportProgress:
     request: DatasetImportRequest
     percent: int
 
-    def __post_init__(self) -> None:
-        if not isinstance(self.request, DatasetImportRequest):
-            raise TypeError(
-                "Dataset import progress requires DatasetImportRequest."
-            )
-        if type(self.percent) is not int or not 0 <= self.percent <= 100:
-            raise ValueError(
-                "Dataset import progress must be an integer from 0 to 100."
-            )
-
 
 @dataclass(frozen=True, slots=True)
 class DatasetImportFailure:
@@ -282,10 +159,6 @@ class DatasetImportFailure:
     message: str
 
     def __post_init__(self) -> None:
-        if not isinstance(self.request, DatasetImportWorkerRequest):
-            raise TypeError(
-                "Dataset import failure requires DatasetImportWorkerRequest."
-            )
         if not isinstance(self.message, str):
             raise TypeError("Dataset import failure message must be a string.")
         message = self.message.strip()
@@ -300,10 +173,6 @@ class DatasetImportCancellation:
     source_label: str
 
     def __post_init__(self) -> None:
-        if not isinstance(self.request, DatasetImportWorkerRequest):
-            raise TypeError(
-                "Dataset import cancellation requires DatasetImportWorkerRequest."
-            )
         if not isinstance(self.source_label, str):
             raise TypeError(
                 "Dataset import cancellation source label must be a string."
@@ -320,10 +189,6 @@ class DatasetImportCancellation:
 class _DatasetImportSuccess:
     unit: DatasetImportUnit
 
-    def __post_init__(self) -> None:
-        if not isinstance(self.unit, DatasetImportUnit):
-            raise TypeError("Dataset import success requires DatasetImportUnit.")
-
 
 class DatasetImportWorker(QtCore.QThread):
     """Exact signal contract for workers retained by DatasetImportStaging."""
@@ -335,10 +200,6 @@ class DatasetImportWorker(QtCore.QThread):
 
     def __init__(self, source: ImportSourceSnapshot) -> None:
         super().__init__()
-        if not isinstance(source, ImportSourceSnapshot):
-            raise TypeError(
-                "Dataset import workers require one immutable source snapshot."
-            )
         self._source = source
 
     @property
@@ -355,10 +216,6 @@ class _CSVLoaderWorker(DatasetImportWorker):
         plan: ResolvedSheetPlan,
     ) -> None:
         super().__init__(source)
-        if source.file_type != "csv":
-            raise ValueError("CSV worker requires an admitted CSV snapshot.")
-        if plan.sheet_name is not None:
-            raise ValueError("CSV worker cannot accept a worksheet plan.")
         self._plan = plan
 
     def _load_payload(self) -> DatasetObservationPayload:
@@ -423,12 +280,6 @@ class _ExcelLoaderWorker(DatasetImportWorker):
         plans: tuple[ResolvedSheetPlan, ...],
     ) -> None:
         super().__init__(source)
-        if source.file_type != "excel":
-            raise ValueError("Excel worker requires an admitted XLSX snapshot.")
-        if not plans or any(plan.sheet_name is None for plan in plans):
-            raise ValueError(
-                "Excel worker requires nonempty plans for the admitted workbook."
-            )
         self._plans = plans
 
     def _load_sheet_payload(
@@ -437,8 +288,6 @@ class _ExcelLoaderWorker(DatasetImportWorker):
         workbooks: ExcelWorkbookPair,
     ) -> tuple[str, DatasetObservationPayload]:
         sheet_name = plan.sheet_name
-        if sheet_name is None:
-            raise ValueError("Excel worker plan is missing a worksheet name.")
         rows = workbooks.read_sheet_rows(sheet_name)
         with closing(rows):
             row_iter = iter(rows)
@@ -631,13 +480,6 @@ class DatasetImportStaging(QtCore.QObject):
             raise DatasetImportAdmissionError("Dataset import admission is fenced.")
         if self.busy:
             raise DatasetImportAdmissionError("A dataset import is already active or awaiting commit.")
-        if type(roster) is not tuple or any(
-            not isinstance(item, DatasetImportWorkerAdmission)
-            for item in roster
-        ):
-            raise TypeError(
-                "Dataset import roster must be an exact typed admission tuple."
-            )
         expected = sum(len(item.admitted_plans) for item in roster)
         if expected <= 0:
             raise DatasetImportAdmissionError("Dataset import requires at least one result unit.")
@@ -686,10 +528,6 @@ class DatasetImportStaging(QtCore.QObject):
     ) -> None:
         """Acquire, connect, install, and start every admitted worker."""
 
-        if not isinstance(import_request, DatasetImportRequest):
-            raise TypeError(
-                "Dataset import start requires DatasetImportRequest."
-            )
         active = self._require_active(import_request.import_id)
         if active.request is not import_request:
             raise DatasetImportStateError("Dataset import request is stale.")
@@ -750,15 +588,6 @@ class DatasetImportStaging(QtCore.QObject):
         request: DatasetImportWorkerRequest,
         worker: DatasetImportWorker,
     ) -> _RegisteredWorker:
-        if not isinstance(worker, DatasetImportWorker):
-            raise TypeError(
-                "Dataset import workers must implement DatasetImportWorker."
-            )
-        if worker.source != request.source:
-            raise DatasetImportStateError(
-                "Dataset import worker source does not match the admitted "
-                "immutable snapshot."
-            )
         if any(
             registration.worker is worker
             for registration in active.workers.values()
@@ -906,7 +735,7 @@ class DatasetImportStaging(QtCore.QObject):
         active = owned[0]
         if active.terminal_outcome is not None:
             return False
-        progress = max(0, min(100, int(percent)))
+        progress = percent
         previous = active.latest_progress_by_worker[request.worker_id]
         if progress <= previous:
             return True
@@ -1100,7 +929,7 @@ class DatasetImportStaging(QtCore.QObject):
         active = self._active
         if (
             active is None
-            or active.request.import_id != int(import_id)
+            or active.request.import_id != import_id
         ):
             raise DatasetImportStateError("Dataset import callback is stale.")
         return active
@@ -1110,14 +939,6 @@ class DatasetImportStaging(QtCore.QObject):
         request: DatasetImportWorkerRequest,
         worker: DatasetImportWorker,
     ) -> tuple[_ActiveImport, _RegisteredWorker] | None:
-        if not isinstance(request, DatasetImportWorkerRequest):
-            raise TypeError(
-                "Dataset import callback requires DatasetImportWorkerRequest."
-            )
-        if not isinstance(worker, DatasetImportWorker):
-            raise TypeError(
-                "Dataset import callback requires DatasetImportWorker."
-            )
         active = self._active
         if (
             active is None

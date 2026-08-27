@@ -152,7 +152,6 @@ class DSLIR:
     prevent semantic drift across entry points.
     """
 
-    version: int
     energy_unit: str
     temperature_K: float
     standard_conc_M: float
@@ -876,7 +875,6 @@ def _forward_rate_family_from_params(
 
 # ------------------------------ main parsing ---------------------------------
 
-_DSL_IR_VERSION = 1
 _NAMED_INITIAL_BLOCK_START_RE = re.compile(
     r"^(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*=\s*\{\s*(?P<body>.*?)\s*$"
 )
@@ -1456,7 +1454,6 @@ def _parse_dsl_ir(text: str, *, units: UnitsModel | None = None) -> "DSLIR":
         notes.append("Intervention schedule detected")
 
     return DSLIR(
-        version=_DSL_IR_VERSION,
         energy_unit=str(energy_unit),
         temperature_K=float(temperature_K),
         standard_conc_M=float(standard_conc_M),
@@ -2035,28 +2032,17 @@ def _mechanism_build_input(
     """Freeze the private parse accumulator into the sole builder input."""
 
     from kindred.core.simulator.dsl_build_input import DslMechanismBuildInput
-    from kindred.core.temperature import TemperatureSchedule
 
-    if type(ir) is not DSLIR:
-        raise TypeError("DSL builder freeze requires the exact private DSLIR.")
     canonical_initials = {
         str(name): float(value)
         for name, value in dict(initials or {}).items()
     }
 
-    temperature_schedule = ir.temperature_schedule
-    if ir.temperature_schedule is not None:
-        if type(ir.temperature_schedule) is not TemperatureSchedule:
-            raise TypeError(
-                "DSL builder freeze requires exact TemperatureSchedule."
-            )
-
     return DslMechanismBuildInput(
-        version=1,
-        energy_unit=str(ir.energy_unit),
-        temperature_K=float(ir.temperature_K),
-        standard_conc_M=float(ir.standard_conc_M),
-        temperature_schedule=temperature_schedule,
+        energy_unit=ir.energy_unit,
+        temperature_K=ir.temperature_K,
+        standard_conc_M=ir.standard_conc_M,
+        temperature_schedule=ir.temperature_schedule,
         steps=tuple(ir.steps),
         initials=tuple(canonical_initials.items()),
     )

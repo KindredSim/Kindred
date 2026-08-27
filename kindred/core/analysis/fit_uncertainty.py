@@ -19,7 +19,6 @@ from kindred.core.analysis.fit_dataset_payload import (
     FitDatasetSpec,
     FitObservationSeries,
 )
-from kindred.core.analysis.parametric_alignment import ParametricXProjection
 from kindred.core.analysis import global_fit_execution as _fit_execution
 from kindred.core.analysis.fit_evaluation_outcome import ScientificUnavailable
 from kindred.core.exceptions import (
@@ -1672,17 +1671,17 @@ def _bootstrap_stratum_manifest(
 def _bootstrap_payloads(
     *,
     payloads: Sequence[FitDatasetSpec],
-    fitted_model: Mapping[str, Mapping[str, np.ndarray]],
-    fitted_x_model: Mapping[str, ParametricXProjection] | None,
+    fitted_info: Mapping[str, object],
     rng: np.random.Generator,
 ) -> tuple[FitDatasetSpec, ...]:
     captured: list[FitDatasetSpec] = []
     for payload in payloads:
-        dataset_model = fitted_model.get(payload.dataset_id)
-        if not isinstance(dataset_model, Mapping):
+        info = fitted_info.get(payload.dataset_id)
+        if not isinstance(info, _fit_execution.DatasetFitInfo):
             raise ValueError(
-                f"Bootstrap terminal model omitted dataset {payload.dataset_id!r}."
+                f"Bootstrap terminal facts omitted dataset {payload.dataset_id!r}."
             )
+        dataset_model = info.model_series
         observations: dict[str, FitObservationSeries] = {}
         for target in payload.species_list:
             source = payload.observations[target]
@@ -1706,15 +1705,11 @@ def _bootstrap_payloads(
             )
         x_observations = None
         if payload.x_name != "t":
-            if payload.x_observations is None or fitted_x_model is None:
+            if payload.x_observations is None or info.x_projection is None:
                 raise ValueError(
                     f"Bootstrap dataset {payload.dataset_id!r} omitted its canonical X model."
                 )
-            projection = fitted_x_model.get(payload.dataset_id)
-            if projection is None:
-                raise ValueError(
-                    f"Bootstrap dataset {payload.dataset_id!r} omitted its X projection."
-                )
+            projection = info.x_projection
             x_source = payload.x_observations
             observed_x = np.asarray(
                 [float(x_source.y[x_source.source_rows.index(row)]) for row in projection.source_rows],
@@ -1928,12 +1923,18 @@ def residual_bootstrap_result(
                 "primary_fit": primary_failure or {"status": "nonconverged"},
             },
         ))
-    fitted_model = getattr(terminal_result, "model_series", None)
-    if not isinstance(fitted_model, Mapping) or not fitted_model:
+    terminal_infos = getattr(terminal_result, "dataset_info", None)
+    if not isinstance(terminal_infos, (tuple, list)) or not terminal_infos:
         raise ValueError(
-            "The terminal Fit did not retain aligned model series for Bootstrap."
+            "The terminal Fit did not retain aligned dataset facts for Bootstrap."
         )
-    fitted_x_model = getattr(terminal_result, "model_x_projection_by_dataset", None)
+    fitted_info = {
+        info.dataset_id: info
+        for info in terminal_infos
+        if isinstance(info, _fit_execution.DatasetFitInfo)
+    }
+    if len(fitted_info) != len(terminal_infos):
+        raise ValueError("The terminal Fit dataset roster is malformed for Bootstrap.")
     for name in config.parameter_names:
         _parameter_value(terminal_result, name)
 
@@ -1951,8 +1952,7 @@ def residual_bootstrap_result(
         try:
             synthetic = _bootstrap_payloads(
                 payloads=payloads,
-                fitted_model=fitted_model,
-                fitted_x_model=fitted_x_model,
+                fitted_info=fitted_info,
                 rng=rng,
             )
             fitted = refit(synthetic, index)

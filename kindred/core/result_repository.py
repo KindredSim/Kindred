@@ -214,6 +214,19 @@ def _validate_rows_against_executed_segments(
     catalog: tuple[tuple[int, str, float, float, bool, bool], ...],
 ) -> None:
     by_id = {entry[0]: entry for entry in catalog}
+    qualifying_boundary_counts = {
+        (segment_id, segment_key, start): 0
+        for (
+            segment_id,
+            segment_key,
+            start,
+            _end,
+            temperature_boundary,
+            starts_after_discontinuity,
+        ) in catalog
+        if segment_id != 0
+        and (temperature_boundary or starts_after_discontinuity)
+    }
     for row, (raw_id, key) in enumerate(
         zip(segment_ids, segment_keys, strict=True)
     ):
@@ -227,6 +240,9 @@ def _validate_rows_against_executed_segments(
             raise ValueError(
                 "result row time lies outside its executed segment span."
             )
+        boundary_key = (int(raw_id), key, row_time)
+        if boundary_key in qualifying_boundary_counts:
+            qualifying_boundary_counts[boundary_key] += 1
 
     if (
         float(time[0]) != catalog[0][2]
@@ -241,29 +257,10 @@ def _validate_rows_against_executed_segments(
             "the final public result row must identify execution end."
         )
 
-    for (
-        segment_id,
-        segment_key,
-        start,
-        _end,
-        temperature_boundary,
-        starts_after_discontinuity,
-    ) in catalog:
-        if segment_id == 0 or not (
-            temperature_boundary or starts_after_discontinuity
-        ):
-            continue
-        matching_rows = [
-            row
-            for row in range(int(time.size))
-            if int(segment_ids[row]) == segment_id
-            and segment_keys[row] == segment_key
-            and float(time[row]) == start
-        ]
-        if len(matching_rows) != 1:
-            raise ValueError(
-                "every public execution boundary must publish one row in its new segment."
-            )
+    if any(count != 1 for count in qualifying_boundary_counts.values()):
+        raise ValueError(
+            "every public execution boundary must publish one row in its new segment."
+        )
 
 
 def _freeze_provenance_value(value: Any) -> Any:

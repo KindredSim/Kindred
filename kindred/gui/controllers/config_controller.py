@@ -68,6 +68,11 @@ _DEFAULT_EQUILIBRIUM_K_DEBOUNCE_MS = 150
 _SPECIES_COLORS_KEY = "plot/species_colors"
 _EXPERIMENTAL_POINT_SIZE_KEY = "plot/experimental_point_size"
 _EXPERIMENTAL_POINT_OPACITY_KEY = "plot/experimental_point_opacity"
+_WINDOW_LAYOUT_KEYS = {
+    "is_maximized": "window/is_maximized",
+    "geometry": "window/geometry",
+    "dock_state": "window/dock_state",
+}
 _DEFAULT_EXPERIMENTAL_POINT_SIZE = 6
 _DEFAULT_EXPERIMENTAL_POINT_OPACITY = 180.0 / 255.0
 _SPECIES_SUFFIXES = ("_conc", "_concentration")
@@ -129,10 +134,12 @@ class ConfigController(QtCore.QObject):
     def set_run_user_maximum(self, value: int | None) -> int | None:
         if value is None:
             settings = self._settings()
+            snapshot = self._snapshot_settings(settings, (_RUN_USER_MAXIMUM_KEY,))
             settings.remove(_RUN_USER_MAXIMUM_KEY)
             self._sync_or_report(
                 settings,
                 "Run user maximum",
+                snapshot=snapshot,
                 success_message="Run parallel maximum reset to Automatic.",
             )
             return None
@@ -140,10 +147,12 @@ class ConfigController(QtCore.QObject):
             raise TypeError("Run user maximum must be an integer or None.")
         accepted = min(MAX_PARALLEL_WORKERS_CEILING, max(1, value))
         settings = self._settings()
+        snapshot = self._snapshot_settings(settings, (_RUN_USER_MAXIMUM_KEY,))
         settings.setValue(_RUN_USER_MAXIMUM_KEY, accepted)
         self._sync_or_report(
             settings,
             "Run user maximum",
+            snapshot=snapshot,
             success_message=f"Run parallel maximum set to {accepted}.",
         )
         return accepted
@@ -175,10 +184,12 @@ class ConfigController(QtCore.QObject):
             )
         previous = self.result_cache_capacity()
         settings = self._settings()
+        snapshot = self._snapshot_settings(settings, (_RESULT_CACHE_CAPACITY_KEY,))
         settings.setValue(_RESULT_CACHE_CAPACITY_KEY, value)
         self._sync_or_report(
             settings,
             "result cache capacity",
+            snapshot=snapshot,
             success_message=(
                 f"Result cache capacity set to {value} per mechanism tab."
             ),
@@ -241,10 +252,12 @@ class ConfigController(QtCore.QObject):
             raise TypeError(f"{label} must be an integer.")
         accepted = min(1000, max(0, value))
         settings = self._settings()
+        snapshot = self._snapshot_settings(settings, (key,))
         settings.setValue(key, accepted)
         self._sync_or_report(
             settings,
             label,
+            snapshot=snapshot,
             success_message=success_message.format(value=accepted),
         )
         return accepted
@@ -441,19 +454,32 @@ class ConfigController(QtCore.QObject):
             "application tab-scientific defaults",
         )
         settings = self._settings()
+        snapshot = self._snapshot_settings(
+            settings,
+            tuple(_SCIENTIFIC_SETTINGS_KEYS.values()),
+        )
         for field_name, key in _SCIENTIFIC_SETTINGS_KEYS.items():
             settings.setValue(key, getattr(accepted, field_name))
-        self._sync_or_report(settings, "tab-scientific defaults")
+        self._sync_or_report(
+            settings,
+            "tab-scientific defaults",
+            snapshot=snapshot,
+        )
         return accepted
 
     def persist_fit_defaults(self, candidate: FitDefaults) -> FitDefaults:
         accepted = validate_fit_defaults(candidate)
         settings = self._settings()
+        snapshot = self._snapshot_settings(
+            settings,
+            tuple(_FIT_SETTINGS_KEYS.values()),
+        )
         for field_name, key in _FIT_SETTINGS_KEYS.items():
             settings.setValue(key, getattr(accepted, field_name))
         self._sync_or_report(
             settings,
             "Fit defaults",
+            snapshot=snapshot,
             success_message=(
                 "Application Fit defaults updated for newly created projects."
             ),
@@ -462,26 +488,77 @@ class ConfigController(QtCore.QObject):
 
     def persist_theme(self, dark_mode: bool) -> None:
         settings = self._settings()
+        snapshot = self._snapshot_settings(settings, (_THEME_KEY,))
         settings.setValue(_THEME_KEY, bool(dark_mode))
-        self._sync_or_report(settings, "theme")
+        self._sync_or_report(settings, "theme", snapshot=snapshot)
+
+    def persist_window_layout(
+        self,
+        is_maximized: bool,
+        geometry: object,
+        dock_state: object,
+    ) -> None:
+        """Persist the complete MainWindow layout as one settings write."""
+
+        settings = self._settings()
+        keys = tuple(_WINDOW_LAYOUT_KEYS.values())
+        snapshot = self._snapshot_settings(settings, keys)
+        settings.setValue(_WINDOW_LAYOUT_KEYS["is_maximized"], is_maximized)
+        settings.setValue(_WINDOW_LAYOUT_KEYS["geometry"], geometry)
+        settings.setValue(_WINDOW_LAYOUT_KEYS["dock_state"], dock_state)
+        self._sync_or_report(
+            settings,
+            "window layout",
+            snapshot=snapshot,
+        )
+
+    @staticmethod
+    def _snapshot_settings(
+        settings: QtCore.QSettings,
+        keys: Sequence[str],
+    ) -> tuple[tuple[str, bool, object], ...]:
+        snapshot: list[tuple[str, bool, object]] = []
+        for key in keys:
+            existed = settings.contains(key)
+            snapshot.append((key, existed, settings.value(key) if existed else None))
+        return tuple(snapshot)
+
+    @staticmethod
+    def _restore_settings(
+        settings: QtCore.QSettings,
+        snapshot: Sequence[tuple[str, bool, object]],
+    ) -> None:
+        for key, existed, raw_value in snapshot:
+            try:
+                if existed:
+                    settings.setValue(key, raw_value)
+                else:
+                    settings.remove(key)
+            except Exception:
+                logger.exception("Could not restore failed setting %s.", key)
 
     def _sync_or_report(
         self,
         settings: QtCore.QSettings,
         label: str,
         *,
+        snapshot: Sequence[tuple[str, bool, object]],
         success_message: str | None = None,
     ) -> None:
         try:
-            settings.sync()
-        except Exception as exc:
-            logger.warning("Could not persist %s: %s", label, exc)
+            try:
+                settings.sync()
+            except Exception as exc:
+                logger.warning("Could not persist %s: %s", label, exc)
+                raise
+            status = settings.status()
+            if status != QtCore.QSettings.Status.NoError:
+                error = RuntimeError(f"Could not persist {label}: {status}.")
+                logger.warning("Could not persist %s: %s", label, error)
+                raise error
+        except Exception:
+            self._restore_settings(settings, snapshot)
             raise
-        status = settings.status()
-        if status != QtCore.QSettings.Status.NoError:
-            error = RuntimeError(f"Could not persist {label}: {status}.")
-            logger.warning("Could not persist %s: %s", label, error)
-            raise error
         if success_message is not None:
             logger.info(success_message)
 
@@ -523,8 +600,13 @@ class ConfigController(QtCore.QObject):
 
     def _persist_recent_projects(self, projects: Sequence[str]) -> None:
         settings = self._settings()
+        snapshot = self._snapshot_settings(settings, (_RECENT_PROJECTS_KEY,))
         settings.setValue(_RECENT_PROJECTS_KEY, list(projects))
-        self._sync_or_report(settings, "recent projects")
+        self._sync_or_report(
+            settings,
+            "recent projects",
+            snapshot=snapshot,
+        )
         self.recentProjectsChanged.emit()
 
     def clear_recent_files(self) -> None:
@@ -559,8 +641,13 @@ class ConfigController(QtCore.QObject):
         overrides = dict(self._species_color_overrides())
         overrides[canonical] = QtGui.QColor(color).name(QtGui.QColor.NameFormat.HexRgb)
         settings = self._settings()
+        snapshot = self._snapshot_settings(settings, (_SPECIES_COLORS_KEY,))
         settings.setValue(_SPECIES_COLORS_KEY, overrides)
-        self._sync_or_report(settings, "species colors")
+        self._sync_or_report(
+            settings,
+            "species colors",
+            snapshot=snapshot,
+        )
         self.applicationPlotPreferencesChanged.emit()
 
     def experimental_point_size(self) -> int:
@@ -578,8 +665,13 @@ class ConfigController(QtCore.QObject):
     def set_experimental_point_size(self, size: int) -> int:
         accepted = self._validate_experimental_point_size(size)
         settings = self._settings()
+        snapshot = self._snapshot_settings(settings, (_EXPERIMENTAL_POINT_SIZE_KEY,))
         settings.setValue(_EXPERIMENTAL_POINT_SIZE_KEY, accepted)
-        self._sync_or_report(settings, "experimental point size")
+        self._sync_or_report(
+            settings,
+            "experimental point size",
+            snapshot=snapshot,
+        )
         self.applicationPlotPreferencesChanged.emit()
         return accepted
 
@@ -598,8 +690,13 @@ class ConfigController(QtCore.QObject):
     def set_experimental_point_opacity(self, opacity: float) -> float:
         accepted = self._validate_experimental_point_opacity(opacity)
         settings = self._settings()
+        snapshot = self._snapshot_settings(settings, (_EXPERIMENTAL_POINT_OPACITY_KEY,))
         settings.setValue(_EXPERIMENTAL_POINT_OPACITY_KEY, accepted)
-        self._sync_or_report(settings, "experimental point opacity")
+        self._sync_or_report(
+            settings,
+            "experimental point opacity",
+            snapshot=snapshot,
+        )
         self.applicationPlotPreferencesChanged.emit()
         return accepted
 

@@ -337,26 +337,6 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
 
         layout.addWidget(group, stretch=1)
 
-    def set_origin(
-        self,
-        origin: FitOriginSnapshot,
-        *,
-        preserve_drafts: bool = False,
-    ) -> None:
-        """Install a new captured origin without introducing a second store."""
-
-        if not isinstance(origin, FitOriginSnapshot):
-            raise TypeError("origin must be FitOriginSnapshot.")
-        if origin is not self._origin and not preserve_drafts:
-            self._pending_target_selections.clear()
-            self._pending_target_weights.clear()
-            self._pending_dataset_weights.clear()
-            self._pending_initial_rows.clear()
-            self._pending_initial_values.clear()
-            self._invalid_raw.clear()
-            self._invalid_initial_raw.clear()
-        self._origin = origin
-
     # ------------------------------------------------------------------
     # Typed snapshot projection
     # ------------------------------------------------------------------

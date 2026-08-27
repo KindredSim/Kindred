@@ -31,8 +31,6 @@ from kindred.gui.workspace_result_presenter import (
     ResultLayerKind,
     encode_clipboard_text,
     encode_tsv_row,
-    iter_blocks_tsv_chunks,
-    validate_copy,
 )
 
 pg = require_pyqtgraph(context="Kindred GUI")
@@ -135,6 +133,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
 
     referenceLayerVisibilityRequested = QtCore.Signal(bool)
     interventionAnnotationsVisibilityRequested = QtCore.Signal(bool)
+    copyAllRequested = QtCore.Signal()
     xSeriesRequested = QtCore.Signal(object)
     ySeriesRequested = QtCore.Signal(object)
     plotPresentationIntentRequested = QtCore.Signal(object)
@@ -152,6 +151,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         self._presentation = _PlotPresentation()
         self._axis_range = _AxisRangeSession()
         self._render_input: ResultRenderInput | None = None
+        self._copy_all_available = False
         self._rendered_point_roster: tuple[_RenderedPointBlock, ...] = ()
         self._settling_static_input = False
         self._interactive_timer = QtCore.QTimer(self)
@@ -240,18 +240,24 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         self._settling_static_input = True
         try:
             self._interactive_display.prepare_result_input(render_input)
+            self._render_input = render_input
+            self._render_result_scene(render_input)
+            self._interactive_display.commit_result_input(render_input)
+            if self._interactive_display.has_visible_frame and locked_view is not None:
+                self._restore_interactive_view(locked_view)
+            elif not self._interactive_display.has_renderable_frame:
+                self._end_interactive_range_session()
+            if render_input.unavailable_x_diagnostic is not None:
+                self.resultDiagnostic.emit(render_input.unavailable_x_diagnostic)
+            return True
+        except Exception:
+            # A failed physical apply must not leave the prior scene, tables,
+            # warnings, or rendered-copy roster attached to a new semantic
+            # input.  MainWindow also clears its semantic cache at this seam.
+            self.clear_result_input()
+            raise
         finally:
             self._settling_static_input = False
-        self._render_input = render_input
-        self._render_result_scene(render_input)
-        self._interactive_display.commit_result_input(render_input)
-        if self._interactive_display.has_visible_frame and locked_view is not None:
-            self._restore_interactive_view(locked_view)
-        elif not self._interactive_display.has_renderable_frame:
-            self._end_interactive_range_session()
-        if render_input.unavailable_x_diagnostic is not None:
-            self.resultDiagnostic.emit(render_input.unavailable_x_diagnostic)
-        return True
 
     def apply_interactive_preview_result(
         self,
@@ -274,38 +280,38 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
             render_input=render_input,
         )
 
-    def copy_eligible(self) -> bool:
-        """Return whether the retained numerical input can be copied."""
+    def set_copy_all_available(self, available: bool) -> None:
+        """Project semantic Copy All eligibility into the physical menu."""
 
-        render_input = self._render_input
-        return bool(
-            render_input is not None
-            and any(block.visible for block in render_input.blocks)
-            and render_input.unavailable_x_diagnostic is None
-        )
-
-    def copy_all_to_clipboard(self) -> None:
-        """Copy full-resolution visible blocks from the retained input."""
-
-        render_input = self._render_input
-        if render_input is None:
-            raise ValueError("No current result data is available to copy.")
-        validate_copy(render_input)
-        output = io.StringIO()
-        output.writelines(
-            iter_blocks_tsv_chunks(
-                tuple(block for block in render_input.blocks if block.visible),
-            )
-        )
-        QtWidgets.QApplication.clipboard().setText(output.getvalue())
+        self._copy_all_available = bool(available)
 
     def _show_plot_context_menu(self, position: QtCore.QPoint) -> None:
         menu = QtWidgets.QMenu(self)
+        copy_all = menu.addAction("Copy All")
+        copy_all.setEnabled(self._copy_all_available)
+        copy_all.triggered.connect(self.copyAllRequested.emit)
+        menu.addSeparator()
         copy_rendered = menu.addAction("Copy Rendered Points")
         copy_rendered.setEnabled(
             any(chunk.x.size for block in self._rendered_point_roster for chunk in block.chunks)
         )
         copy_rendered.triggered.connect(self._copy_rendered_points_to_clipboard)
+        menu.addSeparator()
+        reference = menu.addAction("Show Reference")
+        reference.setCheckable(True)
+        reference.setChecked(
+            bool(self._render_input and self._render_input.reference_lines_visible)
+        )
+        reference.toggled.connect(self.referenceLayerVisibilityRequested)
+        annotations = menu.addAction("Show Intervention Annotations")
+        annotations.setCheckable(True)
+        annotations.setChecked(
+            bool(
+                self._render_input
+                and self._render_input.intervention_annotations_visible
+            )
+        )
+        annotations.toggled.connect(self.interventionAnnotationsVisibilityRequested)
         menu.exec(self._plot_widget.mapToGlobal(position))
 
     @QtCore.Slot()
@@ -485,6 +491,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         """Project replacement/reopen resets non-archived Plot session truth."""
 
         self.dispose_project_content()
+        self._end_interactive_range_session()
         self._interaction_mode = "pan"
         self._presentation = _PlotPresentation()
         self._sampling_limit = None
@@ -499,6 +506,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         """Stop plot-owned asynchronous work before project content teardown."""
 
         self._render_input = None
+        self._copy_all_available = False
         self._rendered_point_roster = ()
         self._interactive_display.clear(reset_currentness=True)
 
@@ -506,8 +514,10 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         """Clear the current result scene and its transient display."""
 
         self._render_input = None
+        self._copy_all_available = False
         self._rendered_point_roster = ()
         self.discard_interactive_display()
+        self._end_interactive_range_session()
         self._clear_plot_items()
         self._parameter_table.setRowCount(0)
         self._species_table.setRowCount(0)

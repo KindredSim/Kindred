@@ -44,7 +44,7 @@ __all__ = [
     "encode_clipboard_text",
     "encode_tsv_row",
     "iter_blocks_tsv_chunks",
-    "validate_copy",
+    "select_copy_blocks",
     "validate_xlsx_export",
     "write_xlsx",
 ]
@@ -1035,7 +1035,6 @@ def compose_interactive_display(
             for block in render_input.blocks
             if block.block_id == set_id
             and block.kind in {ResultLayerKind.EXPLICIT, ResultLayerKind.PREVIEW}
-            and isinstance(block.result, SimulationResultValue)
             and block.visible
         ),
         None,
@@ -1046,7 +1045,6 @@ def compose_interactive_display(
             for block in render_input.blocks
             if block.block_id == set_id
             and block.kind is ResultLayerKind.REFERENCE
-            and isinstance(block.result, SimulationResultValue)
         ),
         None,
     )
@@ -1056,7 +1054,6 @@ def compose_interactive_display(
             for block in render_input.blocks
             if block.block_id == set_id
             and block.kind is ResultLayerKind.EXPLICIT
-            and isinstance(block.result, SimulationResultValue)
         ),
         None,
     )
@@ -1095,12 +1092,7 @@ def compose_interactive_display(
         and (series_values := result_series.get(series_id)) is not None
         and series_values.size
     )
-    if baseline_block is not None:
-        baseline_result = baseline_block.result
-        if not isinstance(baseline_result, SimulationResultValue):
-            baseline_result = None
-    else:
-        baseline_result = None
+    baseline_result = baseline_block.result if baseline_block is not None else None
     if baseline_result is not None:
         if selected_x.series_name == "t":
             baseline_x = _readonly_display_array(baseline_result.t)
@@ -1480,15 +1472,24 @@ def compose_result_input(
         completion_warning_details=tuple(warning_facts),
     )
 
-def validate_copy(
+def select_copy_blocks(
     render_input: ResultRenderInput,
-) -> None:
-    """Validate Copy against one call-local render input."""
+) -> tuple[ResultDataBlock, ...]:
+    """Select the visible, applicable full-resolution semantic blocks once.
 
+    The returned tuple is the sole export selection shared by Copy All and
+    XLSX.  It deliberately ignores the plot's transient rendered-point
+    roster; that roster belongs only to Copy Rendered Points.
+    """
+
+    if not isinstance(render_input, ResultRenderInput):
+        raise TypeError("Copy selection requires a ResultRenderInput.")
     if render_input.unavailable_x_diagnostic is not None:
         raise ValueError(render_input.unavailable_x_diagnostic)
-    if not any(block.visible for block in render_input.blocks):
+    selected = tuple(block for block in render_input.blocks if block.visible)
+    if not selected:
         raise ValueError("No visible result, Reference, or experimental data.")
+    return selected
 
 def iter_blocks_tsv_chunks(
     blocks: Sequence[ResultDataBlock],

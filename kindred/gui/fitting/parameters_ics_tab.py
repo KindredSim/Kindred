@@ -733,20 +733,6 @@ class ParametersIcsTab(QtWidgets.QWidget):
         outer = QtWidgets.QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
         outer.addWidget(self._build_parameters_panel(), stretch=1)
-
-    def set_origin(self, origin: FitOriginSnapshot) -> None:
-        if not isinstance(origin, FitOriginSnapshot):
-            raise TypeError("origin must be FitOriginSnapshot.")
-        if self._origin is not None and self._origin is not origin:
-            self._retire_numeric_drafts()
-        self._origin = origin
-
-
-    def set_parameter_choices(self, **choices: object) -> None:
-        """Set presentation choices used by the observable page."""
-
-        self._set_parameter_choices(choices)
-
     def _set_parameter_choices(self, choices: Mapping[str, object]) -> None:
         self._parameter_choices = {str(key): value for key, value in choices.items()}
         dataset_ids = self._parameter_choices.get("dataset_ids", ())

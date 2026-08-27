@@ -198,14 +198,11 @@ class TabSliderBinding(QtCore.QObject):
         self._active_drag = None
         self._gesture_capture = None
         self._latest_admissible_pending = None
-        selection = table.selectionModel()
         variable_sliders.interactionRequested.connect(self._on_parameter_interaction)
         species_sliders.interactionRequested.connect(self._on_species_interaction)
-        selection.currentChanged.connect(self._on_live_current_changed)
         self._disposable_connections = (
             (variable_sliders.interactionRequested, self._on_parameter_interaction),
             (species_sliders.interactionRequested, self._on_species_interaction),
-            (selection.currentChanged, self._on_live_current_changed),
         )
 
     @property
@@ -549,11 +546,6 @@ class TabSliderBinding(QtCore.QObject):
             if any(float(row.get(name, 0.0)) != first for row in rows[1:]):
                 mixed.add(name)
         return projected, frozenset(mixed)
-
-    @QtCore.Slot(QtCore.QModelIndex, QtCore.QModelIndex)
-    def _on_live_current_changed(self, _current, _previous) -> None:
-        if not self._rendering:
-            self.render()
 
     def _preflight_preview_action(
         self, targets: tuple[str, ...]
@@ -914,6 +906,17 @@ class TabSliderBinding(QtCore.QObject):
             self._tab_id, set_ids, preserve_reference=preserve_reference
         )
         self._exact_preview_capture = None
+
+    def reset_project_session(self) -> None:
+        """Drop retained gesture/capture state before a project replacement."""
+
+        self._cancel_deferred_restore()
+        self._interactive_stop_fenced = True
+        self._clear_gesture_state()
+        self._simulation_jobs.retire_preview(self._tab_id)
+        self._exact_preview_capture = None
+        self._projection = None
+        self._last_targets = ()
 
     def fence_stop(self) -> bool:
         changed = bool(

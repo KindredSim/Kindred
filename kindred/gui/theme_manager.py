@@ -49,8 +49,9 @@ class ThemeManager:
 
         Physical application happens first.  The authoritative value advances
         only after physical application and persistence both succeed.  A
-        failure restores the previous physical and persisted value exactly
-        once.
+        failure restores the previous physical value.  Persistence owns
+        restoring its own failed QSettings write; it is never called a second
+        time as part of theme recovery.
         """
         requested = bool(dark_mode)
         recorded_previous = self._applied_dark_mode
@@ -62,11 +63,11 @@ class ThemeManager:
         try:
             self._apply_physical(requested)
             physical_applied = True
-            self._applied_dark_mode = requested
             if persist is not None:
                 persist(requested)
+            self._applied_dark_mode = requested
         except Exception as exc:
-            restored = self._restore_previous_once(previous, persist)
+            restored = self._restore_previous_physical(previous)
             if restored:
                 self._applied_dark_mode = previous
             elif physical_applied:
@@ -89,20 +90,13 @@ class ThemeManager:
         qdarktheme.setup_theme("dark" if dark_mode else "light")
         self._theme_target.set_theme(dark_mode=dark_mode)
 
-    def _restore_previous_once(
+    def _restore_previous_physical(
         self,
         previous: bool,
-        persist: Callable[[bool], None] | None,
     ) -> bool:
-        restored = False
         try:
             self._apply_physical(previous)
-            restored = True
         except Exception:
             logger.exception("Failed to restore the previous physical theme.")
-        if persist is not None:
-            try:
-                persist(previous)
-            except Exception:
-                logger.exception("Failed to restore the previous persisted theme.")
-        return restored
+            return False
+        return True

@@ -723,17 +723,6 @@ class SimulationJobOwner(QtCore.QObject):
         worker.finished.connect(self._on_worker_finished)
         try:
             worker.start()
-            if kind == "run" and purpose == "ordinary":
-                repository = self._repository(str(tab_id))
-                repository.deauthorize_sets(
-                    tuple(target.set_id for target in targets),
-                )
-                self.results_changed.emit(str(tab_id))
-            elif kind == "preview" and purpose != "interactive-preview":
-                self._promote_preview_targets(
-                    str(tab_id),
-                    tuple(targets),
-                )
         except BaseException as exc:  # noqa: BLE001
             if self._worker is not None:
                 self._generation += 1
@@ -747,6 +736,17 @@ class SimulationJobOwner(QtCore.QObject):
             self.status_changed.emit(f"{kind.capitalize()} dispatch failed: {exc}")
             self._emit_settled_if_complete()
             return False
+        if kind == "run" and purpose == "ordinary":
+            repository = self._repository(str(tab_id))
+            repository.deauthorize_sets(
+                tuple(target.set_id for target in targets),
+            )
+            self.results_changed.emit(str(tab_id))
+        elif kind == "preview" and purpose != "interactive-preview":
+            self._promote_preview_targets(
+                str(tab_id),
+                tuple(targets),
+            )
         self.state_changed.emit()
         if kind == "run":
             self.run_dispatched.emit(str(tab_id), tuple(target.set_id for target in targets))

@@ -2,7 +2,7 @@
 Mechanism construction from one admitted ``DslMechanismBuildInput``.
 
 ``dsl_parse`` owns source parsing and analysis; this module only consumes the
-exact immutable builder input and constructs the typed mechanism authority.
+immutable builder input and constructs the typed mechanism authority.
 """
 
 from __future__ import annotations
@@ -31,12 +31,7 @@ __all__ = ["build_mechanism_from_ir"]
 def build_mechanism_from_ir(
     build_input: DslMechanismBuildInput,
 ) -> Mechanism:
-    """Build a mechanism from the exact admitted immutable builder input."""
-
-    if type(build_input) is not DslMechanismBuildInput:
-        raise TypeError(
-            "build_mechanism_from_ir requires exact DslMechanismBuildInput."
-        )
+    """Build a mechanism from the admitted immutable builder input."""
 
     initials_merged = dict(build_input.initials)
     energy_unit = build_input.energy_unit

@@ -368,7 +368,7 @@ def _dataset_metrics(candidate: FitCandidate) -> list[dict[str, object]]:
     metrics: list[dict[str, object]] = []
     for info in sorted(result.dataset_info, key=lambda item: str(item.dataset_id)):
         dataset_id = str(info.dataset_id)
-        x_projection = result.model_x_projection_by_dataset.get(dataset_id)
+        x_projection = info.x_projection
         x_payload: dict[str, object] = {
             "point_count": int(info.x_point_count),
             "weighted_sse": _metric(info.x_weighted_residual_sse),

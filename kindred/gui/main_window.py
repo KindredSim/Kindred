@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import io
 import os
 import stat
 import tempfile
@@ -35,12 +36,8 @@ from kindred.core.dataset_mapping import (
 from kindred.core.datasets.observation_mapping import suggest_observation_mapping
 from kindred.core.mechanism_source import MechanismAuthoringSource
 from kindred.core.fitting_method_policy import SUPPORTED_FIT_METHODS
-from kindred.core.simulator.dsl_parse import prepare_dsl_request_set
-from kindred.core.simulator.exact_constraint_composition import (
-    compose_exact_constraints,
-)
-from kindred.core.units import UnitsModel
 from kindred.core.project_document import (
+    ExactCorrectionAssessment,
     FIT_MAX_NFEV_RANGE,
     FIT_SEED_RANGE,
     FitDefaults,
@@ -53,7 +50,7 @@ from kindred.core.project_document import (
     canonical_observation_target_names,
     canonical_initial_values,
     new_set_id,
-    reconcile_tab_exact_correction,
+    assess_tab_exact_correction,
     reconcile_tab_mechanism_source,
     retained_tab_mechanism_source,
     validate_project_document,
@@ -150,7 +147,8 @@ from kindred.gui.workspace_result_presenter import (
     VisibleResultSet,
     XlsxExportCompletion,
     compose_result_input,
-    validate_xlsx_export,
+    iter_blocks_tsv_chunks,
+    select_copy_blocks,
     write_xlsx,
 )
 from kindred.gui.workspace_tab_registry import (
@@ -195,16 +193,6 @@ class _TabSurfaceBundle:
 
 
 @dataclass(frozen=True, slots=True)
-class _ExactCorrectionAssessment:
-    """One synchronous symbolic exact-constraint assessment."""
-
-    proposal: MechanismSourceReconciliation | None
-    summary: str
-    blocked: bool = False
-    reason: str | None = None
-
-
-@dataclass(frozen=True, slots=True)
 class _XlsxExportSuccess:
     generation: int
     path: str
@@ -236,10 +224,6 @@ class _XlsxExportWorker(QtCore.QThread):
         parent: QtCore.QObject,
     ) -> None:
         super().__init__(parent)
-        if not isinstance(blocks, tuple) or any(
-            not isinstance(block, ResultDataBlock) for block in blocks
-        ):
-            raise TypeError("blocks must be a tuple of ResultDataBlock values.")
         self._generation = int(generation)
         self._blocks = blocks
         self._path = os.path.abspath(os.fspath(path))
@@ -268,7 +252,6 @@ class _XlsxExportWorker(QtCore.QThread):
                     f"Export directory does not exist: {parent}"
                 )
             self._check_cancelled()
-            validate_xlsx_export(self._blocks)
             descriptor, temporary_path = tempfile.mkstemp(
                 prefix=f".{os.path.basename(self._path)}.",
                 suffix=".partial",
@@ -561,6 +544,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._fit_executing = False
         self._last_export_directory: str | None = None
         self._slider_apply_refreshing: set[str] = set()
+        self._current_row_refreshing: dict[str, ProjectDocument] = {}
+        self._workspace_document_identity: ProjectDocument | None = None
         self.setObjectName("kindredMainWindow")
         self.setWindowTitle("Kindred")
         self.resize(self._startup_size())
@@ -932,8 +917,8 @@ class MainWindow(QtWidgets.QMainWindow):
             )
         )
         bundle.batch_table.selectionModel().currentChanged.connect(
-            lambda _current, _previous, captured=tab_id: (
-                self._render_results_for_tab(captured)
+            lambda _current, _previous, captured=tab_id: self._on_current_row_changed(
+                captured
             )
         )
         data = bundle.data_panel
@@ -1231,6 +1216,9 @@ class MainWindow(QtWidgets.QMainWindow):
                 visible,
             )
         )
+        plot.copyAllRequested.connect(
+            lambda captured=target: self._copy_all_for_tab(captured)
+        )
         plot.xSeriesRequested.connect(
             lambda selection: self._set_x_series(target, selection)
         )
@@ -1250,7 +1238,23 @@ class MainWindow(QtWidgets.QMainWindow):
         self._rendering_workspace = True
         try:
             document = self._project_session.document
+            replacing_document = (
+                self._workspace_document_identity is not None
+                and self._workspace_document_identity is not document
+            )
+            self._workspace_document_identity = document
             document_ids = {tab.tab_id for tab in document.tabs}
+            if replacing_document:
+                # Same-ID retained widgets otherwise keep old debounce/capture
+                # state and can publish an old gesture into the new document.
+                for tab_id, bundle in tuple(self._tab_surfaces.items()):
+                    if tab_id not in document_ids:
+                        continue
+                    bundle.slider_binding.reset_project_session()
+                    try:
+                        self._workspace.plot_for_tab(tab_id).reset_plot_session_state()
+                    except (KeyError, RuntimeError):
+                        pass
             for tab_id in tuple(self._tab_surfaces):
                 if tab_id not in document_ids:
                     self._drop_tab_surface(tab_id)
@@ -1672,15 +1676,65 @@ class MainWindow(QtWidgets.QMainWindow):
             self.set_status_text(
                 f"Result display failed for mechanism {target!r}: {exc}"
             )
-            self._result_render_inputs.pop(target, None)
+            self._clear_result_presentation_after_failure(target)
             self._refresh_actions()
             return False
-        if not self._workspace.plot_for_tab(target).apply_result_input(render_input):
-            self._result_render_inputs.pop(target, None)
+        plot = self._workspace.plot_for_tab(target)
+        try:
+            applied = plot.apply_result_input(render_input)
+        except Exception as exc:
+            logger.exception("Result physical apply failed for mechanism %s", target)
+            self.set_status_text(
+                f"Result display failed for mechanism {target!r}: {exc}"
+            )
+            self._clear_result_presentation_after_failure(target)
             self._refresh_actions()
             return False
+        if not applied:
+            self._clear_result_presentation_after_failure(target)
+            self._refresh_actions()
+            return False
+        try:
+            select_copy_blocks(render_input)
+        except (TypeError, ValueError):
+            copy_available = False
+        else:
+            copy_available = True
+        plot.set_copy_all_available(copy_available)
         self._result_render_inputs[target] = render_input
         self._refresh_actions()
+        return True
+
+    def _clear_result_presentation_after_failure(self, tab_id: str) -> None:
+        """Clear semantic and physical result state after any render failure."""
+
+        target = str(tab_id)
+        self._result_render_inputs.pop(target, None)
+        try:
+            self._workspace.plot_for_tab(target).clear_result_input()
+        except Exception as exc:
+            logger.warning(
+                "Could not clear failed result presentation for %s: %s",
+                target,
+                exc,
+            )
+
+    def _copy_all_for_tab(self, tab_id: str) -> bool:
+        """Serialize the presenter-selected full-resolution blocks once."""
+
+        target = str(tab_id)
+        render_input = self._result_render_inputs.get(target)
+        if render_input is None:
+            self.set_status_text("No current result data is available to copy.")
+            return False
+        try:
+            blocks = select_copy_blocks(render_input)
+            output = io.StringIO()
+            output.writelines(iter_blocks_tsv_chunks(blocks))
+            QtWidgets.QApplication.clipboard().setText(output.getvalue())
+        except (TypeError, ValueError, OSError) as exc:
+            QtWidgets.QMessageBox.critical(self, "Copy All", str(exc))
+            return False
         return True
 
     @QtCore.Slot(str)
@@ -1691,14 +1745,24 @@ class MainWindow(QtWidgets.QMainWindow):
 
     @QtCore.Slot(str)
     def _on_results_changed(self, tab_id: str) -> None:
-        """Ignore late results from a replaced/closed semantic tab."""
+        """Ignore stale or coalesced result publications at the shell owner."""
 
         target = str(tab_id)
+        if self._rendering_workspace:
+            return
         try:
             self._workspace.plot_for_tab(target)
         except (KeyError, RuntimeError):
             return
         if target in self._slider_apply_refreshing:
+            return
+        row_guard = self._current_row_refreshing.get(target)
+        if row_guard is not None:
+            if row_guard is self._project_session.document:
+                return
+            # A queued callback from the superseded document must not render
+            # the replacement; a subsequent gesture may capture it normally.
+            self._current_row_refreshing.pop(target, None)
             return
         self._render_results_for_tab(target)
 
@@ -2579,6 +2643,52 @@ class MainWindow(QtWidgets.QMainWindow):
         self._set_tab_run_enabled(target, self._run_admitted(target))
         self._refresh_project_state()
 
+    @QtCore.Slot(str)
+    def _on_current_row_changed(self, tab_id: str) -> None:
+        """Refresh one current-row gesture through one guarded owner path."""
+
+        target = str(tab_id)
+        if self._rendering_workspace:
+            return
+        bundle = self._tab_surfaces.get(target)
+        if bundle is None:
+            return
+        document = self._project_session.document
+        row_guard = self._current_row_refreshing.get(target)
+        if row_guard is document:
+            return
+        # A prior guard may belong to a superseded document whose queued
+        # callback has not run yet.  Overwrite it so the next gesture captures
+        # the replacement; the old callback remains coalesced against this
+        # target until the one-turn guard releases.
+        self._current_row_refreshing[target] = document
+        try:
+            # InitialConditionsTableActions has already admitted the distinct
+            # current-row presentation intent.  Refresh Slider targets first,
+            # then compose/draw results once, and finally publish shell state.
+            bundle.slider_binding.render()
+            self._render_results_for_tab(target)
+            self._refresh_project_state()
+        finally:
+            QtCore.QTimer.singleShot(
+                0,
+                lambda captured=target, captured_document=document: self._release_current_row_refresh(
+                    captured,
+                    captured_document,
+                ),
+            )
+
+    def _release_current_row_refresh(
+        self,
+        tab_id: str,
+        document: ProjectDocument,
+    ) -> None:
+        """Release a one-turn current-row guard only for its document."""
+
+        target = str(tab_id)
+        if self._current_row_refreshing.get(target) is document:
+            self._current_row_refreshing.pop(target, None)
+
     def _on_invalid_initial_state_changed(self, tab_id: str) -> None:
         """Apply invalid-cell admission immediately to the owning tab."""
 
@@ -2718,100 +2828,87 @@ class MainWindow(QtWidgets.QMainWindow):
             refresh_after_admission=refresh_after_admission,
         ) is not None
 
-    def _assess_exact_correction(
-        self,
-        document: ProjectDocument,
-        tab_id: str,
+    @staticmethod
+    def _format_exact_correction_assessment(
+        assessment: ExactCorrectionAssessment,
         visible_source: MechanismAuthoringSource | None = None,
-    ) -> _ExactCorrectionAssessment:
-        """Assess visible text through the core symbolic correction owner."""
+    ) -> str:
+        """Render core-owned correction facts without recomputing science."""
 
-        tab = document.tab(str(tab_id))
-        visible = visible_source or tab.mechanism_source
-        if not visible.reactions_text.strip():
-            return _ExactCorrectionAssessment(None, "")
-        try:
-            prepared = prepare_dsl_request_set(
-                visible.reactions_text,
-                initials={},
-                units=UnitsModel(temperature_K=tab.scientific_settings.temperature),
-            )
-            detached_tab = replace(
-                tab,
-                mechanism_source=visible,
-                prepared_dsl=prepared,
-            )
-            detached_document = document.replace_tab(detached_tab)
-            composition = compose_exact_constraints(
-                prepared.accepted_mechanism_for_structure(),
-                parameter_algebra_spec=prepared.parameter_algebra_spec_for_execution(),
-            )
-        except (TypeError, ValueError, OverflowError) as exc:
-            return _ExactCorrectionAssessment(
-                None,
-                "",
-                blocked=True,
-                reason=str(exc),
-            )
-        invalid = tuple(
-            item
-            for item in composition.constraints
-            if item.status in {"unsatisfied", "unresolved"}
-        )
-        if not invalid:
-            return _ExactCorrectionAssessment(None, "")
-        try:
-            proposal = reconcile_tab_exact_correction(detached_document, tab_id)
-        except (TypeError, ValueError, KeyError) as exc:
-            proposal = None
-            correction_reason = str(exc)
+        sections: list[str] = []
+        composition = assessment.composition
+        if composition is None:
+            sections.append("Composition:\nUnavailable")
         else:
-            correction_reason = ""
-        if isinstance(proposal, MechanismSourceCollision):
-            proposal = proposal.replacement
-        if proposal is not None and not isinstance(
-            proposal, MechanismSourceReconciliation
-        ):
-            proposal = None
-            correction_reason = "The exact correction proposal was not admitted."
-        details = [
-            "Unsatisfied exact constraints:",
-            *(
-                f"- {item.cycle_id}: {item.expression}"
-                + (f" ({item.reason})" if item.reason else "")
-                for item in invalid
+            constraints = tuple(composition.constraints)
+            lines = ["Composition:"]
+            if constraints:
+                lines.extend(
+                    f"- {item.cycle_id}: {item.status}: {item.expression}"
+                    + (f" ({item.reason})" if item.reason else "")
+                    for item in constraints
+                )
+            else:
+                lines.append("- No exact constraints.")
+            sections.append("\n".join(lines))
+
+        target_lines = ["Targets:"]
+        if assessment.targets:
+            target_lines.extend(
+                f"- {target.name} ({target.family})"
+                + (" [editable]" if target.eligible else " [unavailable]")
+                for target in assessment.targets
+            )
+        else:
+            target_lines.append("- None.")
+        sections.append("\n".join(target_lines))
+
+        plan = assessment.plan
+        plan_lines = [
+            "Plan:",
+            f"- Available: {'yes' if plan.available else 'no'}",
+            f"- Basis: {', '.join(plan.basis) if plan.basis else 'none'}",
+            "- Assignments: "
+            + (
+                ", ".join(
+                    f"{cycle} → {target}"
+                    for cycle, target in plan.assignments
+                )
+                if plan.assignments
+                else "none"
             ),
         ]
-        if proposal is not None:
-            corrected = proposal.proposed_document.tab(tab_id).mechanism_source
-            details.extend(
-                [
-                    "\nExact symbolic source correction:",
-                    "Before:",
-                    visible.reactions_text,
-                    "After:",
-                    corrected.reactions_text,
-                ]
-            )
+        if plan.reason:
+            plan_lines.append(f"- Reason: {plan.reason}")
+        sections.append("\n".join(plan_lines))
+
+        if assessment.proposal is not None:
+            proposal_lines = ["Proposal:", "- Source-backed exact edit is available."]
+            if visible_source is not None:
+                proposal_lines.extend(
+                    (
+                        "Before:",
+                        visible_source.reactions_text,
+                        "After:",
+                        assessment.proposal.reactions_text,
+                    )
+                )
+            sections.append("\n".join(proposal_lines))
         else:
-            details.extend(
-                [
-                    "\nNo valid source-backed correction basis is available.",
-                    f"Correction reason: {correction_reason or 'unknown'}",
-                    "Manual source editing is required.",
-                ]
+            sections.append("Proposal:\n- None.")
+        if assessment.unavailable_reason:
+            sections.append(
+                "Unavailable reason:\n" + assessment.unavailable_reason
             )
-        return _ExactCorrectionAssessment(
-            proposal,
-            "\n".join(details),
-        )
+        return "\n\n".join(sections)
 
     def _show_exact_correction_review(
         self,
         *,
-        assessment: _ExactCorrectionAssessment,
+        assessment: ExactCorrectionAssessment,
+        visible_source: MechanismAuthoringSource | None = None,
         action: str,
-    ) -> MechanismSourceReconciliation | None:
+    ) -> MechanismAuthoringSource | None:
         """Show one local synchronous Accept/Cancel source review."""
 
         dialog = QtWidgets.QDialog(self)
@@ -2825,7 +2922,9 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         details = QtWidgets.QPlainTextEdit(dialog)
         details.setReadOnly(True)
-        details.setPlainText(assessment.summary or assessment.reason or "")
+        details.setPlainText(
+            self._format_exact_correction_assessment(assessment, visible_source)
+        )
         layout.addWidget(details)
         buttons = QtWidgets.QDialogButtonBox(dialog)
         buttons.addButton(QtWidgets.QDialogButtonBox.StandardButton.Cancel)
@@ -2844,24 +2943,28 @@ class MainWindow(QtWidgets.QMainWindow):
     ) -> ProjectDocument | None:
         """Review all incoming tabs once before controller publication."""
 
-        corrections: list[tuple[MechanismTabDocument, _ExactCorrectionAssessment]] = []
+        corrections: list[tuple[MechanismTabDocument, ExactCorrectionAssessment]] = []
         blocked = False
         sections: list[str] = []
         for tab in document.tabs:
-            assessment = self._assess_exact_correction(
+            assessment = assess_tab_exact_correction(
                 document,
                 tab.tab_id,
                 tab.mechanism_source,
             )
-            if assessment.blocked:
+            summary = self._format_exact_correction_assessment(
+                assessment,
+                tab.mechanism_source,
+            )
+            if assessment.unavailable_reason:
                 blocked = True
-                section = assessment.reason or "Source admission could not be assessed."
-            elif assessment.summary:
+                section = summary
+            elif assessment.requires_correction:
                 if assessment.proposal is None:
                     blocked = True
                 else:
                     corrections.append((tab, assessment))
-                section = assessment.summary
+                section = summary
             else:
                 section = "No exact correction is required for this tab."
             sections.append(f"Tab {tab.tab_id}\n{'=' * 40}\n{section}")
@@ -2904,13 +3007,10 @@ class MainWindow(QtWidgets.QMainWindow):
             for tab, assessment in corrections:
                 if assessment.proposal is None:
                     return None
-                corrected = assessment.proposal.proposed_document.tab(
-                    tab.tab_id
-                ).mechanism_source
                 proposal = reconcile_tab_mechanism_source(
                     candidate,
                     tab.tab_id,
-                    corrected,
+                    assessment.proposal,
                 )
                 if isinstance(proposal, MechanismSourceCollision):
                     proposal = proposal.replacement
@@ -2937,26 +3037,33 @@ class MainWindow(QtWidgets.QMainWindow):
     ) -> MechanismSourceReconciliation | None:
         """Assess exact source facts, then perform ordinary reconciliation."""
 
-        assessment = self._assess_exact_correction(document, tab_id, visible)
-        if assessment.blocked:
+        assessment = assess_tab_exact_correction(document, tab_id, visible)
+        if assessment.unavailable_reason:
             if report_error:
                 QtWidgets.QMessageBox.warning(
                     self,
                     "Invalid Reactions",
-                    f"{description} cannot continue:\n\n{assessment.reason}",
+                    f"{description} cannot continue:\n\n"
+                    f"{assessment.unavailable_reason}",
                 )
             return None
-        if assessment.summary:
+        source_for_admission = visible
+        if assessment.requires_correction:
             corrected_proposal = self._show_exact_correction_review(
                 assessment=assessment,
+                visible_source=visible,
                 action=description,
             )
             if corrected_proposal is None:
                 return None
-            return corrected_proposal
+            source_for_admission = corrected_proposal
 
         try:
-            proposal = reconcile_tab_mechanism_source(document, tab_id, visible)
+            proposal = reconcile_tab_mechanism_source(
+                document,
+                tab_id,
+                source_for_admission,
+            )
         except AuthoredSourceError as exc:
             if report_error:
                 QtWidgets.QMessageBox.warning(
@@ -3106,21 +3213,30 @@ class MainWindow(QtWidgets.QMainWindow):
         if not isinstance(source, MechanismAuthoringSource):
             raise TypeError("template source must be MechanismAuthoringSource.")
         document = self._project_session.document
-        assessment = self._assess_exact_correction(document, str(source_tab_id), source)
-        if assessment.blocked:
-            raise AuthoredSourceError(assessment.reason or "Template source is invalid.")
-        if not assessment.summary:
-            reconcile_tab_mechanism_source(document, str(source_tab_id), source)
-            return source
-        corrected_proposal = self._show_exact_correction_review(
-            assessment=assessment,
-            action="Apply mechanism template",
+        target = str(source_tab_id)
+        assessment = assess_tab_exact_correction(document, target, source)
+        if assessment.unavailable_reason:
+            raise AuthoredSourceError(assessment.unavailable_reason)
+        source_for_admission = source
+        if assessment.requires_correction:
+            corrected_proposal = self._show_exact_correction_review(
+                assessment=assessment,
+                visible_source=source,
+                action="Apply mechanism template",
+            )
+            if corrected_proposal is None:
+                raise AuthoredSourceError("Template source correction was cancelled.")
+            source_for_admission = corrected_proposal
+        reconciliation = reconcile_tab_mechanism_source(
+            document,
+            target,
+            source_for_admission,
         )
-        if corrected_proposal is None:
-            raise AuthoredSourceError("Template source correction was cancelled.")
-        return corrected_proposal.proposed_document.tab(
-            str(source_tab_id)
-        ).mechanism_source
+        if isinstance(reconciliation, MechanismSourceCollision):
+            reconciliation = reconciliation.replacement
+        if not isinstance(reconciliation, MechanismSourceReconciliation):
+            raise TypeError("Template source reconciliation returned an invalid result.")
+        return reconciliation.proposed_document.tab(target).mechanism_source
 
     # ------------------------------------------------------------------
     # Dataset intents
@@ -4425,9 +4541,8 @@ class MainWindow(QtWidgets.QMainWindow):
         if render_input is None or not render_input.blocks:
             self.set_status_text("No result data is available to export.")
             return False
-        blocks = render_input.blocks
         try:
-            validate_xlsx_export(blocks)
+            blocks = select_copy_blocks(render_input)
         except (TypeError, ValueError) as exc:
             self.set_status_text(str(exc))
             QtWidgets.QMessageBox.critical(
@@ -4720,7 +4835,6 @@ class MainWindow(QtWidgets.QMainWindow):
                     raise ValueError("restore rejected stored geometry")
             except (EOFError, RuntimeError, TypeError, ValueError) as exc:
                 logger.warning("Ignoring invalid persisted window geometry: %s", exc)
-                settings.remove("window/geometry")
         dock_state = settings.value("window/dock_state")
         if dock_state is not None:
             self._workspace.restore_dock_layout(dock_state)
@@ -4744,16 +4858,14 @@ class MainWindow(QtWidgets.QMainWindow):
             self._dark_mode_action.setChecked(self._theme_manager.applied_dark_mode)
 
     def _save_settings(self) -> bool:
-        """Persist physical shell state without routing it through Config."""
+        """Persist physical shell state through Config's restore contract."""
 
-        settings = QtCore.QSettings()
         try:
-            settings.setValue("window/is_maximized", self.isMaximized())
-            settings.setValue("window/geometry", self.saveGeometry())
-            settings.setValue("window/dock_state", self._workspace.saveState())
-            settings.sync()
-            if settings.status() != QtCore.QSettings.Status.NoError:
-                raise RuntimeError("Could not persist layout preferences.")
+            self.config_controller.persist_window_layout(
+                self.isMaximized(),
+                self.saveGeometry(),
+                self._workspace.saveState(),
+            )
         except Exception as exc:
             logger.warning("Could not save layout preferences: %s", exc)
             self.set_status_text(
@@ -4916,7 +5028,7 @@ class MainWindow(QtWidgets.QMainWindow):
             export_ready = False
             if render_input is not None:
                 try:
-                    validate_xlsx_export(render_input.blocks)
+                    select_copy_blocks(render_input)
                 except (TypeError, ValueError):
                     pass
                 else:

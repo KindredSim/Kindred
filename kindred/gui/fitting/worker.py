@@ -451,9 +451,9 @@ class FitCandidate:
             for dataset_id in self.result.dataset_params
         }
         result_dataset_ids = set(self.result.dataset_params)
-        simulation_dataset_ids = set(
-            self.result.simulation_results_by_dataset
-        )
+        simulation_dataset_ids = {
+            info.dataset_id for info in self.result.dataset_info
+        }
         if (
             scalar_dataset_ids != expected_dataset_ids
             or result_dataset_ids != expected_dataset_ids
@@ -1258,11 +1258,13 @@ def _curves_from_terminal(
     mapped_by_id = {
         item.dataset_id: item for item in request.origin.mapped_datasets
     }
+    info_by_id = {info.dataset_id: info for info in result.dataset_info}
     curves: list[FitCurveDataset] = []
     for dataset_id in (item.dataset_id for item in request.datasets if item.included):
         local = effective_local[dataset_id]
         mapped = mapped_by_id[dataset_id]
-        simulation = result.simulation_results_by_dataset[dataset_id]
+        info = info_by_id[dataset_id]
+        simulation = info.simulation_result
         if not isinstance(simulation, SimulationResultValue):
             raise TypeError("Terminal curve source requires canonical simulations.")
         selected = selected_observations(mapped, local)
@@ -1306,11 +1308,11 @@ def _curves_from_terminal(
             (name, tuple(int(value) for value in simulation.discontinuity_ids))
             for name in model_names
         )
-        objective_model_series = result.model_series[dataset_id]
+        objective_model_series = info.model_series
         objective_model_x = tuple(
             (
                 name,
-                tuple(float(value) for value in result.model_x_by_species[dataset_id][name]),
+                tuple(float(value) for value in info.model_x_by_species[name]),
             )
             for name in objective_model_series
         )
@@ -1321,38 +1323,38 @@ def _curves_from_terminal(
         objective_model_segment_ids = tuple(
             (
                 name,
-                tuple(int(value) for value in result.model_segment_ids[dataset_id][name]),
+                tuple(int(value) for value in info.model_segment_ids[name]),
             )
             for name in objective_model_series
         )
         objective_model_segment_keys = tuple(
             (
                 name,
-                tuple(str(value) for value in result.model_segment_keys[dataset_id][name]),
+                tuple(str(value) for value in info.model_segment_keys[name]),
             )
             for name in objective_model_series
         )
         objective_model_discontinuity_ids = tuple(
             (
                 name,
-                tuple(int(value) for value in result.model_discontinuity_ids[dataset_id][name]),
+                tuple(int(value) for value in info.model_discontinuity_ids[name]),
             )
             for name in objective_model_series
         )
         objective_selection_provenance = tuple(
-            (name, tuple(result.model_selection_provenance[dataset_id][name]))
+            (name, tuple(info.model_selection_provenance[name]))
             for name in objective_model_series
         )
         objective_observation_ids = tuple(
-            (name, tuple(result.model_observation_ids[dataset_id][name]))
+            (name, tuple(info.model_observation_ids[name]))
             for name in objective_model_series
         )
         objective_raw_columns = tuple(
-            (name, tuple(result.model_raw_columns[dataset_id][name]))
+            (name, tuple(info.model_raw_columns[name]))
             for name in objective_model_series
         )
         objective_source_rows = tuple(
-            (name, tuple(result.model_source_rows[dataset_id][name]))
+            (name, tuple(info.model_source_rows[name]))
             for name in objective_model_series
         )
         curves.append(
@@ -1509,8 +1511,8 @@ def _assemble_fit_terminal(
             "Fit terminal prepared identities do not exactly match the included datasets."
         )
     solver_provenance_by_dataset = {
-        str(dataset_id or "").strip(): simulation.solver_provenance
-        for dataset_id, simulation in result.simulation_results_by_dataset.items()
+        str(info.dataset_id or "").strip(): info.simulation_result.solver_provenance
+        for info in result.dataset_info
     }
     if (
         any(not dataset_id for dataset_id in solver_provenance_by_dataset)

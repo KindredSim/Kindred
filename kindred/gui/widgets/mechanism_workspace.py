@@ -121,9 +121,6 @@ class ProjectWorkspaceWidget(QtWidgets.QMainWindow):
         except KeyError as exc:
             raise KeyError(f"Unknown project dock identity: {identity!r}.") from exc
 
-    def dock_shells(self) -> tuple[QtWidgets.QDockWidget, ...]:
-        return tuple(self._dock_by_identity.values())
-
     def apply_default_dock_arrangement(self) -> None:
         """Restore the root-owned default six-dock arrangement."""
 

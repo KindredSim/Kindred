@@ -456,6 +456,7 @@ class ProjectController(QtCore.QObject):
         document: ProjectDocument,
         presentation: WorkspacePresentationState,
         *,
+        baseline_document: ProjectDocument,
         path: str | None,
         expected_token: ProjectContentToken,
         action: str,
@@ -466,7 +467,7 @@ class ProjectController(QtCore.QObject):
             document,
             presentation,
             path=path,
-            baseline_document=document,
+            baseline_document=baseline_document,
             expected_token=expected_token,
         )
         if token is None:
@@ -505,6 +506,7 @@ class ProjectController(QtCore.QObject):
         return self._replace_project(
             document,
             presentation,
+            baseline_document=document,
             path=None,
             expected_token=disposition.content_token,
             action="New Project",
@@ -579,6 +581,7 @@ class ProjectController(QtCore.QObject):
         return self._replace_project(
             admitted_document,
             presentation,
+            baseline_document=archive.document,
             path=absolute_path,
             expected_token=disposition.content_token,
             action="Open Project",

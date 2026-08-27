@@ -32,10 +32,12 @@ from kindred.core.simulator.dsl_derivation import (
     insert_scalar_source_declarations,
 )
 from kindred.core.simulator.exact_constraint_composition import (
+    ExactConstraintComposition,
     compose_exact_constraints,
 )
 from kindred.core.simulator.parameter_namespace import build_namespace_from_mechanism
 from kindred.core.simulator.source_correction import (
+    CorrectionPlan,
     CorrectionTarget,
     build_correction_expressions,
     plan_correction_basis,
@@ -65,6 +67,7 @@ __all__ = [
     "InitialConditionSet",
     "MechanismSourceCollision",
     "MechanismSourceReconciliation",
+    "ExactCorrectionAssessment",
     "MechanismTabDocument",
     "ProjectDocument",
     "SimulationExecutionSettings",
@@ -93,7 +96,8 @@ __all__ = [
     "canonical_species_names",
     "retained_tab_mechanism_source",
     "reconcile_tab_mechanism_source",
-    "reconcile_tab_exact_correction",
+    "assess_tab_exact_correction",
+    "prepare_tab_scientific_settings",
     "resolve_simulation_execution_settings",
     "validate_fit_defaults",
     "validate_project_document",
@@ -765,6 +769,36 @@ class ProjectDocument:
 class MechanismSourceReconciliation:
     proposed_document: ProjectDocument
     materialized_set_ids: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class ExactCorrectionAssessment:
+    """One pure symbolic assessment of visible authored mechanism source.
+
+    The assessment carries the complete typed composition and source-backed
+    target roster used by the global correction planner.  ``proposal`` is
+    source text only: it is deliberately not parsed or admitted here.  The
+    ordinary source reconciliation boundary must admit an accepted proposal
+    before any document publication.
+    """
+
+    composition: ExactConstraintComposition | None
+    targets: tuple[CorrectionTarget, ...]
+    plan: CorrectionPlan
+    proposal: MechanismAuthoringSource | None = None
+    unavailable_reason: str | None = None
+
+    @property
+    def requires_correction(self) -> bool:
+        """Whether the composed symbolic constraints include an invalid row."""
+
+        return bool(
+            self.composition is not None
+            and any(
+                item.status in {"unsatisfied", "unresolved"}
+                for item in self.composition.constraints
+            )
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -1551,35 +1585,134 @@ def _admitted_correction_targets(
     return tuple(admitted)
 
 
-def reconcile_tab_exact_correction(
+def assess_tab_exact_correction(
     document: ProjectDocument,
     tab_id: str,
-) -> MechanismSourceReconciliation | MechanismSourceCollision:
-    """Plan, insert, and ordinarily re-admit one exact source correction."""
+    visible_source: MechanismAuthoringSource | None = None,
+) -> ExactCorrectionAssessment:
+    """Assess visible source and derive one exact correction proposal.
+
+    Parsing, symbolic composition, target derivation, and global basis
+    planning happen once in this core owner.  The returned proposal retains
+    authored source bytes but is not an admitted document; callers must pass
+    it through :func:`reconcile_tab_mechanism_source` before publication.
+    Invalid visible source and unavailable correction bases are represented
+    by ``unavailable_reason`` so a modal caller can synchronously stop without
+    creating a second scientific route.
+    """
 
     if not isinstance(document, ProjectDocument):
         raise TypeError("document must be a ProjectDocument.")
     tab = document.tab(tab_id)
-    prepared = tab.prepared_dsl
-    if prepared is None:
-        raise ValueError(f"Mechanism tab {tab.tab_id!r} has no admitted prepared DSL.")
-    composition = compose_exact_constraints(
-        prepared.accepted_mechanism_for_structure(),
-        parameter_algebra_spec=prepared.parameter_algebra_spec_for_execution(),
-    )
-    admitted_targets = _admitted_correction_targets(tab, composition)
-    plan = plan_correction_basis(composition, admitted_targets)
+    source = tab.mechanism_source if visible_source is None else visible_source
+    if not isinstance(source, MechanismAuthoringSource):
+        raise TypeError("visible_source must be MechanismAuthoringSource.")
+
+    empty_composition = ExactConstraintComposition(())
+    if not source.reactions_text.strip():
+        return ExactCorrectionAssessment(
+            composition=empty_composition,
+            targets=(),
+            plan=CorrectionPlan((), (), True),
+        )
+
+    try:
+        # This is intentionally parse-only.  Mandatory exact validation is
+        # owned by ordinary source admission after a user accepts a proposal.
+        prepared = prepare_dsl_request_set(
+            source.reactions_text,
+            initials={},
+            units=UnitsModel(
+                temperature_K=tab.scientific_settings.temperature,
+            ),
+        )
+        detached_tab = replace(
+            tab,
+            mechanism_source=source,
+            prepared_dsl=prepared,
+        )
+        composition = compose_exact_constraints(
+            prepared.accepted_mechanism_for_structure(),
+            parameter_algebra_spec=prepared.parameter_algebra_spec_for_execution(),
+        )
+        targets = _admitted_correction_targets(detached_tab, composition)
+        plan = plan_correction_basis(composition, targets)
+    except (AuthoredSourceError, DSLError, TypeError, ValueError, OverflowError) as exc:
+        return ExactCorrectionAssessment(
+            composition=None,
+            targets=(),
+            plan=CorrectionPlan((), (), False, str(exc)),
+            unavailable_reason=str(exc),
+        )
+
+    if not any(
+        item.status in {"unsatisfied", "unresolved"}
+        for item in composition.constraints
+    ):
+        return ExactCorrectionAssessment(
+            composition=composition,
+            targets=targets,
+            plan=plan,
+        )
     if not plan.available:
-        details = "; ".join(f"{item.cycle_id}: {item.expression}" for item in composition.constraints)
-        raise ValueError(f"{plan.reason or 'Exact correction is unavailable.'}; constraints: {details}")
-    updated_source = insert_scalar_source_declarations(
-        tab.mechanism_source.reactions_text,
-        build_correction_expressions(composition, plan),
+        return ExactCorrectionAssessment(
+            composition=composition,
+            targets=targets,
+            plan=plan,
+            unavailable_reason=plan.reason or "Exact correction is unavailable.",
+        )
+
+    try:
+        corrections = build_correction_expressions(composition, plan)
+        updated_source = insert_scalar_source_declarations(
+            source.reactions_text,
+            corrections,
+        )
+        proposal = MechanismAuthoringSource.from_parts(
+            reactions_text=updated_source,
+        )
+    except (TypeError, ValueError, OverflowError) as exc:
+        return ExactCorrectionAssessment(
+            composition=composition,
+            targets=targets,
+            plan=plan,
+            unavailable_reason=str(exc),
+        )
+    return ExactCorrectionAssessment(
+        composition=composition,
+        targets=targets,
+        plan=plan,
+        proposal=proposal,
     )
-    return reconcile_tab_mechanism_source(
-        document,
-        tab_id,
-        MechanismAuthoringSource.from_parts(reactions_text=updated_source),
+
+
+def prepare_tab_scientific_settings(
+    tab: MechanismTabDocument,
+    settings: TabScientificSettings,
+) -> MechanismTabDocument:
+    """Build one detached tab with settings-matching prepared science.
+
+    A temperature change is a genuine source-admission event and reparses
+    the unchanged canonical source under the new nominal temperature.  Other
+    scientific setting changes retain the already admitted prepared object by
+    identity.  No state is published here; the registry owns the one
+    ``replace_document`` publication and its single result fence.
+    """
+
+    if not isinstance(tab, MechanismTabDocument):
+        raise TypeError("tab must be a MechanismTabDocument.")
+    validate_tab_scientific_settings(settings)
+    if settings.temperature == tab.scientific_settings.temperature:
+        prepared = tab.prepared_dsl
+    else:
+        prepared = _prepare_authored_source_admission(
+            tab.mechanism_source,
+            settings,
+        )
+    return replace(
+        tab,
+        scientific_settings=settings,
+        prepared_dsl=prepared,
     )
 
 
