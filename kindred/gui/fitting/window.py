@@ -916,7 +916,7 @@ class FittingWindow(QtWidgets.QDialog):
 
     def render_results_summary(
         self,
-        summary: Mapping[str, object],
+        summary: str,
     ) -> None:
         self._run_results_tab.render_results_summary(
             summary,

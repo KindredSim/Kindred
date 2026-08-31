@@ -192,7 +192,6 @@ def _stopped_bootstrap_result(
         failed_replicates=0,
         interval_construction="equal-tailed percentile",
         intervals={},
-        replicate_roster=(),
         diagnostic=cause,
         provenance={
             "settlement": settlement,
@@ -618,7 +617,6 @@ def fit_global(
                     failed_replicates=0,
                     interval_construction="equal-tailed percentile",
                     intervals={},
-                    replicate_roster=(),
                     provenance={
                         "settlement": "not_started_after_stop",
                         "primary_fit_preserved": True,
@@ -679,7 +677,6 @@ def fit_global(
                         failed_replicates=0,
                         interval_construction="equal-tailed percentile",
                         intervals={},
-                        replicate_roster=(),
                         provenance={
                             "settlement": "stopped",
                             "primary_fit_preserved": True,
@@ -724,7 +721,6 @@ def fit_global(
                         failed_replicates=0,
                         interval_construction="equal-tailed percentile",
                         intervals={},
-                        replicate_roster=(),
                         diagnostic=factual_cause_from_exception(
                             exc,
                             domain="fit",

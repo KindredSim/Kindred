@@ -15,16 +15,13 @@ def compute_windowed_indices(
     t_min: float,
     t_max: float,
 ) -> np.ndarray:
-    """Return original-array indices in chronological order inside the window."""
+    """Return eligible original-array indices in physical source order."""
     values = np.asarray(t, dtype=float).reshape(-1)
     if values.size == 0:
         return np.asarray([], dtype=int)
     mask = (values >= float(t_min)) & (values <= float(t_max))
     eligible = np.nonzero(mask)[0].astype(int, copy=False)
-    if eligible.size < 2:
-        return eligible
-    chronological = np.argsort(values[eligible], kind="stable")
-    return eligible[chronological]
+    return eligible
 
 
 def compute_sampled_indices(

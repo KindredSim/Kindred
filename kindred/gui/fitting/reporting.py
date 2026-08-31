@@ -23,7 +23,7 @@ from kindred.gui.fitting.worker import FitCandidate
 
 __all__ = [
     "fit_bound_state",
-    "fit_candidate_summary",
+    "fit_candidate_report_text",
     "fit_candidate_tracker",
 ]
 
@@ -206,27 +206,8 @@ def _profile_endpoint(endpoint: object) -> dict[str, object]:
         "bracket_width": endpoint.bracket_width,
         "reason": endpoint.reason,
         "last_evaluation_index": endpoint.last_evaluation_index,
-    }
-
-
-def _profile_evaluation(evaluation: object) -> dict[str, object]:
-    return {
-        "evaluation_index": evaluation.evaluation_index,
-        "stage": evaluation.stage,
-        "discovery_step": evaluation.discovery_step,
-        "refinement_step": evaluation.refinement_step,
-        "fixed_optimizer_value": evaluation.fixed_optimizer_value,
-        "fixed_value": evaluation.fixed_value,
-        "status": evaluation.status,
-        "warm_start_policy": evaluation.warm_start_policy,
-        "optimizer_converged": evaluation.optimizer_converged,
-        "optimized_parameters": _plain(evaluation.optimized_parameters),
-        "weighted_residual_sse": evaluation.weighted_residual_sse,
-        "likelihood_ratio": evaluation.likelihood_ratio,
-        "likelihood_ratio_raw": evaluation.likelihood_ratio_raw,
-        "likelihood_ratio_log": evaluation.likelihood_ratio_log,
-        "likelihood_ratio_outcome": evaluation.likelihood_ratio_outcome,
-        "failure": _plain(evaluation.failure),
+        "evaluation_count": endpoint.evaluation_count,
+        "failure": _plain(endpoint.failure),
     }
 
 
@@ -243,8 +224,6 @@ def _profile_interval(coordinate: object, interval: object) -> dict[str, object]
         "upper_outcome": interval.upper_outcome,
         "optimizer_bounds": list(interval.optimizer_bounds),
         "physical_bounds": list(interval.physical_bounds),
-        "lower_evaluations": [_profile_evaluation(item) for item in interval.lower_evaluations],
-        "upper_evaluations": [_profile_evaluation(item) for item in interval.upper_evaluations],
         "lower_resolution": _profile_endpoint(interval.lower_resolution),
         "upper_resolution": _profile_endpoint(interval.upper_resolution),
         "endpoint_messages": _plain(interval.endpoint_messages),
@@ -296,18 +275,7 @@ def _bootstrap_interval(coordinate: object, interval: object) -> dict[str, objec
         "lower": interval.lower,
         "upper": interval.upper,
         "construction": interval.construction,
-        "successful_values": list(interval.successful_values),
         "reason": interval.reason,
-    }
-
-
-def _bootstrap_replicate(replicate: object) -> dict[str, object]:
-    return {
-        "replicate": replicate.replicate,
-        "status": replicate.status,
-        "parameters": _plain(replicate.parameters),
-        "failure": _plain(replicate.failure),
-        "unavailable": _plain(replicate.unavailable),
     }
 
 
@@ -321,7 +289,6 @@ def _bootstrap_data(candidate: FitCandidate) -> dict[str, object]:
             "unavailable_reason": None if not requested else "Residual Bootstrap result is unavailable.",
             "diagnostic": None,
             "intervals": [],
-            "replicate_roster": [],
         }
     return {
         "requested": True,
@@ -351,16 +318,21 @@ def _bootstrap_data(candidate: FitCandidate) -> dict[str, object]:
             _bootstrap_interval(coordinate, interval)
             for coordinate, interval in sorted(result.intervals.items(), key=lambda item: str(item[0]))
         ],
-        "replicate_roster": [_bootstrap_replicate(item) for item in result.replicate_roster],
         "primary_fit_diagnostic": _plain(result.primary_fit_diagnostic),
         "primary_fit_unavailable": _plain(result.primary_fit_unavailable),
+        "first_failed_replicate_diagnostic": _plain(result.first_failed_replicate_diagnostic),
+        "first_failed_replicate_unavailable": _plain(result.first_failed_replicate_unavailable),
         "unavailable_reason": result.unavailable_reason,
         "diagnostic": _plain(result.diagnostic),
         "provenance": _plain(result.provenance),
     }
 
 
-def _dataset_metrics(candidate: FitCandidate) -> list[dict[str, object]]:
+def _dataset_metrics(
+    candidate: FitCandidate,
+    *,
+    include_x: bool = True,
+) -> list[dict[str, object]]:
     result = candidate.result
     request_datasets = {item.dataset_id: item for item in candidate.request.datasets}
     mapped_datasets = {item.dataset_id: item for item in candidate.origin.mapped_datasets}
@@ -369,41 +341,7 @@ def _dataset_metrics(candidate: FitCandidate) -> list[dict[str, object]]:
     for info in sorted(result.dataset_info, key=lambda item: str(item.dataset_id)):
         dataset_id = str(info.dataset_id)
         x_projection = info.x_projection
-        x_payload: dict[str, object] = {
-            "point_count": int(info.x_point_count),
-            "weighted_sse": _metric(info.x_weighted_residual_sse),
-            "weighted_mse": _metric(info.x_weighted_residual_mse),
-            "weighted_rmse": _metric(info.x_weighted_rmse),
-            "weighted_mae": _metric(info.x_weighted_mae),
-            "delta_x": _plain(info.x_delta_x),
-            "match_kinds": _plain(info.x_match_kinds),
-            "sample_kinds": _plain(info.x_sample_kinds),
-            "source_rows": _plain(info.x_source_rows),
-        }
-        if x_projection is not None:
-            x_payload.update({
-                "selected_time": _plain(x_projection.selected_time),
-                "selected_model_x": _plain(x_projection.selected_model_x),
-                "segment_ids": _plain(x_projection.segment_ids),
-                "segment_keys": _plain(x_projection.segment_keys),
-                "discontinuity_ids": _plain(x_projection.discontinuity_ids),
-            })
-        setup_dataset = request_datasets.get(dataset_id)
-        mapped_dataset = mapped_datasets.get(dataset_id)
-        if setup_dataset is not None and mapped_dataset is not None and setup_dataset.parametric is not None:
-            x_name = setup_dataset.parametric.x_name
-            raw_id = next((raw_id for raw_id, target in setup_dataset.observation_targets if target == x_name), None)
-            source = next((observation for observation in mapped_dataset.observations if observation.raw_observation_id == raw_id), None)
-            if source is not None:
-                by_row = {int(row): (float(time), float(value)) for row, time, value in zip(source.source_rows, source.t, source.y, strict=True)}
-                selected_rows = tuple(int(row) for row in info.x_source_rows)
-                x_payload.update({
-                    "name": x_name,
-                    "raw_observation_id": source.raw_observation_id,
-                    "raw_column": source.raw_column,
-                    "selected_values": [by_row[row][1] for row in selected_rows],
-                })
-        metrics.append({
+        metric: dict[str, object] = {
             "dataset_id": dataset_id,
             "dataset_display_name": display_names.get(dataset_id, dataset_id),
             "weighted_sse": _metric(info.weighted_residual_sse),
@@ -413,8 +351,44 @@ def _dataset_metrics(candidate: FitCandidate) -> list[dict[str, object]]:
             "r_squared_by_series": {str(name): _metric(value) for name, value in sorted(info.r_squared_by_series.items())},
             "effective_weight": float(info.weight),
             "n_points": int(info.n_points),
-            "x": x_payload,
-        })
+            "x": None,
+        }
+        if include_x:
+            x_payload: dict[str, object] = {
+                "point_count": 0 if x_projection is None else int(x_projection.size),
+                "weighted_sse": _metric(info.x_weighted_residual_sse),
+                "weighted_mse": _metric(info.x_weighted_residual_mse),
+                "weighted_rmse": _metric(info.x_weighted_rmse),
+                "weighted_mae": _metric(info.x_weighted_mae),
+                "delta_x": _plain(() if x_projection is None else x_projection.delta_x),
+                "match_kinds": _plain(() if x_projection is None else x_projection.match_kinds),
+                "sample_kinds": _plain(() if x_projection is None else x_projection.sample_kinds),
+                "source_rows": _plain(() if x_projection is None else x_projection.source_rows),
+            }
+            if x_projection is not None:
+                x_payload.update({
+                    "selected_time": _plain(x_projection.selected_time),
+                    "selected_model_x": _plain(x_projection.selected_model_x),
+                    "segment_ids": _plain(x_projection.segment_ids),
+                    "segment_keys": _plain(x_projection.segment_keys),
+                    "discontinuity_ids": _plain(x_projection.discontinuity_ids),
+                })
+            setup_dataset = request_datasets.get(dataset_id)
+            mapped_dataset = mapped_datasets.get(dataset_id)
+            if setup_dataset is not None and mapped_dataset is not None and setup_dataset.parametric is not None:
+                x_name = setup_dataset.parametric.x_name
+                raw_id = next((raw_id for raw_id, target in setup_dataset.observation_targets if target == x_name), None)
+                source = next((observation for observation in mapped_dataset.observations if observation.raw_observation_id == raw_id), None)
+                if source is not None and x_projection is not None:
+                    by_row = {int(row): (float(time), float(value)) for row, time, value in zip(source.source_rows, source.t, source.y, strict=True)}
+                    x_payload.update({
+                        "name": x_name,
+                        "raw_observation_id": source.raw_observation_id,
+                        "raw_column": source.raw_column,
+                        "selected_values": [by_row[row][1] for row in x_projection.source_rows],
+                    })
+            metric["x"] = x_payload
+        metrics.append(metric)
     return metrics
 
 
@@ -745,23 +719,6 @@ def _known_input_context(candidate: FitCandidate) -> dict[str, object]:
         "known_condition_source": "captured Fit origin scientific settings"}
 
 
-def _presentation_data(candidate: FitCandidate) -> dict[str, object]:
-    """Build only row/text facts required by a synchronous presentation."""
-
-    result = candidate.result
-    shared, individual = _estimate_rows(candidate)
-    metrics = _dataset_metrics(candidate)
-    return {"status": result.status, "message": str(result.message),
-        "optimizer_converged": bool(result.optimizer_converged), "diagnostic_only": bool(result.diagnostic_only),
-        "optimizer_diagnostic": None if result.optimizer_diagnostic is None else _plain(result.optimizer_diagnostic),
-        "primary_model": str(result.primary_model), "weighted_sse": _metric(result.weighted_residual_sse),
-        "weighted_mse": _metric(result.weighted_residual_mse), "shared_estimates": shared,
-        "per_dataset_estimates": individual, "initial_estimates": _initial_rows(candidate),
-        "aggregates": _aggregate_rows(individual), "metrics_by_dataset": metrics,
-        "weighting": _weighting_data(candidate, metrics), "profile_likelihood": _profile_data(candidate),
-        "residual_bootstrap": _bootstrap_data(candidate), "known_input_context": _known_input_context(candidate)}
-
-
 def _estimate_line(row: Mapping[str, object]) -> str:
     percentage = _display(row.get("percentage_change")) + "%" if row.get("percentage_change") is not None else str(row.get("percentage_unavailable_reason") or "unavailable")
     location = f" [{row['dataset_id']}]" if row.get("dataset_id") is not None else ""
@@ -785,6 +742,10 @@ def _profile_lines(profile: Mapping[str, object]) -> tuple[str, ...]:
     for interval in profile.get("intervals", ()):
         if isinstance(interval, Mapping):
             lines.append(f"  {interval.get('display_name', interval.get('coordinate'))}: status={interval.get('status')}; lower={_display(interval.get('lower'))}; upper={_display(interval.get('upper'))}; lower outcome={interval.get('lower_outcome')}; upper outcome={interval.get('upper_outcome')}")
+            for side in ("lower_resolution", "upper_resolution"):
+                endpoint = interval.get(side)
+                if isinstance(endpoint, Mapping) and endpoint.get("failure"):
+                    lines.append(f"    {side.removesuffix('_resolution')} failure: {_display(endpoint['failure'])}")
     return tuple(lines)
 
 
@@ -799,6 +760,16 @@ def _bootstrap_lines(bootstrap: Mapping[str, object]) -> tuple[str, ...]:
         lines.append(f"  unavailable reason: {bootstrap['unavailable_reason']}")
     if bootstrap.get("diagnostic"):
         lines.append(f"  diagnostic: {_display(bootstrap['diagnostic'])}")
+    if bootstrap.get("first_failed_replicate_diagnostic"):
+        lines.append(
+            "  first failed replicate diagnostic: "
+            f"{_display(bootstrap['first_failed_replicate_diagnostic'])}"
+        )
+    if bootstrap.get("first_failed_replicate_unavailable"):
+        lines.append(
+            "  first failed replicate unavailable: "
+            f"{_display(bootstrap['first_failed_replicate_unavailable'])}"
+        )
     for interval in bootstrap.get("intervals", ()):
         if isinstance(interval, Mapping):
             lines.append(f"  {interval.get('display_name', interval.get('coordinate'))}: status={interval.get('status')}; lower={_display(interval.get('lower'))}; upper={_display(interval.get('upper'))}; reason={_display(interval.get('reason'))}")
@@ -861,18 +832,19 @@ def _metric_text(value: object) -> str:
 
 
 def fit_candidate_tracker(candidate: FitCandidate) -> tuple[str, tuple[str, ...], tuple[str, ...]]:
-    """Return terminal tracker text and row/tool-tip leaves synchronously."""
+    """Return the small terminal tracker projection synchronously."""
 
-    data = _presentation_data(candidate)
+    result = candidate.result
+    shared, individual = _estimate_rows(candidate)
+    initial = _initial_rows(candidate)
+    metrics = _dataset_metrics(candidate, include_x=False)
     lines: list[str] = []
     tooltips: list[str] = []
-    for key in ("shared_estimates", "per_dataset_estimates", "initial_estimates"):
-        for row in data.get(key, ()):
-            if isinstance(row, Mapping):
-                lines.append(_estimate_line(row))
-                if row.get("name"):
-                    tooltips.append(f"Parameter ID: {row['name']}")
-    for row in data.get("metrics_by_dataset", ()):
+    for row in (*shared, *individual, *initial):
+        lines.append(_estimate_line(row))
+        if row.get("name"):
+            tooltips.append(f"Parameter ID: {row['name']}")
+    for row in metrics:
         if isinstance(row, Mapping):
             label = row.get("dataset_display_name", row.get("dataset_id"))
             lines.append(
@@ -881,31 +853,36 @@ def fit_candidate_tracker(candidate: FitCandidate) -> tuple[str, tuple[str, ...]
                 f"RMSE={_metric_text(row.get('weighted_rmse'))}"
             )
     return (
-        f"Fit status {data.get('status', 'unavailable')} | Weighted objective SSQ "
-        f"{_metric_text(data.get('weighted_sse'))}",
+        f"Fit status {result.status} | Weighted objective SSQ "
+        f"{_metric_text(_metric(result.weighted_residual_sse))}",
         tuple(lines),
         tuple(tooltips),
     )
 
 
-def fit_candidate_summary(candidate: FitCandidate) -> dict[str, object]:
-    """Return one call-local human-readable Results Summary mapping."""
+def fit_candidate_report_text(candidate: FitCandidate) -> str:
+    """Return one synchronous human-readable Summary string."""
 
-    data = _presentation_data(candidate)
-    return {
-        "status": data["status"],
-        "optimizer_converged": data["optimizer_converged"],
-        "diagnostic_only": data["diagnostic_only"],
-        "weighted_sse": data["weighted_sse"],
-        "weighted_mse": data["weighted_mse"],
-        "shared_estimates": data["shared_estimates"],
-        "per_dataset_estimates": data["per_dataset_estimates"],
-        "initial_estimates": data["initial_estimates"],
-        "aggregates": data["aggregates"],
-        "metrics_by_dataset": data["metrics_by_dataset"],
-        "weighting": data["weighting"],
-        "profile_likelihood": data["profile_likelihood"],
-        "residual_bootstrap": data["residual_bootstrap"],
-        "known_input_context": data["known_input_context"],
-        "report_text": _render_report(data),
+    result = candidate.result
+    shared, individual = _estimate_rows(candidate)
+    metrics = _dataset_metrics(candidate)
+    data = {
+        "status": result.status,
+        "message": str(result.message),
+        "optimizer_converged": bool(result.optimizer_converged),
+        "diagnostic_only": bool(result.diagnostic_only),
+        "optimizer_diagnostic": _plain(result.optimizer_diagnostic),
+        "primary_model": str(result.primary_model),
+        "weighted_sse": _metric(result.weighted_residual_sse),
+        "weighted_mse": _metric(result.weighted_residual_mse),
+        "shared_estimates": shared,
+        "per_dataset_estimates": individual,
+        "initial_estimates": _initial_rows(candidate),
+        "aggregates": _aggregate_rows(individual),
+        "metrics_by_dataset": metrics,
+        "weighting": _weighting_data(candidate, metrics),
+        "profile_likelihood": _profile_data(candidate),
+        "residual_bootstrap": _bootstrap_data(candidate),
+        "known_input_context": _known_input_context(candidate),
     }
+    return _render_report(data)

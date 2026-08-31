@@ -44,7 +44,9 @@ class ProjectTransientState:
 
     reactions_draft: bool = False
     notes_draft: bool = False
+    initial_condition_drafts: bool = False
     invalid_initial_conditions: bool = False
+    run_defaults_drafts: bool = False
     slider_drafts: bool = False
     active_run_or_preview: bool = False
     active_fit: bool = False
@@ -55,7 +57,9 @@ class ProjectTransientState:
         for field_name in (
             "reactions_draft",
             "notes_draft",
+            "initial_condition_drafts",
             "invalid_initial_conditions",
+            "run_defaults_drafts",
             "slider_drafts",
             "active_run_or_preview",
             "active_fit",
@@ -70,6 +74,8 @@ class ProjectTransientState:
         return bool(
             self.reactions_draft
             or self.notes_draft
+            or self.initial_condition_drafts
+            or self.run_defaults_drafts
             or self.invalid_initial_conditions
         )
 
@@ -152,7 +158,7 @@ class ProjectController(QtCore.QObject):
             [ProjectDocument],
             ProjectDocument | None,
         ],
-        settle_execution_candidate: Callable[
+        capture_visible_tab_inputs: Callable[
             [ProjectContentToken],
             ProjectContentToken | None,
         ],
@@ -188,7 +194,7 @@ class ProjectController(QtCore.QObject):
         self._xlsx_exports = xlsx_exports
         self._set_status_text = set_status_text
         self._admit_incoming_document = admit_incoming_document
-        self._settle_execution_candidate = settle_execution_candidate
+        self._capture_visible_tab_inputs = capture_visible_tab_inputs
         self._prepare_before_save = prepare_before_save
         self._commit_saved_document = commit_saved_document
         self._inspect_transient_state = inspect_transient_state
@@ -265,6 +271,10 @@ class ProjectController(QtCore.QObject):
             action=action,
         ):
             return None
+        captured_token = self._capture_visible_tab_inputs(expected_token)
+        if captured_token is None:
+            return None
+        expected_token = captured_token
         request = _ProjectDispositionRequest(
             action=str(action),
             archive_dirty=self._session.is_dirty(
@@ -322,8 +332,12 @@ class ProjectController(QtCore.QObject):
             details.append("Visible Reactions text has not yet been accepted.")
         if transient.notes_draft:
             details.append("Visible Notes text has not yet been saved.")
+        if transient.initial_condition_drafts:
+            details.append("Visible Initial Conditions edits have not yet been saved.")
         if transient.invalid_initial_conditions:
             details.append("One or more visible initial-condition cells are invalid.")
+        if transient.run_defaults_drafts:
+            details.append("Visible Run-default edits have not yet been saved.")
         if transient.slider_drafts:
             details.append("Slider Preview drafts are not project content.")
         if transient.active_run_or_preview:
@@ -346,6 +360,8 @@ class ProjectController(QtCore.QObject):
             request.archive_dirty
             or transient.notes_draft
             or transient.reactions_draft
+            or transient.initial_condition_drafts
+            or transient.run_defaults_drafts
         ):
             if request.application_close:
                 if transient.has_active_work:
@@ -379,6 +395,10 @@ class ProjectController(QtCore.QObject):
             discard_parts.append("Reactions Edit")
         if transient.notes_draft:
             discard_parts.append("Notes Edit")
+        if transient.initial_condition_drafts:
+            discard_parts.append("Initial Conditions Edit")
+        if transient.run_defaults_drafts:
+            discard_parts.append("Run Defaults Edit")
         if transient.invalid_initial_conditions:
             discard_parts.append("Invalid Cell Edit(s)")
         if transient.slider_drafts:
@@ -517,6 +537,12 @@ class ProjectController(QtCore.QObject):
 
         if not idle_admitted or self._reject_mutation_during_close("Open Project"):
             return False
+        # Capture the visible editor before opening the native picker.  The
+        # picker may take focus away; canceling it must leave this exact draft
+        # owned by the current project with no publication or disposition.
+        expected_token = self._session.capture_content_token()
+        if self._capture_visible_tab_inputs(expected_token) is None:
+            return False
         path, _selected_filter = QtWidgets.QFileDialog.getOpenFileName(
             self._parent_widget,
             "Open Project",
@@ -591,7 +617,7 @@ class ProjectController(QtCore.QObject):
         if self._reject_mutation_during_close("Save Project"):
             return False
         entry_token = self._session.capture_content_token()
-        operative_token = self._settle_execution_candidate(entry_token)
+        operative_token = self._capture_visible_tab_inputs(entry_token)
         if operative_token is None:
             return False
         prepared = self._prepared_save_document(
@@ -614,7 +640,7 @@ class ProjectController(QtCore.QObject):
         if self._reject_mutation_during_close("Save Project As"):
             return False
         entry_token = self._session.capture_content_token()
-        operative_token = self._settle_execution_candidate(entry_token)
+        operative_token = self._capture_visible_tab_inputs(entry_token)
         if operative_token is None:
             return False
         prepared = self._prepared_save_document(
@@ -646,9 +672,6 @@ class ProjectController(QtCore.QObject):
             action="Save Project",
         ):
             return None
-        operative_token = self._settle_execution_candidate(expected_token)
-        if operative_token is None:
-            return None
         prepared = self._prepared_save_document(
             discard_invalid_initial_conditions=(
                 discard_invalid_initial_conditions
@@ -660,7 +683,7 @@ class ProjectController(QtCore.QObject):
         return self._save_prepared_document(
             candidate,
             materialized_by_tab,
-            expected_token=operative_token,
+            expected_token=expected_token,
             choose_destination=self._session.current_path is None,
         )
 
@@ -829,12 +852,9 @@ class ProjectController(QtCore.QObject):
             self.notify_close_progress()
             return self._close_authorization is not None
         entry_token = self._session.capture_content_token()
-        operative_token = self._settle_execution_candidate(entry_token)
-        if operative_token is None:
-            return False
         disposition = self._resolve_disposition(
             "closing Kindred",
-            expected_token=operative_token,
+            expected_token=entry_token,
             application_close=True,
         )
         if disposition is None:

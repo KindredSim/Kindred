@@ -59,15 +59,16 @@ class _ProjectedRow:
     set_id: str
     name: str
     canonical_values: tuple[tuple[str, float], ...]
+    raw_values: tuple[tuple[str, str], ...]
     invalid_raw_values: tuple[tuple[str, str], ...]
     custom_run_settings: bool
     plot_requested: bool
     slider_pinned: bool
 
     def display_value(self, species: str) -> str:
-        invalid = dict(self.invalid_raw_values)
-        if species in invalid:
-            return invalid[species]
+        raw = dict(self.raw_values)
+        if species in raw:
+            return raw[species]
         # Preserve the exact accepted binary64 value in the editable
         # projection; formatting must never become a scientific write.
         return repr(float(dict(self.canonical_values).get(species, 0.0)))
@@ -119,10 +120,16 @@ class BatchInitialConditionsTableModel(QtCore.QAbstractTableModel):
                 set_id=initial_set.set_id,
                 name=initial_set.name,
                 canonical_values=initial_set.values,
+                raw_values=tuple(
+                    (str(species_name), str(raw))
+                    for species_name, raw
+                    in invalid.get(initial_set.set_id, {}).items()
+                ),
                 invalid_raw_values=tuple(
                     (str(species_name), str(raw))
                     for species_name, raw
                     in invalid.get(initial_set.set_id, {}).items()
+                    if not self._is_valid_concentration(raw, str(species_name))
                 ),
                 custom_run_settings=initial_set.set_id in override_ids,
                 plot_requested=initial_set.set_id in plot_ids,
@@ -196,6 +203,17 @@ class BatchInitialConditionsTableModel(QtCore.QAbstractTableModel):
         if 0 <= row_i < len(self._rows):
             return self._rows[row_i].set_id
         return None
+
+    @staticmethod
+    def _is_valid_concentration(raw: object, species: str) -> bool:
+        try:
+            validate_concentration(
+                float(raw),
+                field=f"initial concentration for {species}",
+            )
+        except (TypeError, ValueError, OverflowError):
+            return False
+        return True
 
     def set_id_for_live_index(self, index: QtCore.QModelIndex) -> str | None:
         if (
@@ -579,9 +597,10 @@ class BatchInitialConditionsTableView(QtWidgets.QTableView):
         """Synchronously submit the active delegate before an action boundary."""
         editor = QtWidgets.QApplication.focusWidget()
         if editor is not None and editor is not self and self.isAncestorOf(editor):
-            editor.clearFocus()
-            QtWidgets.QApplication.processEvents(
-                QtCore.QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents
+            self.commitData(editor)
+            self.closeEditor(
+                editor,
+                QtWidgets.QAbstractItemDelegate.EndEditHint.NoHint,
             )
 
     def keyPressEvent(self, event: QtGui.QKeyEvent) -> None:
@@ -649,7 +668,7 @@ class InitialConditionsTableActions(QtCore.QObject):
     """Own IC intents for one immutable mechanism-tab identity."""
 
     errorRaised = QtCore.Signal(str)
-    invalidDraftStateChanged = QtCore.Signal(str, bool)
+    draftStateChanged = QtCore.Signal(str, bool)
     selectedRunSetIdsChanged = QtCore.Signal(object)
 
     def __init__(
@@ -707,7 +726,7 @@ class InitialConditionsTableActions(QtCore.QObject):
                     ),
                 )
                 for set_id, values
-                in runtime.invalid_initial_text_by_set_id.items()
+                in runtime.initial_text_by_set_id.items()
             ),
             species_names=tuple(self._species_for_tab(tab)),
             selected_run_set_ids=tuple(runtime.selected_run_set_ids),
@@ -768,6 +787,51 @@ class InitialConditionsTableActions(QtCore.QObject):
     def render(self) -> None:
         self.apply_render_projection(self.prepare_render())
 
+    def capture_active_editor(
+        self,
+        *,
+        expected_token: ProjectContentToken,
+    ) -> ProjectContentToken | None:
+        """Capture the focused numeric editor without committing its value."""
+
+        if not isinstance(expected_token, ProjectContentToken):
+            raise TypeError("expected_token must be ProjectContentToken.")
+        if not self._registry.capture_content_token() == expected_token:
+            return None
+        editor = QtWidgets.QApplication.focusWidget()
+        if not isinstance(editor, QtWidgets.QLineEdit):
+            return expected_token
+        if editor is self._table or not self._table.isAncestorOf(editor):
+            return expected_token
+        center = editor.mapTo(self._table.viewport(), editor.rect().center())
+        index = self._table.indexAt(center)
+        if not index.isValid() or index.model() is not self._model:
+            return expected_token
+        species = self._model.species_for_column(index.column())
+        set_id = self._model.set_id_for_live_index(index)
+        if species is None or set_id is None:
+            return expected_token
+        runtime = self._registry.tab_runtime(self._tab_id)
+        runtime.initial_text_by_set_id.setdefault(set_id, {})[species] = editor.text()
+        # closeEditor(NoHint) does not emit commitData.  Block the native
+        # signals while focus leaves so editingFinished cannot publish a
+        # second path during a modal disposition boundary.
+        blockers = (
+            QtCore.QSignalBlocker(editor),
+            QtCore.QSignalBlocker(self._table),
+            QtCore.QSignalBlocker(self._model),
+        )
+        try:
+            self._table.closeEditor(
+                editor,
+                QtWidgets.QAbstractItemDelegate.EndEditHint.NoHint,
+            )
+        finally:
+            del blockers
+        self.render()
+        self.draftStateChanged.emit(self._tab_id, runtime.has_dirty_drafts)
+        return expected_token
+
     def settle_active_editor(
         self,
         *,
@@ -822,9 +886,10 @@ class InitialConditionsTableActions(QtCore.QObject):
         allowed = None if set_ids is None else {str(item) for item in set_ids}
         return tuple(
             (set_id, species, raw)
-            for set_id, values in runtime.invalid_initial_text_by_set_id.items()
+            for set_id, values in runtime.initial_text_by_set_id.items()
             if allowed is None or set_id in allowed
             for species, raw in values.items()
+            if not self._valid_raw(raw, species)
         )
 
     def has_invalid_cells(self, set_ids: Iterable[str] | None = None) -> bool:
@@ -843,13 +908,16 @@ class InitialConditionsTableActions(QtCore.QObject):
             value = None
         invalid = self._registry.tab_runtime(
             self._tab_id
-        ).invalid_initial_text_by_set_id
+        ).initial_text_by_set_id
         if value is None:
             if invalid.get(set_id, {}).get(species) == str(raw_text):
                 return False
             invalid.setdefault(set_id, {})[species] = str(raw_text)
             self.render()
-            self.invalidDraftStateChanged.emit(self._tab_id, True)
+            self.draftStateChanged.emit(
+                self._tab_id,
+                self._registry.tab_runtime(self._tab_id).has_dirty_drafts,
+            )
             return False
 
         values = dict(initial_set.values)
@@ -870,9 +938,9 @@ class InitialConditionsTableActions(QtCore.QObject):
         invalid_cleared = self._clear_invalid_value(set_id, species)
         self.render()
         if invalid_cleared:
-            self.invalidDraftStateChanged.emit(
+            self.draftStateChanged.emit(
                 self._tab_id,
-                self.has_invalid_cells(),
+                self._registry.tab_runtime(self._tab_id).has_dirty_drafts,
             )
         return changed
 
@@ -948,9 +1016,9 @@ class InitialConditionsTableActions(QtCore.QObject):
             )
         self.render()
         if invalid_cleared:
-            self.invalidDraftStateChanged.emit(
+            self.draftStateChanged.emit(
                 self._tab_id,
-                self.has_invalid_cells(),
+                self._registry.tab_runtime(self._tab_id).has_dirty_drafts,
             )
         return bool(result is not None or invalid_cleared)
 
@@ -1231,13 +1299,24 @@ class InitialConditionsTableActions(QtCore.QObject):
     def _clear_invalid_value(self, set_id: str, species: str) -> bool:
         invalid = self._registry.tab_runtime(
             self._tab_id
-        ).invalid_initial_text_by_set_id
+        ).initial_text_by_set_id
         set_values = invalid.get(set_id)
         if set_values is None or species not in set_values:
             return False
         set_values.pop(species, None)
         if not set_values:
             invalid.pop(set_id, None)
+        return True
+
+    @staticmethod
+    def _valid_raw(raw: object, species: str) -> bool:
+        try:
+            validate_concentration(
+                float(raw),
+                field=f"initial concentration for {species}",
+            )
+        except (TypeError, ValueError, OverflowError):
+            return False
         return True
 
     def _reject(self, message: str) -> bool:

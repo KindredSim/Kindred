@@ -41,6 +41,7 @@ from kindred.gui.interactive_preview import (
     InteractivePreviewTarget,
 )
 from kindred.gui.parameter_enumeration import enumerate_parameter_coordinates
+from kindred.gui.workspace_tab_registry import ScientificDocumentDelta
 
 __all__ = [
     "ExplicitRunCapture",
@@ -343,7 +344,7 @@ class SimulationJobOwner(QtCore.QObject):
     status_changed = QtCore.Signal(str)
     results_changed = QtCore.Signal(str)
     run_dispatched = QtCore.Signal(str, object)
-    interactive_result_ready = QtCore.Signal(str, str, int, object, object)
+    interactive_result_ready = QtCore.Signal(str, str, object, object)
 
     def __init__(self, *, gate: ComputationGate, repository_for_tab: RepositoryResolver,
                  user_parallel_maximum: RawUserParallelMaximum | None = None,
@@ -366,9 +367,6 @@ class SimulationJobOwner(QtCore.QObject):
         self._terminal_state: str | None = None
         self._pending_preview: PreviewCapture | None = None
         self._pending_interactive_preview: InteractivePreviewRequest | None = None
-        self._document_delta_fence_active = False
-        self._document_delta_fenced_targets: set[tuple[str, str]] = set()
-        self._document_delta_fenced_operations: set[int] = set()
         self._close_fenced = False
         self._last_close_settled = True
         self._gate.changed.connect(self._on_gate_changed)
@@ -487,145 +485,97 @@ class SimulationJobOwner(QtCore.QObject):
         self._pending_preview = None
         return True
 
-    def _begin_document_delta_fence(self) -> None:
-        """Enter the registry's computation-only precommit phase."""
+    def fence_document_delta(self, delta: ScientificDocumentDelta) -> bool:
+        """Fence computation for one admitted document delta.
 
-        self._document_delta_fence_active = True
-        self._document_delta_fenced_targets.clear()
-        self._document_delta_fenced_operations.clear()
+        The registry owns repository mutation and physical presentation
+        retirement.  This operation only retires computation intent and
+        records removed identities on the operation being cancelled.
+        """
 
-    def _end_document_delta_fence(self) -> None:
-        """Leave the registry's computation-only precommit phase."""
-
-        self._document_delta_fence_active = False
-        self._document_delta_fenced_targets.clear()
-        self._document_delta_fenced_operations.clear()
-
-    def _fence_document_targets(
-        self,
-        tab_id: str,
-        set_ids: Iterable[str],
-    ) -> bool:
-        """Cancel affected work without touching result repositories."""
-
-        tab = _required_id(tab_id, "tab_id")
-        ids = tuple(
-            dict.fromkeys(_required_id(value, "set_id") for value in set_ids)
-        )
-        fresh_ids = tuple(
-            set_id
-            for set_id in ids
-            if (tab, set_id) not in self._document_delta_fenced_targets
-        )
-        if not fresh_ids:
-            return False
-        if self._document_delta_fence_active:
-            self._document_delta_fenced_targets.update(
-                (tab, set_id) for set_id in fresh_ids
-            )
+        targets_by_tab: dict[str, list[str]] = {}
+        removed_by_tab: dict[str, set[str]] = {}
+        for entries, removed in (
+            (delta.affected_targets_by_tab, False),
+            (delta.removed_targets_by_tab, True),
+        ):
+            for tab_id, set_ids in entries:
+                tab = str(tab_id)
+                targets = targets_by_tab.setdefault(tab, [])
+                removed_ids = removed_by_tab.setdefault(tab, set())
+                for set_id in set_ids:
+                    value = str(set_id)
+                    if value not in targets:
+                        targets.append(value)
+                    if removed:
+                        removed_ids.add(value)
 
         changed = False
+        state_changed = False
         operation = self._operation
-        if operation is not None and str(operation["tab_id"]) == tab:
-            operation_key = id(operation)
-            operation_already_fenced = (
-                operation_key in self._document_delta_fenced_operations
+        if operation is not None:
+            operation_tab = str(operation["tab_id"])
+            recorded_removed = operation.setdefault(
+                "removed_target_ids", set()
             )
-            operation_ids = tuple(
+            new_removed = set(removed_by_tab.get(operation_tab, ())) - recorded_removed
+            if new_removed:
+                recorded_removed.update(new_removed)
+                changed = True
+            affected = tuple(targets_by_tab.get(operation_tab, ()))
+            operation_ids = {
                 target.set_id for target in operation["targets"]
+            }
+            operation_affected = tuple(
+                set_id for set_id in affected if set_id in operation_ids
             )
-            affected = tuple(
-                set_id for set_id in fresh_ids if set_id in operation_ids
-            )
-            if affected:
+            if operation_affected:
                 if (
                     str(operation["kind"]) == "preview"
                     and str(operation["purpose"]) == "interactive-preview"
                 ):
-                    retired_ids = set(operation.get("retired_ids", set()))
-                    interactive_ids = tuple(
-                        set_id
-                        for set_id in affected
-                        if set_id not in retired_ids
+                    retired_ids = operation.setdefault("retired_ids", set())
+                    new_retired = set(operation_affected) - retired_ids
+                    if new_retired:
+                        retired_ids.update(new_retired)
+                        changed = True
+
+                if not operation.get("document_delta_cancelled", False):
+                    self._retire_if_affected(
+                        operation_tab,
+                        operation_affected,
                     )
-                    if interactive_ids:
-                        if not operation_already_fenced:
-                            self._retire_if_affected(tab, interactive_ids)
-                            self._document_delta_fenced_operations.add(
-                                operation_key
-                            )
-                        operation.setdefault("retired_ids", set()).update(
-                            interactive_ids
-                        )
-                        changed = True
-                elif not operation_already_fenced:
-                    if self._retire_if_affected(tab, affected):
-                        self._document_delta_fenced_operations.add(
-                            operation_key
-                        )
-                        changed = True
+                    operation["document_delta_cancelled"] = True
+                    changed = True
+                    state_changed = True
 
-        pending_preview = self._pending_preview
-        if (
-            pending_preview is not None
-            and pending_preview.tab_id == tab
-            and any(
-                set_id in {target.set_id for target in pending_preview.targets}
-                for set_id in fresh_ids
-            )
-        ):
-            self._pending_preview = None
-            changed = True
-
-        pending_interactive = self._pending_interactive_preview
-        if (
-            pending_interactive is not None
-            and pending_interactive.tab_id == tab
-        ):
-            pending_ids = tuple(
-                set_id
-                for set_id in pending_interactive.target_set_ids
-                if set_id in fresh_ids
-            )
-            if pending_ids:
+        for tab, target_ids in targets_by_tab.items():
+            affected_ids = set(target_ids)
+            pending_preview = self._pending_preview
+            if (
+                pending_preview is not None
+                and pending_preview.tab_id == tab
+                and affected_ids.intersection(
+                    target.set_id for target in pending_preview.targets
+                )
+            ):
+                self._pending_preview = None
+                changed = True
+                state_changed = True
+            pending_interactive = self._pending_interactive_preview
+            if (
+                pending_interactive is not None
+                and pending_interactive.tab_id == tab
+                and affected_ids.intersection(pending_interactive.target_set_ids)
+            ):
                 self._pending_interactive_preview = None
                 changed = True
-        if changed:
+                state_changed = True
+
+        if state_changed:
             self.state_changed.emit()
             self._emit_settled_if_complete()
         return changed
-
-    def deauthorize_targets(
-        self,
-        tab_id: str,
-        set_ids: Iterable[str],
-        *,
-        preserve_reference: bool = False,
-    ) -> None:
-        ids = tuple(dict.fromkeys(_required_id(value, "set_id") for value in set_ids))
-        if not ids:
-            return
-        if self._document_delta_fence_active:
-            self._fence_document_targets(tab_id, ids)
-            return
-        operation = self._operation
-        if not (
-            operation is not None
-            and str(operation["kind"]) == "preview"
-            and str(operation["purpose"]) == "interactive-preview"
-        ):
-            self._retire_if_affected(tab_id, ids)
-        interactive_changed = self.retire_interactive_preview(tab_id, ids)
-        pending_changed = self._retire_pending_preview_if_affected(tab_id, ids)
-        repository = self._repository(tab_id)
-        if preserve_reference:
-            repository.deauthorize_sets(ids, preserve_reference=True)
-        else:
-            repository.deauthorize_sets(ids)
-        self.results_changed.emit(str(tab_id))
-        if pending_changed and not interactive_changed:
-            self.state_changed.emit()
-            self._emit_settled_if_complete()
 
     def reconcile_canonical_targets(self, tab_id: str, set_ids: Iterable[str], *, clear_pending: bool = True) -> tuple[tuple[str, bool], ...]:
         ids = tuple(dict.fromkeys(_required_id(value, "set_id") for value in set_ids))
@@ -714,6 +664,9 @@ class SimulationJobOwner(QtCore.QObject):
             "outcomes": [],
             "details": [],
             "payload": payload,
+            "removed_target_ids": set(),
+            "retired_ids": set(),
+            "document_delta_cancelled": False,
         }
         self._worker = worker
         self._cancel_event = event
@@ -999,11 +952,6 @@ class SimulationJobOwner(QtCore.QObject):
         ids = None if set_ids is None else tuple(
             dict.fromkeys(_required_id(value, "set_id") for value in set_ids)
         )
-        if self._document_delta_fence_active:
-            return self._fence_document_targets(
-                tab,
-                () if ids is None else ids,
-            )
         interactive_changed = self.retire_interactive_preview(tab, ids)
         changed = interactive_changed
         restore_ids: tuple[str, ...] = ()
@@ -1128,7 +1076,6 @@ class SimulationJobOwner(QtCore.QObject):
             self.interactive_result_ready.emit(
                 str(operation["tab_id"]),
                 target.set_id,
-                int(generation),
                 request,
                 outcome.result,
             )
@@ -1155,7 +1102,16 @@ class SimulationJobOwner(QtCore.QObject):
             return
         operation = self._operation
         prerequisite_failed = False
+        operation_kind = "run"
+        operation_purpose: str | None = None
+        operation_tab_id: str | None = None
+        reconcile_target_ids: tuple[str, ...] = ()
+        interactive_successor_ids: tuple[str, ...] = ()
         if operation is not None:
+            operation_kind = str(operation["kind"])
+            operation_purpose = str(operation["purpose"])
+            operation_tab_id = str(operation["tab_id"])
+            removed_ids = set(operation.get("removed_target_ids", set()))
             seen = {id(target) for target, _state in operation["outcomes"]}
             for target in operation["targets"]:
                 if id(target) not in seen:
@@ -1167,45 +1123,42 @@ class SimulationJobOwner(QtCore.QObject):
             discarded = states.count("discarded")
             total = succeeded + failed + cancelled + discarded
             state = "success" if total and succeeded == total else "failure" if total and failed == total else "cancelled" if total and cancelled == total else "partial"
-            summary = SimulationTerminalSummary(str(operation["kind"]), state, succeeded, failed, cancelled, discarded, tuple(operation["details"]))
-            if operation["purpose"] == "preview-prerequisite":
+            summary = SimulationTerminalSummary(operation_kind, state, succeeded, failed, cancelled, discarded, tuple(operation["details"]))
+            target_ids = tuple(
+                target.set_id
+                for target in operation["targets"]
+                if target.set_id not in removed_ids
+            )
+            target_ids = tuple(dict.fromkeys(target_ids))
+            if operation_purpose == "preview-prerequisite":
                 prerequisite_failed = summary.state != "success"
                 if prerequisite_failed:
                     pending = self._pending_preview
                     self._pending_preview = None
-                    target_ids = tuple(
-                        target.set_id for target in operation["targets"]
-                    )
                     if pending is not None and pending.tab_id == str(operation["tab_id"]):
                         target_ids = tuple(
                             dict.fromkeys(
-                                (*target_ids, *(target.set_id for target in pending.targets))
+                                (
+                                    *target_ids,
+                                    *(
+                                        target.set_id
+                                        for target in pending.targets
+                                        if target.set_id not in removed_ids
+                                    ),
+                                )
                             )
                         )
-                    self.reconcile_canonical_targets(
-                        str(operation["tab_id"]),
-                        target_ids,
-                    )
+                    reconcile_target_ids = target_ids
 
             elif (
-                str(operation["kind"]) == "preview"
-                and str(operation["purpose"]) != "interactive-preview"
+                operation_kind == "preview"
+                and operation_purpose != "interactive-preview"
                 and summary.state != "success"
             ):
-                target_ids = tuple(
-                    target.set_id for target in operation["targets"]
-                )
-                if operation["purpose"] == "interactive-successor":
-                    repository = self._repository(str(operation["tab_id"]))
-                    for set_id in target_ids:
-                        repository.clear_preview(set_id, clear_reference=False)
-                    self.results_changed.emit(str(operation["tab_id"]))
+                if operation_purpose == "interactive-successor":
+                    interactive_successor_ids = target_ids
                 else:
-                    self.reconcile_canonical_targets(
-                        str(operation["tab_id"]),
-                        target_ids,
-                        clear_pending=False,
-                    )
+                    reconcile_target_ids = target_ids
         else:
             summary = SimulationTerminalSummary("run", "cancelled", 0, 0, 1, 0)
         worker = self._worker
@@ -1218,8 +1171,14 @@ class SimulationJobOwner(QtCore.QObject):
         if worker is not None:
             worker.deleteLater()
         self.state_changed.emit()
+        self._emit_settled_if_complete()
         if not self._close_fenced:
             if prerequisite_failed:
+                if operation_tab_id is not None and reconcile_target_ids:
+                    self.reconcile_canonical_targets(
+                        operation_tab_id,
+                        reconcile_target_ids,
+                    )
                 self.status_changed.emit(
                     "Preview baseline "
                     + ("cancelled" if summary.state == "cancelled" else "failed")
@@ -1230,12 +1189,12 @@ class SimulationJobOwner(QtCore.QObject):
                         0,
                         self._redrive_pending_interactive_preview,
                     )
-            elif operation is not None and operation["purpose"] == "preview-prerequisite":
+            elif operation_purpose == "preview-prerequisite":
                 self.status_changed.emit(
                     "Preview baseline ready; starting exact Preview."
                 )
                 QtCore.QTimer.singleShot(0, self._redrive_pending_preview)
-            elif operation is not None and operation["purpose"] == "interactive-preview":
+            elif operation_purpose == "interactive-preview":
                 self.status_changed.emit(self._terminal_status(summary))
                 if self._pending_interactive_preview is not None:
                     QtCore.QTimer.singleShot(
@@ -1245,6 +1204,21 @@ class SimulationJobOwner(QtCore.QObject):
                 elif self._pending_preview is not None:
                     QtCore.QTimer.singleShot(0, self._redrive_pending_preview)
             else:
+                if (
+                    operation_tab_id is not None
+                    and operation_purpose == "interactive-successor"
+                    and interactive_successor_ids
+                ):
+                    repository = self._repository(operation_tab_id)
+                    for set_id in interactive_successor_ids:
+                        repository.clear_preview(set_id, clear_reference=False)
+                    self.results_changed.emit(operation_tab_id)
+                elif operation_tab_id is not None and reconcile_target_ids:
+                    self.reconcile_canonical_targets(
+                        operation_tab_id,
+                        reconcile_target_ids,
+                        clear_pending=False,
+                    )
                 self.status_changed.emit(self._terminal_status(summary))
                 if self._pending_preview is not None:
                     QtCore.QTimer.singleShot(0, self._redrive_pending_preview)
@@ -1253,8 +1227,6 @@ class SimulationJobOwner(QtCore.QObject):
                         0,
                         self._redrive_pending_interactive_preview,
                     )
-        self._emit_settled_if_complete()
-
     @staticmethod
     def _terminal_status(summary: SimulationTerminalSummary) -> str:
         return f"{summary.kind.capitalize()} {summary.state}: {summary.succeeded} succeeded, {summary.failed} failed, {summary.cancelled} cancelled, {summary.discarded} discarded."

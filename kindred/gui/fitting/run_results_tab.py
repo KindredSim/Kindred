@@ -62,7 +62,7 @@ class ResultsSummaryDialog(QtWidgets.QDialog):
 
     def __init__(
         self,
-        summary: Mapping[str, object] | None = None,
+        summary: str | None = None,
         *,
         parent: QtWidgets.QWidget | None = None,
     ) -> None:
@@ -81,14 +81,13 @@ class ResultsSummaryDialog(QtWidgets.QDialog):
             Qt.TextInteractionFlag.TextSelectableByMouse
         )
         layout.addWidget(self._body, stretch=1)
-        self.refresh(summary or {})
+        self.refresh(summary or "")
 
-    def refresh(self, summary: Mapping[str, object]) -> None:
-        """Immediately render one call-local plain Summary mapping."""
+    def refresh(self, summary: str) -> None:
+        """Immediately render one call-local human-readable Summary string."""
 
-        report_text = summary.get("report_text") if isinstance(summary, Mapping) else None
         self._body.setPlainText(
-            report_text if isinstance(report_text, str) and report_text else "No summary available."
+            summary if summary else "No summary available."
         )
 
 class FitTrackerPanel(QtWidgets.QWidget):
@@ -306,7 +305,7 @@ class RunResultsTab(QtWidgets.QWidget):
 
     def render_results_summary(
         self,
-        summary: Mapping[str, object],
+        summary: str,
     ) -> None:
         """Render a synchronous owner-provided human-readable Summary."""
 

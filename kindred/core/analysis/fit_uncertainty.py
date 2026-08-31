@@ -11,7 +11,7 @@ import math
 from dataclasses import dataclass, field
 from statistics import NormalDist
 from types import MappingProxyType
-from typing import Callable, Literal, Mapping, Sequence
+from typing import Callable, Literal, Mapping, Sequence, cast
 
 import numpy as np
 
@@ -40,11 +40,9 @@ __all__ = [
     "validate_bootstrap_seed",
     "ProfileLikelihoodConfig",
     "ResidualBootstrapConfig",
-    "ProfileLikelihoodEvaluation",
     "ProfileLikelihoodEndpoint",
     "ProfileLikelihoodInterval",
     "ProfileLikelihoodResult",
-    "BootstrapReplicate",
     "BootstrapPercentileInterval",
     "ResidualBootstrapResult",
     "profile_likelihood_result",
@@ -271,7 +269,6 @@ ProfileLikelihoodStatus = Literal[
     "stopped",
     "failed",
 ]
-ProfileLikelihoodEvaluationStatus = Literal["success", "failed"]
 ProfileLikelihoodEndpointStatus = Literal[
     "bound",
     "limiting",
@@ -280,7 +277,6 @@ ProfileLikelihoodEndpointStatus = Literal[
     "unavailable",
 ]
 BootstrapStatus = Literal["available", "unavailable", "stopped", "failed"]
-BootstrapReplicateStatus = Literal["success", "failed"]
 
 
 def _freeze_fact(value: object) -> object:
@@ -300,66 +296,6 @@ def _freeze_fact(value: object) -> object:
 
 
 @dataclass(frozen=True, slots=True)
-class ProfileLikelihoodEvaluation:
-    """One factual fixed-coordinate profile refit/evaluation."""
-
-    evaluation_index: int
-    stage: Literal["discovery", "refinement"]
-    discovery_step: int | None
-    refinement_step: int | None
-    fixed_optimizer_value: float
-    fixed_value: float
-    status: ProfileLikelihoodEvaluationStatus
-    warm_start_policy: str
-    optimizer_converged: bool | None = None
-    optimized_parameters: Mapping[object, float] = field(default_factory=dict)
-    weighted_residual_sse: float | None = None
-    likelihood_ratio: float | None = None
-    likelihood_ratio_raw: float | None = None
-    likelihood_ratio_log: float | None = None
-    likelihood_ratio_outcome: str | None = None
-    failure: FactualCause | None = None
-
-    def __post_init__(self) -> None:
-        index = int(self.evaluation_index)
-        if index < 0:
-            raise ValueError("Profile evaluation index cannot be negative.")
-        if self.stage not in {"discovery", "refinement"}:
-            raise ValueError("Profile evaluation stage is invalid.")
-        status = str(self.status)
-        if status not in {"success", "failed"}:
-            raise ValueError("Profile evaluation status is invalid.")
-        fixed_optimizer = float(self.fixed_optimizer_value)
-        fixed_value = float(self.fixed_value)
-        if not math.isfinite(fixed_optimizer) or not math.isfinite(fixed_value):
-            raise ValueError("Profile fixed values must be finite.")
-        parameters = {
-            key: float(value) for key, value in self.optimized_parameters.items()
-        }
-        if any(not math.isfinite(value) for value in parameters.values()):
-            raise ValueError("Profile optimized parameters must be finite.")
-        if self.failure is not None and not isinstance(self.failure, FactualCause):
-            raise TypeError("Profile evaluation failure must be a FactualCause.")
-        object.__setattr__(self, "evaluation_index", index)
-        object.__setattr__(self, "status", status)
-        object.__setattr__(self, "fixed_optimizer_value", fixed_optimizer)
-        object.__setattr__(self, "fixed_value", fixed_value)
-        object.__setattr__(self, "optimized_parameters", MappingProxyType(parameters))
-        if self.weighted_residual_sse is not None:
-            sse = float(self.weighted_residual_sse)
-            if not math.isfinite(sse) or sse < 0.0:
-                raise ValueError("Profile SSE must be finite and nonnegative.")
-            object.__setattr__(self, "weighted_residual_sse", sse)
-        for name in ("likelihood_ratio", "likelihood_ratio_raw", "likelihood_ratio_log"):
-            value = getattr(self, name)
-            if value is not None:
-                number = float(value)
-                if not math.isfinite(number):
-                    raise ValueError(f"Profile {name} must be finite when present.")
-                object.__setattr__(self, name, number)
-
-
-@dataclass(frozen=True, slots=True)
 class ProfileLikelihoodEndpoint:
     """Resolution facts for one Profile lower or upper endpoint."""
 
@@ -372,6 +308,8 @@ class ProfileLikelihoodEndpoint:
     bracket_width: float | None = None
     reason: str | None = None
     last_evaluation_index: int | None = None
+    evaluation_count: int = 0
+    failure: FactualCause | None = None
 
     def __post_init__(self) -> None:
         status = str(self.status)
@@ -388,6 +326,10 @@ class ProfileLikelihoodEndpoint:
                 if normalized < 0:
                     raise ValueError("Profile endpoint evaluation index cannot be negative.")
                 object.__setattr__(self, name, normalized)
+        evaluation_count = int(self.evaluation_count)
+        if evaluation_count < 0:
+            raise ValueError("Profile endpoint evaluation count cannot be negative.")
+        object.__setattr__(self, "evaluation_count", evaluation_count)
         optimizer_value = self.optimizer_value
         if optimizer_value is not None:
             optimizer_value = float(optimizer_value)
@@ -406,11 +348,13 @@ class ProfileLikelihoodEndpoint:
                 if not math.isfinite(normalized) or normalized < 0.0:
                     raise ValueError(f"Profile endpoint {name} must be finite and nonnegative.")
                 object.__setattr__(self, name, normalized)
+        if self.failure is not None and not isinstance(self.failure, FactualCause):
+            raise TypeError("Profile endpoint failure must be a FactualCause.")
 
 
 @dataclass(frozen=True, slots=True)
 class ProfileLikelihoodInterval:
-    """One coordinate's estimate, endpoints, records, and resolution."""
+    """One coordinate's estimate, endpoints, and bounded resolution facts."""
 
     status: Literal["available", "partial", "unavailable"]
     interval_kind: str
@@ -421,8 +365,6 @@ class ProfileLikelihoodInterval:
     upper_outcome: ProfileLikelihoodEndpointStatus
     optimizer_bounds: tuple[float, float]
     physical_bounds: tuple[float, float]
-    lower_evaluations: tuple[ProfileLikelihoodEvaluation, ...]
-    upper_evaluations: tuple[ProfileLikelihoodEvaluation, ...]
     lower_resolution: ProfileLikelihoodEndpoint
     upper_resolution: ProfileLikelihoodEndpoint
     endpoint_messages: Mapping[str, str] = field(default_factory=dict)
@@ -451,17 +393,10 @@ class ProfileLikelihoodInterval:
             raise TypeError("Profile lower resolution must be a typed endpoint.")
         if not isinstance(self.upper_resolution, ProfileLikelihoodEndpoint):
             raise TypeError("Profile upper resolution must be a typed endpoint.")
-        if any(
-            not isinstance(item, ProfileLikelihoodEvaluation)
-            for item in (*self.lower_evaluations, *self.upper_evaluations)
-        ):
-            raise TypeError("Profile interval evaluations require typed records.")
         object.__setattr__(self, "status", status)
         object.__setattr__(self, "estimate", estimate)
         object.__setattr__(self, "optimizer_bounds", bounds)
         object.__setattr__(self, "physical_bounds", physical_bounds)
-        object.__setattr__(self, "lower_evaluations", tuple(self.lower_evaluations))
-        object.__setattr__(self, "upper_evaluations", tuple(self.upper_evaluations))
         object.__setattr__(
             self,
             "endpoint_messages",
@@ -544,37 +479,6 @@ class ProfileLikelihoodResult:
 
 
 @dataclass(frozen=True, slots=True)
-class BootstrapReplicate:
-    """One deterministic residual-bootstrap refit settlement."""
-
-    replicate: int
-    status: BootstrapReplicateStatus
-    parameters: Mapping[object, float] = field(default_factory=dict)
-    failure: FactualCause | None = None
-    unavailable: ScientificUnavailable | None = None
-
-    def __post_init__(self) -> None:
-        replicate = int(self.replicate)
-        if replicate < 0:
-            raise ValueError("Bootstrap replicate index cannot be negative.")
-        status = str(self.status)
-        if status not in {"success", "failed"}:
-            raise ValueError("Bootstrap replicate status is invalid.")
-        parameters = {key: float(value) for key, value in self.parameters.items()}
-        if any(not math.isfinite(value) for value in parameters.values()):
-            raise ValueError("Bootstrap replicate parameters must be finite.")
-        if self.failure is not None and not isinstance(self.failure, FactualCause):
-            raise TypeError("Bootstrap replicate failure must be a FactualCause.")
-        if self.unavailable is not None and not isinstance(
-            self.unavailable, ScientificUnavailable
-        ):
-            raise TypeError("Bootstrap replicate unavailability must be typed.")
-        object.__setattr__(self, "replicate", replicate)
-        object.__setattr__(self, "status", status)
-        object.__setattr__(self, "parameters", MappingProxyType(parameters))
-
-
-@dataclass(frozen=True, slots=True)
 class BootstrapPercentileInterval:
     """One parameter's equal-tailed bootstrap percentile interval."""
 
@@ -582,16 +486,12 @@ class BootstrapPercentileInterval:
     lower: float | None
     upper: float | None
     construction: str
-    successful_values: tuple[float, ...]
     reason: str | None = None
 
     def __post_init__(self) -> None:
         status = str(self.status)
         if status not in {"available", "unavailable"}:
             raise ValueError("Bootstrap interval status is invalid.")
-        values = tuple(float(value) for value in self.successful_values)
-        if any(not math.isfinite(value) for value in values):
-            raise ValueError("Bootstrap successful values must be finite.")
         for name in ("lower", "upper"):
             value = getattr(self, name)
             if value is not None:
@@ -600,7 +500,6 @@ class BootstrapPercentileInterval:
                     raise ValueError("Bootstrap percentile endpoints must be finite.")
                 object.__setattr__(self, name, number)
         object.__setattr__(self, "status", status)
-        object.__setattr__(self, "successful_values", values)
         object.__setattr__(self, "construction", str(self.construction))
         object.__setattr__(self, "reason", None if self.reason is None else str(self.reason))
 
@@ -632,9 +531,10 @@ class ResidualBootstrapResult:
     failed_replicates: int
     interval_construction: str
     intervals: Mapping[object, BootstrapPercentileInterval]
-    replicate_roster: tuple[BootstrapReplicate, ...]
     primary_fit_diagnostic: FactualCause | None = None
     primary_fit_unavailable: ScientificUnavailable | None = None
+    first_failed_replicate_diagnostic: FactualCause | None = None
+    first_failed_replicate_unavailable: ScientificUnavailable | None = None
     unavailable_reason: str | None = None
     diagnostic: FactualCause | None = None
     provenance: Mapping[str, object] = field(default_factory=dict)
@@ -665,10 +565,11 @@ class ResidualBootstrapResult:
         intervals = dict(self.intervals)
         if any(not isinstance(item, BootstrapPercentileInterval) for item in intervals.values()):
             raise TypeError("Bootstrap intervals require typed percentile records.")
-        roster = tuple(self.replicate_roster)
-        if any(not isinstance(item, BootstrapReplicate) for item in roster):
-            raise TypeError("Bootstrap replicate roster requires typed records.")
-        for cause_name in ("primary_fit_diagnostic", "diagnostic"):
+        for cause_name in (
+            "primary_fit_diagnostic",
+            "diagnostic",
+            "first_failed_replicate_diagnostic",
+        ):
             cause = getattr(self, cause_name)
             if cause is not None and not isinstance(cause, FactualCause):
                 raise TypeError(f"Bootstrap {cause_name} must be a FactualCause.")
@@ -676,6 +577,10 @@ class ResidualBootstrapResult:
             self.primary_fit_unavailable, ScientificUnavailable
         ):
             raise TypeError("Bootstrap primary-fit unavailability must be typed.")
+        if self.first_failed_replicate_unavailable is not None and not isinstance(
+            self.first_failed_replicate_unavailable, ScientificUnavailable
+        ):
+            raise TypeError("Bootstrap first-failure unavailability must be typed.")
         reason = None if self.unavailable_reason is None else str(self.unavailable_reason).strip() or None
         if status == "unavailable" and reason is None:
             raise ValueError("Unavailable Bootstrap results require a factual reason.")
@@ -700,7 +605,6 @@ class ResidualBootstrapResult:
         object.__setattr__(self, "stratum_manifest", _freeze_fact(dict(self.stratum_manifest or {})))
         object.__setattr__(self, "preserved_fields", tuple(str(value) for value in self.preserved_fields))
         object.__setattr__(self, "intervals", MappingProxyType(intervals))
-        object.__setattr__(self, "replicate_roster", roster)
         object.__setattr__(self, "unavailable_reason", reason)
         object.__setattr__(self, "provenance", _freeze_fact(dict(self.provenance or {})))
 
@@ -791,67 +695,6 @@ def _likelihood_ratio_details(
     return _LikelihoodRatioDetails(log_ratio, raw_value, log_ratio, "finite")
 
 
-def _profile_evaluation_record(
-    record: Mapping[str, object],
-) -> ProfileLikelihoodEvaluation:
-    """Convert one call-local profile record into its natural immutable owner."""
-
-    return ProfileLikelihoodEvaluation(
-        evaluation_index=int(record["evaluation_index"]),
-        stage=str(record["stage"]),  # type: ignore[arg-type]
-        discovery_step=(
-            None
-            if record.get("discovery_step") is None
-            else int(record["discovery_step"])
-        ),
-        refinement_step=(
-            None
-            if record.get("refinement_step") is None
-            else int(record["refinement_step"])
-        ),
-        fixed_optimizer_value=float(record["fixed_optimizer_value"]),
-        fixed_value=float(record["fixed_value"]),
-        status=str(record["status"]),  # type: ignore[arg-type]
-        warm_start_policy=str(record.get("warm_start_policy", "")),
-        optimizer_converged=(
-            None
-            if record.get("optimizer_converged") is None
-            else bool(record["optimizer_converged"])
-        ),
-        optimized_parameters=dict(record.get("optimized_parameters", {})),
-        weighted_residual_sse=(
-            None
-            if record.get("weighted_residual_sse") is None
-            else float(record["weighted_residual_sse"])
-        ),
-        likelihood_ratio=(
-            None
-            if record.get("likelihood_ratio") is None
-            else float(record["likelihood_ratio"])
-        ),
-        likelihood_ratio_raw=(
-            None
-            if record.get("likelihood_ratio_raw") is None
-            else float(record["likelihood_ratio_raw"])
-        ),
-        likelihood_ratio_log=(
-            None
-            if record.get("likelihood_ratio_log") is None
-            else float(record["likelihood_ratio_log"])
-        ),
-        likelihood_ratio_outcome=(
-            None
-            if record.get("likelihood_ratio_outcome") is None
-            else str(record["likelihood_ratio_outcome"])
-        ),
-        failure=(
-            record.get("failure")
-            if isinstance(record.get("failure"), FactualCause)
-            else None
-        ),
-    )
-
-
 def _profile_endpoint_record(
     record: Mapping[str, object],
 ) -> ProfileLikelihoodEndpoint:
@@ -885,6 +728,12 @@ def _profile_endpoint_record(
             if record.get("last_evaluation_index") is None
             else int(record["last_evaluation_index"])
         ),
+        evaluation_count=int(record.get("evaluation_count", 0)),
+        failure=(
+            record.get("failure")
+            if isinstance(record.get("failure"), FactualCause)
+            else None
+        ),
     )
 
 
@@ -898,15 +747,6 @@ def _profile_interval_record(
     upper_endpoint = lower_resolution.get("upper", {})
     if not isinstance(lower_endpoint, Mapping) or not isinstance(upper_endpoint, Mapping):
         raise TypeError("Profile endpoint resolutions must be mappings before settlement.")
-    evaluations = record.get("evaluations", {})
-    if not isinstance(evaluations, Mapping):
-        raise TypeError("Profile interval evaluations must be a mapping before settlement.")
-    lower_records = evaluations.get("lower", ())
-    upper_records = evaluations.get("upper", ())
-    if not isinstance(lower_records, Sequence) or isinstance(lower_records, (str, bytes)):
-        raise TypeError("Profile lower evaluations must be a sequence before settlement.")
-    if not isinstance(upper_records, Sequence) or isinstance(upper_records, (str, bytes)):
-        raise TypeError("Profile upper evaluations must be a sequence before settlement.")
     return ProfileLikelihoodInterval(
         status=str(record["status"]),  # type: ignore[arg-type]
         interval_kind=str(record["interval_kind"]),
@@ -917,8 +757,6 @@ def _profile_interval_record(
         upper_outcome=str(record["upper_outcome"]),  # type: ignore[arg-type]
         optimizer_bounds=tuple(record["optimizer_bounds"]),  # type: ignore[arg-type]
         physical_bounds=tuple(record["physical_bounds"]),  # type: ignore[arg-type]
-        lower_evaluations=tuple(_profile_evaluation_record(item) for item in lower_records),
-        upper_evaluations=tuple(_profile_evaluation_record(item) for item in upper_records),
         lower_resolution=_profile_endpoint_record(lower_endpoint),
         upper_resolution=_profile_endpoint_record(upper_endpoint),
         endpoint_messages={
@@ -1222,13 +1060,8 @@ def profile_likelihood_result(
                     )
                     record = {
                         "evaluation_index": len(records),
-                        "stage": stage,
-                        "discovery_step": discovery_step,
-                        "refinement_step": refinement_step,
                         "fixed_optimizer_value": float(fixed),
-                        "fixed_value": decode_coordinate(name, float(fixed)),
                         "status": "failed",
-                        "warm_start_policy": "inner_successful_refit",
                         "failure": failure,
                     }
                     records.append(record)
@@ -1241,23 +1074,13 @@ def profile_likelihood_result(
                 )
                 record = {
                     "evaluation_index": len(records),
-                    "stage": stage,
-                    "discovery_step": discovery_step,
-                    "refinement_step": refinement_step,
                     "fixed_optimizer_value": float(fixed),
-                    "fixed_value": decode_coordinate(name, float(fixed)),
                     "status": "success",
-                    "warm_start_policy": "inner_successful_refit",
-                    "optimizer_converged": bool(fit.success),
-                    "optimized_parameters": dict(fit.parameters),
-                    "weighted_residual_sse": candidate_sse,
                     "likelihood_ratio": (
                         None
                         if lr_details.outcome == "threshold_exceeded_exact_fit"
                         else lr_details.transport_value
                     ),
-                    "likelihood_ratio_raw": lr_details.raw_value,
-                    "likelihood_ratio_log": lr_details.log_value,
                     "likelihood_ratio_outcome": lr_details.outcome,
                 }
                 records.append(record)
@@ -1288,6 +1111,7 @@ def profile_likelihood_result(
                         "status": "failed",
                         "evaluation_index": record["evaluation_index"],
                         "reason": "scientific_unavailable_or_nonconverged",
+                        "failure": record.get("failure"),
                     }
                 outcome = str(record["likelihood_ratio_outcome"])
                 if outcome == "threshold_exceeded_exact_fit":
@@ -1360,6 +1184,7 @@ def profile_likelihood_result(
                         "status": "failed",
                         "evaluation_index": record["evaluation_index"],
                         "reason": "scientific_unavailable_or_nonconverged",
+                        "failure": record.get("failure"),
                     }
                 if str(record["likelihood_ratio_outcome"]) == "threshold_exceeded_exact_fit":
                     return best, "limiting", records, {
@@ -1436,6 +1261,14 @@ def profile_likelihood_result(
                 )
         lower, lower_outcome, lower_records, lower_resolution = side_results["lower"]
         upper, upper_outcome, upper_records, upper_resolution = side_results["upper"]
+        lower_resolution = {
+            **lower_resolution,
+            "evaluation_count": len(lower_records),
+        }
+        upper_resolution = {
+            **upper_resolution,
+            "evaluation_count": len(upper_records),
+        }
         endpoint_messages: dict[str, str] = {}
         for side, outcome, bound in (("lower", lower_outcome, low), ("upper", upper_outcome, high)):
             if outcome == "bound":
@@ -1481,10 +1314,6 @@ def profile_likelihood_result(
                 decode_coordinate(name, low),
                 decode_coordinate(name, high),
             ),
-            "evaluations": {
-                "lower": tuple(lower_records),
-                "upper": tuple(upper_records),
-            },
             "resolution": {
                 "lower": lower_resolution,
                 "upper": upper_resolution,
@@ -1672,6 +1501,8 @@ def _bootstrap_payloads(
     *,
     payloads: Sequence[FitDatasetSpec],
     fitted_info: Mapping[str, object],
+    aligned_observed_x_by_dataset: Mapping[str, np.ndarray],
+    projection_positions_by_dataset: Mapping[str, np.ndarray],
     rng: np.random.Generator,
 ) -> tuple[FitDatasetSpec, ...]:
     captured: list[FitDatasetSpec] = []
@@ -1711,19 +1542,15 @@ def _bootstrap_payloads(
                 )
             projection = info.x_projection
             x_source = payload.x_observations
-            observed_x = np.asarray(
-                [float(x_source.y[x_source.source_rows.index(row)]) for row in projection.source_rows],
-                dtype=float,
-            )
+            observed_x = aligned_observed_x_by_dataset[payload.dataset_id]
             x_residuals = observed_x - np.asarray(projection.selected_model_x, dtype=float)
             centered_x = x_residuals - float(np.mean(x_residuals))
             indexes = rng.integers(0, centered_x.size, size=centered_x.size)
             synthetic_x = np.asarray(projection.selected_model_x, dtype=float) + centered_x[indexes]
-            values_by_row = dict(zip(projection.source_rows, synthetic_x, strict=True))
-            full_values = np.asarray(
-                [values_by_row.get(int(row), float(value)) for row, value in zip(x_source.source_rows, x_source.y, strict=True)],
-                dtype=float,
-            )
+            projection_positions = projection_positions_by_dataset[payload.dataset_id]
+            full_values = np.asarray(x_source.y, dtype=float).copy()
+            projected = projection_positions >= 0
+            full_values[projected] = synthetic_x[projection_positions[projected]]
             x_observations = FitObservationSeries(
                 raw_observation_id=x_source.raw_observation_id,
                 raw_column=x_source.raw_column,
@@ -1745,24 +1572,6 @@ def _bootstrap_payloads(
     return tuple(captured)
 
 
-def _bootstrap_replicate_record(record: Mapping[str, object]) -> BootstrapReplicate:
-    return BootstrapReplicate(
-        replicate=int(record["replicate"]),
-        status=str(record["status"]),  # type: ignore[arg-type]
-        parameters=dict(record.get("parameters", {})),
-        failure=(
-            record.get("failure")
-            if isinstance(record.get("failure"), FactualCause)
-            else None
-        ),
-        unavailable=(
-            record.get("unavailable")
-            if isinstance(record.get("unavailable"), ScientificUnavailable)
-            else None
-        ),
-    )
-
-
 def _bootstrap_interval_record(
     record: Mapping[str, object],
 ) -> BootstrapPercentileInterval:
@@ -1771,9 +1580,6 @@ def _bootstrap_interval_record(
         lower=None if record.get("lower") is None else float(record["lower"]),
         upper=None if record.get("upper") is None else float(record["upper"]),
         construction=str(record.get("construction", "")),
-        successful_values=tuple(
-            float(value) for value in record.get("successful_values", ())
-        ),
         reason=None if record.get("reason") is None else str(record["reason"]),
     )
 
@@ -1795,24 +1601,34 @@ def residual_bootstrap_result(
         raise ValueError("Ordinary residual Bootstrap requires at least one coordinate.")
     primary_converged, primary_failure = _refit_converged(terminal_result)
     stratum_manifest: Mapping[str, object] = {}
-    replicate_records: list[Mapping[str, object]] = []
+    completed = 0
+    successful = 0
+    failed = 0
+    first_failed_replicate_diagnostic: FactualCause | None = None
+    first_failed_replicate_unavailable: ScientificUnavailable | None = None
+    required_successes = max(
+        config.minimum_successful_replicates,
+        int(math.ceil(config.replicates * config.minimum_success_fraction)),
+    )
 
-    def stopped_result(
-        cause: FactualCause,
+    def build_result(
+        status: BootstrapStatus,
         *,
-        settlement: str = "stopped",
+        intervals: Mapping[object, BootstrapPercentileInterval] | None = None,
+        diagnostic: FactualCause | None = None,
+        primary_fit_diagnostic: FactualCause | None = None,
+        primary_fit_unavailable: ScientificUnavailable | None = None,
+        unavailable_reason: str | None = None,
+        provenance: Mapping[str, object] | None = None,
     ) -> ResidualBootstrapResult:
-        completed = len(replicate_records)
-        successful = sum(item["status"] == "success" for item in replicate_records)
-        failed = completed - successful
-        required = max(
-            config.minimum_successful_replicates,
-            int(math.ceil(config.replicates * config.minimum_success_fraction)),
-        )
+        """Build one bounded Bootstrap settlement from current call-local facts."""
+
         return ResidualBootstrapResult(
-            status="stopped",
+            status=status,
             method=_BOOTSTRAP_METHOD,
-            requested_parameters=tuple(_coordinate_display(item) for item in config.parameter_names),
+            requested_parameters=tuple(
+                _coordinate_display(item) for item in config.parameter_names
+            ),
             seed=config.seed,
             replicates=config.replicates,
             confidence_level=config.confidence_level,
@@ -1820,24 +1636,48 @@ def residual_bootstrap_result(
             stratum_manifest_version=_BOOTSTRAP_STRATUM_SCHEMA_VERSION,
             stratum_manifest=stratum_manifest,
             draw_recipe_version=_BOOTSTRAP_DRAW_SCHEMA_VERSION,
-            draw_algorithm="numpy.default_rng(seed) residual-index draws",
-            residual_centering="independent arithmetic mean subtraction within each dataset/target stratum",
+            draw_algorithm=(
+                "numpy.default_rng(seed).integers(0, stratum_residual_count); "
+                "integer draws sample independently mean-centered residuals"
+            ),
+            residual_centering=(
+                "independent arithmetic mean subtraction within each dataset/target stratum"
+            ),
             replay_authority="seed plus versioned draw algorithm and stratum manifest",
-            preserved_fields=("time", "X", "source-row", "dataset weight", "target weight", "full-refit"),
+            preserved_fields=(
+                "time", "X", "source-row", "dataset weight", "target weight", "full-refit"
+            ),
             replicate_execution="full global refit",
             refit_validity="only explicitly converged scientific refits count",
             minimum_successful_replicates=config.minimum_successful_replicates,
             minimum_success_fraction=config.minimum_success_fraction,
-            required_successes=required,
+            required_successes=required_successes,
             successful_replicates=successful,
             failed_replicates=failed,
             interval_construction="equal-tailed percentile",
-            intervals={},
-            replicate_roster=(),
+            intervals={} if intervals is None else intervals,
+            primary_fit_diagnostic=primary_fit_diagnostic,
+            primary_fit_unavailable=primary_fit_unavailable,
+            first_failed_replicate_diagnostic=first_failed_replicate_diagnostic,
+            first_failed_replicate_unavailable=first_failed_replicate_unavailable,
+            unavailable_reason=unavailable_reason,
+            diagnostic=diagnostic,
+            provenance={} if provenance is None else provenance,
+        )
+
+    def stopped_result(
+        cause: FactualCause,
+        *,
+        settlement: str = "stopped",
+    ) -> ResidualBootstrapResult:
+        return build_result(
+            "stopped",
             diagnostic=cause,
-            provenance={"primary_fit_preserved": True, "settlement": settlement,
-                        "completed_replicates": completed, "successful_replicates": successful,
-                        "failed_replicates": failed, "stratum_manifest": stratum_manifest},
+            provenance={
+                "primary_fit_preserved": True,
+                "settlement": settlement,
+                "completed_replicates": completed,
+            },
         )
 
     def emit_progress(
@@ -1864,7 +1704,7 @@ def residual_bootstrap_result(
         emit_progress(
             status=result.status,
             stage="settlement",
-            completed=len(replicate_records),
+            completed=completed,
         )
         return result
 
@@ -1884,37 +1724,8 @@ def residual_bootstrap_result(
             and isinstance(primary_failure.get("cause"), ScientificUnavailable)
             else None
         )
-        required = max(
-            config.minimum_successful_replicates,
-            int(math.ceil(config.replicates * config.minimum_success_fraction)),
-        )
-        return finish(ResidualBootstrapResult(
-            status="unavailable",
-            method=_BOOTSTRAP_METHOD,
-            requested_parameters=tuple(
-                _coordinate_display(item) for item in config.parameter_names
-            ),
-            seed=config.seed,
-            replicates=config.replicates,
-            confidence_level=config.confidence_level,
-            resampling="within each dataset/target residual stratum",
-            stratum_manifest_version=_BOOTSTRAP_STRATUM_SCHEMA_VERSION,
-            stratum_manifest={},
-            draw_recipe_version=_BOOTSTRAP_DRAW_SCHEMA_VERSION,
-            draw_algorithm="numpy.default_rng(seed) residual-index draws",
-            residual_centering="independent arithmetic mean subtraction within each dataset/target stratum",
-            replay_authority="seed plus versioned draw algorithm and stratum manifest",
-            preserved_fields=("time", "X", "source-row", "dataset weight", "target weight", "full-refit"),
-            replicate_execution="full global refit",
-            refit_validity="only explicitly converged scientific refits count",
-            minimum_successful_replicates=config.minimum_successful_replicates,
-            minimum_success_fraction=config.minimum_success_fraction,
-            required_successes=required,
-            successful_replicates=0,
-            failed_replicates=0,
-            interval_construction="equal-tailed percentile",
-            intervals={},
-            replicate_roster=(),
+        return finish(build_result(
+            "unavailable",
             primary_fit_diagnostic=primary_cause,
             primary_fit_unavailable=primary_unavailable,
             unavailable_reason="Residual bootstrap requires a converged primary Fit.",
@@ -1939,6 +1750,48 @@ def residual_bootstrap_result(
         _parameter_value(terminal_result, name)
 
     stratum_manifest = _bootstrap_stratum_manifest(payloads)
+    aligned_observed_x_by_dataset: dict[str, np.ndarray] = {}
+    projection_positions_by_dataset: dict[str, np.ndarray] = {}
+    for payload in payloads:
+        if payload.x_name == "t":
+            continue
+        if payload.x_observations is None:
+            raise ValueError(
+                f"Bootstrap dataset {payload.dataset_id!r} omitted its canonical X model."
+            )
+        info = cast(_fit_execution.DatasetFitInfo, fitted_info[payload.dataset_id])
+        projection = info.x_projection
+        if projection is None:
+            raise ValueError(
+                f"Bootstrap dataset {payload.dataset_id!r} omitted its canonical X model."
+            )
+        observed_by_row = {
+            int(row): float(value)
+            for row, value in zip(
+                payload.x_observations.source_rows,
+                payload.x_observations.y,
+                strict=True,
+            )
+        }
+        aligned = np.asarray(
+            [observed_by_row[int(row)] for row in projection.source_rows],
+            dtype=float,
+        )
+        aligned.setflags(write=False)
+        aligned_observed_x_by_dataset[payload.dataset_id] = aligned
+        projection_positions_by_row = {
+            int(row): index
+            for index, row in enumerate(projection.source_rows)
+        }
+        projection_positions = np.asarray(
+            [
+                projection_positions_by_row.get(int(row), -1)
+                for row in payload.x_observations.source_rows
+            ],
+            dtype=np.intp,
+        )
+        projection_positions.setflags(write=False)
+        projection_positions_by_dataset[payload.dataset_id] = projection_positions
     rng = np.random.default_rng(config.seed)
     successes: dict[str, list[float]] = {
         name: [] for name in config.parameter_names
@@ -1953,6 +1806,8 @@ def residual_bootstrap_result(
             synthetic = _bootstrap_payloads(
                 payloads=payloads,
                 fitted_info=fitted_info,
+                aligned_observed_x_by_dataset=aligned_observed_x_by_dataset,
+                projection_positions_by_dataset=projection_positions_by_dataset,
                 rng=rng,
             )
             fitted = refit(synthetic, index)
@@ -1961,45 +1816,32 @@ def residual_bootstrap_result(
                 exc, domain="fit", origin="bootstrap",
             )))
         except Exception as exc:
-            return finish(ResidualBootstrapResult(
-                status="failed",
-                method=_BOOTSTRAP_METHOD,
-                requested_parameters=tuple(
-                    _coordinate_display(item) for item in config.parameter_names
-                ),
-                seed=config.seed,
-                replicates=config.replicates,
-                confidence_level=config.confidence_level,
-                resampling="within each dataset/target residual stratum",
-                stratum_manifest_version=_BOOTSTRAP_STRATUM_SCHEMA_VERSION,
-                stratum_manifest=stratum_manifest,
-                draw_recipe_version=_BOOTSTRAP_DRAW_SCHEMA_VERSION,
-                draw_algorithm="numpy.default_rng(seed) residual-index draws",
-                residual_centering="independent arithmetic mean subtraction within each dataset/target stratum",
-                replay_authority="seed plus versioned draw algorithm and stratum manifest",
-                preserved_fields=("time", "X", "source-row", "dataset weight", "target weight", "full-refit"),
-                replicate_execution="full global refit",
-                refit_validity="only explicitly converged scientific refits count",
-                minimum_successful_replicates=config.minimum_successful_replicates,
-                minimum_success_fraction=config.minimum_success_fraction,
-                required_successes=max(
-                    config.minimum_successful_replicates,
-                    int(math.ceil(config.replicates * config.minimum_success_fraction)),
-                ),
-                successful_replicates=sum(item["status"] == "success" for item in replicate_records),
-                failed_replicates=len(replicate_records) - sum(item["status"] == "success" for item in replicate_records),
-                interval_construction="equal-tailed percentile",
-                intervals={},
-                replicate_roster=tuple(_bootstrap_replicate_record(item) for item in replicate_records),
-                diagnostic=factual_cause_from_exception(
-                    exc,
-                    domain="fit",
-                    origin="bootstrap",
-                ),
+            completed += 1
+            failed += 1
+            if first_failed_replicate_diagnostic is None:
+                first_failed_replicate_diagnostic = factual_cause_from_exception(
+                    exc, domain="fit", origin="bootstrap"
+                )
+            return finish(build_result(
+                "failed",
+                diagnostic=first_failed_replicate_diagnostic,
                 provenance={"replicate": index, "settlement": "failed"},
             ))
         converged, failure = _refit_converged(fitted)
         if not converged:
+            completed += 1
+            failed += 1
+            raw_failure = failure.get("cause") if isinstance(failure, Mapping) else None
+            if (
+                first_failed_replicate_diagnostic is None
+                and isinstance(raw_failure, FactualCause)
+            ):
+                first_failed_replicate_diagnostic = raw_failure
+            if (
+                first_failed_replicate_unavailable is None
+                and isinstance(raw_failure, ScientificUnavailable)
+            ):
+                first_failed_replicate_unavailable = raw_failure
             if isinstance(failure, Mapping) and failure.get("status") == "fatal":
                 raw_cause = failure.get("cause")
                 cause = (
@@ -2013,63 +1855,21 @@ def residual_bootstrap_result(
                         message="Fatal Bootstrap refit failed.",
                     )
                 )
-                return finish(ResidualBootstrapResult(
-                    status="failed",
-                    method=_BOOTSTRAP_METHOD,
-                    requested_parameters=tuple(
-                        _coordinate_display(item) for item in config.parameter_names
-                    ),
-                    seed=config.seed,
-                    replicates=config.replicates,
-                    confidence_level=config.confidence_level,
-                    resampling="within each dataset/target residual stratum",
-                    stratum_manifest_version=_BOOTSTRAP_STRATUM_SCHEMA_VERSION,
-                    stratum_manifest=stratum_manifest,
-                    draw_recipe_version=_BOOTSTRAP_DRAW_SCHEMA_VERSION,
-                    draw_algorithm="numpy.default_rng(seed) residual-index draws",
-                    residual_centering="independent arithmetic mean subtraction within each dataset/target stratum",
-                    replay_authority="seed plus versioned draw algorithm and stratum manifest",
-                    preserved_fields=("time", "X", "source-row", "dataset weight", "target weight", "full-refit"),
-                    replicate_execution="full global refit",
-                    refit_validity="only explicitly converged scientific refits count",
-                    minimum_successful_replicates=config.minimum_successful_replicates,
-                    minimum_success_fraction=config.minimum_success_fraction,
-                    required_successes=max(
-                        config.minimum_successful_replicates,
-                        int(math.ceil(config.replicates * config.minimum_success_fraction)),
-                    ),
-                    successful_replicates=sum(item["status"] == "success" for item in replicate_records),
-                    failed_replicates=len(replicate_records) - sum(item["status"] == "success" for item in replicate_records),
-                    interval_construction="equal-tailed percentile",
-                    intervals={},
-                    replicate_roster=tuple(_bootstrap_replicate_record(item) for item in replicate_records),
+                if not isinstance(cause, FactualCause):
+                    cause = FactualCause(
+                        domain="fit",
+                        origin="bootstrap",
+                        code=None,
+                        type="FatalBootstrapRefit",
+                        message="Fatal Bootstrap refit failed.",
+                    )
+                if first_failed_replicate_diagnostic is None:
+                    first_failed_replicate_diagnostic = cause
+                return finish(build_result(
+                    "failed",
                     diagnostic=cause,
                     provenance={"replicate": index, "settlement": "failed"},
                 ))
-            replicate_records.append(
-                {
-                    "replicate": index,
-                    "status": "failed",
-                    "unavailable": (
-                        failure.get("cause")
-                        if isinstance(failure, Mapping)
-                        and isinstance(failure.get("cause"), ScientificUnavailable)
-                        else None
-                    ),
-                    "failure": (
-                        failure.get("cause")
-                        if isinstance(failure, Mapping)
-                        and isinstance(failure.get("cause"), FactualCause)
-                        else FactualCause(
-                            domain="fit",
-                            origin="bootstrap",
-                            code=None,
-                            type="NonconvergedRefit",
-                            message="Bootstrap refit did not converge.",
-                        )
-                    ),
-                }
-            )
             progress_cause = emit_progress(completed=index + 1)
             if progress_cause is not None:
                 return finish(stopped_result(progress_cause))
@@ -2080,23 +1880,14 @@ def residual_bootstrap_result(
         }
         for name, value in values.items():
             successes[name].append(value)
-        replicate_records.append(
-            {
-                "replicate": index,
-                "status": "success",
-                "parameters": values,
-            }
-        )
+        completed += 1
+        successful += 1
         progress_cause = emit_progress(completed=index + 1)
         if progress_cause is not None:
             return finish(stopped_result(progress_cause))
 
-    success_count = sum(item["status"] == "success" for item in replicate_records)
-    failure_count = len(replicate_records) - success_count
-    required = max(
-        config.minimum_successful_replicates,
-        int(math.ceil(config.replicates * config.minimum_success_fraction)),
-    )
+    success_count = successful
+    required = required_successes
     valid = success_count >= required
     alpha = 1.0 - config.confidence_level
     intervals: dict[str, object] = {}
@@ -2121,53 +1912,14 @@ def residual_bootstrap_result(
             "lower": float(interval[0]),
             "upper": float(interval[1]),
             "construction": "equal-tailed percentile interval",
-            "successful_values": tuple(float(value) for value in values),
         }
 
-    return finish(ResidualBootstrapResult(
-        status="available" if valid else "unavailable",
-        method=_BOOTSTRAP_METHOD,
-        requested_parameters=tuple(
-            _coordinate_display(item) for item in config.parameter_names
-        ),
-        seed=config.seed,
-        replicates=config.replicates,
-        confidence_level=config.confidence_level,
-        resampling="within each dataset/target residual stratum",
-        stratum_manifest_version=_BOOTSTRAP_STRATUM_SCHEMA_VERSION,
-        stratum_manifest=stratum_manifest,
-        draw_recipe_version=_BOOTSTRAP_DRAW_SCHEMA_VERSION,
-        draw_algorithm=(
-            "numpy.default_rng(seed).integers(0, stratum_residual_count); "
-            "integer draws sample independently mean-centered residuals"
-        ),
-        residual_centering=(
-            "independent arithmetic mean subtraction within each dataset/target stratum"
-        ),
-        replay_authority="seed plus versioned draw algorithm and stratum manifest",
-        preserved_fields=(
-            "time",
-            "X",
-            "source-row",
-            "dataset weight",
-            "target weight",
-            "full-refit",
-        ),
-        replicate_execution="full global refit",
-        refit_validity="only explicitly converged scientific refits count",
-        minimum_successful_replicates=config.minimum_successful_replicates,
-        minimum_success_fraction=config.minimum_success_fraction,
-        required_successes=required,
-        successful_replicates=success_count,
-        failed_replicates=failure_count,
-        interval_construction="equal-tailed percentile",
+    return finish(build_result(
+        "available" if valid else "unavailable",
         intervals={
             name: _bootstrap_interval_record(record)
             for name, record in intervals.items()
         },
-        replicate_roster=tuple(
-            _bootstrap_replicate_record(record) for record in replicate_records
-        ),
         unavailable_reason=(
             None
             if valid
@@ -2176,8 +1928,5 @@ def residual_bootstrap_result(
                 f"successful full refits; {required} required."
             )
         ),
-        provenance={
-            "primary_fit_preserved": True,
-            "stratum_manifest": stratum_manifest,
-        },
+        provenance={"primary_fit_preserved": True},
     ))

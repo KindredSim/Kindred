@@ -44,7 +44,7 @@ from kindred.gui.fitting.launch import (
 )
 from kindred.gui.fitting.window import FittingWindow
 from kindred.gui.fitting.reporting import (
-    fit_candidate_summary,
+    fit_candidate_report_text,
 )
 from kindred.gui.fitting.worker import (
     FitCandidate,
@@ -753,7 +753,7 @@ class FitSessionOwner(QtCore.QObject):
             self._set_status("No completed Fit run is available.")
             return False
         try:
-            self._window.render_results_summary(fit_candidate_summary(candidate))
+            self._window.render_results_summary(fit_candidate_report_text(candidate))
             return True
         except Exception as exc:
             self._set_status(f"Fit Results Summary failed: {exc}")

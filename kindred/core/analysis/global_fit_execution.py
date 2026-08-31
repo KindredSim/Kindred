@@ -390,334 +390,54 @@ class DatasetFitInfo:
     model_raw_columns: Mapping[str, tuple[str, ...]]
     model_source_rows: Mapping[str, tuple[int, ...]]
     x_projection: ParametricXProjection | None
-    x_point_count: int = 0
     x_weighted_residual_sse: FitMetric | None = None
     x_weighted_residual_mse: FitMetric | None = None
     x_weighted_rmse: FitMetric | None = None
     x_weighted_mae: FitMetric | None = None
-    x_delta_x: tuple[float, ...] = ()
-    x_match_kinds: tuple[str, ...] = ()
-    x_sample_kinds: tuple[str, ...] = ()
-    x_source_rows: tuple[int, ...] = ()
 
     def __post_init__(self) -> None:
-        dataset_id = self.dataset_id
-        if (
-            type(dataset_id) is not str
-            or not dataset_id
-            or dataset_id != dataset_id.strip()
-        ):
-            raise ValueError("Dataset fit information requires a nonblank dataset ID.")
-        object.__setattr__(self, "dataset_id", dataset_id)
-        if not isinstance(self.r_squared_by_series, Mapping):
-            raise TypeError("Dataset fit metrics require a mapping by series.")
-        if any(
-            type(name) is not str or not name or name != name.strip()
-            for name in self.r_squared_by_series
-        ):
-            raise ValueError("Dataset fit metric series identities must be exact strings.")
+        # The evaluator owns admission of these typed values.  Keep the
+        # arrays immutable without copying them and shallow-freeze the
+        # mappings so DatasetFitInfo remains an immutable terminal owner.
+        self.residuals.setflags(write=False)
+        self.weighted_residuals.setflags(write=False)
         object.__setattr__(
             self,
             "r_squared_by_series",
-            MappingProxyType(
-                {
-                    name: value
-                    for name, value in self.r_squared_by_series.items()
-                }
-            ),
+            MappingProxyType(dict(self.r_squared_by_series)),
         )
-        if any(
-            not isinstance(value, FitMetric)
-            for value in self.r_squared_by_series.values()
-        ):
-            raise TypeError("Dataset fit R-squared values require typed FitMetric values.")
-        if not all(
-            isinstance(value, FitMetric)
-            for value in (
-                self.weighted_residual_sse,
-                self.weighted_residual_mse,
-                self.weighted_rmse,
-                self.weighted_mae,
-            )
-        ):
-            raise TypeError("Dataset fit metrics require typed FitMetric values.")
-        if isinstance(self.n_points, (bool, np.bool_)) or not isinstance(
-            self.n_points, (int, np.integer)
-        ):
-            raise TypeError("Dataset fit n_points must be an exact integer.")
-        object.__setattr__(self, "n_points", int(self.n_points))
-        object.__setattr__(self, "weight", float(self.weight))
-        if self.n_points <= 0:
-            raise ValueError("Dataset fit information requires positive n_points.")
-        if not math.isfinite(self.weight) or self.weight <= 0.0:
-            raise ValueError("Dataset fit weight must be finite and positive.")
-        if not isinstance(self.simulation_result, SimulationResultValue):
-            raise TypeError("Dataset fit information requires its canonical simulation result.")
-        residuals = np.asarray(self.residuals, dtype=float).reshape(-1).copy()
-        weighted_residuals = np.asarray(self.weighted_residuals, dtype=float).reshape(-1).copy()
-        if (
-            residuals.size == 0
-            or weighted_residuals.size != residuals.size
-            or not np.all(np.isfinite(residuals))
-            or not np.all(np.isfinite(weighted_residuals))
-        ):
-            raise ValueError("Dataset fit residuals must be finite and shape-aligned.")
-        residuals.setflags(write=False)
-        weighted_residuals.setflags(write=False)
-        object.__setattr__(self, "residuals", residuals)
-        object.__setattr__(self, "weighted_residuals", weighted_residuals)
-        if residuals.size != self.n_points:
-            raise ValueError("Dataset fit n_points must equal the residual count.")
-
-        def freeze_array_map(
-            values: Mapping[str, np.ndarray],
-            *,
-            dtype: object = float,
-        ) -> Mapping[str, np.ndarray]:
-            if not isinstance(values, Mapping):
-                raise TypeError("Dataset fit model facts require mappings by series.")
-            frozen: dict[str, np.ndarray] = {}
-            for raw_name, raw_values in values.items():
-                if (
-                    type(raw_name) is not str
-                    or not raw_name
-                    or raw_name != raw_name.strip()
-                ):
-                    raise ValueError("Dataset fit series identities must be exact strings.")
-                array = np.asarray(raw_values, dtype=dtype).reshape(-1).copy()
-                array.setflags(write=False)
-                frozen[raw_name] = array
-            return MappingProxyType(frozen)
-
-        def freeze_integer_array_map(
-            values: Mapping[str, np.ndarray],
-        ) -> Mapping[str, np.ndarray]:
-            if not isinstance(values, Mapping):
-                raise TypeError("Dataset fit identity facts require mappings by series.")
-            frozen: dict[str, np.ndarray] = {}
-            for raw_name, raw_values in values.items():
-                if (
-                    type(raw_name) is not str
-                    or not raw_name
-                    or raw_name != raw_name.strip()
-                ):
-                    raise ValueError("Dataset fit series identities must be exact strings.")
-                raw_array = np.asarray(raw_values)
-                if raw_array.dtype.kind not in {"i", "u"}:
-                    raise ValueError("Dataset fit integer identity arrays must retain integer dtype.")
-                if raw_array.dtype.kind == "u" and np.any(
-                    raw_array > np.iinfo(np.int64).max
-                ):
-                    raise ValueError("Dataset fit integer identity exceeds its supported range.")
-                array = raw_array.astype(np.int64, copy=True).reshape(-1)
-                array.setflags(write=False)
-                frozen[raw_name] = array
-            return MappingProxyType(frozen)
-
-        def freeze_tuple_map(
-            values: Mapping[str, Sequence[object]],
-        ) -> Mapping[str, tuple[object, ...]]:
-            if not isinstance(values, Mapping):
-                raise TypeError("Dataset fit identity facts require mappings by series.")
-            frozen: dict[str, tuple[object, ...]] = {}
-            for raw_name, values_for_name in values.items():
-                if (
-                    type(raw_name) is not str
-                    or not raw_name
-                    or raw_name != raw_name.strip()
-                ):
-                    raise ValueError("Dataset fit series identities must be exact strings.")
-                if isinstance(values_for_name, (str, bytes)):
-                    raise TypeError(
-                        "Dataset fit tuple-map facts require typed sequences, not scalar text."
-                    )
-                frozen[raw_name] = tuple(values_for_name)
-            return MappingProxyType(frozen)
-
-        object.__setattr__(self, "model_series", freeze_array_map(self.model_series))
-        object.__setattr__(self, "model_x_by_species", freeze_array_map(self.model_x_by_species))
-        object.__setattr__(
-            self,
+        for name in (
+            "model_series",
+            "model_x_by_species",
             "model_segment_ids",
-            freeze_integer_array_map(self.model_segment_ids),
-        )
-        object.__setattr__(self, "model_segment_keys", freeze_tuple_map(self.model_segment_keys))
-        object.__setattr__(
-            self,
+            "model_segment_keys",
             "model_discontinuity_ids",
-            freeze_integer_array_map(self.model_discontinuity_ids),
-        )
-        object.__setattr__(
-            self,
             "model_selection_provenance",
-            freeze_tuple_map(self.model_selection_provenance),
-        )
-        object.__setattr__(self, "model_observation_ids", freeze_tuple_map(self.model_observation_ids))
-        object.__setattr__(self, "model_raw_columns", freeze_tuple_map(self.model_raw_columns))
-        object.__setattr__(
-            self,
+            "model_observation_ids",
+            "model_raw_columns",
             "model_source_rows",
-            freeze_tuple_map(self.model_source_rows),
-        )
-        model_names = tuple(self.model_series)
-        if not model_names or any(not str(name or "").strip() for name in model_names):
-            raise ValueError("Dataset fit information requires model series.")
-        if set(self.r_squared_by_series) != set(model_names):
-            raise ValueError("Dataset fit metrics must match the complete model roster.")
-        identity_maps = (
-            self.model_x_by_species,
-            self.model_segment_ids,
-            self.model_segment_keys,
-            self.model_discontinuity_ids,
-            self.model_selection_provenance,
-            self.model_observation_ids,
-            self.model_raw_columns,
-            self.model_source_rows,
-        )
-        if any(set(mapping) != set(model_names) for mapping in identity_maps):
-            raise ValueError("Dataset fit model identity must be complete by series.")
-        model_point_count = 0
-        raw_observation_ids: set[str] = set()
-        for name in model_names:
-            model_values = self.model_series[name]
-            model_x = self.model_x_by_species[name]
-            segment_ids = self.model_segment_ids[name]
-            segment_keys = self.model_segment_keys[name]
-            discontinuity_ids = self.model_discontinuity_ids[name]
-            selection = self.model_selection_provenance[name]
-            observation_ids = self.model_observation_ids[name]
-            raw_columns = self.model_raw_columns[name]
-            source_rows = self.model_source_rows[name]
-            size = model_values.size
-            aligned = (
-                model_x,
-                segment_ids,
-                segment_keys,
-                discontinuity_ids,
-                selection,
-                observation_ids,
-                raw_columns,
-                source_rows,
-            )
-            if size == 0 or any(len(item) != size for item in aligned):
-                raise ValueError("Dataset fit model rows require complete paired identity.")
-            if (
-                not np.all(np.isfinite(model_values))
-                or not np.all(np.isfinite(model_x))
-                or np.any(segment_ids < 0)
-                or any(
-                    type(value) is not str
-                    or not value
-                    or value != value.strip()
-                    for value in segment_keys
-                )
-                or np.any(discontinuity_ids < 0)
-                or any(
-                    type(value) is not str
-                    or value not in {"direct", "interpolated"}
-                    for value in selection
-                )
-                or any(
-                    type(value) is not str
-                    or not value
-                    or value != value.strip()
-                    for value in observation_ids
-                )
-                or len(set(observation_ids)) != 1
-                or any(
-                    type(value) is not str
-                    or not value
-                    or value != value.strip()
-                    for value in raw_columns
-                )
-                or any(
-                    isinstance(value, (bool, np.bool_))
-                    or not isinstance(value, (int, np.integer))
-                    or value <= 0
-                    for value in source_rows
-                )
-                or len(set(source_rows)) != len(source_rows)
-            ):
-                raise ValueError("Dataset fit model row identity is malformed.")
-            raw_observation_ids.add(observation_ids[0])
-            model_point_count += size
-        if len(raw_observation_ids) != len(model_names):
-            raise ValueError("Dataset fit series must retain unique raw observation IDs.")
-        if self.x_projection is not None and not isinstance(
-            self.x_projection,
-            ParametricXProjection,
         ):
-            raise TypeError("Dataset fit X projection requires a ParametricXProjection.")
-        if isinstance(self.x_point_count, (bool, np.bool_)) or not isinstance(
-            self.x_point_count, (int, np.integer)
-        ):
-            raise TypeError("Dataset X point count must be an exact integer.")
-        object.__setattr__(self, "x_point_count", int(self.x_point_count))
-        if self.x_point_count < 0:
-            raise ValueError("Dataset X point count cannot be negative.")
+            values = getattr(self, name)
+            object.__setattr__(self, name, MappingProxyType(dict(values)))
+
+        if self.residuals.size != self.weighted_residuals.size:
+            raise ValueError("Dataset fit residual blocks must have equal counts.")
+
         x_metrics = (
             self.x_weighted_residual_sse,
             self.x_weighted_residual_mse,
             self.x_weighted_rmse,
             self.x_weighted_mae,
         )
-        if any(item is not None and not isinstance(item, FitMetric) for item in x_metrics):
-            raise TypeError("Dataset X metrics require typed FitMetric values.")
-        if any(
-            isinstance(item, (bool, np.bool_))
-            or not isinstance(item, (int, float, np.integer, np.floating))
-            for item in self.x_delta_x
-        ):
-            raise TypeError("Dataset X delta values must be exact numeric values.")
-        if any(
-            type(item) is not str
-            or not item
-            or item != item.strip()
-            for item in (*self.x_match_kinds, *self.x_sample_kinds)
-        ):
-            raise ValueError("Dataset X sampling identities must be exact strings.")
-        if any(
-            isinstance(item, (bool, np.bool_))
-            or not isinstance(item, (int, np.integer))
-            for item in self.x_source_rows
-        ):
-            raise TypeError("Dataset X source rows must be exact integers.")
-        object.__setattr__(self, "x_delta_x", tuple(float(item) for item in self.x_delta_x))
-        object.__setattr__(self, "x_match_kinds", tuple(self.x_match_kinds))
-        object.__setattr__(self, "x_sample_kinds", tuple(self.x_sample_kinds))
-        object.__setattr__(self, "x_source_rows", tuple(int(item) for item in self.x_source_rows))
         if self.x_projection is None:
-            if (
-                self.x_point_count != 0
-                or any(item is not None for item in x_metrics)
-                or bool(
-                    self.x_delta_x
-                    or self.x_match_kinds
-                    or self.x_sample_kinds
-                    or self.x_source_rows
-                )
-            ):
-                raise ValueError("Dataset X facts must be empty without an X projection.")
+            if any(item is not None for item in x_metrics):
+                raise ValueError("Dataset X metrics must be absent without an X projection.")
         else:
-            projection = self.x_projection
-            if self.x_point_count != projection.size:
-                raise ValueError("Dataset X point count must match its projection.")
-            if self.x_point_count <= 0:
-                raise ValueError("Dataset X projection requires positive point count.")
-            if (
-                len(self.x_delta_x) != self.x_point_count
-                or len(self.x_match_kinds) != self.x_point_count
-                or len(self.x_sample_kinds) != self.x_point_count
-                or self.x_source_rows != projection.source_rows
-                or self.x_delta_x != tuple(float(value) for value in projection.delta_x)
-                or tuple(self.x_match_kinds) != projection.match_kinds
-                or tuple(self.x_sample_kinds) != projection.sample_kinds
-                or any(not math.isfinite(value) for value in self.x_delta_x)
-            ):
-                raise ValueError("Dataset X identity facts must match its projection.")
             if any(item is None for item in x_metrics):
-                raise ValueError("Dataset X metrics must be complete when X is fitted.")
-        if model_point_count + self.x_point_count != self.n_points:
+                raise ValueError("Dataset X metrics must be complete with an X projection.")
+        species_rows = sum(values.size for values in self.model_series.values())
+        projection_rows = 0 if self.x_projection is None else self.x_projection.size
+        if self.n_points != species_rows + projection_rows:
             raise ValueError("Dataset fit n_points must match model and X rows exactly.")
 
 
@@ -2126,6 +1846,14 @@ def _build_dataset_fit_info(
     weighted_residuals = np.concatenate(weighted_blocks)
     residuals.setflags(write=False)
     weighted_residuals.setflags(write=False)
+    for values in (
+        model_series,
+        model_x,
+        model_segment,
+        model_discontinuity,
+    ):
+        for array in values.values():
+            array.setflags(write=False)
     x_count = 0 if x_projection is None else int(x_projection.size)
     x_weighted = (
         np.asarray([], dtype=float)
@@ -2157,7 +1885,6 @@ def _build_dataset_fit_info(
         model_raw_columns=model_raw_columns,
         model_source_rows=model_source_rows,
         x_projection=x_projection,
-        x_point_count=x_count,
         x_weighted_residual_sse=(
             None if x_count == 0 else fit_error_metrics(x_weighted).weighted_sse
         ),
@@ -2170,12 +1897,6 @@ def _build_dataset_fit_info(
         x_weighted_mae=(
             None if x_count == 0 else fit_error_metrics(x_weighted).weighted_mae
         ),
-        x_delta_x=(
-            () if x_projection is None else tuple(float(v) for v in x_projection.delta_x)
-        ),
-        x_match_kinds=(() if x_projection is None else x_projection.match_kinds),
-        x_sample_kinds=(() if x_projection is None else x_projection.sample_kinds),
-        x_source_rows=(() if x_projection is None else x_projection.source_rows),
     )
 
 

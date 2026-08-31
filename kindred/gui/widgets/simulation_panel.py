@@ -31,6 +31,7 @@ class SimulationPanel(QtWidgets.QWidget):
     workspaceRunDefaultsRequested = QtCore.Signal(object)
     settingsValidationFailed = QtCore.Signal(str)
     runEnabledChanged = QtCore.Signal(bool)
+    runDefaultsDraftStateChanged = QtCore.Signal(bool)
 
     def __init__(
         self,
@@ -60,8 +61,8 @@ class SimulationPanel(QtWidgets.QWidget):
         controls = QtWidgets.QHBoxLayout()
         self.solver_method_combo = QtWidgets.QComboBox(self)
         self.solver_method_combo.addItems(list(SUPPORTED_SOLVERS))
-        self.t_start_edit = self._number_edit("0", "Absolute Run start time")
-        self.t_end_edit = self._number_edit("10", "Absolute Run end time")
+        self.t_start_edit = self._number_edit("0.0", "Absolute Run start time")
+        self.t_end_edit = self._number_edit("10.0", "Absolute Run end time")
         self.num_points_spinbox = QtWidgets.QSpinBox(self)
         self.num_points_spinbox.setRange(*SIMULATION_POINT_RANGE)
         self.num_points_spinbox.setSingleStep(10)
@@ -128,6 +129,7 @@ class SimulationPanel(QtWidgets.QWidget):
         self.sim_progress = QtWidgets.QProgressBar(self)
         self.sim_progress.setVisible(False)
         layout.addWidget(self.sim_progress)
+        self._reproject_canonical()
         self._sync_controls()
 
     @staticmethod
@@ -202,6 +204,89 @@ class SimulationPanel(QtWidgets.QWidget):
         self._simulation_job_kind = kind
         self._sync_controls()
 
+    @property
+    def has_run_defaults_draft(self) -> bool:
+        """Whether the visible controls contain an unsettled authored draft."""
+
+        return bool(self._candidate_dirty)
+
+    def capture_run_defaults_draft(self) -> bool:
+        """Capture a focused control before a modal boundary, without publishing."""
+
+        focused = QtWidgets.QApplication.focusWidget()
+        controls = (
+            self.solver_method_combo,
+            self.t_start_edit,
+            self.t_end_edit,
+            self.num_points_spinbox,
+        )
+        if focused is None or not any(
+            focused is control or control.isAncestorOf(focused)
+            for control in controls
+        ):
+            return False
+        # A focused control is not necessarily edited.  Preserve the exact
+        # candidate state and only promote it to a draft when its current
+        # value differs from canonical (or cannot be validated).
+        if not self._candidate_dirty:
+            try:
+                self._candidate_dirty = (
+                    self.current_settings_candidate()
+                    != self._canonical_settings
+                )
+            except (TypeError, ValueError):
+                self._candidate_dirty = True
+        if focused is self.solver_method_combo:
+            self._candidate_changed_fields.add("solver")
+            self._candidate_values["solver"] = str(
+                self.solver_method_combo.currentText()
+            )
+        elif focused is self.t_start_edit:
+            self._candidate_changed_fields.add("t_start")
+        elif focused is self.t_end_edit:
+            self._candidate_changed_fields.add("t_end")
+        elif focused is self.num_points_spinbox:
+            self._candidate_changed_fields.add("integration_points")
+        blockers = tuple(QtCore.QSignalBlocker(control) for control in controls)
+        try:
+            focused.clearFocus()
+        finally:
+            del blockers
+        self._sync_controls()
+        self.runDefaultsDraftStateChanged.emit(bool(self._candidate_dirty))
+        return True
+
+    def discard_run_defaults_draft(self) -> bool:
+        if not self._candidate_dirty:
+            return False
+        self._candidate_dirty = False
+        self._reproject_canonical()
+        self._sync_controls()
+        self.runDefaultsDraftStateChanged.emit(False)
+        return True
+
+    def settle_saved_run_defaults(
+        self,
+        settings: SimulationExecutionSettings,
+    ) -> None:
+        """Adopt settings already published by the enclosing Save candidate."""
+
+        validate_simulation_execution_settings(settings)
+        had_draft = self._candidate_dirty
+        self._canonical_settings = settings
+        self._candidate_dirty = False
+        self._candidate_values = {
+            "solver": settings.solver,
+            "t_start": settings.t_start,
+            "t_end": settings.t_end,
+            "integration_points": settings.integration_points,
+        }
+        self._candidate_changed_fields.clear()
+        self._reproject_canonical()
+        self._sync_controls()
+        if had_draft:
+            self.runDefaultsDraftStateChanged.emit(False)
+
     def settle_run_defaults(
         self,
         publish_candidate: (
@@ -229,6 +314,7 @@ class SimulationPanel(QtWidgets.QWidget):
             elif not publish_candidate(candidate):
                 self._reproject_canonical()
                 return False
+        self.runDefaultsDraftStateChanged.emit(False)
         return True
 
     def current_settings_candidate(self) -> SimulationExecutionSettings:

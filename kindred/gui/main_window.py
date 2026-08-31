@@ -67,6 +67,7 @@ from kindred.core.project_presentation_state import (
 from kindred.core.result_repository import (
     ResultRepository,
 )
+from kindred.core.species import validate_concentration
 from kindred.gui.computation_gate import ComputationGate
 from kindred.gui.app_wiring import (
     build_physical_shell,
@@ -535,6 +536,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._recent_menu: QtWidgets.QMenu | None = None
         self._tab_surfaces: dict[str, _TabSurfaceBundle] = {}
         self._result_render_inputs: dict[str, ResultRenderInput] = {}
+        self._result_copy_eligible: dict[str, bool] = {}
         self._dark_mode_action: QtGui.QAction | None = None
         self._run_action: QtGui.QAction | None = None
         self._new_project_action: QtGui.QAction | None = None
@@ -578,9 +580,11 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         self._workspace_tab_registry = WorkspaceTabRegistry(
             self._project_session,
-            deletion_result_fence=self._simulation_jobs,
-            canonical_result_fence=self._fence_canonical_result_delta,
-            interactive_preview_fence=self._fence_interactive_preview_delta,
+            computation_fence=self._simulation_jobs.fence_document_delta,
+            retire_interactive_plot_targets=(
+                self._retire_interactive_plot_targets
+            ),
+            post_document_publication=self._post_document_publication,
             runtime_factory=self._new_tab_runtime,
         )
         self._dataset_import_staging = DatasetImportStaging(parent=self)
@@ -622,10 +626,8 @@ class MainWindow(QtWidgets.QMainWindow):
             fit_session=self._fit_session_owner,
             xlsx_exports=self._xlsx_export_owner,
             set_status_text=self.set_status_text,
-            settle_execution_candidate=(
-                lambda token: self._settle_execution_candidate(
-                    expected_token=token
-                )
+            capture_visible_tab_inputs=(
+                lambda token: self._capture_visible_tab_inputs(token)
             ),
             prepare_before_save=self._prepare_before_save,
             commit_saved_document=self._commit_saved_document,
@@ -849,6 +851,11 @@ class MainWindow(QtWidgets.QMainWindow):
                 enabled,
             )
         )
+        panel.runDefaultsDraftStateChanged.connect(
+            lambda _dirty, captured=tab_id: self._on_initial_draft_state_changed(
+                captured
+            )
+        )
         panel.settingsValidationFailed.connect(self.set_status_text)
         model.plotMembershipChangeRequested.connect(
             lambda set_id, requested, captured=tab_id: (
@@ -911,8 +918,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 captured
             )
         )
-        actions.invalidDraftStateChanged.connect(
-            lambda _captured, _invalid, captured=tab_id: self._on_invalid_initial_state_changed(
+        actions.draftStateChanged.connect(
+            lambda _captured, _dirty, captured=tab_id: self._on_initial_draft_state_changed(
                 captured
             )
         )
@@ -971,6 +978,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if bundle is None:
             return
         self._result_render_inputs.pop(target, None)
+        self._result_copy_eligible.pop(target, None)
         bundle.slider_binding.dispose()
         for stack, widget in (
             (self._mechanism_stack, bundle.editor_panel),
@@ -1262,6 +1270,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 if tab.tab_id not in self._tab_surfaces:
                     self._create_tab_surface(tab.tab_id)
             self._result_render_inputs.clear()
+            self._result_copy_eligible.clear()
             self._workspace.render(
                 document,
                 active_tab_id=self._workspace_tab_registry.active_tab_id,
@@ -1679,29 +1688,27 @@ class MainWindow(QtWidgets.QMainWindow):
             self._clear_result_presentation_after_failure(target)
             self._refresh_actions()
             return False
-        plot = self._workspace.plot_for_tab(target)
-        try:
-            applied = plot.apply_result_input(render_input)
-        except Exception as exc:
-            logger.exception("Result physical apply failed for mechanism %s", target)
-            self.set_status_text(
-                f"Result display failed for mechanism {target!r}: {exc}"
-            )
-            self._clear_result_presentation_after_failure(target)
-            self._refresh_actions()
-            return False
-        if not applied:
-            self._clear_result_presentation_after_failure(target)
-            self._refresh_actions()
-            return False
         try:
             select_copy_blocks(render_input)
         except (TypeError, ValueError):
             copy_available = False
         else:
             copy_available = True
-        plot.set_copy_all_available(copy_available)
+        # Semantic truth and export eligibility are committed before touching
+        # PyQtGraph.  A physical render exception must not erase either.
         self._result_render_inputs[target] = render_input
+        self._result_copy_eligible[target] = copy_available
+        plot = self._workspace.plot_for_tab(target)
+        try:
+            plot.set_copy_all_available(copy_available)
+            plot.apply_result_input(render_input)
+        except Exception as exc:
+            logger.exception("Result physical apply failed for mechanism %s", target)
+            self.set_status_text(
+                f"Result display failed for mechanism {target!r}: {exc}"
+            )
+            self._refresh_actions()
+            return False
         self._refresh_actions()
         return True
 
@@ -1710,6 +1717,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         target = str(tab_id)
         self._result_render_inputs.pop(target, None)
+        self._result_copy_eligible.pop(target, None)
         try:
             self._workspace.plot_for_tab(target).clear_result_input()
         except Exception as exc:
@@ -1766,12 +1774,11 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         self._render_results_for_tab(target)
 
-    @QtCore.Slot(str, str, int, object, object)
+    @QtCore.Slot(str, str, object, object)
     def _on_interactive_result_ready(
         self,
         tab_id: str,
         set_id: str,
-        generation: int,
         request: object,
         result: object,
     ) -> None:
@@ -1787,7 +1794,6 @@ class MainWindow(QtWidgets.QMainWindow):
         plot.apply_interactive_preview_result(
             target,
             set_id,
-            generation,
             request,
             result,
         )
@@ -1809,34 +1815,47 @@ class MainWindow(QtWidgets.QMainWindow):
             raise LookupError(f"Tab {tab_id!r} has no ResultRepository.")
         return repository
 
-    def _fence_canonical_result_delta(
+    def _retire_interactive_plot_targets(
         self,
         delta: ScientificDocumentDelta,
     ) -> None:
-        """Fence one registry-computed non-deletion delta before publication."""
+        """Retire only physical interactive Preview plot targets."""
 
-        if not isinstance(delta, ScientificDocumentDelta):
-            raise TypeError("canonical result fence requires ScientificDocumentDelta.")
-        for tab_id, set_ids in delta.affected_targets_by_tab:
-            if set_ids:
-                self._simulation_jobs.deauthorize_targets(tab_id, set_ids)
+        targets_by_tab: dict[str, list[str]] = {}
+        for entries in (
+            delta.affected_targets_by_tab,
+            delta.removed_targets_by_tab,
+        ):
+            for tab_id, set_ids in entries:
+                targets = targets_by_tab.setdefault(str(tab_id), [])
+                for set_id in set_ids:
+                    value = str(set_id)
+                    if value not in targets:
+                        targets.append(value)
+        for tab_id, target_set_ids in targets_by_tab.items():
+            if target_set_ids:
+                self._workspace.plot_for_tab(
+                    tab_id
+                ).retire_interactive_preview_targets(tuple(target_set_ids))
 
-    def _fence_interactive_preview_delta(
+    def _post_document_publication(
         self,
         delta: ScientificDocumentDelta,
     ) -> None:
-        """Retire transient Preview work before canonical mutation publication."""
+        """Reproject each surviving result touched by one document delta."""
 
-        if not isinstance(delta, ScientificDocumentDelta):
-            raise TypeError(
-                "interactive Preview fence requires ScientificDocumentDelta."
-            )
-        for tab_id, set_ids in delta.affected_targets_by_tab:
-            self._simulation_jobs.retire_preview(tab_id, set_ids)
-            if set_ids:
-                self._workspace.plot_for_tab(tab_id).retire_interactive_preview_targets(
-                    tuple(set_ids)
-                )
+        tab_ids: list[str] = []
+        for entries in (
+            delta.affected_targets_by_tab,
+            delta.removed_targets_by_tab,
+        ):
+            for tab_id, _set_ids in entries:
+                target = str(tab_id)
+                if target not in tab_ids:
+                    tab_ids.append(target)
+        for target in tab_ids:
+            if target in self._tab_surfaces:
+                self._render_results_for_tab(target)
 
     def _build_explicit_target_for_tab(
         self,
@@ -1917,13 +1936,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self._activate_materialized_set(tab_id, proposal.materialized_set_ids)
         runtime.reactions_draft = None
         valid_species = set(canonical_species_names(proposed_tab))
-        runtime.invalid_initial_text_by_set_id = {
+        runtime.initial_text_by_set_id = {
             set_id: {
                 species: raw
                 for species, raw in values.items()
                 if species in valid_species
             }
-            for set_id, values in runtime.invalid_initial_text_by_set_id.items()
+            for set_id, values in runtime.initial_text_by_set_id.items()
             if any(species in valid_species for species in values)
         }
         if refresh_after_admission:
@@ -1946,7 +1965,11 @@ class MainWindow(QtWidgets.QMainWindow):
         tabs = self._project_session.document.tabs
         for tab in tabs:
             runtime = self._workspace_tab_registry.tab_runtime(tab.tab_id)
-            self._workspace.set_tab_dirty(tab.tab_id, runtime.has_dirty_drafts)
+            self._workspace.set_tab_dirty(
+                tab.tab_id,
+                runtime.has_dirty_drafts
+                or self._tab_surfaces[tab.tab_id].simulation_panel.has_run_defaults_draft,
+            )
             self._workspace.set_tab_close_enabled(
                 tab.tab_id,
                 len(tabs) > 1,
@@ -1963,7 +1986,7 @@ class MainWindow(QtWidgets.QMainWindow):
         previous = self._workspace_tab_registry.active_tab_id
         if target == previous:
             return
-        if not self._settle_execution_candidate():
+        if not self._settle_visible_tab_inputs():
             self._workspace.select_tab_surface(previous)
             return
         token = self._workspace_tab_registry.select_tab(
@@ -1979,7 +2002,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _create_tab(self) -> None:
         if not self._mutation_input_admitted("Create Tab"):
             return
-        if not self._settle_execution_candidate():
+        if not self._settle_visible_tab_inputs():
             QtCore.QTimer.singleShot(0, self._refresh_workspace_tab_structure)
             return
         tab = self._workspace_tab_registry.create_tab(
@@ -2017,14 +2040,18 @@ class MainWindow(QtWidgets.QMainWindow):
     def _close_tab(self, tab_id: str) -> None:
         if not self._mutation_input_admitted("Close Tab"):
             return
-        if not self._settle_execution_candidate():
-            return
         document = self._project_session.document
         if len(document.tabs) <= 1:
             self.set_status_text("The last mechanism tab cannot be closed.")
             return
+        expected_token = self._project_session.capture_content_token()
+        if self._capture_visible_tab_inputs(
+            expected_token,
+            tab_id=str(tab_id),
+        ) is None:
+            return
         runtime = self._workspace_tab_registry.tab_runtime(tab_id)
-        invalid_cells = bool(runtime.invalid_initial_text_by_set_id)
+        bundle = self._tab_surfaces[str(tab_id)]
         has_content = self._workspace_tab_registry.tab_has_content_or_drafts(
             tab_id,
             fresh_run_defaults=self.config_controller.application_run_defaults(),
@@ -2032,6 +2059,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.config_controller.application_scientific_defaults()
             ),
         )
+        has_content = bool(has_content or bundle.simulation_panel.has_run_defaults_draft)
         if has_content:
             dialog = QtWidgets.QMessageBox(self)
             dialog.setWindowTitle("Close Mechanism")
@@ -2043,32 +2071,28 @@ class MainWindow(QtWidgets.QMainWindow):
                 details.append("Visible Reactions edits will be discarded.")
             if runtime.notes_draft is not None:
                 details.append("Visible Notes edits will be discarded.")
-            if runtime.invalid_initial_text_by_set_id:
-                details.append("Invalid Initial Conditions edits will be discarded.")
+            if runtime.initial_text_by_set_id:
+                details.append("Initial Conditions edits will be discarded.")
+            if bundle.simulation_panel.has_run_defaults_draft:
+                details.append("Run-default edits will be discarded.")
             if (
                 runtime.slider_parameter_draft
                 or runtime.slider_species_drafts_by_set_id
             ):
                 details.append("Slider Preview drafts will be discarded.")
             dialog.setText("\n\n".join(details))
-            discard_label = "Discard and Close"
-            if invalid_cells:
-                discard_label = "Discard Invalid Cell Edit(s) and Continue"
             discard = dialog.addButton(
-                discard_label,
+                "Discard and Close",
                 QtWidgets.QMessageBox.ButtonRole.DestructiveRole,
             )
-            if invalid_cells:
-                dialog.addButton(
-                    "Return and Fix",
-                    QtWidgets.QMessageBox.ButtonRole.RejectRole,
-                )
             dialog.addButton(QtWidgets.QMessageBox.StandardButton.Cancel)
             dialog.exec()
             if dialog.clickedButton() is not discard:
                 return
         runtime.reactions_draft = None
-        runtime.invalid_initial_text_by_set_id.clear()
+        runtime.notes_draft = None
+        runtime.initial_text_by_set_id.clear()
+        bundle.simulation_panel.discard_run_defaults_draft()
         result = self._workspace_tab_registry.close_tab(
             tab_id,
             expected_token=self._project_session.capture_content_token(),
@@ -2136,7 +2160,6 @@ class MainWindow(QtWidgets.QMainWindow):
         if answer != QtWidgets.QMessageBox.StandardButton.Yes:
             return
         if bundle.initial_actions.delete_selected():
-            bundle.slider_binding.evict_preview_targets(targets)
             self._refresh_dataset_views((tab_id,))
 
     @QtCore.Slot(object)
@@ -2257,11 +2280,11 @@ class MainWindow(QtWidgets.QMainWindow):
         ):
             self._run_action.setEnabled(admitted)
 
-    def _settle_execution_candidate(
+    def _settle_visible_tab_inputs(
         self,
-        tab_id: str | None = None,
-        *,
         expected_token: ProjectContentToken | None = None,
+        *,
+        tab_id: str | None = None,
     ) -> ProjectContentToken | None:
         target = (
             self._workspace_tab_registry.active_tab_id
@@ -2276,33 +2299,160 @@ class MainWindow(QtWidgets.QMainWindow):
         if not self._project_session.is_content_token_current(entry_token):
             return None
         bundle = self._tab_surfaces[target]
-        settled_token = bundle.initial_actions.settle_active_editor(
-            expected_token=entry_token,
+        captured = self._capture_visible_tab_inputs(entry_token, tab_id=target)
+        if captured is None:
+            return None
+        candidate = self._captured_input_candidate(
+            self._project_session.document,
+            (target,),
+            discard_invalid=False,
+            report_invalid=False,
         )
-        if (
-            settled_token is None
-            or not self._project_session.is_content_token_current(settled_token)
-        ):
+        if candidate is None:
+            if bundle.initial_actions.has_invalid_cells():
+                self.set_status_text(
+                    "Visible Initial Conditions contain an invalid draft."
+                )
             return None
-        successor_token = settled_token
-
-        def publish_candidate(settings: SimulationExecutionSettings) -> bool:
-            nonlocal successor_token
-            published = self._set_workspace_run_defaults(
-                target,
-                settings,
-                expected_token=successor_token,
+        successor_token = entry_token
+        if candidate != self._project_session.document:
+            successor_token = self._workspace_tab_registry.replace_document(
+                candidate,
+                expected_token=entry_token,
             )
-            if published is None:
-                return False
-            successor_token = published
-            return True
-
-        if not bundle.simulation_panel.settle_run_defaults(publish_candidate):
+        if successor_token is None:
             return None
-        if not self._project_session.is_content_token_current(successor_token):
-            return None
+        self._clear_settled_input_drafts((target,), candidate)
+        self._refresh_tab_controls(target)
         return successor_token
+
+    def _capture_visible_tab_inputs(
+        self,
+        expected_token: ProjectContentToken,
+        *,
+        tab_id: str | None = None,
+    ) -> ProjectContentToken | None:
+        """Capture the one focused IC or Run-default editor before inspection."""
+
+        if not self._project_session.is_content_token_current(expected_token):
+            return None
+        focused = QtWidgets.QApplication.focusWidget()
+        targets = (
+            (str(tab_id),)
+            if tab_id is not None
+            else tuple(self._tab_surfaces)
+        )
+        for target in targets:
+            bundle = self._tab_surfaces.get(target)
+            if bundle is None:
+                continue
+            # Check the table before the enclosing panel: delegate editors are
+            # descendants of both widgets.
+            if focused is not None and (
+                focused is bundle.batch_table
+                or bundle.batch_table.isAncestorOf(focused)
+            ):
+                return bundle.initial_actions.capture_active_editor(
+                    expected_token=expected_token,
+                )
+            if focused is not None and (
+                focused is bundle.simulation_panel
+                or bundle.simulation_panel.isAncestorOf(focused)
+            ) and bundle.simulation_panel.capture_run_defaults_draft():
+                self._on_initial_draft_state_changed(target)
+                return expected_token
+        return expected_token
+
+    @staticmethod
+    def _valid_initial_text(raw: object, species: str) -> bool:
+        try:
+            validate_concentration(
+                float(raw),
+                field=f"initial concentration for {species}",
+            )
+        except (TypeError, ValueError, OverflowError):
+            return False
+        return True
+
+    def _captured_input_candidate(
+        self,
+        document: ProjectDocument,
+        tab_ids: Iterable[str],
+        *,
+        discard_invalid: bool,
+        report_invalid: bool = True,
+    ) -> ProjectDocument | None:
+        """Project captured widget drafts into one detached document candidate."""
+
+        tabs = list(document.tabs)
+        for target in tuple(dict.fromkeys(str(item) for item in tab_ids)):
+            runtime = self._workspace_tab_registry.tab_runtime(target)
+            tab_index = next(
+                index for index, item in enumerate(tabs) if item.tab_id == target
+            )
+            tab = tabs[tab_index]
+            values_by_set = {
+                item.set_id: dict(item.values)
+                for item in tab.initial_condition_sets
+            }
+            for set_id, values in runtime.initial_text_by_set_id.items():
+                if set_id not in values_by_set:
+                    continue
+                for species, raw in values.items():
+                    if not self._valid_initial_text(raw, species):
+                        if discard_invalid:
+                            continue
+                        if report_invalid:
+                            QtWidgets.QMessageBox.warning(
+                                self,
+                                "Save Project",
+                                "Save is blocked while any visible Initial Conditions cell is invalid.",
+                            )
+                        return None
+                    values_by_set[set_id][str(species)] = validate_concentration(
+                        float(raw),
+                        field=f"initial concentration for {species}",
+                    )
+            updated_sets = tuple(
+                initial_set.with_values(values_by_set[initial_set.set_id])
+                for initial_set in tab.initial_condition_sets
+            )
+            tab = tab.with_initial_condition_sets(updated_sets)
+            panel = self._tab_surfaces[target].simulation_panel
+            if panel.has_run_defaults_draft:
+                try:
+                    settings = panel.current_settings_candidate()
+                except (TypeError, ValueError) as exc:
+                    self.set_status_text(f"Run settings are invalid: {exc}")
+                    return None
+                tab = tab.with_run_defaults(settings)
+            tabs[tab_index] = tab
+        return replace(document, tabs=tuple(tabs))
+
+    def _clear_settled_input_drafts(
+        self,
+        tab_ids: Iterable[str],
+        document: ProjectDocument,
+        *,
+        discard_invalid: bool = False,
+    ) -> None:
+        for target in tuple(dict.fromkeys(str(item) for item in tab_ids)):
+            runtime = self._workspace_tab_registry.tab_runtime(target)
+            if discard_invalid:
+                runtime.initial_text_by_set_id.clear()
+            else:
+                for set_id, values in tuple(runtime.initial_text_by_set_id.items()):
+                    remaining = {
+                        species: raw
+                        for species, raw in values.items()
+                        if not self._valid_initial_text(raw, species)
+                    }
+                    if remaining:
+                        runtime.initial_text_by_set_id[set_id] = remaining
+                    else:
+                        runtime.initial_text_by_set_id.pop(set_id, None)
+            panel = self._tab_surfaces[target].simulation_panel
+            panel.settle_saved_run_defaults(document.tab(target).run_defaults)
 
     def _confirm_discard_slider_preview(
         self,
@@ -2381,7 +2531,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return False
         if not self._confirm_discard_slider_preview(target, "Run"):
             return False
-        if not self._settle_execution_candidate(target):
+        if not self._settle_visible_tab_inputs(tab_id=target):
             return False
         selected = bundle.initial_actions.selected_run_set_ids()
         if bundle.initial_actions.has_invalid_cells(selected):
@@ -2459,7 +2609,9 @@ class MainWindow(QtWidgets.QMainWindow):
     def _inspect_transient_state(self) -> ProjectTransientState:
         reactions_draft = False
         notes_draft = False
+        initial_condition_drafts = False
         invalid_initials = False
+        run_defaults_drafts = False
         slider_drafts = False
         for tab in self._project_session.document.tabs:
             runtime = self._workspace_tab_registry.tab_runtime(tab.tab_id)
@@ -2468,8 +2620,16 @@ class MainWindow(QtWidgets.QMainWindow):
             notes_draft = bool(
                 notes_draft or runtime.notes_draft is not None
             )
+            initial_condition_drafts = bool(
+                initial_condition_drafts or runtime.initial_text_by_set_id
+            )
             invalid_initials = bool(
-                invalid_initials or runtime.invalid_initial_text_by_set_id
+                invalid_initials
+                or self._tab_surfaces[tab.tab_id].initial_actions.has_invalid_cells()
+            )
+            run_defaults_drafts = bool(
+                run_defaults_drafts
+                or self._tab_surfaces[tab.tab_id].simulation_panel.has_run_defaults_draft
             )
             slider_drafts = bool(
                 slider_drafts
@@ -2479,7 +2639,9 @@ class MainWindow(QtWidgets.QMainWindow):
         return ProjectTransientState(
             reactions_draft=reactions_draft,
             notes_draft=notes_draft,
+            initial_condition_drafts=initial_condition_drafts,
             invalid_initial_conditions=invalid_initials,
+            run_defaults_drafts=run_defaults_drafts,
             slider_drafts=slider_drafts,
             active_run_or_preview=self._simulation_work_active(),
             active_fit=bool(self._fit_window_open or self._fit_executing),
@@ -2527,16 +2689,12 @@ class MainWindow(QtWidgets.QMainWindow):
                         for item in candidate.tabs
                     ),
                 )
-        if not discard_invalid_authoring and any(
-            self._workspace_tab_registry.tab_runtime(tab_id)
-            .invalid_initial_text_by_set_id
-            for tab_id in tab_ids
-        ):
-            QtWidgets.QMessageBox.warning(
-                self,
-                "Save Project",
-                "Save is blocked while any visible Initial Conditions cell is invalid.",
-            )
+        candidate = self._captured_input_candidate(
+            candidate,
+            tab_ids,
+            discard_invalid=discard_invalid_authoring,
+        )
+        if candidate is None:
             return None
         return candidate, tuple(materialized_by_tab)
 
@@ -2573,6 +2731,11 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         if result is None:
             return None
+        self._clear_settled_input_drafts(
+            (tab.tab_id for tab in document.tabs),
+            document,
+            discard_invalid=True,
+        )
         for tab_id, visible_draft in captured_reaction_drafts:
             tab = document.tab(tab_id)
             self._tab_surfaces[
@@ -2594,15 +2757,28 @@ class MainWindow(QtWidgets.QMainWindow):
     def _discard_authoring(self, mode: AuthoringDiscardMode) -> None:
         if mode is not AuthoringDiscardMode.ALL_UNACCEPTED:
             raise ValueError("Only whole-project unaccepted authoring can be discarded.")
+        focused_editor = QtWidgets.QApplication.focusWidget()
+        if focused_editor is not None:
+            for bundle in self._tab_surfaces.values():
+                if (
+                    focused_editor is not bundle.batch_table
+                    and bundle.batch_table.isAncestorOf(focused_editor)
+                ):
+                    bundle.batch_table.closeEditor(
+                        focused_editor,
+                        QtWidgets.QAbstractItemDelegate.EndEditHint.RevertModelCache,
+                    )
+                    break
         for tab in self._project_session.document.tabs:
             runtime = self._workspace_tab_registry.tab_runtime(tab.tab_id)
             runtime.reactions_draft = None
             runtime.notes_draft = None
-            runtime.invalid_initial_text_by_set_id.clear()
+            runtime.initial_text_by_set_id.clear()
         for bundle in self._tab_surfaces.values():
             bundle.editor_binding.render()
             bundle.initial_actions.render()
             tab = self._workspace_tab_registry.tab(bundle.tab_id)
+            bundle.simulation_panel.discard_run_defaults_draft()
             bundle.simulation_panel.render_run_defaults(
                 tab.run_defaults,
                 run_admitted=self._run_admitted(bundle.tab_id),
@@ -2630,7 +2806,11 @@ class MainWindow(QtWidgets.QMainWindow):
         # and notes drafts leave executable identity unchanged, but refreshing
         # here keeps the projection synchronized for every draft signal.
         self._refresh_symbolic_calculator(tab_id)
-        self._workspace.set_tab_dirty(tab_id, runtime.has_dirty_drafts)
+        self._workspace.set_tab_dirty(
+            tab_id,
+            runtime.has_dirty_drafts
+            or self._tab_surfaces[tab_id].simulation_panel.has_run_defaults_draft,
+        )
         if tab_id == self._workspace_tab_registry.active_tab_id:
             self._set_tab_run_enabled(tab_id, self._run_admitted(tab_id))
         self._refresh_title()
@@ -2689,8 +2869,8 @@ class MainWindow(QtWidgets.QMainWindow):
         if self._current_row_refreshing.get(target) is document:
             self._current_row_refreshing.pop(target, None)
 
-    def _on_invalid_initial_state_changed(self, tab_id: str) -> None:
-        """Apply invalid-cell admission immediately to the owning tab."""
+    def _on_initial_draft_state_changed(self, tab_id: str) -> None:
+        """Apply current IC-draft admission to the owning tab."""
 
         target = str(tab_id)
         self._set_tab_run_enabled(target, self._run_admitted(target))
@@ -3946,7 +4126,14 @@ class MainWindow(QtWidgets.QMainWindow):
     def _project_actions_idle(self, action: str) -> bool:
         if not self._mutation_input_admitted(action):
             return False
-        if self._inspect_transient_state().has_active_work:
+        active_work = bool(
+            self._simulation_work_active()
+            or self._fit_window_open
+            or self._fit_executing
+            or self._dataset_import_staging.busy
+            or self._xlsx_export_owner.is_exporting
+        )
+        if active_work:
             self.set_status_text(
                 f"{action} rejected: active work must finish first."
             )
@@ -4362,33 +4549,12 @@ class MainWindow(QtWidgets.QMainWindow):
         if not self._mutation_input_admitted("Global Fit"):
             return False
         tab_id = self._workspace_tab_registry.active_tab_id
-        bundle = self._tab_surfaces[tab_id]
         if not self._computation_gate.is_idle:
             self.set_status_text(
                 "Global Fit rejected: another computation is active."
             )
             return False
-        if not self._settle_execution_candidate(tab_id):
-            return False
         if not self._confirm_discard_slider_preview(tab_id, "Global Fit"):
-            return False
-        if not self._accept_visible_source(
-            tab_id,
-            description="Global Fit",
-        ):
-            return False
-        tab = self._workspace_tab_registry.tab(tab_id)
-        fit_set_ids = tuple(
-            link.set_id
-            for _dataset_id, link in tab.dataset_links
-            if link.include_in_fit and link.set_id is not None
-        )
-        if bundle.initial_actions.has_invalid_cells(fit_set_ids):
-            QtWidgets.QMessageBox.warning(
-                self,
-                "Global Fit",
-                "Fit is blocked by invalid visible Initial Conditions in an included set.",
-            )
             return False
         return self._fit_session_owner.open_fit_configuration(tab_id) is not None
 
@@ -4976,6 +5142,10 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._workspace_tab_registry.workspace_presentation()
             )
             or self._workspace_tab_registry.has_dirty_drafts()
+            or any(
+                bundle.simulation_panel.has_run_defaults_draft
+                for bundle in self._tab_surfaces.values()
+            )
         )
         self.setWindowTitle(f"Kindred — {name}{' *' if dirty else ''}")
 
@@ -5022,17 +5192,10 @@ class MainWindow(QtWidgets.QMainWindow):
         if self._recent_menu is not None:
             self._recent_menu.setEnabled(project_actions_enabled)
         if self._xlsx_export_action is not None:
-            render_input = self._result_render_inputs.get(
-                self._workspace_tab_registry.active_tab_id
+            export_ready = self._result_copy_eligible.get(
+                self._workspace_tab_registry.active_tab_id,
+                False,
             )
-            export_ready = False
-            if render_input is not None:
-                try:
-                    select_copy_blocks(render_input)
-                except (TypeError, ValueError):
-                    pass
-                else:
-                    export_ready = True
             self._xlsx_export_action.setEnabled(
                 mutation_admitted
                 and not active_work

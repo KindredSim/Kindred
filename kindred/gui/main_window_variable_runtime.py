@@ -575,13 +575,30 @@ class TabSliderBinding(QtCore.QObject):
         invalid = tuple(
             set_id
             for set_id in targets
-            if runtime.invalid_initial_text_by_set_id.get(set_id)
+            if any(
+                not self._valid_initial_text(raw, species)
+                for species, raw in runtime.initial_text_by_set_id.get(
+                    set_id,
+                    {},
+                ).items()
+            )
         )
         if invalid:
             self.errorRaised.emit(
                 "Preview blocked by invalid visible Initial Conditions in: "
                 + ", ".join(invalid)
             )
+            return False
+        return True
+
+    @staticmethod
+    def _valid_initial_text(raw: object, species: str) -> bool:
+        try:
+            validate_concentration(
+                float(raw),
+                field=f"initial concentration for {species}",
+            )
+        except (TypeError, ValueError, OverflowError):
             return False
         return True
 
@@ -1074,11 +1091,6 @@ class TabSliderBinding(QtCore.QObject):
             self.render()
         self._emit_draft_state()
         return changed
-
-    def evict_preview_targets(self, set_ids: Iterable[str]) -> None:
-        ids = tuple(str(item) for item in set_ids)
-        if ids:
-            self._simulation_jobs.retire_preview(self._tab_id, ids)
 
     def dispose(self) -> None:
         if self._disposed:

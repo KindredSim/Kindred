@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import io
 import json
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, replace
 from collections.abc import Callable, Mapping, Sequence
 from types import MappingProxyType
 from typing import Any
@@ -19,18 +20,17 @@ from kindred.core.result_repository import SimulationResultValue
 from kindred.gui.interactive_preview import InteractivePreviewRequest
 from kindred.gui.plot_config import PlotPresentationIntent, require_pyqtgraph
 from kindred.gui.widgets.axis_toolbar import AxisToolbar
-from kindred.gui.widgets.interactive_plot_transition import (
-    InteractiveDisplayController,
-    InteractiveDisplayState,
-)
 from kindred.gui.widgets.parameter_statistics_table import ParameterStatisticsTable
 from kindred.gui.widgets.species_statistics_table import SpeciesStatisticsTable
 from kindred.gui.workspace_result_presenter import (
+    InteractiveDisplayCurve,
+    InteractiveDisplayProjection,
     ResultDataBlock,
     ResultRenderInput,
     ResultLayerKind,
     encode_clipboard_text,
     encode_tsv_row,
+    compose_interactive_display,
 )
 
 pg = require_pyqtgraph(context="Kindred GUI")
@@ -54,6 +54,42 @@ class _AxisRangeSession:
     x_max: float | None = None
     y_min: float | None = None
     y_max: float | None = None
+
+
+_EPSILON = 1e-9
+
+
+@dataclass(frozen=True, slots=True)
+class _InteractiveDisplayLayer:
+    projection: InteractiveDisplayProjection
+    opacity: float
+
+
+@dataclass(frozen=True, slots=True)
+class _InteractiveDisplayTransition:
+    source: tuple[_InteractiveDisplayLayer, ...]
+    target: InteractiveDisplayProjection
+    started_at: float
+    interpolate: bool
+
+
+@dataclass(frozen=True, slots=True)
+class _InteractiveDisplayState:
+    layers: tuple[_InteractiveDisplayLayer, ...]
+
+
+def _same_interactive_topology(
+    left: InteractiveDisplayCurve,
+    right: InteractiveDisplayCurve,
+) -> bool:
+    if left.segment_ids is None or right.segment_ids is None:
+        return left.segment_ids is None and right.segment_ids is None
+    return bool(
+        np.array_equal(left.segment_ids, right.segment_ids)
+        and left.segment_keys == right.segment_keys
+        and np.array_equal(left.discontinuity_ids, right.discontinuity_ids)
+        and left.intervention_connectors == right.intervention_connectors
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -161,11 +197,16 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         self._interactive_locked_view: (
             tuple[tuple[float, float], tuple[float, float]] | None
         ) = None
-        self._interactive_display = InteractiveDisplayController(
-            render=self._render_interactive_display,
-            request_tick=self._request_interactive_tick,
-            cancel_tick=self._interactive_timer.stop,
-        )
+        self._interactive_visible: tuple[_InteractiveDisplayLayer, ...] | None = None
+        self._interactive_transition: _InteractiveDisplayTransition | None = None
+        self._interactive_pending: InteractiveDisplayProjection | None = None
+        self._interactive_results: dict[str, SimulationResultValue] = {}
+        self._interactive_request: InteractivePreviewRequest | None = None
+        self._interactive_target_set_ids: tuple[str, ...] = ()
+        self._interactive_last_presented_at: float | None = None
+        self._interactive_tick_requested = False
+        self._interactive_frozen = False
+        self._interactive_rendered_frame = False
 
         self._plot_widget = pg.PlotWidget(self)
         self._plot_widget.setObjectName("plotViewport")
@@ -232,30 +273,24 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
 
         return self._analysis_tabs
 
-    def apply_result_input(self, render_input: ResultRenderInput) -> bool:
+    def apply_result_input(self, render_input: ResultRenderInput) -> None:
         """Retain and draw one immutable result input."""
 
         locked_view = self._interactive_locked_view
         self._rendered_point_roster = ()
         self._settling_static_input = True
         try:
-            self._interactive_display.prepare_result_input(render_input)
+            self._prepare_interactive_result_input(render_input)
             self._render_input = render_input
             self._render_result_scene(render_input)
-            self._interactive_display.commit_result_input(render_input)
-            if self._interactive_display.has_visible_frame and locked_view is not None:
+            self._commit_interactive_result_input(render_input)
+            if self._interactive_has_visible_frame and locked_view is not None:
                 self._restore_interactive_view(locked_view)
-            elif not self._interactive_display.has_renderable_frame:
+            elif not self._interactive_rendered_frame:
                 self._end_interactive_range_session()
             if render_input.unavailable_x_diagnostic is not None:
                 self.resultDiagnostic.emit(render_input.unavailable_x_diagnostic)
-            return True
-        except Exception:
-            # A failed physical apply must not leave the prior scene, tables,
-            # warnings, or rendered-copy roster attached to a new semantic
-            # input.  MainWindow also clears its semantic cache at this seam.
-            self.clear_result_input()
-            raise
+            return None
         finally:
             self._settling_static_input = False
 
@@ -263,7 +298,6 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         self,
         tab_id: str,
         set_id: str,
-        generation: int,
         request: InteractivePreviewRequest,
         result: SimulationResultValue,
     ) -> bool:
@@ -272,11 +306,10 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         render_input = self._render_input
         if render_input is None or render_input.tab_id != str(tab_id):
             return False
-        return self._interactive_display.offer_result(
+        return self._offer_interactive_result(
             result,
             set_id=str(set_id),
-            generation=int(generation),
-            target_set_ids=tuple(request.target_set_ids),
+            request=request,
             render_input=render_input,
         )
 
@@ -326,17 +359,16 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
     def retire_interactive_preview_targets(
         self,
         target_set_ids: tuple[str, ...],
-        *,
-        generation: int | None = None,
     ) -> bool:
-        """Retire selected transient targets at an admitted generation."""
+        """Retire selected transient targets from the physical display."""
 
-        retired = self._interactive_display.retire_targets(
+        retired = self._retire_interactive_targets(
             tuple(str(value) for value in target_set_ids),
-            generation=generation,
         )
-        if retired or generation is None:
+        if retired:
             retired = self._retire_static_preview_targets(target_set_ids) or retired
+        else:
+            retired = self._retire_static_preview_targets(target_set_ids)
         return retired
 
     def _retire_static_preview_targets(
@@ -380,11 +412,11 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         """Cancel visual work and freeze the last physically stable display."""
 
         if (
-            not self._interactive_display.has_visible_frame
-            and not self._interactive_display.has_pending_batch
+            not self._interactive_has_visible_frame
+            and not self._interactive_has_pending_batch
         ):
             return False
-        self._interactive_display.stop()
+        self._stop_interactive_display()
         self._end_interactive_range_session()
         return True
 
@@ -508,7 +540,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         self._render_input = None
         self._copy_all_available = False
         self._rendered_point_roster = ()
-        self._interactive_display.clear(reset_currentness=True)
+        self._clear_interactive_display(reset_currentness=True)
 
     def clear_result_input(self) -> None:
         """Clear the current result scene and its transient display."""
@@ -522,17 +554,352 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         self._parameter_table.setRowCount(0)
         self._species_table.setRowCount(0)
         self._clear_completion_warning()
+
+    @property
+    def _interactive_has_visible_frame(self) -> bool:
+        return bool(
+            self._interactive_visible
+            and any(
+                layer.projection.curves for layer in self._interactive_visible
+            )
+        )
+
+    @property
+    def _interactive_has_pending_batch(self) -> bool:
+        return bool(
+            self._interactive_results
+            or self._interactive_pending
+            or self._interactive_transition
+        )
+
+    def _prepare_interactive_result_input(
+        self,
+        render_input: ResultRenderInput,
+    ) -> None:
+        """Retire the transient batch before a static scene is replaced."""
+
+        self._clear_interactive_display(reset_currentness=True)
+        self._interactive_request = None
+        self._interactive_target_set_ids = ()
+        self._render_input = render_input
+
+    def _commit_interactive_result_input(
+        self,
+        render_input: ResultRenderInput,
+    ) -> None:
+        self._render_input = render_input
+
+    def _offer_interactive_result(
+        self,
+        result: SimulationResultValue,
+        *,
+        set_id: str,
+        request: InteractivePreviewRequest,
+        render_input: ResultRenderInput,
+    ) -> bool:
+        """Aggregate out-of-order results for one request identity."""
+
+        self._render_input = render_input
+        set_id = str(set_id)
+        roster = tuple(dict.fromkeys(str(value) for value in request.target_set_ids))
+        if set_id not in roster:
+            return False
+        if self._interactive_frozen and self._interactive_request is request:
+            return False
+        if self._compose_interactive_result(result, set_id=set_id) is None:
+            return False
+        if self._interactive_request is None:
+            self._interactive_request = request
+            self._interactive_target_set_ids = roster
+            self._interactive_frozen = False
+        elif request is not self._interactive_request:
+            allowed = set(roster)
+            self._interactive_results = {
+                target: value
+                for target, value in self._interactive_results.items()
+                if target in allowed
+            }
+            self._interactive_request = request
+            self._interactive_target_set_ids = roster
+            self._interactive_frozen = False
+        elif set_id not in self._interactive_target_set_ids:
+            return False
+        self._interactive_results[set_id] = result
+        self._recompose_interactive_display()
+        return True
+
+    def _offer_interactive_projection(
+        self,
+        projection: InteractiveDisplayProjection,
+    ) -> None:
+        self._interactive_pending = projection
+        self._schedule_interactive_tick()
+
+    def _tick_interactive_display(self) -> None:
+        self._interactive_tick_requested = False
+        now = float(time.monotonic())
+        if self._interactive_pending is not None and self._interactive_cadence_due(now):
+            target = self._interactive_pending
+            self._interactive_pending = None
+            source = self._interactive_visible or ()
+            self._interactive_transition = _InteractiveDisplayTransition(
+                source,
+                target,
+                now,
+                self._can_interpolate_interactive(source, target),
+            )
+        state = self._materialize_interactive(now)
+        if state is None:
+            return
+        if self._render_interactive_display(state):
+            self._interactive_visible = state.layers
+            self._interactive_last_presented_at = now
+        if self._interactive_transition is not None or self._interactive_pending is not None:
+            self._schedule_interactive_tick()
+
+    def _stop_interactive_display(self) -> None:
+        self._interactive_frozen = True
+        self._interactive_pending = None
+        self._interactive_transition = None
+        self._cancel_interactive_tick()
+        if self._interactive_visible is not None:
+            self._render_interactive_display(
+                _InteractiveDisplayState(self._interactive_visible)
+            )
+
+    def _clear_interactive_display(self, *, reset_currentness: bool = False) -> None:
+        had_physical_state = bool(
+            self._interactive_visible
+            or self._interactive_rendered_frame
+            or self._interactive_pending
+            or self._interactive_transition
+        )
+        if had_physical_state:
+            if not self._render_interactive_display(_InteractiveDisplayState(())):
+                return
+            self._interactive_visible = None
+            self._interactive_rendered_frame = False
+            self._interactive_last_presented_at = None
+        self._interactive_pending = None
+        self._interactive_transition = None
+        self._interactive_results.clear()
+        self._interactive_target_set_ids = ()
+        self._interactive_frozen = True
+        if reset_currentness:
+            self._interactive_request = None
+        self._cancel_interactive_tick()
+
+    def _retire_interactive_targets(self, target_set_ids: tuple[str, ...]) -> bool:
+        targets = {str(value) for value in target_set_ids}
+        if not targets:
+            return False
+        known = set(self._interactive_target_set_ids)
+        known.update(self._interactive_results)
+        for layer in self._interactive_visible or ():
+            known.update(self._interactive_projection_target_ids(layer.projection))
+        known.update(self._interactive_projection_target_ids(self._interactive_pending))
+        if self._interactive_transition is not None:
+            known.update(self._interactive_projection_target_ids(self._interactive_transition.target))
+            for layer in self._interactive_transition.source:
+                known.update(self._interactive_projection_target_ids(layer.projection))
+        affected = targets.intersection(known)
+        if not affected:
+            return True
+        visible = tuple(
+            _InteractiveDisplayLayer(filtered, layer.opacity)
+            for layer in self._interactive_visible or ()
+            if (filtered := self._filter_interactive_projection(layer.projection, affected)) is not None
+        )
+        if not self._render_interactive_display(_InteractiveDisplayState(visible)):
+            return False
+        self._interactive_visible = visible or None
+        self._interactive_pending = None
+        self._interactive_transition = None
+        self._cancel_interactive_tick()
+        self._interactive_results = {
+            set_id: result
+            for set_id, result in self._interactive_results.items()
+            if set_id not in affected
+        }
+        self._interactive_target_set_ids = tuple(
+            set_id
+            for set_id in self._interactive_target_set_ids
+            if set_id not in affected
+        )
+        self._interactive_frozen = not bool(
+            self._interactive_results or self._interactive_visible
+        )
+        self._interactive_rendered_frame = bool(self._interactive_visible)
+        if self._interactive_results:
+            self._recompose_interactive_display()
+        return True
+
+    def _recompose_interactive_display(self) -> None:
+        if not self._interactive_results:
+            return
+        projection = self._compose_interactive_batch()
+        if projection is not None:
+            self._offer_interactive_projection(projection)
+
+    def _compose_interactive_batch(self) -> InteractiveDisplayProjection | None:
+        if self._render_input is None or not self._interactive_results:
+            return None
+        curves: list[InteractiveDisplayCurve] = []
+        latest: InteractiveDisplayProjection | None = None
+        for set_id, result in self._interactive_results.items():
+            if set_id not in self._interactive_target_set_ids:
+                continue
+            projection = self._compose_interactive_result(result, set_id=set_id)
+            if projection is None:
+                continue
+            latest = projection
+            curves.extend(projection.curves)
+        if latest is None or not curves:
+            return None
+        return replace(latest, curves=tuple(curves))
+
+    def _compose_interactive_result(
+        self,
+        result: SimulationResultValue,
+        *,
+        set_id: str,
+    ) -> InteractiveDisplayProjection | None:
+        if self._render_input is None:
+            return None
+        return compose_interactive_display(
+            result,
+            tab_id=self._render_input.tab_id,
+            set_id=set_id,
+            render_input=self._render_input,
+        )
+
+    @staticmethod
+    def _interactive_projection_target_ids(
+        projection: InteractiveDisplayProjection | None,
+    ) -> set[str]:
+        if projection is None:
+            return set()
+        return {
+            str(curve.key[2])
+            for curve in projection.curves
+            if len(curve.key) >= 3
+        }
+
+    @staticmethod
+    def _filter_interactive_projection(
+        projection: InteractiveDisplayProjection,
+        removed: set[str],
+    ) -> InteractiveDisplayProjection | None:
+        curves = tuple(
+            curve
+            for curve in projection.curves
+            if len(curve.key) < 3 or str(curve.key[2]) not in removed
+        )
+        if not curves:
+            return None
+        return replace(projection, curves=curves)
+
+    def _schedule_interactive_tick(self) -> None:
+        if self._interactive_tick_requested:
+            return
+        self._interactive_tick_requested = True
+        self._request_interactive_tick(1.0 / 30.0)
+
+    def _cancel_interactive_tick(self) -> None:
+        self._interactive_tick_requested = False
+        self._interactive_timer.stop()
+
+    def _interactive_cadence_due(self, now: float) -> bool:
+        return (
+            self._interactive_last_presented_at is None
+            or now - self._interactive_last_presented_at >= (1.0 / 30.0) - _EPSILON
+        )
+
+    @staticmethod
+    def _can_interpolate_interactive(
+        source: tuple[_InteractiveDisplayLayer, ...],
+        target: InteractiveDisplayProjection,
+    ) -> bool:
+        if len(source) != 1 or source[0].opacity < 1.0 - _EPSILON:
+            return False
+        source_curves = source[0].projection.curves
+        target_curves = target.curves
+        if tuple(curve.key for curve in source_curves) != tuple(curve.key for curve in target_curves):
+            return False
+        return all(
+            left.markers == right.markers
+            and left.x.shape == right.x.shape
+            and left.y.shape == right.y.shape
+            and np.array_equal(left.x, right.x)
+            and _same_interactive_topology(left, right)
+            for left, right in zip(source_curves, target_curves, strict=True)
+        )
+
+    def _materialize_interactive(
+        self,
+        now: float,
+    ) -> _InteractiveDisplayState | None:
+        if self._interactive_transition is None:
+            if self._interactive_visible is None:
+                return None
+            return _InteractiveDisplayState(self._interactive_visible)
+        transition = self._interactive_transition
+        progress = min(
+            1.0,
+            max(0.0, (now - transition.started_at) / 0.12),
+        )
+        eased = progress * progress * (3.0 - 2.0 * progress)
+        layers: tuple[_InteractiveDisplayLayer, ...]
+        if transition.interpolate:
+            projection = self._interpolate_interactive_projection(
+                transition.source[0].projection,
+                transition.target,
+                eased,
+            )
+            layers = (_InteractiveDisplayLayer(projection, 1.0),)
+        else:
+            layers = tuple(
+                _InteractiveDisplayLayer(
+                    item.projection,
+                    item.opacity * (1.0 - eased),
+                )
+                for item in transition.source
+                if item.opacity * (1.0 - eased) > _EPSILON
+            )
+            if eased > _EPSILON:
+                layers = (
+                    *layers,
+                    _InteractiveDisplayLayer(transition.target, eased),
+                )
+            if not layers:
+                layers = (_InteractiveDisplayLayer(transition.target, 1.0),)
+        if progress >= 1.0:
+            layers = (_InteractiveDisplayLayer(transition.target, 1.0),)
+            self._interactive_transition = None
+        return _InteractiveDisplayState(layers)
+
+    @staticmethod
+    def _interpolate_interactive_projection(
+        source: InteractiveDisplayProjection,
+        target: InteractiveDisplayProjection,
+        progress: float,
+    ) -> InteractiveDisplayProjection:
+        curves = tuple(
+            replace(left, y=left.y + (right.y - left.y) * progress)
+            for left, right in zip(source.curves, target.curves, strict=True)
+        )
+        return replace(target, curves=curves)
     def _request_interactive_tick(self, delay_seconds: float) -> None:
         milliseconds = max(0, int(np.ceil(float(delay_seconds) * 1000.0)))
         self._interactive_timer.start(milliseconds)
 
     @QtCore.Slot()
     def _advance_interactive_display(self) -> None:
-        had_rendered_frame = self._interactive_display.has_renderable_frame
-        self._interactive_display.tick()
+        had_rendered_frame = self._interactive_rendered_frame
+        self._tick_interactive_display()
         if (
             not had_rendered_frame
-            and self._interactive_display.has_renderable_frame
+            and self._interactive_rendered_frame
         ):
             self._begin_interactive_range_session()
 
@@ -561,7 +928,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
 
     def _render_interactive_display(
         self,
-        state: InteractiveDisplayState,
+        state: _InteractiveDisplayState,
     ) -> bool:
         self._rendered_point_roster = ()
         if not state.layers:
@@ -704,6 +1071,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
             self._restore_interactive_view(self._interactive_locked_view)
         self._interactive_items = rendered
         self._rendered_point_roster = tuple(rendered_points)
+        self._interactive_rendered_frame = bool(rendered)
         return bool(rendered) or not state.layers
 
     def _remove_interactive_plot_item(self, item: object) -> None:
@@ -758,16 +1126,16 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
     def _release_interactive_display(self) -> None:
         """Release all physical transient custody at one terminal boundary.
 
-        The controller owns the semantic state and invokes this operation by
-        presenting an empty state.  External scene/lifecycle boundaries call
-        it after clearing or superseding that state.  Keep the order explicit:
+        The panel's transient state invokes this operation by presenting an
+        empty state. External scene/lifecycle boundaries call it after
+        clearing or superseding that state. Keep the order explicit:
         transient rows/items disappear first, static simulation items return
         through PlotItem attachment (which restores their named legend rows),
         then range custody ends and the panel's authoritative range is
         reapplied.
         """
 
-        self._interactive_display._cancel_scheduled_tick()
+        self._cancel_interactive_tick()
         self._clear_interactive_items()
         self._reconcile_static_simulation_items(())
         self._end_interactive_range_session()
@@ -827,7 +1195,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
                 self._reattach_static_simulation_item(item)
 
     def discard_interactive_display(self) -> None:
-        self._interactive_display.clear(reset_currentness=True)
+        self._clear_interactive_display(reset_currentness=True)
 
     def _clear_completion_warning(self) -> None:
         self._completion_warning_badge.setText("")
@@ -1418,8 +1786,8 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
             render_input = self._render_input
             if render_input is not None:
                 if (
-                    self._interactive_display.has_visible_frame
-                    or self._interactive_display.has_pending_batch
+                    self._interactive_has_visible_frame
+                    or self._interactive_has_pending_batch
                 ):
                     self.discard_interactive_display()
                 else:

@@ -28,14 +28,10 @@ if TYPE_CHECKING:
     from kindred.core.result_repository import ResultRepository
 
 __all__ = [
-    "CanonicalResultFence",
     "ScientificDocumentDelta",
     "TabRuntimeState",
     "WorkspaceTabRegistry",
 ]
-
-
-CanonicalResultFence = Callable[["ScientificDocumentDelta"], None]
 
 
 @dataclass(slots=True)
@@ -44,7 +40,10 @@ class TabRuntimeState:
 
     reactions_draft: MechanismAuthoringSource | None = None
     notes_draft: str | None = None
-    invalid_initial_text_by_set_id: dict[str, dict[str, str]] = field(
+    # Raw authored concentration text which has not yet crossed the normal
+    # cell-settlement boundary.  Entries intentionally include both valid and
+    # invalid text; validity is derived at the owner that admits a value.
+    initial_text_by_set_id: dict[str, dict[str, str]] = field(
         default_factory=dict
     )
     selected_run_set_ids: tuple[str, ...] = ()
@@ -59,7 +58,7 @@ class TabRuntimeState:
         return bool(
             self.reactions_draft is not None
             or self.notes_draft is not None
-            or self.invalid_initial_text_by_set_id
+            or self.initial_text_by_set_id
             or self.slider_parameter_draft
             or self.slider_species_drafts_by_set_id
         )
@@ -84,21 +83,27 @@ class WorkspaceTabRegistry:
         self,
         session: ProjectSession,
         *,
-        deletion_result_fence: object,
-        canonical_result_fence: CanonicalResultFence,
-        interactive_preview_fence: Callable[[ScientificDocumentDelta], None],
+        computation_fence: Callable[[ScientificDocumentDelta], object],
+        retire_interactive_plot_targets: Callable[
+            [ScientificDocumentDelta], None
+        ],
+        post_document_publication: Callable[[ScientificDocumentDelta], None],
         runtime_factory: Callable[[str], TabRuntimeState] | None = None,
     ) -> None:
         if not isinstance(session, ProjectSession):
             raise TypeError("session must be a ProjectSession.")
-        if not callable(canonical_result_fence):
-            raise TypeError("canonical_result_fence must be callable.")
-        if not callable(interactive_preview_fence):
-            raise TypeError("interactive_preview_fence must be callable.")
+        if not callable(computation_fence):
+            raise TypeError("computation_fence must be callable.")
+        if not callable(retire_interactive_plot_targets):
+            raise TypeError(
+                "retire_interactive_plot_targets must be callable."
+            )
+        if not callable(post_document_publication):
+            raise TypeError("post_document_publication must be callable.")
         self._session = session
-        self._deletion_result_fence = deletion_result_fence
-        self._canonical_result_fence = canonical_result_fence
-        self._interactive_preview_fence = interactive_preview_fence
+        self._computation_fence = computation_fence
+        self._retire_interactive_plot_targets = retire_interactive_plot_targets
+        self._post_document_publication = post_document_publication
         self._runtime_factory = runtime_factory or (lambda _tab_id: TabRuntimeState())
         self._active_tab_id = ""
         self._presentation_by_tab_id: tuple[
@@ -194,6 +199,12 @@ class WorkspaceTabRegistry:
             (tab.tab_id, self._runtime_factory(tab.tab_id))
             for tab in document.tabs
         )
+        previous = self._session.document
+        delta = self.scientific_document_delta(previous, document)
+        if document != previous and (
+            delta.affected_targets_by_tab or delta.removed_targets_by_tab
+        ):
+            self._prepare_document_delta(delta)
         token = self._session.replace_project(
             document,
             presentation,
@@ -265,8 +276,10 @@ class WorkspaceTabRegistry:
             for tab in document.tabs
         )
         delta = self.scientific_document_delta(previous, document)
-        if changed:
-            self._fence_document_delta(delta)
+        if changed and (
+            delta.affected_targets_by_tab or delta.removed_targets_by_tab
+        ):
+            self._prepare_document_delta(delta)
         token = self._session.replace_document(
             document,
             expected_token=expected_token,
@@ -278,36 +291,48 @@ class WorkspaceTabRegistry:
             next_workspace,
             runtime_by_tab_id=next_runtime,
         )
+        if changed:
+            self._post_document_publication(delta)
         return token
 
-    def _fence_document_delta(
+    def _prepare_document_delta(
         self,
         delta: ScientificDocumentDelta,
     ) -> None:
-        """Fence computation before canonical session publication."""
+        """Retire computation and old physical results before publication."""
 
-        self._deletion_result_fence._begin_document_delta_fence()
-        try:
-            self._canonical_result_fence(delta)
-            self._interactive_preview_fence(delta)
-            for tab_id, set_ids in delta.affected_targets_by_tab:
-                if not set_ids:
-                    continue
-                repository = self.tab_runtime(tab_id).result_repository
-                if repository is not None:
-                    repository.deauthorize_sets(set_ids)
-            if delta.removed_targets_by_tab:
-                for tab_id, set_ids in delta.removed_targets_by_tab:
-                    self._deletion_result_fence._fence_document_targets(
-                        tab_id,
-                        set_ids,
-                    )
-                    runtime = self.tab_runtime(tab_id)
-                    repository = runtime.result_repository
-                    if repository is not None:
-                        repository.purge_sets(set_ids)
-        finally:
-            self._deletion_result_fence._end_document_delta_fence()
+        self._computation_fence(delta)
+        self._retire_interactive_plot_targets(delta)
+
+        existing_runtime = dict(self._runtime_by_tab_id)
+        affected_by_tab: dict[str, list[str]] = {}
+        removed_by_tab: dict[str, set[str]] = {}
+        for tab_id, set_ids in delta.removed_targets_by_tab:
+            tab = str(tab_id)
+            removed = removed_by_tab.setdefault(tab, set())
+            removed.update(str(set_id) for set_id in set_ids)
+        for tab_id, set_ids in delta.affected_targets_by_tab:
+            tab = str(tab_id)
+            targets = affected_by_tab.setdefault(tab, [])
+            removed = removed_by_tab.get(tab, set())
+            for set_id in set_ids:
+                value = str(set_id)
+                if value not in removed and value not in targets:
+                    targets.append(value)
+        for tab_id, affected_ids in affected_by_tab.items():
+            if not affected_ids:
+                continue
+            runtime = existing_runtime.get(tab_id)
+            repository = None if runtime is None else runtime.result_repository
+            if repository is not None:
+                repository.deauthorize_sets(tuple(affected_ids))
+        for tab_id, removed_ids in removed_by_tab.items():
+            if not removed_ids:
+                continue
+            runtime = existing_runtime.get(tab_id)
+            repository = None if runtime is None else runtime.result_repository
+            if repository is not None:
+                repository.purge_sets(tuple(removed_ids))
 
     def select_tab(
         self,
