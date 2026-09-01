@@ -460,7 +460,7 @@ def _estimate_rows(candidate: FitCandidate) -> tuple[list[dict[str, object]], li
                 absolute_change=absolute, percentage_change=percentage,
                 percentage_unavailable_reason=unavailable, valid=converged,
                 validity_diagnostic="decoded centred overall value is finite and within configured bounds" + suffix,
-                dataset_ids=list(settlement.dataset_ids), log_scale=configuration.log10,
+                dataset_ids=list(settlement.dataset_ids),
                 captured_value_source=captured_source, nominal_value_source="Fit setup")
             deviation_bounds = math.log10(configuration.maximum) - math.log10(configuration.minimum) if configuration.log10 else configuration.maximum - configuration.minimum
             for deviation in settlement.deviations:
@@ -480,7 +480,7 @@ def _estimate_rows(candidate: FitCandidate) -> tuple[list[dict[str, object]], li
                     absolute_change=absolute, percentage_change=percentage,
                     percentage_unavailable_reason=unavailable, valid=converged,
                     validity_diagnostic="centred optimizer-scale deviation; derived reference included and no deviation is publishable" + suffix,
-                    dataset_id=dataset_id, dataset_ids=[dataset_id], dataset_display_name=display_names.get(dataset_id), log_scale=configuration.log10,
+                    dataset_id=dataset_id, dataset_ids=[dataset_id], dataset_display_name=display_names.get(dataset_id),
                     captured_value_source="centred terminal settlement", nominal_value_source="centred zero-deviation seed")
             continue
         if parameter.scope == "shared":
@@ -511,7 +511,6 @@ def _estimate_rows(candidate: FitCandidate) -> tuple[list[dict[str, object]], li
                 absolute_change=absolute, percentage_change=percentage,
                 percentage_unavailable_reason=unavailable, valid=converged or not configuration.fit,
                 validity_diagnostic="finite and within configured bounds" + ("; Fit-local supplemental scalar provenance" if fit_local else "") + (suffix if configuration.fit else ""),
-                log_scale=configuration.log10,
                 captured_value_source="Fit-local starting value (not a project default)" if fit_local else captured_source,
                 nominal_value_source=nominal_source)
             continue
@@ -549,7 +548,7 @@ def _estimate_rows(candidate: FitCandidate) -> tuple[list[dict[str, object]], li
                 absolute_change=absolute, percentage_change=percentage,
                 percentage_unavailable_reason=unavailable, valid=converged or not configuration.fit,
                 validity_diagnostic="finite and within configured bounds" + ("; Fit-local supplemental scalar provenance" if fit_local else "") + (suffix if configuration.fit else ""),
-                dataset_id=dataset_id, dataset_ids=[dataset_id], dataset_display_name=display_names.get(dataset_id), log_scale=configuration.log10,
+                dataset_id=dataset_id, dataset_ids=[dataset_id], dataset_display_name=display_names.get(dataset_id),
                 captured_value_source="Fit-local starting value (not a project default)" if fit_local else captured_source,
                 nominal_value_source="Fit-local setup admission" if fit_local else "Fit setup")
     return shared, individual
@@ -600,7 +599,7 @@ def _initial_rows(candidate: FitCandidate) -> list[dict[str, object]]:
                 "percentage_change": percentage, "percentage_unavailable_reason": unavailable, "valid": converged,
                 "validity_diagnostic": "finite, nonnegative, and within configured bounds" + suffix,
                 "set_id": item.set_id, "dataset_ids": [mapped.dataset_id], "dataset_display_name": mapped.display_name,
-                "log_scale": bool(launch_item.log10), "set_display_name": mapped.set_name,
+                "set_display_name": mapped.set_name,
                 "captured_value_source": "captured mapped dataset initial value", "nominal_value_source": "Fit setup"})
     for item in terminal_setup.global_initials:
         if not item.fit or scopes.get(item.species) != "global":
@@ -628,7 +627,7 @@ def _initial_rows(candidate: FitCandidate) -> list[dict[str, object]]:
                     "percentage_change": percentage, "percentage_unavailable_reason": unavailable, "valid": converged,
                     "validity_diagnostic": "finite, nonnegative, and within configured bounds" + suffix,
                     "set_id": mapped.set_id, "dataset_ids": [mapped.dataset_id], "dataset_display_name": mapped.display_name,
-                    "log_scale": bool(launch_item.log10), "set_display_name": mapped.set_name,
+                    "set_display_name": mapped.set_name,
                     "captured_value_source": "captured mapped dataset initial value", "nominal_value_source": "Fit setup"})
     return rows
 
@@ -644,14 +643,6 @@ def _aggregate_rows(individual: list[dict[str, object]]) -> list[dict[str, objec
         count = len(values)
         mean = statistics.fmean(values)
         sd = statistics.stdev(values) if count > 1 else None
-        log_scale = bool(rows[0].get("log_scale"))
-        geometric_mean = geometric_spread = None
-        unavailable_reason: str | None = "requires positive log-scale estimates"
-        if log_scale and all(value > 0.0 for value in values):
-            logs = tuple(math.log(value) for value in values)
-            geometric_mean = math.exp(statistics.fmean(logs))
-            geometric_spread = math.exp(statistics.stdev(logs)) if count > 1 else None
-            unavailable_reason = None if count > 1 else "geometric spread requires at least two estimates"
 
         def percentile(percentile: float) -> float:
             position = (count - 1) * percentile
@@ -665,8 +656,7 @@ def _aggregate_rows(individual: list[dict[str, object]]) -> list[dict[str, objec
         aggregates.append({"name": name, "display_name": rows[0]["display_name"], "unit": rows[0]["unit"], "n": count,
             "arithmetic_mean": mean, "sample_sd": sd, "standard_error": None if sd is None else sd / math.sqrt(count),
             "median": statistics.median(values), "iqr": percentile(0.75) - percentile(0.25),
-            "minimum": values[0], "maximum": values[-1], "geometric_mean": geometric_mean,
-            "geometric_spread": geometric_spread, "geometric_unavailable_reason": unavailable_reason})
+            "minimum": values[0], "maximum": values[-1]})
     return aggregates
 
 

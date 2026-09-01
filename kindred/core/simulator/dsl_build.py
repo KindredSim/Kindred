@@ -20,7 +20,6 @@ from .dsl_format import format_stoichiometry_side as _fmt_side
 from .dsl_build_input import DslMechanismBuildInput
 from .parameter_namespace import (
     _namespace_policy_from_step,
-    canonical_source_coordinate_name,
 )
 
 logger = logging.getLogger(__name__)
@@ -91,7 +90,6 @@ def build_mechanism_from_ir(
             if sc is not None:
                 rxn_overrides["standard_conc_M"] = float(sc)
 
-        is_equilibrium = step.is_equilibrium
         namespace_policy = _namespace_policy_from_step(step)
         kr_attr = step.kr
         is_equilibrium_step = namespace_policy.step_kind == "equilibrium"
@@ -138,7 +136,6 @@ def build_mechanism_from_ir(
                 }
 
             eq_metadata = EquilibriumMetadataView(
-                fast_equilibrium=bool(is_equilibrium),
                 user_provided_kf=bool(user_kf_explicit),
                 user_provided_kr=bool(user_kr_explicit),
                 dG_eq_J_per_mol=step.dG_eq_J_per_mol
@@ -163,7 +160,6 @@ def build_mechanism_from_ir(
                 Keq=Keq_model_value,
                 kf=kf_val,
                 kr=kr_val,
-                fast=is_equilibrium,  # Mark "equilibrium:" lines as fast
                 metadata=eq_metadata,
                 authority_context=authority_context,
             )
@@ -185,39 +181,18 @@ def build_mechanism_from_ir(
             "kind": namespace_policy.step_kind,
             "context": context,
         }
-        # Retain the source-backed identity of each physical coordinate at
-        # admission.  The typed builder values tell us which coordinates were
-        # genuinely authored; a derived nominal value must never be promoted
-        # into a writable, unindexed global.  Names are local to the authored
-        # step (A1/Ea1, dG_act1, dG_eq1, ...), so repeated reactions remain
-        # distinct throughout downstream projections.
-        source_coordinates: dict[str, str] = {}
-        if model == "Arrhenius":
-            if step.arrhenius_A is not None:
-                source_coordinates["A"] = canonical_source_coordinate_name(
-                    authored_step_no,
-                    "A",
-                )
-            if step.arrhenius_Ea_J_per_mol is not None:
-                source_coordinates["Ea"] = canonical_source_coordinate_name(
-                    authored_step_no,
-                    "Ea",
-                )
-        elif model == "Eyring" and step.eyring_dG_act_J_per_mol is not None:
-            source_coordinates["dG_act"] = canonical_source_coordinate_name(
-                authored_step_no,
-                "dG_act",
-            )
+        # Project only the parser-admitted physical source roles into the
+        # established metadata map.  Canonical indexed rate coordinates stay
+        # in the same namespace; their authored spans remain on DslAnalysis.
+        source_coordinates: dict[str, str] = {
+            str(coordinate.role): str(coordinate.canonical_name)
+            for coordinate in step.source_coordinates
+        }
         if is_equilibrium_step:
             entry["equilibrium_index"] = int(eq_index)
             entry.update(authority.step_map_fields())
             entry["user_provided_kf"] = step.user_kf_explicit
             entry["user_provided_kr"] = step.user_kr_explicit
-            if step.dG_eq_J_per_mol is not None:
-                source_coordinates["dG_eq"] = canonical_source_coordinate_name(
-                    authored_step_no,
-                    "dG_eq",
-                )
         else:
             entry["reaction_index"] = int(rxn_index)
         entry["source_coordinates"] = source_coordinates

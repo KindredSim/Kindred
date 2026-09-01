@@ -3,9 +3,7 @@
 from __future__ import annotations
 
 import logging
-import math
 import os
-import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
@@ -137,9 +135,6 @@ class ProjectController(QtCore.QObject):
     projectStateChanged = QtCore.Signal()
     closePendingChanged = QtCore.Signal(bool)
     nativeCloseAuthorized = QtCore.Signal()
-    hardExitAuthorized = QtCore.Signal()
-
-    _APPLICATION_CLOSE_TIMEOUT_MS = 60_000
 
     def __init__(
         self,
@@ -202,12 +197,7 @@ class ProjectController(QtCore.QObject):
         self._discard_slider_drafts = discard_slider_drafts
         self._close_started = False
         self._close_pending = False
-        self._close_deadline: float | None = None
-        self._close_authorization: str | None = None
-        self._close_timer = QtCore.QTimer(self)
-        self._close_timer.setSingleShot(True)
-        self._close_timer.setTimerType(QtCore.Qt.TimerType.PreciseTimer)
-        self._close_timer.timeout.connect(self._on_application_close_deadline)
+        self._native_close_authorized = False
         self._simulation_jobs.application_close_settlement_changed.connect(
             self.notify_close_progress
         )
@@ -846,11 +836,11 @@ class ProjectController(QtCore.QObject):
     def request_close(self) -> bool:
         """Start application Close once; subsequent requests only advance it."""
 
-        if self._close_authorization is not None:
+        if self._native_close_authorized:
             return True
         if self._close_started:
             self.notify_close_progress()
-            return self._close_authorization is not None
+            return self._native_close_authorized
         entry_token = self._session.capture_content_token()
         disposition = self._resolve_disposition(
             "closing Kindred",
@@ -888,23 +878,17 @@ class ProjectController(QtCore.QObject):
                     )
                     return False
                 self._close_started = True
-                self._close_authorization = "native"
+                self._native_close_authorized = True
                 self.nativeCloseAuthorized.emit()
                 return True
             # A failed synchronous idle-window teardown is still an owner
-            # cleanup problem, not a second Close policy.  Fall through to
-            # the already-established single 60-second bounded state machine;
-            # its Fit owner cancellation/settlement path gets one chance to
-            # finish disposal before the hard-exit deadline.
+            # cleanup problem. Continue through the normal owner settlement
+            # path so Close remains pending until every owner is settled.
             self._set_status(
-                "Idle Fit cleanup did not finish; waiting for the bounded Close path."
+                "Idle Fit cleanup did not finish; waiting for active work to settle."
             )
         self._close_started = True
         self._close_pending = True
-        self._close_deadline = (
-            time.monotonic()
-            + (float(self._APPLICATION_CLOSE_TIMEOUT_MS) / 1000.0)
-        )
         self.closePendingChanged.emit(True)
         try:
             self._simulation_jobs.cancel_for_application_close()
@@ -930,51 +914,15 @@ class ProjectController(QtCore.QObject):
             logger.exception(
                 "XLSX export admission fencing/cancellation failed during Close"
             )
-        remaining_ms = max(
-            1,
-            math.ceil(
-                (
-                    float(self._close_deadline)
-                    - time.monotonic()
-                )
-                * 1000.0
-            ),
-        )
-        self._close_timer.start(remaining_ms)
         self.notify_close_progress()
-        return self._close_authorization is not None
+        return self._native_close_authorized
 
     @QtCore.Slot()
     def notify_close_progress(self) -> None:
         if not self._close_pending:
             return
-        deadline = self._close_deadline
-        if deadline is None:
-            return
-        if time.monotonic() >= deadline:
-            self._authorize_application_close(hard_exit=True)
-            return
         if self._async_owners_are_settled():
-            self._authorize_application_close(hard_exit=False)
-
-    @QtCore.Slot()
-    def _on_application_close_deadline(self) -> None:
-        if not self._close_pending:
-            return
-        deadline = self._close_deadline
-        if deadline is None:
-            return
-        if time.monotonic() < deadline:
-            self._close_timer.start(
-                max(
-                    1,
-                    math.ceil(
-                        (float(deadline) - time.monotonic()) * 1000.0
-                    ),
-                )
-            )
-            return
-        self._authorize_application_close(hard_exit=True)
+            self._authorize_application_close()
 
     def _async_owners_are_settled(self) -> bool:
         """Read each asynchronous owner's explicit Close settlement truth."""
@@ -999,26 +947,18 @@ class ProjectController(QtCore.QObject):
                 settled = False
         return settled
 
-    def _authorize_application_close(self, *, hard_exit: bool) -> None:
-        if not self._close_pending or self._close_authorization is not None:
-            return
-        if hard_exit:
-            self._close_pending = False
-            self._close_timer.stop()
-            self.closePendingChanged.emit(False)
-            self._close_authorization = "hard_exit"
-            self.hardExitAuthorized.emit()
+    def _authorize_application_close(self) -> None:
+        if not self._close_pending or self._native_close_authorized:
             return
         self._close_pending = False
-        self._close_timer.stop()
         self.closePendingChanged.emit(False)
-        self._close_authorization = "native"
+        self._native_close_authorized = True
         self.nativeCloseAuthorized.emit()
 
     def consume_native_close_authorization(self) -> bool:
         """Consume the one native-close authorization at the physical boundary."""
 
-        if self._close_authorization != "native":
+        if not self._native_close_authorized:
             return False
-        self._close_authorization = None
+        self._native_close_authorized = False
         return True

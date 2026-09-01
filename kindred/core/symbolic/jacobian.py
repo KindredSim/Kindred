@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from fractions import Fraction
 import math
 from typing import Any, Callable, Mapping
 
@@ -291,24 +292,21 @@ def _power_product(sympy: Any, symbols: Mapping[str, Any], powers: Mapping[str, 
     return expr
 
 
-def _explicit_keq_source(eq: Equilibrium) -> object | None:
-    meta = getattr(eq, "metadata", {}) or {}
-    if isinstance(meta, Mapping):
-        keq_input = meta.get(EquilibriumMetadataKeys.KEQ_INPUT)
-        if keq_input is not None:
-            return keq_input
-    return getattr(eq, "Keq", None)
-
-
 def _equilibrium_rate_source(
     mechanism: Mechanism,
     eq: Equilibrium,
     *,
     equilibrium_index: int,
 ) -> _EquilibriumRateSource:
-    kf = getattr(eq, "kf", None)
-    kr = getattr(eq, "kr", None)
-    keq = _explicit_keq_source(eq)
+    try:
+        authority = normalize_existing_equilibrium_rate_authority(eq)
+    except ValueError as exc:
+        raise UnsupportedSymbolicExpressionError(
+            f"Invalid equilibrium rate authority: {exc}"
+        ) from exc
+    kf = authority.kf
+    kr = authority.kr
+    keq = None if authority.kind == EquilibriumRateAuthorityKind.KR else authority.Keq
     kf_name = _canonical_step_parameter_name(
         mechanism,
         kind="equilibrium",
@@ -334,16 +332,6 @@ def _equilibrium_rate_source(
         value=keq,
     )
 
-    try:
-        authority = normalize_existing_equilibrium_rate_authority(eq)
-    except ValueError as exc:
-        raise UnsupportedSymbolicExpressionError(
-            f"Invalid equilibrium rate authority: {exc}"
-        ) from exc
-    if authority.kind == EquilibriumRateAuthorityKind.KR:
-        keq = None
-    elif authority.kind == EquilibriumRateAuthorityKind.KEQ:
-        keq = authority.Keq
     return _EquilibriumRateSource(
         kf=kf,
         kr=kr,
@@ -738,8 +726,10 @@ def _project_symbolic_mechanism_expression_model(
         getattr(mechanism, "metadata", {}) or {}
     )
 
-    def exact_literal(value: float) -> Any:
-        return sympy.Rational(str(float(value)))
+    def exact_literal(value: object) -> Any:
+        if isinstance(value, Fraction):
+            return sympy.Rational(value.numerator, value.denominator)
+        return sympy.Rational(str(value))
 
     temperature = sympy.Symbol("T")
     chemistry_relations: dict[str, Any] = {}
@@ -803,12 +793,8 @@ def _project_symbolic_mechanism_expression_model(
                 literal=exact_literal,
                 exponential=sympy.exp,
             )
-            equilibrium_metadata = getattr(
-                equilibrium,
-                "metadata",
-                {},
-            ) or {}
-            standard_conc = (
+            equilibrium_metadata = getattr(equilibrium, "metadata", {}) or {}
+            standard_concentration = (
                 equilibrium_metadata.get(
                     EquilibriumMetadataKeys.STANDARD_CONC_M,
                     metadata.standard_conc_M,
@@ -816,15 +802,17 @@ def _project_symbolic_mechanism_expression_model(
                 if isinstance(equilibrium_metadata, Mapping)
                 else metadata.standard_conc_M
             )
-            if standard_conc is None:
-                standard_conc = metadata.standard_conc_M
+            if standard_concentration is None:
+                standard_concentration = metadata.standard_conc_M
             relations = equilibrium_rate_symbolic_relations(
                 equilibrium,
                 forward_relation=forward_relation,
                 temperature=temperature,
-                standard_conc_M=float(standard_conc),
                 literal=exact_literal,
                 exponential=sympy.exp,
+                standard_concentration=exact_literal(
+                    float(standard_concentration)
+                ),
             )
         except (TypeError, ValueError) as exc:
             raise UnsupportedSymbolicExpressionError(

@@ -36,7 +36,9 @@ from kindred.core.simulator.parameter_algebra import (
     apply_parameter_algebra_spec_to_mechanism,
     solver_parameter_units_from_mechanism,
 )
+from kindred.core.simulation_preparation import _build_parameter_target_map
 from kindred.core.simulator.parameter_namespace import build_namespace_from_mechanism
+from kindred.core.simulator.dsl_build_input import source_coordinate_capabilities
 from kindred.core.simulator.step_indexing import get_step_index_map
 from kindred.core.validation import try_parse_callable_finite_float, try_parse_int
 from kindred.core.species import validate_temperature
@@ -205,10 +207,12 @@ def enumerate_parameter_coordinates(
     metadata = getattr(mechanism, "metadata", {}) or {}
     metadata_view = MechanismMetadataView.from_metadata(metadata)
     parameter_spec = prepared_dsl.parameter_algebra_spec_for_execution()
+    parameter_target_map = _build_parameter_target_map(mechanism)
     apply_parameter_algebra_spec_to_mechanism(
         parameter_spec,
         mechanism=mechanism,
         require_mutable=False,
+        parameter_target_map=parameter_target_map,
     )
     namespace = build_namespace_from_mechanism(mechanism)
     source_coordinate_names = namespace.source_coordinate_names
@@ -217,11 +221,19 @@ def enumerate_parameter_coordinates(
         parsed, ok = try_parse_int(entry.get("step_index"))
         if ok:
             step_by_index[int(parsed)] = entry
-    units = solver_parameter_units_from_mechanism(mechanism)
-    algebra_owned = set(parameter_spec.param_assignment_names())
+    units = solver_parameter_units_from_mechanism(
+        mechanism,
+        parameter_target_map=parameter_target_map,
+    )
     constrained = {
         str(name)
         for name in dict(metadata.get("constrained_params") or {})
+    }
+    parameter_assignment_kinds = {
+        str(assignment.name): parameter_spec.parameter_assignment_kind(
+            str(assignment.name)
+        )
+        for assignment in parameter_spec.param_statements
     }
     reactions = tuple(getattr(mechanism, "reactions", ()) or ())
     equilibria = tuple(getattr(mechanism, "equilibria", ()) or ())
@@ -236,6 +248,17 @@ def enumerate_parameter_coordinates(
         kind = str(info.step_kind or "")
         role = str(info.role or "")
         name = str(item.canonical_name)
+        source_coordinates = {
+            str(source_role): str(source_name)
+            for source_role, source_name in dict(
+                entry.get("source_coordinates") or {}
+            ).items()
+        }
+        source_info = namespace.source_coordinate_info(name)
+        if source_info is not None and not source_coordinate_capabilities(
+            source_info.role
+        ).continuous:
+            continue
         if name in constrained:
             continue
         context = str(entry.get("context") or "").strip()
@@ -248,6 +271,12 @@ def enumerate_parameter_coordinates(
         value: float | None = None
 
         if kind == "reaction":
+            # A canonical kN is an independent GUI/Fit coordinate only for
+            # an authored Constant source.  Arrhenius/Eyring kN values are
+            # derived readouts and their physical source coordinates are
+            # projected below.
+            if role != "k" or source_coordinates.get("k") != name:
+                continue
             raw_index, ok = try_parse_int(entry.get("reaction_index", -1))
             if not ok or not (0 <= raw_index < len(reactions)):
                 continue
@@ -260,6 +289,12 @@ def enumerate_parameter_coordinates(
             scientific_category = "rate"
             allow_exact_zero = family == "Constant"
         elif kind == "equilibrium":
+            # The indexed forward/reverse/Keq names are independent only when
+            # their exact source role was authored.  This keeps derived
+            # kf/kr/Keq values out of Slider and Fit while retaining their
+            # readout semantics in the rest of the namespace.
+            if source_coordinates.get(role) != name:
+                continue
             raw_index, ok = try_parse_int(entry.get("equilibrium_index", -1))
             if not ok or not (0 <= raw_index < len(equilibria)):
                 continue
@@ -273,7 +308,6 @@ def enumerate_parameter_coordinates(
                 else editable
             )
             writable = writable and not bool(entry.get("locked", False))
-            writable = writable and name not in algebra_owned
             derived = bool(
                 authority.authored_role_is_derived(role)
                 if derived_truth is None
@@ -310,7 +344,7 @@ def enumerate_parameter_coordinates(
                 allow_exact_zero = False
         else:
             continue
-        if name in algebra_owned or bool(entry.get("locked", False)):
+        if bool(entry.get("locked", False)):
             writable = False
         if value is None or not math.isfinite(float(value)):
             continue
@@ -365,6 +399,7 @@ def enumerate_parameter_coordinates(
             str(role): str(name)
             for role, name in dict(entry.get("source_coordinates") or {}).items()
             if str(name) in source_coordinate_names
+            and source_coordinate_capabilities(str(role)).continuous
         }
         if not source_coordinates:
             continue
@@ -400,12 +435,6 @@ def enumerate_parameter_coordinates(
             continue
         step_index = int(entry.get("step_index", 0))
         editable = not bool(entry.get("locked", False))
-        # A reaction's canonical kN owner supersedes its physical Arrhenius
-        # coordinates when retained Algebra binds that rate.  Do not expose
-        # a writable source coordinate that would be immediately overwritten
-        # by the admitted symbolic owner.
-        if kind == "reaction" and f"k{step_index}" in algebra_owned:
-            editable = False
         energy_units = UnitsModel(energy_unit=metadata_view.energy_unit)
         for role, name in source_coordinates.items():
             if role == "A" and isinstance(model, ArrheniusRateModel):
@@ -466,13 +495,33 @@ def enumerate_parameter_coordinates(
                         metadata_view.energy_unit,
                     )
                 )
+            elif role == "kappa" and isinstance(model, EyringRateModel):
+                physical_candidates.append(
+                    (
+                        name,
+                        "Eyring",
+                        role,
+                        float(model.kappa),
+                        RATE_MIN,
+                        RATE_MAX,
+                        editable,
+                        "1",
+                    )
+                )
 
     for name, family, role, value, minimum, maximum, editable, unit in physical_candidates:
-        if name in constrained or name in algebra_owned:
+        if name in constrained:
             continue
         if not editable or not math.isfinite(value):
             continue
         if role == "A":
+            low, high = _positive_bounds(
+                value,
+                minimum=minimum,
+                maximum=maximum,
+            )
+            allow_zero = False
+        elif role == "kappa":
             low, high = _positive_bounds(
                 value,
                 minimum=minimum,
@@ -509,13 +558,14 @@ def enumerate_parameter_coordinates(
         name = str(raw_name)
         value = _finite(raw_value)
         info = dict(scalar_info.get(name) or {})
+        assignment_kind = parameter_assignment_kinds.get(name)
         if (
             value is None
             or name in constrained
-            or name in algebra_owned
             or name in physical_names
-            or info.get("derived") is True
-            or info.get("editable") is False
+            or assignment_kind in {"derived scalar", "mechanism-bound"}
+            or (assignment_kind is None and info.get("derived") is True)
+            or (assignment_kind is None and info.get("editable") is False)
         ):
             continue
         low, high = _signed_bounds(value)

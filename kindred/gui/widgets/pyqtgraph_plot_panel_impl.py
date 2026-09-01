@@ -18,7 +18,7 @@ from kindred.core.project_presentation_state import (
 )
 from kindred.core.result_repository import SimulationResultValue
 from kindred.gui.interactive_preview import InteractivePreviewRequest
-from kindred.gui.plot_config import PlotPresentationIntent, require_pyqtgraph
+from kindred.gui.plot_config import require_pyqtgraph
 from kindred.gui.widgets.axis_toolbar import AxisToolbar
 from kindred.gui.widgets.parameter_statistics_table import ParameterStatisticsTable
 from kindred.gui.widgets.species_statistics_table import SpeciesStatisticsTable
@@ -172,7 +172,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
     copyAllRequested = QtCore.Signal()
     xSeriesRequested = QtCore.Signal(object)
     ySeriesRequested = QtCore.Signal(object)
-    plotPresentationIntentRequested = QtCore.Signal(object)
+    plotPresentationIntentRequested = QtCore.Signal(str, bool)
     resultDiagnostic = QtCore.Signal(str)
 
     def __init__(
@@ -1896,11 +1896,10 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         option: str,
         enabled: bool,
     ) -> None:
-        intent = PlotPresentationIntent(str(option), bool(enabled))
         # The WorkspaceTabRegistry is the sole accepted presentation owner.
         # Do not mutate local state or visible pyqtgraph items until its
         # current-content token has accepted this intent.
-        self.plotPresentationIntentRequested.emit(intent)
+        self.plotPresentationIntentRequested.emit(str(option), bool(enabled))
 
     def _apply_plot_presentation(
         self,

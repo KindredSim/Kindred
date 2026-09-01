@@ -330,6 +330,16 @@ class WorkspaceTabRegistry:
             if not removed_ids:
                 continue
             runtime = existing_runtime.get(tab_id)
+            if runtime is not None:
+                removed = set(removed_ids)
+                runtime.selected_run_set_ids = tuple(
+                    set_id
+                    for set_id in runtime.selected_run_set_ids
+                    if set_id not in removed
+                )
+                for set_id in removed:
+                    runtime.initial_text_by_set_id.pop(set_id, None)
+                    runtime.slider_species_drafts_by_set_id.pop(set_id, None)
             repository = None if runtime is None else runtime.result_repository
             if repository is not None:
                 repository.purge_sets(tuple(removed_ids))

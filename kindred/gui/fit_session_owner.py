@@ -12,9 +12,11 @@ from kindred.core.algebra.observable_introspection import (
     FitLocalObservable,
     validate_fit_local_observable,
 )
+from kindred.core.dataset_mapping import with_confirmed_observation_mapping
 from kindred.core.project_document import (
     FitDefaults,
     MechanismSourceCollision,
+    canonical_observation_target_names,
     reconcile_tab_mechanism_source,
 )
 from kindred.core.mechanism_source import MechanismAuthoringSource
@@ -378,10 +380,15 @@ class FitSessionOwner(QtCore.QObject):
         setup: FitSetupSnapshot,
         window: FittingWindow,
     ) -> None:
-        """Replace prior local/candidate state only after native start is known."""
+        """Install the admitted setup only after native start is known."""
 
+        candidate = self._candidate
+        if candidate is not None and candidate.setup_snapshot != setup:
+            self._invalidate_candidate_custody()
         self._install_setup(setup)
-        self._invalidate_candidate_custody()
+        # Execution owns the physical presentation until terminal settlement;
+        # custody remains in ``self._candidate`` for a failed or cancelled
+        # replacement attempt.
         self._clear_candidate_presentation(window)
 
     @QtCore.Slot(object)
@@ -442,10 +449,10 @@ class FitSessionOwner(QtCore.QObject):
         worker = self._worker
         if worker is None:
             return False
-        worker.request_cancel(publish_best=True)
+        worker.request_cancel()
         self._set_status(
-            "Fit stop requested; the best fully evaluated valid candidate will "
-            "be finalized if one exists."
+            "Fit stop requested; the current terminal candidate will be "
+            "restored after settlement."
         )
         return True
 
@@ -1079,6 +1086,19 @@ class FitSessionOwner(QtCore.QObject):
         ):
             return
         self._candidate = candidate
+        # Keep terminal actions disabled until the worker's finished callback
+        # releases execution custody.  The candidate itself remains in owner
+        # custody so a failed/cancelled replacement can restore it.
+        self._set_status("Fit complete.")
+
+    def _present_candidate(
+        self,
+        candidate: FitCandidate,
+        *,
+        announce: bool = True,
+    ) -> None:
+        """Project one retained candidate into the terminal Fit presentation."""
+
         terminal_setup = candidate.setup_snapshot
         self._last_fit_setup_snapshot = terminal_setup
         self._install_setup(terminal_setup)
@@ -1099,7 +1119,16 @@ class FitSessionOwner(QtCore.QObject):
         except Exception as exc:
             self._set_status(f"Fit result presentation failed: {exc}")
         else:
-            self._set_status("Fit complete.")
+            if announce:
+                self._set_status("Fit complete.")
+
+    def _restore_candidate_presentation(self) -> None:
+        """Restore retained terminal Fit state after a transient attempt."""
+
+        candidate = self._candidate
+        if candidate is None or self._window is None:
+            return
+        self._present_candidate(candidate, announce=False)
 
     @QtCore.Slot(str)
     def seed_shared_fit(self, statistic: str) -> bool:
@@ -1371,6 +1400,23 @@ class FitSessionOwner(QtCore.QObject):
                 reconciliation = reconciliation.replacement
             proposed_document = reconciliation.proposed_document
             proposed_tab = proposed_document.tab(origin.tab_id)
+            for local in candidate.setup_snapshot.datasets:
+                current_link = proposed_tab.dataset_link(local.dataset_id)
+                current_mapping = (
+                    ()
+                    if current_link is None
+                    else current_link.observation_mapping
+                )
+                if current_mapping == local.observation_targets:
+                    continue
+                proposed_tab = with_confirmed_observation_mapping(
+                    document=proposed_document,
+                    tab=proposed_tab,
+                    dataset=proposed_document.dataset(local.dataset_id),
+                    model_targets=canonical_observation_target_names(proposed_tab),
+                    confirmed_mapping=local.observation_targets,
+                )
+                proposed_document = proposed_document.replace_tab(proposed_tab)
             if initial_values:
                 found_keys: set[tuple[str, str]] = set()
                 proposed_sets = []
@@ -1428,7 +1474,6 @@ class FitSessionOwner(QtCore.QObject):
             or self._worker is not worker
         ):
             return
-        self._candidate = None
         if self._window is not None:
             self._clear_candidate_presentation(self._window)
             self._window.set_terminal_failure(failure)
@@ -1447,7 +1492,6 @@ class FitSessionOwner(QtCore.QObject):
             or self._worker is not worker
         ):
             return
-        self._candidate = None
         if self._window is not None:
             self._window.set_terminal_unavailable(unavailable)
         cause = unavailable.factual_cause
@@ -1465,7 +1509,6 @@ class FitSessionOwner(QtCore.QObject):
             or self._worker is not worker
         ):
             return
-        self._candidate = None
         if self._window is not None:
             self._clear_candidate_presentation(self._window)
             self._window.set_status("Fit cancelled.")
@@ -1488,6 +1531,7 @@ class FitSessionOwner(QtCore.QObject):
         closing = self._closing
         if self._window is not None and not self._application_close_fenced and not closing:
             self._window.set_executing(False)
+            self._restore_candidate_presentation()
         self.execution_changed.emit(False)
         if worker is not None:
             worker.deleteLater()

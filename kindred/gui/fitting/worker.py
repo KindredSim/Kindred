@@ -155,9 +155,6 @@ class FitCurveDataset:
     model_segment_ids: tuple[tuple[str, tuple[int, ...]], ...]
     model_segment_keys: tuple[tuple[str, tuple[str, ...]], ...]
     model_discontinuity_ids: tuple[tuple[str, tuple[int, ...]], ...]
-    observed_source_rows: tuple[tuple[str, tuple[int, ...]], ...]
-    observed_raw_ids: tuple[tuple[str, str], ...]
-    observed_raw_columns: tuple[tuple[str, str], ...]
     objective_model_x: tuple[tuple[str, tuple[float, ...]], ...]
     objective_model_y: tuple[tuple[str, tuple[float, ...]], ...]
     objective_model_segment_ids: tuple[tuple[str, tuple[int, ...]], ...]
@@ -189,18 +186,6 @@ class FitCurveDataset:
                 tuple(str(value or "").strip() for value in values),
             )
             for name, values in self.model_segment_keys
-        )
-        observed_source_rows = tuple(
-            (str(name), tuple(int(value) for value in values))
-            for name, values in self.observed_source_rows
-        )
-        observed_raw_ids = tuple(
-            (str(name), str(raw_id))
-            for name, raw_id in self.observed_raw_ids
-        )
-        observed_raw_columns = tuple(
-            (str(name), str(raw_column))
-            for name, raw_column in self.observed_raw_columns
         )
         model_discontinuity_ids = tuple(
             (str(name), tuple(int(value) for value in values))
@@ -269,11 +254,6 @@ class FitCurveDataset:
         segment_key_names = tuple(
             name for name, _values in model_segment_keys
         )
-        source_row_names = tuple(name for name, _values in observed_source_rows)
-        raw_id_names = tuple(name for name, _raw_id in observed_raw_ids)
-        raw_column_names = tuple(
-            name for name, _raw_column in observed_raw_columns
-        )
         discontinuity_names = tuple(name for name, _values in model_discontinuity_ids)
         if (
             not names
@@ -282,15 +262,9 @@ class FitCurveDataset:
             or set(names) != {name for name, _values in observed_y}
             or set(names) != set(segment_names)
             or set(names) != set(segment_key_names)
-            or set(names) != set(source_row_names)
-            or set(names) != set(raw_id_names)
-            or set(names) != set(raw_column_names)
             or set(names) != set(discontinuity_names)
             or len(segment_names) != len(set(segment_names))
             or len(segment_key_names) != len(set(segment_key_names))
-            or len(source_row_names) != len(set(source_row_names))
-            or len(raw_id_names) != len(set(raw_id_names))
-            or len(raw_column_names) != len(set(raw_column_names))
         ):
             raise ValueError(
                 "Fit curves require complete model and observation axes "
@@ -308,9 +282,6 @@ class FitCurveDataset:
             dict(objective_source_rows),
         )
         observed_y_by_name = dict(observed_y)
-        rows_by_name = dict(observed_source_rows)
-        raw_ids_by_name = dict(observed_raw_ids)
-        raw_columns_by_name = dict(observed_raw_columns)
         if any(set(mapping) != set(names) for mapping in objective_maps):
             raise ValueError("Fit objective rows require complete paired identity.")
         for name in names:
@@ -326,15 +297,6 @@ class FitCurveDataset:
                 or any(not value for value in objective_maps[6][name])
                 or any(not value for value in objective_maps[7][name])
                 or any(value <= 0 for value in objective_maps[8][name])
-                or any(
-                    value != raw_ids_by_name[name]
-                    for value in objective_maps[6][name]
-                )
-                or any(
-                    value != raw_columns_by_name[name]
-                    for value in objective_maps[7][name]
-                )
-                or tuple(objective_maps[8][name]) != rows_by_name[name]
             ):
                 raise ValueError("Fit objective rows contain incomplete paired identity.")
         for axis, values, field in (
@@ -357,10 +319,6 @@ class FitCurveDataset:
             or any(not value for value in segment_keys_by_name[name])
             or len(discontinuities_by_name[name]) != len(model_y_by_name[name])
             or any(value < 0 for value in discontinuities_by_name[name])
-            or len(rows_by_name[name]) != len(observed_y_by_name[name])
-            or any(value <= 0 for value in rows_by_name[name])
-            or not raw_ids_by_name[name].strip()
-            or not raw_columns_by_name[name].strip()
             for name in names
         ):
             raise ValueError(
@@ -391,13 +349,6 @@ class FitCurveDataset:
         object.__setattr__(self, "objective_observation_ids", objective_observation_ids)
         object.__setattr__(self, "objective_raw_columns", objective_raw_columns)
         object.__setattr__(self, "objective_source_rows", objective_source_rows)
-        object.__setattr__(
-            self,
-            "observed_source_rows",
-            observed_source_rows,
-        )
-        object.__setattr__(self, "observed_raw_ids", observed_raw_ids)
-        object.__setattr__(self, "observed_raw_columns", observed_raw_columns)
 
 
 @dataclass(frozen=True, slots=True)
@@ -997,9 +948,6 @@ def _construct_fit_curve_dataset(
     model_segment_ids: tuple[tuple[str, tuple[int, ...]], ...],
     model_segment_keys: tuple[tuple[str, tuple[str, ...]], ...],
     model_discontinuity_ids: tuple[tuple[str, tuple[int, ...]], ...],
-    observed_source_rows: tuple[tuple[str, tuple[int, ...]], ...],
-    observed_raw_ids: tuple[tuple[str, str], ...],
-    observed_raw_columns: tuple[tuple[str, str], ...],
     objective_model_x: tuple[tuple[str, tuple[float, ...]], ...],
     objective_model_y: tuple[tuple[str, tuple[float, ...]], ...],
     objective_model_segment_ids: tuple[tuple[str, tuple[int, ...]], ...],
@@ -1024,9 +972,6 @@ def _construct_fit_curve_dataset(
         model_segment_ids=model_segment_ids,
         model_segment_keys=model_segment_keys,
         model_discontinuity_ids=model_discontinuity_ids,
-        observed_source_rows=observed_source_rows,
-        observed_raw_ids=observed_raw_ids,
-        observed_raw_columns=observed_raw_columns,
         objective_model_x=objective_model_x,
         objective_model_y=objective_model_y,
         objective_model_segment_ids=objective_model_segment_ids,
@@ -1066,15 +1011,6 @@ def _curves_from_live(
         observed_x, observed_y = _observed_curve_parts(
             selected,
             x_observations=x_observations,
-        )
-        observed_source_rows = tuple(
-            (item.model_target, item.source_rows) for item in selected
-        )
-        observed_raw_ids = tuple(
-            (item.model_target, item.raw_observation_id) for item in selected
-        )
-        observed_raw_columns = tuple(
-            (item.model_target, item.raw_column) for item in selected
         )
         x_name = local.parametric.x_name if local.parametric is not None else "t"
         model_names = tuple(item.model_target for item in selected)
@@ -1229,9 +1165,6 @@ def _curves_from_live(
                 model_segment_ids=model_segment_ids,
                 model_segment_keys=model_segment_keys,
                 model_discontinuity_ids=model_discontinuity_ids,
-                observed_source_rows=observed_source_rows,
-                observed_raw_ids=observed_raw_ids,
-                observed_raw_columns=observed_raw_columns,
                 objective_model_x=objective_model_x,
                 objective_model_y=objective_model_y,
                 objective_model_segment_ids=objective_model_segment_ids,
@@ -1272,15 +1205,6 @@ def _curves_from_terminal(
         observed_x, observed_y = _observed_curve_parts(
             selected,
             x_observations=x_observations,
-        )
-        observed_source_rows = tuple(
-            (item.model_target, item.source_rows) for item in selected
-        )
-        observed_raw_ids = tuple(
-            (item.model_target, item.raw_observation_id) for item in selected
-        )
-        observed_raw_columns = tuple(
-            (item.model_target, item.raw_column) for item in selected
         )
         x_name = local.parametric.x_name if local.parametric is not None else "t"
         model_names = tuple(item.model_target for item in selected)
@@ -1369,9 +1293,6 @@ def _curves_from_terminal(
                 model_segment_ids=model_segment_ids,
                 model_segment_keys=model_segment_keys,
                 model_discontinuity_ids=model_discontinuity_ids,
-                observed_source_rows=observed_source_rows,
-                observed_raw_ids=observed_raw_ids,
-                observed_raw_columns=observed_raw_columns,
                 objective_model_x=objective_model_x,
                 objective_model_y=objective_model_y,
                 objective_model_segment_ids=objective_model_segment_ids,

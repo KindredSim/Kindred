@@ -13,6 +13,7 @@ if TYPE_CHECKING:
 __all__ = [
     "ANALYSIS_DOCK_SPEC",
     "BATCH_DOCK_SPEC",
+    "DOCK_SPECS",
     "DockShellSpec",
     "MECHANISM_DOCK_SPEC",
     "RIGHT_DOCK_SPEC",
@@ -30,6 +31,7 @@ class DockShellSpec:
     title: str
     object_name: str
     default_area: QtCore.Qt.DockWidgetArea
+    surface_object_name: str | None = None
 
 
 _DEFAULT_DOCK_AREA_PROPERTY = "kindred/defaultDockArea"
@@ -38,24 +40,28 @@ MECHANISM_DOCK_SPEC = DockShellSpec(
     "Mechanism",
     "mechanismDock",
     QtCore.Qt.DockWidgetArea.LeftDockWidgetArea,
+    "mechanismSurfaceStack",
 )
 SLIDERS_DOCK_SPEC = DockShellSpec(
     "interactive_sliders",
     "Interactive Sliders",
     "slidersDock",
     QtCore.Qt.DockWidgetArea.LeftDockWidgetArea,
+    "sliderSurfaceStack",
 )
 BATCH_DOCK_SPEC = DockShellSpec(
     "batch_initial_conditions",
     "Initial Conditions",
     "batchDock",
     QtCore.Qt.DockWidgetArea.RightDockWidgetArea,
+    "initialConditionsSurfaceStack",
 )
 RIGHT_DOCK_SPEC = DockShellSpec(
     "data",
     "Data",
     "rightDock",
     QtCore.Qt.DockWidgetArea.RightDockWidgetArea,
+    "dataSurfaceStack",
 )
 ANALYSIS_DOCK_SPEC = DockShellSpec(
     "analysis",
@@ -68,6 +74,16 @@ SYMBOLIC_CALCULATOR_DOCK_SPEC = DockShellSpec(
     "Symbolic Calculator",
     "symbolicCalculatorDock",
     QtCore.Qt.DockWidgetArea.RightDockWidgetArea,
+    "symbolicCalculatorSurfaceStack",
+)
+
+DOCK_SPECS = (
+    MECHANISM_DOCK_SPEC,
+    SLIDERS_DOCK_SPEC,
+    BATCH_DOCK_SPEC,
+    RIGHT_DOCK_SPEC,
+    ANALYSIS_DOCK_SPEC,
+    SYMBOLIC_CALCULATOR_DOCK_SPEC,
 )
 
 
@@ -137,25 +153,19 @@ def build_physical_shell(
 
     try:
         stacks = {
-            "mechanism": QtWidgets.QStackedWidget(workspace_root),
-            "interactive_sliders": QtWidgets.QStackedWidget(workspace_root),
-            "batch_initial_conditions": QtWidgets.QStackedWidget(workspace_root),
-            "data": QtWidgets.QStackedWidget(workspace_root),
-            "symbolic_calculator": QtWidgets.QStackedWidget(workspace_root),
+            spec.identity_key: QtWidgets.QStackedWidget(workspace_root)
+            for spec in DOCK_SPECS
+            if spec.surface_object_name is not None
         }
-        object_names = {
-            "mechanism": "mechanismSurfaceStack",
-            "interactive_sliders": "sliderSurfaceStack",
-            "batch_initial_conditions": "initialConditionsSurfaceStack",
-            "data": "dataSurfaceStack",
-            "symbolic_calculator": "symbolicCalculatorSurfaceStack",
-        }
-        for identity, stack in stacks.items():
-            stack.setObjectName(object_names[identity])
+        for spec in DOCK_SPECS:
+            if spec.surface_object_name is not None:
+                stacks[spec.identity_key].setObjectName(spec.surface_object_name)
         workspace_root.install_dock_panels(
             {
                 **stacks,
-                "analysis": workspace_root.main_plot_analysis_widget(),
+                ANALYSIS_DOCK_SPEC.identity_key: (
+                    workspace_root.main_plot_analysis_widget()
+                ),
             }
         )
     except Exception:

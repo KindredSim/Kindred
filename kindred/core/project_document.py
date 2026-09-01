@@ -25,26 +25,21 @@ from kindred.core.simulator.dsl_parse import (
     PreparedDslRequestSet,
     prepare_dsl_request_set,
 )
+from kindred.core.simulator.dsl_build_input import source_coordinate_capabilities
 from kindred.core.simulator.dsl_derivation import (
-    authored_step_origin,
-    coordinate_source_parts,
-    coordinate_token_matches,
     insert_scalar_source_declarations,
 )
 from kindred.core.simulator.exact_constraint_composition import (
     ExactConstraintComposition,
     compose_exact_constraints,
 )
-from kindred.core.simulator.parameter_namespace import build_namespace_from_mechanism
 from kindred.core.simulator.source_correction import (
     CorrectionPlan,
     CorrectionTarget,
     build_correction_expressions,
     plan_correction_basis,
 )
-from kindred.core.simulator.step_indexing import (
-    get_step_index_map,
-)
+from kindred.core.simulator.step_indexing import lookup_source_coordinate_target
 from kindred.core.simulator.solvers import normalize_solver_name
 from kindred.core.units import UnitsModel
 from kindred.core.species import (
@@ -1443,38 +1438,6 @@ def reconcile_tab_mechanism_source(
     return reconciliation
 
 
-def _retained_algebra_dependencies(spec: object | None) -> Mapping[str, tuple[str, ...]]:
-    """Return dependencies from the already admitted Algebra statements."""
-
-    if spec is None:
-        return {}
-    block = getattr(spec, "parameter_block", None)
-    statements_method = getattr(block, "statements_in_evaluation_order", None)
-    if block is None or not callable(statements_method):
-        return {}
-    dependencies: dict[str, tuple[str, ...]] = {}
-
-    def names_in(node: object, result: set[str]) -> None:
-        if node is None:
-            return
-        if type(node).__name__ == "IdentNode":
-            result.add(str(getattr(node, "name", "")))
-            return
-        for attribute in ("lhs", "rhs"):
-            names_in(getattr(node, attribute, None), result)
-        arguments = getattr(node, "args", ())
-        for argument in arguments or ():
-            names_in(argument, result)
-
-    for statement in statements_method():
-        name = str(getattr(statement, "name", ""))
-        found: set[str] = set()
-        names_in(getattr(statement, "expr", None), found)
-        found.discard(name)
-        dependencies[name] = tuple(sorted(found))
-    return dependencies
-
-
 def _admitted_correction_targets(
     tab: MechanismTabDocument,
     composition: object,
@@ -1484,104 +1447,70 @@ def _admitted_correction_targets(
     prepared = tab.prepared_dsl
     if prepared is None:
         raise ValueError("Correction requires admitted prepared DSL.")
+    if prepared.temperature_schedule_for_execution() is not None:
+        raise ValueError(
+            "Exact source correction is unavailable when temperature is scheduled."
+        )
     mechanism = prepared.accepted_mechanism_for_structure()
-    namespace = build_namespace_from_mechanism(mechanism)
-    source_coordinates: dict[str, tuple[Mapping[str, object], str]] = {}
-    step_entries = tuple(get_step_index_map(mechanism))
-    for entry in step_entries:
-        raw_coordinates = entry.get("source_coordinates") or {}
-        if not isinstance(raw_coordinates, Mapping):
-            raise ValueError("Admitted source-coordinate map is invalid.")
-        for raw_role, raw_name in raw_coordinates.items():
-            role, name = str(raw_role), str(raw_name)
-            if name in source_coordinates:
-                raise ValueError(f"Source coordinate {name!r} has duplicate admitted identity.")
-            source_coordinates[name] = (entry, role)
-    spec = prepared.parameter_algebra_spec_for_execution()
-    assignment_method = getattr(spec, "param_assignment_names", None)
-    assignment_names = (
-        {str(name) for name in assignment_method()}
-        if callable(assignment_method)
-        else set()
-    )
-    dependencies_by_name = _retained_algebra_dependencies(spec)
-    powers = {
-        str(name)
-        for item in getattr(composition, "constraints", ())
-        for name, _power in item.powers
+    parameter_spec = prepared.parameter_algebra_spec_for_execution()
+    parameter_dependencies = parameter_spec.parameter_dependencies
+    assignment_kinds = {
+        str(name): parameter_spec.parameter_assignment_kind(str(name))
+        for name in parameter_dependencies
     }
+    coordinates = tuple(
+        coordinate
+        for origin in prepared.analysis.origins
+        for coordinate in origin.coordinates
+    )
+    powers: set[str] = set()
+    for item in getattr(composition, "constraints", ()):
+        monomial = getattr(item, "monomial", None)
+        if monomial is not None and callable(
+            getattr(monomial, "coordinate_power_map", None)
+        ):
+            powers.update(str(name) for name in monomial.coordinate_power_map())
+        else:
+            powers.update(str(name) for name, _power in item.powers)
     admitted: list[CorrectionTarget] = []
-    seen: set[str] = set()
     equilibria = tuple(getattr(mechanism, "equilibria", ()) or ())
-    for entry in step_entries:
-        kind = str(entry.get("kind") or "")
-        step_index = int(entry.get("step_index"))
-        origin = authored_step_origin(prepared.analysis, step_index=step_index)
-        _prefix, tokens, _comment = coordinate_source_parts(origin.source_text)
-        roles = ("k",) if kind == "reaction" else ("kf", "kr", "Keq")
-        role_entries = tuple((role, f"{role}{step_index}") for role in roles)
-        for role, name in role_entries:
-            if name not in namespace.canonical_names or name not in powers:
-                continue
-            matches = [
-                token
-                for token in tokens
-                if coordinate_token_matches(token[0], "k" if role == "k" else role)
-            ]
-            if len(matches) != 1 or name in seen:
-                continue
-            editable, derived = True, False
-            item_index = entry.get("equilibrium_index")
-            if kind == "equilibrium" and item_index is not None:
-                authority = normalize_existing_equilibrium_rate_authority(
-                    equilibria[int(item_index)]
-                )
-                editable = authority.authored_role_is_editable(role)
-                derived = authority.authored_role_is_derived(role)
-            admitted.append(
-                CorrectionTarget(
-                    name=name,
-                    family=role,
-                    editable=editable,
-                    locked=bool(entry.get("locked", False)),
-                    algebra_owned=name in assignment_names,
-                    derived=derived,
-                    dependencies=dependencies_by_name.get(name, ()),
-                    canonical_identity=(name, role),
-                    source_origin=origin.source_text,
-                )
+    for coordinate in coordinates:
+        name = str(coordinate.canonical_name)
+        role = str(coordinate.role)
+        capabilities = source_coordinate_capabilities(role)
+        if (
+            not capabilities.correction_target
+            or name not in powers
+            # An admitted Algebra assignment owns a mechanism/source target,
+            # including an empty-dependency mechanism-bound assignment.  Such
+            # coordinates are not independently writable correction targets.
+            or assignment_kinds.get(name) in {"derived scalar", "mechanism-bound"}
+        ):
+            continue
+        source_target = lookup_source_coordinate_target(mechanism, name)
+        if source_target is None:
+            continue
+        kind, item_index, target_role, entry = source_target
+        if str(target_role) != role:
+            continue
+        editable = not bool(entry.get("locked", False))
+        derived = False
+        if str(kind) == "equilibrium":
+            authority = normalize_existing_equilibrium_rate_authority(
+                equilibria[int(item_index)]
             )
-            seen.add(name)
-        for raw_role, raw_name in (entry.get("source_coordinates") or {}).items():
-            role, name = str(raw_role), str(raw_name)
-            if name not in namespace.source_coordinate_names or name not in powers or name in seen:
-                continue
-            matches = [token for token in tokens if coordinate_token_matches(token[0], role)]
-            if len(matches) != 1:
-                continue
-            editable = not bool(entry.get("locked", False))
-            derived = False
-            item_index = entry.get("equilibrium_index")
-            if kind == "equilibrium" and role == "dG_eq" and item_index is not None:
-                authority = normalize_existing_equilibrium_rate_authority(
-                    equilibria[int(item_index)]
-                )
+            if capabilities.equilibrium_authority:
                 editable = editable and authority.authored_role_is_editable(role)
                 derived = authority.authored_role_is_derived(role)
-            admitted.append(
-                CorrectionTarget(
-                    name=name,
-                    family=role,
-                    editable=editable,
-                    locked=bool(entry.get("locked", False)),
-                    algebra_owned=name in assignment_names,
-                    derived=derived,
-                    dependencies=dependencies_by_name.get(name, ()),
-                    canonical_identity=(name, role),
-                    source_origin=origin.source_text,
-                )
+        admitted.append(
+            CorrectionTarget(
+                name=name,
+                family=role,
+                editable=editable,
+                locked=bool(entry.get("locked", False)),
+                derived=derived,
             )
-            seen.add(name)
+        )
     return tuple(admitted)
 
 
@@ -1631,9 +1560,10 @@ def assess_tab_exact_correction(
             mechanism_source=source,
             prepared_dsl=prepared,
         )
+        parameter_spec = prepared.parameter_algebra_spec_for_execution()
         composition = compose_exact_constraints(
             prepared.accepted_mechanism_for_structure(),
-            parameter_algebra_spec=prepared.parameter_algebra_spec_for_execution(),
+            parameter_algebra_spec=parameter_spec,
         )
         targets = _admitted_correction_targets(detached_tab, composition)
         plan = plan_correction_basis(composition, targets)

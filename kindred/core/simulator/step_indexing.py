@@ -3,17 +3,17 @@ Canonical global step-index naming helpers.
 
 Canonical rule:
 - Every kinetic step in DSL order gets a 1-based index N.
-- Reaction step -> parameter kN
-- Equilibrium step -> parameters kfN, krN, and KeqN
+- Reaction step -> readout kN
+- Equilibrium step -> readouts kfN, krN, and KeqN
 
-Policy:
-- The map covers only canonical authored reaction and equilibrium steps, so
-  each user-visible kinetic parameter has one unambiguous name.
+The step map separately records parser-admitted source coordinates.  Consumers
+must use that source map to distinguish writable authored values from derived
+indexed readouts.
 """
 
 from __future__ import annotations
 
-import re
+from collections.abc import Mapping
 from typing import Dict, Iterator, List, Optional, Tuple
 
 from kindred.core.simulator.parameter_namespace import build_namespace_from_mechanism
@@ -22,11 +22,8 @@ from kindred.core.validation import try_parse_int
 __all__ = [
     "get_step_index_map",
     "iter_canonical_parameters",
-    "lookup_step_param_target",
+    "lookup_source_coordinate_target",
 ]
-
-_CANON_PARAM_RE = re.compile(r"^(k|kf|kr|Keq)(\d+)$")
-
 
 def get_step_index_map(mechanism: object) -> List[Dict[str, object]]:
     meta = getattr(mechanism, "metadata", {}) or {}
@@ -63,49 +60,32 @@ def iter_canonical_parameters(mechanism: object) -> Iterator[Tuple[str, Dict[str
         yield (item.canonical_name, entry, role)
 
 
-def lookup_step_param_target(
+def lookup_source_coordinate_target(
     mechanism: object, name: str
 ) -> Optional[Tuple[str, int, str, Dict[str, object]]]:
-    """
-    Resolve a canonical parameter name to a mechanism target.
+    """Resolve one parser-admitted physical coordinate to its owning step.
 
-    Returns (kind, index, role, entry) where:
-    - kind: "reaction" or "equilibrium"
-    - index: 0-based index into mechanism.reactions or mechanism.equilibria
-    - role: "k" / "kf" / "kr" / "Keq"
+    The source-coordinate map is populated by the parser/build seam and keeps
+    physical model roles distinct from canonical indexed rate readouts.  This
+    lookup therefore never infers ownership from a token spelling or from a
+    derived mechanism value.
     """
-    m = _CANON_PARAM_RE.match(str(name))
-    if not m:
-        return None
+
+    requested = str(name)
     namespace = build_namespace_from_mechanism(mechanism)
-    resolution = namespace.resolve(str(name))
-    if resolution.canonical_name is None or str(resolution.canonical_name) != str(name):
-        return None
-    role = m.group(1)
-    step_no, ok = try_parse_int(m.group(2))
-    if not ok:
+    if requested not in namespace.source_coordinate_names:
         return None
     for entry in get_step_index_map(mechanism):
-        n, ok = try_parse_int(entry.get("step_index"))
-        if not ok:
+        raw_coordinates = entry.get("source_coordinates") or {}
+        if not isinstance(raw_coordinates, Mapping):
             continue
-        if n != step_no:
-            continue
-        kind = str(entry.get("kind") or "")
-        if role == "k":
-            if kind != "reaction":
+        for raw_role, raw_name in raw_coordinates.items():
+            if str(raw_name) != requested:
+                continue
+            kind = str(entry.get("kind") or "")
+            index_key = "reaction_index" if kind == "reaction" else "equilibrium_index"
+            index, ok = try_parse_int(entry.get(index_key))
+            if not ok or kind not in {"reaction", "equilibrium"}:
                 return None
-            idx_raw = entry.get("reaction_index")
-            idx, ok = try_parse_int(idx_raw)
-            if not ok:
-                return None
-            return ("reaction", idx, "k", entry)
-        if role in {"kf", "kr", "Keq"}:
-            if kind != "equilibrium":
-                return None
-            idx_raw = entry.get("equilibrium_index")
-            idx, ok = try_parse_int(idx_raw)
-            if not ok:
-                return None
-            return ("equilibrium", idx, role, entry)
+            return (kind, int(index), str(raw_role), entry)
     return None

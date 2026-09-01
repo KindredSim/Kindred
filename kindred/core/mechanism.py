@@ -28,7 +28,6 @@ Current contract
   - Keq: float | Expr | None
   - kf: float | Expr | None
   - kr: float | Expr | None
-  - fast: bool  (true if originated from `equilibrium:`)
 
 Design notes
 ------------
@@ -332,14 +331,12 @@ class Equilibrium:
     one column with forward/reverse power-law terms rather than duplicating
     into two reactions.
 
-    fast=True marks an entry that originated from `equilibrium:` in the DSL.
     """
     stoich_forward: Mapping[str, float]
     stoich_back: Mapping[str, float]
     Keq: Union[float, Expr, None] = None
     kf: Union[float, Expr, None] = None
     kr: Union[float, Expr, None] = None
-    fast: bool = False
     metadata: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -456,7 +453,6 @@ class Mechanism:
         Keq: Any | None = None,
         kf: Any | None = None,
         kr: Any | None = None,
-        fast: bool = False,
         metadata: Optional[Mapping[str, Any]] = None,
         authority_context: EquilibriumRateInputContext | str | None = None,
     ) -> tuple[Equilibrium, EquilibriumRateAuthority]:
@@ -506,7 +502,6 @@ class Mechanism:
             Keq=Keq,
             kf=kf,
             kr=kr,
-            fast=bool(fast),
             metadata=meta,
         )
         self.equilibria.append(eq)

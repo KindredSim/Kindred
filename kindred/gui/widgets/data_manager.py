@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import html
 import logging
-from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 from PySide6 import QtCore, QtWidgets
@@ -34,13 +33,9 @@ from kindred.gui.controllers.dataset_errors import (
     DatasetImportAdmissionError,
 )
 from kindred.gui.dataset_import_staging import (
-    DatasetImportCancellation,
-    DatasetImportFailure,
-    DatasetImportProgress,
     DatasetImportRequest,
     DatasetImportStaging,
     DatasetImportWorkerAdmission,
-    DatasetImportWorkerRequest,
 )
 from kindred.gui.dataset_payload_snapshot import (
     ActiveDatasetLinkSnapshot,
@@ -57,64 +52,7 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "DataManagerPanel",
-    "DatasetDeleteIntent",
-    "DatasetExportOriginalIntent",
-    "DatasetFitInclusionIntent",
-    "DatasetMappingIntent",
-    "DatasetObservationMappingIntent",
-    "DatasetPlotOverlayIntent",
-    "DatasetRenameIntent",
 ]
-
-
-@dataclass(frozen=True)
-class DatasetRenameIntent:
-    dataset_id: str
-    display_name: str
-
-
-@dataclass(frozen=True)
-class DatasetDeleteIntent:
-    dataset_id: str
-
-
-@dataclass(frozen=True)
-class DatasetExportOriginalIntent:
-    dataset_id: str
-
-
-@dataclass(frozen=True)
-class DatasetMappingIntent:
-    dataset_id: str
-    action: str
-    set_id: str | None = None
-    occupied_choice: str | None = None
-
-
-@dataclass(frozen=True)
-class DatasetObservationMappingIntent:
-    dataset_id: str
-
-
-@dataclass(frozen=True)
-class DatasetPlotOverlayIntent:
-    dataset_id: str
-
-    def __post_init__(self) -> None:
-        if (
-            type(self.dataset_id) is not str
-            or not self.dataset_id
-            or self.dataset_id != self.dataset_id.strip()
-        ):
-            raise ValueError(
-                "Plot Overlay navigation requires one stable dataset ID."
-            )
-
-
-@dataclass(frozen=True)
-class DatasetFitInclusionIntent:
-    dataset_id: str
-    include: bool
 
 
 class DataManagerPanel(QtWidgets.QWidget):
@@ -134,13 +72,13 @@ class DataManagerPanel(QtWidgets.QWidget):
     callbacks own every canonical mutation.
     """
 
-    datasetRenameRequested = QtCore.Signal(object)
-    datasetDeleteRequested = QtCore.Signal(object)
-    datasetExportOriginalRequested = QtCore.Signal(object)
-    datasetMappingRequested = QtCore.Signal(object)
-    datasetObservationMappingRequested = QtCore.Signal(object)
-    datasetPlotOverlayRequested = QtCore.Signal(object)
-    datasetFitInclusionRequested = QtCore.Signal(object)
+    datasetRenameRequested = QtCore.Signal(str, str)
+    datasetDeleteRequested = QtCore.Signal(str)
+    datasetExportOriginalRequested = QtCore.Signal(str)
+    datasetMappingRequested = QtCore.Signal(str, str, object, object)
+    datasetObservationMappingRequested = QtCore.Signal(str)
+    datasetPlotOverlayRequested = QtCore.Signal(str)
+    datasetFitInclusionRequested = QtCore.Signal(str, bool)
     def __init__(
         self,
         staging: DatasetImportStaging,
@@ -249,7 +187,6 @@ class DataManagerPanel(QtWidgets.QWidget):
         self._visible_records_by_id: Dict[str, RawDatasetRecord] = {}
 
         self._progress_dialog: Optional[QtWidgets.QProgressDialog] = None
-        self._initiating_import_request: DatasetImportRequest | None = None
         self._staging.busyChanged.connect(self._on_staging_busy_changed)
         self._staging.workerProgressed.connect(self._on_import_progress)
         self._staging.workerFailed.connect(self._on_import_failure)
@@ -432,7 +369,6 @@ class DataManagerPanel(QtWidgets.QWidget):
                 str(exc),
             )
             return
-        self._initiating_import_request = import_request
         dataset_label = f"{expected_count} dataset{'s' if expected_count != 1 else ''}"
         logger.info("User initiated dataset import: %s", dataset_label)
 
@@ -568,31 +504,22 @@ class DataManagerPanel(QtWidgets.QWidget):
             plans=tuple(plans),
         )
 
-    def _on_import_progress(self, event: DatasetImportProgress) -> None:
-        """Render one staging-owned aggregate progress event."""
-        if event.request is not self._initiating_import_request:
-            return
+    def _on_import_progress(self, percent: int) -> None:
+        """Render one staging-owned aggregate progress fact."""
         if self._progress_dialog:
-            self._progress_dialog.setValue(event.percent)
+            self._progress_dialog.setValue(percent)
 
-    def _on_import_failure(self, event: DatasetImportFailure) -> None:
-        """Present one staging-owned typed worker failure."""
-        if not self._owns_worker_request(event.request):
-            return
+    def _on_import_failure(self, message: str) -> None:
+        """Present one staging-owned worker failure fact."""
         self._show_message(
             QtWidgets.QMessageBox.Icon.Critical,
             "Load Error",
-            f"Failed to load dataset:\n\n{event.message}",
+            f"Failed to load dataset:\n\n{message}",
         )
 
-    def _on_import_cancellation(
-        self,
-        event: DatasetImportCancellation,
-    ) -> None:
-        """Observe one staging-owned typed worker cancellation."""
-        if not self._owns_worker_request(event.request):
-            return
-        logger.info("Dataset import canceled: %s", event.source_label)
+    def _on_import_cancellation(self, source_label: str) -> None:
+        """Observe one staging-owned worker cancellation fact."""
+        logger.info("Dataset import canceled: %s", source_label)
 
     def _on_load_canceled(self):
         """Handle cancel request during dataset loading."""
@@ -615,16 +542,14 @@ class DataManagerPanel(QtWidgets.QWidget):
         dataset_id = self._selected_dataset_id()
         if not dataset_id:
             return
-        self.datasetDeleteRequested.emit(DatasetDeleteIntent(dataset_id))
+        self.datasetDeleteRequested.emit(dataset_id)
 
     def _export_original(self) -> None:
         """Request the integration-owned destination dialog for exact bytes."""
         dataset_id = self._selected_dataset_id()
         if not dataset_id:
             return
-        self.datasetExportOriginalRequested.emit(
-            DatasetExportOriginalIntent(dataset_id)
-        )
+        self.datasetExportOriginalRequested.emit(dataset_id)
 
     def _rename_dataset(self) -> None:
         dataset_id = self._selected_dataset_id()
@@ -638,9 +563,7 @@ class DataManagerPanel(QtWidgets.QWidget):
             text=str(record.display_name),
         )
         if accepted:
-            self.datasetRenameRequested.emit(
-                DatasetRenameIntent(dataset_id=dataset_id, display_name=str(value))
-            )
+            self.datasetRenameRequested.emit(dataset_id, str(value))
 
     def _on_dataset_selected(self, current, previous):
         """Update preview when dataset is selected."""
@@ -754,12 +677,10 @@ class DataManagerPanel(QtWidgets.QWidget):
         if not dataset_id:
             return
         self.datasetMappingRequested.emit(
-            DatasetMappingIntent(
-                dataset_id=dataset_id,
-                action=str(action),
-                set_id=set_id,
-                occupied_choice=occupied_choice,
-            )
+            dataset_id,
+            str(action),
+            set_id,
+            occupied_choice,
         )
 
     def _map_existing(self) -> None:
@@ -844,17 +765,13 @@ class DataManagerPanel(QtWidgets.QWidget):
         dataset_id = self._selected_dataset_id()
         if not dataset_id:
             return
-        self.datasetObservationMappingRequested.emit(
-            DatasetObservationMappingIntent(dataset_id=dataset_id)
-        )
+        self.datasetObservationMappingRequested.emit(dataset_id)
 
     def _request_plot_overlay(self) -> None:
         dataset_id = self._selected_dataset_id()
         if not dataset_id:
             return
-        self.datasetPlotOverlayRequested.emit(
-            DatasetPlotOverlayIntent(dataset_id=dataset_id)
-        )
+        self.datasetPlotOverlayRequested.emit(dataset_id)
 
     def _on_fit_include_toggled(self, checked: bool) -> None:
         dataset_id = self._selected_dataset_id()
@@ -865,22 +782,9 @@ class DataManagerPanel(QtWidgets.QWidget):
             or link.set_id is None
         ):
             return
-        self.datasetFitInclusionRequested.emit(
-            DatasetFitInclusionIntent(dataset_id=dataset_id, include=bool(checked))
-        )
+        self.datasetFitInclusionRequested.emit(dataset_id, bool(checked))
 
     def _on_staging_busy_changed(self, busy: bool) -> None:
         self._load_btn.setEnabled(not bool(busy))
         if not busy:
             self._finalize_progress_dialog()
-            self._initiating_import_request = None
-
-    def _owns_worker_request(
-        self,
-        request: DatasetImportWorkerRequest,
-    ) -> bool:
-        initiating = self._initiating_import_request
-        return bool(
-            initiating is not None
-            and request.import_request is initiating
-        )

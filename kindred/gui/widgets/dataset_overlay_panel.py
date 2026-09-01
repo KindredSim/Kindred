@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import replace
 from typing import Callable, Iterable
 
 from PySide6 import QtCore, QtGui, QtWidgets
@@ -11,49 +11,13 @@ from PySide6.QtCore import Qt
 from kindred.core.datasets.foundation import RawDatasetRecord
 from kindred.gui.dataset_payload_snapshot import ActiveDatasetLinkSnapshot
 
-__all__ = ["DatasetOverlayPanel", "OverlaySelectionIntent"]
-
-
-@dataclass(frozen=True)
-class OverlaySelectionIntent:
-    dataset_id: str
-    raw_observation_ids: tuple[str, ...]
-
-    def __post_init__(self) -> None:
-        if (
-            not isinstance(self.dataset_id, str)
-            or not self.dataset_id
-            or self.dataset_id != self.dataset_id.strip()
-        ):
-            raise ValueError(
-                "Overlay selection requires a nonblank edge-normalized "
-                "dataset ID."
-            )
-        raw_observation_ids = tuple(self.raw_observation_ids)
-        if (
-            any(
-                not isinstance(raw_observation_id, str)
-                or not raw_observation_id
-                or raw_observation_id != raw_observation_id.strip()
-                for raw_observation_id in raw_observation_ids
-            )
-            or len(raw_observation_ids) != len(set(raw_observation_ids))
-        ):
-            raise ValueError(
-                "Overlay selection raw observation IDs must be unique "
-                "nonblank edge-normalized strings."
-            )
-        object.__setattr__(
-            self,
-            "raw_observation_ids",
-            raw_observation_ids,
-        )
+__all__ = ["DatasetOverlayPanel"]
 
 
 class DatasetOverlayPanel(QtWidgets.QWidget):
     """Render global records with persisted active-tab overlay membership."""
 
-    overlaySelectionRequested = QtCore.Signal(object)
+    overlaySelectionRequested = QtCore.Signal(str, object)
     speciesColorRequested = QtCore.Signal(str, object, object)
     experimentalPointSizeRequested = QtCore.Signal(int)
     experimentalPointOpacityRequested = QtCore.Signal(float)
@@ -398,12 +362,7 @@ class DatasetOverlayPanel(QtWidgets.QWidget):
             if parent.child(index).checkState(0) == Qt.CheckState.Checked
         )
         try:
-            self.overlaySelectionRequested.emit(
-                OverlaySelectionIntent(
-                    dataset_id=dataset_id,
-                    raw_observation_ids=raw_observation_ids,
-                )
-            )
+            self.overlaySelectionRequested.emit(dataset_id, raw_observation_ids)
         finally:
             # Direct handlers update ``_links_by_dataset_id`` on acceptance.
             # Rejection/cancellation leaves the prior authoritative snapshot,

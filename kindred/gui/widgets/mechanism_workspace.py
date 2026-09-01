@@ -79,24 +79,12 @@ class ProjectWorkspaceWidget(QtWidgets.QMainWindow):
         """Install the six root-local physical module shells."""
 
         from kindred.gui.app_wiring import (
-            ANALYSIS_DOCK_SPEC,
-            BATCH_DOCK_SPEC,
-            MECHANISM_DOCK_SPEC,
-            RIGHT_DOCK_SPEC,
-            SLIDERS_DOCK_SPEC,
-            SYMBOLIC_CALCULATOR_DOCK_SPEC,
+            DOCK_SPECS,
             build_module_dock,
         )
 
-        specs = (
-            (MECHANISM_DOCK_SPEC, "mechanism"),
-            (SLIDERS_DOCK_SPEC, "interactive_sliders"),
-            (BATCH_DOCK_SPEC, "batch_initial_conditions"),
-            (RIGHT_DOCK_SPEC, "data"),
-            (ANALYSIS_DOCK_SPEC, "analysis"),
-            (SYMBOLIC_CALCULATOR_DOCK_SPEC, "symbolic_calculator"),
-        )
-        expected = {identity for _spec, identity in specs}
+        specs = DOCK_SPECS
+        expected = {spec.identity_key for spec in specs}
         supplied = {str(key) for key in panels}
         if supplied != expected:
             raise ValueError(
@@ -105,13 +93,13 @@ class ProjectWorkspaceWidget(QtWidgets.QMainWindow):
         if self._dock_by_identity:
             raise RuntimeError("Project workspace docks are already installed.")
         docks: list[QtWidgets.QDockWidget] = []
-        for spec, identity in specs:
+        for spec in specs:
             dock = build_module_dock(
                 self,
                 spec=spec,
-                panel=panels[identity],
+                panel=panels[spec.identity_key],
             )
-            self._dock_by_identity[identity] = dock
+            self._dock_by_identity[spec.identity_key] = dock
             docks.append(dock)
         return tuple(docks)
 
@@ -131,14 +119,27 @@ class ProjectWorkspaceWidget(QtWidgets.QMainWindow):
             if area is not None:
                 self.addDockWidget(QtCore.Qt.DockWidgetArea(int(area)), dock)
             dock.show()
-        if len(docks) != 6:
+        from kindred.gui.app_wiring import (
+            ANALYSIS_DOCK_SPEC,
+            BATCH_DOCK_SPEC,
+            DOCK_SPECS,
+            MECHANISM_DOCK_SPEC,
+            RIGHT_DOCK_SPEC,
+            SLIDERS_DOCK_SPEC,
+            SYMBOLIC_CALCULATOR_DOCK_SPEC,
+        )
+
+        if len(docks) != len(DOCK_SPECS):
             return
-        mechanism = self.dock_for_identity("mechanism")
-        sliders = self.dock_for_identity("interactive_sliders")
-        batch = self.dock_for_identity("batch_initial_conditions")
-        data = self.dock_for_identity("data")
-        analysis = self.dock_for_identity("analysis")
-        calculator = self.dock_for_identity("symbolic_calculator")
+
+        mechanism = self.dock_for_identity(MECHANISM_DOCK_SPEC.identity_key)
+        sliders = self.dock_for_identity(SLIDERS_DOCK_SPEC.identity_key)
+        batch = self.dock_for_identity(BATCH_DOCK_SPEC.identity_key)
+        data = self.dock_for_identity(RIGHT_DOCK_SPEC.identity_key)
+        analysis = self.dock_for_identity(ANALYSIS_DOCK_SPEC.identity_key)
+        calculator = self.dock_for_identity(
+            SYMBOLIC_CALCULATOR_DOCK_SPEC.identity_key
+        )
         self.splitDockWidget(mechanism, sliders, QtCore.Qt.Orientation.Vertical)
         self.splitDockWidget(batch, data, QtCore.Qt.Orientation.Vertical)
         self.tabifyDockWidget(data, analysis)

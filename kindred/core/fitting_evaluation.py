@@ -41,9 +41,9 @@ from kindred.core.simulation_preparation import (
     SimulationExecutionRequest,
     PreparedSimulationRun,
     _canonical_step_override_name,
+    _build_parameter_target_map,
     _classify_request_parameter_names,
     _parameter_algebra_scalar_authority_names,
-    _schedule_resolution_values_for_request,
     fit_simulation_error_from_preparation_error,
     prepare_preparation_failure,
     raise_unowned_request_parameter_values,
@@ -52,7 +52,6 @@ from kindred.core.simulation_preparation import (
     build_simulation_request_from_prepared_run,
     metadata_view_for_mechanism,
     prepare_simulation_worker_run,
-    resolve_prepared_run_intervention_execution,
     SimulationPreparationError,
 )
 from kindred.core.simulation_preparation_stages import PreparedSolverConfig
@@ -399,6 +398,7 @@ def prepare_fitting_execution_context(
     ):
         raise FittingCancelled()
     try:
+        parameter_target_map = _build_parameter_target_map(mechanism)
         mechanism_namespace = build_namespace_from_mechanism(mechanism)
         namespace_info = mechanism_namespace.info_by_name
         declared_scalar_names, derived_scalar_names = _parameter_algebra_scalar_authority_names(
@@ -421,7 +421,6 @@ def prepare_fitting_execution_context(
         unknown_names: set[str] = set()
         mechanism_name_by_raw: dict[str, str] = {}
         unbound_mechanism_name_by_raw: dict[str, str] = {}
-        schedule_name_by_raw: dict[str, str] = {}
         invalid_messages: dict[str, str] = {}
         _classify_request_parameter_names(
             mechanism=mechanism,
@@ -435,10 +434,11 @@ def prepare_fitting_execution_context(
             unknown_names=unknown_names,
             mechanism_name_by_raw=mechanism_name_by_raw,
             unbound_mechanism_name_by_raw=unbound_mechanism_name_by_raw,
-            schedule_name_by_raw=schedule_name_by_raw,
             invalid_messages=invalid_messages,
+            parameter_target_map=parameter_target_map,
             requested_parameter_names=mechanism_param_names,
             declared_scalar_names=declared_scalar_names,
+            derived_scalar_names=derived_scalar_names,
         )
         raise_unowned_request_parameter_values(
             raw_values=raw_values,
@@ -447,7 +447,6 @@ def prepare_fitting_execution_context(
             unbound_mechanism_names=unbound_mechanism_names,
             unknown_names=unknown_names,
             invalid_messages=invalid_messages,
-            allow_unbound_mechanism_parameters=True,
         )
         canonical_by_raw = {**mechanism_name_by_raw, **unbound_mechanism_name_by_raw}
         canonical_requested_param_names: list[str] = []
@@ -468,6 +467,7 @@ def prepare_fitting_execution_context(
             mechanism,
             parameter_algebra_spec,
             set(mechanism_names) | set(unbound_mechanism_names),
+            parameter_target_map=parameter_target_map,
         )
         constrained = {
             str(stmt.name)
@@ -478,7 +478,11 @@ def prepare_fitting_execution_context(
             name for name in constrained if namespace_info[name].role == "Keq"
         }
         requested = {
-            _canonical_step_override_name(mechanism, str(name))
+            _canonical_step_override_name(
+                mechanism,
+                str(name),
+                parameter_target_map=parameter_target_map,
+            )
             for name in (set(mechanism_names) | set(unbound_mechanism_names))
             if str(name).strip()
         }
@@ -656,7 +660,6 @@ class FittingEvaluator:
             for name, value in non_initial_parameters.items()
         }
         prepared_request = self._context.prepared_run.request
-        typed_schedule = prepared_request.prepared_dsl.parameterized_intervention_schedule_for_binding()
         try:
             # Every candidate, including the first, receives a fresh isolated
             # request and one canonical preparation.  A rejected candidate can
@@ -692,65 +695,6 @@ class FittingEvaluator:
         species_index = {
             name: idx for idx, name in enumerate(prepared_run.species_names)
         }
-        try:
-            raw_values: dict[str, float] = {}
-            mechanism_names: set[str] = set()
-            unbound_mechanism_names: set[str] = set()
-            schedule_names: set[str] = set()
-            scalar_names: set[str] = set()
-            unknown_names: set[str] = set()
-            mechanism_name_by_raw: dict[str, str] = {}
-            unbound_mechanism_name_by_raw: dict[str, str] = {}
-            schedule_name_by_raw: dict[str, str] = {}
-            invalid_messages: dict[str, str] = {}
-            _classify_request_parameter_names(
-                mechanism=prepared_run.mechanism,
-                parameter_overrides=non_initial_parameters,
-                unresolved_intervention_schedule=typed_schedule,
-                raw_values=raw_values,
-                mechanism_names=mechanism_names,
-                unbound_mechanism_names=unbound_mechanism_names,
-                schedule_names=schedule_names,
-                scalar_names=scalar_names,
-                unknown_names=unknown_names,
-                mechanism_name_by_raw=mechanism_name_by_raw,
-                unbound_mechanism_name_by_raw=unbound_mechanism_name_by_raw,
-                schedule_name_by_raw=schedule_name_by_raw,
-                invalid_messages=invalid_messages,
-                validate_values=False,
-            )
-            raise_unowned_request_parameter_values(
-                raw_values=raw_values,
-                mechanism_name_by_raw=mechanism_name_by_raw,
-                unbound_mechanism_name_by_raw=unbound_mechanism_name_by_raw,
-                unbound_mechanism_names=unbound_mechanism_names,
-                unknown_names=unknown_names,
-                invalid_messages=invalid_messages,
-            )
-        except SimulationPreparationError as exc:
-            raise fit_simulation_error_from_preparation_error(exc) from exc
-        except ValueError as exc:
-            raise FitSimulationError(
-                str(exc),
-                failed_params=failed_params,
-                details={"fatal": True, "stage": "parameter_binding"},
-            ) from exc
-
-        requested_parameter_names = set(
-            self._context.prepared_run.request.requested_parameter_names
-        )
-        consumed_parameter_names = {
-            *mechanism_names,
-            *unbound_mechanism_names,
-            *scalar_names,
-        }
-        schedule_only_parameter_names = {
-            name
-            for name in schedule_names
-            if schedule_name_by_raw.get(name, name) not in mechanism_names
-            and schedule_name_by_raw.get(name, name) not in unbound_mechanism_names
-            and name not in scalar_names
-        }
         for key, raw_val in param_map.items():
             name = str(key)
             if name.startswith(self._context.initial_prefix):
@@ -758,48 +702,6 @@ class FittingEvaluator:
                 if species_name not in species_index:
                     continue
                 initial_overrides[species_name] = _coerce_consumed_parameter_value(
-                    name=name,
-                    raw_value=raw_val,
-                    origins=origin_map,
-                    failed_params=failed_params,
-                )
-            elif name not in local_scalar_names:
-                binding_name = mechanism_name_by_raw.get(
-                    name,
-                    unbound_mechanism_name_by_raw.get(name, name),
-                )
-                if binding_name not in consumed_parameter_names:
-                    if name in schedule_only_parameter_names:
-                        if name not in requested_parameter_names:
-                            raise FitSimulationError(
-                                (
-                                    f"Unrequested intervention schedule parameter {name!r} "
-                                    "cannot be used as fitting candidate authority."
-                                ),
-                                details={"fatal": True, "stage": "parameter_binding"},
-                            )
-                        _coerce_consumed_parameter_value(
-                            name=name,
-                            raw_value=raw_val,
-                            origins=origin_map,
-                            failed_params=failed_params,
-                        )
-                        continue
-                    if name in invalid_messages:
-                        raise FitSimulationError(
-                            invalid_messages[name],
-                            details={"fatal": True, "stage": "parameter_binding"},
-                        )
-                    if name in requested_parameter_names:
-                        raise FitSimulationError(
-                            (
-                                f"Requested fitting parameter {name!r} is unavailable after preparation; "
-                                "it may be algebra-derived or unsupported as a fitted dimension."
-                            ),
-                            details={"fatal": True, "stage": "parameter_binding"},
-                        )
-                    continue
-                _coerce_consumed_parameter_value(
                     name=name,
                     raw_value=raw_val,
                     origins=origin_map,
@@ -815,28 +717,21 @@ class FittingEvaluator:
 
         intervention_execution = prepared_run.intervention_execution
         if intervention_execution is None:
-            try:
-                intervention_execution = resolve_prepared_run_intervention_execution(
-                    prepared_run,
-                    parameter_values=_schedule_resolution_values_for_request(
-                        typed_schedule,
-                        raw_values=raw_values,
-                        mechanism_name_by_raw=mechanism_name_by_raw,
-                        unbound_mechanism_name_by_raw=unbound_mechanism_name_by_raw,
-                        schedule_name_by_raw=schedule_name_by_raw,
-                        mechanism=prepared_run.mechanism,
-                    ) or {},
-                    cancellation_check=(
-                        self._cancellation_control.cancel_requested
-                        if self._cancellation_control is not None
-                        else None
-                    ),
-                )
-            except SimulationPreparationError as exc:
-                raise fit_simulation_error_from_preparation_error(
-                    exc,
+            # Candidate preparation owns schedule resolution while its admitted
+            # target map is alive.  Reconstructing here would create a second
+            # authority and could silently run without an authored schedule.
+            if prepared_run.unresolved_intervention_schedule is not None:
+                raise FitSimulationError(
+                    "Candidate preparation left a parameterized intervention "
+                    "schedule unresolved.",
                     failed_params=failed_params,
-                ) from exc
+                    details={"fatal": True, "stage": "candidate_preparation"},
+                )
+            raise FitSimulationError(
+                "Candidate preparation produced no intervention execution contract.",
+                failed_params=failed_params,
+                details={"fatal": True, "stage": "candidate_preparation"},
+            )
 
         symbolic_jacobian = prepared_run.symbolic_jacobian
 
@@ -891,6 +786,16 @@ class FittingEvaluator:
                 temperature_schedule=prepared_run.temperature_schedule,
                 parameter_algebra_spec=prepared_run.parameter_algebra_spec,
                 algebra_policy=self._context.algebra_policy,
+                solver_provenance_updates={
+                    "fit_sampling_policy": self._context.fit_sampling_policy,
+                    "fit_sampling_identity": dict(
+                        self._context.fit_sampling_identity
+                    ),
+                    "fit_final_sampling_times": tuple(
+                        float(value)
+                        for value in np.asarray(result.t, dtype=float)
+                    ),
+                },
             )
         except Exception as exc:
             if isinstance(exc, (FittingCancelled, SimulationCancelled)):
@@ -903,22 +808,6 @@ class FittingEvaluator:
                 stage="result_finalization",
                 failed_params=failed_params,
             ) from exc
-        final_solver_provenance = dict(admitted.solver_provenance)
-        final_solver_provenance.update(
-            {
-                "fit_sampling_policy": self._context.fit_sampling_policy,
-                "fit_sampling_identity": dict(
-                    self._context.fit_sampling_identity
-                ),
-                "fit_final_sampling_times": tuple(
-                    float(value) for value in np.asarray(admitted.t, dtype=float)
-                ),
-            }
-        )
-        admitted = replace(
-            admitted,
-            solver_provenance=final_solver_provenance,
-        )
         if admission is not None:
             self._raise_if_cancel_requested()
             try:
@@ -970,12 +859,10 @@ class FittingEvaluator:
                     failed_params=failed_params,
                 ) from exc
             local_names = tuple(admission.observable_names)
-            solver_provenance = dict(admitted.solver_provenance)
             admitted = replace(
                 admitted,
                 series={**dict(admitted.series), **local_series},
                 scalars={**dict(admitted.scalars), **local_scalars},
-                solver_provenance=solver_provenance,
                 requested_algebra_outputs=(
                         *admitted.requested_algebra_outputs,
                         *local_names,
@@ -985,13 +872,6 @@ class FittingEvaluator:
                         *local_names,
                 ),
             )
-        segment_ids = np.asarray(admitted.segment_ids, dtype=np.int64)
-        segment_keys = tuple(admitted.segment_keys)
-        discontinuity_ids = np.asarray(
-            admitted.discontinuity_ids,
-            dtype=np.int64,
-        )
-        times = np.asarray(admitted.t, dtype=float)
         result_execution = admitted.intervention_execution
         if not isinstance(result_execution, InterventionExecutionContract):
             raise FitSimulationError(
@@ -1007,40 +887,5 @@ class FittingEvaluator:
                 "resolved request contract.",
                 details={"fatal": True, "stage": "intervention_execution"},
             )
-        if not (
-            discontinuity_ids.size
-            == len(segment_keys)
-            == segment_ids.size
-            == times.size
-        ):
-            raise FitSimulationError(
-                "Fitting result lost aligned segment/discontinuity identity.",
-                details={"fatal": True, "stage": "intervention_execution"},
-            )
-        if np.any(np.diff(segment_ids) < 0) or np.any(np.diff(discontinuity_ids) < 0):
-            raise FitSimulationError(
-                "Fitting result segment identity is not ordered.",
-                details={"fatal": True, "stage": "intervention_execution"},
-            )
-        key_by_segment_id: dict[int, str] = {}
-        for segment_id, segment_key in zip(
-            segment_ids,
-            segment_keys,
-            strict=True,
-        ):
-            normalized_key = str(segment_key or "").strip()
-            existing = key_by_segment_id.setdefault(
-                int(segment_id),
-                normalized_key,
-            )
-            if not normalized_key or existing != normalized_key:
-                raise FitSimulationError(
-                    "Fitting result segment identity is internally "
-                    "inconsistent.",
-                    details={
-                        "fatal": True,
-                        "stage": "intervention_execution",
-                    },
-                )
         self._raise_if_cancel_requested()
         return admitted

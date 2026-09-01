@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from fractions import Fraction
 from typing import Callable, Mapping, TypeAlias
 
 from .constants import R, h, k_B
@@ -411,15 +412,21 @@ def forward_rate_symbolic_relation(
     model: ForwardRateModel,
     *,
     temperature: object,
-    literal: Callable[[float], object],
+    literal: Callable[[object], object],
     exponential: Callable[[object], object],
-    source_coordinate: Callable[[str], object] | None = None,
+    source_coordinate: Callable[[str], object | None] | None = None,
+    standard_concentration: object | None = None,
 ) -> object:
     """Project one accepted typed rate model onto a symbolic backend.
 
     Chemistry owns the relation and all canonical-unit inputs.  The caller
     supplies only the backend's symbolic temperature, exact-literal constructor,
-    and exponential operation; no symbolic backend is imported here.
+    and exponential operation; no symbolic backend is imported here.  When a
+    source-coordinate callback is supplied, it may return ``None`` for omitted
+    Eyring coordinates; those roles then retain their literal defaults.  The
+    optional ``standard_concentration`` is a backend-owned exact expression
+    used for Eyring's concentration normalization.  If omitted, the accepted
+    model's numeric standard concentration is used for ordinary projections.
     """
 
     if not callable(literal):
@@ -439,7 +446,17 @@ def forward_rate_symbolic_relation(
         """Use a canonical authored coordinate, or the admitted literal."""
 
         if source_coordinate is not None:
-            return source_coordinate(role)
+            resolved = source_coordinate(role)
+            # A source-coordinate owner may omit a role whose scientific
+            # value is a model default.  Omitted Eyring κ and degeneracy
+            # remain their literal defaults, while authored values are
+            # source-backed coordinates.
+            if resolved is not None:
+                return resolved
+            if role not in {"kappa", "degeneracy"}:
+                raise ValueError(
+                    f"missing canonical source coordinate for {role!r}"
+                )
         return literal(float(value))
 
     if isinstance(model, ConstantRateModel):
@@ -467,10 +484,17 @@ def forward_rate_symbolic_relation(
             field="Eyring dG_act_J_per_mol",
         )
         transmission = _numeric_float(model.kappa, field="Eyring kappa")
+        barrier = admit_energy_j_per_mol(
+            barrier,
+            field="Eyring dG_act_J_per_mol",
+        )
+        if not math.isfinite(transmission) or transmission <= 0.0:
+            raise ValueError("Eyring kappa must be positive and finite.")
         standard = _numeric_float(
             model.standard_conc_M,
             field="Eyring standard_conc_M",
         )
+        standard = validate_c0(standard, field="Eyring standard_conc_M")
         order = _directional_order(
             model.molecularity,
             field="Eyring molecularity",
@@ -479,16 +503,16 @@ def forward_rate_symbolic_relation(
             model.degeneracy,
             field="Eyring degeneracy",
         )
-        barrier = admit_energy_j_per_mol(
-            barrier,
-            field="Eyring dG_act_J_per_mol",
+        degeneracy_relation = coordinate("degeneracy", float(degeneracy))
+        kappa_relation = coordinate("kappa", transmission)
+        concentration_relation = (
+            literal(float(standard))
+            if standard_concentration is None
+            else standard_concentration
         )
-        if not math.isfinite(transmission) or transmission <= 0.0:
-            raise ValueError("Eyring kappa must be positive and finite.")
-        standard = validate_c0(standard, field="Eyring standard_conc_M")
         relation = (
-            literal(float(degeneracy))
-            * literal(float(transmission))
+            degeneracy_relation
+            * kappa_relation
             * exact(k_B, field="k_B")
             * temperature
             / exact(h, field="h")
@@ -497,11 +521,9 @@ def forward_rate_symbolic_relation(
                 / (exact(R, field="R") * temperature)  # type: ignore[operator]
             )
         )
-        standard_exponent = 1.0 - float(order)
-        if standard_exponent != 0.0:
-            relation *= literal(float(standard)) ** literal(  # type: ignore[operator]
-                float(standard_exponent)
-            )
+        standard_exponent = Fraction(1) - Fraction(str(order))
+        if standard_exponent:
+            relation *= concentration_relation ** literal(standard_exponent)  # type: ignore[operator]
         return relation
     raise TypeError("model must be one typed forward-rate model.")
 

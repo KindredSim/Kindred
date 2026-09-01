@@ -492,6 +492,37 @@ class ConfigController(QtCore.QObject):
         settings.setValue(_THEME_KEY, bool(dark_mode))
         self._sync_or_report(settings, "theme", snapshot=snapshot)
 
+    def theme_preference(self) -> bool:
+        """Return the persisted application theme preference."""
+
+        return bool(
+            self._setting(
+                self._settings(),
+                _THEME_KEY,
+                True,
+                bool,
+            )
+        )
+
+    def window_layout_preference(
+        self,
+    ) -> tuple[bool, object | None, object | None]:
+        """Return persisted physical window state and optional Qt payloads."""
+
+        settings = self._settings()
+        return (
+            bool(
+                self._setting(
+                    settings,
+                    _WINDOW_LAYOUT_KEYS["is_maximized"],
+                    False,
+                    bool,
+                )
+            ),
+            settings.value(_WINDOW_LAYOUT_KEYS["geometry"]),
+            settings.value(_WINDOW_LAYOUT_KEYS["dock_state"]),
+        )
+
     def persist_window_layout(
         self,
         is_maximized: bool,

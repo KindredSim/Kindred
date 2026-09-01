@@ -383,13 +383,33 @@ def fit_global(
                     },
                 )
         keys = layout.opt_param_keys()
-        vector = np.asarray(
+        optimizer_endpoint_vector = np.asarray(
             [optimizer_result.parameters[key] for key in keys],
             dtype=float,
         )
+        vector = optimizer_endpoint_vector.copy()
         retained_best = objective.best_complete_vector
         if retained_best is not None:
-            vector = np.asarray(retained_best, dtype=float).reshape(-1)
+            retained_best_vector = np.asarray(retained_best, dtype=float).reshape(-1)
+            if not np.array_equal(optimizer_endpoint_vector, retained_best_vector):
+                success = False
+                replacement_cause = FactualCause(
+                    domain="fit",
+                    origin="optimizer_endpoint",
+                    code=None,
+                    type="FittingUnavailableEndpointReplaced",
+                    message=(
+                        "The unavailable optimizer endpoint was replaced by the "
+                        "best valid evaluated candidate."
+                    ),
+                    details={
+                        "endpoint_replaced": True,
+                        "settlement": "best_valid_evaluated_candidate",
+                    },
+                    cause=optimizer_diagnostic,
+                )
+                optimizer_diagnostic = replacement_cause
+            vector = retained_best_vector
         layout.validate_optimizer_vector(vector)
         replay_cancellation_check = cancellation_check
         replay_cancellation_control = cancellation_control

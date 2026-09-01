@@ -2241,6 +2241,145 @@ class GlobalFitObjective:
                 )
             return np.concatenate(blocks) if blocks else np.asarray([], dtype=float)
 
+        def settle_unavailable_residuals(
+            completed_blocks: Sequence[np.ndarray],
+            artificial_penalty_blocks: Sequence[np.ndarray],
+        ) -> tuple[np.ndarray, float] | None:
+            """Return one finite objective vector for an unavailable candidate.
+
+            Completed scientific residuals retain their original values.  Only
+            artificial penalty blocks may be enlarged, and only after a valid
+            complete candidate has established a finite ordering reference.
+            The factor is derived from the separately stable block SSEs and is
+            nudged by representable floating-point steps until the returned
+            vector scores strictly above the retained valid best.
+            """
+
+            completed = (
+                np.concatenate(tuple(completed_blocks)).astype(float, copy=False)
+                if completed_blocks
+                else np.asarray([], dtype=float)
+            )
+            artificial = (
+                np.concatenate(tuple(artificial_penalty_blocks)).astype(
+                    float, copy=False
+                )
+                if artificial_penalty_blocks
+                else np.asarray([], dtype=float)
+            )
+            completed_sse = finite_sum_of_squares(completed)
+            artificial_sse = finite_sum_of_squares(artificial)
+            if completed_sse is None or artificial_sse is None:
+                return None
+
+            residuals = np.concatenate((completed, artificial))
+            cost = finite_sum_of_squares(residuals)
+            if cost is None:
+                return None
+
+            best_cost = float(self._best_cost)
+            if (
+                not math.isfinite(best_cost)
+                or not artificial_penalty_blocks
+                or artificial_sse <= 0.0
+                or cost > best_cost
+            ):
+                return residuals, float(cost)
+
+            next_cost = math.nextafter(best_cost, math.inf)
+            if not math.isfinite(next_cost):
+                return residuals, float(cost)
+
+            required_penalty_sse = next_cost - completed_sse
+            if not math.isfinite(required_penalty_sse) or required_penalty_sse <= 0.0:
+                return residuals, float(cost)
+            factor = math.sqrt(required_penalty_sse / artificial_sse)
+            if not math.isfinite(factor) or factor <= 1.0:
+                factor = 1.0
+
+            maximum_penalty = float(np.max(np.abs(artificial)))
+            if maximum_penalty > 0.0:
+                safe_factor = np.finfo(float).max / maximum_penalty
+                if math.isfinite(safe_factor):
+                    factor = min(factor, math.nextafter(safe_factor, 0.0))
+
+            def scaled_settlement(
+                scale: float,
+            ) -> tuple[np.ndarray, float] | None:
+                scaled_artificial = artificial * float(scale)
+                if not np.all(np.isfinite(scaled_artificial)):
+                    return None
+                settled = np.concatenate((completed, scaled_artificial))
+                settled_cost = finite_sum_of_squares(settled)
+                if settled_cost is None:
+                    return None
+                return settled, float(settled_cost)
+
+            settled = scaled_settlement(factor)
+            if settled is None:
+                return residuals, float(cost)
+            settled_residuals, settled_cost = settled
+
+            # Bracket the first finite scale that clears the best cost.  The
+            # square-root estimate is based on separate SSEs, while the final
+            # comparison is made against the exact returned residual vector;
+            # geometric expansion handles rounding plateaus in the combined
+            # stable-SSE calculation without touching completed blocks.
+            lower_factor = 1.0
+            if settled_cost <= best_cost:
+                lower_factor = factor
+                upper_factor = factor
+                for _ in range(1024):
+                    expanded = upper_factor * 2.0
+                    if not math.isfinite(expanded):
+                        expanded = np.finfo(float).max
+                    if maximum_penalty > 0.0:
+                        safe_factor = np.finfo(float).max / maximum_penalty
+                        if math.isfinite(safe_factor):
+                            expanded = min(
+                                expanded,
+                                math.nextafter(safe_factor, 0.0),
+                            )
+                    if expanded <= upper_factor:
+                        break
+                    upper_factor = expanded
+                    expanded_settlement = scaled_settlement(upper_factor)
+                    if expanded_settlement is None:
+                        break
+                    settled_residuals, settled_cost = expanded_settlement
+                    if settled_cost > best_cost:
+                        break
+                else:
+                    return residuals, float(cost)
+                if settled_cost <= best_cost:
+                    return residuals, float(cost)
+            else:
+                upper_factor = factor
+
+            # Binary search over representable factors for the smallest scale
+            # that scores strictly above the retained valid candidate.
+            for _ in range(128):
+                next_lower = math.nextafter(lower_factor, upper_factor)
+                if next_lower >= upper_factor:
+                    break
+                midpoint = lower_factor + (upper_factor - lower_factor) / 2.0
+                if midpoint <= lower_factor or midpoint >= upper_factor:
+                    break
+                midpoint_settlement = scaled_settlement(midpoint)
+                if midpoint_settlement is None:
+                    upper_factor = midpoint
+                    continue
+                if midpoint_settlement[1] > best_cost:
+                    upper_factor = midpoint
+                    settled_residuals, settled_cost = midpoint_settlement
+                else:
+                    lower_factor = midpoint
+
+            final_settlement = scaled_settlement(upper_factor)
+            if final_settlement is None or final_settlement[1] <= best_cost:
+                return residuals, float(cost)
+            return final_settlement
+
         def finalize_candidate(
             *,
             optimizer_vector: np.ndarray,
@@ -2299,9 +2438,10 @@ class GlobalFitObjective:
                     unavailability.producer,
                     unavailability.stage,
                 )
-            penalty_cost = finite_sum_of_squares(penalty)
-            if penalty_cost is None:
+            settled_penalty = settle_unavailable_residuals((), (penalty,))
+            if settled_penalty is None:
                 raise RuntimeError("Configured Fit candidate penalty overflowed.")
+            penalty, penalty_cost = settled_penalty
             finalize_candidate(
                 optimizer_vector=optimizer_vector,
                 cost=float(penalty_cost),
@@ -2324,7 +2464,6 @@ class GlobalFitObjective:
                 {"stage": "optimizer_vector_domain"},
                 optimizer_vector=np.asarray(params, dtype=float).reshape(-1),
             )
-        all_residuals: List[float] = []
         dataset_inputs: List[ObjectiveDatasetInput] = []
 
         for payload in self._payloads:
@@ -2433,11 +2572,15 @@ class GlobalFitObjective:
                 {"datasets": timed_out_dataset_roster, "stage": "dataset_deadline"},
             )
 
+        completed_residual_blocks: list[np.ndarray] = []
+        artificial_penalty_blocks: list[np.ndarray] = []
         for item, evaluation in zip(dataset_inputs, simulation_evaluations, strict=True):
             _raise_if_fitting_cancel_requested(self._cancellation_control)
 
             if item.payload.dataset_id in timed_out_dataset_ids:
-                all_residuals.extend(dataset_penalty_residuals(item.payload).tolist())
+                artificial_penalty_blocks.append(
+                    dataset_penalty_residuals(item.payload)
+                )
                 continue
             if isinstance(evaluation, ScientificUnavailable):
                 return reject_candidate(
@@ -2447,24 +2590,43 @@ class GlobalFitObjective:
                 )
             if evaluation.dataset_id != item.payload.dataset_id:
                 raise RuntimeError("Fit evaluation order no longer matches its admitted dataset roster.")
-            all_residuals.extend(np.asarray(evaluation.weighted_residuals, dtype=float).tolist())
+            completed_residual_blocks.append(
+                np.asarray(evaluation.weighted_residuals, dtype=float)
+            )
             continue
 
-
-        residuals = np.asarray(all_residuals, dtype=float).ravel()
-
-        finite_cost = finite_sum_of_squares(residuals)
-        if finite_cost is None:
-            return reject_candidate(
-                ScientificUnavailable(
-                    producer="global_fit_objective",
-                    stage="objective_residual_arithmetic",
-                    details={"scope": "combined"},
-                ),
-                {"stage": "objective"},
-                optimizer_vector=params,
+        if artificial_penalty_blocks:
+            settled_unavailable = settle_unavailable_residuals(
+                completed_residual_blocks,
+                artificial_penalty_blocks,
             )
-        cost = float(finite_cost)
+            if settled_unavailable is None:
+                return reject_candidate(
+                    ScientificUnavailable(
+                        producer="global_fit_objective",
+                        stage="objective_residual_arithmetic",
+                        details={"scope": "combined"},
+                    ),
+                    {"stage": "objective"},
+                    optimizer_vector=params,
+                )
+            residuals, cost = settled_unavailable
+        else:
+            residuals = np.concatenate(tuple(completed_residual_blocks)).astype(
+                float, copy=False
+            )
+            finite_cost = finite_sum_of_squares(residuals)
+            if finite_cost is None:
+                return reject_candidate(
+                    ScientificUnavailable(
+                        producer="global_fit_objective",
+                        stage="objective_residual_arithmetic",
+                        details={"scope": "combined"},
+                    ),
+                    {"stage": "objective"},
+                    optimizer_vector=params,
+                )
+            cost = float(finite_cost)
         candidate_evaluations = {
             evaluation.dataset_id: evaluation.simulation_result
             for evaluation in simulation_evaluations

@@ -9,8 +9,10 @@ from fractions import Fraction
 from itertools import combinations
 
 from kindred.core.simulator.exact_constraint_composition import (
+    ExactMonomial,
     ExactConstraintComposition,
 )
+from kindred.core.simulator.dsl_build_input import source_coordinate_capabilities
 
 __all__ = [
     "CorrectionTarget",
@@ -30,11 +32,7 @@ class CorrectionTarget:
     source_backed: bool = True
     editable: bool = True
     locked: bool = False
-    algebra_owned: bool = False
     derived: bool = False
-    dependencies: tuple[str, ...] = ()
-    canonical_identity: tuple[str, str] | None = None
-    source_origin: str | None = None
 
     @property
     def eligible(self) -> bool:
@@ -46,16 +44,8 @@ class CorrectionTarget:
             and self.source_backed
             and self.editable
             and not self.locked
-            and not self.algebra_owned
             and not self.derived
-            and self.canonical_identity is not None
-            and self.canonical_identity[0] == self.name
-            and self.canonical_identity[1]
-            in {"A", "Ea", "dG_act", "dG_eq", "kf", "kr", "kf+kr", "Keq", "k"}
-            and isinstance(self.source_origin, str)
-            and bool(self.source_origin)
-            and "\n" not in self.source_origin
-            and "\r" not in self.source_origin
+            and _correction_role_is_admitted(self.family)
         )
 
 
@@ -141,7 +131,16 @@ def _preference(target: CorrectionTarget, source_index: int) -> tuple[int, int, 
         return (2, 0, source_index)
     if family in {"A", "Ea", "dG_act"}:
         return (3, {"A": 0, "Ea": 1, "dG_act": 2}[family], source_index)
-    return (4, 0, source_index)
+    if family == "kappa":
+        return (4, 0, source_index)
+    return (5, 0, source_index)
+
+
+def _correction_role_is_admitted(role: str) -> bool:
+    try:
+        return source_coordinate_capabilities(str(role)).correction_target
+    except ValueError:
+        return False
 
 
 def _correction_constraints(
@@ -155,30 +154,89 @@ def _correction_constraints(
         if item.status in {"resolved", "unsatisfied"}
         and (
             item.status == "unsatisfied"
-            or bool(item.powers)
+            or not _is_exact_identity(_constraint_monomial(item))
         )
+    )
+
+
+def _constraint_monomial(item: object) -> ExactMonomial:
+    """Read the retained composition, with a narrow legacy-value fallback."""
+
+    value = getattr(item, "monomial", None)
+    if isinstance(value, ExactMonomial):
+        return value
+    return ExactMonomial(
+        Fraction(getattr(item, "coefficient", Fraction(1))),
+        tuple(getattr(item, "powers", ()) or ()),
+    )
+
+
+def _is_exact_identity(value: ExactMonomial) -> bool:
+    return bool(
+        value.coefficient == 1
+        and not value.powers
+        and not value.exponentials
+        and not value.sum_terms
     )
 
 
 def _direct_source_power(item: object, target_name: str) -> Fraction:
     """Return only a multiplicative authored factor's power."""
 
-    return Fraction(dict(item.powers).get(str(target_name), Fraction(0)))
+    return Fraction(
+        dict(_constraint_monomial(item).powers).get(
+            str(target_name),
+            Fraction(0),
+        )
+    )
 
 
 def _has_unsupported_source_factor(item: object) -> bool:
     """Reject factors that cannot be authored as a static correction RHS."""
 
-    if item.coefficient == 0:
+    monomial = _constraint_monomial(item)
+    if monomial.exponentials or monomial.sum_terms:
+        return True
+    if monomial.coefficient == 0:
         return True
     return any(
         (
-            str(name).startswith("exp(")
-            or str(name) == "T"
+            str(name) == "T"
             or re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", str(name)) is None
         )
-        for name, _power in item.powers
+        for name, _power in monomial.powers
     )
+
+
+def _simplify_generated_factors(
+    factors: Mapping[tuple[str, str | Fraction], Fraction],
+) -> dict[tuple[str, str | Fraction], Fraction]:
+    """Combine exact RHS factors and drop every cancelled zero power."""
+
+    simplified: dict[tuple[str, str | Fraction], Fraction] = {}
+    for key, raw_power in factors.items():
+        power = Fraction(raw_power)
+        if power:
+            simplified[key] = simplified.get(key, Fraction(0)) + power
+    return {
+        key: power
+        for key, power in simplified.items()
+        if power
+    }
+
+
+def _has_unmaterializable_generated_factor(
+    factors: Mapping[tuple[str, str | Fraction], Fraction],
+) -> bool:
+    """Reject only surviving factors without an exact authored RHS value."""
+
+    for (kind, value), power in factors.items():
+        if not power or kind != "symbol":
+            continue
+        name = str(value)
+        if name == "C0" or re.fullmatch(r"degeneracy[1-9]\d*", name):
+            return True
+    return False
 
 
 def _solve_correction_factors(
@@ -207,23 +265,246 @@ def _solve_correction_factors(
             exponent = inverse[target_index][row_index]
             if not exponent:
                 continue
-            constraint_coefficient = Fraction(constraint.coefficient)
+            monomial = _constraint_monomial(constraint)
+            constraint_coefficient = Fraction(monomial.coefficient)
             if constraint_coefficient != 1:
                 key = ("coefficient", constraint_coefficient)
                 factors[key] = factors.get(key, Fraction(0)) - exponent
-            for name, power in constraint.powers:
+            for name, power in monomial.powers:
                 if not power:
                     continue
                 key = ("symbol", str(name))
                 factors[key] = factors.get(key, Fraction(0)) - Fraction(power) * exponent
         generated.append(
-            {
-                key: power
-                for key, power in factors.items()
-                if power and not (key[0] == "symbol" and key[1] in selected_names)
-            }
+            _simplify_generated_factors(
+                {
+                    key: power
+                    for key, power in factors.items()
+                    if power
+                    and not (
+                        key[0] == "symbol" and key[1] in selected_names
+                    )
+                }
+            )
         )
     return inverse, tuple(generated)
+
+
+def _plan_for_basis(
+    constraints: Sequence[object],
+    basis: Sequence[CorrectionTarget],
+) -> CorrectionPlan:
+    return CorrectionPlan(
+        basis=tuple(target.name for target in basis),
+        assignments=tuple(
+            (constraint.cycle_id, target.name)
+            for target, constraint in zip(basis, constraints, strict=True)
+        ),
+        available=True,
+    )
+
+
+def _choose_multiplicative_basis(
+    composition: ExactConstraintComposition,
+    constraints: Sequence[object],
+    eligible: Sequence[CorrectionTarget],
+) -> tuple[CorrectionTarget, ...] | None:
+    """Choose a full-rank basis whose RHS is an exact product of factors."""
+
+    rows = [
+        tuple(_direct_source_power(item, target.name) for target in eligible)
+        for item in constraints
+    ]
+    if _rank(rows) != len(constraints):
+        return None
+    for candidate in combinations(eligible, len(constraints)):
+        candidate_rows = [
+            tuple(_direct_source_power(item, target.name) for target in candidate)
+            for item in constraints
+        ]
+        if _rank(candidate_rows) != len(constraints):
+            continue
+        solution = _solve_correction_factors(
+            composition,
+            tuple(target.name for target in candidate),
+        )
+        if solution is None:
+            continue
+        _inverse_matrix, generated_factors = solution
+        if any(
+            _has_unmaterializable_generated_factor(factors)
+            for factors in generated_factors
+        ):
+            # Keep searching for a basis that does not require a symbolic-only
+            # C0 or degeneracy RHS.
+            continue
+        return tuple(candidate)
+    return None
+
+
+_ENERGY_FAMILIES = frozenset({"Ea", "dG_act", "dG_eq"})
+_ENERGY_COMMON_POWERS = frozenset({"T"})
+
+
+def _energy_term_data(
+    term: ExactMonomial,
+    energy_names: frozenset[str],
+) -> tuple[str, Fraction, tuple[tuple[str, Fraction], ...]] | None:
+    """Split one additive exponent term into energy and common factors."""
+
+    if term.sum_terms or term.exponentials:
+        return None
+    energy_powers = [
+        (str(name), Fraction(power))
+        for name, power in term.powers
+        if str(name) in energy_names
+    ]
+    if len(energy_powers) != 1 or energy_powers[0][1] != 1:
+        return None
+    energy_name, _energy_power = energy_powers[0]
+    common_powers = tuple(
+        (str(name), Fraction(power))
+        for name, power in term.powers
+        if str(name) != energy_name
+    )
+    if any(name not in _ENERGY_COMMON_POWERS for name, _power in common_powers):
+        return None
+    return energy_name, Fraction(term.coefficient), common_powers
+
+
+def _energy_rows(
+    constraints: Sequence[object],
+    energy_names: frozenset[str],
+) -> tuple[dict[str, Fraction], ...] | None:
+    """Return normalized linear energy coefficients for every exact row."""
+
+    rows: list[dict[str, Fraction]] = []
+    for item in constraints:
+        monomial = _constraint_monomial(item)
+        if (
+            monomial.coefficient != 1
+            or monomial.powers
+            or monomial.sum_terms
+            or len(monomial.exponentials) != 1
+        ):
+            return None
+        argument = monomial.exponentials[0]
+        terms = argument.sum_terms or (argument,)
+        parsed = [
+            _energy_term_data(term, energy_names)
+            for term in terms
+        ]
+        if not parsed or any(value is None for value in parsed):
+            return None
+        typed = tuple(value for value in parsed if value is not None)
+        # All terms must share one exact non-energy factor.  Their rational
+        # coefficients become the linear row coefficients after factoring it.
+        common_powers = typed[0][2]
+        if any(value[2] != common_powers for value in typed):
+            return None
+        scale = typed[0][1]
+        if not scale:
+            return None
+        row: dict[str, Fraction] = {}
+        for name, coefficient, _powers in typed:
+            row[name] = row.get(name, Fraction(0)) + coefficient / scale
+        rows.append({name: value for name, value in row.items() if value})
+    return tuple(rows)
+
+
+def _choose_energy_basis(
+    constraints: Sequence[object],
+    eligible: Sequence[CorrectionTarget],
+) -> tuple[CorrectionTarget, ...] | None:
+    """Choose an exact linear basis for exponential energy residuals."""
+
+    if not eligible:
+        return None
+    energy_names = frozenset(
+        str(target.name)
+        for target in eligible
+    )
+    rows = _energy_rows(constraints, energy_names)
+    if rows is None:
+        return None
+    candidate_rows = [
+        tuple(row.get(target.name, Fraction(0)) for target in eligible)
+        for row in rows
+    ]
+    if _rank(candidate_rows) != len(constraints):
+        return None
+    for candidate in combinations(eligible, len(constraints)):
+        matrix = [
+            tuple(row.get(target.name, Fraction(0)) for target in candidate)
+            for row in rows
+        ]
+        if _rank(matrix) != len(constraints) or _inverse(matrix) is None:
+            continue
+        return tuple(candidate)
+    return None
+
+
+def _render_linear_term(name: str, coefficient: Fraction) -> str:
+    coefficient = Fraction(coefficient)
+    if coefficient == 1:
+        return str(name)
+    if coefficient == -1:
+        return f"-{name}"
+    return f"{_render_fraction(coefficient)} * {name}"
+
+
+def _render_linear_expression(terms: Mapping[str, Fraction]) -> str:
+    nonzero = [
+        (str(name), Fraction(coefficient))
+        for name, coefficient in terms.items()
+        if Fraction(coefficient)
+    ]
+    if not nonzero:
+        return "0"
+    rendered = _render_linear_term(*nonzero[0])
+    for name, coefficient in nonzero[1:]:
+        coefficient = Fraction(coefficient)
+        if coefficient < 0:
+            rendered += " - " + _render_linear_term(name, -coefficient)
+        else:
+            rendered += " + " + _render_linear_term(name, coefficient)
+    return rendered
+
+
+def _build_energy_correction_expressions(
+    constraints: Sequence[object],
+    basis: Sequence[str],
+) -> dict[str, str] | None:
+    energy_names = frozenset(
+        str(name)
+        for item in constraints
+        for name in _constraint_monomial(item).coordinate_power_map()
+        if re.fullmatch(r"(?:Ea|dG_act|dG_eq)[1-9][0-9]*", str(name))
+    )
+    rows = _energy_rows(constraints, energy_names)
+    if rows is None:
+        return None
+    matrix = [
+        tuple(row.get(str(name), Fraction(0)) for name in basis)
+        for row in rows
+    ]
+    inverse = _inverse(matrix)
+    if inverse is None:
+        return None
+    selected = set(str(name) for name in basis)
+    output: dict[str, str] = {}
+    for target_index, target_name in enumerate(basis):
+        terms: dict[str, Fraction] = {}
+        for row_index, row in enumerate(rows):
+            multiplier = -inverse[target_index][row_index]
+            if not multiplier:
+                continue
+            for name, coefficient in row.items():
+                if name in selected:
+                    continue
+                terms[name] = terms.get(name, Fraction(0)) + multiplier * coefficient
+        output[str(target_name)] = _render_linear_expression(terms)
+    return output
 
 
 class CorrectionPlanner:
@@ -262,131 +543,47 @@ class CorrectionPlanner:
         )
         if not unsatisfied:
             return CorrectionPlan((), (), True)
-        if any(not item.powers for item in unsatisfied):
-            return CorrectionPlan(
-                (),
-                (),
-                False,
-                "an unsatisfied exact constraint has no source-backed powers",
-            )
-        if any(_has_unsupported_source_factor(item) for item in constraints):
-            return CorrectionPlan(
-                (),
-                (),
-                False,
-                "exact source correction requires an unsupported non-multiplicative inverse",
-            )
-        eligible = [target for target in self.targets.values() if target.eligible]
+        eligible = [
+            target
+            for target in self.targets.values()
+            if target.eligible
+        ]
         eligible.sort(
             key=lambda target: _preference(
                 target,
                 tuple(self.targets).index(target.name),
             )
         )
-        rows = [
-            tuple(_direct_source_power(item, target.name) for target in eligible)
-            for item in constraints
+        # A direct multiplicative basis remains the preferred route for
+        # authored k/kf/kr/Keq/A/kappa coordinates.  Exponential residuals
+        # cannot be represented by this solver; leave those rows for the
+        # bounded energy projection below.
+        if not any(_has_unsupported_source_factor(item) for item in constraints):
+            basis = _choose_multiplicative_basis(self.composition, constraints, eligible)
+            if basis is not None:
+                return _plan_for_basis(constraints, basis)
+
+        energy_eligible = [
+            target
+            for target in eligible
+            if target.family in {"Ea", "dG_act", "dG_eq"}
         ]
-        if _rank(rows) != len(constraints):
-            return CorrectionPlan((), (), False, "exact constraints are rank-deficient")
-        selected: tuple[CorrectionTarget, ...] | None = None
-        cycle_reason: str | None = None
-        for candidate in combinations(eligible, len(constraints)):
-            candidate_rows = [
-                tuple(
-                    _direct_source_power(item, item_target.name)
-                    for item_target in candidate
-                )
-                for item in constraints
-            ]
-            if _rank(candidate_rows) != len(constraints):
-                continue
-            solution = _solve_correction_factors(
-                self.composition,
-                tuple(target.name for target in candidate),
-            )
-            if solution is None:
-                continue
-            _inverse_matrix, generated_factors = solution
-            selected_names = {target.name for target in candidate}
-            generated_by_target = dict(
-                zip(
-                    (target.name for target in candidate),
-                    generated_factors,
-                    strict=True,
-                )
-            )
-            dependency_graph = {
-                target.name: tuple(
-                    dict.fromkeys(
-                        (
-                            tuple(str(dependency) for dependency in target.dependencies)
-                            + (
-                                tuple(
-                                    str(value)
-                                    for (kind, value), power in generated_by_target[target.name].items()
-                                    if kind == "symbol" and power
-                                )
-                                if target.name in selected_names
-                                else ()
-                            )
-                        )
-                    )
-                )
-                for target in self.targets.values()
-            }
-            visiting: list[str] = []
-            visited: set[str] = set()
+        energy_basis = _choose_energy_basis(constraints, energy_eligible)
+        if energy_basis is not None:
+            return _plan_for_basis(constraints, energy_basis)
 
-            def visit(name: str) -> str | None:
-                if name not in dependency_graph:
-                    # Symbols outside the admitted target set are ordinary
-                    # authored leaves, not dependency edges owned here.
-                    return None
-                if name in visiting:
-                    start = visiting.index(name)
-                    return " -> ".join((*visiting[start:], name))
-                if name in visited:
-                    return None
-                visiting.append(name)
-                for dependency in dependency_graph[name]:
-                    cycle = visit(dependency)
-                    if cycle is not None:
-                        return cycle
-                visiting.pop()
-                visited.add(name)
-                return None
-
-            cycle: str | None = None
-            for name in (target.name for target in candidate):
-                cycle = visit(name)
-                if cycle is not None:
-                    break
-            if cycle is None:
-                selected = candidate
-                break
-            cycle_reason = cycle
-        if selected is None:
-            if cycle_reason is not None:
-                return CorrectionPlan(
-                    (),
-                    (),
-                    False,
-                    f"generated correction dependency cycle: {cycle_reason}",
-                )
+        if any(_has_unsupported_source_factor(item) for item in constraints):
             return CorrectionPlan(
                 (),
                 (),
                 False,
-                "no source-backed editable unlocked global full-rank generated-expression-acyclic basis is available",
+                "exact source correction requires a bounded linear energy projection",
             )
         return CorrectionPlan(
-            basis=tuple(target.name for target in selected),
-            assignments=tuple(
-                (constraint.cycle_id, target.name)
-                for target, constraint in zip(selected, constraints, strict=True)
-            ),
-            available=True,
+            (),
+            (),
+            False,
+            "no source-backed editable unlocked global full-rank correction basis is available",
         )
 
 
@@ -419,16 +616,31 @@ def build_correction_expressions(
     if not plan.available or not plan.basis:
         return {}
     constraints = _correction_constraints(composition)
-    if any(_has_unsupported_source_factor(item) for item in constraints):
-        raise ValueError("Exact source correction cannot invert an exponential factor.")
     basis = tuple(plan.basis)
+    assignment_map = dict(plan.assignments)
+    if tuple(assignment_map.get(item.cycle_id) for item in constraints) != basis:
+        raise ValueError("Correction plan assignments do not match its global basis.")
+
+    if any(_has_unsupported_source_factor(item) for item in constraints):
+        expressions = _build_energy_correction_expressions(constraints, basis)
+        if expressions is None:
+            raise ValueError(
+                "Exact source correction requires a bounded linear energy projection."
+            )
+        return expressions
+
     solution = _solve_correction_factors(composition, basis)
     if solution is None:
         raise ValueError("Correction basis is not invertible.")
     _inverse_matrix, generated_factors = solution
-    assignment_map = dict(plan.assignments)
-    if tuple(assignment_map.get(item.cycle_id) for item in constraints) != basis:
-        raise ValueError("Correction plan assignments do not match its global basis.")
+    if any(
+        _has_unmaterializable_generated_factor(factors)
+        for factors in generated_factors
+    ):
+        raise ValueError(
+            "Exact source correction requires a basis whose simplified RHS "
+            "does not depend on symbolic-only degeneracy or C0."
+        )
     output: dict[str, str] = {}
     for target_index, target_name in enumerate(basis):
         factors: list[str] = []

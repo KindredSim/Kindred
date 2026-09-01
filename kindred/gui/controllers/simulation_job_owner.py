@@ -16,7 +16,6 @@ from kindred.core.project_document import (
     SimulationExecutionSettings,
     TabScientificSettings,
 )
-from kindred.core.project_session import ProjectContentToken
 from kindred.core.result_repository import ResultRepository, SimulationResultValue
 from kindred.core.runtime_defaults import MAX_PARALLEL_WORKERS_CEILING
 from kindred.core.simulation_algebra_policy import SimulationAlgebraPolicy
@@ -28,7 +27,6 @@ from kindred.core.simulation_preparation import (
     build_simulation_request_from_prepared_run,
     build_simulation_execution_request,
     prepare_simulation_worker_run,
-    resolve_prepared_run_intervention_execution,
     simulation_execution_requests_equal,
 )
 from kindred.core.simulation_result_finalization import finalize_simulation_result
@@ -88,13 +86,10 @@ class ExplicitRunTarget:
 @dataclass(frozen=True, slots=True)
 class ExplicitRunCapture:
     tab_id: str
-    content_token: ProjectContentToken
     targets: tuple[ExplicitRunTarget, ...]
 
     def __post_init__(self) -> None:
         tab = _required_id(self.tab_id, "tab_id")
-        if not isinstance(self.content_token, ProjectContentToken):
-            raise TypeError("content_token must be ProjectContentToken.")
         targets = tuple(self.targets)
         if not targets or any(not isinstance(target, ExplicitRunTarget) for target in targets):
             raise TypeError("Run requires ExplicitRunTarget values.")
@@ -126,13 +121,10 @@ class PreviewCapture:
     """One exact Preview action, before or after B request admission."""
 
     tab_id: str
-    content_token: ProjectContentToken
     targets: tuple[PreviewTarget, ...]
 
     def __post_init__(self) -> None:
         tab = _required_id(self.tab_id, "tab_id")
-        if not isinstance(self.content_token, ProjectContentToken):
-            raise TypeError("content_token must be ProjectContentToken.")
         targets = tuple(self.targets)
         if not targets or any(not isinstance(item, PreviewTarget) for item in targets):
             raise TypeError("Preview requires PreviewTarget values.")
@@ -225,10 +217,23 @@ def _solve_prepared(prepared: PreparedSimulationRun, *, parameters: tuple[tuple[
         raise SimulationCancelled()
     intervention_execution = prepared.intervention_execution
     if intervention_execution is None:
-        intervention_execution = resolve_prepared_run_intervention_execution(
-            prepared,
-            parameter_values={name: value for name, value, _unit in parameters},
-            cancellation_check=cancellation_control.cancel_requested,
+        if (
+            prepared.unresolved_intervention_schedule is not None
+            and prepared.unresolved_intervention_schedule.is_parameterized
+        ):
+            message = (
+                "Prepared Run retained an unresolved parameterized "
+                "intervention schedule; no compiled execution contract is "
+                "available."
+            )
+        else:
+            message = (
+                "Prepared Run is missing its compiled intervention execution "
+                "contract."
+            )
+        raise SimulationPreparationError(
+            "intervention_schedule",
+            message,
         )
     solved = solve_ode(
         build_simulation_request_from_prepared_run(
@@ -691,10 +696,14 @@ class SimulationJobOwner(QtCore.QObject):
             return False
         if kind == "run" and purpose == "ordinary":
             repository = self._repository(str(tab_id))
-            repository.deauthorize_sets(
-                tuple(target.set_id for target in targets),
+            changed_request_ids = tuple(
+                target.set_id
+                for target in targets
+                if not self._current_run_matches_target(repository, target)
             )
-            self.results_changed.emit(str(tab_id))
+            if changed_request_ids:
+                repository.deauthorize_sets(changed_request_ids)
+                self.results_changed.emit(str(tab_id))
         elif kind == "preview" and purpose != "interactive-preview":
             self._promote_preview_targets(
                 str(tab_id),
@@ -704,6 +713,24 @@ class SimulationJobOwner(QtCore.QObject):
         if kind == "run":
             self.run_dispatched.emit(str(tab_id), tuple(target.set_id for target in targets))
         return True
+
+    @staticmethod
+    def _current_run_matches_target(
+        repository: ResultRepository,
+        target: ExplicitRunTarget,
+    ) -> bool:
+        """Keep a current result only for the exact ordinary Run request."""
+
+        current_request = repository.current_request(target.set_id)
+        current_result = repository.current_result(target.set_id)
+        return bool(
+            current_request is not None
+            and current_result is not None
+            and simulation_execution_requests_equal(
+                current_request,
+                target.execution_request,
+            )
+        )
 
     def capture_settled_preview(
         self,

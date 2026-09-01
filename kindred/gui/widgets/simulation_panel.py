@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 from collections.abc import Callable
 
-from PySide6 import QtCore, QtWidgets
+from PySide6 import QtCore, QtGui, QtWidgets
 
 from kindred.core.project_document import (
     SIMULATION_POINT_RANGE,
@@ -80,6 +80,13 @@ class SimulationPanel(QtWidgets.QWidget):
         self.solver_method_combo.currentTextChanged.connect(self._mark_candidate_dirty)
         self.t_start_edit.textEdited.connect(self._mark_candidate_dirty)
         self.t_end_edit.textEdited.connect(self._mark_candidate_dirty)
+        # QSpinBox normalizes its value before ``valueChanged`` reaches us.
+        # Capture the embedded editor's authored text first so an invalid or
+        # intermediate draft remains visible until the owner admits or
+        # explicitly discards it.
+        self.num_points_spinbox.lineEdit().textEdited.connect(
+            self._capture_integration_points_text
+        )
         self.num_points_spinbox.valueChanged.connect(self._mark_candidate_dirty)
         self.solver_method_combo.activated.connect(self._settle_after_edit)
         self.t_start_edit.editingFinished.connect(self._settle_after_edit)
@@ -213,6 +220,7 @@ class SimulationPanel(QtWidgets.QWidget):
     def capture_run_defaults_draft(self) -> bool:
         """Capture a focused control before a modal boundary, without publishing."""
 
+        was_dirty = self._candidate_dirty
         focused = QtWidgets.QApplication.focusWidget()
         controls = (
             self.solver_method_combo,
@@ -236,6 +244,14 @@ class SimulationPanel(QtWidgets.QWidget):
                 )
             except (TypeError, ValueError):
                 self._candidate_dirty = True
+                points_edit = self.num_points_spinbox.lineEdit()
+                if points_edit.text() != str(
+                    int(self._candidate_values["integration_points"])
+                ):
+                    self._candidate_values["integration_points"] = (
+                        points_edit.text()
+                    )
+                    self._candidate_changed_fields.add("integration_points")
         if focused is self.solver_method_combo:
             self._candidate_changed_fields.add("solver")
             self._candidate_values["solver"] = str(
@@ -247,13 +263,20 @@ class SimulationPanel(QtWidgets.QWidget):
             self._candidate_changed_fields.add("t_end")
         elif focused is self.num_points_spinbox:
             self._candidate_changed_fields.add("integration_points")
+        elif (
+            focused is self.num_points_spinbox.lineEdit()
+            or self.num_points_spinbox.lineEdit().isAncestorOf(focused)
+        ):
+            self._candidate_changed_fields.add("integration_points")
         blockers = tuple(QtCore.QSignalBlocker(control) for control in controls)
         try:
             focused.clearFocus()
+            self._restore_integration_points_draft()
         finally:
             del blockers
         self._sync_controls()
-        self.runDefaultsDraftStateChanged.emit(bool(self._candidate_dirty))
+        if self._candidate_dirty != was_dirty:
+            self.runDefaultsDraftStateChanged.emit(bool(self._candidate_dirty))
         return True
 
     def discard_run_defaults_draft(self) -> bool:
@@ -304,6 +327,7 @@ class SimulationPanel(QtWidgets.QWidget):
             # canonical values here would make a focus-loss event silently
             # erase the invalid text before Run can observe it.
             self._candidate_dirty = True
+            self._restore_integration_points_draft()
             self._sync_controls()
             self.settingsValidationFailed.emit(str(exc))
             return False
@@ -343,11 +367,40 @@ class SimulationPanel(QtWidgets.QWidget):
             except (TypeError, ValueError, OverflowError) as exc:
                 raise ValueError("Run start and end times must be numeric.") from exc
             values[field] = parsed
+        points_edit = self.num_points_spinbox.lineEdit()
+        projected_points = str(int(values["integration_points"]))
+        if points_edit.text() != projected_points:
+            changed.add("integration_points")
+            if "integration_points" not in self._candidate_changed_fields:
+                values["integration_points"] = points_edit.text()
+                self._candidate_values["integration_points"] = points_edit.text()
+                self._candidate_changed_fields.add("integration_points")
+        if "integration_points" in changed:
+            raw_points = values["integration_points"]
+            raw_text = str(raw_points)
+            state, _corrected, _position = self.num_points_spinbox.validate(
+                raw_text,
+                0,
+            )
+            if state is not QtGui.QValidator.State.Acceptable:
+                minimum, maximum = SIMULATION_POINT_RANGE
+                raise ValueError(
+                    "Integration points must be an integer between "
+                    f"{minimum} and {maximum}."
+                )
+            try:
+                values["integration_points"] = int(raw_text)
+            except (TypeError, ValueError, OverflowError) as exc:
+                minimum, maximum = SIMULATION_POINT_RANGE
+                raise ValueError(
+                    "Integration points must be an integer between "
+                    f"{minimum} and {maximum}."
+                ) from exc
         candidate = SimulationExecutionSettings(
             solver=str(self.solver_method_combo.currentText()),
             t_start=float(values["t_start"]),
             t_end=float(values["t_end"]),
-            integration_points=int(self.num_points_spinbox.value()),
+            integration_points=int(values["integration_points"]),
         )
         validate_simulation_execution_settings(candidate)
         return candidate
@@ -375,6 +428,7 @@ class SimulationPanel(QtWidgets.QWidget):
     def _mark_candidate_dirty(self, *_args) -> None:
         if self._rendering:
             return
+        was_dirty = self._candidate_dirty
         self._candidate_dirty = True
         sender = self.sender()
         if sender is self.solver_method_combo:
@@ -388,6 +442,43 @@ class SimulationPanel(QtWidgets.QWidget):
             self._candidate_changed_fields.add("t_end")
         elif sender is self.num_points_spinbox:
             self._candidate_changed_fields.add("integration_points")
+            stored = self._candidate_values.get("integration_points")
+            try:
+                stored_value = int(stored) if isinstance(stored, str) else None
+            except (TypeError, ValueError, OverflowError):
+                stored_value = None
+            if stored_value != int(self.num_points_spinbox.value()):
+                self._candidate_values["integration_points"] = (
+                    self.num_points_spinbox.lineEdit().text()
+                )
+        if not was_dirty:
+            self.runDefaultsDraftStateChanged.emit(True)
+
+    @QtCore.Slot(str)
+    def _capture_integration_points_text(self, text: str) -> None:
+        if self._rendering:
+            return
+        was_dirty = self._candidate_dirty
+        self._candidate_dirty = True
+        self._candidate_changed_fields.add("integration_points")
+        self._candidate_values["integration_points"] = str(text)
+        if not was_dirty:
+            self.runDefaultsDraftStateChanged.emit(True)
+
+    def _restore_integration_points_draft(self) -> None:
+        """Restore exact authored Points text after Qt editor normalization."""
+
+        if "integration_points" not in self._candidate_changed_fields:
+            return
+        value = self._candidate_values.get("integration_points")
+        if not isinstance(value, str):
+            return
+        edit = self.num_points_spinbox.lineEdit()
+        blocker = QtCore.QSignalBlocker(edit)
+        try:
+            edit.setText(value)
+        finally:
+            del blocker
 
     @QtCore.Slot()
     def _settle_after_edit(self, *_args) -> None:

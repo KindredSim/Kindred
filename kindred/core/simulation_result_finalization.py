@@ -14,7 +14,15 @@ from kindred.core.result_repository import (
     SimulationResultValue,
 )
 from kindred.core.simulator.parameter_namespace import build_namespace_from_mechanism
-from kindred.core.simulator.step_indexing import iter_canonical_parameters
+from kindred.core.simulator.step_indexing import get_step_index_map, iter_canonical_parameters
+from kindred.core.kinetics import (
+    ArrheniusRateModel,
+    EyringRateModel,
+    forward_rate_model_for_equilibrium,
+    forward_rate_model_for_reaction,
+)
+from kindred.core.mechanism_metadata import EquilibriumMetadataKeys
+from kindred.core.units import UnitsModel
 from kindred.core.temperature import (
     TemperatureScheduleProtocol,
     coerce_temperature_schedule,
@@ -126,6 +134,59 @@ def _prepared_static_scalar_snapshot(
                 f"prepared static scalar {name!r} must be finite."
             )
         values[name] = value
+    # Parser-admitted physical source coordinates are static Algebra symbols.
+    # Their values come from the typed model/thermodynamic authority; only
+    # calculated indexed readouts remain row-dependent below.
+    metadata_view = MechanismMetadataView.from_metadata(metadata)
+    energy_units = UnitsModel(energy_unit=metadata_view.energy_unit)
+    reactions = tuple(getattr(mechanism, "reactions", ()) or ())
+    equilibria = tuple(getattr(mechanism, "equilibria", ()) or ())
+    step_map = get_step_index_map(mechanism)
+    for coordinate in build_namespace_from_mechanism(mechanism).source_coordinates:
+        role = str(coordinate.role)
+        if role not in {"A", "Ea", "dG_act", "dG_eq", "kappa"}:
+            continue
+        source_index = coordinate.source_index
+        if source_index is None or not 0 <= int(source_index) < len(step_map):
+            continue
+        entry = step_map[int(source_index)]
+        kind = str(entry.get("kind") or "")
+        index_key = "reaction_index" if kind == "reaction" else "equilibrium_index"
+        try:
+            index = int(entry[index_key])
+        except (KeyError, TypeError, ValueError):
+            continue
+        model = None
+        if kind == "reaction" and 0 <= index < len(reactions):
+            model = forward_rate_model_for_reaction(
+                reactions[index],
+                default_standard_conc_M=float(metadata_view.standard_conc_M),
+            )
+        elif kind == "equilibrium" and 0 <= index < len(equilibria):
+            model = forward_rate_model_for_equilibrium(
+                equilibria[index],
+                temperature_K=None,
+                default_standard_conc_M=float(metadata_view.standard_conc_M),
+            )
+        value: float | None = None
+        if role == "A" and isinstance(model, ArrheniusRateModel):
+            value = float(model.A)
+        elif role == "Ea" and isinstance(model, ArrheniusRateModel):
+            value = float(energy_units.from_jmol(model.Ea_J_per_mol))
+        elif role == "dG_act" and isinstance(model, EyringRateModel):
+            value = float(energy_units.from_jmol(model.dG_act_J_per_mol))
+        elif role == "kappa" and isinstance(model, EyringRateModel):
+            value = float(model.kappa)
+        elif role == "dG_eq" and kind == "equilibrium":
+            raw_dg = dict(getattr(equilibria[index], "metadata", {}) or {}).get(
+                EquilibriumMetadataKeys.DG_EQ_J_PER_MOL
+            )
+            try:
+                value = float(energy_units.from_jmol(float(raw_dg)))
+            except (TypeError, ValueError, OverflowError):
+                value = None
+        if value is not None and np.isfinite(value):
+            values[str(coordinate.canonical_name)] = float(value)
     return values
 
 
@@ -478,6 +539,7 @@ def finalize_simulation_result(
     algebra_policy: SimulationAlgebraPolicy | str,
     parameters: tuple[tuple[str, float, str], ...] = (),
     preparation_warnings: list[str] | tuple[str, ...] = (),
+    solver_provenance_updates: Mapping[str, object] | None = None,
 ) -> SimulationResultValue:
     """Admit one solver output through canonical row finalization.
 
@@ -531,6 +593,8 @@ def finalize_simulation_result(
         for name, value in solver_provenance.items()
         if name not in _DIRECT_RESULT_IDENTITY_FIELDS
     }
+    if solver_provenance_updates:
+        retained_solver_provenance.update(solver_provenance_updates)
     compiled_algebra = compiled_algebra_for_mechanism(mechanism)
     requested_algebra_outputs = (
         ()

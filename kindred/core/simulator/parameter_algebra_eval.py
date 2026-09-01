@@ -1,594 +1,140 @@
+"""Runtime evaluation of the admitted parameter Algebra program.
+
+The parser owns admission, canonical AST retention, and the parameter
+dependency mapping.  This module only consumes those retained facts; it does
+not parse source text or rediscover dependencies from expression trees.
+"""
+
 from __future__ import annotations
 
-from dataclasses import dataclass
 import math
-from typing import Dict, Iterable, List, Mapping, Sequence, Set
+from collections.abc import Mapping, Sequence
+from typing import Dict
 
 import numpy as np
 
 from kindred.core.algebra.errors import AlgebraError
 from kindred.core.algebra.evaluator import EvaluationContext, evaluate_block
-from kindred.core.algebra.parser import (
-    AlgebraBlock,
-    BinaryNode,
-    CallNode,
-    ExprNode,
-    IdentNode,
-    LetStatement,
-    SpeciesRefNode,
-    UnaryNode,
-)
+from kindred.core.algebra.parser import AlgebraBlock
 from kindred.core.algebra.symbols import SymbolTable
 from kindred.core.simulator.errors import DSLError
 from kindred.core.simulator.parameter_algebra_spec import (
-    ParameterAlgebraNamespace,
     ParameterAlgebraSpec,
-    ParameterAssignment,
-    mechanism_parameter_name_pattern,
 )
 
-
-def _iter_identifiers(expr: ExprNode) -> Iterable[str]:
-    if isinstance(expr, IdentNode):
-        yield expr.name
-        return
-    if isinstance(expr, SpeciesRefNode):
-        return
-    if isinstance(expr, UnaryNode):
-        yield from _iter_identifiers(expr.rhs)
-        return
-    if isinstance(expr, BinaryNode):
-        yield from _iter_identifiers(expr.lhs)
-        yield from _iter_identifiers(expr.rhs)
-        return
-    if isinstance(expr, CallNode):
-        for arg in expr.args:
-            yield from _iter_identifiers(arg)
-        return
+__all__ = [
+    "evaluate_parameter_algebra",
+    "evaluate_parameter_algebra_in_context",
+]
 
 
-def _toposort(names: Sequence[str], deps: Dict[str, Set[str]]) -> List[str]:
-    order: List[str] = []
-    visiting: Set[str] = set()
-    visited: Set[str] = set()
-    stack: List[str] = []
-
-    def visit(name: str) -> None:
-        if name in visited:
-            return
-        if name in visiting:
-            if name in stack:
-                j = stack.index(name)
-                cycle = stack[j:] + [name]
-            else:
-                cycle = [name, name]
-            raise DSLError(
-                "Parameter algebra has a dependency cycle: " + " -> ".join(cycle),
-                suggestion="Remove the cycle by rewriting the param definitions so they form an acyclic dependency graph.",
-            )
-        visiting.add(name)
-        stack.append(name)
-        for dep in sorted(deps.get(name, set())):
-            visit(dep)
-        stack.pop()
-        visiting.remove(name)
-        visited.add(name)
-        order.append(name)
-
-    for name in names:
-        visit(name)
-    return order
-
-
-def _map_algebra_error_to_assignment(
-    err: AlgebraError,
-    *,
-    order: Sequence[ParameterAssignment],
-) -> DSLError:
-    stmt_idx = int(getattr(err, "line", 0)) - 2
-    if 0 <= stmt_idx < len(order):
-        assignment = order[stmt_idx]
-        return DSLError(
-            str(err),
-            line_number=assignment.line_number,
-            line_content=assignment.line_content,
-        )
-    return DSLError(str(err))
-
-
-@dataclass(frozen=True)
-class _CanonicalizedParameterBlock:
-    block: AlgebraBlock
-    raw_to_canonical_identifiers_by_assignment: Mapping[str, Mapping[str, str]]
-
-
-def _parse_canonicalized_param_block(
+def _retained_block(
     spec: ParameterAlgebraSpec,
-    assignments: Sequence[ParameterAssignment],
-) -> _CanonicalizedParameterBlock:
+    names: Sequence[str],
+) -> AlgebraBlock:
     retained = spec.parameter_block
     if retained is None:
         raise DSLError(
             "Parameter algebra has no retained admitted AST.",
             suggestion="Re-admit the mechanism source before evaluating parameter algebra.",
         )
-    retained_by_name = {str(statement.name): statement for statement in retained.lines}
-    lines: List[LetStatement] = []
-    static_values = retained.static_value_map()
-    aliases = dict(spec.raw_to_canonical_identifiers_by_assignment)
-    for assignment in assignments:
-        statement = retained_by_name.get(str(assignment.name))
-        expr = assignment.expr_ast
-        if statement is not None:
-            expr = statement.expr
-        if expr is None:
-            raise DSLError(
-                f"Parameter algebra assignment {assignment.name!r} has no retained AST.",
-                line_number=assignment.line_number,
-                line_content=assignment.line_content,
-            )
-        lines.append(
-            LetStatement(
-                name=str(assignment.name),
-                expr=expr,
-                line=int(assignment.line_number or (statement.line if statement else 0)),
-                col=int(statement.col if statement is not None else 1),
-                line_text=str(assignment.line_content),
-            )
-        )
-    selected_names = {str(assignment.name) for assignment in assignments}
-    return _CanonicalizedParameterBlock(
-        block=AlgebraBlock(
-            lines=tuple(lines),
-            ast=tuple(line.expr for line in lines),
-            static_values={name: value for name, value in static_values.items() if name in selected_names},
-        ),
-        raw_to_canonical_identifiers_by_assignment={
-            str(name): dict(mapping)
-            for name, mapping in aliases.items()
-            if str(name) in selected_names
-        },
-    )
-
-
-def _display_identifier_names(
-    identifier_names: Iterable[str],
-    *,
-    raw_to_canonical_identifiers: Mapping[str, str],
-) -> List[str]:
-    raw_names_by_canonical: Dict[str, List[str]] = {}
-    for raw_name, canonical_name in raw_to_canonical_identifiers.items():
-        raw_names_by_canonical.setdefault(canonical_name, []).append(raw_name)
-
-    ordered: List[str] = []
-    for identifier_name in identifier_names:
-        raw_names = sorted(set(raw_names_by_canonical.get(identifier_name, [])))
-        if raw_names:
-            ordered.extend(raw_names)
-            continue
-        ordered.append(identifier_name)
-    return list(dict.fromkeys(ordered))
-
-
-@dataclass(frozen=True)
-class ParameterAlgebraEvaluationModel:
-    namespace: ParameterAlgebraNamespace
-    identifier_names_by_assignment: Mapping[str, frozenset[str]]
-    referenced_scalar_inputs: frozenset[str]
-    solver_dependencies_by_assignment: Mapping[str, frozenset[str]]
-    assignment_dependencies_by_assignment: Mapping[str, frozenset[str]]
-
-    def registerable_input_names(self) -> Set[str]:
-        return self.namespace.solver_param_names() | set(self.referenced_scalar_inputs)
-
-
-@dataclass(frozen=True)
-class ParameterAlgebraAssignmentAnalysis:
-    identifier_names: frozenset[str]
-    referenced_scalar_inputs: frozenset[str]
-    solver_dependencies: frozenset[str]
-    assignment_dependencies: frozenset[str]
-    error: DSLError | None
-
-
-def _build_assignment_analysis(
-    namespace: ParameterAlgebraNamespace,
-    *,
-    assignment: ParameterAssignment,
-    expr: ExprNode,
-    raw_to_canonical_identifiers: Mapping[str, str],
-    defined_names: Set[str],
-    base_values: Mapping[str, float],
-) -> ParameterAlgebraAssignmentAnalysis:
-    solver_params = namespace.solver_param_names()
-    allowed_constants = set(namespace.protected_symbol_names) - {"T"}
-    idents = set(_iter_identifiers(expr))
-    referenced_scalar_inputs = frozenset(name for name in idents if name in namespace.scalar_input_names)
-    solver_dependencies = frozenset(name for name in idents if name in solver_params and name != assignment.name)
-    assignment_dependencies = frozenset(name for name in idents if name in defined_names and name != assignment.name)
-
-    def _analysis(error: DSLError | None = None) -> ParameterAlgebraAssignmentAnalysis:
-        return ParameterAlgebraAssignmentAnalysis(
-            identifier_names=frozenset(idents),
-            referenced_scalar_inputs=referenced_scalar_inputs,
-            solver_dependencies=solver_dependencies,
-            assignment_dependencies=assignment_dependencies,
-            error=error,
-        )
-
-    if expr.has_species_ref():
-        return _analysis(
-            DSLError(
-                "Parameter expressions cannot reference concentrations like [A] or [A]_0",
-                suggestion="Use only numeric literals, math functions, and other parameters (k1, k2, ...).",
-                line_number=assignment.line_number,
-                line_content=assignment.line_content,
-            )
-        )
-    if "T" in idents:
-        return _analysis(
-            DSLError(
-                "Parameter expressions cannot reference temperature 'T' (keep parameter algebra static)",
-                suggestion="If you need temperature-dependent rates, use Arrhenius/Eyring reaction models instead.",
-                line_number=assignment.line_number,
-                line_content=assignment.line_content,
-            )
-        )
-    if "t" in idents:
-        return _analysis(
-            DSLError(
-                "Parameter expressions cannot reference row-local time 't'",
-                suggestion="Use time only in dynamic 'let' observables.",
-                line_number=assignment.line_number,
-                line_content=assignment.line_content,
-            )
-        )
-
-    dynamic_scalar_inputs = sorted(idents & set(namespace.scalar_input_names))
-    if dynamic_scalar_inputs:
-        display_names = _display_identifier_names(
-            dynamic_scalar_inputs,
-            raw_to_canonical_identifiers=raw_to_canonical_identifiers,
-        )
-        return _analysis(
-            DSLError(
-                "Parameter expressions cannot reference dynamic scalar input(s): "
-                + ", ".join(repr(name) for name in display_names),
-                suggestion="Use admitted solver parameters in 'param' expressions and consume dynamic scalars from a 'let'.",
-                line_number=assignment.line_number,
-                line_content=assignment.line_content,
-            )
-        )
-
-    for name in sorted(idents):
-        if name in namespace.observable_names:
-            display_name = _display_identifier_names(
-                [name],
-                raw_to_canonical_identifiers=raw_to_canonical_identifiers,
-            )[0]
-            return _analysis(
-                DSLError(
-                    f"{display_name!r} is an observable (defined with 'let') and cannot be used in parameter algebra",
-                    suggestion=f"Define it as a solver parameter instead: param {display_name} = <number>",
-                    examples=[f"param {display_name} = 4", "param k2 = a*k1"],
-                    line_number=assignment.line_number,
-                    line_content=assignment.line_content,
-                )
-            )
-
-    referenced_reserved_scalar_names = sorted(
-        name
-        for name in idents
-        if name in namespace.scalar_input_names and name in namespace.reserved_identifier_names()
-    )
-    if referenced_reserved_scalar_names:
-        display_names = _display_identifier_names(
-            referenced_reserved_scalar_names,
-            raw_to_canonical_identifiers=raw_to_canonical_identifiers,
-        )
-        names = ", ".join(repr(name) for name in display_names)
-        return _analysis(
-            DSLError(
-                f"Scalar input name(s) {names} shadow protected algebra names and cannot be referenced in parameter expressions",
-                suggestion="Rename the top-level scalar assignment so it does not shadow a protected constant or builtin function.",
-                line_number=assignment.line_number,
-                line_content=assignment.line_content,
-            )
-        )
-
-    unknown: Set[str] = set()
-    for name in idents:
-        if name in defined_names:
-            continue
-        if name in solver_params:
-            continue
-        if name in allowed_constants:
-            continue
-        unknown.add(name)
-    if unknown:
-        unknown_display_names = _display_identifier_names(
-            sorted(unknown),
-            raw_to_canonical_identifiers=raw_to_canonical_identifiers,
-        )
-        unknown_sorted = ", ".join(repr(name) for name in unknown_display_names)
-        return _analysis(
-            DSLError(
-                f"Unknown name(s) in parameter expression: {unknown_sorted}",
-                suggestion="Parameter expressions may only reference other parameters (k1, k2, ...) and supported math/constants.",
-                line_number=assignment.line_number,
-                line_content=assignment.line_content,
-            )
-        )
-
-    referenced_input_names = sorted(
-        name
-        for name in idents
-        if name in solver_params and name not in defined_names
-    )
-    missing = [name for name in referenced_input_names if name not in base_values]
-    if missing:
-        missing_display_names = _display_identifier_names(
-            missing,
-            raw_to_canonical_identifiers=raw_to_canonical_identifiers,
-        )
-        return _analysis(
-            DSLError(
-                f"Undefined parameter value(s) referenced in expression: {', '.join(missing_display_names)}",
-                suggestion="Ensure those parameters exist in the mechanism and have numeric values.",
-                line_number=assignment.line_number,
-                line_content=assignment.line_content,
-            )
-        )
-
-    nonfinite: list[str] = []
-    for name in referenced_input_names:
-        try:
-            value = float(base_values[name])
-        except (TypeError, ValueError):
-            nonfinite.append(name)
-            continue
-        if not math.isfinite(value):
-            nonfinite.append(name)
-    if nonfinite:
-        nonfinite_display_names = _display_identifier_names(
-            nonfinite,
-            raw_to_canonical_identifiers=raw_to_canonical_identifiers,
-        )
-        return _analysis(
-            DSLError(
-                f"Non-finite parameter value(s) referenced in expression: {', '.join(nonfinite_display_names)}",
-                suggestion="Set those referenced parameters to finite numeric values before using them in parameter algebra.",
-                line_number=assignment.line_number,
-                line_content=assignment.line_content,
-            )
-        )
-
-    return _analysis()
-
-
-def analyze_parameter_algebra_assignments(
-    spec: ParameterAlgebraSpec,
-    *,
-    assignments: Sequence[ParameterAssignment],
-    ast_by_name: Mapping[str, ExprNode] | None = None,
-    raw_to_canonical_identifiers_by_assignment: Mapping[str, Mapping[str, str]] | None = None,
-    base_values: Mapping[str, float],
-) -> Mapping[str, ParameterAlgebraAssignmentAnalysis]:
-    namespace = spec.namespace_model()
-    defined_names = {assignment.name for assignment in assignments}
-    ast_map = dict(ast_by_name or {})
-    raw_identifier_map = {
-        name: dict(mapping)
-        for name, mapping in (raw_to_canonical_identifiers_by_assignment or {}).items()
+    statements_by_name = {
+        str(statement.name): statement
+        for statement in retained.lines
     }
-    analyses: Dict[str, ParameterAlgebraAssignmentAnalysis] = {}
-
-    for assignment in assignments:
-        expr = ast_map.get(assignment.name)
-        raw_to_canonical_identifiers = raw_identifier_map.get(assignment.name, {})
-        if expr is None:
-            try:
-                parsed_block = _parse_canonicalized_param_block(spec, [assignment])
-            except AlgebraError as err:
-                analyses[assignment.name] = ParameterAlgebraAssignmentAnalysis(
-                    identifier_names=frozenset(),
-                    referenced_scalar_inputs=frozenset(),
-                    solver_dependencies=frozenset(),
-                    assignment_dependencies=frozenset(),
-                    error=_map_algebra_error_to_assignment(err, order=[assignment]),
-                )
-                continue
-            expr = parsed_block.block.lines[0].expr
-            raw_to_canonical_identifiers = parsed_block.raw_to_canonical_identifiers_by_assignment.get(
-                assignment.name,
-                {},
-            )
-        analyses[assignment.name] = _build_assignment_analysis(
-            namespace,
-            assignment=assignment,
-            expr=expr,
-            raw_to_canonical_identifiers=raw_to_canonical_identifiers,
-            defined_names=defined_names,
-            base_values=base_values,
+    ordered_names = tuple(str(name) for name in names)
+    missing = [name for name in ordered_names if name not in statements_by_name]
+    if missing:
+        raise DSLError(
+            "Parameter algebra is missing retained assignment(s): "
+            + ", ".join(repr(name) for name in missing)
         )
-    return dict(analyses)
+    lines = tuple(statements_by_name[name] for name in ordered_names)
+    static_values = retained.static_value_map()
+    return AlgebraBlock(
+        lines=lines,
+        ast=tuple(statement.expr for statement in lines),
+        static_values={
+            name: value
+            for name, value in static_values.items()
+            if name in ordered_names
+        },
+        evaluation_order=ordered_names,
+    )
 
 
-def build_parameter_algebra_evaluation_model(
+def _symbol_table(
     spec: ParameterAlgebraSpec,
-    *,
-    assignments: Sequence[ParameterAssignment],
-    ast_by_name: Mapping[str, ExprNode] | None = None,
-    raw_to_canonical_identifiers_by_assignment: Mapping[str, Mapping[str, str]] | None = None,
-    base_values: Mapping[str, float],
-) -> ParameterAlgebraEvaluationModel:
-    if ast_by_name is None:
-        try:
-            parsed_block = _parse_canonicalized_param_block(spec, assignments)
-        except AlgebraError as err:
-            raise _map_algebra_error_to_assignment(err, order=list(assignments)) from err
-        ast_by_name = {stmt.name: stmt.expr for stmt in parsed_block.block.lines}
-        raw_to_canonical_identifiers_by_assignment = parsed_block.raw_to_canonical_identifiers_by_assignment
-    namespace = spec.namespace_model()
-    analyses = analyze_parameter_algebra_assignments(
-        spec,
-        assignments=assignments,
-        ast_by_name=ast_by_name,
-        raw_to_canonical_identifiers_by_assignment=raw_to_canonical_identifiers_by_assignment,
-        base_values=base_values,
-    )
-
-    identifier_names_by_assignment: Dict[str, frozenset[str]] = {}
-    solver_dependencies_by_assignment: Dict[str, frozenset[str]] = {}
-    assignment_dependencies_by_assignment: Dict[str, frozenset[str]] = {}
-    referenced_scalar_inputs: Set[str] = set()
-
-    for assignment in assignments:
-        analysis = analyses[assignment.name]
-        if analysis.error is not None:
-            raise analysis.error
-        identifier_names_by_assignment[assignment.name] = analysis.identifier_names
-        solver_dependencies_by_assignment[assignment.name] = analysis.solver_dependencies
-        assignment_dependencies_by_assignment[assignment.name] = analysis.assignment_dependencies
-        referenced_scalar_inputs.update(analysis.referenced_scalar_inputs)
-
-    return ParameterAlgebraEvaluationModel(
-        namespace=namespace,
-        identifier_names_by_assignment=dict(identifier_names_by_assignment),
-        referenced_scalar_inputs=frozenset(referenced_scalar_inputs),
-        solver_dependencies_by_assignment=dict(solver_dependencies_by_assignment),
-        assignment_dependencies_by_assignment=dict(assignment_dependencies_by_assignment),
-    )
-
-
-def _build_symbol_table(
-    evaluation_model: ParameterAlgebraEvaluationModel,
-    *,
     base_values: Mapping[str, float],
 ) -> SymbolTable:
     symtab = SymbolTable()
-    for name, value in base_values.items():
-        if name not in evaluation_model.registerable_input_names():
+    admitted_names = (
+        set(spec.mechanism_param_names)
+        | set(spec.scalar_input_names)
+        | set(spec.param_assignment_names())
+    )
+    for raw_name, raw_value in base_values.items():
+        name = str(raw_name)
+        if name not in admitted_names or name in symtab.protected_names():
             continue
         try:
-            symtab.define_user(name, float(value), species_names=set())
-        except ValueError as exc:
-            raise DSLError(f"Invalid parameter algebra input name {name!r}: {exc}") from exc
+            symtab.define_user(name, float(raw_value), species_names=set())
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise DSLError(f"Invalid parameter algebra input {name!r}: {exc}") from exc
     return symtab
 
 
-def evaluate_parameter_algebra(
+def _evaluate_names(
     spec: ParameterAlgebraSpec,
+    names: Sequence[str],
     *,
-    base_values: Dict[str, float],
+    base_values: Mapping[str, float],
 ) -> Dict[str, float]:
-    assignments = list(spec.param_statements)
-    if not assignments:
+    if not names:
         return {}
-
-    try:
-        parsed_block = _parse_canonicalized_param_block(spec, assignments)
-    except AlgebraError as err:
-        raise _map_algebra_error_to_assignment(err, order=list(assignments)) from err
-
-    ast_by_name: Dict[str, ExprNode] = {stmt.name: stmt.expr for stmt in parsed_block.block.lines}
-    evaluation_model = build_parameter_algebra_evaluation_model(
-        spec,
-        assignments=assignments,
-        ast_by_name=ast_by_name,
-        raw_to_canonical_identifiers_by_assignment=parsed_block.raw_to_canonical_identifiers_by_assignment,
-        base_values=base_values,
-    )
-
-    scalar_defaults: Dict[str, float] = {}
-    derived_statements: List[ParameterAssignment] = []
-    depends_on_map: Dict[str, Set[str]] = {}
-    mech_param_re = mechanism_parameter_name_pattern()
-
-    for assignment in assignments:
-        depends_on = set(evaluation_model.solver_dependencies_by_assignment.get(assignment.name, frozenset()))
-        depends_on_map[assignment.name] = set(depends_on)
-
-        is_mech_target = mech_param_re.match(assignment.name) is not None
-        if not is_mech_target and not depends_on:
-            try:
-                tmp_spec = ParameterAlgebraSpec(
-                    param_statements=[assignment],
-                    observable_names=set(spec.observable_names),
-                    mechanism_namespace=spec.mechanism_namespace,
-                    scalar_input_names=set(spec.scalar_input_names),
-                    parameter_block=spec.parameter_block,
-                    observable_block=spec.observable_block,
-                    raw_to_canonical_identifiers_by_assignment=(
-                        dict(spec.raw_to_canonical_identifiers_by_assignment)
-                    ),
-                )
-                val_map = evaluate_parameter_algebra_in_context(
-                    tmp_spec,
-                    base_values=dict(base_values),
-                )
-                scalar_defaults[assignment.name] = float(val_map[assignment.name])
-            except DSLError:
-                raise
-            except Exception as exc:
-                raise DSLError(
-                    f"Failed to evaluate default value for parameter {assignment.name!r}: {exc}",
-                    line_number=assignment.line_number,
-                    line_content=assignment.line_content,
-                ) from exc
-        else:
-            derived_statements.append(assignment)
-
-    for name, default_val in scalar_defaults.items():
-        if name not in base_values:
-            base_values[name] = float(default_val)
-
-    if not derived_statements:
-        return {}
-
-    derived_set = {assignment.name for assignment in derived_statements}
-    deps: Dict[str, Set[str]] = {}
-    for assignment in derived_statements:
-        deps[assignment.name] = {
-            name for name in depends_on_map.get(assignment.name, set()) if name in derived_set
-        }
-
-    topo_names = _toposort(sorted(derived_set), deps)
-    topo_assignments = [next(assignment for assignment in derived_statements if assignment.name == name) for name in topo_names]
-
-    try:
-        block = _parse_canonicalized_param_block(spec, topo_assignments).block
-    except AlgebraError as err:
-        raise _map_algebra_error_to_assignment(err, order=topo_assignments) from err
-
-    symtab = _build_symbol_table(evaluation_model, base_values=base_values)
-
-    ctx = EvaluationContext(
+    block = _retained_block(spec, names)
+    context = EvaluationContext(
         t=np.array([0.0]),
         species_series={},
         initials={},
         species_names=set(),
-        symtab=symtab,
+        symtab=_symbol_table(spec, base_values),
     )
-
     try:
-        series, scalars = evaluate_block(block, ctx)
-    except AlgebraError as err:
-        raise _map_algebra_error_to_assignment(err, order=topo_assignments) from err
+        series, scalars = evaluate_block(block, context)
+    except AlgebraError as exc:
+        assignment = next(
+            (
+                item
+                for item in spec.param_statements
+                if int(getattr(item, "line_number", 0) or 0)
+                == int(getattr(exc, "line", 0) or 0)
+            ),
+            None,
+        )
+        if assignment is not None:
+            raise DSLError(
+                str(exc),
+                line_number=assignment.line_number,
+                line_content=assignment.line_content,
+            ) from exc
+        raise DSLError(str(exc)) from exc
 
-    out: Dict[str, float] = {}
-    for name in topo_names:
+    values: Dict[str, float] = {}
+    for name in names:
         if name in scalars:
             value = float(scalars[name])
         else:
-            arr = series.get(name)
-            if arr is None or arr.size < 1:
-                raise DSLError(f"Failed to evaluate derived parameter {name!r}")
-            value = float(arr[0])
+            values_array = series.get(name)
+            if values_array is None or values_array.size < 1:
+                raise DSLError(f"Failed to evaluate parameter assignment {name!r}.")
+            value = float(values_array[0])
         if not math.isfinite(value):
-            raise DSLError(f"Derived parameter {name!r} evaluated to a non-finite value: {value!r}")
-        out[name] = value
-    return out
+            raise DSLError(
+                f"Parameter assignment {name!r} evaluated to a non-finite value: {value!r}"
+            )
+        values[name] = value
+    return values
 
 
 def evaluate_parameter_algebra_in_context(
@@ -596,60 +142,59 @@ def evaluate_parameter_algebra_in_context(
     *,
     base_values: Dict[str, float],
 ) -> Dict[str, float]:
-    statements = list(spec.param_statements)
-    if not statements:
+    """Evaluate all admitted assignments using the retained graph and AST."""
+
+    if not isinstance(spec, ParameterAlgebraSpec):
+        raise TypeError("spec must be a ParameterAlgebraSpec.")
+    mapping = spec.parameter_dependencies
+    if not mapping:
         return {}
 
-    try:
-        parsed_block = _parse_canonicalized_param_block(spec, statements)
-    except AlgebraError as err:
-        raise _map_algebra_error_to_assignment(err, order=statements) from err
+    independent_names = tuple(
+        name
+        for name in mapping
+        if spec.parameter_assignment_kind(name) == "independent scalar"
+    )
+    missing_defaults = tuple(
+        name for name in independent_names if name not in base_values
+    )
+    if missing_defaults:
+        defaults = _evaluate_names(
+            spec,
+            missing_defaults,
+            base_values=base_values,
+        )
+        base_values.update(defaults)
 
-    ast_by_name: Dict[str, ExprNode] = {stmt.name: stmt.expr for stmt in parsed_block.block.lines}
-    evaluation_model = build_parameter_algebra_evaluation_model(
+    dependent_names = tuple(
+        name
+        for name in mapping
+        if name not in independent_names
+    )
+    derived = _evaluate_names(
         spec,
-        assignments=statements,
-        ast_by_name=ast_by_name,
-        raw_to_canonical_identifiers_by_assignment=parsed_block.raw_to_canonical_identifiers_by_assignment,
+        dependent_names,
         base_values=base_values,
     )
+    return {
+        name: float(base_values[name])
+        for name in independent_names
+    } | derived
 
-    deps: Dict[str, Set[str]] = {}
-    for assignment in statements:
-        deps[assignment.name] = set(
-            evaluation_model.assignment_dependencies_by_assignment.get(assignment.name, frozenset())
-        )
 
-    topo = _toposort(sorted(evaluation_model.namespace.param_assignment_names), deps)
-    topo_assignments = [next(assignment for assignment in statements if assignment.name == name) for name in topo]
-    try:
-        block = _parse_canonicalized_param_block(spec, topo_assignments).block
-    except AlgebraError as err:
-        raise _map_algebra_error_to_assignment(err, order=topo_assignments) from err
+def evaluate_parameter_algebra(
+    spec: ParameterAlgebraSpec,
+    *,
+    base_values: Dict[str, float],
+) -> Dict[str, float]:
+    """Evaluate only mechanism-bound and derived scalar assignments."""
 
-    symtab = _build_symbol_table(evaluation_model, base_values=base_values)
-    ctx = EvaluationContext(
-        t=np.array([0.0]),
-        species_series={},
-        initials={},
-        species_names=set(),
-        symtab=symtab,
+    values = evaluate_parameter_algebra_in_context(
+        spec,
+        base_values=base_values,
     )
-    try:
-        series, scalars = evaluate_block(block, ctx)
-    except AlgebraError as err:
-        raise _map_algebra_error_to_assignment(err, order=topo_assignments) from err
-
-    out: Dict[str, float] = {}
-    for name in topo:
-        if name in scalars:
-            value = float(scalars[name])
-        else:
-            arr = series.get(name)
-            if arr is None or arr.size < 1:
-                raise DSLError(f"Failed to evaluate derived parameter {name!r}")
-            value = float(arr[0])
-        if not math.isfinite(value):
-            raise DSLError(f"Derived parameter {name!r} evaluated to a non-finite value: {value!r}")
-        out[name] = value
-    return out
+    return {
+        name: value
+        for name, value in values.items()
+        if spec.parameter_assignment_kind(name) != "independent scalar"
+    }

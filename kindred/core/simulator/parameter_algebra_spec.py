@@ -23,12 +23,17 @@ from kindred.core.simulator.parameter_namespace import (
     MechanismParameterNamespace,
     is_protected_indexed_identifier,
 )
+from .dsl_build_input import (
+    DslSourceCoordinate,
+    source_coordinate_capabilities,
+    source_coordinate_name_pattern,
+)
 
 _PARAM_STMT_RE = re.compile(r"^\s*(?i:param)\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.+?)\s*$")
 _LET_STMT_RE = re.compile(r"^\s*(?i:let)\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.+?)\s*$")
 _ASSIGN_RE = re.compile(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=")
 _ARROW_RE = re.compile(r"<->|<=>|->|=>")
-_MECH_PARAM_RE = re.compile(r"^(k|kf|kr|Keq)(\d+)$")
+_MECH_PARAM_RE = source_coordinate_name_pattern()
 _PROTECTED_STEP_KEY_IDENTIFIERS = frozenset({"k", "kf", "kr", "keq"})
 _NON_ALGEBRA_ASSIGNMENT_PREFIXES = {
     "energy",
@@ -162,6 +167,7 @@ class ParameterAssignment:
     # Retained canonical AST.  ``expr_src`` remains source provenance only;
     # execution must consume this object rather than reconstructing text.
     expr_ast: ExprNode | None = None
+    source_coordinate: "DslSourceCoordinate | None" = None
 
 
 @dataclass(frozen=True)
@@ -183,7 +189,7 @@ def classify_parameter_algebra_declaration(
     mechanism_namespace: MechanismParameterNamespace | None = None,
     allow_non_algebra_bare_assignment: bool = True,
 ) -> ParameterAlgebraDeclarationClassification:
-    original = str(line or "").rstrip("\n")
+    original = str(line or "").rstrip("\r\n")
     stripped = original.strip()
     if not stripped or stripped.startswith("#"):
         return ParameterAlgebraDeclarationClassification(
@@ -316,7 +322,11 @@ class ParameterAlgebraSpec:
     scalar_input_names: Set[str] = field(default_factory=set)
     parameter_block: AlgebraBlock | None = None
     observable_block: AlgebraBlock | None = None
-    raw_to_canonical_identifiers_by_assignment: Mapping[str, Mapping[str, str]] = field(
+    # One admitted graph for parameter Algebra.  Mapping insertion order is the
+    # retained dependency order; each value contains only direct references to
+    # another ``param`` assignment.  Protected constants and mechanism leaves
+    # are intentionally absent from these dependency tuples.
+    parameter_dependencies: Mapping[str, Tuple[str, ...]] = field(
         default_factory=dict
     )
 
@@ -324,21 +334,14 @@ class ParameterAlgebraSpec:
         object.__setattr__(self, "param_statements", tuple(self.param_statements))
         object.__setattr__(self, "observable_names", frozenset(self.observable_names))
         object.__setattr__(self, "scalar_input_names", frozenset(self.scalar_input_names))
-        aliases = {
-            str(name): MappingProxyType(
-                {
-                    str(raw_name): str(canonical_name)
-                    for raw_name, canonical_name in dict(mapping).items()
-                }
-            )
-            for name, mapping in dict(
-                self.raw_to_canonical_identifiers_by_assignment
-            ).items()
+        dependencies = {
+            str(name): tuple(dict.fromkeys(str(dep) for dep in values))
+            for name, values in dict(self.parameter_dependencies).items()
         }
         object.__setattr__(
             self,
-            "raw_to_canonical_identifiers_by_assignment",
-            MappingProxyType(aliases),
+            "parameter_dependencies",
+            MappingProxyType(dependencies),
         )
 
     def __deepcopy__(self, memo: dict[int, object]) -> "ParameterAlgebraSpec":
@@ -352,8 +355,8 @@ class ParameterAlgebraSpec:
             copy.deepcopy(self.parameter_block, memo),
             copy.deepcopy(self.observable_block, memo),
             {
-                name: dict(mapping)
-                for name, mapping in self.raw_to_canonical_identifiers_by_assignment.items()
+                name: tuple(dependencies)
+                for name, dependencies in self.parameter_dependencies.items()
             },
         )
         memo[id(self)] = clone
@@ -370,8 +373,8 @@ class ParameterAlgebraSpec:
                 self.parameter_block,
                 self.observable_block,
                 {
-                    name: dict(mapping)
-                    for name, mapping in self.raw_to_canonical_identifiers_by_assignment.items()
+                    name: tuple(dependencies)
+                    for name, dependencies in self.parameter_dependencies.items()
                 },
             ),
         )
@@ -382,6 +385,18 @@ class ParameterAlgebraSpec:
 
     def param_assignment_names(self) -> Set[str]:
         return {p.name for p in self.param_statements}
+
+    def parameter_assignment_kind(self, name: str) -> str:
+        """Classify one admitted assignment from the retained graph."""
+
+        requested = str(name)
+        if requested not in self.parameter_dependencies:
+            raise KeyError(f"Unknown parameter assignment {requested!r}.")
+        if requested in self.mechanism_param_names:
+            return "mechanism-bound"
+        if self.parameter_dependencies[requested]:
+            return "derived scalar"
+        return "independent scalar"
 
     def solver_param_names(self) -> Set[str]:
         return self.namespace_model().solver_param_names()
@@ -431,10 +446,10 @@ def _canonicalize_parameter_expr(
     mechanism_namespace: MechanismParameterNamespace,
     scalar_input_names: Set[str],
     assignment: ParameterAssignment,
-) -> tuple[ExprNode, Mapping[str, str]]:
+) -> ExprNode:
     """Canonicalize mechanism identifiers while retaining the parsed AST."""
     if isinstance(expr, (NumberNode, SpeciesRefNode)):
-        return expr, {}
+        return expr
     if isinstance(expr, IdentNode):
         raw_name = str(expr.name)
         resolution = mechanism_namespace.resolve(raw_name)
@@ -458,58 +473,52 @@ def _canonicalize_parameter_expr(
                 line_content=assignment.line_content,
             )
         if resolution.canonical_name is None or raw_name in scalar_input_names:
-            return expr, {}
-        return IdentNode(resolution.canonical_name), {raw_name: resolution.canonical_name}
+            return expr
+        source_info = mechanism_namespace.source_coordinate_info(
+            str(resolution.canonical_name)
+        )
+        if source_info is not None and not source_coordinate_capabilities(
+            source_info.role
+        ).algebra_target:
+            raise DSLError(
+                f"Source coordinate {raw_name!r} is symbolic-only and cannot be used in Parameter Algebra.",
+                suggestion="Use an authored continuous coordinate such as A1, Ea1, dG_act1, dG_eq1, or kappa1.",
+            )
+        return IdentNode(resolution.canonical_name)
     if isinstance(expr, UnaryNode):
-        rhs, aliases = _canonicalize_parameter_expr(
+        rhs = _canonicalize_parameter_expr(
             expr.rhs,
             mechanism_namespace=mechanism_namespace,
             scalar_input_names=scalar_input_names,
             assignment=assignment,
         )
-        return UnaryNode(expr.op, rhs), aliases
+        return UnaryNode(expr.op, rhs)
     if isinstance(expr, BinaryNode):
-        lhs, lhs_aliases = _canonicalize_parameter_expr(
+        lhs = _canonicalize_parameter_expr(
             expr.lhs,
             mechanism_namespace=mechanism_namespace,
             scalar_input_names=scalar_input_names,
             assignment=assignment,
         )
-        rhs, rhs_aliases = _canonicalize_parameter_expr(
+        rhs = _canonicalize_parameter_expr(
             expr.rhs,
             mechanism_namespace=mechanism_namespace,
             scalar_input_names=scalar_input_names,
             assignment=assignment,
         )
-        aliases = dict(lhs_aliases)
-        for raw_name, canonical_name in rhs_aliases.items():
-            old = aliases.get(raw_name)
-            if old is not None and old != canonical_name:
-                raise ValueError(
-                    f"Conflicting mechanism identifier mapping for {raw_name!r}."
-                )
-            aliases[raw_name] = canonical_name
-        return BinaryNode(expr.op, lhs, rhs), aliases
+        return BinaryNode(expr.op, lhs, rhs)
     if isinstance(expr, CallNode):
         args: list[ExprNode] = []
-        aliases: dict[str, str] = {}
         for arg in expr.args:
-            canonical_arg, arg_aliases = _canonicalize_parameter_expr(
+            canonical_arg = _canonicalize_parameter_expr(
                 arg,
                 mechanism_namespace=mechanism_namespace,
                 scalar_input_names=scalar_input_names,
                 assignment=assignment,
             )
             args.append(canonical_arg)
-            for raw_name, canonical_name in arg_aliases.items():
-                old = aliases.get(raw_name)
-                if old is not None and old != canonical_name:
-                    raise ValueError(
-                        f"Conflicting mechanism identifier mapping for {raw_name!r}."
-                    )
-                aliases[raw_name] = canonical_name
-        return CallNode(expr.name, tuple(args)), aliases
-    return expr, {}
+        return CallNode(expr.name, tuple(args))
+    return expr
 
 
 def _compile_retained_parameter_block(
@@ -518,12 +527,11 @@ def _compile_retained_parameter_block(
     mechanism_namespace: MechanismParameterNamespace,
     scalar_input_names: Set[str],
     parsed: AlgebraBlock,
-) -> tuple[AlgebraBlock, Mapping[str, Mapping[str, str]]]:
+) -> AlgebraBlock:
     """Canonicalize the parameter slice of the retained admission AST."""
     canonical_lines: list[LetStatement] = []
-    alias_map: dict[str, Mapping[str, str]] = {}
     for assignment, statement in zip(assignments, parsed.lines):
-        expr, aliases = _canonicalize_parameter_expr(
+        expr = _canonicalize_parameter_expr(
             statement.expr,
             mechanism_namespace=mechanism_namespace,
             scalar_input_names=set(scalar_input_names),
@@ -538,13 +546,13 @@ def _compile_retained_parameter_block(
                 line_text=assignment.line_content,
             )
         )
-        alias_map[assignment.name] = dict(aliases)
     block = AlgebraBlock(
         lines=tuple(canonical_lines),
         ast=tuple(stmt.expr for stmt in canonical_lines),
         static_values=parsed.static_values,
+        evaluation_order=parsed.evaluation_order,
     )
-    return block, alias_map
+    return block
 
 
 def _validate_retained_parameter_program(
@@ -552,7 +560,7 @@ def _validate_retained_parameter_program(
     *,
     assignments: Sequence[ParameterAssignment],
     block: AlgebraBlock,
-) -> None:
+) -> Mapping[str, Tuple[str, ...]]:
     """Validate names, roles, and dependency cycles before acceptance."""
     namespace = spec.namespace_model()
     defined = {str(assignment.name) for assignment in assignments}
@@ -560,9 +568,12 @@ def _validate_retained_parameter_program(
     # row-local time, and temperature belong to dynamic ``let`` observables and
     # are rejected here before any source or mechanism mutation.
     allowed_constants = set(namespace.protected_symbol_names) - {"T"}
-    dependencies: dict[str, set[str]] = {}
+    # Keep the parser's admitted expression order.  This is the sole graph
+    # retained by the spec; consumers must not rediscover it from the AST.
+    dependencies: dict[str, tuple[str, ...]] = {}
     for assignment, statement in zip(assignments, block.lines):
-        idents = set(_iter_expr_identifiers(statement.expr))
+        identifier_order = tuple(dict.fromkeys(_iter_expr_identifiers(statement.expr)))
+        idents = set(identifier_order)
         if statement.expr.has_species_ref() or "T" in idents or "t" in idents:
             raise DSLError(
                 f"Parameter expression for {assignment.name!r} must be static.",
@@ -635,12 +646,13 @@ def _validate_retained_parameter_program(
                 line_number=assignment.line_number,
                 line_content=assignment.line_content,
             )
-        dependencies[assignment.name] = {
-            name for name in idents if name in defined
-        }
+        dependencies[assignment.name] = tuple(
+            name for name in identifier_order if name in defined
+        )
 
     visiting: set[str] = set()
     visited: set[str] = set()
+    ordered_names: list[str] = []
 
     def visit(name: str, stack: list[str]) -> None:
         if name in visited:
@@ -652,12 +664,13 @@ def _validate_retained_parameter_program(
                 suggestion="Rewrite the param definitions so they form an acyclic dependency graph.",
             )
         visiting.add(name)
-        for dependency in sorted(dependencies.get(name, ())):
+        for dependency in dependencies.get(name, ()):
             visit(dependency, stack + [name])
         visiting.remove(name)
         visited.add(name)
+        ordered_names.append(name)
 
-    for name in sorted(defined):
+    for name in block.evaluation_order:
         visit(name, [])
 
     # Catch domains that become statically decidable through a chain of
@@ -693,7 +706,7 @@ def _validate_retained_parameter_program(
         def append_static(name: str) -> None:
             if name in ordered_seen:
                 return
-            for dependency in sorted(dependencies.get(name, ())):
+            for dependency in dependencies.get(name, ()):
                 if dependency in static_names:
                     append_static(dependency)
             ordered_seen.add(name)
@@ -756,6 +769,13 @@ def _validate_retained_parameter_program(
                 line_number=assignment.line_number,
                 line_content=assignment.line_content,
             ) from exc
+
+    # ``ordered_names`` is the admitted evaluation order, and each tuple is
+    # the direct identifier order retained from that assignment's AST.
+    return {
+        name: tuple(dependencies.get(name, ()))
+        for name in ordered_names
+    }
 
 
 def _validate_retained_observable_program(
@@ -1018,7 +1038,8 @@ def collect_algebra_section_lines(dsl_text: str) -> List[Tuple[int, str]]:
     Return (line_number, raw_line) entries for algebra lines anywhere in the DSL text.
     """
     out: List[Tuple[int, str]] = []
-    for ln, raw in enumerate(dsl_text.splitlines(), start=1):
+    for ln, raw_with_eol in enumerate(dsl_text.splitlines(keepends=True), start=1):
+        raw = raw_with_eol.rstrip("\r\n")
         stripped = raw.strip()
         classification = classify_parameter_algebra_declaration(raw, line_number=ln)
         if stripped and not stripped.startswith("#") and (
@@ -1029,8 +1050,42 @@ def collect_algebra_section_lines(dsl_text: str) -> List[Tuple[int, str]]:
                 "unsupported_bare_assignment",
             }
         ):
-            out.append((ln, raw.rstrip("\n")))
+            out.append((ln, raw))
     return out
+
+
+def _scalar_source_coordinate(
+    line_number: int,
+    line_content: str,
+    *,
+    name: str,
+) -> "DslSourceCoordinate":
+    """Capture one admitted scalar RHS span from exact line content."""
+
+    code = strip_inline_comment(line_content)
+    equals_index = code.find("=")
+    if equals_index < 0:
+        raise DSLError(
+            "Malformed param declaration.",
+            line_number=line_number,
+            line_content=line_content,
+        )
+    rhs = code[equals_index + 1 :]
+    value_start = equals_index + 1 + (len(rhs) - len(rhs.lstrip()))
+    value_end = len(code.rstrip())
+    if value_end <= value_start:
+        raise DSLError(
+            "Param declaration requires a nonempty right-hand side.",
+            line_number=line_number,
+            line_content=line_content,
+        )
+    return DslSourceCoordinate(
+        canonical_name=str(name),
+        role="param",
+        physical_line_index=int(line_number) - 1,
+        value_start=value_start,
+        value_end=value_end,
+    )
 
 
 def extract_parameter_assignments_from_algebra_lines(
@@ -1043,7 +1098,7 @@ def extract_parameter_assignments_from_algebra_lines(
     mechanism_param_names = mechanism_namespace.flat_names()
 
     for line_no, raw in algebra_lines:
-        original = raw.rstrip("\n")
+        original = raw.rstrip("\r\n")
         stripped = original.strip()
         if not stripped or stripped.startswith("#"):
             continue
@@ -1068,6 +1123,16 @@ def extract_parameter_assignments_from_algebra_lines(
                     line_content=original,
                 )
             name = resolution.canonical_name or raw_name
+            source_info = mechanism_namespace.source_coordinate_info(str(name))
+            if source_info is not None and not source_coordinate_capabilities(
+                source_info.role
+            ).algebra_target:
+                raise DSLError(
+                    f"Source coordinate {raw_name!r} is symbolic-only and cannot be a Parameter Algebra target.",
+                    suggestion="Use an authored continuous coordinate for Parameter Algebra.",
+                    line_number=line_no,
+                    line_content=original,
+                )
             expr = _PARAM_STMT_RE.match(code).group(2).strip()  # type: ignore[union-attr]
             if name in SymbolTable().protected_names() or name in SymbolTable().functions().keys():
                 raise DSLError(
@@ -1099,6 +1164,15 @@ def extract_parameter_assignments_from_algebra_lines(
                     expr_src=expr,
                     line_number=line_no,
                     line_content=original,
+                    source_coordinate=(
+                        None
+                        if source_info is not None
+                        else _scalar_source_coordinate(
+                            line_no,
+                            original,
+                            name=name,
+                        )
+                    ),
                 )
             )
             continue
@@ -1227,13 +1301,13 @@ def parse_parameter_algebra_spec_from_dsl_text(
         },
     )
     if assignments:
-        block, alias_map = _compile_retained_parameter_block(
+        block = _compile_retained_parameter_block(
             assignments,
             mechanism_namespace=mechanism_namespace,
             scalar_input_names=set(scalar_input_names or ()),
             parsed=parameter_raw_block,
         )
-        _validate_retained_parameter_program(
+        parameter_dependencies = _validate_retained_parameter_program(
             initial_spec,
             assignments=assignments,
             block=block,
@@ -1249,8 +1323,8 @@ def parse_parameter_algebra_spec_from_dsl_text(
         # Keep an explicit empty parameter block so let-only Algebra still
         # carries one accepted, partitioned program through the pipeline.
         block = parameter_raw_block
-        alias_map = {}
         retained_assignments = []
+        parameter_dependencies = {}
 
     observable_block = AlgebraBlock(
         lines=tuple(full_block.lines[index] for index in observable_indices),
@@ -1267,5 +1341,5 @@ def parse_parameter_algebra_spec_from_dsl_text(
         param_statements=retained_assignments,
         parameter_block=block,
         observable_block=observable_block,
-        raw_to_canonical_identifiers_by_assignment=alias_map,
+        parameter_dependencies=parameter_dependencies,
     )

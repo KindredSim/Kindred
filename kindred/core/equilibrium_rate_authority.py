@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
+from fractions import Fraction
 import math
 from typing import Any, Callable, Iterable, Mapping
 
@@ -280,21 +281,40 @@ class EquilibriumRateSymbolicRelations:
     Keq: object
 
 
+def _exact_directional_order(
+    stoichiometry: Mapping[object, object],
+    *,
+    label: str,
+) -> Fraction:
+    """Return one admitted directional order without binary-float summation."""
+
+    if not isinstance(stoichiometry, Mapping):
+        raise ValueError(f"{label} must be a mapping.")
+    result = Fraction(0)
+    for raw_value in stoichiometry.values():
+        try:
+            result += Fraction(str(raw_value))
+        except (TypeError, ValueError, ZeroDivisionError, OverflowError) as exc:
+            raise ValueError(f"{label} must contain finite numeric values.") from exc
+    return result
+
+
 def equilibrium_rate_symbolic_relations(
     equilibrium: object,
     *,
     forward_relation: object,
     temperature: object,
-    standard_conc_M: float,
-    literal: Callable[[float], object],
+    literal: Callable[[object], object],
     exponential: Callable[[object], object],
     source_coordinate: Callable[[str], object] | None = None,
+    standard_concentration: object | None = None,
 ) -> EquilibriumRateSymbolicRelations:
     """Project accepted equilibrium authority without choosing a backend.
 
     Explicit ``kf + kr`` is standard-state inert.  Thermodynamic authority
-    consumes the accepted standard concentration only at the directional
-    exponent that owns the missing reverse coefficient.
+    projects its accepted free-energy relation from the normalized authority;
+    ``standard_concentration`` is the exact backend expression used for the
+    concentration-form normalization.
     """
 
     if not callable(literal):
@@ -339,31 +359,6 @@ def equilibrium_rate_symbolic_relations(
             Keq=forward_relation / reverse_relation,  # type: ignore[operator]
         )
 
-    try:
-        standard = validate_c0(
-            standard_conc_M,
-            field="equilibrium standard_conc_M",
-        )
-    except ValueError as exc:
-        raise ValueError(
-            "equilibrium standard_conc_M must be strictly positive and admitted"
-        ) from exc
-    forward_order = math.fsum(
-        float(value)
-        for value in dict(
-            getattr(equilibrium, "stoich_forward", {}) or {}
-        ).values()
-    )
-    reverse_order = math.fsum(
-        float(value)
-        for value in dict(
-            getattr(equilibrium, "stoich_back", {}) or {}
-        ).values()
-    )
-    delta_n = float(reverse_order - forward_order)
-    if not math.isfinite(delta_n):
-        raise ValueError("equilibrium standard-state exponent must be finite.")
-
     if authority.has_explicit_keq_param:
         keq_relation = (
             source_coordinate("Keq")
@@ -386,8 +381,34 @@ def equilibrium_rate_symbolic_relations(
             -(source_coordinate("dG_eq") if source_coordinate is not None else literal(delta_g))
             / (literal(float(R)) * temperature)  # type: ignore[operator]
         )
-        if delta_n != 0.0:
-            keq_relation *= literal(standard) ** literal(delta_n)  # type: ignore[operator]
+        forward_order = _exact_directional_order(
+            getattr(equilibrium, "stoich_forward", {}) or {},
+            label="equilibrium forward directional order",
+        )
+        reverse_order = _exact_directional_order(
+            getattr(equilibrium, "stoich_back", {}) or {},
+            label="equilibrium reverse directional order",
+        )
+        delta_n = reverse_order - forward_order
+        if delta_n:
+            if standard_concentration is None:
+                metadata = getattr(equilibrium, "metadata", {}) or {}
+                raw_standard = (
+                    metadata.get(EquilibriumMetadataKeys.STANDARD_CONC_M, 1.0)
+                    if isinstance(metadata, Mapping)
+                    else 1.0
+                )
+                try:
+                    standard = validate_c0(
+                        raw_standard,
+                        field="equilibrium standard_conc_M",
+                    )
+                except ValueError as exc:
+                    raise ValueError(
+                        "equilibrium standard concentration must be strictly positive and admitted"
+                    ) from exc
+                standard_concentration = literal(float(standard))
+            keq_relation *= standard_concentration ** literal(delta_n)  # type: ignore[operator]
     else:
         keq_relation = (
             source_coordinate("Keq")
@@ -587,58 +608,34 @@ def effective_equilibrium_keq(eq: object, *, temperature_K: float = 298.15) -> f
         except ValueError:
             return None
 
-    if isinstance(meta, Mapping):
-        if (
-            authority.kind == EquilibriumRateAuthorityKind.KEQ
-            and authority.dG_eq_J_per_mol is not None
-            and not authority.has_explicit_keq_param
-        ):
-            dg_value = _finite_float_or_none(authority.dG_eq_J_per_mol, temperature_K=temperature)
-            if dg_value is not None:
-                return float(
-                    concentration_Keq_from_deltaG_eq(
-                        dg_value, temperature, standard_conc, delta_n
-                    )
-                )
-        metadata_keq_source = meta.get(EquilibriumMetadataKeys.KEQ_INPUT)
-        if callable(metadata_keq_source):
-            metadata_keq = _finite_float_or_none(metadata_keq_source, temperature_K=temperature)
-            if metadata_keq is not None:
-                try:
-                    return admit_keq(metadata_keq, field="Keq_input")
-                except ValueError:
-                    return None
-        dg_value = _finite_float_or_none(meta.get(EquilibriumMetadataKeys.DG_EQ_J_PER_MOL), temperature_K=temperature)
+    if (
+        authority.kind == EquilibriumRateAuthorityKind.KEQ
+        and authority.dG_eq_J_per_mol is not None
+        and not authority.has_explicit_keq_param
+    ):
+        dg_value = _finite_float_or_none(
+            authority.dG_eq_J_per_mol,
+            temperature_K=temperature,
+        )
         if dg_value is not None:
             return float(
                 concentration_Keq_from_deltaG_eq(
-                    dg_value, temperature, standard_conc, delta_n
+                    dg_value,
+                    temperature,
+                    standard_conc,
+                    delta_n,
                 )
             )
-        metadata_keq = _finite_float_or_none(metadata_keq_source, temperature_K=temperature)
-        if metadata_keq is not None:
-            try:
-                return admit_keq(metadata_keq, field="Keq_input")
-            except ValueError:
-                return None
-    direct_keq = _finite_float_or_none(getattr(eq, "Keq", None), temperature_K=temperature)
-    if direct_keq is not None:
+
+    authoritative_keq = _finite_float_or_none(
+        authority.Keq,
+        temperature_K=temperature,
+    )
+    if authoritative_keq is not None:
         try:
-            return admit_keq(direct_keq, field="Keq")
+            return admit_keq(authoritative_keq, field="Keq")
         except ValueError:
             return None
-    kf = effective_equilibrium_forward_rate(eq, temperature_K=temperature)
-    kr = _finite_float_or_none(getattr(eq, "kr", None), temperature_K=temperature)
-    if kf is not None and kr is not None and kf > 0.0 and kr > 0.0:
-        try:
-            derived = float(kf) / float(kr)
-        except (OverflowError, ZeroDivisionError):
-            return None
-        if math.isfinite(derived) and derived > 0.0:
-            try:
-                return admit_keq(derived, field="derived Keq")
-            except ValueError:
-                return None
     return None
 
 def effective_equilibrium_reverse_rate(eq: object, *, temperature_K: float = 298.15) -> float | None:
@@ -723,8 +720,20 @@ def _validate_concrete_positive_coefficient(
     allow_zero: bool = False,
 ) -> None:
     """Reject invalid concrete coefficients while preserving symbolic authority."""
-    if value is None or callable(value):
+    if value is None:
         return
+    if callable(value):
+        # Mutable rate bindings are concrete admitted values despite their
+        # callable runtime interface.  Leave symbolic/deferred callables
+        # unresolved at this boundary.
+        try:
+            from kindred.core.rate_binding import RateBinding
+
+            if not isinstance(value, RateBinding):
+                return
+            value = value()
+        except (TypeError, ValueError, OverflowError):
+            return
     if type(value) is bool or isinstance(value, str):
         raise ValueError(f"{label} must be a positive finite real")
     try:
@@ -732,7 +741,7 @@ def _validate_concrete_positive_coefficient(
     except (TypeError, ValueError, OverflowError):
         return
     if label in {"kf", "kr"}:
-        admit_rate(number, field=label, allow_zero=(label == "kf" or allow_zero))
+        admit_rate(number, field=label, allow_zero=bool(allow_zero))
         return
     if label in {"Keq", "Keq_input"}:
         admit_keq(number, field=label)
@@ -753,19 +762,36 @@ def normalize_equilibrium_rate_authority(
     meta = metadata or {}
     metadata_keq = _metadata_keq_input(meta)
     metadata_dg = _metadata_dg_eq(meta)
-    _validate_concrete_positive_coefficient(kf, label="kf")
+    thermo_input = bool(
+        Keq is not None or metadata_keq is not None or metadata_dg is not None
+    )
+    user_kf, user_kr = _metadata_user_flags(meta)
+    # A zero forward coefficient is meaningful only when the authored reverse
+    # authority is thermodynamic (it disables both directions).  In
+    # particular, an explicit kf+kr pair remains strictly positive.
+    _validate_concrete_positive_coefficient(
+        kf,
+        label="kf",
+        # Normalized mechanisms retain their derived ``kr`` readout on the
+        # object, so authored reverse-role metadata—not the presence of that
+        # derived field—decides whether thermodynamic zero is admissible.
+        allow_zero=bool(thermo_input and not user_kr),
+    )
     _validate_concrete_positive_coefficient(
         kr,
         label="kr",
-        allow_zero=(
-            not bool(_metadata_user_flags(meta)[1])
-            and plain_finite_float_or_none(kf) == 0.0
-            and bool(Keq is not None or metadata_keq is not None or metadata_dg is not None)
+        # A normalized thermodynamic step retains its derived ``kr`` field.
+        # Permit that field to be zero only when the authored forward
+        # authority is the thermodynamic zero; an authored explicit pair still
+        # rejects zero in either direction.
+        allow_zero=bool(
+            thermo_input
+            and not user_kr
+            and _finite_float_or_none(kf) == 0.0
         ),
     )
     _validate_concrete_positive_coefficient(Keq, label="Keq")
     _validate_concrete_positive_coefficient(metadata_keq, label="Keq_input")
-    user_kf, user_kr = _metadata_user_flags(meta)
     thermo_count = int(Keq is not None or metadata_keq is not None) + int(metadata_dg is not None)
     has_thermo = thermo_count > 0
     has_kf = kf is not None

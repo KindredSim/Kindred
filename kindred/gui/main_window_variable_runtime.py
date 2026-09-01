@@ -16,10 +16,10 @@ from kindred.core.project_document import (
     canonical_species_names,
     reconcile_tab_mechanism_source,
 )
-from kindred.core.project_session import ProjectContentToken
 from kindred.core.simulation_preparation import (
     SimulationExecutionRequest,
     build_simulation_execution_request,
+    simulation_execution_requests_equal,
 )
 from kindred.core.species import validate_concentration
 from kindred.core.simulator.dsl_parse import (
@@ -93,7 +93,6 @@ class _PendingGesture:
 
 @dataclass(frozen=True, slots=True)
 class _GestureCapture:
-    content_token: ProjectContentToken
     tab: MechanismTabDocument
     projection: ParameterSliderProjection
     targets: tuple[str, ...]
@@ -322,7 +321,6 @@ class TabSliderBinding(QtCore.QObject):
             if prepared is None:
                 return
             self._gesture_capture = _GestureCapture(
-                self._registry.capture_content_token(),
                 prepared.tab,
                 prepared.projection,
                 prepared.targets,
@@ -478,7 +476,7 @@ class TabSliderBinding(QtCore.QObject):
         runtime = self._registry.tab_runtime(prepared.tab.tab_id)
         if runtime.slider_parameter_draft or runtime.slider_species_drafts_by_set_id:
             self._begin_preview_cycle(
-                (prepared.tab, prepared.projection),
+                prepared.tab,
                 prepared.targets,
                 interaction=SliderInteractionKind.EXACT_TYPED_COMMIT,
             )
@@ -608,7 +606,6 @@ class TabSliderBinding(QtCore.QObject):
         if (
             capture.tab.tab_id != self._tab_id
             or capture.targets != tuple(targets)
-            or self._registry.capture_content_token() != capture.content_token
             or self._registry.tab(self._tab_id) is not capture.tab
         ):
             return None
@@ -668,7 +665,7 @@ class TabSliderBinding(QtCore.QObject):
             # capture, even when the value was already staged by the drag.
         self._exact_preview_capture = None
         if not self._begin_preview_cycle(
-            (prepared.tab, prepared.projection), targets, interaction=_interaction
+            prepared.tab, targets, interaction=_interaction
         ):
             runtime.slider_parameter_draft.clear()
             runtime.slider_parameter_draft.update(before)
@@ -732,7 +729,7 @@ class TabSliderBinding(QtCore.QObject):
             # capture, even when the value was already staged by the drag.
         self._exact_preview_capture = None
         if not self._begin_preview_cycle(
-            (prepared.tab, prepared.projection), targets, interaction=_interaction
+            prepared.tab, targets, interaction=_interaction
         ):
             for set_id, snapshot in before.items():
                 if snapshot:
@@ -780,7 +777,6 @@ class TabSliderBinding(QtCore.QObject):
         targets: Iterable[str],
         *,
         tab: MechanismTabDocument | None = None,
-        content_token: ProjectContentToken | None = None,
     ) -> PreviewCapture | None:
         base = self._registry.tab(self._tab_id) if tab is None else tab
         roster = tuple(str(item) for item in targets)
@@ -801,9 +797,6 @@ class TabSliderBinding(QtCore.QObject):
             )
             capture = PreviewCapture(
                 base.tab_id,
-                self._registry.capture_content_token()
-                if content_token is None
-                else content_token,
                 tuple(
                     PreviewTarget(base.tab_id, set_id, set_name, request, canonical)
                     for (set_id, set_name, request), canonical in zip(
@@ -817,6 +810,42 @@ class TabSliderBinding(QtCore.QObject):
                 f"Preview construction failed before admission: {exc}"
             )
             return None
+
+    def _canonical_preview_requests_match(
+        self,
+        capture: PreviewCapture,
+        tab: MechanismTabDocument,
+        targets: tuple[str, ...],
+    ) -> bool:
+        """Require the settled Preview's canonical requests to remain current."""
+
+        try:
+            current_requests = tuple(
+                build_explicit_target(
+                    prepared_dsl=tab.prepared_dsl,
+                    tab_id=tab.tab_id,
+                    set_id=set_id,
+                    set_name=tab.initial_condition_set(set_id).name,
+                    mechanism_source=tab.mechanism_source,
+                    initial_values=canonical_initial_values(tab, set_id),
+                    execution_settings=tab.resolved_execution_settings(set_id),
+                    scientific_settings=tab.scientific_settings,
+                ).execution_request
+                for set_id in targets
+            )
+        except (TypeError, ValueError, KeyError):
+            return False
+        return all(
+            simulation_execution_requests_equal(
+                target.canonical_run_target.execution_request,
+                current_request,
+            )
+            for target, current_request in zip(
+                capture.targets,
+                current_requests,
+                strict=True,
+            )
+        )
 
     def capture_interactive_preview(
         self,
@@ -850,12 +879,11 @@ class TabSliderBinding(QtCore.QObject):
 
     def _begin_preview_cycle(
         self,
-        transaction: tuple[MechanismTabDocument, ParameterSliderProjection],
+        tab: MechanismTabDocument,
         targets: tuple[str, ...],
         *,
         interaction: SliderInteractionKind = SliderInteractionKind.EXACT_TYPED_COMMIT,
     ) -> bool:
-        tab, projection = transaction
         runtime = self._registry.tab_runtime(tab.tab_id)
         has_draft = bool(
             runtime.slider_parameter_draft
@@ -1025,14 +1053,17 @@ class TabSliderBinding(QtCore.QObject):
                 "Slider Apply requires the exact Preview to settle first."
             )
         capture = self._exact_preview_capture
-        expected_token = self._registry.capture_content_token()
         if (
             capture is None
-            or capture.content_token != expected_token
             or tuple(target.set_id for target in capture.targets) != targets
         ):
             return self._reject(
                 "Slider Apply requires one settled exact Preview for the current draft and target roster."
+            )
+        current_tab = self._registry.tab(self._tab_id)
+        if not self._canonical_preview_requests_match(capture, current_tab, targets):
+            return self._reject(
+                "Slider Apply requires one settled exact Preview for the current tab science and target roster."
             )
         pairs = self._simulation_jobs.capture_settled_preview(
             self._tab_id,
@@ -1045,10 +1076,10 @@ class TabSliderBinding(QtCore.QObject):
         if pairs is None:
             return self._reject(
                 "Slider Apply requires one settled exact Preview for the current draft and target roster."
-            )
+        )
         try:
             candidate = self._build_slider_candidate(
-                self._registry.tab(self._tab_id),
+                current_tab,
                 targets,
             )
         except (KeyError, LookupError, TypeError, ValueError) as exc:
@@ -1058,6 +1089,10 @@ class TabSliderBinding(QtCore.QObject):
         # lose the strict object identity checked above and could publish a
         # request other than the one that produced these results.
         canonical_pairs = tuple(pairs)
+        # Capture the session token only after the same-tab request, source,
+        # and target-roster guards have passed.  Edits confined to unrelated
+        # tabs therefore do not invalidate this tab's settled preview.
+        expected_token = self._registry.capture_content_token()
         if self._registry.replace_document(
             candidate,
             expected_token=expected_token,

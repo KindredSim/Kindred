@@ -27,7 +27,6 @@ class MechanismMetadataKeys:
 
 
 class EquilibriumMetadataKeys:
-    FAST_EQUILIBRIUM = "fast_equilibrium"
     USER_PROVIDED_KF = "user_provided_kf"
     USER_PROVIDED_KR = "user_provided_kr"
     DG_EQ_J_PER_MOL = "dG_eq_J_per_mol"
@@ -85,7 +84,6 @@ class MechanismMetadataView:
 
 @dataclass(frozen=True)
 class EquilibriumMetadataView:
-    fast_equilibrium: bool
     user_provided_kf: bool
     user_provided_kr: bool
     dG_eq_J_per_mol: Optional[float] = None
@@ -107,7 +105,6 @@ class EquilibriumMetadataView:
 
     def to_metadata(self) -> dict[str, object]:
         out: dict[str, object] = {
-            EquilibriumMetadataKeys.FAST_EQUILIBRIUM: bool(self.fast_equilibrium),
             EquilibriumMetadataKeys.USER_PROVIDED_KF: bool(self.user_provided_kf),
             EquilibriumMetadataKeys.USER_PROVIDED_KR: bool(self.user_provided_kr),
         }

@@ -39,8 +39,6 @@ from typing import Dict, List, Mapping, Optional, Tuple, TYPE_CHECKING
 import re
 
 from ..equilibrium_rate_authority import (
-    admit_explicit_directional_rate_pair,
-    derived_equilibrium_ratio_from_directional_rates,
     validate_equilibrium_rate_authority_flags,
 )
 from ..mechanism_source import (
@@ -65,18 +63,15 @@ from .errors import (
     invalid_keyvalue_pair_error,
 )
 from .parameter_algebra_spec import classify_parameter_algebra_declaration
-from .parameter_namespace import build_namespace_from_mechanism
-from .dsl_build_input import DslBuildStep
-from .dsl_parameter_scan import DslParameterAnalysis
-from .dsl_derivation import (
-    authored_step_origin,
-    coordinate_source_parts,
-    coordinate_token_matches,
-    origin_line_positions,
-    rewrite_coordinate_source_line,
-    rewrite_scalar_source_line,
-    scalar_origin,
+from .parameter_namespace import (
+    build_namespace_from_mechanism,
 )
+from .dsl_build_input import (
+    DslBuildStep,
+    DslSourceCoordinate,
+    canonical_source_coordinate_name,
+)
+from .dsl_parameter_scan import DslParameterAnalysis
 
 if TYPE_CHECKING:
     from ..intervention_schedule import InterventionSchedule
@@ -138,9 +133,6 @@ _SEMI_SPLIT_RE = re.compile(r"[;]")
 _REACTION_KNOWN_KEYS = frozenset(
     {"κ", "degeneracy", "kf", "k", "kr", "A", "Ea", "Keq", "dG_eq", "dG_act"}
 )
-_EQUILIBRIUM_KNOWN_KEYS = frozenset({"Keq", "kf", "kr", "dG_eq", "dg_eq"})
-
-
 # ------------------------------ data models ----------------------------------
 
 @dataclass
@@ -183,6 +175,9 @@ def _dsl_admission_payload(
 class DslSourceOrigin:
     authored_ordinal: int
     source_text: str
+    physical_line_index: int = 0
+    step_index: int | None = None
+    coordinates: tuple[DslSourceCoordinate, ...] = ()
 
     def __post_init__(self) -> None:
         if (
@@ -192,6 +187,30 @@ class DslSourceOrigin:
             raise ValueError("DSL origin ordinal must be a non-negative int.")
         if type(self.source_text) is not str:
             raise TypeError("DSL origin source text must be an exact string.")
+        if type(self.physical_line_index) is not int or self.physical_line_index < 0:
+            raise ValueError("DSL origin physical line index must be non-negative.")
+        if self.step_index is not None and (
+            type(self.step_index) is not int or self.step_index <= 0
+        ):
+            raise ValueError("DSL origin step index must be a positive int or None.")
+        if type(self.coordinates) is not tuple or any(
+            type(item) is not DslSourceCoordinate for item in self.coordinates
+        ):
+            raise TypeError(
+                "DSL origin coordinates must be an exact tuple of DslSourceCoordinate values."
+            )
+        seen_coordinate_identities: set[tuple[str, str]] = set()
+        for coordinate in self.coordinates:
+            identity = (coordinate.canonical_name, coordinate.role)
+            if identity in seen_coordinate_identities:
+                raise ValueError("DSL source coordinate identities must be unique.")
+            seen_coordinate_identities.add(identity)
+            if coordinate.physical_line_index != self.physical_line_index:
+                raise ValueError("DSL source coordinate line ownership is inconsistent.")
+            if coordinate.value_end > len(self.source_text):
+                raise ValueError("DSL source coordinate span exceeds exact source line text.")
+            if not self.source_text[coordinate.value_start:coordinate.value_end].strip():
+                raise ValueError("DSL source coordinate span must contain a value.")
 
 
 @dataclass(frozen=True, slots=True)
@@ -372,6 +391,15 @@ class DslAnalysis:
             range(len(self.origins))
         ):
             raise ValueError("DSL origin ordinals must be contiguous.")
+        seen_coordinates: set[tuple[str, str]] = set()
+        for origin in self.origins:
+            for coordinate in origin.coordinates:
+                identity = (coordinate.canonical_name, coordinate.role)
+                if identity in seen_coordinates:
+                    raise ValueError(
+                        "DSL source coordinate identities must be unique."
+                    )
+                seen_coordinates.add(identity)
         for attr, label in (
             ("species_names", "species"),
             ("observable_names", "observable"),
@@ -628,6 +656,8 @@ def _parse_keyvals(
     reject_duplicate_canonical_keys: bool = False,
     line_number: int | None = None,
     line_content: str | None = None,
+    coordinate_spans: list[tuple[str, int, int]] | None = None,
+    source_offset: int = 0,
 ) -> Dict[str, str]:
     """
     Parse comma or semicolon-separated key=value pairs with lenient spacing.
@@ -637,10 +667,20 @@ def _parse_keyvals(
     """
     out: Dict[str, str] = {}
     original_spellings: Dict[str, str] = {}
-    if not rest.strip():
+    # Inline comments are source bytes, not part of the admitted key/value
+    # grammar.  Keep offsets relative to the original line so exact Apply
+    # can retain the comment and everything after it byte-for-byte.
+    comment_index = rest.find("#")
+    code = rest if comment_index < 0 else rest[:comment_index]
+    if not code.strip():
         return out
     # Split on both commas and semicolons to support both formats
-    for chunk in _COMMA_SEMI_SPLIT_RE.split(rest):
+    cursor = 0
+    for chunk in _COMMA_SEMI_SPLIT_RE.split(code):
+        chunk_offset = cursor
+        cursor += len(chunk)
+        if cursor < len(code):
+            cursor += 1
         if not chunk.strip():
             continue
         if "=" not in chunk:
@@ -658,6 +698,18 @@ def _parse_keyvals(
             )
         original_spellings[canonical_key] = raw_key
         out[canonical_key] = v.strip()
+        if coordinate_spans is not None and out[canonical_key]:
+            value_start = (
+                source_offset
+                + chunk_offset
+                + chunk.find("=")
+                + 1
+                + (len(v) - len(v.lstrip()))
+            )
+            value_end = value_start + len(out[canonical_key])
+            coordinate_spans.append(
+                (canonical_key, value_start, value_end)
+            )
     return out
 
 
@@ -1249,6 +1301,81 @@ def _admit_temperature_directive(text: str) -> str | None:
     return directives[0][1] if directives else None
 
 
+def _line_content(raw_line: str) -> str:
+    """Remove only the physical line ending, retaining authored whitespace."""
+
+    if raw_line.endswith("\r\n"):
+        return raw_line[:-2]
+    if raw_line.endswith(("\r", "\n")):
+        return raw_line[:-1]
+    return raw_line
+
+
+def _source_coordinates_from_key_value_spans(
+    key_value_spans: tuple[tuple[str, int, int], ...],
+    *,
+    physical_line_index: int,
+    step_index: int,
+    step: DslBuildStep,
+    line_content: str,
+) -> tuple[DslSourceCoordinate, ...]:
+    """Project parser-captured value spans into canonical source identities."""
+
+    equilibrium = bool(
+        step.is_equilibrium or (step.reversible and step.kr is not None)
+    )
+    coordinates: list[DslSourceCoordinate] = []
+    seen_names: set[str] = set()
+    for role, value_start, value_end in key_value_spans:
+        if role in {"k", "kf"}:
+            if equilibrium:
+                canonical_role = "kf"
+            else:
+                canonical_role = "k"
+        elif role in {"kr", "Keq"}:
+            if not equilibrium:
+                continue
+            canonical_role = role
+        elif role in {"A", "Ea", "dG_act", "dG_eq"}:
+            if role == "dG_eq" and not equilibrium:
+                continue
+            canonical_role = role
+        elif role == "degeneracy":
+            if step.model != "Eyring":
+                continue
+            canonical_role = role
+        elif role == "κ":
+            # κ is a physical Eyring coordinate only when explicitly
+            # authored.  Its source span remains tied to the original key
+            # spelling; only the canonical authority name is normalized.
+            if step.model != "Eyring":
+                continue
+            canonical_role = "kappa"
+        else:
+            continue
+        canonical_name = canonical_source_coordinate_name(
+            step_index,
+            canonical_role,
+        )
+        if canonical_name in seen_names:
+            raise _DSLError(
+                f"Duplicate source coordinate {canonical_name!r}.",
+                line_number=physical_line_index + 1,
+                line_content=line_content,
+            )
+        seen_names.add(canonical_name)
+        coordinates.append(
+            DslSourceCoordinate(
+                canonical_name=canonical_name,
+                role=canonical_role,
+                physical_line_index=physical_line_index,
+                value_start=value_start,
+                value_end=value_end,
+            )
+        )
+    return tuple(coordinates)
+
+
 def _parse_dsl_ir(text: str, *, units: UnitsModel | None = None) -> "DSLIR":
     """
     Parse simulator DSL into a structured intermediate representation (IR).
@@ -1283,10 +1410,11 @@ def _parse_dsl_ir(text: str, *, units: UnitsModel | None = None) -> "DSLIR":
     )
     intervention_schedule = _admit_intervention_directives(text)
 
-    raw_lines = text.splitlines()
-    if not any(line.strip() and not line.strip().startswith("#") for line in raw_lines):
+    raw_lines = text.splitlines(keepends=True)
+    line_contents = [_line_content(raw_line) for raw_line in raw_lines]
+    if not any(line.strip() and not line.strip().startswith("#") for line in line_contents):
         raise _DSLError("DSL text is empty. Provide at least one reaction or directive.")
-    lines = [ln.rstrip() for ln in raw_lines]
+    lines = [line.rstrip() for line in line_contents]
 
     # Resolve source-wide settings before lowering any reaction.  A directive
     # may appear anywhere in the source, but each global setting has exactly
@@ -1406,21 +1534,29 @@ def _parse_dsl_ir(text: str, *, units: UnitsModel | None = None) -> "DSLIR":
         # reaction: line
         if lower.startswith("reaction:"):
             _, rest = line.split(":", 1)
-            steps.append(
-                _parse_reaction_step(
-                    rest,
-                    energy_unit=energy_unit,
-                    T=temperature_K,
-                    C0=standard_conc_M,
-                    line_number=line_no,
-                    line_content=raw,
-                )
+            leading_offset = len(line_contents[line_no - 1]) - len(
+                line_contents[line_no - 1].lstrip()
             )
+            parsed_step = _parse_reaction_step(
+                rest,
+                energy_unit=energy_unit,
+                T=temperature_K,
+                C0=standard_conc_M,
+                line_number=line_no,
+                line_content=raw,
+                physical_line_index=line_no - 1,
+                step_index=len(steps) + 1,
+                source_offset=leading_offset + len("reaction:"),
+            )
+            steps.append(parsed_step)
             continue
 
         # equilibrium: line
         if lower.startswith("equilibrium:"):
             _, rest = line.split(":", 1)
+            leading_offset = len(line_contents[line_no - 1]) - len(
+                line_contents[line_no - 1].lstrip()
+            )
             parsed_step = _parse_equilibrium_step(
                 rest,
                 energy_unit=energy_unit,
@@ -1428,22 +1564,30 @@ def _parse_dsl_ir(text: str, *, units: UnitsModel | None = None) -> "DSLIR":
                 C0=standard_conc_M,
                 line_number=line_no,
                 line_content=raw,
+                physical_line_index=line_no - 1,
+                step_index=len(steps) + 1,
+                source_offset=leading_offset + len("equilibrium:"),
             )
             steps.append(parsed_step)
             continue
 
         # Fallback: Try to parse as bare arrow syntax (no "reaction:" or "equilibrium:" prefix)
         if _ARROW_RE.search(line):
-            steps.append(
-                _parse_bare_arrow_step(
-                    line,
-                    energy_unit=energy_unit,
-                    T=temperature_K,
-                    C0=standard_conc_M,
-                    line_number=line_no,
-                    line_content=raw,
-                )
+            leading_offset = len(line_contents[line_no - 1]) - len(
+                line_contents[line_no - 1].lstrip()
             )
+            parsed_step = _parse_bare_arrow_step(
+                line,
+                energy_unit=energy_unit,
+                T=temperature_K,
+                C0=standard_conc_M,
+                line_number=line_no,
+                line_content=raw,
+                physical_line_index=line_no - 1,
+                step_index=len(steps) + 1,
+                source_offset=leading_offset,
+            )
+            steps.append(parsed_step)
             continue
 
         raise _DSLError(f"unrecognized line: {line!r}", line_number=line_no, line_content=raw)
@@ -1504,6 +1648,8 @@ def _split_stoich_and_params(
     reject_duplicate_canonical_keys: bool = False,
     line_number: int | None = None,
     line_content: str | None = None,
+    coordinate_spans: list[tuple[str, int, int]] | None = None,
+    source_offset: int = 0,
 ) -> Tuple[str, Dict[str, str]]:
     stoich_part, *tail = _SEMI_SPLIT_RE.split(text, maxsplit=1)
     params = (
@@ -1512,6 +1658,8 @@ def _split_stoich_and_params(
             reject_duplicate_canonical_keys=reject_duplicate_canonical_keys,
             line_number=line_number,
             line_content=line_content,
+            coordinate_spans=coordinate_spans,
+            source_offset=source_offset + len(stoich_part) + 1,
         )
         if tail
         else {}
@@ -1568,6 +1716,7 @@ def _parse_reaction_like_step(
     missing_eyring_message: str,
     line_number: int | None,
     line_content: str | None,
+    step_label: str = "reaction",
 ) -> DslBuildStep:
     from ..kinetics import arrhenius_rate, eyring_rate
     from .common import molecularity
@@ -1583,7 +1732,7 @@ def _parse_reaction_like_step(
     reversible = arrow in ("<->", "<=>")
 
     _reject_per_step_globals(params, line_number=line_number, line_content=line_content)
-    _reject_unknown_params(params, _REACTION_KNOWN_KEYS, "reaction",
+    _reject_unknown_params(params, _REACTION_KNOWN_KEYS, step_label,
                            line_number=line_number, line_content=line_content)
 
     model = _forward_rate_family_from_params(
@@ -1794,7 +1943,7 @@ def _parse_reaction_like_step(
         user_kf_explicit=any(
             key in params for key in ("kf", "k", "A", "Ea", "dG_act")
         ),
-        user_kr_explicit=bool(params.get("kr")),
+        user_kr_explicit=("kr" in params),
         degeneracy=degeneracy,
     )
 
@@ -1807,14 +1956,20 @@ def _parse_reaction_step(
     C0: float,
     line_number: int,
     line_content: str,
+    physical_line_index: int = 0,
+    step_index: int = 1,
+    source_offset: int = 0,
 ) -> DslBuildStep:
+    coordinate_spans: list[tuple[str, int, int]] = []
     stoich_part, params = _split_stoich_and_params(
         rest,
         reject_duplicate_canonical_keys=True,
         line_number=line_number,
         line_content=line_content,
+        coordinate_spans=coordinate_spans,
+        source_offset=source_offset,
     )
-    return _parse_reaction_like_step(
+    parsed_step = _parse_reaction_like_step(
         stoich_part=stoich_part,
         params=params,
         energy_unit=energy_unit,
@@ -1823,6 +1978,16 @@ def _parse_reaction_step(
         missing_eyring_message="Eyring step requires dG_act or explicit k",
         line_number=line_number,
         line_content=line_content,
+    )
+    return replace(
+        parsed_step,
+        source_coordinates=_source_coordinates_from_key_value_spans(
+            tuple(coordinate_spans),
+            physical_line_index=physical_line_index,
+            step_index=step_index,
+            step=parsed_step,
+            line_content=line_content,
+        ),
     )
 
 
@@ -1834,14 +1999,20 @@ def _parse_bare_arrow_step(
     C0: float,
     line_number: int,
     line_content: str,
+    physical_line_index: int = 0,
+    step_index: int = 1,
+    source_offset: int = 0,
 ) -> DslBuildStep:
+    coordinate_spans: list[tuple[str, int, int]] = []
     stoich_part, params = _split_stoich_and_params(
         line,
         reject_duplicate_canonical_keys=True,
         line_number=line_number,
         line_content=line_content,
+        coordinate_spans=coordinate_spans,
+        source_offset=source_offset,
     )
-    return _parse_reaction_like_step(
+    parsed_step = _parse_reaction_like_step(
         stoich_part=stoich_part,
         params=params,
         energy_unit=energy_unit,
@@ -1850,6 +2021,16 @@ def _parse_bare_arrow_step(
         missing_eyring_message="Bare arrow syntax requires k (or kf), or dG_act for Eyring",
         line_number=line_number,
         line_content=line_content,
+    )
+    return replace(
+        parsed_step,
+        source_coordinates=_source_coordinates_from_key_value_spans(
+            tuple(coordinate_spans),
+            physical_line_index=physical_line_index,
+            step_index=step_index,
+            step=parsed_step,
+            line_content=line_content,
+        ),
     )
 
 
@@ -1861,18 +2042,21 @@ def _parse_equilibrium_step(
     C0: float,
     line_number: int,
     line_content: str,
+    physical_line_index: int = 0,
+    step_index: int = 1,
+    source_offset: int = 0,
 ) -> DslBuildStep:
-    from .common import molecularity
-    from .kinetics import normalize_energy_to_J_per_mol
-
+    coordinate_spans: list[tuple[str, int, int]] = []
     stoich_part, params = _split_stoich_and_params(
         rest,
         reject_duplicate_canonical_keys=True,
         line_number=line_number,
         line_content=line_content,
+        coordinate_spans=coordinate_spans,
+        source_offset=source_offset,
     )
     try:
-        react, prod, arrow = _parse_stoich(stoich_part)
+        _, _, arrow = _parse_stoich(stoich_part)
     except _DSLError as exc:
         if exc.line_number is None:
             raise _DSLError(str(exc.message), suggestion=exc.suggestion, examples=exc.examples,
@@ -1884,141 +2068,70 @@ def _parse_equilibrium_step(
             examples=["equilibrium: A <-> B ; Keq=2.0 ; kf=10"],
             line_number=line_number, line_content=line_content,
         )
-    _ = molecularity(react)
-
-    _reject_per_step_globals(params, line_number=line_number, line_content=line_content)
-    _reject_unknown_params(params, _EQUILIBRIUM_KNOWN_KEYS, "equilibrium",
-                           line_number=line_number, line_content=line_content)
-
-    has_explicit_Keq = "Keq" in params
-    has_explicit_dG_eq = "dG_eq" in params
-    Keq = _float_or_none(params.get("Keq"))
-    if has_explicit_Keq and Keq is None:
-        raise _DSLError(
-            "Keq must be numeric",
-            line_number=line_number,
-            line_content=line_content,
-        )
-    if has_explicit_Keq and Keq is not None:
-        _validate_rate_or_K(Keq, "Keq", line_number=line_number, line_content=line_content)
-    dG_eqJ = None
-
-    kf_explicit = None
-    kr_explicit = None
-    if "kf" in params:
-        kfv = _float_or_none(params["kf"])
-        if kfv is None:
-            raise _DSLError("kf must be numeric", line_number=line_number, line_content=line_content)
-        _validate_rate_or_K(kfv, "kf", line_number=line_number, line_content=line_content)
-        kf_explicit = kfv
-    if "kr" in params:
-        krv = _float_or_none(params["kr"])
-        if krv is None:
-            raise _DSLError("kr must be numeric", line_number=line_number, line_content=line_content)
-        _validate_rate_or_K(krv, "kr", line_number=line_number, line_content=line_content)
-        kr_explicit = krv
-
-    _validate_equilibrium_rate_authority_for_dsl(
-        has_kf=kf_explicit is not None,
-        has_kr=kr_explicit is not None,
-        has_Keq=has_explicit_Keq,
-        has_dG_eq=has_explicit_dG_eq,
+    parsed_step = _parse_reaction_like_step(
+        stoich_part=stoich_part,
+        params=params,
+        energy_unit=energy_unit,
+        T=T,
+        C0=C0,
+        missing_eyring_message="Equilibrium requires kf or a complete forward rate family",
+        step_label="equilibrium",
         line_number=line_number,
         line_content=line_content,
     )
-
-    explicit_directional_pair = (
-        not has_explicit_Keq
-        and not has_explicit_dG_eq
-        and kf_explicit is not None
-        and kr_explicit is not None
-    )
-    if explicit_directional_pair:
-        try:
-            kf_explicit, kr_explicit = admit_explicit_directional_rate_pair(
-                kf_explicit,
-                kr_explicit,
-            )
-            _ = derived_equilibrium_ratio_from_directional_rates(
-                kf_explicit,
-                kr_explicit,
-            )
-        except ValueError as exc:
-            raise _DSLError(
-                str(exc),
-                line_number=line_number,
-                line_content=line_content,
-            ) from exc
-
-    if Keq is None and has_explicit_dG_eq:
-        dG_eq = (
-            params["dG_eq"]
-            if "dG_eq" in params
-            else params.get("dg_eq")
-        )
-        dG_eq_val = _float_or_none(dG_eq)
-        if dG_eq_val is None:
-            raise _DSLError("dG_eq must be numeric", line_number=line_number, line_content=line_content)
-        dG_eqJ = normalize_energy_to_J_per_mol(dG_eq_val, energy_unit)
-        try:
-            dG_eqJ = admit_energy_j_per_mol(dG_eqJ, field="dG_eq")
-        except ValueError as exc:
-            raise _DSLError(str(exc), line_number=line_number, line_content=line_content) from exc
-    if explicit_directional_pair:
-        if kf_explicit is None or kr_explicit is None:
-            raise AssertionError("explicit directional admission lost its pair")
-        kf = kf_explicit
-        kr = kr_explicit
-        derived_Keq = None
-    else:
-        fe = _derive_equilibrium_rates_with_context(
-            Keq=Keq,
-            dG_eq_J_per_mol=dG_eqJ,
-            T=T,
-            standard_conc_M=C0,
-            delta_n=math.fsum(prod.values()) - math.fsum(react.values()),
-            explicit_rates=(kf_explicit,),
-            line_number=line_number,
+    parsed_step = replace(parsed_step, is_equilibrium=True)
+    return replace(
+        parsed_step,
+        source_coordinates=_source_coordinates_from_key_value_spans(
+            tuple(coordinate_spans),
+            physical_line_index=physical_line_index,
+            step_index=step_index,
+            step=parsed_step,
             line_content=line_content,
-        )
-        kf = fe.kf if kf_explicit is None else kf_explicit
-        kr = fe.kr if kr_explicit is None else kr_explicit
-        derived_Keq = float(fe.Keq)
-
-    return DslBuildStep(
-        reactants=tuple(
-            (str(name), float(value)) for name, value in react.items()
         ),
-        products=tuple(
-            (str(name), float(value)) for name, value in prod.items()
-        ),
-        reversible=True,
-        kf=float(kf),
-        kr=float(kr) if kr is not None else None,
-        model="Eyring",
-        is_equilibrium=True,
-        eyring_dG_act_J_per_mol=None,
-        kappa=1.0,
-        standard_conc_M=C0,
-        dG_eq_J_per_mol=dG_eqJ,
-        Keq=derived_Keq,
-        Keq_input=(Keq if has_explicit_Keq else None),
-        user_kf_explicit=("kf" in params),
-        user_kr_explicit=("kr" in params),
-        degeneracy=1,
     )
 
 
-def _source_origins(text: str) -> tuple[DslSourceOrigin, ...]:
+def _source_origins(
+    text: str,
+    *,
+    steps: tuple[DslBuildStep, ...] | list[DslBuildStep] = (),
+    parameter_algebra_spec: object | None = None,
+) -> tuple[DslSourceOrigin, ...]:
+    """Retain exact admitted line origins and their typed value spans."""
+
+    coordinates_by_line: dict[int, list[DslSourceCoordinate]] = {}
+    step_by_line: dict[int, int] = {}
+    for step_index, step in enumerate(steps, start=1):
+        for coordinate in step.source_coordinates:
+            coordinates_by_line.setdefault(
+                coordinate.physical_line_index,
+                [],
+            ).append(coordinate)
+            step_by_line[coordinate.physical_line_index] = step_index
+    if parameter_algebra_spec is not None:
+        for statement in getattr(parameter_algebra_spec, "param_statements", ()):
+            coordinate = getattr(statement, "source_coordinate", None)
+            if isinstance(coordinate, DslSourceCoordinate):
+                coordinates_by_line.setdefault(
+                    coordinate.physical_line_index,
+                    [],
+                ).append(coordinate)
     origins: list[DslSourceOrigin] = []
-    for raw_line in text.splitlines():
-        stripped = raw_line.strip()
+    for physical_line_index, raw_line in enumerate(text.splitlines(keepends=True)):
+        source_line = _line_content(raw_line)
+        stripped = source_line.strip()
         if not stripped or stripped.startswith("#"):
             continue
         origins.append(
             DslSourceOrigin(
                 authored_ordinal=len(origins),
-                source_text=raw_line,
+                source_text=source_line,
+                physical_line_index=physical_line_index,
+                step_index=step_by_line.get(physical_line_index),
+                coordinates=tuple(
+                    coordinates_by_line.get(physical_line_index, ())
+                ),
             )
         )
     return tuple(origins)
@@ -2090,16 +2203,6 @@ def prepare_dsl_request_set(
         text,
         mechanism_namespace=mechanism_namespace,
     )
-    source_coordinate_names = mechanism_namespace.source_coordinate_names
-    algebra_coordinate_collisions = source_coordinate_names.intersection(
-        parameter_algebra_spec.param_assignment_names()
-    )
-    if algebra_coordinate_collisions:
-        names = ", ".join(sorted(algebra_coordinate_collisions))
-        raise _DSLError(
-            "Algebra declarations cannot shadow admitted reaction-local "
-            f"source coordinates: {names}."
-        )
     # The retained spec is the sole admitted Algebra program.  Compile the
     # observable partition from its retained ASTs; passing raw source here (or
     # in the builder) would reparse the same Algebra text and violate the
@@ -2130,7 +2233,11 @@ def prepare_dsl_request_set(
     )
     analysis = DslAnalysis(
         normalized_text=normalized_text,
-        origins=_source_origins(text),
+        origins=_source_origins(
+            text,
+            steps=ir.steps,
+            parameter_algebra_spec=parameter_algebra_spec,
+        ),
         species_names=species_names,
         observable_names=tuple(
             sorted(
@@ -2156,57 +2263,23 @@ def prepare_dsl_request_set(
     )
 
 
-def _lookup_physical_source_coordinate(
-    mechanism: object,
+def _analysis_source_coordinates(
     analysis: DslAnalysis,
-    name: str,
-) -> tuple[str, int, str, Mapping[str, object], str] | None:
-    """Resolve one unique authored kinetic/thermodynamic source coordinate."""
+) -> tuple[tuple[DslSourceCoordinate, DslSourceOrigin], ...]:
+    """Return each admitted coordinate with its retained line owner."""
 
-    from kindred.core.simulator.step_indexing import get_step_index_map
-
-    candidates: list[tuple[str, int, str, Mapping[str, object], str]] = []
-    for entry in get_step_index_map(mechanism):
-        kind = str(entry.get("kind") or "")
-        try:
-            step_index = int(entry.get("step_index"))
-        except (TypeError, ValueError):
-            continue
-        source_coordinates = {
-            str(role): str(canonical_name)
-            for role, canonical_name in dict(
-                entry.get("source_coordinates") or {}
-            ).items()
-        }
-        matching_roles = [
-            role for role, canonical_name in source_coordinates.items()
-            if canonical_name == str(name)
-        ]
-        if len(matching_roles) != 1:
-            continue
-        origin = authored_step_origin(analysis, step_index=step_index)
-        tokens = coordinate_source_parts(origin.source_text)[1]
-        role = matching_roles[0]
-        matches = [
-            str(token[0])
-            for token in tokens
-            if coordinate_token_matches(token[0], role)
-        ]
-        if len(matches) != 1:
-            raise ValueError(
-                f"Physical source coordinate {name!r} has no unique authored token."
-            )
-        index_key = "reaction_index" if kind == "reaction" else "equilibrium_index"
-        try:
-            index = int(entry.get(index_key))
-        except (TypeError, ValueError):
-            continue
-        candidates.append((kind, index, role, entry, matches[0]))
-    if len(candidates) > 1:
-        raise ValueError(
-            f"Physical source coordinate {name!r} is ambiguous across admitted steps."
-        )
-    return candidates[0] if candidates else None
+    pairs = tuple(
+        (coordinate, origin)
+        for origin in analysis.origins
+        for coordinate in origin.coordinates
+    )
+    identities = [
+        (coordinate.canonical_name, coordinate.role)
+        for coordinate, _origin in pairs
+    ]
+    if len(identities) != len(set(identities)):
+        raise ValueError("Retained DSL source coordinates are ambiguous.")
+    return pairs
 
 
 def derive_source_with_parameter_updates(
@@ -2215,24 +2288,6 @@ def derive_source_with_parameter_updates(
     updates: tuple[DslParameterCoordinateUpdate, ...],
 ) -> str:
     """Authenticate typed coordinates and rewrite the visible source bytes."""
-
-    from kindred.core.equilibrium_rate_authority import (
-        EquilibriumRateAuthorityKind,
-        normalize_existing_equilibrium_rate_authority,
-    )
-    from kindred.core.kinetics import (
-        ArrheniusRateModel,
-        EyringRateModel,
-        forward_rate_model_for_equilibrium,
-        forward_rate_model_for_reaction,
-        write_reference_rate,
-    )
-    from kindred.core.mechanism_metadata import (
-        MechanismMetadataView,
-    )
-    from kindred.core.simulator.step_indexing import (
-        lookup_step_param_target,
-    )
 
     if base.analysis.inline_initial_conditions.has_declarations:
         raise ValueError(
@@ -2250,251 +2305,128 @@ def derive_source_with_parameter_updates(
     if len(names) != len(set(names)):
         raise ValueError("DSL parameter update names must be unique.")
 
-    mechanism = base.accepted_mechanism_for_structure()
     spec = base.parameter_algebra_spec_for_execution()
-    metadata = getattr(mechanism, "metadata", None)
-    if not isinstance(metadata, Mapping):
-        raise TypeError("Prepared DSL mechanism metadata must be a mapping.")
-    metadata_view = MechanismMetadataView.from_metadata(metadata)
-    temperature = float(base.analysis.temperature_K)
-    if temperature != metadata_view.temperature_K:
-        raise ValueError(
-            "Prepared DSL nominal temperature metadata is inconsistent."
-        )
-
-    parameter_by_name = {
-        str(item.name): item
-        for item in base.analysis.parameters
-    }
-    constrained = {
-        str(statement.name)
-        for statement in spec.param_statements
-        if lookup_step_param_target(mechanism, str(statement.name)) is not None
-    }
-    algebra_owned_names = {str(statement.name) for statement in spec.param_statements}
-    authored_source = source_text
-    raw_lines = authored_source.splitlines(keepends=True)
-    line_contents = [line.rstrip("\r\n") for line in raw_lines]
+    mechanism = base.accepted_mechanism_for_structure()
+    from .step_indexing import lookup_source_coordinate_target
+    from ..equilibrium_rate_authority import step_entry_authored_role_is_editable
+    raw_lines = source_text.splitlines(keepends=True)
+    source_lines = [_line_content(line) for line in raw_lines]
     line_endings = [
         line[len(content):]
-        for line, content in zip(raw_lines, line_contents)
+        for line, content in zip(raw_lines, source_lines)
     ]
-    if not raw_lines and authored_source:
-        line_contents = [authored_source]
+    if not raw_lines and source_text:
+        source_lines = [source_text]
         line_endings = [""]
-    source_lines = line_contents
-    origin_positions = origin_line_positions(base.analysis, authored_source)
-    updated_origin_lines: dict[int, str] = {}
-    for update in updates:
-        target = lookup_step_param_target(mechanism, update.name)
-        physical_target = (
-            None
-            if target is not None
-            else _lookup_physical_source_coordinate(
-                mechanism,
-                base.analysis,
-                str(update.name),
+
+    # Coordinates retain their physical line index and exact half-open span.
+    # Apply accepts only that retained location, and only when the current line
+    # still matches admission byte-for-byte (apart from its line ending).
+    for origin in base.analysis.origins:
+        index = int(origin.physical_line_index)
+        if index >= len(source_lines) or source_lines[index] != origin.source_text:
+            raise ValueError(
+                "Typed parameter derivation source line no longer matches admission."
             )
+    coordinate_pairs = _analysis_source_coordinates(base.analysis)
+    source_coordinates = {
+        coordinate.canonical_name: (coordinate, origin)
+        for coordinate, origin in coordinate_pairs
+    }
+    if len(source_coordinates) != len(coordinate_pairs):
+        raise ValueError("Retained DSL source coordinates are ambiguous.")
+    replacements: dict[int, list[tuple[int, int, str]]] = {}
+
+    def retain_replacement(
+        coordinate: DslSourceCoordinate,
+        replacement: str,
+    ) -> None:
+        replacements.setdefault(int(coordinate.physical_line_index), []).append(
+            (coordinate.value_start, coordinate.value_end, replacement)
         )
-        definition = parameter_by_name.get(update.name)
-        scalar_statement_known = any(
-            statement.name == update.name
-            for statement in spec.param_statements
-        )
-        if target is None and physical_target is None and not scalar_statement_known:
+
+    for update in updates:
+        coordinate_entry = source_coordinates.get(update.name)
+        if coordinate_entry is None:
             raise LookupError(
                 f"Parameter {update.name!r} is absent from retained DSL."
             )
-        if physical_target is not None:
-            if update.name in algebra_owned_names:
-                raise ValueError(
-                    f"Parameter {update.name!r} is Algebra-owned and not writable."
-                )
-            _kind, _index, _source_token_role, entry, source_token = physical_target
-            if bool(entry.get("locked", False)):
-                raise ValueError(
-                    f"Parameter {update.name!r} is locked and not writable."
-                )
-            if (
-                _kind == "reaction"
-                and f"k{int(entry['step_index'])}" in algebra_owned_names
-            ):
-                raise ValueError(
-                    f"Parameter {update.name!r} is owned by its admitted Algebra rate."
-                )
-            origin = authored_step_origin(
-                base.analysis,
-                step_index=int(entry["step_index"]),
-            )
-            old_line = updated_origin_lines.get(
-                origin.authored_ordinal,
-                source_lines[origin_positions[origin.authored_ordinal]],
-            )
-            updated_origin_lines[origin.authored_ordinal] = rewrite_coordinate_source_line(
-                old_line,
-                token=source_token,
-                value=float(update.value),
-            )
-            continue
-        if (
-            target is not None
-            and (
-                definition is None
-                or not bool(definition.editable)
-            )
-        ) or update.name in constrained:
+        coordinate, _origin = coordinate_entry
+        try:
+            assignment_kind = spec.parameter_assignment_kind(update.name)
+        except KeyError:
+            assignment_kind = None
+        # Classify from the admitted Algebra dependency map before inspecting
+        # the coordinate role.  Algebra-owned assignments are never rewritten
+        # as if their source spelling were an independent mechanism value.
+        if assignment_kind in {"derived scalar", "mechanism-bound"}:
             raise ValueError(
-                f"Parameter {update.name!r} is not writable."
+                f"Scalar parameter {update.name!r} is not writable."
             )
-        if target is None:
-            scalar_info = dict(
-                dict(metadata.get("scalar_param_info") or {}).get(
-                    update.name
-                )
-                or {}
-            )
-            if (
-                scalar_info.get("derived") is True
-                or scalar_info.get("editable") is False
-            ):
+        if assignment_kind == "independent scalar":
+            if coordinate.role != "param":
                 raise ValueError(
                     f"Scalar parameter {update.name!r} is not writable."
                 )
-            origin = scalar_origin(
-                base.analysis,
-                name=update.name,
-            )
-            old_line = updated_origin_lines.get(
-                origin.authored_ordinal,
-                source_lines[origin_positions[origin.authored_ordinal]],
-            )
-            new_line = rewrite_scalar_source_line(
-                old_line,
-                name=update.name,
-                expression=repr(float(update.value)),
-            )
-            updated_origin_lines[origin.authored_ordinal] = new_line
-            continue
-
-        kind, index, role, entry = target
-        origin = authored_step_origin(
-            base.analysis,
-            step_index=int(entry["step_index"]),
-        )
-        old_line = updated_origin_lines.get(
-            origin.authored_ordinal,
-            source_lines[origin_positions[origin.authored_ordinal]],
-        )
-        _prefix, tokens, _comment = coordinate_source_parts(old_line)
-        source_token = role
-        source_value = update.value
-
-        if kind == "reaction":
-            reaction = mechanism.reactions[index]
-            model = forward_rate_model_for_reaction(
-                reaction,
-                default_standard_conc_M=metadata_view.standard_conc_M,
-            )
-            rewritten = write_reference_rate(
-                model,
-                reference_rate=update.value,
-                reference_temperature_K=temperature,
-            )
-            if isinstance(rewritten, ArrheniusRateModel):
-                source_token = "Ea"
-                source_value = UnitsModel(
-                    energy_unit=metadata_view.energy_unit,
-                ).from_jmol(rewritten.Ea_J_per_mol)
-            elif isinstance(rewritten, EyringRateModel):
-                source_token = "dG_act"
-                source_value = UnitsModel(
-                    energy_unit=metadata_view.energy_unit,
-                ).from_jmol(rewritten.dG_act_J_per_mol)
-            else:
-                authored_forward_tokens = [
-                    pair[0]
-                    for pair in tokens
-                    if str(pair[0]).strip().casefold() in {"k", "kf"}
-                ]
-                if len(authored_forward_tokens) != 1:
-                    raise ValueError(
-                        f"Parameter {update.name!r} has no unique admitted "
-                        "irreversible forward-rate token."
-                    )
-                source_token = authored_forward_tokens[0]
-        elif kind == "equilibrium":
-            equilibrium = mechanism.equilibria[index]
-            authority = normalize_existing_equilibrium_rate_authority(
-                equilibrium
-            )
-            if role == "kf":
-                model = forward_rate_model_for_equilibrium(
-                    equilibrium,
-                    temperature_K=temperature,
-                    default_standard_conc_M=metadata_view.standard_conc_M,
-                )
-                rewritten = write_reference_rate(
-                    model,
-                    reference_rate=update.value,
-                    reference_temperature_K=temperature,
-                )
-                source_energy_unit = metadata_view.energy_unit
-                if isinstance(rewritten, ArrheniusRateModel):
-                    source_token = "Ea"
-                    source_value = UnitsModel(
-                        energy_unit=source_energy_unit,
-                    ).from_jmol(rewritten.Ea_J_per_mol)
-                elif isinstance(rewritten, EyringRateModel):
-                    source_token = "dG_act"
-                    source_value = UnitsModel(
-                        energy_unit=source_energy_unit,
-                    ).from_jmol(rewritten.dG_act_J_per_mol)
-                else:
-                    authored_forward_tokens = [
-                        pair[0]
-                        for pair in tokens
-                        if str(pair[0]).strip().casefold() in {"k", "kf"}
-                    ]
-                    if len(authored_forward_tokens) != 1:
-                        raise ValueError(
-                            f"Parameter {update.name!r} has no unique admitted "
-                            "reversible forward-rate token."
-                        )
-                    source_token = authored_forward_tokens[0]
-            elif role == "kr":
-                if authority.kind != EquilibriumRateAuthorityKind.KR:
-                    raise ValueError(
-                        f"Parameter {update.name!r} is derived, not writable."
-                    )
-                source_token = "kr"
-            elif role == "Keq":
-                if not authority.has_explicit_keq_param:
-                    raise ValueError(
-                        f"Parameter {update.name!r} is derived, not writable."
-                    )
-                if update.value <= 0.0:
-                    raise ValueError(
-                        f"Parameter {update.name!r} must be positive."
-                    )
-                source_token = "Keq"
-            else:
+            if not coordinate.capabilities.continuous:
                 raise ValueError(
-                    f"Unsupported equilibrium coordinate role {role!r}."
+                    f"Parameter {update.name!r} is not a continuous writable coordinate."
                 )
-        else:
-            raise ValueError(
-                f"Unsupported mechanism coordinate kind {kind!r}."
+            retain_replacement(coordinate, repr(float(update.value)))
+            continue
+        if coordinate.role == "param":
+            raise LookupError(
+                f"Parameter {update.name!r} is absent from admitted Algebra assignments."
             )
+        if not coordinate.capabilities.continuous:
+            raise ValueError(
+                f"Parameter {update.name!r} is not a continuous writable coordinate."
+            )
+        source_target = lookup_source_coordinate_target(mechanism, update.name)
+        if source_target is None:
+            raise ValueError(
+                f"Parameter {update.name!r} has no admitted source owner."
+            )
+        kind, index, role, entry = source_target
+        if str(role) != coordinate.role:
+            raise ValueError(
+                f"Parameter {update.name!r} has inconsistent admitted source role."
+            )
+        if bool(entry.get("locked", False)):
+            raise ValueError(f"Parameter {update.name!r} is locked and not writable.")
+        if (
+            str(kind) == "equilibrium"
+            and coordinate.capabilities.equilibrium_authority
+            and not step_entry_authored_role_is_editable(entry, str(role))
+        ):
+            raise ValueError(f"Parameter {update.name!r} is a derived readout, not writable.")
+        # Physical and authored indexed source coordinates are already in the
+        # exact units and representation expected by their retained span.
+        retain_replacement(coordinate, repr(float(update.value)))
 
-        new_line = rewrite_coordinate_source_line(
-            old_line,
-            token=source_token,
-            value=float(source_value),
+    for line_index, line_replacements in replacements.items():
+        seen_spans: set[tuple[int, int]] = set()
+        ordered_replacements = sorted(
+            line_replacements,
+            key=lambda item: item[0],
+            reverse=True,
         )
-        updated_origin_lines[origin.authored_ordinal] = new_line
-
-    for ordinal, line in updated_origin_lines.items():
-        source_lines[origin_positions[ordinal]] = line
+        previous_start = len(source_lines[line_index]) + 1
+        for start, end, _replacement in ordered_replacements:
+            if (start, end) in seen_spans:
+                raise ValueError("Duplicate DSL source replacement span.")
+            if not 0 <= start < end <= len(source_lines[line_index]):
+                raise ValueError("DSL source replacement span is out of bounds.")
+            if end > previous_start:
+                raise ValueError("Overlapping DSL source replacement spans.")
+            seen_spans.add((start, end))
+            previous_start = start
+        for start, end, replacement in ordered_replacements:
+            source_lines[line_index] = (
+                source_lines[line_index][:start]
+                + replacement
+                + source_lines[line_index][end:]
+            )
     updated_text = "".join(
         content + ending
         for content, ending in zip(source_lines, line_endings)

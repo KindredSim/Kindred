@@ -764,8 +764,7 @@ def _selected_x_unavailable_diagnostic(
     )
     return (
         f"Selected X {selected_identity} is unavailable for result layer(s) {labels}. "
-        "The semantic result layer(s) are retained, but plot, Copy, and XLSX rows "
-        "cannot be produced without X values."
+        "Those layer(s) are omitted from plot and full-resolution export composition."
     )
 
 
@@ -1325,13 +1324,13 @@ def compose_result_input(
                     if visible.set_id == current_id:
                         blocks.append(replace(reference_semantic, visible=False))
                 add_warning(reference_semantic.label, reference, True)
+                annotations.extend(_annotations_from_execution(reference))
             else:
                 # Retain the semantic Reference block even when its ordinary
                 # line is hidden. Interactive Preview needs this authority as
                 # its foreground base, and the physical renderer honors the
                 # block's invisible presentation flag.
                 blocks.append(reference_semantic)
-            annotations.extend(_annotations_from_execution(reference))
         if visible.set_id == current_id:
             foreground_names = (
                 _statistics_series_names(
@@ -1484,8 +1483,6 @@ def select_copy_blocks(
 
     if not isinstance(render_input, ResultRenderInput):
         raise TypeError("Copy selection requires a ResultRenderInput.")
-    if render_input.unavailable_x_diagnostic is not None:
-        raise ValueError(render_input.unavailable_x_diagnostic)
     selected = tuple(block for block in render_input.blocks if block.visible)
     if not selected:
         raise ValueError("No visible result, Reference, or experimental data.")

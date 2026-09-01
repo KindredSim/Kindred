@@ -70,7 +70,14 @@ from kindred.core.result_repository import (
 from kindred.core.species import validate_concentration
 from kindred.gui.computation_gate import ComputationGate
 from kindred.gui.app_wiring import (
+    ANALYSIS_DOCK_SPEC,
+    BATCH_DOCK_SPEC,
     build_physical_shell,
+    DOCK_SPECS,
+    MECHANISM_DOCK_SPEC,
+    RIGHT_DOCK_SPEC,
+    SLIDERS_DOCK_SPEC,
+    SYMBOLIC_CALCULATOR_DOCK_SPEC,
 )
 from kindred.gui.controllers.config_controller import (
     ConfigController,
@@ -107,7 +114,6 @@ from kindred.gui.main_window_variable_runtime import (
     ActiveSliderRenderProjection,
     TabSliderBinding,
 )
-from kindred.gui.plot_config import PlotPresentationIntent
 from kindred.gui.symbolic_calculator_owner import SymbolicCalculatorOwner
 from kindred.gui.theme_manager import ThemeManager
 from kindred.gui.widgets.batch_initial_conditions_table import (
@@ -117,18 +123,10 @@ from kindred.gui.widgets.batch_initial_conditions_table import (
 )
 from kindred.gui.widgets.data_manager import (
     DataManagerPanel,
-    DatasetDeleteIntent,
-    DatasetFitInclusionIntent,
-    DatasetMappingIntent,
-    DatasetObservationMappingIntent,
-    DatasetPlotOverlayIntent,
-    DatasetRenameIntent,
-    DatasetExportOriginalIntent,
 )
 from kindred.gui.widgets.dataset_mapping_batch_dialog import DatasetMappingBatchDialog
 from kindred.gui.widgets.dataset_overlay_panel import (
     DatasetOverlayPanel,
-    OverlaySelectionIntent,
 )
 from kindred.gui.widgets.editor_panel import EditorPanel
 from kindred.gui.widgets.mechanism_editor import (
@@ -195,14 +193,12 @@ class _TabSurfaceBundle:
 
 @dataclass(frozen=True, slots=True)
 class _XlsxExportSuccess:
-    generation: int
     path: str
     completion: XlsxExportCompletion
 
 
 @dataclass(frozen=True, slots=True)
 class _XlsxExportFailure:
-    generation: int
     path: str
     message: str
     cancelled: bool
@@ -219,13 +215,11 @@ class _XlsxExportWorker(QtCore.QThread):
     def __init__(
         self,
         *,
-        generation: int,
         blocks: tuple[ResultDataBlock, ...],
         path: str,
         parent: QtCore.QObject,
     ) -> None:
         super().__init__(parent)
-        self._generation = int(generation)
         self._blocks = blocks
         self._path = os.path.abspath(os.fspath(path))
         self._commit_started = False
@@ -290,7 +284,6 @@ class _XlsxExportWorker(QtCore.QThread):
             temporary_path = ""
         except _XlsxExportCancelled:
             outcome = _XlsxExportFailure(
-                generation=self._generation,
                 path=self._path,
                 message="XLSX export was cancelled.",
                 cancelled=True,
@@ -302,7 +295,6 @@ class _XlsxExportWorker(QtCore.QThread):
                 and self.isInterruptionRequested()
             )
             outcome = _XlsxExportFailure(
-                generation=self._generation,
                 path=self._path,
                 message=(
                     "XLSX export was cancelled."
@@ -314,7 +306,6 @@ class _XlsxExportWorker(QtCore.QThread):
             self.failed.emit(outcome)
         else:
             outcome = _XlsxExportSuccess(
-                generation=self._generation,
                 path=self._path,
                 completion=completion,
             )
@@ -347,7 +338,6 @@ class _XlsxExportOwner(QtCore.QObject):
 
     def __init__(self, *, parent: QtCore.QObject) -> None:
         super().__init__(parent)
-        self._generation = 0
         self._active_worker: _XlsxExportWorker | None = None
         self._application_close_fenced = False
         self._application_close_settled = True
@@ -399,7 +389,6 @@ class _XlsxExportOwner(QtCore.QObject):
         if self._application_close_fenced:
             self.failed.emit(
                 _XlsxExportFailure(
-                    generation=self._generation,
                     path=absolute_path,
                     message="XLSX export is unavailable while Kindred closes.",
                     cancelled=True,
@@ -410,17 +399,13 @@ class _XlsxExportOwner(QtCore.QObject):
         if worker is not None:
             self.failed.emit(
                 _XlsxExportFailure(
-                    generation=self._generation,
                     path=absolute_path,
                     message="Another XLSX export is already active.",
                     cancelled=False,
                 )
             )
             return False
-        self._generation += 1
-        generation = self._generation
         worker = _XlsxExportWorker(
-            generation=generation,
             blocks=blocks,
             path=absolute_path,
             parent=self,
@@ -463,7 +448,6 @@ class _XlsxExportOwner(QtCore.QObject):
             logger.exception("XLSX worker startup failed before execution")
             self.failed.emit(
                 _XlsxExportFailure(
-                    generation=generation,
                     path=absolute_path,
                     message=f"Could not start XLSX export: {exc}",
                     cancelled=False,
@@ -482,8 +466,6 @@ class _XlsxExportOwner(QtCore.QObject):
             return
         if not isinstance(outcome, _XlsxExportSuccess):
             return
-        if outcome.generation != self._generation:
-            return
         self.succeeded.emit(outcome)
 
     @QtCore.Slot(object)
@@ -494,8 +476,6 @@ class _XlsxExportOwner(QtCore.QObject):
         if worker is not self._active_worker:
             return
         if not isinstance(outcome, _XlsxExportFailure):
-            return
-        if outcome.generation != self._generation:
             return
         self.failed.emit(outcome)
 
@@ -529,7 +509,6 @@ class MainWindow(QtWidgets.QMainWindow):
         if not isinstance(application, QtWidgets.QApplication):
             raise RuntimeError("MainWindow requires an existing QApplication.")
 
-        self._native_close_authorized = False
         self._close_mutation_fenced = False
         self._close_fenced_action_states: dict[QtGui.QAction, bool] = {}
         self._rendering_workspace = False
@@ -679,20 +658,32 @@ class MainWindow(QtWidgets.QMainWindow):
         """Resolve the current root's direct stacks and dock ownership."""
 
         stacks = self._surface_stacks
-        self._mechanism_stack = stacks["mechanism"]
-        self._slider_stack = stacks["interactive_sliders"]
-        self._initial_conditions_stack = stacks["batch_initial_conditions"]
-        self._data_stack = stacks["data"]
-        self._calculator_stack = stacks["symbolic_calculator"]
-        self._mechanism_dock = self._workspace.dock_for_identity("mechanism")
-        self._sliders_dock = self._workspace.dock_for_identity("interactive_sliders")
-        self._batch_dock = self._workspace.dock_for_identity(
-            "batch_initial_conditions"
+        self._mechanism_stack = stacks[MECHANISM_DOCK_SPEC.identity_key]
+        self._slider_stack = stacks[SLIDERS_DOCK_SPEC.identity_key]
+        self._initial_conditions_stack = stacks[
+            BATCH_DOCK_SPEC.identity_key
+        ]
+        self._data_stack = stacks[RIGHT_DOCK_SPEC.identity_key]
+        self._calculator_stack = stacks[
+            SYMBOLIC_CALCULATOR_DOCK_SPEC.identity_key
+        ]
+        self._mechanism_dock = self._workspace.dock_for_identity(
+            MECHANISM_DOCK_SPEC.identity_key
         )
-        self._right_dock = self._workspace.dock_for_identity("data")
-        self._analysis_dock = self._workspace.dock_for_identity("analysis")
+        self._sliders_dock = self._workspace.dock_for_identity(
+            SLIDERS_DOCK_SPEC.identity_key
+        )
+        self._batch_dock = self._workspace.dock_for_identity(
+            BATCH_DOCK_SPEC.identity_key
+        )
+        self._right_dock = self._workspace.dock_for_identity(
+            RIGHT_DOCK_SPEC.identity_key
+        )
+        self._analysis_dock = self._workspace.dock_for_identity(
+            ANALYSIS_DOCK_SPEC.identity_key
+        )
         self._symbolic_calculator_dock = self._workspace.dock_for_identity(
-            "symbolic_calculator"
+            SYMBOLIC_CALCULATOR_DOCK_SPEC.identity_key
         )
 
     def _create_tab_surface(
@@ -933,30 +924,38 @@ class MainWindow(QtWidgets.QMainWindow):
         data.datasetDeleteRequested.connect(self._delete_dataset)
         data.datasetExportOriginalRequested.connect(self._export_original_dataset)
         data.datasetMappingRequested.connect(
-            lambda intent, captured=tab_id: self._map_dataset(captured, intent)
+            lambda dataset_id, action, set_id, occupied_choice, captured=tab_id: self._map_dataset(
+                captured,
+                dataset_id,
+                action,
+                set_id,
+                occupied_choice,
+            )
         )
         data.datasetObservationMappingRequested.connect(
-            lambda intent, captured=tab_id: self._edit_observation_mapping(
+            lambda dataset_id, captured=tab_id: self._edit_observation_mapping(
                 captured,
-                intent,
+                dataset_id,
             )
         )
         data.datasetPlotOverlayRequested.connect(
-            lambda intent, captured=tab_id: self._show_plot_overlay(
+            lambda dataset_id, captured=tab_id: self._show_plot_overlay(
                 captured,
-                intent,
+                dataset_id,
             )
         )
         data.datasetFitInclusionRequested.connect(
-            lambda intent, captured=tab_id: self._set_dataset_fit_inclusion(
+            lambda dataset_id, include, captured=tab_id: self._set_dataset_fit_inclusion(
                 captured,
-                intent,
+                dataset_id,
+                include,
             )
         )
         bundle.overlay_panel.overlaySelectionRequested.connect(
-            lambda intent, captured=tab_id: self._set_overlay_selection(
+            lambda dataset_id, raw_observation_ids, captured=tab_id: self._set_overlay_selection(
                 captured,
-                intent,
+                dataset_id,
+                raw_observation_ids,
             )
         )
         bundle.overlay_panel.speciesColorRequested.connect(
@@ -1055,7 +1054,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.project_controller.nativeCloseAuthorized.connect(
             self.authorize_and_schedule_close
         )
-        self.project_controller.hardExitAuthorized.connect(self._hard_exit)
 
         self._connect_workspace_root()
 
@@ -1135,9 +1133,9 @@ class MainWindow(QtWidgets.QMainWindow):
         if fenced:
             self._close_mutation_fenced = True
         elif not self._mutation_input_admitted():
-            # Native/hard-exit authorization is terminal.  Do not briefly
+            # Native-close authorization is terminal.  Do not briefly
             # reopen the shell between closePendingChanged(False) and
-            # closeEvent()/hard exit.
+            # closeEvent().
             fenced = True
         else:
             self._close_mutation_fenced = False
@@ -1234,7 +1232,11 @@ class MainWindow(QtWidgets.QMainWindow):
             lambda selections: self._set_y_series(target, selections)
         )
         plot.plotPresentationIntentRequested.connect(
-            lambda intent: self._set_plot_presentation(target, intent)
+            lambda option, enabled: self._set_plot_presentation(
+                target,
+                option,
+                enabled,
+            )
         )
         plot.resultDiagnostic.connect(self._on_workspace_result_diagnostic)
 
@@ -2423,6 +2425,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 try:
                     settings = panel.current_settings_candidate()
                 except (TypeError, ValueError) as exc:
+                    panel.settingsValidationFailed.emit(str(exc))
                     self.set_status_text(f"Run settings are invalid: {exc}")
                     return None
                 tab = tab.with_run_defaults(settings)
@@ -2576,7 +2579,6 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         if published is None:
             return False
-        capture_token = published
         selected = bundle.initial_actions.selected_run_set_ids()
         if not selected:
             self.set_status_text("Select one or more Initial Conditions rows.")
@@ -2597,7 +2599,6 @@ class MainWindow(QtWidgets.QMainWindow):
             )
             capture = ExplicitRunCapture(
                 tab_id=target,
-                content_token=capture_token,
                 targets=targets,
             )
         except Exception as exc:
@@ -2801,10 +2802,10 @@ class MainWindow(QtWidgets.QMainWindow):
         if runtime.reactions_draft is not None:
             self._retire_preview_for_source_change(tab_id)
         # Reactions drafts invalidate only the calculator's current snapshot;
-        # reverting the draft immediately rebuilds from accepted prepared DSL
-        # and lets the owner restore any matching fingerprint history.  Slider
-        # and notes drafts leave executable identity unchanged, but refreshing
-        # here keeps the projection synchronized for every draft signal.
+        # reverting the draft immediately rebuilds from the current
+        # prepared-object identity. Slider and notes drafts leave executable identity
+        # unchanged, but refreshing here keeps the projection synchronized for
+        # every draft signal.
         self._refresh_symbolic_calculator(tab_id)
         self._workspace.set_tab_dirty(
             tab_id,
@@ -2873,7 +2874,16 @@ class MainWindow(QtWidgets.QMainWindow):
         """Apply current IC-draft admission to the owning tab."""
 
         target = str(tab_id)
+        bundle = self._tab_surfaces.get(target)
+        if bundle is None:
+            return
+        runtime = self._workspace_tab_registry.tab_runtime(target)
+        self._workspace.set_tab_dirty(
+            target,
+            runtime.has_dirty_drafts or bundle.simulation_panel.has_run_defaults_draft,
+        )
         self._set_tab_run_enabled(target, self._run_admitted(target))
+        self._refresh_title()
         self._refresh_actions()
 
     @QtCore.Slot(str, bool)
@@ -3561,22 +3571,22 @@ class MainWindow(QtWidgets.QMainWindow):
             message + f" Reviewed mapping applied for {len(batch.proposals)} dataset(s)."
         )
 
-    @QtCore.Slot(object)
-    def _rename_dataset(self, intent: DatasetRenameIntent) -> None:
+    @QtCore.Slot(str, str)
+    def _rename_dataset(self, dataset_id: str, display_name: str) -> None:
         if not self._mutation_input_admitted("Rename Dataset"):
             return
         changed = False
         try:
             name = validate_unique_dataset_name(
-                intent.display_name,
+                display_name,
                 existing=(
                     (record.dataset_id, record.display_name)
                     for record in self._project_session.document.datasets
                 ),
-                excluding_dataset_id=intent.dataset_id,
+                excluding_dataset_id=dataset_id,
             )
             candidate = self._project_session.document.rename_dataset(
-                intent.dataset_id,
+                dataset_id,
                 name,
             )
             expected_token = self._project_session.capture_content_token()
@@ -3591,13 +3601,13 @@ class MainWindow(QtWidgets.QMainWindow):
         if changed:
             self._refresh_dataset_views()
 
-    @QtCore.Slot(object)
-    def _delete_dataset(self, intent: DatasetDeleteIntent) -> None:
+    @QtCore.Slot(str)
+    def _delete_dataset(self, dataset_id: str) -> None:
         if not self._mutation_input_admitted("Delete Dataset"):
             return
         presentations = dict(self._workspace_tab_registry.presentation_items())
         plan = plan_global_dataset_delete(
-            dataset_id=intent.dataset_id,
+            dataset_id=dataset_id,
             links_by_tab={
                 tab.tab_id: tab.dataset_links
                 for tab in self._project_session.document.tabs
@@ -3621,7 +3631,7 @@ class MainWindow(QtWidgets.QMainWindow):
             if answer != QtWidgets.QMessageBox.StandardButton.Yes:
                 return
         candidate = self._project_session.document.remove_dataset(
-            intent.dataset_id
+            dataset_id
         )
         result = self._workspace_tab_registry.replace_document(
             candidate,
@@ -3631,15 +3641,12 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         self._refresh_dataset_views()
 
-    @QtCore.Slot(object)
-    def _export_original_dataset(
-        self,
-        intent: DatasetExportOriginalIntent,
-    ) -> None:
+    @QtCore.Slot(str)
+    def _export_original_dataset(self, dataset_id: str) -> None:
         if not self._mutation_input_admitted("Export Original Dataset"):
             return
         try:
-            record = self._project_session.document.dataset(intent.dataset_id)
+            record = self._project_session.document.dataset(dataset_id)
         except KeyError:
             return
         try:
@@ -3692,14 +3699,17 @@ class MainWindow(QtWidgets.QMainWindow):
     def _map_dataset(
         self,
         tab_id: str,
-        intent: DatasetMappingIntent,
+        dataset_id: str,
+        action: str,
+        set_id: str | None,
+        occupied_choice: str | None,
     ) -> None:
         if not self._mutation_input_admitted("Map Dataset"):
             return
         changed = False
         previous_set_ids: tuple[str, ...] = ()
         try:
-            choice = DatasetMappingChoice(intent.action)
+            choice = DatasetMappingChoice(action)
             description = (
                 "Leave Dataset Unmapped"
                 if choice is DatasetMappingChoice.LEAVE_UNMAPPED
@@ -3711,7 +3721,7 @@ class MainWindow(QtWidgets.QMainWindow):
             previous_set_ids = tuple(
                 item.set_id for item in tab.initial_condition_sets
             )
-            dataset = self._project_session.document.dataset(intent.dataset_id)
+            dataset = self._project_session.document.dataset(dataset_id)
             if choice is DatasetMappingChoice.CREATE_SET:
                 model_targets = canonical_observation_target_names(tab)
                 if not model_targets:
@@ -3743,16 +3753,16 @@ class MainWindow(QtWidgets.QMainWindow):
                     confirmed_mapping=mapping,
                 )
             elif choice is DatasetMappingChoice.MAP_EXISTING:
-                if not intent.set_id:
+                if not set_id:
                     raise ValueError("Map Existing requires an initial-condition set.")
                 occupied = (
-                    OccupiedSetChoice(intent.occupied_choice)
-                    if intent.occupied_choice
+                    OccupiedSetChoice(occupied_choice)
+                    if occupied_choice
                     else None
                 )
                 copy_plan = None
                 if occupied is OccupiedSetChoice.CREATE_COPY:
-                    source_set = tab.initial_condition_set(intent.set_id)
+                    source_set = tab.initial_condition_set(set_id)
                     copy_plan = SetCopyPlan(
                         source_set_id=source_set.set_id,
                         new_set_id=new_set_id(),
@@ -3766,8 +3776,8 @@ class MainWindow(QtWidgets.QMainWindow):
                     )
                 plan = plan_dataset_to_set_mapping(
                     links=tab.dataset_links,
-                    dataset_id=intent.dataset_id,
-                    target_set_id=intent.set_id,
+                    dataset_id=dataset_id,
+                    target_set_id=set_id,
                     occupied_choice=occupied,
                     copy_plan=copy_plan,
                 )
@@ -3780,7 +3790,7 @@ class MainWindow(QtWidgets.QMainWindow):
             else:
                 plan = plan_leave_unmapped(
                     links=tab.dataset_links,
-                    dataset_id=intent.dataset_id,
+                    dataset_id=dataset_id,
                 )
                 candidate_tab = apply_dataset_set_mapping_plan(
                     document=self._project_session.document,
@@ -3810,11 +3820,7 @@ class MainWindow(QtWidgets.QMainWindow):
             bundle.slider_binding.render()
         self._refresh_dataset_views((tab_id,))
 
-    def _edit_observation_mapping(
-        self,
-        tab_id: str,
-        intent: DatasetObservationMappingIntent,
-    ) -> None:
+    def _edit_observation_mapping(self, tab_id: str, dataset_id: str) -> None:
         if not self._mutation_input_admitted("Edit Observation Mapping"):
             return
         changed = False
@@ -3825,7 +3831,7 @@ class MainWindow(QtWidgets.QMainWindow):
             ):
                 return
             tab = self._workspace_tab_registry.tab(tab_id)
-            dataset = self._project_session.document.dataset(intent.dataset_id)
+            dataset = self._project_session.document.dataset(dataset_id)
             model_targets = canonical_observation_target_names(tab)
             current = tab.dataset_link(dataset.dataset_id)
             mapping = self._prompt_observation_mapping(
@@ -3856,16 +3862,12 @@ class MainWindow(QtWidgets.QMainWindow):
         if changed:
             self._refresh_dataset_views((tab_id,))
 
-    def _show_plot_overlay(
-        self,
-        tab_id: str,
-        intent: DatasetPlotOverlayIntent,
-    ) -> None:
+    def _show_plot_overlay(self, tab_id: str, dataset_id: str) -> None:
         bundle = self._tab_surfaces.get(str(tab_id))
         if bundle is None:
             return
         bundle.right_panel.select_plot_overlays_page()
-        bundle.overlay_panel.navigate_to_dataset(intent.dataset_id)
+        bundle.overlay_panel.navigate_to_dataset(dataset_id)
 
     def _prompt_observation_mapping(
         self,
@@ -3941,7 +3943,8 @@ class MainWindow(QtWidgets.QMainWindow):
     def _set_dataset_fit_inclusion(
         self,
         tab_id: str,
-        intent: DatasetFitInclusionIntent,
+        dataset_id: str,
+        include: bool,
     ) -> None:
         if not self._mutation_input_admitted("Change Fit Dataset Inclusion"):
             return
@@ -3956,8 +3959,8 @@ class MainWindow(QtWidgets.QMainWindow):
             candidate = with_validated_fit_inclusion(
                 document=self._project_session.document,
                 tab=tab,
-                dataset_id=intent.dataset_id,
-                include=intent.include,
+                dataset_id=dataset_id,
+                include=include,
                 model_targets=canonical_observation_target_names(tab),
             )
             expected_token = self._project_session.capture_content_token()
@@ -3976,16 +3979,17 @@ class MainWindow(QtWidgets.QMainWindow):
     def _set_overlay_selection(
         self,
         tab_id: str,
-        intent: OverlaySelectionIntent,
+        dataset_id: str,
+        raw_observation_ids: tuple[str, ...],
     ) -> None:
         if not self._mutation_input_admitted("Change Dataset Overlay"):
             return
         state = self._workspace_tab_registry.presentation(tab_id)
         overlays = dict(state.overlay_raw_observation_ids_by_dataset)
-        if intent.raw_observation_ids:
-            overlays[intent.dataset_id] = tuple(intent.raw_observation_ids)
+        if raw_observation_ids:
+            overlays[dataset_id] = raw_observation_ids
         else:
-            overlays.pop(intent.dataset_id, None)
+            overlays.pop(dataset_id, None)
         token = self._workspace_tab_registry.set_presentation(
             tab_id,
             replace(
@@ -3997,8 +4001,8 @@ class MainWindow(QtWidgets.QMainWindow):
         if token is None:
             return
         self._tab_surfaces[tab_id].overlay_panel.render_overlay_selection(
-            dataset_id=intent.dataset_id,
-            raw_observation_ids=intent.raw_observation_ids,
+            dataset_id=dataset_id,
+            raw_observation_ids=raw_observation_ids,
         )
         self._render_results_for_tab(tab_id)
         self._refresh_project_state()
@@ -4080,12 +4084,13 @@ class MainWindow(QtWidgets.QMainWindow):
     def _set_plot_presentation(
         self,
         tab_id: str,
-        intent: PlotPresentationIntent,
+        option: str,
+        enabled: bool,
     ) -> None:
         if not self._mutation_input_admitted("Change Plot Presentation"):
             return
         state = self._workspace_tab_registry.presentation(tab_id)
-        next_state = replace(state, **{intent.option: intent.enabled})
+        next_state = replace(state, **{str(option): bool(enabled)})
         token = self._workspace_tab_registry.set_presentation(
             tab_id,
             next_state,
@@ -4253,26 +4258,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self._view_menu = view_menu
         panels = view_menu.addMenu("Panels")
         self._panels_menu = panels
-        panel_titles = {
-            "mechanism": "Mechanism",
-            "interactive_sliders": "Interactive Sliders",
-            "batch_initial_conditions": "Initial Conditions",
-            "data": "Data",
-            "analysis": "Analysis",
-            "symbolic_calculator": "Symbolic Calculator",
-        }
-        for identity in (
-            "mechanism",
-            "interactive_sliders",
-            "batch_initial_conditions",
-            "data",
-            "analysis",
-            "symbolic_calculator",
-        ):
-            dock = self._workspace.dock_for_identity(identity)
+        for spec in DOCK_SPECS:
+            dock = self._workspace.dock_for_identity(spec.identity_key)
             action = dock.toggleViewAction()
-            action.setText(panel_titles[identity])
-            action.setObjectName(f"{identity}PanelAction")
+            action.setText(spec.title)
+            action.setObjectName(f"{spec.identity_key}PanelAction")
             panels.addAction(action)
         view_menu.addSeparator()
         self._add_action(
@@ -4464,6 +4454,22 @@ class MainWindow(QtWidgets.QMainWindow):
                     "Scientific settings rejected: canonical project content "
                     "changed before publication."
                 )
+            if changed:
+                changed_fields = frozenset(
+                    field
+                    for field in (
+                        "temperature",
+                        "rtol",
+                        "atol",
+                        "analytic_jacobian_policy",
+                    )
+                    if getattr(previous_settings, field)
+                    != getattr(settings, field)
+                )
+                self._refresh_tab_controls(
+                    tab_id,
+                    scientific_fields=changed_fields,
+                )
             self.config_controller.set_mechanism_parameter_debounce_ms(
                 parameter_debounce
             )
@@ -4500,22 +4506,6 @@ class MainWindow(QtWidgets.QMainWindow):
                 message,
             )
             return
-        if changed:
-            changed_fields = frozenset(
-                field
-                for field in (
-                    "temperature",
-                    "rtol",
-                    "atol",
-                    "analytic_jacobian_policy",
-                )
-                if getattr(previous_settings, field)
-                != getattr(settings, field)
-            )
-            self._refresh_tab_controls(
-                tab_id,
-                scientific_fields=changed_fields,
-            )
         if persist_scientific_defaults:
             try:
                 self.config_controller.persist_scientific_defaults(settings)
@@ -4823,7 +4813,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._calculator_stack.setCurrentWidget(bundle.calculator_panel)
         screen = self.screen()
         self._workspace.reveal_dock(
-            "symbolic_calculator",
+            SYMBOLIC_CALCULATOR_DOCK_SPEC.identity_key,
             available_geometry=(
                 screen.availableGeometry() if screen is not None else None
             ),
@@ -4990,18 +4980,15 @@ class MainWindow(QtWidgets.QMainWindow):
     def _load_settings(self) -> None:
         """Restore physical shell state owned by MainWindow and its owners."""
 
-        settings = QtCore.QSettings()
-        restore_maximized = bool(
-            settings.value("window/is_maximized", False, type=bool)
+        restore_maximized, geometry, dock_state = (
+            self.config_controller.window_layout_preference()
         )
-        geometry = settings.value("window/geometry")
         if geometry:
             try:
                 if self.restoreGeometry(geometry) is False:
                     raise ValueError("restore rejected stored geometry")
             except (EOFError, RuntimeError, TypeError, ValueError) as exc:
                 logger.warning("Ignoring invalid persisted window geometry: %s", exc)
-        dock_state = settings.value("window/dock_state")
         if dock_state is not None:
             self._workspace.restore_dock_layout(dock_state)
             QtCore.QTimer.singleShot(
@@ -5015,9 +5002,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if restore_maximized:
             self.restore_persisted_maximized_state()
 
-        requested_dark = bool(
-            settings.value("ui/dark_mode", True, type=bool)
-        )
+        requested_dark = self.config_controller.theme_preference()
         if not self._theme_manager.apply(requested_dark, None):
             self.set_status_text("Could not apply the persisted theme preference.")
         if self._dark_mode_action is not None:
@@ -5223,20 +5208,12 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def authorize_and_schedule_close(self) -> None:
         self._set_close_mutation_fence(True)
-        self._native_close_authorized = True
         QtCore.QTimer.singleShot(0, self.close)
 
-    def _hard_exit(self) -> None:
-        os._exit(0)
-
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:
-        if not self._native_close_authorized:
+        if not self.project_controller.consume_native_close_authorization():
             event.ignore()
             self.project_controller.request_close()
-            return
-        if not self.project_controller.consume_native_close_authorization():
-            self._native_close_authorized = False
-            event.ignore()
             return
         self._save_settings()
         event.accept()

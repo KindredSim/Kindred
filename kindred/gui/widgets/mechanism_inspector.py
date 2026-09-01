@@ -20,6 +20,7 @@ from kindred.core.simulator.dsl_parse import PreparedDslRequestSet
 from kindred.core.simulator.parameter_algebra import (
     apply_parameter_algebra_spec_to_mechanism,
 )
+from kindred.core.simulation_preparation import _build_parameter_target_map
 from kindred.core.simulator.step_indexing import get_step_index_map, iter_canonical_parameters
 
 __all__ = ["MechanismInspectorDialog", "MechanismInspectorSections", "build_mechanism_inspector_sections"]
@@ -40,10 +41,12 @@ def build_mechanism_inspector_sections(
     parameter_spec = prepared_dsl.parameter_algebra_spec_for_execution()
     if parameter_spec.param_statements:
         mechanism = prepared_dsl.mutable_mechanism_shell()
+        parameter_target_map = _build_parameter_target_map(mechanism)
         apply_parameter_algebra_spec_to_mechanism(
             parameter_spec,
             mechanism=mechanism,
             require_mutable=False,
+            parameter_target_map=parameter_target_map,
         )
     else:
         mechanism = accepted_mechanism
