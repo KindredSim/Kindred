@@ -210,6 +210,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
 
         self._plot_widget = pg.PlotWidget(self)
         self._plot_widget.setObjectName("plotViewport")
+        self._plot_widget.plotItem.setContentsMargins(0, 0, 0, 10)
         self._plot_widget.setBackground("w")
         self._plot_widget.showGrid(x=True, y=True, alpha=0.25)
         self._legend = self._plot_widget.addLegend()

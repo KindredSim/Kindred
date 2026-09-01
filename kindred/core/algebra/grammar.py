@@ -5,7 +5,7 @@ Reference data for the Algebra DSL grammar, helpers, and protected symbols.
 ---------------------------------------------------------------------------
 EBNF (power is right-associative):
 
-    algebra_block  := "# Algebra" newline { let_stmt }
+    algebra_block  := { let_stmt }
     let_stmt       := "let" IDENT "=" expr newline
     expr           := logic_or
     logic_or       := logic_and { "||" logic_and }
@@ -39,7 +39,7 @@ from typing import Dict, List, Tuple
 # ----------------------------- EBNF (reference) ------------------------------
 
 EBNF: str = (
-    "algebra_block  := \"# Algebra\" newline { let_stmt }\n"
+    "algebra_block  := { let_stmt }\n"
     "let_stmt       := \"let\" IDENT \"=\" expr newline\n"
     "expr           := logic_or\n"
     "logic_or       := logic_and { \"||\" logic_and }\n"
@@ -96,10 +96,6 @@ class TokenKind(str, Enum):
     GT = "GT"                # >
     GTE = "GTE"              # >=
 
-    # Header marker
-    HASH = "HASH"            # #   (used to match "# Algebra")
-
-
 # ----------------------------- lexical spec (data only) ----------------------
 # Intended for a future lexer. Order matters for maximal munch on multi-char ops.
 
@@ -132,7 +128,6 @@ TOKEN_SPEC: List[Tuple[TokenKind, str]] = [
     (TokenKind.RBRACK, r"\]"),
     (TokenKind.COMMA, r","),
     (TokenKind.EQUALS, r"="),
-    (TokenKind.HASH, r"#"),
     # Literals
     # NUMBER: decimal or integer with optional exponent (e or E), no leading +
     (TokenKind.NUMBER, r"(?:\d+\.\d*|\d*\.\d+|\d+)(?:[eE][+\-]?\d+)?"),
@@ -143,7 +138,6 @@ TOKEN_SPEC: List[Tuple[TokenKind, str]] = [
 # Keywords that the lexer should fold to specific TokenKind when IDENT matches.
 KEYWORDS: Dict[str, TokenKind] = {
     "let": TokenKind.LET,
-    # "Algebra" stays IDENT; the header is recognized as "#"+"Algebra" at the parser level.
 }
 
 # Built-in function names (reference for parser validation; not enforced here).

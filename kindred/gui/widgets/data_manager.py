@@ -29,14 +29,6 @@ from kindred.gui.import_workflow import (
     resolve_import_plans,
 )
 from kindred.gui.widgets.import_config_dialog import ImportConfigDialog, ImportDialogResult
-from kindred.gui.controllers.dataset_errors import (
-    DatasetImportAdmissionError,
-)
-from kindred.gui.dataset_import_staging import (
-    DatasetImportRequest,
-    DatasetImportStaging,
-    DatasetImportWorkerAdmission,
-)
 from kindred.gui.dataset_payload_snapshot import (
     ActiveDatasetLinkSnapshot,
     DataManagerSnapshot,
@@ -68,8 +60,8 @@ class DataManagerPanel(QtWidgets.QWidget):
     - Multiple dataset support
 
     The panel retains only rendered snapshots and import UI configuration.
-    DatasetImportStaging owns workers and uncommitted output; ProjectSession
-    callbacks own every canonical mutation.
+    The application import owner retains workers and uncommitted output;
+    ProjectSession callbacks own every canonical mutation.
     """
 
     datasetRenameRequested = QtCore.Signal(str, str)
@@ -79,9 +71,10 @@ class DataManagerPanel(QtWidgets.QWidget):
     datasetObservationMappingRequested = QtCore.Signal(str)
     datasetPlotOverlayRequested = QtCore.Signal(str)
     datasetFitInclusionRequested = QtCore.Signal(str, bool)
+    datasetImportRequested = QtCore.Signal(str, object)
+
     def __init__(
         self,
-        staging: DatasetImportStaging,
         *,
         origin_tab_id: str,
         parent: Optional[QtWidgets.QWidget] = None,
@@ -95,8 +88,6 @@ class DataManagerPanel(QtWidgets.QWidget):
             Parent widget
         """
         super().__init__(parent)
-        if not isinstance(staging, DatasetImportStaging):
-            raise TypeError("DataManagerPanel requires the application DatasetImportStaging owner.")
         if (
             type(origin_tab_id) is not str
             or not origin_tab_id
@@ -106,7 +97,6 @@ class DataManagerPanel(QtWidgets.QWidget):
                 "DataManagerPanel requires one stable edge-normalized origin "
                 "tab ID."
             )
-        self._staging = staging
         self._origin_tab_id = origin_tab_id
 
         layout = QtWidgets.QVBoxLayout(self)
@@ -186,11 +176,7 @@ class DataManagerPanel(QtWidgets.QWidget):
         self._snapshot = DataManagerSnapshot((), None, (), ())
         self._visible_records_by_id: Dict[str, RawDatasetRecord] = {}
 
-        self._progress_dialog: Optional[QtWidgets.QProgressDialog] = None
-        self._staging.busyChanged.connect(self._on_staging_busy_changed)
-        self._staging.workerProgressed.connect(self._on_import_progress)
-        self._staging.workerFailed.connect(self._on_import_failure)
-        self._staging.workerCanceled.connect(self._on_import_cancellation)
+        self._import_busy = False
         self._set_mapping_controls_enabled(False)
 
     def _show_message(
@@ -266,11 +252,13 @@ class DataManagerPanel(QtWidgets.QWidget):
                 selected_row = row
         if selected_row >= 0:
             self._dataset_list.setCurrentRow(selected_row)
-        self._load_btn.setEnabled(not self._staging.busy)
+        self._load_btn.setEnabled(not self._import_busy)
         self._update_mapping_area()
 
     def _load_dataset(self):
-        """Load dataset(s) using per-file import configuration and background workers."""
+        """Load dataset(s) using per-file import configuration."""
+        if self._import_busy:
+            return
         filenames, _ = QtWidgets.QFileDialog.getOpenFileNames(
             self,
             "Load Dataset(s)",
@@ -349,46 +337,9 @@ class DataManagerPanel(QtWidgets.QWidget):
             return
 
         expected_count = sum(len(config.plans) for config in configs)
-        roster = tuple(
-            DatasetImportWorkerAdmission(
-                source=config.source,
-                admitted_plans=tuple(config.plans),
-            )
-            for config in configs
-        )
-
-        try:
-            import_request: DatasetImportRequest = self._staging.begin(
-                origin_tab_id=self._origin_tab_id,
-                roster=roster,
-            )
-        except DatasetImportAdmissionError as exc:
-            self._show_message(
-                QtWidgets.QMessageBox.Icon.Warning,
-                "Dataset Import",
-                str(exc),
-            )
-            return
         dataset_label = f"{expected_count} dataset{'s' if expected_count != 1 else ''}"
         logger.info("User initiated dataset import: %s", dataset_label)
-
-        self._progress_dialog = QtWidgets.QProgressDialog(
-            f"Loading {dataset_label}...", "Cancel", 0, 100, self
-        )
-        self._progress_dialog.setWindowTitle("Loading Datasets")
-        self._progress_dialog.setWindowModality(Qt.WindowModal)
-        self._progress_dialog.setMinimumDuration(0)
-        self._progress_dialog.canceled.connect(self._on_load_canceled)
-        self._progress_dialog.show()
-
-        try:
-            self._staging.start_import(import_request)
-        except DatasetImportAdmissionError as exc:
-            self._show_message(
-                QtWidgets.QMessageBox.Icon.Critical,
-                "Dataset Import",
-                str(exc),
-            )
+        self.datasetImportRequested.emit(self._origin_tab_id, tuple(configs))
 
     def _collect_import_config(
         self,
@@ -504,38 +455,10 @@ class DataManagerPanel(QtWidgets.QWidget):
             plans=tuple(plans),
         )
 
-    def _on_import_progress(self, percent: int) -> None:
-        """Render one staging-owned aggregate progress fact."""
-        if self._progress_dialog:
-            self._progress_dialog.setValue(percent)
-
-    def _on_import_failure(self, message: str) -> None:
-        """Present one staging-owned worker failure fact."""
-        self._show_message(
-            QtWidgets.QMessageBox.Icon.Critical,
-            "Load Error",
-            f"Failed to load dataset:\n\n{message}",
-        )
-
-    def _on_import_cancellation(self, source_label: str) -> None:
-        """Observe one staging-owned worker cancellation fact."""
-        logger.info("Dataset import canceled: %s", source_label)
-
-    def _on_load_canceled(self):
-        """Handle cancel request during dataset loading."""
-        logger.info("Dataset import cancellation requested by user")
-        self._staging.cancel_active(outcome="user_canceled")
-
-    def _finalize_progress_dialog(self) -> None:
-        """Close and clear the progress dialog if it exists."""
-        if not self._progress_dialog:
-            return
-        try:
-            self._progress_dialog.canceled.disconnect(self._on_load_canceled)
-        except (TypeError, RuntimeError):
-            pass
-        self._progress_dialog.close()
-        self._progress_dialog = None
+    def set_import_busy(self, busy: bool) -> None:
+        """Project application-global import custody onto this Load button."""
+        self._import_busy = bool(busy)
+        self._load_btn.setEnabled(not self._import_busy)
 
     def _remove_dataset(self):
         """Emit one global-delete intent; confirmation belongs to integration."""
@@ -783,8 +706,3 @@ class DataManagerPanel(QtWidgets.QWidget):
         ):
             return
         self.datasetFitInclusionRequested.emit(dataset_id, bool(checked))
-
-    def _on_staging_busy_changed(self, busy: bool) -> None:
-        self._load_btn.setEnabled(not bool(busy))
-        if not busy:
-            self._finalize_progress_dialog()

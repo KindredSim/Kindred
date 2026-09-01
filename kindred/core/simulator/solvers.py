@@ -12,7 +12,6 @@ SciPy is a hard dependency; all integration routes through `scipy.integrate.solv
 from __future__ import annotations
 
 import logging
-from dataclasses import replace
 from typing import (
     Any,
     Callable,
@@ -28,7 +27,6 @@ from kindred.core.scipy_integrate import load_scipy_integrate
 from kindred.core.temperature import (
     TemperatureScheduleDictProtocol,
     TemperatureScheduleProtocol,
-    coerce_temperature_schedule,
 )
 from kindred.core.exceptions import (
     InitialConditionError,
@@ -158,14 +156,7 @@ def normalize_solver_name(name: object) -> str:
 class _TemperatureInjectedRhs:
     def __init__(self, rhs: _ODERhsWithTemp, schedule: TemperatureScheduleProtocol) -> None:
         self._rhs = rhs
-        schedule_obj = (
-            schedule
-            if isinstance(schedule, TemperatureScheduleDictProtocol)
-            else coerce_temperature_schedule(schedule)
-        )
-        if schedule_obj is None:
-            raise TypeError("temperature_schedule must not be None when injecting temperature.")
-        self._schedule = schedule_obj
+        self._schedule = schedule
 
     def __call__(self, t: float, y: np.ndarray) -> np.ndarray:
         T = float(self._schedule(t))
@@ -281,7 +272,7 @@ def _build_provenance(req: _SimulationRequest, *, t_eval: np.ndarray) -> Dict[st
         )
 
     if req.temperature_schedule is not None:
-        temperature_schedule = coerce_temperature_schedule(req.temperature_schedule)
+        temperature_schedule = req.temperature_schedule
         if isinstance(temperature_schedule, TemperatureScheduleDictProtocol):
             prov["temperature_schedule"] = dict(temperature_schedule.to_dict())
         else:
@@ -627,16 +618,6 @@ def solve_ode(
         and req.cancellation_control.cancel_requested()
     ):
         raise SimulationCancelled()
-    if req.temperature_schedule is not None:
-        schedule = (
-            req.temperature_schedule
-            if isinstance(
-                req.temperature_schedule,
-                TemperatureScheduleDictProtocol,
-            )
-            else coerce_temperature_schedule(req.temperature_schedule)
-        )
-        req = replace(req, temperature_schedule=schedule)
     y0 = np.asarray(req.y0, float)
     if y0.ndim != 1 or not np.all(np.isfinite(y0)):
         raise InitialConditionError("y0 must be a 1D finite array")

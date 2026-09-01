@@ -7,7 +7,7 @@ no worker, Fit, cache, parameter-binding, or GUI ownership.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 import logging
 from numbers import Real
@@ -159,7 +159,6 @@ def build_prepared_run_context(
     *,
     mechanism: Any,
     temperature_schedule: TemperatureScheduleProtocol | None,
-    metadata_view: Callable[..., Any],
     symbolic_structure: Any = None,
     coefficient_evaluator: Any = None,
 ) -> tuple[
@@ -169,11 +168,9 @@ def build_prepared_run_context(
 ]:
     """Prepare temperature, symbolic Jacobian, and ODE metadata as one stage."""
 
-    mech_meta = metadata_view(
-        mechanism,
-        temperature_schedule_override=temperature_schedule,
-    )
-    resolved_temperature_schedule = mech_meta.temperature_schedule
+    # The schedule has already been admitted by the source/metadata ingress;
+    # preserve that typed object through preparation and execution.
+    resolved_temperature_schedule = temperature_schedule
     warnings: list[str] = []
     symbolic_jacobian = SymbolicJacobianExecution()
     if not symbolic_jacobian.has_executable_jacobian:

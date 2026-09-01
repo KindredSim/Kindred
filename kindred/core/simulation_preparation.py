@@ -1576,7 +1576,7 @@ def prepare_simulation_worker_run(
     Prepare an execution-ready SimulationRequest for the GUI SimulationWorker.
 
     This function is the single owner for:
-    - Temperature schedule coercion (DSL schedule takes precedence)
+    - Retaining the admitted DSL temperature schedule through execution
     - Parameter algebra application
     - Generated symbolic Jacobian construction when supported by the solver path
     """
@@ -1717,7 +1717,6 @@ def prepare_simulation_worker_run(
         temperature_schedule, runtime_symbolic_jacobian, preparation_warnings = build_prepared_run_context(
             mechanism=mechanism,
             temperature_schedule=temperature_schedule_override,
-            metadata_view=metadata_view_for_mechanism,
             symbolic_structure=symbolic_structure,
             coefficient_evaluator=_coefficient_evaluator,
         )

@@ -9,7 +9,3 @@ class DatasetError(RuntimeError):
 
 class DatasetImportAdmissionError(DatasetError):
     """A direct GUI-thread import admission check rejected the request."""
-
-
-class DatasetImportStateError(DatasetError):
-    """A stale or invalid import callback attempted to alter staging."""

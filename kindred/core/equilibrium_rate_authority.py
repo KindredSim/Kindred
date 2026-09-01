@@ -722,18 +722,6 @@ def _validate_concrete_positive_coefficient(
     """Reject invalid concrete coefficients while preserving symbolic authority."""
     if value is None:
         return
-    if callable(value):
-        # Mutable rate bindings are concrete admitted values despite their
-        # callable runtime interface.  Leave symbolic/deferred callables
-        # unresolved at this boundary.
-        try:
-            from kindred.core.rate_binding import RateBinding
-
-            if not isinstance(value, RateBinding):
-                return
-            value = value()
-        except (TypeError, ValueError, OverflowError):
-            return
     if type(value) is bool or isinstance(value, str):
         raise ValueError(f"{label} must be a positive finite real")
     try:

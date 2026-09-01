@@ -108,6 +108,14 @@ def coerce_temperature_schedule(value: object) -> TemperatureScheduleProtocol | 
     """
     if value is None:
         return None
+    # Schedule values are admitted once at their genuine ingress.  Keep the
+    # typed schedule (and its validating wrappers) intact when it crosses
+    # trusted in-process boundaries so identity and callable state survive.
+    if isinstance(
+        value,
+        (TemperatureSchedule, _ValidatedCallableTemperatureSchedule),
+    ):
+        return value
     if isinstance(value, Mapping):
         if "type" not in value:
             raise TypeError(
@@ -646,10 +654,17 @@ def temperature_schedule_execution_identity(
 
     if schedule is None:
         return None
-    normalized = coerce_temperature_schedule(schedule)
+    normalized = schedule
     if not isinstance(normalized, TemperatureScheduleDictProtocol):
         return None
-    decoded = TemperatureSchedule.from_dict(dict(normalized.to_dict()))
+    # Native schedules are already fully admitted.  Only a typed schedule
+    # supplied through the serializable protocol needs its protocol payload
+    # decoded for semantic identity projection.
+    decoded = (
+        normalized
+        if isinstance(normalized, TemperatureSchedule)
+        else TemperatureSchedule.from_dict(dict(normalized.to_dict()))
+    )
     if decoded.schedule_type == "constant":
         return {
             "type": "constant",

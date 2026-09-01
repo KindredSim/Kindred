@@ -618,12 +618,15 @@ class PreparedDslRequestSet:
 
         return self.compiled_ode_topology(), self.symbolic_jacobian_structure()
 
-    def temperature_schedule_for_execution(self) -> object:
-        from kindred.core.mechanism_metadata import MechanismMetadataView
+    def temperature_schedule_for_execution(self) -> Optional["TemperatureScheduleProtocol"]:
+        """Return the accepted mechanism's retained typed schedule directly."""
 
-        return MechanismMetadataView.from_metadata(
-            getattr(self.__mechanism, "metadata", {}) or {}
-        ).temperature_schedule
+        from kindred.core.mechanism_metadata import MechanismMetadataKeys
+
+        metadata = getattr(self.__mechanism, "metadata", {}) or {}
+        if not isinstance(metadata, Mapping):
+            return None
+        return metadata.get(MechanismMetadataKeys.TEMPERATURE_SCHEDULE)
 
     def parameterized_intervention_schedule_for_binding(self) -> InterventionSchedule | None:
         return self.__intervention_schedule

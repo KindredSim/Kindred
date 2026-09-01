@@ -154,20 +154,8 @@ def _correction_constraints(
         if item.status in {"resolved", "unsatisfied"}
         and (
             item.status == "unsatisfied"
-            or not _is_exact_identity(_constraint_monomial(item))
+            or not _is_exact_identity(item.monomial)
         )
-    )
-
-
-def _constraint_monomial(item: object) -> ExactMonomial:
-    """Read the retained composition, with a narrow legacy-value fallback."""
-
-    value = getattr(item, "monomial", None)
-    if isinstance(value, ExactMonomial):
-        return value
-    return ExactMonomial(
-        Fraction(getattr(item, "coefficient", Fraction(1))),
-        tuple(getattr(item, "powers", ()) or ()),
     )
 
 
@@ -184,7 +172,7 @@ def _direct_source_power(item: object, target_name: str) -> Fraction:
     """Return only a multiplicative authored factor's power."""
 
     return Fraction(
-        dict(_constraint_monomial(item).powers).get(
+        dict(item.monomial.powers).get(
             str(target_name),
             Fraction(0),
         )
@@ -194,7 +182,7 @@ def _direct_source_power(item: object, target_name: str) -> Fraction:
 def _has_unsupported_source_factor(item: object) -> bool:
     """Reject factors that cannot be authored as a static correction RHS."""
 
-    monomial = _constraint_monomial(item)
+    monomial = item.monomial
     if monomial.exponentials or monomial.sum_terms:
         return True
     if monomial.coefficient == 0:
@@ -265,7 +253,7 @@ def _solve_correction_factors(
             exponent = inverse[target_index][row_index]
             if not exponent:
                 continue
-            monomial = _constraint_monomial(constraint)
+            monomial = constraint.monomial
             constraint_coefficient = Fraction(monomial.coefficient)
             if constraint_coefficient != 1:
                 key = ("coefficient", constraint_coefficient)
@@ -380,7 +368,7 @@ def _energy_rows(
 
     rows: list[dict[str, Fraction]] = []
     for item in constraints:
-        monomial = _constraint_monomial(item)
+        monomial = item.monomial
         if (
             monomial.coefficient != 1
             or monomial.powers
@@ -478,7 +466,7 @@ def _build_energy_correction_expressions(
     energy_names = frozenset(
         str(name)
         for item in constraints
-        for name in _constraint_monomial(item).coordinate_power_map()
+        for name in item.monomial.coordinate_power_map()
         if re.fullmatch(r"(?:Ea|dG_act|dG_eq)[1-9][0-9]*", str(name))
     )
     rows = _energy_rows(constraints, energy_names)

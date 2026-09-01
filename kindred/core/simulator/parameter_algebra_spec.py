@@ -298,9 +298,6 @@ class ParameterAlgebraNamespace:
     def solver_param_names(self) -> Set[str]:
         return set(self.mechanism_param_names) | set(self.param_assignment_names)
 
-    def reserved_identifier_names(self) -> Set[str]:
-        return set(self.builtin_function_names) | set(self.protected_symbol_names)
-
 
 @dataclass(frozen=True)
 class ParameterAlgebraSpec:
@@ -975,7 +972,7 @@ def _compile_retained_algebra_program(
     observable views are partitioned from this retained block; no later layer
     needs to rebuild source text.
     """
-    source_lines = ["# Algebra"]
+    source_lines: list[str] = []
     descriptors: list[tuple[str, int, str]] = []
     for line_number, raw in algebra_lines:
         classification = classify_parameter_algebra_declaration(
@@ -999,7 +996,7 @@ def _compile_retained_algebra_program(
     try:
         block = parse_algebra("\n".join(source_lines) + "\n")
     except Exception as exc:
-        statement_index = int(getattr(exc, "line", 0) or 0) - 2
+        statement_index = int(getattr(exc, "line", 0) or 0) - 1
         if 0 <= statement_index < len(descriptors):
             _kind, line_number, line_content = descriptors[statement_index]
             raise DSLError(

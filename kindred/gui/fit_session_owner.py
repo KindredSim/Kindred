@@ -1460,7 +1460,7 @@ class FitSessionOwner(QtCore.QObject):
         declarations = tuple(
             f"param {name} = {values[name]:.17g}" for name in sorted(values)
         )
-        algebra = ("# Algebra",) + tuple(
+        algebra = tuple(
             f"let {item.name} = {item.expression}" for item in observables
         )
         return source + separator + newline.join((*declarations, *algebra))

@@ -9,9 +9,9 @@ and parser-facing error reporting used by the Algebra DSL.
 Scope of this module
 --------------------
 - Tokenize source into a deterministic stream with locations.
-- Parse the internal synthetic source format: `# Algebra` header then
-  { let IDENT = expr NEWLINE }. External mechanism DSL algebra declarations
-  are normalized into this format before reaching this parser.
+- Parse the internal source format: { let IDENT = expr NEWLINE }. External
+  mechanism DSL algebra declarations are normalized into this format before
+  reaching this parser.
 - Build a typed AST with nodes:
     Number, Ident, Unary, Binary, Call, SpeciesRef(kind="now"|"init")
 - Enforce precedence and right-associative power (** and ^).
@@ -369,11 +369,8 @@ class Parser:
             raise AlgebraSyntaxError(msg, line=t.line, col=t.col, line_text=t.line_text)
         return self._advance()
 
-    # Entry: "# Algebra" newline { let_stmt }
+    # Entry: { let_stmt }
     def parse_block(self) -> AlgebraBlock:
-        # header: '#' 'Algebra'
-        self._parse_header()
-
         lines: List[LetStatement] = []
         exprs: List[ExprNode] = []
         static_values: Dict[str, float] = {}
@@ -413,32 +410,6 @@ class Parser:
             static_values=static_values,
             evaluation_order=_topological_evaluation_order(tuple(lines)),
         )
-
-    def _parse_header(self) -> None:
-        # Accept optional leading newlines
-        self._consume_newlines()
-        t = self._cur()
-        # Either tokenized as HASH IDENT "Algebra" or just IDENT if line starts directly with "#"
-        if t.kind is TokenKind.HASH:
-            self._advance()
-            ident = self._expect(TokenKind.IDENT, "expected 'Algebra' after '#'")
-            if ident.text != "Algebra":
-                raise AlgebraSyntaxError("expected '# Algebra' header", line=ident.line, col=ident.col, line_text=ident.line_text)
-        elif t.kind is TokenKind.IDENT and t.text == "Algebra":
-            # Extremely permissive header variant; still require it's the first token
-            pass
-        else:
-            raise AlgebraSyntaxError("algebra block must start with '# Algebra'", line=t.line, col=t.col, line_text=t.line_text)
-
-        # Require a newline after the header
-        if self._cur().kind is TokenKind.NEWLINE:
-            self._advance()
-        elif self._cur().kind is TokenKind.EOF:
-            # Degenerate empty block allowed
-            return
-        else:
-            t2 = self._cur()
-            raise AlgebraSyntaxError("expected newline after '# Algebra'", line=t2.line, col=t2.col, line_text=t2.line_text)
 
     def _consume_newlines(self) -> None:
         while self._cur().kind is TokenKind.NEWLINE:

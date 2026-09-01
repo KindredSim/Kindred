@@ -11,10 +11,7 @@ from kindred.core.simulator.errors import DSLError
 
 __all__ = [
     "WegscheiderCycle",
-    "WegscheiderConstraint",
-    "WegscheiderConstraintReport",
     "WegscheiderTopologyReport",
-    "analyze_wegscheider_constraints",
     "analyze_wegscheider_topology",
 ]
 
@@ -31,20 +28,6 @@ class WegscheiderTopologyReport:
     """Readable cycle topology derived from canonical reversible stoichiometry."""
 
     cycles: tuple[WegscheiderCycle, ...]
-
-
-@dataclass(frozen=True)
-class WegscheiderConstraint:
-    """One exact symbolic product constraint from an independent cycle."""
-
-    cycle_id: str
-    terms: tuple[tuple[str, int], ...]
-    expression: str
-
-
-@dataclass(frozen=True)
-class WegscheiderConstraintReport:
-    constraints: tuple[WegscheiderConstraint, ...]
 
 
 @dataclass(frozen=True)
@@ -340,33 +323,3 @@ def analyze_wegscheider_topology(mechanism: object) -> WegscheiderTopologyReport
         )
         cycles.append(cycle)
     return WegscheiderTopologyReport(cycles=tuple(cycles))
-
-
-def analyze_wegscheider_constraints(
-    mechanism: object,
-) -> WegscheiderConstraintReport:
-    """Emit exact independent cycle products without evaluating any values."""
-
-    constraints: list[WegscheiderConstraint] = []
-    for cycle in analyze_wegscheider_topology(mechanism).cycles:
-        terms = tuple(
-            (f"Keq{step_index}", int(coefficient))
-            for step_index, coefficient in zip(
-                cycle.step_indices,
-                cycle.coefficients,
-                strict=True,
-            )
-            if int(coefficient) != 0
-        )
-        factors = " * ".join(
-            f"{name}(T)**({coefficient})"
-            for name, coefficient in terms
-        )
-        constraints.append(
-            WegscheiderConstraint(
-                cycle_id=cycle.cycle_id,
-                terms=terms,
-                expression=f"product({factors}) = 1",
-            )
-        )
-    return WegscheiderConstraintReport(constraints=tuple(constraints))

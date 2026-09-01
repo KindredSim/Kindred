@@ -25,7 +25,6 @@ from kindred.core.mechanism_metadata import EquilibriumMetadataKeys
 from kindred.core.units import UnitsModel
 from kindred.core.temperature import (
     TemperatureScheduleProtocol,
-    coerce_temperature_schedule,
 )
 from kindred.core.algebra.simulation_series import (
     compiled_algebra_for_mechanism,
@@ -195,7 +194,7 @@ def build_simulation_row_algebra_context(
     times: np.ndarray,
     *,
     parameter_algebra_spec: object,
-    temperature_schedule: TemperatureScheduleProtocol | Mapping[str, object] | None,
+    temperature_schedule: TemperatureScheduleProtocol | None,
 ) -> tuple[dict[str, np.ndarray], dict[str, float]]:
     """Build the sole row-local temperature/coefficient/static context.
 
@@ -208,7 +207,7 @@ def build_simulation_row_algebra_context(
         raise TypeError("prepared mechanism metadata must be a mapping.")
     mechanism_metadata = MechanismMetadataView.from_metadata(metadata)
     nominal_temperature = float(mechanism_metadata.temperature_K)
-    schedule = coerce_temperature_schedule(temperature_schedule)
+    schedule = temperature_schedule
     row_times = np.asarray(times, dtype=float)
     if row_times.ndim != 1 or row_times.size == 0:
         raise ValueError("result row times must be a nonempty 1D array.")
@@ -233,9 +232,10 @@ def build_simulation_row_algebra_context(
         str(item.canonical_name) for item in namespace.ordered_items
     }
     coefficient_rows: dict[str, list[float]] = {}
+    canonical_parameters = tuple(iter_canonical_parameters(mechanism))
     for temperature in temperatures:
         coefficients = coefficient_evaluator(float(temperature))
-        for name, entry, role in iter_canonical_parameters(mechanism):
+        for name, entry, role in canonical_parameters:
             kind = str(entry.get("kind") or "")
             if kind == "reaction" and role == "k":
                 index = int(entry.get("reaction_index", -1))
@@ -285,7 +285,7 @@ def evaluate_simulation_result_algebra(
     result: object,
     species_names: list[str],
     initials_for_algebra: Mapping[str, Any] | None,
-    temperature_schedule: TemperatureScheduleProtocol | Mapping[str, object] | None,
+    temperature_schedule: TemperatureScheduleProtocol | None,
     parameter_algebra_spec: object,
     algebra_policy: SimulationAlgebraPolicy | str,
 ) -> tuple[
@@ -534,7 +534,7 @@ def finalize_simulation_result(
     result: object,
     species_names: list[str],
     initials_for_algebra: Mapping[str, Any] | None,
-    temperature_schedule: TemperatureScheduleProtocol | Mapping[str, object] | None,
+    temperature_schedule: TemperatureScheduleProtocol | None,
     parameter_algebra_spec: object,
     algebra_policy: SimulationAlgebraPolicy | str,
     parameters: tuple[tuple[str, float, str], ...] = (),

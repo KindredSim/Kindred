@@ -1,9 +1,9 @@
-"""Direct owner for dataset-import workers and uncommitted normalized output."""
+"""Application-global sequential owner for dataset-import batches."""
 
 from __future__ import annotations
 
 from contextlib import closing
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 import itertools
 import logging
 
@@ -24,12 +24,10 @@ from kindred.core.datasets.foundation import (
 )
 from kindred.gui.controllers.dataset_errors import (
     DatasetImportAdmissionError,
-    DatasetImportStateError,
 )
-from kindred.core.project_document import (
-    new_dataset_id,
-)
+from kindred.core.project_document import new_dataset_id
 from kindred.gui.import_workflow import (
+    ImportConfig,
     ImportSourceSnapshot,
     ResolvedSheetPlan,
 )
@@ -38,9 +36,8 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "DatasetImportCompletion",
-    "DatasetImportRequest",
     "DatasetImportStaging",
-    "DatasetImportWorkerAdmission",
+    "DatasetImportUnit",
     "RawDatasetBatchProposal",
     "build_raw_record_batch_proposal",
 ]
@@ -65,7 +62,7 @@ class DatasetImportUnit:
         if not isinstance(self.payload, DatasetObservationPayload):
             raise TypeError(
                 "Imported dataset payload must be a DatasetObservationPayload."
-        )
+            )
         object.__setattr__(self, "display_name", name)
 
 
@@ -96,209 +93,208 @@ class RawDatasetBatchProposal:
             )
 
 
-@dataclass(frozen=True, slots=True)
-class DatasetImportRequest:
-    origin_tab_id: str
-    expected_units: int
+class _DatasetImportCancelled(Exception):
+    """Internal cooperative cancellation marker."""
 
 
-@dataclass(frozen=True, slots=True)
-class DatasetImportWorkerAdmission:
-    """One immutable source/plan member of an admitted ordered import roster."""
+class _DatasetImportBatchWorker(QtCore.QThread):
+    """Read one admitted batch serially in source and sheet order."""
 
-    source: ImportSourceSnapshot
-    admitted_plans: tuple[ResolvedSheetPlan, ...]
-
-
-@dataclass(frozen=True, slots=True)
-class _DatasetImportSuccess:
-    unit: DatasetImportUnit
-
-
-_UNSUCCESSFUL_OUTCOME = object()
-_CANCELED_OUTCOME = _UNSUCCESSFUL_OUTCOME
-
-
-class DatasetImportWorker(QtCore.QThread):
-    """Exact signal contract for workers retained by DatasetImportStaging."""
-
-    loaded = QtCore.Signal(str, object)
-    cancelled = QtCore.Signal(str)
-    error = QtCore.Signal(str)
-    progress = QtCore.Signal(int)
-
-    def __init__(self, source: ImportSourceSnapshot) -> None:
-        super().__init__()
-        self._source = source
-
-    @property
-    def source(self) -> ImportSourceSnapshot:
-        return self._source
-
-
-class _CSVLoaderWorker(DatasetImportWorker):
-    """Background worker for one admitted CSV source."""
+    completed = QtCore.Signal(object)
+    failed = QtCore.Signal(str)
+    cancelled = QtCore.Signal()
+    progressed = QtCore.Signal(int)
 
     def __init__(
         self,
-        source: ImportSourceSnapshot,
-        plan: ResolvedSheetPlan,
+        *,
+        origin_tab_id: str,
+        configs: tuple[ImportConfig, ...],
+        parent: QtCore.QObject,
     ) -> None:
-        super().__init__(source)
-        self._plan = plan
+        super().__init__(parent)
+        self._origin_tab_id = origin_tab_id
+        self._configs = configs
+        self._total_units = sum(len(config.plans) for config in configs)
+        self._completed_units = 0
 
-    def _load_payload(self) -> DatasetObservationPayload:
-        columns, rows = read_csv_rows_from_bytes(
-            self.source.exact_source_bytes,
-            source_label=self.source.original_filename,
+    def cancel(self) -> None:
+        self.requestInterruption()
+
+    def _check_interrupted(self) -> None:
+        if self.isInterruptionRequested():
+            raise _DatasetImportCancelled()
+
+    @staticmethod
+    def _parse_rows(
+        rows,
+        *,
+        columns,
+        plan: ResolvedSheetPlan,
+        source: ImportSourceSnapshot,
+        sheet_name: str | None = None,
+        first_row=None,
+        interruption_checker,
+    ) -> DatasetObservationPayload:
+        row_iter = iter(rows)
+        if first_row is None:
+            first_row = next(row_iter, None)
+        if first_row is None:
+            label = (
+                f"Sheet {sheet_name!r} in workbook {source.original_filename!r}"
+                if sheet_name is not None
+                else f"CSV file {source.original_filename!r}"
+            )
+            raise ValueError(f"{label} is empty.")
+        rows_to_parse = (
+            row_iter
+            if plan.skip_unit_row
+            else itertools.chain((first_row,), row_iter)
         )
-        with closing(rows):
-            row_iter = iter(rows)
-            first_row = next(row_iter, None)
-            if first_row is None:
-                raise ValueError("CSV file is empty")
-            rows_to_parse = row_iter if self._plan.skip_unit_row else itertools.chain((first_row,), row_iter)
-            payload = parse_physical_rows(
-                rows_to_parse,
-                columns=columns,
-                time_column=self._plan.time_column,
-                species_columns=self._plan.species_columns,
-                interruption_checker=self.isInterruptionRequested,
-                source_label=self.source.original_filename,
-                source_row_start=3 if self._plan.skip_unit_row else 2,
-                time_factor=self._plan.time_factor,
-                observation_factors=self._plan.conc_factors,
-                metadata_extras={
-                    "original_time_unit": self._plan.original_time_unit,
-                    "original_concentration_units": dict(
-                        self._plan.original_conc_units
-                    ),
-                    "skip_unit_row": self._plan.skip_unit_row,
-                },
-            )
-        return payload
+        return parse_physical_rows(
+            rows_to_parse,
+            columns=columns,
+            time_column=plan.time_column,
+            species_columns=plan.species_columns,
+            interruption_checker=interruption_checker,
+            source_label=source.original_filename,
+            sheet_name=sheet_name,
+            source_row_start=3 if plan.skip_unit_row else 2,
+            time_factor=plan.time_factor,
+            observation_factors=plan.conc_factors,
+            metadata_extras={
+                "original_time_unit": plan.original_time_unit,
+                "original_concentration_units": dict(plan.original_conc_units),
+                "skip_unit_row": plan.skip_unit_row,
+            },
+        )
 
-    def run(self) -> None:
-        dataset_name = self.source.original_filename
+    def _load_csv(self, config: ImportConfig) -> DatasetImportUnit:
+        source = config.source
+        plan = config.plans[0]
         try:
-            self.progress.emit(10)
-            if self.isInterruptionRequested():
-                self.cancelled.emit(dataset_name)
-                return
-            self.progress.emit(30)
-            payload = self._load_payload()
-            self.progress.emit(80)
-            if self.isInterruptionRequested():
-                self.cancelled.emit(dataset_name)
-                return
-            self.progress.emit(100)
-            self.loaded.emit(dataset_name, payload)
-        except CsvImportInterrupted:
-            self.cancelled.emit(dataset_name)
+            columns, rows = read_csv_rows_from_bytes(
+                source.exact_source_bytes,
+                source_label=source.original_filename,
+            )
+            with closing(rows):
+                payload = self._parse_rows(
+                    rows,
+                    columns=columns,
+                    plan=plan,
+                    source=source,
+                    interruption_checker=lambda: self.isInterruptionRequested(),
+                )
+        except (_DatasetImportCancelled, CsvImportInterrupted):
+            raise
         except Exception as exc:
-            logger.exception("CSV import failed: %s", dataset_name)
-            self.error.emit(f"{type(exc).__name__}: {exc}")
+            raise ValueError(
+                f"CSV file {source.original_filename!r}: {exc}"
+            ) from exc
+        return DatasetImportUnit(
+            source=source,
+            display_name=source.original_filename,
+            payload=payload,
+        )
 
-
-class _ExcelLoaderWorker(DatasetImportWorker):
-    """Background worker for one admitted XLSX source."""
-
-    def __init__(
-        self,
-        source: ImportSourceSnapshot,
-        plans: tuple[ResolvedSheetPlan, ...],
-    ) -> None:
-        super().__init__(source)
-        self._plans = plans
-
-    def _load_sheet_payload(
-        self,
-        plan: ResolvedSheetPlan,
-        workbooks: ExcelWorkbookPair,
-    ) -> tuple[str, DatasetObservationPayload]:
-        sheet_name = plan.sheet_name
-        rows = workbooks.read_sheet_rows(sheet_name)
-        with closing(rows):
-            row_iter = iter(rows)
-            first_row = next(row_iter, None)
-            if first_row is None:
-                raise ValueError(f"Sheet {sheet_name!r} is empty.")
-            columns = tuple(first_row)
-            rows_to_parse = (
-                row_iter
-                if plan.skip_unit_row
-                else itertools.chain((first_row,), row_iter)
-            )
-            payload = parse_physical_rows(
-                rows_to_parse,
-                columns=columns,
-                time_column=plan.time_column,
-                species_columns=plan.species_columns,
-                interruption_checker=self.isInterruptionRequested,
-                source_label=self.source.original_filename,
-                sheet_name=sheet_name,
-                source_row_start=3 if plan.skip_unit_row else 2,
-                time_factor=plan.time_factor,
-                observation_factors=plan.conc_factors,
-                metadata_extras={
-                    "original_time_unit": plan.original_time_unit,
-                    "original_concentration_units": dict(plan.original_conc_units),
-                    "skip_unit_row": plan.skip_unit_row,
-                },
-            )
-        return f"{self.source.original_filename}::{sheet_name}", payload
-
-    def run(self) -> None:
-        dataset_name = self.source.original_filename
+    def _load_excel(self, config: ImportConfig) -> tuple[DatasetImportUnit, ...]:
+        source = config.source
+        units: list[DatasetImportUnit] = []
+        # Keep one workbook pair open for all selected sheets in this source.
         try:
-            self.progress.emit(0)
             with ExcelWorkbookPair(
-                self.source.exact_source_bytes,
-                source_label=self.source.original_filename,
+                source.exact_source_bytes,
+                source_label=source.original_filename,
             ) as workbooks:
-                for index, plan in enumerate(self._plans, start=1):
-                    if self.isInterruptionRequested():
-                        self.cancelled.emit(dataset_name)
-                        return
+                for plan in config.plans:
+                    self._check_interrupted()
+                    sheet_name = plan.sheet_name
+                    if sheet_name is None:
+                        raise ValueError("XLSX import plans require a sheet name.")
                     try:
-                        loaded_name, payload = self._load_sheet_payload(
-                            plan,
-                            workbooks,
-                        )
-                    except CsvImportInterrupted:
-                        self.cancelled.emit(dataset_name)
-                        return
+                        rows = workbooks.read_sheet_rows(sheet_name)
+                        with closing(rows):
+                            row_iter = iter(rows)
+                            first_row = next(row_iter, None)
+                            if first_row is None:
+                                raise ValueError("sheet is empty")
+                            payload = self._parse_rows(
+                                row_iter,
+                                columns=tuple(first_row),
+                                plan=plan,
+                                source=source,
+                                sheet_name=sheet_name,
+                                first_row=first_row,
+                                interruption_checker=lambda: self.isInterruptionRequested(),
+                            )
+                    except (_DatasetImportCancelled, CsvImportInterrupted):
+                        raise
                     except Exception as exc:
-                        logger.exception(
-                            "Excel import failed: %s sheet %s",
-                            dataset_name,
-                            plan.sheet_name,
+                        raise ValueError(
+                            f"Workbook {source.original_filename!r}, sheet "
+                            f"{sheet_name!r}: {exc}"
+                        ) from exc
+                    units.append(
+                        DatasetImportUnit(
+                            source=source,
+                            display_name=f"{source.original_filename}::{sheet_name}",
+                            payload=payload,
                         )
-                        self.error.emit(
-                            f"Sheet {plan.sheet_name!r}: {type(exc).__name__}: {exc}"
-                        )
-                    else:
-                        self.loaded.emit(loaded_name, payload)
-                    self.progress.emit(int((index / len(self._plans)) * 100))
-                    if self.isInterruptionRequested():
-                        self.cancelled.emit(dataset_name)
-                        return
+                    )
+                    self._completed_units += 1
+                    self._publish_plan_progress()
+                    self._check_interrupted()
+        except (_DatasetImportCancelled, CsvImportInterrupted):
+            raise
         except Exception as exc:
-            logger.exception("Excel import failed: %s", dataset_name)
-            self.error.emit(f"{type(exc).__name__}: {exc}")
+            if str(source.original_filename) in str(exc):
+                raise
+            raise ValueError(
+                f"Workbook {source.original_filename!r}: {exc}"
+            ) from exc
+        return tuple(units)
+
+    def _publish_plan_progress(self) -> None:
+        """Publish completed-plan progress while reserving 100 for success."""
+        if self._completed_units < self._total_units:
+            self.progressed.emit(
+                (self._completed_units * 100) // self._total_units
+            )
+
+    def run(self) -> None:
+        units: list[DatasetImportUnit] = []
+        try:
+            self._check_interrupted()
+            for config in self._configs:
+                self._check_interrupted()
+                source = config.source
+                if source.file_type == "excel":
+                    units.extend(self._load_excel(config))
+                else:
+                    units.append(self._load_csv(config))
+                    self._completed_units += 1
+                    self._publish_plan_progress()
+                self._check_interrupted()
+            self._check_interrupted()
+            self.progressed.emit(100)
+            completion = DatasetImportCompletion(
+                origin_tab_id=self._origin_tab_id,
+                units=tuple(units),
+            )
+            self.completed.emit(completion)
+        except (_DatasetImportCancelled, CsvImportInterrupted):
+            self.cancelled.emit()
+        except Exception as exc:
+            logger.exception("Dataset import failed")
+            self.failed.emit(f"{type(exc).__name__}: {exc}")
+
 
 def build_raw_record_batch_proposal(
     completion: DatasetImportCompletion,
     *,
     existing_records: tuple[RawDatasetRecord, ...],
 ) -> RawDatasetBatchProposal:
-    """Build the complete immutable batch for one ProjectDocument admission.
-
-    This is identity/name allocation only. ``ProjectDocument.add_datasets``
-    validates the whole returned tuple in one all-or-none project proposal.
-    Optional active-tab mapping remains a later transaction over committed raw
-    records.
-    """
+    """Build the complete immutable batch for one ProjectDocument admission."""
     used_names = {record.display_name.casefold() for record in existing_records}
     candidates: list[RawDatasetRecord] = []
     sources_by_id: dict[str, ImportedSource] = {}
@@ -342,609 +338,93 @@ def build_raw_record_batch_proposal(
     )
 
 
-@dataclass
-class _WorkerRecord:
-    """Private admitted worker state owned by one active import."""
-
-    source: ImportSourceSnapshot
-    admitted_plans: tuple[ResolvedSheetPlan, ...]
-    admitted_ordinals: tuple[int, ...]
-    worker: DatasetImportWorker | None = None
-    progress: int = 0
-    accounted_units: int = 0
-
-
-@dataclass
-class _ActiveImport:
-    request: DatasetImportRequest
-    workers: list[_WorkerRecord] = field(default_factory=list)
-    outcomes: list[_DatasetImportSuccess | object | None] = field(default_factory=list)
-    completed_units: int = 0
-    terminal_outcome: str | None = None
-    launch_started: bool = False
-    aggregate_progress: int = 0
-
-
 class DatasetImportStaging(QtCore.QObject):
-    """Own live QThreads until finish and exactly one normalized completion.
-
-    The object admits one complete raw-record batch before a GUI-thread
-    integration owner commits it through ProjectSession and only then offers
-    optional active-tab mapping.
-    """
+    """Own one global batch worker until terminal settlement."""
 
     completionAvailable = QtCore.Signal(object)
     busyChanged = QtCore.Signal(bool)
     application_close_settlement_changed = QtCore.Signal()
-    workerProgressed = QtCore.Signal(int)
-    workerFailed = QtCore.Signal(str)
-    workerCanceled = QtCore.Signal(str)
+    progressed = QtCore.Signal(int)
+    failed = QtCore.Signal(str)
+    cancelled = QtCore.Signal()
 
-    def __init__(
-        self,
-        *,
-        parent: QtCore.QObject | None = None,
-    ) -> None:
+    def __init__(self, *, parent: QtCore.QObject | None = None) -> None:
         super().__init__(parent)
-        self._active: _ActiveImport | None = None
-        self._application_close_settled = True
+        self._active_worker: _DatasetImportBatchWorker | None = None
         self._application_close_fenced = False
 
     @property
     def busy(self) -> bool:
-        return self._active is not None
-
-    def begin(
-        self,
-        *,
-        origin_tab_id: str,
-        roster: tuple[DatasetImportWorkerAdmission, ...],
-    ) -> DatasetImportRequest:
-        """Admit one complete immutable source/plan roster in user order."""
-        if self._application_close_fenced:
-            raise DatasetImportAdmissionError("Dataset import admission is fenced.")
-        if self.busy:
-            raise DatasetImportAdmissionError("A dataset import is already active or awaiting commit.")
-        expected = sum(len(item.admitted_plans) for item in roster)
-        if expected <= 0:
-            raise DatasetImportAdmissionError("Dataset import requires at least one result unit.")
-        request = DatasetImportRequest(
-            origin_tab_id=origin_tab_id,
-            expected_units=expected,
-        )
-        worker_records: list[_WorkerRecord] = []
-        next_ordinal = 0
-        for admission in roster:
-            unit_count = len(admission.admitted_plans)
-            ordinals = tuple(range(next_ordinal, next_ordinal + unit_count))
-            next_ordinal += unit_count
-            worker_records.append(
-                _WorkerRecord(
-                    source=admission.source,
-                    admitted_plans=admission.admitted_plans,
-                    admitted_ordinals=ordinals,
-                )
-            )
-        self._active = _ActiveImport(
-            request=request,
-            workers=worker_records,
-            outcomes=[None] * expected,
-        )
-        self._application_close_settled = False
-        self.busyChanged.emit(True)
-        return request
-
-    def start_import(
-        self,
-        import_request: DatasetImportRequest,
-    ) -> None:
-        """Acquire, connect, install, and start every admitted worker."""
-
-        active = self._require_active(import_request)
-        if self._application_close_fenced or active.terminal_outcome is not None:
-            raise DatasetImportAdmissionError(
-                "Dataset import start is fenced."
-            )
-        if active.launch_started:
-            raise DatasetImportStateError("Dataset import roster already started.")
-        active.launch_started = True
-        for record in tuple(active.workers):
-            if active.terminal_outcome is not None:
-                break
-            worker: DatasetImportWorker | None = None
-            try:
-                worker = self._acquire_worker(record)
-                self._install_worker(active, record, worker)
-                worker.start()
-            except Exception as exc:
-                self.cancel_active(outcome="worker_start_failed")
-                if worker is not None:
-                    try:
-                        worker.requestInterruption()
-                    except RuntimeError:
-                        pass
-                    if self._worker_is_verified_unstarted(worker):
-                        owned = self._lookup_worker_callback(
-                            import_request,
-                            worker,
-                        )
-                        if owned is not None:
-                            self._release_worker(*owned)
-                        else:
-                            try:
-                                worker.deleteLater()
-                            except RuntimeError:
-                                pass
-                raise DatasetImportAdmissionError(
-                    "Failed to start dataset import: "
-                    f"{type(exc).__name__}: {exc}"
-                ) from exc
-
-    @staticmethod
-    def _acquire_worker(
-        record: _WorkerRecord,
-    ) -> DatasetImportWorker:
-        if record.source.file_type == "excel":
-            return _ExcelLoaderWorker(
-                record.source,
-                record.admitted_plans,
-            )
-        return _CSVLoaderWorker(
-            record.source,
-            record.admitted_plans[0],
-        )
-
-    def _install_worker(
-        self,
-        active: _ActiveImport,
-        record: _WorkerRecord,
-        worker: DatasetImportWorker,
-    ) -> _WorkerRecord:
-        if any(
-            registered.worker is worker
-            for registered in active.workers
-        ):
-            raise DatasetImportStateError(
-                "Dataset import worker is already registered."
-            )
-        if not any(admitted is record for admitted in active.workers):
-            raise DatasetImportStateError(
-                "Dataset import worker record is not admitted."
-            )
-        if record.worker is not None:
-            raise DatasetImportStateError(
-                "Dataset import worker record is already installed."
-            )
-        record.worker = worker
-        worker.loaded.connect(
-            lambda display_name, payload, token=active.request, worker=worker: (
-                self._worker_loaded(
-                    token,
-                    worker,
-                    display_name,
-                    payload,
-                )
-            )
-        )
-        worker.progress.connect(
-            lambda percent, token=active.request, worker=worker: (
-                self._worker_progressed(
-                    token,
-                    worker,
-                    percent,
-                )
-            )
-        )
-        worker.cancelled.connect(
-            lambda source_label, token=active.request, worker=worker: (
-                self._worker_canceled(
-                    token,
-                    worker,
-                    source_label,
-                )
-            )
-        )
-        worker.error.connect(
-            lambda message, token=active.request, worker=worker: (
-                self._worker_failed(
-                    token,
-                    worker,
-                    message,
-                )
-            )
-        )
-        worker.finished.connect(
-            lambda token=active.request, worker=worker: (
-                self._worker_finished(
-                    token,
-                    worker,
-                )
-            )
-        )
-        return record
-
-    @staticmethod
-    def _worker_is_verified_unstarted(worker: DatasetImportWorker) -> bool:
-        try:
-            return bool(
-                not worker.isRunning()
-                and not worker.isFinished()
-            )
-        except RuntimeError:
-            return False
+        return self._active_worker is not None
 
     @property
     def application_close_settled(self) -> bool:
-        """Return whether this owner has completed all admitted import work."""
+        """Close settlement derives directly from worker custody."""
+        return self._active_worker is None
 
-        return self._application_close_settled
-
-    def _publish_application_close_settlement(self) -> None:
-        if self._active is not None:
-            return
-        if self._application_close_settled:
-            return
-        self._application_close_settled = True
-        self.application_close_settlement_changed.emit()
-
-    def _worker_loaded(
+    def start_import(
         self,
-        import_request: DatasetImportRequest,
-        worker: DatasetImportWorker,
-        display_name: str,
-        payload: DatasetObservationPayload,
-    ) -> bool:
-        owned = self._lookup_worker_callback(import_request, worker)
-        if owned is None:
-            return False
-        active, record = owned
-        if active.terminal_outcome is not None:
-            return False
-        try:
-            plan = record.admitted_plans[record.accounted_units]
-            expected_display_name = record.source.original_filename
-            if plan.sheet_name is not None:
-                expected_display_name = (
-                    f"{expected_display_name}::{plan.sheet_name}"
-                )
-            if display_name != expected_display_name:
-                raise ValueError(
-                    "Dataset worker result label does not match its next "
-                    "admitted typed plan."
-                )
-            unit = DatasetImportUnit(
-                source=record.source,
-                display_name=display_name,
-                payload=payload,
-            )
-        except (IndexError, TypeError, ValueError) as exc:
-            self._record_failure(
-                active,
-                record,
-                f"{type(exc).__name__}: {exc}",
-            )
-            return False
-        ordinal = record.admitted_ordinals[record.accounted_units]
-        self._store_outcomes(
-            active,
-            record,
-            (ordinal,),
-            _DatasetImportSuccess(
-                unit=unit,
-            ),
-        )
-        return True
-
-    def _worker_progressed(
-        self,
-        import_request: DatasetImportRequest,
-        worker: DatasetImportWorker,
-        percent: int,
-    ) -> bool:
-        owned = self._lookup_worker_callback(import_request, worker)
-        if owned is None:
-            return False
-        active, record = owned
-        if active.terminal_outcome is not None:
-            return False
-        progress = percent
-        previous = record.progress
-        if progress <= previous:
-            return True
-        record.progress = progress
-        self._publish_aggregate_progress(active)
-        return True
-
-    def _publish_aggregate_progress(
-        self,
-        active: _ActiveImport,
         *,
-        force_complete: bool = False,
+        origin_tab_id: str,
+        configs: tuple[ImportConfig, ...],
     ) -> None:
-        """Publish monotonic progress weighted by admitted dataset units."""
-        if active.terminal_outcome is not None:
-            return
-        if not active.workers:
-            return
-        if force_complete:
-            if active.completed_units != active.request.expected_units:
-                return
-            aggregate = 100
-        else:
-            weighted_progress = sum(
-                record.progress * len(record.admitted_plans)
-                for record in active.workers
+        if self._application_close_fenced:
+            raise DatasetImportAdmissionError("Dataset import admission is fenced.")
+        if self._active_worker is not None:
+            raise DatasetImportAdmissionError("A dataset import is already active.")
+        if not configs:
+            raise DatasetImportAdmissionError(
+                "Dataset import requires at least one configuration."
             )
-            total_units = active.request.expected_units
-            aggregate = (weighted_progress + total_units // 2) // total_units
-            # Worker progress may reach 100 before its result signal has been
-            # validated and settled.  Reserve terminal 100 for the successful
-            # completion path below.
-            aggregate = min(aggregate, 99)
-        if aggregate <= active.aggregate_progress:
-            return
-        active.aggregate_progress = aggregate
-        self.workerProgressed.emit(aggregate)
-
-    def _worker_failed(
-        self,
-        import_request: DatasetImportRequest,
-        worker: DatasetImportWorker,
-        message: str,
-    ) -> bool:
-        owned = self._lookup_worker_callback(import_request, worker)
-        if owned is None:
-            return False
-        active, record = owned
-        if active.terminal_outcome is not None:
-            return False
-        self._record_failure(active, record, message)
-        return True
-
-    def _worker_canceled(
-        self,
-        import_request: DatasetImportRequest,
-        worker: DatasetImportWorker,
-        source_label: str,
-    ) -> bool:
-        owned = self._lookup_worker_callback(import_request, worker)
-        if owned is None:
-            return False
-        active, record = owned
-        if active.terminal_outcome is None:
-            ordinals = self._unsettled_ordinals(active, record)
-            self._store_outcomes(
-                active,
-                record,
-                ordinals,
-                _CANCELED_OUTCOME,
-            )
-            self._latch_cancellation(active, outcome="worker_canceled")
-        self.workerCanceled.emit(source_label)
-        return True
-
-    def _worker_finished(
-        self,
-        import_request: DatasetImportRequest,
-        worker: DatasetImportWorker,
-    ) -> None:
-        """Release custody after the finished signal or a verified stopped wait."""
-
-        owned = self._lookup_worker_callback(import_request, worker)
-        if owned is None:
-            return
-        active, record = owned
-        self._release_worker(active, record)
-
-    def _release_worker(
-        self,
-        active: _ActiveImport,
-        record: _WorkerRecord,
-    ) -> None:
-        worker = record.worker
-        if worker is None:
-            return
-        missing = self._remaining_worker_units(record)
-        failure: str | None = None
-        if missing and active.terminal_outcome is None:
-            ordinals = self._unsettled_ordinals(active, record)
-            message = (
-                "Dataset importer ended without returning "
-                f"{missing} expected result{'s' if missing != 1 else ''}."
-            )
-            self._store_outcomes(
-                active,
-                record,
-                ordinals,
-                _UNSUCCESSFUL_OUTCOME,
-            )
-            failure = message
-        if failure is not None:
-            self._latch_failure(active)
-        record.worker = None
+        worker = _DatasetImportBatchWorker(
+            origin_tab_id=origin_tab_id,
+            configs=configs,
+            parent=self,
+        )
+        self._active_worker = worker
+        worker.completed.connect(self.completionAvailable)
+        worker.failed.connect(self.failed)
+        worker.cancelled.connect(self.cancelled)
+        worker.progressed.connect(self.progressed)
+        worker.finished.connect(self._worker_finished)
+        self.busyChanged.emit(True)
         try:
-            worker.deleteLater()
-        except RuntimeError:
-            pass
-        if failure is not None:
-            self.workerFailed.emit(failure)
-        self._finish_if_ready()
+            worker.start()
+        except Exception as exc:
+            try:
+                unstarted = not worker.isRunning() and not worker.isFinished()
+            except RuntimeError:
+                unstarted = False
+            if unstarted:
+                self._active_worker = None
+                self.busyChanged.emit(False)
+                try:
+                    worker.deleteLater()
+                except RuntimeError:
+                    pass
+                raise DatasetImportAdmissionError(
+                    f"Failed to start dataset import: {type(exc).__name__}: {exc}"
+                ) from exc
+            raise
 
-    def cancel_active(self, *, outcome: str = "user_canceled") -> bool:
-        active = self._active
-        if active is None:
-            return False
-        if active.terminal_outcome is None:
-            self._latch_cancellation(
-                active,
-                outcome=str(outcome or "user_canceled"),
-            )
-        self._finish_if_ready()
-        return True
+    def cancel_active(self) -> None:
+        worker = self._active_worker
+        if worker is not None:
+            worker.cancel()
 
     def fence_application_close_admission(self) -> None:
-        """Reject dataset-import admission for the active Close attempt."""
-
         self._application_close_fenced = True
 
     def cancel_for_application_close(self) -> None:
-        """Suppress publication and request cancellation without waiting."""
+        self._application_close_fenced = True
+        self.cancel_active()
 
-        self.fence_application_close_admission()
-        self.cancel_active(outcome="application_close")
-
-    def _finish_if_ready(self) -> None:
-        active = self._active
-        if active is None or any(record.worker is not None for record in active.workers):
+    @QtCore.Slot()
+    def _worker_finished(self) -> None:
+        worker = self.sender()
+        if worker is not self._active_worker:
             return
-        if active.terminal_outcome is not None:
-            self._active = None
-            self.busyChanged.emit(False)
-            self._publish_application_close_settlement()
-            return
-        if active.completed_units < active.request.expected_units:
-            return
-        successes = tuple(
-            outcome
-            for outcome in active.outcomes
-            if isinstance(outcome, _DatasetImportSuccess)
-        )
-        if len(successes) != active.request.expected_units:
-            raise DatasetImportStateError(
-                "A successful import must settle every ordinal with one unit."
-            )
-        completion = DatasetImportCompletion(
-            origin_tab_id=active.request.origin_tab_id,
-            units=tuple(outcome.unit for outcome in successes),
-        )
-        self._publish_aggregate_progress(active, force_complete=True)
-        self._active = None
+        self._active_worker = None
+        worker.deleteLater()
         self.busyChanged.emit(False)
-        self.completionAvailable.emit(completion)
-        self._publish_application_close_settlement()
-
-    def _require_active(self, import_request: DatasetImportRequest) -> _ActiveImport:
-        active = self._active
-        if (
-            active is None
-            or active.request is not import_request
-        ):
-            raise DatasetImportStateError("Dataset import callback is stale.")
-        return active
-
-    def _lookup_worker_callback(
-        self,
-        import_request: DatasetImportRequest,
-        worker: DatasetImportWorker,
-    ) -> tuple[_ActiveImport, _WorkerRecord] | None:
-        active = self._active
-        if active is None or active.request is not import_request:
-            return None
-        for record in active.workers:
-            if record.worker is worker:
-                return active, record
-        return None
-
-    def _record_failure(
-        self,
-        active: _ActiveImport,
-        record: _WorkerRecord,
-        message: str,
-    ) -> None:
-        ordinals = self._unsettled_ordinals(active, record)
-        self._store_outcomes(
-            active,
-            record,
-            ordinals,
-            _UNSUCCESSFUL_OUTCOME,
-        )
-        self._latch_failure(active)
-        self.workerFailed.emit(message)
-
-    def _latch_failure(self, active: _ActiveImport) -> None:
-        if active.terminal_outcome is not None:
-            return
-        active.terminal_outcome = "worker_failed"
-        self._settle_canceled_ordinals(active)
-        for record in tuple(active.workers):
-            worker = record.worker
-            if worker is None:
-                continue
-            try:
-                worker.requestInterruption()
-            except RuntimeError:
-                continue
-
-    def _latch_cancellation(
-        self,
-        active: _ActiveImport,
-        *,
-        outcome: str,
-    ) -> None:
-        if active.terminal_outcome is not None:
-            return
-        active.terminal_outcome = str(outcome)
-        self._settle_canceled_ordinals(active)
-        for record in tuple(active.workers):
-            worker = record.worker
-            if worker is None:
-                continue
-            try:
-                worker.requestInterruption()
-            except RuntimeError:
-                continue
-
-    def _settle_canceled_ordinals(self, active: _ActiveImport) -> None:
-        for record in active.workers:
-            ordinals = self._unsettled_ordinals(active, record)
-            if not ordinals:
-                continue
-            self._store_outcomes(
-                active,
-                record,
-                ordinals,
-                _CANCELED_OUTCOME,
-            )
-
-    @staticmethod
-    def _unsettled_ordinals(
-        active: _ActiveImport,
-        record: _WorkerRecord,
-    ) -> tuple[int, ...]:
-        return tuple(
-            ordinal
-            for ordinal in record.admitted_ordinals
-            if active.outcomes[ordinal] is None
-        )
-
-    @staticmethod
-    def _store_outcomes(
-        active: _ActiveImport,
-        record: _WorkerRecord,
-        ordinals: tuple[int, ...],
-        outcome: _DatasetImportSuccess | object,
-    ) -> None:
-        if any(
-            ordinal not in record.admitted_ordinals
-            or active.outcomes[ordinal] is not None
-            for ordinal in ordinals
-        ) or len(ordinals) != len(set(ordinals)):
-            raise DatasetImportStateError(
-                "Dataset import ordinal was settled twice or by the wrong worker."
-            )
-        for ordinal in ordinals:
-            active.outcomes[ordinal] = outcome
-        record.accounted_units += len(ordinals)
-        if record.accounted_units == len(record.admitted_plans):
-            if isinstance(outcome, _DatasetImportSuccess):
-                record.progress = 100
-        active.completed_units += len(ordinals)
-
-    @staticmethod
-    def _remaining_worker_units(
-        record: _WorkerRecord,
-    ) -> int:
-        return max(
-            0,
-            len(record.admitted_plans) - record.accounted_units,
-        )
+        self.application_close_settlement_changed.emit()

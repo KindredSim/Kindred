@@ -669,6 +669,7 @@ class InitialConditionsTableActions(QtCore.QObject):
 
     errorRaised = QtCore.Signal(str)
     draftStateChanged = QtCore.Signal(str, bool)
+    setNameChanged = QtCore.Signal(str)
     selectedRunSetIdsChanged = QtCore.Signal(object)
 
     def __init__(
@@ -1037,6 +1038,7 @@ class InitialConditionsTableActions(QtCore.QObject):
                 f"An initial-condition set named {normalized!r} already exists."
             )
         initial_set = tab.initial_condition_set(set_id)
+        changed = initial_set.name != normalized
         result = self._registry.replace_initial_condition_set(
             self._tab_id,
             replace(initial_set, name=normalized),
@@ -1045,6 +1047,8 @@ class InitialConditionsTableActions(QtCore.QObject):
         self._carry_editor_mutation(result)
         accepted = result is not None
         self.render()
+        if accepted and changed:
+            self.setNameChanged.emit(self._tab_id)
         return accepted
 
     def add_set(self) -> InitialConditionSet | None:

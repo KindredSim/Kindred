@@ -1465,13 +1465,7 @@ def _admitted_correction_targets(
     )
     powers: set[str] = set()
     for item in getattr(composition, "constraints", ()):
-        monomial = getattr(item, "monomial", None)
-        if monomial is not None and callable(
-            getattr(monomial, "coordinate_power_map", None)
-        ):
-            powers.update(str(name) for name in monomial.coordinate_power_map())
-        else:
-            powers.update(str(name) for name, _power in item.powers)
+        powers.update(str(name) for name in item.monomial.coordinate_power_map())
     admitted: list[CorrectionTarget] = []
     equilibria = tuple(getattr(mechanism, "equilibria", ()) or ())
     for coordinate in coordinates:

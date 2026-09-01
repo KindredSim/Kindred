@@ -2,15 +2,16 @@
 Temperature schedule DSL parsing for Kindred.
 
 Supports parsing temperature schedule definitions from DSL text:
-- temp_step: t=[0,50,100], T=[298,320,310]  (piecewise steps)
+- temp_step: t=[0,50,100], T=[298,320]  (piecewise steps)
 - temp_response: t=[0,50,100], T=[298,320], tau=10  (first-order response)
 
 Integrates with TemperatureSchedule class from kindred.core.temperature.
 
 Example DSL:
     # Piecewise temperature schedule
-    temp_step: t=[0,50,100,150], T=[298,320,320,310]
-    # Creates intervals: [0,50)→298K, [50,100)→320K, [100,150]→310K
+    temp_step: t=[0,50,100,150], T=[298,320,310]
+    # Creates intervals: [0,50)→298K, [50,100)→320K, [100,150)→310K;
+    # the final 310K temperature continues after t=150.
 """
 
 from __future__ import annotations
@@ -174,7 +175,7 @@ def parse_temperature_schedule(
     Parse one admitted temperature schedule directive.
 
     Recognizes:
-    - temp_step: t=[0,50,100], T=[298,320,310]  (piecewise)
+    - temp_step: t=[0,50,100], T=[298,320]  (piecewise)
     - temp_response: t=[0,50,100], T=[298,320], tau=10
 
     Parameters
@@ -195,7 +196,7 @@ def parse_temperature_schedule(
 
     Examples
     --------
-    >>> dsl = "temp_step: t=[0,50,100], T=[298,320,310]"
+    >>> dsl = "temp_step: t=[0,50,100], T=[298,320]"
     >>> schedule = parse_temperature_schedule(dsl)
     >>> schedule(25.0)
     298.0
@@ -231,12 +232,12 @@ def _parse_piecewise_temperature(
     """
     Parse piecewise temperature line.
 
-    Format: temp_step: t=[0,50,100], T=[298,320,310]
+    Format: temp_step: t=[0,50,100], T=[298,320]
 
     Creates intervals:
     - [0, 50) → 298 K
     - [50, 100) → 320 K
-    - [100, inf) → 310 K (last interval extends to infinity)
+    - [100, inf) → 320 K (the final temperature continues)
 
     Parameters
     ----------

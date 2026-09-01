@@ -266,7 +266,7 @@ def admit_fit_local_algebra(
     expected = {name for item in items for name in item.scalar_names}
     if set(names) != expected:
         raise ValueError("scalar_names must exactly cover observable scalar dependencies.")
-    source = "# Algebra\n" + "\n".join(
+    source = "\n".join(
         f"let {item.name} = {item.expression}" for item in items
     ) + "\n"
     return _admit_local_block(
@@ -374,7 +374,7 @@ def validate_fit_local_observable(
         )
 
     block = parse_algebra(
-        f"# Algebra\nlet __kindred_fit_observable__ = {expression_source}\n"
+        f"let __kindred_fit_observable__ = {expression_source}\n"
     )
     if not block.lines:
         raise ValueError("Observable expression did not produce an Algebra value.")

@@ -5,8 +5,6 @@ from __future__ import annotations
 import logging
 import io
 import os
-import stat
-import tempfile
 import webbrowser
 from dataclasses import dataclass, replace
 from typing import Callable, Iterable, Sequence
@@ -97,6 +95,8 @@ from kindred.gui.dataset_import_staging import (
     DatasetImportStaging,
     build_raw_record_batch_proposal,
 )
+from kindred.gui.xlsx_export_owner import XlsxExportOwner
+from kindred.gui.import_workflow import ImportConfig
 from kindred.gui.dataset_payload_snapshot import (
     build_data_manager_snapshot,
     build_experimental_layer_inputs,
@@ -141,14 +141,11 @@ from kindred.gui.widgets.solver_settings import SimulationSettingsDialog
 from kindred.gui.widgets.symbolic_calculator_panel import SymbolicCalculatorPanel
 from kindred.gui.ui_helpers import setup_scientific_validator
 from kindred.gui.workspace_result_presenter import (
-    ResultDataBlock,
     ResultRenderInput,
     VisibleResultSet,
-    XlsxExportCompletion,
     compose_result_input,
     iter_blocks_tsv_chunks,
     select_copy_blocks,
-    write_xlsx,
 )
 from kindred.gui.workspace_tab_registry import (
     ScientificDocumentDelta,
@@ -191,315 +188,6 @@ class _TabSurfaceBundle:
     slider_binding: TabSliderBinding
 
 
-@dataclass(frozen=True, slots=True)
-class _XlsxExportSuccess:
-    path: str
-    completion: XlsxExportCompletion
-
-
-@dataclass(frozen=True, slots=True)
-class _XlsxExportFailure:
-    path: str
-    message: str
-    cancelled: bool
-
-
-class _XlsxExportCancelled(Exception):
-    """Internal cancellation fence for one application-owned XLSX export."""
-
-
-class _XlsxExportWorker(QtCore.QThread):
-    succeeded = QtCore.Signal(object)
-    failed = QtCore.Signal(object)
-
-    def __init__(
-        self,
-        *,
-        blocks: tuple[ResultDataBlock, ...],
-        path: str,
-        parent: QtCore.QObject,
-    ) -> None:
-        super().__init__(parent)
-        self._blocks = blocks
-        self._path = os.path.abspath(os.fspath(path))
-        self._commit_started = False
-
-    def cancel(self) -> bool:
-        """Request cancellation without waiting on destination finalization."""
-
-        if self._commit_started or self.isFinished():
-            return False
-        self.requestInterruption()
-        return True
-
-    def _check_cancelled(self) -> None:
-        if self.isInterruptionRequested():
-            raise _XlsxExportCancelled()
-
-    def run(self) -> None:
-        temporary_path = ""
-        descriptor = -1
-        try:
-            self._check_cancelled()
-            parent = os.path.dirname(self._path) or os.curdir
-            if not os.path.isdir(parent):
-                raise FileNotFoundError(
-                    f"Export directory does not exist: {parent}"
-                )
-            self._check_cancelled()
-            descriptor, temporary_path = tempfile.mkstemp(
-                prefix=f".{os.path.basename(self._path)}.",
-                suffix=".partial",
-                dir=parent,
-            )
-            self._check_cancelled()
-            with os.fdopen(descriptor, "w+b") as destination:
-                descriptor = -1
-                self._check_cancelled()
-                completion = write_xlsx(
-                    self._blocks,
-                    destination,
-                    cancellation_check=self._check_cancelled,
-                )
-                if not isinstance(completion, XlsxExportCompletion):
-                    raise TypeError(
-                        "write_xlsx() must return "
-                        "XlsxExportCompletion."
-                )
-                self._check_cancelled()
-                destination.flush()
-                self._check_cancelled()
-            try:
-                existing_mode = stat.S_IMODE(os.stat(self._path).st_mode)
-            except FileNotFoundError:
-                existing_mode = None
-            if existing_mode is not None:
-                os.chmod(temporary_path, existing_mode)
-            self._check_cancelled()
-            # Enter the sole commit boundary. Cancellation thereafter neither
-            # waits for nor interrupts a potentially blocking atomic replace;
-            # that commit may finish.
-            self._commit_started = True
-            os.replace(temporary_path, self._path)
-            temporary_path = ""
-        except _XlsxExportCancelled:
-            outcome = _XlsxExportFailure(
-                path=self._path,
-                message="XLSX export was cancelled.",
-                cancelled=True,
-            )
-            self.failed.emit(outcome)
-        except Exception as exc:
-            cancelled = bool(
-                not self._commit_started
-                and self.isInterruptionRequested()
-            )
-            outcome = _XlsxExportFailure(
-                path=self._path,
-                message=(
-                    "XLSX export was cancelled."
-                    if cancelled
-                    else f"{type(exc).__name__}: {exc}"
-                ),
-                cancelled=cancelled,
-            )
-            self.failed.emit(outcome)
-        else:
-            outcome = _XlsxExportSuccess(
-                path=self._path,
-                completion=completion,
-            )
-            self.succeeded.emit(outcome)
-        finally:
-            if descriptor >= 0:
-                try:
-                    os.close(descriptor)
-                except OSError:
-                    pass
-            if temporary_path:
-                try:
-                    os.unlink(temporary_path)
-                except FileNotFoundError:
-                    pass
-                except OSError:
-                    logger.warning(
-                        "Could not remove partial XLSX export %s",
-                        temporary_path,
-                        exc_info=True,
-                    )
-
-
-class _XlsxExportOwner(QtCore.QObject):
-    """Own one exact XLSX worker and its Close fence."""
-
-    succeeded = QtCore.Signal(object)
-    failed = QtCore.Signal(object)
-    application_close_settlement_changed = QtCore.Signal()
-
-    def __init__(self, *, parent: QtCore.QObject) -> None:
-        super().__init__(parent)
-        self._active_worker: _XlsxExportWorker | None = None
-        self._application_close_fenced = False
-        self._application_close_settled = True
-
-    @property
-    def is_exporting(self) -> bool:
-        return self._active_worker is not None
-
-    @property
-    def application_close_settled(self) -> bool:
-        """Return whether the admitted export has completed full cleanup."""
-
-        return self._application_close_settled
-
-    @staticmethod
-    def _canonical_local_path(path: str | os.PathLike[str]) -> str:
-        """Normalize one local destination for exact ownership comparison."""
-
-        return os.path.normcase(
-            os.path.realpath(
-                os.path.abspath(os.fsdecode(os.fspath(path)))
-            )
-        )
-
-    def owns_destination(self, path: str | os.PathLike[str]) -> bool:
-        """Return whether the active XLSX worker owns this exact destination."""
-
-        worker = self._active_worker
-        if worker is None:
-            return False
-        return self._canonical_local_path(path) == self._canonical_local_path(
-            worker._path
-        )
-
-    def _publish_application_close_settlement(self) -> None:
-        if self._active_worker is not None:
-            return
-        if self._application_close_settled:
-            return
-        self._application_close_settled = True
-        self.application_close_settlement_changed.emit()
-
-    def start(
-        self,
-        blocks: tuple[ResultDataBlock, ...],
-        path: str,
-    ) -> bool:
-        absolute_path = os.path.abspath(os.fspath(path))
-        if self._application_close_fenced:
-            self.failed.emit(
-                _XlsxExportFailure(
-                    path=absolute_path,
-                    message="XLSX export is unavailable while Kindred closes.",
-                    cancelled=True,
-                )
-            )
-            return False
-        worker = self._active_worker
-        if worker is not None:
-            self.failed.emit(
-                _XlsxExportFailure(
-                    path=absolute_path,
-                    message="Another XLSX export is already active.",
-                    cancelled=False,
-                )
-            )
-            return False
-        worker = _XlsxExportWorker(
-            blocks=blocks,
-            path=absolute_path,
-            parent=self,
-        )
-        self._active_worker = worker
-        self._application_close_settled = False
-        try:
-            worker.succeeded.connect(self._publish_success)
-            worker.failed.connect(self._publish_failure)
-            worker.finished.connect(self._worker_finished)
-            worker.start()
-        except Exception as exc:
-            try:
-                verified_unstarted = bool(
-                    not worker.isRunning()
-                    and not worker.isFinished()
-                )
-            except RuntimeError:
-                verified_unstarted = False
-            if not verified_unstarted:
-                logger.exception(
-                    "XLSX worker startup raised and unstarted state could not "
-                    "be verified; retaining worker custody"
-                )
-                # Native launch may already have happened even though start()
-                # raised. Keep worker custody until its finished signal settles
-                # the sole terminal outcome.
-                return True
-            self._active_worker = None
-            for signal, slot in (
-                (worker.succeeded, self._publish_success),
-                (worker.failed, self._publish_failure),
-                (worker.finished, self._worker_finished),
-            ):
-                try:
-                    signal.disconnect(slot)
-                except (RuntimeError, TypeError):
-                    pass
-            worker.deleteLater()
-            logger.exception("XLSX worker startup failed before execution")
-            self.failed.emit(
-                _XlsxExportFailure(
-                    path=absolute_path,
-                    message=f"Could not start XLSX export: {exc}",
-                    cancelled=False,
-                )
-            )
-            self._publish_application_close_settlement()
-            return False
-        return True
-
-    @QtCore.Slot(object)
-    def _publish_success(self, outcome: object) -> None:
-        """Admit one current worker success before public publication."""
-
-        worker = self.sender()
-        if worker is not self._active_worker:
-            return
-        if not isinstance(outcome, _XlsxExportSuccess):
-            return
-        self.succeeded.emit(outcome)
-
-    @QtCore.Slot(object)
-    def _publish_failure(self, outcome: object) -> None:
-        """Admit one current worker failure before public publication."""
-
-        worker = self.sender()
-        if worker is not self._active_worker:
-            return
-        if not isinstance(outcome, _XlsxExportFailure):
-            return
-        self.failed.emit(outcome)
-
-    @QtCore.Slot()
-    def _worker_finished(self) -> None:
-        worker = self.sender()
-        if worker is not self._active_worker:
-            return
-        self._active_worker = None
-        if isinstance(worker, QtCore.QThread):
-            worker.deleteLater()
-        self._publish_application_close_settlement()
-
-    def _cancel_active(self) -> _XlsxExportWorker | None:
-        worker = self._active_worker
-        if worker is not None:
-            worker.cancel()
-        return worker
-
-    def cancel_for_application_close(self) -> None:
-        self._application_close_fenced = True
-        self._cancel_active()
-
-
 class MainWindow(QtWidgets.QMainWindow):
     """One physical shell over one explicit, retained semantic owner graph."""
 
@@ -521,6 +209,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._new_project_action: QtGui.QAction | None = None
         self._open_project_action: QtGui.QAction | None = None
         self._xlsx_export_action: QtGui.QAction | None = None
+        self._dataset_import_progress_dialog: QtWidgets.QProgressDialog | None = None
         self._fit_window_open = False
         self._fit_executing = False
         self._last_export_directory: str | None = None
@@ -581,12 +270,15 @@ class MainWindow(QtWidgets.QMainWindow):
 
         for tab in self._project_session.document.tabs:
             self._create_tab_surface(tab.tab_id)
-        self._xlsx_export_owner = _XlsxExportOwner(parent=self)
+        self._xlsx_export_owner = XlsxExportOwner(parent=self)
         self._xlsx_export_owner.succeeded.connect(
             self._on_xlsx_export_succeeded
         )
         self._xlsx_export_owner.failed.connect(
             self._on_xlsx_export_failed
+        )
+        self._xlsx_export_owner.cancelled.connect(
+            self._on_xlsx_export_cancelled
         )
         self._xlsx_export_owner.application_close_settlement_changed.connect(
             self._refresh_actions
@@ -710,10 +402,10 @@ class MainWindow(QtWidgets.QMainWindow):
         batch_model.setParent(simulation_panel)
         batch_table = simulation_panel.batch_table
         data_panel = DataManagerPanel(
-            self._dataset_import_staging,
             origin_tab_id=target,
             parent=self._data_stack,
         )
+        data_panel.set_import_busy(self._dataset_import_staging.busy)
         overlay_panel = DatasetOverlayPanel(
             self._workspace,
             color_for_species=self.config_controller.species_color,
@@ -904,6 +596,7 @@ class MainWindow(QtWidgets.QMainWindow):
             )
         )
         actions.errorRaised.connect(self.set_status_text)
+        actions.setNameChanged.connect(self._on_initial_set_name_changed)
         actions.selectedRunSetIdsChanged.connect(
             lambda _ids, captured=tab_id: self._on_selected_run_sets_changed(
                 captured
@@ -920,6 +613,7 @@ class MainWindow(QtWidgets.QMainWindow):
             )
         )
         data = bundle.data_panel
+        data.datasetImportRequested.connect(self._start_dataset_import)
         data.datasetRenameRequested.connect(self._rename_dataset)
         data.datasetDeleteRequested.connect(self._delete_dataset)
         data.datasetExportOriginalRequested.connect(self._export_original_dataset)
@@ -1085,6 +779,15 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         self._dataset_import_staging.busyChanged.connect(
             self._on_import_busy_changed
+        )
+        self._dataset_import_staging.progressed.connect(
+            self._on_import_progress
+        )
+        self._dataset_import_staging.failed.connect(
+            self._on_import_failure
+        )
+        self._dataset_import_staging.cancelled.connect(
+            self._on_import_cancellation
         )
         self.config_controller.applicationPlotPreferencesChanged.connect(
             self._refresh_application_plot_preferences
@@ -2886,6 +2589,20 @@ class MainWindow(QtWidgets.QMainWindow):
         self._refresh_title()
         self._refresh_actions()
 
+    @QtCore.Slot(str)
+    def _on_initial_set_name_changed(self, tab_id: str) -> None:
+        """Reproject every display label after one accepted set rename."""
+
+        target = str(tab_id)
+        bundle = self._tab_surfaces.get(target)
+        if bundle is None:
+            return
+        self._refresh_dataset_views((target,))
+        self._refresh_slider_target_summary(
+            target,
+            bundle.slider_binding.resolve_target_set_ids(),
+        )
+
     @QtCore.Slot(str, bool)
     def _on_slider_draft_state_changed(
         self,
@@ -3431,8 +3148,85 @@ class MainWindow(QtWidgets.QMainWindow):
     # ------------------------------------------------------------------
     # Dataset intents
     # ------------------------------------------------------------------
+    @QtCore.Slot(str, object)
+    def _start_dataset_import(
+        self,
+        origin_tab_id: str,
+        configs: tuple[ImportConfig, ...],
+    ) -> None:
+        """Admit one configured import intent into the global staging owner."""
+        if not self._mutation_input_admitted("Import Dataset"):
+            return
+        dataset_count = sum(len(config.plans) for config in configs)
+        label = f"{dataset_count} dataset{'s' if dataset_count != 1 else ''}"
+        self._dataset_import_progress_dialog = QtWidgets.QProgressDialog(
+            f"Loading {label}...",
+            "Cancel",
+            0,
+            100,
+            self,
+        )
+        self._dataset_import_progress_dialog.setWindowTitle("Loading Datasets")
+        self._dataset_import_progress_dialog.setWindowModality(Qt.WindowModal)
+        self._dataset_import_progress_dialog.setMinimumDuration(0)
+        self._dataset_import_progress_dialog.canceled.connect(
+            self._cancel_dataset_import
+        )
+        self._dataset_import_progress_dialog.show()
+        try:
+            self._dataset_import_staging.start_import(
+                origin_tab_id=origin_tab_id,
+                configs=configs,
+            )
+        except Exception as exc:
+            self._close_import_progress_dialog()
+            logger.exception("Dataset import could not start")
+            QtWidgets.QMessageBox.critical(
+                self,
+                "Dataset Import",
+                str(exc),
+            )
+
+    @QtCore.Slot(int)
+    def _on_import_progress(self, percent: int) -> None:
+        dialog = self._dataset_import_progress_dialog
+        if dialog is not None:
+            dialog.setValue(int(percent))
+
+    @QtCore.Slot(str)
+    def _on_import_failure(self, message: str) -> None:
+        self.set_status_text(f"Dataset import failed: {message}")
+        QtWidgets.QMessageBox.critical(
+            self,
+            "Dataset Import",
+            message,
+        )
+
+    @QtCore.Slot()
+    def _on_import_cancellation(self) -> None:
+        self.set_status_text("Dataset import cancelled.")
+
+    @QtCore.Slot()
+    def _cancel_dataset_import(self) -> None:
+        self._dataset_import_staging.cancel_active()
+
+    def _close_import_progress_dialog(self) -> None:
+        dialog = self._dataset_import_progress_dialog
+        if dialog is None:
+            return
+        try:
+            dialog.canceled.disconnect(self._cancel_dataset_import)
+        except (TypeError, RuntimeError):
+            pass
+        dialog.close()
+        self._dataset_import_progress_dialog = None
+
     @QtCore.Slot(bool)
-    def _on_import_busy_changed(self, _busy: bool) -> None:
+    def _on_import_busy_changed(self, busy: bool) -> None:
+        for bundle in self._tab_surfaces.values():
+            bundle.data_panel.set_import_busy(bool(busy))
+        if not busy:
+            self._close_import_progress_dialog()
         self._refresh_actions()
 
     @QtCore.Slot(object)
@@ -4546,6 +4340,11 @@ class MainWindow(QtWidgets.QMainWindow):
             return False
         if not self._confirm_discard_slider_preview(tab_id, "Global Fit"):
             return False
+        if self._accept_visible_source_result(
+            tab_id,
+            description="Global Fit",
+        ) is None:
+            return False
         return self._fit_session_owner.open_fit_configuration(tab_id) is not None
 
     def _configure_fitting(self) -> bool:
@@ -4752,7 +4551,15 @@ class MainWindow(QtWidgets.QMainWindow):
             if answer != QtWidgets.QMessageBox.StandardButton.Yes:
                 return False
         self._remember_export_directory(path)
-        if not self._xlsx_export_owner.start(blocks, path):
+        try:
+            self._xlsx_export_owner.start(blocks, path)
+        except (OSError, RuntimeError, TypeError, ValueError) as exc:
+            self.set_status_text(f"XLSX export could not start: {exc}")
+            QtWidgets.QMessageBox.critical(
+                self,
+                "Export Results XLSX",
+                str(exc),
+            )
             return False
         self.set_status_text(f"Exporting XLSX: {path}")
         self._refresh_actions()
@@ -4763,31 +4570,33 @@ class MainWindow(QtWidgets.QMainWindow):
         if os.path.isdir(directory):
             self._last_export_directory = directory
 
-    @QtCore.Slot(object)
-    def _on_xlsx_export_succeeded(self, outcome: object) -> None:
-        completion = outcome.completion
+    @QtCore.Slot(str, object)
+    def _on_xlsx_export_succeeded(
+        self,
+        path: str,
+        completion: object,
+    ) -> None:
         self.set_status_text(
-            f"Exported XLSX: {outcome.path} "
+            f"Exported XLSX: {path} "
             f"({completion.worksheet_count} worksheets, "
             f"{completion.data_row_count} data rows, "
             f"{completion.bytes_written} bytes)."
         )
         self._refresh_actions()
 
-    @QtCore.Slot(object)
-    def _on_xlsx_export_failed(self, outcome: object) -> None:
-        status = (
-            outcome.message
-            if outcome.cancelled
-            else f"XLSX export failed: {outcome.message}"
+    @QtCore.Slot(str, str)
+    def _on_xlsx_export_failed(self, path: str, message: str) -> None:
+        self.set_status_text(f"XLSX export failed: {path}: {message}")
+        QtWidgets.QMessageBox.critical(
+            self,
+            "Export Results XLSX",
+            f"{path}\n\n{message}",
         )
-        self.set_status_text(status)
-        if not outcome.cancelled:
-            QtWidgets.QMessageBox.critical(
-                self,
-                "Export Results XLSX",
-                outcome.message,
-            )
+        self._refresh_actions()
+
+    @QtCore.Slot(str)
+    def _on_xlsx_export_cancelled(self, path: str) -> None:
+        self.set_status_text(f"XLSX export cancelled: {path}")
         self._refresh_actions()
 
     # ------------------------------------------------------------------

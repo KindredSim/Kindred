@@ -24,7 +24,7 @@ from kindred.core.simulator.step_indexing import (
     get_step_index_map,
     lookup_source_coordinate_target,
 )
-from kindred.core.simulator.wegscheider_symbolic import WegscheiderConstraintReport, analyze_wegscheider_constraints
+from kindred.core.simulator.wegscheider_symbolic import analyze_wegscheider_topology
 
 __all__ = [
     "ExactMonomial",
@@ -121,15 +121,6 @@ class ExactMonomial:
             for name, power in result.items()
             if power
         }
-
-    def power_map(self) -> dict[str, Fraction]:
-        """Return only direct multiplicative powers.
-
-        Exponential arguments are not powers of opaque strings.  Callers that
-        need all retained coordinates should use :meth:`coordinate_power_map`.
-        """
-
-        return dict(self.powers)
 
     def scale(self, factor: Fraction) -> "ExactMonomial":
         """Scale a scalar expression by an exact factor.
@@ -370,16 +361,10 @@ def _exact_monomial_from_ast(
 @dataclass(frozen=True, slots=True)
 class ExactConstraint:
     cycle_id: str
-    powers: tuple[tuple[str, Fraction], ...]
+    monomial: ExactMonomial
     expression: str
     status: str = "resolved"
     reason: str | None = None
-    coefficient: Fraction = Fraction(1)
-    # The complete composed expression is the one source of truth for
-    # satisfaction, correction target discovery, and RHS generation.  The
-    # flattened ``powers``/``expression`` fields remain presentation and
-    # direct multiplicative projections for existing callers.
-    monomial: ExactMonomial | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -701,27 +686,39 @@ def compose_exact_constraints(
     mechanism: object,
     *,
     parameter_algebra_spec: object | None = None,
-    constraint_report: WegscheiderConstraintReport | None = None,
 ) -> ExactConstraintComposition:
     """Compose exact cycle products using one symbolic relation graph."""
 
-    report = constraint_report or analyze_wegscheider_constraints(mechanism)
+    topology = analyze_wegscheider_topology(mechanism)
     relations = _mechanism_relations(mechanism)
     algebra, unresolved = _algebra_relations(parameter_algebra_spec)
     relations.update(algebra)
     result: list[ExactConstraint] = []
-    for constraint in report.constraints:
-        initial = ExactMonomial(Fraction(1), tuple((name, Fraction(power)) for name, power in constraint.terms))
+    for cycle in topology.cycles:
+        initial = ExactMonomial(
+            Fraction(1),
+            tuple(
+                (f"Keq{step_index}", Fraction(coefficient))
+                for step_index, coefficient in zip(
+                    cycle.step_indices,
+                    cycle.coefficients,
+                    strict=True,
+                )
+                if int(coefficient) != 0
+            ),
+        )
         composed = _substitute(initial, relations, unresolved)
         if composed is None:
             result.append(
                 ExactConstraint(
-                    constraint.cycle_id,
-                    initial.powers,
-                    constraint.expression,
-                    "unresolved",
-                    "constraint depends on an unsupported, cyclic, or unprovable relation",
+                    cycle_id=cycle.cycle_id,
                     monomial=initial,
+                    expression=_render_constraint(initial),
+                    status="unresolved",
+                    reason=(
+                        "constraint depends on an unsupported, cyclic, or "
+                        "unprovable relation"
+                    ),
                 )
             )
             continue
@@ -736,13 +733,11 @@ def compose_exact_constraints(
             reason = None
         result.append(
             ExactConstraint(
-                constraint.cycle_id,
-                tuple(sorted(composed.powers)),
-                _render_constraint(composed),
-                status,
-                reason,
-                composed.coefficient,
-                composed,
+                cycle_id=cycle.cycle_id,
+                monomial=composed,
+                expression=_render_constraint(composed),
+                status=status,
+                reason=reason,
             )
         )
     return ExactConstraintComposition(tuple(result))

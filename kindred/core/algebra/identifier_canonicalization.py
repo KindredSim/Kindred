@@ -118,7 +118,7 @@ def canonicalize_observable_rhs_source(
     *,
     mechanism_namespace: MechanismParameterNamespace,
 ) -> str:
-    block = parse_algebra(f"# Algebra\nlet __kindred_observable__ = {expr_src}\n")
+    block = parse_algebra(f"let __kindred_observable__ = {expr_src}\n")
     canonicalized = canonicalize_algebra_block(block, mechanism_namespace=mechanism_namespace)
     if not canonicalized.lines:
         return str(expr_src)
