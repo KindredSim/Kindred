@@ -18,7 +18,11 @@ from kindred.core.project_presentation_state import (
 )
 from kindred.core.result_repository import SimulationResultValue
 from kindred.gui.interactive_preview import InteractivePreviewRequest
-from kindred.gui.plot_config import require_pyqtgraph
+from kindred.gui.plot_config import (
+    CONCENTRATION_DISPLAY_UNIT_FACTORS,
+    TIME_DISPLAY_UNIT_FACTORS,
+    require_pyqtgraph,
+)
 from kindred.gui.widgets.axis_toolbar import AxisToolbar
 from kindred.gui.widgets.parameter_statistics_table import ParameterStatisticsTable
 from kindred.gui.widgets.species_statistics_table import SpeciesStatisticsTable
@@ -139,6 +143,8 @@ class _RenderedPointBlock:
     label: str
     kind: str
     x_name: str
+    x_unit: str | None
+    y_unit: str | None
     x_provenance: Mapping[str, object]
     series_provenance: tuple[tuple[str, Mapping[str, object]], ...]
     chunks: tuple[_RenderedPointChunk, ...]
@@ -148,6 +154,16 @@ class _RenderedPointBlock:
         object.__setattr__(self, "label", str(self.label))
         object.__setattr__(self, "kind", str(self.kind))
         object.__setattr__(self, "x_name", str(self.x_name))
+        object.__setattr__(
+            self,
+            "x_unit",
+            None if self.x_unit is None else str(self.x_unit),
+        )
+        object.__setattr__(
+            self,
+            "y_unit",
+            None if self.y_unit is None else str(self.y_unit),
+        )
         object.__setattr__(
             self,
             "x_provenance",
@@ -186,6 +202,9 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         self._interaction_mode = "pan"
         self._presentation = _PlotPresentation()
         self._axis_range = _AxisRangeSession()
+        self._x_time_unit = "s"
+        self._x_concentration_unit = "M"
+        self._y_concentration_unit = "M"
         self._render_input: ResultRenderInput | None = None
         self._copy_all_available = False
         self._rendered_point_roster: tuple[_RenderedPointBlock, ...] = ()
@@ -519,6 +538,9 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         self._presentation = _PlotPresentation()
         self._sampling_limit = None
         self._axis_range = _AxisRangeSession()
+        self._x_time_unit = "s"
+        self._x_concentration_unit = "M"
+        self._y_concentration_unit = "M"
 
     def reset_plot_session_state(self) -> None:
         """Project replacement/reopen resets non-archived Plot session truth."""
@@ -529,8 +551,17 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         self._presentation = _PlotPresentation()
         self._sampling_limit = None
         self._axis_range = _AxisRangeSession()
+        self._x_time_unit = "s"
+        self._x_concentration_unit = "M"
+        self._y_concentration_unit = "M"
         self._axis_toolbar.set_interaction_mode("pan")
         self._axis_toolbar.set_coarse_sampling(False)
+        self._axis_toolbar.set_axis_unit_choices(
+            x_units=tuple(TIME_DISPLAY_UNIT_FACTORS),
+            selected_x="s",
+            y_units=(),
+            selected_y=None,
+        )
         self._axis_toolbar.set_manual_ranges(None, None, None, None)
         self._axis_toolbar.set_auto_range(True)
         self._apply_interaction_mode("pan")
@@ -940,6 +971,11 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         rendered: dict[tuple[object, ...], Any] = {}
         rendered_points: list[_RenderedPointBlock] = []
         render_input = self._render_input
+        _x_unit, _y_unit, x_scale, y_scale = (
+            self._display_unit_state(render_input)
+            if render_input is not None
+            else (None, None, 1.0, 1.0)
+        )
         if render_input is not None:
             for block in render_input.blocks:
                 if block.kind is not ResultLayerKind.EXPERIMENTAL or not block.visible:
@@ -958,6 +994,14 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
                 for chunk_index, (start, end) in enumerate(
                     self._interactive_curve_chunks(curve)
                 ):
+                    displayed_x = self._scaled_display_values(
+                        curve.x[start:end],
+                        x_scale,
+                    )
+                    displayed_y = self._scaled_display_values(
+                        curve.y[start:end],
+                        y_scale,
+                    )
                     curve_name = curve.label if chunk_index == 0 else None
                     item_key = (
                         layer_index,
@@ -970,8 +1014,8 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
                     if item is None:
                         if curve.markers:
                             item = self._plot_widget.plot(
-                                curve.x[start:end],
-                                curve.y[start:end],
+                                displayed_x,
+                                displayed_y,
                                 pen=None,
                                 symbol="o",
                                 symbolSize=curve.point_size,
@@ -981,8 +1025,8 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
                             )
                         else:
                             item = self._plot_widget.plot(
-                                curve.x[start:end],
-                                curve.y[start:end],
+                                displayed_x,
+                                displayed_y,
                                 pen=pg.mkPen(
                                     color=color,
                                     width=2,
@@ -995,7 +1039,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
                                 name=curve_name,
                             )
                     else:
-                        item.setData(curve.x[start:end], curve.y[start:end])
+                        item.setData(displayed_x, displayed_y)
                         if curve.markers:
                             item.setSymbolSize(curve.point_size)
                             item.setSymbolBrush(pg.mkBrush(color))
@@ -1026,6 +1070,9 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
                         rendered_points.append(rendered_block)
                 for connector in curve.intervention_connectors:
                     boundary_index, boundary_time, pre_value, post_value = connector
+                    displayed_time = boundary_time * x_scale
+                    displayed_pre = pre_value * y_scale
+                    displayed_post = post_value * y_scale
                     item_key = (
                         layer_index,
                         *curve.key,
@@ -1044,15 +1091,15 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
                     )
                     if item is None:
                         item = self._plot_widget.plot(
-                            [boundary_time, boundary_time],
-                            [pre_value, post_value],
+                            [displayed_time, displayed_time],
+                            [displayed_pre, displayed_post],
                             pen=pen,
                             name=None,
                         )
                     else:
                         item.setData(
-                            [boundary_time, boundary_time],
-                            [pre_value, post_value],
+                            [displayed_time, displayed_time],
+                            [displayed_pre, displayed_post],
                         )
                         item.setPen(pen)
                     item.setOpacity(opacity)
@@ -1204,6 +1251,87 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         self._completion_warning_badge.setAccessibleDescription("")
         self._completion_warning_badge.setVisible(False)
 
+    @staticmethod
+    def _has_time_x(render_input: ResultRenderInput) -> bool:
+        selection = render_input.selected_x_series
+        return (
+            isinstance(selection, SimulationSeriesAxisSelection)
+            and selection.series_name == "t"
+        )
+
+    def _display_unit_state(
+        self,
+        render_input: ResultRenderInput,
+    ) -> tuple[str | None, str | None, float, float]:
+        if self._has_time_x(render_input):
+            x_unit = self._x_time_unit
+            x_scale = 1.0 / TIME_DISPLAY_UNIT_FACTORS[x_unit]
+        elif render_input.x_is_concentration:
+            x_unit = self._x_concentration_unit
+            x_scale = 1.0 / CONCENTRATION_DISPLAY_UNIT_FACTORS[x_unit]
+        else:
+            x_unit = None
+            x_scale = 1.0
+        if render_input.y_is_concentration:
+            y_unit = self._y_concentration_unit
+            y_scale = 1.0 / CONCENTRATION_DISPLAY_UNIT_FACTORS[y_unit]
+        else:
+            y_unit = None
+            y_scale = 1.0
+        return x_unit, y_unit, x_scale, y_scale
+
+    def _configure_axis_unit_controls(
+        self,
+        render_input: ResultRenderInput,
+    ) -> None:
+        x_unit, y_unit, _x_scale, _y_scale = self._display_unit_state(
+            render_input
+        )
+        if self._has_time_x(render_input):
+            x_units = tuple(TIME_DISPLAY_UNIT_FACTORS)
+        elif render_input.x_is_concentration:
+            x_units = tuple(CONCENTRATION_DISPLAY_UNIT_FACTORS)
+        else:
+            x_units = ()
+        y_units = (
+            tuple(CONCENTRATION_DISPLAY_UNIT_FACTORS)
+            if render_input.y_is_concentration
+            else ()
+        )
+        self._axis_toolbar.set_axis_unit_choices(
+            x_units=x_units,
+            selected_x=x_unit,
+            y_units=y_units,
+            selected_y=y_unit,
+        )
+
+    def _display_axis_labels(
+        self,
+        render_input: ResultRenderInput,
+    ) -> tuple[str, str]:
+        x_unit, y_unit, _x_scale, _y_scale = self._display_unit_state(
+            render_input
+        )
+        if self._has_time_x(render_input):
+            x_label = f"Time ({x_unit})"
+        elif x_unit is not None:
+            x_label = f"{render_input.x_label} ({x_unit})"
+        else:
+            x_label = render_input.x_label
+        y_label = (
+            f"Concentration ({y_unit})"
+            if y_unit is not None
+            else render_input.y_label
+        )
+        return x_label, y_label
+
+    @staticmethod
+    def _scaled_display_values(values: np.ndarray, scale: float) -> np.ndarray:
+        array = np.asarray(values)
+        if scale == 1.0:
+            return array
+        return np.asarray(array * scale)
+
     def _render_result_scene(
         self,
         render_input: ResultRenderInput,
@@ -1212,8 +1340,10 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         self._reconcile_static_simulation_items(())
         existing_items = dict(self._plot_items_by_key)
         self._clear_annotation_items()
-        self._plot_widget.setLabel("bottom", render_input.x_label)
-        self._plot_widget.setLabel("left", render_input.y_label)
+        self._configure_axis_unit_controls(render_input)
+        x_label, y_label = self._display_axis_labels(render_input)
+        self._plot_widget.setLabel("bottom", x_label)
+        self._plot_widget.setLabel("left", y_label)
         rendered_items: dict[tuple[object, ...], object] = {}
         rendered_points: list[_RenderedPointBlock] = []
         for block in render_input.blocks:
@@ -1304,9 +1434,19 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         sampling_limit: int | None,
     ) -> tuple[_RenderedPointBlock, tuple[_RenderedPointChunk, ...]]:
         sample, chunks = self._sample_and_chunks(block, sampling_limit)
-        x = block.t[sample]
+        render_input = self._render_input
+        x_unit, y_unit, x_scale, y_scale = (
+            self._display_unit_state(render_input)
+            if render_input is not None
+            else (None, None, 1.0, 1.0)
+        )
+        x = self._scaled_display_values(block.t[sample], x_scale)
         sampled_series = tuple(
-            (name, values[sample]) for name, values in block.series
+            (
+                name,
+                self._scaled_display_values(values[sample], y_scale),
+            )
+            for name, values in block.series
         )
         source_row = (
             None if block.source_row is None else block.source_row[sample]
@@ -1352,6 +1492,8 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
             label=block.label,
             kind=block.kind.value,
             x_name=block.x_name,
+            x_unit=x_unit,
+            y_unit=y_unit,
             x_provenance=block.x_provenance,
             series_provenance=block.series_provenance,
             chunks=rendered_chunks,
@@ -1398,11 +1540,25 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
             )
         if source is None:
             return None
+        x_unit, y_unit, x_scale, y_scale = self._display_unit_state(
+            render_input
+        )
         series_provenance = dict(source.series_provenance)
         curve_chunks = tuple(
             _RenderedPointChunk(
-                x=curve.x[start:end],
-                series=((series_name, curve.y[start:end]),),
+                x=self._scaled_display_values(
+                    curve.x[start:end],
+                    x_scale,
+                ),
+                series=(
+                    (
+                        series_name,
+                        self._scaled_display_values(
+                            curve.y[start:end],
+                            y_scale,
+                        ),
+                    ),
+                ),
                 segment_ids=(
                     None
                     if curve.segment_ids is None
@@ -1435,6 +1591,8 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
                 else source.kind.value
             ),
             x_name=source.x_name,
+            x_unit=x_unit,
+            y_unit=y_unit,
             x_provenance=source.x_provenance,
             series_provenance=(
                 (series_name, series_provenance.get(series_name, {})),
@@ -1497,15 +1655,24 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
             chunk.x.size for chunk in rendered_block.chunks
         ):
             rendered_points.append(rendered_block)
+        render_input = self._render_input
+        _x_unit, _y_unit, x_scale, y_scale = (
+            self._display_unit_state(render_input)
+            if render_input is not None
+            else (None, None, 1.0, 1.0)
+        )
         for boundary_index, species_name, boundary_time, pre_value, post_value in self._intervention_connector_entries(block):
             color = colors[species_name]
             item_key = (role, "intervention-boundary", boundary_index, species_name)
             pen = pg.mkPen(color=color, width=2, style=(QtCore.Qt.PenStyle.DashLine if block.dashed else QtCore.Qt.PenStyle.SolidLine))
+            displayed_time = boundary_time * x_scale
+            displayed_pre = pre_value * y_scale
+            displayed_post = post_value * y_scale
             item = existing_store.get(item_key)
             if item is None:
-                item = self._plot_widget.plot([boundary_time, boundary_time], [pre_value, post_value], pen=pen, name=None)
+                item = self._plot_widget.plot([displayed_time, displayed_time], [displayed_pre, displayed_post], pen=pen, name=None)
             else:
-                item.setData([boundary_time, boundary_time], [pre_value, post_value])
+                item.setData([displayed_time, displayed_time], [displayed_pre, displayed_post])
                 item.setPen(pen)
             item.setOpacity(block.opacity)
             item_store[item_key] = item
@@ -1665,14 +1832,17 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
     ) -> None:
         if not render_input.intervention_annotations_visible:
             return
+        _x_unit, _y_unit, x_scale, _y_scale = self._display_unit_state(
+            render_input
+        )
         for annotation in render_input.intervention_annotations:
             if "start" in annotation and "end" in annotation:
                 start = self._raw_to_view_coordinate(
-                    annotation["start"],
+                    float(annotation["start"]) * x_scale,
                     log_enabled=presentation.log_x,
                 )
                 end = self._raw_to_view_coordinate(
-                    annotation["end"],
+                    float(annotation["end"]) * x_scale,
                     log_enabled=presentation.log_x,
                 )
                 if start is None or end is None:
@@ -1689,7 +1859,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
             if "time" not in annotation:
                 continue
             time = self._raw_to_view_coordinate(
-                annotation["time"],
+                float(annotation["time"]) * x_scale,
                 log_enabled=presentation.log_x,
             )
             if time is None:
@@ -1780,9 +1950,88 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
                 pass
         self._annotation_items.clear()
 
+    @staticmethod
+    def _scaled_optional(value: float | None, ratio: float) -> float | None:
+        return None if value is None else float(value) * ratio
+
+    @staticmethod
+    def _rescaled_view_axis(
+        axis_range: tuple[float, float],
+        *,
+        ratio: float,
+        log_enabled: bool,
+    ) -> tuple[float, float]:
+        if log_enabled:
+            offset = float(np.log10(ratio))
+            return axis_range[0] + offset, axis_range[1] + offset
+        return axis_range[0] * ratio, axis_range[1] * ratio
+
+    def _apply_display_unit_change(self, axis: str, unit: str) -> None:
+        render_input = self._render_input
+        if render_input is None:
+            return
+        _old_x_unit, _old_y_unit, old_x_scale, old_y_scale = (
+            self._display_unit_state(render_input)
+        )
+        if axis == "x" and self._has_time_x(render_input):
+            if unit not in TIME_DISPLAY_UNIT_FACTORS:
+                return
+            self._x_time_unit = unit
+        elif axis == "x" and render_input.x_is_concentration:
+            if unit not in CONCENTRATION_DISPLAY_UNIT_FACTORS:
+                return
+            self._x_concentration_unit = unit
+        elif axis == "y" and render_input.y_is_concentration:
+            if unit not in CONCENTRATION_DISPLAY_UNIT_FACTORS:
+                return
+            self._y_concentration_unit = unit
+        else:
+            return
+        _new_x_unit, _new_y_unit, new_x_scale, new_y_scale = (
+            self._display_unit_state(render_input)
+        )
+        x_ratio = new_x_scale / old_x_scale
+        y_ratio = new_y_scale / old_y_scale
+        self._axis_range = replace(
+            self._axis_range,
+            x_min=self._scaled_optional(self._axis_range.x_min, x_ratio),
+            x_max=self._scaled_optional(self._axis_range.x_max, x_ratio),
+            y_min=self._scaled_optional(self._axis_range.y_min, y_ratio),
+            y_max=self._scaled_optional(self._axis_range.y_max, y_ratio),
+        )
+        self._axis_toolbar.set_manual_ranges(
+            self._axis_range.x_min,
+            self._axis_range.x_max,
+            self._axis_range.y_min,
+            self._axis_range.y_max,
+        )
+        if self._interactive_locked_view is not None:
+            self._interactive_locked_view = (
+                self._rescaled_view_axis(
+                    self._interactive_locked_view[0],
+                    ratio=x_ratio,
+                    log_enabled=self._presentation.log_x,
+                ),
+                self._rescaled_view_axis(
+                    self._interactive_locked_view[1],
+                    ratio=y_ratio,
+                    log_enabled=self._presentation.log_y,
+                ),
+            )
+        self._render_result_scene(render_input)
+        interactive_state = self._materialize_interactive(float(time.monotonic()))
+        if interactive_state is not None:
+            self._render_interactive_display(interactive_state)
+            self._interactive_visible = interactive_state.layers
+
     @QtCore.Slot(str, object)
     def _on_axis_option(self, action: str, value: object) -> None:
-        if str(action) == "sampling":
+        normalized_action = str(action)
+        if normalized_action == "x_unit":
+            self._apply_display_unit_change("x", str(value))
+        elif normalized_action == "y_unit":
+            self._apply_display_unit_change("y", str(value))
+        elif normalized_action == "sampling":
             self._sampling_limit = 1000 if str(value) == "coarse" else None
             render_input = self._render_input
             if render_input is not None:
@@ -1942,8 +2191,10 @@ def _rendered_column_header(
     label: str,
     name: str,
     provenance: Mapping[str, object],
+    unit: str | None,
 ) -> str:
-    header = f"{label}::{name}"
+    displayed_name = f"{name} ({unit})" if unit is not None else name
+    header = f"{label}::{displayed_name}"
     identity = {
         key: str(provenance[key])
         for key in (
@@ -2008,6 +2259,7 @@ def _iter_rendered_point_tsv_chunks(
                 block.label,
                 block.x_name,
                 block.x_provenance,
+                block.x_unit,
             )
         ]
         if block.kind == ResultLayerKind.EXPERIMENTAL.value:
@@ -2037,6 +2289,7 @@ def _iter_rendered_point_tsv_chunks(
                 block.label,
                 name,
                 provenance_by_name.get(name, MappingProxyType({})),
+                block.y_unit,
             )
             for name in series_names
         )

@@ -81,6 +81,16 @@ class AxisToolbar(QtWidgets.QWidget):
         self._x_combo.setSizeAdjustPolicy(QtWidgets.QComboBox.SizeAdjustPolicy.AdjustToContents)
         self._x_combo.setMaximumWidth(220)
 
+        self._x_unit_combo = QtWidgets.QComboBox(self)
+        self._x_unit_combo.setObjectName("axisToolbarXUnit")
+        self._x_unit_combo.setMinimumWidth(64)
+        self._x_unit_combo.setMaximumWidth(84)
+
+        self._y_unit_combo = QtWidgets.QComboBox(self)
+        self._y_unit_combo.setObjectName("axisToolbarYUnit")
+        self._y_unit_combo.setMinimumWidth(64)
+        self._y_unit_combo.setMaximumWidth(84)
+
         self._y_list = QtWidgets.QListWidget(self)
         self._y_list.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.NoSelection)
         self._y_list.setAlternatingRowColors(True)
@@ -216,6 +226,12 @@ class AxisToolbar(QtWidgets.QWidget):
 
         # Wiring
         self._x_combo.currentIndexChanged.connect(self._on_x_changed)
+        self._x_unit_combo.currentTextChanged.connect(
+            lambda unit: self._emit_option("x_unit", unit)
+        )
+        self._y_unit_combo.currentTextChanged.connect(
+            lambda unit: self._emit_option("y_unit", unit)
+        )
         self._y_list.itemChanged.connect(self._on_y_item_changed)
         self._invert_y_selection_btn.clicked.connect(self.invert_y_selection)
 
@@ -235,6 +251,12 @@ class AxisToolbar(QtWidgets.QWidget):
         self.set_x_candidates(
             (AxisSelectionCandidate(time_selection, "t"),),
             selected=time_selection,
+        )
+        self.set_axis_unit_choices(
+            x_units=("s",),
+            selected_x="s",
+            y_units=(),
+            selected_y=None,
         )
         self.set_tab_order()
 
@@ -367,6 +389,41 @@ class AxisToolbar(QtWidgets.QWidget):
             self._y_list.addItem(it)
         self._y_list.blockSignals(False)
         self._update_y_selector_text()
+
+    def set_axis_unit_choices(
+        self,
+        *,
+        x_units: Sequence[str],
+        selected_x: str | None,
+        y_units: Sequence[str],
+        selected_y: str | None,
+    ) -> None:
+        """Project the available display-only units without emitting intent."""
+
+        self._set_unit_combo(self._x_unit_combo, x_units, selected_x)
+        self._set_unit_combo(self._y_unit_combo, y_units, selected_y)
+
+    @staticmethod
+    def _set_unit_combo(
+        combo: QtWidgets.QComboBox,
+        units: Sequence[str],
+        selected: str | None,
+    ) -> None:
+        choices = tuple(str(unit) for unit in units)
+        blocker = QtCore.QSignalBlocker(combo)
+        try:
+            combo.clear()
+            if not choices:
+                combo.addItem("—")
+                combo.setEnabled(False)
+                return
+            combo.addItems(choices)
+            combo.setCurrentText(
+                selected if selected in choices else choices[0]
+            )
+            combo.setEnabled(True)
+        finally:
+            del blocker
 
     def invert_y_selection(self) -> None:
         """Invert enabled Y-series rows while leaving disabled scalar rows unchecked."""
@@ -546,7 +603,11 @@ class AxisToolbar(QtWidgets.QWidget):
         x_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         lay.addWidget(x_label, stretch=0)
         lay.addWidget(self._x_combo, stretch=0)
+        lay.addWidget(QtWidgets.QLabel("Unit:", self), stretch=0)
+        lay.addWidget(self._x_unit_combo, stretch=0)
         lay.addWidget(self._y_selector_btn, stretch=0)
+        lay.addWidget(QtWidgets.QLabel("Unit:", self), stretch=0)
+        lay.addWidget(self._y_unit_combo, stretch=0)
         lay.addWidget(self._pan_button, stretch=0)
         lay.addWidget(self._rectangle_zoom_button, stretch=0)
         lay.addWidget(self._auto_range, stretch=0)
@@ -591,6 +652,8 @@ class AxisToolbar(QtWidgets.QWidget):
         x_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         lay.addWidget(x_label, alignment=Qt.AlignmentFlag.AlignLeft)
         lay.addWidget(self._x_combo, alignment=Qt.AlignmentFlag.AlignLeft)
+        lay.addWidget(QtWidgets.QLabel("X Unit:", self))
+        lay.addWidget(self._x_unit_combo, alignment=Qt.AlignmentFlag.AlignLeft)
 
         lay.addWidget(self._pan_button, alignment=Qt.AlignmentFlag.AlignLeft)
         lay.addWidget(
@@ -600,6 +663,8 @@ class AxisToolbar(QtWidgets.QWidget):
 
         lay.addWidget(y_label, alignment=Qt.AlignmentFlag.AlignLeft)
         lay.addWidget(self._y_list)
+        lay.addWidget(QtWidgets.QLabel("Y Unit:", self))
+        lay.addWidget(self._y_unit_combo, alignment=Qt.AlignmentFlag.AlignLeft)
 
         range_frame = QtWidgets.QFrame(self)
         range_frame.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
@@ -709,13 +774,17 @@ class AxisToolbar(QtWidgets.QWidget):
 
     def set_tab_order(self) -> None:
         if self._orientation == "horizontal":
-            QtWidgets.QWidget.setTabOrder(self._x_combo, self._y_selector_btn)
-            QtWidgets.QWidget.setTabOrder(self._y_selector_btn, self._auto_range)
+            QtWidgets.QWidget.setTabOrder(self._x_combo, self._x_unit_combo)
+            QtWidgets.QWidget.setTabOrder(self._x_unit_combo, self._y_selector_btn)
+            QtWidgets.QWidget.setTabOrder(self._y_selector_btn, self._y_unit_combo)
+            QtWidgets.QWidget.setTabOrder(self._y_unit_combo, self._auto_range)
             QtWidgets.QWidget.setTabOrder(self._auto_range, self._x_min)
             QtWidgets.QWidget.setTabOrder(self._x_min, self._x_max)
             QtWidgets.QWidget.setTabOrder(self._x_max, self._y_min)
             QtWidgets.QWidget.setTabOrder(self._y_min, self._y_max)
             QtWidgets.QWidget.setTabOrder(self._y_max, self._options_btn)
             return
-        QtWidgets.QWidget.setTabOrder(self._x_combo, self._y_list)
-        QtWidgets.QWidget.setTabOrder(self._y_list, self._options_btn)
+        QtWidgets.QWidget.setTabOrder(self._x_combo, self._x_unit_combo)
+        QtWidgets.QWidget.setTabOrder(self._x_unit_combo, self._y_list)
+        QtWidgets.QWidget.setTabOrder(self._y_list, self._y_unit_combo)
+        QtWidgets.QWidget.setTabOrder(self._y_unit_combo, self._options_btn)

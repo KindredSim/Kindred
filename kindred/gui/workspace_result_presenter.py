@@ -521,6 +521,8 @@ class ResultRenderInput:
     selected_y_uses_default_all: bool = True
     x_label: str = "Time (s)"
     y_label: str = "Value"
+    x_is_concentration: bool = False
+    y_is_concentration: bool = False
     axis_candidates: tuple[AxisSelectionCandidate, ...] = ()
     reference_lines_visible: bool = True
     intervention_annotations: tuple[Mapping[str, object], ...] = ()
@@ -586,6 +588,8 @@ class ResultRenderInput:
         object.__setattr__(self, "selected_y_uses_default_all", bool(self.selected_y_uses_default_all))
         object.__setattr__(self, "x_label", str(self.x_label))
         object.__setattr__(self, "y_label", str(self.y_label))
+        object.__setattr__(self, "x_is_concentration", bool(self.x_is_concentration))
+        object.__setattr__(self, "y_is_concentration", bool(self.y_is_concentration))
         object.__setattr__(self, "axis_candidates", candidates)
         object.__setattr__(self, "reference_lines_visible", bool(self.reference_lines_visible))
         object.__setattr__(self, "intervention_annotations", tuple(MappingProxyType(dict(item)) for item in annotations))
@@ -1447,13 +1451,27 @@ def compose_result_input(
             else f"{selected_x.dataset_id}: {selected_x.raw_observation_id}",
         )
     selected_candidate = next(item for item in candidates if item.selection == selected_x)
-    y_axes = tuple(selection for block in blocks for _name, selection in block.series_axes)
+    y_axes = tuple(
+        selection
+        for block in blocks
+        if block.visible
+        for _name, selection in block.series_axes
+    )
 
     def is_concentration(selection: AxisSeriesSelection) -> bool:
         if isinstance(selection, ExperimentalAxisSelection):
-            item = experimental_by_axis.get(selection)
-            return item is not None and item.model_target in mechanism_species_set
+            # Every imported observation crosses an explicit concentration-unit
+            # ingress and is retained canonically in molar units.
+            return selection in experimental_by_axis
         return isinstance(selection, SimulationSeriesAxisSelection) and selection.series_name in mechanism_species_set
+
+    x_is_concentration = (
+        not _is_time_selection(selected_x)
+        and is_concentration(selected_x)
+    )
+    y_is_concentration = bool(y_axes) and all(
+        is_concentration(item) for item in y_axes
+    )
 
     return ResultRenderInput(
         tab_id=tab_id, current_set_id=current_id, blocks=tuple(blocks),
@@ -1462,7 +1480,9 @@ def compose_result_input(
         mapped_overlay_locks=mapped_overlay_locks,
         selected_y_uses_default_all=bool(selected_y_uses_default_all),
         x_label="Time (s)" if _is_time_selection(selected_x) else selected_candidate.label,
-        y_label="Concentration (M)" if y_axes and all(is_concentration(item) for item in y_axes) else "Value",
+        y_label="Concentration (M)" if y_is_concentration else "Value",
+        x_is_concentration=x_is_concentration,
+        y_is_concentration=y_is_concentration,
         axis_candidates=tuple(candidates),
         reference_lines_visible=bool(reference_lines_visible),
         intervention_annotations=tuple(unique_annotations),
