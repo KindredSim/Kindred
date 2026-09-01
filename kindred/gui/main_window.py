@@ -143,9 +143,9 @@ from kindred.gui.ui_helpers import setup_scientific_validator
 from kindred.gui.workspace_result_presenter import (
     ResultRenderInput,
     VisibleResultSet,
+    compose_canonical_export_blocks,
     compose_result_input,
     iter_blocks_tsv_chunks,
-    select_copy_blocks,
 )
 from kindred.gui.workspace_tab_registry import (
     ScientificDocumentDelta,
@@ -1393,12 +1393,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._clear_result_presentation_after_failure(target)
             self._refresh_actions()
             return False
-        try:
-            select_copy_blocks(render_input)
-        except (TypeError, ValueError):
-            copy_available = False
-        else:
-            copy_available = True
+        copy_available = self._canonical_export_available(target)
         # Semantic truth and export eligibility are committed before touching
         # PyQtGraph.  A physical render exception must not erase either.
         self._result_render_inputs[target] = render_input
@@ -1422,9 +1417,12 @@ class MainWindow(QtWidgets.QMainWindow):
 
         target = str(tab_id)
         self._result_render_inputs.pop(target, None)
-        self._result_copy_eligible.pop(target, None)
+        copy_available = self._canonical_export_available(target)
+        self._result_copy_eligible[target] = copy_available
         try:
-            self._workspace.plot_for_tab(target).clear_result_input()
+            plot = self._workspace.plot_for_tab(target)
+            plot.clear_result_input()
+            plot.set_copy_all_available(copy_available)
         except Exception as exc:
             logger.warning(
                 "Could not clear failed result presentation for %s: %s",
@@ -1432,16 +1430,38 @@ class MainWindow(QtWidgets.QMainWindow):
                 exc,
             )
 
-    def _copy_all_for_tab(self, tab_id: str) -> bool:
-        """Serialize the presenter-selected full-resolution blocks once."""
+    def _canonical_export_available(self, tab_id: str) -> bool:
+        """Return whether the active-tab repositories own any retained result."""
 
         target = str(tab_id)
-        render_input = self._result_render_inputs.get(target)
-        if render_input is None:
+        try:
+            tab = self._project_session.document.tab(target)
+            repository = self._repository_for_tab(target)
+        except (KeyError, RuntimeError):
+            return False
+        return any(
+            repository.current_result(initial_set.set_id) is not None
+            or repository.reference_result(initial_set.set_id) is not None
+            for initial_set in tab.initial_condition_sets
+        )
+
+    def _canonical_export_blocks(self, tab_id: str):
+        target = str(tab_id)
+        return compose_canonical_export_blocks(
+            document=self._project_session.document,
+            tab_id=target,
+            repository=self._repository_for_tab(target),
+        )
+
+    def _copy_all_for_tab(self, tab_id: str) -> bool:
+        """Serialize the active tab's complete canonical export roster once."""
+
+        target = str(tab_id)
+        blocks = self._canonical_export_blocks(target)
+        if not blocks:
             self.set_status_text("No current result data is available to copy.")
             return False
         try:
-            blocks = select_copy_blocks(render_input)
             output = io.StringIO()
             output.writelines(iter_blocks_tsv_chunks(blocks))
             QtWidgets.QApplication.clipboard().setText(output.getvalue())
@@ -4490,14 +4510,10 @@ class MainWindow(QtWidgets.QMainWindow):
     def _export_xlsx(self) -> bool:
         if not self._mutation_input_admitted("Export Results XLSX"):
             return False
-        render_input = self._result_render_inputs.get(
-            self._workspace_tab_registry.active_tab_id
-        )
-        if render_input is None or not render_input.blocks:
-            self.set_status_text("No result data is available to export.")
-            return False
         try:
-            blocks = select_copy_blocks(render_input)
+            blocks = self._canonical_export_blocks(
+                self._workspace_tab_registry.active_tab_id
+            )
         except (TypeError, ValueError) as exc:
             self.set_status_text(str(exc))
             QtWidgets.QMessageBox.critical(
@@ -4505,6 +4521,9 @@ class MainWindow(QtWidgets.QMainWindow):
                 "Export Results XLSX",
                 str(exc),
             )
+            return False
+        if not blocks:
+            self.set_status_text("No result data is available to export.")
             return False
         try:
             start_directory = resolve_export_start_dir(

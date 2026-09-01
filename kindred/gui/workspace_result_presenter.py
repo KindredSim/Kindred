@@ -22,6 +22,7 @@ from kindred.core.project_presentation_state import (
     ExperimentalAxisSelection,
     SimulationSeriesAxisSelection,
 )
+from kindred.core.project_document import ProjectDocument
 from kindred.core.result_repository import (
     ResultRepository,
     SimulationResultValue,
@@ -39,12 +40,12 @@ __all__ = [
     "ResultRenderInput",
     "VisibleResultSet",
     "XlsxExportCompletion",
+    "compose_canonical_export_blocks",
     "compose_interactive_display",
     "compose_result_input",
     "encode_clipboard_text",
     "encode_tsv_row",
     "iter_blocks_tsv_chunks",
-    "select_copy_blocks",
     "validate_xlsx_export",
     "write_xlsx",
 ]
@@ -675,6 +676,115 @@ def _result_block(
         opacity=0.42 if kind is ResultLayerKind.REFERENCE else 1.0,
         presentation_boundaries=result.presentation_boundaries,
     )
+
+
+def compose_canonical_export_blocks(
+    *,
+    document: ProjectDocument,
+    tab_id: str,
+    repository: ResultRepository,
+) -> tuple[ResultDataBlock, ...]:
+    """Project every retained active-tab result and its qualifying raw data."""
+
+    if not isinstance(document, ProjectDocument):
+        raise TypeError("Canonical export requires a ProjectDocument.")
+    tab = document.tab(_required_id(tab_id, "tab_id"))
+    if not isinstance(repository, ResultRepository):
+        raise TypeError("Canonical export requires a ResultRepository.")
+    if repository.tab_id != tab.tab_id:
+        raise ValueError("Canonical export repository belongs to another tab.")
+
+    blocks: list[ResultDataBlock] = []
+    retained_set_ids: set[str] = set()
+    preview_set_ids = set(repository.preview_set_ids())
+    for initial_set in tab.initial_condition_sets:
+        set_id = initial_set.set_id
+        current = repository.current_result(set_id)
+        reference = repository.reference_result(set_id)
+        if current is not None:
+            retained_set_ids.add(set_id)
+            kind = (
+                ResultLayerKind.PREVIEW
+                if set_id in preview_set_ids
+                else ResultLayerKind.EXPLICIT
+            )
+            blocks.append(
+                _result_block(
+                    set_id=set_id,
+                    label=initial_set.name,
+                    result=current,
+                    kind=kind,
+                    color_by_axis_selection={
+                        SimulationSeriesAxisSelection(name): "#000000"
+                        for name in current.series
+                    },
+                )
+            )
+        if reference is not None:
+            retained_set_ids.add(set_id)
+            blocks.append(
+                _result_block(
+                    set_id=set_id,
+                    label=initial_set.name,
+                    result=reference,
+                    kind=ResultLayerKind.REFERENCE,
+                    color_by_axis_selection={
+                        SimulationSeriesAxisSelection(name): "#000000"
+                        for name in reference.series
+                    },
+                )
+            )
+
+    links = dict(tab.dataset_links)
+    for record in document.datasets:
+        link = links.get(record.dataset_id)
+        if link is None or link.set_id not in retained_set_ids:
+            continue
+        mapping = dict(link.observation_mapping)
+        for series in record.observations:
+            source = ExperimentalLayerInput(
+                axis=ExperimentalAxisSelection(
+                    record.dataset_id,
+                    series.raw_observation_id,
+                ),
+                dataset_name=record.display_name,
+                raw_column=series.column_name,
+                model_target=mapping.get(series.raw_observation_id),
+                set_id=link.set_id,
+                t=series.t,
+                y=series.y,
+                source_rows=series.source_rows,
+            )
+            label = f"{source.dataset_name}: {source.raw_column}"
+            if source.model_target is not None:
+                label = f"{label} → {source.model_target}"
+            time = np.array(source.t, dtype=float, copy=True)
+            values = np.array(source.y, dtype=float, copy=True)
+            source_rows = np.array(source.source_rows, dtype=np.int64, copy=True)
+            time.setflags(write=False)
+            values.setflags(write=False)
+            source_rows.setflags(write=False)
+            blocks.append(
+                ResultDataBlock(
+                    block_id=source.axis,
+                    label=label,
+                    kind=ResultLayerKind.EXPERIMENTAL,
+                    t=time,
+                    series=((source.raw_column, values),),
+                    series_axes=((source.raw_column, source.axis),),
+                    x_axis=SimulationSeriesAxisSelection("t"),
+                    result=None,
+                    segment_ids=None,
+                    segment_keys=None,
+                    discontinuity_ids=None,
+                    source_row=source_rows,
+                    series_provenance=(
+                        (source.raw_column, _observation_provenance(source)),
+                    ),
+                    color_by_series=((source.raw_column, "#000000"),),
+                )
+            )
+    return tuple(blocks)
 
 
 def _data_block(
@@ -1491,23 +1601,6 @@ def compose_result_input(
         completion_warning_details=tuple(warning_facts),
     )
 
-def select_copy_blocks(
-    render_input: ResultRenderInput,
-) -> tuple[ResultDataBlock, ...]:
-    """Select the visible, applicable full-resolution semantic blocks once.
-
-    The returned tuple is the sole export selection shared by Copy All and
-    XLSX.  It deliberately ignores the plot's transient rendered-point
-    roster; that roster belongs only to Copy Rendered Points.
-    """
-
-    if not isinstance(render_input, ResultRenderInput):
-        raise TypeError("Copy selection requires a ResultRenderInput.")
-    selected = tuple(block for block in render_input.blocks if block.visible)
-    if not selected:
-        raise ValueError("No visible result, Reference, or experimental data.")
-    return selected
-
 def iter_blocks_tsv_chunks(
     blocks: Sequence[ResultDataBlock],
     *,
@@ -1577,10 +1670,9 @@ def iter_blocks_tsv_chunks(
             for name, values in block.series
         )
     if not columns:
-        raise ValueError("No visible result, Reference, or experimental data.")
+        raise ValueError("No retained result or qualifying mapped dataset data.")
     row_count = max(len(values) for _header, values, _kind in columns)
-    result_entries = _unique_result_entries(block_values)
-    cell_count = (row_count + 1) * len(columns) + 2 * len(result_entries)
+    cell_count = (row_count + 1) * len(columns)
     if cell_count > _MAX_COPY_CELLS:
         raise ValueError(
             "Copy payload exceeds the bounded full-resolution cell limit "
@@ -1590,22 +1682,6 @@ def iter_blocks_tsv_chunks(
     if chunk_size < 1:
         raise ValueError("rows_per_chunk must be positive.")
     total_characters = 0
-    for entry in result_entries:
-        metadata_line = encode_tsv_row(
-            (
-                "# Kindred canonical result",
-                encode_clipboard_text(
-                        _canonical_json(_result_provenance_payload(entry))
-                ),
-            )
-        )
-        total_characters += len(metadata_line)
-        if total_characters > _MAX_COPY_CHARACTERS:
-            raise ValueError(
-                "Copy payload exceeds the bounded output-size limit "
-                f"({_MAX_COPY_CHARACTERS // (1024 * 1024)} MiB)."
-            )
-        yield metadata_line
     header = encode_tsv_row(tuple(header for header, _values, _kind in columns))
     total_characters += len(header)
     if total_characters > _MAX_COPY_CHARACTERS:
@@ -1647,17 +1723,15 @@ def iter_blocks_tsv_chunks(
 def validate_xlsx_export(
     blocks: Sequence[ResultDataBlock],
 ) -> None:
-    """Validate the immutable visible block roster before writing."""
+    """Validate the immutable canonical block roster before writing."""
 
     block_values = tuple(blocks)
     if not block_values:
-        raise ValueError("No visible result, Reference, or experimental data.")
+        raise ValueError("No retained result or qualifying mapped dataset data.")
     if any(not isinstance(block, ResultDataBlock) for block in block_values):
         raise TypeError(
             "XLSX export blocks must contain only ResultDataBlock values."
         )
-    if any(not block.visible for block in block_values):
-        raise ValueError("XLSX export blocks must all be visible.")
     lineage_row_count = sum(
         int(bool(block.x_provenance))
         + sum(bool(provenance) for _, provenance in block.series_provenance)
