@@ -115,6 +115,12 @@ class FitSessionOwner(QtCore.QObject):
         return self._session.document.fit_defaults
 
     @property
+    def active(self) -> bool:
+        """Return whether Fit owns an open window or worker."""
+
+        return bool(self._window is not None or self._worker is not None)
+
+    @property
     def application_close_settled(self) -> bool:
         """Return whether Close-facing Fit cleanup is fully owner-settled."""
 

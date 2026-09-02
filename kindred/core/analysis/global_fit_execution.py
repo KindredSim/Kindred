@@ -2318,7 +2318,7 @@ class GlobalFitObjective:
             settled = scaled_settlement(factor)
             if settled is None:
                 return residuals, float(cost)
-            settled_residuals, settled_cost = settled
+            _, settled_cost = settled
 
             # Bracket the first finite scale that clears the best cost.  The
             # square-root estimate is based on separate SSEs, while the final
@@ -2346,7 +2346,7 @@ class GlobalFitObjective:
                     expanded_settlement = scaled_settlement(upper_factor)
                     if expanded_settlement is None:
                         break
-                    settled_residuals, settled_cost = expanded_settlement
+                    _, settled_cost = expanded_settlement
                     if settled_cost > best_cost:
                         break
                 else:
@@ -2371,7 +2371,7 @@ class GlobalFitObjective:
                     continue
                 if midpoint_settlement[1] > best_cost:
                     upper_factor = midpoint
-                    settled_residuals, settled_cost = midpoint_settlement
+                    _, settled_cost = midpoint_settlement
                 else:
                     lower_factor = midpoint
 

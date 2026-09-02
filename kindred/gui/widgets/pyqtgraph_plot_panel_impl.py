@@ -370,11 +370,16 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
     @QtCore.Slot()
     def _copy_rendered_points_to_clipboard(self) -> None:
         roster = self._rendered_point_roster
-        if not any(chunk.x.size for block in roster for chunk in block.chunks):
-            raise ValueError("No rendered points are available to copy.")
-        output = io.StringIO()
-        output.writelines(_iter_rendered_point_tsv_chunks(roster))
-        QtWidgets.QApplication.clipboard().setText(output.getvalue())
+        try:
+            if not any(chunk.x.size for block in roster for chunk in block.chunks):
+                raise ValueError("No rendered points are available to copy.")
+            output = io.StringIO()
+            output.writelines(_iter_rendered_point_tsv_chunks(roster))
+            rendered_text = output.getvalue()
+        except (TypeError, ValueError, OSError) as exc:
+            QtWidgets.QMessageBox.critical(self, "Copy Rendered Points", str(exc))
+            return
+        QtWidgets.QApplication.clipboard().setText(rendered_text)
 
     def retire_interactive_preview_targets(
         self,
@@ -2233,9 +2238,12 @@ def _iter_rendered_point_tsv_chunks(
     planned_cells = 0
     for block in nonempty:
         first_chunk = next(chunk for chunk in block.chunks if chunk.x.size)
-        columns = 2 + len(first_chunk.series)
-        if block.kind != ResultLayerKind.EXPERIMENTAL.value:
-            columns += 3
+        columns = 1 + len(first_chunk.series)
+        columns += (
+            1
+            if block.kind == ResultLayerKind.EXPERIMENTAL.value
+            else 3
+        )
         rows = sum(int(chunk.x.size) for chunk in block.chunks)
         planned_cells += (rows + 1) * columns
     if planned_cells > _MAX_RENDERED_COPY_CELLS:

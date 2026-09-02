@@ -168,7 +168,6 @@ __all__ = [
     "SimulationPreparationError",
     "build_simulation_request_from_prepared_run",
     "metadata_view_for_mechanism",
-    "bind_simulation_execution_request_interventions",
     "build_simulation_execution_request",
     "solver_config_for_execution_settings",
     "prepare_simulation_worker_run",
@@ -822,24 +821,6 @@ def _schedule_parameters_deferred_to_prepared_request(
     return frozenset(deferred)
 
 
-def bind_simulation_execution_request_interventions(
-    request: SimulationExecutionRequest,
-) -> SimulationExecutionRequest:
-    """Retain declarative target schedules for worker-local resolution."""
-
-    if not isinstance(request, SimulationExecutionRequest):
-        raise TypeError(
-            "intervention binding requires SimulationExecutionRequest."
-        )
-    unresolved = request.prepared_dsl.parameterized_intervention_schedule_for_binding()
-    if unresolved is None:
-        return request
-    # Classification and candidate-dependency admission belong to the
-    # isolated worker preparation, where the one call-local target map is
-    # already alive.  Request capture only retains the declarative schedule.
-    return request
-
-
 def solver_config_for_execution_settings(
     *,
     execution_settings: Any,
@@ -882,7 +863,7 @@ def build_simulation_execution_request(
     scientific_settings: Any,
     parameter_values: Mapping[str, float] | None = None,
 ) -> SimulationExecutionRequest:
-    """Capture, isolate, bind, and compile one direct Run/Preview target."""
+    """Capture, isolate, and compile one direct Run/Preview target."""
 
     from kindred.core.mechanism_source import (
         MechanismAuthoringSource,
@@ -977,7 +958,7 @@ def build_simulation_execution_request(
         requested_parameter_names=(),
         parameter_overrides=normalized_parameters,
     )
-    return bind_simulation_execution_request_interventions(request)
+    return request
 
 
 def metadata_view_for_mechanism(
@@ -1044,8 +1025,7 @@ def _coerce_parameter_override_items(
     return items
 
 
-def _parameter_algebra_scalar_authority_names(mechanism: Any, spec: Any) -> tuple[frozenset[str], frozenset[str]]:
-    del mechanism
+def _parameter_algebra_scalar_authority_names(spec: Any) -> tuple[frozenset[str], frozenset[str]]:
     dependencies = getattr(spec, "parameter_dependencies", None)
     assignment_kind = getattr(spec, "parameter_assignment_kind", None)
     if not isinstance(dependencies, Mapping) or not callable(assignment_kind):
@@ -1942,7 +1922,6 @@ def _bind_request_parameter_overrides(
 
     declared_scalar_names, derived_scalar_names = (
         _parameter_algebra_scalar_authority_names(
-            mechanism,
             parameter_algebra_spec,
         )
     )

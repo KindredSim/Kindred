@@ -132,7 +132,7 @@ class _DispositionResult:
 class ProjectController(QtCore.QObject):
     """The sole Save/Save As/Close disposition owner."""
 
-    projectStateChanged = QtCore.Signal()
+    projectStateChanged = QtCore.Signal(bool)
     closePendingChanged = QtCore.Signal(bool)
     nativeCloseAuthorized = QtCore.Signal()
 
@@ -495,13 +495,13 @@ class ProjectController(QtCore.QObject):
                 logger.warning("Recent-project update failed", exc_info=True)
                 status += f"; recent-project persistence failed: {exc}"
         self._set_status(status)
-        self.projectStateChanged.emit()
+        self.projectStateChanged.emit(True)
         return True
 
-    def new_project(self, *, idle_admitted: bool) -> bool:
-        """Replace the current project after W8 admits an idle action."""
+    def new_project(self) -> bool:
+        """Replace the current project after project-action admission."""
 
-        if not idle_admitted or self._reject_mutation_during_close("New Project"):
+        if self._reject_mutation_during_close("New Project"):
             return False
         expected_token = self._session.capture_content_token()
         disposition = self._resolve_disposition(
@@ -522,10 +522,10 @@ class ProjectController(QtCore.QObject):
             action="New Project",
         )
 
-    def load_project(self, *, idle_admitted: bool) -> bool:
+    def load_project(self) -> bool:
         """Choose and directly install one validated project archive."""
 
-        if not idle_admitted or self._reject_mutation_during_close("Open Project"):
+        if self._reject_mutation_during_close("Open Project"):
             return False
         # Capture the visible editor before opening the native picker.  The
         # picker may take focus away; canceling it must leave this exact draft
@@ -541,17 +541,15 @@ class ProjectController(QtCore.QObject):
         )
         if not path:
             return False
-        return self.load_recent_project(path, idle_admitted=True)
+        return self.load_recent_project(path)
 
     def load_recent_project(
         self,
         path: str | os.PathLike[str],
-        *,
-        idle_admitted: bool,
     ) -> bool:
         """Admit and directly install one selected project archive."""
 
-        if not idle_admitted or self._reject_mutation_during_close("Open Project"):
+        if self._reject_mutation_during_close("Open Project"):
             return False
         expected_token = self._session.capture_content_token()
         disposition = self._resolve_disposition(
@@ -830,7 +828,7 @@ class ProjectController(QtCore.QObject):
         self._discard_authoring(AuthoringDiscardMode.ALL_UNACCEPTED)
         status = f"Saved project: {absolute_path}"
         self._set_status(status)
-        self.projectStateChanged.emit()
+        self.projectStateChanged.emit(False)
         return committed_token
 
     def request_close(self) -> bool:

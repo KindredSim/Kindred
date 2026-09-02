@@ -1003,34 +1003,6 @@ class FitExecutionRequest:
         raw_parameters = tuple(self.parameters)
         raw_initials = tuple(self.initials)
         raw_global_initials = tuple(self.global_initials)
-        if any(
-            not isinstance(item, FitDatasetLocalSettings)
-            for item in raw_datasets
-        ):
-            raise TypeError(
-                "Fit request datasets must be FitDatasetLocalSettings values."
-            )
-        if any(
-            not isinstance(item, FitParameterVariable)
-            for item in raw_parameters
-        ):
-            raise TypeError(
-                "Fit request parameters must be FitParameterVariable values."
-            )
-        if any(
-            not isinstance(item, FitInitialVariable)
-            for item in raw_initials
-        ):
-            raise TypeError(
-                "Fit request initials must be FitInitialVariable values."
-            )
-        if any(
-            not isinstance(item, FitInitialGlobalVariable)
-            for item in raw_global_initials
-        ):
-            raise TypeError(
-                "Fit request global initials must be FitInitialGlobalVariable values."
-            )
         datasets = tuple(sorted(raw_datasets, key=lambda item: item.dataset_id))
         parameters = tuple(
             _replace_fit_parameter(

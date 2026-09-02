@@ -48,7 +48,6 @@ from kindred.core.simulation_preparation import (
     prepare_preparation_failure,
     raise_unowned_request_parameter_values,
     reject_requested_algebra_owned_mechanism_parameters_for_fitting,
-    bind_simulation_execution_request_interventions,
     build_simulation_request_from_prepared_run,
     metadata_view_for_mechanism,
     prepare_simulation_worker_run,
@@ -402,7 +401,7 @@ def prepare_fitting_execution_context(
         mechanism_namespace = build_namespace_from_mechanism(mechanism)
         namespace_info = mechanism_namespace.info_by_name
         declared_scalar_names, derived_scalar_names = _parameter_algebra_scalar_authority_names(
-            mechanism, parameter_algebra_spec
+            parameter_algebra_spec
         )
         requested_derived_scalar_names = sorted(
             name for name in mechanism_param_names if str(name) in derived_scalar_names
@@ -507,9 +506,6 @@ def prepare_fitting_execution_context(
         t_span=(float(t_start), float(t_end)),
         solver_config=prepared_solver_config,
         requested_parameter_names=tuple(canonical_requested_param_names),
-    )
-    execution_request = bind_simulation_execution_request_interventions(
-        execution_request
     )
     if (
         cancellation_control is not None

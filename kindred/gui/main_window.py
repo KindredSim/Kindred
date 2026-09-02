@@ -202,7 +202,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self._rendering_workspace = False
         self._recent_menu: QtWidgets.QMenu | None = None
         self._tab_surfaces: dict[str, _TabSurfaceBundle] = {}
-        self._result_render_inputs: dict[str, ResultRenderInput] = {}
         self._result_copy_eligible: dict[str, bool] = {}
         self._dark_mode_action: QtGui.QAction | None = None
         self._run_action: QtGui.QAction | None = None
@@ -210,12 +209,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self._open_project_action: QtGui.QAction | None = None
         self._xlsx_export_action: QtGui.QAction | None = None
         self._dataset_import_progress_dialog: QtWidgets.QProgressDialog | None = None
-        self._fit_window_open = False
-        self._fit_executing = False
         self._last_export_directory: str | None = None
         self._slider_apply_refreshing: set[str] = set()
         self._current_row_refreshing: dict[str, ProjectDocument] = {}
-        self._workspace_document_identity: ProjectDocument | None = None
         self.setObjectName("kindredMainWindow")
         self.setWindowTitle("Kindred")
         self.resize(self._startup_size())
@@ -670,7 +666,6 @@ class MainWindow(QtWidgets.QMainWindow):
         bundle = self._tab_surfaces.pop(target, None)
         if bundle is None:
             return
-        self._result_render_inputs.pop(target, None)
         self._result_copy_eligible.pop(target, None)
         bundle.slider_binding.dispose()
         for stack, widget in (
@@ -943,7 +938,7 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         plot.resultDiagnostic.connect(self._on_workspace_result_diagnostic)
 
-    def _refresh_workspace_document(self) -> None:
+    def _refresh_workspace_document(self, project_replaced: bool = False) -> None:
         """Refresh canonical/global projections without changing selected page state."""
 
         if self._rendering_workspace:
@@ -951,13 +946,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._rendering_workspace = True
         try:
             document = self._project_session.document
-            replacing_document = (
-                self._workspace_document_identity is not None
-                and self._workspace_document_identity is not document
-            )
-            self._workspace_document_identity = document
             document_ids = {tab.tab_id for tab in document.tabs}
-            if replacing_document:
+            if project_replaced:
                 # Same-ID retained widgets otherwise keep old debounce/capture
                 # state and can publish an old gesture into the new document.
                 for tab_id, bundle in tuple(self._tab_surfaces.items()):
@@ -974,7 +964,6 @@ class MainWindow(QtWidgets.QMainWindow):
             for tab in document.tabs:
                 if tab.tab_id not in self._tab_surfaces:
                     self._create_tab_surface(tab.tab_id)
-            self._result_render_inputs.clear()
             self._result_copy_eligible.clear()
             self._workspace.render(
                 document,
@@ -1396,7 +1385,6 @@ class MainWindow(QtWidgets.QMainWindow):
         copy_available = self._canonical_export_available(target)
         # Semantic truth and export eligibility are committed before touching
         # PyQtGraph.  A physical render exception must not erase either.
-        self._result_render_inputs[target] = render_input
         self._result_copy_eligible[target] = copy_available
         plot = self._workspace.plot_for_tab(target)
         try:
@@ -1416,7 +1404,6 @@ class MainWindow(QtWidgets.QMainWindow):
         """Clear semantic and physical result state after any render failure."""
 
         target = str(tab_id)
-        self._result_render_inputs.pop(target, None)
         copy_available = self._canonical_export_available(target)
         self._result_copy_eligible[target] = copy_available
         try:
@@ -2368,7 +2355,7 @@ class MainWindow(QtWidgets.QMainWindow):
             run_defaults_drafts=run_defaults_drafts,
             slider_drafts=slider_drafts,
             active_run_or_preview=self._simulation_work_active(),
-            active_fit=bool(self._fit_window_open or self._fit_executing),
+            active_fit=self._fit_session_owner.active,
             active_import=bool(self._dataset_import_staging.busy),
             active_xlsx_export=self._xlsx_export_owner.is_exporting,
         )
@@ -3947,8 +3934,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return False
         active_work = bool(
             self._simulation_work_active()
-            or self._fit_window_open
-            or self._fit_executing
+            or self._fit_session_owner.active
             or self._dataset_import_staging.busy
             or self._xlsx_export_owner.is_exporting
         )
@@ -3967,22 +3953,17 @@ class MainWindow(QtWidgets.QMainWindow):
     def _new_project(self) -> bool:
         if not self._project_actions_idle("New Project"):
             return False
-        return bool(self.project_controller.new_project(idle_admitted=True))
+        return bool(self.project_controller.new_project())
 
     def _open_project(self) -> bool:
         if not self._project_actions_idle("Open Project"):
             return False
-        return bool(self.project_controller.load_project(idle_admitted=True))
+        return bool(self.project_controller.load_project())
 
     def _open_recent_project(self, path: str) -> bool:
         if not self._project_actions_idle("Open Project"):
             return False
-        return bool(
-            self.project_controller.load_recent_project(
-                path,
-                idle_admitted=True,
-            )
-        )
+        return bool(self.project_controller.load_recent_project(path))
 
     def _reset_layout(self) -> None:
         if not self._mutation_input_admitted("Reset Layout"):
@@ -4887,11 +4868,11 @@ class MainWindow(QtWidgets.QMainWindow):
     def set_status_text(self, text: str) -> None:
         self._status_label.setText(str(text))
 
-    @QtCore.Slot()
-    def _on_project_state_changed(self) -> None:
+    @QtCore.Slot(bool)
+    def _on_project_state_changed(self, project_replaced: bool) -> None:
         """Refresh the current root after semantic publication."""
 
-        self._refresh_workspace_document()
+        self._refresh_workspace_document(project_replaced)
 
     def _refresh_project_state(self) -> None:
         self._render_tab_state()
@@ -4912,13 +4893,11 @@ class MainWindow(QtWidgets.QMainWindow):
         return bool(self._simulation_jobs.busy)
 
     @QtCore.Slot(bool)
-    def _on_fit_window_changed(self, open_: bool) -> None:
-        self._fit_window_open = bool(open_)
+    def _on_fit_window_changed(self, _open: bool) -> None:
         self._refresh_actions()
 
     @QtCore.Slot(bool)
-    def _on_fit_execution_changed(self, executing: bool) -> None:
-        self._fit_executing = bool(executing)
+    def _on_fit_execution_changed(self, _executing: bool) -> None:
         self._refresh_actions()
 
     @QtCore.Slot()
@@ -4987,13 +4966,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self._global_fit_action.setEnabled(
             mutation_admitted
             and self._computation_gate.is_idle
-            and not self._fit_window_open
+            and not self._fit_session_owner.active
             and not self._xlsx_export_owner.is_exporting
         )
         active_work = bool(
             self._simulation_work_active()
-            or self._fit_window_open
-            or self._fit_executing
+            or self._fit_session_owner.active
             or self._dataset_import_staging.busy
             or self._xlsx_export_owner.is_exporting
         )
