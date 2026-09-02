@@ -878,7 +878,8 @@ def _selected_x_unavailable_diagnostic(
     )
     return (
         f"Selected X {selected_identity} is unavailable for result layer(s) {labels}. "
-        "Those layer(s) are omitted from plot and full-resolution export composition."
+        "Those layer(s) are omitted from the current plot only; "
+        "full-resolution Copy All/XLSX exports remain unaffected."
     )
 
 

@@ -2099,8 +2099,8 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         enabled: bool,
     ) -> None:
         # The WorkspaceTabRegistry is the sole accepted presentation owner.
-        # Do not mutate local state or visible pyqtgraph items until its
-        # current-content token has accepted this intent.
+        # Do not mutate local state or visible pyqtgraph items until it has
+        # validated and stored this intent.
         self.plotPresentationIntentRequested.emit(str(option), bool(enabled))
 
     def _apply_plot_presentation(

@@ -1610,7 +1610,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self._workspace_tab_registry.set_presentation(
             target,
             next_state,
-            expected_token=self._project_session.capture_content_token(),
         )
         self._workspace_tab_registry.tab_runtime(target).selected_run_set_ids = (
             ids[0],
@@ -1704,13 +1703,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if not self._settle_visible_tab_inputs():
             self._workspace.select_tab_surface(previous)
             return
-        token = self._workspace_tab_registry.select_tab(
-            target,
-            expected_token=self._project_session.capture_content_token(),
-        )
-        if token is None:
-            self._workspace.select_tab_surface(previous)
-            return
+        self._workspace_tab_registry.select_tab(target)
         self._select_tab_surfaces(target)
 
     @QtCore.Slot()
@@ -3794,16 +3787,13 @@ class MainWindow(QtWidgets.QMainWindow):
             overlays[dataset_id] = raw_observation_ids
         else:
             overlays.pop(dataset_id, None)
-        token = self._workspace_tab_registry.set_presentation(
+        self._workspace_tab_registry.set_presentation(
             tab_id,
             replace(
                 state,
                 overlay_raw_observation_ids_by_dataset=tuple(overlays.items()),
             ),
-            expected_token=self._project_session.capture_content_token(),
         )
-        if token is None:
-            return
         self._tab_surfaces[tab_id].overlay_panel.render_overlay_selection(
             dataset_id=dataset_id,
             raw_observation_ids=raw_observation_ids,
@@ -3815,13 +3805,10 @@ class MainWindow(QtWidgets.QMainWindow):
         if not self._mutation_input_admitted("Change Reference Lines"):
             return
         state = self._workspace_tab_registry.presentation(tab_id)
-        token = self._workspace_tab_registry.set_presentation(
+        self._workspace_tab_registry.set_presentation(
             tab_id,
             replace(state, reference_lines_visible=bool(visible)),
-            expected_token=self._project_session.capture_content_token(),
         )
-        if token is None:
-            return
         self._refresh_project_state()
         self._render_results_for_tab(tab_id)
 
@@ -3835,16 +3822,13 @@ class MainWindow(QtWidgets.QMainWindow):
         ):
             return
         state = self._workspace_tab_registry.presentation(tab_id)
-        token = self._workspace_tab_registry.set_presentation(
+        self._workspace_tab_registry.set_presentation(
             tab_id,
             replace(
                 state,
                 intervention_annotations_visible=bool(visible),
             ),
-            expected_token=self._project_session.capture_content_token(),
         )
-        if token is None:
-            return
         self._refresh_project_state()
         self._render_results_for_tab(tab_id)
 
@@ -3856,13 +3840,10 @@ class MainWindow(QtWidgets.QMainWindow):
         if not self._mutation_input_admitted("Change X Series"):
             return
         state = self._workspace_tab_registry.presentation(tab_id)
-        token = self._workspace_tab_registry.set_presentation(
+        self._workspace_tab_registry.set_presentation(
             tab_id,
             replace(state, selected_x_series=selection),
-            expected_token=self._project_session.capture_content_token(),
         )
-        if token is None:
-            return
         self._refresh_project_state()
         self._render_results_for_tab(tab_id)
 
@@ -3871,17 +3852,14 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         selected = tuple(selections or ())
         state = self._workspace_tab_registry.presentation(tab_id)
-        token = self._workspace_tab_registry.set_presentation(
+        self._workspace_tab_registry.set_presentation(
             tab_id,
             replace(
                 state,
                 selected_y_series=selected,
                 selected_y_uses_default_all=False,
             ),
-            expected_token=self._project_session.capture_content_token(),
         )
-        if token is None:
-            return
         self._refresh_project_state()
         self._render_results_for_tab(tab_id)
 
@@ -3895,13 +3873,10 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         state = self._workspace_tab_registry.presentation(tab_id)
         next_state = replace(state, **{str(option): bool(enabled)})
-        token = self._workspace_tab_registry.set_presentation(
+        self._workspace_tab_registry.set_presentation(
             tab_id,
             next_state,
-            expected_token=self._project_session.capture_content_token(),
         )
-        if token is None:
-            return
         self._workspace.plot_for_tab(tab_id).set_persisted_plot_state(
             log_x=next_state.log_x,
             log_y=next_state.log_y,

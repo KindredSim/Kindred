@@ -1381,6 +1381,7 @@ class FitSessionOwner(QtCore.QObject):
         try:
             parameter_values = self._candidate_publishable_parameter_values(candidate)
             self._candidate_local_scalar_values(candidate)
+            centred_provenance = self._candidate_centred_fixed_effects_provenance(candidate)
             initial_values = {
                 (set_id, species): value
                 for set_id, values in candidate.initial_values_by_set
@@ -1399,6 +1400,7 @@ class FitSessionOwner(QtCore.QObject):
                 )
             if candidate.local_observables:
                 source_text = self._append_observable_source(candidate, source_text)
+            source_text = self._append_centred_fixed_effects_provenance(source_text, centred_provenance)
             reconciliation = reconcile_tab_mechanism_source(
                 self._registry.document,
                 origin.tab_id,
@@ -1454,8 +1456,44 @@ class FitSessionOwner(QtCore.QObject):
             return False
         self.project_document_changed.emit(origin.tab_id)
         window.set_apply_available(False)
-        self._set_status("Fit candidate applied to the project.")
+        self._set_status("Centred Fit applied: overall values published; dataset estimates not applied (recorded as mechanism-source provenance)." if centred_provenance else "Fit candidate applied to the project.")
         return True
+
+    @staticmethod
+    def _candidate_centred_fixed_effects_provenance(candidate: FitCandidate) -> tuple[str, ...]:
+        """Build non-executable provenance for fitted centred parameters."""
+
+        settlements = tuple(sorted(candidate.result.centred_fixed_effects_settlements, key=lambda item: item.parameter_name))
+        if not settlements:
+            return ()
+        display_names = {mapped.dataset_id: mapped.display_name for mapped in candidate.origin.mapped_datasets}
+        return tuple(
+            f"# Centred Fit applied: overall {settlement.parameter_name} = "
+            f"{settlement.overall_decoded_value:.17g}; "
+            "dataset estimates not applied: "
+            + ", ".join(
+                (
+                    str(display_names[dataset_id])
+                    .replace("\r\n", " ")
+                    .replace("\r", " ")
+                    .replace("\n", " ")
+                    + f" = {settlement.dataset_values[dataset_id]:.17g}"
+                )
+                for dataset_id in settlement.dataset_ids
+            )
+            for settlement in settlements
+        )
+
+    @staticmethod
+    def _append_centred_fixed_effects_provenance(
+        source: str,
+        comments: Sequence[str],
+    ) -> str:
+        if not comments:
+            return source
+        newline = "\r\n" if "\r\n" in source else "\n"
+        separator = "" if source.endswith(("\n", "\r")) else newline
+        return source + separator + newline.join(comments)
 
     @classmethod
     def _append_observable_source(cls, candidate: FitCandidate, source: str) -> str:

@@ -1126,13 +1126,10 @@ class InitialConditionsTableActions(QtCore.QObject):
         next_state = replace(state, plot_set_ids=tuple(ids))
         if next_state == state:
             return False
-        token = self._registry.set_presentation(
+        self._registry.set_presentation(
             self._tab_id,
             next_state,
-            expected_token=self._registry.capture_content_token(),
         )
-        if token is None:
-            return False
         self.render()
         return True
 
@@ -1143,13 +1140,10 @@ class InitialConditionsTableActions(QtCore.QObject):
         next_ids = tuple(dict.fromkeys((*state.plot_set_ids, *admitted)))
         if next_ids == state.plot_set_ids:
             return False
-        token = self._registry.set_presentation(
+        self._registry.set_presentation(
             self._tab_id,
             replace(state, plot_set_ids=next_ids),
-            expected_token=self._registry.capture_content_token(),
         )
-        if token is None:
-            return False
         self.render()
         return True
 
@@ -1162,13 +1156,10 @@ class InitialConditionsTableActions(QtCore.QObject):
         next_state = replace(state, pinned_slider_set_ids=tuple(ids))
         if next_state == state:
             return False
-        token = self._registry.set_presentation(
+        self._registry.set_presentation(
             self._tab_id,
             next_state,
-            expected_token=self._registry.capture_content_token(),
         )
-        if token is None:
-            return False
         self.render()
         return True
 
@@ -1297,7 +1288,6 @@ class InitialConditionsTableActions(QtCore.QObject):
             self._registry.set_presentation(
                 self._tab_id,
                 replace(state, current_set_id=set_id),
-                expected_token=self._registry.capture_content_token(),
             )
 
     def _clear_invalid_value(self, set_id: str, species: str) -> bool:

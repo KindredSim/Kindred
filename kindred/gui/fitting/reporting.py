@@ -15,7 +15,7 @@ from typing import Literal
 
 import numpy as np
 
-from kindred.core.analysis.fit_statistics import FitMetric, finite_positive_mean_normalize
+from kindred.core.analysis.fit_statistics import FitMetric
 from kindred.core.analysis.global_fit_execution import FitCoordinate
 from kindred.core.simulation_failure import FactualCause
 from kindred.gui.fitting.constants import INITIAL_PREFIX
@@ -328,19 +328,12 @@ def _bootstrap_data(candidate: FitCandidate) -> dict[str, object]:
     }
 
 
-def _dataset_metrics(
-    candidate: FitCandidate,
-    *,
-    include_x: bool = True,
-) -> list[dict[str, object]]:
+def _dataset_metrics(candidate: FitCandidate) -> list[dict[str, object]]:
     result = candidate.result
-    request_datasets = {item.dataset_id: item for item in candidate.request.datasets}
-    mapped_datasets = {item.dataset_id: item for item in candidate.origin.mapped_datasets}
     display_names = {mapped.dataset_id: mapped.display_name for mapped in candidate.origin.mapped_datasets}
     metrics: list[dict[str, object]] = []
     for info in sorted(result.dataset_info, key=lambda item: str(item.dataset_id)):
         dataset_id = str(info.dataset_id)
-        x_projection = info.x_projection
         metric: dict[str, object] = {
             "dataset_id": dataset_id,
             "dataset_display_name": display_names.get(dataset_id, dataset_id),
@@ -350,44 +343,7 @@ def _dataset_metrics(
             "weighted_mae": _metric(info.weighted_mae),
             "r_squared_by_series": {str(name): _metric(value) for name, value in sorted(info.r_squared_by_series.items())},
             "effective_weight": float(info.weight),
-            "n_points": int(info.n_points),
-            "x": None,
         }
-        if include_x:
-            x_payload: dict[str, object] = {
-                "point_count": 0 if x_projection is None else int(x_projection.size),
-                "weighted_sse": _metric(info.x_weighted_residual_sse),
-                "weighted_mse": _metric(info.x_weighted_residual_mse),
-                "weighted_rmse": _metric(info.x_weighted_rmse),
-                "weighted_mae": _metric(info.x_weighted_mae),
-                "delta_x": _plain(() if x_projection is None else x_projection.delta_x),
-                "match_kinds": _plain(() if x_projection is None else x_projection.match_kinds),
-                "sample_kinds": _plain(() if x_projection is None else x_projection.sample_kinds),
-                "source_rows": _plain(() if x_projection is None else x_projection.source_rows),
-            }
-            if x_projection is not None:
-                x_payload.update({
-                    "selected_time": _plain(x_projection.selected_time),
-                    "selected_model_x": _plain(x_projection.selected_model_x),
-                    "segment_ids": _plain(x_projection.segment_ids),
-                    "segment_keys": _plain(x_projection.segment_keys),
-                    "discontinuity_ids": _plain(x_projection.discontinuity_ids),
-                })
-            setup_dataset = request_datasets.get(dataset_id)
-            mapped_dataset = mapped_datasets.get(dataset_id)
-            if setup_dataset is not None and mapped_dataset is not None and setup_dataset.parametric is not None:
-                x_name = setup_dataset.parametric.x_name
-                raw_id = next((raw_id for raw_id, target in setup_dataset.observation_targets if target == x_name), None)
-                source = next((observation for observation in mapped_dataset.observations if observation.raw_observation_id == raw_id), None)
-                if source is not None and x_projection is not None:
-                    by_row = {int(row): (float(time), float(value)) for row, time, value in zip(source.source_rows, source.t, source.y, strict=True)}
-                    x_payload.update({
-                        "name": x_name,
-                        "raw_observation_id": source.raw_observation_id,
-                        "raw_column": source.raw_column,
-                        "selected_values": [by_row[row][1] for row in x_projection.source_rows],
-                    })
-            metric["x"] = x_payload
         metrics.append(metric)
     return metrics
 
@@ -660,43 +616,6 @@ def _aggregate_rows(individual: list[dict[str, object]]) -> list[dict[str, objec
     return aggregates
 
 
-def _weighting_data(candidate: FitCandidate, metrics: list[dict[str, object]]) -> dict[str, object]:
-    request = candidate.request
-    setup_by_id = {item.dataset_id: item for item in request.datasets if item.included}
-    datasets: list[dict[str, object]] = []
-    for metric in metrics:
-        dataset_id = str(metric["dataset_id"])
-        setup = setup_by_id[dataset_id]
-        effective = float(metric["effective_weight"])
-        configured = {str(name): float(value) for name, value in setup.target_weights}
-        normalized = finite_positive_mean_normalize(configured)
-        targets = [{"target_key": f"{dataset_id}::{target}", "target": target,
-            "configured_target_weight": configured[target], "normalized_target_weight": normalized[target],
-            "target_residual_multiplier": math.sqrt(normalized[target]),
-            "combined_residual_multiplier": math.sqrt(effective * normalized[target])} for target in setup.target_species]
-        x = metric["x"]
-        x_payload = None
-        if setup.parametric is not None and isinstance(x, Mapping):
-            x_name = setup.parametric.x_name
-            x_payload = {"name": x_name, "configured_target_weight": configured[x_name],
-                "normalized_target_weight": normalized[x_name], "target_residual_multiplier": math.sqrt(normalized[x_name]),
-                "combined_residual_multiplier": math.sqrt(effective * normalized[x_name]), "point_count": x["point_count"],
-                "weighted_sse": x["weighted_sse"], "weighted_mse": x["weighted_mse"], "weighted_rmse": x["weighted_rmse"],
-                "weighted_mae": x["weighted_mae"], "selected_time": x.get("selected_time"),
-                "selected_model_x": x.get("selected_model_x"), "source_rows": x["source_rows"], "delta_x": x["delta_x"],
-                "match_kinds": x["match_kinds"], "sample_kinds": x["sample_kinds"], "segment_ids": x.get("segment_ids", []),
-                "segment_keys": x.get("segment_keys", []), "discontinuity_ids": x.get("discontinuity_ids", [])}
-        dataset_payload: dict[str, object] = {"dataset_id": dataset_id, "point_count": int(metric["n_points"]),
-            "normalized_effective_dataset_weight": effective, "dataset_residual_multiplier": math.sqrt(effective),
-            "targets": targets, "x": x_payload}
-        if str(request.dataset_weight_mode) == "user":
-            dataset_payload["original_user_dataset_weight"] = float(setup.weight)
-        datasets.append(dataset_payload)
-    return {"dataset_weight_mode": str(request.dataset_weight_mode),
-        "combined_residual_weighting_rule": "weighted_residual = raw_residual * sqrt(normalized_effective_dataset_weight) * sqrt(normalized_target_weight)",
-        "datasets": datasets}
-
-
 def _known_input_context(candidate: FitCandidate) -> dict[str, object]:
     settings = candidate.origin.scientific_settings
     request = candidate.request
@@ -827,7 +746,7 @@ def fit_candidate_tracker(candidate: FitCandidate) -> tuple[str, tuple[str, ...]
     result = candidate.result
     shared, individual = _estimate_rows(candidate)
     initial = _initial_rows(candidate)
-    metrics = _dataset_metrics(candidate, include_x=False)
+    metrics = _dataset_metrics(candidate)
     lines: list[str] = []
     tooltips: list[str] = []
     for row in (*shared, *individual, *initial):
@@ -870,7 +789,10 @@ def fit_candidate_report_text(candidate: FitCandidate) -> str:
         "initial_estimates": _initial_rows(candidate),
         "aggregates": _aggregate_rows(individual),
         "metrics_by_dataset": metrics,
-        "weighting": _weighting_data(candidate, metrics),
+        "weighting": {
+            "dataset_weight_mode": str(candidate.request.dataset_weight_mode),
+            "combined_residual_weighting_rule": "weighted_residual = raw_residual * sqrt(normalized_effective_dataset_weight) * sqrt(normalized_target_weight)",
+        },
         "profile_likelihood": _profile_data(candidate),
         "residual_bootstrap": _bootstrap_data(candidate),
         "known_input_context": _known_input_context(candidate),

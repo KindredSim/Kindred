@@ -347,29 +347,18 @@ class WorkspaceTabRegistry:
     def select_tab(
         self,
         tab_id: str,
-        *,
-        expected_token: ProjectContentToken,
-    ) -> ProjectContentToken | None:
+    ) -> None:
         target = str(tab_id)
         self._session.document.tab(target)
-        if not self._session.is_content_token_current(expected_token):
-            return None
         if target == self.active_tab_id:
-            return self._session.capture_content_token()
+            return
         self._active_tab_id = target
-        return self._session.capture_content_token()
 
     def set_presentation(
         self,
         tab_id: str,
         state: ProjectPresentationState,
-        *,
-        expected_token: ProjectContentToken,
-    ) -> ProjectContentToken | None:
-        if not isinstance(state, ProjectPresentationState):
-            raise TypeError("state must be ProjectPresentationState.")
-        if not self._session.is_content_token_current(expected_token):
-            return None
+    ) -> None:
         tab = self._session.document.tab(tab_id)
         candidate = validate_project_presentation_state(
             self._session.document,
@@ -378,12 +367,11 @@ class WorkspaceTabRegistry:
         )
         current = self.presentation(tab.tab_id)
         if candidate == current:
-            return self._session.capture_content_token()
+            return
         self._presentation_by_tab_id = tuple(
-                (current_id, candidate if current_id == tab.tab_id else current)
-                for current_id, current in self._presentation_by_tab_id
-            )
-        return self._session.capture_content_token()
+            (current_id, candidate if current_id == tab.tab_id else current)
+            for current_id, current in self._presentation_by_tab_id
+        )
 
     def create_tab(
         self,
