@@ -768,6 +768,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self._fit_session_owner.execution_changed.connect(
             self._on_fit_execution_changed
         )
+        self._fit_session_owner.project_document_changed.connect(
+            self._on_fit_project_document_changed
+        )
         self._fit_session_owner.status_changed.connect(self.set_status_text)
         self._dataset_import_staging.completionAvailable.connect(
             self._commit_import_completion
@@ -4900,6 +4903,13 @@ class MainWindow(QtWidgets.QMainWindow):
     def _on_fit_execution_changed(self, _executing: bool) -> None:
         self._refresh_actions()
 
+    @QtCore.Slot(object)
+    def _on_fit_project_document_changed(self, tab_id: object) -> None:
+        if tab_id is None:
+            self._refresh_project_state()
+            return
+        self._refresh_tab_controls(str(tab_id))
+
     @QtCore.Slot()
     def _on_simulation_state_changed(self) -> None:
         """Project the live simulation kind into every retained panel."""
@@ -5021,7 +5031,14 @@ class MainWindow(QtWidgets.QMainWindow):
             event.ignore()
             self.project_controller.request_close()
             return
-        self._save_settings()
+        if not self._save_settings():
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Layout Not Saved",
+                "Kindred could not save the current window layout. "
+                "The previously saved layout will be restored the next time "
+                "Kindred starts.",
+            )
         event.accept()
 
     def showEvent(self, event: QtGui.QShowEvent) -> None:

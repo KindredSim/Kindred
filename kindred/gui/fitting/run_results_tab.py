@@ -230,7 +230,7 @@ class RunResultsTab(QtWidgets.QWidget):
         self._color_resolver = color_resolver
         self._summary_dialog: ResultsSummaryDialog | None = None
         self._dark_mode = False
-        self._view_autorange_locked = False
+        self._live_layout_locked = False
         self._curves: tuple[FitCurveDataset, ...] = ()
         self._dataset_presentation: Mapping[str, DatasetPlotPresentation] = (
             MappingProxyType({})
@@ -373,12 +373,14 @@ class RunResultsTab(QtWidgets.QWidget):
             raise ValueError("No Fit curves are available to copy.")
         view.copy_projection_to_clipboard(self._curves)
 
-    def set_view_autorange_locked(self, running: bool) -> None:
-        self._view_autorange_locked = bool(running)
+    def set_live_layout_locked(self, running: bool) -> None:
+        self._live_layout_locked = bool(running)
         for plot_view in self._dataset_plot_views.values():
-            plot_view.set_autorange_locked(self._view_autorange_locked)
+            plot_view.set_live_layout_locked(self._live_layout_locked)
         if self._all_datasets_plot_view is not None:
-            self._all_datasets_plot_view.set_autorange_locked(self._view_autorange_locked)
+            self._all_datasets_plot_view.set_live_layout_locked(
+                self._live_layout_locked
+            )
 
     def set_dark_mode(self, enabled: bool) -> None:
         self._dark_mode = bool(enabled)
@@ -441,7 +443,7 @@ class RunResultsTab(QtWidgets.QWidget):
         )
         plot_view.setObjectName(object_name)
         plot_view.set_dark_mode(self._dark_mode)
-        plot_view.set_autorange_locked(self._view_autorange_locked)
+        plot_view.set_live_layout_locked(self._live_layout_locked)
         return plot_view
 
     def _install_plot_projection(

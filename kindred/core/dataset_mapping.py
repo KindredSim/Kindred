@@ -21,6 +21,7 @@ from kindred.core.project_document import (
     InitialConditionSet,
     MechanismTabDocument,
     ProjectDocument,
+    canonical_initial_values,
     canonical_species_names,
     new_set_id,
 )
@@ -594,7 +595,7 @@ def _validate_current_fit_inclusion(
         dataset=dataset,
         set_id=initial_set.set_id,
         observation_mapping=normalized_mapping,
-        initial_values=initial_set.values_dict(),
+        initial_values=dict(canonical_initial_values(tab, initial_set.set_id)),
         mechanism_species=canonical_species_names(tab),
         observation_targets=model_targets,
         resolved_t_start=resolve_fit_t_start(

@@ -800,14 +800,14 @@ class FittingWindow(QtWidgets.QDialog):
             if not was_executing:
                 self._progress.setValue(0)
             self._paused = False
-            self._run_results_tab.set_view_autorange_locked(True)
             self._run_results_tab.set_live_curves(())
+            self._run_results_tab.set_live_layout_locked(True)
             self._copy_button.setEnabled(False)
             self._apply_button.setEnabled(False)
             self.set_shared_seed_available(False)
         else:
             self._paused = False
-            self._run_results_tab.set_view_autorange_locked(False)
+            self._run_results_tab.set_live_layout_locked(False)
         self._cancel_button.setEnabled(self._executing)
         self._pause_button.setEnabled(self._executing)
         self._resume_button.setEnabled(False)

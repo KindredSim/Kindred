@@ -28,56 +28,6 @@ def _required_id(value: object, field: str) -> str:
     return normalized
 
 
-def _frozen_vector(value: object, *, field: str) -> np.ndarray:
-    candidate = np.asarray(value, dtype=float)
-    if candidate.ndim != 1:
-        raise ValueError(f"{field} must be one-dimensional.")
-    array = (
-        value
-        if (
-            isinstance(value, np.ndarray)
-            and value.dtype == np.dtype(float)
-            and value.ndim == 1
-            and not value.flags.writeable
-        )
-        else candidate.copy()
-    )
-    if array.size == 0:
-        raise ValueError(f"{field} must not be empty.")
-    if np.any(~np.isfinite(array)):
-        raise ValueError(f"{field} must contain only finite values.")
-    array.setflags(write=False)
-    return array
-
-
-def _frozen_identity_vector(
-    value: object,
-    *,
-    field: str,
-    size: int,
-) -> np.ndarray:
-    raw = np.asarray(value)
-    if raw.ndim != 1 or raw.dtype.kind not in {"i", "u"}:
-        raise ValueError(f"{field} must be a one-dimensional integer array.")
-    candidate = raw.astype(np.int64, copy=False)
-    array = (
-        value
-        if (
-            isinstance(value, np.ndarray)
-            and value.dtype == np.dtype(np.int64)
-            and value.ndim == 1
-            and not value.flags.writeable
-        )
-        else candidate.copy()
-    )
-    if array.size != int(size):
-        raise ValueError(f"{field} must align with result time.")
-    if np.any(array < 0) or np.any(np.diff(array) < 0):
-        raise ValueError(f"{field} must be ordered and nonnegative.")
-    array.setflags(write=False)
-    return array
-
-
 def _freeze_provenance_value(value: Any) -> Any:
     if isinstance(value, Mapping):
         return MappingProxyType(
@@ -133,78 +83,10 @@ class SimulationResultValue:
     presentation_boundaries: tuple[SimulationPresentationBoundary, ...] = ()
 
     def __post_init__(self) -> None:
-        if not isinstance(self.solver_provenance, Mapping):
-            raise TypeError("solver_provenance must be a mapping.")
-        if not isinstance(
-            self.intervention_execution, InterventionExecutionContract
-        ):
-            raise TypeError(
-                "intervention_execution must be an InterventionExecutionContract."
-            )
+        # Canonical finalization is the sole producer; solver-owned arrays and
+        # boundaries already crossed their typed admission boundary.
         presentation_boundaries = tuple(self.presentation_boundaries)
-        if any(
-            not isinstance(boundary, SimulationPresentationBoundary)
-            for boundary in presentation_boundaries
-        ):
-            raise TypeError(
-                "presentation_boundaries must contain only "
-                "SimulationPresentationBoundary values."
-            )
-        if any(
-            current.time <= previous.time
-            for previous, current in zip(
-                presentation_boundaries,
-                presentation_boundaries[1:],
-            )
-        ):
-            raise ValueError(
-                "presentation boundaries must be strictly ordered by time."
-            )
-        time = _frozen_vector(self.t, field="result time")
-        if time.size > 1 and np.any(np.diff(time) <= 0.0):
-            raise ValueError("result time must be strictly increasing.")
-        if presentation_boundaries and (
-            presentation_boundaries[0].time < float(time[0])
-            or presentation_boundaries[-1].time > float(time[-1])
-        ):
-            raise ValueError(
-                "presentation boundaries must lie within the result time span."
-            )
-        if any(
-            not bool(np.any(time == boundary.time))
-            for boundary in presentation_boundaries
-        ):
-            raise ValueError(
-                "presentation boundaries must align with canonical result times."
-            )
-        segment_ids = _frozen_identity_vector(
-            self.segment_ids,
-            field="result segment identity",
-            size=time.size,
-        )
-        discontinuity_ids = _frozen_identity_vector(
-            self.discontinuity_ids,
-            field="result discontinuity identity",
-            size=time.size,
-        )
-        segment_keys = tuple(
-            _required_id(value, "result segment key")
-            for value in self.segment_keys
-        )
-        if len(segment_keys) != time.size:
-            raise ValueError("result segment keys must align with result time.")
-        series: dict[str, np.ndarray] = {}
-        for raw_name, raw_values in dict(self.series or {}).items():
-            name = _required_id(raw_name, "series name")
-            values = _frozen_vector(raw_values, field=f"series {name!r}")
-            if values.size != time.size:
-                raise ValueError(
-                    f"series {name!r} has {values.size} values for "
-                    f"{time.size} time points."
-                )
-            series[name] = values
-        if not series:
-            raise ValueError("result must contain at least one series.")
+        series = dict(self.series)
 
         scalars: dict[str, float] = {}
         for raw_name, raw_value in dict(self.scalars or {}).items():
@@ -249,11 +131,7 @@ class SimulationResultValue:
         if any(not isinstance(value, FactualCause) for value in errors):
             raise TypeError("algebra_errors must contain only FactualCause values.")
 
-        object.__setattr__(self, "t", time)
         object.__setattr__(self, "series", MappingProxyType(series))
-        object.__setattr__(self, "segment_ids", segment_ids)
-        object.__setattr__(self, "segment_keys", segment_keys)
-        object.__setattr__(self, "discontinuity_ids", discontinuity_ids)
         object.__setattr__(self, "scalars", MappingProxyType(scalars))
         object.__setattr__(self, "parameters", tuple(parameters))
         object.__setattr__(self, "solver_provenance", _frozen_provenance_mapping(self.solver_provenance))

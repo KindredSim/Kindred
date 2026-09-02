@@ -303,3 +303,52 @@ class SimulationOutput:
             _freeze_solver_value(self.provenance),
         )
         object.__setattr__(self, "presentation_boundaries", boundaries)
+
+
+@dataclass(frozen=True, kw_only=True)
+class FinalSimulationOutput(SimulationOutput):
+    """One fully composed execution with direct identity for every row."""
+
+    segment_ids: np.ndarray
+    segment_keys: tuple[str, ...]
+    discontinuity_ids: np.ndarray
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+
+        def identity_vector(value: object, *, field: str) -> np.ndarray:
+            raw = np.asarray(value)
+            if raw.ndim != 1 or raw.dtype.kind not in {"i", "u"}:
+                raise ValueError(
+                    f"{field} must be a one-dimensional integer array."
+                )
+            if raw.dtype.kind == "u" and raw.size:
+                if int(np.max(raw)) > np.iinfo(np.int64).max:
+                    raise ValueError(f"{field} exceeds int64 range.")
+            values = raw.astype(np.int64, copy=True)
+            if np.any(values < 0) or np.any(np.diff(values) < 0):
+                raise ValueError(f"{field} must be ordered and nonnegative.")
+            values.setflags(write=False)
+            return values
+
+        segment_ids = identity_vector(
+            self.segment_ids,
+            field="result segment identity",
+        )
+        discontinuity_ids = identity_vector(
+            self.discontinuity_ids,
+            field="result discontinuity identity",
+        )
+        segment_keys = tuple(str(value).strip() for value in self.segment_keys)
+        if any(not value for value in segment_keys):
+            raise ValueError("Result segment keys must be nonblank.")
+        expected = int(self.t.size)
+        if (
+            segment_ids.size != expected
+            or len(segment_keys) != expected
+            or discontinuity_ids.size != expected
+        ):
+            raise ValueError("Result row identity must align with output time.")
+        object.__setattr__(self, "segment_ids", segment_ids)
+        object.__setattr__(self, "segment_keys", segment_keys)
+        object.__setattr__(self, "discontinuity_ids", discontinuity_ids)

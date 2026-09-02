@@ -53,6 +53,7 @@ from .solver_types import (
     ODERhsWithTemp as _ODERhsWithTemp,
     Rhs2 as _Rhs2,
     SimulationCancellationControl as _SimulationCancellationControl,
+    FinalSimulationOutput as _FinalSimulationOutput,
     SimulationOutput as _SimulationOutput,
     SimulationScientificUnavailability as _SimulationScientificUnavailability,
     _SimulationScientificUnavailabilitySignal,
@@ -610,7 +611,7 @@ def _normal_event_provenance(
 
 def solve_ode(
     req: _SimulationRequest,
-) -> _SimulationOutput | _SimulationScientificUnavailability:
+) -> _FinalSimulationOutput | _SimulationScientificUnavailability:
     if not isinstance(req, _SimulationRequest):
         raise TypeError(f"solve_ode expects SimulationRequest, got {type(req)!r}")
     if (

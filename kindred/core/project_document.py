@@ -1967,7 +1967,9 @@ def validate_project_document(document: ProjectDocument) -> ProjectDocument:
                     dataset=dataset,
                     set_id=initial_set.set_id,
                     observation_mapping=link.observation_mapping,
-                    initial_values=initial_set.values_dict(),
+                    initial_values=dict(
+                        canonical_initial_values(tab, initial_set.set_id)
+                    ),
                     mechanism_species=mechanism_species_by_tab_id[tab.tab_id],
                     observation_targets=canonical_observation_target_names(tab),
                     resolved_t_start=resolved_settings.t_start,

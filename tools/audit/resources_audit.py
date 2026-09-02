@@ -30,7 +30,6 @@ EXCLUDE_DIR_NAMES = {
 RESOURCE_ROOT_CANDIDATES = (
     "kindred/data",
     "data",
-    "benchmarks/regression_suite",
 )
 
 RESOURCE_EXTS = {
@@ -67,7 +66,6 @@ RESOURCE_HINT_PARTS = {
     "data",
     "presets",
     "dsl",
-    "benchmarks",
     "resources",
 }
 
@@ -312,7 +310,7 @@ def _string_looks_like_resource_path(s: str) -> bool:
         return True
     if ext in RESOURCE_EXTS and any(p.lower() in RESOURCE_HINT_PARTS for p in parts):
         return True
-    if norm.startswith(("assets/", "ui/", "presets/", "dsl/", "data/", "benchmarks/")):
+    if norm.startswith(("assets/", "ui/", "presets/", "dsl/", "data/")):
         return True
     return False
 

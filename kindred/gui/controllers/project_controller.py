@@ -827,6 +827,11 @@ class ProjectController(QtCore.QObject):
             return None
         self._discard_authoring(AuthoringDiscardMode.ALL_UNACCEPTED)
         status = f"Saved project: {absolute_path}"
+        try:
+            self._config.record_recent_project(absolute_path)
+        except Exception as exc:
+            logger.warning("Recent-project update failed", exc_info=True)
+            status += f"; recent-project persistence failed: {exc}"
         self._set_status(status)
         self.projectStateChanged.emit(False)
         return committed_token

@@ -213,9 +213,6 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         self._interactive_timer.setSingleShot(True)
         self._interactive_timer.timeout.connect(self._advance_interactive_display)
         self._interactive_items: dict[tuple[object, ...], Any] = {}
-        self._interactive_locked_view: (
-            tuple[tuple[float, float], tuple[float, float]] | None
-        ) = None
         self._interactive_visible: tuple[_InteractiveDisplayLayer, ...] | None = None
         self._interactive_transition: _InteractiveDisplayTransition | None = None
         self._interactive_pending: InteractiveDisplayProjection | None = None
@@ -296,7 +293,6 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
     def apply_result_input(self, render_input: ResultRenderInput) -> None:
         """Retain and draw one immutable result input."""
 
-        locked_view = self._interactive_locked_view
         self._rendered_point_roster = ()
         self._settling_static_input = True
         try:
@@ -304,10 +300,8 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
             self._render_input = render_input
             self._render_result_scene(render_input)
             self._commit_interactive_result_input(render_input)
-            if self._interactive_has_visible_frame and locked_view is not None:
-                self._restore_interactive_view(locked_view)
-            elif not self._interactive_rendered_frame:
-                self._end_interactive_range_session()
+            if not self._interactive_rendered_frame:
+                self._end_interactive_gesture_session()
             if render_input.unavailable_x_diagnostic is not None:
                 self.resultDiagnostic.emit(render_input.unavailable_x_diagnostic)
             return None
@@ -442,7 +436,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         ):
             return False
         self._stop_interactive_display()
-        self._end_interactive_range_session()
+        self._end_interactive_gesture_session()
         return True
 
     def set_persisted_plot_state(
@@ -465,8 +459,6 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         )
         self._presentation = state
         self._apply_plot_presentation(state)
-        if self._interactive_locked_view is not None:
-            self._restore_interactive_view(self._interactive_locked_view)
         if self._render_input is not None:
             self._clear_annotation_items()
             self._render_annotations(self._render_input, state)
@@ -551,7 +543,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         """Project replacement/reopen resets non-archived Plot session truth."""
 
         self.dispose_project_content()
-        self._end_interactive_range_session()
+        self._end_interactive_gesture_session()
         self._interaction_mode = "pan"
         self._presentation = _PlotPresentation()
         self._sampling_limit = None
@@ -586,7 +578,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         self._copy_all_available = False
         self._rendered_point_roster = ()
         self.discard_interactive_display()
-        self._end_interactive_range_session()
+        self._end_interactive_gesture_session()
         self._clear_plot_items()
         self._parameter_table.setRowCount(0)
         self._species_table.setRowCount(0)
@@ -938,30 +930,13 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
             not had_rendered_frame
             and self._interactive_rendered_frame
         ):
-            self._begin_interactive_range_session()
+            self._begin_interactive_gesture_session()
 
-    def _begin_interactive_range_session(self) -> None:
-        view_box = self._plot_widget.getPlotItem().getViewBox()
-        x_range, y_range = view_box.viewRange()
-        self._interactive_locked_view = (
-            (float(x_range[0]), float(x_range[1])),
-            (float(y_range[0]), float(y_range[1])),
-        )
+    def _begin_interactive_gesture_session(self) -> None:
         self._axis_toolbar.set_interactive_gesture_active(True)
-        self._restore_interactive_view(self._interactive_locked_view)
 
-    def _end_interactive_range_session(self) -> None:
-        self._interactive_locked_view = None
+    def _end_interactive_gesture_session(self) -> None:
         self._axis_toolbar.set_interactive_gesture_active(False)
-
-    def _restore_interactive_view(
-        self,
-        view: tuple[tuple[float, float], tuple[float, float]],
-    ) -> None:
-        view_box = self._plot_widget.getPlotItem().getViewBox()
-        view_box.disableAutoRange()
-        self._plot_widget.setXRange(view[0][0], view[0][1], padding=0)
-        self._plot_widget.setYRange(view[1][0], view[1][1], padding=0)
 
     def _render_interactive_display(
         self,
@@ -1120,8 +1095,6 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
             and curve.key[0:2] == ("simulation", "foreground")
         }
         self._reconcile_static_simulation_items(foreground_set_ids)
-        if self._interactive_locked_view is not None:
-            self._restore_interactive_view(self._interactive_locked_view)
         self._interactive_items = rendered
         self._rendered_point_roster = tuple(rendered_points)
         self._interactive_rendered_frame = bool(rendered)
@@ -1184,14 +1157,13 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         clearing or superseding that state. Keep the order explicit:
         transient rows/items disappear first, static simulation items return
         through PlotItem attachment (which restores their named legend rows),
-        then range custody ends and the panel's authoritative range is
-        reapplied.
+        then gesture custody ends and the panel's authored range is reapplied.
         """
 
         self._cancel_interactive_tick()
         self._clear_interactive_items()
         self._reconcile_static_simulation_items(())
-        self._end_interactive_range_session()
+        self._end_interactive_gesture_session()
         self._apply_axis_range_state(self._axis_range, self._presentation)
         if self._render_input is not None and not self._settling_static_input:
             self._render_result_scene(self._render_input)
@@ -1959,18 +1931,6 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
     def _scaled_optional(value: float | None, ratio: float) -> float | None:
         return None if value is None else float(value) * ratio
 
-    @staticmethod
-    def _rescaled_view_axis(
-        axis_range: tuple[float, float],
-        *,
-        ratio: float,
-        log_enabled: bool,
-    ) -> tuple[float, float]:
-        if log_enabled:
-            offset = float(np.log10(ratio))
-            return axis_range[0] + offset, axis_range[1] + offset
-        return axis_range[0] * ratio, axis_range[1] * ratio
-
     def _apply_display_unit_change(self, axis: str, unit: str) -> None:
         render_input = self._render_input
         if render_input is None:
@@ -2010,19 +1970,6 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
             self._axis_range.y_min,
             self._axis_range.y_max,
         )
-        if self._interactive_locked_view is not None:
-            self._interactive_locked_view = (
-                self._rescaled_view_axis(
-                    self._interactive_locked_view[0],
-                    ratio=x_ratio,
-                    log_enabled=self._presentation.log_x,
-                ),
-                self._rescaled_view_axis(
-                    self._interactive_locked_view[1],
-                    ratio=y_ratio,
-                    log_enabled=self._presentation.log_y,
-                ),
-            )
         self._render_result_scene(render_input)
         interactive_state = self._materialize_interactive(float(time.monotonic()))
         if interactive_state is not None:

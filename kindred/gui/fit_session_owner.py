@@ -70,6 +70,7 @@ class FitSessionOwner(QtCore.QObject):
     window_changed = QtCore.Signal(bool)
     execution_changed = QtCore.Signal(bool)
     status_changed = QtCore.Signal(str)
+    project_document_changed = QtCore.Signal(object)
     application_close_settlement_changed = QtCore.Signal()
 
     def __init__(
@@ -923,6 +924,7 @@ class FitSessionOwner(QtCore.QObject):
             return False
         if successor_token == expected_token:
             return False
+        self.project_document_changed.emit(None)
         self._set_status("Current-project Fit defaults updated.")
         return True
 
@@ -1431,10 +1433,9 @@ class FitSessionOwner(QtCore.QObject):
                     for key, value in initial_values.items():
                         if key[0] != initial_set.set_id:
                             continue
-                        if key[1] not in values:
-                            raise ValueError(
-                                f"Fit Apply initial {key[1]!r} is absent from set {key[0]!r}."
-                            )
+                        # Fit captures the complete canonical species roster;
+                        # assigning here materializes an authored omission
+                        # whose accepted initial concentration was exact zero.
                         values[key[1]] = value
                         found_keys.add(key)
                     proposed_sets.append(initial_set.with_values(values))
@@ -1451,6 +1452,7 @@ class FitSessionOwner(QtCore.QObject):
         if self._registry.replace_document(proposed_document, expected_token=token) is None:
             self._set_status("Fit Apply rejected: the captured project is stale.")
             return False
+        self.project_document_changed.emit(origin.tab_id)
         window.set_apply_available(False)
         self._set_status("Fit candidate applied to the project.")
         return True

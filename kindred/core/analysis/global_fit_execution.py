@@ -2242,8 +2242,8 @@ class GlobalFitObjective:
             return np.concatenate(blocks) if blocks else np.asarray([], dtype=float)
 
         def settle_unavailable_residuals(
-            completed_blocks: Sequence[np.ndarray],
-            artificial_penalty_blocks: Sequence[np.ndarray],
+            residual_blocks: Sequence[np.ndarray],
+            artificial_block_indexes: set[int],
         ) -> tuple[np.ndarray, float] | None:
             """Return one finite objective vector for an unavailable candidate.
 
@@ -2252,19 +2252,38 @@ class GlobalFitObjective:
             complete candidate has established a finite ordering reference.
             The factor is derived from the separately stable block SSEs and is
             nudged by representable floating-point steps until the returned
-            vector scores strictly above the retained valid best.
+            vector scores strictly above the retained valid best.  Blocks stay
+            in canonical dataset order so residual-row identity never changes
+            between optimizer calls.
             """
 
+            ordered_blocks = tuple(
+                np.asarray(block, dtype=float).reshape(-1)
+                for block in residual_blocks
+            )
             completed = (
-                np.concatenate(tuple(completed_blocks)).astype(float, copy=False)
-                if completed_blocks
+                np.concatenate(
+                    tuple(
+                        block
+                        for index, block in enumerate(ordered_blocks)
+                        if index not in artificial_block_indexes
+                    )
+                ).astype(float, copy=False)
+                if len(artificial_block_indexes) < len(ordered_blocks)
                 else np.asarray([], dtype=float)
             )
             artificial = (
-                np.concatenate(tuple(artificial_penalty_blocks)).astype(
-                    float, copy=False
+                np.concatenate(
+                    tuple(
+                        block
+                        for index, block in enumerate(ordered_blocks)
+                        if index in artificial_block_indexes
+                    )
+                ).astype(
+                    float,
+                    copy=False,
                 )
-                if artificial_penalty_blocks
+                if artificial_block_indexes
                 else np.asarray([], dtype=float)
             )
             completed_sse = finite_sum_of_squares(completed)
@@ -2272,7 +2291,7 @@ class GlobalFitObjective:
             if completed_sse is None or artificial_sse is None:
                 return None
 
-            residuals = np.concatenate((completed, artificial))
+            residuals = np.concatenate(ordered_blocks)
             cost = finite_sum_of_squares(residuals)
             if cost is None:
                 return None
@@ -2280,7 +2299,7 @@ class GlobalFitObjective:
             best_cost = float(self._best_cost)
             if (
                 not math.isfinite(best_cost)
-                or not artificial_penalty_blocks
+                or not artificial_block_indexes
                 or artificial_sse <= 0.0
                 or cost > best_cost
             ):
@@ -2306,10 +2325,16 @@ class GlobalFitObjective:
             def scaled_settlement(
                 scale: float,
             ) -> tuple[np.ndarray, float] | None:
-                scaled_artificial = artificial * float(scale)
-                if not np.all(np.isfinite(scaled_artificial)):
+                settled = np.concatenate(
+                    tuple(
+                        block * float(scale)
+                        if index in artificial_block_indexes
+                        else block
+                        for index, block in enumerate(ordered_blocks)
+                    )
+                )
+                if not np.all(np.isfinite(settled)):
                     return None
-                settled = np.concatenate((completed, scaled_artificial))
                 settled_cost = finite_sum_of_squares(settled)
                 if settled_cost is None:
                     return None
@@ -2412,13 +2437,10 @@ class GlobalFitObjective:
                 )
             )
 
-        def reject_candidate(
+        def record_candidate_unavailability(
             unavailability: ScientificUnavailable,
             provenance: object,
-            *,
-            optimizer_vector: np.ndarray,
-        ) -> np.ndarray:
-            penalty = candidate_penalty_residuals()
+        ) -> None:
             context_error = FitSimulationError(
                 "Fit candidate scientific result was unavailable.",
                 details={
@@ -2438,7 +2460,16 @@ class GlobalFitObjective:
                     unavailability.producer,
                     unavailability.stage,
                 )
-            settled_penalty = settle_unavailable_residuals((), (penalty,))
+
+        def reject_candidate(
+            unavailability: ScientificUnavailable,
+            provenance: object,
+            *,
+            optimizer_vector: np.ndarray,
+        ) -> np.ndarray:
+            penalty = candidate_penalty_residuals()
+            record_candidate_unavailability(unavailability, provenance)
+            settled_penalty = settle_unavailable_residuals((penalty,), {0})
             if settled_penalty is None:
                 raise RuntimeError("Configured Fit candidate penalty overflowed.")
             penalty, penalty_cost = settled_penalty
@@ -2547,16 +2578,6 @@ class GlobalFitObjective:
             else ()
         )
         timed_out_dataset_ids = set(timed_out_dataset_roster)
-        for item, evaluation in zip(dataset_inputs, simulation_evaluations, strict=True):
-            if isinstance(evaluation, ScientificUnavailable):
-                if _is_dataset_deadline_unavailable(evaluation):
-                    continue
-                return reject_candidate(
-                    evaluation,
-                    {"dataset": item.payload.dataset_id},
-                    optimizer_vector=params,
-                )
-
         if timeout_unavailability is not None:
             timeout_error = FitSimulationError(
                 "Fit candidate dataset evaluation exceeded its deadline.",
@@ -2572,33 +2593,38 @@ class GlobalFitObjective:
                 {"datasets": timed_out_dataset_roster, "stage": "dataset_deadline"},
             )
 
-        completed_residual_blocks: list[np.ndarray] = []
-        artificial_penalty_blocks: list[np.ndarray] = []
+        residual_blocks: list[np.ndarray] = []
+        artificial_block_indexes: set[int] = set()
+        nondeadline_unavailability_recorded = False
         for item, evaluation in zip(dataset_inputs, simulation_evaluations, strict=True):
             _raise_if_fitting_cancel_requested(self._cancellation_control)
 
-            if item.payload.dataset_id in timed_out_dataset_ids:
-                artificial_penalty_blocks.append(
+            if isinstance(evaluation, ScientificUnavailable):
+                if (
+                    item.payload.dataset_id not in timed_out_dataset_ids
+                    and not nondeadline_unavailability_recorded
+                ):
+                    record_candidate_unavailability(
+                        evaluation,
+                        {"dataset": item.payload.dataset_id},
+                    )
+                    nondeadline_unavailability_recorded = True
+                artificial_block_indexes.add(len(residual_blocks))
+                residual_blocks.append(
                     dataset_penalty_residuals(item.payload)
                 )
                 continue
-            if isinstance(evaluation, ScientificUnavailable):
-                return reject_candidate(
-                    evaluation,
-                    {"dataset": item.payload.dataset_id},
-                    optimizer_vector=params,
-                )
             if evaluation.dataset_id != item.payload.dataset_id:
                 raise RuntimeError("Fit evaluation order no longer matches its admitted dataset roster.")
-            completed_residual_blocks.append(
+            residual_blocks.append(
                 np.asarray(evaluation.weighted_residuals, dtype=float)
             )
             continue
 
-        if artificial_penalty_blocks:
+        if artificial_block_indexes:
             settled_unavailable = settle_unavailable_residuals(
-                completed_residual_blocks,
-                artificial_penalty_blocks,
+                residual_blocks,
+                artificial_block_indexes,
             )
             if settled_unavailable is None:
                 return reject_candidate(
@@ -2612,7 +2638,7 @@ class GlobalFitObjective:
                 )
             residuals, cost = settled_unavailable
         else:
-            residuals = np.concatenate(tuple(completed_residual_blocks)).astype(
+            residuals = np.concatenate(tuple(residual_blocks)).astype(
                 float, copy=False
             )
             finite_cost = finite_sum_of_squares(residuals)
@@ -2639,6 +2665,7 @@ class GlobalFitObjective:
             cost=cost,
             improved=improved,
             best_results=candidate_evaluations if improved else {},
+            publish_every_call=nondeadline_unavailability_recorded,
         )
         _raise_if_fitting_cancelled(self._cancellation_check)
 

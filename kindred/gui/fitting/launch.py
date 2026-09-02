@@ -1413,7 +1413,9 @@ def capture_fit_origin(
                 dataset=dataset,
                 set_id=link.set_id,
                 observation_mapping=link.observation_mapping,
-                initial_values=initial_set.values_dict(),
+                initial_values=dict(
+                    canonical_initial_values(tab, initial_set.set_id)
+                ),
                 mechanism_species=mechanism_species,
                 observation_targets=observation_targets,
                 resolved_t_start=resolve_fit_t_start(
@@ -1743,7 +1745,9 @@ def revalidate_fit_request_inclusions(
             dataset=dataset,
             set_id=link.set_id,
             observation_mapping=link.observation_mapping,
-            initial_values=initial_set.values_dict(),
+            initial_values=dict(
+                canonical_initial_values(tab, initial_set.set_id)
+            ),
             mechanism_species=mechanism_species,
             observation_targets=observation_targets,
             resolved_t_start=resolve_fit_t_start(

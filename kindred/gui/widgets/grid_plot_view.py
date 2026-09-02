@@ -88,12 +88,8 @@ class GridPlotView(QtWidgets.QWidget):
         self._plot_legends: list[object | None] = []
         self._structure_key: tuple[tuple[str, ...], int, int] | None = None
         self._dark_mode = False
-        self._autorange_locked = False
-        self._autorange_lock_pending = False
-        self._locked_view_ranges: dict[
-            int, tuple[tuple[float, float], tuple[float, float]]
-        ] = {}
-        self._locked_autorange_prev: dict[int, tuple[bool, bool]] = {}
+        self._live_layout_locked = False
+        self._live_layout_lock_pending = False
         self._locked_left_axis_width: int | None = None
         self._locked_bottom_axis_height: int | None = None
         self._scrollbar_policies_prev: (
@@ -423,8 +419,8 @@ class GridPlotView(QtWidgets.QWidget):
             except Exception:
                 pass
         self._apply_dark_mode_to_plot(plot)
-        if self._autorange_locked:
-            self._apply_locked_axis_style(plot)
+        if self._live_layout_locked:
+            self._apply_live_axis_style(plot)
 
     def _apply_dark_mode_to_plot(self, plot: object) -> None:
         text_color = (224, 224, 224) if self._dark_mode else (0, 0, 0)
@@ -662,19 +658,8 @@ class GridPlotView(QtWidgets.QWidget):
                 self._plot_series_items.append({})
                 self._plot_legends.append(None)
                 self._configure_plot_static(plot, curve.x_name)
-                if self._autorange_locked:
-                    view_box = plot.getViewBox()
-                    try:
-                        view_box.enableAutoRange(x=False, y=False)
-                    except Exception:
-                        pass
-                    frozen = self._locked_view_ranges.get(index)
-                    if frozen:
-                        try:
-                            plot.setXRange(frozen[0][0], frozen[0][1], padding=0)
-                            plot.setYRange(frozen[1][0], frozen[1][1], padding=0)
-                        except Exception:
-                            pass
+                if self._live_layout_locked:
+                    self._apply_live_axis_style(plot)
             self._structure_key = self._dataset_structure_key(self._curves)
         finally:
             self._canvas.setUpdatesEnabled(True)
@@ -711,7 +696,7 @@ class GridPlotView(QtWidgets.QWidget):
                 pass
         self._scrollbar_policies_prev = None
 
-    def _snapshot_locked_axis_geometry(self) -> None:
+    def _snapshot_live_axis_geometry(self) -> None:
         left_width = 0.0
         bottom_height = 0.0
         for plot in self._plot_items:
@@ -749,8 +734,8 @@ class GridPlotView(QtWidgets.QWidget):
             )
         )
 
-    def _apply_locked_axis_style(self, plot: object) -> None:
-        if not self._autorange_locked:
+    def _apply_live_axis_style(self, plot: object) -> None:
+        if not self._live_layout_locked:
             return
         try:
             left_axis = plot.getAxis("left")
@@ -765,30 +750,6 @@ class GridPlotView(QtWidgets.QWidget):
             )
         except Exception:
             pass
-
-    def _snapshot_plot_view_ranges(self) -> None:
-        for index, plot in enumerate(self._plot_items):
-            try:
-                view = plot.getViewBox().viewRange()
-                self._locked_view_ranges[index] = (
-                    (float(view[0][0]), float(view[0][1])),
-                    (float(view[1][0]), float(view[1][1])),
-                )
-            except (TypeError, ValueError, IndexError):
-                continue
-
-    def _restore_locked_view_ranges(self) -> None:
-        if not self._autorange_locked:
-            return
-        for index, plot in enumerate(self._plot_items):
-            frozen = self._locked_view_ranges.get(index)
-            if frozen is None:
-                continue
-            try:
-                plot.setXRange(frozen[0][0], frozen[0][1], padding=0)
-                plot.setYRange(frozen[1][0], frozen[1][1], padding=0)
-            except Exception:
-                pass
 
     def _update_species_selector(self) -> None:
         available = tuple(
@@ -857,26 +818,27 @@ class GridPlotView(QtWidgets.QWidget):
             self._apply_dark_mode_to_plot(plot)
         self._redraw()
 
-    def set_autorange_locked(self, locked: bool) -> None:
-        """Freeze or restore historical pyqtgraph autorange during live updates."""
+    def set_live_layout_locked(self, locked: bool) -> None:
+        """Stabilize live grid geometry without freezing numerical ranges."""
 
         requested = bool(locked)
-        if requested and (self._autorange_locked or self._autorange_lock_pending):
+        if requested and (
+            self._live_layout_locked or self._live_layout_lock_pending
+        ):
             return
         if requested:
             if not self._curves or not self._plot_items:
-                self._autorange_lock_pending = True
+                self._live_layout_lock_pending = True
                 return
-            self._activate_autorange_lock()
+            self._activate_live_layout_lock()
             return
 
-        self._autorange_lock_pending = False
-        if not self._autorange_locked:
+        self._live_layout_lock_pending = False
+        if not self._live_layout_locked:
             return
-        self._autorange_locked = False
+        self._live_layout_locked = False
         self._set_scrollbars_locked(False)
-        for index, plot in enumerate(self._plot_items):
-            view_box = plot.getViewBox()
+        for plot in self._plot_items:
             try:
                 left_axis = plot.getAxis("left")
                 bottom_axis = plot.getAxis("bottom")
@@ -886,46 +848,25 @@ class GridPlotView(QtWidgets.QWidget):
                 bottom_axis.setHeight(None)
             except Exception:
                 pass
-            previous = self._locked_autorange_prev.get(index, (True, True))
-            try:
-                view_box.enableAutoRange(x=previous[0], y=previous[1])
-            except Exception:
-                pass
-        self._locked_view_ranges.clear()
-        self._locked_autorange_prev.clear()
         self._locked_left_axis_width = None
         self._locked_bottom_axis_height = None
         self._redraw()
 
-    def _activate_autorange_lock(self) -> None:
-        """Snapshot one established view and freeze it for the active run."""
+    def _activate_live_layout_lock(self) -> None:
+        """Freeze established axis geometry while live values continue changing."""
 
-        self._autorange_lock_pending = False
-        self._autorange_locked = True
+        self._live_layout_lock_pending = False
+        self._live_layout_locked = True
         self._set_scrollbars_locked(True)
-        self._snapshot_plot_view_ranges()
-        self._snapshot_locked_axis_geometry()
-        for index, plot in enumerate(self._plot_items):
-            view_box = plot.getViewBox()
-            self._apply_locked_axis_style(plot)
-            try:
-                previous = view_box.autoRangeEnabled()
-                self._locked_autorange_prev[index] = (
-                    bool(previous[0]),
-                    bool(previous[1]),
-                )
-            except Exception:
-                self._locked_autorange_prev[index] = (True, True)
-            try:
-                view_box.enableAutoRange(x=False, y=False)
-            except Exception:
-                pass
+        self._snapshot_live_axis_geometry()
+        for plot in self._plot_items:
+            self._apply_live_axis_style(plot)
 
-    def _establish_first_valid_ranges(self) -> None:
-        """Autorange one first payload before satisfying a deferred lock."""
+    def _establish_live_layout_lock(self) -> None:
+        """Autorange the first live payload, then stabilize only its layout."""
 
         if (
-            not self._autorange_lock_pending
+            not self._live_layout_lock_pending
             or not self._curves
             or len(self._plot_items) != len(self._curves)
         ):
@@ -935,13 +876,12 @@ class GridPlotView(QtWidgets.QWidget):
             try:
                 view_box.enableAutoRange(x=True, y=True)
                 view_box.autoRange()
+                view_box.enableAutoRange(x=True, y=True)
             except Exception:
                 pass
-        self._activate_autorange_lock()
+        self._activate_live_layout_lock()
 
     def _update_grid(self) -> None:
-        if self._autorange_locked:
-            self._snapshot_plot_view_ranges()
         desired_key = self._dataset_structure_key(self._curves)
         if (
             self._structure_key != desired_key
@@ -950,8 +890,7 @@ class GridPlotView(QtWidgets.QWidget):
         ):
             self._rebuild_structure()
         self._update_plot_data_in_place()
-        self._establish_first_valid_ranges()
-        self._restore_locked_view_ranges()
+        self._establish_live_layout_lock()
 
     def _redraw(self) -> bool:
         self._update_species_selector()

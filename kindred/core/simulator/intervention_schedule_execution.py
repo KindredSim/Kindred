@@ -24,6 +24,7 @@ from .nonnegative_invariant import (
     project_nonnegative_trajectory,
 )
 from .solver_types import (
+    FinalSimulationOutput,
     Rhs2,
     SimulationScientificUnavailability,
     _SimulationScientificUnavailabilitySignal,
@@ -168,7 +169,7 @@ class InterventionScheduleExecutionOwner:
     def __init__(self, segment_runner: BaseSegmentRunner) -> None:
         self._segment_runner = segment_runner
 
-    def execute(self, request: ScheduleExecutionRequest) -> SimulationOutput:
+    def execute(self, request: ScheduleExecutionRequest) -> FinalSimulationOutput:
         req = request.request
         t0 = float(request.t0)
         t1 = float(request.t1)
@@ -842,8 +843,11 @@ class InterventionScheduleExecutionOwner:
                 )
             )
             provenance.update(runtime_symbolic_jacobian.provenance_fields())
-        _publish_direct_result_sample_identity(
-            provenance,
+        (
+            result_segment_ids,
+            result_segment_keys,
+            result_discontinuity_ids,
+        ) = _compose_direct_result_sample_identity(
             output_segment_ids,
             output_segment_keys,
             output_discontinuity_ids,
@@ -860,12 +864,15 @@ class InterventionScheduleExecutionOwner:
             if len(distinct) > 1:
                 provenance["intervention_segment_solvers"] = segment_solvers
         _raise_if_cancelled(cancellation_check)
-        return SimulationOutput(
+        return FinalSimulationOutput(
             t=output_t,
             Y=output_y,
             provenance=provenance,
             intervention_execution=final_contract,
             presentation_boundaries=tuple(presentation_boundaries),
+            segment_ids=result_segment_ids,
+            segment_keys=result_segment_keys,
+            discontinuity_ids=result_discontinuity_ids,
         )
 
 
@@ -887,15 +894,14 @@ def _raise_if_cancelled(check: Callable[[], bool] | None) -> None:
         raise SimulationCancelled()
 
 
-def _publish_direct_result_sample_identity(
-    provenance: dict[str, object],
+def _compose_direct_result_sample_identity(
     segment_ids: Sequence[np.ndarray],
     segment_keys: Sequence[tuple[str, ...]],
     discontinuity_ids: Sequence[np.ndarray],
-) -> None:
-    """Publish row identity captured at emission time.
+) -> tuple[np.ndarray, tuple[str, ...], np.ndarray]:
+    """Compose row identity captured at emission time.
 
-    Identity is attached while each unique segment/root row is emitted, so no
+    Identity is captured while each unique segment/root row is emitted, so no
     downstream boundary reconstructs execution authority from timestamps.
     """
 
@@ -915,11 +921,7 @@ def _publish_direct_result_sample_identity(
         raise InterventionScheduleError(
             "Direct result row identity is not aligned with emitted rows."
         )
-    provenance["result_segment_ids"] = tuple(int(value) for value in ids)
-    provenance["result_segment_keys"] = keys
-    provenance["result_discontinuity_ids"] = tuple(
-        int(value) for value in discontinuities
-    )
+    return ids, keys, discontinuities
 
 
 def _required_raw_terminal_state(

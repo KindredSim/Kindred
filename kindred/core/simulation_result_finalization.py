@@ -14,6 +14,7 @@ from kindred.core.result_repository import (
     SimulationResultValue,
 )
 from kindred.core.simulator.parameter_namespace import build_namespace_from_mechanism
+from kindred.core.simulator.solver_types import FinalSimulationOutput
 from kindred.core.simulator.step_indexing import get_step_index_map, iter_canonical_parameters
 from kindred.core.kinetics import (
     ArrheniusRateModel,
@@ -37,21 +38,6 @@ __all__ = [
     "evaluate_simulation_result_algebra",
     "finalize_simulation_result",
 ]
-
-
-def _immutable_exact_float_matrix(value: object) -> np.ndarray:
-    if (
-        isinstance(value, np.ndarray)
-        and value.dtype == np.dtype(float)
-        and value.ndim == 2
-        and not value.flags.writeable
-        and value.flags.owndata
-    ):
-        return value
-    array = np.array(value, dtype=float, copy=True)
-    array.setflags(write=False)
-    return array
-
 
 def _initials_for_algebra(
     mechanism: object,
@@ -282,7 +268,7 @@ def build_simulation_row_algebra_context(
 def evaluate_simulation_result_algebra(
     *,
     mechanism: object,
-    result: object,
+    result: FinalSimulationOutput,
     species_names: list[str],
     initials_for_algebra: Mapping[str, Any] | None,
     temperature_schedule: TemperatureScheduleProtocol | None,
@@ -302,17 +288,9 @@ def evaluate_simulation_result_algebra(
         or len(set(base_species_names)) != len(base_species_names)
     ):
         raise ValueError("base simulation species names must be nonblank and unique.")
-    result_y = _immutable_exact_float_matrix(getattr(result, "Y"))
-    result_t = np.asarray(getattr(result, "t"), dtype=float)
-    if result_t.ndim != 1 or result_t.size == 0:
-        raise ValueError("solver result time must be a nonempty 1D array.")
-    if np.any(~np.isfinite(result_t)) or np.any(np.diff(result_t) <= 0.0):
-        raise ValueError("solver result time must be finite and strictly increasing.")
-    if (
-        result_y.ndim != 2
-        or result_y.shape != (len(base_species_names), result_t.size)
-        or np.any(~np.isfinite(result_y))
-    ):
+    result_y = result.Y
+    result_t = result.t
+    if result_y.shape[0] != len(base_species_names):
         raise ValueError(
             "solver result matrix must align with base species and row time."
         )
@@ -455,83 +433,10 @@ def evaluate_simulation_result_algebra(
     )
 
 
-_DIRECT_RESULT_IDENTITY_FIELDS = (
-    "result_segment_ids",
-    "result_segment_keys",
-    "result_discontinuity_ids",
-)
-
-
-def _required_direct_row_identity(
-    result: object,
-) -> tuple[
-    np.ndarray,
-    tuple[str, ...],
-    np.ndarray,
-]:
-    """Validate and promote the executor's one-time row identity payload."""
-
-    provenance = getattr(result, "provenance", None)
-    if not isinstance(provenance, Mapping):
-        raise TypeError("solver result provenance must be a mapping.")
-    missing = tuple(
-        field for field in _DIRECT_RESULT_IDENTITY_FIELDS if field not in provenance
-    )
-    if missing:
-        raise ValueError(
-            "solver result is missing direct row identity: "
-            + ", ".join(missing)
-        )
-    retired = frozenset(
-        {
-            "boundary_sides",
-            "boundary_phases",
-            "result_boundary_sides",
-            "result_boundary_phases",
-        }
-    ).intersection(provenance)
-    if retired:
-        raise ValueError(
-            "solver result contains retired boundary identity: "
-            + ", ".join(sorted(retired))
-        )
-
-    def identity_vector(field: str) -> np.ndarray:
-        raw = np.asarray(provenance[field])
-        if raw.ndim != 1 or raw.dtype.kind not in {"i", "u"}:
-            raise ValueError(
-                f"solver result {field!r} must be a one-dimensional integer array."
-            )
-        if raw.dtype.kind == "u" and raw.size:
-            if int(np.max(raw)) > np.iinfo(np.int64).max:
-                raise ValueError(f"solver result {field!r} exceeds int64 range.")
-        values = raw.astype(np.int64, copy=False)
-        if np.any(values < 0) or np.any(np.diff(values) < 0):
-            raise ValueError(
-                f"solver result {field!r} must be ordered and nonnegative."
-            )
-        return values
-
-    segment_ids = identity_vector("result_segment_ids")
-    discontinuity_ids = identity_vector("result_discontinuity_ids")
-    raw_keys = provenance["result_segment_keys"]
-    if isinstance(raw_keys, (str, bytes)):
-        raise ValueError("solver result segment keys must be a sequence.")
-    try:
-        segment_keys = tuple(
-            str(value).strip() for value in raw_keys  # type: ignore[union-attr]
-        )
-    except TypeError as exc:
-        raise ValueError("solver result segment keys must be a sequence.") from exc
-    if any(not value for value in segment_keys):
-        raise ValueError("solver result segment keys must be nonblank.")
-    return segment_ids, segment_keys, discontinuity_ids
-
-
 def finalize_simulation_result(
     *,
     mechanism: object,
-    result: object,
+    result: FinalSimulationOutput,
     species_names: list[str],
     initials_for_algebra: Mapping[str, Any] | None,
     temperature_schedule: TemperatureScheduleProtocol | None,
@@ -548,28 +453,7 @@ def finalize_simulation_result(
     never repairs or reconstructs row identity.
     """
 
-    (
-        segment_ids,
-        segment_keys,
-        discontinuity_ids,
-    ) = _required_direct_row_identity(result)
-    result_time = np.asarray(getattr(result, "t"), dtype=float)
-    if result_time.ndim != 1 or result_time.size == 0:
-        raise ValueError("solver result time must be a nonempty 1D array.")
-    if np.any(~np.isfinite(result_time)) or np.any(
-        np.diff(result_time) <= 0.0
-    ):
-        raise ValueError("solver result time must be finite and strictly increasing.")
-    if (
-        segment_ids.ndim != 1
-        or segment_ids.size != result_time.size
-        or len(segment_keys) != result_time.size
-        or discontinuity_ids.ndim != 1
-        or discontinuity_ids.size != result_time.size
-    ):
-        raise ValueError(
-            "solver result identity must align with unique result rows."
-        )
+    result_time = result.t
     (
         finalized_y,
         finalized_species_names,
@@ -585,14 +469,7 @@ def finalize_simulation_result(
         parameter_algebra_spec=parameter_algebra_spec,
         algebra_policy=algebra_policy,
     )
-    solver_provenance = getattr(result, "provenance", None)
-    if not isinstance(solver_provenance, Mapping):
-        raise TypeError("solver result provenance must be a mapping.")
-    retained_solver_provenance = {
-        str(name): value
-        for name, value in solver_provenance.items()
-        if name not in _DIRECT_RESULT_IDENTITY_FIELDS
-    }
+    retained_solver_provenance = dict(result.provenance)
     if solver_provenance_updates:
         retained_solver_provenance.update(solver_provenance_updates)
     compiled_algebra = compiled_algebra_for_mechanism(mechanism)
@@ -631,9 +508,9 @@ def finalize_simulation_result(
             str(name): finalized_y[index, :]
             for index, name in enumerate(finalized_species_names)
         },
-        segment_ids=segment_ids,
-        segment_keys=segment_keys,
-        discontinuity_ids=discontinuity_ids,
+        segment_ids=result.segment_ids,
+        segment_keys=result.segment_keys,
+        discontinuity_ids=result.discontinuity_ids,
         scalars=finalized_algebra_scalars,
         parameters=parameters,
         solver_provenance=retained_solver_provenance,
