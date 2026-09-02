@@ -822,15 +822,10 @@ def _translate_calculator_parameter_node(
 
 
 def _translate_calculator_parameter_expression(
-    assignment: Any,
+    retained_node: Any,
     *,
     namespace: SymbolicParameterNamespaceContext,
 ) -> tuple[Any, tuple[str, ...]]:
-    retained_node = getattr(assignment, "expr_ast", None)
-    if retained_node is None:
-        raise SymbolicCalculatorError(
-            "Calculator parameter expansion requires the retained admitted Algebra AST."
-        )
     return _translate_calculator_parameter_node(
         retained_node,
         namespace=namespace,
@@ -842,20 +837,26 @@ def _translate_calculator_parameter_expression(
 # Algebra admission retains the validated program on the mechanism.  The
 # calculator consumes that retained AST without reconstructing or reparsing
 # accepted source text or metadata.
+def _retained_parameter_expressions(spec: Any) -> dict[str, Any]:
+    block = spec.parameter_block
+    if block is None:
+        raise SymbolicCalculatorError(
+            "Calculator parameter expansion requires the retained admitted Algebra AST."
+        )
+    return {
+        str(statement.name): statement.expr
+        for statement in block.lines
+    }
+
+
 def _parameter_definition_sources(mechanism: Any) -> dict[str, str]:
     spec = parameter_algebra_spec_from_mechanism(mechanism)
     if spec is None:
         return {}
-    rendered: dict[str, str] = {}
-    for assignment in spec.param_statements:
-        name = str(assignment.name)
-        ast_node = getattr(assignment, "expr_ast", None)
-        if ast_node is None:
-            raise SymbolicCalculatorError(
-                f"Parameter {name!r} has no retained Algebra expression."
-            )
-        rendered[name] = expression_to_source(ast_node)
-    return rendered
+    return {
+        name: expression_to_source(expression)
+        for name, expression in _retained_parameter_expressions(spec).items()
+    }
 
 
 def _translated_parameter_definitions(
@@ -865,11 +866,11 @@ def _translated_parameter_definitions(
     if spec is None:
         return {}, {}
     sympy = require_sympy()
-    assignments_by_name = {
-        str(assignment.name): assignment
-        for assignment in spec.param_statements
+    expressions_by_name = _retained_parameter_expressions(spec)
+    rendered = {
+        name: expression_to_source(expression)
+        for name, expression in expressions_by_name.items()
     }
-    rendered = _parameter_definition_sources(mechanism)
     parameter_namespace = SymbolicParameterNamespaceContext.from_spec(spec)
 
     expanded_by_name: dict[str, Any] = {}
@@ -879,10 +880,9 @@ def _translated_parameter_definitions(
             return expanded_by_name[name]
         if name in stack:
             raise SymbolicCalculatorError(f"Cyclic symbolic parameter dependency for {name!r}.")
-        assignment = assignments_by_name[name]
         try:
             translated_expression, translated_identifiers = _translate_calculator_parameter_expression(
-                assignment,
+                expressions_by_name[name],
                 namespace=parameter_namespace,
             )
         except UnsupportedSymbolicExpressionError as exc:
@@ -890,7 +890,7 @@ def _translated_parameter_definitions(
         substitutions = {
             dep_name: expand_assignment(dep_name, stack + (name,))
             for dep_name in translated_identifiers
-            if dep_name in assignments_by_name
+            if dep_name in expressions_by_name
         }
         expr = translated_expression
         if substitutions:
@@ -904,7 +904,7 @@ def _translated_parameter_definitions(
         expanded_by_name[name] = expr
         return expr
 
-    expressions = {name: expand_assignment(name) for name in assignments_by_name}
+    expressions = {name: expand_assignment(name) for name in expressions_by_name}
     return expressions, rendered
 
 

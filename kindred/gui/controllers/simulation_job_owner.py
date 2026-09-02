@@ -350,6 +350,7 @@ class SimulationJobOwner(QtCore.QObject):
     results_changed = QtCore.Signal(str)
     run_dispatched = QtCore.Signal(str, object)
     interactive_result_ready = QtCore.Signal(str, str, object, object)
+    interactive_target_failed = QtCore.Signal(str, str, object)
 
     def __init__(self, *, gate: ComputationGate, repository_for_tab: RepositoryResolver,
                  user_parallel_maximum: RawUserParallelMaximum | None = None,
@@ -1082,8 +1083,37 @@ class SimulationJobOwner(QtCore.QObject):
         if operation is None:
             return
         target = outcome.target
+        interactive = (
+            operation["kind"] == "preview"
+            and operation["purpose"] == "interactive-preview"
+        )
+        request = operation.get("payload") if interactive else None
+        # A newer request may remain pending while this worker drains. Its
+        # terminal outcomes are no longer presentation authority, even when
+        # its target roster does not overlap the older operation.
+        superseded = bool(
+            interactive
+            and self._pending_interactive_preview is not None
+            and self._pending_interactive_preview is not request
+        )
+        retired = bool(
+            interactive
+            and (
+                target.set_id in set(operation.get("retired_ids", set()))
+                or target.set_id in set(operation.get("removed_target_ids", set()))
+            )
+        )
+        if superseded or retired:
+            operation["outcomes"].append((target, "discarded"))
+            return
         if outcome.state != "success" or not isinstance(outcome.result, SimulationResultValue):
             state = "cancelled" if outcome.state == "cancelled" else "failure"
+            if interactive and state == "failure":
+                self.interactive_target_failed.emit(
+                    str(operation["tab_id"]),
+                    target.set_id,
+                    request,
+                )
             operation["outcomes"].append((target, state))
             if outcome.message:
                 operation["details"].append(f"{target.set_name}: {outcome.message}")
@@ -1095,11 +1125,7 @@ class SimulationJobOwner(QtCore.QObject):
         if self._close_fenced:
             operation["outcomes"].append((target, "discarded"))
             return
-        if (
-            operation["kind"] == "preview"
-            and operation["purpose"] == "interactive-preview"
-        ):
-            request = operation["payload"]
+        if interactive:
             self.interactive_result_ready.emit(
                 str(operation["tab_id"]),
                 target.set_id,

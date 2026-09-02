@@ -300,7 +300,6 @@ def _bootstrap_data(candidate: FitCandidate) -> dict[str, object]:
         "confidence_level": result.confidence_level,
         "resampling": result.resampling,
         "stratum_manifest_version": result.stratum_manifest_version,
-        "stratum_manifest": _plain(result.stratum_manifest),
         "draw_recipe_version": result.draw_recipe_version,
         "draw_algorithm": result.draw_algorithm,
         "residual_centering": result.residual_centering,

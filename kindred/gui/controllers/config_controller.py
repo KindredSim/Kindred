@@ -589,6 +589,16 @@ class ConfigController(QtCore.QObject):
                 raise error
         except Exception:
             self._restore_settings(settings, snapshot)
+            try:
+                # QSettings may write new values while retaining a prior
+                # FormatError status. Persist the restored accepted values;
+                # the original failure remains the caller-visible error.
+                settings.sync()
+            except Exception:
+                logger.exception(
+                    "Could not synchronize restored setting values for %s.",
+                    label,
+                )
             raise
         if success_message is not None:
             logger.info(success_message)

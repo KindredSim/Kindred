@@ -164,10 +164,7 @@ class ParameterAssignment:
     expr_src: str
     line_number: int
     line_content: str
-    # Retained canonical AST.  ``expr_src`` remains source provenance only;
-    # execution must consume this object rather than reconstructing text.
-    expr_ast: ExprNode | None = None
-    source_coordinate: "DslSourceCoordinate | None" = None
+    source_coordinate: DslSourceCoordinate | None = None
 
 
 @dataclass(frozen=True)
@@ -1056,7 +1053,7 @@ def _scalar_source_coordinate(
     line_content: str,
     *,
     name: str,
-) -> "DslSourceCoordinate":
+) -> DslSourceCoordinate:
     """Capture one admitted scalar RHS span from exact line content."""
 
     code = strip_inline_comment(line_content)
@@ -1309,13 +1306,7 @@ def parse_parameter_algebra_spec_from_dsl_text(
             assignments=assignments,
             block=block,
         )
-        retained_assignments = [
-            replace(
-                assignment,
-                expr_ast=statement.expr,
-            )
-            for assignment, statement in zip(assignments, block.lines)
-        ]
+        retained_assignments = assignments
     else:
         # Keep an explicit empty parameter block so let-only Algebra still
         # carries one accepted, partitioned program through the pipeline.

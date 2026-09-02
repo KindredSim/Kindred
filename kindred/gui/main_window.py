@@ -5,7 +5,6 @@ from __future__ import annotations
 import logging
 import io
 import os
-import webbrowser
 from dataclasses import dataclass, replace
 from typing import Callable, Iterable, Sequence
 
@@ -162,7 +161,6 @@ logger = logging.getLogger(__name__)
 
 __all__ = ["MainWindow"]
 
-DOCUMENTATION_URL: str | None = None
 _ABOUT_DIALOG_MIN_WIDTH = 420
 _ABOUT_DIALOG_IMAGE_MAX_SIZE = 320
 
@@ -211,6 +209,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._dataset_import_progress_dialog: QtWidgets.QProgressDialog | None = None
         self._last_export_directory: str | None = None
         self._slider_apply_refreshing: set[str] = set()
+        self._plot_membership_refreshing: set[str] = set()
         self._current_row_refreshing: dict[str, ProjectDocument] = {}
         self.setObjectName("kindredMainWindow")
         self.setWindowTitle("Kindred")
@@ -760,6 +759,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self._simulation_jobs.results_changed.connect(self._on_results_changed)
         self._simulation_jobs.interactive_result_ready.connect(
             self._on_interactive_result_ready
+        )
+        self._simulation_jobs.interactive_target_failed.connect(
+            self._on_interactive_target_failed
         )
         self._simulation_jobs.status_changed.connect(self.set_status_text)
         self._fit_session_owner.window_changed.connect(
@@ -1367,7 +1369,12 @@ class MainWindow(QtWidgets.QMainWindow):
             ),
         )
 
-    def _render_results_for_tab(self, tab_id: str) -> bool:
+    def _render_results_for_tab(
+        self,
+        tab_id: str,
+        *,
+        preserve_interactive_membership: bool = False,
+    ) -> bool:
         target = str(tab_id)
         try:
             self._project_session.document.tab(target)
@@ -1392,7 +1399,10 @@ class MainWindow(QtWidgets.QMainWindow):
         plot = self._workspace.plot_for_tab(target)
         try:
             plot.set_copy_all_available(copy_available)
-            plot.apply_result_input(render_input)
+            if preserve_interactive_membership:
+                plot.apply_result_input_preserving_interactive(render_input)
+            else:
+                plot.apply_result_input(render_input)
         except Exception as exc:
             logger.exception("Result physical apply failed for mechanism %s", target)
             self.set_status_text(
@@ -1477,6 +1487,12 @@ class MainWindow(QtWidgets.QMainWindow):
             self._workspace.plot_for_tab(target)
         except (KeyError, RuntimeError):
             return
+        if target in self._plot_membership_refreshing:
+            self._render_results_for_tab(
+                target,
+                preserve_interactive_membership=True,
+            )
+            return
         if target in self._slider_apply_refreshing:
             return
         row_guard = self._current_row_refreshing.get(target)
@@ -1499,18 +1515,27 @@ class MainWindow(QtWidgets.QMainWindow):
     ) -> None:
         """Project one canonical transient result onto its owning plot."""
 
-        target = str(tab_id)
-        if target not in self._tab_surfaces:
-            return
-        try:
-            plot = self._workspace.plot_for_tab(target)
-        except (KeyError, RuntimeError):
-            return
+        plot = self._workspace.plot_for_tab(tab_id)
         plot.apply_interactive_preview_result(
-            target,
+            tab_id,
             set_id,
             request,
             result,
+        )
+
+    @QtCore.Slot(str, str, object)
+    def _on_interactive_target_failed(
+        self,
+        tab_id: str,
+        set_id: str,
+        request: object,
+    ) -> None:
+        """Retire one failed transient target from its owning plot."""
+
+        self._workspace.plot_for_tab(tab_id).retire_interactive_preview_target(
+            tab_id,
+            set_id,
+            request,
         )
 
     @QtCore.Slot(str, object)
@@ -1913,9 +1938,13 @@ class MainWindow(QtWidgets.QMainWindow):
             set_id,
             requested,
         )
-        if not requested:
-            return
         if not changed:
+            return
+        if not requested:
+            self._render_results_for_tab(
+                tab_id,
+                preserve_interactive_membership=True,
+            )
             return
         slider_binding = self._tab_surfaces[tab_id].slider_binding
         slider_targets = slider_binding.resolve_target_set_ids()
@@ -1935,6 +1964,10 @@ class MainWindow(QtWidgets.QMainWindow):
                 )
             )
             if protected_slider_state:
+                self._render_results_for_tab(
+                    tab_id,
+                    preserve_interactive_membership=True,
+                )
                 return
         try:
             tab = self._workspace_tab_registry.tab(tab_id)
@@ -1942,15 +1975,27 @@ class MainWindow(QtWidgets.QMainWindow):
                 tab,
                 set_id,
             )
-            if not self._simulation_jobs.show_cached(
-                tab_id,
-                set_id,
-                target.execution_request,
-            ):
-                # set_plot_requested() already rendered the changed Plot
-                # membership through the retained tab surface.
+            self._plot_membership_refreshing.add(tab_id)
+            try:
+                cached = self._simulation_jobs.show_cached(
+                    tab_id,
+                    set_id,
+                    target.execution_request,
+                )
+            finally:
+                self._plot_membership_refreshing.discard(tab_id)
+            if not cached:
+                self._render_results_for_tab(
+                    tab_id,
+                    preserve_interactive_membership=True,
+                )
                 return
         except Exception as exc:
+            self._plot_membership_refreshing.discard(tab_id)
+            self._render_results_for_tab(
+                tab_id,
+                preserve_interactive_membership=True,
+            )
             self.set_status_text(f"Could not show cached result: {exc}")
 
     @QtCore.Slot(str, bool)
@@ -3321,6 +3366,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 model_targets=model_targets,
                 parent=self,
             )
+            mapping_expected_token = self._project_session.capture_content_token()
             if review.exec() != QtWidgets.QDialog.DialogCode.Accepted:
                 self.set_status_text(
                     message + " Mapping canceled; raw data remains unmapped."
@@ -3333,18 +3379,17 @@ class MainWindow(QtWidgets.QMainWindow):
                 batch=batch,
                 model_targets=model_targets,
             )
-            expected_token = self._project_session.capture_content_token()
             result = self._workspace_tab_registry.replace_tab(
                 origin_tab_id,
                 candidate_tab,
-                expected_token=expected_token,
+                expected_token=mapping_expected_token,
             )
             if result is None:
                 self.set_status_text(
                     message + " Mapping was not published; raw data remains unmapped."
                 )
                 return
-            mapping_changed = result != expected_token
+            mapping_changed = result != mapping_expected_token
         except Exception as exc:
             logger.exception("Batch dataset mapping failed")
             QtWidgets.QMessageBox.warning(
@@ -3514,6 +3559,7 @@ class MainWindow(QtWidgets.QMainWindow):
             )
             if not self._accept_visible_source(tab_id, description=description):
                 return
+            expected_token = self._project_session.capture_content_token()
             tab = self._workspace_tab_registry.tab(tab_id)
             previous_set_ids = tuple(
                 item.set_id for item in tab.initial_condition_sets
@@ -3595,7 +3641,6 @@ class MainWindow(QtWidgets.QMainWindow):
                     plan=plan,
                     model_targets=canonical_observation_target_names(tab),
                 )
-            expected_token = self._project_session.capture_content_token()
             result = self._workspace_tab_registry.replace_tab(
                 tab_id,
                 candidate_tab,
@@ -3627,6 +3672,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 description="Edit Observation Mapping"
             ):
                 return
+            expected_token = self._project_session.capture_content_token()
             tab = self._workspace_tab_registry.tab(tab_id)
             dataset = self._project_session.document.dataset(dataset_id)
             model_targets = canonical_observation_target_names(tab)
@@ -3646,7 +3692,6 @@ class MainWindow(QtWidgets.QMainWindow):
                 model_targets=model_targets,
                 confirmed_mapping=mapping,
             )
-            expected_token = self._project_session.capture_content_token()
             result = self._workspace_tab_registry.replace_tab(
                 tab_id,
                 candidate,
@@ -3810,7 +3855,10 @@ class MainWindow(QtWidgets.QMainWindow):
             replace(state, reference_lines_visible=bool(visible)),
         )
         self._refresh_project_state()
-        self._render_results_for_tab(tab_id)
+        self._render_results_for_tab(
+            tab_id,
+            preserve_interactive_membership=True,
+        )
 
     def _set_intervention_annotations_visible(
         self,
@@ -3830,7 +3878,10 @@ class MainWindow(QtWidgets.QMainWindow):
             ),
         )
         self._refresh_project_state()
-        self._render_results_for_tab(tab_id)
+        self._render_results_for_tab(
+            tab_id,
+            preserve_interactive_membership=True,
+        )
 
     def _set_x_series(
         self,
@@ -3845,7 +3896,10 @@ class MainWindow(QtWidgets.QMainWindow):
             replace(state, selected_x_series=selection),
         )
         self._refresh_project_state()
-        self._render_results_for_tab(tab_id)
+        self._render_results_for_tab(
+            tab_id,
+            preserve_interactive_membership=True,
+        )
 
     def _set_y_series(self, tab_id: str, selections: object) -> None:
         if not self._mutation_input_admitted("Change Y Series"):
@@ -3861,7 +3915,10 @@ class MainWindow(QtWidgets.QMainWindow):
             ),
         )
         self._refresh_project_state()
-        self._render_results_for_tab(tab_id)
+        self._render_results_for_tab(
+            tab_id,
+            preserve_interactive_membership=True,
+        )
 
     def _set_plot_presentation(
         self,
@@ -3885,7 +3942,10 @@ class MainWindow(QtWidgets.QMainWindow):
             y_inverted=next_state.y_inverted,
         )
         self._refresh_project_state()
-        self._render_results_for_tab(tab_id)
+        self._render_results_for_tab(
+            tab_id,
+            preserve_interactive_membership=True,
+        )
 
     def _populate_recent_menu(self) -> None:
         menu = self._recent_menu
@@ -4030,7 +4090,6 @@ class MainWindow(QtWidgets.QMainWindow):
         view_menu = bar.addMenu("&View")
         self._view_menu = view_menu
         panels = view_menu.addMenu("Panels")
-        self._panels_menu = panels
         for spec in DOCK_SPECS:
             dock = self._workspace.dock_for_identity(spec.identity_key)
             action = dock.toggleViewAction()
@@ -4633,9 +4692,6 @@ class MainWindow(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.warning(self, "Mechanism Inspector", str(exc))
 
     def _open_docs(self) -> None:
-        if DOCUMENTATION_URL:
-            webbrowser.open(DOCUMENTATION_URL)
-            return
         QtWidgets.QMessageBox.information(
             self,
             "Documentation",

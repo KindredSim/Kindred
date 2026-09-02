@@ -403,6 +403,18 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
 
         self._refresh_footer_validity()
 
+    def clear_pending_edits(self) -> None:
+        """Discard every target, weight, IC, and raw editor draft."""
+
+        self._pending_target_selections.clear()
+        self._pending_target_weights.clear()
+        self._pending_dataset_weights.clear()
+        self._pending_initial_rows.clear()
+        self._pending_initial_values.clear()
+        self._invalid_raw.clear()
+        self._invalid_initial_raw.clear()
+        self._refresh_visible_presentation()
+
     def set_running_state(self, running: bool) -> None:
         """Preserve the historical disabled/locked running-state visuals."""
 
@@ -1366,14 +1378,7 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
         self._refresh_visible_presentation()
 
     def _revert_presentation_edits(self) -> None:
-        self._pending_target_selections.clear()
-        self._pending_target_weights.clear()
-        self._pending_dataset_weights.clear()
-        self._pending_initial_rows.clear()
-        self._pending_initial_values.clear()
-        self._invalid_raw.clear()
-        self._invalid_initial_raw.clear()
-        self._refresh_visible_presentation()
+        self.clear_pending_edits()
         self.set_status("Pending Fit target, weight, and IC edits reverted.")
 
     def _apply_bulk_action(self, action: str) -> None:

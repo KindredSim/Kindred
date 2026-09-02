@@ -41,6 +41,7 @@ from kindred.gui.fitting.launch import (
     FitParameterVariable,
     FitSetupSnapshot,
     fit_uncertainty_coordinates,
+    prune_fit_analysis_coordinates,
     _replace_fit_parameter,
 )
 from kindred.gui.fitting.constants import (
@@ -1736,24 +1737,8 @@ class ParametersIcsTab(QtWidgets.QWidget):
         profile = setup.profile_likelihood
         bootstrap = setup.residual_bootstrap
         if not desired:
-            available = set(fit_uncertainty_coordinates(setup.parameters, setup.datasets))
-
-            def without_parameter_coordinates(configuration: object):
-                if configuration is None:
-                    return None
-                remaining = tuple(
-                    coordinate
-                    for coordinate in configuration.parameter_names
-                    if not (
-                        isinstance(coordinate, FitCoordinate)
-                        and coordinate in available
-                        and coordinate.name == parameter.name
-                    )
-                )
-                return None if not remaining else replace(configuration, parameter_names=remaining)
-
-            profile = without_parameter_coordinates(profile)
-            bootstrap = without_parameter_coordinates(bootstrap)
+            profile = prune_fit_analysis_coordinates(profile, (parameter.name,))
+            bootstrap = prune_fit_analysis_coordinates(bootstrap, (parameter.name,))
         self.setupSnapshotRequested.emit(
             replace(
                 setup,
@@ -1832,6 +1817,19 @@ class ParametersIcsTab(QtWidgets.QWidget):
                     dataset_values=tuple((dataset_id, config.value) for dataset_id in dataset_ids),
                 ),
             )
+        profile = prune_fit_analysis_coordinates(
+            self._projected_setup.profile_likelihood,
+            (parameter.name,),
+        )
+        bootstrap = prune_fit_analysis_coordinates(
+            self._projected_setup.residual_bootstrap,
+            (parameter.name,),
+        )
+        # The combo is an immediate projection of the accepted snapshot.  Put
+        # it back before publishing the candidate snapshot so a rejected
+        # admission cannot leave the control ahead of accepted state.  The
+        # owner's synchronous projection restores the accepted new scope.
+        self._restore_scope(parameter.scope)
         self.setupSnapshotRequested.emit(
             replace(
                 self._projected_setup,
@@ -1839,6 +1837,8 @@ class ParametersIcsTab(QtWidgets.QWidget):
                     replacement if item.name == replacement.name else item
                     for item in self._projected_setup.parameters
                 ),
+                profile_likelihood=profile,
+                residual_bootstrap=bootstrap,
             )
         )
 

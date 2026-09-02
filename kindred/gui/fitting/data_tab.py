@@ -99,6 +99,14 @@ class DataTab(QtWidgets.QWidget):
         }
         return bool(included.intersection(self._pending))
 
+    def clear_pending_edits(self) -> None:
+        """Discard every Data draft and refresh the visible controls."""
+
+        self._pending.clear()
+        self._changed_fields.clear()
+        self._invalid_raw.clear()
+        self._project_controls()
+
     def _build_panel(self) -> QtWidgets.QWidget:
         panel = QtWidgets.QWidget(self)
         panel.setObjectName("global_fit_data_range_panel")

@@ -893,7 +893,10 @@ class TabSliderBinding(QtCore.QObject):
         )
         if interaction is SliderInteractionKind.INTERACTIVE_DRAG_SAMPLE:
             if not has_draft:
-                self._simulation_jobs.retire_interactive_preview(tab.tab_id, targets)
+                self._simulation_jobs.reconcile_canonical_targets(
+                    tab.tab_id,
+                    targets,
+                )
                 return True
             request = self.capture_interactive_preview(targets, tab=tab)
             if request is None:

@@ -314,11 +314,12 @@ class FittingWindow(QtWidgets.QDialog):
 
         self._params_ics_tab.set_last_fit_presentation()
 
-    def clear_parameters_pending_edits(self) -> None:
-        """Clear Parameters-owned drafts and refresh leaf validity."""
+    def clear_pending_setup_edits(self) -> None:
+        """Discard every leaf draft and refresh the complete Fit surface."""
 
         self._params_ics_tab.clear_pending_setup_edits()
-        self._species_table.refresh_validity_ui()
+        self._species_table.clear_pending_edits()
+        self._data_tab.clear_pending_edits()
         self._refresh_setup_validity()
 
     def project_setup_snapshot(self, snapshot: FitSetupSnapshot) -> None:

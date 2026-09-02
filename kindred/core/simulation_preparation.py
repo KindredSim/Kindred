@@ -129,21 +129,6 @@ def _target_parts(
     return str(route), str(kind), int(index), str(role), entry
 
 
-@dataclass(frozen=True, slots=True)
-class _RequestParameterClassification:
-    """Facts produced by one isolated request classification pass."""
-
-    raw_values: Mapping[str, float]
-    mechanism_names: frozenset[str]
-    unbound_mechanism_names: frozenset[str]
-    schedule_names: frozenset[str]
-    scalar_names: frozenset[str]
-    unknown_names: frozenset[str]
-    mechanism_name_by_raw: Mapping[str, str]
-    unbound_mechanism_name_by_raw: Mapping[str, str]
-    invalid_messages: Mapping[str, str]
-    parameter_target_map: Mapping[str, _PreparedParameterTarget]
-
 def _freeze_prepared_value(value: Any) -> Any:
     """Freeze one retained preparation value without owning its policy."""
 
@@ -491,7 +476,6 @@ class PreparedSimulationRun:
     symbolic_jacobian: SymbolicJacobianExecution
     initials_for_algebra: Optional[Mapping[str, float]]
     warnings: tuple[str, ...]
-    solver_config: _PreparedSolverConfig
     request: SimulationExecutionRequest
     unresolved_intervention_schedule: InterventionSchedule | None = None
     cancellation_control: SimulationCancellationControl | None = None
@@ -502,12 +486,6 @@ class PreparedSimulationRun:
         object.__setattr__(self, "y0", y0)
         object.__setattr__(self, "species_names", tuple(self.species_names))
         object.__setattr__(self, "warnings", tuple(str(value) for value in self.warnings))
-        if not isinstance(self.solver_config, _PreparedSolverConfig):
-            raise TypeError("solver_config must be PreparedSolverConfig.")
-        if self.request.solver_config != self.solver_config:
-            raise ValueError(
-                "Prepared run request and solver policy must share one authority."
-            )
         if self.initials_for_algebra is not None:
             if not isinstance(self.initials_for_algebra, Mapping):
                 raise TypeError("initials_for_algebra must be a mapping or None.")
@@ -539,10 +517,10 @@ def build_simulation_request_from_prepared_run(
         y0=np.asarray(y0, dtype=float).reshape(-1),
         intervention_execution=intervention_execution,
         symbolic_jacobian=symbolic_jacobian,
-        solver=prepared_run.solver_config.solver,
-        rtol=prepared_run.solver_config.rtol,
-        atol=prepared_run.solver_config.atol,
-        grid=prepared_run.solver_config.grid,
+        solver=request.solver_config.solver,
+        rtol=request.solver_config.rtol,
+        atol=request.solver_config.atol,
+        grid=request.solver_config.grid,
         temperature_schedule=prepared_run.temperature_schedule,
         species_names=tuple(prepared_run.species_names),
         cancellation_control=cancellation_control,
@@ -1607,7 +1585,7 @@ def prepare_simulation_worker_run(
             execution_request
         )
     )
-    request_classification: _RequestParameterClassification | None = None
+    request_parameter_values: Mapping[str, float] | None = None
     if (
         bool(execution_request.parameter_overrides)
         or bool(
@@ -1616,7 +1594,7 @@ def prepare_simulation_worker_run(
         )
     ):
         try:
-            request_classification = _bind_request_parameter_overrides(
+            request_parameter_values = _bind_request_parameter_overrides(
                 mechanism=mechanism,
                 parameter_algebra_spec=parameter_algebra_spec,
                 parameter_overrides=execution_request.parameter_overrides,
@@ -1647,11 +1625,7 @@ def prepare_simulation_worker_run(
                     unresolved_intervention_schedule,
                     parameter_values=_schedule_resolution_values_for_request(
                         unresolved_intervention_schedule,
-                        raw_values=(
-                            request_classification.raw_values
-                            if request_classification is not None
-                            else None
-                        ),
+                        raw_values=request_parameter_values,
                         parameter_target_map=parameter_target_map,
                         mechanism=mechanism,
                     ),
@@ -1728,7 +1702,6 @@ def prepare_simulation_worker_run(
         symbolic_jacobian=runtime_symbolic_jacobian,
         initials_for_algebra=initials_for_algebra,
         warnings=list(preparation_warnings),
-        solver_config=prepared_solver_config,
         request=request,
         unresolved_intervention_schedule=unresolved_intervention_schedule,
         cancellation_control=cancellation_control,
@@ -1917,7 +1890,7 @@ def _bind_request_parameter_overrides(
     parameter_overrides: Mapping[str, float] | None,
     unresolved_intervention_schedule: Any,
     parameter_target_map: Mapping[str, _PreparedParameterTarget],
-) -> _RequestParameterClassification:
+) -> Mapping[str, float]:
     """Bind one request through the fixed preparation-owned parameter path."""
 
     declared_scalar_names, derived_scalar_names = (
@@ -1979,18 +1952,7 @@ def _bind_request_parameter_overrides(
         sorted(set(mechanism_override_names) | set(internal_names)),
         parameter_target_map=parameter_target_map,
     )
-    return _RequestParameterClassification(
-        raw_values=dict(raw_values),
-        mechanism_names=frozenset(mechanism_names),
-        unbound_mechanism_names=frozenset(unbound_mechanism_names),
-        schedule_names=frozenset(schedule_names),
-        scalar_names=frozenset(scalar_names),
-        unknown_names=frozenset(unknown_names),
-        mechanism_name_by_raw=dict(mechanism_name_by_raw),
-        unbound_mechanism_name_by_raw=dict(unbound_mechanism_name_by_raw),
-        invalid_messages=dict(invalid_messages),
-        parameter_target_map=parameter_target_map,
-    )
+    return dict(raw_values)
 
 
 def _internal_parameter_algebra_binding_names(

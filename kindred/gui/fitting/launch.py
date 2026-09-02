@@ -91,6 +91,7 @@ __all__ = [
     "fit_execution_span",
     "build_fit_local_admission",
     "fit_uncertainty_coordinates",
+    "prune_fit_analysis_coordinates",
     "FitLocalScalarProvenance",
     "fit_setup_readiness",
 ]
@@ -885,6 +886,32 @@ def fit_uncertainty_coordinates(
                 if dataset_id in values
             )
     return tuple(coordinates)
+
+
+def prune_fit_analysis_coordinates(
+    configuration: ProfileLikelihoodConfig | ResidualBootstrapConfig | None,
+    changed_parameter_names: Iterable[str],
+) -> ProfileLikelihoodConfig | ResidualBootstrapConfig | None:
+    """Drop stale uncertainty coordinates for changed Fit parameters.
+
+    Fit-coordinate identities are admitted before this projection.  A scope
+    or Vary change invalidates every coordinate for the changed parameter,
+    while unrelated coordinates retain their original order and identity.
+    """
+
+    if configuration is None:
+        return None
+    changed_names = set(changed_parameter_names)
+    remaining = tuple(
+        coordinate
+        for coordinate in configuration.parameter_names
+        if coordinate.name not in changed_names
+    )
+    if not remaining:
+        return None
+    if remaining == configuration.parameter_names:
+        return configuration
+    return replace(configuration, parameter_names=remaining)
 
 
 @dataclass(frozen=True, slots=True)

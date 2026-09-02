@@ -532,53 +532,31 @@ class ResultRenderInput:
     completion_warning_details: tuple[tuple[str, tuple[str, ...]], ...] = ()
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "tab_id", _required_id(self.tab_id, "tab_id"))
-        object.__setattr__(self, "current_set_id", str(self.current_set_id or ""))
         blocks = tuple(self.blocks)
-        if any(not isinstance(block, ResultDataBlock) for block in blocks):
-            raise TypeError("blocks must contain ResultDataBlock values.")
         identities = tuple((block.kind, block.block_id) for block in blocks)
         if len(identities) != len(set(identities)):
             raise ValueError("render blocks must have unique semantic identities.")
         object.__setattr__(self, "blocks", blocks)
-        names = tuple(
-            _required_id(name, "statistics series name")
-            for name in self.statistics_series_names
-        )
+        names = tuple(self.statistics_series_names)
         if len(names) != len(set(names)):
             raise ValueError("statistics series names must be unique.")
         object.__setattr__(self, "statistics_series_names", names)
-        selected_x = _axis_selection(self.selected_x_series, field="selected_x_series")
-        selected_y = tuple(_axis_selection(item, field="selected_y_series") for item in self.selected_y_series)
+        selected_x = self.selected_x_series
+        selected_y = tuple(self.selected_y_series)
         if len(selected_y) != len(set(selected_y)):
             raise ValueError("selected_y_series must be unique.")
-        overlay_locks = tuple(
-            (axis, _required_id(model_target, "mapped overlay model target"))
-            for axis, model_target in self.mapped_overlay_locks
-        )
-        if any(not isinstance(axis, ExperimentalAxisSelection) for axis, _ in overlay_locks):
-            raise TypeError("mapped overlay locks must contain experimental axes.")
+        overlay_locks = tuple(self.mapped_overlay_locks)
         if len({axis for axis, _ in overlay_locks}) != len(overlay_locks):
             raise ValueError("mapped overlay locks must be unique by axis.")
         candidates = tuple(self.axis_candidates)
-        if any(not isinstance(item, AxisSelectionCandidate) for item in candidates):
-            raise TypeError("axis candidates must contain AxisSelectionCandidate values.")
         candidate_ids = tuple(item.selection for item in candidates)
         if len(candidate_ids) != len(set(candidate_ids)) or selected_x not in candidate_ids:
             raise ValueError("axis candidates must be unique and include selected X.")
         if any(axis not in candidate_ids for axis, _ in overlay_locks):
             raise ValueError("mapped overlay locks must be axis candidates.")
         annotations = tuple(self.intervention_annotations)
-        if any(not isinstance(item, Mapping) for item in annotations):
-            raise TypeError("intervention annotations must be mappings.")
-        diagnostic = self.unavailable_x_diagnostic
-        if diagnostic is not None and (type(diagnostic) is not str or not diagnostic.strip()):
-            raise ValueError("unavailable X diagnostic must be nonblank.")
         warnings = tuple(
-            (
-                _required_id(label, "completion warning label"),
-                tuple(str(detail) for detail in details),
-            )
+            (label, tuple(details))
             for label, details in self.completion_warning_details
         )
         if len({label for label, _details in warnings}) != len(warnings):
@@ -586,16 +564,8 @@ class ResultRenderInput:
         object.__setattr__(self, "selected_x_series", selected_x)
         object.__setattr__(self, "selected_y_series", selected_y)
         object.__setattr__(self, "mapped_overlay_locks", overlay_locks)
-        object.__setattr__(self, "selected_y_uses_default_all", bool(self.selected_y_uses_default_all))
-        object.__setattr__(self, "x_label", str(self.x_label))
-        object.__setattr__(self, "y_label", str(self.y_label))
-        object.__setattr__(self, "x_is_concentration", bool(self.x_is_concentration))
-        object.__setattr__(self, "y_is_concentration", bool(self.y_is_concentration))
         object.__setattr__(self, "axis_candidates", candidates)
-        object.__setattr__(self, "reference_lines_visible", bool(self.reference_lines_visible))
         object.__setattr__(self, "intervention_annotations", tuple(MappingProxyType(dict(item)) for item in annotations))
-        object.__setattr__(self, "intervention_annotations_visible", bool(self.intervention_annotations_visible))
-        object.__setattr__(self, "unavailable_x_diagnostic", diagnostic)
         object.__setattr__(self, "completion_warning_details", warnings)
 
     def _analysis_block(self) -> ResultDataBlock | None:
@@ -1159,19 +1129,11 @@ def compose_interactive_display(
             for block in render_input.blocks
             if block.block_id == set_id
             and block.kind is ResultLayerKind.REFERENCE
+            and block.visible
         ),
         None,
     )
-    explicit_block = next(
-        (
-            block
-            for block in render_input.blocks
-            if block.block_id == set_id
-            and block.kind is ResultLayerKind.EXPLICIT
-        ),
-        None,
-    )
-    baseline_block = reference_block or explicit_block
+    baseline_block = reference_block
     if live_block is None:
         return None
     topology = _result_topology(result)

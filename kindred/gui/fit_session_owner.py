@@ -41,7 +41,7 @@ from kindred.gui.fitting.launch import (
     build_fit_local_admission,
     create_initial_fit_setup,
     revalidate_fit_request_inclusions,
-    selected_observations,
+    prune_fit_analysis_coordinates,
     _replace_fit_parameter,
 )
 from kindred.gui.fitting.window import FittingWindow
@@ -472,7 +472,9 @@ class FitSessionOwner(QtCore.QObject):
         ):
             return False
         self._worker.pause()
-        self._set_status("Fit paused.")
+        self._set_status(
+            "Fit pause requested; the current evaluation will finish before execution pauses."
+        )
         return True
 
     @QtCore.Slot()
@@ -725,31 +727,16 @@ class FitSessionOwner(QtCore.QObject):
             self._set_status("Fit setup reset rejected: the owner snapshot is stale.")
             return False
         try:
-            current = self._accepted_setup()
-            if current is None:
-                return False
-            restored_snapshot = self._parameters_reset_snapshot(
-                current=current,
-                retained=snapshot,
-                origin=origin,
-            )
-            self._params_reset_projection()
+            window.clear_pending_setup_edits()
             self._clear_candidate_presentation(window)
-            window.project_setup_snapshot(restored_snapshot)
+            window.project_setup_snapshot(snapshot)
         except (TypeError, ValueError, KeyError) as exc:
             self._set_status(f"Fit setup reset failed: {exc}")
             return False
-        self._install_setup(restored_snapshot)
+        self._install_setup(snapshot)
         self._invalidate_candidate_custody()
         self._set_status(f"Fit setup {kind.replace('_', ' ')} snapshot restored.")
         return True
-
-    def _params_reset_projection(self) -> None:
-        """Clear only presentation drafts owned by the Parameters surface."""
-
-        window = self._window
-        if window is not None:
-            window.clear_parameters_pending_edits()
 
     def _clear_candidate_presentation(self, window: FittingWindow) -> None:
         """Clear the candidate presentation."""
@@ -791,113 +778,6 @@ class FitSessionOwner(QtCore.QObject):
         """Release the current terminal candidate."""
 
         self._candidate = None
-
-    def _parameters_reset_snapshot(
-        self,
-        *,
-        current: FitSetupSnapshot,
-        retained: FitSetupSnapshot,
-        origin: FitOriginSnapshot,
-    ) -> FitSetupSnapshot:
-        """Restore setup values while retaining only executable target routes."""
-
-        current_by_dataset = {
-            item.dataset_id: item for item in current.datasets
-        }
-        if set(current_by_dataset) != {
-            item.dataset_id for item in retained.datasets
-        }:
-            raise ValueError(
-                "Fit reset changed the stable dataset identities."
-            )
-        datasets = []
-        for retained_dataset in retained.datasets:
-            current_dataset = current_by_dataset[retained_dataset.dataset_id]
-            retain_current_route = self._dataset_target_route_is_executable(
-                origin=origin,
-                setup=retained,
-                dataset=current_dataset,
-            )
-            route_owner = (
-                current_dataset
-                if retain_current_route
-                else retained_dataset
-            )
-            restored_dataset = replace(
-                retained_dataset,
-                # These fields are authored by Data and survive Parameters Reset.
-                t_start=current_dataset.t_start,
-                included=current_dataset.included,
-                data_range_min=current_dataset.data_range_min,
-                data_range_max=current_dataset.data_range_max,
-                maximum_observations_per_target=(
-                    current_dataset.maximum_observations_per_target
-                ),
-                # Target/weight/mapping state survives only as one executable route.
-                weight=route_owner.weight,
-                target_species=route_owner.target_species,
-                target_weights=route_owner.target_weights,
-                observation_targets=route_owner.observation_targets,
-                parametric=route_owner.parametric,
-            )
-            if not self._dataset_target_route_is_executable(
-                origin=origin,
-                setup=retained,
-                dataset=restored_dataset,
-            ):
-                raise ValueError(
-                    "Fit reset cannot restore an executable target/mapping "
-                    f"for dataset {retained_dataset.dataset_id!r}."
-                )
-            datasets.append(restored_dataset)
-        return replace(
-            retained,
-            datasets=tuple(datasets),
-            solver=current.solver,
-            dataset_weight_mode=current.dataset_weight_mode,
-        )
-
-    @staticmethod
-    def _dataset_target_route_is_executable(
-        *,
-        origin: FitOriginSnapshot,
-        setup: FitSetupSnapshot,
-        dataset: FitDatasetLocalSettings,
-    ) -> bool:
-        """Check one target/mapping route against canonical plus local science."""
-
-        try:
-            if not isinstance(dataset, FitDatasetLocalSettings):
-                return False
-            mapped = next(
-                item
-                for item in origin.mapped_datasets
-                if item.dataset_id == dataset.dataset_id
-            )
-            captured_by_raw_id = {
-                item.raw_observation_id: item
-                for item in mapped.observations
-            }
-            allowed_observables = set(
-                origin.prepared_dsl.analysis.observable_names
-            )
-            allowed_observables.update(
-                item.name for item in setup.local_observables
-            )
-            for raw_id, target in dataset.observation_targets:
-                captured = captured_by_raw_id.get(raw_id)
-                if captured is None or (
-                    target != captured.model_target
-                    and target not in allowed_observables
-                ):
-                    return False
-            # Exclusion suspends execution; it does not make an empty or stale
-            # target route valid.  Reset must preserve a route that can execute
-            # immediately if the dataset is re-included later.
-            selected = selected_observations(mapped, dataset)
-            return bool(selected)
-        except (AttributeError, StopIteration, TypeError, ValueError, KeyError):
-            return False
 
     def set_project_defaults(self, defaults: FitDefaults) -> bool:
         self._require_thread()
@@ -1171,6 +1051,7 @@ class FitSessionOwner(QtCore.QObject):
         )
         result_values = candidate.result.dataset_params
         parameters: list[FitParameterVariable] = []
+        changed_parameter_names: list[str] = []
         try:
             for parameter in setup.parameters:
                 if (
@@ -1209,10 +1090,22 @@ class FitSessionOwner(QtCore.QObject):
                         dataset_values=(),
                     )
                 )
+                changed_parameter_names.append(parameter.name)
         except (TypeError, ValueError, KeyError, ZeroDivisionError) as exc:
             self._set_status(f"Shared Fit setup rejected: {exc}")
             return False
-        shared_setup = replace(setup, parameters=tuple(parameters))
+        shared_setup = replace(
+            setup,
+            parameters=tuple(parameters),
+            profile_likelihood=prune_fit_analysis_coordinates(
+                setup.profile_likelihood,
+                changed_parameter_names,
+            ),
+            residual_bootstrap=prune_fit_analysis_coordinates(
+                setup.residual_bootstrap,
+                changed_parameter_names,
+            ),
+        )
         self._install_setup(shared_setup)
         self._invalidate_candidate_custody()
         self._clear_candidate_presentation(window)
@@ -1473,10 +1366,7 @@ class FitSessionOwner(QtCore.QObject):
             "dataset estimates not applied: "
             + ", ".join(
                 (
-                    str(display_names[dataset_id])
-                    .replace("\r\n", " ")
-                    .replace("\r", " ")
-                    .replace("\n", " ")
+                    " ".join(str(display_names[dataset_id]).splitlines())
                     + f" = {settlement.dataset_values[dataset_id]:.17g}"
                 )
                 for dataset_id in settlement.dataset_ids
