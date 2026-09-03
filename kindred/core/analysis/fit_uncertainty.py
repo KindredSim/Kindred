@@ -545,11 +545,8 @@ class ResidualBootstrapResult:
     replicates: int
     confidence_level: float
     resampling: str
-    draw_recipe_version: int
     draw_algorithm: str
     residual_centering: str
-    replay_authority: str
-    preserved_fields: tuple[str, ...]
     replicate_execution: str
     refit_validity: str
     minimum_successful_replicates: int
@@ -646,8 +643,6 @@ class ResidualBootstrapResult:
         object.__setattr__(self, "required_successes", required)
         object.__setattr__(self, "successful_replicates", successful)
         object.__setattr__(self, "failed_replicates", failed)
-        object.__setattr__(self, "draw_recipe_version", int(self.draw_recipe_version))
-        object.__setattr__(self, "preserved_fields", tuple(str(value) for value in self.preserved_fields))
         object.__setattr__(self, "intervals", MappingProxyType(intervals))
         object.__setattr__(self, "unavailable_reason", reason)
         object.__setattr__(self, "provenance", _freeze_fact(dict(self.provenance or {})))
@@ -672,7 +667,7 @@ def profile_likelihood_settlement_result(
         likelihood_model="weighted Gaussian residuals with profiled variance",
         likelihood_ratio_transport="finite log likelihood ratio",
         fixed_coordinate_policy="selected coordinate fixed; all others reoptimized",
-        warm_start_policy="inner_successful_refit",
+        warm_start_policy="previous scientifically available nuisance endpoint",
         optimizer_method=config.optimizer_method,
         max_bracketing_steps_per_side=config.max_bracketing_steps_per_side,
         max_nfev_per_point=config.max_nfev_per_point,
@@ -708,13 +703,10 @@ def residual_bootstrap_settlement_result(
         replicates=config.replicates,
         confidence_level=config.confidence_level,
         resampling="within each dataset/target residual stratum",
-        draw_recipe_version=_BOOTSTRAP_DRAW_SCHEMA_VERSION,
         draw_algorithm="numpy.default_rng(seed) residual-index draws",
         residual_centering="independent arithmetic mean subtraction within each dataset/target stratum",
-        replay_authority="seed plus versioned draw algorithm",
-        preserved_fields=("time", "X", "source-row", "dataset weight", "target weight", "full-refit"),
         replicate_execution="full global refit",
-        refit_validity="only explicitly converged scientific refits count",
+        refit_validity="scientifically available completed refits count regardless of optimizer convergence",
         minimum_successful_replicates=config.minimum_successful_replicates,
         minimum_success_fraction=config.minimum_success_fraction,
         required_successes=required_successes,
@@ -897,7 +889,6 @@ def profile_likelihood_result(
     decode_coordinate: Callable[[object, float], float],
     base_residuals: np.ndarray | None = None,
     cancellation_check: Callable[[], bool] | None = None,
-    terminal_converged: bool | None = None,
     progress_callback: Callable[[FitExtensionProgress], None] | None = None,
 ) -> ProfileLikelihoodResult:
     """Fix selected coordinates and reoptimize nuisances on a bounded profile.
@@ -1012,7 +1003,7 @@ def profile_likelihood_result(
                     "finite un-clamped log-ratio with typed exact-fit/overflow crossing outcome"
                 ),
                 fixed_coordinate_policy="selected coordinate fixed; all others reoptimized",
-                warm_start_policy="inner_successful_refit",
+                warm_start_policy="previous scientifically available nuisance endpoint",
                 optimizer_method=config.optimizer_method,
                 max_bracketing_steps_per_side=config.max_bracketing_steps_per_side,
                 max_nfev_per_point=config.max_nfev_per_point,
@@ -1024,28 +1015,6 @@ def profile_likelihood_result(
             )
         )
 
-    if terminal_converged is False:
-        return finish(ProfileLikelihoodResult(
-            status="unavailable",
-            method=_PROFILE_METHOD,
-            requested_parameters=tuple(
-                _coordinate_display(item) for item in config.parameter_names
-            ),
-            confidence_level=config.confidence_level,
-            likelihood_ratio_threshold=threshold,
-            likelihood_model="weighted Gaussian residuals with profiled variance",
-            likelihood_ratio_transport="finite log likelihood ratio",
-            fixed_coordinate_policy="selected coordinate fixed; all others reoptimized",
-            warm_start_policy="inner_successful_refit",
-            optimizer_method=config.optimizer_method,
-            max_bracketing_steps_per_side=config.max_bracketing_steps_per_side,
-            max_nfev_per_point=config.max_nfev_per_point,
-            observation_count=None,
-            terminal_weighted_residual_sse=None,
-            intervals={},
-            unavailable_reason="Profile likelihood requires a converged primary Fit.",
-            provenance={"primary_fit_required": "converged"},
-        ))
     if base_residuals is None:
         try:
             base_vector = np.asarray([initial[name] for name in initial], dtype=float)
@@ -1073,20 +1042,15 @@ def profile_likelihood_result(
             likelihood_model="weighted Gaussian residuals with profiled variance",
             likelihood_ratio_transport="finite log likelihood ratio",
             fixed_coordinate_policy="selected coordinate fixed; all others reoptimized",
-            warm_start_policy="inner_successful_refit",
+            warm_start_policy="previous scientifically available nuisance endpoint",
             optimizer_method=config.optimizer_method,
             max_bracketing_steps_per_side=config.max_bracketing_steps_per_side,
             max_nfev_per_point=config.max_nfev_per_point,
             observation_count=None,
             terminal_weighted_residual_sse=None,
             intervals={},
-            unavailable_reason=(
-                "The primary Fit did not provide a valid converged scientific evaluation."
-            ),
-            provenance={
-                "primary_fit_required": "converged",
-                "base_evaluation": "invalid",
-            },
+            unavailable_reason="The primary Fit did not provide a scientifically available evaluation.",
+            provenance={"base_evaluation": "scientifically_unavailable"},
         ))
     base_sse = _sse(base_residuals)
     observation_count = int(base_residuals.size)
@@ -1169,22 +1133,12 @@ def profile_likelihood_result(
                     )
                 except Exception as exc:
                     raise RuntimeError("Fatal Profile nuisance evaluation failed.") from exc
-                if (
-                    not fit.success
-                    or evaluation_residuals is None
-                ):
-                    failure = FactualCause(
-                        domain="fit",
-                        origin="profile_likelihood",
-                        code=None,
-                        type="NonconvergedRefit",
-                        message=str(fit.message or "Profile refit did not converge."),
-                    )
+                if evaluation_residuals is None:
                     record = {
                         "evaluation_index": len(records),
                         "fixed_optimizer_value": float(fixed),
-                        "status": "failed",
-                        "failure": failure,
+                        "status": "unavailable",
+                        "reason": "scientific_unavailable",
                     }
                     records.append(record)
                     return record, None
@@ -1232,7 +1186,7 @@ def profile_likelihood_result(
                     return None, "failed", records, {
                         "status": "failed",
                         "evaluation_index": record["evaluation_index"],
-                        "reason": "scientific_unavailable_or_nonconverged",
+                        "reason": "scientific_unavailable",
                         "failure": record.get("failure"),
                     }
                 outcome = str(record["likelihood_ratio_outcome"])
@@ -1305,7 +1259,7 @@ def profile_likelihood_result(
                     return None, "failed", records, {
                         "status": "failed",
                         "evaluation_index": record["evaluation_index"],
-                        "reason": "scientific_unavailable_or_nonconverged",
+                        "reason": "scientific_unavailable",
                         "failure": record.get("failure"),
                     }
                 if str(record["likelihood_ratio_outcome"]) == "threshold_exceeded_exact_fit":
@@ -1470,7 +1424,7 @@ def profile_likelihood_result(
             "finite un-clamped log-ratio with typed exact-fit/overflow crossing outcome"
         ),
         fixed_coordinate_policy="selected coordinate fixed; all others reoptimized",
-        warm_start_policy="inner_successful_refit",
+        warm_start_policy="previous scientifically available nuisance endpoint",
         optimizer_method=config.optimizer_method,
         max_bracketing_steps_per_side=config.max_bracketing_steps_per_side,
         max_nfev_per_point=config.max_nfev_per_point,
@@ -1547,42 +1501,20 @@ def _parameter_value(result: object, name: object) -> float:
 _BootstrapRefitOutcome = _fit_execution.GlobalFitResult | ScientificUnavailable
 
 
-def _refit_converged(
+def _refit_scientifically_available(
     result: object,
 ) -> tuple[bool, Mapping[str, object] | None]:
-    """Classify one completed refit from its canonical result/cause."""
+    """Classify one completed refit by scientific availability only."""
 
     if isinstance(result, ScientificUnavailable):
         return False, {
             "status": "scientific_unavailable",
             "cause": result,
         }
-    converged = bool(getattr(result, "optimizer_converged", False))
-    if converged:
-        return True, None
-    message = str(
-        getattr(result, "message", "") or "Fit refit did not converge."
-    )
-    optimizer_diagnostic = getattr(result, "optimizer_diagnostic", None)
-    return False, {
-        "status": "nonconverged",
-        "message": message,
-        "cause": FactualCause(
-            domain="fit",
-            origin="bootstrap",
-            code=None,
-            type="NonconvergedRefit",
-            message=message,
-            cause=(
-                optimizer_diagnostic
-                if isinstance(optimizer_diagnostic, FactualCause)
-                else None
-            ),
-        ),
-    }
-
-
-_BOOTSTRAP_DRAW_SCHEMA_VERSION = 2
+    # The refit callback is an admitted typed internal route.  Its concrete
+    # result owner has already established scientific availability; optimizer
+    # convergence is only a fact on that owner, never a second admission gate.
+    return True, None
 
 
 def _bootstrap_payloads(
@@ -1687,7 +1619,7 @@ def residual_bootstrap_result(
         raise TypeError("Residual bootstrap requires ResidualBootstrapConfig.")
     if not config.parameter_names:
         raise ValueError("Ordinary residual Bootstrap requires at least one coordinate.")
-    primary_converged, primary_failure = _refit_converged(terminal_result)
+    primary_available, primary_failure = _refit_scientifically_available(terminal_result)
     completed = 0
     successful = 0
     failed = 0
@@ -1720,7 +1652,6 @@ def residual_bootstrap_result(
             replicates=config.replicates,
             confidence_level=config.confidence_level,
             resampling="within each dataset/target residual stratum",
-            draw_recipe_version=_BOOTSTRAP_DRAW_SCHEMA_VERSION,
             draw_algorithm=(
                 "numpy.default_rng(seed).integers(0, stratum_residual_count); "
                 "integer draws sample independently mean-centered residuals"
@@ -1728,12 +1659,8 @@ def residual_bootstrap_result(
             residual_centering=(
                 "independent arithmetic mean subtraction within each dataset/target stratum"
             ),
-            replay_authority="seed plus versioned draw algorithm",
-            preserved_fields=(
-                "time", "X", "source-row", "dataset weight", "target weight", "full-refit"
-            ),
             replicate_execution="full global refit",
-            refit_validity="only explicitly converged scientific refits count",
+            refit_validity="scientifically available completed refits count regardless of optimizer convergence",
             minimum_successful_replicates=config.minimum_successful_replicates,
             minimum_success_fraction=config.minimum_success_fraction,
             required_successes=required_successes,
@@ -1796,7 +1723,7 @@ def residual_bootstrap_result(
     progress_cause = emit_progress(stage="primary_complete")
     if progress_cause is not None:
         return finish(stopped_result(progress_cause))
-    if not primary_converged:
+    if not primary_available:
         primary_cause = (
             primary_failure.get("cause")
             if isinstance(primary_failure, Mapping)
@@ -1813,11 +1740,8 @@ def residual_bootstrap_result(
             "unavailable",
             primary_fit_diagnostic=primary_cause,
             primary_fit_unavailable=primary_unavailable,
-            unavailable_reason="Residual bootstrap requires a converged primary Fit.",
-            provenance={
-                "primary_fit_required": "converged",
-                "primary_fit": primary_failure or {"status": "nonconverged"},
-            },
+            unavailable_reason="Residual bootstrap requires a scientifically available primary Fit.",
+            provenance={"primary_fit": primary_failure or {"status": "scientific_unavailable"}},
         ))
     terminal_infos = getattr(terminal_result, "dataset_info", None)
     if not isinstance(terminal_infos, (tuple, list)) or not terminal_infos:
@@ -1911,8 +1835,8 @@ def residual_bootstrap_result(
                 diagnostic=first_failed_replicate_diagnostic,
                 provenance={"replicate": index, "settlement": "failed"},
             ))
-        converged, failure = _refit_converged(fitted)
-        if not converged:
+        scientifically_available, failure = _refit_scientifically_available(fitted)
+        if not scientifically_available:
             completed += 1
             failed += 1
             raw_failure = failure.get("cause") if isinstance(failure, Mapping) else None
@@ -1972,11 +1896,11 @@ def residual_bootstrap_result(
 
     success_count = successful
     required = required_successes
-    valid = success_count >= required
+    threshold_met = success_count >= required
     alpha = 1.0 - config.confidence_level
     intervals: dict[str, object] = {}
     for name, values in successes.items():
-        if not valid:
+        if not threshold_met:
             intervals[name] = {
                 "status": "unavailable",
                 "lower": None,
@@ -1999,14 +1923,14 @@ def residual_bootstrap_result(
         }
 
     return finish(build_result(
-        "available" if valid else "unavailable",
+        "available" if threshold_met else "unavailable",
         intervals={
             name: _bootstrap_interval_record(record)
             for name, record in intervals.items()
         },
         unavailable_reason=(
             None
-            if valid
+            if threshold_met
             else (
                 f"Bootstrap validity threshold was not met: {success_count} "
                 f"successful full refits; {required} required."

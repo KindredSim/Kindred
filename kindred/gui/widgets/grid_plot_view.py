@@ -62,6 +62,8 @@ def _fit_y_axis_label(
 class GridPlotView(QtWidgets.QWidget):
     """Render immutable live and terminal Fit curves in the Fit-local plot."""
 
+    copyFitDataRequested = QtCore.Signal()
+
     def __init__(
         self,
         *,
@@ -86,6 +88,7 @@ class GridPlotView(QtWidgets.QWidget):
         self._plot_items: list[object] = []
         self._plot_series_items: list[dict[str, object]] = []
         self._plot_legends: list[object | None] = []
+        self._plot_display_state: dict[str, tuple[object, ...]] = {}
         self._structure_key: tuple[tuple[str, ...], int, int] | None = None
         self._dark_mode = False
         self._live_layout_locked = False
@@ -100,6 +103,31 @@ class GridPlotView(QtWidgets.QWidget):
         self._copy_timer = QtCore.QTimer(self)
         self._copy_timer.setInterval(0)
         self._copy_timer.timeout.connect(self._continue_copy)
+
+        self._context_menu = QtWidgets.QMenu(self)
+        self._context_actions = {
+            key: self._context_menu.addAction(label)
+            for key, label in (
+                ("copy", "Copy Fit Data"),
+                ("range", "Auto Range"),
+                ("pan", "Pan"),
+                ("rect", "Rectangle Zoom"),
+                ("legend", "Show Legend"),
+                ("log_x", "Log X"),
+                ("log_y", "Log Y"),
+                ("invert_x", "Invert X"),
+                ("invert_y", "Invert Y"),
+            )
+        }
+        for action in tuple(self._context_actions.values())[2:]:
+            action.setCheckable(True)
+        self._mouse_mode_group = QtGui.QActionGroup(self)
+        self._mouse_mode_group.setExclusive(True)
+        self._mouse_mode_group.addAction(self._context_actions["pan"])
+        self._mouse_mode_group.addAction(self._context_actions["rect"])
+        self._context_plot_index: int | None = None
+        for action in self._context_actions.values():
+            action.triggered.connect(self._context_action_triggered)
 
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -136,6 +164,7 @@ class GridPlotView(QtWidgets.QWidget):
         self._controls_widget.setVisible(bool(show_generic_controls))
 
         self._canvas = pg.GraphicsLayoutWidget(self)
+        self._canvas.scene().installEventFilter(self)
         try:
             self._canvas.useOpenGL(False)
         except (AttributeError, RuntimeError):
@@ -171,6 +200,9 @@ class GridPlotView(QtWidgets.QWidget):
         """Install curves and presentation together, then redraw exactly once."""
 
         self._cancel_copy()
+        if len(self._plot_items) == len(self._curves):
+            for curve, plot in zip(self._curves, self._plot_items, strict=True):
+                self._plot_display_state[curve.dataset_id] = self._plot_display_state_for_plot(plot)
         values = tuple(curves)
         if any(not isinstance(item, FitCurveDataset) for item in values):
             raise TypeError("curves must contain FitCurveDataset values.")
@@ -201,6 +233,108 @@ class GridPlotView(QtWidgets.QWidget):
             self._selected_species_list = []
             self._available_species_cache = ()
         return self._redraw()
+
+    def _plot_display_state_for_plot(self, plot: object) -> tuple[object, ...]:
+        state = plot.getViewBox().getState(copy=True)
+        return (state["mouseMode"], tuple(state["logMode"]), state["xInverted"],
+                state["yInverted"], tuple(state["autoRange"]),
+                tuple(tuple(axis) for axis in state["viewRange"]))
+
+    def _restore_plot_display_state(
+        self,
+        plot: object,
+        dataset_id: str,
+    ) -> None:
+        """Restore one dataset's display state after a PlotItem rebuild."""
+
+        state = self._plot_display_state.get(dataset_id)
+        if state is None:
+            return
+        view_box = plot.getViewBox()
+        mouse_mode, log_mode, x_inverted, y_inverted, auto_range, view_range = state
+        view_box.setMouseMode(mouse_mode)
+        plot.setLogMode(x=log_mode[0], y=log_mode[1])
+        plot.invertX(bool(x_inverted))
+        plot.invertY(bool(y_inverted))
+        view_box.enableAutoRange(x=auto_range[0], y=auto_range[1])
+        view_box.setRange(
+            xRange=view_range[0], yRange=view_range[1], padding=0,
+            disableAutoRange=False)
+
+    def _prepare_context_menu(self, plot_index: int) -> None:
+        plot = self._plot_items[plot_index]
+        view_box = plot.getViewBox()
+        state = view_box.getState(copy=False)
+        mouse_mode = state["mouseMode"]
+        self._context_plot_index = plot_index
+        actions = self._context_actions
+        actions["copy"].setEnabled(bool(self._curves))
+        log_mode = state["logMode"]
+        for key, value in (
+            ("pan", mouse_mode == pg.ViewBox.PanMode),
+            ("rect", mouse_mode == pg.ViewBox.RectMode),
+            ("legend", self._legend_visible),
+            ("log_x", log_mode[0]),
+            ("log_y", log_mode[1]),
+            ("invert_x", state["xInverted"]),
+            ("invert_y", state["yInverted"]),
+        ):
+            actions[key].setChecked(bool(value))
+
+    def _show_context_menu(
+        self,
+        scene_position: QtCore.QPointF,
+        global_position: QtCore.QPoint,
+    ) -> None:
+        plot_index = next((index for index, plot in enumerate(self._plot_items)
+                           if plot.sceneBoundingRect().contains(scene_position)), None)
+        if plot_index is None:
+            self._context_plot_index = None
+            return
+        self._prepare_context_menu(plot_index)
+        self._context_menu.exec(global_position)
+        self._context_plot_index = None
+
+    def eventFilter(self, watched: object, event: QtCore.QEvent) -> bool:
+        if watched is self._canvas.scene() and event.type() == QtCore.QEvent.Type.GraphicsSceneContextMenu:
+            self._show_context_menu(event.scenePos(), event.screenPos())
+            event.accept()
+            return True
+        return super().eventFilter(watched, event)
+
+    def _context_action_triggered(self, checked: bool) -> None:
+        kind = next(key for key, action in self._context_actions.items() if action is self.sender())
+        if kind == "copy":
+            self.copyFitDataRequested.emit()
+            return
+        index = self._context_plot_index
+        if index is None:
+            return
+        plot = self._plot_items[index]
+        view_box = plot.getViewBox()
+        if kind == "range":
+            view_box.enableAutoRange(x=True, y=True)
+            view_box.autoRange()
+        elif kind in {"pan", "rect"} and checked:
+            view_box.setMouseMode(pg.ViewBox.PanMode if kind == "pan" else pg.ViewBox.RectMode)
+        elif kind == "legend":
+            self._toggle_legend(checked)
+            return
+        elif kind in {"log_x", "log_y"}:
+            before = self._plot_display_state_for_plot(plot)
+            plot.setLogMode(**{kind[-1]: bool(checked)})
+            auto_range = before[4]
+            view_box.enableAutoRange(x=auto_range[0], y=auto_range[1])
+            if not all(bool(item) for item in auto_range):
+                view_range = before[5]
+                view_box.setRange(
+                    xRange=view_range[0], yRange=view_range[1], padding=0,
+                    disableAutoRange=False)
+        elif kind in {"invert_x", "invert_y"}:
+            getattr(plot, f"invert{kind[-1].upper()}")(bool(checked))
+        else:
+            return
+        self._plot_display_state[self._curves[index].dataset_id] = self._plot_display_state_for_plot(plot)
 
     def copy_eligible(self) -> bool:
         """Whether this Fit-local panel has immutable curves to copy."""
@@ -402,6 +536,7 @@ class GridPlotView(QtWidgets.QWidget):
     def _configure_plot_static(self, plot: object, x_name: str) -> None:
         """Apply the historical static axes, grid, and tick geometry."""
 
+        plot.setMenuEnabled(False)
         x_label = "Time" if x_name.casefold() == "t" else x_name
         if x_name.casefold() == "t":
             plot.setLabel("bottom", x_label, units="s")
@@ -643,6 +778,7 @@ class GridPlotView(QtWidgets.QWidget):
                     anchor=(0.5, 0.5),
                 )
                 placeholder = self._canvas.addPlot(row=0, col=0)
+                placeholder.setMenuEnabled(False)
                 placeholder.hideAxis("left")
                 placeholder.hideAxis("bottom")
                 placeholder.addItem(text)
@@ -658,6 +794,7 @@ class GridPlotView(QtWidgets.QWidget):
                 self._plot_series_items.append({})
                 self._plot_legends.append(None)
                 self._configure_plot_static(plot, curve.x_name)
+                self._restore_plot_display_state(plot, curve.dataset_id)
                 if self._live_layout_locked:
                     self._apply_live_axis_style(plot)
             self._structure_key = self._dataset_structure_key(self._curves)
@@ -802,6 +939,12 @@ class GridPlotView(QtWidgets.QWidget):
 
     def _toggle_legend(self, visible: bool) -> None:
         self._legend_visible = bool(visible)
+        if self._legend_toggle_btn.isChecked() != self._legend_visible:
+            self._legend_toggle_btn.blockSignals(True)
+            try:
+                self._legend_toggle_btn.setChecked(self._legend_visible)
+            finally:
+                self._legend_toggle_btn.blockSignals(False)
         self._redraw()
 
     def set_dark_mode(self, enabled: bool) -> None:

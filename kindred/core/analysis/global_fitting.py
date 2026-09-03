@@ -106,28 +106,6 @@ def _validate_run_inputs(
             + "."
         )
     return payloads, evaluators, shared, overrides
-def _mark_late_stop(
-    result: _fit_execution.GlobalFitResult,
-    *,
-    cause: FactualCause,
-) -> _fit_execution.GlobalFitResult:
-    """Mark an already replayed result diagnostic-only without replaying it."""
-
-    if not result.optimizer_converged and result.diagnostic_only:
-        return result
-    return replace(
-        result,
-        message=_fit_execution.fit_result_message(
-            base_message="Stopped by user after primary Fit settlement.",
-            status="warn",
-            optimizer_converged=False,
-            optimizer_diagnostic=cause,
-        ),
-        status="warn",
-        optimizer_converged=False,
-        optimizer_diagnostic=cause,
-        diagnostic_only=True,
-    )
 
 
 def fit_global(
@@ -149,8 +127,6 @@ def fit_global(
     ] = None,
     cancellation_check: Optional[Callable[[], bool]] = None,
     cancellation_control: SimulationCancellationControl | None = None,
-    stop_best_requested: Callable[[], bool] | None = None,
-    stopped_replay_control: SimulationCancellationControl | None = None,
     profile_likelihood: ProfileLikelihoodConfig | None = None,
     residual_bootstrap: ResidualBootstrapConfig | None = None,
     extension_progress_callback: Optional[
@@ -268,95 +244,84 @@ def fit_global(
                 message=identifiability,
                 details={"final_report_warning": True},
             )
-        if context.last_error is not None and optimizer_diagnostic is None:
-            provenance = context.last_error_provenance
-            dataset_id = (
-                str(provenance.get("dataset"))
-                if isinstance(provenance, Mapping) and provenance.get("dataset") is not None
-                else None
-            )
-            optimizer_diagnostic = factual_cause_from_exception(
-                context.last_error,
-                domain="fit",
-                origin="optimizer",
-            )
-            if dataset_id is not None:
-                optimizer_diagnostic = replace(
-                    optimizer_diagnostic,
-                    details={
-                        **dict(optimizer_diagnostic.details),
-                        "dataset": dataset_id,
-                    },
-                )
         keys = layout.opt_param_keys()
         optimizer_endpoint_vector = np.asarray(
             [optimizer_result.parameters[key] for key in keys],
             dtype=float,
         )
-        vector = optimizer_endpoint_vector.copy()
-        retained_best = objective.best_complete_vector
-        if retained_best is not None:
-            retained_best_vector = np.asarray(retained_best, dtype=float).reshape(-1)
-            if not np.array_equal(optimizer_endpoint_vector, retained_best_vector):
-                success = False
-                replacement_cause = FactualCause(
-                    domain="fit",
-                    origin="optimizer_endpoint",
-                    code=None,
-                    type="FittingUnavailableEndpointReplaced",
-                    message=(
-                        "The unavailable optimizer endpoint was replaced by the "
-                        "best valid evaluated candidate."
-                    ),
-                    details={
-                        "endpoint_replaced": True,
-                        "settlement": "best_valid_evaluated_candidate",
-                    },
-                    cause=optimizer_diagnostic,
-                )
-                optimizer_diagnostic = replacement_cause
-            vector = retained_best_vector
-        layout.validate_optimizer_vector(vector)
-        replay_cancellation_check = cancellation_check
-        replay_cancellation_control = cancellation_control
-        if callable(stop_best_requested):
-            def stopped_replay_check() -> bool:
-                # A user Stop is settled by this one terminal replay.  The
-                # ordinary control still owns Close and dataset deadlines.
-                return False
-            replay_cancellation_check = stopped_replay_check
-            if stopped_replay_control is not None:
-                replay_cancellation_control = stopped_replay_control
-        try:
-            replay_state = _fit_execution._assemble_fit_replay_state(
+        layout.validate_optimizer_vector(optimizer_endpoint_vector)
+
+        def replay(
+            candidate_vector: np.ndarray,
+            *,
+            converged: bool,
+        ) -> _fit_execution._FitReplayState:
+            return _fit_execution._assemble_fit_replay_state(
                 fit_evaluators=evaluators,
                 payloads=payloads,
                 layout=layout,
-                candidate_vector=vector,
+                candidate_vector=candidate_vector,
                 fixed_dataset_params=fixed_dataset_params,
                 weights=weights_norm,
-                cancellation_check=replay_cancellation_check,
-                cancellation_control=replay_cancellation_control,
-                success=success,
+                cancellation_check=cancellation_check,
+                cancellation_control=cancellation_control,
+                success=converged,
                 message=message,
-                scipy_nfev=int(optimizer_result.scipy_nfev),
-                objective_call_count=int(objective.objective_calls),
                 optimizer_diagnostic=optimizer_diagnostic,
                 executor=executor,
             )
+
+        try:
+            # Scientific availability belongs to the actual optimizer endpoint
+            # replay.  A better fully evaluated probe must not replace it.
+            replay_state = replay(optimizer_endpoint_vector, converged=success)
         except FitSimulationError as exc:
             details = dict(getattr(exc, "details", None) or {})
             if not details.get("scientific_unavailable"):
                 raise
-            return ScientificUnavailable(
-                producer=str(details.get("producer", "global_fit_replay")),
-                stage=str(details.get("stage", "final_replay")),
-                details=details,
-                factual_cause=getattr(exc, "factual_cause", None),
+            retained_best = objective.best_complete_vector
+            if retained_best is None:
+                return ScientificUnavailable(
+                    producer=str(details.get("producer", "global_fit_replay")),
+                    stage=str(details.get("stage", "final_replay")),
+                    details=details,
+                    factual_cause=getattr(exc, "factual_cause", None),
+                )
+            retained_best_vector = np.asarray(retained_best, dtype=float).reshape(-1)
+            layout.validate_optimizer_vector(retained_best_vector)
+            success = False
+            optimizer_diagnostic = FactualCause(
+                domain="fit",
+                origin="optimizer_endpoint",
+                code=None,
+                type="FittingUnavailableEndpointReplaced",
+                message=(
+                    "The unavailable optimizer endpoint was replaced by the "
+                    "best scientifically available evaluated candidate."
+                ),
+                details={
+                    "endpoint_replaced": True,
+                    "settlement": "best_scientifically_available_evaluated_candidate",
+                },
+                cause=optimizer_diagnostic,
             )
-        stop_during_primary_replay = bool(
-            callable(stop_best_requested) and stop_best_requested()
-        )
+            try:
+                replay_state = replay(retained_best_vector, converged=False)
+            except FitSimulationError as fallback_exc:
+                fallback_details = dict(
+                    getattr(fallback_exc, "details", None) or {}
+                )
+                if not fallback_details.get("scientific_unavailable"):
+                    raise
+                return ScientificUnavailable(
+                    producer=str(
+                        fallback_details.get("producer", "global_fit_replay")
+                    ),
+                    stage=str(fallback_details.get("stage", "final_replay")),
+                    details=fallback_details,
+                    factual_cause=getattr(fallback_exc, "factual_cause", None),
+                )
+        vector = np.asarray(replay_state.optimizer_vector, dtype=float)
         # Post-fit methods receive a fresh objective without progress emission.
         # It retains the same evaluators, candidate/fatal taxonomy, coordinates,
         # normalized weights, cancellation owner, and immutable captures.
@@ -397,7 +362,6 @@ def fit_global(
                     decode_coordinate=layout.decode_coordinate,
                     base_residuals=replay_state.weighted_residuals,
                     cancellation_check=cancellation_check,
-                    terminal_converged=replay_state.optimizer_converged,
                     progress_callback=extension_progress_callback,
                 )
             except (FittingCancelled, SimulationCancelled) as exc:
@@ -519,187 +483,10 @@ def fit_global(
             residual_bootstrap_result=bootstrap_result,
         )
         result = _fit_execution._construct_global_fit_result(replay_state)
-        if (
-            callable(stop_best_requested)
-            and stop_best_requested()
-            and (
-                stop_during_primary_replay
-                or not optional_analysis_stopped
-            )
-        ):
-            result = _mark_late_stop(
-                result,
-                cause=factual_cause_from_exception(
-                    FittingCancelled(
-                        "Stopped by user after primary Fit settlement."
-                    ),
-                    domain="fit",
-                    origin="user_stop",
-                ),
-            )
         return result
 
-    except FittingCancelled as exc:
-        if not hasattr(exc, "scipy_nfev"):
-            optimizer = locals().get("optimizer_result")
-            if optimizer is not None:
-                setattr(exc, "scipy_nfev", int(optimizer.scipy_nfev))
-        if not hasattr(exc, "objective_call_count"):
-            active_objective = locals().get("objective")
-            calls = getattr(active_objective, "objective_calls", None)
-            if calls is not None:
-                setattr(exc, "objective_call_count", int(calls))
-        existing_replay_state = locals().get("replay_state")
-        if (
-            callable(stop_best_requested)
-            and stop_best_requested()
-            and existing_replay_state is not None
-            and hasattr(existing_replay_state, "weighted_residuals")
-        ):
-            stop_cause = factual_cause_from_exception(
-                exc,
-                domain="fit",
-                origin="user_stop",
-            )
-            settled_profile = locals().get("profile_result")
-            if profile_likelihood is not None and settled_profile is None:
-                settled_profile_config = replace(
-                    profile_likelihood,
-                    parameter_names=tuple(
-                        layout.coordinate_identity(name)
-                        for name in profile_likelihood.parameter_names
-                    ),
-                )
-                settled_profile = profile_likelihood_settlement_result(
-                    config=settled_profile_config,
-                    status="stopped",
-                    cause=stop_cause,
-                    observation_count=int(existing_replay_state.weighted_residuals.size),
-                    terminal_weighted_residual_sse=float(
-                        existing_replay_state.weighted_residual_sse.value
-                    ),
-                )
-            settled_bootstrap = locals().get("bootstrap_result")
-            if residual_bootstrap is not None and settled_bootstrap is None:
-                settled_bootstrap = residual_bootstrap_settlement_result(
-                    config=residual_bootstrap,
-                    cause=stop_cause,
-                    settlement="not_started_after_stop",
-                    status="stopped",
-                )
-            settled_state = replace(
-                existing_replay_state,
-                profile_likelihood_result=settled_profile,
-                residual_bootstrap_result=settled_bootstrap,
-            )
-            return _fit_execution._construct_global_fit_result(settled_state)
-        active_objective = locals().get("objective")
-        if (
-            callable(stop_best_requested)
-            and stop_best_requested()
-            and stopped_replay_control is not None
-            and active_objective is not None
-        ):
-            retained_best = getattr(active_objective, "best_complete_vector", None)
-            if callable(retained_best):
-                retained_best = retained_best()
-            if retained_best is not None:
-                scipy_nfev = getattr(exc, "scipy_nfev", None)
-                objective_call_count = getattr(exc, "objective_call_count", None)
-                if scipy_nfev is None or objective_call_count is None:
-                    raise RuntimeError(
-                        "Stopped Fit lost its exact optimizer/objective counters."
-                    )
-                stop_cause = factual_cause_from_exception(
-                    exc,
-                    domain="fit",
-                    origin="user_stop",
-                )
-                try:
-                    stopped_state = _fit_execution._assemble_fit_replay_state(
-                        fit_evaluators=evaluators,
-                        payloads=payloads,
-                        layout=layout,
-                        candidate_vector=np.asarray(retained_best, dtype=float),
-                        fixed_dataset_params=fixed_dataset_params,
-                        weights=weights_norm,
-                        cancellation_check=None,
-                        cancellation_control=stopped_replay_control,
-                        success=False,
-                        message=(
-                            "Stopped by user; published the best fully evaluated "
-                            "valid candidate."
-                        ),
-                        scipy_nfev=int(scipy_nfev),
-                        objective_call_count=int(objective_call_count),
-                        optimizer_diagnostic=stop_cause,
-                        executor=executor,
-                    )
-                except FitSimulationError as replay_error:
-                    replay_details = dict(
-                        getattr(replay_error, "details", None) or {}
-                    )
-                    if not replay_details.get("scientific_unavailable"):
-                        raise
-                    return ScientificUnavailable(
-                        producer=str(
-                            replay_details.get("producer", "fit_stopped_replay")
-                        ),
-                        stage=str(
-                            replay_details.get("stage", "stopped_replay")
-                        ),
-                        details=replay_details,
-                        factual_cause=getattr(
-                            replay_error, "factual_cause", None
-                        ),
-                    )
-                if not stop_best_requested():
-                    raise FittingCancelled()
-                stopped_profile = None
-                if profile_likelihood is not None:
-                    stopped_profile = replace(
-                        profile_likelihood,
-                        parameter_names=tuple(
-                            layout.coordinate_identity(name)
-                            for name in profile_likelihood.parameter_names
-                        ),
-                    )
-                stopped_bootstrap = residual_bootstrap
-                stopped_state = replace(
-                    stopped_state,
-                    profile_likelihood_result=(
-                        None
-                        if stopped_profile is None
-                        else profile_likelihood_settlement_result(
-                            config=stopped_profile,
-                            status="stopped",
-                            cause=stop_cause,
-                            observation_count=int(stopped_state.weighted_residuals.size),
-                            terminal_weighted_residual_sse=float(
-                                stopped_state.weighted_residual_sse.value
-                            ),
-                        )
-                    ),
-                    residual_bootstrap_result=(
-                        None
-                        if stopped_bootstrap is None
-                        else residual_bootstrap_settlement_result(
-                            config=stopped_bootstrap,
-                            cause=stop_cause,
-                            settlement="not_started_after_stop",
-                            status="stopped",
-                        )
-                    ),
-                )
-                return _fit_execution._construct_global_fit_result(stopped_state)
+    except FittingCancelled:
         raise
     except SimulationCancelled as exc:
         cancellation = FittingCancelled()
-        optimizer = locals().get("optimizer_result")
-        if optimizer is not None:
-            setattr(cancellation, "scipy_nfev", int(optimizer.scipy_nfev))
-        active_objective = locals().get("objective")
-        calls = getattr(active_objective, "objective_calls", None)
-        if calls is not None:
-            setattr(cancellation, "objective_call_count", int(calls))
         raise cancellation from exc

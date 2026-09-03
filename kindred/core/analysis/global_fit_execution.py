@@ -79,22 +79,6 @@ logger = logging.getLogger(__name__)
 _DATASET_DEADLINE_SECONDS = 10.0
 
 
-def _freeze_result_value(value: object) -> object:
-    """Freeze a small factual field graph owned by ``GlobalFitResult``."""
-
-    if isinstance(value, Mapping):
-        return MappingProxyType(
-            {str(name): _freeze_result_value(item) for name, item in value.items()}
-        )
-    if isinstance(value, (list, tuple, set, frozenset)):
-        return tuple(_freeze_result_value(item) for item in value)
-    if isinstance(value, np.ndarray):
-        array = np.asarray(value).copy()
-        array.setflags(write=False)
-        return array
-    return value
-
-
 __all__ = [
     "FitCoordinate",
     "CentredFixedEffectsSettlement",
@@ -190,7 +174,6 @@ class CentredFixedEffectsDeviation:
     """One typed dataset deviation in a centred terminal settlement."""
 
     coordinate: FitCoordinate
-    optimizer_value: float
     decoded_value: float
 
     def __post_init__(self) -> None:
@@ -198,11 +181,9 @@ class CentredFixedEffectsDeviation:
             raise ValueError(
                 "Centred settlement deviations require a centred_deviation coordinate."
             )
-        optimizer_value = float(self.optimizer_value)
         decoded_value = float(self.decoded_value)
-        if not math.isfinite(optimizer_value) or not math.isfinite(decoded_value):
+        if not math.isfinite(decoded_value):
             raise ValueError("Centred settlement deviations must be finite.")
-        object.__setattr__(self, "optimizer_value", optimizer_value)
         object.__setattr__(self, "decoded_value", decoded_value)
 
 
@@ -212,9 +193,6 @@ class CentredFixedEffectsSettlement:
 
     parameter_name: str
     dataset_ids: tuple[str, ...]
-    reference_dataset_id: str
-    overall_coordinate: FitCoordinate
-    overall_optimizer_value: float
     overall_decoded_value: float
     deviations: tuple[CentredFixedEffectsDeviation, ...]
     dataset_values: Mapping[str, float]
@@ -230,12 +208,6 @@ class CentredFixedEffectsSettlement:
             or roster != tuple(sorted(roster))
         ):
             raise ValueError("Centred settlement requires a sorted unique dataset roster.")
-        reference = str(self.reference_dataset_id or "").strip()
-        if reference != roster[0]:
-            raise ValueError("Centred settlement reference must be the first sorted dataset.")
-        expected_overall = FitCoordinate("centred_overall", name)
-        if self.overall_coordinate != expected_overall:
-            raise ValueError("Centred settlement overall identity is not canonical.")
         deviations = tuple(self.deviations)
         if any(not isinstance(item, CentredFixedEffectsDeviation) for item in deviations):
             raise TypeError("Centred settlement deviations require typed rows.")
@@ -251,14 +223,11 @@ class CentredFixedEffectsSettlement:
         values = {str(dataset_id): float(value) for dataset_id, value in self.dataset_values.items()}
         if tuple(values) != roster or any(not math.isfinite(value) for value in values.values()):
             raise ValueError("Centred settlement decoded dataset values must match its roster.")
-        overall_optimizer = float(self.overall_optimizer_value)
         overall_decoded = float(self.overall_decoded_value)
-        if not math.isfinite(overall_optimizer) or not math.isfinite(overall_decoded):
+        if not math.isfinite(overall_decoded):
             raise ValueError("Centred settlement overall values must be finite.")
         object.__setattr__(self, "parameter_name", name)
         object.__setattr__(self, "dataset_ids", roster)
-        object.__setattr__(self, "reference_dataset_id", reference)
-        object.__setattr__(self, "overall_optimizer_value", overall_optimizer)
         object.__setattr__(self, "overall_decoded_value", overall_decoded)
         object.__setattr__(self, "deviations", deviations)
         object.__setattr__(self, "dataset_values", MappingProxyType(values))
@@ -390,10 +359,6 @@ class DatasetFitInfo:
     model_raw_columns: Mapping[str, tuple[str, ...]]
     model_source_rows: Mapping[str, tuple[int, ...]]
     x_projection: ParametricXProjection | None
-    x_weighted_residual_sse: FitMetric | None = None
-    x_weighted_residual_mse: FitMetric | None = None
-    x_weighted_rmse: FitMetric | None = None
-    x_weighted_mae: FitMetric | None = None
 
     def __post_init__(self) -> None:
         # The evaluator owns admission of these typed values.  Keep the
@@ -423,18 +388,6 @@ class DatasetFitInfo:
         if self.residuals.size != self.weighted_residuals.size:
             raise ValueError("Dataset fit residual blocks must have equal counts.")
 
-        x_metrics = (
-            self.x_weighted_residual_sse,
-            self.x_weighted_residual_mse,
-            self.x_weighted_rmse,
-            self.x_weighted_mae,
-        )
-        if self.x_projection is None:
-            if any(item is not None for item in x_metrics):
-                raise ValueError("Dataset X metrics must be absent without an X projection.")
-        else:
-            if any(item is None for item in x_metrics):
-                raise ValueError("Dataset X metrics must be complete with an X projection.")
         species_rows = sum(values.size for values in self.model_series.values())
         projection_rows = 0 if self.x_projection is None else self.x_projection.size
         if self.n_points != species_rows + projection_rows:
@@ -473,47 +426,31 @@ class GlobalFitResult:
     status: Literal["ok", "warn"]
     optimizer_converged: bool
     optimizer_diagnostic: FactualCause | None = None
-    diagnostic_only: bool = False
     profile_likelihood_result: ProfileLikelihoodResult | None = None
     residual_bootstrap_result: ResidualBootstrapResult | None = None
     primary_model: Literal["ordinary", "centred_fixed_effects"] = "ordinary"
-    primary_model_details: Mapping[str, object] = field(default_factory=dict)
     centred_fixed_effects_settlements: tuple[CentredFixedEffectsSettlement, ...] = ()
-    scipy_nfev: int | None = None
-    terminal_replay_count: int = 0
-    objective_call_count: int | None = None
 
     def __post_init__(self) -> None:
         status = str(self.status or "")
         if status not in {"ok", "warn"}:
             raise ValueError(f"Unsupported GlobalFitResult status: {status!r}")
         optimizer_converged = bool(self.optimizer_converged)
-        diagnostic_only = bool(self.diagnostic_only)
         optimizer_diagnostic = self.optimizer_diagnostic
         if optimizer_diagnostic is not None and not isinstance(
             optimizer_diagnostic, FactualCause
         ):
             raise TypeError("GlobalFitResult optimizer diagnostic must be a FactualCause.")
-        if status == "ok" and (not optimizer_converged or optimizer_diagnostic is not None):
-            raise ValueError("A successful GlobalFitResult requires convergence and no diagnostic.")
-        if status == "warn" and optimizer_converged and optimizer_diagnostic is None:
-            raise ValueError("A warning GlobalFitResult requires a diagnostic when converged.")
-        if diagnostic_only != (not optimizer_converged):
-            raise ValueError(
-                "GlobalFitResult diagnostic-only classification must match convergence."
-            )
+        if status == "ok" and optimizer_diagnostic is not None:
+            raise ValueError("An ok GlobalFitResult cannot carry a factual diagnostic.")
+        if status == "warn" and optimizer_diagnostic is None:
+            raise ValueError("A warning GlobalFitResult requires a factual diagnostic.")
         primary_model = str(self.primary_model or "ordinary")
         if primary_model not in {"ordinary", "centred_fixed_effects"}:
             raise ValueError(f"Unsupported GlobalFitResult primary model: {primary_model!r}")
         object.__setattr__(self, "status", status)
         object.__setattr__(self, "optimizer_converged", optimizer_converged)
-        object.__setattr__(self, "diagnostic_only", diagnostic_only)
         object.__setattr__(self, "primary_model", primary_model)
-        object.__setattr__(
-            self,
-            "primary_model_details",
-            _freeze_result_value(dict(self.primary_model_details or {})),
-        )
         if not (
             isinstance(self.weighted_residual_sse, FitMetric)
             and isinstance(self.weighted_residual_mse, FitMetric)
@@ -584,19 +521,6 @@ class GlobalFitResult:
             ),
         )
         object.__setattr__(self, "dataset_info", tuple(self.dataset_info))
-        if self.scipy_nfev is None:
-            raise ValueError("GlobalFitResult requires the exact SciPy nfev count.")
-        scipy_nfev = int(self.scipy_nfev)
-        terminal_replay_count = int(self.terminal_replay_count)
-        if terminal_replay_count < 0:
-            raise ValueError("GlobalFitResult terminal replay count cannot be negative.")
-        object.__setattr__(self, "scipy_nfev", scipy_nfev)
-        object.__setattr__(self, "terminal_replay_count", terminal_replay_count)
-        if self.objective_call_count is not None:
-            objective_call_count = int(self.objective_call_count)
-            if objective_call_count < 0:
-                raise ValueError("GlobalFitResult objective-call count cannot be negative.")
-            object.__setattr__(self, "objective_call_count", objective_call_count)
         if not self.dataset_info:
             raise ValueError("GlobalFitResult requires a nonempty dataset roster.")
         if any(not isinstance(info, DatasetFitInfo) for info in self.dataset_info):
@@ -619,12 +543,6 @@ class GlobalFitResult:
 
         return self.weighted_residual_sse
 
-    @property
-    def classification(self) -> Literal["converged", "nonconverged"]:
-        """Classify the retained candidate for presentation."""
-
-        return "converged" if self.optimizer_converged else "nonconverged"
-
 
 @dataclass(frozen=True, slots=True)
 class _FitReplayState:
@@ -640,9 +558,6 @@ class _FitReplayState:
     optimizer_converged: bool
     optimizer_diagnostic: FactualCause | None
     optimizer_vector: np.ndarray
-    scipy_nfev: int
-    terminal_replay_count: int
-    objective_call_count: int | None
     weighted_residuals: np.ndarray
     profile_likelihood_result: ProfileLikelihoodResult | None = None
     residual_bootstrap_result: ResidualBootstrapResult | None = None
@@ -672,21 +587,7 @@ def _construct_global_fit_result(
     if not isinstance(state, _FitReplayState):
         raise TypeError("Global Fit publication requires private replay state.")
     settlements = tuple(state.centred_fixed_effects_settlements or ())
-    if settlements:
-        primary_model = "centred_fixed_effects"
-        primary_model_details: Mapping[str, object] = {
-            "scope": FIT_SCOPE_CENTRED_FIXED_EFFECTS,
-            "parameter_coordinates": tuple(
-                item.overall_coordinate for item in settlements
-            ),
-            "dataset_rosters": tuple(item.dataset_ids for item in settlements),
-            "reference_dataset_ids": tuple(
-                item.reference_dataset_id for item in settlements
-            ),
-        }
-    else:
-        primary_model = "ordinary"
-        primary_model_details = {}
+    primary_model = "centred_fixed_effects" if settlements else "ordinary"
     return GlobalFitResult(
         shared_params=dict(state.shared_params),
         dataset_params={
@@ -701,15 +602,10 @@ def _construct_global_fit_result(
         status=state.status,
         optimizer_converged=state.optimizer_converged,
         optimizer_diagnostic=state.optimizer_diagnostic,
-        diagnostic_only=not state.optimizer_converged,
         profile_likelihood_result=state.profile_likelihood_result,
         residual_bootstrap_result=state.residual_bootstrap_result,
         primary_model=primary_model,
-        primary_model_details=primary_model_details,
         centred_fixed_effects_settlements=settlements,
-        scipy_nfev=int(state.scipy_nfev),
-        terminal_replay_count=int(state.terminal_replay_count),
-        objective_call_count=state.objective_call_count,
     )
 
 
@@ -728,15 +624,20 @@ def fit_result_message(
     optimizer_diagnostic: FactualCause | None,
 ) -> str:
     if status == "ok":
+        if not optimizer_converged:
+            stopped = str(base_message or "").strip()
+            if not stopped:
+                stopped = "the optimizer stopped without a termination message"
+            return f"Fit completed. Optimizer stopped: {stopped}"
         return str(base_message)
     if status == "warn":
         warning_parts: list[str] = []
         if not optimizer_converged:
             fallback = str(base_message or "").strip()
-            if fallback and "success" not in fallback.lower():
-                warning_parts.append(fallback)
+            if fallback:
+                warning_parts.append(f"Optimizer stopped: {fallback}")
             else:
-                warning_parts.append("optimizer did not report convergence")
+                warning_parts.append("Optimizer stopped without a termination message")
         if optimizer_diagnostic is not None:
             detail = _compact_failure_message(optimizer_diagnostic)
             if detail:
@@ -1305,7 +1206,6 @@ class FitParameterLayout:
                     coordinate=FitCoordinate(
                         "centred_deviation", spec.parameter_name, dataset_id
                     ),
-                    optimizer_value=float(raw_values[dataset_id] - overall_raw),
                     decoded_value=float(raw_values[dataset_id] - overall_raw),
                 )
                 for dataset_id in spec.dataset_ids
@@ -1322,11 +1222,6 @@ class FitParameterLayout:
                 CentredFixedEffectsSettlement(
                     parameter_name=spec.parameter_name,
                     dataset_ids=tuple(sorted(spec.dataset_ids)),
-                    reference_dataset_id=tuple(sorted(spec.dataset_ids))[0],
-                    overall_coordinate=FitCoordinate(
-                        "centred_overall", spec.parameter_name
-                    ),
-                    overall_optimizer_value=overall_raw,
                     overall_decoded_value=overall_decoded,
                     deviations=deviations,
                     dataset_values=decoded_dataset_values,
@@ -1383,7 +1278,6 @@ class FitParameterLayout:
                 else raw_value
             )
         return out
-
 
 
 def build_parameter_layout_for_dataset_ids(
@@ -1854,14 +1748,6 @@ def _build_dataset_fit_info(
     ):
         for array in values.values():
             array.setflags(write=False)
-    x_count = 0 if x_projection is None else int(x_projection.size)
-    x_weighted = (
-        np.asarray([], dtype=float)
-        if x_projection is None
-        else dataset_weight
-        * float(target_multipliers[payload.x_name])
-        * np.asarray(x_projection.delta_x, dtype=float)
-    )
     dataset_metrics = fit_error_metrics(weighted_residuals)
     return DatasetFitInfo(
         dataset_id=dataset_id,
@@ -1885,18 +1771,6 @@ def _build_dataset_fit_info(
         model_raw_columns=model_raw_columns,
         model_source_rows=model_source_rows,
         x_projection=x_projection,
-        x_weighted_residual_sse=(
-            None if x_count == 0 else fit_error_metrics(x_weighted).weighted_sse
-        ),
-        x_weighted_residual_mse=(
-            None if x_count == 0 else fit_error_metrics(x_weighted).weighted_mse
-        ),
-        x_weighted_rmse=(
-            None if x_count == 0 else fit_error_metrics(x_weighted).weighted_rmse
-        ),
-        x_weighted_mae=(
-            None if x_count == 0 else fit_error_metrics(x_weighted).weighted_mae
-        ),
     )
 
 
@@ -1993,6 +1867,7 @@ def evaluate_dataset_simulation(
         if time.monotonic() >= deadline:
             return deadline_unavailable()
         raise
+
 
 def evaluate_dataset_simulations(
     fit_evaluators: Mapping[str, object],
@@ -2248,11 +2123,13 @@ class GlobalFitObjective:
             """Return one finite objective vector for an unavailable candidate.
 
             Completed scientific residuals retain their original values.  Only
-            artificial penalty blocks may be enlarged, and only after a valid
-            complete candidate has established a finite ordering reference.
+            artificial penalty blocks may be enlarged, and only after a
+            scientifically available complete candidate has established a
+            finite ordering reference.
             The factor is derived from the separately stable block SSEs and is
             nudged by representable floating-point steps until the returned
-            vector scores strictly above the retained valid best.  Blocks stay
+            vector scores strictly above the retained scientifically available
+            best.  Blocks stay
             in canonical dataset order so residual-row identity never changes
             between optimizer calls.
             """
@@ -2382,7 +2259,8 @@ class GlobalFitObjective:
                 upper_factor = factor
 
             # Binary search over representable factors for the smallest scale
-            # that scores strictly above the retained valid candidate.
+            # that scores strictly above the retained scientifically available
+            # candidate.
             for _ in range(128):
                 next_lower = math.nextafter(lower_factor, upper_factor)
                 if next_lower >= upper_factor:
@@ -2439,7 +2317,6 @@ class GlobalFitObjective:
 
         def record_candidate_unavailability(
             unavailability: ScientificUnavailable,
-            provenance: object,
         ) -> None:
             context_error = FitSimulationError(
                 "Fit candidate scientific result was unavailable.",
@@ -2451,7 +2328,7 @@ class GlobalFitObjective:
             )
             if unavailability.factual_cause is not None:
                 context_error.factual_cause = unavailability.factual_cause
-            self._ctx.set_error(context_error, provenance)
+            self._ctx.set_error(context_error)
             key = ("__candidate__", unavailability.producer, unavailability.stage)
             if key not in self._warned_objective_keys:
                 self._warned_objective_keys.add(key)
@@ -2463,12 +2340,11 @@ class GlobalFitObjective:
 
         def reject_candidate(
             unavailability: ScientificUnavailable,
-            provenance: object,
             *,
             optimizer_vector: np.ndarray,
         ) -> np.ndarray:
             penalty = candidate_penalty_residuals()
-            record_candidate_unavailability(unavailability, provenance)
+            record_candidate_unavailability(unavailability)
             settled_penalty = settle_unavailable_residuals((penalty,), {0})
             if settled_penalty is None:
                 raise RuntimeError("Configured Fit candidate penalty overflowed.")
@@ -2492,7 +2368,6 @@ class GlobalFitObjective:
                     stage="optimizer_vector_domain",
                     details={"error_type": type(exc).__name__},
                 ),
-                {"stage": "optimizer_vector_domain"},
                 optimizer_vector=np.asarray(params, dtype=float).reshape(-1),
             )
         dataset_inputs: List[ObjectiveDatasetInput] = []
@@ -2513,7 +2388,6 @@ class GlobalFitObjective:
                         stage="dataset_parameter_decode",
                         details={"dataset": ds_id, "error_type": type(exc).__name__},
                     ),
-                    {"dataset": ds_id},
                     optimizer_vector=params,
                 )
             raw_full_params: Dict[str, float] = {}
@@ -2588,10 +2462,7 @@ class GlobalFitObjective:
                 },
             )
             timeout_error.factual_cause = timeout_unavailability.factual_cause
-            self._ctx.set_error(
-                timeout_error,
-                {"datasets": timed_out_dataset_roster, "stage": "dataset_deadline"},
-            )
+            self._ctx.set_error(timeout_error)
 
         residual_blocks: list[np.ndarray] = []
         artificial_block_indexes: set[int] = set()
@@ -2604,10 +2475,7 @@ class GlobalFitObjective:
                     item.payload.dataset_id not in timed_out_dataset_ids
                     and not nondeadline_unavailability_recorded
                 ):
-                    record_candidate_unavailability(
-                        evaluation,
-                        {"dataset": item.payload.dataset_id},
-                    )
+                    record_candidate_unavailability(evaluation)
                     nondeadline_unavailability_recorded = True
                 artificial_block_indexes.add(len(residual_blocks))
                 residual_blocks.append(
@@ -2633,7 +2501,6 @@ class GlobalFitObjective:
                         stage="objective_residual_arithmetic",
                         details={"scope": "combined"},
                     ),
-                    {"stage": "objective"},
                     optimizer_vector=params,
                 )
             residuals, cost = settled_unavailable
@@ -2649,7 +2516,6 @@ class GlobalFitObjective:
                         stage="objective_residual_arithmetic",
                         details={"scope": "combined"},
                     ),
-                    {"stage": "objective"},
                     optimizer_vector=params,
                 )
             cost = float(finite_cost)
@@ -2740,8 +2606,6 @@ def _assemble_fit_replay_state(
     cancellation_check: Optional[Callable[[], bool]],
     success: bool,
     message: str,
-    scipy_nfev: int,
-    objective_call_count: int | None = None,
     optimizer_diagnostic: FactualCause | None = None,
     cancellation_control: SimulationCancellationControl | None = None,
     executor: Executor,
@@ -2888,7 +2752,7 @@ def _assemble_fit_replay_state(
         and not bool(factual_optimizer_diagnostic.details.get("final_report_warning"))
     ):
         factual_optimizer_diagnostic = None
-    if (not optimizer_converged) or factual_optimizer_diagnostic is not None:
+    if factual_optimizer_diagnostic is not None:
         result_status: Literal["ok", "warn"] = "warn"
     else:
         result_status = "ok"
@@ -2928,9 +2792,6 @@ def _assemble_fit_replay_state(
         optimizer_converged=optimizer_converged,
         optimizer_diagnostic=factual_optimizer_diagnostic,
         optimizer_vector=candidate_vector,
-        scipy_nfev=scipy_nfev,
-        terminal_replay_count=1,
-        objective_call_count=objective_call_count,
         weighted_residuals=np.concatenate(global_weighted_residual_blocks),
         profile_likelihood_result=None,
         residual_bootstrap_result=None,

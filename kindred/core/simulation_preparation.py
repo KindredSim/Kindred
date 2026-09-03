@@ -23,7 +23,6 @@ from kindred.core.exceptions import (
 from kindred.core.species import validate_concentration, validate_time_seconds
 from kindred.core.mechanism_metadata import (
     EquilibriumMetadataKeys,
-    MechanismMetadataKeys,
     MechanismMetadataView,
 )
 from kindred.core.temperature import (
@@ -53,7 +52,6 @@ from kindred.core.simulator.dsl_parse import PreparedDslRequestSet
 from kindred.core.simulation_preparation_stages import (
     PreparedSolverConfig as _PreparedSolverConfig,
     build_prepared_run_context,
-    build_solver_config,
 )
 from kindred.core.time_grid import build_time_grid
 
@@ -152,9 +150,7 @@ __all__ = [
     "PreparedSimulationRun",
     "SimulationPreparationError",
     "build_simulation_request_from_prepared_run",
-    "metadata_view_for_mechanism",
     "build_simulation_execution_request",
-    "solver_config_for_execution_settings",
     "prepare_simulation_worker_run",
     "fit_simulation_error_from_preparation_error",
     "prepare_preparation_failure",
@@ -641,8 +637,6 @@ class SimulationExecutionRequest:
         object.__setattr__(self, "t_span", t_span)
         object.__setattr__(self, "parameter_overrides", overrides)
 
-_MISSING = object()
-
 
 def _fresh_preparation_unresolved_intervention_schedule_for_request(
     execution_request: SimulationExecutionRequest,
@@ -799,46 +793,13 @@ def _schedule_parameters_deferred_to_prepared_request(
     return frozenset(deferred)
 
 
-def solver_config_for_execution_settings(
-    *,
-    execution_settings: Any,
-    scientific_settings: Any,
-) -> _PreparedSolverConfig:
-    """Project accepted tab settings into the sole direct-request policy."""
-
-    from kindred.core.project_document import (
-        SimulationExecutionSettings,
-        TabScientificSettings,
-        validate_simulation_execution_settings,
-        validate_tab_scientific_settings,
-    )
-
-    if not isinstance(execution_settings, SimulationExecutionSettings):
-        raise TypeError(
-            "execution_settings must be a SimulationExecutionSettings value."
-        )
-    if not isinstance(scientific_settings, TabScientificSettings):
-        raise TypeError("scientific_settings must be a TabScientificSettings value.")
-    validate_simulation_execution_settings(execution_settings)
-    validate_tab_scientific_settings(scientific_settings)
-    return build_solver_config(
-        solver_input=execution_settings.solver,
-        rtol=scientific_settings.rtol,
-        atol=scientific_settings.atol,
-        grid={"N": execution_settings.integration_points},
-        use_analytic_jacobian=(
-            scientific_settings.analytic_jacobian_policy
-        ),
-    )
-
-
 def build_simulation_execution_request(
     *,
     prepared_dsl: PreparedDslRequestSet,
     mechanism_source: Any,
     initial_values: Iterable[tuple[str, float]],
-    execution_settings: Any,
-    scientific_settings: Any,
+    t_span: tuple[float, float],
+    solver_config: _PreparedSolverConfig,
     parameter_values: Mapping[str, float] | None = None,
 ) -> SimulationExecutionRequest:
     """Capture, isolate, and compile one direct Run/Preview target."""
@@ -852,10 +813,6 @@ def build_simulation_execution_request(
         raise TypeError("prepared_dsl must be a PreparedDslRequestSet.")
     if not isinstance(mechanism_source, MechanismAuthoringSource):
         raise TypeError("mechanism_source must be a MechanismAuthoringSource.")
-    solver_config = solver_config_for_execution_settings(
-        execution_settings=execution_settings,
-        scientific_settings=scientific_settings,
-    )
     normalized_initials: dict[str, float] = {}
     for raw_name, raw_value in initial_values:
         name = str(raw_name or "").strip()
@@ -893,11 +850,11 @@ def build_simulation_execution_request(
             normalized_parameters[name] = value
     try:
         t_start = validate_time_seconds(
-            execution_settings.t_start,
+            t_span[0],
             field="execution t_start",
         )
         t_end = validate_time_seconds(
-            execution_settings.t_end,
+            t_span[1],
             field="execution t_end",
         )
     except (TypeError, ValueError) as exc:
@@ -913,12 +870,6 @@ def build_simulation_execution_request(
     if not source_matches_analysis(mechanism_source, prepared_dsl.analysis):
         raise ValueError(
             "prepared DSL source does not match the captured mechanism source."
-        )
-    if float(prepared_dsl.analysis.temperature_K) != float(
-        scientific_settings.temperature
-    ):
-        raise ValueError(
-            "prepared DSL nominal temperature does not match tab science."
         )
     species_names = tuple(str(name) for name in prepared_dsl.analysis.species_names)
     if not species_names:
@@ -937,20 +888,6 @@ def build_simulation_execution_request(
         parameter_overrides=normalized_parameters,
     )
     return request
-
-
-def metadata_view_for_mechanism(
-    mechanism: Any,
-    *,
-    temperature_schedule_override: object = _MISSING,
-) -> Any:
-    meta_raw = getattr(mechanism, "metadata", {}) or {}
-    if not isinstance(meta_raw, Mapping):
-        meta_raw = {}
-    if temperature_schedule_override is not _MISSING:
-        meta_raw = dict(meta_raw)
-        meta_raw[MechanismMetadataKeys.TEMPERATURE_SCHEDULE] = temperature_schedule_override
-    return MechanismMetadataView.from_metadata(meta_raw)
 
 
 def prepare_preparation_failure(stage: str, message: object) -> SimulationPreparationError:
@@ -1539,11 +1476,6 @@ def prepare_simulation_worker_run(
     - Generated symbolic Jacobian construction when supported by the solver path
     """
 
-    if not isinstance(execution_request, SimulationExecutionRequest):
-        raise SimulationPreparationError(
-            "execution_request",
-            "Worker preparation requires a direct SimulationExecutionRequest.",
-        )
     _raise_if_cancelled(cancellation_control)
     t_span = (
         float(execution_request.t_span[0]),

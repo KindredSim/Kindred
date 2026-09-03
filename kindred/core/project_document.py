@@ -664,9 +664,15 @@ class ProjectDocument:
 
     def rename_tab(self, tab_id: str, name: str) -> "ProjectDocument":
         tab = self.tab(tab_id)
-        return self.replace_tab(
+        candidate = self.replace_tab(
             replace(tab, name=_require_name(name, "tab name"))
         )
+        _validate_unique(
+            (_require_name(item.name, "tab name") for item in candidate.tabs),
+            "tab names",
+            key=lambda value: str(value).casefold(),
+        )
+        return candidate
 
     def remove_tab(self, tab_id: str) -> "ProjectDocument":
         if len(self.tabs) <= 1:

@@ -24,10 +24,6 @@ class DifferentialEvolutionEvaluationBudget:
             raise ValueError("Differential Evolution max_nfev must be positive.")
 
     @property
-    def nfev(self) -> int:
-        return self._nfev
-
-    @property
     def remaining(self) -> int:
         return self.limit - self._nfev
 

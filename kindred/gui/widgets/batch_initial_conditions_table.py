@@ -694,8 +694,6 @@ class InitialConditionsTableActions(QtCore.QObject):
         self._table = table
         self._species_for_tab = species_for_tab or canonical_species_names
         self._rendering = False
-        self._editor_settlement_expected_token: ProjectContentToken | None = None
-        self._editor_settlement_successor_token: ProjectContentToken | None = None
         model.initialValueEditRequested.connect(self.accept_value_edit)
         model.setNameEditRequested.connect(self.accept_name_edit)
         model.customRunSettingsToggleRequested.connect(
@@ -833,46 +831,10 @@ class InitialConditionsTableActions(QtCore.QObject):
         self.draftStateChanged.emit(self._tab_id, runtime.has_dirty_drafts)
         return expected_token
 
-    def settle_active_editor(
-        self,
-        *,
-        expected_token: ProjectContentToken | None = None,
-    ) -> ProjectContentToken | None:
-        """Submit one active cell edit and carry its exact accepted successor."""
+    def settle_active_editor(self) -> None:
+        """Synchronously submit the active cell editor."""
 
-        if expected_token is None:
-            self._table.settle_active_editor()
-            return None
-        if not isinstance(expected_token, ProjectContentToken):
-            raise TypeError("expected_token must be ProjectContentToken or None.")
-        if self._editor_settlement_expected_token is not None:
-            raise RuntimeError("Initial-condition editor settlement is re-entrant.")
-        self._editor_settlement_expected_token = expected_token
-        self._editor_settlement_successor_token = expected_token
-        try:
-            self._table.settle_active_editor()
-            return self._editor_settlement_successor_token
-        finally:
-            self._editor_settlement_expected_token = None
-            self._editor_settlement_successor_token = None
-
-    def _editor_mutation_token(self) -> ProjectContentToken:
-        expected = self._editor_settlement_expected_token
-        return (
-            expected
-            if expected is not None
-            else self._registry.capture_content_token()
-        )
-
-    def _carry_editor_mutation(
-        self,
-        result: ProjectContentToken | None,
-    ) -> None:
-        if (
-            result is not None
-            and self._editor_settlement_expected_token is not None
-        ):
-            self._editor_settlement_successor_token = result
+        self._table.settle_active_editor()
 
     def selected_run_set_ids(self) -> tuple[str, ...]:
         return tuple(
@@ -931,11 +893,10 @@ class InitialConditionsTableActions(QtCore.QObject):
             result = self._registry.replace_initial_condition_set(
                 self._tab_id,
                 candidate,
-                expected_token=self._editor_mutation_token(),
+                expected_token=self._registry.capture_content_token(),
             )
             if result is None:
                 return False
-            self._carry_editor_mutation(result)
         invalid_cleared = self._clear_invalid_value(set_id, species)
         self.render()
         if invalid_cleared:
@@ -1042,9 +1003,8 @@ class InitialConditionsTableActions(QtCore.QObject):
         result = self._registry.replace_initial_condition_set(
             self._tab_id,
             replace(initial_set, name=normalized),
-            expected_token=self._editor_mutation_token(),
+            expected_token=self._registry.capture_content_token(),
         )
-        self._carry_editor_mutation(result)
         accepted = result is not None
         self.render()
         if accepted and changed:

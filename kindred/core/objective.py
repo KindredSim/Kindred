@@ -11,20 +11,13 @@ class ObjectiveContext:
 
     def __init__(self) -> None:
         self._error: ContextVar[Optional[Any]] = ContextVar("objective_error", default=None)
-        self._prov: ContextVar[Optional[Any]] = ContextVar("objective_error_provenance", default=None)
 
     def clear(self) -> None:
         self._error.set(None)
-        self._prov.set(None)
 
-    def set_error(self, err: Any, provenance: Any = None) -> None:
+    def set_error(self, err: Any) -> None:
         self._error.set(err)
-        self._prov.set(provenance)
 
     @property
     def last_error(self) -> Any:
         return self._error.get()
-
-    @property
-    def last_error_provenance(self) -> Any:
-        return self._prov.get()

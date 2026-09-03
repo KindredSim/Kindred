@@ -219,7 +219,12 @@ def build_simulation_row_algebra_context(
     }
     coefficient_rows: dict[str, list[float]] = {}
     canonical_parameters = tuple(iter_canonical_parameters(mechanism))
-    for temperature in temperatures:
+    evaluation_temperatures = (
+        (nominal_temperature,)
+        if schedule is None
+        else temperatures
+    )
+    for temperature in evaluation_temperatures:
         coefficients = coefficient_evaluator(float(temperature))
         for name, entry, role in canonical_parameters:
             kind = str(entry.get("kind") or "")
@@ -251,6 +256,11 @@ def build_simulation_row_algebra_context(
                     f"chemistry coefficient {canonical_name!r} is outside the admitted namespace."
                 )
             coefficient_rows.setdefault(canonical_name, []).append(float(value))
+    if schedule is None:
+        coefficient_rows = {
+            name: [values[0]] * temperatures.size
+            for name, values in coefficient_rows.items()
+        }
     symbol_series = {"T": temperatures}
     symbol_series.update(
         {

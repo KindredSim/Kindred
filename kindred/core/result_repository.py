@@ -160,7 +160,7 @@ class ResultRepository:
         *,
         cache_capacity: int,
     ) -> None:
-        self._tab_id = _required_id(tab_id, "tab_id")
+        self._tab_id = tab_id
         if type(cache_capacity) is not int:
             raise TypeError("cache_capacity must be an int.")
         self._cache_capacity = cache_capacity
@@ -194,25 +194,25 @@ class ResultRepository:
         self._trim_explicit_cache()
 
     def current_result(self, set_id: str) -> SimulationResultValue | None:
-        entry = self._current_by_set_id.get(str(set_id or ""))
+        entry = self._current_by_set_id.get(set_id)
         return None if entry is None else entry[2]
 
     def reference_result(self, set_id: str) -> SimulationResultValue | None:
-        entry = self._reference_by_set_id.get(str(set_id or ""))
+        entry = self._reference_by_set_id.get(set_id)
         return None if entry is None else entry[2]
 
     def current_request(self, set_id: str) -> SimulationExecutionRequest | None:
-        entry = self._current_by_set_id.get(str(set_id or ""))
+        entry = self._current_by_set_id.get(set_id)
         return None if entry is None else entry[1]
 
     def reference_request(self, set_id: str) -> SimulationExecutionRequest | None:
-        entry = self._reference_by_set_id.get(str(set_id or ""))
+        entry = self._reference_by_set_id.get(set_id)
         return None if entry is None else entry[1]
 
     def retain_explicit_as_reference(self, set_id: str) -> None:
         """Retain the current Run unless its Reference is already retained."""
 
-        sid = _required_id(set_id, "set_id")
+        sid = set_id
         if (
             sid not in self._current_run_set_ids
             or sid in self._reference_by_set_id
@@ -224,7 +224,7 @@ class ResultRepository:
             self._reference_by_set_id[sid] = explicit
 
     def clear_preview(self, set_id: str, *, clear_reference: bool = True) -> None:
-        sid = _required_id(set_id, "set_id")
+        sid = set_id
         if sid not in self._current_run_set_ids:
             self._current_by_set_id.pop(sid, None)
         if clear_reference:
@@ -239,7 +239,7 @@ class ResultRepository:
         membership and LRU order are deliberately untouched.
         """
 
-        sid = _required_id(set_id, "set_id")
+        sid = set_id
         if sid in self._current_run_set_ids:
             return True
         reference = self._reference_by_set_id.pop(sid, None)
@@ -268,11 +268,7 @@ class ResultRepository:
     ) -> SimulationResultValue:
         """Publish a completed Run and admit it to the bounded exact cache."""
 
-        sid = _required_id(set_id, "set_id")
-        if not isinstance(execution_request, SimulationExecutionRequest):
-            raise TypeError("execution_request must be a SimulationExecutionRequest.")
-        if not isinstance(result, SimulationResultValue):
-            raise TypeError("result must be a SimulationResultValue.")
+        sid = set_id
         entry = (sid, execution_request, result)
         self._current_by_set_id[sid] = entry
         self._current_run_set_ids.add(sid)
@@ -299,11 +295,7 @@ class ResultRepository:
     ) -> SimulationResultValue:
         """Publish a Preview current value without cache admission or Reference changes."""
 
-        sid = _required_id(set_id, "set_id")
-        if not isinstance(execution_request, SimulationExecutionRequest):
-            raise TypeError("execution_request must be a SimulationExecutionRequest.")
-        if not isinstance(result, SimulationResultValue):
-            raise TypeError("result must be a SimulationResultValue.")
+        sid = set_id
         self._current_by_set_id[sid] = (
             sid,
             execution_request,
@@ -315,9 +307,7 @@ class ResultRepository:
     def hydrate_cached(self, set_id: str, execution_request: SimulationExecutionRequest) -> SimulationResultValue | None:
         """Hydrate a structurally equal full request; a miss changes nothing."""
         from kindred.core.simulation_preparation import simulation_execution_requests_equal
-        sid = _required_id(set_id, "set_id")
-        if not isinstance(execution_request, SimulationExecutionRequest):
-            raise TypeError("execution_request must be a SimulationExecutionRequest.")
+        sid = set_id
         entry = next(
             (
                 cached
@@ -338,7 +328,7 @@ class ResultRepository:
 
     def clear_semantic_set(self, set_id: str) -> None:
         """Clear visible semantic entries while retaining exact cache storage."""
-        sid = _required_id(set_id, "set_id")
+        sid = set_id
         self._current_by_set_id.pop(sid, None)
         self._current_run_set_ids.discard(sid)
         self._reference_by_set_id.pop(sid, None)
@@ -359,10 +349,7 @@ class ResultRepository:
         remains absent for ordinary invalidation.
         """
 
-        targets = {
-            _required_id(set_id, "set_id")
-            for set_id in set_ids
-        }
+        targets = set(set_ids)
         if not targets:
             return
         for set_id in targets:
@@ -371,15 +358,10 @@ class ResultRepository:
             if not preserve_reference:
                 self._reference_by_set_id.pop(set_id, None)
 
-    def clear_all_semantic_entries(self) -> None:
-        self._current_by_set_id.clear()
-        self._current_run_set_ids.clear()
-        self._reference_by_set_id.clear()
-
     def purge_set(self, set_id: str) -> None:
         """Delete/history removal purges visible entries and cached storage."""
 
-        sid = _required_id(set_id, "set_id")
+        sid = set_id
         self.clear_semantic_set(sid)
         self._explicit_cache[:] = [
             entry for entry in self._explicit_cache if entry[0] != sid
@@ -388,10 +370,6 @@ class ResultRepository:
     def purge_sets(self, set_ids: Iterable[str]) -> None:
         for set_id in tuple(set_ids):
             self.purge_set(set_id)
-
-    def clear(self) -> None:
-        self.clear_all_semantic_entries()
-        self._explicit_cache.clear()
 
     def _trim_explicit_cache(self) -> None:
         del self._explicit_cache[:-self._cache_capacity]

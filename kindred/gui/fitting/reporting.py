@@ -301,11 +301,8 @@ def _bootstrap_data(candidate: FitCandidate) -> dict[str, object]:
         "replicates": result.replicates,
         "confidence_level": result.confidence_level,
         "resampling": result.resampling,
-        "draw_recipe_version": result.draw_recipe_version,
         "draw_algorithm": result.draw_algorithm,
         "residual_centering": result.residual_centering,
-        "replay_authority": result.replay_authority,
-        "preserved_fields": list(result.preserved_fields),
         "replicate_execution": result.replicate_execution,
         "refit_validity": result.refit_validity,
         "minimum_successful_replicates": result.minimum_successful_replicates,
@@ -359,8 +356,6 @@ def _estimate_rows(candidate: FitCandidate) -> tuple[list[dict[str, object]], li
     display_names = {item.dataset_id: item.display_name for item in candidate.origin.mapped_datasets}
     request_parameters = {item.name: item for item in request_setup.parameters}
     settlements = {item.parameter_name: item for item in result.centred_fixed_effects_settlements}
-    converged = bool(result.optimizer_converged)
-    suffix = "" if converged else "; optimizer did not converge; estimates are diagnostic only"
     shared: list[dict[str, object]] = []
     individual: list[dict[str, object]] = []
 
@@ -413,8 +408,7 @@ def _estimate_rows(candidate: FitCandidate) -> tuple[list[dict[str, object]], li
                     log_scale=configuration.log10,
                 ),
                 absolute_change=absolute, percentage_change=percentage,
-                percentage_unavailable_reason=unavailable, valid=converged,
-                validity_diagnostic="decoded centred overall value is finite and within configured bounds" + suffix,
+                percentage_unavailable_reason=unavailable,
                 dataset_ids=list(settlement.dataset_ids),
                 captured_value_source=captured_source, nominal_value_source="Fit setup")
             deviation_bounds = math.log10(configuration.maximum) - math.log10(configuration.minimum) if configuration.log10 else configuration.maximum - configuration.minimum
@@ -433,8 +427,7 @@ def _estimate_rows(candidate: FitCandidate) -> tuple[list[dict[str, object]], li
                         deviation_bounds,
                     ),
                     absolute_change=absolute, percentage_change=percentage,
-                    percentage_unavailable_reason=unavailable, valid=converged,
-                    validity_diagnostic="centred optimizer-scale deviation; derived reference included and no deviation is publishable" + suffix,
+                    percentage_unavailable_reason=unavailable,
                     dataset_id=dataset_id, dataset_ids=[dataset_id], dataset_display_name=display_names.get(dataset_id),
                     captured_value_source="centred terminal settlement", nominal_value_source="centred zero-deviation seed")
             continue
@@ -463,8 +456,7 @@ def _estimate_rows(candidate: FitCandidate) -> tuple[list[dict[str, object]], li
                     log_scale=configuration.log10,
                 ),
                 absolute_change=absolute, percentage_change=percentage,
-                percentage_unavailable_reason=unavailable, valid=converged or not configuration.fit,
-                validity_diagnostic="finite and within configured bounds" + (suffix if configuration.fit else ""),
+                percentage_unavailable_reason=unavailable,
                 captured_value_source=captured_source,
                 nominal_value_source="Fit setup")
             continue
@@ -500,8 +492,7 @@ def _estimate_rows(candidate: FitCandidate) -> tuple[list[dict[str, object]], li
                     log_scale=configuration.log10,
                 ),
                 absolute_change=absolute, percentage_change=percentage,
-                percentage_unavailable_reason=unavailable, valid=converged or not configuration.fit,
-                validity_diagnostic="finite and within configured bounds" + (suffix if configuration.fit else ""),
+                percentage_unavailable_reason=unavailable,
                 dataset_id=dataset_id, dataset_ids=[dataset_id], dataset_display_name=display_names.get(dataset_id),
                 captured_value_source=captured_source,
                 nominal_value_source="Fit setup")
@@ -511,7 +502,6 @@ def _estimate_rows(candidate: FitCandidate) -> tuple[list[dict[str, object]], li
 def _initial_rows(candidate: FitCandidate) -> list[dict[str, object]]:
     request = candidate.request
     request_setup = request.setup
-    result = candidate.result
     origin = candidate.origin
     terminal_setup = candidate.setup_snapshot
     included_ids = {item.dataset_id for item in terminal_setup.datasets if item.included}
@@ -529,8 +519,6 @@ def _initial_rows(candidate: FitCandidate) -> list[dict[str, object]]:
         for dataset_id in group.member_dataset_ids
     }
     rows: list[dict[str, object]] = []
-    converged = bool(result.optimizer_converged)
-    suffix = "" if converged else "; optimizer did not converge; estimates are diagnostic only"
     for item in terminal_setup.initials:
         if not item.fit:
             continue
@@ -554,8 +542,7 @@ def _initial_rows(candidate: FitCandidate) -> list[dict[str, object]]:
                     launch_item.maximum,
                     log_scale=bool(launch_item.log10),
                 ), "absolute_change": absolute,
-                "percentage_change": percentage, "percentage_unavailable_reason": unavailable, "valid": converged,
-                "validity_diagnostic": "finite, nonnegative, and within configured bounds" + suffix,
+                "percentage_change": percentage, "percentage_unavailable_reason": unavailable,
                 "set_id": item.set_id, "dataset_ids": [mapped.dataset_id], "dataset_display_name": mapped.display_name,
                 "set_display_name": mapped.set_name,
                 "captured_value_source": "captured mapped dataset initial value", "nominal_value_source": "Fit setup"})
@@ -595,8 +582,7 @@ def _initial_rows(candidate: FitCandidate) -> list[dict[str, object]]:
                     launch_item.maximum,
                     log_scale=bool(launch_item.log10),
                 ), "absolute_change": absolute,
-                "percentage_change": percentage, "percentage_unavailable_reason": unavailable, "valid": converged,
-                "validity_diagnostic": "finite, nonnegative, and within configured bounds" + suffix,
+                "percentage_change": percentage, "percentage_unavailable_reason": unavailable,
                 "set_id": mapped.set_id, "dataset_ids": [mapped.dataset_id], "dataset_display_name": mapped.display_name,
                 "set_display_name": mapped.set_name,
                 "captured_value_source": "captured mapped dataset initial value", "nominal_value_source": "Fit setup"})
@@ -705,7 +691,6 @@ def _render_report(data: Mapping[str, object]) -> str:
     lines = [f"Fit status: {data.get('status')}", f"Message: {data.get('message') or 'none'}",
         f"Primary Fit model: {data.get('primary_model') or 'ordinary'}",
         f"Optimizer converged: {str(data.get('optimizer_converged')).lower()}",
-        f"Diagnostic only: {str(data.get('diagnostic_only')).lower()}",
         f"Weighted SSE: {_metric_text(data.get('weighted_sse'))}", f"Weighted MSE: {_metric_text(data.get('weighted_mse'))}"]
     if data.get("optimizer_diagnostic"):
         lines.append(f"Optimizer diagnostic: {_display(data['optimizer_diagnostic'])}")
@@ -795,7 +780,6 @@ def fit_candidate_report_text(candidate: FitCandidate) -> str:
         "status": result.status,
         "message": str(result.message),
         "optimizer_converged": bool(result.optimizer_converged),
-        "diagnostic_only": bool(result.diagnostic_only),
         "optimizer_diagnostic": _plain(result.optimizer_diagnostic),
         "primary_model": str(result.primary_model),
         "weighted_sse": _metric(result.weighted_residual_sse),

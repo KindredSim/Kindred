@@ -27,7 +27,6 @@ from kindred.core.result_repository import (
     ResultRepository,
     SimulationResultValue,
 )
-from kindred.core.simulation_failure import FactualCause
 from kindred.core.simulator.solver_types import SimulationPresentationBoundary
 from kindred.gui.dataset_payload_snapshot import ExperimentalLayerInput
 from kindred.gui.plot_config import AxisSelectionCandidate
@@ -289,17 +288,13 @@ def _series_tuple(
     return tuple((name, values) for name, values in result.series.items())
 
 
-def _result_warning_details(result: SimulationResultValue | None) -> tuple[str, ...]:
-    if not isinstance(result, SimulationResultValue):
-        raise TypeError("warning details require a canonical simulation result.")
+def _result_warning_details(result: SimulationResultValue) -> tuple[str, ...]:
     details = [f"Preparation: {warning}" for warning in result.preparation_warnings]
     if result.failed_algebra_outputs:
         details.append(
             "Algebra failed: " + ", ".join(result.failed_algebra_outputs)
         )
     for cause in result.algebra_errors:
-        if not isinstance(cause, FactualCause):
-            raise TypeError("algebra errors must contain FactualCause values.")
         raw_name = cause.details.get("name")
         observable_name = str(raw_name or "<unknown observable>")
         code = cause.code if cause.code is not None else "<none>"
@@ -318,8 +313,6 @@ def _result_warning_details(result: SimulationResultValue | None) -> tuple[str, 
 def _result_provenance_payload(result: SimulationResultValue) -> Mapping[str, object]:
     """Serialize readable provenance directly from the canonical result."""
 
-    if not isinstance(result, SimulationResultValue):
-        raise TypeError("result metadata requires a canonical simulation result.")
     return MappingProxyType(
         {
             "provenance": MappingProxyType(
@@ -622,8 +615,6 @@ def _result_block(
     color_by_axis_selection: Mapping[AxisSeriesSelection, str],
     visible: bool = True,
 ) -> ResultDataBlock:
-    if not isinstance(result, SimulationResultValue):
-        raise TypeError("result block requires a canonical simulation result.")
     display_label = (
         f"{label} [Preview]"
         if kind is ResultLayerKind.PREVIEW
@@ -659,8 +650,6 @@ def compose_canonical_export_blocks(
     if not isinstance(document, ProjectDocument):
         raise TypeError("Canonical export requires a ProjectDocument.")
     tab = document.tab(_required_id(tab_id, "tab_id"))
-    if not isinstance(repository, ResultRepository):
-        raise TypeError("Canonical export requires a ResultRepository.")
     if repository.tab_id != tab.tab_id:
         raise ValueError("Canonical export repository belongs to another tab.")
 
@@ -816,8 +805,6 @@ def _statistics_series_names(
     *,
     y_axes: set[AxisSeriesSelection] | None,
 ) -> tuple[str, ...]:
-    if not isinstance(block.result, SimulationResultValue):
-        raise TypeError("statistics require a canonical simulation result.")
     series_axes = dict(block.series_axes)
     succeeded = set(block.result.succeeded_algebra_outputs)
     return tuple(
@@ -1236,8 +1223,6 @@ def compose_result_input(
     preview_set_ids: Sequence[str] = (),
 ) -> ResultRenderInput:
     tab_id = _required_id(tab_id, "tab_id")
-    if not isinstance(repository, ResultRepository):
-        raise TypeError("repository must be a ResultRepository.")
     if repository.tab_id != tab_id:
         raise ValueError("repository does not belong to requested tab.")
     mechanism_species_set = {

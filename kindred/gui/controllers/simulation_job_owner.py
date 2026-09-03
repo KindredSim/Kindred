@@ -29,6 +29,7 @@ from kindred.core.simulation_preparation import (
     prepare_simulation_worker_run,
     simulation_execution_requests_equal,
 )
+from kindred.core.simulation_preparation_stages import build_solver_config
 from kindred.core.simulation_result_finalization import finalize_simulation_result
 from kindred.core.simulator.dsl_parse import PreparedDslRequestSet
 from kindred.core.simulator.solvers import solve_ode
@@ -107,7 +108,7 @@ class PreviewTarget:
     tab_id: str
     set_id: str
     set_name: str
-    execution_request: SimulationExecutionRequest | None
+    execution_request: SimulationExecutionRequest
     canonical_run_target: ExplicitRunTarget
 
     def __post_init__(self) -> None:
@@ -118,7 +119,7 @@ class PreviewTarget:
 
 @dataclass(frozen=True, slots=True)
 class PreviewCapture:
-    """One exact Preview action, before or after B request admission."""
+    """One exact Preview action."""
 
     tab_id: str
     targets: tuple[PreviewTarget, ...]
@@ -173,10 +174,18 @@ def _simulation_worker_cause(exc: BaseException) -> FactualCause:
 def build_explicit_target(*, prepared_dsl: PreparedDslRequestSet, tab_id: str, set_id: str, set_name: str,
                           mechanism_source: MechanismAuthoringSource, initial_values: Iterable[tuple[str, float]],
                           execution_settings: SimulationExecutionSettings, scientific_settings: TabScientificSettings) -> ExplicitRunTarget:
+    solver_config = build_solver_config(
+        solver_input=execution_settings.solver,
+        rtol=scientific_settings.rtol,
+        atol=scientific_settings.atol,
+        grid={"N": execution_settings.integration_points},
+        use_analytic_jacobian=scientific_settings.analytic_jacobian_policy,
+    )
     execution_request = build_simulation_execution_request(
         prepared_dsl=prepared_dsl, mechanism_source=mechanism_source,
         initial_values=initial_values,
-        execution_settings=execution_settings, scientific_settings=scientific_settings,
+        t_span=(execution_settings.t_start, execution_settings.t_end),
+        solver_config=solver_config,
     )
     return ExplicitRunTarget(tab_id, set_id, set_name, execution_request)
 

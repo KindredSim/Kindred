@@ -54,21 +54,12 @@ class FitResult:
     success: bool
     parameters: Dict[object, float]
     message: str
-    scipy_nfev: int | None = None
-    objective_call_count: int | None = None
     identifiability_warning: Optional[str] = None
 
     def __post_init__(self) -> None:
         self.parameters = {
             name: float(value) for name, value in self.parameters.items()
         }
-        if self.scipy_nfev is None:
-            raise ValueError("FitResult requires the exact SciPy nfev count.")
-        self.scipy_nfev = int(self.scipy_nfev)
-        if self.objective_call_count is not None:
-            self.objective_call_count = int(self.objective_call_count)
-            if self.objective_call_count < 0:
-                raise ValueError("FitResult objective-call count cannot be negative.")
         self.success = bool(self.success)
 
 
@@ -148,8 +139,6 @@ def fit_parameters_with_fixed(
             success=True,
             parameters={name: fixed[name] for name in names},
             message="All optimizer coordinates were fixed.",
-            scipy_nfev=0,
-            objective_call_count=getattr(objective_func, "objective_calls", None),
         )
 
     def reduced_objective(vector: np.ndarray) -> np.ndarray:
@@ -179,8 +168,6 @@ def fit_parameters_with_fixed(
             for name in names
         },
         message=reduced.message,
-        scipy_nfev=reduced.scipy_nfev,
-        objective_call_count=reduced.objective_call_count,
         identifiability_warning=reduced.identifiability_warning,
     )
 
@@ -239,13 +226,10 @@ def fit_parameters(
 
     de_evaluation_budget: DifferentialEvolutionEvaluationBudget | None = None
     identifiability_warning: Optional[str] = None
-    optimizer_evaluation_count = 0
 
     def wrapped_objective(params):
-        nonlocal optimizer_evaluation_count
         if cancellation_check is not None and cancellation_check():
             raise FittingCancelled()
-        optimizer_evaluation_count += 1
         return objective_func(params)
 
     try:
@@ -267,6 +251,8 @@ def fit_parameters(
 
             effective_penalty = float(de_penalty) if de_penalty is not None else 1e12
             de_evaluation_budget = DifferentialEvolutionEvaluationBudget(max_nfev)
+            best_de_score: float | None = None
+            best_de_params: np.ndarray | None = None
 
             def evaluate_de_residuals(
                 params: np.ndarray,
@@ -280,6 +266,7 @@ def fit_parameters(
                 return residuals
 
             def de_objective(params):
+                nonlocal best_de_score, best_de_params
                 try:
                     residuals = evaluate_de_residuals(params, reserve=1)
                 except FittingCancelled:
@@ -292,11 +279,15 @@ def fit_parameters(
                             "Fit objective returned empty or non-finite residuals."
                         )
                     finite_score = finite_sum_of_squares(residuals)
-                    return (
+                    score = (
                         float(effective_penalty)
                         if finite_score is None
                         else float(finite_score)
                     )
+                    if best_de_score is None or score < best_de_score:
+                        best_de_score = score
+                        best_de_params = np.asarray(params, dtype=float).copy()
+                    return score
 
             dim = max(1, len(x0))
             result = None
@@ -326,7 +317,9 @@ def fit_parameters(
                 message = str(result.message)
             else:
                 x_opt = (
-                    np.asarray(x0, dtype=float).copy()
+                    np.asarray(best_de_params, dtype=float).copy()
+                    if best_de_params is not None
+                    else np.asarray(x0, dtype=float).copy()
                 )
                 success = False
                 message = (
@@ -334,7 +327,6 @@ def fit_parameters(
                     f"budget ({de_evaluation_budget.limit})."
                 )
 
-            scipy_nfev = int(de_evaluation_budget.nfev)
         else:
             least_squares, _de = scipy_loader()
 
@@ -355,7 +347,6 @@ def fit_parameters(
             x_opt = result.x
             success = bool(result.success)
             message = str(result.message)
-            scipy_nfev = int(result.nfev)
             try:
                 J = result.jac
                 param_count = len(x_opt)
@@ -368,19 +359,7 @@ def fit_parameters(
                     message = f"{message}; {identifiability_warning}"
             except Exception as exc:
                 logger.debug("Failed to assess Fit Jacobian rank: %s", exc)
-    except FittingCancelled as exc:
-        setattr(
-            exc,
-            "scipy_nfev",
-            int(
-                de_evaluation_budget.nfev
-                if de_evaluation_budget is not None
-                else optimizer_evaluation_count
-            ),
-        )
-        objective_calls = getattr(objective_func, "objective_calls", None)
-        if objective_calls is not None:
-            setattr(exc, "objective_call_count", int(objective_calls))
+    except FittingCancelled:
         raise
     except (FitSimulationError, KineticRuntimeDomainError):
         raise
@@ -394,14 +373,9 @@ def fit_parameters(
 
     terminal_success = bool(success)
 
-    objective_call_count = getattr(objective_func, "objective_calls", None)
-    if objective_call_count is not None:
-        objective_call_count = int(objective_call_count)
     return FitResult(
         success=terminal_success,
         parameters=fitted_params,
         message=message,
-        scipy_nfev=scipy_nfev,
-        objective_call_count=objective_call_count,
         identifiability_warning=identifiability_warning,
     )

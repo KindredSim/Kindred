@@ -707,6 +707,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.set_status_text(
                     f"Experimental point size was not persisted: {exc}"
                 )
+                self._refresh_application_plot_preferences()
 
     def _set_experimental_point_opacity(self, request: object) -> None:
         if self._mutation_input_admitted("Change Experimental Point Opacity"):
@@ -720,6 +721,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.set_status_text(
                     f"Experimental point opacity was not persisted: {exc}"
                 )
+                self._refresh_application_plot_preferences()
 
     def _selected_bundle(self) -> _TabSurfaceBundle:
         return self._tab_surfaces[self._workspace_tab_registry.active_tab_id]
@@ -3802,10 +3804,9 @@ class MainWindow(QtWidgets.QMainWindow):
         dataset_id: str,
         include: bool,
     ) -> None:
-        if not self._mutation_input_admitted("Change Fit Dataset Inclusion"):
-            return
-        changed = False
         try:
+            if not self._mutation_input_admitted("Change Fit Dataset Inclusion"):
+                return
             if not self._accept_visible_source(
                 tab_id,
                 description="Change Fit Dataset Inclusion"
@@ -3820,16 +3821,14 @@ class MainWindow(QtWidgets.QMainWindow):
                 model_targets=canonical_observation_target_names(tab),
             )
             expected_token = self._project_session.capture_content_token()
-            result = self._workspace_tab_registry.replace_tab(
+            self._workspace_tab_registry.replace_tab(
                 tab_id,
                 candidate,
                 expected_token=expected_token,
             )
-            if result is not None:
-                changed = result != expected_token
         except Exception as exc:
             QtWidgets.QMessageBox.warning(self, "Fit Dataset", str(exc))
-        if changed:
+        finally:
             self._refresh_dataset_views((tab_id,))
 
     def _set_overlay_selection(

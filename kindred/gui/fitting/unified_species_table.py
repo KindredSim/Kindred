@@ -601,6 +601,61 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
             None,
         )
 
+    def _pending_initial_config(
+        self,
+        set_id: str,
+        species: str,
+    ) -> FitInitialVariable | None:
+        """Return one valid typed pending local-IC draft, if present."""
+
+        pending = self._pending_initial_values.get((set_id, species))
+        if not isinstance(pending, dict):
+            return None
+        tolerance = pending.get("tolerance")
+        if not isinstance(tolerance, FitInitialTolerance):
+            return None
+        try:
+            return FitInitialVariable(
+                set_id=set_id,
+                species=species,
+                initial=pending["initial"],
+                tolerance=tolerance,
+                log10=pending["log10"],
+            )
+        except (KeyError, TypeError, ValueError, OverflowError):
+            return None
+
+    def _refresh_vary_global_availability(self, row: int) -> None:
+        """Refresh one Vary Global cell without rebuilding the table."""
+
+        global_item = self._table.item(row, _Col.VARY_GLOBAL)
+        initial_item = self._table.item(row, _Col.INITIAL)
+        if global_item is None or initial_item is None:
+            return
+        dataset_id = str(initial_item.data(_DATASET_ROLE) or "").strip()
+        set_id = str(initial_item.data(_SET_ROLE) or "").strip()
+        species = str(initial_item.data(_SPECIES_ROLE) or "").strip()
+        if not dataset_id or not set_id or not species:
+            return
+        group = self._shared_initial_group(dataset_id, species)
+        if group is not None:
+            checked = True
+            enabled = True
+        else:
+            local = self._local_initial(
+                self._projected_dataset(dataset_id),
+                species,
+            )
+            if (set_id, species) in self._pending_initial_rows:
+                pending = self._pending_initial_config(set_id, species)
+                enabled = pending is not None and pending.fit
+            else:
+                enabled = local is not None and local.fit
+            checked = False
+        blocker = QtCore.QSignalBlocker(self._table)
+        self._set_checkable(global_item, checked, enabled)
+        del blocker
+
     def _compatible_group_members(
         self,
         species: str,
@@ -724,6 +779,12 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
             return
         group = self._shared_initial_group(dataset_id, species)
         if group is not None:
+            if (
+                dataset_id == group.origin_dataset_id
+                and item.checkState() != Qt.CheckState.Checked
+            ):
+                self._dissolve_shared_initial_group(group)
+                return
             members = self._group_edit_dialog(group)
             if members is None:
                 self._refresh_visible_presentation()
@@ -741,25 +802,21 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
         current_dataset = self._current_dataset()
         local = self._local_initial(current_dataset, species) if current_dataset else None
         mapped = self._mapped_dataset(dataset_id)
-        pending = (
-            None
-            if mapped is None
-            else self._pending_initial_values.get((mapped.set_id, species))
-        )
-        if local is None or (
-            local.tolerance.mode == "disabled"
-            and (pending is None or pending.get("tolerance") is None
-                 or not pending["tolerance"].enabled)
-        ):
+        if mapped is None or local is None:
             self._refresh_visible_presentation()
             return
-        if pending is not None:
-            local = replace(
-                local,
-                initial=float(pending["initial"]),
-                tolerance=pending["tolerance"],
-                log10=bool(pending["log10"]),
-            )
+        key = (mapped.set_id, species)
+        if key in self._pending_initial_rows:
+            pending = self._pending_initial_config(mapped.set_id, species)
+            if pending is None or not pending.fit:
+                self._refresh_visible_presentation()
+                return
+            group_local = pending
+        else:
+            if not local.fit:
+                self._refresh_visible_presentation()
+                return
+            group_local = local
         members = self._compatible_group_members(species, dataset_id)
         if not members:
             self.set_status("Vary Global needs an additional compatible dataset.")
@@ -769,15 +826,15 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
             species=species,
             origin_dataset_id=dataset_id,
             member_dataset_ids=(dataset_id, members[0]),
-            initial=local.initial,
-            tolerance=local.tolerance,
-            log10=local.log10,
+            initial=group_local.initial,
+            tolerance=group_local.tolerance,
+            log10=group_local.log10,
         )
         selected = self._group_edit_dialog(group)
         if selected:
             if mapped is not None:
-                self._pending_initial_rows.pop((mapped.set_id, species), None)
-                self._pending_initial_values.pop((mapped.set_id, species), None)
+                self._pending_initial_rows.pop(key, None)
+                self._pending_initial_values.pop(key, None)
             self._stage_shared_initial_group(replace(group, member_dataset_ids=selected))
         else:
             self._refresh_visible_presentation()
@@ -1003,11 +1060,7 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
             self._table.setCellWidget(row, _Col.TOLERANCE_MODE, mode)
 
             global_item = QtWidgets.QTableWidgetItem()
-            self._set_checkable(
-                global_item,
-                group_config is not None,
-                local is not None and raw_initial.get("mode") != "disabled",
-            )
+            self._set_checkable(global_item, False, False)
             global_item.setData(_DATASET_ROLE, dataset.dataset_id)
             global_item.setData(_SET_ROLE, mapped.set_id)
             global_item.setData(_SPECIES_ROLE, species)
@@ -1017,7 +1070,9 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
             self._set_checkable(
                 check_item,
                 bool(raw_initial.get("log10", False)),
-                local is not None and raw_initial.get("mode") != "disabled",
+                local is not None
+                and raw_initial.get("mode") != "disabled"
+                and (group_config is None or group_origin),
             )
             check_item.setData(_DATASET_ROLE, dataset.dataset_id)
             check_item.setData(_SET_ROLE, mapped.set_id)
@@ -1025,6 +1080,7 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
             if local is not None:
                 check_item.setData(_EXACT_VALUE_ROLE, local.log10)
             self._table.setItem(row, _Col.LOG10, check_item)
+            self._refresh_vary_global_availability(row)
 
     @staticmethod
     def _set_vary_ic_combo_tooltip(combo: QtWidgets.QComboBox) -> None:
@@ -1336,6 +1392,7 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
                     }[field],
                     message,
                 )
+            self._refresh_vary_global_availability(row)
             self._refresh_footer_dirty()
             self._refresh_footer_validity()
             return
@@ -1381,6 +1438,7 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
             self._clear_initial_row_errors(set_id, species, row)
             if group_origin and group is not None:
                 if initial.tolerance.mode == "disabled":
+                    self._refresh_vary_global_availability(row)
                     self._dissolve_shared_initial_group(group)
                     return
                 self._stage_shared_initial_group(
@@ -1400,6 +1458,7 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
                 if accepted is not None and initial == accepted:
                     self._pending_initial_rows.pop(key, None)
                     self._pending_initial_values.pop(key, None)
+        self._refresh_vary_global_availability(row)
         self._refresh_footer_dirty()
         self._refresh_footer_validity()
 

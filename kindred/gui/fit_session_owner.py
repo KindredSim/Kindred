@@ -8,11 +8,9 @@ from dataclasses import replace
 
 from PySide6 import QtCore, QtWidgets
 
-from kindred.core.dataset_mapping import with_confirmed_observation_mapping
 from kindred.core.project_document import (
     FitDefaults,
     MechanismSourceCollision,
-    canonical_observation_target_names,
     reconcile_tab_mechanism_source,
 )
 from kindred.core.mechanism_source import MechanismAuthoringSource
@@ -615,9 +613,7 @@ class FitSessionOwner(QtCore.QObject):
         if window is not None:
             window.enter_stopping()
         if not was_closing:
-            # Close is explicit so a stopped-best terminal can never win
-            # application teardown.
-            worker.request_cancel(close=True)
+            worker.request_cancel()
 
     def _request_window_close(self) -> bool:
         if self._closing:
@@ -626,7 +622,7 @@ class FitSessionOwner(QtCore.QObject):
         if self._worker is not None:
             if self._window is not None:
                 self._window.enter_stopping()
-            self._worker.request_cancel(close=True)
+            self._worker.request_cancel()
             return False
         self._discard_local()
         return True
@@ -883,13 +879,10 @@ class FitSessionOwner(QtCore.QObject):
 
     @staticmethod
     def _candidate_result_is_apply_eligible(candidate: FitCandidate) -> bool:
-        result = candidate.result
-        return bool(
-            result.optimizer_converged
-            and not result.diagnostic_only
-            and result.optimizer_diagnostic is None
-            and result.status == "ok"
-        )
+        # A typed terminal candidate is scientifically available regardless
+        # of whether its optimizer reports convergence.  The concrete
+        # Shared/centred Apply checks below remain authoritative.
+        return True
 
     @classmethod
     def _candidate_publishable_parameter_values(
@@ -980,7 +973,7 @@ class FitSessionOwner(QtCore.QObject):
         ):
             return False
         if not self._candidate_result_is_apply_eligible(candidate):
-            self._set_status("Fit Apply rejected: the terminal result is not converged.")
+            self._set_status("Fit Apply rejected: no scientifically available terminal result.")
             return False
         if not self._origin_science_is_current(candidate.origin):
             self._set_status("Fit Apply rejected: origin science is no longer current.")
@@ -1023,23 +1016,6 @@ class FitSessionOwner(QtCore.QObject):
                 reconciliation = reconciliation.replacement
             proposed_document = reconciliation.proposed_document
             proposed_tab = proposed_document.tab(origin.tab_id)
-            for local in candidate.setup_snapshot.datasets:
-                current_link = proposed_tab.dataset_link(local.dataset_id)
-                current_mapping = (
-                    ()
-                    if current_link is None
-                    else current_link.observation_mapping
-                )
-                if current_mapping == local.observation_targets:
-                    continue
-                proposed_tab = with_confirmed_observation_mapping(
-                    document=proposed_document,
-                    tab=proposed_tab,
-                    dataset=proposed_document.dataset(local.dataset_id),
-                    model_targets=canonical_observation_target_names(proposed_tab),
-                    confirmed_mapping=local.observation_targets,
-                )
-                proposed_document = proposed_document.replace_tab(proposed_tab)
             if initial_values:
                 found_keys: set[tuple[str, str]] = set()
                 proposed_sets = []

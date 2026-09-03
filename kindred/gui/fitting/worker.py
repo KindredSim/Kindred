@@ -365,7 +365,7 @@ class FitLiveUpdate:
 
 @dataclass(frozen=True, slots=True)
 class FitCandidate:
-    """Scientifically valid terminal result, still local to the Fit window."""
+    """Scientifically available terminal result, still local to the Fit window."""
 
     request: FitExecutionRequest
     result: GlobalFitResult
@@ -1417,8 +1417,6 @@ def _execute_global_fit_model(
     extension_progress_callback: Callable[[FitExtensionProgress], None],
     cancellation_check: Callable[[], bool],
     cancellation_control: SimulationCancellationControl,
-    stop_best_requested: Callable[[], bool],
-    stopped_replay_control: SimulationCancellationControl,
     executor: ThreadPoolExecutor,
 ) -> GlobalFitResult | ScientificUnavailable:
     """Dispatch one exact ordinary or advanced Fit execution."""
@@ -1440,8 +1438,6 @@ def _execute_global_fit_model(
         "extension_progress_callback": extension_progress_callback,
         "cancellation_check": cancellation_check,
         "cancellation_control": cancellation_control,
-        "stop_best_requested": stop_best_requested,
-        "stopped_replay_control": stopped_replay_control,
         "profile_likelihood": request.setup.profile_likelihood,
         "residual_bootstrap": request.setup.residual_bootstrap,
     }
@@ -1487,7 +1483,6 @@ class GlobalFitWorker(QtCore.QThread):
             raise TypeError("request must be FitExecutionRequest.")
         self._request = request
         self._cancelled = Event()
-        self._close_requested = Event()
         self._cancellation_control = SimulationCancellationControl(
             self._cancelled.is_set
         )
@@ -1497,7 +1492,6 @@ class GlobalFitWorker(QtCore.QThread):
         self._last_curve_emit = 0.0
         self._resolved_auto_modes: tuple[tuple[str, str], ...] = ()
         self._terminal_unavailable: ScientificUnavailable | None = None
-        self._publish_best_on_cancel = False
         self._executor: ThreadPoolExecutor | None = None
 
     def pause(self) -> None:
@@ -1509,17 +1503,9 @@ class GlobalFitWorker(QtCore.QThread):
             self._paused = False
             self._pause_condition.notify_all()
 
-    def request_cancel(
-        self,
-        *,
-        publish_best: bool = False,
-        close: bool = False,
-    ) -> None:
+    def request_cancel(self) -> None:
         """Request cancellation without waiting for worker settlement."""
 
-        self._publish_best_on_cancel = bool(publish_best)
-        if close:
-            self._close_requested.set()
         self._cancelled.set()
         with self._pause_condition:
             self._paused = False
@@ -1548,13 +1534,7 @@ class GlobalFitWorker(QtCore.QThread):
                 origin="fit_worker",
             )
         else:
-            if (
-                self._checkpoint()
-                and (
-                    self._close_requested.is_set()
-                    or not self._publish_best_on_cancel
-                )
-            ):
+            if self._checkpoint():
                 cancelled = True
             else:
                 unavailable = self._terminal_unavailable
@@ -1883,21 +1863,6 @@ class GlobalFitWorker(QtCore.QThread):
         def execution_cancellation_poll() -> bool:
             return self._cancelled.is_set()
 
-        def stop_best_requested() -> bool:
-            return (
-                self._publish_best_on_cancel
-                and self._cancelled.is_set()
-                and not self._close_requested.is_set()
-            )
-
-        stopped_replay_control = SimulationCancellationControl(
-            lambda: self._close_requested.is_set()
-            or (
-                self._cancelled.is_set()
-                and not self._publish_best_on_cancel
-            )
-        )
-
         def extension_progress(update: FitExtensionProgress) -> None:
             nonlocal extension_progress_value
             if self._checkpoint():
@@ -1964,8 +1929,6 @@ class GlobalFitWorker(QtCore.QThread):
             extension_progress_callback=extension_progress,
             cancellation_check=execution_cancellation_check,
             cancellation_control=execution_cancellation_control,
-            stop_best_requested=stop_best_requested,
-            stopped_replay_control=stopped_replay_control,
             executor=self._executor,
         )
         if isinstance(result_or_unavailable, ScientificUnavailable):
@@ -1983,11 +1946,10 @@ class GlobalFitWorker(QtCore.QThread):
             resolved_modes=resolved_modes,
             evaluators=evaluators,
         )
-        if self._checkpoint() and not stop_best_requested():
+        if self._checkpoint():
             raise FittingCancelled()
-        if not result.diagnostic_only:
-            self.progress.emit(100, "Fit complete")
-        if self._checkpoint() and not stop_best_requested():
+        self.progress.emit(100, "Fit complete")
+        if self._checkpoint():
             raise FittingCancelled()
         return candidate
 

@@ -8,7 +8,7 @@ import time
 from dataclasses import dataclass, replace
 from collections.abc import Mapping, Sequence
 from types import MappingProxyType
-from typing import Any
+from typing import Any, Iterator
 
 import numpy as np
 from PySide6 import QtCore, QtGui, QtWidgets
@@ -1223,8 +1223,29 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
                 style = "marker" if curve.markers else "line"
                 color = QtGui.QColor(curve.color)
                 opacity = layer.opacity * curve.opacity
+                visual_break_indices = tuple(
+                    chunk_index
+                    for chunk_index, (start, _end) in enumerate(
+                        self._interactive_curve_chunks(curve)[1:], 1
+                    )
+                    if any(
+                        float(curve.x[start]) == float(connector[1])
+                        for connector in curve.intervention_connectors
+                    )
+                    or (
+                        render_input is not None
+                        and not self._has_time_x(render_input)
+                        and (
+                            curve.x[start] != curve.x[start - 1]
+                            or curve.y[start] != curve.y[start - 1]
+                        )
+                    )
+                )
                 for chunk_index, (start, end) in enumerate(
-                    self._interactive_curve_chunks(curve)
+                    self._interactive_curve_chunks(
+                        curve,
+                        visual_break_indices=visual_break_indices,
+                    )
                 ):
                     displayed_x = self._scaled_display_values(
                         curve.x[start:end],
@@ -1377,6 +1398,8 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
     @staticmethod
     def _interactive_curve_chunks(
         curve: object,
+        *,
+        visual_break_indices: Sequence[int] | None = None,
     ) -> tuple[tuple[int, int], ...]:
         """Split a transient curve at every executor-issued topology change."""
 
@@ -1389,17 +1412,18 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         discontinuities = curve.discontinuity_ids
         if segment_ids is None or segment_keys is None or discontinuities is None:
             raise ValueError("Interactive curve is missing executor topology.")
-        starts = [0]
-        starts.extend(
-            index
-            for index in range(1, count)
+        changes = tuple(
+            index for index in range(1, count)
             if (
                 int(segment_ids[index]) != int(segment_ids[index - 1])
                 or segment_keys[index] != segment_keys[index - 1]
-                or int(discontinuities[index])
-                != int(discontinuities[index - 1])
+                or int(discontinuities[index]) != int(discontinuities[index - 1])
             )
         )
+        starts = [0, *changes] if visual_break_indices is None else [
+            0,
+            *(changes[index - 1] for index in visual_break_indices),
+        ]
         return tuple(
             (
                 start,
@@ -1819,11 +1843,60 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         item_store = rendered_items if rendered_items is not None else {}
         existing_store = existing_items if existing_items is not None else {}
         role = (block.kind.value, block.block_id)
+        visual_breaks: dict[str, set[int]] = {
+            name: set() for name, _values in block.series
+        }
+        if block.result is not None:
+            result = block.result
+            result_chunks = self._execution_region_chunks(
+                np.asarray(result.segment_ids).reshape(-1),
+                tuple(result.segment_keys),
+                np.asarray(result.discontinuity_ids).reshape(-1),
+            )
+            transition_times = tuple(
+                float(result.t[start]) for start, _end in result_chunks[1:]
+            )
+            requested = set(result.requested_algebra_outputs)
+            x_name = None if block.x_axis.series_name == "t" else block.x_axis.series_name
+            boundary_by_time = {
+                float(item.time): (dict(item.pre_state), dict(item.post_state))
+                for item in block.presentation_boundaries
+            }
+            states = tuple(boundary_by_time.get(time) for time in transition_times)
+            visual_breaks = {
+                name: {
+                    chunk_index
+                    for chunk_index, state in enumerate(states, 1)
+                    if (
+                        ((x_name is not None and x_name in requested) or name in requested)
+                        if state is None
+                        else any(
+                            axis_name not in state[0]
+                            or axis_name not in state[1]
+                            or state[0][axis_name] != state[1][axis_name]
+                            for axis_name in (x_name, name)
+                            if axis_name is not None
+                        )
+                    )
+                }
+                for name, _values in block.series
+            }
         for series_name, _values in block.series:
             color = colors[series_name]
+            physical_chunks: list[tuple[np.ndarray, np.ndarray]] = []
             for chunk_index, chunk in enumerate(rendered_chunks):
+                x = chunk.x
                 y = dict(chunk.series)[series_name]
-                singleton = chunk.x.size == 1
+                if chunk_index and chunk_index not in visual_breaks[series_name]:
+                    prior_x, prior_y = physical_chunks[-1]
+                    physical_chunks[-1] = (
+                        np.concatenate((prior_x, x)),
+                        np.concatenate((prior_y, y)),
+                    )
+                else:
+                    physical_chunks.append((x, y))
+            for chunk_index, (x, y) in enumerate(physical_chunks):
+                singleton = x.size == 1
                 marker = bool(block.markers or singleton)
                 item_key = (role, series_name, chunk_index, "marker" if marker else "line")
                 item = existing_store.get(item_key)
@@ -1831,19 +1904,19 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
                 if item is None:
                     if marker:
                         item = self._plot_widget.plot(
-                            chunk.x, y, pen=None, symbol="o",
+                            x, y, pen=None, symbol="o",
                             symbolSize=(block.point_size if block.markers else 5.0),
                             symbolBrush=pg.mkBrush(color), symbolPen=pg.mkPen(color),
                             name=name if chunk_index == 0 else None,
                         )
                     else:
                         item = self._plot_widget.plot(
-                            chunk.x, y,
+                            x, y,
                             pen=pg.mkPen(color=color, width=2, style=(QtCore.Qt.PenStyle.DashLine if block.dashed else QtCore.Qt.PenStyle.SolidLine)),
                             name=name if chunk_index == 0 else None,
                         )
                 else:
-                    item.setData(chunk.x, y)
+                    item.setData(x, y)
                     if marker:
                         item.setSymbolBrush(pg.mkBrush(color))
                         item.setSymbolPen(pg.mkPen(color))
@@ -2387,7 +2460,7 @@ def _iter_rendered_point_tsv_chunks(
     *,
     rows_per_chunk: int = 2048,
 ) -> tuple[str, ...]:
-    """Serialize only the private arrays captured for the visible projection."""
+    """Serialize the captured roster as one rectangular TSV table."""
 
     values = tuple(roster)
     if rows_per_chunk < 1:
@@ -2399,25 +2472,9 @@ def _iter_rendered_point_tsv_chunks(
     )
     if not nonempty:
         raise ValueError("No rendered points are available to copy.")
-    planned_cells = 0
-    for block in nonempty:
-        first_chunk = next(chunk for chunk in block.chunks if chunk.x.size)
-        columns = 1 + len(first_chunk.series)
-        columns += (
-            1
-            if block.kind == ResultLayerKind.EXPERIMENTAL.value
-            else 3
-        )
-        rows = sum(int(chunk.x.size) for chunk in block.chunks)
-        planned_cells += (rows + 1) * columns
-    if planned_cells > _MAX_RENDERED_COPY_CELLS:
-        raise ValueError(
-            "Rendered Copy payload exceeds the bounded cell limit "
-            f"({_MAX_RENDERED_COPY_CELLS:,})."
-        )
-
-    output_chunks: list[str] = []
-    total_characters = 0
+    block_specs: list[tuple[_RenderedPointBlock, tuple[str, ...], int, int]] = []
+    planned_rows = 0
+    planned_width = 0
     for block in nonempty:
         chunks = tuple(chunk for chunk in block.chunks if chunk.x.size)
         series_names = tuple(name for name, _values in chunks[0].series)
@@ -2426,7 +2483,35 @@ def _iter_rendered_point_tsv_chunks(
             for chunk in chunks[1:]
         ):
             raise ValueError("rendered point chunks must preserve series order.")
-        headers: list[str] = [
+        if block.kind == ResultLayerKind.EXPERIMENTAL.value:
+            if any(chunk.source_row is None for chunk in chunks):
+                raise ValueError("experimental rendered points lack source_row.")
+            metadata_width = 1
+        else:
+            if any(
+                chunk.segment_ids is None
+                or chunk.segment_keys is None
+                or chunk.discontinuity_ids is None
+                for chunk in chunks
+            ):
+                raise ValueError("simulation rendered points lack topology.")
+            metadata_width = 3
+        rows = sum(int(chunk.x.size) for chunk in chunks)
+        width = 1 + metadata_width + len(series_names)
+        block_specs.append((block, series_names, rows, width))
+        planned_rows = max(planned_rows, rows)
+        planned_width += width
+    planned_cells = (planned_rows + 1) * planned_width
+    if planned_cells > _MAX_RENDERED_COPY_CELLS:
+        raise ValueError(
+            "Rendered Copy payload exceeds the bounded cell limit "
+            f"({_MAX_RENDERED_COPY_CELLS:,})."
+        )
+
+    combined_headers: list[str] = []
+    for block, series_names, _rows, _width in block_specs:
+        chunks = tuple(chunk for chunk in block.chunks if chunk.x.size)
+        headers = [
             _rendered_column_header(
                 block.label,
                 block.x_name,
@@ -2465,10 +2550,15 @@ def _iter_rendered_point_tsv_chunks(
             )
             for name in series_names
         )
-        output = io.StringIO()
-        output.write(encode_tsv_row(headers))
-        rows_in_chunk = 0
-        for chunk in chunks:
+        # Extend the one combined header in roster order.  Each block remains
+        # an adjacent, independently identified column group.
+        combined_headers.extend(headers)
+
+    def iter_block_rows(
+        block: _RenderedPointBlock,
+        series_names: tuple[str, ...],
+    ) -> Iterator[tuple[str, ...]]:
+        for chunk in tuple(chunk for chunk in block.chunks if chunk.x.size):
             series_by_name = dict(chunk.series)
             for index in range(chunk.x.size):
                 row: list[str] = [f"{float(chunk.x[index]):.17g}"]
@@ -2486,24 +2576,44 @@ def _iter_rendered_point_tsv_chunks(
                     f"{float(series_by_name[name][index]):.17g}"
                     for name in series_names
                 )
-                output.write(encode_tsv_row(row))
-                rows_in_chunk += 1
-                if rows_in_chunk >= rows_per_chunk:
-                    piece = output.getvalue()
-                    total_characters += len(piece)
-                    if total_characters > _MAX_RENDERED_COPY_CHARACTERS:
-                        raise ValueError(
-                            "Rendered Copy payload exceeds the bounded output-size limit."
-                        )
-                    output_chunks.append(piece)
-                    output = io.StringIO()
-                    rows_in_chunk = 0
-        piece = output.getvalue()
-        total_characters += len(piece)
-        if total_characters > _MAX_RENDERED_COPY_CHARACTERS:
-            raise ValueError(
-                "Rendered Copy payload exceeds the bounded output-size limit."
-            )
-        if piece:
+                yield tuple(row)
+
+    output_chunks: list[str] = []
+    total_characters = 0
+    output = io.StringIO()
+    output.write(encode_tsv_row(combined_headers))
+    rows_in_chunk = 1
+    row_iterators = [
+        iter_block_rows(block, series_names)
+        for block, series_names, _rows, _width in block_specs
+    ]
+    for row_index in range(planned_rows):
+        row: list[str] = []
+        for iterator, (_block, _series_names, rows, width) in zip(
+            row_iterators, block_specs, strict=True
+        ):
+            if row_index < rows:
+                row.extend(next(iterator))
+            else:
+                row.extend("" for _ in range(width))
+        output.write(encode_tsv_row(row))
+        rows_in_chunk += 1
+        if rows_in_chunk >= rows_per_chunk:
+            piece = output.getvalue()
+            total_characters += len(piece)
+            if total_characters > _MAX_RENDERED_COPY_CHARACTERS:
+                raise ValueError(
+                    "Rendered Copy payload exceeds the bounded output-size limit."
+                )
             output_chunks.append(piece)
+            output = io.StringIO()
+            rows_in_chunk = 0
+    piece = output.getvalue()
+    total_characters += len(piece)
+    if total_characters > _MAX_RENDERED_COPY_CHARACTERS:
+        raise ValueError(
+            "Rendered Copy payload exceeds the bounded output-size limit."
+        )
+    if piece:
+        output_chunks.append(piece)
     return tuple(output_chunks)

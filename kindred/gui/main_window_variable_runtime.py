@@ -21,6 +21,7 @@ from kindred.core.simulation_preparation import (
     build_simulation_execution_request,
     simulation_execution_requests_equal,
 )
+from kindred.core.simulation_preparation_stages import build_solver_config
 from kindred.core.species import validate_concentration
 from kindred.core.simulator.dsl_parse import (
     DslParameterCoordinateUpdate,
@@ -765,8 +766,16 @@ class TabSliderBinding(QtCore.QObject):
                 prepared_dsl=tab.prepared_dsl,
                 mechanism_source=tab.mechanism_source,
                 initial_values=initials.items(),
-                execution_settings=settings,
-                scientific_settings=tab.scientific_settings,
+                t_span=(settings.t_start, settings.t_end),
+                solver_config=build_solver_config(
+                    solver_input=settings.solver,
+                    rtol=tab.scientific_settings.rtol,
+                    atol=tab.scientific_settings.atol,
+                    grid={"N": settings.integration_points},
+                    use_analytic_jacobian=(
+                        tab.scientific_settings.analytic_jacobian_policy
+                    ),
+                ),
                 parameter_values=runtime.slider_parameter_draft or None,
             )
             output.append((set_id, tab.initial_condition_set(set_id).name, request))

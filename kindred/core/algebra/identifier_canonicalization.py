@@ -16,7 +16,6 @@ from kindred.core.algebra.parser import (
     NumberNode,
     SpeciesRefNode,
     UnaryNode,
-    parse_algebra,
 )
 from kindred.core.simulator.parameter_namespace import MechanismParameterNamespace
 
@@ -112,14 +111,3 @@ def canonicalize_algebra_block(
         ast=[line.expr for line in lines],
         static_values=dict(block.static_values),
     )
-
-def canonicalize_observable_rhs_source(
-    expr_src: str,
-    *,
-    mechanism_namespace: MechanismParameterNamespace,
-) -> str:
-    block = parse_algebra(f"let __kindred_observable__ = {expr_src}\n")
-    canonicalized = canonicalize_algebra_block(block, mechanism_namespace=mechanism_namespace)
-    if not canonicalized.lines:
-        return str(expr_src)
-    return expression_to_source(canonicalized.lines[0].expr)

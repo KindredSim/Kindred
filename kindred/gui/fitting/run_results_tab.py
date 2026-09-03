@@ -442,6 +442,7 @@ class RunResultsTab(QtWidgets.QWidget):
             parent=self,
         )
         plot_view.setObjectName(object_name)
+        plot_view.copyFitDataRequested.connect(self.copy_all_to_clipboard)
         plot_view.set_dark_mode(self._dark_mode)
         plot_view.set_live_layout_locked(self._live_layout_locked)
         return plot_view
