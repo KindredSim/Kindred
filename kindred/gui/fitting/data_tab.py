@@ -519,9 +519,7 @@ class DataTab(QtWidgets.QWidget):
         self,
         modes: tuple[tuple[str, str], ...],
     ) -> None:
-        self._resolved_auto_modes = {
-            str(dataset_id): str(mode) for dataset_id, mode in modes
-        }
+        self._resolved_auto_modes = dict(modes)
         self._refresh_parametric_presentation()
 
     def _refresh_parametric_presentation(self) -> None:

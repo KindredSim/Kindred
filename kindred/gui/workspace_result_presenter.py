@@ -111,6 +111,9 @@ class InteractiveDisplayCurve:
         object.__setattr__(self, "intervention_connectors", tuple(self.intervention_connectors))
 
 
+_DisplayAnnotation = tuple[str, str, Mapping[str, object], float]
+
+
 @dataclass(frozen=True, slots=True)
 class InteractiveDisplayProjection:
     tab_id: str
@@ -118,9 +121,11 @@ class InteractiveDisplayProjection:
     x_label: str
     y_label: str
     curves: tuple[InteractiveDisplayCurve, ...]
+    intervention_annotations: tuple[_DisplayAnnotation, ...] = ()
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "curves", tuple(self.curves))
+        object.__setattr__(self, "intervention_annotations", tuple(self.intervention_annotations))
 
 
 class _XlsxDestination:
@@ -519,7 +524,7 @@ class ResultRenderInput:
     y_is_concentration: bool = False
     axis_candidates: tuple[AxisSelectionCandidate, ...] = ()
     reference_lines_visible: bool = True
-    intervention_annotations: tuple[Mapping[str, object], ...] = ()
+    intervention_annotations: tuple[_DisplayAnnotation, ...] = ()
     intervention_annotations_visible: bool = True
     unavailable_x_diagnostic: str | None = None
     completion_warning_details: tuple[tuple[str, tuple[str, ...]], ...] = ()
@@ -558,7 +563,7 @@ class ResultRenderInput:
         object.__setattr__(self, "selected_y_series", selected_y)
         object.__setattr__(self, "mapped_overlay_locks", overlay_locks)
         object.__setattr__(self, "axis_candidates", candidates)
-        object.__setattr__(self, "intervention_annotations", tuple(MappingProxyType(dict(item)) for item in annotations))
+        object.__setattr__(self, "intervention_annotations", annotations)
         object.__setattr__(self, "completion_warning_details", warnings)
 
     def _analysis_block(self) -> ResultDataBlock | None:
@@ -1009,8 +1014,16 @@ def _annotations_from_execution(
     result: SimulationResultValue,
 ) -> tuple[Mapping[str, object], ...]:
     return result.intervention_execution.annotation_projection(
-        execution_start=float(result.t[0]),
-        execution_end=float(result.t[-1]),
+        execution_start=float(result.t[0]), execution_end=float(result.t[-1]),
+    )
+
+
+def _owned_annotations(
+    result: SimulationResultValue, role: str, set_id: str,
+) -> tuple[_DisplayAnnotation, ...]:
+    return tuple(
+        (role, set_id, annotation, 0.42 if role == "ghost" else 1.0)
+        for annotation in _annotations_from_execution(result)
     )
 
 
@@ -1195,12 +1208,18 @@ def compose_interactive_display(
         for curve in curves
     ):
         return None
+    annotations: tuple[_DisplayAnnotation, ...] = ()
+    if _is_time_selection(selected_x):
+        annotations = _owned_annotations(result, "foreground", set_id)
+        if baseline_result is not None:
+            annotations += _owned_annotations(baseline_result, "ghost", set_id)
     return InteractiveDisplayProjection(
         tab_id=tab_id,
         set_id=set_id,
         x_label=render_input.x_label,
         y_label=render_input.y_label,
         curves=curves,
+        intervention_annotations=annotations,
     )
 
 
@@ -1295,7 +1314,7 @@ def compose_result_input(
         if isinstance(selection, SimulationSeriesAxisSelection):
             add_candidate(selection, selection.series_name)
     statistics_names: tuple[str, ...] = ()
-    annotations: list[Mapping[str, object]] = []
+    annotations: list[_DisplayAnnotation] = []
     warning_facts: list[tuple[str, tuple[str, ...]]] = []
     warning_ids: set[int] = set()
     seen_sets: set[str] = set()
@@ -1336,7 +1355,7 @@ def compose_result_input(
                 if visible.set_id == current_id:
                     blocks.append(replace(semantic, visible=False))
             add_warning(semantic.label, foreground, True)
-            annotations.extend(_annotations_from_execution(foreground))
+            annotations.extend(_owned_annotations(foreground, "foreground", visible.set_id))
         reference = repository.reference_result(visible.set_id)
         reference_semantic: ResultDataBlock | None = None
         if reference is not None:
@@ -1362,7 +1381,7 @@ def compose_result_input(
                     if visible.set_id == current_id:
                         blocks.append(replace(reference_semantic, visible=False))
                 add_warning(reference_semantic.label, reference, True)
-                annotations.extend(_annotations_from_execution(reference))
+                annotations.extend(_owned_annotations(reference, "ghost", visible.set_id))
             else:
                 blocks.append(reference_semantic)
         if visible.set_id == current_id:
@@ -1462,15 +1481,7 @@ def compose_result_input(
             )
         )
 
-    unique_annotations: list[Mapping[str, object]] = []
-    signatures: set[tuple[tuple[str, str], ...]] = set()
-    for annotation in annotations:
-        signature = tuple(sorted((str(name), repr(value)) for name, value in annotation.items()))
-        if signature not in signatures:
-            signatures.add(signature)
-            unique_annotations.append(annotation)
-    if not _is_time_selection(selected_x):
-        unique_annotations.clear()
+    owned_annotations = tuple(annotations) if _is_time_selection(selected_x) else ()
     if selected_x not in candidate_ids:
         add_candidate(
             selected_x,
@@ -1512,7 +1523,7 @@ def compose_result_input(
         y_is_concentration=y_is_concentration,
         axis_candidates=tuple(candidates),
         reference_lines_visible=bool(reference_lines_visible),
-        intervention_annotations=tuple(unique_annotations),
+        intervention_annotations=owned_annotations,
         intervention_annotations_visible=bool(intervention_annotations_visible and _is_time_selection(selected_x)),
         unavailable_x_diagnostic=_selected_x_unavailable_diagnostic(selected_x, unavailable_labels),
         completion_warning_details=tuple(warning_facts),

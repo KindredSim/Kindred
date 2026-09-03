@@ -153,7 +153,7 @@ class SimulationSettingsDialog(QtWidgets.QDialog):
             minimum=TEMPERATURE_RANGE_K[0],
             maximum=TEMPERATURE_RANGE_K[1],
             value=298.15,
-            decimals=8,
+            decimals=2,
         )
         self.rtol_edit = QtWidgets.QLineEdit("1e-6", science_box)
         self.atol_edit = QtWidgets.QLineEdit("1e-12", science_box)
@@ -262,7 +262,7 @@ class SimulationSettingsDialog(QtWidgets.QDialog):
         decimals: int,
     ) -> QtWidgets.QDoubleSpinBox:
         spin = QtWidgets.QDoubleSpinBox()
-        spin.setDecimals(max(17, int(decimals)))
+        spin.setDecimals(int(decimals))
         spin.setRange(float(minimum), float(maximum))
         spin.setValue(float(value))
         spin.setMaximumWidth(190)

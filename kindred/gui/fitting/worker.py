@@ -1490,7 +1490,6 @@ class GlobalFitWorker(QtCore.QThread):
         self._paused = False
         self._last_best_emit = 0.0
         self._last_curve_emit = 0.0
-        self._resolved_auto_modes: tuple[tuple[str, str], ...] = ()
         self._terminal_unavailable: ScientificUnavailable | None = None
         self._executor: ThreadPoolExecutor | None = None
 
@@ -1772,7 +1771,6 @@ class GlobalFitWorker(QtCore.QThread):
         resolved_modes = tuple(
             sorted(resolved_mode_items)
         )
-        self._resolved_auto_modes = resolved_modes
         if self._checkpoint():
             raise FittingCancelled()
         self.auto_modes_resolved.emit(resolved_modes)

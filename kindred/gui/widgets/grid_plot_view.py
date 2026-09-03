@@ -91,6 +91,7 @@ class GridPlotView(QtWidgets.QWidget):
         self._plot_display_state: dict[str, tuple[object, ...]] = {}
         self._structure_key: tuple[tuple[str, ...], int, int] | None = None
         self._dark_mode = False
+        self._copy_allowed = True
         self._live_layout_locked = False
         self._live_layout_lock_pending = False
         self._locked_left_axis_width: int | None = None
@@ -228,6 +229,7 @@ class GridPlotView(QtWidgets.QWidget):
         )
         self._dataset_presentation = normalized_presentation
         self._curves = values
+        self._context_actions["copy"].setEnabled(self.copy_eligible())
         if not values:
             self._seen_nonempty_payload = False
             self._selected_species_list = []
@@ -268,7 +270,7 @@ class GridPlotView(QtWidgets.QWidget):
         mouse_mode = state["mouseMode"]
         self._context_plot_index = plot_index
         actions = self._context_actions
-        actions["copy"].setEnabled(bool(self._curves))
+        actions["copy"].setEnabled(self.copy_eligible())
         log_mode = state["logMode"]
         for key, value in (
             ("pan", mouse_mode == pg.ViewBox.PanMode),
@@ -339,7 +341,11 @@ class GridPlotView(QtWidgets.QWidget):
     def copy_eligible(self) -> bool:
         """Whether this Fit-local panel has immutable curves to copy."""
 
-        return bool(self._curves)
+        return self._copy_allowed and bool(self._curves)
+
+    def set_copy_allowed(self, allowed: bool) -> None:
+        self._copy_allowed = bool(allowed)
+        self._context_actions["copy"].setEnabled(self.copy_eligible())
 
     def copy_projection_to_clipboard(
         self,

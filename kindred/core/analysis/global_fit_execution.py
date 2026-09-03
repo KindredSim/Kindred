@@ -1172,7 +1172,6 @@ class FitParameterLayout:
         dataset_id: str,
         vector: np.ndarray,
     ) -> dict[str, float]:
-        self.validate_optimizer_vector(vector)
         dataset_id = str(dataset_id or "").strip()
         values: dict[str, float] = {}
         for spec in self.centred_var_order:

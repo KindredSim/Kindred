@@ -151,6 +151,7 @@ from kindred.gui.workspace_tab_registry import (
     WorkspaceTabRegistry,
 )
 from kindred.io.kin_archive_store import KinArchiveStore
+from kindred.io.logging import diagnostic_log_path
 from kindred.io.paths import resolve_export_start_dir
 from kindred.io.resources import (
     InterventionExampleCatalogError,
@@ -206,6 +207,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._new_project_action: QtGui.QAction | None = None
         self._open_project_action: QtGui.QAction | None = None
         self._xlsx_export_action: QtGui.QAction | None = None
+        self._diagnostic_log_dialog: QtWidgets.QDialog | None = None
         self._dataset_import_progress_dialog: QtWidgets.QProgressDialog | None = None
         self._last_export_directory: str | None = None
         self._slider_apply_refreshing: set[str] = set()
@@ -4220,6 +4222,13 @@ class MainWindow(QtWidgets.QMainWindow):
             None,
             "panelLayoutTipsAction",
         )
+        self._add_action(
+            help_menu,
+            "Diagnostic Log...",
+            self._show_diagnostic_log,
+            None,
+            "diagnosticLogAction",
+        )
         help_menu.addSeparator()
         self._add_action(
             help_menu,
@@ -4708,6 +4717,92 @@ class MainWindow(QtWidgets.QMainWindow):
             "to restore the default arrangement.",
         )
 
+    def _build_diagnostic_log_dialog(self) -> QtWidgets.QDialog:
+        """Build a readable view of the active diagnostic log."""
+
+        dialog = QtWidgets.QDialog(self)
+        dialog.setObjectName("diagnosticLogDialog")
+        dialog.setWindowTitle("Diagnostic Log")
+        dialog.resize(800, 560)
+
+        layout = QtWidgets.QVBoxLayout(dialog)
+        log_view = QtWidgets.QPlainTextEdit(dialog)
+        log_view.setObjectName("diagnosticLogText")
+        log_view.setReadOnly(True)
+        revision: tuple[str, int, int, int] | None = None
+
+        def refresh_log() -> None:
+            nonlocal revision
+            try:
+                path = diagnostic_log_path()
+                state = path.stat()
+                current_revision = (
+                    os.fspath(path),
+                    int(state.st_ino),
+                    int(state.st_mtime_ns),
+                    int(state.st_size),
+                )
+                if current_revision == revision:
+                    return
+                text = path.read_text(encoding="utf-8", errors="replace")
+            except (OSError, RuntimeError) as exc:
+                current_revision = ("", 0, 0, 0)
+                text = f"Diagnostic log could not be read:\n{exc}"
+
+            scroll_bar = log_view.verticalScrollBar()
+            was_at_bottom = scroll_bar.value() >= scroll_bar.maximum()
+            previous = log_view.toPlainText()
+            if previous and text.startswith(previous):
+                cursor = QtGui.QTextCursor(log_view.document())
+                cursor.movePosition(QtGui.QTextCursor.MoveOperation.End)
+                cursor.insertText(text[len(previous):])
+            else:
+                log_view.setPlainText(text)
+            revision = current_revision
+            if was_at_bottom:
+                scroll_bar.setValue(scroll_bar.maximum())
+
+        refresh_log()
+        refresh_timer = QtCore.QTimer(dialog)
+        refresh_timer.setInterval(500)
+        refresh_timer.timeout.connect(refresh_log)
+        refresh_timer.start()
+
+        buttons = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.StandardButton.Close,
+            dialog,
+        )
+        buttons.setObjectName("diagnosticLogButtonBox")
+        copy_button = buttons.addButton(
+            "Copy",
+            QtWidgets.QDialogButtonBox.ButtonRole.ActionRole,
+        )
+        copy_button.setObjectName("copyDiagnosticLogButton")
+        copy_button.clicked.connect(
+            lambda _checked=False: QtWidgets.QApplication.clipboard().setText(
+                log_view.toPlainText()
+            )
+        )
+        buttons.rejected.connect(dialog.reject)
+
+        layout.addWidget(log_view)
+        layout.addWidget(buttons)
+        return dialog
+
+    def _show_diagnostic_log(self) -> None:
+        dialog = self._diagnostic_log_dialog
+        if dialog is None:
+            dialog = self._build_diagnostic_log_dialog()
+            dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+            dialog.destroyed.connect(self._diagnostic_log_destroyed)
+            self._diagnostic_log_dialog = dialog
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+
+    def _diagnostic_log_destroyed(self, _object: object = None) -> None:
+        self._diagnostic_log_dialog = None
+
     def _about_brand_asset_path(self) -> str:
         """Return the bundled brand image for the currently applied theme."""
         action = self._dark_mode_action
@@ -4776,12 +4871,6 @@ class MainWindow(QtWidgets.QMainWindow):
         body_label = QtWidgets.QLabel(
             "Desktop GUI for reaction mechanism investigation, kinetic "
             "modeling, and data fitting.\n\n"
-            "Diagnostic logs are written to the platform log directory "
-            "(Linux: `~/.cache/kindred/logs`, macOS: "
-            "`~/Library/Logs/kindred`, Windows: `%LOCALAPPDATA%\\kindred\\logs`; "
-            "override with `KINDRED_LOG_DIR`). If that location is unavailable, "
-            "logs are written to the system temporary directory under "
-            "`kindred/logs`.\n\n"
             "The initial development of Kindred was led primarily by Pedro "
             "Helou de Oliveira.\n"
             "Kindred is now developed and maintained jointly by Pedro Helou "

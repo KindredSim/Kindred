@@ -695,24 +695,19 @@ class FitSessionOwner(QtCore.QObject):
         if self._window is not None:
             self._window.set_live_best(update)
 
-    def _on_auto_modes(self, worker: GlobalFitWorker, modes: object) -> None:
+    def _on_auto_modes(
+        self,
+        worker: GlobalFitWorker,
+        modes: tuple[tuple[str, str], ...],
+    ) -> None:
         if (
             self._application_close_fenced
             or self._closing
             or self._worker is not worker
-            or not isinstance(modes, tuple)
         ):
             return
-        normalized = tuple(
-            (str(dataset_id), str(mode))
-            for dataset_id, mode in modes
-        )
-        if any(mode not in {"monotone", "time_guided"} for _item, mode in normalized):
-            worker.request_cancel()
-            self._set_status("Fit emitted an invalid resolved Auto map.")
-            return
         if self._window is not None:
-            self._window.set_resolved_auto_modes(normalized)
+            self._window.set_resolved_auto_modes(modes)
 
     def _on_live_curves(self, worker: GlobalFitWorker, curves: object) -> None:
         if (

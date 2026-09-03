@@ -231,6 +231,7 @@ class RunResultsTab(QtWidgets.QWidget):
         self._summary_dialog: ResultsSummaryDialog | None = None
         self._dark_mode = False
         self._live_layout_locked = False
+        self._copy_allowed = True
         self._curves: tuple[FitCurveDataset, ...] = ()
         self._dataset_presentation: Mapping[str, DatasetPlotPresentation] = (
             MappingProxyType({})
@@ -365,7 +366,15 @@ class RunResultsTab(QtWidgets.QWidget):
         self._terminal_failure_label.show()
 
     def copy_eligible(self) -> bool:
-        return bool(self._curves)
+        return self._copy_allowed and bool(self._curves)
+
+    def set_copy_allowed(self, allowed: bool) -> None:
+        self._copy_allowed = bool(allowed)
+        for plot_view in self._dataset_plot_views.values():
+            plot_view.set_copy_allowed(self._copy_allowed)
+        if self._all_datasets_plot_view is not None:
+            self._all_datasets_plot_view.set_copy_allowed(self._copy_allowed)
+        self.copyAvailableChanged.emit(self.copy_eligible())
 
     def copy_all_to_clipboard(self) -> None:
         view = self._all_datasets_plot_view
@@ -445,6 +454,7 @@ class RunResultsTab(QtWidgets.QWidget):
         plot_view.copyFitDataRequested.connect(self.copy_all_to_clipboard)
         plot_view.set_dark_mode(self._dark_mode)
         plot_view.set_live_layout_locked(self._live_layout_locked)
+        plot_view.set_copy_allowed(self._copy_allowed)
         return plot_view
 
     def _install_plot_projection(

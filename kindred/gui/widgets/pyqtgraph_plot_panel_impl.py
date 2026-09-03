@@ -61,6 +61,9 @@ class _AxisRangeSession:
 
 
 _EPSILON = 1e-9
+_DisplayAnnotation = tuple[str, str, Mapping[str, object], float]
+_AnnotationKey = tuple[str, str, tuple[tuple[str, str], ...]]
+_ANNOTATION_ACCENTS = ("#4E79A7", "#F28E2B", "#59A14F", "#E15759", "#B07AA1", "#76B7B2")
 
 
 @dataclass(frozen=True, slots=True)
@@ -198,7 +201,10 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         super().__init__(parent)
         self._sampling_limit: int | None = None
         self._plot_items_by_key: dict[tuple[object, ...], object] = {}
-        self._annotation_items: list[object] = []
+        self._annotation_items: dict[_AnnotationKey, object] = {}
+        self._annotation_labels: dict[
+            tuple[object, ...], tuple[object, QtCore.QPointF]
+        ] = {}
         self._interaction_mode = "pan"
         self._presentation = _PlotPresentation()
         self._axis_range = _AxisRangeSession()
@@ -231,7 +237,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         self._plot_widget.plotItem.setContentsMargins(0, 0, 0, 10)
         self._plot_widget.setBackground("w")
         self._plot_widget.showGrid(x=True, y=True, alpha=0.25)
-        self._legend = self._plot_widget.addLegend()
+        self._legend = self._plot_widget.addLegend(offset=(-10, 10))
         self._plot_widget.getPlotItem().setMenuEnabled(False)
         self._plot_widget.setContextMenuPolicy(
             QtCore.Qt.ContextMenuPolicy.CustomContextMenu
@@ -505,7 +511,18 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
             curves.append(curve)
         if not curves:
             return None
-        filtered = replace(projection, curves=tuple(curves))
+        target_ids = {
+            str(curve.key[2])
+            for curve in curves
+            if len(curve.key) >= 3 and curve.key[0] == "simulation"
+        }
+        annotations = tuple(
+            annotation
+            for annotation in projection.intervention_annotations
+            if annotation[1] in target_ids
+            and (annotation[0] != "ghost" or render_input.reference_lines_visible)
+        )
+        filtered = replace(projection, curves=tuple(curves), intervention_annotations=annotations)
         if self._sampling_limit is not None:
             filtered = self._sample_interactive_projection(filtered)
         return filtered
@@ -644,6 +661,12 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
             )
         )
         retired = retired or len(prior_roster) != len(self._rendered_point_roster)
+        for annotation_key, item in tuple(self._annotation_items.items()):
+            if annotation_key[1] not in targets:
+                continue
+            self._remove_annotation_item(item)
+            del self._annotation_items[annotation_key]
+            retired = True
         return retired
 
     def stop_interactive_display(self) -> bool:
@@ -966,6 +989,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         if self._render_input is None or not self._interactive_results:
             return None
         curves: list[InteractiveDisplayCurve] = []
+        annotations: list[_DisplayAnnotation] = []
         latest: InteractiveDisplayProjection | None = None
         for set_id, result in self._interactive_results.items():
             if set_id not in self._interactive_target_set_ids:
@@ -975,9 +999,10 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
                 continue
             latest = projection
             curves.extend(projection.curves)
+            annotations.extend(projection.intervention_annotations)
         if latest is None or not curves:
             return None
-        return replace(latest, curves=tuple(curves))
+        return replace(latest, curves=tuple(curves), intervention_annotations=tuple(annotations))
 
     def _compose_interactive_result(
         self,
@@ -1050,7 +1075,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
             str(curve.key[2])
             for curve in projection.curves
             if len(curve.key) >= 3
-        }
+        } | {annotation[1] for annotation in projection.intervention_annotations}
 
     @staticmethod
     def _filter_interactive_projection(
@@ -1062,9 +1087,14 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
             for curve in projection.curves
             if len(curve.key) < 3 or str(curve.key[2]) not in removed
         )
+        annotations = tuple(
+            annotation
+            for annotation in projection.intervention_annotations
+            if annotation[1] not in removed
+        )
         if not curves:
             return None
-        return replace(projection, curves=curves)
+        return replace(projection, curves=curves, intervention_annotations=annotations)
 
     def _schedule_interactive_tick(self) -> None:
         if self._interactive_tick_requested:
@@ -1101,6 +1131,25 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
             and _same_interactive_topology(left, right)
             for left, right in zip(source_curves, target_curves, strict=True)
         )
+
+    @staticmethod
+    def _annotation_signature(
+        annotation: _DisplayAnnotation,
+    ) -> _AnnotationKey:
+        role, set_id, payload, _opacity = annotation
+        return (
+            role,
+            set_id,
+            tuple(sorted((str(name), repr(value)) for name, value in payload.items())),
+        )
+
+    @staticmethod
+    def _annotation_accent(annotation: Mapping[str, object]) -> QtGui.QColor:
+        authored = annotation.get("authored_ordinal")
+        index = int(annotation["declaration_ordinal"]) + (
+            0 if authored is None else int(authored)
+        )
+        return QtGui.QColor(_ANNOTATION_ACCENTS[index % len(_ANNOTATION_ACCENTS)])
 
     def _materialize_interactive(
         self,
@@ -1155,7 +1204,20 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
             replace(left, y=left.y + (right.y - left.y) * progress)
             for left, right in zip(source.curves, target.curves, strict=True)
         )
-        return replace(target, curves=curves)
+        annotations = tuple(
+            (role, set_id, payload, opacity * weight)
+            for values, weight in (
+                (source.intervention_annotations, 1.0 - progress),
+                (target.intervention_annotations, progress),
+            )
+            for role, set_id, payload, opacity in values
+            if opacity * weight > _EPSILON
+        )
+        return replace(
+            target, curves=curves,
+            intervention_annotations=PyQtGraphPlotPanel._merge_annotation_values(annotations),
+        )
+
     def _request_interactive_tick(self, delay_seconds: float) -> None:
         milliseconds = max(0, int(np.ceil(float(delay_seconds) * 1000.0)))
         self._interactive_timer.start(milliseconds)
@@ -1197,6 +1259,14 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
             if len(curve.key) >= 3
             and curve.key[0:2] == ("simulation", "ghost")
         }
+        replaced_annotation_owners = (
+            {("foreground", set_id) for set_id in transient_set_ids}
+            | {("ghost", set_id) for set_id in transient_reference_set_ids}
+            | {(role, set_id)
+            for layer in state.layers
+            for role, set_id, _payload, _opacity
+            in layer.projection.intervention_annotations}
+        )
         _x_unit, _y_unit, x_scale, y_scale = (
             self._display_unit_state(render_input)
             if render_input is not None
@@ -1358,6 +1428,28 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
             transient_reference_set_ids,
         )
         self._interactive_items = rendered
+        if render_input is not None:
+            static_annotations = tuple(
+                annotation
+                for annotation in render_input.intervention_annotations
+                if annotation[:2] not in replaced_annotation_owners
+            )
+            interactive_annotations = tuple(
+                (role, set_id, payload, opacity * layer.opacity)
+                for layer in state.layers
+                for role, set_id, payload, opacity
+                in layer.projection.intervention_annotations
+                if opacity * layer.opacity > _EPSILON
+            )
+            if len(state.layers) > 1:
+                interactive_annotations = self._merge_annotation_values(
+                    interactive_annotations
+                )
+            self._render_annotations(
+                render_input,
+                self._presentation,
+                annotations=(*static_annotations, *interactive_annotations),
+            )
         # Copy Rendered is a semantic settled projection. During a cross-fade
         # the transition source and target are both physical layers, but only
         # the target belongs in the copy roster; hidden static target items
@@ -1582,7 +1674,6 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
     ) -> None:
         self._rendered_point_roster = ()
         existing_items = dict(self._plot_items_by_key)
-        self._clear_annotation_items()
         self._configure_axis_unit_controls(render_input)
         x_label, y_label = self._display_axis_labels(render_input)
         self._plot_widget.setLabel("bottom", x_label)
@@ -1632,12 +1723,12 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         self._axis_toolbar.set_interaction_mode(interaction)
         self._apply_interaction_mode(interaction)
         presentation = self._presentation
-        self._render_annotations(render_input, presentation)
         self._render_analysis(render_input)
         axis_range = self._axis_range
         self._axis_toolbar.set_manual_ranges(axis_range.x_min, axis_range.x_max, axis_range.y_min, axis_range.y_max)
         self._axis_toolbar.set_auto_range(axis_range.auto)
         self._apply_plot_presentation(presentation, axis_range=axis_range)
+        self._render_annotations(render_input, presentation)
         self._project_completion_warning(render_input)
         self._rendered_point_roster = tuple(rendered_points)
 
@@ -2106,13 +2197,47 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         self,
         render_input: ResultRenderInput,
         presentation: _PlotPresentation,
+        *,
+        annotations: Sequence[_DisplayAnnotation] | None = None,
     ) -> None:
-        if not render_input.intervention_annotations_visible:
+        if annotations is None:
+            annotations = self._merge_annotation_values(render_input.intervention_annotations)
+        self._render_owned_annotations(render_input, annotations, presentation)
+
+    @staticmethod
+    def _merge_annotation_values(
+        annotations: Sequence[_DisplayAnnotation],
+    ) -> tuple[_DisplayAnnotation, ...]:
+        merged: dict[_AnnotationKey, _DisplayAnnotation] = {}
+        for annotation in annotations:
+            signature = PyQtGraphPlotPanel._annotation_signature(annotation)
+            prior = merged.get(signature)
+            opacity = annotation[3] + (0.0 if prior is None else prior[3])
+            merged[signature] = (*annotation[:3], min(1.0, opacity))
+        return tuple(merged.values())
+
+    def _render_owned_annotations(
+        self,
+        render_input: ResultRenderInput,
+        annotations: Sequence[_DisplayAnnotation],
+        presentation: _PlotPresentation,
+    ) -> None:
+        if (
+            not render_input.intervention_annotations_visible
+            or not self._has_time_x(render_input)
+        ):
+            self._clear_annotation_items()
             return
         _x_unit, _y_unit, x_scale, _y_scale = self._display_unit_state(
             render_input
         )
-        for annotation in render_input.intervention_annotations:
+        entries: list[
+            tuple[_AnnotationKey, _DisplayAnnotation, float, float | None]
+        ] = []
+        for owned in annotations:
+            role, set_id, annotation, opacity = owned
+            if role == "ghost" and not render_input.reference_lines_visible:
+                continue
             if "start" in annotation and "end" in annotation:
                 start = self._raw_to_view_coordinate(
                     float(annotation["start"]) * x_scale,
@@ -2124,14 +2249,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
                 )
                 if start is None or end is None:
                     continue
-                region = pg.LinearRegionItem(
-                    values=(start, end),
-                    movable=False,
-                    brush=pg.mkBrush(255, 190, 80, 35),
-                    pen=pg.mkPen(220, 150, 40, 100),
-                )
-                self._plot_widget.addItem(region)
-                self._annotation_items.append(region)
+                entries.append((self._annotation_signature(owned), owned, start, end))
                 continue
             if "time" not in annotation:
                 continue
@@ -2141,15 +2259,122 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
             )
             if time is None:
                 continue
-            line = pg.InfiniteLine(
-                pos=time,
-                angle=90,
-                movable=False,
-                pen=pg.mkPen("#b36b00", width=1, style=QtCore.Qt.PenStyle.DashLine),
-                label=str(annotation.get("label") or "intervention"),
+            entries.append((self._annotation_signature(owned), owned, time, None))
+
+        view_range = self._plot_widget.getPlotItem().getViewBox().viewRange()
+        x_min, x_max = (float(value) for value in view_range[0])
+        y_min, y_max = (float(value) for value in view_range[1])
+        x_span = x_max - x_min
+        y_span = y_max - y_min
+        if not np.isfinite(x_span) or x_span <= 0.0:
+            x_span = 1.0
+        if not np.isfinite(y_span) or y_span <= 0.0:
+            y_min, y_max, y_span = 0.0, 1.0, 1.0
+        foreground_opacity: dict[tuple[object, ...], float] = {}
+        for _key, (role, set_id, _payload, opacity), start, end in entries:
+            if role == "foreground":
+                geometry = (set_id, start, end)
+                foreground_opacity[geometry] = min(1.0, foreground_opacity.get(geometry, 0.0) + opacity)
+        existing = self._annotation_items
+        rendered: dict[_AnnotationKey, object] = {}
+        label_candidates: dict[
+            tuple[object, ...], tuple[Mapping[str, object], float, float]
+        ] = {}
+        for key, owned, start, end in entries:
+            role, set_id, annotation, opacity = owned
+            if role == "ghost":
+                opacity *= 1.0 - foreground_opacity.get((set_id, start, end), 0.0)
+                if opacity <= _EPSILON:
+                    continue
+            if role == "foreground":
+                occurrence = (
+                    set_id, str(annotation.get("kind") or "intervention"),
+                    annotation["declaration_ordinal"],
+                    annotation.get("authored_ordinal"), annotation.get("window_ordinal"),
+                    annotation.get("firing_ordinal"),
+                )
+                prior = label_candidates.get(occurrence)
+                label_candidates[occurrence] = (
+                    annotation,
+                    start * opacity + (0.0 if prior is None else prior[1]),
+                    opacity + (0.0 if prior is None else prior[2]),
+                )
+            primary = rendered.get(key) or existing.get(key)
+            if primary is None:
+                accent = self._annotation_accent(annotation)
+                if end is None:
+                    primary = pg.InfiniteLine(
+                        pos=start,
+                        angle=90,
+                        movable=False,
+                        pen=pg.mkPen(accent, width=1, style=QtCore.Qt.PenStyle.DashLine),
+                    )
+                else:
+                    fill = QtGui.QColor(accent)
+                    fill.setAlpha(35)
+                    primary = pg.LinearRegionItem(
+                        values=(start, end),
+                        movable=False,
+                        brush=pg.mkBrush(fill),
+                        pen=pg.mkPen(accent),
+                    )
+                primary.setZValue(10)
+                self._plot_widget.addItem(primary)
+            elif end is None:
+                primary.setValue(start)
+            else:
+                primary.setRegion((start, end))
+            primary.setOpacity(opacity)
+            rendered[key] = primary
+        for key, item in existing.items():
+            if key not in rendered:
+                self._remove_annotation_item(item)
+        self._annotation_items = rendered
+
+        existing_labels = self._annotation_labels
+        rendered_labels: dict[
+            tuple[object, ...], tuple[object, QtCore.QPointF]
+        ] = {}
+        for lane, (occurrence, candidate) in enumerate(label_candidates.items()):
+            annotation, weighted_start, weight = candidate
+            lane_offset = 0.10 + 0.08 * (lane % 4)
+            label_y = (
+                y_min + y_span * lane_offset
+                if presentation.y_inverted
+                else y_max - y_span * lane_offset
             )
-            self._plot_widget.addItem(line)
-            self._annotation_items.append(line)
+            anchor = QtCore.QPointF(
+                weighted_start / weight
+                + x_span * (-0.012 if presentation.x_inverted else 0.012),
+                label_y,
+            )
+            prior = existing_labels.get(occurrence)
+            accent = self._annotation_accent(annotation)
+            if prior is None:
+                label = pg.TextItem(
+                    str(annotation.get("label") or "intervention"),
+                    color=(238, 238, 238), anchor=(0.0, 0.5),
+                    border=pg.mkPen(accent), fill=pg.mkBrush(30, 30, 30, 210),
+                )
+                label.setFlag(
+                    QtWidgets.QGraphicsItem.GraphicsItemFlag.ItemIsMovable, True
+                )
+                label.setZValue(11)
+                self._plot_widget.addItem(label, ignoreBounds=True)
+                offset = QtCore.QPointF()
+            else:
+                label, prior_anchor = prior
+                offset = label.pos() - prior_anchor
+                label.setText(str(annotation.get("label") or "intervention"))
+                label.border = pg.mkPen(accent)
+                label.update()
+            label.setPos(anchor + offset)
+            label.setOpacity(min(1.0, weight))
+            rendered_labels[occurrence] = (label, anchor)
+        for occurrence, (label, _anchor) in existing_labels.items():
+            if occurrence not in rendered_labels:
+                self._remove_annotation_item(label)
+        self._annotation_labels = rendered_labels
 
     @staticmethod
     def _sample_indices(
@@ -2216,16 +2441,23 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         self._plot_widget.clear()
         self._plot_items_by_key.clear()
         self._annotation_items.clear()
+        self._annotation_labels.clear()
         self._rendered_point_roster = ()
-        self._legend = self._plot_widget.addLegend()
+        self._legend = self._plot_widget.addLegend(offset=(-10, 10))
+
+    def _remove_annotation_item(self, item: object) -> None:
+        try:
+            self._plot_widget.removeItem(item)
+        except (RuntimeError, TypeError, ValueError):
+            pass
 
     def _clear_annotation_items(self) -> None:
-        for item in self._annotation_items:
-            try:
-                self._plot_widget.removeItem(item)
-            except (RuntimeError, TypeError, ValueError):
-                pass
+        for item in self._annotation_items.values():
+            self._remove_annotation_item(item)
+        for label, _anchor in self._annotation_labels.values():
+            self._remove_annotation_item(label)
         self._annotation_items.clear()
+        self._annotation_labels.clear()
 
     @staticmethod
     def _scaled_optional(value: float | None, ratio: float) -> float | None:
@@ -2270,6 +2502,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
             self._axis_range.y_min,
             self._axis_range.y_max,
         )
+        self._clear_annotation_items()
         self.apply_result_input(render_input)
 
     @QtCore.Slot(str, object)

@@ -725,6 +725,7 @@ class FittingWindow(QtWidgets.QDialog):
         self._paused = True
         self._pause_button.setEnabled(False)
         self._resume_button.setEnabled(True)
+        self._refresh_copy_allowed()
         self.pauseRequested.emit()
 
     def _resume_from_button(self) -> None:
@@ -733,6 +734,7 @@ class FittingWindow(QtWidgets.QDialog):
         self._paused = False
         self._pause_button.setEnabled(True)
         self._resume_button.setEnabled(False)
+        self._refresh_copy_allowed()
         self.resumeRequested.emit()
 
     def set_executing(self, executing: bool) -> None:
@@ -750,6 +752,7 @@ class FittingWindow(QtWidgets.QDialog):
         else:
             self._paused = False
             self._run_results_tab.set_live_layout_locked(False)
+        self._refresh_copy_allowed()
         self._cancel_button.setEnabled(self._executing)
         self._pause_button.setEnabled(self._executing)
         self._resume_button.setEnabled(False)
@@ -797,12 +800,7 @@ class FittingWindow(QtWidgets.QDialog):
         self,
         modes: tuple[tuple[str, str], ...],
     ) -> None:
-        if any(mode not in {"monotone", "time_guided"} for _id, mode in modes):
-            raise ValueError("Resolved Auto modes are invalid.")
-        normalized = tuple((str(dataset_id), str(mode)) for dataset_id, mode in modes)
-        if len(normalized) != len({dataset_id for dataset_id, _mode in normalized}):
-            raise ValueError("Resolved Auto modes repeat a dataset ID.")
-        self._data_tab.set_resolved_auto_modes(normalized)
+        self._data_tab.set_resolved_auto_modes(modes)
 
     def _clear_resolved_auto_modes(self) -> None:
         self._data_tab.set_resolved_auto_modes(())
@@ -823,11 +821,9 @@ class FittingWindow(QtWidgets.QDialog):
         )
         self._results_summary_button.setEnabled(candidate is not None)
         self._apply_button.setEnabled(candidate is not None and not self._executing)
-        resolved_auto_modes = () if candidate is None else tuple(
-            (str(dataset_id), str(mode))
-            for dataset_id, mode in candidate.resolved_auto_modes
+        self.set_resolved_auto_modes(
+            () if candidate is None else candidate.resolved_auto_modes
         )
-        self.set_resolved_auto_modes(resolved_auto_modes)
         self.set_last_fit_presentation()
         self._tabs.setCurrentIndex(2)
         return bool(rendered)
@@ -895,8 +891,13 @@ class FittingWindow(QtWidgets.QDialog):
         if setup is not None:
             self.projectDefaultsRequested.emit(setup.defaults)
 
+    def _refresh_copy_allowed(self) -> None:
+        self._run_results_tab.set_copy_allowed(
+            not self._closing and (not self._executing or self._paused)
+        )
+
     def _set_copy_available(self, available: bool) -> None:
-        self._copy_button.setEnabled(bool(available) and not self._executing)
+        self._copy_button.setEnabled(bool(available))
 
     def _current_results_dark_mode(self) -> bool:
         for candidate in (self.parentWidget(), self.parent()):
@@ -939,6 +940,7 @@ class FittingWindow(QtWidgets.QDialog):
         if self._closing_after_cleanup:
             return
         self._closing = True
+        self._refresh_copy_allowed()
         self._status.setText("Stopping…")
         self._tabs.setEnabled(False)
         self._current_tab_stack.setEnabled(False)

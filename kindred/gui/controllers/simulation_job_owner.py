@@ -633,20 +633,6 @@ class SimulationJobOwner(QtCore.QObject):
             target_count=count,
         )
 
-    def _promote_preview_targets(
-        self,
-        tab_id: str,
-        targets: tuple[PreviewTarget, ...],
-    ) -> None:
-        """Establish exact Preview semantic authority at worker start."""
-
-        repository = self._repository(tab_id)
-        set_ids = tuple(target.set_id for target in targets)
-        for set_id in set_ids:
-            repository.retain_explicit_as_reference(set_id)
-        repository.deauthorize_sets(set_ids, preserve_reference=True)
-        self.results_changed.emit(str(tab_id))
-
     def _start(
         self,
         tab_id: str,
@@ -679,6 +665,7 @@ class SimulationJobOwner(QtCore.QObject):
             "outcomes": [],
             "details": [],
             "payload": payload,
+            "preview_results": {},
             "removed_target_ids": set(),
             "retired_ids": set(),
             "document_delta_cancelled": False,
@@ -714,11 +701,6 @@ class SimulationJobOwner(QtCore.QObject):
             if changed_request_ids:
                 repository.deauthorize_sets(changed_request_ids)
                 self.results_changed.emit(str(tab_id))
-        elif kind == "preview" and purpose != "interactive-preview":
-            self._promote_preview_targets(
-                str(tab_id),
-                tuple(targets),
-            )
         self.state_changed.emit()
         if kind == "run":
             self.run_dispatched.emit(str(tab_id), tuple(target.set_id for target in targets))
@@ -1144,19 +1126,22 @@ class SimulationJobOwner(QtCore.QObject):
             operation["outcomes"].append((target, "success"))
             self._terminal_state = "success"
             return
-        try:
-            repository = self._repository(str(operation["tab_id"]))
-            if operation["kind"] == "run":
-                repository.publish_run(target.set_id, target.execution_request, outcome.result)
-            else:
-                repository.publish_preview(target.set_id, target.execution_request, outcome.result)
-        except Exception as exc:  # noqa: BLE001
-            operation["outcomes"].append((target, "discarded"))
-            operation["details"].append(f"{target.set_name}: repository rejected publication ({exc})")
-            return
+        if operation["kind"] == "preview":
+            operation["preview_results"][target.set_id] = outcome.result
+        else:
+            try:
+                repository = self._repository(str(operation["tab_id"]))
+                repository.publish_run(
+                    target.set_id, target.execution_request, outcome.result
+                )
+            except Exception as exc:  # noqa: BLE001
+                operation["outcomes"].append((target, "discarded"))
+                operation["details"].append(f"{target.set_name}: repository rejected publication ({exc})")
+                return
         operation["outcomes"].append((target, "success"))
         self._terminal_state = "success"
-        self.results_changed.emit(str(operation["tab_id"]))
+        if operation["kind"] == "run":
+            self.results_changed.emit(str(operation["tab_id"]))
 
     @QtCore.Slot()
     def _on_worker_finished(self) -> None:
@@ -1169,6 +1154,7 @@ class SimulationJobOwner(QtCore.QObject):
         operation_tab_id: str | None = None
         reconcile_target_ids: tuple[str, ...] = ()
         interactive_successor_ids: tuple[str, ...] = ()
+        preview_published = False
         if operation is not None:
             operation_kind = str(operation["kind"])
             operation_purpose = str(operation["purpose"])
@@ -1186,6 +1172,30 @@ class SimulationJobOwner(QtCore.QObject):
             total = succeeded + failed + cancelled + discarded
             state = "success" if total and succeeded == total else "failure" if total and failed == total else "cancelled" if total and cancelled == total else "partial"
             summary = SimulationTerminalSummary(operation_kind, state, succeeded, failed, cancelled, discarded, tuple(operation["details"]))
+            superseded_preview = any(
+                pending is not None and pending.tab_id == operation_tab_id
+                for pending in (
+                    self._pending_preview,
+                    self._pending_interactive_preview,
+                )
+            )
+            if (
+                not self._close_fenced
+                and operation_kind == "preview"
+                and operation_purpose == "ordinary"
+                and summary.state == "success"
+                and not superseded_preview
+            ):
+                repository = self._repository(operation_tab_id)
+                preview_results = operation["preview_results"]
+                for target in operation["targets"]:
+                    repository.retain_explicit_as_reference(target.set_id)
+                    repository.publish_preview(
+                        target.set_id,
+                        target.execution_request,
+                        preview_results[target.set_id],
+                    )
+                preview_published = True
             target_ids = tuple(
                 target.set_id
                 for target in operation["targets"]
@@ -1267,6 +1277,11 @@ class SimulationJobOwner(QtCore.QObject):
                     QtCore.QTimer.singleShot(0, self._redrive_pending_preview)
             else:
                 if (
+                    preview_published
+                    and operation_tab_id is not None
+                ):
+                    self.results_changed.emit(operation_tab_id)
+                elif (
                     operation_tab_id is not None
                     and operation_purpose == "interactive-successor"
                     and interactive_successor_ids

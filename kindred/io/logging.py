@@ -9,7 +9,7 @@ import sys
 import tempfile
 from pathlib import Path
 
-__all__ = ["setup_logging"]
+__all__ = ["diagnostic_log_path", "setup_logging"]
 
 _DEFAULT_LOG_LEVEL = "INFO"
 _DEFAULT_LOG_FILENAME = "kindred.log"
@@ -64,6 +64,16 @@ def _get_log_level_from_env() -> str:
         if configured_level in _VALID_LOG_LEVELS:
             return configured_level
     return _DEFAULT_LOG_LEVEL
+
+
+def diagnostic_log_path() -> Path:
+    """Return the active diagnostic log path."""
+
+    for handler in logging.getLogger().handlers:
+        if isinstance(handler, logging.handlers.RotatingFileHandler):
+            handler.flush()
+            return Path(handler.baseFilename)
+    raise RuntimeError("The diagnostic log is not available.")
 
 
 def setup_logging() -> None:

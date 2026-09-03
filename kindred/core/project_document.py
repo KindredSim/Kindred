@@ -691,18 +691,6 @@ class ProjectDocument:
     ) -> "ProjectDocument":
         """Prepare one complete dataset batch as one atomic proposal."""
 
-        if type(records) is not tuple or any(
-            not isinstance(record, dataset_foundation.RawDatasetRecord)
-            for record in records
-        ):
-            raise TypeError(
-                "records must be an exact tuple of RawDatasetRecord values."
-            )
-        if type(sources) is not tuple or any(
-            not isinstance(source, dataset_foundation.ImportedSource)
-            for source in sources
-        ):
-            raise TypeError("sources must be an exact tuple of ImportedSource values.")
         return replace(
             self,
             datasets=(*self.datasets, *records),
