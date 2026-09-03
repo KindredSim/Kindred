@@ -23,7 +23,9 @@ from kindred.core.analysis.fit_uncertainty import (
     ProfileLikelihoodResult,
     ResidualBootstrapConfig,
     ResidualBootstrapResult,
+    profile_likelihood_settlement_result,
     profile_likelihood_result,
+    residual_bootstrap_settlement_result,
     residual_bootstrap_result,
 )
 from kindred.core.analysis import global_fit_execution as _fit_execution
@@ -104,102 +106,6 @@ def _validate_run_inputs(
             + "."
         )
     return payloads, evaluators, shared, overrides
-
-
-
-
-
-def _stopped_profile_result(
-    *,
-    config: ProfileLikelihoodConfig,
-    replay_state: _fit_execution._FitReplayState,
-    cause: FactualCause,
-) -> ProfileLikelihoodResult:
-    """Settle a requested Profile analysis that a primary Stop prevented."""
-
-    return ProfileLikelihoodResult(
-        status="stopped",
-        method="profile likelihood with nuisance reoptimization",
-        requested_parameters=tuple(
-            str(item.display_name) for item in config.parameter_names
-        ),
-        confidence_level=config.confidence_level,
-        likelihood_ratio_threshold=float(config.likelihood_ratio_threshold),
-        likelihood_model="weighted Gaussian residuals with profiled variance",
-        likelihood_ratio_transport="finite log likelihood ratio",
-        fixed_coordinate_policy="selected coordinate fixed; all others reoptimized",
-        warm_start_policy="inner_successful_refit",
-        optimizer_method=config.optimizer_method,
-        max_bracketing_steps_per_side=config.max_bracketing_steps_per_side,
-        max_nfev_per_point=config.max_nfev_per_point,
-        observation_count=int(replay_state.weighted_residuals.size),
-        terminal_weighted_residual_sse=float(
-            replay_state.weighted_residual_sse.value
-        ),
-        intervals={},
-        diagnostic=cause,
-        provenance={
-            "settlement": "stopped",
-            "primary_fit_preserved": True,
-        },
-    )
-
-
-def _stopped_bootstrap_result(
-    *,
-    config: ResidualBootstrapConfig,
-    cause: FactualCause,
-    settlement: str,
-) -> ResidualBootstrapResult:
-    """Settle a requested Bootstrap analysis that did not start or stopped."""
-
-    required_successes = max(
-        config.minimum_successful_replicates,
-        int(np.ceil(config.replicates * config.minimum_success_fraction)),
-    )
-    return ResidualBootstrapResult(
-        status="stopped",
-        method="stratified residual bootstrap with full refits",
-        requested_parameters=tuple(
-            str(item.display_name) for item in config.parameter_names
-        ),
-        seed=config.seed,
-        replicates=config.replicates,
-        confidence_level=config.confidence_level,
-        resampling="within each dataset/target residual stratum",
-        stratum_manifest_version=1,
-        stratum_manifest={},
-        draw_recipe_version=2,
-        draw_algorithm="numpy.default_rng(seed) residual-index draws",
-        residual_centering=(
-            "independent arithmetic mean subtraction within each dataset/target stratum"
-        ),
-        replay_authority="seed plus versioned draw algorithm and stratum manifest",
-        preserved_fields=(
-            "time",
-            "X",
-            "source-row",
-            "dataset weight",
-            "target weight",
-            "full-refit",
-        ),
-        replicate_execution="full global refit",
-        refit_validity="only explicitly converged scientific refits count",
-        minimum_successful_replicates=config.minimum_successful_replicates,
-        minimum_success_fraction=config.minimum_success_fraction,
-        required_successes=required_successes,
-        successful_replicates=0,
-        failed_replicates=0,
-        interval_construction="equal-tailed percentile",
-        intervals={},
-        diagnostic=cause,
-        provenance={
-            "settlement": settlement,
-            "primary_fit_preserved": True,
-        },
-    )
-
-
 def _mark_late_stop(
     result: _fit_execution.GlobalFitResult,
     *,
@@ -414,10 +320,11 @@ def fit_global(
         replay_cancellation_check = cancellation_check
         replay_cancellation_control = cancellation_control
         if callable(stop_best_requested):
-            def replay_cancellation_check() -> bool:
+            def stopped_replay_check() -> bool:
                 # A user Stop is settled by this one terminal replay.  The
                 # ordinary control still owns Close and dataset deadlines.
                 return False
+            replay_cancellation_check = stopped_replay_check
             if stopped_replay_control is not None:
                 replay_cancellation_control = stopped_replay_control
         try:
@@ -500,68 +407,28 @@ def fit_global(
                     domain="fit",
                     origin="profile_likelihood",
                 )
-                profile_result = ProfileLikelihoodResult(
+                profile_result = profile_likelihood_settlement_result(
+                    config=profile_config,
                     status="stopped",
-                    method="profile likelihood with nuisance reoptimization",
-                    requested_parameters=tuple(
-                        str(item.display_name)
-                        for item in profile_config.parameter_names
-                    ),
-                    confidence_level=profile_config.confidence_level,
-                    likelihood_ratio_threshold=float(
-                        profile_config.likelihood_ratio_threshold
-                    ),
-                    likelihood_model="weighted Gaussian residuals with profiled variance",
-                    likelihood_ratio_transport="finite log likelihood ratio",
-                    fixed_coordinate_policy="selected coordinate fixed; all others reoptimized",
-                    warm_start_policy="inner_successful_refit",
-                    optimizer_method=profile_config.optimizer_method,
-                    max_bracketing_steps_per_side=profile_config.max_bracketing_steps_per_side,
-                    max_nfev_per_point=profile_config.max_nfev_per_point,
+                    cause=stop_cause,
                     observation_count=int(replay_state.weighted_residuals.size),
                     terminal_weighted_residual_sse=float(
                         replay_state.weighted_residual_sse.value
                     ),
-                    intervals={},
-                    diagnostic=stop_cause,
-                    provenance={
-                        "settlement": "stopped",
-                        "primary_fit_preserved": True,
-                    },
                 )
             except Exception as exc:
-                profile_result = ProfileLikelihoodResult(
+                profile_result = profile_likelihood_settlement_result(
+                    config=profile_config,
                     status="failed",
-                    method="weighted-Gaussian profile likelihood",
-                    requested_parameters=tuple(
-                        str(item.display_name)
-                        for item in profile_config.parameter_names
-                    ),
-                    confidence_level=profile_config.confidence_level,
-                    likelihood_ratio_threshold=float(
-                        profile_config.likelihood_ratio_threshold
-                    ),
-                    likelihood_model="weighted Gaussian residuals with profiled variance",
-                    likelihood_ratio_transport="finite log likelihood ratio",
-                    fixed_coordinate_policy="selected coordinate fixed; all others reoptimized",
-                    warm_start_policy="inner_successful_refit",
-                    optimizer_method=profile_config.optimizer_method,
-                    max_bracketing_steps_per_side=profile_config.max_bracketing_steps_per_side,
-                    max_nfev_per_point=profile_config.max_nfev_per_point,
-                    observation_count=int(replay_state.weighted_residuals.size),
-                    terminal_weighted_residual_sse=float(
-                        replay_state.weighted_residual_sse.value
-                    ),
-                    intervals={},
-                    diagnostic=factual_cause_from_exception(
+                    cause=factual_cause_from_exception(
                         exc,
                         domain="fit",
                         origin="profile_likelihood",
                     ),
-                    provenance={
-                        "settlement": "failed",
-                        "primary_fit_preserved": True,
-                    },
+                    observation_count=int(replay_state.weighted_residuals.size),
+                    terminal_weighted_residual_sse=float(
+                        replay_state.weighted_residual_sse.value
+                    ),
                 )
 
         if residual_bootstrap is not None:
@@ -601,47 +468,11 @@ def fit_global(
                 )
 
             if optional_analysis_stopped:
-                required_successes = max(
-                    residual_bootstrap.minimum_successful_replicates,
-                    int(
-                        np.ceil(
-                            residual_bootstrap.replicates
-                            * residual_bootstrap.minimum_success_fraction
-                        )
-                    ),
-                )
-                bootstrap_result = ResidualBootstrapResult(
+                bootstrap_result = residual_bootstrap_settlement_result(
+                    config=residual_bootstrap,
                     status="stopped",
-                    method="stratified residual bootstrap with full refits",
-                    requested_parameters=tuple(
-                        str(item.display_name)
-                        for item in residual_bootstrap.parameter_names
-                    ),
-                    seed=residual_bootstrap.seed,
-                    replicates=residual_bootstrap.replicates,
-                    confidence_level=residual_bootstrap.confidence_level,
-                    resampling="within each dataset/target residual stratum",
-                    stratum_manifest_version=1,
-                    stratum_manifest={},
-                    draw_recipe_version=2,
-                    draw_algorithm="numpy.default_rng(seed) residual-index draws",
-                    residual_centering="independent arithmetic mean subtraction within each dataset/target stratum",
-                    replay_authority="seed plus versioned draw algorithm and stratum manifest",
-                    preserved_fields=("time", "X", "source-row", "dataset weight", "target weight", "full-refit"),
-                    replicate_execution="full global refit",
-                    refit_validity="only explicitly converged scientific refits count",
-                    minimum_successful_replicates=residual_bootstrap.minimum_successful_replicates,
-                    minimum_success_fraction=residual_bootstrap.minimum_success_fraction,
-                    required_successes=required_successes,
-                    successful_replicates=0,
-                    failed_replicates=0,
-                    interval_construction="equal-tailed percentile",
-                    intervals={},
-                    provenance={
-                        "settlement": "not_started_after_stop",
-                        "primary_fit_preserved": True,
-                    },
-                    diagnostic=factual_cause_from_exception(
+                    settlement="not_started_after_stop",
+                    cause=factual_cause_from_exception(
                         FittingCancelled(
                             "Bootstrap was not started after post-fit processing stopped."
                         ),
@@ -662,94 +493,24 @@ def fit_global(
                     optional_analysis_stopped = bootstrap_result.status == "stopped"
                 except (FittingCancelled, SimulationCancelled) as exc:
                     optional_analysis_stopped = True
-                    bootstrap_result = ResidualBootstrapResult(
+                    bootstrap_result = residual_bootstrap_settlement_result(
+                        config=residual_bootstrap,
                         status="stopped",
-                        method="stratified residual bootstrap with full refits",
-                        requested_parameters=tuple(
-                            str(item.display_name)
-                            for item in residual_bootstrap.parameter_names
-                        ),
-                        seed=residual_bootstrap.seed,
-                        replicates=residual_bootstrap.replicates,
-                        confidence_level=residual_bootstrap.confidence_level,
-                        resampling="within each dataset/target residual stratum",
-                        stratum_manifest_version=1,
-                        stratum_manifest={},
-                        draw_recipe_version=2,
-                        draw_algorithm="numpy.default_rng(seed) residual-index draws",
-                        residual_centering="independent arithmetic mean subtraction within each dataset/target stratum",
-                        replay_authority="seed plus versioned draw algorithm and stratum manifest",
-                        preserved_fields=("time", "X", "source-row", "dataset weight", "target weight", "full-refit"),
-                        replicate_execution="full global refit",
-                        refit_validity="only explicitly converged scientific refits count",
-                        minimum_successful_replicates=residual_bootstrap.minimum_successful_replicates,
-                        minimum_success_fraction=residual_bootstrap.minimum_success_fraction,
-                        required_successes=max(
-                            residual_bootstrap.minimum_successful_replicates,
-                            int(
-                                np.ceil(
-                                    residual_bootstrap.replicates
-                                    * residual_bootstrap.minimum_success_fraction
-                                )
-                            ),
-                        ),
-                        successful_replicates=0,
-                        failed_replicates=0,
-                        interval_construction="equal-tailed percentile",
-                        intervals={},
-                        provenance={
-                            "settlement": "stopped",
-                            "primary_fit_preserved": True,
-                        },
-                        diagnostic=factual_cause_from_exception(
+                        settlement="stopped",
+                        cause=factual_cause_from_exception(
                             exc, domain="fit", origin="bootstrap"
                         ),
                     )
                 except Exception as exc:
-                    bootstrap_result = ResidualBootstrapResult(
+                    bootstrap_result = residual_bootstrap_settlement_result(
+                        config=residual_bootstrap,
                         status="failed",
-                        method="stratified residual bootstrap with full refits",
-                        requested_parameters=tuple(
-                            str(item.display_name)
-                            for item in residual_bootstrap.parameter_names
-                        ),
-                        seed=residual_bootstrap.seed,
-                        replicates=residual_bootstrap.replicates,
-                        confidence_level=residual_bootstrap.confidence_level,
-                        resampling="within each dataset/target residual stratum",
-                        stratum_manifest_version=1,
-                        stratum_manifest={},
-                        draw_recipe_version=2,
-                        draw_algorithm="numpy.default_rng(seed) residual-index draws",
-                        residual_centering="independent arithmetic mean subtraction within each dataset/target stratum",
-                        replay_authority="seed plus versioned draw algorithm and stratum manifest",
-                        preserved_fields=("time", "X", "source-row", "dataset weight", "target weight", "full-refit"),
-                        replicate_execution="full global refit",
-                        refit_validity="only explicitly converged scientific refits count",
-                        minimum_successful_replicates=residual_bootstrap.minimum_successful_replicates,
-                        minimum_success_fraction=residual_bootstrap.minimum_success_fraction,
-                        required_successes=max(
-                            residual_bootstrap.minimum_successful_replicates,
-                            int(
-                                np.ceil(
-                                    residual_bootstrap.replicates
-                                    * residual_bootstrap.minimum_success_fraction
-                                )
-                            ),
-                        ),
-                        successful_replicates=0,
-                        failed_replicates=0,
-                        interval_construction="equal-tailed percentile",
-                        intervals={},
-                        diagnostic=factual_cause_from_exception(
+                        settlement="failed",
+                        cause=factual_cause_from_exception(
                             exc,
                             domain="fit",
                             origin="bootstrap",
                         ),
-                        provenance={
-                            "settlement": "failed",
-                            "primary_fit_preserved": True,
-                        },
                     )
 
         replay_state = replace(
@@ -809,17 +570,22 @@ def fit_global(
                         for name in profile_likelihood.parameter_names
                     ),
                 )
-                settled_profile = _stopped_profile_result(
+                settled_profile = profile_likelihood_settlement_result(
                     config=settled_profile_config,
-                    replay_state=existing_replay_state,
+                    status="stopped",
                     cause=stop_cause,
+                    observation_count=int(existing_replay_state.weighted_residuals.size),
+                    terminal_weighted_residual_sse=float(
+                        existing_replay_state.weighted_residual_sse.value
+                    ),
                 )
             settled_bootstrap = locals().get("bootstrap_result")
             if residual_bootstrap is not None and settled_bootstrap is None:
-                settled_bootstrap = _stopped_bootstrap_result(
+                settled_bootstrap = residual_bootstrap_settlement_result(
                     config=residual_bootstrap,
                     cause=stop_cause,
                     settlement="not_started_after_stop",
+                    status="stopped",
                 )
             settled_state = replace(
                 existing_replay_state,
@@ -904,19 +670,24 @@ def fit_global(
                     profile_likelihood_result=(
                         None
                         if stopped_profile is None
-                        else _stopped_profile_result(
+                        else profile_likelihood_settlement_result(
                             config=stopped_profile,
-                            replay_state=stopped_state,
+                            status="stopped",
                             cause=stop_cause,
+                            observation_count=int(stopped_state.weighted_residuals.size),
+                            terminal_weighted_residual_sse=float(
+                                stopped_state.weighted_residual_sse.value
+                            ),
                         )
                     ),
                     residual_bootstrap_result=(
                         None
                         if stopped_bootstrap is None
-                        else _stopped_bootstrap_result(
+                        else residual_bootstrap_settlement_result(
                             config=stopped_bootstrap,
                             cause=stop_cause,
                             settlement="not_started_after_stop",
+                            status="stopped",
                         )
                     ),
                 )

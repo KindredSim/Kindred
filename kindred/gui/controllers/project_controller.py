@@ -587,9 +587,12 @@ class ProjectController(QtCore.QObject):
                 archive.presentation,
             )
         except (KeyError, TypeError, ValueError) as exc:
-            raise ValueError(
-                f"Incoming project presentation is incoherent after admission: {exc}"
-            ) from exc
+            logger.exception("Incoming project presentation validation failed")
+            self._show_error(
+                "Open Project Error",
+                f"Could not open project:\n\n{exc}",
+            )
+            return False
         self._apply_discard(disposition)
         absolute_path = os.path.abspath(os.fsdecode(os.fspath(path)))
         return self._replace_project(

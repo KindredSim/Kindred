@@ -26,13 +26,7 @@ from kindred.core.exceptions import (
 from kindred.core.analysis.fit_evaluation_outcome import (
     ScientificUnavailable,
 )
-from kindred.core.algebra.errors import (
-    AlgebraError,
-)
-from kindred.core.algebra.observable_introspection import AdmittedAlgebraProgram
-from kindred.core.algebra.simulation_series import (
-    evaluate_compiled_algebra_series_for_simulation,
-)
+from kindred.core.algebra.errors import AlgebraError
 from kindred.core.intervention_schedule_compiler import (
     InterventionExecutionContract,
 )
@@ -49,17 +43,13 @@ from kindred.core.simulation_preparation import (
     raise_unowned_request_parameter_values,
     reject_requested_algebra_owned_mechanism_parameters_for_fitting,
     build_simulation_request_from_prepared_run,
-    metadata_view_for_mechanism,
     prepare_simulation_worker_run,
     SimulationPreparationError,
 )
 from kindred.core.simulation_preparation_stages import PreparedSolverConfig
 from kindred.core.simulation_algebra_policy import SimulationAlgebraPolicy
 from kindred.core.result_repository import SimulationResultValue
-from kindred.core.simulation_result_finalization import (
-    build_simulation_row_algebra_context,
-    finalize_simulation_result,
-)
+from kindred.core.simulation_result_finalization import finalize_simulation_result
 from kindred.core.simulator.solver_types import (
     SimulationCancellationControl,
     SimulationScientificUnavailability,
@@ -236,7 +226,6 @@ class PreparedFittingExecutionContext:
     requested_sample_times: tuple[float, ...]
     fit_sampling_policy: str = "fit_internal_regular_grid"
     fit_sampling_identity: Mapping[str, object] = field(default_factory=dict)
-    fit_local_admission: AdmittedAlgebraProgram | None = None
     initial_prefix: str = "init:"
 
     def __post_init__(self) -> None:
@@ -281,9 +270,6 @@ class PreparedFittingExecutionContext:
             "fit_sampling_identity",
             dict(self.fit_sampling_identity or {}),
         )
-        admission = self.fit_local_admission
-        if admission is not None and not isinstance(admission, AdmittedAlgebraProgram):
-            raise TypeError("Fit-local admission must be a typed value.")
         object.__setattr__(self, "initial_prefix", str(self.initial_prefix or "init:"))
 
 def prepare_fitting_execution_context(
@@ -298,7 +284,6 @@ def prepare_fitting_execution_context(
     initial_prefix: str = "init:",
     fit_sampling_policy: str = "fit_internal_regular_grid",
     fit_sampling_identity: Mapping[str, object] | None = None,
-    fit_local_admission: AdmittedAlgebraProgram | None = None,
     cancellation_control: SimulationCancellationControl | None = None,
 ) -> PreparedFittingExecutionContext:
     """Prepare structured execution data for one per-dataset evaluator."""
@@ -327,24 +312,11 @@ def prepare_fitting_execution_context(
         raise ValueError("Fitting num_points must be >= 2.")
     grid_n = num_points
     initial_prefix = str(initial_prefix or "init:")
-    if fit_local_admission is not None:
-        if not isinstance(fit_local_admission, AdmittedAlgebraProgram):
-            raise TypeError("fit_local_admission must be a typed value.")
-        # Re-entry is deliberate: namespace and domain drift must reject before
-        # Fit setup or solver mutation.  The returned admission is the only
-        # request-local Algebra authority used below.
-        fit_local_admission = fit_local_admission.reenter(prepared_dsl)
-    local_scalar_names = set(
-        ()
-        if fit_local_admission is None
-        else fit_local_admission.scalar_names
-    )
     mechanism_param_names = [
         str(name)
         for name in (param_names or ())
         if str(name).strip()
         and not str(name).startswith(initial_prefix)
-        and str(name) not in local_scalar_names
     ]
     if not isinstance(prepared_solver_config, PreparedSolverConfig):
         raise TypeError("Fit preparation requires a PreparedSolverConfig.")
@@ -523,7 +495,6 @@ def prepare_fitting_execution_context(
         requested_sample_times=requested_sample_times,
         fit_sampling_policy=str(fit_sampling_policy or "fit_internal_regular_grid"),
         fit_sampling_identity=dict(fit_sampling_identity or {}),
-        fit_local_admission=fit_local_admission,
         initial_prefix=str(initial_prefix),
     )
 
@@ -618,32 +589,11 @@ class FittingEvaluator:
         }
         origin_map = dict(origins or {})
 
-        admission = self._context.fit_local_admission
-        local_scalar_names = set(
-            () if admission is None else admission.scalar_names
-        )
-        missing_local_scalars = sorted(local_scalar_names - set(param_map))
-        if missing_local_scalars:
-            raise FitSimulationError(
-                "Fit-local evaluation is missing request scalar value(s): "
-                + ", ".join(repr(name) for name in missing_local_scalars),
-                details={"fatal": True, "stage": "fit_local_evaluation"},
-            )
-        local_scalar_values = {
-            name: _coerce_consumed_parameter_value(
-                name=name,
-                raw_value=param_map[name],
-                origins=origin_map,
-                failed_params=failed_params,
-            )
-            for name in local_scalar_names
-        }
         initial_overrides: Dict[str, float] = {}
         non_initial_parameters = {
             str(name): value
             for name, value in param_map.items()
             if not str(name).startswith(self._context.initial_prefix)
-            and str(name) not in local_scalar_names
         }
 
         non_initial_parameters = {
@@ -804,70 +754,6 @@ class FittingEvaluator:
                 stage="result_finalization",
                 failed_params=failed_params,
             ) from exc
-        if admission is not None:
-            self._raise_if_cancel_requested()
-            try:
-                symbol_series, symbol_values = build_simulation_row_algebra_context(
-                    prepared_run.mechanism,
-                    np.asarray(admitted.t, dtype=float),
-                    parameter_algebra_spec=prepared_run.parameter_algebra_spec,
-                    temperature_schedule=prepared_run.temperature_schedule,
-                )
-                symbol_series.update(
-                    {
-                        str(name): np.asarray(values, dtype=float)
-                        for name, values in admitted.series.items()
-                    }
-                )
-                symbol_values.update(
-                    {str(name): float(value) for name, value in admitted.scalars.items()}
-                )
-                symbol_values.update(local_scalar_values)
-                species_series = {
-                    str(name): np.asarray(admitted.series[name], dtype=float)
-                    for name in prepared_run.species_names
-                }
-                local_series, local_scalars = (
-                    evaluate_compiled_algebra_series_for_simulation(
-                        prepared_run.mechanism,
-                        admission.compiled,
-                        t=np.asarray(admitted.t, dtype=float),
-                        species_series=species_series,
-                        initials=initials_map,
-                        temperature_K=float(
-                            metadata_view_for_mechanism(
-                                prepared_run.mechanism
-                            ).temperature_K
-                        ),
-                        symbol_series=symbol_series,
-                        symbol_values=symbol_values,
-                    )
-                )
-            except Exception as exc:
-                if isinstance(exc, (FittingCancelled, SimulationCancelled)):
-                    raise FittingCancelled() from exc
-                if isinstance(exc, AlgebraError):
-                    raise
-                raise _fatal_evaluation_error(
-                    exc,
-                    message=f"Fit-local observable evaluation failed: {exc}",
-                    stage="fit_local_evaluation",
-                    failed_params=failed_params,
-                ) from exc
-            local_names = tuple(admission.observable_names)
-            admitted = replace(
-                admitted,
-                series={**dict(admitted.series), **local_series},
-                scalars={**dict(admitted.scalars), **local_scalars},
-                requested_algebra_outputs=(
-                        *admitted.requested_algebra_outputs,
-                        *local_names,
-                ),
-                succeeded_algebra_outputs=(
-                        *admitted.succeeded_algebra_outputs,
-                        *local_names,
-                ),
-            )
         result_execution = admitted.intervention_execution
         if not isinstance(result_execution, InterventionExecutionContract):
             raise FitSimulationError(

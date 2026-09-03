@@ -43,7 +43,6 @@ class FittingWindow(QtWidgets.QDialog):
     cancelRequested = QtCore.Signal()
     pauseRequested = QtCore.Signal()
     resumeRequested = QtCore.Signal()
-    addObservableRequested = QtCore.Signal(str, str, object, str)
     setupSnapshotRequested = QtCore.Signal(object)
     resetRequested = QtCore.Signal(str)
     projectDefaultsRequested = QtCore.Signal(object)
@@ -108,7 +107,6 @@ class FittingWindow(QtWidgets.QDialog):
         )
         self._params_ics_tab = ParametersIcsTab(
             origin=self._origin,
-            parameter_choices=self._parameter_choices_for_origin(),
             parent=self,
         )
         self._run_results_tab = RunResultsTab(
@@ -254,9 +252,6 @@ class FittingWindow(QtWidgets.QDialog):
         self._params_ics_tab.resetRequested.connect(
             self.resetRequested
         )
-        self._params_ics_tab.addObservableRequested.connect(
-            self._on_add_observable_requested
-        )
         self._params_ics_tab.viewStepsRequested.connect(
             self._open_mechanism_inspector
         )
@@ -282,14 +277,6 @@ class FittingWindow(QtWidgets.QDialog):
         dataset_list.datasetIncludeChanged.connect(
             self._on_dataset_include_changed
         )
-    def _parameter_choices_for_origin(self) -> dict[str, object]:
-        return {
-            "dataset_ids": tuple(
-                item.dataset_id for item in self._origin.mapped_datasets
-            ),
-            "available_species": self._mechanism_species(),
-        }
-
     def _open_mechanism_inspector(self) -> None:
         from kindred.gui.widgets.mechanism_inspector import MechanismInspectorDialog
 
@@ -299,14 +286,11 @@ class FittingWindow(QtWidgets.QDialog):
         ).exec()
 
     def set_initial_reset_available(self, snapshot: FitSetupSnapshot) -> None:
-        self._check_snapshot(snapshot)
         self._params_ics_tab.set_initial_reset_available(snapshot)
 
     def set_last_fit_reset_available(self, snapshot: FitSetupSnapshot | None) -> None:
         """Project Last Fit reset availability without retaining the snapshot."""
 
-        if snapshot is not None:
-            self._check_snapshot(snapshot)
         self._params_ics_tab.set_last_fit_reset_available(snapshot)
 
     def set_last_fit_presentation(self) -> None:
@@ -325,7 +309,6 @@ class FittingWindow(QtWidgets.QDialog):
     def project_setup_snapshot(self, snapshot: FitSetupSnapshot) -> None:
         """Project accepted baselines while retaining unrelated local edits."""
 
-        self._check_snapshot(snapshot)
         self._projected_setup = snapshot
         self._populate_dataset_list(snapshot)
         selected_dataset_id = (
@@ -334,9 +317,6 @@ class FittingWindow(QtWidgets.QDialog):
         self._setup_projecting = True
         try:
             self._params_ics_tab.project_setup_snapshot(snapshot)
-            self._params_ics_tab.set_selected_dataset_ids(
-                self._included_dataset_ids(snapshot)
-            )
             self._species_table.project_setup_snapshot(
                 snapshot,
                 dataset_id=selected_dataset_id,
@@ -359,19 +339,6 @@ class FittingWindow(QtWidgets.QDialog):
         if self._closing or self._setup_projecting:
             return
         self.setupSnapshotRequested.emit(snapshot)
-
-    def _check_snapshot(self, snapshot: FitSetupSnapshot) -> None:
-        self._check_snapshot_origin(snapshot, self._origin)
-
-    @staticmethod
-    def _check_snapshot_origin(
-        snapshot: FitSetupSnapshot,
-        origin: FitOriginSnapshot,
-    ) -> None:
-        if not isinstance(snapshot, FitSetupSnapshot):
-            raise TypeError("snapshot must be FitSetupSnapshot.")
-        if snapshot.origin is not origin:
-            raise ValueError("Fit snapshot does not match this origin.")
 
     @property
     def has_invalid_setup_edits(self) -> bool:
@@ -407,8 +374,7 @@ class FittingWindow(QtWidgets.QDialog):
                 datasets=setup.datasets,
                 parameters=setup.parameters,
                 initials=setup.initials,
-                global_initials=setup.global_initials,
-                initial_scopes=setup.initial_scopes,
+                shared_initial_groups=setup.shared_initial_groups,
             )
         ready = (
             setup is not None
@@ -451,15 +417,14 @@ class FittingWindow(QtWidgets.QDialog):
         )
 
     # ------------------------------------------------------------------
-    # Fit-local data and setup presentation adapters
+    # Fit data and setup presentation adapters
     # ------------------------------------------------------------------
 
     def _mechanism_species(self) -> tuple[str, ...]:
+        analysis = self._origin.prepared_dsl.analysis
         return tuple(
             dict.fromkeys(
-                species
-                for mapped in self._origin.mapped_datasets
-                for species, _value in mapped.initial_values
+                (*analysis.species_names, *analysis.observable_names)
             )
         )
 
@@ -711,20 +676,6 @@ class FittingWindow(QtWidgets.QDialog):
             resolved_mode=None if mode == "auto" else mode,
         )
 
-    def _on_add_observable_requested(
-        self,
-        name: str,
-        expression: str,
-        observations: object,
-        scalar_scope: str,
-    ) -> None:
-        self.addObservableRequested.emit(
-            str(name),
-            str(expression),
-            observations,
-            str(scalar_scope),
-        )
-
     # ------------------------------------------------------------------
     # Current public window behavior
     # ------------------------------------------------------------------
@@ -741,16 +692,6 @@ class FittingWindow(QtWidgets.QDialog):
         return self._data_tab.has_pending_edits(
             self._included_dataset_ids(setup)
         )
-
-    def add_observable_conflict(self, dataset_id: str) -> str | None:
-        """Expose the target leaf's same-dataset Add Observable guard."""
-
-        return self._species_table.add_observable_conflict(dataset_id)
-
-    def selected_fit_dataset_ids(self) -> tuple[str, ...]:
-        """Return the accepted dataset roster used by the observable dialog."""
-
-        return tuple(self._params_ics_tab._selected_dataset_ids)
 
     def _is_executing(self) -> bool:
         return bool(self._executing)

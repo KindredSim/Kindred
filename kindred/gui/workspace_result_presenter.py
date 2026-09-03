@@ -762,7 +762,6 @@ def _data_block(
     *,
     x_axis: AxisSeriesSelection,
     y_axes: set[AxisSeriesSelection] | None = None,
-    excluded_y_axes: set[AxisSeriesSelection] | None = None,
 ) -> ResultDataBlock | None:
     series_axis_map = dict(block.series_axes)
     if _is_time_selection(x_axis):
@@ -779,9 +778,7 @@ def _data_block(
     selected = tuple(
         (name, values)
         for name, values in block.series
-        if series_axis_map[name] != x_axis
-        and (excluded_y_axes is None or series_axis_map[name] not in excluded_y_axes)
-        and (y_axes is None or series_axis_map[name] in y_axes)
+        if (y_axes is None or series_axis_map[name] in y_axes)
     )
     if not selected:
         return None
@@ -807,11 +804,9 @@ def _has_selected_y_series(
     block: ResultDataBlock,
     *,
     y_axes: set[AxisSeriesSelection] | None,
-    excluded_y_axes: set[AxisSeriesSelection] | None,
 ) -> bool:
     return any(
-        (excluded_y_axes is None or selection not in excluded_y_axes)
-        and (y_axes is None or selection in y_axes)
+        y_axes is None or selection in y_axes
         for _name, selection in block.series_axes
     )
 
@@ -820,7 +815,6 @@ def _statistics_series_names(
     block: ResultDataBlock,
     *,
     y_axes: set[AxisSeriesSelection] | None,
-    excluded_y_axes: set[AxisSeriesSelection] | None = None,
 ) -> tuple[str, ...]:
     if not isinstance(block.result, SimulationResultValue):
         raise TypeError("statistics require a canonical simulation result.")
@@ -829,7 +823,6 @@ def _statistics_series_names(
     return tuple(
         name for name in block.result.series
         if name not in succeeded
-        and (excluded_y_axes is None or series_axes[name] not in excluded_y_axes)
         and (y_axes is None or series_axes[name] in y_axes)
     )
 
@@ -1104,13 +1097,12 @@ def compose_interactive_display(
             return None
         x_values = _readonly_display_array(selected_series)
     wanted_y = (
-        tuple(name for name in result_series if name != selected_x.series_name)
+        tuple(result_series)
         if render_input.selected_y_uses_default_all
         else tuple(
             selection.series_name
             for selection in render_input.selected_y_series
             if isinstance(selection, SimulationSeriesAxisSelection)
-            and selection.series_name != selected_x.series_name
         )
     )
     live_block = next(
@@ -1292,21 +1284,9 @@ def compose_result_input(
         )
     )
     wanted_y = None if bool(selected_y_uses_default_all) else set(effective_y)
-    excluded_simulation_y: set[AxisSeriesSelection] = set()
-    excluded_experimental_y: set[AxisSeriesSelection] = set()
     selected_x_source: ExperimentalLayerInput | None = None
-    if isinstance(selected_x, SimulationSeriesAxisSelection):
-        excluded_simulation_y.add(selected_x)
-        excluded_experimental_y.update(
-            item.axis for item in active if item.model_target == selected_x.series_name
-        )
-    elif isinstance(selected_x, ExperimentalAxisSelection):
+    if isinstance(selected_x, ExperimentalAxisSelection):
         selected_x_source = experimental_by_axis.get(selected_x)
-        excluded_experimental_y.add(selected_x)
-        if selected_x_source is not None and selected_x_source.model_target:
-            excluded_simulation_y.add(
-                SimulationSeriesAxisSelection(selected_x_source.model_target)
-            )
     simulation_x = (
         SimulationSeriesAxisSelection(selected_x_source.model_target)
         if isinstance(selected_x, ExperimentalAxisSelection)
@@ -1359,7 +1339,6 @@ def compose_result_input(
                 add_candidate(selection, name)
             physical = _data_block(
                 semantic, x_axis=simulation_x, y_axes=wanted_y,
-                excluded_y_axes=excluded_simulation_y,
             )
             if physical is not None:
                 blocks.append(physical)
@@ -1367,7 +1346,6 @@ def compose_result_input(
                 if _has_selected_y_series(
                     semantic,
                     y_axes=wanted_y,
-                    excluded_y_axes=excluded_simulation_y,
                 ):
                     unavailable_labels.append(semantic.label)
                 if visible.set_id == current_id:
@@ -1387,7 +1365,6 @@ def compose_result_input(
             if reference_lines_visible:
                 reference_physical = _data_block(
                     reference_semantic, x_axis=simulation_x, y_axes=wanted_y,
-                    excluded_y_axes=excluded_simulation_y,
                 )
                 if reference_physical is not None:
                     blocks.append(reference_physical)
@@ -1395,7 +1372,6 @@ def compose_result_input(
                     if _has_selected_y_series(
                         reference_semantic,
                         y_axes=wanted_y,
-                        excluded_y_axes=excluded_simulation_y,
                     ):
                         unavailable_labels.append(reference_semantic.label)
                     if visible.set_id == current_id:
@@ -1403,15 +1379,11 @@ def compose_result_input(
                 add_warning(reference_semantic.label, reference, True)
                 annotations.extend(_annotations_from_execution(reference))
             else:
-                # Retain the semantic Reference block even when its ordinary
-                # line is hidden. Interactive Preview needs this authority as
-                # its foreground base, and the physical renderer honors the
-                # block's invisible presentation flag.
                 blocks.append(reference_semantic)
         if visible.set_id == current_id:
             foreground_names = (
                 _statistics_series_names(
-                    semantic, y_axes=wanted_y, excluded_y_axes=excluded_simulation_y
+                    semantic, y_axes=wanted_y
                 )
                 if foreground is not None
                 and foreground_kind is ResultLayerKind.EXPLICIT
@@ -1426,7 +1398,7 @@ def compose_result_input(
                 statistics_names = foreground_names
             elif reference is not None and reference_semantic is not None:
                 statistics_names = _statistics_series_names(
-                    reference_semantic, y_axes=wanted_y, excluded_y_axes=excluded_simulation_y
+                    reference_semantic, y_axes=wanted_y
                 )
 
     for experimental in active:
@@ -1462,10 +1434,7 @@ def compose_result_input(
             if (
                 x_source is None
                 or x_source.axis.dataset_id != experimental.axis.dataset_id
-                or y_axis in excluded_experimental_y
             ):
-                if y_axis in excluded_experimental_y:
-                    continue
                 unavailable = True
             else:
                 paired = _same_source_row_values(x_source, experimental)

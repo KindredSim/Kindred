@@ -161,7 +161,7 @@ class FitTrackerPanel(QtWidgets.QWidget):
                 f"[{label.display}] "
                 + " | ".join(
                     f"{compact_text(name, max_chars=STATUS_ITEM_LABEL_MAX_CHARS).display}="
-                    f"{float(value):.6g} (Fit-local; not applied to Run)"
+                    f"{float(value):.6g}"
                     for name, value in values
                 )
             )

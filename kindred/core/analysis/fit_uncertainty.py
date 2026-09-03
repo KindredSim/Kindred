@@ -45,6 +45,8 @@ __all__ = [
     "ProfileLikelihoodResult",
     "BootstrapPercentileInterval",
     "ResidualBootstrapResult",
+    "profile_likelihood_settlement_result",
+    "residual_bootstrap_settlement_result",
     "profile_likelihood_result",
     "residual_bootstrap_result",
 ]
@@ -116,6 +118,26 @@ def _bounded_positive_integer(
         raise ValueError(f"{field} must be an integer.")
     if result <= 0 or result > int(maximum):
         raise ValueError(f"{field} must be within 1 and {int(maximum)}.")
+    return result
+
+
+def _bounded_nonnegative_integer(
+    value: object,
+    *,
+    field: str,
+    maximum: int,
+) -> int:
+    if isinstance(value, bool):
+        raise TypeError(f"{field} must be an integer.")
+    try:
+        result = int(value)
+        exact = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise TypeError(f"{field} must be an integer.") from exc
+    if not math.isfinite(exact) or exact != result:
+        raise ValueError(f"{field} must be an integer.")
+    if result < 0 or result > int(maximum):
+        raise ValueError(f"{field} must be within 0 and {int(maximum)}.")
     return result
 
 
@@ -439,15 +461,23 @@ class ProfileLikelihoodResult:
         if not math.isfinite(threshold) or threshold <= 0.0:
             raise ValueError("Profile result threshold must be positive.")
         for name in ("max_bracketing_steps_per_side", "max_nfev_per_point"):
-            value = int(getattr(self, name))
-            if value <= 0:
-                raise ValueError(f"Profile result {name} must be positive.")
+            value = _bounded_positive_integer(
+                getattr(self, name),
+                field=f"Profile result {name}",
+                maximum=(
+                    _PROFILE_MAX_POINTS_PER_SIDE
+                    if name == "max_bracketing_steps_per_side"
+                    else 100_000
+                ),
+            )
             object.__setattr__(self, name, value)
         count = self.observation_count
         if count is not None:
-            count = int(count)
-            if count < 0:
-                raise ValueError("Profile observation count cannot be negative.")
+            count = _bounded_nonnegative_integer(
+                count,
+                field="Profile observation count",
+                maximum=2_147_483_647,
+            )
         sse = self.terminal_weighted_residual_sse
         if sse is not None:
             sse = float(sse)
@@ -467,7 +497,7 @@ class ProfileLikelihoodResult:
         if not method:
             raise ValueError("Profile results require a named method.")
         object.__setattr__(self, "status", status)
-        object.__setattr__(self, "method", method)
+        object.__setattr__(self, "method", _PROFILE_METHOD)
         object.__setattr__(self, "requested_parameters", names)
         object.__setattr__(self, "confidence_level", confidence)
         object.__setattr__(self, "likelihood_ratio_threshold", threshold)
@@ -515,8 +545,6 @@ class ResidualBootstrapResult:
     replicates: int
     confidence_level: float
     resampling: str
-    stratum_manifest_version: int
-    stratum_manifest: Mapping[str, object]
     draw_recipe_version: int
     draw_algorithm: str
     residual_centering: str
@@ -547,14 +575,32 @@ class ResidualBootstrapResult:
         if len(names) != len(set(names)) or any(not value.strip() for value in names):
             raise ValueError("Bootstrap result parameter names must be unique and nonblank.")
         seed = validate_bootstrap_seed(self.seed)
-        replicates = int(self.replicates)
-        if replicates <= 0:
-            raise ValueError("Bootstrap result replicate count must be positive.")
+        replicates = _bounded_positive_integer(
+            self.replicates,
+            field="Bootstrap result replicate count",
+            maximum=_BOOTSTRAP_MAX_REPLICATES,
+        )
         confidence = _confidence(self.confidence_level)
-        minimum = int(self.minimum_successful_replicates)
-        required = int(self.required_successes)
-        successful = int(self.successful_replicates)
-        failed = int(self.failed_replicates)
+        minimum = _bounded_positive_integer(
+            self.minimum_successful_replicates,
+            field="Bootstrap result minimum successful replicates",
+            maximum=replicates,
+        )
+        required = _bounded_nonnegative_integer(
+            self.required_successes,
+            field="Bootstrap result required successes",
+            maximum=replicates,
+        )
+        successful = _bounded_nonnegative_integer(
+            self.successful_replicates,
+            field="Bootstrap result successful replicates",
+            maximum=replicates,
+        )
+        failed = _bounded_nonnegative_integer(
+            self.failed_replicates,
+            field="Bootstrap result failed replicates",
+            maximum=replicates,
+        )
         if not 0 < minimum <= replicates or not 0 <= required <= replicates:
             raise ValueError("Bootstrap result success thresholds are invalid.")
         if successful < 0 or failed < 0 or successful + failed > replicates:
@@ -590,7 +636,7 @@ class ResidualBootstrapResult:
         if not method:
             raise ValueError("Bootstrap results require a named method.")
         object.__setattr__(self, "status", status)
-        object.__setattr__(self, "method", method)
+        object.__setattr__(self, "method", _BOOTSTRAP_METHOD)
         object.__setattr__(self, "requested_parameters", names)
         object.__setattr__(self, "seed", seed)
         object.__setattr__(self, "replicates", replicates)
@@ -600,13 +646,89 @@ class ResidualBootstrapResult:
         object.__setattr__(self, "required_successes", required)
         object.__setattr__(self, "successful_replicates", successful)
         object.__setattr__(self, "failed_replicates", failed)
-        object.__setattr__(self, "stratum_manifest_version", int(self.stratum_manifest_version))
         object.__setattr__(self, "draw_recipe_version", int(self.draw_recipe_version))
-        object.__setattr__(self, "stratum_manifest", _freeze_fact(dict(self.stratum_manifest or {})))
         object.__setattr__(self, "preserved_fields", tuple(str(value) for value in self.preserved_fields))
         object.__setattr__(self, "intervals", MappingProxyType(intervals))
         object.__setattr__(self, "unavailable_reason", reason)
         object.__setattr__(self, "provenance", _freeze_fact(dict(self.provenance or {})))
+
+
+def profile_likelihood_settlement_result(
+    *,
+    config: ProfileLikelihoodConfig,
+    status: Literal["stopped", "failed"],
+    cause: FactualCause,
+    observation_count: int,
+    terminal_weighted_residual_sse: float,
+) -> ProfileLikelihoodResult:
+    """Construct a stopped/failed Profile result from call-local facts."""
+
+    return ProfileLikelihoodResult(
+        status=status,
+        method=_PROFILE_METHOD,
+        requested_parameters=tuple(_coordinate_display(item) for item in config.parameter_names),
+        confidence_level=config.confidence_level,
+        likelihood_ratio_threshold=float(config.likelihood_ratio_threshold),
+        likelihood_model="weighted Gaussian residuals with profiled variance",
+        likelihood_ratio_transport="finite log likelihood ratio",
+        fixed_coordinate_policy="selected coordinate fixed; all others reoptimized",
+        warm_start_policy="inner_successful_refit",
+        optimizer_method=config.optimizer_method,
+        max_bracketing_steps_per_side=config.max_bracketing_steps_per_side,
+        max_nfev_per_point=config.max_nfev_per_point,
+        observation_count=int(observation_count),
+        terminal_weighted_residual_sse=float(terminal_weighted_residual_sse),
+        intervals={},
+        diagnostic=cause,
+        provenance={"settlement": status, "primary_fit_preserved": True},
+    )
+
+
+def residual_bootstrap_settlement_result(
+    *,
+    config: ResidualBootstrapConfig,
+    status: Literal["stopped", "failed"],
+    cause: FactualCause,
+    settlement: str,
+    successful_replicates: int = 0,
+    failed_replicates: int = 0,
+    completed_replicates: int = 0,
+) -> ResidualBootstrapResult:
+    """Construct a stopped/failed Bootstrap result from local facts."""
+
+    required_successes = max(
+        config.minimum_successful_replicates,
+        int(math.ceil(config.replicates * config.minimum_success_fraction)),
+    )
+    return ResidualBootstrapResult(
+        status=status,
+        method=_BOOTSTRAP_METHOD,
+        requested_parameters=tuple(_coordinate_display(item) for item in config.parameter_names),
+        seed=config.seed,
+        replicates=config.replicates,
+        confidence_level=config.confidence_level,
+        resampling="within each dataset/target residual stratum",
+        draw_recipe_version=_BOOTSTRAP_DRAW_SCHEMA_VERSION,
+        draw_algorithm="numpy.default_rng(seed) residual-index draws",
+        residual_centering="independent arithmetic mean subtraction within each dataset/target stratum",
+        replay_authority="seed plus versioned draw algorithm",
+        preserved_fields=("time", "X", "source-row", "dataset weight", "target weight", "full-refit"),
+        replicate_execution="full global refit",
+        refit_validity="only explicitly converged scientific refits count",
+        minimum_successful_replicates=config.minimum_successful_replicates,
+        minimum_success_fraction=config.minimum_success_fraction,
+        required_successes=required_successes,
+        successful_replicates=int(successful_replicates),
+        failed_replicates=int(failed_replicates),
+        interval_construction="equal-tailed percentile",
+        intervals={},
+        diagnostic=cause,
+        provenance={
+            "settlement": str(settlement),
+            "primary_fit_preserved": True,
+            "completed_replicates": int(completed_replicates),
+        },
+    )
 
 
 def _sse(residuals: object) -> float:
@@ -1460,41 +1582,7 @@ def _refit_converged(
     }
 
 
-_BOOTSTRAP_STRATUM_SCHEMA_VERSION = 1
 _BOOTSTRAP_DRAW_SCHEMA_VERSION = 2
-
-
-def _bootstrap_stratum_manifest(
-    payloads: Sequence[FitDatasetSpec],
-) -> Mapping[str, object]:
-    """Capture invariant stratum structure once for all replicates."""
-
-    manifest: dict[str, object] = {}
-    for payload in payloads:
-        targets: dict[str, object] = {}
-        for target in payload.species_list:
-            source = payload.observations[target]
-            targets[target] = {
-                "raw_observation_id": source.raw_observation_id,
-                "raw_column": source.raw_column,
-                "time": tuple(float(value) for value in source.t),
-                "source_rows": tuple(int(value) for value in source.source_rows),
-                "target_weight": float(payload.target_weights[target]),
-                "x_name": payload.x_name,
-            }
-        if payload.x_name != "t" and payload.x_observations is not None:
-            x_source = payload.x_observations
-            targets["__x__"] = {
-                "raw_observation_id": x_source.raw_observation_id,
-                "raw_column": x_source.raw_column,
-                "time": tuple(float(value) for value in x_source.t),
-                "source_rows": tuple(int(value) for value in x_source.source_rows),
-                "target_weight": float(payload.target_weights[payload.x_name]),
-                "x": tuple(float(value) for value in x_source.y),
-                "x_name": payload.x_name,
-            }
-        manifest[payload.dataset_id] = targets
-    return manifest
 
 
 def _bootstrap_payloads(
@@ -1600,7 +1688,6 @@ def residual_bootstrap_result(
     if not config.parameter_names:
         raise ValueError("Ordinary residual Bootstrap requires at least one coordinate.")
     primary_converged, primary_failure = _refit_converged(terminal_result)
-    stratum_manifest: Mapping[str, object] = {}
     completed = 0
     successful = 0
     failed = 0
@@ -1633,8 +1720,6 @@ def residual_bootstrap_result(
             replicates=config.replicates,
             confidence_level=config.confidence_level,
             resampling="within each dataset/target residual stratum",
-            stratum_manifest_version=_BOOTSTRAP_STRATUM_SCHEMA_VERSION,
-            stratum_manifest=stratum_manifest,
             draw_recipe_version=_BOOTSTRAP_DRAW_SCHEMA_VERSION,
             draw_algorithm=(
                 "numpy.default_rng(seed).integers(0, stratum_residual_count); "
@@ -1643,7 +1728,7 @@ def residual_bootstrap_result(
             residual_centering=(
                 "independent arithmetic mean subtraction within each dataset/target stratum"
             ),
-            replay_authority="seed plus versioned draw algorithm and stratum manifest",
+            replay_authority="seed plus versioned draw algorithm",
             preserved_fields=(
                 "time", "X", "source-row", "dataset weight", "target weight", "full-refit"
             ),
@@ -1749,7 +1834,6 @@ def residual_bootstrap_result(
     for name in config.parameter_names:
         _parameter_value(terminal_result, name)
 
-    stratum_manifest = _bootstrap_stratum_manifest(payloads)
     aligned_observed_x_by_dataset: dict[str, np.ndarray] = {}
     projection_positions_by_dataset: dict[str, np.ndarray] = {}
     for payload in payloads:

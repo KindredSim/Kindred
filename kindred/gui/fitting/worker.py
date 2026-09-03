@@ -14,7 +14,6 @@ from threading import Condition, Event
 import numpy as np
 from PySide6 import QtCore
 
-from kindred.core.algebra.observable_introspection import FitLocalObservable
 from kindred.core.analysis.fit_dataset_payload import (
     FitDatasetSpec,
     FitObservationSeries,
@@ -65,12 +64,11 @@ from kindred.gui.fitting.launch import (
     FitDatasetLocalSettings,
     _FitDispatchCompilation,
     FitExecutionRequest,
-    FitMappedDatasetSnapshot,
     FitOriginSnapshot,
     FitSelectedObservation,
+    FitPreparedDatasetConfig,
     FitSetupSnapshot,
     _replace_fit_parameter,
-    selected_observations,
 )
 from kindred.gui.parameter_enumeration import admit_gui_parameter_value
 from kindred.core.species import validate_concentration
@@ -444,7 +442,7 @@ class FitCandidate:
 
     @property
     def origin(self) -> FitOriginSnapshot:
-        return self.request.origin
+        return self.request.setup.origin
 
     @property
     def initial_values_by_set(
@@ -457,11 +455,6 @@ class FitCandidate:
             self.origin,
             self.result,
         )
-
-    @property
-    def local_observables(self) -> tuple[FitLocalObservable, ...]:
-        return self.setup_snapshot.local_observables
-
 
 def _observed_curve_parts(
     observations: tuple[FitSelectedObservation, ...],
@@ -510,66 +503,40 @@ def _observed_curve_parts(
     )
 
 
-def _parametric_x_observation(
-    mapped: FitMappedDatasetSnapshot,
-    local: FitDatasetLocalSettings,
-) -> FitObservationSeries | None:
-    parametric = local.parametric
-    if parametric is None:
-        return None
-    x_raw_id = next(
-        (raw_id for raw_id, target in local.observation_targets if target == parametric.x_name),
-        None,
-    )
-    if x_raw_id is None:
-        raise ValueError(
-            f"Dataset {mapped.display_name!r} requires exactly one observed "
-            f"source for X={parametric.x_name!r}."
-        )
-    source = next(
-        (
-            item
-            for item in mapped.observations
-            if item.raw_observation_id == x_raw_id
-        ),
-        None,
-    )
-    if source is None:
-        raise ValueError(
-            f"Dataset {mapped.display_name!r} requires exactly one observed "
-            f"source for X={parametric.x_name!r}."
-        )
+def _series_from_selected(
+    observation: FitSelectedObservation,
+) -> FitObservationSeries:
+    """Lower one retained immutable selection into the evaluator payload."""
+
     return FitObservationSeries(
-        raw_observation_id=source.raw_observation_id,
-        raw_column=source.raw_column,
-        t=np.asarray(source.t, dtype=float),
-        y=np.asarray(source.y, dtype=float),
-        source_rows=source.source_rows,
+        raw_observation_id=observation.raw_observation_id,
+        raw_column=observation.raw_column,
+        t=np.asarray(observation.t, dtype=float),
+        y=np.asarray(observation.y, dtype=float),
+        source_rows=observation.source_rows,
     )
 
 
 def _compile_dataset_spec(
-    mapped: FitMappedDatasetSnapshot,
+    prepared: FitPreparedDatasetConfig,
     local: FitDatasetLocalSettings,
 ) -> FitDatasetSpec:
     parametric = local.parametric
     if parametric is not None and parametric.resolved_mode is None:
         raise ValueError(
-            f"Dataset {mapped.display_name!r}: Auto parametric mode must be "
+            f"Dataset {prepared.dataset_id!r}: Auto parametric mode must be "
             "resolved once before execution lowering."
         )
-    selected = selected_observations(mapped, local)
+    selected = prepared.selected_observations
     observation_map = {
-        item.model_target: FitObservationSeries(
-            raw_observation_id=item.raw_observation_id,
-            raw_column=item.raw_column,
-            t=np.asarray(item.t, dtype=float),
-            y=np.asarray(item.y, dtype=float),
-            source_rows=item.source_rows,
-        )
+        item.model_target: _series_from_selected(item)
         for item in selected
     }
-    x_observations = _parametric_x_observation(mapped, local)
+    x_observations = (
+        None
+        if prepared.parametric_x_observation is None
+        else _series_from_selected(prepared.parametric_x_observation)
+    )
     if x_observations is not None:
         x_rows = set(x_observations.source_rows)
         if any(
@@ -577,10 +544,10 @@ def _compile_dataset_spec(
             for item in observation_map.values()
         ):
             raise ValueError(
-                f"Dataset {mapped.display_name!r}: Parametric-X capture is missing a selected Y source row."
+                f"Dataset {prepared.dataset_id!r}: Parametric-X capture is missing a selected Y source row."
             )
     return FitDatasetSpec(
-        dataset_id=mapped.dataset_id,
+        dataset_id=prepared.dataset_id,
         species_list=tuple(item.model_target for item in selected),
         observations=observation_map,
         target_weights=dict(local.target_weights),
@@ -599,29 +566,20 @@ def _initial_values_from_result(
     origin: FitOriginSnapshot,
     result: GlobalFitResult,
 ) -> tuple[tuple[str, tuple[tuple[str, float], ...]], ...]:
-    scopes = dict(setup.initial_scopes)
-    fitted_by_key: dict[tuple[str, str], object] = {
-        (initial.set_id, initial.species): initial
-        for initial in setup.initials
-        if initial.fit and scopes.get(initial.species) == "local"
-    }
     included_ids = {
         item.dataset_id for item in setup.datasets if item.included
     }
-    datasets_by_set: dict[str, list[str]] = {}
-    for mapped in origin.mapped_datasets:
-        if mapped.dataset_id in included_ids:
-            datasets_by_set.setdefault(mapped.set_id, []).append(
-                mapped.dataset_id
-            )
+    mapped_by_id = {mapped.dataset_id: mapped for mapped in origin.mapped_datasets}
     values_by_set: dict[str, dict[str, float]] = {}
-    global_values: dict[str, set[float]] = {}
-    for (set_id, species), initial in sorted(fitted_by_key.items()):
-        dataset_ids = sorted(datasets_by_set.get(set_id, ()))
-        if not dataset_ids:
-            continue
+    grouped = {
+        (dataset_id, group.species)
+        for group in setup.shared_initial_groups
+        for dataset_id in group.member_dataset_ids
+    }
+
+    def coupled_value(dataset_ids: Sequence[str], species: str) -> float:
+        values: set[float] = set()
         parameter_name = f"{INITIAL_PREFIX}{species}"
-        coupled_values: set[float] = set()
         for dataset_id in dataset_ids:
             dataset_result = result.dataset_params.get(dataset_id)
             if dataset_result is None or parameter_name not in dataset_result:
@@ -629,75 +587,46 @@ def _initial_values_from_result(
                     f"Fit result omitted coupled initial {species!r} for "
                     f"included dataset {dataset_id!r}."
                 )
-            value = float(dataset_result[parameter_name])
+            value = validate_concentration(
+                float(dataset_result[parameter_name]),
+                field=f"fitted initial {species!r}",
+            )
             if not math.isfinite(value):
-                raise ValueError(
-                    f"Fit result contains a non-finite initial {species!r}."
-                )
-            coupled_values.add(
-                validate_concentration(
-                    value,
-                    field=f"fitted initial {(set_id, species)!r}",
-                )
-            )
-        if len(coupled_values) != 1:
-            raise ValueError(
-                f"Fit result disagrees across coupled datasets for initial "
-                f"{species!r} in set {set_id!r}."
-            )
-        value = coupled_values.pop()
-        values_by_set.setdefault(set_id, {})[species] = value
-    for global_initial in setup.global_initials:
-        if not global_initial.fit or scopes.get(global_initial.species) != "global":
+                raise ValueError(f"Fit result contains a non-finite initial {species!r}.")
+            values.add(value)
+        if len(values) != 1:
+            raise ValueError(f"Fit result disagrees across coupled initial rows for {species!r}.")
+        return values.pop()
+
+    for initial in sorted(setup.initials, key=lambda item: (item.set_id, item.species)):
+        if not initial.fit:
             continue
-        parameter_name = f"{INITIAL_PREFIX}{global_initial.species}"
-        values: set[float] = set()
-        applicable_ids = sorted(
+        dataset_ids = sorted(
             mapped.dataset_id
             for mapped in origin.mapped_datasets
-            if mapped.dataset_id in included_ids
-            and any(
-                species == global_initial.species
-                for species, _value in mapped.initial_values
-            )
+            if mapped.set_id == initial.set_id
+            and mapped.dataset_id in included_ids
+            and (mapped.dataset_id, initial.species) not in grouped
         )
+        if not dataset_ids:
+            continue
+        value = coupled_value(dataset_ids, initial.species)
+        values_by_set.setdefault(initial.set_id, {})[initial.species] = value
+
+    for group in setup.shared_initial_groups:
+        if not group.fit:
+            continue
+        applicable_ids = sorted(
+            dataset_id
+            for dataset_id in group.member_dataset_ids
+            if dataset_id in included_ids
+        )
+        if not applicable_ids:
+            continue
+        value = coupled_value(applicable_ids, group.species)
         for dataset_id in applicable_ids:
-            dataset_result = result.dataset_params.get(dataset_id)
-            if dataset_result is None or parameter_name not in dataset_result:
-                raise ValueError(
-                    f"Fit result omitted Global initial {global_initial.species!r} "
-                    f"for included dataset {dataset_id!r}."
-                )
-            value = float(dataset_result[parameter_name])
-            if not math.isfinite(value):
-                raise ValueError(
-                    f"Fit result contains a non-finite Global initial "
-                    f"{global_initial.species!r}."
-                )
-            value = validate_concentration(
-                value,
-                field=f"fitted Global initial {global_initial.species!r}",
-            )
-            values.add(value)
-            set_ids = {
-                mapped.set_id
-                for mapped in origin.mapped_datasets
-                if mapped.dataset_id == dataset_id
-            }
-            for set_id in set_ids:
-                values_by_set.setdefault(set_id, {})[global_initial.species] = value
-        if values:
-            global_values[global_initial.species] = values
-    inconsistent_global = sorted(
-        species
-        for species, values in global_values.items()
-        if len(values) != 1
-    )
-    if inconsistent_global:
-        raise ValueError(
-            "Fit result disagrees across globally coupled initial rows: "
-            + ", ".join(inconsistent_global)
-        )
+            mapped = mapped_by_id[dataset_id]
+            values_by_set.setdefault(mapped.set_id, {})[group.species] = value
     return tuple(
         (
             set_id,
@@ -858,22 +787,11 @@ def _terminal_setup_snapshot(
         for set_id, values in initial_values_by_set
         for species, value in values
     }
-    scopes = dict(setup_snapshot.initial_scopes)
-    global_initial_results: dict[str, float] = {}
-    for global_initial in setup_snapshot.global_initials:
-        if not global_initial.fit or scopes.get(global_initial.species) != "global":
-            continue
-        values = {
-            value
-            for (set_id, species), value in initial_results.items()
-            if species == global_initial.species and set_id in included_set_ids
-        }
-        if len(values) != 1:
-            raise ValueError(
-                f"Fit result did not resolve one global value for initial "
-                f"{global_initial.species!r}."
-            )
-        global_initial_results[global_initial.species] = values.pop()
+    grouped = {
+        (dataset_id, group.species)
+        for group in setup_snapshot.shared_initial_groups
+        for dataset_id in group.member_dataset_ids
+    }
     initials = tuple(
         replace(
             initial,
@@ -884,24 +802,40 @@ def _terminal_setup_snapshot(
         if (
             initial.fit
             and initial.set_id in included_set_ids
-            and scopes.get(initial.species) == "local"
+            and not any(
+                (mapped.dataset_id, initial.species) in grouped
+                for mapped in origin.mapped_datasets
+                if mapped.set_id == initial.set_id
+            )
             and (initial.set_id, initial.species) in initial_results
         )
         else initial
         for initial in setup_snapshot.initials
     )
-    global_initials = tuple(
-        replace(
-            initial,
-            initial=global_initial_results[initial.species],
-        )
-        if (
-            initial.species in global_initial_results
-            and scopes.get(initial.species) == "global"
-        )
-        else initial
-        for initial in setup_snapshot.global_initials
-    )
+    groups = []
+    for group in setup_snapshot.shared_initial_groups:
+        if not group.fit:
+            groups.append(group)
+            continue
+        applicable_set_ids = {
+            mapped.set_id
+            for mapped in origin.mapped_datasets
+            if mapped.dataset_id in included_ids
+            and mapped.dataset_id in group.member_dataset_ids
+        }
+        values = {
+            value
+            for (set_id, species), value in initial_results.items()
+            if species == group.species and set_id in applicable_set_ids
+        }
+        if values:
+            if len(values) != 1:
+                raise ValueError(
+                    f"Fit result did not resolve one shared initial value for {group.species!r}."
+                )
+            groups.append(replace(group, initial=values.pop()))
+        else:
+            groups.append(group)
     return replace(
         setup_snapshot,
         datasets=tuple(
@@ -910,9 +844,7 @@ def _terminal_setup_snapshot(
         ),
         parameters=tuple(parameters),
         initials=initials,
-        global_initials=global_initials,
-        initial_scopes=setup_snapshot.initial_scopes,
-        local_observables=setup_snapshot.local_observables,
+        shared_initial_groups=tuple(groups),
     )
 
 
@@ -994,9 +926,12 @@ def _curves_from_live(
     """Adapt callback-local simulations into plotting curves."""
 
     mapped_by_id = {
-        item.dataset_id: item for item in request.origin.mapped_datasets
+        item.dataset_id: item for item in request.setup.origin.mapped_datasets
     }
-    included_ids = tuple(item.dataset_id for item in request.datasets if item.included)
+    included_ids = request.dispatch.included_dataset_ids
+    prepared_by_id = {
+        item.dataset_id: item for item in request.dispatch.prepared_datasets
+    }
     curves: list[FitCurveDataset] = []
     for dataset_id in included_ids:
         simulation = evaluations.get(dataset_id)
@@ -1006,8 +941,13 @@ def _curves_from_live(
             raise TypeError("Live curve source requires canonical simulations.")
         local = effective_local[dataset_id]
         mapped = mapped_by_id[dataset_id]
-        selected = selected_observations(mapped, local)
-        x_observations = _parametric_x_observation(mapped, local)
+        prepared = prepared_by_id[dataset_id]
+        selected = prepared.selected_observations
+        x_observations = (
+            None
+            if prepared.parametric_x_observation is None
+            else _series_from_selected(prepared.parametric_x_observation)
+        )
         observed_x, observed_y = _observed_curve_parts(
             selected,
             x_observations=x_observations,
@@ -1026,9 +966,6 @@ def _curves_from_live(
                 raise FitSimulationError(
                     f"Dataset {dataset_id!r}: Parametric-X capture is missing."
                 )
-            retained_rows = {
-                int(row) for item in selected for row in item.source_rows
-            }
             x_by_row = {
                 int(row): (float(time_value), float(value))
                 for row, time_value, value in zip(
@@ -1038,11 +975,7 @@ def _curves_from_live(
                     strict=True,
                 )
             }
-            x_rows = tuple(
-                int(row)
-                for row in x_observations.source_rows
-                if int(row) in retained_rows
-            )
+            x_rows = tuple(int(row) for row in x_observations.source_rows)
             projection = align_parametric_x(
                 observation_time=np.asarray(
                     [x_by_row[row][0] for row in x_rows],
@@ -1157,7 +1090,7 @@ def _curves_from_live(
             _construct_fit_curve_dataset(
                 dataset_id=dataset_id,
                 display_name=mapped.display_name,
-                y_semantics=_fit_curve_y_semantics(request.origin.prepared_dsl, model_names),
+                y_semantics=_fit_curve_y_semantics(request.setup.origin.prepared_dsl, model_names),
                 model_x=model_x,
                 model_y=model_y,
                 observed_x=observed_x,
@@ -1189,19 +1122,27 @@ def _curves_from_terminal(
     """Adapt canonical terminal result fields into plotting curves."""
 
     mapped_by_id = {
-        item.dataset_id: item for item in request.origin.mapped_datasets
+        item.dataset_id: item for item in request.setup.origin.mapped_datasets
     }
     info_by_id = {info.dataset_id: info for info in result.dataset_info}
+    prepared_by_id = {
+        item.dataset_id: item for item in request.dispatch.prepared_datasets
+    }
     curves: list[FitCurveDataset] = []
-    for dataset_id in (item.dataset_id for item in request.datasets if item.included):
+    for dataset_id in request.dispatch.included_dataset_ids:
         local = effective_local[dataset_id]
         mapped = mapped_by_id[dataset_id]
+        prepared = prepared_by_id[dataset_id]
         info = info_by_id[dataset_id]
         simulation = info.simulation_result
         if not isinstance(simulation, SimulationResultValue):
             raise TypeError("Terminal curve source requires canonical simulations.")
-        selected = selected_observations(mapped, local)
-        x_observations = _parametric_x_observation(mapped, local)
+        selected = prepared.selected_observations
+        x_observations = (
+            None
+            if prepared.parametric_x_observation is None
+            else _series_from_selected(prepared.parametric_x_observation)
+        )
         observed_x, observed_y = _observed_curve_parts(
             selected,
             x_observations=x_observations,
@@ -1285,7 +1226,7 @@ def _curves_from_terminal(
             _construct_fit_curve_dataset(
                 dataset_id=dataset_id,
                 display_name=mapped.display_name,
-                y_semantics=_fit_curve_y_semantics(request.origin.prepared_dsl, model_names),
+                y_semantics=_fit_curve_y_semantics(request.setup.origin.prepared_dsl, model_names),
                 model_x=model_x,
                 model_y=model_y,
                 observed_x=observed_x,
@@ -1376,7 +1317,8 @@ def _assemble_fit_terminal(
         dataset_id: dict(values)
         for dataset_id, values in request.dispatch.fixed_by_dataset
     }
-    for parameter in request.parameters:
+    setup = request.setup
+    for parameter in setup.parameters:
         if parameter.scope == "shared":
             values = (
                 (result.shared_params[parameter.name],)
@@ -1445,12 +1387,12 @@ def _assemble_fit_terminal(
         )
     initial_values_by_set = _initial_values_from_result(
         setup_snapshot,
-        request.origin,
+        setup.origin,
         result,
     )
     terminal_setup = _terminal_setup_snapshot(
         setup_snapshot,
-        origin=request.origin,
+        origin=setup.origin,
         result=result,
         dispatch=request.dispatch,
         effective_datasets=effective_local,
@@ -1485,13 +1427,13 @@ def _execute_global_fit_model(
         "fit_evaluators": evaluators,
         "datasets": datasets,
         "weights": weights,
-        "method": request.defaults.method,
-        "max_nfev": int(request.defaults.max_nfev),
-        "ftol": float(request.defaults.ftol),
-        "xtol": float(request.defaults.xtol),
+        "method": request.setup.defaults.method,
+        "max_nfev": int(request.setup.defaults.max_nfev),
+        "ftol": float(request.setup.defaults.ftol),
+        "xtol": float(request.setup.defaults.xtol),
         "seed": (
-            int(request.defaults.seed)
-            if request.defaults.use_seed
+            int(request.setup.defaults.seed)
+            if request.setup.defaults.use_seed
             else None
         ),
         "progress_callback": progress_callback,
@@ -1500,8 +1442,8 @@ def _execute_global_fit_model(
         "cancellation_control": cancellation_control,
         "stop_best_requested": stop_best_requested,
         "stopped_replay_control": stopped_replay_control,
-        "profile_likelihood": request.profile_likelihood,
-        "residual_bootstrap": request.residual_bootstrap,
+        "profile_likelihood": request.setup.profile_likelihood,
+        "residual_bootstrap": request.setup.residual_bootstrap,
     }
     dispatch = request.dispatch
     layout = dispatch.ordinary_optimizer_layout
@@ -1537,7 +1479,6 @@ class GlobalFitWorker(QtCore.QThread):
     def __init__(
         self,
         request: FitExecutionRequest,
-        setup: FitSetupSnapshot,
         *,
         parent: QtCore.QObject | None = None,
     ) -> None:
@@ -1545,7 +1486,6 @@ class GlobalFitWorker(QtCore.QThread):
         if not isinstance(request, FitExecutionRequest):
             raise TypeError("request must be FitExecutionRequest.")
         self._request = request
-        self._setup = setup
         self._cancelled = Event()
         self._close_requested = Event()
         self._cancellation_control = SimulationCancellationControl(
@@ -1648,10 +1588,11 @@ class GlobalFitWorker(QtCore.QThread):
         self,
     ) -> FitCandidate | None:
         request = self._request
+        setup = request.setup
         if self._checkpoint():
             raise FittingCancelled()
-        included = tuple(item for item in request.datasets if item.included)
-        mapped_by_id = {item.dataset_id: item for item in request.origin.mapped_datasets}
+        included = tuple(item for item in setup.datasets if item.included)
+        mapped_by_id = {item.dataset_id: item for item in setup.origin.mapped_datasets}
         dispatch = request.dispatch
         included_ids = dispatch.included_dataset_ids
         if tuple(item.dataset_id for item in included) != included_ids:
@@ -1673,7 +1614,7 @@ class GlobalFitWorker(QtCore.QThread):
             dataset_context = prepared_datasets[local.dataset_id]
             try:
                 context = prepare_fitting_execution_context(
-                    prepared_dsl=request.origin.prepared_dsl,
+                    prepared_dsl=setup.origin.prepared_dsl,
                     param_names=candidate_names,
                     t_start=dataset_context.execution_t_start,
                     t_end=dataset_context.execution_t_end,
@@ -1684,11 +1625,10 @@ class GlobalFitWorker(QtCore.QThread):
                     fit_sampling_identity=dict(dataset_context.fit_sampling_identity),
                     cancellation_control=self._cancellation_control,
                     initial_prefix=INITIAL_PREFIX,
-                    fit_local_admission=request.fit_local_admission,
                 )
             except BaseException as exc:
                 if isinstance(exc, FitSimulationError):
-                    exc.details.setdefault("fit_solver", request.solver)
+                    exc.details.setdefault("fit_solver", setup.solver)
                 raise
             evaluator = FittingEvaluator(
                 context,
@@ -1724,7 +1664,7 @@ class GlobalFitWorker(QtCore.QThread):
         )
         starting_weights = (
             {item.dataset_id: item.weight for item in included}
-            if request.dataset_weight_mode == "user"
+            if setup.dataset_weight_mode == "user"
             else {item.dataset_id: 1.0 for item in included}
         )
         starting_futures = {}
@@ -1736,26 +1676,21 @@ class GlobalFitWorker(QtCore.QThread):
                     if parameter.scope in {"per_dataset", "centred_fixed_effects"}
                     else parameter.selected_config.value
                 )
-                for parameter in request.parameters
+                for parameter in setup.parameters
             }
             starting_values.update({item.name: item.initial for item in execution_shared_variables})
             starting_values.update(fixed_by_dataset[local.dataset_id])
-            for initial in request.initials:
-                if (
-                    initial.set_id == mapped.set_id
-                    and dict(request.initial_scopes).get(initial.species) == "local"
-                ):
+            grouped_species = {
+                group.species
+                for group in setup.shared_initial_groups
+                if local.dataset_id in group.member_dataset_ids
+            }
+            for initial in setup.initials:
+                if initial.set_id == mapped.set_id and initial.species not in grouped_species:
                     starting_values[f"{INITIAL_PREFIX}{initial.species}"] = initial.initial
-            for initial in request.global_initials:
-                if (
-                    dict(request.initial_scopes).get(initial.species) == "global"
-                    and mapped.set_id in {
-                        item.set_id
-                        for item in request.initials
-                        if item.species == initial.species
-                    }
-                ):
-                    starting_values[f"{INITIAL_PREFIX}{initial.species}"] = initial.initial
+            for group in setup.shared_initial_groups:
+                if local.dataset_id in group.member_dataset_ids:
+                    starting_values[f"{INITIAL_PREFIX}{group.species}"] = group.initial
             starting_origins = {
                 name: (
                     FITTING_PARAM_ORIGIN_OPTIMIZER_SHARED
@@ -1775,7 +1710,10 @@ class GlobalFitWorker(QtCore.QThread):
                     local,
                     parametric=replace(local.parametric, resolved_mode="monotone"),
                 )
-            starting_payload = _compile_dataset_spec(mapped, starting_local)
+            starting_payload = _compile_dataset_spec(
+                prepared_datasets[local.dataset_id],
+                starting_local,
+            )
             starting_input = ObjectiveDatasetInput(
                 payload=starting_payload,
                 full_params=starting_values,
@@ -1846,7 +1784,8 @@ class GlobalFitWorker(QtCore.QThread):
             effective_local[local.dataset_id] = chosen
         datasets = [
             _compile_dataset_spec(
-                mapped_by_id[item.dataset_id], effective_local[item.dataset_id]
+                prepared_datasets[item.dataset_id],
+                effective_local[item.dataset_id],
             )
             for item in included
         ]
@@ -1893,7 +1832,7 @@ class GlobalFitWorker(QtCore.QThread):
                         int(
                             100
                             * objective_calls
-                            / max(1, request.defaults.max_nfev)
+                            / max(1, setup.defaults.max_nfev)
                         ),
                     ),
                 ),
@@ -1933,7 +1872,7 @@ class GlobalFitWorker(QtCore.QThread):
 
         weights = (
             {item.dataset_id: item.weight for item in included}
-            if request.dataset_weight_mode == "user"
+            if setup.dataset_weight_mode == "user"
             else None
         )
         extension_progress_value = 95
@@ -1963,7 +1902,7 @@ class GlobalFitWorker(QtCore.QThread):
             nonlocal extension_progress_value
             if self._checkpoint():
                 raise FittingCancelled()
-            has_profile = request.profile_likelihood is not None
+            has_profile = setup.profile_likelihood is not None
             if update.stage == "primary_complete":
                 extension_progress_value = max(extension_progress_value, 95)
                 self.progress.emit(extension_progress_value, "Primary global fit complete")
@@ -1979,7 +1918,7 @@ class GlobalFitWorker(QtCore.QThread):
                     detail = (
                         f"Profile likelihood · {update.coordinate} · {update.side} "
                         f"discovery {update.discovery_step}/"
-                        f"{request.profile_likelihood.max_bracketing_steps_per_side}"
+                        f"{setup.profile_likelihood.max_bracketing_steps_per_side}"
                     )
                 elif update.stage == "refinement":
                     detail = (
@@ -2040,7 +1979,7 @@ class GlobalFitWorker(QtCore.QThread):
             result=result,
             included_ids=included_ids,
             effective_local=effective_local,
-            setup_snapshot=self._setup,
+            setup_snapshot=setup,
             resolved_modes=resolved_modes,
             evaluators=evaluators,
         )
@@ -2058,6 +1997,7 @@ class GlobalFitWorker(QtCore.QThread):
         layout = dispatch.ordinary_optimizer_layout
         if not isinstance(layout, FitParameterLayout):
             raise RuntimeError("Live Fit update omitted its admitted optimizer layout.")
+        setup = self._request.setup
         vector = np.asarray(best_progress.optimizer_vector, dtype=float).reshape(-1)
         layout.validate_optimizer_vector(vector)
         coordinate_values = {
@@ -2069,20 +2009,28 @@ class GlobalFitWorker(QtCore.QThread):
             )
         }
         included_dataset_ids = {
-            item.dataset_id for item in self._request.datasets if item.included
+            item.dataset_id for item in setup.datasets if item.included
         }
         included_set_ids = {
             mapped.set_id
-            for mapped in self._request.origin.mapped_datasets
+            for mapped in setup.origin.mapped_datasets
             if mapped.dataset_id in included_dataset_ids
         }
         initials_by_set: dict[str, dict[str, float]] = {}
-        scopes = dict(self._request.initial_scopes)
-        for initial in self._request.initials:
+        grouped = {
+            (dataset_id, group.species)
+            for group in setup.shared_initial_groups
+            for dataset_id in group.member_dataset_ids
+        }
+        for initial in setup.initials:
             if (
                 not initial.fit
                 or initial.set_id not in included_set_ids
-                or scopes.get(initial.species) != "local"
+                or any(
+                    (mapped.dataset_id, initial.species) in grouped
+                    for mapped in setup.origin.mapped_datasets
+                    if mapped.set_id == initial.set_id
+                )
             ):
                 continue
             variable_id = f"initial:{initial.set_id}:{initial.species}"
@@ -2091,25 +2039,21 @@ class GlobalFitWorker(QtCore.QThread):
                 initials_by_set.setdefault(initial.set_id, {})[
                     initial.species
                 ] = float(value)
-        for initial in self._request.global_initials:
-            if not initial.fit or scopes.get(initial.species) != "global":
+        for group in setup.shared_initial_groups:
+            if not group.fit:
                 continue
             value = coordinate_values.get(
-                FitCoordinate("coupled", f"initial:global:{initial.species}")
+                FitCoordinate("coupled", f"initial:{group.species}:{group.origin_dataset_id}")
             )
             if value is None or not math.isfinite(float(value)):
                 continue
             applicable_set_ids = {
-                mapped.set_id
-                for mapped in self._request.origin.mapped_datasets
+                mapped.set_id for mapped in setup.origin.mapped_datasets
                 if mapped.dataset_id in included_dataset_ids
-                and any(
-                    species == initial.species
-                    for species, _value in mapped.initial_values
-                )
+                and mapped.dataset_id in group.member_dataset_ids
             }
             for set_id in applicable_set_ids:
-                initials_by_set.setdefault(set_id, {})[initial.species] = float(value)
+                initials_by_set.setdefault(set_id, {})[group.species] = float(value)
         centred_values_by_dataset = {
             dataset_id: layout.centred_params_for_dataset(dataset_id, vector)
             for dataset_id in included_dataset_ids
@@ -2141,7 +2085,7 @@ class GlobalFitWorker(QtCore.QThread):
                                     dict(parameter.selected_config.dataset_values)[dataset_id],
                                 ),
                             )
-                            for parameter in self._request.parameters
+                            for parameter in setup.parameters
                             if (
                                 parameter.selected_config.fit
                                 and parameter.scope in {"per_dataset", "centred_fixed_effects"}

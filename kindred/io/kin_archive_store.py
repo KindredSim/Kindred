@@ -1360,15 +1360,6 @@ def _decode_project(
         ),
         presentation_by_tab_id=tuple(presentations),
     )
-    try:
-        workspace_presentation = validate_workspace_presentation_state(
-            document,
-            workspace_presentation,
-        )
-    except (KeyError, TypeError, ValueError) as exc:
-        raise ValueError(
-            f"Current project archive presentation is invalid: {exc}"
-        ) from exc
     return ArchiveProject(
         document=document,
         presentation=workspace_presentation,

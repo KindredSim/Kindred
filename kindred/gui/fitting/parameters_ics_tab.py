@@ -33,10 +33,7 @@ from kindred.core.project_document import (
     validate_fit_defaults,
 )
 from kindred.gui.fitting.launch import (
-    FitInitialGlobalVariable,
-    FitMappedDatasetSnapshot,
     FitOriginSnapshot,
-    FitObservationSnapshot,
     FitParameterConfiguration,
     FitParameterVariable,
     FitSetupSnapshot,
@@ -107,310 +104,6 @@ def _resolve_coordinate_selection(
             raise ValueError(f"Unavailable Fit coordinate: {display!r}.")
         resolved.add(matches[0])
     return resolved
-
-
-class _FitLocalObservableDialog(QtWidgets.QDialog):
-    """Author a Fit-local observable against one column per selected dataset."""
-
-    def __init__(
-        self,
-        *,
-        dataset_ids: Sequence[str],
-        available_observations: Sequence[FitMappedDatasetSnapshot] = (),
-        parent: QtWidgets.QWidget | None = None,
-    ) -> None:
-        super().__init__(parent)
-        self.setWindowTitle("Define New Fit-local Observable")
-        self.setModal(True)
-        self.resize(520, 340)
-
-        self._dataset_ids = tuple(
-            dict.fromkeys(str(x).strip() for x in (dataset_ids or []) if str(x).strip())
-        )
-        self._available_observations = {
-            mapped.dataset_id: mapped
-            for mapped in self._normalize_available_observations(
-                available_observations
-            )
-        }
-        self._selection: tuple[
-            str,
-            str,
-            tuple[FitObservationSnapshot, ...],
-            str,
-        ] | None = None
-
-        layout = QtWidgets.QVBoxLayout(self)
-        self._observable_tab = QtWidgets.QWidget(self)
-        layout.addWidget(self._observable_tab, stretch=1)
-        self._init_observable_tab()
-        self._add_button_box(layout)
-
-    @staticmethod
-    def _normalize_available_observations(
-        available_observations: Sequence[FitMappedDatasetSnapshot],
-    ) -> tuple[FitMappedDatasetSnapshot, ...]:
-        normalized: list[FitMappedDatasetSnapshot] = []
-        for mapped in available_observations:
-            if not isinstance(mapped, FitMappedDatasetSnapshot):
-                raise TypeError(
-                    "Observable choices must be typed mapped dataset snapshots."
-                )
-            if any(item.dataset_id == mapped.dataset_id for item in normalized):
-                raise ValueError(
-                    "Observable choices repeat a mapped dataset snapshot."
-                )
-            if any(
-                not isinstance(observation, FitObservationSnapshot)
-                for observation in mapped.observations
-            ):
-                raise TypeError("Mapped observations must be typed snapshots.")
-            normalized.append(mapped)
-        return tuple(normalized)
-
-    def _init_observable_tab(self) -> None:
-        observable_layout = QtWidgets.QVBoxLayout(self._observable_tab)
-        header = QtWidgets.QLabel(
-            "Define an algebraic observable for this Fit session.",
-            self._observable_tab,
-        )
-        header.setWordWrap(True)
-        observable_layout.addWidget(header)
-
-        target_form = QtWidgets.QFormLayout()
-        self._observable_column_combos: dict[str, QtWidgets.QComboBox] = {}
-        for dataset_id in self._dataset_ids:
-            entry = self._available_observations.get(dataset_id)
-            combo = QtWidgets.QComboBox(self._observable_tab)
-            combo.setObjectName(f"fit_local_observable_column_{dataset_id}")
-            if entry is None:
-                combo.addItem("No captured observations available")
-                combo.setEnabled(False)
-                label = f"{dataset_id} observed column:"
-            else:
-                for observation in entry.observations:
-                    # Store the existing immutable snapshot itself.  The
-                    # accepted selection must not reconstruct an observation
-                    # from raw IDs.
-                    combo.addItem(observation.raw_column, observation)
-                label = f"{entry.display_name} observed column:"
-            self._observable_column_combos[dataset_id] = combo
-            target_form.addRow(label, combo)
-        observable_layout.addLayout(target_form)
-
-        scope_form = QtWidgets.QFormLayout()
-        scalar_scope_label = QtWidgets.QLabel(
-            "Per-dataset (choose Shared later in Parameters and enter a fresh value)",
-            self._observable_tab,
-        )
-        scalar_scope_label.setWordWrap(True)
-        scope_form.addRow("Auto-added scalars:", scalar_scope_label)
-        ds_count = len(self._dataset_ids)
-        self._observable_dataset_label = QtWidgets.QLabel(
-            f"Applies to {ds_count} selected dataset{'' if ds_count == 1 else 's'}."
-        )
-        scope_form.addRow("", self._observable_dataset_label)
-        observable_layout.addLayout(scope_form)
-
-        self._new_observable_container = QtWidgets.QGroupBox(
-            "Fit-local observable", self._observable_tab
-        )
-        new_layout = QtWidgets.QFormLayout(self._new_observable_container)
-        self._new_observable_name_edit = QtWidgets.QLineEdit(
-            self._new_observable_container
-        )
-        self._new_observable_name_edit.setPlaceholderText("e.g. signal")
-        new_layout.addRow("Observable name:", self._new_observable_name_edit)
-        self._new_observable_expr_edit = QtWidgets.QLineEdit(
-            self._new_observable_container
-        )
-        self._new_observable_expr_edit.setPlaceholderText("e.g. scale * ([A] + [B])")
-        new_layout.addRow("Expression:", self._new_observable_expr_edit)
-        observable_layout.addWidget(self._new_observable_container)
-
-        observable_help = QtWidgets.QLabel(
-            "Species must be referenced using brackets: [A], [A]_0 (bare A is invalid).",
-            self._observable_tab,
-        )
-        observable_help.setWordWrap(True)
-        observable_layout.addWidget(observable_help)
-        observable_layout.addStretch(1)
-
-    def _add_button_box(self, layout: QtWidgets.QVBoxLayout) -> None:
-        button_box = QtWidgets.QDialogButtonBox(
-            QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel,
-            self,
-        )
-        button_box.accepted.connect(self.accept)
-        button_box.rejected.connect(self.reject)
-        layout.addWidget(button_box)
-
-    def selection(
-        self,
-    ) -> tuple[str, str, tuple[FitObservationSnapshot, ...], str] | None:
-        return self._selection
-
-    def _selected_observations(self) -> tuple[FitObservationSnapshot, ...] | None:
-        selected: list[FitObservationSnapshot] = []
-        for dataset_id in self._dataset_ids:
-            combo = self._observable_column_combos.get(dataset_id)
-            if combo is None:
-                return None
-            observation = combo.currentData()
-            if not isinstance(observation, FitObservationSnapshot):
-                return None
-            selected.append(observation)
-        if len(selected) != len(self._dataset_ids):
-            return None
-        return tuple(selected)
-
-    def accept(self) -> None:  # noqa: D401 - Qt override
-        mode = "per_dataset"
-        observations = self._selected_observations()
-        if observations is None:
-            return
-        name = str(self._new_observable_name_edit.text()).strip()
-        expression = str(self._new_observable_expr_edit.text()).strip()
-        if not name or not expression:
-            return
-        self._selection = (name, expression, observations, mode)
-        super().accept()
-
-
-class _InitialConcentrationsDialog(QtWidgets.QDialog):
-    """Choose one existing IC configuration and its consumption scope."""
-
-    def __init__(
-        self,
-        *,
-        species: Sequence[str],
-        current_scopes: Mapping[str, str],
-        current_globals: Mapping[str, FitInitialGlobalVariable] | None = None,
-        parent: QtWidgets.QWidget | None = None,
-    ) -> None:
-        super().__init__(parent)
-        self.setWindowTitle("Add Initial Concentrations")
-        self.setModal(True)
-        layout = QtWidgets.QFormLayout(self)
-        self._species = QtWidgets.QComboBox(self)
-        self._species.addItems([str(item) for item in species if str(item)])
-        self._scope = QtWidgets.QComboBox(self)
-        self._scope.addItem("Local", "local")
-        self._scope.addItem("Global", "global")
-        if self._species.count():
-            current = str(current_scopes.get(self._species.currentText(), "local"))
-            index = self._scope.findData(current)
-            self._scope.setCurrentIndex(max(0, index))
-        self._species.currentTextChanged.connect(
-            lambda value: self._scope.setCurrentIndex(
-                max(0, self._scope.findData(current_scopes.get(value, "local")))
-            )
-        )
-        layout.addRow("Species:", self._species)
-        layout.addRow("Optimizer mode:", self._scope)
-        self._global_initial = QtWidgets.QLineEdit(self)
-        self._global_minimum = QtWidgets.QLineEdit(self)
-        self._global_maximum = QtWidgets.QLineEdit(self)
-        self._global_fit = QtWidgets.QCheckBox("Fit Global value", self)
-        self._global_fit.setObjectName("global_fit_ic_fit")
-        self._global_log10 = QtWidgets.QCheckBox("Fit in Log10", self)
-        self._global_log10.setObjectName("global_fit_ic_log10")
-        for edit in (
-            self._global_initial,
-            self._global_minimum,
-            self._global_maximum,
-        ):
-            setup_scientific_validator(edit)
-        layout.addRow("Global value:", self._global_initial)
-        layout.addRow("Global minimum:", self._global_minimum)
-        layout.addRow("Global maximum:", self._global_maximum)
-        layout.addRow("Global Fit:", self._global_fit)
-        layout.addRow("Global Log10:", self._global_log10)
-        self._current_scopes = {
-            str(name): str(scope).strip().lower()
-            for name, scope in current_scopes.items()
-        }
-        self._current_globals = dict(current_globals or {})
-        self._project_global_fields()
-        self._species.currentTextChanged.connect(self._project_global_fields)
-        self._scope.currentIndexChanged.connect(
-            lambda _index: self._set_global_fields_enabled(
-                self._scope.currentData() == "global"
-            )
-        )
-        note = QtWidgets.QLabel(
-            "Global activation requires fresh value and bounds. Cancel leaves "
-            "the current Local setup unchanged; Local removes Global state.",
-            self,
-        )
-        note.setWordWrap(True)
-        layout.addRow("", note)
-        buttons = QtWidgets.QDialogButtonBox(
-            QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel,
-            self,
-        )
-        buttons.accepted.connect(self.accept)
-        buttons.rejected.connect(self.reject)
-        layout.addRow("", buttons)
-
-    def selection(self) -> tuple[str, str] | None:
-        species = str(self._species.currentText() or "").strip()
-        scope = str(self._scope.currentData() or "").strip().lower()
-        if not species or scope not in {"local", "global"}:
-            return None
-        return species, scope
-
-    def _project_global_fields(self, *_args: object) -> None:
-        species = self._species.currentText()
-        current = (
-            self._current_globals.get(species)
-            if self._current_scopes.get(species) == "global"
-            else None
-        )
-        blocker = QtCore.QSignalBlocker(self)
-        if current is None:
-            # A Local species has no dormant Global scientific values. Global
-            # activation therefore starts with required, empty fields.
-            self._global_initial.clear()
-            self._global_minimum.clear()
-            self._global_maximum.clear()
-            self._global_fit.setChecked(False)
-            self._global_log10.setChecked(False)
-        else:
-            self._global_initial.setText(_format_scientific(current.initial))
-            self._global_minimum.setText(_format_scientific(current.minimum))
-            self._global_maximum.setText(_format_scientific(current.maximum))
-            self._global_fit.setChecked(bool(current.fit))
-            self._global_log10.setChecked(bool(current.log10))
-        del blocker
-        self._set_global_fields_enabled(
-            self._scope.currentData() == "global"
-        )
-
-    def _set_global_fields_enabled(self, enabled: bool) -> None:
-        for edit in (
-            self._global_initial,
-            self._global_minimum,
-            self._global_maximum,
-            self._global_fit,
-            self._global_log10,
-        ):
-            edit.setEnabled(bool(enabled))
-
-    def global_configuration(self) -> FitInitialGlobalVariable | None:
-        if self._scope.currentData() != "global":
-            return None
-        try:
-            return FitInitialGlobalVariable(
-                species=self._species.currentText(),
-                initial=float(self._global_initial.text()),
-                minimum=float(self._global_minimum.text()),
-                maximum=float(self._global_maximum.text()),
-                fit=self._global_fit.isChecked(),
-                log10=self._global_log10.isChecked(),
-            )
-        except (TypeError, ValueError, OverflowError):
-            return None
 
 
 class _ConvergenceDialog(QtWidgets.QDialog):
@@ -698,7 +391,6 @@ class ParametersIcsTab(QtWidgets.QWidget):
     """Presentation-only parameter, IC-scope, and optimizer panel."""
 
     setupSnapshotRequested = QtCore.Signal(object)
-    addObservableRequested = QtCore.Signal(str, str, object, str)
     resetRequested = QtCore.Signal(str)
     viewStepsRequested = QtCore.Signal()
     statusMessage = QtCore.Signal(str)
@@ -708,7 +400,6 @@ class ParametersIcsTab(QtWidgets.QWidget):
         self,
         *,
         origin: FitOriginSnapshot | None = None,
-        parameter_choices: Mapping[str, object] | None = None,
         parent: QtWidgets.QWidget | None = None,
     ) -> None:
         super().__init__(parent)
@@ -719,14 +410,11 @@ class ParametersIcsTab(QtWidgets.QWidget):
         self._last_fit_parameters: dict[str, FitParameterVariable] = {}
         self._can_reset_initial = False
         self._can_reset_last_fit = False
-        self._selected_dataset_ids: tuple[str, ...] = ()
-        self._parameter_choices: dict[str, object] = {}
         self._invalid_numeric_drafts: dict[
             tuple[str, ...], _InvalidNumericDraft
         ] = {}
         self._projecting = False
         self._running = False
-        self._set_parameter_choices(parameter_choices or {})
         self._build_ui()
 
 
@@ -734,124 +422,10 @@ class ParametersIcsTab(QtWidgets.QWidget):
         outer = QtWidgets.QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
         outer.addWidget(self._build_parameters_panel(), stretch=1)
-    def _set_parameter_choices(self, choices: Mapping[str, object]) -> None:
-        self._parameter_choices = {str(key): value for key, value in choices.items()}
-        dataset_ids = self._parameter_choices.get("dataset_ids", ())
-        self._selected_dataset_ids = tuple(
-            dict.fromkeys(
-                str(item).strip() for item in (dataset_ids or ()) if str(item).strip()
-            )
-        )
-
-    def set_selected_dataset_ids(self, dataset_ids: Sequence[str]) -> None:
-        self._selected_dataset_ids = tuple(
-            dict.fromkeys(
-                str(item).strip() for item in (dataset_ids or ()) if str(item).strip()
-            )
-        )
-        # Selection controls the Fit-local observable target only. Parameter
-        # rows always retain every captured dataset value, including excluded
-        # datasets.
-
-
     # ------------------------------------------------------------------
     # Parameter presentation and complete snapshot replacements
     # ------------------------------------------------------------------
 
-
-    def _add_fit_local_observable(self) -> None:
-        if self._running:
-            self.statusMessage.emit("Stop the current fit before adding an observable.")
-            return
-        dataset_ids = self._selected_dataset_ids
-        if not dataset_ids:
-            self.statusMessage.emit(
-                "Select at least one dataset to include before adding an observable."
-            )
-            return
-        dialog = _FitLocalObservableDialog(
-            dataset_ids=dataset_ids,
-            available_observations=self._available_observation_choices(dataset_ids),
-            parent=self,
-        )
-        if dialog.exec() != QtWidgets.QDialog.DialogCode.Accepted:
-            return
-        selection = dialog.selection()
-        if not selection:
-            return
-        # Window/owner handoff: name, expression, exact selected snapshot
-        # roster (in selected-dataset order), and scalar scope.  No edit object
-        # or raw-observation reconstruction crosses this boundary.
-        name, expression, observations, scalar_scope = selection
-        self.addObservableRequested.emit(
-            name,
-            expression,
-            observations,
-            scalar_scope,
-        )
-
-    def _add_initial_concentrations(self) -> None:
-        if self._running:
-            self.statusMessage.emit(
-                "Stop the current fit before changing initial-condition scope."
-            )
-            return
-        setup = self._projected_setup
-        if setup is None:
-            self.statusMessage.emit("Fit setup is not available.")
-            return
-        species = tuple(dict.fromkeys(item.species for item in setup.initials))
-        if not species:
-            self.statusMessage.emit("No retained initial concentrations are available.")
-            return
-        dialog = _InitialConcentrationsDialog(
-            species=species,
-            current_scopes=dict(setup.initial_scopes),
-            current_globals={
-                item.species: item for item in setup.global_initials
-            },
-            parent=self,
-        )
-        if dialog.exec() != QtWidgets.QDialog.DialogCode.Accepted:
-            return
-        selection = dialog.selection()
-        if selection is None:
-            return
-        species_name, scope = selection
-        configured: FitInitialGlobalVariable | None = None
-        if scope == "global":
-            configured = dialog.global_configuration()
-            if configured is None:
-                self.statusMessage.emit(
-                    "Global initial value and bounds are required and must be valid."
-                )
-                return
-        else:
-            local_rows = tuple(
-                item
-                for item in setup.initials
-                if item.species == species_name
-            )
-            if not local_rows:
-                self.statusMessage.emit(
-                    "The selected species has no retained Local configuration."
-                )
-                return
-        scope_map = dict(setup.initial_scopes)
-        scope_map[species_name] = scope
-        global_initials = tuple(
-            item for item in setup.global_initials if item.species != species_name
-        )
-        if configured is not None:
-            global_initials = (*global_initials, configured)
-            global_initials = tuple(sorted(global_initials, key=lambda item: item.species))
-        self.setupSnapshotRequested.emit(
-            replace(
-                setup,
-                initial_scopes=tuple(scope_map.items()),
-                global_initials=global_initials,
-            )
-        )
 
     def _reset_to_initial(self) -> None:
         if not self._can_reset_initial:
@@ -865,19 +439,6 @@ class ParametersIcsTab(QtWidgets.QWidget):
             return
         self.resetRequested.emit("last_fit")
 
-
-    def _available_observation_choices(
-        self,
-        dataset_ids: Sequence[str],
-    ) -> tuple[FitMappedDatasetSnapshot, ...]:
-        selected = {str(dataset_id) for dataset_id in dataset_ids}
-        if self._origin is None:
-            return ()
-        return tuple(
-            mapped
-            for mapped in self._origin.mapped_datasets
-            if mapped.dataset_id in selected
-        )
 
     _SCOPE_LABELS = {
         "shared": "One shared value",
@@ -1011,31 +572,26 @@ class ParametersIcsTab(QtWidgets.QWidget):
         params_layout.addWidget(split, stretch=1)
 
         actions = QtWidgets.QHBoxLayout()
-        self._add_button = QtWidgets.QToolButton(params_group)
-        self._add_button.setText("Add parameter ▼")
-        self._add_button.setPopupMode(QtWidgets.QToolButton.ToolButtonPopupMode.InstantPopup)
-        add_menu = QtWidgets.QMenu(self._add_button)
-        self._add_initial_action = add_menu.addAction("Initial Concentrations")
-        self._add_initial_action.triggered.connect(self._add_initial_concentrations)
-        self._add_button.setMenu(add_menu)
-        self._add_observable_button = QtWidgets.QPushButton(
-            "Define Fit-local observable…", params_group
-        )
-        self._add_observable_button.clicked.connect(self._add_fit_local_observable)
         self._view_steps_button = QtWidgets.QPushButton("View mechanism steps", params_group)
         self._view_steps_button.setObjectName("global_fit_parameters_view_steps")
         self._view_steps_button.clicked.connect(self.viewStepsRequested)
         self._reset_initial_button = QtWidgets.QPushButton(
             "Reset selected to initial", params_group
         )
+        self._reset_initial_button.setToolTip(
+            "Restore the entire Fit setup captured when this window opened, "
+            "discarding all later accepted and unapplied changes."
+        )
         self._reset_initial_button.clicked.connect(self._reset_to_initial)
         self._reset_last_button = QtWidgets.QPushButton(
             "Reset selected to last fit", params_group
         )
+        self._reset_last_button.setToolTip(
+            "Restore the entire Fit setup used by the last completed Fit, "
+            "discarding all later accepted and unapplied changes."
+        )
         self._reset_last_button.clicked.connect(self._reset_to_last_fit)
         for control in (
-            self._add_button,
-            self._add_observable_button,
             self._view_steps_button,
             self._reset_initial_button,
             self._reset_last_button,
@@ -1161,14 +717,6 @@ class ParametersIcsTab(QtWidgets.QWidget):
         for method in SUPPORTED_FIT_METHODS:
             combo.addItem(FIT_METHOD_LABELS.get(method, method), method)
 
-    def _check_snapshot(self, snapshot: FitSetupSnapshot) -> None:
-        if not isinstance(snapshot, FitSetupSnapshot):
-            raise TypeError("snapshot must be FitSetupSnapshot.")
-        if self._origin is not None and (
-            snapshot.origin is not self._origin
-        ):
-            raise ValueError("Fit snapshot does not match this origin.")
-
     def _parameter_dataset_ids(
         self,
         snapshot: FitSetupSnapshot,
@@ -1223,7 +771,6 @@ class ParametersIcsTab(QtWidgets.QWidget):
         return self._available_analysis_coordinates()
 
     def project_setup_snapshot(self, snapshot: FitSetupSnapshot) -> None:
-        self._check_snapshot(snapshot)
         self._projected_setup = snapshot
         blocker = QtCore.QSignalBlocker(self._param_table)
         self._projecting = True
@@ -1248,7 +795,6 @@ class ParametersIcsTab(QtWidgets.QWidget):
 
     def set_last_fit_reset_available(self, snapshot: FitSetupSnapshot | None) -> None:
         if snapshot is not None:
-            self._check_snapshot(snapshot)
             self._last_fit_parameters = {item.name: item for item in snapshot.parameters}
         else:
             self._last_fit_parameters.clear()
@@ -1274,7 +820,6 @@ class ParametersIcsTab(QtWidgets.QWidget):
         )
 
     def set_initial_reset_available(self, snapshot: FitSetupSnapshot) -> None:
-        self._check_snapshot(snapshot)
         self.set_reset_availability(initial=True, last_fit=self._can_reset_last_fit)
 
     def set_reset_availability(self, *, initial: bool, last_fit: bool) -> None:
@@ -1481,11 +1026,7 @@ class ParametersIcsTab(QtWidgets.QWidget):
     def _project_scope_choices(self, parameter: FitParameterVariable) -> None:
         """Offer only scopes supported by the accepted parameter authority."""
 
-        allowed = (
-            ("shared", "per_dataset")
-            if parameter.fit_local_provenance is not None
-            else tuple(self._SCOPE_LABELS)
-        )
+        allowed = tuple(self._SCOPE_LABELS)
         current = tuple(
             str(self._scope_combo.itemData(index) or "")
             for index in range(self._scope_combo.count())
@@ -1631,7 +1172,6 @@ class ParametersIcsTab(QtWidgets.QWidget):
             scientific_category=parameter.scientific_category,
             allow_exact_zero=parameter.allow_exact_zero,
             unit=parameter.unit,
-            fit_local_provenance=parameter.fit_local_provenance,
         )
 
     def _uncertainty_effects_for_parameter(
@@ -1788,15 +1328,6 @@ class ParametersIcsTab(QtWidgets.QWidget):
         if parameter is None:
             return
         desired = str(self._scope_combo.currentData() or "")
-        if (
-            parameter.fit_local_provenance is not None
-            and desired == "centred_fixed_effects"
-        ):
-            self._restore_scope(parameter.scope)
-            self.statusMessage.emit(
-                "Fit-local observable scalars cannot use centred dataset deviations."
-            )
-            return
         if desired == parameter.scope:
             return
         if desired not in {"shared", "per_dataset", "centred_fixed_effects"}:
@@ -2169,8 +1700,6 @@ class ParametersIcsTab(QtWidgets.QWidget):
 
     def set_running_state(self, running: bool) -> None:
         self._running = bool(running)
-        self._add_observable_button.setEnabled(not self._running)
-        self._add_button.setEnabled(not self._running)
 
     def clear_pending_setup_edits(self) -> None:
         self._retire_numeric_drafts()

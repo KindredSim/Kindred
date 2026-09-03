@@ -603,8 +603,9 @@ class MainWindow(QtWidgets.QMainWindow):
             )
         )
         bundle.batch_table.selectionModel().currentChanged.connect(
-            lambda _current, _previous, captured=tab_id: self._on_current_row_changed(
-                captured
+            lambda _current, previous, captured=tab_id: self._on_current_row_changed(
+                captured,
+                previous,
             )
         )
         data = bundle.data_panel
@@ -1150,8 +1151,6 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._refresh_project_state()
 
     def _refresh_application_plot_preferences(self) -> None:
-        point_size = self.config_controller.experimental_point_size()
-        point_opacity = self.config_controller.experimental_point_opacity()
         for tab in self._project_session.document.tabs:
             bundle = self._tab_surfaces.get(tab.tab_id)
             if bundle is None:
@@ -1160,14 +1159,7 @@ class MainWindow(QtWidgets.QMainWindow):
             bundle.overlay_panel.refresh_color_swatches(
                 known_species=tuple(canonical_observation_target_names(tab)),
             )
-            self._workspace.plot_for_tab(
-                tab.tab_id
-            ).apply_application_plot_preferences(
-                color_for_species=self.config_controller.species_color,
-                known_species=tuple(canonical_observation_target_names(tab)),
-                experimental_point_size=point_size,
-                experimental_point_opacity=point_opacity,
-            )
+            self._render_results_for_tab(tab.tab_id)
         self._refresh_actions()
 
     def _refresh_dataset_views(
@@ -1372,8 +1364,6 @@ class MainWindow(QtWidgets.QMainWindow):
     def _render_results_for_tab(
         self,
         tab_id: str,
-        *,
-        preserve_interactive_membership: bool = False,
     ) -> bool:
         target = str(tab_id)
         try:
@@ -1399,10 +1389,7 @@ class MainWindow(QtWidgets.QMainWindow):
         plot = self._workspace.plot_for_tab(target)
         try:
             plot.set_copy_all_available(copy_available)
-            if preserve_interactive_membership:
-                plot.apply_result_input_preserving_interactive(render_input)
-            else:
-                plot.apply_result_input(render_input)
+            plot.apply_result_input(render_input)
         except Exception as exc:
             logger.exception("Result physical apply failed for mechanism %s", target)
             self.set_status_text(
@@ -1478,20 +1465,17 @@ class MainWindow(QtWidgets.QMainWindow):
 
     @QtCore.Slot(str)
     def _on_results_changed(self, tab_id: str) -> None:
-        """Ignore stale or coalesced result publications at the shell owner."""
+        """Recompose result publications after their owner-side retirement."""
 
         target = str(tab_id)
         if self._rendering_workspace:
             return
         try:
-            self._workspace.plot_for_tab(target)
+            plot = self._workspace.plot_for_tab(target)
         except (KeyError, RuntimeError):
             return
         if target in self._plot_membership_refreshing:
-            self._render_results_for_tab(
-                target,
-                preserve_interactive_membership=True,
-            )
+            self._render_results_for_tab(target)
             return
         if target in self._slider_apply_refreshing:
             return
@@ -1503,6 +1487,18 @@ class MainWindow(QtWidgets.QMainWindow):
             # the replacement; a subsequent gesture may capture it normally.
             self._current_row_refreshing.pop(target, None)
             return
+        bundle = self._tab_surfaces.get(target)
+        if bundle is not None and self._simulation_jobs.current_kind != "run":
+            plot.retire_interactive_preview_targets(
+                tuple(
+                    dict.fromkeys(
+                        (
+                            *bundle.slider_binding.active_preview_set_ids,
+                            *bundle.slider_binding.resolve_target_set_ids(),
+                        )
+                    )
+                )
+            )
         self._render_results_for_tab(target)
 
     @QtCore.Slot(str, str, object, object)
@@ -1544,7 +1540,11 @@ class MainWindow(QtWidgets.QMainWindow):
         bundle = self._tab_surfaces.get(target)
         if bundle is None:
             return
-        if not bundle.initial_actions.union_plot_membership(set_ids):
+        target_set_ids = tuple(str(set_id) for set_id in set_ids)
+        self._workspace.plot_for_tab(target).retire_interactive_preview_targets(
+            target_set_ids
+        )
+        if not bundle.initial_actions.union_plot_membership(target_set_ids):
             return
         self._render_results_for_tab(target)
         self._refresh_project_state()
@@ -1698,6 +1698,16 @@ class MainWindow(QtWidgets.QMainWindow):
         target = str(tab_id)
         bundle = self._tab_surfaces.get(target)
         if bundle is not None:
+            self._workspace.plot_for_tab(target).retire_interactive_preview_targets(
+                tuple(
+                    dict.fromkeys(
+                        (
+                            *bundle.slider_binding.active_preview_set_ids,
+                            *bundle.slider_binding.resolve_target_set_ids(),
+                        )
+                    )
+                )
+            )
             bundle.slider_binding.cancel_pending_preview_intent()
 
     def _render_tab_state(self) -> None:
@@ -1941,10 +1951,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if not changed:
             return
         if not requested:
-            self._render_results_for_tab(
-                tab_id,
-                preserve_interactive_membership=True,
-            )
+            self._render_results_for_tab(tab_id)
             return
         slider_binding = self._tab_surfaces[tab_id].slider_binding
         slider_targets = slider_binding.resolve_target_set_ids()
@@ -1964,10 +1971,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 )
             )
             if protected_slider_state:
-                self._render_results_for_tab(
-                    tab_id,
-                    preserve_interactive_membership=True,
-                )
+                self._render_results_for_tab(tab_id)
                 return
         try:
             tab = self._workspace_tab_registry.tab(tab_id)
@@ -1985,17 +1989,11 @@ class MainWindow(QtWidgets.QMainWindow):
             finally:
                 self._plot_membership_refreshing.discard(tab_id)
             if not cached:
-                self._render_results_for_tab(
-                    tab_id,
-                    preserve_interactive_membership=True,
-                )
+                self._render_results_for_tab(tab_id)
                 return
         except Exception as exc:
             self._plot_membership_refreshing.discard(tab_id)
-            self._render_results_for_tab(
-                tab_id,
-                preserve_interactive_membership=True,
-            )
+            self._render_results_for_tab(tab_id)
             self.set_status_text(f"Could not show cached result: {exc}")
 
     @QtCore.Slot(str, bool)
@@ -2241,11 +2239,11 @@ class MainWindow(QtWidgets.QMainWindow):
                 (*binding.active_preview_set_ids, *binding.resolve_target_set_ids())
             )
         )
-        changed = binding.discard_slider_draft()
         if ids:
             self._workspace.plot_for_tab(target).retire_interactive_preview_targets(
                 ids
             )
+        changed = binding.discard_slider_draft()
         self._render_results_for_tab(target)
         return changed
 
@@ -2257,11 +2255,11 @@ class MainWindow(QtWidgets.QMainWindow):
                 (*binding.active_preview_set_ids, *binding.resolve_target_set_ids())
             )
         )
-        changed = binding.reset()
         if ids:
             self._workspace.plot_for_tab(target).retire_interactive_preview_targets(
                 ids
             )
+        changed = binding.reset()
         self._render_results_for_tab(target)
         return changed
 
@@ -2575,8 +2573,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self._set_tab_run_enabled(target, self._run_admitted(target))
         self._refresh_project_state()
 
-    @QtCore.Slot(str)
-    def _on_current_row_changed(self, tab_id: str) -> None:
+    @QtCore.Slot(str, object)
+    def _on_current_row_changed(
+        self,
+        tab_id: str,
+        previous_index: QtCore.QModelIndex | None = None,
+    ) -> None:
         """Refresh one current-row gesture through one guarded owner path."""
 
         target = str(tab_id)
@@ -2585,6 +2587,18 @@ class MainWindow(QtWidgets.QMainWindow):
         bundle = self._tab_surfaces.get(target)
         if bundle is None:
             return
+        previous_set_id = (
+            None
+            if previous_index is None
+            else bundle.batch_model.set_id_for_live_index(previous_index)
+        )
+        current_set_id = self._workspace_tab_registry.presentation(
+            target
+        ).current_set_id
+        if previous_set_id is not None and previous_set_id != current_set_id:
+            self._workspace.plot_for_tab(target).retire_interactive_preview_targets(
+                (previous_set_id,)
+            )
         document = self._project_session.document
         row_guard = self._current_row_refreshing.get(target)
         if row_guard is document:
@@ -3855,10 +3869,7 @@ class MainWindow(QtWidgets.QMainWindow):
             replace(state, reference_lines_visible=bool(visible)),
         )
         self._refresh_project_state()
-        self._render_results_for_tab(
-            tab_id,
-            preserve_interactive_membership=True,
-        )
+        self._render_results_for_tab(tab_id)
 
     def _set_intervention_annotations_visible(
         self,
@@ -3878,10 +3889,7 @@ class MainWindow(QtWidgets.QMainWindow):
             ),
         )
         self._refresh_project_state()
-        self._render_results_for_tab(
-            tab_id,
-            preserve_interactive_membership=True,
-        )
+        self._render_results_for_tab(tab_id)
 
     def _set_x_series(
         self,
@@ -3896,10 +3904,7 @@ class MainWindow(QtWidgets.QMainWindow):
             replace(state, selected_x_series=selection),
         )
         self._refresh_project_state()
-        self._render_results_for_tab(
-            tab_id,
-            preserve_interactive_membership=True,
-        )
+        self._render_results_for_tab(tab_id)
 
     def _set_y_series(self, tab_id: str, selections: object) -> None:
         if not self._mutation_input_admitted("Change Y Series"):
@@ -3915,10 +3920,7 @@ class MainWindow(QtWidgets.QMainWindow):
             ),
         )
         self._refresh_project_state()
-        self._render_results_for_tab(
-            tab_id,
-            preserve_interactive_membership=True,
-        )
+        self._render_results_for_tab(tab_id)
 
     def _set_plot_presentation(
         self,
@@ -3942,10 +3944,7 @@ class MainWindow(QtWidgets.QMainWindow):
             y_inverted=next_state.y_inverted,
         )
         self._refresh_project_state()
-        self._render_results_for_tab(
-            tab_id,
-            preserve_interactive_membership=True,
-        )
+        self._render_results_for_tab(tab_id)
 
     def _populate_recent_menu(self) -> None:
         menu = self._recent_menu
@@ -4359,10 +4358,12 @@ class MainWindow(QtWidgets.QMainWindow):
             changed = bundle.slider_binding.fence_stop() or changed
         for target in tuple(self._tab_surfaces):
             try:
-                plot = self._workspace.plot_for_tab(target)
+                changed = (
+                    self._workspace.plot_for_tab(target).stop_interactive_display()
+                    or changed
+                )
             except KeyError:
                 continue
-            changed = plot.stop_interactive_display() or changed
         for bundle in tuple(self._tab_surfaces.values()):
             changed = bundle.slider_binding.settle_stop() or changed
         return bool(self._simulation_jobs.cancel_current() or changed)
@@ -4963,6 +4964,11 @@ class MainWindow(QtWidgets.QMainWindow):
     def _on_close_pending_changed(self, pending: bool) -> None:
         if pending:
             self._set_close_mutation_fence(True)
+            for target in tuple(self._tab_surfaces):
+                try:
+                    self._workspace.plot_for_tab(target).discard_interactive_display()
+                except KeyError:
+                    continue
             self.set_status_text("Closing Kindred; waiting for active work to stop.")
         else:
             self._set_close_mutation_fence(False)
