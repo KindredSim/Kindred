@@ -9,13 +9,12 @@ from __future__ import annotations
 
 import logging
 from numbers import Real
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Any, Callable, Dict, Iterable, Mapping, Optional
 
 import numpy as np
 
-from kindred.core.rate_binding import ForwardRateBinding, RateBinding
 from kindred.core.exceptions import (
     FitSimulationError,
     SimulationCancelled,
@@ -23,7 +22,6 @@ from kindred.core.exceptions import (
 from kindred.core.species import validate_concentration, validate_time_seconds
 from kindred.core.mechanism_metadata import (
     EquilibriumMetadataKeys,
-    MechanismMetadataView,
 )
 from kindred.core.temperature import (
     TemperatureScheduleProtocol,
@@ -47,7 +45,10 @@ from kindred.core.symbolic.jacobian_execution import SymbolicJacobianExecution
 from kindred.core.simulator.parameter_namespace import (
     build_namespace_from_mechanism,
 )
-from kindred.core.simulator.step_indexing import get_step_index_map
+from kindred.core.simulator.parameter_coordinates import (
+    ParameterTarget,
+    build_parameter_target_map,
+)
 from kindred.core.simulator.dsl_parse import PreparedDslRequestSet
 from kindred.core.simulation_preparation_stages import (
     PreparedSolverConfig as _PreparedSolverConfig,
@@ -56,75 +57,6 @@ from kindred.core.simulation_preparation_stages import (
 from kindred.core.time_grid import build_time_grid
 
 logger = logging.getLogger(__name__)
-
-
-_PreparedParameterTarget = tuple[
-    str,
-    tuple[str, int, str, Mapping[str, object]],
-]
-
-
-def _build_parameter_target_map(
-    mechanism: Any,
-) -> dict[str, _PreparedParameterTarget]:
-    """Build one admitted indexed/physical target map for a preparation."""
-
-    namespace = build_namespace_from_mechanism(mechanism)
-    step_roster = get_step_index_map(mechanism)
-    targets: dict[str, _PreparedParameterTarget] = {}
-
-    for item in namespace.ordered_items:
-        source_index = item.source_index
-        if source_index is None or not (0 <= int(source_index) < len(step_roster)):
-            continue
-        entry = step_roster[int(source_index)]
-        kind = str(entry.get("kind") or "")
-        index_key = "reaction_index" if kind == "reaction" else "equilibrium_index"
-        try:
-            index = int(entry[index_key])
-        except (KeyError, TypeError, ValueError) as exc:
-            raise ValueError(
-                f"Admitted parameter {item.canonical_name!r} has no valid target index."
-            ) from exc
-        role = str(item.info.role or "")
-        if kind not in {"reaction", "equilibrium"} or not role:
-            continue
-        targets[str(item.canonical_name)] = (
-            "indexed",
-            (kind, index, role, entry),
-        )
-
-    for coordinate in namespace.source_coordinates:
-        name = str(coordinate.canonical_name)
-        if name in targets:
-            continue
-        source_index = coordinate.source_index
-        if source_index is None or not (0 <= int(source_index) < len(step_roster)):
-            continue
-        entry = step_roster[int(source_index)]
-        kind = str(entry.get("kind") or "")
-        index_key = "reaction_index" if kind == "reaction" else "equilibrium_index"
-        try:
-            index = int(entry[index_key])
-        except (KeyError, TypeError, ValueError) as exc:
-            raise ValueError(
-                f"Admitted source coordinate {name!r} has no valid target index."
-            ) from exc
-        if kind not in {"reaction", "equilibrium"}:
-            continue
-        targets[name] = (
-            "physical",
-            (kind, index, str(coordinate.role), entry),
-        )
-    return targets
-
-
-def _target_parts(
-    target: _PreparedParameterTarget,
-) -> tuple[str, str, int, str, Mapping[str, object]]:
-    route, facts = target
-    kind, index, role, entry = facts
-    return str(route), str(kind), int(index), str(role), entry
 
 
 def _freeze_prepared_value(value: Any) -> Any:
@@ -155,7 +87,6 @@ __all__ = [
     "fit_simulation_error_from_preparation_error",
     "prepare_preparation_failure",
     "raise_unowned_request_parameter_values",
-    "reject_requested_algebra_owned_mechanism_parameters_for_fitting",
     "simulation_execution_requests_equal",
 ]
 
@@ -223,14 +154,12 @@ def _classify_request_parameter_names(
     unresolved_intervention_schedule: InterventionSchedule | None,
     raw_values: dict[str, float],
     mechanism_names: set[str],
-    unbound_mechanism_names: set[str],
     schedule_names: set[str],
     scalar_names: set[str],
     unknown_names: set[str],
     mechanism_name_by_raw: dict[str, str],
-    unbound_mechanism_name_by_raw: dict[str, str],
     invalid_messages: dict[str, str],
-    parameter_target_map: Mapping[str, _PreparedParameterTarget],
+    parameter_target_map: Mapping[str, ParameterTarget],
     requested_parameter_names: Iterable[str] | None = None,
     declared_scalar_names: Iterable[str] | None = None,
     derived_scalar_names: Iterable[str] | None = None,
@@ -271,38 +200,12 @@ def _classify_request_parameter_names(
         claimed = False
         target = parameter_target_map.get(name)
         if target is not None:
-            route, _kind, _index, _role, _entry = _target_parts(target)
+            # Classification owns namespace routing only.  Concrete target
+            # editability, locking, and scientific admission belong to the
+            # grouped coordinate owner at the actual write ingress.
             canonical_name = name
-            if route == "indexed":
-                try:
-                    can_apply = _indexed_parameter_target_can_apply(
-                        mechanism,
-                        target,
-                        canonical_name=name,
-                    )
-                except SimulationPreparationError:
-                    # A derived indexed value can be a schedule readout.  It
-                    # is not a writable request coordinate unless a value was
-                    # actually supplied for it.
-                    if name in schedule_names and name not in raw_values:
-                        continue
-                    raise
-            else:
-                can_apply = _role in {
-                    "A",
-                    "Ea",
-                    "dG_act",
-                    "dG_eq",
-                    "kappa",
-                }
-            if can_apply:
-                mechanism_names.add(canonical_name)
-                mechanism_name_by_raw[name] = canonical_name
-            else:
-                if name in schedule_names and name not in raw_values:
-                    continue
-                unbound_mechanism_names.add(canonical_name)
-                unbound_mechanism_name_by_raw[name] = canonical_name
+            mechanism_names.add(canonical_name)
+            mechanism_name_by_raw[name] = canonical_name
             continue
         invalid_message = invalid_request_parameter_identifier_message(mechanism, name)
         if invalid_message is not None:
@@ -323,46 +226,10 @@ def _classify_request_parameter_names(
             unknown_names.add(name)
 
 
-def _indexed_parameter_target_can_apply(
-    mechanism: Any,
-    target: _PreparedParameterTarget,
-    *,
-    canonical_name: str,
-) -> bool:
-    """Return whether one indexed target has a prepared write authority."""
-
-    _route, kind, index, role, entry = _target_parts(target)
-    if kind == "equilibrium":
-        _equilibrium_override_binding_target(
-            mechanism,
-            idx=index,
-            role=role,
-            entry=entry,
-        )
-        return True
-    # Binding creates a target-local RateBinding when the parser supplied a
-    # literal.  Current object mutability is therefore not an admission
-    # criterion; only the admitted indexed role decides ownership.
-    if kind == "reaction" and role == "k":
-        source_coordinates = entry.get("source_coordinates") or {}
-        if isinstance(source_coordinates, Mapping) and any(
-            str(role) in {"A", "Ea", "dG_act"}
-            for role in source_coordinates
-        ):
-            raise SimulationPreparationError(
-                "parameter_overrides",
-                f"mechanism parameter {canonical_name!r} is a derived rate readout and cannot be used as write authority.",
-                parameter_names=(canonical_name,),
-            )
-        return True
-    return False
-
 def raise_unowned_request_parameter_values(
     *,
     raw_values: Mapping[str, float],
     mechanism_name_by_raw: Mapping[str, str],
-    unbound_mechanism_name_by_raw: Mapping[str, str],
-    unbound_mechanism_names: Iterable[str],
     unknown_names: Iterable[str],
     invalid_messages: Mapping[str, str],
 ) -> None:
@@ -370,12 +237,7 @@ def raise_unowned_request_parameter_values(
         first_name = sorted(invalid_messages)[0]
         raise ValueError(invalid_messages[first_name])
     owner_to_raw: dict[str, str] = {}
-    for raw_name, owner_name in sorted(
-        {
-            **mechanism_name_by_raw,
-            **unbound_mechanism_name_by_raw,
-        }.items()
-    ):
+    for raw_name, owner_name in sorted(mechanism_name_by_raw.items()):
         if raw_name not in raw_values:
             continue
         owner = str(owner_name)
@@ -392,19 +254,8 @@ def raise_unowned_request_parameter_values(
             + ", ".join(repr(name) for name in unknown)
             + ". Request parameters must belong to the mechanism, schedule, scalar algebra, or initial-condition namespace."
         )
-    unbound = frozenset(str(name) for name in unbound_mechanism_names)
-    if unbound:
-        first_name = sorted(unbound)[0]
-        raw_names = sorted(
-            raw_name
-            for raw_name, canonical_name in unbound_mechanism_name_by_raw.items()
-            if canonical_name == first_name
-        )
-        raw_clause = f" from request name {raw_names[0]!r}" if raw_names else ""
-        raise ValueError(
-            f"Request parameter{raw_clause} resolves to mechanism parameter {first_name!r}, "
-            "but no prepared execution binding can consume it."
-        )
+
+
 class SimulationPreparationError(RuntimeError):
     """
     Error raised when preparing a SimulationWorker run payload/request fails.
@@ -471,7 +322,6 @@ class PreparedSimulationRun:
     intervention_execution: InterventionExecutionContract | None
     symbolic_jacobian: SymbolicJacobianExecution
     initials_for_algebra: Optional[Mapping[str, float]]
-    warnings: tuple[str, ...]
     request: SimulationExecutionRequest
     unresolved_intervention_schedule: InterventionSchedule | None = None
     cancellation_control: SimulationCancellationControl | None = None
@@ -481,7 +331,6 @@ class PreparedSimulationRun:
         y0.setflags(write=False)
         object.__setattr__(self, "y0", y0)
         object.__setattr__(self, "species_names", tuple(self.species_names))
-        object.__setattr__(self, "warnings", tuple(str(value) for value in self.warnings))
         if self.initials_for_algebra is not None:
             if not isinstance(self.initials_for_algebra, Mapping):
                 raise TypeError("initials_for_algebra must be a mapping or None.")
@@ -648,7 +497,6 @@ def _expanded_intervention_schedule_dependency_metadata(
     schedule: InterventionSchedule | None,
     *,
     parameter_algebra_spec: Any,
-    parameter_target_map: Mapping[str, _PreparedParameterTarget],
 ) -> InterventionScheduleDependencyMetadata:
     """Expand direct schedule names through the admitted Algebra dependency map."""
 
@@ -659,18 +507,13 @@ def _expanded_intervention_schedule_dependency_metadata(
     if not isinstance(admitted_dependencies, Mapping):
         admitted_dependencies = {}
 
-    def canonical_name(raw_name: object) -> str:
-        name = str(raw_name or "").strip()
-        target = parameter_target_map.get(name)
-        return name if target is not None else name
-
     expanded: dict[tuple[int, int | None, str], tuple[str, ...]] = {}
     for identity, raw_names in direct_metadata.items():
         leaves: set[str] = set()
         visiting: set[str] = set()
 
         def visit(raw_name: object) -> None:
-            name = canonical_name(raw_name)
+            name = str(raw_name or "").strip()
             if name in visiting:
                 # Admission has already rejected cycles; this keeps the
                 # consumer fail-closed if supplied typed state is corrupted.
@@ -736,7 +579,6 @@ def _schedule_parameters_deferred_to_prepared_request(
     execution_request: SimulationExecutionRequest,
     unresolved_intervention_schedule: InterventionSchedule,
     *,
-    parameter_target_map: Mapping[str, _PreparedParameterTarget],
     parameter_algebra_spec: Any | None = None,
 ) -> frozenset[str]:
     if not unresolved_intervention_schedule.is_parameterized:
@@ -766,21 +608,15 @@ def _schedule_parameters_deferred_to_prepared_request(
             execution_request.prepared_dsl.parameter_algebra_spec_for_execution()
         )
 
-    def canonical_name(raw_name: object) -> str:
-        name = str(raw_name or "").strip()
-        target = parameter_target_map.get(name)
-        return name if target is not None else name
-
     requested_names = {
-        canonical_name(name)
+        str(name).strip()
         for name in requested
         if str(name).strip()
     }
-    supplied_names = {canonical_name(name) for name in supplied if str(name).strip()}
+    supplied_names = {str(name).strip() for name in supplied if str(name).strip()}
     expanded_metadata = _expanded_intervention_schedule_dependency_metadata(
         unresolved_intervention_schedule,
         parameter_algebra_spec=parameter_algebra_spec,
-        parameter_target_map=parameter_target_map,
     )
     deferred: set[str] = set()
     for identity, direct_names in intervention_schedule_parameter_dependencies(
@@ -992,7 +828,7 @@ def _schedule_resolution_values_for_request(
     unresolved_intervention_schedule: InterventionSchedule | None,
     *,
     raw_values: Mapping[str, float] | None = None,
-    parameter_target_map: Mapping[str, _PreparedParameterTarget] | None = None,
+    parameter_target_map: Mapping[str, ParameterTarget] | None = None,
     mechanism: Any | None = None,
 ) -> Dict[str, float] | None:
     values: Dict[str, float] = {
@@ -1023,7 +859,7 @@ def _effective_mechanism_schedule_values(
     mechanism: Any,
     *,
     names: Iterable[str],
-    parameter_target_map: Mapping[str, _PreparedParameterTarget],
+    parameter_target_map: Mapping[str, ParameterTarget],
 ) -> dict[str, float]:
     """Read indexed schedule coordinates from the effective rate authority."""
 
@@ -1063,7 +899,7 @@ def _effective_mechanism_schedule_values(
         target = target_map.get(raw_name)
         if target is None:
             continue
-        route, kind, index, role, _entry = _target_parts(target)
+        route, kind, index, role, _entry = target
         if route == "physical":
             if role == "dG_eq" and kind == "equilibrium":
                 raw_dg = dict(
@@ -1184,235 +1020,49 @@ def _apply_parameter_overrides_to_prepared_mechanism(
     parameter_algebra_spec: Any,
     raw_values: Mapping[str, float],
     mechanism_parameter_name_by_raw: Mapping[str, str],
-    unbound_mechanism_parameter_name_by_raw: Mapping[str, str],
-    unbound_mechanism_parameter_names: Iterable[str],
     scalar_parameter_names: Iterable[str],
     unknown_parameter_names: Iterable[str],
     invalid_parameter_identifier_messages: Mapping[str, str],
-    parameter_target_map: Mapping[str, _PreparedParameterTarget],
+    parameter_target_map: Mapping[str, ParameterTarget],
 ) -> None:
     """Apply slider-style values to one isolated execution mechanism."""
     raise_unowned_request_parameter_values(
         raw_values=raw_values,
         mechanism_name_by_raw=mechanism_parameter_name_by_raw,
-        unbound_mechanism_name_by_raw=unbound_mechanism_parameter_name_by_raw,
-        unbound_mechanism_names=unbound_mechanism_parameter_names,
         unknown_names=unknown_parameter_names,
         invalid_messages=invalid_parameter_identifier_messages,
     )
-    if not raw_values:
-        return
-
-    mechanism_binding_values = {
-        str(canonical_name): float(raw_values[raw_name])
+    mechanism_coordinate_values = {
+        canonical_name: raw_values[raw_name]
         for raw_name, canonical_name in mechanism_parameter_name_by_raw.items()
         if raw_name in raw_values
-        and parameter_target_map.get(str(canonical_name), None) is not None
-        and _target_parts(parameter_target_map[str(canonical_name)])[0] == "indexed"
     }
     scalar_override_values = {
-        str(name): float(raw_values[name])
+        name: raw_values[name]
         for name in scalar_parameter_names
         if name in raw_values
     }
-    # Admit and construct every indexed replacement before publishing any
-    # physical/scalar/indexed value.  This guarantees a later invalid target
-    # cannot leave an earlier target mutated in the isolated shell.
     from kindred.core.simulator.parameter_algebra import (
-        _prepare_mechanism_param_replacement,
+        apply_parameter_algebra_spec_to_mechanism,
     )
-    reaction_replacements: dict[int, object] = {}
-    equilibrium_replacements: dict[int, object] = {}
-    indexed_values: list[tuple[str, str, int, str, object]] = []
-    for name, value in sorted(
-        (str(name), float(value)) for name, value in mechanism_binding_values.items()
-    ):
-        target = parameter_target_map.get(name)
-        if target is None:
-            continue
-        route, kind, index, role, entry = _target_parts(target)
-        if route != "indexed":
-            continue
-        target_role = str(role)
-        if kind == "equilibrium":
-            target_role, _ = _equilibrium_override_binding_target(
-                mechanism,
-                idx=index,
-                role=target_role,
-                entry=entry,
-            )
-        replacement = _prepare_mechanism_param_replacement(
-            mechanism,
-            name,
-            value,
-            require_mutable=True,
-            parameter_target_map=parameter_target_map,
-        )
-        indexed_values.append((name, kind, index, target_role, replacement))
 
-    for name, kind, index, role, replacement in indexed_values:
-        if kind == "reaction" and role == "k":
-            reaction = reaction_replacements.get(index, mechanism.reactions[index])
-            reaction_replacements[index] = replace(
-                reaction,
-                rate=replacement.rate,
-            )
-            continue
-        if kind != "equilibrium" or role not in {"kf", "kr", "Keq"}:
-            raise SimulationPreparationError(
-                "parameter_overrides",
-                f"Unsupported mechanism parameter {name!r}.",
-                parameter_names=(name,),
-            )
-        equilibrium = equilibrium_replacements.get(index, mechanism.equilibria[index])
-        if role == "kf":
-            equilibrium_replacements[index] = replace(
-                equilibrium,
-                kf=replacement.kf,
-            )
-        elif role == "kr":
-            equilibrium_replacements[index] = replace(
-                equilibrium,
-                kr=replacement.kr,
-            )
-        else:
-            equilibrium_replacements[index] = replace(
-                equilibrium,
-                metadata=replacement.metadata,
-            )
-
-    physical_values = {
-        str(canonical_name): float(raw_values[raw_name])
-        for raw_name, canonical_name in mechanism_parameter_name_by_raw.items()
-        if raw_name in raw_values
-        and parameter_target_map.get(str(canonical_name), None) is not None
-        and _target_parts(parameter_target_map[str(canonical_name)])[0] == "physical"
-        and _target_parts(parameter_target_map[str(canonical_name)])[3]
-        in {"A", "Ea", "dG_act", "dG_eq", "kappa"}
-    }
-    if physical_values:
-        try:
-            from kindred.core.simulator.parameter_algebra import (
-                apply_source_coordinate_values_to_mechanism,
-            )
-
-            apply_source_coordinate_values_to_mechanism(
-                mechanism,
-                physical_values,
-                parameter_target_map=parameter_target_map,
-            )
-        except Exception as exc:
-            raise SimulationPreparationError(
-                "parameter_overrides",
-                str(exc),
-                parameter_names=tuple(sorted(physical_values)),
-            ) from exc
-    for idx, replacement in reaction_replacements.items():
-        mechanism.reactions[idx] = replacement
-    for idx, replacement in equilibrium_replacements.items():
-        mechanism.equilibria[idx] = replacement
-
-    override_applied = bool(
-        physical_values or indexed_values or scalar_override_values
-    )
-    if override_applied:
-        from kindred.core.simulator.parameter_algebra import (
-            apply_parameter_algebra_spec_to_mechanism,
-        )
-
+    try:
         apply_parameter_algebra_spec_to_mechanism(
             parameter_algebra_spec,
             mechanism=mechanism,
             require_mutable=True,
             parameter_target_map=parameter_target_map,
+            mechanism_coordinate_overrides=mechanism_coordinate_values,
             scalar_parameter_overrides=scalar_override_values,
         )
-    return None
-
-
-def _canonical_step_override_name(
-    mechanism: Any,
-    name: str,
-    *,
-    parameter_target_map: Mapping[str, _PreparedParameterTarget] | None = None,
-) -> str:
-    name_s = str(name or "").strip()
-    if not name_s:
-        return ""
-    if parameter_target_map is not None:
-        target = parameter_target_map.get(name_s)
-        if target is not None:
-            return name_s
-        return name_s
-    resolution = build_namespace_from_mechanism(mechanism).resolve(name_s)
-    if resolution.canonical_name:
-        return str(resolution.canonical_name)
-    return name_s
-
-
-def _equilibrium_step_parameter_name(entry: Mapping[str, Any], role: str) -> str:
-    try:
-        step_index = int(entry.get("step_index"))
-    except (TypeError, ValueError) as exc:
+    except Exception as exc:
         raise SimulationPreparationError(
             "parameter_overrides",
-            f"Equilibrium parameter {role!r} is missing a valid canonical step index.",
+            str(exc),
+            parameter_names=tuple(sorted(mechanism_coordinate_values))
+            + tuple(sorted(scalar_override_values)),
         ) from exc
-    prefix = "Keq" if str(role) == "Keq" else str(role)
-    return f"{prefix}{step_index}"
-
-
-def _equilibrium_override_binding_target(
-    mechanism: Any,
-    *,
-    idx: int,
-    role: str,
-    entry: Mapping[str, Any],
-) -> tuple[str, str]:
-    from kindred.core.equilibrium_rate_authority import (
-        normalize_existing_equilibrium_rate_authority,
-        step_entry_authored_role_is_editable,
-    )
-
-    eq = mechanism.equilibria[int(idx)]
-    editable = step_entry_authored_role_is_editable(entry, str(role))
-    if editable is False:
-        name = _equilibrium_step_parameter_name(entry, str(role))
-        raise SimulationPreparationError(
-            "parameter_overrides",
-            f"equilibrium parameter {name} is a derived readout and cannot be used as write authority.",
-            parameter_names=(name,),
-        )
-    if editable is True:
-        return str(role), _equilibrium_step_parameter_name(entry, str(role))
-    authority = normalize_existing_equilibrium_rate_authority(eq)
-    if not authority.authored_role_is_editable(str(role)):
-        name = _equilibrium_step_parameter_name(entry, str(role))
-        raise SimulationPreparationError(
-            "parameter_overrides",
-            f"equilibrium parameter {name} is a derived readout and cannot be used as write authority.",
-            parameter_names=(name,),
-        )
-    return str(role), _equilibrium_step_parameter_name(entry, str(role))
-
-
-def _apply_execution_parameter_algebra(
-    *,
-    mechanism: Any,
-    parameter_algebra_spec: Any,
-    require_mutable: bool,
-    parameter_target_map: Mapping[str, _PreparedParameterTarget],
-) -> None:
-    from kindred.core.simulator.parameter_algebra import (
-        apply_parameter_algebra_spec_to_mechanism,
-    )
-    apply_parameter_algebra_spec_to_mechanism(
-        parameter_algebra_spec,
-        mechanism=mechanism,
-        require_mutable=bool(require_mutable),
-        parameter_target_map=parameter_target_map,
-    )
-
+    return None
 
 
 def prepare_simulation_worker_run(
@@ -1459,40 +1109,23 @@ def prepare_simulation_worker_run(
     y0 = np.asarray(execution_request.y0, dtype=float).reshape(-1).copy()
     temperature_schedule_override = execution_request.prepared_dsl.temperature_schedule_for_execution()
     parameter_algebra_spec = execution_request.prepared_dsl.parameter_algebra_spec_for_execution()
-    require_mutable = True
-    parameter_target_map = _build_parameter_target_map(mechanism)
-
-    _apply_execution_parameter_algebra(
-        mechanism=mechanism,
-        parameter_algebra_spec=parameter_algebra_spec,
-        require_mutable=bool(require_mutable),
-        parameter_target_map=parameter_target_map,
-    )
-    _raise_if_cancelled(cancellation_control)
+    parameter_target_map = build_parameter_target_map(mechanism)
 
     unresolved_intervention_schedule = (
         _fresh_preparation_unresolved_intervention_schedule_for_request(
             execution_request
         )
     )
-    request_parameter_values: Mapping[str, float] | None = None
-    if (
-        bool(execution_request.parameter_overrides)
-        or bool(
-            unresolved_intervention_schedule is not None
-            and unresolved_intervention_schedule.is_parameterized
+    try:
+        request_parameter_values = _bind_request_parameter_overrides(
+            mechanism=mechanism,
+            parameter_algebra_spec=parameter_algebra_spec,
+            parameter_overrides=execution_request.parameter_overrides,
+            unresolved_intervention_schedule=unresolved_intervention_schedule,
+            parameter_target_map=parameter_target_map,
         )
-    ):
-        try:
-            request_parameter_values = _bind_request_parameter_overrides(
-                mechanism=mechanism,
-                parameter_algebra_spec=parameter_algebra_spec,
-                parameter_overrides=execution_request.parameter_overrides,
-                unresolved_intervention_schedule=unresolved_intervention_schedule,
-                parameter_target_map=parameter_target_map,
-            )
-        except SimulationPreparationError:
-            raise
+    except SimulationPreparationError:
+        raise
     _raise_if_cancelled(cancellation_control)
 
     intervention_execution = execution_request.prepared_dsl.intervention_execution_contract()
@@ -1500,7 +1133,6 @@ def prepare_simulation_worker_run(
         if _schedule_parameters_deferred_to_prepared_request(
             execution_request,
             unresolved_intervention_schedule,
-            parameter_target_map=parameter_target_map,
             parameter_algebra_spec=parameter_algebra_spec,
         ):
             unresolved_intervention_schedule.validate_species(species_names)
@@ -1509,7 +1141,6 @@ def prepare_simulation_worker_run(
                 dependency_metadata = _expanded_intervention_schedule_dependency_metadata(
                     unresolved_intervention_schedule,
                     parameter_algebra_spec=parameter_algebra_spec,
-                    parameter_target_map=parameter_target_map,
                 )
                 resolved_schedule = _resolve_intervention_schedule_for_request(
                     unresolved_intervention_schedule,
@@ -1558,7 +1189,7 @@ def prepare_simulation_worker_run(
     _raise_if_cancelled(cancellation_control)
 
     try:
-        temperature_schedule, runtime_symbolic_jacobian, preparation_warnings = build_prepared_run_context(
+        temperature_schedule, runtime_symbolic_jacobian = build_prepared_run_context(
             mechanism=mechanism,
             temperature_schedule=temperature_schedule_override,
             use_analytic_jacobian=prepared_solver_config.use_analytic_jacobian,
@@ -1586,186 +1217,10 @@ def prepare_simulation_worker_run(
         intervention_execution=intervention_execution,
         symbolic_jacobian=runtime_symbolic_jacobian,
         initials_for_algebra=initials_for_algebra,
-        warnings=list(preparation_warnings),
         request=request,
         unresolved_intervention_schedule=unresolved_intervention_schedule,
         cancellation_control=cancellation_control,
     )
-
-
-def _bind_parameters_to_mechanism(
-    mech: Any,
-    names: Iterable[str],
-    *,
-    parameter_target_map: Mapping[str, _PreparedParameterTarget],
-) -> None:
-    from kindred.core.kinetics import (
-        ConstantRateModel,
-        forward_rate_model_for_equilibrium,
-        forward_rate_model_for_reaction,
-    )
-    from kindred.core.validation import try_parse_callable_finite_float
-
-    bindings: Dict[str, RateBinding] = {}
-    reaction_replacements: dict[int, object] = {}
-    equilibrium_replacements: dict[int, object] = {}
-    mechanism_metadata = MechanismMetadataView.from_metadata(
-        getattr(mech, "metadata", {}) or {}
-    )
-
-    def _forward_binding(
-        *,
-        name: str,
-        model: Any,
-    ) -> RateBinding:
-        if isinstance(model, ConstantRateModel):
-            return RateBinding(name=name, value=float(model.k))
-        return ForwardRateBinding(
-            name=name,
-            model=model,
-            reference_temperature_K=float(
-                mechanism_metadata.temperature_K
-            ),
-    )
-
-    for raw_name in names:
-        name = str(raw_name or "").strip()
-        target_info = parameter_target_map.get(name)
-        if target_info is None:
-            continue
-        route, kind, idx, role, entry = _target_parts(target_info)
-        if route != "indexed":
-            continue
-        target_name = name
-        target_role = str(role)
-        if kind == "equilibrium":
-            target_role, target_name = _equilibrium_override_binding_target(
-                mech,
-                idx=int(idx),
-                role=str(role),
-                entry=entry,
-            )
-
-        binding = bindings.get(target_name)
-        if binding is None:
-            if kind == "reaction" and role == "k":
-                rxn = mech.reactions[idx]
-                current = getattr(rxn, "rate", None)
-                model = forward_rate_model_for_reaction(
-                    rxn,
-                    default_standard_conc_M=float(
-                        mechanism_metadata.standard_conc_M
-                    ),
-                )
-                if isinstance(current, ForwardRateBinding) or (
-                    isinstance(model, ConstantRateModel)
-                    and isinstance(current, RateBinding)
-                ):
-                    binding = current
-                else:
-                    binding = _forward_binding(
-                        name=target_name,
-                        model=model,
-                    )
-                    if isinstance(current, RateBinding) and isinstance(
-                        binding, ForwardRateBinding
-                    ):
-                        # Seed only the newly constructed binding.  Do not
-                        # mutate the mechanism's current binding until every
-                        # requested replacement has been constructed.
-                        binding.set(float(current()))
-            elif kind == "equilibrium" and target_role in {"kf", "kr"}:
-                eq = mech.equilibria[idx]
-                current = getattr(eq, target_role, None)
-                if target_role == "kr" and isinstance(current, RateBinding):
-                    binding = current
-                elif target_role == "kf":
-                    model = forward_rate_model_for_equilibrium(
-                        eq,
-                        temperature_K=float(
-                            mechanism_metadata.temperature_K
-                        ),
-                        default_standard_conc_M=float(
-                            mechanism_metadata.standard_conc_M
-                        ),
-                    )
-                    if isinstance(current, ForwardRateBinding) or (
-                        isinstance(model, ConstantRateModel)
-                        and isinstance(current, RateBinding)
-                    ):
-                        binding = current
-                    else:
-                        binding = _forward_binding(
-                            name=target_name,
-                            model=model,
-                        )
-                        if isinstance(current, RateBinding) and isinstance(
-                            binding, ForwardRateBinding
-                        ):
-                            binding.set(float(current()))
-                else:
-                    parsed, ok = try_parse_callable_finite_float(current)
-                    if not ok or float(parsed) <= 0.0:
-                        raise SimulationPreparationError(
-                            "parameter_binding",
-                            f"Cannot bind {target_name!r}: equilibrium reverse rate must be positive and finite.",
-                        )
-                    binding = RateBinding(
-                        name=target_name,
-                        value=float(parsed),
-                    )
-            elif kind == "equilibrium" and target_role == "Keq":
-                eq = mech.equilibria[idx]
-                meta = getattr(eq, "metadata", {}) or {}
-                current = meta.get(EquilibriumMetadataKeys.KEQ_INPUT)
-                if isinstance(current, RateBinding):
-                    binding = current
-                else:
-                    parsed, ok = try_parse_callable_finite_float(current)
-                    if not ok:
-                        raise SimulationPreparationError(
-                            "parameter_binding",
-                            (
-                                f"Cannot bind {target_name!r}: equilibrium "
-                                "parameter has no explicit equilibrium-constant "
-                                "source token."
-                            ),
-                        )
-                    if float(parsed) <= 0.0:
-                        raise SimulationPreparationError(
-                            "parameter_binding",
-                            f"Cannot bind {target_name!r}: equilibrium constant must be positive and finite.",
-                        )
-                    binding = RateBinding(
-                        name=target_name,
-                        value=float(parsed),
-                    )
-            else:
-                raise SimulationPreparationError(
-                    "parameter_binding",
-                    f"Cannot bind unsupported mechanism coordinate {target_name!r}.",
-                )
-            bindings[target_name] = binding
-
-        if kind == "reaction" and role == "k":
-            rxn = reaction_replacements.get(idx, mech.reactions[idx])
-            reaction_replacements[idx] = replace(rxn, rate=binding)
-        elif kind == "equilibrium" and target_role in {"kf", "kr"}:
-            eq = equilibrium_replacements.get(idx, mech.equilibria[idx])
-            equilibrium_replacements[idx] = replace(eq, **{target_role: binding})
-        elif kind == "equilibrium" and target_role == "Keq":
-            eq = equilibrium_replacements.get(idx, mech.equilibria[idx])
-            meta = dict(getattr(eq, "metadata", {}) or {})
-            meta[EquilibriumMetadataKeys.KEQ_INPUT] = binding
-            equilibrium_replacements[idx] = replace(eq, metadata=meta)
-
-    # Publish only after all requested targets have a concrete replacement.
-    # This keeps a later binding/admission failure from partially mutating the
-    # isolated mechanism shell.
-    for idx, replacement in reaction_replacements.items():
-        mech.reactions[idx] = replacement
-    for idx, replacement in equilibrium_replacements.items():
-        mech.equilibria[idx] = replacement
 
 
 def _bind_request_parameter_overrides(
@@ -1774,7 +1229,7 @@ def _bind_request_parameter_overrides(
     parameter_algebra_spec: Any,
     parameter_overrides: Mapping[str, float] | None,
     unresolved_intervention_schedule: Any,
-    parameter_target_map: Mapping[str, _PreparedParameterTarget],
+    parameter_target_map: Mapping[str, ParameterTarget],
 ) -> Mapping[str, float]:
     """Bind one request through the fixed preparation-owned parameter path."""
 
@@ -1785,12 +1240,10 @@ def _bind_request_parameter_overrides(
     )
     raw_values: dict[str, float] = {}
     mechanism_names: set[str] = set()
-    unbound_mechanism_names: set[str] = set()
     schedule_names: set[str] = set()
     scalar_names: set[str] = set()
     unknown_names: set[str] = set()
     mechanism_name_by_raw: dict[str, str] = {}
-    unbound_mechanism_name_by_raw: dict[str, str] = {}
     invalid_messages: dict[str, str] = {}
     _classify_request_parameter_names(
         mechanism=mechanism,
@@ -1798,117 +1251,23 @@ def _bind_request_parameter_overrides(
         unresolved_intervention_schedule=unresolved_intervention_schedule,
         raw_values=raw_values,
         mechanism_names=mechanism_names,
-        unbound_mechanism_names=unbound_mechanism_names,
         schedule_names=schedule_names,
         scalar_names=scalar_names,
         unknown_names=unknown_names,
         mechanism_name_by_raw=mechanism_name_by_raw,
-        unbound_mechanism_name_by_raw=unbound_mechanism_name_by_raw,
         invalid_messages=invalid_messages,
         parameter_target_map=parameter_target_map,
         declared_scalar_names=declared_scalar_names,
         derived_scalar_names=derived_scalar_names,
-    )
-    mechanism_override_names = sorted(
-        set(mechanism_names) | set(unbound_mechanism_names)
-    )
-    internal_names = _internal_parameter_algebra_binding_names(
-        mechanism,
-        parameter_algebra_spec=parameter_algebra_spec,
     )
     _apply_parameter_overrides_to_prepared_mechanism(
         mechanism,
         parameter_algebra_spec=parameter_algebra_spec,
         raw_values=raw_values,
         mechanism_parameter_name_by_raw=mechanism_name_by_raw,
-        unbound_mechanism_parameter_name_by_raw=unbound_mechanism_name_by_raw,
-        unbound_mechanism_parameter_names=unbound_mechanism_names,
         scalar_parameter_names=scalar_names,
         unknown_parameter_names=unknown_names,
         invalid_parameter_identifier_messages=invalid_messages,
         parameter_target_map=parameter_target_map,
     )
-    # Bindings are published only after all request values have been admitted
-    # and every requested replacement has been constructed.  In particular,
-    # a later invalid indexed value cannot leave an earlier binding-only
-    # replacement visible on the isolated mechanism shell.
-    _bind_parameters_to_mechanism(
-        mechanism,
-        sorted(set(mechanism_override_names) | set(internal_names)),
-        parameter_target_map=parameter_target_map,
-    )
     return dict(raw_values)
-
-
-def _internal_parameter_algebra_binding_names(
-    mechanism: Any,
-    *,
-    parameter_algebra_spec: Any,
-) -> set[str]:
-    spec = parameter_algebra_spec
-    if spec is None:
-        raise SimulationPreparationError(
-            "parameter_algebra",
-            "Parameter algebra binding requires its retained typed spec.",
-        )
-    mechanism_namespace = (
-        spec.mechanism_namespace
-        if spec is not None and getattr(spec, "mechanism_namespace", None) is not None
-        else build_namespace_from_mechanism(mechanism)
-    )
-    namespace_info = mechanism_namespace.info_by_name
-    constrained = {
-        str(stmt.name)
-        for stmt in ((getattr(spec, "param_statements", None) or ()) if spec is not None else ())
-        if str(stmt.name) in namespace_info
-    }
-    constrained_keq_targets = {
-        name for name in constrained if namespace_info[name].role == "Keq"
-    }
-    return constrained - constrained_keq_targets
-
-
-def reject_requested_algebra_owned_mechanism_parameters_for_fitting(
-    mechanism: Any,
-    parameter_algebra_spec: Any,
-    requested_names: Iterable[str] = (),
-    *,
-    parameter_target_map: Mapping[str, _PreparedParameterTarget],
-) -> None:
-    requested = {
-        _canonical_step_override_name(
-            mechanism,
-            str(name),
-            parameter_target_map=parameter_target_map,
-        )
-        for name in (requested_names or ())
-        if str(name or "").strip()
-    }
-    target_info_by_name = {
-        str(name): target for name, target in parameter_target_map.items()
-    }
-    algebra_owned = sorted(
-        str(name)
-        for name in (
-            requested
-            & _internal_parameter_algebra_binding_names(
-                mechanism,
-                parameter_algebra_spec=parameter_algebra_spec,
-            )
-        )
-        if (
-            str(name) in target_info_by_name
-            and _target_parts(target_info_by_name[str(name)])[3]
-            in {"k", "kf", "kr"}
-        )
-    )
-    if not algebra_owned:
-        return
-    raise SimulationPreparationError(
-        "parameter_algebra",
-        (
-            "Requested algebra-owned mechanism parameter(s) cannot be fitted directly "
-            "because parameter algebra overwrites them: "
-            + ", ".join(algebra_owned)
-        ),
-    )

@@ -36,12 +36,13 @@ from kindred.core.simulator.parameter_algebra import (
     apply_parameter_algebra_spec_to_mechanism,
     solver_parameter_units_from_mechanism,
 )
-from kindred.core.simulation_preparation import _build_parameter_target_map
+from kindred.core.simulator.parameter_coordinates import build_parameter_target_map
 from kindred.core.simulator.parameter_namespace import build_namespace_from_mechanism
 from kindred.core.simulator.dsl_build_input import source_coordinate_capabilities
 from kindred.core.simulator.step_indexing import get_step_index_map
 from kindred.core.validation import try_parse_callable_finite_float, try_parse_int
 from kindred.core.species import validate_temperature
+from kindred.core.stoichiometry import directional_order_fraction
 from kindred.core.units import (
     ARRHENIUS_A_MAX,
     KEQ_MIN,
@@ -207,7 +208,7 @@ def enumerate_parameter_coordinates(
     metadata = getattr(mechanism, "metadata", {}) or {}
     metadata_view = MechanismMetadataView.from_metadata(metadata)
     parameter_spec = prepared_dsl.parameter_algebra_spec_for_execution()
-    parameter_target_map = _build_parameter_target_map(mechanism)
+    parameter_target_map = build_parameter_target_map(mechanism)
     apply_parameter_algebra_spec_to_mechanism(
         parameter_spec,
         mechanism=mechanism,
@@ -225,16 +226,13 @@ def enumerate_parameter_coordinates(
         mechanism,
         parameter_target_map=parameter_target_map,
     )
-    constrained = {
-        str(name)
-        for name in dict(metadata.get("constrained_params") or {})
-    }
-    parameter_assignment_kinds = {
-        str(assignment.name): parameter_spec.parameter_assignment_kind(
-            str(assignment.name)
-        )
-        for assignment in parameter_spec.param_statements
-    }
+    parameter_assignment_names = parameter_spec.param_assignment_names()
+
+    def assignment_kind(name: str) -> str | None:
+        if name not in parameter_assignment_names:
+            return None
+        return parameter_spec.parameter_assignment_kind(name)
+
     reactions = tuple(getattr(mechanism, "reactions", ()) or ())
     equilibria = tuple(getattr(mechanism, "equilibria", ()) or ())
     coordinates: list[GuiParameterCoordinate] = []
@@ -259,7 +257,10 @@ def enumerate_parameter_coordinates(
             source_info.role
         ).continuous:
             continue
-        if name in constrained:
+        if (
+            name in parameter_assignment_names
+            and assignment_kind(name) == "mechanism-bound"
+        ):
             continue
         context = str(entry.get("context") or "").strip()
         family = "Constant"
@@ -415,7 +416,11 @@ def enumerate_parameter_coordinates(
                 reaction,
                 default_standard_conc_M=metadata_view.standard_conc_M,
             )
-            order = float(getattr(reaction, "order", 1.0))
+            order = float(
+                directional_order_fraction(
+                    getattr(reaction, "rate_orders", {}) or {},
+                )
+            )
         elif kind == "equilibrium":
             raw_index, ok = try_parse_int(entry.get("equilibrium_index", -1))
             if not ok or not (0 <= raw_index < len(equilibria)):
@@ -427,9 +432,10 @@ def enumerate_parameter_coordinates(
                 temperature_K=temperature,
                 default_standard_conc_M=metadata_view.standard_conc_M,
             )
-            order = math.fsum(
-                float(value)
-                for value in dict(getattr(equilibrium, "stoich_forward", {}) or {}).values()
+            order = float(
+                directional_order_fraction(
+                    getattr(equilibrium, "stoich_forward", {}) or {},
+                )
             )
         if model is None:
             continue
@@ -510,7 +516,10 @@ def enumerate_parameter_coordinates(
                 )
 
     for name, family, role, value, minimum, maximum, editable, unit in physical_candidates:
-        if name in constrained:
+        if (
+            name in parameter_assignment_names
+            and assignment_kind(name) == "mechanism-bound"
+        ):
             continue
         if not editable or not math.isfinite(value):
             continue
@@ -558,14 +567,11 @@ def enumerate_parameter_coordinates(
         name = str(raw_name)
         value = _finite(raw_value)
         info = dict(scalar_info.get(name) or {})
-        assignment_kind = parameter_assignment_kinds.get(name)
+        assignment = assignment_kind(name)
         if (
             value is None
-            or name in constrained
             or name in physical_names
-            or assignment_kind in {"derived scalar", "mechanism-bound"}
-            or (assignment_kind is None and info.get("derived") is True)
-            or (assignment_kind is None and info.get("editable") is False)
+            or assignment in {"derived scalar", "mechanism-bound"}
         ):
             continue
         low, high = _signed_bounds(value)

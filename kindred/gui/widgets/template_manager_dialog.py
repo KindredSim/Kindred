@@ -719,8 +719,6 @@ class TemplateManagerDialog(QtWidgets.QDialog):
             accepted = self._destination_apply(
                 self._current_template.source
             )
-            if type(accepted) is not bool:
-                raise TypeError("destination_apply must return bool.")
         except Exception as exc:
             logger.error(
                 "Template destination rejected Apply: %s",
@@ -742,12 +740,7 @@ class TemplateManagerDialog(QtWidgets.QDialog):
     ) -> MechanismAuthoringSource:
         if not isinstance(source, MechanismAuthoringSource):
             raise TypeError("template source must be MechanismAuthoringSource.")
-        admitted = self._source_preflight(source)
-        if not isinstance(admitted, MechanismAuthoringSource):
-            raise TypeError(
-                "source_preflight must return MechanismAuthoringSource."
-            )
-        return admitted
+        return self._source_preflight(source)
 
     def _select_template(self, template_id: str) -> None:
         for index in range(self._template_list.count()):

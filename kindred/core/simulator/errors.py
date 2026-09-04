@@ -141,19 +141,6 @@ def empty_stoichiometry_error() -> DSLError:
     )
 
 
-def non_positive_stoichiometry_error() -> DSLError:
-    """Error for non-positive stoichiometric coefficients."""
-    return DSLError(
-        "Stoichiometric coefficients must be positive",
-        suggestion="Use positive numbers for all coefficients",
-        examples=[
-            "A -> B",
-            "2*A -> B",
-            "0.5*A + B -> C"
-        ]
-    )
-
-
 def invalid_keyvalue_pair_error(chunk: str) -> DSLError:
     """Error for malformed key=value pair."""
     return DSLError(

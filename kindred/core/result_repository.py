@@ -28,39 +28,6 @@ def _required_id(value: object, field: str) -> str:
     return normalized
 
 
-def _freeze_provenance_value(value: Any) -> Any:
-    if isinstance(value, Mapping):
-        return MappingProxyType(
-            {
-                str(name): _freeze_provenance_value(item)
-                for name, item in value.items()
-            }
-        )
-    if isinstance(value, (tuple, list)):
-        return tuple(_freeze_provenance_value(item) for item in value)
-    if isinstance(value, (set, frozenset)):
-        return tuple(
-            _freeze_provenance_value(item)
-            for item in sorted(value, key=repr)
-        )
-    if isinstance(value, np.ndarray):
-        array = np.asarray(value).copy()
-        array.setflags(write=False)
-        return array
-    return value
-
-
-def _frozen_provenance_mapping(
-    value: Mapping[str, Any],
-) -> Mapping[str, Any]:
-    return MappingProxyType(
-        {
-            str(name): _freeze_provenance_value(item)
-            for name, item in value.items()
-        }
-    )
-
-
 @dataclass(frozen=True, slots=True, eq=False)
 class SimulationResultValue:
     """Immutable numerical output and its complete execution truth."""
@@ -72,7 +39,6 @@ class SimulationResultValue:
     discontinuity_ids: np.ndarray
     intervention_execution: InterventionExecutionContract
     solver_provenance: Mapping[str, Any]
-    preparation_warnings: tuple[str, ...] = ()
     requested_algebra_outputs: tuple[str, ...] = ()
     succeeded_algebra_outputs: tuple[str, ...] = ()
     failed_algebra_outputs: tuple[str, ...] = ()
@@ -114,7 +80,6 @@ class SimulationResultValue:
                 raise ValueError(f"{field} contains duplicate output names.")
             return result
 
-        preparation_warnings = tuple(str(value) for value in self.preparation_warnings)
         requested = normalized_names(self.requested_algebra_outputs, "requested_algebra_outputs")
         succeeded = normalized_names(self.succeeded_algebra_outputs, "succeeded_algebra_outputs")
         failed = normalized_names(self.failed_algebra_outputs, "failed_algebra_outputs")
@@ -134,8 +99,6 @@ class SimulationResultValue:
         object.__setattr__(self, "series", MappingProxyType(series))
         object.__setattr__(self, "scalars", MappingProxyType(scalars))
         object.__setattr__(self, "parameters", tuple(parameters))
-        object.__setattr__(self, "solver_provenance", _frozen_provenance_mapping(self.solver_provenance))
-        object.__setattr__(self, "preparation_warnings", preparation_warnings)
         object.__setattr__(self, "requested_algebra_outputs", requested)
         object.__setattr__(self, "succeeded_algebra_outputs", succeeded)
         object.__setattr__(self, "failed_algebra_outputs", failed)
@@ -147,10 +110,6 @@ class SimulationResultValue:
             presentation_boundaries,
         )
 
-
-    @property
-    def completed_with_warnings(self) -> bool:
-        return bool(self.preparation_warnings or self.failed_algebra_outputs or self.omitted_algebra_outputs or self.algebra_errors)
 class ResultRepository:
     """Store completed result values and a bounded exact-request Run cache."""
 

@@ -354,6 +354,7 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
     ) -> None:
         """Render an owner snapshot without reconstructing Fit state."""
 
+        self._origin = snapshot.origin
         available_ids = tuple(item.dataset_id for item in snapshot.datasets)
         requested_id = str(dataset_id or self._current_dataset_id or "").strip()
         if requested_id and requested_id not in available_ids:

@@ -2,13 +2,10 @@
 
 from __future__ import annotations
 
-import math
 from typing import Dict
-from .errors import non_positive_stoichiometry_error
 
 __all__ = [
     "STANDARD_ENERGY_UNIT_MAP",
-    "molecularity",
     "normalize_energy_unit",
 ]
 
@@ -37,21 +34,3 @@ def normalize_energy_unit(
     if default is not None:
         return default
     raise ValueError(f"unsupported energy_unit {value!r}")
-
-
-def molecularity(reactants: Dict[str, float]) -> float:
-    coefficients: list[float] = []
-    for v in (reactants or {}).values():
-        if type(v) is bool:
-            raise non_positive_stoichiometry_error()
-        try:
-            coefficient = float(v)
-        except (TypeError, ValueError, OverflowError) as exc:
-            raise non_positive_stoichiometry_error() from exc
-        if not math.isfinite(coefficient) or coefficient <= 0.0:
-            raise non_positive_stoichiometry_error()
-        coefficients.append(coefficient)
-    total = math.fsum(coefficients)
-    if not math.isfinite(total):
-        raise non_positive_stoichiometry_error()
-    return float(total)

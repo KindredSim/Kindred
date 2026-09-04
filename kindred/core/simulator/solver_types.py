@@ -240,8 +240,13 @@ class SimulationRequest:
             )
 
 
-@dataclass(frozen=True)
-class SimulationOutput:
+@dataclass(frozen=True, kw_only=True)
+class FinalSimulationOutput:
+    """One fully composed execution with direct identity for every row."""
+
+    segment_ids: np.ndarray
+    segment_keys: tuple[str, ...]
+    discontinuity_ids: np.ndarray
     t: np.ndarray
     Y: np.ndarray
     provenance: Mapping[str, object]
@@ -253,8 +258,11 @@ class SimulationOutput:
             raise TypeError(
                 "intervention_execution must be an InterventionExecutionContract."
             )
-        t = np.asarray(self.t, dtype=float).copy()
-        Y = np.asarray(self.Y, dtype=float).copy()
+        # The schedule executor has already admitted and newly owned these
+        # arrays.  Finalization adopts them directly; this boundary only
+        # validates their scientific shape and freezes the owned buffers.
+        t = np.asarray(self.t, dtype=float)
+        Y = np.asarray(self.Y, dtype=float)
         if (
             t.ndim != 1
             or np.any(~np.isfinite(t))
@@ -289,31 +297,11 @@ class SimulationOutput:
             raise ValueError(
                 "presentation boundaries must be strictly ordered by time."
             )
-        if any(
-            not bool(np.any(t == boundary.time))
-            for boundary in boundaries
-        ):
+        if any(not bool(np.any(t == boundary.time)) for boundary in boundaries):
             raise ValueError(
                 "presentation boundaries must align with canonical output times."
             )
-        object.__setattr__(
-            self,
-            "provenance",
-            _freeze_solver_value(self.provenance),
-        )
         object.__setattr__(self, "presentation_boundaries", boundaries)
-
-
-@dataclass(frozen=True, kw_only=True)
-class FinalSimulationOutput(SimulationOutput):
-    """One fully composed execution with direct identity for every row."""
-
-    segment_ids: np.ndarray
-    segment_keys: tuple[str, ...]
-    discontinuity_ids: np.ndarray
-
-    def __post_init__(self) -> None:
-        super().__post_init__()
         if not self.t.size:
             raise ValueError("Final simulation output cannot be empty.")
 
@@ -326,7 +314,7 @@ class FinalSimulationOutput(SimulationOutput):
             if raw.dtype.kind == "u" and raw.size:
                 if int(np.max(raw)) > np.iinfo(np.int64).max:
                     raise ValueError(f"{field} exceeds int64 range.")
-            values = raw.astype(np.int64, copy=True)
+            values = raw.astype(np.int64, copy=False)
             if np.any(values < 0) or np.any(np.diff(values) < 0):
                 raise ValueError(f"{field} must be ordered and nonnegative.")
             values.setflags(write=False)

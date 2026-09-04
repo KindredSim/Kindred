@@ -34,18 +34,16 @@ from kindred.core.intervention_schedule import coerce_intervention_schedule
 from kindred.core.simulation_preparation import (
     SimulationExecutionRequest,
     PreparedSimulationRun,
-    _canonical_step_override_name,
-    _build_parameter_target_map,
     _classify_request_parameter_names,
     _parameter_algebra_scalar_authority_names,
     fit_simulation_error_from_preparation_error,
     prepare_preparation_failure,
     raise_unowned_request_parameter_values,
-    reject_requested_algebra_owned_mechanism_parameters_for_fitting,
     build_simulation_request_from_prepared_run,
     prepare_simulation_worker_run,
     SimulationPreparationError,
 )
+from kindred.core.simulator.parameter_coordinates import build_parameter_target_map
 from kindred.core.simulation_preparation_stages import PreparedSolverConfig
 from kindred.core.simulation_algebra_policy import SimulationAlgebraPolicy
 from kindred.core.result_repository import SimulationResultValue
@@ -56,7 +54,6 @@ from kindred.core.simulator.solver_types import (
 )
 from kindred.core.simulator.solvers import solve_ode
 from kindred.core.simulator.dsl_parse import PreparedDslRequestSet
-from kindred.core.simulator.parameter_namespace import build_namespace_from_mechanism
 from kindred.core.time_grid import build_time_grid
 
 logger = logging.getLogger(__name__)
@@ -234,11 +231,10 @@ class PreparedFittingExecutionContext:
             raise TypeError(
                 "prepared_run must be PreparedSimulationRun."
             )
-        from kindred.core.simulation_algebra_policy import (
-            ensure_fitting_strict_algebra_policy,
-        )
-
-        ensure_fitting_strict_algebra_policy(self.algebra_policy)
+        if self.algebra_policy is not SimulationAlgebraPolicy.FITTING_STRICT:
+            raise ValueError(
+                "Fitting algebra handling requires a fitting_strict algebra policy."
+            )
         object.__setattr__(self, "prepared_run", prepared_run)
         object.__setattr__(
             self,
@@ -369,9 +365,7 @@ def prepare_fitting_execution_context(
     ):
         raise FittingCancelled()
     try:
-        parameter_target_map = _build_parameter_target_map(mechanism)
-        mechanism_namespace = build_namespace_from_mechanism(mechanism)
-        namespace_info = mechanism_namespace.info_by_name
+        parameter_target_map = build_parameter_target_map(mechanism)
         declared_scalar_names, derived_scalar_names = _parameter_algebra_scalar_authority_names(
             parameter_algebra_spec
         )
@@ -386,12 +380,10 @@ def prepare_fitting_execution_context(
             )
         raw_values: dict[str, float] = {}
         mechanism_names: set[str] = set()
-        unbound_mechanism_names: set[str] = set()
         schedule_names: set[str] = set()
         scalar_names: set[str] = set()
         unknown_names: set[str] = set()
         mechanism_name_by_raw: dict[str, str] = {}
-        unbound_mechanism_name_by_raw: dict[str, str] = {}
         invalid_messages: dict[str, str] = {}
         _classify_request_parameter_names(
             mechanism=mechanism,
@@ -399,12 +391,10 @@ def prepare_fitting_execution_context(
             unresolved_intervention_schedule=unresolved_intervention_schedule,
             raw_values=raw_values,
             mechanism_names=mechanism_names,
-            unbound_mechanism_names=unbound_mechanism_names,
             schedule_names=schedule_names,
             scalar_names=scalar_names,
             unknown_names=unknown_names,
             mechanism_name_by_raw=mechanism_name_by_raw,
-            unbound_mechanism_name_by_raw=unbound_mechanism_name_by_raw,
             invalid_messages=invalid_messages,
             parameter_target_map=parameter_target_map,
             requested_parameter_names=mechanism_param_names,
@@ -414,12 +404,10 @@ def prepare_fitting_execution_context(
         raise_unowned_request_parameter_values(
             raw_values=raw_values,
             mechanism_name_by_raw=mechanism_name_by_raw,
-            unbound_mechanism_name_by_raw=unbound_mechanism_name_by_raw,
-            unbound_mechanism_names=unbound_mechanism_names,
             unknown_names=unknown_names,
             invalid_messages=invalid_messages,
         )
-        canonical_by_raw = {**mechanism_name_by_raw, **unbound_mechanism_name_by_raw}
+        canonical_by_raw = mechanism_name_by_raw
         canonical_requested_param_names: list[str] = []
         owner_to_raw: dict[str, str] = {}
         for raw_name in mechanism_param_names:
@@ -434,37 +422,6 @@ def prepare_fitting_execution_context(
                 )
             owner_to_raw[owner] = raw
             canonical_requested_param_names.append(owner)
-        reject_requested_algebra_owned_mechanism_parameters_for_fitting(
-            mechanism,
-            parameter_algebra_spec,
-            set(mechanism_names) | set(unbound_mechanism_names),
-            parameter_target_map=parameter_target_map,
-        )
-        constrained = {
-            str(stmt.name)
-            for stmt in (parameter_algebra_spec.param_statements or [])
-            if str(stmt.name) in namespace_info
-        }
-        constrained_keq_targets = {
-            name for name in constrained if namespace_info[name].role == "Keq"
-        }
-        requested = {
-            _canonical_step_override_name(
-                mechanism,
-                str(name),
-                parameter_target_map=parameter_target_map,
-            )
-            for name in (set(mechanism_names) | set(unbound_mechanism_names))
-            if str(name).strip()
-        }
-        requested_dependent_keq = sorted(requested & constrained_keq_targets)
-        if requested_dependent_keq:
-            raise SimulationPreparationError(
-                "parameter_algebra",
-                "Dependent equilibrium parameter(s) cannot be fitted directly because "
-                "Algebra constraints overwrite them: "
-                + ", ".join(requested_dependent_keq),
-            )
     except SimulationPreparationError as exc:
         raise fit_simulation_error_from_preparation_error(exc) from exc
     except ValueError as exc:

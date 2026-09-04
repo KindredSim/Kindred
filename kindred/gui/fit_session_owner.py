@@ -210,7 +210,6 @@ class FitSessionOwner(QtCore.QObject):
         window.applyRequested.connect(self.apply_fit_to_project)
         window.setupSnapshotRequested.connect(self._on_setup_snapshot)
         window.resetRequested.connect(self.reset_setup)
-        window.projectDefaultsRequested.connect(self.set_project_defaults)
         window.destroyed.connect(self._on_window_destroyed)
         self.window_changed.emit(True)
         window.show()
@@ -957,12 +956,14 @@ class FitSessionOwner(QtCore.QObject):
         self._require_thread()
         candidate = self._candidate
         origin = self._current_origin()
+        setup = self._accepted_setup()
         window = self._window
         if (
             self._closing
             or self._application_close_fenced
             or candidate is None
             or origin is None
+            or setup is None
             or window is None
             or self._worker is not None
         ):
@@ -1030,7 +1031,20 @@ class FitSessionOwner(QtCore.QObject):
                 proposed_document = proposed_document.replace_tab(
                     proposed_tab.with_initial_condition_sets(tuple(proposed_sets))
                 )
-            capture_fit_origin(proposed_document, origin.tab_id)
+            successor_origin = capture_fit_origin(proposed_document, origin.tab_id)
+            rebased_setup = replace(setup, origin=successor_origin)
+            rebased_initial_setup = (
+                None
+                if self._initial_setup_snapshot is None
+                else replace(
+                    self._initial_setup_snapshot,
+                    origin=successor_origin,
+                )
+            )
+            rebased_last_fit_setup = replace(
+                candidate.setup_snapshot,
+                origin=successor_origin,
+            )
         except (TypeError, ValueError, KeyError, LookupError) as exc:
             self._set_status(f"Fit Apply rejected: {exc}")
             return False
@@ -1038,6 +1052,11 @@ class FitSessionOwner(QtCore.QObject):
         if self._registry.replace_document(proposed_document, expected_token=token) is None:
             self._set_status("Fit Apply rejected: the captured project is stale.")
             return False
+        self._install_setup(rebased_setup)
+        self._initial_setup_snapshot = rebased_initial_setup
+        self._last_fit_setup_snapshot = rebased_last_fit_setup
+        window.project_setup_snapshot(rebased_setup)
+        window.set_last_fit_reset_available(rebased_last_fit_setup)
         self.project_document_changed.emit(origin.tab_id)
         window.set_apply_available(False)
         self._set_status("Centred Fit applied: overall values published; dataset estimates not applied (recorded as mechanism-source provenance)." if centred_provenance else "Fit candidate applied to the project.")

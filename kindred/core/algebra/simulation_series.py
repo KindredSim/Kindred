@@ -39,7 +39,6 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "compiled_algebra_for_mechanism",
     "compile_algebra_observables",
-    "evaluate_algebra_series_for_simulation_with_errors",
     "evaluate_compiled_algebra_series_for_simulation",
 ]
 
@@ -249,10 +248,7 @@ def evaluate_compiled_algebra_series_for_simulation(
     series_out = {str(name): np.asarray(values, dtype=float).reshape(-1) for name, values in (series or {}).items()}
     scalars_out: Dict[str, float] = {}
     for name, value in (scalars or {}).items():
-        try:
-            scalars_out[str(name)] = float(value)
-        except Exception:
-            scalars_out[str(name)] = float("nan")
+        scalars_out[str(name)] = float(value)
     for name, values in list(series_out.items()):
         if values.size != ctx.t.size:
             # Best-effort: broadcast scalar-like series to match time grid.
@@ -267,22 +263,6 @@ def evaluate_compiled_algebra_series_for_simulation(
                 )
                 series_out.pop(name, None)
     return series_out, scalars_out
-
-
-def _error_from_exception(name: str, exc: Exception) -> AlgebraObservableError:
-    code = getattr(exc, "code", None)
-    line = getattr(exc, "line", None)
-    col = getattr(exc, "col", None)
-    line_text = getattr(exc, "line_text", None)
-    return AlgebraObservableError(
-        name=str(name),
-        exc_type=exc.__class__.__name__,
-        message=str(exc),
-        code=str(code) if code is not None else None,
-        line=int(line) if line is not None else None,
-        col=int(col) if col is not None else None,
-        line_text=str(line_text) if line_text is not None else None,
-    )
 
 
 def evaluate_compiled_algebra_series_for_simulation_partial(
@@ -310,10 +290,7 @@ def evaluate_compiled_algebra_series_for_simulation_partial(
     series_out = {str(name): np.asarray(values, dtype=float).reshape(-1) for name, values in (series or {}).items()}
     scalars_out: Dict[str, float] = {}
     for name, value in (scalars or {}).items():
-        try:
-            scalars_out[str(name)] = float(value)
-        except Exception:
-            scalars_out[str(name)] = float("nan")
+        scalars_out[str(name)] = float(value)
     for name, values in list(series_out.items()):
         if values.size != ctx.t.size:
             # Best-effort: broadcast scalar-like series to match time grid.
@@ -340,43 +317,3 @@ def evaluate_compiled_algebra_series_for_simulation_partial(
                     )
                 )
     return series_out, scalars_out, list(errors or [])
-
-
-def evaluate_algebra_series_for_simulation_with_errors(
-    mechanism: object,
-    *,
-    t: np.ndarray,
-    species_series: Dict[str, np.ndarray],
-    initials: Dict[str, float],
-    temperature_K: Optional[float] = None,
-    symbol_series: Mapping[str, np.ndarray | float] | None = None,
-    symbol_values: Mapping[str, float] | None = None,
-) -> Tuple[Dict[str, np.ndarray], Dict[str, float], list[AlgebraObservableError]]:
-    """
-    Best-effort evaluation of the Algebra program retained by accepted
-    mechanism parsing against time series arrays.
-
-    Returns (series, scalars, errors). This does not raise for per-observable evaluation errors.
-    """
-    try:
-        compiled = compiled_algebra_for_mechanism(mechanism)
-    except Exception as exc:
-        return {}, {}, [_error_from_exception("__parse__", exc)]
-    if compiled is None:
-        return {}, {}, []
-
-    try:
-        series, scalars, errors = evaluate_compiled_algebra_series_for_simulation_partial(
-            mechanism,
-            compiled,
-            t=t,
-            species_series=species_series,
-            initials=initials,
-            temperature_K=temperature_K,
-            symbol_series=symbol_series,
-            symbol_values=symbol_values,
-        )
-    except Exception as exc:
-        return {}, {}, [_error_from_exception("__eval__", exc)]
-
-    return series, scalars, errors

@@ -11,7 +11,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from numbers import Real
 from types import MappingProxyType
-from typing import Any, Dict, Tuple
+from typing import Any, Dict
 
 import numpy as np
 
@@ -162,9 +162,8 @@ def build_prepared_run_context(
 ) -> tuple[
     TemperatureScheduleProtocol | None,
     SymbolicJacobianExecution,
-    Tuple[str, ...],
 ]:
-    """Prepare temperature, symbolic Jacobian, and ODE metadata as one stage."""
+    """Prepare the retained temperature schedule and symbolic Jacobian."""
 
     # The schedule has already been admitted by the source/metadata ingress;
     # preserve that typed object through preparation and execution.
@@ -176,7 +175,6 @@ def build_prepared_run_context(
                 code="policy-disabled",
                 reason="Analytic Jacobian preference is disabled.",
             ),
-            (),
         )
     symbolic_jacobian = SymbolicJacobianExecution()
     if not symbolic_jacobian.has_executable_jacobian:
@@ -189,4 +187,4 @@ def build_prepared_run_context(
             )
         except UnsupportedSymbolicExpressionError as exc:
             symbolic_jacobian = _symbolic_jacobian_for_bind_failure(mechanism, exc)
-    return resolved_temperature_schedule, symbolic_jacobian, ()
+    return resolved_temperature_schedule, symbolic_jacobian

@@ -3,9 +3,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from fractions import Fraction
 import json
-import math
+from fractions import Fraction
 from collections.abc import Callable, Mapping
 
 from PySide6 import QtWidgets
@@ -34,13 +33,14 @@ from kindred.core.simulator.dsl_parse import DslAnalysis, PreparedDslRequestSet
 from kindred.core.simulator.parameter_algebra import (
     apply_parameter_algebra_spec_to_mechanism,
 )
+from kindred.core.simulator.parameter_coordinates import build_parameter_target_map
 from kindred.core.simulator.parameter_algebra_spec import ParameterAlgebraSpec
-from kindred.core.simulation_preparation import _build_parameter_target_map
 from kindred.core.simulator.step_indexing import (
     get_step_index_map,
     iter_canonical_parameters,
 )
 from kindred.core.units import equilibrium_constant_unit, rate_constant_unit
+from kindred.core.stoichiometry import directional_order_fraction
 
 __all__ = [
     "MechanismInspectorDialog",
@@ -65,7 +65,7 @@ def build_mechanism_inspector_sections(
     parameter_spec = prepared_dsl.parameter_algebra_spec_for_execution()
     if parameter_spec.param_statements:
         mechanism = prepared_dsl.mutable_mechanism_shell()
-        parameter_target_map = _build_parameter_target_map(mechanism)
+        parameter_target_map = build_parameter_target_map(mechanism)
         apply_parameter_algebra_spec_to_mechanism(
             parameter_spec,
             mechanism=mechanism,
@@ -193,7 +193,11 @@ def _format_mechanism_step(
         reaction = (getattr(mechanism, "reactions", ()) or ())[
             int(entry["reaction_index"])
         ]
-        forward_order = float(reaction.order)
+        forward_order = float(
+            directional_order_fraction(
+                reaction.rate_orders,
+            )
+        )
         forward_model = forward_rate_model_for_reaction(
             reaction,
             default_standard_conc_M=float(metadata.standard_conc_M),
@@ -204,11 +208,15 @@ def _format_mechanism_step(
         equilibrium = (getattr(mechanism, "equilibria", ()) or ())[
             int(entry["equilibrium_index"])
         ]
-        forward_order = math.fsum(
-            float(value) for value in equilibrium.stoich_forward.values()
+        forward_order = float(
+            directional_order_fraction(
+                equilibrium.stoich_forward,
+            )
         )
-        reverse_order = math.fsum(
-            float(value) for value in equilibrium.stoich_back.values()
+        reverse_order = float(
+            directional_order_fraction(
+                equilibrium.stoich_back,
+            )
         )
         forward_model = forward_rate_model_for_equilibrium(
             equilibrium,
@@ -265,9 +273,11 @@ def _format_mechanism_step(
         if keq_provenance is None and authority_kind == EquilibriumRateAuthorityKind.KR:
             keq_provenance = f"{forward_name} / {reverse_name}"
         elif keq_provenance is None and "dG_eq" in source_coordinates:
-            delta_n = _directional_order_fraction(
-                equilibrium.stoich_back
-            ) - _directional_order_fraction(equilibrium.stoich_forward)
+            delta_n = directional_order_fraction(
+                equilibrium.stoich_back,
+            ) - directional_order_fraction(
+                equilibrium.stoich_forward,
+            )
             thermo_inputs = [source_coordinates["dG_eq"], "T"]
             if delta_n:
                 thermo_inputs.append("C0")
@@ -337,13 +347,6 @@ def _family_provenance(
     if uses_standard_concentration:
         inputs.append("C0")
     return f"{family}({', '.join(inputs)})"
-
-
-def _directional_order_fraction(stoichiometry: Mapping[str, object]) -> Fraction:
-    return sum(
-        (Fraction(str(value)) for value in stoichiometry.values()),
-        start=Fraction(0),
-    )
 
 
 def _format_number(value: object) -> str:

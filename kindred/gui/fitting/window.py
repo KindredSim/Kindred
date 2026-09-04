@@ -45,7 +45,6 @@ class FittingWindow(QtWidgets.QDialog):
     resumeRequested = QtCore.Signal()
     setupSnapshotRequested = QtCore.Signal(object)
     resetRequested = QtCore.Signal(str)
-    projectDefaultsRequested = QtCore.Signal(object)
     resultsSummaryRequested = QtCore.Signal()
 
     def __init__(
@@ -185,14 +184,10 @@ class FittingWindow(QtWidgets.QDialog):
         self._pause_button = QtWidgets.QPushButton("Pause", footer)
         self._pause_button.setEnabled(False)
         self._pause_button.clicked.connect(self._toggle_pause)
-        self._resume_button = QtWidgets.QPushButton("Resume", footer)
-        self._resume_button.setEnabled(False)
-        self._resume_button.clicked.connect(self._resume_from_button)
         for button in (
             self._run_button,
             self._cancel_button,
             self._pause_button,
-            self._resume_button,
         ):
             actions.addWidget(button)
 
@@ -205,12 +200,6 @@ class FittingWindow(QtWidgets.QDialog):
         )
         actions.addWidget(self._results_summary_button)
 
-        self._copy_button = QtWidgets.QPushButton("Copy Fit Curves", footer)
-        self._copy_button.setEnabled(False)
-        self._copy_button.clicked.connect(
-            self._run_results_tab.copy_all_to_clipboard
-        )
-        actions.addWidget(self._copy_button)
         self._apply_button = QtWidgets.QPushButton("Apply Fit to Project", footer)
         self._apply_button.setEnabled(False)
         self._apply_button.clicked.connect(self.applyRequested)
@@ -226,17 +215,7 @@ class FittingWindow(QtWidgets.QDialog):
         self._shared_seed_button.setEnabled(False)
         self._shared_seed_button.clicked.connect(self._request_shared_seed)
         actions.addWidget(self._shared_seed_button)
-        self._project_defaults_button = QtWidgets.QPushButton(
-            "Save Optimizer Settings as Project Defaults", footer
-        )
-        self._project_defaults_button.clicked.connect(
-            self._emit_project_defaults
-        )
-        actions.addWidget(self._project_defaults_button)
 
-        self._close_button = QtWidgets.QPushButton("Close", footer)
-        self._close_button.clicked.connect(self.close)
-        actions.addWidget(self._close_button)
         control_row.addLayout(actions)
         return footer
 
@@ -261,9 +240,6 @@ class FittingWindow(QtWidgets.QDialog):
         )
 
         self._run_results_tab.statusMessage.connect(self.set_status)
-        self._run_results_tab.copyAvailableChanged.connect(
-            self._set_copy_available
-        )
 
     def _connect_origin_dependent_leaf_signals(self) -> None:
         self._species_table.setupSnapshotRequested.connect(
@@ -309,6 +285,7 @@ class FittingWindow(QtWidgets.QDialog):
     def project_setup_snapshot(self, snapshot: FitSetupSnapshot) -> None:
         """Project accepted baselines while retaining unrelated local edits."""
 
+        self._origin = snapshot.origin
         self._projected_setup = snapshot
         self._populate_dataset_list(snapshot)
         selected_dataset_id = (
@@ -720,22 +697,15 @@ class FittingWindow(QtWidgets.QDialog):
         if self._closing or not self._executing:
             return
         if self._paused:
-            self._resume_from_button()
+            self._paused = False
+            self._pause_button.setText("Pause")
+            self._refresh_copy_allowed()
+            self.resumeRequested.emit()
             return
         self._paused = True
-        self._pause_button.setEnabled(False)
-        self._resume_button.setEnabled(True)
+        self._pause_button.setText("Resume")
         self._refresh_copy_allowed()
         self.pauseRequested.emit()
-
-    def _resume_from_button(self) -> None:
-        if self._closing or not self._executing:
-            return
-        self._paused = False
-        self._pause_button.setEnabled(True)
-        self._resume_button.setEnabled(False)
-        self._refresh_copy_allowed()
-        self.resumeRequested.emit()
 
     def set_executing(self, executing: bool) -> None:
         was_executing = self._executing
@@ -746,7 +716,6 @@ class FittingWindow(QtWidgets.QDialog):
             self._paused = False
             self._run_results_tab.set_live_curves(())
             self._run_results_tab.set_live_layout_locked(True)
-            self._copy_button.setEnabled(False)
             self._apply_button.setEnabled(False)
             self.set_shared_seed_available(False)
         else:
@@ -754,14 +723,13 @@ class FittingWindow(QtWidgets.QDialog):
             self._run_results_tab.set_live_layout_locked(False)
         self._refresh_copy_allowed()
         self._cancel_button.setEnabled(self._executing)
+        self._pause_button.setText("Pause")
         self._pause_button.setEnabled(self._executing)
-        self._resume_button.setEnabled(False)
         self._species_table.set_running_state(self._executing)
         self._params_ics_tab.set_running_state(self._executing)
         self._params_ics_tab.setEnabled(not self._executing)
         self._data_targets_tab.unified_list.set_running_state(self._executing)
         self._data_tab.setEnabled(not self._executing)
-        self._project_defaults_button.setEnabled(not self._executing)
         self._refresh_setup_validity()
 
     def set_progress(self, value: int, text: str) -> None:
@@ -834,7 +802,6 @@ class FittingWindow(QtWidgets.QDialog):
 
     def clear_candidate(self) -> None:
         self._clear_resolved_auto_modes()
-        self._copy_button.setEnabled(False)
         self._apply_button.setEnabled(False)
         self.set_shared_seed_available(False)
         self._results_summary_button.setEnabled(False)
@@ -873,20 +840,10 @@ class FittingWindow(QtWidgets.QDialog):
         )
         self._tabs.setCurrentIndex(2)
 
-    def _emit_project_defaults(self) -> None:
-        if self._closing:
-            return
-        setup = self._projected_setup
-        if setup is not None:
-            self.projectDefaultsRequested.emit(setup.defaults)
-
     def _refresh_copy_allowed(self) -> None:
         self._run_results_tab.set_copy_allowed(
             not self._closing and (not self._executing or self._paused)
         )
-
-    def _set_copy_available(self, available: bool) -> None:
-        self._copy_button.setEnabled(bool(available))
 
     def _current_results_dark_mode(self) -> bool:
         for candidate in (self.parentWidget(), self.parent()):
@@ -937,14 +894,11 @@ class FittingWindow(QtWidgets.QDialog):
         self._params_ics_tab.setEnabled(False)
         self._run_button.setEnabled(False)
         self._cancel_button.setEnabled(False)
+        self._pause_button.setText("Pause")
         self._pause_button.setEnabled(False)
-        self._resume_button.setEnabled(False)
         self._results_summary_button.setEnabled(False)
-        self._copy_button.setEnabled(False)
         self._apply_button.setEnabled(False)
         self.set_shared_seed_available(False)
-        self._project_defaults_button.setEnabled(False)
-        self._close_button.setEnabled(False)
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:  # noqa: N802
         if self._closing_after_cleanup:

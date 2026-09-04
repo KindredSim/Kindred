@@ -1530,10 +1530,14 @@ class GlobalFitWorker(QtCore.QThread):
                 origin="fit_worker",
             )
         else:
-            if self._checkpoint():
-                cancelled = True
-            else:
-                unavailable = self._terminal_unavailable
+            if candidate is None:
+                if self._checkpoint():
+                    cancelled = True
+                else:
+                    unavailable = self._terminal_unavailable
+            # A GlobalFitResult has already settled the primary fit and every
+            # requested optional analysis.  Once assembled, the candidate is
+            # terminal science; a late stop cannot veto it.
         finally:
             executor = self._executor
             self._executor = None
@@ -1941,11 +1945,7 @@ class GlobalFitWorker(QtCore.QThread):
             resolved_modes=resolved_modes,
             evaluators=evaluators,
         )
-        if self._checkpoint():
-            raise FittingCancelled()
         self.progress.emit(100, "Fit complete")
-        if self._checkpoint():
-            raise FittingCancelled()
         return candidate
 
     def _live_update(self, best_progress: FitProgress) -> FitLiveUpdate:

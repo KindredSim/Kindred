@@ -8,7 +8,6 @@ immutable builder input and constructs the typed mechanism authority.
 from __future__ import annotations
 
 import logging
-import math
 from typing import Dict, List, Optional
 
 from ..equilibrium_rate_authority import (
@@ -16,6 +15,7 @@ from ..equilibrium_rate_authority import (
 )
 from ..mechanism import Mechanism
 from ..mechanism_metadata import MechanismMetadataKeys, MechanismMetadataView, EquilibriumMetadataView
+from ..stoichiometry import directional_order_fraction
 from .dsl_format import format_stoichiometry_side as _fmt_side
 from .dsl_build_input import DslMechanismBuildInput
 from .parameter_namespace import (
@@ -147,8 +147,14 @@ def build_mechanism_from_ir(
                 if step.standard_conc_M is not None
                 else None,
                 Keq_unit=equilibrium_constant_unit(
-                    math.fsum(float(value) for value in products.values())
-                    - math.fsum(float(value) for value in reactants.values())
+                    float(
+                        directional_order_fraction(
+                            products,
+                        )
+                        - directional_order_fraction(
+                            reactants,
+                        )
+                    )
                 ),
             ).to_metadata()
             authority_context = "normalized_public"

@@ -54,7 +54,6 @@ from .solver_types import (
     Rhs2 as _Rhs2,
     SimulationCancellationControl as _SimulationCancellationControl,
     FinalSimulationOutput as _FinalSimulationOutput,
-    SimulationOutput as _SimulationOutput,
     SimulationScientificUnavailability as _SimulationScientificUnavailability,
     _SimulationScientificUnavailabilitySignal,
     SimulationRequest as _SimulationRequest,
@@ -507,7 +506,10 @@ def _execute_scipy(
         )
 
     prov["solver_used"] = method
-    t_out = np.asarray(sol.t, float)
+    # Detach SciPy's time vector at ingress.  The trajectory copy below is
+    # owned exactly once by project_nonnegative_trajectory; retain the exact
+    # pre-projection terminal column separately for continuation semantics.
+    t_out = np.asarray(sol.t, dtype=float).copy()
     raw_trajectory = solver_trajectory_array(
         sol.y,
         y0=y0,
@@ -520,10 +522,7 @@ def _execute_scipy(
         and raw_trajectory.ndim == 2
         and raw_trajectory.shape[1]
     ):
-        raw_terminal_state = np.asarray(
-            raw_trajectory[:, -1],
-            dtype=float,
-        ).reshape(-1).copy()
+        raw_terminal_state = raw_trajectory[:, -1].copy()
     Y_out, nonnegative_projection = project_nonnegative_trajectory(
         raw_trajectory,
         context="Simulation",
@@ -551,26 +550,21 @@ def _execute_scipy(
         and req.cancellation_control.cancel_requested()
     ):
         raise SimulationCancelled()
-    output = _SimulationOutput(
-        t=t_out,
-        Y=Y_out,
-        provenance=prov,
-        intervention_execution=req.intervention_execution,
-    )
     return SegmentRunResult(
         identity=segment_identity,
-        output=output,
+        t=t_out,
+        Y=Y_out,
         event_times=event_times,
         raw_event_states=raw_event_states,
         raw_terminal_state=raw_terminal_state,
         trajectory_projection=nonnegative_projection,
         event_state_projection=event_state_projection,
-        solver_used=str(output.provenance.get("solver_used") or method),
+        solver_used=str(prov.get("solver_used") or method),
         symbolic_jacobian_used=bool(
-            output.provenance.get("symbolic_jacobian")
+            prov.get("symbolic_jacobian")
         ),
         jacobian_sparsity_hint=bool(
-            output.provenance.get("jacobian_sparsity_hint")
+            prov.get("jacobian_sparsity_hint")
         ),
     )
 

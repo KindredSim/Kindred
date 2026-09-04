@@ -29,7 +29,7 @@ pg = require_pyqtgraph(context="Kindred GUI")
 
 ColorResolver = Callable[[str], object]
 DatasetPlotPresentation: TypeAlias = tuple[str, str]
-_FIT_COPY_COLUMNS = 15
+_FIT_COPY_COLUMNS_PER_SERIES = 12
 _MAX_FIT_COPY_CELLS = 1_000_000
 _MAX_FIT_COPY_CHARACTERS = 64 * 1024 * 1024
 _FIT_COPY_ROWS_PER_CHUNK = 2048
@@ -62,7 +62,8 @@ def _fit_y_axis_label(
 class GridPlotView(QtWidgets.QWidget):
     """Render immutable live and terminal Fit curves in the Fit-local plot."""
 
-    copyFitDataRequested = QtCore.Signal()
+    copyFitDataRequested = QtCore.Signal(str)
+    fitDataCopied = QtCore.Signal()
 
     def __init__(
         self,
@@ -306,10 +307,11 @@ class GridPlotView(QtWidgets.QWidget):
 
     def _context_action_triggered(self, checked: bool) -> None:
         kind = next(key for key, action in self._context_actions.items() if action is self.sender())
-        if kind == "copy":
-            self.copyFitDataRequested.emit()
-            return
         index = self._context_plot_index
+        if kind == "copy":
+            if index is not None and 0 <= index < len(self._curves):
+                self.copyFitDataRequested.emit(self._curves[index].dataset_id)
+            return
         if index is None:
             return
         plot = self._plot_items[index]
@@ -375,103 +377,109 @@ class GridPlotView(QtWidgets.QWidget):
     def _iter_copy_chunks(
         curves: tuple[FitCurveDataset, ...],
     ) -> Iterable[str]:
-        row_count = sum(
-            len(values)
+        block_specs = tuple(
+            (dataset, species, len(model_y_values))
             for dataset in curves
-            for _species, values in dataset.objective_model_y
+            for species, model_y_values in dataset.objective_model_y
         )
-        cell_count = (row_count + 1) * _FIT_COPY_COLUMNS
+        if not block_specs:
+            raise ValueError("No Fit curves are available to copy.")
+        row_count = max(length for _dataset, _species, length in block_specs)
+        column_count = len(block_specs) * _FIT_COPY_COLUMNS_PER_SERIES
+        cell_count = (row_count + 1) * column_count
         if cell_count > _MAX_FIT_COPY_CELLS:
             raise ValueError(
                 "Fit Copy payload exceeds the bounded full-resolution cell "
                 f"limit ({_MAX_FIT_COPY_CELLS:,})."
             )
-        header = encode_tsv_row(
-            (
-                "dataset_id",
-                "dataset_label",
-                "series",
-                "raw_observation_id",
-                "raw_column",
-                "source_row",
-                "segment_id",
-                "segment_key",
-                "discontinuity_id",
-                "selection_provenance",
-                "x_name",
-                "observed_x",
-                "observed_y",
-                "model_x",
-                "model_y",
-            )
+        fields = (
+            "raw_observation_id",
+            "raw_column",
+            "source_row",
+            "segment_id",
+            "segment_key",
+            "discontinuity_id",
+            "selection_provenance",
+            "x_name",
+            "observed_x",
+            "observed_y",
+            "model_x",
+            "model_y",
         )
+        headers: list[str] = []
+        for dataset, species, _length in block_specs:
+            prefix = f"{dataset.display_name} [{dataset.dataset_id}]::{species}"
+            headers.extend(
+                encode_clipboard_text(f"{prefix}::{field}") for field in fields
+            )
+
+        def iter_series_rows(
+            dataset: FitCurveDataset,
+            species: str,
+        ) -> Iterable[tuple[str, ...]]:
+            model_x = dict(dataset.objective_model_x)[species]
+            model_y = dict(dataset.objective_model_y)[species]
+            observed_x = dict(dataset.observed_x)[species]
+            observed_y = dict(dataset.observed_y)[species]
+            segment_ids = dict(dataset.objective_model_segment_ids)[species]
+            segment_keys = dict(dataset.objective_model_segment_keys)[species]
+            discontinuity_ids = dict(
+                dataset.objective_model_discontinuity_ids
+            )[species]
+            selection = dict(dataset.objective_selection_provenance)[species]
+            observation_ids = dict(dataset.objective_observation_ids)[species]
+            raw_columns = dict(dataset.objective_raw_columns)[species]
+            source_rows = dict(dataset.objective_source_rows)[species]
+            for index, (obs_x, obs_y, selected_x, selected_y) in enumerate(
+                zip(observed_x, observed_y, model_x, model_y, strict=True)
+            ):
+                yield (
+                    encode_clipboard_text(observation_ids[index]),
+                    encode_clipboard_text(raw_columns[index]),
+                    str(source_rows[index]),
+                    str(segment_ids[index]),
+                    encode_clipboard_text(segment_keys[index]),
+                    str(discontinuity_ids[index]),
+                    encode_clipboard_text(selection[index]),
+                    encode_clipboard_text(dataset.x_name),
+                    f"{float(obs_x):.17g}",
+                    f"{float(obs_y):.17g}",
+                    f"{float(selected_x):.17g}",
+                    f"{float(selected_y):.17g}",
+                )
+
         total_characters = 0
         output = io.StringIO()
-        output.write(header)
+        output.write(encode_tsv_row(headers))
         rows_in_chunk = 0
-        for dataset in curves:
-            model_x = dict(dataset.objective_model_x)
-            model_y = dict(dataset.objective_model_y)
-            observed_x = dict(dataset.observed_x)
-            observed_y = dict(dataset.observed_y)
-            segment_ids = dict(dataset.objective_model_segment_ids)
-            segment_keys = dict(dataset.objective_model_segment_keys)
-            discontinuity_ids = dict(dataset.objective_model_discontinuity_ids)
-            selection = dict(dataset.objective_selection_provenance)
-            observation_ids = dict(dataset.objective_observation_ids)
-            raw_columns = dict(dataset.objective_raw_columns)
-            source_rows = dict(dataset.objective_source_rows)
-            for species, model_y_values in model_y.items():
-                rows = zip(
-                    observed_x[species],
-                    observed_y[species],
-                    model_x[species],
-                    model_y_values,
-                    strict=True,
-                )
-                for index, (obs_x, obs_y, selected_x, selected_y) in enumerate(rows):
-                    output.write(
-                        encode_tsv_row(
-                            (
-                                encode_clipboard_text(dataset.dataset_id),
-                                encode_clipboard_text(dataset.display_name),
-                                encode_clipboard_text(species),
-                                encode_clipboard_text(
-                                    observation_ids[species][index]
-                                ),
-                                encode_clipboard_text(
-                                    raw_columns[species][index]
-                                ),
-                                str(source_rows[species][index]),
-                                str(segment_ids[species][index]),
-                                encode_clipboard_text(
-                                    segment_keys[species][index]
-                                ),
-                                str(discontinuity_ids[species][index]),
-                                encode_clipboard_text(
-                                    selection[species][index]
-                                ),
-                                encode_clipboard_text(dataset.x_name),
-                                f"{float(obs_x):.17g}",
-                                f"{float(obs_y):.17g}",
-                                f"{float(selected_x):.17g}",
-                                f"{float(selected_y):.17g}",
-                            )
-                        )
+        row_iterators = [
+            iter(iter_series_rows(dataset, species))
+            for dataset, species, _length in block_specs
+        ]
+        for row_index in range(row_count):
+            row: list[str] = []
+            for iterator, (_dataset, _species, length) in zip(
+                row_iterators,
+                block_specs,
+                strict=True,
+            ):
+                if row_index < length:
+                    row.extend(next(iterator))
+                else:
+                    row.extend("" for _ in range(_FIT_COPY_COLUMNS_PER_SERIES))
+            output.write(encode_tsv_row(row))
+            rows_in_chunk += 1
+            if rows_in_chunk >= _FIT_COPY_ROWS_PER_CHUNK:
+                chunk = output.getvalue()
+                total_characters += len(chunk)
+                if total_characters > _MAX_FIT_COPY_CHARACTERS:
+                    raise ValueError(
+                        "Fit Copy payload exceeds the bounded output-size limit "
+                        f"({_MAX_FIT_COPY_CHARACTERS // (1024 * 1024)} MiB)."
                     )
-                    rows_in_chunk += 1
-                    if rows_in_chunk >= _FIT_COPY_ROWS_PER_CHUNK:
-                        chunk = output.getvalue()
-                        total_characters += len(chunk)
-                        if total_characters > _MAX_FIT_COPY_CHARACTERS:
-                            raise ValueError(
-                                "Fit Copy payload exceeds the bounded "
-                                "output-size limit "
-                                f"({_MAX_FIT_COPY_CHARACTERS // (1024 * 1024)} MiB)."
-                            )
-                        yield chunk
-                        output = io.StringIO()
-                        rows_in_chunk = 0
+                yield chunk
+                output = io.StringIO()
+                rows_in_chunk = 0
         chunk = output.getvalue()
         total_characters += len(chunk)
         if total_characters > _MAX_FIT_COPY_CHARACTERS:
@@ -503,6 +511,7 @@ class GridPlotView(QtWidgets.QWidget):
                 )
                 return
             application.clipboard().setText(text)
+            self.fitDataCopied.emit()
         except Exception as exc:
             self._cancel_copy()
             QtWidgets.QMessageBox.critical(

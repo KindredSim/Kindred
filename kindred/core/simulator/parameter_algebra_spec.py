@@ -1005,10 +1005,6 @@ def _compile_retained_algebra_program(
     return block, tuple(descriptors)
 
 
-def mechanism_parameter_name_pattern() -> re.Pattern[str]:
-    return _MECH_PARAM_RE
-
-
 def strip_inline_comment(line: str) -> str:
     """
     Strip inline comments using the same conservative heuristic as the GUI:

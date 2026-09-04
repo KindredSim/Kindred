@@ -48,6 +48,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Iterable, Iterator, List, Mapping, Union, Protocol, Optional
 
 from .species import Species
+from .stoichiometry import directional_order_fraction
 from .validation import validate_name
 from .equilibrium_rate_authority import (
     EquilibriumRateAuthority,
@@ -64,7 +65,6 @@ __all__ = [
     "Reaction",
     "Equilibrium",
     "Mechanism",
-    "derive_molecularity",
 ]
 
 
@@ -138,19 +138,6 @@ def _ensure_species_exist(stoich: Mapping[str, float], declared: Mapping[str, Sp
     for n in stoich:
         if n not in declared:
             raise KeyError(f"unknown species in stoichiometry: {n!r}")
-
-
-def derive_molecularity(rate_orders: Mapping[str, float]) -> float:
-    """
-    Derive reaction molecularity (order) as the sum of kinetic exponents.
-
-    Coefficients like 0.5A + B -> ... yield order 1.5. Rate orders are
-    already validated positive finite real coefficients at this boundary.
-    """
-    total = math.fsum(float(v) for v in rate_orders.values())
-    if not math.isfinite(total) or total < 0.0:
-        raise ValueError("reaction directional order must be finite and non-negative")
-    return float(total)
 
 
 def _validate_positive_side(side: Mapping[str, float] | None, *, label: str) -> Dict[str, float]:
@@ -311,7 +298,15 @@ class Reaction:
         object.__setattr__(self, "rate_orders", FrozenDict(rate_orders))
         object.__setattr__(self, "net_stoich", FrozenDict(net_stoich))
         object.__setattr__(self, "overrides", FrozenDict(self.overrides))
-        object.__setattr__(self, "order", derive_molecularity(rate_orders))
+        object.__setattr__(
+            self,
+            "order",
+            float(
+                directional_order_fraction(
+                    rate_orders,
+                )
+            ),
+        )
 
     def net_stoich_vector(self, species_order: Iterable[str]) -> List[float]:
         """Vectorize net stoichiometry against a given species order."""
@@ -356,7 +351,31 @@ class Equilibrium:
             "stoich_back",
             FrozenDict(stoich_back),
         )
-        object.__setattr__(self, "metadata", FrozenDict(self.metadata))
+        metadata = dict(self.metadata)
+        authority_context: EquilibriumRateInputContext | str | None = None
+        if (
+            metadata.get(EquilibriumMetadataKeys.KEQ_INPUT) is not None
+            or metadata.get(EquilibriumMetadataKeys.DG_EQ_J_PER_MOL) is not None
+        ) and not bool(metadata.get(EquilibriumMetadataKeys.USER_PROVIDED_KR)):
+            authority_context = EquilibriumRateInputContext.NORMALIZED_PUBLIC
+        authority = normalize_equilibrium_rate_authority(
+            kf=self.kf,
+            kr=self.kr,
+            Keq=self.Keq,
+            metadata=metadata,
+            context=authority_context,
+        )
+        if authority.kind == "Keq_authoritative":
+            if (
+                metadata.get(EquilibriumMetadataKeys.KEQ_INPUT) is None
+                and metadata.get(EquilibriumMetadataKeys.DG_EQ_J_PER_MOL) is None
+            ):
+                metadata[EquilibriumMetadataKeys.KEQ_INPUT] = self.Keq
+            object.__setattr__(self, "Keq", None)
+            object.__setattr__(self, "kr", None)
+        else:
+            object.__setattr__(self, "Keq", None)
+        object.__setattr__(self, "metadata", FrozenDict(metadata))
 
     def forward_vector(self, species_order: Iterable[str]) -> List[float]:
         return [float(self.stoich_forward.get(n, 0.0)) for n in species_order]
@@ -490,12 +509,29 @@ class Mechanism:
             context=authority_context,
         )
 
+        # Keep thermodynamic authority solely in metadata.  ``kr`` and
+        # ``Keq`` are derived readouts, never stored scalar mirrors; explicit
+        # KR authority retains only its authored reverse coordinate.
+        if authority.kind == "Keq_authoritative":
+            if (
+                meta.get(EquilibriumMetadataKeys.KEQ_INPUT) is None
+                and meta.get(EquilibriumMetadataKeys.DG_EQ_J_PER_MOL) is None
+            ):
+                if Keq is None:
+                    raise ValueError("thermodynamic equilibrium authority requires Keq or dG_eq")
+                meta[EquilibriumMetadataKeys.KEQ_INPUT] = Keq
+            stored_keq = None
+            stored_kr = None
+        else:
+            stored_keq = None
+            stored_kr = kr
+
         eq = Equilibrium(
             stoich_forward=sf,
             stoich_back=sb,
-            Keq=Keq,
+            Keq=stored_keq,
             kf=kf,
-            kr=kr,
+            kr=stored_kr,
             metadata=meta,
         )
         self.equilibria.append(eq)

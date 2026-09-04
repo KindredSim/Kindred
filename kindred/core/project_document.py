@@ -93,6 +93,7 @@ __all__ = [
     "canonical_initial_values",
     "canonical_observation_target_names",
     "canonical_species_names",
+    "prepare_authored_source_admission",
     "retained_tab_mechanism_source",
     "reconcile_tab_mechanism_source",
     "assess_tab_exact_correction",
@@ -1008,7 +1009,7 @@ def validate_fit_defaults(defaults: FitDefaults) -> FitDefaults:
     return defaults
 
 
-def _prepare_authored_source_admission(
+def prepare_authored_source_admission(
     source: MechanismAuthoringSource,
     scientific_settings: TabScientificSettings,
 ) -> PreparedDslRequestSet | None:
@@ -1166,7 +1167,7 @@ def reconcile_tab_mechanism_source(
     if not isinstance(visible_source, MechanismAuthoringSource):
         raise TypeError("visible_source must be MechanismAuthoringSource.")
     tab = document.tab(tab_id)
-    admitted_dsl = _prepare_authored_source_admission(
+    admitted_dsl = prepare_authored_source_admission(
         visible_source,
         tab.scientific_settings,
     )
@@ -1377,7 +1378,7 @@ def reconcile_tab_mechanism_source(
         )
     )
     if admission.has_declarations:
-        prepared_dsl = _prepare_authored_source_admission(
+        prepared_dsl = prepare_authored_source_admission(
             accepted_source,
             tab.scientific_settings,
         )
@@ -1701,7 +1702,7 @@ def prepare_tab_scientific_settings(
     if settings.temperature == tab.scientific_settings.temperature:
         prepared = tab.prepared_dsl
     else:
-        prepared = _prepare_authored_source_admission(
+        prepared = prepare_authored_source_admission(
             tab.mechanism_source,
             settings,
         )
@@ -1846,7 +1847,7 @@ def validate_project_document(document: ProjectDocument) -> ProjectDocument:
             )
         try:
             if not _prepared_dsl_matches_tab(tab):
-                prepared_dsl = _prepare_authored_source_admission(
+                prepared_dsl = prepare_authored_source_admission(
                     tab.mechanism_source,
                     tab.scientific_settings,
                 )

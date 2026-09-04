@@ -13,7 +13,7 @@ from kindred.core.simulator.errors import DSLError
 from kindred.core.simulator.parameter_algebra import (
     apply_parameter_algebra_spec_to_mechanism,
 )
-from kindred.core.simulation_preparation import _build_parameter_target_map
+from kindred.core.simulator.parameter_coordinates import build_parameter_target_map
 from kindred.core.symbolic.calculator import (
     SymbolicCalculatorError,
     evaluate_symbolic_query,
@@ -218,7 +218,7 @@ class SymbolicCalculatorOwner:
                     "scheduled interventions.",
                 )
             mechanism = prepared_dsl.mutable_mechanism_shell()
-            parameter_target_map = _build_parameter_target_map(mechanism)
+            parameter_target_map = build_parameter_target_map(mechanism)
             apply_parameter_algebra_spec_to_mechanism(
                 prepared_dsl.parameter_algebra_spec_for_execution(),
                 mechanism=mechanism,

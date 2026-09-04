@@ -218,7 +218,6 @@ class RunResultsTab(QtWidgets.QWidget):
     """Physical Results action surface with no scientific custody."""
 
     statusMessage = Signal(str)
-    copyAvailableChanged = Signal(bool)
 
     def __init__(
         self,
@@ -246,6 +245,14 @@ class RunResultsTab(QtWidgets.QWidget):
         layout.setSpacing(8)
         self._tracker_panel = FitTrackerPanel(self)
         layout.addWidget(self._tracker_panel)
+
+        actions = QtWidgets.QHBoxLayout()
+        actions.addStretch(1)
+        self._copy_button = QtWidgets.QPushButton("Copy Fit Data (TSV)", self)
+        self._copy_button.setEnabled(False)
+        self._copy_button.clicked.connect(self.copy_active_to_clipboard)
+        actions.addWidget(self._copy_button)
+        layout.addLayout(actions)
 
         self._render_diagnostic_label = QtWidgets.QLabel(self)
         self._render_diagnostic_label.setWordWrap(True)
@@ -374,13 +381,37 @@ class RunResultsTab(QtWidgets.QWidget):
             plot_view.set_copy_allowed(self._copy_allowed)
         if self._all_datasets_plot_view is not None:
             self._all_datasets_plot_view.set_copy_allowed(self._copy_allowed)
-        self.copyAvailableChanged.emit(self.copy_eligible())
+        self._copy_button.setEnabled(self.copy_eligible())
 
-    def copy_all_to_clipboard(self) -> None:
-        view = self._all_datasets_plot_view
-        if view is None or not self._curves:
+    def copy_active_to_clipboard(self) -> None:
+        """Copy only the dataset scope represented by the active Results tab."""
+
+        view_id = self._active_plot_view_id()
+        if view_id is None:
             raise ValueError("No Fit curves are available to copy.")
-        view.copy_projection_to_clipboard(self._curves)
+        if view_id[0] == "aggregate":
+            view = self._all_datasets_plot_view
+            curves = self._curves
+        else:
+            view = self._dataset_plot_views.get(view_id)
+            curves = tuple(
+                curve for curve in self._curves if curve.dataset_id == view_id[1]
+            )
+        if view is None or not curves:
+            raise ValueError("No Fit curves are available to copy.")
+        view.copy_projection_to_clipboard(curves)
+
+    def copy_dataset_to_clipboard(self, dataset_id: str) -> None:
+        """Copy the one dataset represented by a clicked Fit plot."""
+
+        identity = str(dataset_id or "").strip()
+        curves = tuple(
+            curve for curve in self._curves if curve.dataset_id == identity
+        )
+        view = self._dataset_plot_views.get(("dataset", identity))
+        if view is None or len(curves) != 1:
+            raise ValueError("The selected Fit dataset has no curves to copy.")
+        view.copy_projection_to_clipboard(curves)
 
     def set_live_layout_locked(self, running: bool) -> None:
         self._live_layout_locked = bool(running)
@@ -451,7 +482,10 @@ class RunResultsTab(QtWidgets.QWidget):
             parent=self,
         )
         plot_view.setObjectName(object_name)
-        plot_view.copyFitDataRequested.connect(self.copy_all_to_clipboard)
+        plot_view.copyFitDataRequested.connect(self.copy_dataset_to_clipboard)
+        plot_view.fitDataCopied.connect(
+            lambda: self.statusMessage.emit("Fit data copied to clipboard.")
+        )
         plot_view.set_dark_mode(self._dark_mode)
         plot_view.set_live_layout_locked(self._live_layout_locked)
         plot_view.set_copy_allowed(self._copy_allowed)
@@ -482,7 +516,7 @@ class RunResultsTab(QtWidgets.QWidget):
                     (), self._dataset_presentation
                 )
             rendered = False
-        self.copyAvailableChanged.emit(self.copy_eligible())
+        self._copy_button.setEnabled(self.copy_eligible())
         return rendered
 
     def _active_plot_view_id(self) -> tuple[str, str] | None:
@@ -511,14 +545,14 @@ class RunResultsTab(QtWidgets.QWidget):
         if plot_view is None:
             return False
         rendered = plot_view.set_projection(curves, self._dataset_presentation)
-        self.copyAvailableChanged.emit(self.copy_eligible())
+        self._copy_button.setEnabled(self.copy_eligible())
         return bool(rendered)
 
     def _on_subtab_changed(self, index: int) -> None:
         if 0 <= int(index) < self._subtab_stack.count():
             self._subtab_stack.setCurrentIndex(int(index))
         self._refresh_active_plot_view()
-        self.copyAvailableChanged.emit(self.copy_eligible())
+        self._copy_button.setEnabled(self.copy_eligible())
 
     def _clear_subtabs(self) -> None:
         while self._subtabs.count():

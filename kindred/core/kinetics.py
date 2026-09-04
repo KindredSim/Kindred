@@ -15,6 +15,7 @@ from typing import Callable, Mapping, TypeAlias
 
 from .constants import R, h, k_B
 from .species import validate_c0, validate_temperature
+from .stoichiometry import directional_order_fraction
 from .units import (
     admit_arrhenius_prefactor,
     admit_energy_j_per_mol,
@@ -153,7 +154,7 @@ def _decode_forward_rate_model(
     *,
     family: str,
     constant_rate: object | None,
-    molecularity: float,
+    molecularity: object,
     default_standard_conc_M: float = 1.0,
 ) -> ForwardRateModel:
     """Decode one final Constant/Arrhenius/Eyring authority.
@@ -295,11 +296,19 @@ def forward_rate_model_for_reaction(
                 "Constant symbolic rate authority cannot depend on runtime temperature."
             )
         constant_rate = constant_rate()
+    rate_orders = getattr(reaction, "rate_orders", None)
+    molecularity = (
+        directional_order_fraction(
+            rate_orders,
+        )
+        if rate_orders is not None
+        else getattr(reaction, "order", 1)
+    )
     return _decode_forward_rate_model(
         fields,
         family=family,
         constant_rate=constant_rate,
-        molecularity=getattr(reaction, "order", 1),
+        molecularity=molecularity,
         default_standard_conc_M=default_standard_conc_M,
     )
 
@@ -319,8 +328,6 @@ def forward_rate_model_for_equilibrium(
     if raw_model is not None and not isinstance(raw_model, Mapping):
         raise TypeError("equilibrium forward_model must be a mapping.")
     model_payload = raw_model if isinstance(raw_model, Mapping) else None
-    from .equilibrium_rate_authority import effective_equilibrium_forward_rate
-
     bound_model = getattr(getattr(equilibrium, "kf", None), "model", None)
     if isinstance(
         bound_model,
@@ -350,19 +357,31 @@ def forward_rate_model_for_equilibrium(
             else:
                 constant_rate = constant_rate()
     else:
-        constant_rate = effective_equilibrium_forward_rate(
-            equilibrium,
-            temperature_K=_numeric_float(
-                temperature_K,
-                field="temperature_K",
-            ),
+        # Model construction must decode the typed family directly.  Rate
+        # evaluation belongs to ``forward_rate_at_temperature``; calling the
+        # equilibrium authority here would recurse through this factory and
+        # could replace an Arrhenius/Eyring family with a nominal scalar.
+        runtime_temperature = _numeric_float(
+            temperature_K,
+            field="temperature_K",
         )
+        constant_rate = getattr(equilibrium, "kf", None)
+        if callable(constant_rate):
+            if bool(
+                getattr(
+                    constant_rate,
+                    "accepts_runtime_temperature",
+                    False,
+                )
+            ):
+                constant_rate = constant_rate(runtime_temperature)
+            else:
+                constant_rate = constant_rate()
     molecularity = _directional_order(
-        math.fsum(
-            float(value)
-            for value in dict(
-                getattr(equilibrium, "stoich_forward", {}) or {}
-            ).values()
+        float(
+            directional_order_fraction(
+                getattr(equilibrium, "stoich_forward", {}) or {},
+            )
         ),
         field="equilibrium forward directional order",
     )

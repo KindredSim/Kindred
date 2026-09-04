@@ -19,6 +19,7 @@ from kindred.core.intervention_schedule_compiler import (
     validate_boundary_conflicts,
 )
 from kindred.core.temperature import declared_temperature_step_boundaries
+from kindred.core.species import TIME_MAX_S
 from .nonnegative_invariant import (
     NonnegativeProjection,
     project_nonnegative_trajectory,
@@ -28,7 +29,6 @@ from .solver_types import (
     Rhs2,
     SimulationScientificUnavailability,
     _SimulationScientificUnavailabilitySignal,
-    SimulationOutput,
     SimulationPresentationBoundary,
     SimulationRequest,
 )
@@ -91,7 +91,8 @@ class SegmentExecutionRequest:
 @dataclass(frozen=True)
 class SegmentRunResult:
     identity: SegmentIdentity
-    output: SimulationOutput
+    t: np.ndarray
+    Y: np.ndarray
     event_times: Sequence[Sequence[float]]
     raw_event_states: Sequence[Sequence[np.ndarray]]
     raw_terminal_state: np.ndarray | None
@@ -102,14 +103,31 @@ class SegmentRunResult:
     jacobian_sparsity_hint: bool = False
 
     def __post_init__(self) -> None:
-        if self.raw_terminal_state is None:
+        t = np.asarray(self.t, dtype=float)
+        Y = np.asarray(self.Y, dtype=float)
+        if (
+            t.ndim != 1
+            or np.any(~np.isfinite(t))
+            or np.any(t < 0.0)
+            or np.any(t > TIME_MAX_S)
+            or (t.size > 1 and np.any(np.diff(t) <= 0.0))
+        ):
+            raise ValueError("Simulation output times must be bounded and increasing.")
+        if Y.ndim != 2 or Y.shape[1] != t.size:
+            raise ValueError("Simulation output state rows must align with time.")
+        if np.any(~np.isfinite(Y)) or np.any(Y < 0.0):
+            raise ValueError("Simulation output states must be finite and nonnegative.")
+        t.setflags(write=False)
+        Y.setflags(write=False)
+        object.__setattr__(self, "t", t)
+        object.__setattr__(self, "Y", Y)
+        state = self.raw_terminal_state
+        if state is None:
             return
-        state = np.asarray(
-            self.raw_terminal_state,
-            dtype=float,
-        ).reshape(-1).copy()
-        if not np.all(np.isfinite(state)):
-            raise ValueError("Raw solver terminal state must be finite.")
+        if state.ndim != 1 or not np.all(np.isfinite(state)):
+            raise ValueError(
+                "Raw solver terminal state must be finite and one-dimensional."
+            )
         state.setflags(write=False)
         object.__setattr__(self, "raw_terminal_state", state)
 
@@ -443,9 +461,9 @@ class InterventionScheduleExecutionOwner:
                     )
                 ):
                     trigger_hit = None
-                seg_t = np.asarray(segment_result.output.t, dtype=float).reshape(-1)
+                seg_t = segment_result.t
                 seg_y = _apply_holds_to_trajectory(
-                    segment_result.output.Y,
+                    segment_result.Y,
                     active_holds,
                     species_index=species_index,
                     cancellation_check=cancellation_check,
@@ -513,11 +531,12 @@ class InterventionScheduleExecutionOwner:
                 elif purge_hit is not None:
                     current_y = purge_hit[2].copy()
                 else:
+                    if segment_result.raw_terminal_state is None:
+                        raise InterventionScheduleError(
+                            "Completed solver segment is missing its exact raw terminal state."
+                        )
                     current_y = _apply_holds(
-                        _required_raw_terminal_state(
-                            segment_result,
-                            species_count=current_y.size,
-                        ),
+                        segment_result.raw_terminal_state,
                         active_holds,
                         species_index=species_index,
                         cancellation_check=cancellation_check,
@@ -771,6 +790,10 @@ class InterventionScheduleExecutionOwner:
             time=t0,
             context="Scheduled simulation output",
         )
+        # Concatenation creates the final owned buffers.  Freeze them here so
+        # the standalone result can adopt them without defensive recapture.
+        output_t.setflags(write=False)
+        output_y.setflags(write=False)
         final_contract = contract.with_trigger_firings(trigger_firings)
         provenance = request.provenance
         _raise_if_cancelled(cancellation_check)
@@ -855,25 +878,9 @@ def _compose_direct_result_sample_identity(
         raise InterventionScheduleError(
             "Direct result row identity is not aligned with emitted rows."
         )
+    ids.setflags(write=False)
+    discontinuities.setflags(write=False)
     return ids, keys, discontinuities
-
-
-def _required_raw_terminal_state(
-    result: SegmentRunResult,
-    *,
-    species_count: int,
-) -> np.ndarray:
-    state = result.raw_terminal_state
-    if state is None:
-        raise InterventionScheduleError(
-            "Completed solver segment is missing its exact raw terminal state."
-        )
-    values = np.asarray(state, dtype=float).reshape(-1).copy()
-    if values.size != int(species_count) or not np.all(np.isfinite(values)):
-        raise InterventionScheduleError(
-            "Completed solver segment returned an invalid raw terminal state."
-        )
-    return values
 
 
 def _record_segment_projection(
@@ -1297,6 +1304,8 @@ def _apply_instants(
     species_index: Mapping[str, int],
     cancellation_check: Callable[[], bool] | None,
 ) -> np.ndarray:
+    if not instants:
+        return state
     output = np.asarray(state, dtype=float).reshape(-1).copy()
     for instant in instants:
         _raise_if_cancelled(cancellation_check)
@@ -1331,6 +1340,8 @@ def _apply_holds(
     species_index: Mapping[str, int],
     cancellation_check: Callable[[], bool] | None,
 ) -> np.ndarray:
+    if not holds:
+        return state
     output = np.asarray(state, dtype=float).reshape(-1).copy()
     for hold in holds:
         _raise_if_cancelled(cancellation_check)
@@ -1351,6 +1362,8 @@ def _apply_holds_to_trajectory(
     species_index: Mapping[str, int],
     cancellation_check: Callable[[], bool] | None,
 ) -> np.ndarray:
+    if not holds:
+        return np.asarray(states, dtype=float)
     output = np.asarray(states, dtype=float).copy()
     if output.ndim != 2:
         return output
@@ -1749,7 +1762,9 @@ def _normal_event_states(
         if not isinstance(raw, Sequence):
             continue
         for state in raw:
-            array = np.asarray(state, dtype=float).reshape(-1)
+            # Event normalization owns a detached row before any boundary
+            # action can mutate the continuation state.
+            array = np.asarray(state, dtype=float).reshape(-1).copy()
             if array.size != species_count:
                 raise InterventionScheduleError(
                     "Trigger event-time state has the wrong species count."

@@ -54,6 +54,7 @@ from ..units import (
     admit_rate,
 )
 from ..species import validate_c0, validate_concentration, validate_temperature
+from ..stoichiometry import directional_order_fraction
 from .errors import (
     DSLError as _DSLError,
     invalid_number_error,
@@ -517,6 +518,10 @@ class PreparedDslRequestSet:
     def mutable_mechanism_shell(self) -> object:
         from collections.abc import Mapping
 
+        from kindred.core.equilibrium_rate_authority import (
+            EquilibriumRateAuthorityKind,
+            normalize_existing_equilibrium_rate_authority,
+        )
         from kindred.core.mechanism import Mechanism
         from kindred.core.rate_binding import ForwardRateBinding, RateBinding
 
@@ -553,13 +558,21 @@ class PreparedDslRequestSet:
             for reaction in self.__mechanism.reactions
         ]
         shell.equilibria = [
-            replace(
-                equilibrium,
-                Keq=clone_binding(equilibrium.Keq),
-                kf=clone_binding(equilibrium.kf),
-                kr=clone_binding(equilibrium.kr),
-                metadata=clone_binding(equilibrium.metadata),
-            )
+            (
+                lambda authority: replace(
+                    equilibrium,
+                    # Thermodynamic authority has no raw scalar mirrors.
+                    # Explicit KR keeps its admitted binding unchanged.
+                    Keq=None,
+                    kf=clone_binding(equilibrium.kf),
+                    kr=(
+                        clone_binding(equilibrium.kr)
+                        if authority.kind == EquilibriumRateAuthorityKind.KR
+                        else None
+                    ),
+                    metadata=clone_binding(equilibrium.metadata),
+                )
+            )(normalize_existing_equilibrium_rate_authority(equilibrium))
             for equilibrium in self.__mechanism.equilibria
         ]
         compiled_series = getattr(self.__mechanism, "_compiled_algebra_series", None)
@@ -1320,7 +1333,7 @@ def _source_coordinates_from_key_value_spans(
     """Project parser-captured value spans into canonical source identities."""
 
     equilibrium = bool(
-        step.is_equilibrium or (step.reversible and step.kr is not None)
+        step.is_equilibrium or step.reversible
     )
     coordinates: list[DslSourceCoordinate] = []
     seen_names: set[str] = set()
@@ -1717,7 +1730,6 @@ def _parse_reaction_like_step(
     step_label: str = "reaction",
 ) -> DslBuildStep:
     from ..kinetics import arrhenius_rate, eyring_rate
-    from .common import molecularity
     from .kinetics import normalize_energy_to_J_per_mol
 
     try:
@@ -1756,7 +1768,11 @@ def _parse_reaction_like_step(
         kappa = kappa_raw
     else:
         kappa = 1.0
-    n = molecularity(react)
+    n = float(
+        directional_order_fraction(
+            react,
+        )
+    )
 
     forward_rate_raw = params.get("kf") if "kf" in params else params.get("k")
     kf = _float_or_none(forward_rate_raw)
@@ -1908,7 +1924,14 @@ def _parse_reaction_like_step(
             dG_eq_J_per_mol=dG_eqJ_for_step,
             T=T,
             standard_conc_M=C0,
-            delta_n=math.fsum(prod.values()) - math.fsum(react.values()),
+            delta_n=float(
+                directional_order_fraction(
+                    prod,
+                )
+                - directional_order_fraction(
+                    react,
+                )
+            ),
             explicit_rates=(float(kf),),
             line_number=line_number,
             line_content=line_content,

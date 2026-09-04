@@ -1,10 +1,10 @@
 from __future__ import annotations
 
+from types import MappingProxyType
 from typing import Any, Mapping
 
 import numpy as np
 
-from kindred.core import simulation_algebra_policy
 from kindred.core.equilibrium_rate_authority import effective_equilibrium_keq
 from kindred.core.mechanism_metadata import MechanismMetadataView
 from kindred.core.ode_builder import build_effective_rate_coefficient_evaluator
@@ -35,9 +35,41 @@ from kindred.core.algebra.simulation_series import (
 
 __all__ = [
     "build_simulation_row_algebra_context",
-    "evaluate_simulation_result_algebra",
     "finalize_simulation_result",
 ]
+
+
+def _freeze_solver_provenance_value(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return MappingProxyType(
+            {
+                str(name): _freeze_solver_provenance_value(item)
+                for name, item in value.items()
+            }
+        )
+    if isinstance(value, (tuple, list)):
+        return tuple(_freeze_solver_provenance_value(item) for item in value)
+    if isinstance(value, (set, frozenset)):
+        return tuple(
+            _freeze_solver_provenance_value(item)
+            for item in sorted(value, key=repr)
+        )
+    if isinstance(value, np.ndarray):
+        array = np.asarray(value).copy()
+        array.setflags(write=False)
+        return array
+    return value
+
+
+def _freeze_solver_provenance_mapping(
+    value: Mapping[str, Any],
+) -> Mapping[str, Any]:
+    return MappingProxyType(
+        {
+            str(name): _freeze_solver_provenance_value(item)
+            for name, item in value.items()
+        }
+    )
 
 def _initials_for_algebra(
     mechanism: object,
@@ -275,172 +307,41 @@ def build_simulation_row_algebra_context(
     )
 
 
-def evaluate_simulation_result_algebra(
-    *,
-    mechanism: object,
-    result: FinalSimulationOutput,
-    species_names: list[str],
-    initials_for_algebra: Mapping[str, Any] | None,
-    temperature_schedule: TemperatureScheduleProtocol | None,
-    parameter_algebra_spec: object,
-    algebra_policy: SimulationAlgebraPolicy | str,
-) -> tuple[
-    np.ndarray,
-    list[str],
-    int,
-    dict[str, float],
-    tuple[FactualCause, ...],
-]:
-    base_species_names = [str(name) for name in species_names]
-    if (
-        not base_species_names
-        or any(not name.strip() for name in base_species_names)
-        or len(set(base_species_names)) != len(base_species_names)
-    ):
-        raise ValueError("base simulation species names must be nonblank and unique.")
-    result_y = result.Y
-    result_t = result.t
-    if result_y.shape[0] != len(base_species_names):
-        raise ValueError(
-            "solver result matrix must align with base species and row time."
-        )
-    algebra_scalars: dict[str, float] = {}
-    algebra_errors: tuple[FactualCause, ...] = ()
+def _algebra_cause(error: object) -> FactualCause:
+    """Project one expected per-observable Algebra failure."""
 
-    if compiled_algebra_for_mechanism(mechanism) is None:
-        return (
-            result_y,
-            base_species_names,
-            len(base_species_names),
-            algebra_scalars,
-            algebra_errors,
-        )
-
-    species_series = {
-        str(species): result_y[index, :]
-        for index, species in enumerate(base_species_names)
-    }
-    compiled = compiled_algebra_for_mechanism(mechanism)
-    if compiled is None:
-        return (
-            result_y,
-            base_species_names,
-            len(base_species_names),
-            algebra_scalars,
-            algebra_errors,
-        )
-    policy = simulation_algebra_policy.coerce_simulation_algebra_policy(
-        algebra_policy,
-        default=SimulationAlgebraPolicy.GUI_BEST_EFFORT,
+    details: dict[str, object] = {}
+    name = getattr(error, "name", None)
+    if name is not None:
+        details["name"] = str(name)
+    for source_name in ("line", "col", "line_text"):
+        value = getattr(error, source_name, None)
+        if value is not None:
+            details[source_name] = value
+    code = getattr(error, "code", None)
+    return FactualCause(
+        domain="simulation",
+        origin="algebra",
+        code=str(code) if code is not None else None,
+        type=str(getattr(error, "exc_type", None) or type(error).__name__),
+        message=str(getattr(error, "message", None) or str(error)),
+        details=details,
     )
-    authority_error: Exception | None = None
-    try:
-        symbol_series, symbol_values = build_simulation_row_algebra_context(
-            mechanism,
-            result_t,
-            temperature_schedule=temperature_schedule,
-            parameter_algebra_spec=parameter_algebra_spec,
-        )
-    except Exception as exc:
-        # Keep authority/schedule failures inside the existing policy boundary:
-        # GUI and batch remain best-effort while fitting remains strict.
-        authority_error = exc
-        symbol_series, symbol_values = {}, {}
 
-    def _best_effort_evaluator(
-        _mechanism: object,
-        *,
-        t: np.ndarray,
-        species_series: Mapping[str, np.ndarray],
-        initials: Mapping[str, float],
-    ):
-        if authority_error is not None:
-            raise authority_error
-        return evaluate_compiled_algebra_series_for_simulation_partial(
-            _mechanism,
-            compiled,
-            t=t,
-            species_series=dict(species_series),
-            initials=dict(initials),
-            symbol_series=symbol_series,
-            symbol_values=symbol_values,
-        )
 
-    def _strict_evaluator(
-        _mechanism: object,
-        *,
-        t: np.ndarray,
-        species_series: Mapping[str, np.ndarray],
-        initials: Mapping[str, float],
-    ):
-        if authority_error is not None:
-            raise authority_error
-        return evaluate_compiled_algebra_series_for_simulation(
-            _mechanism,
-            compiled,
-            t=t,
-            species_series=dict(species_series),
-            initials=dict(initials),
-            symbol_series=symbol_series,
-            symbol_values=symbol_values,
-        )
+def _freeze_algebra_series(
+    series: Mapping[str, np.ndarray],
+) -> dict[str, np.ndarray]:
+    """Freeze evaluator-owned series exactly once before publication."""
 
-    initials = _initials_for_algebra(
-        mechanism,
-        base_species_names,
-        initials_for_algebra,
-    )
-    if policy is SimulationAlgebraPolicy.FITTING_STRICT:
-        strict_series, strict_scalars = _strict_evaluator(
-            mechanism,
-            t=result_t,
-            species_series=species_series,
-            initials=initials,
-        )
-        evaluation = simulation_algebra_policy.SimulationAlgebraEvaluation(
-            series=strict_series,
-            scalars=strict_scalars,
-            errors=[],
-            warning=None,
-        )
-    else:
-        evaluation = simulation_algebra_policy.evaluate_simulation_algebra(
-            policy,
-            mechanism,
-            t=result_t,
-            species_series=species_series,
-            initials=initials,
-            gui_evaluator=_best_effort_evaluator,
-        )
-    algebra_scalars = dict(evaluation.scalars)
-    algebra_errors = tuple(evaluation.errors)
-    if not evaluation.series:
-        return (
-            result_y,
-            base_species_names,
-            len(base_species_names),
-            algebra_scalars,
-            algebra_errors,
-        )
-
-    algebra_names = [str(name) for name in evaluation.series.keys()]
-    expanded_y = np.vstack(
-        [
-            result_y,
-            *(
-                np.asarray(evaluation.series[name], dtype=float)
-                for name in algebra_names
-            ),
-        ]
-    )
-    expanded_y.setflags(write=False)
-    return (
-        expanded_y,
-        base_species_names + algebra_names,
-        len(base_species_names),
-        algebra_scalars,
-        algebra_errors,
-    )
+    frozen: dict[str, np.ndarray] = {}
+    for raw_name, raw_values in series.items():
+        values = np.asarray(raw_values, dtype=float)
+        if values.ndim != 1:
+            values = values.reshape(-1)
+        values.setflags(write=False)
+        frozen[str(raw_name)] = values
+    return frozen
 
 
 def finalize_simulation_result(
@@ -451,9 +352,8 @@ def finalize_simulation_result(
     initials_for_algebra: Mapping[str, Any] | None,
     temperature_schedule: TemperatureScheduleProtocol | None,
     parameter_algebra_spec: object,
-    algebra_policy: SimulationAlgebraPolicy | str,
+    algebra_policy: SimulationAlgebraPolicy,
     parameters: tuple[tuple[str, float, str], ...] = (),
-    preparation_warnings: list[str] | tuple[str, ...] = (),
     solver_provenance_updates: Mapping[str, object] | None = None,
 ) -> SimulationResultValue:
     """Admit one solver output through canonical row finalization.
@@ -464,25 +364,80 @@ def finalize_simulation_result(
     """
 
     result_time = result.t
-    (
-        finalized_y,
-        finalized_species_names,
-        finalized_base_species_count,
-        finalized_algebra_scalars,
-        finalized_algebra_errors,
-    ) = evaluate_simulation_result_algebra(
-        mechanism=mechanism,
-        result=result,
-        species_names=species_names,
-        initials_for_algebra=initials_for_algebra,
-        temperature_schedule=temperature_schedule,
-        parameter_algebra_spec=parameter_algebra_spec,
-        algebra_policy=algebra_policy,
-    )
-    retained_solver_provenance = dict(result.provenance)
-    if solver_provenance_updates:
-        retained_solver_provenance.update(solver_provenance_updates)
+    result_y = result.Y
+    base_species_names = [str(name) for name in species_names]
+    if (
+        not base_species_names
+        or any(not name.strip() for name in base_species_names)
+        or len(set(base_species_names)) != len(base_species_names)
+    ):
+        raise ValueError("base simulation species names must be nonblank and unique.")
+    if result_y.shape[0] != len(base_species_names):
+        raise ValueError(
+            "solver result matrix must align with base species and row time."
+        )
+
+    finalized_series: dict[str, np.ndarray] = {
+        name: result_y[index, :]
+        for index, name in enumerate(base_species_names)
+    }
+    finalized_algebra_scalars: dict[str, float] = {}
+    finalized_algebra_errors: tuple[FactualCause, ...] = ()
     compiled_algebra = compiled_algebra_for_mechanism(mechanism)
+    if compiled_algebra is not None:
+        species_series = {
+            name: result_y[index, :]
+            for index, name in enumerate(base_species_names)
+        }
+        symbol_series, symbol_values = build_simulation_row_algebra_context(
+            mechanism,
+            result_time,
+            temperature_schedule=temperature_schedule,
+            parameter_algebra_spec=parameter_algebra_spec,
+        )
+        initials = _initials_for_algebra(
+            mechanism,
+            base_species_names,
+            initials_for_algebra,
+        )
+        if algebra_policy is SimulationAlgebraPolicy.GUI_BEST_EFFORT:
+            algebra_series, algebra_scalars, algebra_errors = (
+                evaluate_compiled_algebra_series_for_simulation_partial(
+                    mechanism,
+                    compiled_algebra,
+                    t=result_time,
+                    species_series=species_series,
+                    initials=initials,
+                    symbol_series=symbol_series,
+                    symbol_values=symbol_values,
+                )
+            )
+            finalized_algebra_errors = tuple(
+                _algebra_cause(error) for error in algebra_errors
+            )
+        elif algebra_policy is SimulationAlgebraPolicy.FITTING_STRICT:
+            algebra_series, algebra_scalars = (
+                evaluate_compiled_algebra_series_for_simulation(
+                    mechanism,
+                    compiled_algebra,
+                    t=result_time,
+                    species_series=species_series,
+                    initials=initials,
+                    symbol_series=symbol_series,
+                    symbol_values=symbol_values,
+                )
+            )
+        else:
+            raise ValueError(f"Unsupported simulation algebra policy: {algebra_policy!r}")
+        finalized_series.update(_freeze_algebra_series(algebra_series))
+        finalized_algebra_scalars = dict(algebra_scalars)
+
+    completed_solver_provenance = dict(result.provenance)
+    if solver_provenance_updates:
+        completed_solver_provenance.update(solver_provenance_updates)
+    frozen_solver_provenance = _freeze_solver_provenance_mapping(
+        completed_solver_provenance
+    )
     requested_algebra_outputs = (
         ()
         if compiled_algebra is None
@@ -490,7 +445,7 @@ def finalize_simulation_result(
     )
     succeeded_names = set(finalized_algebra_scalars)
     succeeded_names.update(
-        finalized_species_names[finalized_base_species_count:]
+        name for name in finalized_series if name not in base_species_names
     )
     failed_names = {
         str(error.details.get("name") or "")
@@ -514,17 +469,13 @@ def finalize_simulation_result(
     )
     return SimulationResultValue(
         t=result_time,
-        series={
-            str(name): finalized_y[index, :]
-            for index, name in enumerate(finalized_species_names)
-        },
+        series=finalized_series,
         segment_ids=result.segment_ids,
         segment_keys=result.segment_keys,
         discontinuity_ids=result.discontinuity_ids,
         scalars=finalized_algebra_scalars,
         parameters=parameters,
-        solver_provenance=retained_solver_provenance,
-        preparation_warnings=tuple(preparation_warnings),
+        solver_provenance=frozen_solver_provenance,
         requested_algebra_outputs=requested_algebra_outputs,
         succeeded_algebra_outputs=succeeded_algebra_outputs,
         failed_algebra_outputs=failed_algebra_outputs,

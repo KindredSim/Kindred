@@ -25,9 +25,7 @@ from kindred.core.mechanism_metadata import (
 )
 from kindred.core.equilibrium_rate_authority import (
     EquilibriumRateAuthorityKind,
-    admit_explicit_directional_rate_pair,
     equilibrium_rate_symbolic_relations,
-    effective_reverse_rate_from_keq,
     normalize_existing_equilibrium_rate_authority,
 )
 from kindred.core.simulator.parameter_namespace import (
@@ -350,65 +348,6 @@ def _unsupported_support(code: str, reason: str) -> SymbolicJacobianSupport:
     )
 
 
-def _symbolic_snapshot_scalar_value(value: object) -> float | None:
-    try:
-        scalar_value = _runtime_scalar_binding_value(value, label="symbolic snapshot scalar")
-        if callable(scalar_value):
-            return None
-        scalar = float(scalar_value)  # type: ignore[arg-type]
-    except (TypeError, ValueError, OverflowError, UnsupportedSymbolicExpressionError):
-        return None
-    if not math.isfinite(scalar):
-        return None
-    return float(scalar)
-
-
-def _validate_equilibrium_parameter_values(
-    source: _EquilibriumRateSource,
-) -> None:
-    kf_label = source.kf_name or "equilibrium kf"
-    kr_label = source.kr_name or "equilibrium kr"
-    keq_label = source.keq_name or "equilibrium Keq"
-    kf_value = _finite_scalar(source.kf, label=f"symbolic parameter {kf_label}")
-    if kf_value < 0.0:
-        raise UnsupportedSymbolicExpressionError(
-            "equilibrium kf must be finite and nonnegative."
-        )
-    kr_value = _symbolic_snapshot_scalar_value(source.kr) if source.kr is not None else None
-    keq_value = _symbolic_snapshot_scalar_value(source.keq) if source.keq is not None else None
-
-    if source.keq is not None and keq_value is None:
-        raise UnsupportedSymbolicExpressionError(
-            f"equilibrium Keq input {keq_label} must be finite for symbolic Jacobian."
-        )
-    if keq_value is not None:
-        if keq_value <= 0.0:
-            raise UnsupportedSymbolicExpressionError("equilibrium Keq must be positive.")
-        _ = float(
-            effective_reverse_rate_from_keq(
-                kf_value,
-                keq_value,
-            )
-        )
-        return
-
-    if kr_value is None:
-        if source.kr is not None:
-            raise UnsupportedSymbolicExpressionError(
-                f"equilibrium kr input {kr_label} must be finite for symbolic Jacobian."
-            )
-        raise UnsupportedSymbolicExpressionError(
-            "Symbolic Jacobian requires finite equilibrium kf plus finite kr or Keq."
-        )
-    try:
-        admit_explicit_directional_rate_pair(kf_value, kr_value)
-    except ValueError as exc:
-        raise UnsupportedSymbolicExpressionError(
-            "explicit equilibrium kf and kr must each be an admitted "
-            "strictly positive rate."
-        ) from exc
-
-
 def _authored_equilibrium_forward_rate_family(
     mechanism: Mechanism,
     eq: Equilibrium,
@@ -508,7 +447,7 @@ def classify_symbolic_jacobian_support(mechanism: Mechanism) -> SymbolicJacobian
             unsupported_reason = f"Symbolic Jacobian does not support dynamic or non-finite reaction rate k{idx}."
     for idx, eq in enumerate(getattr(mechanism, "equilibria", []) or [], start=1):
         try:
-            source = _equilibrium_rate_source(
+            _equilibrium_rate_source(
                 mechanism,
                 eq,
                 equilibrium_index=idx - 1,
@@ -524,18 +463,6 @@ def classify_symbolic_jacobian_support(mechanism: Mechanism) -> SymbolicJacobian
             if not unsupported_code:
                 unsupported_code = "unsupported-equilibrium-rate-model"
                 unsupported_reason = str(exc)
-        if unsupported_code:
-            continue
-        try:
-            _validate_equilibrium_parameter_values(source)
-        except UnsupportedSymbolicExpressionError as exc:
-            unsupported_reason = str(exc)
-            unsupported_code = (
-                "unsupported-equilibrium-keq"
-                if "Keq" in unsupported_reason
-                else "unsupported-equilibrium-parameters"
-            )
-            continue
     if unsupported_code:
         return _unsupported_support(unsupported_code, unsupported_reason)
     try:

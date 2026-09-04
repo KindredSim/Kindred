@@ -259,7 +259,7 @@ def _solve_prepared(prepared: PreparedSimulationRun, *, parameters: tuple[tuple[
         mechanism=prepared.mechanism, result=solved, species_names=list(prepared.species_names),
         initials_for_algebra=prepared.initials_for_algebra, temperature_schedule=prepared.temperature_schedule,
         parameter_algebra_spec=prepared.parameter_algebra_spec, algebra_policy=SimulationAlgebraPolicy.GUI_BEST_EFFORT,
-        parameters=parameters, preparation_warnings=prepared.warnings,
+        parameters=parameters,
     )
     if cancellation_control.cancel_requested():
         raise SimulationCancelled()

@@ -2,13 +2,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
-from fractions import Fraction
 import math
 from typing import Any, Callable, Iterable, Mapping
 
 from kindred.core.constants import R
 from kindred.core.mechanism_metadata import EquilibriumMetadataKeys
 from kindred.core.species import validate_c0, validate_temperature
+from kindred.core.stoichiometry import directional_order_fraction
 from kindred.core.thermodynamics import (
     concentration_Keq_from_deltaG_eq,
 )
@@ -281,24 +281,6 @@ class EquilibriumRateSymbolicRelations:
     Keq: object
 
 
-def _exact_directional_order(
-    stoichiometry: Mapping[object, object],
-    *,
-    label: str,
-) -> Fraction:
-    """Return one admitted directional order without binary-float summation."""
-
-    if not isinstance(stoichiometry, Mapping):
-        raise ValueError(f"{label} must be a mapping.")
-    result = Fraction(0)
-    for raw_value in stoichiometry.values():
-        try:
-            result += Fraction(str(raw_value))
-        except (TypeError, ValueError, ZeroDivisionError, OverflowError) as exc:
-            raise ValueError(f"{label} must contain finite numeric values.") from exc
-    return result
-
-
 def equilibrium_rate_symbolic_relations(
     equilibrium: object,
     *,
@@ -381,13 +363,11 @@ def equilibrium_rate_symbolic_relations(
             -(source_coordinate("dG_eq") if source_coordinate is not None else literal(delta_g))
             / (literal(float(R)) * temperature)  # type: ignore[operator]
         )
-        forward_order = _exact_directional_order(
+        forward_order = directional_order_fraction(
             getattr(equilibrium, "stoich_forward", {}) or {},
-            label="equilibrium forward directional order",
         )
-        reverse_order = _exact_directional_order(
+        reverse_order = directional_order_fraction(
             getattr(equilibrium, "stoich_back", {}) or {},
-            label="equilibrium reverse directional order",
         )
         delta_n = reverse_order - forward_order
         if delta_n:
@@ -562,15 +542,27 @@ def plain_finite_float_or_none(value: object) -> float | None:
 
 
 def effective_equilibrium_forward_rate(eq: object, *, temperature_K: float = 298.15) -> float | None:
-    value = _finite_float_or_none(
-        getattr(eq, "kf", None),
-        temperature_K=float(temperature_K),
-    )
-    if value is None:
-        return None
     try:
+        temperature = validate_temperature(temperature_K, field="temperature_K")
+        metadata = getattr(eq, "metadata", {}) or {}
+        standard_conc = (
+            metadata.get(EquilibriumMetadataKeys.STANDARD_CONC_M, 1.0)
+            if isinstance(metadata, Mapping)
+            else 1.0
+        )
+        from kindred.core.kinetics import (
+            forward_rate_at_temperature,
+            forward_rate_model_for_equilibrium,
+        )
+
+        model = forward_rate_model_for_equilibrium(
+            eq,
+            temperature_K=temperature,
+            default_standard_conc_M=float(standard_conc),
+        )
+        value = forward_rate_at_temperature(model, temperature)
         return admit_rate(value, field="equilibrium kf", allow_zero=True)
-    except ValueError:
+    except (TypeError, ValueError, OverflowError):
         return None
 
 
@@ -578,11 +570,11 @@ def effective_equilibrium_keq(eq: object, *, temperature_K: float = 298.15) -> f
     authority = normalize_existing_equilibrium_rate_authority(eq)
     temperature = validate_temperature(temperature_K, field="temperature_K")
     meta = getattr(eq, "metadata", {}) or {}
-    forward_order = math.fsum(
-        float(value) for value in dict(getattr(eq, "stoich_forward", {}) or {}).values()
+    forward_order = directional_order_fraction(
+        getattr(eq, "stoich_forward", {}) or {},
     )
-    reverse_order = math.fsum(
-        float(value) for value in dict(getattr(eq, "stoich_back", {}) or {}).values()
+    reverse_order = directional_order_fraction(
+        getattr(eq, "stoich_back", {}) or {},
     )
     delta_n = float(reverse_order - forward_order)
     standard_conc = 1.0

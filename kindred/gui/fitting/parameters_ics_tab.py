@@ -771,6 +771,7 @@ class ParametersIcsTab(QtWidgets.QWidget):
         return self._available_analysis_coordinates()
 
     def project_setup_snapshot(self, snapshot: FitSetupSnapshot) -> None:
+        self._origin = snapshot.origin
         self._projected_setup = snapshot
         blocker = QtCore.QSignalBlocker(self._param_table)
         self._projecting = True

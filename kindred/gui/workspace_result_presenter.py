@@ -294,7 +294,7 @@ def _series_tuple(
 
 
 def _result_warning_details(result: SimulationResultValue) -> tuple[str, ...]:
-    details = [f"Preparation: {warning}" for warning in result.preparation_warnings]
+    details: list[str] = []
     if result.failed_algebra_outputs:
         details.append(
             "Algebra failed: " + ", ".join(result.failed_algebra_outputs)
@@ -323,7 +323,6 @@ def _result_provenance_payload(result: SimulationResultValue) -> Mapping[str, ob
             "provenance": MappingProxyType(
                 {
                     "solver": result.solver_provenance,
-                    "preparation_warnings": result.preparation_warnings,
                     "algebra": MappingProxyType(
                         {
                             "requested": result.requested_algebra_outputs,
@@ -506,6 +505,31 @@ class ResultDataBlock:
         object.__setattr__(self, "presentation_boundaries", boundaries)
 
 
+def _select_analysis_block(
+    blocks: Sequence[ResultDataBlock],
+    current_set_id: str,
+) -> ResultDataBlock | None:
+    return next(
+        (
+            block
+            for block in blocks
+            if block.block_id == current_set_id
+            and block.kind in {ResultLayerKind.EXPLICIT, ResultLayerKind.PREVIEW}
+            and isinstance(block.result, SimulationResultValue)
+        ),
+        next(
+            (
+                block
+                for block in blocks
+                if block.block_id == current_set_id
+                and block.kind is ResultLayerKind.REFERENCE
+                and isinstance(block.result, SimulationResultValue)
+            ),
+            None,
+        ),
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class ResultRenderInput:
     """Call-local render facts; never durable result or export authority."""
@@ -566,41 +590,16 @@ class ResultRenderInput:
         object.__setattr__(self, "intervention_annotations", annotations)
         object.__setattr__(self, "completion_warning_details", warnings)
 
-    def _analysis_block(self) -> ResultDataBlock | None:
-        candidates = tuple(
-            block
-            for block in self.blocks
-            if block.block_id == self.current_set_id
-            and block.kind in {
-                ResultLayerKind.EXPLICIT,
-                ResultLayerKind.REFERENCE,
-            }
-            and isinstance(block.result, SimulationResultValue)
-        )
-        return next(
-            (item for item in candidates if item.kind is ResultLayerKind.EXPLICIT),
-            next(
-                (item for item in candidates if item.kind is ResultLayerKind.REFERENCE),
-                None,
-            ),
-        )
-
     @property
     def statistics_result(self) -> SimulationResultValue | None:
-        block = self._analysis_block()
+        block = _select_analysis_block(self.blocks, self.current_set_id)
         return block.result if block is not None else None
 
     @property
     def parameters(self) -> tuple[tuple[str, float, str], ...]:
-        block = self._analysis_block()
+        block = _select_analysis_block(self.blocks, self.current_set_id)
         result = block.result if block is not None else None
         return tuple(result.parameters) if isinstance(result, SimulationResultValue) else ()
-
-    @property
-    def scalar_values(self) -> tuple[tuple[str, float], ...]:
-        block = self._analysis_block()
-        result = block.result if block is not None else None
-        return tuple(result.scalars.items()) if isinstance(result, SimulationResultValue) else ()
 
     @property
     def completion_warning_tooltip(self) -> str:
@@ -810,12 +809,14 @@ def _statistics_series_names(
     *,
     y_axes: set[AxisSeriesSelection] | None,
 ) -> tuple[str, ...]:
-    series_axes = dict(block.series_axes)
     succeeded = set(block.result.succeeded_algebra_outputs)
     return tuple(
         name for name in block.result.series
         if name not in succeeded
-        and (y_axes is None or series_axes[name] in y_axes)
+        and (
+            y_axes is None
+            or SimulationSeriesAxisSelection(name) in y_axes
+        )
     )
 
 
@@ -1239,7 +1240,6 @@ def compose_result_input(
     selected_x_series: AxisSeriesSelection = SimulationSeriesAxisSelection("t"),
     selected_y_series: Sequence[AxisSeriesSelection] = (),
     selected_y_uses_default_all: bool = True,
-    preview_set_ids: Sequence[str] = (),
 ) -> ResultRenderInput:
     tab_id = _required_id(tab_id, "tab_id")
     if repository.tab_id != tab_id:
@@ -1248,7 +1248,7 @@ def compose_result_input(
         _required_id(name, "mechanism species") for name in mechanism_species
     }
     current_id = str(current_set_id or "")
-    preview_ids = {_required_id(value, "preview set_id") for value in preview_set_ids}
+    preview_ids = set(repository.preview_set_ids())
     colors = {
         _axis_selection(selection, field="configured color axis"):
         _required_id(color, "configured axis color")
@@ -1313,14 +1313,18 @@ def compose_result_input(
     for selection in colors:
         if isinstance(selection, SimulationSeriesAxisSelection):
             add_candidate(selection, selection.series_name)
-    statistics_names: tuple[str, ...] = ()
     annotations: list[_DisplayAnnotation] = []
     warning_facts: list[tuple[str, tuple[str, ...]]] = []
     warning_ids: set[int] = set()
     seen_sets: set[str] = set()
 
     def add_warning(label: str, result: SimulationResultValue, visible: bool) -> None:
-        if visible and result.completed_with_warnings and id(result) not in warning_ids:
+        has_algebra_warnings = bool(
+            result.failed_algebra_outputs
+            or result.omitted_algebra_outputs
+            or result.algebra_errors
+        )
+        if visible and has_algebra_warnings and id(result) not in warning_ids:
             warning_ids.add(id(result))
             warning_facts.append((label, tuple(_result_warning_details(result))))
 
@@ -1384,27 +1388,12 @@ def compose_result_input(
                 annotations.extend(_owned_annotations(reference, "ghost", visible.set_id))
             else:
                 blocks.append(reference_semantic)
-        if visible.set_id == current_id:
-            foreground_names = (
-                _statistics_series_names(
-                    semantic, y_axes=wanted_y
-                )
-                if foreground is not None
-                and foreground_kind is ResultLayerKind.EXPLICIT
-                and semantic is not None
-                else ()
-            )
-            if (
-                semantic is not None
-                and foreground is not None
-                and foreground_kind is ResultLayerKind.EXPLICIT
-            ):
-                statistics_names = foreground_names
-            elif reference is not None and reference_semantic is not None:
-                statistics_names = _statistics_series_names(
-                    reference_semantic, y_axes=wanted_y
-                )
-
+    analysis_block = _select_analysis_block(blocks, current_id)
+    statistics_names = (
+        _statistics_series_names(analysis_block, y_axes=wanted_y)
+        if analysis_block is not None
+        else ()
+    )
     for experimental in active:
         y_axis = experimental.axis
         label = f"{experimental.dataset_name}: {experimental.raw_column}"

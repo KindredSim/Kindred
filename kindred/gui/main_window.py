@@ -47,6 +47,7 @@ from kindred.core.project_document import (
     canonical_observation_target_names,
     canonical_initial_values,
     new_set_id,
+    prepare_authored_source_admission,
     assess_tab_exact_correction,
     reconcile_tab_mechanism_source,
     retained_tab_mechanism_source,
@@ -1320,7 +1321,6 @@ class MainWindow(QtWidgets.QMainWindow):
                 if result is not None:
                     simulation_series_names.extend(result.series)
         simulation_series = tuple(dict.fromkeys(simulation_series_names))
-        bundle = self._tab_surfaces.get(tab_id)
         color_by_axis_selection: dict[AxisSeriesSelection, str] = {
             SimulationSeriesAxisSelection(species): (
                 self.config_controller.species_color(
@@ -1360,11 +1360,6 @@ class MainWindow(QtWidgets.QMainWindow):
             selected_y_series=presentation.selected_y_series,
             selected_y_uses_default_all=(
                 presentation.selected_y_uses_default_all
-            ),
-            preview_set_ids=(
-                bundle.slider_binding.active_preview_set_ids
-                if bundle is not None
-                else ()
             ),
         )
 
@@ -3273,16 +3268,11 @@ class MainWindow(QtWidgets.QMainWindow):
             if corrected_proposal is None:
                 raise AuthoredSourceError("Template source correction was cancelled.")
             source_for_admission = corrected_proposal
-        reconciliation = reconcile_tab_mechanism_source(
-            document,
-            target,
+        prepare_authored_source_admission(
             source_for_admission,
+            document.tab(target).scientific_settings,
         )
-        if isinstance(reconciliation, MechanismSourceCollision):
-            reconciliation = reconciliation.replacement
-        if not isinstance(reconciliation, MechanismSourceReconciliation):
-            raise TypeError("Template source reconciliation returned an invalid result.")
-        return reconciliation.proposed_document.tab(target).mechanism_source
+        return source_for_admission
 
     # ------------------------------------------------------------------
     # Dataset intents
