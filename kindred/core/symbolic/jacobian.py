@@ -448,6 +448,46 @@ def classify_symbolic_jacobian_support(mechanism: Mechanism) -> SymbolicJacobian
             "Symbolic Jacobian requires at least one species.",
         )
 
+    concentration_exponents: list[tuple[str, str, float]] = []
+    for idx, reaction in enumerate(
+        getattr(mechanism, "reactions", ()) or (),
+        start=1,
+    ):
+        concentration_exponents.extend(
+            (
+                f"reaction {idx}",
+                str(species_name),
+                float(exponent),
+            )
+            for species_name, exponent in (
+                getattr(reaction, "rate_orders", {}) or {}
+            ).items()
+        )
+    for idx, equilibrium in enumerate(
+        getattr(mechanism, "equilibria", ()) or (),
+        start=1,
+    ):
+        for direction, side in (
+            ("forward", getattr(equilibrium, "stoich_forward", {}) or {}),
+            ("reverse", getattr(equilibrium, "stoich_back", {}) or {}),
+        ):
+            concentration_exponents.extend(
+                (
+                    f"equilibrium {idx} {direction}",
+                    str(species_name),
+                    float(exponent),
+                )
+                for species_name, exponent in side.items()
+            )
+    for location, species_name, exponent in concentration_exponents:
+        if not exponent.is_integer():
+            return _unsupported_support(
+                "nonintegral-concentration-exponent",
+                "Symbolic Jacobian is not used because "
+                f"{location} concentration exponent for {species_name!r} is "
+                f"non-integral ({exponent:g}).",
+            )
+
     unsupported_code = ""
     unsupported_reason = ""
     for idx, rxn in enumerate(getattr(mechanism, "reactions", []) or [], start=1):

@@ -9,7 +9,6 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-import logging
 from numbers import Real
 from types import MappingProxyType
 from typing import Any, Dict, Tuple
@@ -25,8 +24,6 @@ from kindred.core.temperature import (
     TemperatureScheduleProtocol,
 )
 from kindred.core.time_grid import normalize_time_grid_policy
-
-logger = logging.getLogger(__name__)
 
 __all__ = [
     "PreparedSolverConfig",
@@ -159,6 +156,7 @@ def build_prepared_run_context(
     *,
     mechanism: Any,
     temperature_schedule: TemperatureScheduleProtocol | None,
+    use_analytic_jacobian: bool,
     symbolic_structure: Any = None,
     coefficient_evaluator: Any = None,
 ) -> tuple[
@@ -171,7 +169,15 @@ def build_prepared_run_context(
     # The schedule has already been admitted by the source/metadata ingress;
     # preserve that typed object through preparation and execution.
     resolved_temperature_schedule = temperature_schedule
-    warnings: list[str] = []
+    if not use_analytic_jacobian:
+        return (
+            resolved_temperature_schedule,
+            SymbolicJacobianExecution.disabled(
+                code="policy-disabled",
+                reason="Analytic Jacobian preference is disabled.",
+            ),
+            (),
+        )
     symbolic_jacobian = SymbolicJacobianExecution()
     if not symbolic_jacobian.has_executable_jacobian:
         try:
@@ -183,11 +189,4 @@ def build_prepared_run_context(
             )
         except UnsupportedSymbolicExpressionError as exc:
             symbolic_jacobian = _symbolic_jacobian_for_bind_failure(mechanism, exc)
-            reason_text = str((symbolic_jacobian.status or {}).get("reason") or exc)
-            symbolic_message = (
-                "Symbolic Jacobian unsupported; using solver default Jacobian "
-                f"handling: {reason_text}"
-            )
-            logger.warning("%s", symbolic_message)
-            warnings.append(symbolic_message)
-    return resolved_temperature_schedule, symbolic_jacobian, tuple(warnings)
+    return resolved_temperature_schedule, symbolic_jacobian, ()

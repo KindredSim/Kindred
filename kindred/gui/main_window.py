@@ -128,6 +128,9 @@ from kindred.gui.widgets.dataset_overlay_panel import (
     DatasetOverlayPanel,
 )
 from kindred.gui.widgets.editor_panel import EditorPanel
+from kindred.gui.widgets.exact_correction_basis_dialog import (
+    ExactCorrectionBasisDialog,
+)
 from kindred.gui.widgets.mechanism_editor import (
     MechanismEditorBinding,
     MechanismEditorTabbed,
@@ -2837,19 +2840,18 @@ class MainWindow(QtWidgets.QMainWindow):
         sections.append("\n".join(target_lines))
 
         plan = assessment.plan
+        independent = tuple(
+            target.name
+            for target in assessment.targets
+            if target.name not in plan.basis and not target.derived
+        )
         plan_lines = [
             "Plan:",
             f"- Available: {'yes' if plan.available else 'no'}",
-            f"- Basis: {', '.join(plan.basis) if plan.basis else 'none'}",
-            "- Assignments: "
-            + (
-                ", ".join(
-                    f"{cycle} → {target}"
-                    for cycle, target in plan.assignments
-                )
-                if plan.assignments
-                else "none"
-            ),
+            "- Dependent basis: "
+            + (", ".join(plan.basis) if plan.basis else "none"),
+            "- Independent parameters: "
+            + (", ".join(independent) if independent else "none"),
         ]
         if plan.reason:
             plan_lines.append(f"- Reason: {plan.reason}")
@@ -2884,6 +2886,7 @@ class MainWindow(QtWidgets.QMainWindow):
     ) -> MechanismAuthoringSource | None:
         """Show one local synchronous Accept/Cancel source review."""
 
+        selected_assessment = assessment
         dialog = QtWidgets.QDialog(self)
         dialog.setWindowTitle(f"Review exact correction — {action}")
         layout = QtWidgets.QVBoxLayout(dialog)
@@ -2896,19 +2899,46 @@ class MainWindow(QtWidgets.QMainWindow):
         details = QtWidgets.QPlainTextEdit(dialog)
         details.setReadOnly(True)
         details.setPlainText(
-            self._format_exact_correction_assessment(assessment, visible_source)
+            self._format_exact_correction_assessment(
+                selected_assessment,
+                visible_source,
+            )
         )
         layout.addWidget(details)
         buttons = QtWidgets.QDialogButtonBox(dialog)
         buttons.addButton(QtWidgets.QDialogButtonBox.StandardButton.Cancel)
         if assessment.proposal is not None:
             buttons.addButton("Accept", QtWidgets.QDialogButtonBox.ButtonRole.AcceptRole)
+        if assessment.proposal is not None and visible_source is not None:
+            choose_button = buttons.addButton(
+                "Choose dependent parameters…",
+                QtWidgets.QDialogButtonBox.ButtonRole.ActionRole,
+            )
+
+            def choose_basis() -> None:
+                nonlocal selected_assessment
+                chooser = ExactCorrectionBasisDialog(
+                    assessment=selected_assessment,
+                    visible_source=visible_source,
+                    parent=dialog,
+                )
+                if chooser.exec() != QtWidgets.QDialog.DialogCode.Accepted:
+                    return
+                selected_assessment = chooser.selected_assessment
+                details.setPlainText(
+                    self._format_exact_correction_assessment(
+                        selected_assessment,
+                        visible_source,
+                    )
+                )
+
+            choose_button.clicked.connect(choose_basis)
         layout.addWidget(buttons)
         buttons.rejected.connect(dialog.reject)
         buttons.accepted.connect(dialog.accept)
         if dialog.exec() != QtWidgets.QDialog.DialogCode.Accepted:
             return None
-        return assessment.proposal
+        return selected_assessment.proposal
 
     def _admit_incoming_document(
         self,
@@ -2918,7 +2948,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         corrections: list[tuple[MechanismTabDocument, ExactCorrectionAssessment]] = []
         blocked = False
-        sections: list[str] = []
+        sections_by_tab: dict[str, str] = {}
         for tab in document.tabs:
             assessment = assess_tab_exact_correction(
                 document,
@@ -2940,7 +2970,9 @@ class MainWindow(QtWidgets.QMainWindow):
                 section = summary
             else:
                 section = "No exact correction is required for this tab."
-            sections.append(f"Tab {tab.tab_id}\n{'=' * 40}\n{section}")
+            sections_by_tab[tab.tab_id] = (
+                f"Tab {tab.tab_id}\n{'=' * 40}\n{section}"
+            )
         if not corrections and not blocked:
             try:
                 return validate_project_document(document)
@@ -2963,12 +2995,53 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         details = QtWidgets.QPlainTextEdit(dialog)
         details.setReadOnly(True)
-        details.setPlainText("\n\n".join(sections))
+        details.setPlainText(
+            "\n\n".join(sections_by_tab[tab.tab_id] for tab in document.tabs)
+        )
         layout.addWidget(details)
         buttons = QtWidgets.QDialogButtonBox(dialog)
         buttons.addButton(QtWidgets.QDialogButtonBox.StandardButton.Cancel)
         if not blocked:
             buttons.addButton("Accept", QtWidgets.QDialogButtonBox.ButtonRole.AcceptRole)
+        if corrections and not blocked:
+            tab_choice = QtWidgets.QComboBox(dialog)
+            for index, (tab, _assessment) in enumerate(corrections):
+                tab_choice.addItem(f"{tab.name} ({tab.tab_id})", index)
+            choose_button = buttons.addButton(
+                "Choose dependent parameters…",
+                QtWidgets.QDialogButtonBox.ButtonRole.ActionRole,
+            )
+
+            def choose_incoming_basis() -> None:
+                correction_index = int(tab_choice.currentData())
+                tab, current_assessment = corrections[correction_index]
+                chooser = ExactCorrectionBasisDialog(
+                    assessment=current_assessment,
+                    visible_source=tab.mechanism_source,
+                    parent=dialog,
+                )
+                if chooser.exec() != QtWidgets.QDialog.DialogCode.Accepted:
+                    return
+                selected_assessment = chooser.selected_assessment
+                corrections[correction_index] = (tab, selected_assessment)
+                sections_by_tab[tab.tab_id] = (
+                    f"Tab {tab.tab_id}\n{'=' * 40}\n"
+                    + self._format_exact_correction_assessment(
+                        selected_assessment,
+                        tab.mechanism_source,
+                    )
+                )
+                details.setPlainText(
+                    "\n\n".join(
+                        sections_by_tab[item.tab_id] for item in document.tabs
+                    )
+                )
+
+            choose_button.clicked.connect(choose_incoming_basis)
+            selector_row = QtWidgets.QHBoxLayout()
+            selector_row.addWidget(QtWidgets.QLabel("Correction tab:", dialog))
+            selector_row.addWidget(tab_choice, stretch=1)
+            layout.insertLayout(layout.count() - 1, selector_row)
         layout.addWidget(buttons)
         buttons.rejected.connect(dialog.reject)
         buttons.accepted.connect(dialog.accept)
@@ -3505,8 +3578,10 @@ class MainWindow(QtWidgets.QMainWindow):
     def _export_original_dataset(self, dataset_id: str) -> None:
         if not self._mutation_input_admitted("Export Original Dataset"):
             return
+        document = self._project_session.document
         try:
-            record = self._project_session.document.dataset(dataset_id)
+            record = document.dataset(dataset_id)
+            source = document.imported_source(record.source_id)
         except KeyError:
             return
         try:
@@ -3525,7 +3600,7 @@ class MainWindow(QtWidgets.QMainWindow):
             "Export Original Dataset",
             os.path.join(
                 start_directory,
-                self._project_session.document.imported_source(record.source_id).original_filename,
+                source.original_filename,
             ),
             "All Files (*)",
         )
@@ -3547,7 +3622,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         self._remember_export_directory(path)
         try:
-            exported = export_original_source(self._project_session.document, record, path)
+            exported = export_original_source(source, path)
             self.set_status_text(f"Exported original dataset: {exported}")
         except (DatasetMappingError, OSError) as exc:
             QtWidgets.QMessageBox.critical(

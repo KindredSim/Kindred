@@ -1306,7 +1306,10 @@ class SimulationJobOwner(QtCore.QObject):
                     )
     @staticmethod
     def _terminal_status(summary: SimulationTerminalSummary) -> str:
-        return f"{summary.kind.capitalize()} {summary.state}: {summary.succeeded} succeeded, {summary.failed} failed, {summary.cancelled} cancelled, {summary.discarded} discarded."
+        status = f"{summary.kind.capitalize()} {summary.state}: {summary.succeeded} succeeded, {summary.failed} failed, {summary.cancelled} cancelled, {summary.discarded} discarded."
+        if summary.details:
+            status += " " + "; ".join(summary.details)
+        return status
 
     @QtCore.Slot()
     def _on_gate_changed(self) -> None:

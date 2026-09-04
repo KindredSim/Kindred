@@ -484,7 +484,6 @@ def prepare_fitting_execution_context(
         and cancellation_control.cancel_requested()
     ):
         raise FittingCancelled()
-    prepared_dsl.ensure_scientific_structures()
     prepared_run = prepare_simulation_worker_run(
         execution_request=execution_request,
         cancellation_control=cancellation_control,

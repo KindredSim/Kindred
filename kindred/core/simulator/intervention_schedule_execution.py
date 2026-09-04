@@ -192,10 +192,6 @@ class InterventionScheduleExecutionOwner:
         output_discontinuity_ids: list[np.ndarray] = []
         presentation_boundaries: list[SimulationPresentationBoundary] = []
         segment_solvers: list[str] = []
-        segment_symbolic_jacobian_usage: list[bool] = []
-        segment_symbolic_jacobian_runtime_fallbacks: list[
-            dict[str, object]
-        ] = []
         integration_segments: list[dict[str, object]] = []
         segment_projections: dict[str, SegmentProjection] = {}
         segment_count = 0
@@ -489,24 +485,6 @@ class InterventionScheduleExecutionOwner:
                 segment_solvers.append(
                     str(segment_result.solver_used or request.method)
                 )
-                segment_symbolic_jacobian_usage.append(
-                    bool(segment_result.symbolic_jacobian_used)
-                )
-                runtime_fallback = segment_result.output.provenance.get(
-                    "symbolic_jacobian_runtime_fallback"
-                )
-                runtime_fallback_payload = (
-                    dict(runtime_fallback)
-                    if isinstance(runtime_fallback, Mapping)
-                    else None
-                )
-                if runtime_fallback_payload is not None:
-                    runtime_fallback_payload["segment"] = (
-                        segment_output_identity.to_payload()
-                    )
-                    segment_symbolic_jacobian_runtime_fallbacks.append(
-                        runtime_fallback_payload
-                    )
                 segment_payload: dict[str, object] = {
                     "segment_id": segment_count,
                     "segment_key": segment_output_identity.key,
@@ -527,10 +505,6 @@ class InterventionScheduleExecutionOwner:
                         segment_result.jacobian_sparsity_hint
                     ),
                 }
-                if runtime_fallback_payload is not None:
-                    segment_payload["symbolic_jacobian_runtime_fallback"] = (
-                        runtime_fallback_payload
-                    )
                 integration_segments.append(segment_payload)
                 segment_count += 1
                 if trigger_hit is not None:
@@ -803,46 +777,6 @@ class InterventionScheduleExecutionOwner:
         provenance["intervention_execution"] = final_contract.provenance_projection()
         provenance["integration_segments"] = integration_segments
         provenance["intervention_segments"] = segment_count
-        if segment_symbolic_jacobian_runtime_fallbacks:
-            provenance["symbolic_jacobian_runtime_fallbacks"] = list(
-                segment_symbolic_jacobian_runtime_fallbacks
-            )
-        base_symbolic_jacobian = req.symbolic_jacobian
-        if (
-            base_symbolic_jacobian.has_executable_jacobian
-            and segment_symbolic_jacobian_usage
-            and not all(segment_symbolic_jacobian_usage)
-        ):
-            partially_disabled = any(segment_symbolic_jacobian_usage)
-            if segment_symbolic_jacobian_runtime_fallbacks:
-                status_code = "nonfinite-runtime"
-                status_reason = (
-                    "Symbolic Jacobian disabled only for segments where its "
-                    "runtime evaluation was non-finite or invalid."
-                    if partially_disabled
-                    else
-                    "Symbolic Jacobian disabled for every executed segment "
-                    "because its runtime evaluation was non-finite or "
-                    "invalid."
-                )
-            else:
-                status_code = "singular-state"
-                status_reason = (
-                    "Symbolic Jacobian disabled only for segments with a "
-                    "non-finite initial symbolic Jacobian."
-                    if partially_disabled
-                    else
-                    "Symbolic Jacobian disabled for every executed segment "
-                    "because it was non-finite at the segment initial state."
-                )
-            runtime_symbolic_jacobian = (
-                base_symbolic_jacobian.with_runtime_disabled(
-                    partially=partially_disabled,
-                    code=status_code,
-                    reason=status_reason,
-                )
-            )
-            provenance.update(runtime_symbolic_jacobian.provenance_fields())
         (
             result_segment_ids,
             result_segment_keys,

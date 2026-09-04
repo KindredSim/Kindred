@@ -1446,10 +1446,7 @@ def _execute_global_fit_model(
     if not isinstance(layout, FitParameterLayout):
         raise RuntimeError("Ordinary Fit omitted its admitted optimizer layout.")
     return fit_global(
-        shared_variables=dispatch.ordinary_shared_variables,
         dataset_overrides=dispatch.ordinary_dataset_overrides,
-        coupled_variables=dispatch.ordinary_coupled_variables,
-        centred_variables=dispatch.ordinary_centred_variables,
         optimizer_layout=layout,
         executor=executor,
         **common,

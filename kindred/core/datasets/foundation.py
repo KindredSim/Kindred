@@ -194,9 +194,6 @@ class DatasetMappedTarget:
     dataset_id: str
     raw_observation_id: str
     model_target: str
-    t: tuple[float, ...]
-    y: tuple[float, ...]
-    source_rows: tuple[int, ...]
 
     def __post_init__(self) -> None:
         dataset_id = str(self.dataset_id).strip()
@@ -213,30 +210,6 @@ class DatasetMappedTarget:
         model_target = str(self.model_target).strip()
         if not dataset_id or not raw_observation_id or not model_target:
             raise ValueError("Mapped dataset target identities must be nonblank.")
-        if (
-            type(self.t) is not tuple
-            or type(self.y) is not tuple
-            or type(self.source_rows) is not tuple
-            or not self.t
-            or len(self.t) != len(self.y)
-            or len(self.t) != len(self.source_rows)
-        ):
-            raise ValueError(
-                "Mapped dataset target time, value, and source-row tuples "
-                "must be immutable and have equal nonzero length."
-            )
-        if (
-            any(
-                type(value) is not float or not math.isfinite(value)
-                for value in (*self.t, *self.y)
-            )
-            or any(type(row) is not int or row <= 0 for row in self.source_rows)
-            or len(set(self.source_rows)) != len(self.source_rows)
-        ):
-            raise ValueError(
-                "Mapped dataset targets require finite values and unique "
-                "positive physical source rows."
-            )
         object.__setattr__(self, "dataset_id", dataset_id)
         object.__setattr__(self, "raw_observation_id", raw_observation_id)
         object.__setattr__(self, "model_target", model_target)
@@ -524,27 +497,13 @@ def validate_fit_inclusion(
         raise RawDatasetValidationError(
             "Fit inclusion observation mapping must already be canonical and ordered by raw observation identity."
         )
-    series_by_raw_id = {series.raw_observation_id: series for series in dataset.observations}
     targets: list[DatasetMappedTarget] = []
     for raw_observation_id, model_target in mapping:
-        series = series_by_raw_id[raw_observation_id]
-        if (
-            not series.source_rows
-            or len(series.source_rows) != len(series.t)
-            or len(series.t) != len(series.y)
-            or any(type(row) is not int or row <= 0 for row in series.source_rows)
-        ):
-            raise RawDatasetValidationError(
-                f"Observation {series.column_name!r} (raw ID {raw_observation_id!r}) does not retain complete positive physical source-row identity."
-            )
         targets.append(
             DatasetMappedTarget(
                 dataset_id=dataset.dataset_id,
                 raw_observation_id=raw_observation_id,
                 model_target=model_target,
-                t=series.t,
-                y=series.y,
-                source_rows=series.source_rows,
             )
         )
     if type(resolved_t_start) is bool:

@@ -35,11 +35,15 @@ from kindred.core.simulator.exact_constraint_composition import (
 )
 from kindred.core.simulator.source_correction import (
     CorrectionPlan,
+    CorrectionPlanner,
     CorrectionTarget,
     build_correction_expressions,
-    plan_correction_basis,
 )
-from kindred.core.simulator.step_indexing import lookup_source_coordinate_target
+from kindred.core.simulator.step_indexing import (
+    iter_canonical_parameters,
+    lookup_source_coordinate_target,
+)
+from kindred.core.simulator.wegscheider_symbolic import analyze_wegscheider_topology
 from kindred.core.simulator.solvers import normalize_solver_name
 from kindred.core.units import UnitsModel
 from kindred.core.species import (
@@ -92,6 +96,7 @@ __all__ = [
     "retained_tab_mechanism_source",
     "reconcile_tab_mechanism_source",
     "assess_tab_exact_correction",
+    "select_exact_correction_basis",
     "prepare_tab_scientific_settings",
     "resolve_simulation_execution_settings",
     "validate_fit_defaults",
@@ -1436,7 +1441,7 @@ def _admitted_correction_targets(
     tab: MechanismTabDocument,
     composition: object,
 ) -> tuple[CorrectionTarget, ...]:
-    """Derive every source-backed correction candidate from admitted state."""
+    """Derive every potential correction target and its owned availability."""
 
     prepared = tab.prepared_dsl
     if prepared is None:
@@ -1461,35 +1466,58 @@ def _admitted_correction_targets(
     for item in getattr(composition, "constraints", ()):
         powers.update(str(name) for name in item.monomial.coordinate_power_map())
     admitted: list[CorrectionTarget] = []
+    admitted_names: set[str] = set()
     equilibria = tuple(getattr(mechanism, "equilibria", ()) or ())
     for coordinate in coordinates:
         name = str(coordinate.canonical_name)
         role = str(coordinate.role)
         capabilities = source_coordinate_capabilities(role)
+        assignment_kind = assignment_kinds.get(name)
         if (
             not capabilities.correction_target
-            or name not in powers
-            # An admitted Algebra assignment owns a mechanism/source target,
-            # including an empty-dependency mechanism-bound assignment.  Such
-            # coordinates are not independently writable correction targets.
-            or assignment_kinds.get(name) in {"derived scalar", "mechanism-bound"}
+            or (
+                name not in powers
+                and assignment_kind not in {"derived scalar", "mechanism-bound"}
+            )
         ):
             continue
+        admitted_names.add(name)
         source_target = lookup_source_coordinate_target(mechanism, name)
         if source_target is None:
+            admitted.append(
+                CorrectionTarget(
+                    name=name,
+                    family=role,
+                    source_backed=False,
+                    editable=False,
+                    derived=assignment_kind in {"derived scalar", "mechanism-bound"},
+                )
+            )
             continue
         kind, item_index, target_role, entry = source_target
         if str(target_role) != role:
+            admitted.append(
+                CorrectionTarget(
+                    name=name,
+                    family=role,
+                    source_backed=False,
+                    editable=False,
+                    derived=assignment_kind in {"derived scalar", "mechanism-bound"},
+                )
+            )
             continue
         editable = not bool(entry.get("locked", False))
-        derived = False
+        derived = assignment_kind in {
+            "derived scalar",
+            "mechanism-bound",
+        }
         if str(kind) == "equilibrium":
             authority = normalize_existing_equilibrium_rate_authority(
                 equilibria[int(item_index)]
             )
             if capabilities.equilibrium_authority:
                 editable = editable and authority.authored_role_is_editable(role)
-                derived = authority.authored_role_is_derived(role)
+                derived = derived or authority.authored_role_is_derived(role)
         admitted.append(
             CorrectionTarget(
                 name=name,
@@ -1499,7 +1527,64 @@ def _admitted_correction_targets(
                 derived=derived,
             )
         )
+    cycle_steps = {
+        step_index
+        for cycle in analyze_wegscheider_topology(mechanism).cycles
+        for step_index in cycle.step_indices
+    }
+    for name, entry, role in iter_canonical_parameters(mechanism):
+        if role != "Keq" or name in admitted_names:
+            continue
+        step_index = int(entry["step_index"])
+        if step_index not in cycle_steps:
+            continue
+        admitted.append(
+            CorrectionTarget(
+                name=name,
+                family=role,
+                source_backed=False,
+                editable=False,
+                derived=True,
+            )
+        )
     return tuple(admitted)
+
+
+def _correction_proposal(
+    source: MechanismAuthoringSource,
+    composition: ExactConstraintComposition,
+    plan: CorrectionPlan,
+) -> MechanismAuthoringSource:
+    corrections = build_correction_expressions(composition, plan)
+    updated_source = insert_scalar_source_declarations(
+        source.reactions_text,
+        corrections,
+    )
+    return MechanismAuthoringSource.from_parts(reactions_text=updated_source)
+
+
+def select_exact_correction_basis(
+    assessment: ExactCorrectionAssessment,
+    visible_source: MechanismAuthoringSource,
+    selected_basis: Sequence[str],
+) -> ExactCorrectionAssessment:
+    """Build a proposal from the original source for one exact selected basis."""
+
+    composition = assessment.composition
+    if composition is None:
+        raise ValueError("Exact correction composition is unavailable.")
+    plan = CorrectionPlanner(composition, assessment.targets).plan_selected_basis(
+        selected_basis
+    )
+    if not plan.available:
+        raise ValueError(plan.reason or "Selected correction basis is unavailable.")
+    proposal = _correction_proposal(visible_source, composition, plan)
+    return replace(
+        assessment,
+        plan=plan,
+        proposal=proposal,
+        unavailable_reason=None,
+    )
 
 
 def assess_tab_exact_correction(
@@ -1554,7 +1639,7 @@ def assess_tab_exact_correction(
             parameter_algebra_spec=parameter_spec,
         )
         targets = _admitted_correction_targets(detached_tab, composition)
-        plan = plan_correction_basis(composition, targets)
+        plan = CorrectionPlanner(composition, targets).plan()
     except (AuthoredSourceError, DSLError, TypeError, ValueError, OverflowError) as exc:
         return ExactCorrectionAssessment(
             composition=None,
@@ -1581,14 +1666,7 @@ def assess_tab_exact_correction(
         )
 
     try:
-        corrections = build_correction_expressions(composition, plan)
-        updated_source = insert_scalar_source_declarations(
-            source.reactions_text,
-            corrections,
-        )
-        proposal = MechanismAuthoringSource.from_parts(
-            reactions_text=updated_source,
-        )
+        proposal = _correction_proposal(source, composition, plan)
     except (TypeError, ValueError, OverflowError) as exc:
         return ExactCorrectionAssessment(
             composition=composition,

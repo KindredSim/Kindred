@@ -36,7 +36,7 @@ class SymbolicJacobianExecution:
         status = dict(self.status or {}) if isinstance(self.status, Mapping) else None
         state = str((status or {}).get("state") or "")
         if self.jacobian_func is None:
-            if state in {"supported", "partially_disabled"}:
+            if state == "supported":
                 raise ValueError("Executable symbolic Jacobian state requires a Jacobian callable.")
         else:
             if state in {"unsupported", "disabled"}:
@@ -91,10 +91,8 @@ class SymbolicJacobianExecution:
         *,
         code: str,
         reason: str,
-        jac_sparsity: Any = None,
     ) -> "SymbolicJacobianExecution":
         return cls(
-            jac_sparsity=jac_sparsity,
             status=symbolic_status_payload(
                 kind="jacobian",
                 state="disabled",
@@ -116,25 +114,6 @@ class SymbolicJacobianExecution:
         return cls.unsupported(
             code="binding-failed",
             reason=str(exc) or "Symbolic Jacobian binding failed.",
-        )
-
-    def with_runtime_disabled(
-        self,
-        *,
-        partially: bool,
-        code: str,
-        reason: str,
-    ) -> "SymbolicJacobianExecution":
-        state = "partially_disabled" if partially and self.has_executable_jacobian else "disabled"
-        return SymbolicJacobianExecution(
-            jacobian_func=self.jacobian_func if state == "partially_disabled" else None,
-            jac_sparsity=self.jac_sparsity,
-            status=symbolic_status_payload(
-                kind="jacobian",
-                state=state,
-                code=code,
-                reason=reason,
-            ),
         )
 
     def provenance_fields(self) -> dict[str, Any]:

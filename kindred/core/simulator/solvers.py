@@ -63,12 +63,13 @@ from .solver_types import (
 logger = logging.getLogger(__name__)
 
 
-class _NonfiniteSymbolicJacobianError(RuntimeError):
-    """Internal signal that permits one same-segment no-Jacobian retry."""
+class _SymbolicJacobianEvaluationError(RuntimeError):
+    """Internal signal for one failed admitted analytic evaluation."""
 
-    def __init__(self, *, time: float) -> None:
+    def __init__(self, *, time: float, reason: str) -> None:
         self.time = float(time)
-        super().__init__("Symbolic Jacobian evaluation was non-finite or invalid.")
+        self.reason = str(reason)
+        super().__init__(self.reason)
 
 
 def _solve_ivp(*, fun: Callable[[float, np.ndarray], np.ndarray], t_span: Tuple[float, float], y0: np.ndarray, **kwargs: Any):
@@ -301,12 +302,27 @@ def _guard_runtime_symbolic_jacobian(
                 dtype=float,
             )
         except (ArithmeticError, TypeError, ValueError, OverflowError) as exc:
-            raise _NonfiniteSymbolicJacobianError(time=float(time)) from exc
-        if (
-            matrix.shape != (values.size, values.size)
-            or not np.all(np.isfinite(matrix))
-        ):
-            raise _NonfiniteSymbolicJacobianError(time=float(time))
+            raise _SymbolicJacobianEvaluationError(
+                time=float(time),
+                reason=(
+                    "Analytic Jacobian callback raised "
+                    f"{type(exc).__name__}: {exc}"
+                ),
+            ) from exc
+        expected_shape = (values.size, values.size)
+        if matrix.shape != expected_shape:
+            raise _SymbolicJacobianEvaluationError(
+                time=float(time),
+                reason=(
+                    "Analytic Jacobian callback returned shape "
+                    f"{matrix.shape}; expected {expected_shape}."
+                ),
+            )
+        if not np.all(np.isfinite(matrix)):
+            raise _SymbolicJacobianEvaluationError(
+                time=float(time),
+                reason="Analytic Jacobian callback returned non-finite values.",
+            )
         return matrix
 
     return guarded
@@ -360,25 +376,6 @@ def _execute_scipy(
     symbolic_jacobian = req.symbolic_jacobian
     jac_callable = symbolic_jacobian.jacobian_func
     jac_sparsity = symbolic_jacobian.jac_sparsity
-
-    def _disable_symbolic_jacobian_for_segment(
-        *,
-        code: str,
-        reason: str,
-    ) -> None:
-        nonlocal jac_callable, jac_sparsity
-        jac_callable = None
-        prov["symbolic_jacobian"] = False
-        prov["jacobian_sparsity_hint"] = jac_sparsity is not None
-        if symbolic_jacobian.has_executable_jacobian:
-            runtime_symbolic_jacobian = (
-                symbolic_jacobian.with_runtime_disabled(
-                    partially=False,
-                    code=code,
-                    reason=reason,
-                )
-            )
-            prov.update(runtime_symbolic_jacobian.provenance_fields())
 
     if jac_callable is not None and symbolic_jacobian.has_executable_jacobian:
         jac_callable = _guard_runtime_symbolic_jacobian(
@@ -453,25 +450,40 @@ def _execute_scipy(
 
     try:
         sol = _solve_once(method)
-    except _NonfiniteSymbolicJacobianError as exc:
-        _disable_symbolic_jacobian_for_segment(
-            code="nonfinite-runtime",
-            reason=(
-                "Symbolic Jacobian disabled for this segment because a runtime "
-                "evaluation was non-finite or invalid."
-            ),
-        )
-        prov["symbolic_jacobian_runtime_fallback"] = {
-            "code": "nonfinite-runtime",
-            "time": float(exc.time),
-            "segment": segment_identity.to_payload(),
-        }
+    except _SymbolicJacobianEvaluationError as exc:
         if (
             req.cancellation_control is not None
             and req.cancellation_control.cancel_requested()
         ):
             raise SimulationCancelled() from exc
-        sol = _solve_once(method)
+        if req.candidate_evaluation:
+            raise _SimulationScientificUnavailabilitySignal(
+                _SimulationScientificUnavailability(
+                    producer="analytic_jacobian",
+                    stage="runtime_evaluation",
+                    details={
+                        "solver": req.solver,
+                        "time": float(exc.time),
+                        "segment": segment_identity.to_payload(),
+                        "reason": exc.reason,
+                    },
+                )
+            ) from exc
+        raise SolverError(
+            "Analytic Jacobian evaluation failed at "
+            f"t={exc.time:.4e}: {exc.reason}",
+            suggestion=(
+                "Disable the analytic Jacobian preference to execute with the "
+                "solver's numerical Jacobian, or correct the reported "
+                "analytic evaluation condition."
+            ),
+            details={
+                "solver": req.solver,
+                "time": float(exc.time),
+                "segment": segment_identity.to_payload(),
+                "reason": exc.reason,
+            },
+        ) from exc
 
     if not sol.success:
         prov["solver_failure"] = str(sol.message)

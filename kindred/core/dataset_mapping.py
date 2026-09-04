@@ -163,24 +163,15 @@ def resolve_fit_t_start(
 
 
 def export_original_source(
-    document: ProjectDocument,
-    record: dataset_foundation.RawDatasetRecord,
+    source: dataset_foundation.ImportedSource,
     destination: str | os.PathLike[str],
 ) -> Path:
-    """Resolve and write a dataset's canonical source bytes to the destination.
+    """Write an admitted source's exact bytes to the destination.
 
     Passing a directory uses the original filename. Passing a file path writes
     to that exact path, allowing the integration-owned save dialog to control
     overwrite confirmation.
     """
-    if not isinstance(document, ProjectDocument):
-        raise TypeError("document must be a ProjectDocument.")
-    try:
-        validated_record = dataset_foundation.validate_raw_dataset_record(record)
-        source = document.imported_source(validated_record.source_id)
-        source = dataset_foundation.validate_imported_source(source)
-    except dataset_foundation.RawDatasetValidationError as exc:
-        raise DatasetMappingError(str(exc)) from exc
     original_filename = source.original_filename
     source_bytes = source.exact_source_bytes
     target = Path(destination)

@@ -772,18 +772,7 @@ class FittingWindow(QtWidgets.QDialog):
         if self._closing and not self._closing_after_cleanup:
             self._status.setText("Stopping…")
             return
-        self._status.setText(self._display_text(text))
-
-    def _display_text(self, text: object) -> str:
-        rendered = str(text)
-        for mapped in sorted(
-            self._origin.mapped_datasets,
-            key=lambda item: max(len(item.dataset_id), len(item.set_id)),
-            reverse=True,
-        ):
-            rendered = rendered.replace(mapped.dataset_id, mapped.display_name)
-            rendered = rendered.replace(mapped.set_id, mapped.set_name)
-        return rendered
+        self._status.setText(str(text))
 
     def set_live_best(self, update: FitLiveUpdate) -> None:
         if not isinstance(update, FitLiveUpdate):

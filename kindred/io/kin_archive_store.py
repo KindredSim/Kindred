@@ -313,7 +313,6 @@ def _encode_document(
     source_members: list[tuple[str, bytes]] = []
     source_payloads: list[dict[str, object]] = []
     for index, source in enumerate(document.imported_sources):
-        validate_imported_source(source)
         source_member = (
             f"{_SOURCE_MEMBER_PREFIX}{index:08d}/{source.original_filename}"
         )
@@ -328,20 +327,6 @@ def _encode_document(
         )
     datasets: list[dict[str, object]] = []
     for dataset in document.datasets:
-        source = next(
-            (
-                candidate
-                for candidate in document.imported_sources
-                if candidate.source_id == dataset.source_id
-            ),
-            None,
-        )
-        if source is None:
-            raise ValueError(
-                f"Dataset {dataset.dataset_id!r} references an unknown source."
-            )
-        validate_raw_dataset_record(dataset)
-        _require_replay_metadata(dataset, source, label=f"dataset {dataset.dataset_id!r}")
         datasets.append(
             {
                 "dataset_id": dataset.dataset_id,

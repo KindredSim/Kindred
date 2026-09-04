@@ -6,7 +6,6 @@ import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from fractions import Fraction
-from itertools import combinations
 
 from kindred.core.simulator.exact_constraint_composition import (
     ExactMonomial,
@@ -18,7 +17,6 @@ __all__ = [
     "CorrectionTarget",
     "CorrectionPlan",
     "CorrectionPlanner",
-    "plan_correction_basis",
     "build_correction_expressions",
 ]
 
@@ -52,7 +50,7 @@ class CorrectionTarget:
 @dataclass(frozen=True, slots=True)
 class CorrectionPlan:
     basis: tuple[str, ...]
-    assignments: tuple[tuple[str, str], ...]
+    constraint_basis: tuple[str, ...]
     available: bool
     reason: str | None = None
 
@@ -123,7 +121,7 @@ def _preference(target: CorrectionTarget, source_index: int) -> tuple[int, int, 
     """Rank correction families, then retain authenticated source order."""
 
     family = str(target.family)
-    if family in {"kf+kr", "kf", "kr"}:
+    if family in {"kf", "kr"}:
         return (0, 0 if family == "kr" else 1, source_index)
     if family == "Keq":
         return (1, 0, source_index)
@@ -219,8 +217,14 @@ def _has_unmaterializable_generated_factor(
     """Reject only surviving factors without an exact authored RHS value."""
 
     for (kind, value), power in factors.items():
-        if not power or kind != "symbol":
+        if not power:
             continue
+        if kind == "coefficient":
+            if ExactMonomial(Fraction(value)).power(power) is None:
+                return True
+            continue
+        if kind != "symbol":
+            return True
         name = str(value)
         if name == "C0" or re.fullmatch(r"degeneracy[1-9]\d*", name):
             return True
@@ -228,7 +232,7 @@ def _has_unmaterializable_generated_factor(
 
 
 def _solve_correction_factors(
-    composition: ExactConstraintComposition,
+    constraints: Sequence[object],
     basis: Sequence[str],
 ) -> tuple[
     tuple[tuple[Fraction, ...], ...],
@@ -236,7 +240,6 @@ def _solve_correction_factors(
 ] | None:
     """Solve one basis and aggregate its exact generated RHS factors."""
 
-    constraints = _correction_constraints(composition)
     inverse = _inverse(
         [
             tuple(_direct_source_power(item, name) for name in basis)
@@ -284,50 +287,36 @@ def _plan_for_basis(
 ) -> CorrectionPlan:
     return CorrectionPlan(
         basis=tuple(target.name for target in basis),
-        assignments=tuple(
-            (constraint.cycle_id, target.name)
-            for target, constraint in zip(basis, constraints, strict=True)
-        ),
+        constraint_basis=tuple(constraint.cycle_id for constraint in constraints),
         available=True,
     )
 
 
-def _choose_multiplicative_basis(
-    composition: ExactConstraintComposition,
+def _multiplicative_basis_is_admissible(
     constraints: Sequence[object],
-    eligible: Sequence[CorrectionTarget],
-) -> tuple[CorrectionTarget, ...] | None:
-    """Choose a full-rank basis whose RHS is an exact product of factors."""
+    candidate: Sequence[CorrectionTarget],
+) -> bool:
+    """Apply the one multiplicative rank/materialization admission rule."""
 
-    rows = [
-        tuple(_direct_source_power(item, target.name) for target in eligible)
+    if len(candidate) != len(constraints):
+        return False
+    candidate_rows = [
+        tuple(_direct_source_power(item, target.name) for target in candidate)
         for item in constraints
     ]
-    if _rank(rows) != len(constraints):
-        return None
-    for candidate in combinations(eligible, len(constraints)):
-        candidate_rows = [
-            tuple(_direct_source_power(item, target.name) for target in candidate)
-            for item in constraints
-        ]
-        if _rank(candidate_rows) != len(constraints):
-            continue
-        solution = _solve_correction_factors(
-            composition,
-            tuple(target.name for target in candidate),
-        )
-        if solution is None:
-            continue
-        _inverse_matrix, generated_factors = solution
-        if any(
-            _has_unmaterializable_generated_factor(factors)
-            for factors in generated_factors
-        ):
-            # Keep searching for a basis that does not require a symbolic-only
-            # C0 or degeneracy RHS.
-            continue
-        return tuple(candidate)
-    return None
+    if _rank(candidate_rows) != len(constraints):
+        return False
+    solution = _solve_correction_factors(
+        constraints,
+        tuple(target.name for target in candidate),
+    )
+    if solution is None:
+        return False
+    _inverse_matrix, generated_factors = solution
+    return not any(
+        _has_unmaterializable_generated_factor(factors)
+        for factors in generated_factors
+    )
 
 
 _ENERGY_FAMILIES = frozenset({"Ea", "dG_act", "dG_eq"})
@@ -336,20 +325,19 @@ _ENERGY_COMMON_POWERS = frozenset({"T"})
 
 def _energy_term_data(
     term: ExactMonomial,
-    energy_names: frozenset[str],
 ) -> tuple[str, Fraction, tuple[tuple[str, Fraction], ...]] | None:
-    """Split one additive exponent term into energy and common factors."""
+    """Split one linear energy term into its symbolic leaf and common factors."""
 
     if term.sum_terms or term.exponentials:
         return None
-    energy_powers = [
+    symbolic_powers = [
         (str(name), Fraction(power))
         for name, power in term.powers
-        if str(name) in energy_names
+        if str(name) not in _ENERGY_COMMON_POWERS
     ]
-    if len(energy_powers) != 1 or energy_powers[0][1] != 1:
+    if len(symbolic_powers) != 1 or symbolic_powers[0][1] != 1:
         return None
-    energy_name, _energy_power = energy_powers[0]
+    energy_name, _energy_power = symbolic_powers[0]
     common_powers = tuple(
         (str(name), Fraction(power))
         for name, power in term.powers
@@ -362,7 +350,6 @@ def _energy_term_data(
 
 def _energy_rows(
     constraints: Sequence[object],
-    energy_names: frozenset[str],
 ) -> tuple[dict[str, Fraction], ...] | None:
     """Return normalized linear energy coefficients for every exact row."""
 
@@ -379,7 +366,7 @@ def _energy_rows(
         argument = monomial.exponentials[0]
         terms = argument.sum_terms or (argument,)
         parsed = [
-            _energy_term_data(term, energy_names)
+            _energy_term_data(term)
             for term in terms
         ]
         if not parsed or any(value is None for value in parsed):
@@ -400,36 +387,157 @@ def _energy_rows(
     return tuple(rows)
 
 
-def _choose_energy_basis(
+def _energy_basis_is_admissible(
     constraints: Sequence[object],
-    eligible: Sequence[CorrectionTarget],
-) -> tuple[CorrectionTarget, ...] | None:
-    """Choose an exact linear basis for exponential energy residuals."""
+    candidate: Sequence[CorrectionTarget],
+) -> bool:
+    """Apply the one bounded linear-energy basis admission rule."""
 
-    if not eligible:
-        return None
-    energy_names = frozenset(
-        str(target.name)
-        for target in eligible
-    )
-    rows = _energy_rows(constraints, energy_names)
+    if len(candidate) != len(constraints) or not candidate:
+        return False
+    if any(target.family not in _ENERGY_FAMILIES for target in candidate):
+        return False
+    rows = _energy_rows(constraints)
     if rows is None:
-        return None
-    candidate_rows = [
-        tuple(row.get(target.name, Fraction(0)) for target in eligible)
+        return False
+    matrix = [
+        tuple(row.get(target.name, Fraction(0)) for target in candidate)
         for row in rows
     ]
-    if _rank(candidate_rows) != len(constraints):
-        return None
-    for candidate in combinations(eligible, len(constraints)):
-        matrix = [
-            tuple(row.get(target.name, Fraction(0)) for target in candidate)
-            for row in rows
+    return _rank(matrix) == len(constraints) and _inverse(matrix) is not None
+
+
+def _independent_row_indices(
+    rows: Sequence[Sequence[Fraction]],
+) -> tuple[int, ...]:
+    """Return the first source-ordered row basis of one exact matrix."""
+
+    selected: list[int] = []
+    current_rank = 0
+    for index, row in enumerate(rows):
+        candidate = [rows[item] for item in selected] + [row]
+        candidate_rank = _rank(candidate)
+        if candidate_rank > current_rank:
+            selected.append(index)
+            current_rank = candidate_rank
+    return tuple(selected)
+
+
+def _span_coefficients(
+    basis_rows: Sequence[Sequence[Fraction]],
+    row: Sequence[Fraction],
+) -> tuple[Fraction, ...] | None:
+    """Express one row in an independent row basis, if possible."""
+
+    if not basis_rows:
+        return () if not any(row) else None
+    required = len(basis_rows)
+    pivot_columns: list[int] = []
+    current_rank = 0
+    for column in range(len(row)):
+        projected = [
+            tuple(source[item] for item in (*pivot_columns, column))
+            for source in basis_rows
         ]
-        if _rank(matrix) != len(constraints) or _inverse(matrix) is None:
-            continue
-        return tuple(candidate)
-    return None
+        projected_rank = _rank(projected)
+        if projected_rank > current_rank:
+            pivot_columns.append(column)
+            current_rank = projected_rank
+            if current_rank == required:
+                break
+    if len(pivot_columns) != required:
+        return None
+    matrix = [
+        tuple(source[column] for column in pivot_columns)
+        for source in basis_rows
+    ]
+    inverse = _inverse(matrix)
+    if inverse is None:
+        return None
+    pivot_values = tuple(Fraction(row[column]) for column in pivot_columns)
+    coefficients = tuple(
+        sum(
+            (pivot_values[column] * inverse[column][basis_index]
+             for column in range(required)),
+            Fraction(0),
+        )
+        for basis_index in range(required)
+    )
+    reconstructed = tuple(
+        sum(
+            (coefficient * Fraction(source[column])
+             for coefficient, source in zip(coefficients, basis_rows, strict=True)),
+            Fraction(0),
+        )
+        for column in range(len(row))
+    )
+    return coefficients if reconstructed == tuple(map(Fraction, row)) else None
+
+
+def _multiplicative_rows_are_consistent(
+    constraints: Sequence[object],
+    target_rows: Sequence[Sequence[Fraction]],
+    independent_indices: Sequence[int],
+) -> bool:
+    """Prove that every exact product row follows from the retained row basis."""
+
+    basis_rows = tuple(target_rows[index] for index in independent_indices)
+    basis_constraints = tuple(constraints[index] for index in independent_indices)
+    for constraint, row in zip(constraints, target_rows, strict=True):
+        coefficients = _span_coefficients(basis_rows, row)
+        if coefficients is None:
+            return False
+        combined = ExactMonomial()
+        for basis_constraint, coefficient in zip(
+            basis_constraints,
+            coefficients,
+            strict=True,
+        ):
+            powered = basis_constraint.monomial.power(coefficient)
+            if powered is None:
+                return False
+            combined = combined.multiply(powered)
+        if combined != constraint.monomial:
+            return False
+    return True
+
+
+def _linear_rows_are_consistent(
+    rows: Sequence[Mapping[str, Fraction]],
+    target_rows: Sequence[Sequence[Fraction]],
+    independent_indices: Sequence[int],
+) -> bool:
+    """Prove that every linear energy row follows from the retained row basis."""
+
+    basis_target_rows = tuple(target_rows[index] for index in independent_indices)
+    basis_rows = tuple(rows[index] for index in independent_indices)
+    for row, target_row in zip(rows, target_rows, strict=True):
+        coefficients = _span_coefficients(basis_target_rows, target_row)
+        if coefficients is None:
+            return False
+        names = set(row)
+        for basis_row in basis_rows:
+            names.update(basis_row)
+        reconstructed = {
+            name: value
+            for name in names
+            if (
+                value := sum(
+                    (
+                        coefficient * basis_row.get(name, Fraction(0))
+                        for coefficient, basis_row in zip(
+                            coefficients,
+                            basis_rows,
+                            strict=True,
+                        )
+                    ),
+                    Fraction(0),
+                )
+            )
+        }
+        if reconstructed != dict(row):
+            return False
+    return True
 
 
 def _render_linear_term(name: str, coefficient: Fraction) -> str:
@@ -463,13 +571,7 @@ def _build_energy_correction_expressions(
     constraints: Sequence[object],
     basis: Sequence[str],
 ) -> dict[str, str] | None:
-    energy_names = frozenset(
-        str(name)
-        for item in constraints
-        for name in item.monomial.coordinate_power_map()
-        if re.fullmatch(r"(?:Ea|dG_act|dG_eq)[1-9][0-9]*", str(name))
-    )
-    rows = _energy_rows(constraints, energy_names)
+    rows = _energy_rows(constraints)
     if rows is None:
         return None
     matrix = [
@@ -514,6 +616,261 @@ class CorrectionPlanner:
                 raise ValueError(f"Duplicate correction target {name!r}.")
             admitted[name] = target
         self.targets = admitted
+        self._constraints = _correction_constraints(composition)
+        self._eligible = self._ordered_eligible_targets()
+        (
+            self._system_kind,
+            self._system_constraints,
+            self._system_rows,
+            self._system_targets,
+            self._system_reason,
+        ) = self._build_correction_system()
+        self._completion_cache: dict[frozenset[str], bool] = {}
+
+    @property
+    def required_basis_size(self) -> int:
+        """Number of dependent coordinates required by the exact system."""
+
+        return len(self._system_constraints)
+
+    def _ordered_eligible_targets(self) -> tuple[CorrectionTarget, ...]:
+        source_order = tuple(self.targets)
+        eligible = [target for target in self.targets.values() if target.eligible]
+        eligible.sort(
+            key=lambda target: _preference(
+                target,
+                source_order.index(target.name),
+            )
+        )
+        return tuple(eligible)
+
+    def _build_correction_system(
+        self,
+    ) -> tuple[
+        str,
+        tuple[object, ...],
+        tuple[dict[str, Fraction], ...],
+        tuple[CorrectionTarget, ...],
+        str | None,
+    ]:
+        """Build the one independent exact system used by every planner API."""
+
+        constraints = self._constraints
+        if not constraints:
+            return "multiplicative", (), (), self._eligible, None
+
+        if not any(_has_unsupported_source_factor(item) for item in constraints):
+            kind = "multiplicative"
+            system_targets = self._eligible
+            rows = tuple(dict(item.monomial.powers) for item in constraints)
+        else:
+            kind = "energy"
+            system_targets = tuple(
+                target
+                for target in self._eligible
+                if target.family in _ENERGY_FAMILIES
+            )
+            energy_rows = _energy_rows(constraints)
+            if energy_rows is None:
+                return (
+                    kind,
+                    (),
+                    (),
+                    system_targets,
+                    "exact source correction requires a bounded linear energy projection",
+                )
+            rows = energy_rows
+
+        target_names = tuple(target.name for target in system_targets)
+        target_rows = tuple(
+            tuple(row.get(name, Fraction(0)) for name in target_names)
+            for row in rows
+        )
+        independent_indices = _independent_row_indices(target_rows)
+        if not independent_indices:
+            return (
+                kind,
+                (),
+                (),
+                system_targets,
+                "no source-backed editable unlocked global full-rank correction basis is available",
+            )
+        consistent = (
+            _multiplicative_rows_are_consistent(
+                constraints,
+                target_rows,
+                independent_indices,
+            )
+            if kind == "multiplicative"
+            else _linear_rows_are_consistent(
+                rows,
+                target_rows,
+                independent_indices,
+            )
+        )
+        if not consistent:
+            return (
+                kind,
+                (),
+                (),
+                system_targets,
+                "the exact constraints contain independent requirements without "
+                "enough editable correction coordinates",
+            )
+        return (
+            kind,
+            tuple(constraints[index] for index in independent_indices),
+            tuple(rows[index] for index in independent_indices),
+            system_targets,
+            None,
+        )
+
+    def _column_rank(self, targets: Sequence[CorrectionTarget]) -> int:
+        return _rank(
+            [
+                tuple(row.get(target.name, Fraction(0)) for target in targets)
+                for row in self._system_rows
+            ]
+        )
+
+    def _basis_is_admissible(
+        self,
+        candidate: Sequence[CorrectionTarget],
+    ) -> bool:
+        if self._system_reason is not None:
+            return False
+        if self._system_kind == "multiplicative":
+            return _multiplicative_basis_is_admissible(
+                self._system_constraints,
+                candidate,
+            )
+        return _energy_basis_is_admissible(self._system_constraints, candidate)
+
+    def _selected_targets(
+        self,
+        selected_names: Sequence[str],
+    ) -> tuple[CorrectionTarget, ...] | None:
+        selected = tuple(selected_names)
+        selected_set = set(selected)
+        if len(selected_set) != len(selected):
+            return None
+        if not selected_set.issubset(target.name for target in self._system_targets):
+            return None
+        return tuple(
+            target for target in self._system_targets if target.name in selected_set
+        )
+
+    def _rank_only_completion_is_safe(self) -> bool:
+        if self._system_kind == "energy":
+            return True
+        return all(
+            item.monomial.coefficient == 1
+            and not any(
+                name == "C0" or re.fullmatch(r"degeneracy[1-9]\d*", name)
+                for name, _power in item.monomial.powers
+            )
+            for item in self._system_constraints
+        )
+
+    def _selection_can_complete(
+        self,
+        selected: tuple[CorrectionTarget, ...],
+    ) -> bool:
+        selected_names = frozenset(target.name for target in selected)
+        cached = self._completion_cache.get(selected_names)
+        if cached is not None:
+            return cached
+        required = self.required_basis_size
+        selected_rank = self._column_rank(selected)
+        if selected_rank != len(selected):
+            result = False
+        elif len(selected) == required:
+            result = self._basis_is_admissible(selected)
+        elif self._rank_only_completion_is_safe():
+            result = True
+        else:
+            result = any(
+                self._selection_can_complete((*selected, target))
+                for target in self._system_targets
+                if target.name not in selected_names
+                and self._column_rank((*selected, target)) == len(selected) + 1
+            )
+        self._completion_cache[selected_names] = result
+        return result
+
+    def partial_selection_can_complete(
+        self,
+        selected_names: Sequence[str],
+    ) -> bool:
+        """Whether one dependent-target selection extends to an exact basis."""
+
+        if any(item.status == "unresolved" for item in self.composition.constraints):
+            return False
+        if self._system_reason is not None:
+            return False
+        required = self.required_basis_size
+        selected = self._selected_targets(selected_names)
+        if selected is None or len(selected) > required:
+            return False
+        return self._selection_can_complete(selected)
+
+    def viable_next_targets(
+        self,
+        selected_names: Sequence[str],
+    ) -> tuple[str, ...]:
+        """Return every unchecked target preserving at least one completion."""
+
+        selected = tuple(selected_names)
+        selected_set = set(selected)
+        if len(selected) >= self.required_basis_size:
+            return ()
+        return tuple(
+            target.name
+            for target in self._system_targets
+            if target.name not in selected_set
+            and self.partial_selection_can_complete((*selected, target.name))
+        )
+
+    def plan_selected_basis(
+        self,
+        selected_names: Sequence[str],
+    ) -> CorrectionPlan:
+        """Validate and build the exact plan for one user-selected basis."""
+
+        unresolved = tuple(
+            item for item in self.composition.constraints if item.status == "unresolved"
+        )
+        if unresolved:
+            reasons = "; ".join(
+                f"{item.cycle_id}: {item.reason or 'unresolved exact constraint'}"
+                for item in unresolved
+            )
+            return CorrectionPlan((), (), False, reasons)
+        if self._system_reason is not None:
+            return CorrectionPlan((), (), False, self._system_reason)
+        selected = self._selected_targets(selected_names)
+        if selected is None:
+            return CorrectionPlan(
+                (),
+                (),
+                False,
+                "selected correction targets must be distinct and eligible",
+            )
+        if len(selected) != self.required_basis_size:
+            return CorrectionPlan(
+                (),
+                (),
+                False,
+                f"select exactly {self.required_basis_size} dependent parameters",
+            )
+        if not self._basis_is_admissible(selected):
+            return CorrectionPlan(
+                (),
+                (),
+                False,
+                "selected correction targets do not form an admissible full-rank basis",
+            )
+        return _plan_for_basis(self._system_constraints, selected)
 
     def plan(self) -> CorrectionPlan:
         unresolved = tuple(
@@ -525,61 +882,41 @@ class CorrectionPlanner:
                 for item in unresolved
             )
             return CorrectionPlan((), (), False, reasons)
-        constraints = _correction_constraints(self.composition)
         unsatisfied = tuple(
-            item for item in constraints if item.status == "unsatisfied"
+            item for item in self._constraints if item.status == "unsatisfied"
         )
         if not unsatisfied:
             return CorrectionPlan((), (), True)
-        eligible = [
-            target
-            for target in self.targets.values()
-            if target.eligible
-        ]
-        eligible.sort(
-            key=lambda target: _preference(
-                target,
-                tuple(self.targets).index(target.name),
-            )
-        )
-        # A direct multiplicative basis remains the preferred route for
-        # authored k/kf/kr/Keq/A/kappa coordinates.  Exponential residuals
-        # cannot be represented by this solver; leave those rows for the
-        # bounded energy projection below.
-        if not any(_has_unsupported_source_factor(item) for item in constraints):
-            basis = _choose_multiplicative_basis(self.composition, constraints, eligible)
-            if basis is not None:
-                return _plan_for_basis(constraints, basis)
-
-        energy_eligible = [
-            target
-            for target in eligible
-            if target.family in {"Ea", "dG_act", "dG_eq"}
-        ]
-        energy_basis = _choose_energy_basis(constraints, energy_eligible)
-        if energy_basis is not None:
-            return _plan_for_basis(constraints, energy_basis)
-
-        if any(_has_unsupported_source_factor(item) for item in constraints):
-            return CorrectionPlan(
-                (),
-                (),
-                False,
-                "exact source correction requires a bounded linear energy projection",
-            )
+        if self._system_reason is not None:
+            return CorrectionPlan((), (), False, self._system_reason)
+        basis: list[CorrectionTarget] = []
+        for target in self._system_targets:
+            candidate = (*basis, target)
+            if self._column_rank(candidate) == len(candidate):
+                basis.append(target)
+                if len(basis) == self.required_basis_size:
+                    break
+        if self._basis_is_admissible(basis):
+            return _plan_for_basis(self._system_constraints, basis)
+        if self._selection_can_complete(()) and not self._rank_only_completion_is_safe():
+            for target in self._system_targets:
+                if self._selection_can_complete((target,)):
+                    basis = [target]
+                    while len(basis) < self.required_basis_size:
+                        next_target = next(
+                            item
+                            for item in self._system_targets
+                            if item not in basis
+                            and self._selection_can_complete((*basis, item))
+                        )
+                        basis.append(next_target)
+                    return _plan_for_basis(self._system_constraints, basis)
         return CorrectionPlan(
             (),
             (),
             False,
             "no source-backed editable unlocked global full-rank correction basis is available",
         )
-
-
-def plan_correction_basis(
-    composition: ExactConstraintComposition,
-    targets: Mapping[str, CorrectionTarget] | Sequence[CorrectionTarget],
-) -> CorrectionPlan:
-    return CorrectionPlanner(composition, targets).plan()
 
 
 def _render_fraction(value: Fraction) -> str:
@@ -603,11 +940,20 @@ def build_correction_expressions(
 
     if not plan.available or not plan.basis:
         return {}
-    constraints = _correction_constraints(composition)
+    constraints_by_id = {
+        item.cycle_id: item
+        for item in _correction_constraints(composition)
+    }
+    try:
+        constraints = tuple(
+            constraints_by_id[cycle_id]
+            for cycle_id in plan.constraint_basis
+        )
+    except KeyError as exc:
+        raise ValueError("Correction plan constraint basis is absent from the composition.") from exc
     basis = tuple(plan.basis)
-    assignment_map = dict(plan.assignments)
-    if tuple(assignment_map.get(item.cycle_id) for item in constraints) != basis:
-        raise ValueError("Correction plan assignments do not match its global basis.")
+    if len(constraints) != len(basis):
+        raise ValueError("Correction plan constraint and parameter bases differ in size.")
 
     if any(_has_unsupported_source_factor(item) for item in constraints):
         expressions = _build_energy_correction_expressions(constraints, basis)
@@ -617,7 +963,7 @@ def build_correction_expressions(
             )
         return expressions
 
-    solution = _solve_correction_factors(composition, basis)
+    solution = _solve_correction_factors(constraints, basis)
     if solution is None:
         raise ValueError("Correction basis is not invertible.")
     _inverse_matrix, generated_factors = solution

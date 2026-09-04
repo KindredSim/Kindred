@@ -613,11 +613,6 @@ class PreparedDslRequestSet:
                 structure = self.__symbolic_jacobian_structure
         return structure
 
-    def ensure_scientific_structures(self) -> tuple[object, object]:
-        """Build common scientific structures before target-local execution."""
-
-        return self.compiled_ode_topology(), self.symbolic_jacobian_structure()
-
     def temperature_schedule_for_execution(self) -> Optional["TemperatureScheduleProtocol"]:
         """Return the accepted mechanism's retained typed schedule directly."""
 

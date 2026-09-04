@@ -11,10 +11,7 @@ from typing import Optional
 import numpy as np
 
 from kindred.core.analysis.dataset_parameter_overrides import (
-    FitCentredFixedEffectsParamSpec,
-    FitCoupledVariableParamSpec,
     FitDatasetParameterOverrides,
-    FitSharedVariableParamSpec,
 )
 from kindred.core.analysis.fit_dataset_payload import FitDatasetSpec
 from kindred.core.analysis.fit_uncertainty import (
@@ -57,12 +54,10 @@ def _validate_run_inputs(
     *,
     fit_evaluators: Mapping[str, object],
     datasets: Sequence[FitDatasetSpec],
-    shared_variables: Sequence[FitSharedVariableParamSpec],
     dataset_overrides: Sequence[FitDatasetParameterOverrides],
 ) -> tuple[
     list[FitDatasetSpec],
     dict[str, object],
-    tuple[FitSharedVariableParamSpec, ...],
     tuple[FitDatasetParameterOverrides, ...],
 ]:
     payloads = sorted(datasets, key=lambda item: str(getattr(item, "dataset_id", "")))
@@ -89,11 +84,6 @@ def _validate_run_inputs(
             + "."
         )
 
-    shared = tuple(sorted(shared_variables, key=lambda item: item.name))
-    shared_names = [item.name for item in shared]
-    if len(shared_names) != len(set(shared_names)):
-        raise ValueError("Shared Fit parameter names must be unique.")
-
     overrides = tuple(sorted(dataset_overrides, key=lambda item: item.dataset_id))
     override_ids = [item.dataset_id for item in overrides]
     if len(override_ids) != len(set(override_ids)):
@@ -105,17 +95,14 @@ def _validate_run_inputs(
             + ", ".join(unknown_overrides)
             + "."
         )
-    return payloads, evaluators, shared, overrides
+    return payloads, evaluators, overrides
 
 
 def fit_global(
     *,
     fit_evaluators: Mapping[str, object],
     datasets: Sequence[FitDatasetSpec],
-    shared_variables: Sequence[FitSharedVariableParamSpec],
     dataset_overrides: Sequence[FitDatasetParameterOverrides] = (),
-    coupled_variables: Sequence[FitCoupledVariableParamSpec] = (),
-    centred_variables: Sequence[FitCentredFixedEffectsParamSpec] = (),
     weights: Optional[Mapping[str, float]] = None,
     method: str,
     max_nfev: int = 1000,
@@ -146,22 +133,11 @@ def fit_global(
     )
     if max_nfev <= 0:
         raise ValueError("Fit evaluation budget must be positive.")
-    payloads, evaluators, shared, overrides = _validate_run_inputs(
+    payloads, evaluators, overrides = _validate_run_inputs(
         fit_evaluators=fit_evaluators,
         datasets=datasets,
-        shared_variables=shared_variables,
         dataset_overrides=dataset_overrides,
     )
-    coupled = tuple(coupled_variables)
-    centred = tuple(centred_variables)
-    if any(not isinstance(item, FitCentredFixedEffectsParamSpec) for item in centred):
-        raise TypeError("Centred Fit requests must contain typed parameter specifications.")
-    shared_params = {item.name: item.initial for item in shared}
-    shared_bounds = {
-        item.name: (item.minimum, item.maximum)
-        for item in shared
-    }
-    shared_log10 = {item.name: item.log10 for item in shared}
     fixed_dataset_params = {
         item.dataset_id: dict(item.fixed_params)
         for item in overrides
@@ -173,21 +149,6 @@ def fit_global(
     if not isinstance(optimizer_layout, _fit_execution.FitParameterLayout):
         raise TypeError("Global Fit requires its pre-dispatch optimizer layout.")
     layout = optimizer_layout
-    expected_layout = _fit_execution.build_parameter_layout_for_dataset_ids(
-        dataset_ids=tuple(item.dataset_id for item in payloads),
-        shared_params=shared_params,
-        dataset_overrides=overrides,
-        coupled_variables=coupled,
-        bounds=shared_bounds,
-        log10_params=shared_log10,
-        centred_variables=centred,
-    )
-    if (
-        layout.opt_param_keys() != expected_layout.opt_param_keys()
-        or layout.initial_params() != expected_layout.initial_params()
-        or layout.bounds_dict() != expected_layout.bounds_dict()
-    ):
-        raise ValueError("Pre-dispatch Fit optimizer layout no longer matches execution.")
 
     logger.info(
         "Global fitting: %d datasets, %d optimizer coordinates",
@@ -413,10 +374,7 @@ def fit_global(
                 return fit_global(
                     fit_evaluators=evaluators,
                     datasets=synthetic_payloads,
-                    shared_variables=shared,
                     dataset_overrides=overrides,
-                    coupled_variables=coupled,
-                    centred_variables=centred,
                     weights=weights_norm,
                     method=residual_bootstrap.optimizer_method,
                     max_nfev=max_nfev,

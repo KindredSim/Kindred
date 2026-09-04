@@ -7,7 +7,7 @@ Current contract
   - species: OrderedDict[str, Species] (preserves declaration order)
   - reactions: list[Reaction]
   - equilibria: list[Equilibrium]
-  - metadata: dict includes declaration_order: list[str]
+  - metadata: dict
 - Species:
   - name: str
   - initial_conc: finite non-negative float  (standard state basis)
@@ -377,14 +377,14 @@ class Mechanism:
     species : OrderedDict[str, Species]
     reactions : list[Reaction]
     equilibria : list[Equilibrium]
-    metadata : dict   (includes 'declaration_order')
+    metadata : dict
     """
 
     def __init__(self) -> None:
         self._species: "OrderedDict[str, Species]" = _SpeciesMap()
         self.reactions: List[Reaction] = []
         self.equilibria: List[Equilibrium] = []
-        self.metadata: Dict[str, Any] = {"declaration_order": []}
+        self.metadata: Dict[str, Any] = {}
 
     @property
     def species(self) -> "OrderedDict[str, Species]":
@@ -393,8 +393,6 @@ class Mechanism:
     @species.setter
     def species(self, value: Mapping[str, Species] | Iterable[tuple[str, Species]] | None) -> None:
         self._species = _SpeciesMap(value)
-        if hasattr(self, "metadata"):
-            self._sync_metadata_order()
 
     # ---------- species management ----------
 
@@ -404,14 +402,10 @@ class Mechanism:
             raise ValueError(f"species {n!r} already exists")
         sp = Species(n, initial_conc)
         self.species[n] = sp
-        self._sync_metadata_order()
         return sp
 
     def species_names(self) -> List[str]:
         return list(self.species.keys())
-
-    def _sync_metadata_order(self) -> None:
-        self.metadata["declaration_order"] = self.species_names()
 
     # ---------- step additions ----------
 

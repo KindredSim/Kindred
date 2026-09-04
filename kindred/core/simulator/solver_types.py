@@ -257,7 +257,6 @@ class SimulationOutput:
         Y = np.asarray(self.Y, dtype=float).copy()
         if (
             t.ndim != 1
-            or t.size == 0
             or np.any(~np.isfinite(t))
             or np.any(t < 0.0)
             or np.any(t > TIME_MAX_S)
@@ -315,6 +314,8 @@ class FinalSimulationOutput(SimulationOutput):
 
     def __post_init__(self) -> None:
         super().__post_init__()
+        if not self.t.size:
+            raise ValueError("Final simulation output cannot be empty.")
 
         def identity_vector(value: object, *, field: str) -> np.ndarray:
             raw = np.asarray(value)

@@ -1219,19 +1219,11 @@ def _apply_parameter_overrides_to_prepared_mechanism(
     # physical/scalar/indexed value.  This guarantees a later invalid target
     # cannot leave an earlier target mutated in the isolated shell.
     from kindred.core.simulator.parameter_algebra import (
-        _admit_mechanism_parameter_value,
-    )
-    from kindred.core.kinetics import (
-        ConstantRateModel,
-        forward_rate_model_for_equilibrium,
-        forward_rate_model_for_reaction,
-    )
-    mechanism_metadata = MechanismMetadataView.from_metadata(
-        getattr(mechanism, "metadata", {}) or {}
+        _prepare_mechanism_param_replacement,
     )
     reaction_replacements: dict[int, object] = {}
     equilibrium_replacements: dict[int, object] = {}
-    indexed_values: list[tuple[str, str, int, str, float, Mapping[str, object]]] = []
+    indexed_values: list[tuple[str, str, int, str, object]] = []
     for name, value in sorted(
         (str(name), float(value)) for name, value in mechanism_binding_values.items()
     ):
@@ -1249,44 +1241,21 @@ def _apply_parameter_overrides_to_prepared_mechanism(
                 role=target_role,
                 entry=entry,
             )
-        admitted = _admit_mechanism_parameter_value(
+        replacement = _prepare_mechanism_param_replacement(
             mechanism,
             name,
             value,
+            require_mutable=True,
             parameter_target_map=parameter_target_map,
         )
-        indexed_values.append((name, kind, index, target_role, admitted, entry))
+        indexed_values.append((name, kind, index, target_role, replacement))
 
-    def _new_indexed_binding(
-        *,
-        name: str,
-        model: object,
-        value: float,
-    ) -> RateBinding:
-        if isinstance(model, ConstantRateModel):
-            return RateBinding(name=name, value=float(value))
-        binding = ForwardRateBinding(
-            name=name,
-            model=model,
-            reference_temperature_K=float(mechanism_metadata.temperature_K),
-        )
-        binding.set(float(value))
-        return binding
-
-    for name, kind, index, role, value, entry in indexed_values:
+    for name, kind, index, role, replacement in indexed_values:
         if kind == "reaction" and role == "k":
             reaction = reaction_replacements.get(index, mechanism.reactions[index])
-            model = forward_rate_model_for_reaction(
-                reaction,
-                default_standard_conc_M=float(mechanism_metadata.standard_conc_M),
-            )
             reaction_replacements[index] = replace(
                 reaction,
-                rate=_new_indexed_binding(
-                    name=name,
-                    model=model,
-                    value=value,
-                ),
+                rate=replacement.rate,
             )
             continue
         if kind != "equilibrium" or role not in {"kf", "kr", "Keq"}:
@@ -1296,36 +1265,21 @@ def _apply_parameter_overrides_to_prepared_mechanism(
                 parameter_names=(name,),
             )
         equilibrium = equilibrium_replacements.get(index, mechanism.equilibria[index])
-        if role in {"kf", "kr"}:
-            if role == "kf":
-                model = forward_rate_model_for_equilibrium(
-                    equilibrium,
-                    temperature_K=float(mechanism_metadata.temperature_K),
-                    default_standard_conc_M=float(mechanism_metadata.standard_conc_M),
-                )
-                equilibrium_replacements[index] = replace(
-                    equilibrium,
-                    kf=_new_indexed_binding(
-                        name=name,
-                        model=model,
-                        value=value,
-                    ),
-                )
-            else:
-                equilibrium_replacements[index] = replace(
-                    equilibrium,
-                    kr=RateBinding(name=name, value=float(value)),
-                )
-            continue
-        equilibrium_metadata = dict(getattr(equilibrium, "metadata", {}) or {})
-        equilibrium_metadata[EquilibriumMetadataKeys.KEQ_INPUT] = RateBinding(
-            name=name,
-            value=float(value),
-        )
-        equilibrium_replacements[index] = replace(
-            equilibrium,
-            metadata=equilibrium_metadata,
-        )
+        if role == "kf":
+            equilibrium_replacements[index] = replace(
+                equilibrium,
+                kf=replacement.kf,
+            )
+        elif role == "kr":
+            equilibrium_replacements[index] = replace(
+                equilibrium,
+                kr=replacement.kr,
+            )
+        else:
+            equilibrium_replacements[index] = replace(
+                equilibrium,
+                metadata=replacement.metadata,
+            )
 
     physical_values = {
         str(canonical_name): float(raw_values[raw_name])
@@ -1492,7 +1446,11 @@ def prepare_simulation_worker_run(
             "execution grid cannot be realized on this time span.",
         ) from exc
     topology = execution_request.prepared_dsl.compiled_ode_topology()
-    symbolic_structure = execution_request.prepared_dsl.symbolic_jacobian_structure()
+    symbolic_structure = (
+        execution_request.prepared_dsl.symbolic_jacobian_structure()
+        if prepared_solver_config.use_analytic_jacobian
+        else None
+    )
     _raise_if_cancelled(cancellation_control)
 
     mechanism = execution_request.prepared_dsl.mutable_mechanism_shell()
@@ -1603,6 +1561,7 @@ def prepare_simulation_worker_run(
         temperature_schedule, runtime_symbolic_jacobian, preparation_warnings = build_prepared_run_context(
             mechanism=mechanism,
             temperature_schedule=temperature_schedule_override,
+            use_analytic_jacobian=prepared_solver_config.use_analytic_jacobian,
             symbolic_structure=symbolic_structure,
             coefficient_evaluator=_coefficient_evaluator,
         )
@@ -1615,12 +1574,6 @@ def prepare_simulation_worker_run(
     except Exception as exc:
         raise SimulationPreparationError("initials_for_algebra", str(exc)) from exc
 
-    if not prepared_solver_config.use_analytic_jacobian:
-        runtime_symbolic_jacobian = SymbolicJacobianExecution.disabled(
-            code="policy-disabled",
-            reason="Symbolic Jacobian runtime use disabled by analytic Jacobian policy.",
-            jac_sparsity=runtime_symbolic_jacobian.jac_sparsity,
-        )
     request = execution_request
 
     return PreparedSimulationRun(

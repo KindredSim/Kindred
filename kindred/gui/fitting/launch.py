@@ -146,23 +146,6 @@ class FitObservationSnapshot:
             "model_target",
             _required(self.model_target, "mapped model target"),
         )
-        times = tuple(_finite(value, "observation time") for value in self.t)
-        values = tuple(_finite(value, "observation value") for value in self.y)
-        if len(times) != len(values) or not times:
-            raise ValueError("Fit observation requires equal nonempty t/y values.")
-        rows = tuple(int(value) for value in self.source_rows)
-        if (
-            len(rows) != len(times)
-            or any(row <= 0 for row in rows)
-            or len(set(rows)) != len(rows)
-        ):
-            raise ValueError(
-                "Fit observations require complete unique positive physical "
-                "source-row identity."
-            )
-        object.__setattr__(self, "t", times)
-        object.__setattr__(self, "y", values)
-        object.__setattr__(self, "source_rows", rows)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1203,9 +1186,7 @@ def capture_fit_origin(
             and dataset_id not in selected_dataset_ids
         ):
             continue
-        dataset = dataset_foundation.validate_raw_dataset_record(
-            document.dataset(dataset_id)
-        )
+        dataset = document.dataset(dataset_id)
         initial_set = tab.initial_condition_set(link.set_id)
         validated = (
             dataset_foundation.validate_fit_inclusion(
