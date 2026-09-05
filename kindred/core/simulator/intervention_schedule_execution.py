@@ -93,8 +93,8 @@ class SegmentRunResult:
     identity: SegmentIdentity
     t: np.ndarray
     Y: np.ndarray
-    event_times: Sequence[Sequence[float]]
-    raw_event_states: Sequence[Sequence[np.ndarray]]
+    event_times: tuple[tuple[float, ...], ...]
+    raw_event_states: tuple[tuple[np.ndarray, ...], ...]
     raw_terminal_state: np.ndarray | None
     trajectory_projection: NonnegativeProjection
     event_state_projection: NonnegativeProjection
@@ -407,17 +407,11 @@ class InterventionScheduleExecutionOwner:
                     raise InterventionScheduleError(
                         "Segment runner returned a mismatched segment identity."
                     )
-                event_times = _normal_event_times(
-                    segment_result.event_times, count=len(segment_events)
-                )
-                event_states = _normal_event_states(
-                    segment_result.raw_event_states,
-                    count=len(segment_events),
-                    species_count=current_y.size,
-                )
+                event_times = segment_result.event_times
+                event_states = segment_result.raw_event_states
                 if active_holds:
-                    event_states = [
-                        [
+                    event_states = tuple(
+                        tuple(
                             _apply_holds(
                                 state,
                                 active_holds,
@@ -425,9 +419,9 @@ class InterventionScheduleExecutionOwner:
                                 cancellation_check=cancellation_check,
                             )
                             for state in states
-                        ]
+                        )
                         for states in event_states
-                    ]
+                    )
                 trigger_hit = (
                     _first_trigger_hit(
                         event_times,
@@ -1736,41 +1730,6 @@ def _first_purge_hit(
         tuple(dict.fromkeys(item[1] for item in simultaneous)),
         state,
     )
-
-
-def _normal_event_times(
-    values: object, *, count: int
-) -> list[list[float]]:
-    output = [[] for _ in range(count)]
-    if not isinstance(values, Sequence):
-        return output
-    for index, raw in enumerate(values[:count]):
-        try:
-            output[index] = [float(value) for value in raw]
-        except TypeError:
-            output[index] = []
-    return output
-
-
-def _normal_event_states(
-    values: object, *, count: int, species_count: int
-) -> list[list[np.ndarray]]:
-    output: list[list[np.ndarray]] = [[] for _ in range(count)]
-    if not isinstance(values, Sequence):
-        return output
-    for index, raw in enumerate(values[:count]):
-        if not isinstance(raw, Sequence):
-            continue
-        for state in raw:
-            # Event normalization owns a detached row before any boundary
-            # action can mutate the continuation state.
-            array = np.asarray(state, dtype=float).reshape(-1).copy()
-            if array.size != species_count:
-                raise InterventionScheduleError(
-                    "Trigger event-time state has the wrong species count."
-                )
-            output[index].append(array)
-    return output
 
 
 def _requested_eval(

@@ -337,9 +337,8 @@ def validate_raw_dataset_record(record: RawDatasetRecord) -> RawDatasetRecord:
             not series.t
             or len(series.t) != len(series.y)
             or len(series.t) != len(series.source_rows)
-            or any(type(value) is not float or not math.isfinite(value) for value in (*series.t, *series.y))
         ):
-            fail(f"Raw dataset {record.dataset_id!r} observation {name!r} must retain equal nonempty finite float time/value tuples aligned with source rows.")
+            fail(f"Raw dataset {record.dataset_id!r} observation {name!r} must retain equal nonempty time/value tuples aligned with source rows.")
         if any(type(row) is not int or row <= 0 for row in series.source_rows):
             fail(f"Raw dataset {record.dataset_id!r} observation {name!r} source rows must be positive integers.")
         if len(set(series.source_rows)) != len(series.source_rows):

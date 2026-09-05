@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import logging
 import math
-from typing import Dict, Mapping, Optional, Tuple
+from typing import Dict, Mapping, Tuple
 
 import numpy as np
 
@@ -25,9 +25,6 @@ from kindred.core.algebra.parser import (
     UnaryNode,
 )
 from kindred.core.algebra.identifier_canonicalization import canonicalize_algebra_block
-from kindred.core.algebra.symbol_table import (
-    build_algebra_symbol_table as _build_algebra_symbol_table,
-)
 from kindred.core.algebra.symbols import SymbolTable
 from kindred.core.simulator.parameter_algebra_spec import (
     invalid_parameter_algebra_identifier_reference_message,
@@ -191,22 +188,18 @@ def compile_algebra_observables(
 
 
 def _build_simulation_context(
-    mechanism: object,
     *,
     t: np.ndarray,
     species_series: Dict[str, np.ndarray],
     initials: Dict[str, float],
-    temperature_K: Optional[float],
-    symbol_series: Mapping[str, np.ndarray | float] | None,
-    symbol_values: Mapping[str, float] | None,
+    symbol_series: Mapping[str, np.ndarray | float],
+    symbol_values: Mapping[str, float],
 ) -> EvaluationContext:
     """Build one row-aligned context for the retained Algebra program."""
     t_arr = np.asarray(t, dtype=float).reshape(-1)
-    runtime_series: Dict[str, np.ndarray | float] = dict(symbol_series or {})
+    runtime_series: Dict[str, np.ndarray | float] = dict(symbol_series)
     runtime_series.setdefault("t", t_arr)
-    if temperature_K is not None and "T" not in runtime_series:
-        runtime_series["T"] = float(temperature_K)
-    symtab = _build_algebra_symbol_table(mechanism)
+    symtab = SymbolTable()
     return EvaluationContext(
         t=t_arr,
         species_series={k: np.asarray(v, dtype=float).reshape(-1) for k, v in species_series.items()},
@@ -214,20 +207,18 @@ def _build_simulation_context(
         species_names=set(species_series.keys()),
         symtab=symtab,
         symbol_series=runtime_series,
-        symbol_values={str(name): float(value) for name, value in (symbol_values or {}).items()},
+        symbol_values={str(name): float(value) for name, value in symbol_values.items()},
     )
 
 
 def evaluate_compiled_algebra_series_for_simulation(
-    mechanism: object,
     compiled: CompiledAlgebraSeries,
     *,
     t: np.ndarray,
     species_series: Dict[str, np.ndarray],
     initials: Dict[str, float],
-    temperature_K: Optional[float] = None,
-    symbol_series: Mapping[str, np.ndarray | float] | None = None,
-    symbol_values: Mapping[str, float] | None = None,
+    symbol_series: Mapping[str, np.ndarray | float],
+    symbol_values: Mapping[str, float],
 ) -> Tuple[Dict[str, np.ndarray], Dict[str, float]]:
     """Evaluate retained observables against canonical row-local context.
 
@@ -236,11 +227,9 @@ def evaluate_compiled_algebra_series_for_simulation(
     ``symbol_values`` is the complete prepared static scalar snapshot.
     """
     ctx = _build_simulation_context(
-        mechanism,
         t=t,
         species_series=species_series,
         initials=initials,
-        temperature_K=temperature_K,
         symbol_series=symbol_series,
         symbol_values=symbol_values,
     )
@@ -266,23 +255,19 @@ def evaluate_compiled_algebra_series_for_simulation(
 
 
 def evaluate_compiled_algebra_series_for_simulation_partial(
-    mechanism: object,
     compiled: CompiledAlgebraSeries,
     *,
     t: np.ndarray,
     species_series: Dict[str, np.ndarray],
     initials: Dict[str, float],
-    temperature_K: Optional[float] = None,
-    symbol_series: Mapping[str, np.ndarray | float] | None = None,
-    symbol_values: Mapping[str, float] | None = None,
+    symbol_series: Mapping[str, np.ndarray | float],
+    symbol_values: Mapping[str, float],
 ) -> Tuple[Dict[str, np.ndarray], Dict[str, float], list[AlgebraObservableError]]:
     """Best-effort variant of evaluate_compiled_algebra_series_for_simulation()."""
     ctx = _build_simulation_context(
-        mechanism,
         t=t,
         species_series=species_series,
         initials=initials,
-        temperature_K=temperature_K,
         symbol_series=symbol_series,
         symbol_values=symbol_values,
     )

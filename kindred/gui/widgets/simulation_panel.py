@@ -133,9 +133,6 @@ class SimulationPanel(QtWidgets.QWidget):
         )
         layout.addWidget(self.batch_table, 1)
 
-        self.sim_progress = QtWidgets.QProgressBar(self)
-        self.sim_progress.setVisible(False)
-        layout.addWidget(self.sim_progress)
         self._reproject_canonical()
         self._sync_controls()
 

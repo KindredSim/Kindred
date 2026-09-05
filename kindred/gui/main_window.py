@@ -1952,6 +1952,7 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         if not changed:
             return
+        self._refresh_project_state()
         if not requested:
             self._render_results_for_tab(tab_id)
             return
@@ -2006,6 +2007,7 @@ class MainWindow(QtWidgets.QMainWindow):
         pinned: bool,
     ) -> None:
         if bundle.initial_actions.set_slider_pinned(set_id, pinned):
+            self._refresh_project_state()
             bundle.slider_binding.render()
 
     def _run_admitted(self, tab_id: str) -> bool:

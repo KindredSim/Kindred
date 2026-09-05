@@ -161,7 +161,14 @@ def _prepared_static_scalar_snapshot(
     step_map = get_step_index_map(mechanism)
     for coordinate in build_namespace_from_mechanism(mechanism).source_coordinates:
         role = str(coordinate.role)
-        if role not in {"A", "Ea", "dG_act", "dG_eq", "kappa"}:
+        if role not in {
+            "A",
+            "Ea",
+            "dG_act",
+            "dG_eq",
+            "kappa",
+            "degeneracy",
+        }:
             continue
         source_index = coordinate.source_index
         if source_index is None or not 0 <= int(source_index) < len(step_map):
@@ -194,6 +201,8 @@ def _prepared_static_scalar_snapshot(
             value = float(energy_units.from_jmol(model.dG_act_J_per_mol))
         elif role == "kappa" and isinstance(model, EyringRateModel):
             value = float(model.kappa)
+        elif role == "degeneracy" and isinstance(model, EyringRateModel):
+            value = float(model.degeneracy)
         elif role == "dG_eq" and kind == "equilibrium":
             raw_dg = dict(getattr(equilibria[index], "metadata", {}) or {}).get(
                 EquilibriumMetadataKeys.DG_EQ_J_PER_MOL
@@ -403,7 +412,6 @@ def finalize_simulation_result(
         if algebra_policy is SimulationAlgebraPolicy.GUI_BEST_EFFORT:
             algebra_series, algebra_scalars, algebra_errors = (
                 evaluate_compiled_algebra_series_for_simulation_partial(
-                    mechanism,
                     compiled_algebra,
                     t=result_time,
                     species_series=species_series,
@@ -418,7 +426,6 @@ def finalize_simulation_result(
         elif algebra_policy is SimulationAlgebraPolicy.FITTING_STRICT:
             algebra_series, algebra_scalars = (
                 evaluate_compiled_algebra_series_for_simulation(
-                    mechanism,
                     compiled_algebra,
                     t=result_time,
                     species_series=species_series,

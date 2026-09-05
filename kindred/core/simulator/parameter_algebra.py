@@ -103,7 +103,6 @@ def _ensure_scalar_param_storage(mechanism: object, *, require_mutable: bool) ->
 
 
 def _active_equilibrium_keq_names(
-    mechanism: object,
     spec: ParameterAlgebraSpec,
     *,
     parameter_target_map: Mapping[str, ParameterTarget],
@@ -134,7 +133,6 @@ def _active_equilibrium_keq_names(
 
 
 def _apply_equilibrium_Keq_constraints_to_values(
-    mechanism: object,
     base_values: Dict[str, float],
     *,
     active_keq_names: Set[str],
@@ -224,7 +222,6 @@ def apply_parameter_algebra_spec_to_mechanism(
     direct_coordinates = mechanism_coordinate_overrides or {}
     scalar_overrides = scalar_parameter_overrides or {}
     active_keq_names = _active_equilibrium_keq_names(
-        mechanism,
         spec,
         parameter_target_map=parameter_target_map,
     )
@@ -248,7 +245,6 @@ def apply_parameter_algebra_spec_to_mechanism(
     # indexed replacement has been constructed successfully.
     base_values.update(scalar_overrides)
     _apply_equilibrium_Keq_constraints_to_values(
-        mechanism,
         base_values,
         active_keq_names=active_keq_names,
         parameter_target_map=parameter_target_map,
@@ -274,7 +270,6 @@ def apply_parameter_algebra_spec_to_mechanism(
     # Validate every thermodynamic consequence against the complete proposed
     # map before publishing any physical or indexed replacement.
     _apply_equilibrium_Keq_constraints_to_values(
-        mechanism,
         proposed_values,
         active_keq_names=active_keq_names,
         parameter_target_map=parameter_target_map,

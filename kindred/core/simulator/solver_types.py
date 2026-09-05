@@ -171,7 +171,6 @@ class SimulationRequest:
     t_eval: Optional[np.ndarray] = None
     grid: Optional[Mapping[str, float | int]] = None
 
-    progress_callback: Optional[Callable[[float, float, float], None]] = None
     temperature_schedule: TemperatureScheduleProtocol | None = None
     species_names: Optional[Tuple[str, ...]] = None
     cancellation_control: SimulationCancellationControl | None = None

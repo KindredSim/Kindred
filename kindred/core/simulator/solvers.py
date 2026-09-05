@@ -5,7 +5,6 @@ ODE solver wrappers for Kindred.
 SciPy is a hard dependency; all integration routes through `scipy.integrate.solve_ivp` with:
 - Deterministic `t_eval` output grid
 - Optional TemperatureSchedule wrapper that injects T into RHS(T=...) calls
-- Optional progress callback wrapper
 - Non-negative concentration invariant enforcement at output boundaries
 """
 
@@ -88,7 +87,7 @@ def _normal_event_states_with_projection(
     count: int,
     species_count: int,
 ) -> tuple[
-    list[list[np.ndarray]],
+    tuple[tuple[np.ndarray, ...], ...],
     NonnegativeProjection,
 ]:
     raw_output = _normal_event_states(
@@ -100,19 +99,24 @@ def _normal_event_states_with_projection(
     for exact_rows in raw_output:
         for exact in exact_rows:
             _projected, projection = project_nonnegative_trajectory(
-                np.asarray(exact, dtype=float).reshape(-1, 1).copy(),
+                np.asarray(exact, dtype=float).reshape(-1, 1),
                 context="Simulation event state",
             )
             projections.append(projection)
     return raw_output, NonnegativeProjection.aggregate(projections)
 
 
-def _normal_event_states(raw_states: object, *, count: int, species_count: int) -> list[list[np.ndarray]]:
+def _normal_event_states(
+    raw_states: object,
+    *,
+    count: int,
+    species_count: int,
+) -> tuple[tuple[np.ndarray, ...], ...]:
     output: list[list[np.ndarray]] = [
         [] for _ in range(max(0, int(count)))
     ]
     if raw_states is None or count <= 0 or not isinstance(raw_states, Sequence):
-        return output
+        return tuple(tuple(rows) for rows in output)
     for idx in range(min(int(count), len(raw_states))):
         raw = raw_states[idx]
         arr = np.asarray(raw, dtype=float)
@@ -130,11 +134,11 @@ def _normal_event_states(raw_states: object, *, count: int, species_count: int) 
                 arr = arr.reshape(-1, int(species_count))
             except ValueError:
                 continue
-        output[idx] = [
-            np.asarray(row, dtype=float).reshape(-1).copy()
-            for row in arr
-        ]
-    return output
+        for row in arr:
+            state = np.asarray(row, dtype=float).reshape(-1).copy()
+            state.setflags(write=False)
+            output[idx].append(state)
+    return tuple(tuple(rows) for rows in output)
 
 
 def normalize_solver_name(name: object) -> str:
@@ -162,41 +166,6 @@ class _TemperatureInjectedRhs:
     def __call__(self, t: float, y: np.ndarray) -> np.ndarray:
         T = float(self._schedule(t))
         return self._rhs(t, y, T=T)
-
-
-class _ProgressRhs:
-    def __init__(
-        self,
-        rhs: _Rhs2,
-        *,
-        callback: Callable[[float, float, float], None],
-        t0: float,
-        t1: float,
-        every: int = 10,
-    ) -> None:
-        self._rhs = rhs
-        self._callback = callback
-        self._t0 = float(t0)
-        self._t1 = float(t1)
-        self._every = int(every)
-        self._span = float(self._t1 - self._t0)
-        self._last_bucket = -1
-
-    def __call__(self, t: float, y: np.ndarray) -> np.ndarray:
-        if self._every > 0 and np.isfinite(self._span):
-            if self._span <= 0.0:
-                bucket = 0
-            else:
-                frac = (float(t) - self._t0) / self._span
-                if frac < 0.0:
-                    frac = 0.0
-                elif frac > 1.0:
-                    frac = 1.0
-                bucket = int(frac * float(self._every))
-            if bucket > self._last_bucket:
-                self._last_bucket = bucket
-                self._callback(float(t), self._t0, self._t1)
-        return self._rhs(t, y)
 
 
 class _CancellationRhs:
@@ -236,7 +205,7 @@ def _prepare_time_grid(req: _SimulationRequest, *, t0: float, t1: float) -> np.n
     return t_eval
 
 
-def _prepare_rhs(req: _SimulationRequest, *, t0: float, t1: float) -> _Rhs2:
+def _prepare_rhs(req: _SimulationRequest) -> _Rhs2:
     if req.temperature_schedule is None:
         rhs: _Rhs2 = cast(_ODERhsNoTemp, req.rhs)
     else:
@@ -244,8 +213,6 @@ def _prepare_rhs(req: _SimulationRequest, *, t0: float, t1: float) -> _Rhs2:
             cast(_ODERhsWithTemp, req.rhs), req.temperature_schedule
         )
 
-    if req.progress_callback is not None:
-        rhs = _ProgressRhs(rhs, callback=req.progress_callback, t0=t0, t1=t1)
     if req.cancellation_control is not None:
         rhs = _CancellationRhs(rhs, req.cancellation_control)
     return rhs
@@ -602,10 +569,10 @@ def _normal_event_provenance(
     events: object,
     *,
     count: int,
-) -> list[list[float]]:
+) -> tuple[tuple[float, ...], ...]:
     out = [[] for _ in range(max(0, int(count)))]
     if not isinstance(events, Sequence):
-        return out
+        return tuple(tuple(values) for values in out)
     for idx, raw in enumerate(events):
         if idx >= len(out):
             break
@@ -613,7 +580,7 @@ def _normal_event_provenance(
             out[idx].extend(float(value) for value in raw)  # type: ignore[union-attr]
         except TypeError:
             continue
-    return out
+    return tuple(tuple(values) for values in out)
 
 def solve_ode(
     req: _SimulationRequest,
@@ -632,7 +599,7 @@ def solve_ode(
         raise InitialConditionError("y0 must contain non-negative concentrations")
     t0, t1 = map(float, req.t_span)
     t_eval = _prepare_time_grid(req, t0=t0, t1=t1)
-    rhs = _prepare_rhs(req, t0=t0, t1=t1)
+    rhs = _prepare_rhs(req)
     prov = _build_provenance(req, t_eval=t_eval)
 
     method = normalize_solver_name(req.solver)

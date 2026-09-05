@@ -1068,7 +1068,6 @@ def _apply_parameter_overrides_to_prepared_mechanism(
 def prepare_simulation_worker_run(
     *,
     execution_request: SimulationExecutionRequest,
-    progress_callback: Optional[Callable[[float, float, float], None]] = None,
     cancellation_control: SimulationCancellationControl | None = None,
 ) -> PreparedSimulationRun:
     """

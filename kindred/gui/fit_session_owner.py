@@ -871,13 +871,6 @@ class FitSessionOwner(QtCore.QObject):
         )
         return True
 
-    @staticmethod
-    def _candidate_result_is_apply_eligible(candidate: FitCandidate) -> bool:
-        # A typed terminal candidate is scientifically available regardless
-        # of whether its optimizer reports convergence.  The concrete
-        # Shared/centred Apply checks below remain authoritative.
-        return True
-
     @classmethod
     def _candidate_publishable_parameter_values(
         cls,
@@ -924,8 +917,7 @@ class FitSessionOwner(QtCore.QObject):
     @staticmethod
     def _candidate_can_seed_shared(candidate: FitCandidate) -> bool:
         return bool(
-            FitSessionOwner._candidate_result_is_apply_eligible(candidate)
-            and any(
+            any(
                 parameter.scope == "per_dataset"
                 and parameter.selected_config.fit
                 for parameter in candidate.setup_snapshot.parameters
@@ -934,8 +926,6 @@ class FitSessionOwner(QtCore.QObject):
 
     @classmethod
     def _candidate_can_apply(cls, candidate: FitCandidate) -> bool:
-        if not cls._candidate_result_is_apply_eligible(candidate):
-            return False
         if any(
             parameter.scope == "per_dataset"
             and parameter.selected_config.fit
@@ -967,9 +957,6 @@ class FitSessionOwner(QtCore.QObject):
             or window is None
             or self._worker is not None
         ):
-            return False
-        if not self._candidate_result_is_apply_eligible(candidate):
-            self._set_status("Fit Apply rejected: no scientifically available terminal result.")
             return False
         if not self._origin_science_is_current(candidate.origin):
             self._set_status("Fit Apply rejected: origin science is no longer current.")

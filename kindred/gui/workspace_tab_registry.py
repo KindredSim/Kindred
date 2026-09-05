@@ -204,7 +204,7 @@ class WorkspaceTabRegistry:
         if document != previous and (
             delta.affected_targets_by_tab or delta.removed_targets_by_tab
         ):
-            self._prepare_document_delta(delta)
+            self._prepare_document_delta(delta, previous, document)
         token = self._session.replace_project(
             document,
             presentation,
@@ -279,7 +279,7 @@ class WorkspaceTabRegistry:
         if changed and (
             delta.affected_targets_by_tab or delta.removed_targets_by_tab
         ):
-            self._prepare_document_delta(delta)
+            self._prepare_document_delta(delta, previous, document)
         token = self._session.replace_document(
             document,
             expected_token=expected_token,
@@ -298,6 +298,8 @@ class WorkspaceTabRegistry:
     def _prepare_document_delta(
         self,
         delta: ScientificDocumentDelta,
+        previous: ProjectDocument,
+        replacement: ProjectDocument,
     ) -> None:
         """Retire computation and old physical results before publication."""
 
@@ -305,6 +307,8 @@ class WorkspaceTabRegistry:
         self._retire_interactive_plot_targets(delta)
 
         existing_runtime = dict(self._runtime_by_tab_id)
+        previous_by_tab_id = {tab.tab_id: tab for tab in previous.tabs}
+        replacement_by_tab_id = {tab.tab_id: tab for tab in replacement.tabs}
         affected_by_tab: dict[str, list[str]] = {}
         removed_by_tab: dict[str, set[str]] = {}
         for tab_id, set_ids in delta.removed_targets_by_tab:
@@ -325,7 +329,16 @@ class WorkspaceTabRegistry:
             runtime = existing_runtime.get(tab_id)
             repository = None if runtime is None else runtime.result_repository
             if repository is not None:
-                repository.deauthorize_sets(tuple(affected_ids))
+                previous_tab = previous_by_tab_id.get(tab_id)
+                replacement_tab = replacement_by_tab_id.get(tab_id)
+                if (
+                    previous_tab is not None
+                    and replacement_tab is not None
+                    and previous_tab.prepared_dsl is not replacement_tab.prepared_dsl
+                ):
+                    repository.purge_sets(tuple(affected_ids))
+                else:
+                    repository.deauthorize_sets(tuple(affected_ids))
         for tab_id, removed_ids in removed_by_tab.items():
             if not removed_ids:
                 continue
