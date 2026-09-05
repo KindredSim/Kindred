@@ -929,7 +929,6 @@ class MechanismEditorBinding(QtCore.QObject):
         self._editor = editor
         self._registry = registry
         self._rendering = False
-        self._rendered_token = None
         editor.sourceDraftEdited.connect(self._on_source_draft)
         editor.reactionsRevertRequested.connect(self.revert_reactions_draft)
         editor.notesEdited.connect(self._on_notes_edited)
@@ -963,8 +962,6 @@ class MechanismEditorBinding(QtCore.QObject):
             raise TypeError(
                 "projection must be _MechanismEditorRenderProjection."
             )
-        current_token = self._registry.capture_content_token()
-        token_changed = current_token != self._rendered_token
         self._rendering = True
         try:
             self._editor.render_authoring_snapshot(
@@ -975,9 +972,6 @@ class MechanismEditorBinding(QtCore.QObject):
                 has_draft=projection.reactions_draft,
                 has_accepted_reactions=projection.accepted_reactions,
             )
-            if token_changed:
-                self._editor.clear_native_text_history()
-            self._rendered_token = current_token
         finally:
             self._rendering = False
 

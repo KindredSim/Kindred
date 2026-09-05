@@ -669,6 +669,7 @@ class InitialConditionsTableActions(QtCore.QObject):
 
     errorRaised = QtCore.Signal(str)
     draftStateChanged = QtCore.Signal(str, bool)
+    initialValuesChanged = QtCore.Signal(str)
     setNameChanged = QtCore.Signal(str)
     selectedRunSetIdsChanged = QtCore.Signal(object)
 
@@ -899,6 +900,8 @@ class InitialConditionsTableActions(QtCore.QObject):
                 return False
         invalid_cleared = self._clear_invalid_value(set_id, species)
         self.render()
+        if changed:
+            self.initialValuesChanged.emit(self._tab_id)
         if invalid_cleared:
             self.draftStateChanged.emit(
                 self._tab_id,
@@ -977,6 +980,8 @@ class InitialConditionsTableActions(QtCore.QObject):
                 or invalid_cleared
             )
         self.render()
+        if result is not None:
+            self.initialValuesChanged.emit(self._tab_id)
         if invalid_cleared:
             self.draftStateChanged.emit(
                 self._tab_id,

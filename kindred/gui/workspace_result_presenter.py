@@ -290,7 +290,33 @@ def _canonical_json(value: object) -> str:
 def _series_tuple(
     result: SimulationResultValue,
 ) -> tuple[tuple[str, np.ndarray], ...]:
-    return tuple((name, values) for name, values in result.series.items())
+    projected = [(name, values) for name, values in result.series.items()]
+    existing_names = set(result.series)
+    for name in result.succeeded_algebra_outputs:
+        if name in existing_names or name not in result.scalars:
+            continue
+        projected.append(
+            (
+                name,
+                _readonly_display_array(
+                    np.full(result.t.shape, result.scalars[name])
+                ),
+            )
+        )
+    return tuple(projected)
+
+
+def _series_names(result: SimulationResultValue) -> tuple[str, ...]:
+    """Return projected display names without allocating scalar arrays."""
+
+    names = list(result.series)
+    existing_names = set(names)
+    names.extend(
+        name
+        for name in result.succeeded_algebra_outputs
+        if name in result.scalars and name not in existing_names
+    )
+    return tuple(names)
 
 
 def _result_warning_details(result: SimulationResultValue) -> tuple[str, ...]:
@@ -469,7 +495,7 @@ class ResultDataBlock:
             (_required_id(name, "color series name"), _required_id(color, "data series color"))
             for name, color in self.color_by_series
         )
-        if {name for name, _color in colors} != names:
+        if not names.issubset({name for name, _color in colors}):
             raise ValueError("data series colors must cover every data series.")
         if len(colors) != len({name for name, _color in colors}):
             raise ValueError("data series colors must be unique by series.")
@@ -581,8 +607,6 @@ class ResultRenderInput:
             (label, tuple(details))
             for label, details in self.completion_warning_details
         )
-        if len({label for label, _details in warnings}) != len(warnings):
-            raise ValueError("completion warning labels must be unique.")
         object.__setattr__(self, "selected_x_series", selected_x)
         object.__setattr__(self, "selected_y_series", selected_y)
         object.__setattr__(self, "mapped_overlay_locks", overlay_locks)
@@ -626,16 +650,20 @@ def _result_block(
         if kind is ResultLayerKind.REFERENCE
         else label
     )
-    series_axes = tuple((name, SimulationSeriesAxisSelection(name)) for name in result.series)
+    series = _series_tuple(result)
+    series_axes = tuple(
+        (name, SimulationSeriesAxisSelection(name)) for name, _values in series
+    )
     return ResultDataBlock(
         block_id=set_id, label=display_label, kind=kind, t=result.t,
-        series=_series_tuple(result), series_axes=series_axes,
+        series=series, series_axes=series_axes,
         x_axis=SimulationSeriesAxisSelection("t"), result=result,
         segment_ids=result.segment_ids, segment_keys=result.segment_keys,
         discontinuity_ids=result.discontinuity_ids, source_row=None,
         color_by_series=tuple(
-            (name, str(color_by_axis_selection[selection]))
-            for name, selection in series_axes
+            (selection.series_name, str(color))
+            for selection, color in color_by_axis_selection.items()
+            if isinstance(selection, SimulationSeriesAxisSelection)
         ),
         visible=visible, dashed=kind is ResultLayerKind.REFERENCE,
         opacity=0.42 if kind is ResultLayerKind.REFERENCE else 1.0,
@@ -679,7 +707,7 @@ def compose_canonical_export_blocks(
                     kind=kind,
                     color_by_axis_selection={
                         SimulationSeriesAxisSelection(name): "#000000"
-                        for name in current.series
+                        for name in _series_names(current)
                     },
                 )
             )
@@ -693,7 +721,7 @@ def compose_canonical_export_blocks(
                     kind=ResultLayerKind.REFERENCE,
                     color_by_axis_selection={
                         SimulationSeriesAxisSelection(name): "#000000"
-                        for name in reference.series
+                        for name in _series_names(reference)
                     },
                 )
             )
@@ -786,7 +814,7 @@ def _data_block(
         x_name=x_name,
         series_provenance=tuple((name, payload) for name, payload in block.series_provenance if name in names),
         x_provenance=x_provenance,
-        color_by_series=tuple((name, color) for name, color in block.color_by_series if name in names),
+        color_by_series=block.color_by_series,
         visible=block.visible, dashed=block.dashed, opacity=block.opacity,
         markers=block.markers, point_size=block.point_size,
         presentation_boundaries=block.presentation_boundaries,
@@ -863,21 +891,26 @@ def _export_column_header(
     return encode_clipboard_text(header)
 
 
-def _unique_result_entries(
+def _xlsx_metadata_rows(
     blocks: Sequence[ResultDataBlock],
-) -> tuple[SimulationResultValue, ...]:
+) -> tuple[tuple[str, int, str], ...]:
+    used: set[str] = set()
     seen: set[int] = set()
-    ordered: list[SimulationResultValue] = []
+    rows: list[tuple[str, int, str]] = []
     for block in blocks:
+        title = _worksheet_title(block.label, used)
         entry = block.result
-        if entry is None:
+        if entry is None or id(entry) in seen:
             continue
-        entry_identity = id(entry)
-        if entry_identity in seen:
-            continue
-        seen.add(entry_identity)
-        ordered.append(entry)
-    return tuple(ordered)
+        seen.add(id(entry))
+        serialized = _canonical_json(_result_provenance_payload(entry))
+        rows.extend(
+            (title, part, serialized[start:start + _MAX_XLSX_STRING_LENGTH])
+            for part, start in enumerate(
+                range(0, len(serialized), _MAX_XLSX_STRING_LENGTH), start=1
+            )
+        )
+    return tuple(rows)
 
 
 def _xlsx_literal_cell(sheet: object, value: object) -> object:
@@ -925,7 +958,7 @@ def _planned_xlsx_worksheet_dimensions(
     blocks: Sequence[ResultDataBlock],
     *,
     lineage_row_count: int,
-    result_entry_count: int,
+    metadata_row_count: int,
 ) -> tuple[tuple[str, int, int], ...]:
     """Plan data and support worksheet dimensions without allocating them."""
 
@@ -952,15 +985,15 @@ def _planned_xlsx_worksheet_dimensions(
                 8,
             )
         )
-    if result_entry_count:
+    if metadata_row_count:
         dimensions.append(
             (
                 _worksheet_title(
                     "_Kindred Result Metadata",
                     used,
                 ),
-                result_entry_count + 1,
-                2,
+                metadata_row_count + 1,
+                3,
             )
         )
     return tuple(dimensions)
@@ -1085,7 +1118,7 @@ def compose_interactive_display(
     set_id: str,
     render_input: ResultRenderInput,
 ) -> InteractiveDisplayProjection | None:
-    result_series = result.series
+    result_series = dict(_series_tuple(result))
     selected_x = render_input.selected_x_series
 
     if isinstance(selected_x, ExperimentalAxisSelection):
@@ -1112,7 +1145,6 @@ def compose_interactive_display(
             for block in render_input.blocks
             if block.block_id == set_id
             and block.kind in {ResultLayerKind.EXPLICIT, ResultLayerKind.PREVIEW}
-            and block.visible
         ),
         None,
     )
@@ -1122,7 +1154,7 @@ def compose_interactive_display(
             for block in render_input.blocks
             if block.block_id == set_id
             and block.kind is ResultLayerKind.REFERENCE
-            and block.visible
+            and render_input.reference_lines_visible
         ),
         None,
     )
@@ -1133,14 +1165,13 @@ def compose_interactive_display(
     connectors = _result_connectors(
         result, selected_x=selected_x, series_names=set(result_series)
     )
-    live_colors = dict(live_block.color_by_series) if live_block is not None else {}
+    live_colors = dict(live_block.color_by_series)
     baseline_colors = (
         dict(baseline_block.color_by_series)
         if baseline_block is not None
         else live_colors
     )
     live_label = live_block.label
-    plotted_series = {name for name, _values in live_block.series}
     curves = tuple(
         InteractiveDisplayCurve(
             key=("simulation", "foreground", set_id, series_id),
@@ -1156,17 +1187,22 @@ def compose_interactive_display(
             ),
         )
         for series_id in wanted_y
-        if series_id in plotted_series
-        and x_values.size
+        if x_values.size
         and (series_values := result_series.get(series_id)) is not None
         and series_values.size
     )
     baseline_result = baseline_block.result if baseline_block is not None else None
     if baseline_result is not None:
+        baseline_series_map = dict(_series_tuple(baseline_result))
+        baseline_wanted_y = (
+            tuple(baseline_series_map)
+            if render_input.selected_y_uses_default_all
+            else wanted_y
+        )
         if selected_x.series_name == "t":
             baseline_x = _readonly_display_array(baseline_result.t)
         else:
-            baseline_series = baseline_result.series.get(selected_x.series_name)
+            baseline_series = baseline_series_map.get(selected_x.series_name)
             baseline_x = (
                 None
                 if baseline_series is None
@@ -1174,7 +1210,6 @@ def compose_interactive_display(
             )
         if baseline_x is not None:
             baseline_topology = _result_topology(baseline_result)
-            baseline_series_map = baseline_result.series
             baseline_connectors = _result_connectors(
                 baseline_result,
                 selected_x=selected_x,
@@ -1198,7 +1233,7 @@ def compose_interactive_display(
                         if item[4] == series_id
                     ),
                 )
-                for series_id in wanted_y
+                for series_id in baseline_wanted_y
                 if baseline_x.size
                 if (series_values := baseline_series_map.get(series_id)) is not None
                 and series_values.size
@@ -1356,8 +1391,7 @@ def compose_result_input(
                     y_axes=wanted_y,
                 ):
                     unavailable_labels.append(semantic.label)
-                if visible.set_id == current_id:
-                    blocks.append(replace(semantic, visible=False))
+                blocks.append(replace(semantic, visible=False))
             add_warning(semantic.label, foreground, True)
             annotations.extend(_owned_annotations(foreground, "foreground", visible.set_id))
         reference = repository.reference_result(visible.set_id)
@@ -1382,8 +1416,7 @@ def compose_result_input(
                         y_axes=wanted_y,
                     ):
                         unavailable_labels.append(reference_semantic.label)
-                    if visible.set_id == current_id:
-                        blocks.append(replace(reference_semantic, visible=False))
+                    blocks.append(replace(reference_semantic, visible=False))
                 add_warning(reference_semantic.label, reference, True)
                 annotations.extend(_owned_annotations(reference, "ghost", visible.set_id))
             else:
@@ -1639,8 +1672,8 @@ def iter_blocks_tsv_chunks(
 
 def validate_xlsx_export(
     blocks: Sequence[ResultDataBlock],
-) -> None:
-    """Validate the immutable canonical block roster before writing."""
+) -> tuple[tuple[str, int, str], ...]:
+    """Admit worksheet dimensions and prepare canonical metadata rows once."""
 
     block_values = tuple(blocks)
     if not block_values:
@@ -1654,13 +1687,14 @@ def validate_xlsx_export(
         + sum(bool(provenance) for _, provenance in block.series_provenance)
         for block in block_values
     )
-    result_entry_count = len(_unique_result_entries(block_values))
+    metadata_rows = _xlsx_metadata_rows(block_values)
     dimensions = _planned_xlsx_worksheet_dimensions(
         block_values,
         lineage_row_count=lineage_row_count,
-        result_entry_count=result_entry_count,
+        metadata_row_count=len(metadata_rows),
     )
     _validate_xlsx_worksheet_dimensions(dimensions)
+    return metadata_rows
 
 def write_xlsx(
     blocks: Sequence[ResultDataBlock],
@@ -1671,7 +1705,7 @@ def write_xlsx(
     """Write full-resolution worksheets directly to the destination."""
 
     block_values = tuple(blocks)
-    validate_xlsx_export(block_values)
+    metadata_rows = validate_xlsx_export(block_values)
     output = _XlsxDestination(
         destination,
         cancellation_check=cancellation_check,
@@ -1679,8 +1713,6 @@ def write_xlsx(
     workbook = Workbook(write_only=True)
     used: set[str] = set()
     lineage_rows: list[tuple[str, str, Mapping[str, object]]] = []
-    metadata_rows: list[tuple[str, SimulationResultValue]] = []
-    metadata_ids: set[int] = set()
     data_rows = 0
     archive: ZipFile | None = None
     original_failure: BaseException | None = None
@@ -1743,10 +1775,6 @@ def write_xlsx(
                 for name, provenance in block.series_provenance
                 if provenance
             )
-            entry = block.result
-            if entry is not None and id(entry) not in metadata_ids:
-                metadata_ids.add(id(entry))
-                metadata_rows.append((title, entry))
         if lineage_rows:
             if cancellation_check is not None:
                 cancellation_check()
@@ -1797,17 +1825,14 @@ def write_xlsx(
             )
             _append_xlsx_row(
                 metadata_sheet,
-                ("worksheet", "repository_entry"),
+                ("worksheet", "part", "repository_entry"),
             )
-            for title, entry in metadata_rows:
+            for row in metadata_rows:
                 if cancellation_check is not None:
                     cancellation_check()
                 _append_xlsx_row(
                     metadata_sheet,
-                    (
-                        title,
-                        _canonical_json(_result_provenance_payload(entry)),
-                    ),
+                    row,
                 )
             metadata_sheet.sheet_state = "hidden"
         if cancellation_check is not None:

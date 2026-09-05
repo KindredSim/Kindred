@@ -18,7 +18,6 @@ from kindred.core.project_document import (
 )
 from kindred.core.result_repository import ResultRepository, SimulationResultValue
 from kindred.core.runtime_defaults import MAX_PARALLEL_WORKERS_CEILING
-from kindred.core.simulation_algebra_policy import SimulationAlgebraPolicy
 from kindred.core.simulation_failure import FactualCause, factual_cause_from_exception
 from kindred.core.simulation_preparation import (
     PreparedSimulationRun,
@@ -258,7 +257,7 @@ def _solve_prepared(prepared: PreparedSimulationRun, *, parameters: tuple[tuple[
     result = finalize_simulation_result(
         mechanism=prepared.mechanism, result=solved, species_names=list(prepared.species_names),
         initials_for_algebra=prepared.initials_for_algebra, temperature_schedule=prepared.temperature_schedule,
-        parameter_algebra_spec=prepared.parameter_algebra_spec, algebra_policy=SimulationAlgebraPolicy.GUI_BEST_EFFORT,
+        parameter_algebra_spec=prepared.parameter_algebra_spec,
         parameters=parameters,
     )
     if cancellation_control.cancel_requested():
@@ -440,6 +439,41 @@ class SimulationJobOwner(QtCore.QObject):
         """Return semantic exact Preview identities for one tab."""
 
         return self._repository(tab_id).preview_set_ids()
+
+    def owns_preview_capture(self, capture: PreviewCapture) -> bool:
+        """Report whether an exact Preview capture still owns live work."""
+
+        if self._pending_preview is capture:
+            return True
+
+        operation = self._operation
+        if (
+            operation is not None
+            and str(operation["kind"]) == "preview"
+            and str(operation["purpose"]) == "ordinary"
+            and self._operation_is_current(int(operation["generation"]))
+        ):
+            operation_targets = tuple(operation["targets"])
+            if len(operation_targets) == len(capture.targets) and all(
+                operation_target is capture_target
+                for operation_target, capture_target in zip(
+                    operation_targets,
+                    capture.targets,
+                    strict=True,
+                )
+            ):
+                return True
+
+        repository = self._repository(capture.tab_id)
+        capture_ids = tuple(target.set_id for target in capture.targets)
+        if set(repository.preview_set_ids()) != set(capture_ids):
+            return False
+        return all(
+            repository.current_request(target.set_id)
+            is target.execution_request
+            and repository.current_result(target.set_id) is not None
+            for target in capture.targets
+        )
 
     def _mark_unsettled(self) -> None:
         self._last_close_settled = False
@@ -1164,6 +1198,30 @@ class SimulationJobOwner(QtCore.QObject):
             for target in operation["targets"]:
                 if id(target) not in seen:
                     operation["outcomes"].append((target, "cancelled" if self._terminal_state == "cancelled" else "failure"))
+            superseded_preview = any(
+                pending is not None and pending.tab_id == operation_tab_id
+                for pending in (
+                    self._pending_preview,
+                    self._pending_interactive_preview,
+                )
+            )
+            preview_current = True
+            if (
+                not self._close_fenced
+                and operation_kind == "preview"
+                and operation_purpose == "ordinary"
+            ):
+                preview_current = self._operation_is_current(
+                    int(operation["generation"])
+                )
+                if not preview_current:
+                    operation["outcomes"] = [
+                        (
+                            target,
+                            "discarded" if outcome_state == "success" else outcome_state,
+                        )
+                        for target, outcome_state in operation["outcomes"]
+                    ]
             states = [state for _target, state in operation["outcomes"]]
             succeeded = states.count("success")
             failed = states.count("failure")
@@ -1172,19 +1230,13 @@ class SimulationJobOwner(QtCore.QObject):
             total = succeeded + failed + cancelled + discarded
             state = "success" if total and succeeded == total else "failure" if total and failed == total else "cancelled" if total and cancelled == total else "partial"
             summary = SimulationTerminalSummary(operation_kind, state, succeeded, failed, cancelled, discarded, tuple(operation["details"]))
-            superseded_preview = any(
-                pending is not None and pending.tab_id == operation_tab_id
-                for pending in (
-                    self._pending_preview,
-                    self._pending_interactive_preview,
-                )
-            )
             if (
                 not self._close_fenced
                 and operation_kind == "preview"
                 and operation_purpose == "ordinary"
                 and summary.state == "success"
                 and not superseded_preview
+                and preview_current
             ):
                 repository = self._repository(operation_tab_id)
                 preview_results = operation["preview_results"]

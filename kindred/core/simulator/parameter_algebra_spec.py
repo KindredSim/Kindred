@@ -987,6 +987,12 @@ def _compile_retained_algebra_program(
                 line_content=raw,
             )
         name = str(match.group(1))
+        if name == "t":
+            raise DSLError(
+                "'t' is reserved for simulation time and cannot be declared as a parameter or observable.",
+                line_number=line_number,
+                line_content=raw,
+            )
         expr_src = str(match.group(2) or "").strip()
         source_lines.append(f"let {name} = {expr_src}")
         descriptors.append((classification.kind, int(line_number), str(raw)))
@@ -1002,6 +1008,18 @@ def _compile_retained_algebra_program(
                 line_content=line_content,
             ) from exc
         raise DSLError(str(exc)) from exc
+    block = replace(
+        block,
+        lines=tuple(
+            replace(
+                statement,
+                line=line_number,
+                col=len(raw) - len(raw.lstrip()) + 1,
+                line_text=raw,
+            )
+            for statement, (_kind, line_number, raw) in zip(block.lines, descriptors)
+        ),
+    )
     return block, tuple(descriptors)
 
 

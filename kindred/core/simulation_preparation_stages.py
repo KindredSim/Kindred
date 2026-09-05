@@ -16,6 +16,7 @@ from typing import Any, Dict
 import numpy as np
 
 from kindred.core.simulator.solvers import normalize_solver_name
+from kindred.core.scipy_integrate import validate_scipy_rtol
 from kindred.core.symbolic.errors import UnsupportedSymbolicExpressionError
 from kindred.core.symbolic.jacobian_execution import SymbolicJacobianExecution
 from kindred.core.symbolic.namespaces import symbolic_status_payload
@@ -48,14 +49,10 @@ class PreparedSolverConfig:
             raise TypeError("Prepared solver input must be a nonblank string.")
         solver_input = self.solver_input.strip()
         solver = normalize_solver_name(solver_input)
-        if type(self.rtol) is bool or not isinstance(self.rtol, Real):
-            raise TypeError("Prepared solver rtol must be a real number.")
         if type(self.atol) is bool or not isinstance(self.atol, Real):
             raise TypeError("Prepared solver atol must be a real number.")
-        rtol = float(self.rtol)
+        rtol = validate_scipy_rtol(self.rtol)
         atol = float(self.atol)
-        if not (np.isfinite(rtol) and rtol > 0.0):
-            raise ValueError("rtol must be finite and > 0.")
         if not (np.isfinite(atol) and atol > 0.0):
             raise ValueError("atol must be finite and > 0.")
         if not isinstance(self.grid, Mapping):

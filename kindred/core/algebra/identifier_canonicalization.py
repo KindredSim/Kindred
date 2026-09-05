@@ -5,7 +5,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Dict, Mapping
 
-from kindred.core.algebra.printer import expression_to_source
 from kindred.core.algebra.parser import (
     AlgebraBlock,
     BinaryNode,
@@ -96,14 +95,13 @@ def canonicalize_algebra_block(
     lines = []
     for stmt in block.lines:
         canonicalized = canonicalize_mechanism_identifiers(stmt.expr, mechanism_namespace=mechanism_namespace)
-        line_text = f"let {stmt.name} = {expression_to_source(canonicalized.expr)}"
         lines.append(
             LetStatement(
                 name=stmt.name,
                 expr=canonicalized.expr,
                 line=stmt.line,
                 col=stmt.col,
-                line_text=line_text,
+                line_text=stmt.line_text,
             )
         )
     return AlgebraBlock(

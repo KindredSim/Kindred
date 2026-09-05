@@ -8,7 +8,6 @@ import numpy as np
 from kindred.core.equilibrium_rate_authority import effective_equilibrium_keq
 from kindred.core.mechanism_metadata import MechanismMetadataView
 from kindred.core.ode_builder import build_effective_rate_coefficient_evaluator
-from kindred.core.simulation_algebra_policy import SimulationAlgebraPolicy
 from kindred.core.simulation_failure import FactualCause
 from kindred.core.result_repository import (
     SimulationResultValue,
@@ -29,7 +28,6 @@ from kindred.core.temperature import (
 )
 from kindred.core.algebra.simulation_series import (
     compiled_algebra_for_mechanism,
-    evaluate_compiled_algebra_series_for_simulation,
     evaluate_compiled_algebra_series_for_simulation_partial,
 )
 
@@ -361,7 +359,6 @@ def finalize_simulation_result(
     initials_for_algebra: Mapping[str, Any] | None,
     temperature_schedule: TemperatureScheduleProtocol | None,
     parameter_algebra_spec: object,
-    algebra_policy: SimulationAlgebraPolicy,
     parameters: tuple[tuple[str, float, str], ...] = (),
     solver_provenance_updates: Mapping[str, object] | None = None,
 ) -> SimulationResultValue:
@@ -409,33 +406,19 @@ def finalize_simulation_result(
             base_species_names,
             initials_for_algebra,
         )
-        if algebra_policy is SimulationAlgebraPolicy.GUI_BEST_EFFORT:
-            algebra_series, algebra_scalars, algebra_errors = (
-                evaluate_compiled_algebra_series_for_simulation_partial(
-                    compiled_algebra,
-                    t=result_time,
-                    species_series=species_series,
-                    initials=initials,
-                    symbol_series=symbol_series,
-                    symbol_values=symbol_values,
-                )
+        algebra_series, algebra_scalars, algebra_errors = (
+            evaluate_compiled_algebra_series_for_simulation_partial(
+                compiled_algebra,
+                t=result_time,
+                species_series=species_series,
+                initials=initials,
+                symbol_series=symbol_series,
+                symbol_values=symbol_values,
             )
-            finalized_algebra_errors = tuple(
-                _algebra_cause(error) for error in algebra_errors
-            )
-        elif algebra_policy is SimulationAlgebraPolicy.FITTING_STRICT:
-            algebra_series, algebra_scalars = (
-                evaluate_compiled_algebra_series_for_simulation(
-                    compiled_algebra,
-                    t=result_time,
-                    species_series=species_series,
-                    initials=initials,
-                    symbol_series=symbol_series,
-                    symbol_values=symbol_values,
-                )
-            )
-        else:
-            raise ValueError(f"Unsupported simulation algebra policy: {algebra_policy!r}")
+        )
+        finalized_algebra_errors = tuple(
+            _algebra_cause(error) for error in algebra_errors
+        )
         finalized_series.update(_freeze_algebra_series(algebra_series))
         finalized_algebra_scalars = dict(algebra_scalars)
 

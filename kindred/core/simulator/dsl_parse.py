@@ -127,7 +127,9 @@ _SPECIES_TERM_RE = re.compile(
     r"^\s*(?:(-?(?:(?:\d+(?:\.\d*)?)|(?:\.\d+))(?:[eE][+-]?\d+)?)\s*\*?\s*)?"
     r"([A-Za-z_][A-Za-z0-9_]*)\s*$"
 )
-_STOICH_TERM_SPLIT_RE = re.compile(r"(?<![eE])\+")
+_SCIENTIFIC_COEFFICIENT_MANTISSA_RE = re.compile(
+    r"^\s*-?(?:(?:\d+(?:\.\d*)?)|(?:\.\d+))[eE]$"
+)
 _COMMA_SEMI_SPLIT_RE = re.compile(r"[,;]")
 _SEMI_SPLIT_RE = re.compile(r"[;]")
 
@@ -732,7 +734,27 @@ def _parse_species_side(text: str) -> Dict[str, float]:
     if not text.strip():
         return {}
     result: Dict[str, float] = {}
-    for term in _STOICH_TERM_SPLIT_RE.split(text):
+    terms: list[str] = []
+    term_start = 0
+    for index, character in enumerate(text):
+        if character != "+":
+            continue
+        prefix = text[term_start:index]
+        if _SCIENTIFIC_COEFFICIENT_MANTISSA_RE.fullmatch(prefix):
+            exponent_start = index + 1
+            exponent_end = exponent_start
+            while (
+                exponent_end < len(text)
+                and text[exponent_end].isdigit()
+            ):
+                exponent_end += 1
+            if exponent_end > exponent_start:
+                continue
+        terms.append(text[term_start:index])
+        term_start = index + 1
+    terms.append(text[term_start:])
+
+    for term in terms:
         term = term.strip()
         if not term:
             raise _DSLError("Malformed stoichiometry: empty term (e.g., consecutive '+' signs)")
@@ -743,6 +765,10 @@ def _parse_species_side(text: str) -> Dict[str, float]:
         if not m:
             raise invalid_species_term_error(term)
         coef_s, name = m.groups()
+        if name == "t":
+            raise _DSLError(
+                "'t' is reserved for simulation time and cannot be used as a species name"
+            )
         coef = _float_or_none(coef_s) if coef_s is not None else 1.0
         if coef is None or coef <= 0.0:
             raise _DSLError("Stoichiometric coefficients must be positive finite real numbers")

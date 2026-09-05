@@ -85,6 +85,12 @@ def _freeze_int(values: object) -> np.ndarray:
     return array
 
 
+def _physical_x_tolerance(*operands: float) -> float:
+    """Return a scale-relative tolerance for a physical-X comparison."""
+
+    return 16.0 * np.finfo(float).eps * max(abs(float(value)) for value in operands)
+
+
 @dataclass(frozen=True, slots=True)
 class ParametricXProjection:
     """Immutable one-row-per-canonical-X projection."""
@@ -297,8 +303,6 @@ def align_parametric_x(
     # Comparisons live in the physical X unit, while endpoint/direct
     # classification lives in the dimensionless interpolation fraction.  A
     # large X scale must not turn a genuine midpoint into a direct sample.
-    scale = max(1.0, float(np.max(np.abs(x))), float(np.max(np.abs(obs_x))))
-    x_tolerance = 16.0 * np.finfo(float).eps * scale
     fraction_tolerance = 16.0 * np.finfo(float).eps
     # Monotone means every uninterrupted branch is strictly monotone and time
     # cannot be used to settle a duplicate branch.
@@ -311,7 +315,17 @@ def align_parametric_x(
             ]
             if len(branch_rows) >= 2:
                 differences = np.diff(x[branch_rows])
-                if not np.all(differences > x_tolerance) and not np.all(differences < -x_tolerance):
+                tolerances = np.asarray(
+                    [
+                        _physical_x_tolerance(left, right)
+                        for left, right in zip(
+                            x[branch_rows][:-1], x[branch_rows][1:], strict=True
+                        )
+                    ]
+                )
+                if not np.all(differences > tolerances) and not np.all(
+                    differences < -tolerances
+                ):
                     raise DeterministicParametricResolutionError(
                         f"Dataset {dataset_label!r}: X(t) is not strictly monotone.",
                         dataset_label=dataset_label,
@@ -325,9 +339,13 @@ def align_parametric_x(
         for left, right in intervals:
             x_left, x_right = float(x[left]), float(x[right])
             low, high = min(x_left, x_right), max(x_left, x_right)
-            if value_x >= low - x_tolerance and value_x <= high + x_tolerance:
+            if (
+                value_x >= low - _physical_x_tolerance(value_x, low)
+                and value_x <= high + _physical_x_tolerance(value_x, high)
+            ):
                 width = x_right - x_left
-                if abs(width) <= x_tolerance:
+                width_tolerance = _physical_x_tolerance(x_left, x_right)
+                if abs(width) <= width_tolerance:
                     continue
                 fraction = min(1.0, max(0.0, float((value_x - x_left) / width)))
                 selected_t = float(t[left] + fraction * (t[right] - t[left]))
@@ -348,8 +366,13 @@ def align_parametric_x(
                     )
                 )
             # Bounded projection onto the interval; no extrapolation.
-            fraction = 0.0 if abs(x_right - x_left) <= x_tolerance else min(
-                1.0, max(0.0, float((value_x - x_left) / (x_right - x_left)))
+            fraction = (
+                0.0
+                if abs(x_right - x_left) <= _physical_x_tolerance(x_left, x_right)
+                else min(
+                    1.0,
+                    max(0.0, float((value_x - x_left) / (x_right - x_left))),
+                )
             )
             projected_x = float(x_left + fraction * (x_right - x_left))
             projected_t = float(t[left] + fraction * (t[right] - t[left]))
@@ -390,8 +413,13 @@ def align_parametric_x(
         if mode_norm == "time_guided":
             chosen = min(candidates, key=lambda item: (abs(item[1] - float(value_t)), item[1], item[3]))
         else:
-            best_distance = min(item[0] for item in candidates)
-            tied = [item for item in candidates if abs(item[0] - best_distance) <= x_tolerance]
+            best = min(candidates, key=lambda item: item[0])
+            tied = [
+                item
+                for item in candidates
+                if abs(item[0] - best[0])
+                <= _physical_x_tolerance(item[0], best[0], value_x, item[2], best[2])
+            ]
             if len(tied) != 1:
                 raise DeterministicParametricResolutionError(
                     f"Dataset {dataset_label!r}: X={float(value_x):.6g} has unresolved equal branches.",
@@ -442,12 +470,13 @@ def project_parametric_y(
     ):
         raise FitSimulationError("Parametric Y projection received malformed model identity.")
     result: list[float] = []
-    for selected_t, segment, key, discontinuity, row in zip(
+    for selected_t, segment, key, discontinuity, row, sample_kind in zip(
         projection.selected_time,
         projection.segment_ids,
         projection.segment_keys,
         projection.discontinuity_ids,
         projection.model_rows,
+        projection.sample_kinds,
         strict=True,
     ):
         if row < 0 or row >= t.size:
@@ -458,7 +487,7 @@ def project_parametric_y(
             or int(discontinuities[row]) != int(discontinuity)
         ):
             raise FitSimulationError("Parametric projection crossed a discontinuity.")
-        if abs(float(selected_t) - float(t[row])) <= 16.0 * np.finfo(float).eps:
+        if sample_kind == "direct":
             result.append(float(y[row]))
             continue
         if selected_t >= t[row] and row + 1 < t.size:

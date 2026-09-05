@@ -45,6 +45,7 @@ from kindred.core.simulator.step_indexing import (
 )
 from kindred.core.simulator.wegscheider_symbolic import analyze_wegscheider_topology
 from kindred.core.simulator.solvers import normalize_solver_name
+from kindred.core.scipy_integrate import validate_scipy_rtol
 from kindred.core.units import UnitsModel
 from kindred.core.species import (
     CONCENTRATION_MAX_M,
@@ -949,10 +950,9 @@ def validate_tab_scientific_settings(
     if not isinstance(settings, TabScientificSettings):
         raise TypeError(f"{label} must be TabScientificSettings.")
     validate_temperature(settings.temperature, field=f"{label}.temperature")
-    _require_finite(
+    validate_scipy_rtol(
         settings.rtol,
-        f"{label}.rtol",
-        strictly_positive=True,
+        field=f"{label}.rtol",
     )
     _require_finite(
         settings.atol,

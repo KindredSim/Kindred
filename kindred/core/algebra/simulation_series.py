@@ -12,7 +12,6 @@ import numpy as np
 from kindred.core.algebra.evaluator import (
     AlgebraObservableError,
     EvaluationContext,
-    evaluate_block,
     evaluate_block_partial,
 )
 from kindred.core.algebra.parser import (
@@ -36,7 +35,6 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "compiled_algebra_for_mechanism",
     "compile_algebra_observables",
-    "evaluate_compiled_algebra_series_for_simulation",
 ]
 
 
@@ -211,49 +209,6 @@ def _build_simulation_context(
     )
 
 
-def evaluate_compiled_algebra_series_for_simulation(
-    compiled: CompiledAlgebraSeries,
-    *,
-    t: np.ndarray,
-    species_series: Dict[str, np.ndarray],
-    initials: Dict[str, float],
-    symbol_series: Mapping[str, np.ndarray | float],
-    symbol_values: Mapping[str, float],
-) -> Tuple[Dict[str, np.ndarray], Dict[str, float]]:
-    """Evaluate retained observables against canonical row-local context.
-
-    ``symbol_series`` carries exact per-row temperature, mechanism
-    coefficients, and changing inputs for dynamic ``let`` observables.
-    ``symbol_values`` is the complete prepared static scalar snapshot.
-    """
-    ctx = _build_simulation_context(
-        t=t,
-        species_series=species_series,
-        initials=initials,
-        symbol_series=symbol_series,
-        symbol_values=symbol_values,
-    )
-    series, scalars = evaluate_block(compiled.block, ctx)
-    series_out = {str(name): np.asarray(values, dtype=float).reshape(-1) for name, values in (series or {}).items()}
-    scalars_out: Dict[str, float] = {}
-    for name, value in (scalars or {}).items():
-        scalars_out[str(name)] = float(value)
-    for name, values in list(series_out.items()):
-        if values.size != ctx.t.size:
-            # Best-effort: broadcast scalar-like series to match time grid.
-            if values.size == 1 and ctx.t.size > 1 and math.isfinite(float(values[0])):
-                series_out[name] = np.full_like(ctx.t, float(values[0]), dtype=float)
-            else:
-                logger.debug(
-                    "Dropping algebra series '%s' due to shape mismatch (%s vs %s).",
-                    name,
-                    values.size,
-                    ctx.t.size,
-                )
-                series_out.pop(name, None)
-    return series_out, scalars_out
-
-
 def evaluate_compiled_algebra_series_for_simulation_partial(
     compiled: CompiledAlgebraSeries,
     *,
@@ -263,7 +218,7 @@ def evaluate_compiled_algebra_series_for_simulation_partial(
     symbol_series: Mapping[str, np.ndarray | float],
     symbol_values: Mapping[str, float],
 ) -> Tuple[Dict[str, np.ndarray], Dict[str, float], list[AlgebraObservableError]]:
-    """Best-effort variant of evaluate_compiled_algebra_series_for_simulation()."""
+    """Evaluate retained observables while preserving per-observable failures."""
     ctx = _build_simulation_context(
         t=t,
         species_series=species_series,

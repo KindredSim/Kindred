@@ -608,6 +608,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 captured
             )
         )
+        actions.initialValuesChanged.connect(self._on_initial_values_changed)
         bundle.batch_table.selectionModel().currentChanged.connect(
             lambda _current, previous, captured=tab_id: self._on_current_row_changed(
                 captured,
@@ -968,6 +969,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     if tab_id not in document_ids:
                         continue
                     bundle.slider_binding.reset_project_session()
+                    bundle.editor.clear_native_text_history()
                     try:
                         self._workspace.plot_for_tab(tab_id).reset_plot_session_state()
                     except (KeyError, RuntimeError):
@@ -2654,6 +2656,17 @@ class MainWindow(QtWidgets.QMainWindow):
         self._set_tab_run_enabled(target, self._run_admitted(target))
         self._refresh_title()
         self._refresh_actions()
+
+    @QtCore.Slot(str)
+    def _on_initial_values_changed(self, tab_id: str) -> None:
+        """Refresh the owning Slider projection after canonical IC mutation."""
+
+        target = str(tab_id)
+        bundle = self._tab_surfaces.get(target)
+        if bundle is None:
+            return
+        bundle.slider_binding.render()
+        self._refresh_project_state()
 
     @QtCore.Slot(str)
     def _on_initial_set_name_changed(self, tab_id: str) -> None:

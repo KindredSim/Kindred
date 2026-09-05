@@ -735,23 +735,16 @@ def _align_series(
     aligned_discontinuities = np.empty(target_t.size, dtype=np.int64)
     aligned_keys: list[str] = []
     selection: list[str] = []
+    insertion_positions = np.searchsorted(sim_t, target_t, side="left")
     for index, time_value in enumerate(target_t):
-        exact = np.flatnonzero(sim_t == time_value)
-        if exact.size:
-            if exact.size != 1:
-                raise FitSimulationError(
-                    "Exact Fit time must select one public simulation row.",
-                    details={"fatal": True, "stage": "fit_identity"},
-                )
-            chosen = int(exact[0])
-            aligned[index] = values[chosen]
-            aligned_segments[index] = segments[chosen]
-            aligned_discontinuities[index] = discontinuities[chosen]
-            aligned_keys.append(keys[chosen])
+        right = int(insertion_positions[index])
+        if right < sim_t.size and sim_t[right] == time_value:
+            aligned[index] = values[right]
+            aligned_segments[index] = segments[right]
+            aligned_discontinuities[index] = discontinuities[right]
+            aligned_keys.append(keys[right])
             selection.append("direct")
             continue
-        right_candidates = np.flatnonzero(sim_t > time_value)
-        right = int(right_candidates[0]) if right_candidates.size else sim_t.size
         left = right - 1
         if left < 0 or right >= sim_t.size:
             raise ValueError("Dataset time lies outside the simulation time span.")

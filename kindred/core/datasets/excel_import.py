@@ -118,12 +118,6 @@ def _read_worksheet_rows(
     filepath: str,
     sheet_name: str,
 ) -> Iterator[Mapping[PhysicalColumn, object]]:  # noqa: ANN001
-    declared_rows = max(
-        int(worksheet.max_row or 0),
-        int(authored_worksheet.max_row or 0),
-    )
-    if declared_rows <= 0:
-        raise ValueError(f"Sheet {sheet_name!r} in workbook {filepath!r} has no rows.")
     physical_width = max(
         _exact_worksheet_width(worksheet),
         _exact_worksheet_width(authored_worksheet),

@@ -474,6 +474,15 @@ class TabSliderBinding(QtCore.QObject):
 
     def settle_render_projection(self, prepared: ActiveSliderRenderProjection) -> None:
         self._reconcile_target_change(prepared.tab, prepared.targets)
+        capture = self._exact_preview_capture
+        if capture is not None:
+            captured_targets = tuple(target.set_id for target in capture.targets)
+            if (
+                captured_targets == prepared.targets
+                and self._simulation_jobs.owns_preview_capture(capture)
+            ):
+                return
+            self._exact_preview_capture = None
         runtime = self._registry.tab_runtime(prepared.tab.tab_id)
         if runtime.slider_parameter_draft or runtime.slider_species_drafts_by_set_id:
             self._begin_preview_cycle(

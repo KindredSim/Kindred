@@ -360,8 +360,11 @@ class DataManagerPanel(QtWidgets.QWidget):
                 f"'{source.original_filename}':\n\n{type(exc).__name__}: {exc}",
             )
             return ImportDialogResult(config=None, action="skip")
-        dialog.exec()
-        return dialog.get_result()
+        try:
+            dialog.exec()
+            return dialog.get_result()
+        finally:
+            dialog.deleteLater()
 
     def _build_remaining_file_config(
         self,

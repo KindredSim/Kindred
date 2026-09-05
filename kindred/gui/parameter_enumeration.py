@@ -120,6 +120,23 @@ def _positive_bounds(value: float, *, minimum: float = RATE_MIN, maximum: float 
     return 0.0, max(1.0, abs(value) * 10.0)
 
 
+def _kappa_bounds(value: float) -> tuple[float, float]:
+    """Return a finite positive interval around an admitted Eyring kappa."""
+
+    low = value * 0.01
+    if not math.isfinite(low) or low <= 0.0:
+        low = math.nextafter(value, 0.0)
+        if not math.isfinite(low) or low <= 0.0:
+            low = value
+
+    high = value * 100.0
+    if not math.isfinite(high):
+        high = math.nextafter(value, math.inf)
+        if not math.isfinite(high):
+            high = value
+    return float(low), float(high)
+
+
 def _signed_bounds(value: float) -> tuple[float, float]:
     span = max(1.0, abs(value) * 0.5)
     low = value - span
@@ -502,14 +519,15 @@ def enumerate_parameter_coordinates(
                     )
                 )
             elif role == "kappa" and isinstance(model, EyringRateModel):
+                kappa_low, kappa_high = _kappa_bounds(float(model.kappa))
                 physical_candidates.append(
                     (
                         name,
                         "Eyring",
                         role,
                         float(model.kappa),
-                        RATE_MIN,
-                        RATE_MAX,
+                        kappa_low,
+                        kappa_high,
                         editable,
                         "1",
                     )
@@ -531,11 +549,7 @@ def enumerate_parameter_coordinates(
             )
             allow_zero = False
         elif role == "kappa":
-            low, high = _positive_bounds(
-                value,
-                minimum=minimum,
-                maximum=maximum,
-            )
+            low, high = minimum, maximum
             allow_zero = False
         else:
             low, high = _signed_bounds(value)

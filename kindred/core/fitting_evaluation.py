@@ -45,7 +45,6 @@ from kindred.core.simulation_preparation import (
 )
 from kindred.core.simulator.parameter_coordinates import build_parameter_target_map
 from kindred.core.simulation_preparation_stages import PreparedSolverConfig
-from kindred.core.simulation_algebra_policy import SimulationAlgebraPolicy
 from kindred.core.result_repository import SimulationResultValue
 from kindred.core.simulation_result_finalization import finalize_simulation_result
 from kindred.core.simulator.solver_types import (
@@ -216,10 +215,9 @@ def _fatal_evaluation_error(
 
 @dataclass(frozen=True)
 class PreparedFittingExecutionContext:
-    """Typed fitting request, fixed policy, and preparation metadata."""
+    """Typed fitting request and preparation metadata."""
 
     prepared_run: PreparedSimulationRun
-    algebra_policy: SimulationAlgebraPolicy
     requested_sample_times: tuple[float, ...]
     fit_sampling_policy: str = "fit_internal_regular_grid"
     fit_sampling_identity: Mapping[str, object] = field(default_factory=dict)
@@ -231,16 +229,7 @@ class PreparedFittingExecutionContext:
             raise TypeError(
                 "prepared_run must be PreparedSimulationRun."
             )
-        if self.algebra_policy is not SimulationAlgebraPolicy.FITTING_STRICT:
-            raise ValueError(
-                "Fitting algebra handling requires a fitting_strict algebra policy."
-            )
         object.__setattr__(self, "prepared_run", prepared_run)
-        object.__setattr__(
-            self,
-            "algebra_policy",
-            SimulationAlgebraPolicy.FITTING_STRICT,
-        )
         sample_times = tuple(float(value) for value in self.requested_sample_times)
         request = prepared_run.request
         t_start, t_end = request.t_span
@@ -447,7 +436,6 @@ def prepare_fitting_execution_context(
     )
     return PreparedFittingExecutionContext(
         prepared_run=prepared_run,
-        algebra_policy=SimulationAlgebraPolicy.FITTING_STRICT,
         requested_sample_times=requested_sample_times,
         fit_sampling_policy=str(fit_sampling_policy or "fit_internal_regular_grid"),
         fit_sampling_identity=dict(fit_sampling_identity or {}),
@@ -687,7 +675,6 @@ class FittingEvaluator:
                 initials_for_algebra=initials_map,
                 temperature_schedule=prepared_run.temperature_schedule,
                 parameter_algebra_spec=prepared_run.parameter_algebra_spec,
-                algebra_policy=self._context.algebra_policy,
                 solver_provenance_updates={
                     "fit_sampling_policy": self._context.fit_sampling_policy,
                     "fit_sampling_identity": dict(

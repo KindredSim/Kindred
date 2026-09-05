@@ -305,17 +305,16 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         self._rendered_point_roster = ()
         self._settling_static_input = True
         try:
-            visible_set_ids = {
+            plotted_set_ids = {
                 str(block.block_id)
                 for block in render_input.blocks
-                if block.visible
-                and block.kind
+                if block.kind
                 in {ResultLayerKind.EXPLICIT, ResultLayerKind.PREVIEW}
             }
             removed = tuple(
                 set_id
                 for set_id in self._interactive_target_set_ids
-                if set_id not in visible_set_ids
+                if set_id not in plotted_set_ids
             )
             if removed:
                 self._retire_interactive_targets(removed)
@@ -432,6 +431,13 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         if previous_x is not None and previous_x != render_input.selected_x_series:
             return False
 
+        if (
+            previous_input is not None
+            and not previous_input.selected_y_uses_default_all
+            and render_input.selected_y_uses_default_all
+        ):
+            return False
+
         if self._interactive_projection_sampling_known:
             old_limit = self._interactive_projection_sampling_limit
             new_limit = self._sampling_limit
@@ -444,6 +450,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
             ):
                 return False
 
+        wanted = self._cached_interactive_y_names(render_input)
         for projection in projections:
             names_by_target: dict[str, set[str]] = {}
             for curve in projection.curves:
@@ -451,11 +458,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
                 if len(key) < 4 or key[0] != "simulation":
                     continue
                 names_by_target.setdefault(str(key[2]), set()).add(str(key[3]))
-            for target_set_id, available in names_by_target.items():
-                wanted = self._cached_interactive_y_names(
-                    render_input,
-                    target_set_id,
-                )
+            for available in names_by_target.values():
                 if wanted is not None and not wanted.issubset(available):
                     return False
         return True
@@ -463,47 +466,27 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
     @staticmethod
     def _cached_interactive_y_names(
         render_input: ResultRenderInput,
-        set_id: str,
     ) -> set[str] | None:
-        if not render_input.selected_y_uses_default_all:
-            return {
-                selection.series_name
-                for selection in render_input.selected_y_series
-                if isinstance(selection, SimulationSeriesAxisSelection)
-            }
-        block = next(
-            (
-                item
-                for item in render_input.blocks
-                if str(item.block_id) == str(set_id)
-                and item.kind
-                in {ResultLayerKind.EXPLICIT, ResultLayerKind.PREVIEW}
-                and item.visible
-                and isinstance(item.result, SimulationResultValue)
-            ),
-            None,
-        )
-        if block is None:
+        if render_input.selected_y_uses_default_all:
             return None
-        return {name for name in block.result.series}
+        return {
+            selection.series_name
+            for selection in render_input.selected_y_series
+            if isinstance(selection, SimulationSeriesAxisSelection)
+        }
 
     def _filter_cached_interactive_projection(
         self,
         projection: InteractiveDisplayProjection,
         render_input: ResultRenderInput,
     ) -> InteractiveDisplayProjection | None:
-        wanted_by_target: dict[str, set[str] | None] = {}
+        wanted = self._cached_interactive_y_names(render_input)
         curves: list[InteractiveDisplayCurve] = []
         for curve in projection.curves:
             key = tuple(curve.key)
             if len(key) < 4 or key[0] != "simulation":
                 curves.append(curve)
                 continue
-            target_set_id = str(key[2])
-            wanted = wanted_by_target.setdefault(
-                target_set_id,
-                self._cached_interactive_y_names(render_input, target_set_id),
-            )
             if wanted is not None and str(key[3]) not in wanted:
                 continue
             if key[1] == "ghost" and not render_input.reference_lines_visible:
@@ -800,9 +783,6 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         elif set_id not in self._interactive_target_set_ids:
             return False
         if self._interactive_frozen:
-            return False
-        if self._compose_interactive_result(result, set_id=set_id) is None:
-            self._retire_interactive_targets((set_id,))
             return False
         self._interactive_results[set_id] = result
         self._recompose_interactive_display()
