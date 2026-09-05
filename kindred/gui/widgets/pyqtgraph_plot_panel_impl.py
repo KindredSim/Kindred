@@ -2699,9 +2699,10 @@ def _iter_rendered_point_tsv_chunks(
     )
     if not nonempty:
         raise ValueError("No rendered points are available to copy.")
-    block_specs: list[tuple[_RenderedPointBlock, tuple[str, ...], int, int]] = []
+    block_specs: list[tuple[_RenderedPointBlock, tuple[str, ...], int, int, bool]] = []
     planned_rows = 0
     planned_width = 0
+    previous_group = None
     for block in nonempty:
         chunks = tuple(chunk for chunk in block.chunks if chunk.x.size)
         series_names = tuple(name for name, _values in chunks[0].series)
@@ -2725,9 +2726,17 @@ def _iter_rendered_point_tsv_chunks(
             metadata_width = 3
         rows = sum(int(chunk.x.size) for chunk in chunks)
         width = 1 + metadata_width + len(series_names)
-        block_specs.append((block, series_names, rows, width))
+        group = (
+            block.kind,
+            dict(block.series_provenance)[series_names[0]]["dataset_id"]
+            if block.kind == ResultLayerKind.EXPERIMENTAL.value
+            else block.block_id,
+        )
+        separator = bool(block_specs) and group != previous_group
+        previous_group = group
+        block_specs.append((block, series_names, rows, width, separator))
         planned_rows = max(planned_rows, rows)
-        planned_width += width
+        planned_width += width + separator
     planned_cells = (planned_rows + 1) * planned_width
     if planned_cells > _MAX_RENDERED_COPY_CELLS:
         raise ValueError(
@@ -2736,7 +2745,9 @@ def _iter_rendered_point_tsv_chunks(
         )
 
     combined_headers: list[str] = []
-    for block, series_names, _rows, _width in block_specs:
+    for block, series_names, _rows, _width, separator in block_specs:
+        if separator:
+            combined_headers.append("")
         chunks = tuple(chunk for chunk in block.chunks if chunk.x.size)
         headers = [
             _rendered_column_header(
@@ -2788,7 +2799,7 @@ def _iter_rendered_point_tsv_chunks(
         for chunk in tuple(chunk for chunk in block.chunks if chunk.x.size):
             series_by_name = dict(chunk.series)
             for index in range(chunk.x.size):
-                row: list[str] = [f"{float(chunk.x[index]):.17g}"]
+                row: list[str] = [repr(float(chunk.x[index]))]
                 if block.kind == ResultLayerKind.EXPERIMENTAL.value:
                     row.append(str(int(chunk.source_row[index])))
                 else:
@@ -2800,7 +2811,7 @@ def _iter_rendered_point_tsv_chunks(
                         )
                     )
                 row.extend(
-                    f"{float(series_by_name[name][index]):.17g}"
+                    repr(float(series_by_name[name][index]))
                     for name in series_names
                 )
                 yield tuple(row)
@@ -2812,13 +2823,15 @@ def _iter_rendered_point_tsv_chunks(
     rows_in_chunk = 1
     row_iterators = [
         iter_block_rows(block, series_names)
-        for block, series_names, _rows, _width in block_specs
+        for block, series_names, _rows, _width, _separator in block_specs
     ]
     for row_index in range(planned_rows):
         row: list[str] = []
-        for iterator, (_block, _series_names, rows, width) in zip(
+        for iterator, (_block, _series_names, rows, width, separator) in zip(
             row_iterators, block_specs, strict=True
         ):
+            if separator:
+                row.append("")
             if row_index < rows:
                 row.extend(next(iterator))
             else:

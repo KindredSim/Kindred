@@ -1561,7 +1561,17 @@ def iter_blocks_tsv_chunks(
 ) -> Iterator[str]:
     block_values = tuple(blocks)
     columns: list[tuple[str, Sequence[object], str]] = []
+    previous_group = None
     for block in block_values:
+        group = (
+            block.kind,
+            block.block_id.dataset_id
+            if block.kind is ResultLayerKind.EXPERIMENTAL
+            else block.block_id,
+        )
+        if columns and group != previous_group:
+            columns.append(("", (), "text"))
+        previous_group = group
         columns.append(
             (
                 _export_column_header(
@@ -1650,7 +1660,7 @@ def iter_blocks_tsv_chunks(
                 encode_tsv_row(
                     tuple(
                         (
-                            f"{float(values[index]):.17g}"
+                            repr(float(values[index]))
                             if kind == "float"
                             else (
                                 str(int(values[index]))

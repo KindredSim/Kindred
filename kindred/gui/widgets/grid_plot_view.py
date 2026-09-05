@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import io
+import json
 import math
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from types import MappingProxyType
 from typing import TypeAlias
 
@@ -29,7 +30,6 @@ pg = require_pyqtgraph(context="Kindred GUI")
 
 ColorResolver = Callable[[str], object]
 DatasetPlotPresentation: TypeAlias = tuple[str, str]
-_FIT_COPY_COLUMNS_PER_SERIES = 12
 _MAX_FIT_COPY_CELLS = 1_000_000
 _MAX_FIT_COPY_CHARACTERS = 64 * 1024 * 1024
 _FIT_COPY_ROWS_PER_CHUNK = 2048
@@ -59,11 +59,115 @@ def _fit_y_axis_label(
     return "Value", None
 
 
+def _fit_copy_columns(
+    dataset: FitCurveDataset,
+) -> list[tuple[str, Sequence[object], str]]:
+    """Build one dataset's model and observation columns in plot-series order."""
+
+    dataset_label = f"{dataset.display_name} [{dataset.dataset_id}]"
+    dataset_identity = {
+        "dataset_id": dataset.dataset_id,
+        "dataset_name": dataset.display_name,
+    }
+
+    def header(
+        label: str,
+        name: str,
+        identity: Mapping[str, str],
+        unit: str | None = None,
+    ) -> str:
+        displayed_name = f"{name} ({unit})" if unit is not None else name
+        provenance = json.dumps(
+            {**dataset_identity, **identity}, sort_keys=True, separators=(",", ":")
+        )
+        return encode_clipboard_text(
+            f"{label}::{displayed_name} [provenance={provenance}]"
+        )
+
+    model_x = dict(dataset.model_x)
+    model_y = dict(dataset.model_y)
+    segment_ids = dict(dataset.model_segment_ids)
+    segment_keys = dict(dataset.model_segment_keys)
+    discontinuity_ids = dict(dataset.model_discontinuity_ids)
+    selection = dict(dataset.model_selection_provenance)
+    series_names = sorted(model_y)
+    x_unit = "s" if dataset.x_name.casefold() == "t" else None
+    _y_label, y_unit = _fit_y_axis_label(dataset.y_semantics, series_names)
+    model_groups: dict[tuple[object, ...], list[str]] = {}
+    for name in series_names:
+        # Repeated X values on different execution segments are separate grids.
+        grid = (
+            model_x[name], segment_ids[name], segment_keys[name],
+            discontinuity_ids[name],
+        )
+        model_groups.setdefault(grid, []).append(name)
+
+    columns: list[tuple[str, Sequence[object], str]] = []
+    for index, names in enumerate(model_groups.values(), 1):
+        suffix = f" {index}" if len(model_groups) > 1 else ""
+        label = f"{dataset_label} — Model{suffix}"
+        first = names[0]
+        x_identity = {} if x_unit is not None else {"model_target": dataset.x_name}
+        columns.append(
+            (header(label, dataset.x_name, x_identity, x_unit), model_x[first], "float")
+        )
+        columns.extend(
+            (
+                encode_clipboard_text(f"{label} — {field}"), values, kind,
+            )
+            for field, values, kind in (
+                ("segment_id", segment_ids[first], "int"),
+                ("segment_key", segment_keys[first], "text"),
+                ("discontinuity_id", discontinuity_ids[first], "int"),
+            )
+        )
+        for name in names:
+            identity = {"model_target": name}
+            kinds = selection.get(name, ())
+            varying_selection = bool(kinds) and len(set(kinds)) > 1
+            if kinds and not varying_selection:
+                identity["selection_provenance"] = kinds[0]
+            columns.append((header(label, name, identity, y_unit), model_y[name], "float"))
+            if varying_selection:
+                columns.append(
+                    (header(label, f"{name} — selection_provenance", {"model_target": name}), kinds, "text")
+                )
+
+    observed_x = dict(dataset.observed_x)
+    observed_y = dict(dataset.observed_y)
+    observation_ids = dict(dataset.observed_observation_ids)
+    raw_columns = dict(dataset.observed_raw_columns)
+    source_rows = dict(dataset.observed_source_rows)
+    for name in sorted(observed_y):
+        label = f"{dataset_label} — Observed {name}"
+        if dataset.observed_x_identity is None:
+            x_identity = {"raw_observation_id": observation_ids[name]}
+        else:
+            observation_id, raw_column = dataset.observed_x_identity
+            x_identity = {
+                "raw_observation_id": observation_id,
+                "raw_column": raw_column,
+                "model_target": dataset.x_name,
+            }
+        y_identity = {
+            "raw_observation_id": observation_ids[name],
+            "raw_column": raw_columns[name],
+            "model_target": name,
+        }
+        columns.extend(
+            (
+                (header(label, dataset.x_name, x_identity, x_unit), observed_x[name], "float"),
+                (encode_clipboard_text(f"{label} — source_row"), source_rows[name], "int"),
+                (header(label, raw_columns[name], y_identity, y_unit), observed_y[name], "float"),
+            )
+        )
+    return columns
+
+
 class GridPlotView(QtWidgets.QWidget):
     """Render immutable live and terminal Fit curves in the Fit-local plot."""
 
     copyFitDataRequested = QtCore.Signal(str)
-    fitDataCopied = QtCore.Signal()
 
     def __init__(
         self,
@@ -353,7 +457,7 @@ class GridPlotView(QtWidgets.QWidget):
         self,
         curves: Iterable[FitCurveDataset],
     ) -> None:
-        """Copy a fresh canonical projection without using retained plot data."""
+        """Copy the Results owner's immutable plotted arrays for the given scope."""
 
         values = tuple(curves)
         if any(not isinstance(item, FitCurveDataset) for item in values):
@@ -377,96 +481,37 @@ class GridPlotView(QtWidgets.QWidget):
     def _iter_copy_chunks(
         curves: tuple[FitCurveDataset, ...],
     ) -> Iterable[str]:
-        block_specs = tuple(
-            (dataset, species, len(model_y_values))
-            for dataset in curves
-            for species, model_y_values in dataset.objective_model_y
-        )
-        if not block_specs:
+        columns: list[tuple[str, Sequence[object], str]] = []
+        for dataset in curves:
+            dataset_columns = _fit_copy_columns(dataset)
+            if columns and dataset_columns:
+                columns.append(("", (), "text"))
+            columns.extend(dataset_columns)
+        if not columns:
             raise ValueError("No Fit curves are available to copy.")
-        row_count = max(length for _dataset, _species, length in block_specs)
-        column_count = len(block_specs) * _FIT_COPY_COLUMNS_PER_SERIES
-        cell_count = (row_count + 1) * column_count
+        row_count = max(len(values) for _header, values, _kind in columns)
+        cell_count = (row_count + 1) * len(columns)
         if cell_count > _MAX_FIT_COPY_CELLS:
             raise ValueError(
                 "Fit Copy payload exceeds the bounded full-resolution cell "
                 f"limit ({_MAX_FIT_COPY_CELLS:,})."
             )
-        fields = (
-            "raw_observation_id",
-            "raw_column",
-            "source_row",
-            "segment_id",
-            "segment_key",
-            "discontinuity_id",
-            "selection_provenance",
-            "x_name",
-            "observed_x",
-            "observed_y",
-            "model_x",
-            "model_y",
-        )
-        headers: list[str] = []
-        for dataset, species, _length in block_specs:
-            prefix = f"{dataset.display_name} [{dataset.dataset_id}]::{species}"
-            headers.extend(
-                encode_clipboard_text(f"{prefix}::{field}") for field in fields
-            )
-
-        def iter_series_rows(
-            dataset: FitCurveDataset,
-            species: str,
-        ) -> Iterable[tuple[str, ...]]:
-            model_x = dict(dataset.objective_model_x)[species]
-            model_y = dict(dataset.objective_model_y)[species]
-            observed_x = dict(dataset.observed_x)[species]
-            observed_y = dict(dataset.observed_y)[species]
-            segment_ids = dict(dataset.objective_model_segment_ids)[species]
-            segment_keys = dict(dataset.objective_model_segment_keys)[species]
-            discontinuity_ids = dict(
-                dataset.objective_model_discontinuity_ids
-            )[species]
-            selection = dict(dataset.objective_selection_provenance)[species]
-            observation_ids = dict(dataset.objective_observation_ids)[species]
-            raw_columns = dict(dataset.objective_raw_columns)[species]
-            source_rows = dict(dataset.objective_source_rows)[species]
-            for index, (obs_x, obs_y, selected_x, selected_y) in enumerate(
-                zip(observed_x, observed_y, model_x, model_y, strict=True)
-            ):
-                yield (
-                    encode_clipboard_text(observation_ids[index]),
-                    encode_clipboard_text(raw_columns[index]),
-                    str(source_rows[index]),
-                    str(segment_ids[index]),
-                    encode_clipboard_text(segment_keys[index]),
-                    str(discontinuity_ids[index]),
-                    encode_clipboard_text(selection[index]),
-                    encode_clipboard_text(dataset.x_name),
-                    f"{float(obs_x):.17g}",
-                    f"{float(obs_y):.17g}",
-                    f"{float(selected_x):.17g}",
-                    f"{float(selected_y):.17g}",
-                )
 
         total_characters = 0
         output = io.StringIO()
-        output.write(encode_tsv_row(headers))
+        output.write(encode_tsv_row([header for header, _values, _kind in columns]))
         rows_in_chunk = 0
-        row_iterators = [
-            iter(iter_series_rows(dataset, species))
-            for dataset, species, _length in block_specs
-        ]
         for row_index in range(row_count):
             row: list[str] = []
-            for iterator, (_dataset, _species, length) in zip(
-                row_iterators,
-                block_specs,
-                strict=True,
-            ):
-                if row_index < length:
-                    row.extend(next(iterator))
+            for _header, values, kind in columns:
+                if row_index >= len(values):
+                    row.append("")
+                elif kind == "float":
+                    row.append(repr(float(values[row_index])))
+                elif kind == "int":
+                    row.append(str(int(values[row_index])))
                 else:
-                    row.extend("" for _ in range(_FIT_COPY_COLUMNS_PER_SERIES))
+                    row.append(encode_clipboard_text(str(values[row_index])))
             output.write(encode_tsv_row(row))
             rows_in_chunk += 1
             if rows_in_chunk >= _FIT_COPY_ROWS_PER_CHUNK:
@@ -511,7 +556,6 @@ class GridPlotView(QtWidgets.QWidget):
                 )
                 return
             application.clipboard().setText(text)
-            self.fitDataCopied.emit()
         except Exception as exc:
             self._cancel_copy()
             QtWidgets.QMessageBox.critical(

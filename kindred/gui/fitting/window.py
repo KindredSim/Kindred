@@ -200,6 +200,13 @@ class FittingWindow(QtWidgets.QDialog):
         )
         actions.addWidget(self._results_summary_button)
 
+        self._copy_button = QtWidgets.QPushButton("Copy Fit Curves", footer)
+        self._copy_button.setEnabled(False)
+        self._copy_button.clicked.connect(
+            self._run_results_tab.copy_active_to_clipboard
+        )
+        actions.addWidget(self._copy_button)
+
         self._apply_button = QtWidgets.QPushButton("Apply Fit to Project", footer)
         self._apply_button.setEnabled(False)
         self._apply_button.clicked.connect(self.applyRequested)
@@ -239,7 +246,9 @@ class FittingWindow(QtWidgets.QDialog):
             self._refresh_setup_validity
         )
 
-        self._run_results_tab.statusMessage.connect(self.set_status)
+        self._run_results_tab.copyAvailableChanged.connect(
+            self._copy_button.setEnabled
+        )
 
     def _connect_origin_dependent_leaf_signals(self) -> None:
         self._species_table.setupSnapshotRequested.connect(
