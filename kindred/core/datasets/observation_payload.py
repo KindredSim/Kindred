@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
-from numbers import Real
 from collections.abc import Iterable
 from typing import Mapping
 import uuid
@@ -15,7 +14,6 @@ from kindred.core.datasets.foundation import (
     freeze_json_value,
     validate_raw_observation_id,
 )
-from kindred.core.species import validate_imported_time_seconds, validate_observation
 
 @dataclass(frozen=True, slots=True)
 class DatasetObservationPayload:
@@ -56,39 +54,6 @@ class DatasetObservationPayload:
 def new_raw_observation_id() -> str:
     """Allocate one opaque dataset-local raw observation identity."""
     return uuid.uuid4().hex
-
-
-def _as_finite_float_tuple(
-    values: object,
-    *,
-    label: str,
-) -> tuple[float, ...]:
-    if isinstance(values, np.ndarray):
-        source = values.reshape(-1)
-    else:
-        if not isinstance(values, Iterable):
-            raise ValueError(f"{label} must be a one-dimensional sequence.")
-        source = tuple(values)
-    converted: list[float] = []
-    for index, value in enumerate(source):
-        if isinstance(value, (bool, np.bool_)) or not isinstance(value, Real):
-            raise ValueError(f"{label} must contain only finite numeric values.")
-        parsed = float(value)
-        if label.endswith(" times"):
-            try:
-                parsed = validate_imported_time_seconds(
-                    parsed,
-                    field=f"{label}[{index}]",
-                )
-            except (TypeError, ValueError) as exc:
-                raise ValueError(str(exc)) from exc
-        else:
-            try:
-                parsed = validate_observation(parsed, field=f"{label}[{index}]")
-            except (TypeError, ValueError) as exc:
-                raise ValueError(str(exc)) from exc
-        converted.append(parsed)
-    return tuple(converted)
 
 
 def _as_source_row_tuple(values: object) -> tuple[int, ...]:
@@ -153,14 +118,8 @@ def immutable_dataset_payload(
                 "Raw observation identity "
                 f"{raw_observation_id!r} is duplicated within the dataset."
             )
-        times = _as_finite_float_tuple(
-            raw_spec.get("t", ()),
-            label=f"Observation series {name!r} times",
-        )
-        values = _as_finite_float_tuple(
-            raw_spec.get("y", ()),
-            label=f"Observation series {name!r} values",
-        )
+        times = tuple(raw_spec.get("t", ()))
+        values = tuple(raw_spec.get("y", ()))
         rows = _as_source_row_tuple(raw_spec.get("source_rows", ()))
         if not times or len(times) != len(values) or len(times) != len(rows):
             raise ValueError(

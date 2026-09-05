@@ -90,7 +90,6 @@ class SegmentExecutionRequest:
 
 @dataclass(frozen=True)
 class SegmentRunResult:
-    identity: SegmentIdentity
     t: np.ndarray
     Y: np.ndarray
     event_times: tuple[tuple[float, ...], ...]
@@ -174,13 +173,9 @@ class BaseSegmentRunner(Protocol):
 class ScheduleExecutionRequest:
     request: SimulationRequest
     rhs: Rhs2
-    t0: float
-    t1: float
-    y0: np.ndarray
     t_eval: np.ndarray
     provenance: dict[str, object]
     method: str
-    schedule: InterventionExecutionContract
 
 
 class InterventionScheduleExecutionOwner:
@@ -189,12 +184,11 @@ class InterventionScheduleExecutionOwner:
 
     def execute(self, request: ScheduleExecutionRequest) -> FinalSimulationOutput:
         req = request.request
-        t0 = float(request.t0)
-        t1 = float(request.t1)
+        t0, t1 = req.t_span
         t_eval = np.asarray(request.t_eval, dtype=float).reshape(-1)
-        contract = request.schedule
+        contract = req.intervention_execution
         species_index = _species_index(req, contract)
-        current_y = np.asarray(request.y0, dtype=float).reshape(-1).copy()
+        current_y = np.asarray(req.y0, dtype=float).reshape(-1).copy()
         cancellation_check = (
             req.cancellation_control.cancel_requested
             if req.cancellation_control is not None
@@ -403,10 +397,6 @@ class InterventionScheduleExecutionOwner:
                     )
                 )
                 _raise_if_cancelled(cancellation_check)
-                if segment_result.identity != segment_identity:
-                    raise InterventionScheduleError(
-                        "Segment runner returned a mismatched segment identity."
-                    )
                 event_times = segment_result.event_times
                 event_states = segment_result.raw_event_states
                 if active_holds:
@@ -481,12 +471,13 @@ class InterventionScheduleExecutionOwner:
                     )
                 )
                 segment_output_identity = replace(
-                    segment_result.identity,
+                    segment_identity,
                     t_end=actual_segment_end,
                 )
                 _record_segment_projection(
                     segment_projections,
-                    replace(segment_result, identity=segment_output_identity),
+                    segment_result,
+                    identity=segment_output_identity,
                 )
                 if segment_count == 0:
                     _record_continuation_projection(
@@ -880,14 +871,16 @@ def _compose_direct_result_sample_identity(
 def _record_segment_projection(
     records: dict[str, SegmentProjection],
     result: SegmentRunResult,
+    *,
+    identity: SegmentIdentity,
 ) -> None:
-    key = result.identity.key
+    key = identity.key
     if key in records:
         raise InterventionScheduleError(
             f"Duplicate segment projection identity: {key!r}."
         )
     records[key] = SegmentProjection(
-        identity=result.identity,
+        identity=identity,
         trajectory=result.trajectory_projection,
         event_states=result.event_state_projection,
     )

@@ -758,8 +758,6 @@ def _objective_scientific_residuals(
 @dataclass(frozen=True, slots=True)
 class _LikelihoodRatioDetails:
     transport_value: float
-    raw_value: float | None
-    log_value: float | None
     outcome: str
 
 
@@ -771,8 +769,8 @@ def _likelihood_ratio_details(
 ) -> _LikelihoodRatioDetails:
     """Calculate an un-clamped finite transport value and crossing outcome.
 
-    The profile comparison is a log likelihood ratio.  Its raw/log values are
-    retained when representable.  Exact-fit and overflow limits use a finite
+    The profile comparison is a log likelihood ratio.
+    Exact-fit and overflow limits use a finite
     transport sentinel plus a typed outcome; they are never falsely clamped to
     the configured threshold before crossing interpolation.
     """
@@ -785,28 +783,21 @@ def _likelihood_ratio_details(
     if count <= 0:
         raise ValueError("Likelihood evaluation requires a positive observation count.")
     if candidate <= best:
-        raw_ratio = 1.0 if best == 0.0 else max(0.0, candidate / best)
-        return _LikelihoodRatioDetails(0.0, raw_ratio, 0.0, "finite")
+        return _LikelihoodRatioDetails(0.0, "finite")
     if best == 0.0:
         finite_transport = float(np.finfo(float).max / 4.0)
         return _LikelihoodRatioDetails(
             finite_transport,
-            None,
-            None,
             "threshold_exceeded_exact_fit",
         )
-    raw_ratio = candidate / best
-    raw_value = raw_ratio if math.isfinite(raw_ratio) else None
     log_ratio = float(count) * (math.log(candidate) - math.log(best))
     if not math.isfinite(log_ratio):
         finite_transport = float(np.finfo(float).max / 4.0)
         return _LikelihoodRatioDetails(
             finite_transport,
-            None,
-            None,
             "threshold_exceeded_overflow",
         )
-    return _LikelihoodRatioDetails(log_ratio, raw_value, log_ratio, "finite")
+    return _LikelihoodRatioDetails(log_ratio, "finite")
 
 
 def _profile_endpoint_record(

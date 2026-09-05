@@ -445,15 +445,6 @@ class TabSliderBinding(QtCore.QObject):
                 dict(prepared.parameter_values),
                 metadata=prepared.projection.metadata_dict(),
                 preserve_visibility=prepared.preserve_visibility,
-                visibility_scope_signature=tuple(
-                    (
-                        item.name,
-                        item.family,
-                        item.role,
-                        "log" if item.log10_allowed else "linear",
-                    )
-                    for item in prepared.projection.coordinates
-                ),
             )
             self._species_sliders.render_values(
                 dict(prepared.species_values),
@@ -461,9 +452,6 @@ class TabSliderBinding(QtCore.QObject):
                 target_display_names=prepared.target_display_names,
                 mixed_species=prepared.mixed_species,
                 preserve_visibility=prepared.preserve_visibility,
-                visibility_scope_signature=tuple(
-                    name for name, _ in prepared.species_values
-                ),
             )
         finally:
             del sb

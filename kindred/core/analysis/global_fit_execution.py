@@ -61,7 +61,6 @@ from kindred.core.fitting_evaluation import (
     FITTING_PARAM_ORIGIN_OPTIMIZER_DATASET,
     FITTING_PARAM_ORIGIN_OPTIMIZER_SHARED,
 )
-from kindred.core.objective import ObjectiveContext
 from kindred.core.result_repository import SimulationResultValue
 from kindred.core.simulator.solver_types import SimulationCancellationControl
 from kindred.core.simulation_failure import (
@@ -344,7 +343,6 @@ class DatasetFitInfo:
     weighted_residual_mse: FitMetric  # Exact objective contribution per observation
     weighted_rmse: FitMetric
     weighted_mae: FitMetric
-    n_points: int  # Number of data points
     weight: float  # Weight used in global objective
     simulation_result: SimulationResultValue
     residuals: np.ndarray
@@ -390,8 +388,8 @@ class DatasetFitInfo:
 
         species_rows = sum(values.size for values in self.model_series.values())
         projection_rows = 0 if self.x_projection is None else self.x_projection.size
-        if self.n_points != species_rows + projection_rows:
-            raise ValueError("Dataset fit n_points must match model and X rows exactly.")
+        if self.residuals.size != species_rows + projection_rows:
+            raise ValueError("Dataset fit residual count must match model and X rows exactly.")
 
 
 @dataclass(frozen=True, slots=True)
@@ -1748,7 +1746,6 @@ def _build_dataset_fit_info(
         weighted_residual_mse=dataset_metrics.weighted_mse,
         weighted_rmse=dataset_metrics.weighted_rmse,
         weighted_mae=dataset_metrics.weighted_mae,
-        n_points=int(residuals.size),
         weight=weights.get(dataset_id, 1.0),
         simulation_result=simulation,
         residuals=residuals,
@@ -1915,7 +1912,6 @@ class GlobalFitObjective:
         weights: Dict[str, float],
         layout: FitParameterLayout,
         penalty_value: float,
-        ctx: ObjectiveContext,
         progress_callback: Optional[Callable[[FitProgress], None]],
         cancellation_check: Optional[Callable[[], bool]],
         cancellation_control: SimulationCancellationControl | None = None,
@@ -1957,7 +1953,7 @@ class GlobalFitObjective:
         self._weights = weights
         self._layout = layout
         self._penalty_value = float(penalty_value)
-        self._ctx = ctx
+        self._last_error: FitSimulationError | None = None
         self._progress_callback = progress_callback
         self._cancellation_check = cancellation_check
         self._cancellation_control = cancellation_control
@@ -1987,7 +1983,7 @@ class GlobalFitObjective:
         """
 
         residuals = self(np.asarray(params, dtype=float))
-        if self._ctx.last_error is not None:
+        if self._last_error is not None:
             return None
         values = np.asarray(residuals, dtype=float).reshape(-1)
         return values if values.size and np.all(np.isfinite(values)) else None
@@ -2036,7 +2032,7 @@ class GlobalFitObjective:
 
     def __call__(self, params: np.ndarray) -> np.ndarray:
         _raise_if_fitting_cancelled(self._cancellation_check)
-        self._ctx.clear()
+        self._last_error = None
 
         def candidate_penalty_residuals() -> np.ndarray:
             blocks: list[np.ndarray] = []
@@ -2320,7 +2316,7 @@ class GlobalFitObjective:
             )
             if unavailability.factual_cause is not None:
                 context_error.factual_cause = unavailability.factual_cause
-            self._ctx.set_error(context_error)
+            self._last_error = context_error
             key = ("__candidate__", unavailability.producer, unavailability.stage)
             if key not in self._warned_objective_keys:
                 self._warned_objective_keys.add(key)
@@ -2454,7 +2450,7 @@ class GlobalFitObjective:
                 },
             )
             timeout_error.factual_cause = timeout_unavailability.factual_cause
-            self._ctx.set_error(timeout_error)
+            self._last_error = timeout_error
 
         residual_blocks: list[np.ndarray] = []
         artificial_block_indexes: set[int] = set()

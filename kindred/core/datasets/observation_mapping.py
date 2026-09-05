@@ -3,10 +3,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-import math
 from typing import Iterable, Mapping, Sequence
 
-from kindred.core.species import validate_imported_time_seconds, validate_observation
+from kindred.core.species import validate_concentration
 
 
 class ObservationMappingError(ValueError):
@@ -210,31 +209,13 @@ def seed_species_values_at_exact_zero(
                 spec.get("raw_column"),
                 "Raw observation label",
             )
-            try:
-                t_values = tuple(
-                    validate_imported_time_seconds(item, field="observation time")
-                    for item in spec.get("t", ())
-                )
-                y_values = tuple(
-                    validate_observation(item, field="observation value")
-                    for item in spec.get("y", ())
-                )
-            except (TypeError, ValueError) as exc:
-                raise ObservationMappingError(str(exc)) from exc
-            if len(t_values) != len(y_values):
+            t_values = spec["t"]
+            y_values = spec["y"]
+            source_rows = spec["source_rows"]
+            if len(set(source_rows)) != len(source_rows):
                 raise ObservationMappingError(
-                    f"Observation {raw_column!r} (raw ID {raw_id!r}) has "
-                    "mismatched time and value lengths."
-                )
-            source_rows = tuple(int(item) for item in spec.get("source_rows", ()))
-            if (
-                len(source_rows) != len(t_values)
-                or any(row <= 0 for row in source_rows)
-                or len(set(source_rows)) != len(source_rows)
-            ):
-                raise ObservationMappingError(
-                    f"Observation {raw_column!r} (raw ID {raw_id!r}) requires "
-                    "one unique positive physical source row per value."
+                    f"Observation {raw_column!r} (raw ID {raw_id!r}) contains "
+                    "duplicate physical source-row identities."
                 )
             zero_indexes = tuple(
                 index
@@ -252,12 +233,12 @@ def seed_species_values_at_exact_zero(
                     f"at source rows {joined}."
                 )
             if zero_indexes:
-                y_value = y_values[zero_indexes[0]]
-                if not math.isfinite(y_value):
-                    raise ObservationMappingError(
-                        f"Observation {raw_column!r} (raw ID {raw_id!r}) "
-                        "has a non-finite value at t=0."
+                try:
+                    value = validate_concentration(
+                        y_values[zero_indexes[0]],
+                        field=f"initial concentration for {species}",
                     )
-                value = y_value
+                except (TypeError, ValueError) as exc:
+                    raise ObservationMappingError(str(exc)) from exc
         seeded.append((species, value))
     return tuple(seeded)

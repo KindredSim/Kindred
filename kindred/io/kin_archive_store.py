@@ -553,7 +553,7 @@ def _replay_imported_dataset(
     if source.original_format != "xlsx":
         raise ValueError(f"{label} has unsupported source format {source.original_format!r}.")
     sheet_name = metadata.get("sheet_name")
-    if not isinstance(sheet_name, str) or not sheet_name.strip():
+    if not isinstance(sheet_name, str) or not sheet_name:
         raise ValueError(f"{label}.source_metadata.sheet_name is required for XLSX replay.")
     workbook_context = (
         nullcontext(workbooks)
@@ -616,7 +616,7 @@ def _require_replay_metadata(
         )
     if source.original_format == "xlsx":
         sheet_name = metadata.get("sheet_name")
-        if not isinstance(sheet_name, str) or not sheet_name.strip():
+        if not isinstance(sheet_name, str) or not sheet_name:
             raise ValueError(
                 f"{label}.source_metadata.sheet_name is required for XLSX replay."
             )

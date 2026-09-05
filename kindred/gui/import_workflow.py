@@ -17,8 +17,8 @@ from types import MappingProxyType
 from typing import Dict, List, Mapping, Optional, Sequence, Tuple
 import uuid
 
-from kindred.core.datasets.foundation import validate_original_basename
-from kindred.core.datasets.source_rules import PhysicalColumn, validate_tabular_source_bytes
+from kindred.core.datasets.foundation import ImportedSource, validate_imported_source
+from kindred.core.datasets.source_rules import PhysicalColumn
 from kindred.core.datasets.units import (
     looks_like_unit_row,
     parse_concentration_unit,
@@ -28,7 +28,6 @@ from kindred.core.datasets.units import (
 
 __all__ = [
     "ImportConfig",
-    "ImportSourceSnapshot",
     "ResolvedSheetPlan",
     "SheetImportIntent",
     "UnitDetection",
@@ -39,50 +38,9 @@ __all__ = [
     "resolve_import_plans",
 ]
 
-@dataclass(frozen=True, slots=True)
-class ImportSourceSnapshot:
-    """One immutable source-byte snapshot captured before any preview read."""
-
-    file_type: str
-    original_filename: str
-    exact_source_bytes: bytes
-    source_id: str = field(default_factory=lambda: f"source-{uuid.uuid4().hex}")
-
-    def __post_init__(self) -> None:
-        filename = str(self.original_filename)
-        source_type = str(self.file_type)
-        source_bytes = self.exact_source_bytes
-        source_id = str(self.source_id)
-        try:
-            validate_original_basename(filename, label="dataset import source filename")
-        except ValueError as exc:
-            raise ValueError(str(exc)) from exc
-        suffix = Path(filename).suffix.lower()
-        expected_type = "excel" if suffix == ".xlsx" else "csv" if suffix == ".csv" else ""
-        if source_type != expected_type:
-            raise ValueError(
-                "Dataset import source type must exactly match its .csv or "
-                ".xlsx filename."
-            )
-        if not source_id or source_id != source_id.strip():
-            raise ValueError("Dataset import source ID must be nonblank and edge-normalized.")
-        validate_tabular_source_bytes(
-            source_bytes,
-            source_format="xlsx" if source_type == "excel" else "csv",
-            source_label=filename,
-        )
-        object.__setattr__(self, "file_type", source_type)
-        object.__setattr__(self, "original_filename", filename)
-        object.__setattr__(self, "source_id", source_id)
-
-    @property
-    def archive_format(self) -> str:
-        return "xlsx" if self.file_type == "excel" else "csv"
-
-
 def capture_import_source(
     filepath: str | os.PathLike[str],
-) -> ImportSourceSnapshot:
+) -> ImportedSource:
     """Read one source exactly once before any semantic preview or planning."""
 
     path = Path(filepath)
@@ -103,11 +61,13 @@ def capture_import_source(
             source_bytes = source.read()
     except OSError as exc:
         raise ValueError(f"Cannot read dataset source {path!s}: {exc}") from exc
-    return ImportSourceSnapshot(
-        file_type="excel" if suffix == ".xlsx" else "csv",
+    source = ImportedSource(
+        source_id=f"source-{uuid.uuid4().hex}",
+        original_format=suffix[1:],
         original_filename=path.name,
         exact_source_bytes=source_bytes,
     )
+    return validate_imported_source(source)
 
 
 @dataclass(frozen=True)
@@ -196,13 +156,12 @@ class UserImportIntent:
             any(
                 not isinstance(name, str)
                 or not name
-                or name != name.strip()
                 for name in sheet_names
             )
             or len(sheet_names) != len(set(sheet_names))
         ):
             raise ValueError(
-                "Selected worksheet names must be unique nonblank strings."
+                "Selected worksheet names must be unique nonempty strings."
             )
         if type(self.apply_to_remaining) is not bool:
             raise TypeError("apply_to_remaining must be a bool.")
@@ -274,10 +233,9 @@ class ResolvedSheetPlan:
         if self.sheet_name is not None and (
             not isinstance(self.sheet_name, str)
             or not self.sheet_name
-            or not self.sheet_name.strip()
         ):
             raise ValueError(
-                "Resolved worksheet name must be None or a nonblank string."
+                "Resolved worksheet name must be None or a nonempty string."
             )
         if not isinstance(self.time_column, PhysicalColumn):
             raise TypeError(
@@ -346,19 +304,19 @@ class ResolvedSheetPlan:
 class ImportConfig:
     """Top-level import configuration grouping source intent and plans."""
 
-    source: ImportSourceSnapshot
+    source: ImportedSource
     file_intent: UserImportIntent
     plans: Tuple[ResolvedSheetPlan, ...]
     remaining_file_template: Optional[SheetImportIntent] = None
 
     def __post_init__(self) -> None:
-        if not isinstance(self.source, ImportSourceSnapshot):
+        if not isinstance(self.source, ImportedSource):
             raise TypeError(
                 "Import configuration requires one immutable source snapshot."
             )
         if not isinstance(self.file_intent, UserImportIntent):
             raise TypeError("Import configuration requires UserImportIntent.")
-        admitted_type = self.source.file_type
+        admitted_type = self.source.original_format
         plans = tuple(self.plans)
         if not plans:
             raise ValueError("Import configuration requires at least one plan.")
@@ -368,12 +326,12 @@ class ImportConfig:
             len(plans) != 1 or plans[0].sheet_name is not None
         ):
             raise ValueError("A CSV import requires exactly one non-sheet plan.")
-        if admitted_type == "excel" and any(
+        if admitted_type == "xlsx" and any(
             plan.sheet_name is None for plan in plans
         ):
             raise ValueError("Every XLSX import plan requires a sheet name.")
         plan_keys = tuple(plan.sheet_name for plan in plans)
-        if admitted_type == "excel" and tuple(
+        if admitted_type == "xlsx" and tuple(
             self.file_intent.sheet_names
         ) != tuple(key for key in plan_keys if key is not None):
             raise ValueError(
@@ -472,7 +430,7 @@ def rebuild_intent_for_target(
 
 
 def resolve_import_plans(
-    source: ImportSourceSnapshot,
+    source: ImportedSource,
     per_sheet_intents: Dict[Optional[str], SheetImportIntent],
     per_sheet_detections: Dict[Optional[str], UnitDetection],
     per_sheet_columns: Dict[Optional[str], Sequence[PhysicalColumn]],
@@ -483,15 +441,15 @@ def resolve_import_plans(
     file structure (missing sheets, missing columns, or ambiguous
     concentration factors).
     """
-    if not isinstance(source, ImportSourceSnapshot):
+    if not isinstance(source, ImportedSource):
         raise TypeError("Import planning requires one immutable source snapshot.")
-    admitted_type = source.file_type
+    admitted_type = source.original_format
     target_sheets = list(per_sheet_intents.keys())
     if not target_sheets:
         raise ValueError("Select at least one CSV source or XLSX sheet.")
     if admitted_type == "csv" and target_sheets != [None]:
         raise ValueError("A CSV import requires exactly one non-sheet intent.")
-    if admitted_type == "excel" and any(
+    if admitted_type == "xlsx" and any(
         sheet is None for sheet in target_sheets
     ):
         raise ValueError("Every XLSX import intent requires a sheet name.")

@@ -18,7 +18,6 @@ from kindred.core.project_document import (
 )
 from kindred.core.result_repository import ResultRepository, SimulationResultValue
 from kindred.core.runtime_defaults import MAX_PARALLEL_WORKERS_CEILING
-from kindred.core.simulation_failure import FactualCause, factual_cause_from_exception
 from kindred.core.simulation_preparation import (
     PreparedSimulationRun,
     SimulationExecutionRequest,
@@ -152,22 +151,8 @@ class SimulationTerminalSummary:
 class _TargetTerminalOutcome:
     target: ExplicitRunTarget | PreviewTarget | InteractivePreviewTarget
     state: Literal["success", "failure", "cancelled"]
-    stage: Literal["preparation", "execution"]
     result: SimulationResultValue | None = None
     message: str = ""
-    cause: FactualCause | None = None
-
-
-def _simulation_worker_cause(exc: BaseException) -> FactualCause:
-    cause = factual_cause_from_exception(exc, domain="simulation", origin="simulation_worker")
-    if not isinstance(exc, SimulationPreparationError):
-        return cause
-    details = dict(cause.details)
-    details.update({"stage": str(exc.stage or "unknown"), "parameter_names": tuple(sorted(exc.parameter_names))})
-    return FactualCause(
-        domain=cause.domain, origin=cause.origin, code=cause.code, type=cause.type,
-        message=cause.message, context=cause.context, details=details, cause=cause.cause,
-    )
 
 
 def build_explicit_target(*, prepared_dsl: PreparedDslRequestSet, tab_id: str, set_id: str, set_name: str,
@@ -304,7 +289,6 @@ class _DirectSimulationWorker(QtCore.QThread):
                     _TargetTerminalOutcome(
                         target=target,
                         state="cancelled",
-                        stage="preparation",
                         message="Simulation cancelled.",
                     ),
                 )
@@ -318,8 +302,7 @@ class _DirectSimulationWorker(QtCore.QThread):
                 except BaseException as exc:  # noqa: BLE001
                     outcome = _TargetTerminalOutcome(
                         target=target, state="cancelled" if self.cancelled else "failure",
-                        stage="preparation", message=str(exc) or type(exc).__name__,
-                        cause=None if self.cancelled else _simulation_worker_cause(exc),
+                        message=str(exc) or type(exc).__name__,
                     )
                 self.target_terminal.emit(self._generation, outcome)
                 if self.cancelled:
@@ -331,20 +314,20 @@ class _DirectSimulationWorker(QtCore.QThread):
         target: ExplicitRunTarget | PreviewTarget | InteractivePreviewTarget,
     ) -> _TargetTerminalOutcome:
         if self.cancelled:
-            return _TargetTerminalOutcome(target, "cancelled", "preparation", message="Simulation cancelled.")
+            return _TargetTerminalOutcome(target, "cancelled", message="Simulation cancelled.")
         try:
             prepared, parameters = _prepare_target(target, cancellation_control=self._control)
         except SimulationCancelled:
-            return _TargetTerminalOutcome(target, "cancelled", "preparation", message="Simulation cancelled.")
+            return _TargetTerminalOutcome(target, "cancelled", message="Simulation cancelled.")
         except BaseException as exc:  # noqa: BLE001
-            return _TargetTerminalOutcome(target, "failure", "preparation", message=str(exc) or type(exc).__name__, cause=_simulation_worker_cause(exc))
+            return _TargetTerminalOutcome(target, "failure", message=str(exc) or type(exc).__name__)
         try:
             result = _solve_prepared(prepared, parameters=parameters, cancellation_control=self._control)
         except SimulationCancelled:
-            return _TargetTerminalOutcome(target, "cancelled", "execution", message="Simulation cancelled.")
+            return _TargetTerminalOutcome(target, "cancelled", message="Simulation cancelled.")
         except BaseException as exc:  # noqa: BLE001
-            return _TargetTerminalOutcome(target, "failure", "execution", message=str(exc) or type(exc).__name__, cause=_simulation_worker_cause(exc))
-        return _TargetTerminalOutcome(target, "success", "execution", result=result)
+            return _TargetTerminalOutcome(target, "failure", message=str(exc) or type(exc).__name__)
+        return _TargetTerminalOutcome(target, "success", result=result)
 
 
 RepositoryResolver = Callable[[str], ResultRepository | None]

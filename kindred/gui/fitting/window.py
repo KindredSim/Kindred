@@ -732,9 +732,8 @@ class FittingWindow(QtWidgets.QDialog):
         self._data_tab.setEnabled(not self._executing)
         self._refresh_setup_validity()
 
-    def set_progress(self, value: int, text: str) -> None:
+    def set_progress(self, value: int) -> None:
         self._progress.setValue(max(0, min(100, int(value))))
-        self.set_status(text)
 
     def set_status(self, text: str) -> None:
         if self._closing and not self._closing_after_cleanup:
@@ -820,7 +819,6 @@ class FittingWindow(QtWidgets.QDialog):
         """Present a worker failure while retaining its factual cause chain."""
 
         self._run_results_tab.set_terminal_failure(failure)
-        self.set_status(f"Fit failed: {failure.message}")
         self._tabs.setCurrentIndex(2)
 
     def set_terminal_unavailable(
@@ -832,11 +830,6 @@ class FittingWindow(QtWidgets.QDialog):
         self.clear_candidate()
         self._run_results_tab.set_terminal_unavailable(
             cause,
-        )
-        factual = cause.factual_cause
-        self.set_status(
-            "Fit result scientifically unavailable: "
-            + (factual.message if factual is not None else cause.stage)
         )
         self._tabs.setCurrentIndex(2)
 

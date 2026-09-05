@@ -254,17 +254,17 @@ class TemplateManager:
         self._require_writable_collection()
         if not isinstance(template, Template):
             raise TypeError("template must be a Template.")
-        validated = Template.from_dict(template.to_dict())
-        target = self._template_path(validated.id, create_root=True)
+        payload = template.to_dict()
+        target = self._template_path(payload["id"], create_root=True)
         descriptor, temporary_path = tempfile.mkstemp(
-            prefix=f".{validated.id}.",
+            prefix=f".{payload['id']}.",
             suffix=".tmp",
             dir=target.parent,
         )
         try:
             with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
                 json.dump(
-                    validated.to_dict(),
+                    payload,
                     handle,
                     ensure_ascii=False,
                     allow_nan=False,

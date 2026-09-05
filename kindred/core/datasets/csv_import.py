@@ -16,7 +16,6 @@ from kindred.core.datasets.observation_payload import (
 )
 from kindred.core.datasets.source_rules import (
     PhysicalColumn,
-    validate_tabular_source_bytes,
     identify_physical_columns,
 )
 from kindred.core.species import validate_imported_time_seconds, validate_observation
@@ -76,11 +75,6 @@ def read_csv_rows_from_bytes(
     or explicitly closed.  Header positions remain physical, including blank
     and sparse positions, for the shared ``parse_physical_rows`` boundary.
     """
-    validate_tabular_source_bytes(
-        source_bytes,
-        source_format="csv",
-        source_label=source_label,
-    )
     owned_bytes = bytes(source_bytes)
     label = str(source_label).strip() or "<csv>"
     handle = io.TextIOWrapper(
@@ -237,8 +231,8 @@ def parse_physical_rows(
         parts: list[str] = []
         if str(source_label or "").strip():
             parts.append(f"file {str(source_label).strip()!r}")
-        if str(sheet_name or "").strip():
-            parts.append(f"sheet {str(sheet_name).strip()!r}")
+        if sheet_name is not None:
+            parts.append(f"sheet {sheet_name!r}")
         return "" if not parts else ", ".join(parts) + ", "
 
     row_items = itertools.chain((first,), row_iter)
@@ -348,7 +342,7 @@ def parse_physical_rows(
         ],
         "mapping_source": "explicit",
     }
-    if sheet_name is not None and str(sheet_name).strip():
+    if sheet_name is not None:
         metadata["sheet_name"] = str(sheet_name)
     extras = dict(metadata_extras or {})
     collisions = set(extras) & set(metadata)

@@ -142,7 +142,6 @@ def simulation_execution_requests_equal(
         and _simulation_container_values_equal(left.solver_config.grid, right.solver_config.grid)
         and left.solver_config.use_analytic_jacobian == right.solver_config.use_analytic_jacobian
         and left.requested_parameter_names == right.requested_parameter_names
-        and left.candidate_dependent_intervention_parameter_names == right.candidate_dependent_intervention_parameter_names
         and _simulation_container_values_equal(left.parameter_overrides, right.parameter_overrides)
     )
 
@@ -157,7 +156,6 @@ def _classify_request_parameter_names(
     schedule_names: set[str],
     scalar_names: set[str],
     unknown_names: set[str],
-    mechanism_name_by_raw: dict[str, str],
     invalid_messages: dict[str, str],
     parameter_target_map: Mapping[str, ParameterTarget],
     requested_parameter_names: Iterable[str] | None = None,
@@ -203,9 +201,7 @@ def _classify_request_parameter_names(
             # Classification owns namespace routing only.  Concrete target
             # editability, locking, and scientific admission belong to the
             # grouped coordinate owner at the actual write ingress.
-            canonical_name = name
-            mechanism_names.add(canonical_name)
-            mechanism_name_by_raw[name] = canonical_name
+            mechanism_names.add(name)
             continue
         invalid_message = invalid_request_parameter_identifier_message(mechanism, name)
         if invalid_message is not None:
@@ -228,25 +224,12 @@ def _classify_request_parameter_names(
 
 def raise_unowned_request_parameter_values(
     *,
-    raw_values: Mapping[str, float],
-    mechanism_name_by_raw: Mapping[str, str],
     unknown_names: Iterable[str],
     invalid_messages: Mapping[str, str],
 ) -> None:
     if invalid_messages:
         first_name = sorted(invalid_messages)[0]
         raise ValueError(invalid_messages[first_name])
-    owner_to_raw: dict[str, str] = {}
-    for raw_name, owner_name in sorted(mechanism_name_by_raw.items()):
-        if raw_name not in raw_values:
-            continue
-        owner = str(owner_name)
-        previous = owner_to_raw.get(owner)
-        if previous is not None and previous != raw_name:
-            raise ValueError(
-                f"Request parameter names {previous!r} and {raw_name!r} both resolve to {owner!r}."
-            )
-        owner_to_raw[owner] = str(raw_name)
     unknown = sorted(str(name) for name in unknown_names)
     if unknown:
         raise ValueError(
@@ -386,7 +369,6 @@ class SimulationExecutionRequest:
     t_span: tuple[float, float]
     solver_config: _PreparedSolverConfig
     requested_parameter_names: tuple[str, ...] = ()
-    candidate_dependent_intervention_parameter_names: frozenset[str] = frozenset()
     parameter_overrides: Mapping[str, float] | None = None
 
     def __post_init__(self) -> None:
@@ -429,15 +411,6 @@ class SimulationExecutionRequest:
         if any(not name for name in requested_names) or len(requested_names) != len(set(requested_names)):
             raise ValueError(
                 "execution request requested parameter names must be unique and nonblank."
-            )
-        candidate_dependent_names = frozenset(
-            str(name).strip()
-            for name in self.candidate_dependent_intervention_parameter_names
-            if str(name).strip()
-        )
-        if candidate_dependent_names and schedule is None:
-            raise ValueError(
-                "candidate-dependent intervention parameters require a declarative schedule."
             )
         if type(self.t_span) is not tuple or len(self.t_span) != 2:
             raise TypeError("execution request t_span must be an exact pair.")
@@ -482,7 +455,6 @@ class SimulationExecutionRequest:
         object.__setattr__(self, "species_names", species_names)
         object.__setattr__(self, "y0", y0)
         object.__setattr__(self, "requested_parameter_names", requested_names)
-        object.__setattr__(self, "candidate_dependent_intervention_parameter_names", candidate_dependent_names)
         object.__setattr__(self, "t_span", t_span)
         object.__setattr__(self, "parameter_overrides", overrides)
 
@@ -583,20 +555,6 @@ def _schedule_parameters_deferred_to_prepared_request(
 ) -> frozenset[str]:
     if not unresolved_intervention_schedule.is_parameterized:
         return frozenset()
-    retained = execution_request.candidate_dependent_intervention_parameter_names
-    if retained:
-        # A candidate request carries the fitted values explicitly.  Resolve
-        # it during this preparation while the admitted target map is alive;
-        # only the base Fit request (which has no candidate values yet) keeps
-        # the declarative schedule deferred.
-        supplied = {
-            str(name).strip()
-            for name in dict(execution_request.parameter_overrides or {})
-            if str(name).strip()
-        }
-        if retained.issubset(supplied):
-            return frozenset()
-        return retained
     requested = execution_request.requested_parameter_names
     supplied = set(dict(execution_request.parameter_overrides or {}).keys())
     referenced = set(intervention_schedule_parameter_names(unresolved_intervention_schedule))
@@ -1019,7 +977,7 @@ def _apply_parameter_overrides_to_prepared_mechanism(
     *,
     parameter_algebra_spec: Any,
     raw_values: Mapping[str, float],
-    mechanism_parameter_name_by_raw: Mapping[str, str],
+    mechanism_parameter_names: set[str],
     scalar_parameter_names: Iterable[str],
     unknown_parameter_names: Iterable[str],
     invalid_parameter_identifier_messages: Mapping[str, str],
@@ -1027,20 +985,18 @@ def _apply_parameter_overrides_to_prepared_mechanism(
 ) -> None:
     """Apply slider-style values to one isolated execution mechanism."""
     raise_unowned_request_parameter_values(
-        raw_values=raw_values,
-        mechanism_name_by_raw=mechanism_parameter_name_by_raw,
         unknown_names=unknown_parameter_names,
         invalid_messages=invalid_parameter_identifier_messages,
     )
     mechanism_coordinate_values = {
-        canonical_name: raw_values[raw_name]
-        for raw_name, canonical_name in mechanism_parameter_name_by_raw.items()
-        if raw_name in raw_values
+        name: value
+        for name, value in raw_values.items()
+        if name in mechanism_parameter_names
     }
     scalar_override_values = {
-        name: raw_values[name]
-        for name in scalar_parameter_names
-        if name in raw_values
+        name: value
+        for name, value in raw_values.items()
+        if name in scalar_parameter_names
     }
     from kindred.core.simulator.parameter_algebra import (
         apply_parameter_algebra_spec_to_mechanism,
@@ -1080,20 +1036,7 @@ def prepare_simulation_worker_run(
     """
 
     _raise_if_cancelled(cancellation_control)
-    t_span = (
-        float(execution_request.t_span[0]),
-        float(execution_request.t_span[1]),
-    )
     prepared_solver_config = execution_request.solver_config
-    try:
-        # Validate the target grid before worker-owned preparation mutates its
-        # one execution shell.
-        build_time_grid(t_span[0], t_span[1], prepared_solver_config.grid)
-    except (TypeError, ValueError) as exc:
-        raise SimulationPreparationError(
-            "time_grid",
-            "execution grid cannot be realized on this time span.",
-        ) from exc
     topology = execution_request.prepared_dsl.compiled_ode_topology()
     symbolic_structure = (
         execution_request.prepared_dsl.symbolic_jacobian_structure()
@@ -1242,7 +1185,6 @@ def _bind_request_parameter_overrides(
     schedule_names: set[str] = set()
     scalar_names: set[str] = set()
     unknown_names: set[str] = set()
-    mechanism_name_by_raw: dict[str, str] = {}
     invalid_messages: dict[str, str] = {}
     _classify_request_parameter_names(
         mechanism=mechanism,
@@ -1253,7 +1195,6 @@ def _bind_request_parameter_overrides(
         schedule_names=schedule_names,
         scalar_names=scalar_names,
         unknown_names=unknown_names,
-        mechanism_name_by_raw=mechanism_name_by_raw,
         invalid_messages=invalid_messages,
         parameter_target_map=parameter_target_map,
         declared_scalar_names=declared_scalar_names,
@@ -1263,7 +1204,7 @@ def _bind_request_parameter_overrides(
         mechanism,
         parameter_algebra_spec=parameter_algebra_spec,
         raw_values=raw_values,
-        mechanism_parameter_name_by_raw=mechanism_name_by_raw,
+        mechanism_parameter_names=mechanism_names,
         scalar_parameter_names=scalar_names,
         unknown_parameter_names=unknown_names,
         invalid_parameter_identifier_messages=invalid_messages,

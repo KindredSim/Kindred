@@ -132,7 +132,6 @@ def build_mechanism_from_ir(
             elif model == "Constant":
                 forward_model = {
                     "type": "Constant",
-                    "k": float(kf_val),
                 }
 
             eq_metadata = EquilibriumMetadataView(

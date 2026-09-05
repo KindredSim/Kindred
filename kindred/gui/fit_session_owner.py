@@ -680,7 +680,7 @@ class FitSessionOwner(QtCore.QObject):
         ):
             return
         if self._window is not None:
-            self._window.set_progress(value, text)
+            self._window.set_progress(value)
         self._set_status(text)
 
     def _on_best(self, worker: GlobalFitWorker, update: object) -> None:
@@ -1128,7 +1128,6 @@ class FitSessionOwner(QtCore.QObject):
             return
         if self._window is not None:
             self._clear_candidate_presentation(self._window)
-            self._window.set_status("Fit cancelled.")
         self._set_status("Fit cancelled.")
 
     def _on_worker_finished(self, worker: GlobalFitWorker) -> None:

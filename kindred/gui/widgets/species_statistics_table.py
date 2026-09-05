@@ -41,6 +41,7 @@ class SpeciesStatisticsTable(QtWidgets.QTableWidget):
             Parent widget
         """
         super().__init__(parent)
+        self.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
 
         # Configure table
         self.setColumnCount(5)

@@ -312,7 +312,6 @@ class TriggerFiring:
 @dataclass(frozen=True, slots=True)
 class InterventionExecutionContract:
     declarative_payload: Mapping[str, Any]
-    executable_payload: Mapping[str, Any]
     instants: tuple[ExecutableInstant, ...] = ()
     fluxes: tuple[ExecutableFlux, ...] = ()
     holds: tuple[ExecutableHold, ...] = ()
@@ -325,9 +324,6 @@ class InterventionExecutionContract:
     def __post_init__(self) -> None:
         object.__setattr__(
             self, "declarative_payload", _frozen_mapping(self.declarative_payload)
-        )
-        object.__setattr__(
-            self, "executable_payload", _frozen_mapping(self.executable_payload)
         )
         object.__setattr__(
             self,
@@ -357,9 +353,25 @@ class InterventionExecutionContract:
         return replace(self, trigger_firings=tuple(firings))
 
     def provenance_projection(self) -> dict[str, Any]:
+        executable_operations = [
+            *(item.to_payload() for item in self.instants),
+            *(item.to_payload() for item in self.fluxes),
+            *(item.to_payload() for item in self.holds),
+            *(item.to_payload() for item in self.triggers),
+        ]
+        executable_operations.sort(
+            key=lambda item: (
+                int(item["declaration_ordinal"]),
+                int(item.get("window_ordinal", -1)),
+                {"ordinary": 0, "before": 1, "during": 2, "after": 3}.get(
+                    str(item.get("phase", "ordinary")), 4
+                ),
+                int(item.get("authored_ordinal", -1)),
+            )
+        )
         return {
             "declarative": _plain(self.declarative_payload),
-            "executable": _plain(self.executable_payload),
+            "executable": {"operations": executable_operations},
             "discontinuities": list(self.discontinuities),
             "segment_identity": [
                 {"start_time": start, "end_time": end}
@@ -1069,23 +1081,6 @@ def compile_intervention_schedule(
         cancellation_check=cancellation_check,
         dependency_metadata=dependency_metadata,
     )
-    executable_operations = [
-        *(item.to_payload() for item in instants),
-        *(item.to_payload() for item in fluxes),
-        *(item.to_payload() for item in holds),
-        *(item.to_payload() for item in triggers),
-    ]
-    executable_operations.sort(
-        key=lambda item: (
-            int(item["declaration_ordinal"]),
-            int(item.get("window_ordinal", -1)),
-            {"ordinary": 0, "before": 1, "during": 2, "after": 3}.get(
-                str(item.get("phase", "ordinary")), 4
-            ),
-            int(item.get("authored_ordinal", -1)),
-        )
-    )
-    executable_payload = {"operations": executable_operations}
     discontinuities = sorted(
         {
             *(item.time for item in instants),
@@ -1105,7 +1100,6 @@ def compile_intervention_schedule(
     declarative_payload = schedule_obj.to_payload()
     return InterventionExecutionContract(
         declarative_payload=declarative_payload,
-        executable_payload=executable_payload,
         instants=tuple(instants),
         fluxes=tuple(fluxes),
         holds=tuple(holds),

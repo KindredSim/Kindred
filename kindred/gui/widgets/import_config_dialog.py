@@ -14,6 +14,7 @@ from typing import Dict, List, Optional
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
+from kindred.core.datasets.foundation import ImportedSource
 from kindred.core.datasets.source_rules import PhysicalColumn
 from kindred.core.datasets.csv_import import read_csv_rows_from_bytes
 from kindred.core.datasets.excel_import import (
@@ -26,7 +27,6 @@ from kindred.core.datasets.units import (
 )
 from kindred.gui.import_workflow import (
     ImportConfig as _ImportConfig,
-    ImportSourceSnapshot,
     SheetImportIntent,
     UnitDetection,
     UserImportIntent,
@@ -52,18 +52,18 @@ class ImportConfigDialog(QtWidgets.QDialog):
 
     def __init__(
         self,
-        source: ImportSourceSnapshot,
+        source: ImportedSource,
         remaining_count: int = 0,
         parent: Optional[QtWidgets.QWidget] = None,
     ) -> None:
         super().__init__(parent)
-        if not isinstance(source, ImportSourceSnapshot):
+        if not isinstance(source, ImportedSource):
             raise TypeError(
                 "ImportConfigDialog requires one immutable source snapshot."
             )
         self._source = source
         self._remaining_count = remaining_count
-        self._file_type = source.file_type
+        self._file_type = source.original_format
         self._result: Optional[ImportDialogResult] = None
 
         # State populated during preview reading
@@ -129,7 +129,7 @@ class ImportConfigDialog(QtWidgets.QDialog):
         self._sheet_list = QtWidgets.QListWidget(self._sheet_section)
         self._sheet_list.setMinimumHeight(90)
         sheet_lay.addWidget(self._sheet_list)
-        self._sheet_section.setVisible(self._file_type == "excel")
+        self._sheet_section.setVisible(self._file_type == "xlsx")
 
         # --- Preview table ---
         self._preview_section = QtWidgets.QWidget(self._top_splitter)
@@ -216,12 +216,12 @@ class ImportConfigDialog(QtWidgets.QDialog):
 
         # --- Apply to remaining ---
         self._apply_remaining_cb = QtWidgets.QCheckBox("", self)
-        if self._file_type == "excel" and self._remaining_count > 0:
+        if self._file_type == "xlsx" and self._remaining_count > 0:
             self._apply_remaining_cb.setText(
                 "Apply these settings to all other sheets and remaining files"
             )
             self._apply_remaining_cb.setVisible(True)
-        elif self._file_type == "excel":
+        elif self._file_type == "xlsx":
             self._apply_remaining_cb.setText(
                 "Apply these settings to all other sheets"
             )
@@ -256,7 +256,7 @@ class ImportConfigDialog(QtWidgets.QDialog):
         self._time_combo.currentTextChanged.connect(self._on_time_column_changed)
         self._conc_unit_combo.currentTextChanged.connect(lambda _: self._refresh_species_labels())
         self._apply_remaining_cb.toggled.connect(lambda _: self._update_import_enabled())
-        if self._file_type == "excel":
+        if self._file_type == "xlsx":
             self._sheet_list.itemClicked.connect(self._on_sheet_clicked)
             self._sheet_list.itemChanged.connect(lambda _: self._update_import_enabled())
         self._update_top_workspace_bounds()
@@ -266,7 +266,7 @@ class ImportConfigDialog(QtWidgets.QDialog):
     # ------------------------------------------------------------------
 
     def _load_preview(self) -> None:
-        if self._file_type == "excel":
+        if self._file_type == "xlsx":
             self._load_excel_preview()
         else:
             self._load_csv_preview()
@@ -484,7 +484,7 @@ class ImportConfigDialog(QtWidgets.QDialog):
         key = sheet_name
         if key is None:
             key = None if self._file_type == "csv" else self._previewed_sheet_name
-        if key is None and self._file_type == "excel":
+        if key is None and self._file_type == "xlsx":
             return None
         state = self._current_state_from_widgets()
         previous = self._sheet_states.get(key, {})
@@ -856,7 +856,7 @@ class ImportConfigDialog(QtWidgets.QDialog):
         sheets_ok = True
         all_sheet_configs_ok = time_ok and species_ok
         incompatible_hint = ""
-        if self._file_type == "excel":
+        if self._file_type == "xlsx":
             checked_sheet_names = self._get_checked_sheet_names()
             sheets_ok = bool(checked_sheet_names)
             # When the unified checkbox is checked, _build_result copies
@@ -922,7 +922,7 @@ class ImportConfigDialog(QtWidgets.QDialog):
         Returns the list of checked sheet keys ([None] for CSV).
         """
         self._save_current_sheet_state()
-        if self._file_type != "excel":
+        if self._file_type != "xlsx":
             return [None]
 
         checked_sheet_names: list[str] = self._get_checked_sheet_names()
@@ -1132,7 +1132,7 @@ class ImportConfigDialog(QtWidgets.QDialog):
         return required_columns <= self._sheet_columns(sheet_name)
 
     def _update_bulk_sheet_buttons(self, *, time_ok: bool, species_ok: bool) -> None:
-        if self._file_type != "excel":
+        if self._file_type != "xlsx":
             return
         has_sheets = self._sheet_list.count() > 0
         self._btn_select_all.setEnabled(has_sheets)
@@ -1150,7 +1150,7 @@ class ImportConfigDialog(QtWidgets.QDialog):
 
     def _update_top_workspace_bounds(self) -> None:
         self._top_workspace.setMaximumHeight(self._top_workspace_max_height())
-        self._sheet_section.setMinimumHeight(110 if self._file_type == "excel" else 0)
+        self._sheet_section.setMinimumHeight(110 if self._file_type == "xlsx" else 0)
         self._preview_section.setMinimumHeight(160)
 
     def _selected_time_column(self) -> PhysicalColumn | None:

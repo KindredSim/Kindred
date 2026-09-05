@@ -387,11 +387,6 @@ def forward_rate_model_for_equilibrium(
     )
     raw_fields = dict(model_payload or {})
     family = str(raw_fields.pop("type", "Constant") or "Constant")
-    if family == "Constant":
-        # ``equilibrium.kf`` is the live accepted coordinate.  The metadata
-        # copy records authored family shape and must not become a stale mirror
-        # after canonical parameter rebinding.
-        raw_fields.pop("k", None)
     return _decode_forward_rate_model(
         raw_fields,
         family=family,

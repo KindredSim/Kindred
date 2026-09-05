@@ -39,6 +39,7 @@ class ExcelWorkbookPair:
         if self._workbook is not None:
             raise RuntimeError("Excel workbook pair is already open.")
         try:
+            _validate_xlsx_zip(self._source_bytes, source_label=self._source_label)
             self._workbook = _open_workbook_bytes(
                 self._source_bytes,
                 source_label=self._source_label,
@@ -183,7 +184,6 @@ def _open_workbook_bytes(
     source_label: str,
     data_only: bool,
 ):  # noqa: ANN202
-    _validate_xlsx_zip(source_bytes, source_label=source_label)
     try:
         return load_workbook(
             BytesIO(source_bytes),

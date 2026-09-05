@@ -19,7 +19,6 @@ from kindred.core.datasets.observation_payload import DatasetObservationPayload
 from kindred.core.datasets.foundation import (
     ImportedSource,
     RawDatasetRecord,
-    validate_imported_source,
     validate_raw_dataset_record,
 )
 from kindred.gui.controllers.dataset_errors import (
@@ -28,7 +27,6 @@ from kindred.gui.controllers.dataset_errors import (
 from kindred.core.project_document import new_dataset_id
 from kindred.gui.import_workflow import (
     ImportConfig,
-    ImportSourceSnapshot,
     ResolvedSheetPlan,
 )
 
@@ -45,12 +43,12 @@ __all__ = [
 
 @dataclass(frozen=True)
 class DatasetImportUnit:
-    source: ImportSourceSnapshot
+    source: ImportedSource
     display_name: str
     payload: DatasetObservationPayload
 
     def __post_init__(self) -> None:
-        if not isinstance(self.source, ImportSourceSnapshot):
+        if not isinstance(self.source, ImportedSource):
             raise TypeError(
                 "Imported datasets require their immutable source snapshot."
             )
@@ -131,7 +129,7 @@ class _DatasetImportBatchWorker(QtCore.QThread):
         *,
         columns,
         plan: ResolvedSheetPlan,
-        source: ImportSourceSnapshot,
+        source: ImportedSource,
         sheet_name: str | None = None,
         first_row=None,
         interruption_checker,
@@ -268,7 +266,7 @@ class _DatasetImportBatchWorker(QtCore.QThread):
             for config in self._configs:
                 self._check_interrupted()
                 source = config.source
-                if source.file_type == "excel":
+                if source.original_format == "xlsx":
                     units.extend(self._load_excel(config))
                 else:
                     units.append(self._load_csv(config))
@@ -309,13 +307,7 @@ def build_raw_record_batch_proposal(
             display_name = f"{base}_{counter}{extension}"
             counter += 1
         used_names.add(display_name.casefold())
-        source = ImportedSource(
-            source_id=unit.source.source_id,
-            original_filename=unit.source.original_filename,
-            original_format=unit.source.archive_format,
-            exact_source_bytes=unit.source.exact_source_bytes,
-        )
-        validate_imported_source(source)
+        source = unit.source
         previous_source = sources_by_id.get(source.source_id)
         if previous_source is not None and previous_source != source:
             raise ValueError(

@@ -22,6 +22,7 @@ class ParameterStatisticsTable(QtWidgets.QTableWidget):
 
     def __init__(self, parent: Optional[QtWidgets.QWidget] = None):
         super().__init__(parent)
+        self.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
         self.setColumnCount(3)
         self.setHorizontalHeaderLabels(["Name", "Value", "Unit"])
         header = self.horizontalHeader()

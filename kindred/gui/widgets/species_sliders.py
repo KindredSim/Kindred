@@ -153,7 +153,6 @@ class BatchSpeciesSliders(QtWidgets.QWidget):
         mixed_species: Sequence[str] = (),
         display_names: Mapping[str, str] | None = None,
         preserve_visibility: bool = True,
-        visibility_scope_signature: object | None = None,
     ) -> None:
         normalized: dict[str, float] = {}
         normalized_display_names: dict[str, str] = {}
@@ -173,7 +172,6 @@ class BatchSpeciesSliders(QtWidgets.QWidget):
             normalized_display_names[name] = display
         self._reconcile_visibility_scope(
             set(normalized),
-            visibility_scope_signature,
             preserve_visibility=preserve_visibility,
         )
         self._target_set_ids = tuple(str(item) for item in target_set_ids)
@@ -413,19 +411,11 @@ class BatchSpeciesSliders(QtWidgets.QWidget):
     def _reconcile_visibility_scope(
         self,
         names: set[str],
-        supplied_signature: object | None,
         *,
         preserve_visibility: bool,
     ) -> None:
         """Reconcile choices by stable canonical species identity."""
-        signature = frozenset(
-            str(name)
-            for name in (names if supplied_signature is None else supplied_signature)
-        )
-        if signature != names:
-            raise ValueError(
-                "Species visibility scope names must match slider values."
-            )
+        signature = frozenset(names)
         previous = self._scope_signature
         if not preserve_visibility or previous is None:
             self._hidden_species = set(names)

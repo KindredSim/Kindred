@@ -1679,6 +1679,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._activate_materialized_set(tab_id, proposal.materialized_set_ids)
         runtime.reactions_draft = None
         valid_species = set(canonical_species_names(proposed_tab))
+        surviving_sets = {item.set_id for item in proposed_tab.initial_condition_sets}
         runtime.initial_text_by_set_id = {
             set_id: {
                 species: raw
@@ -1686,7 +1687,9 @@ class MainWindow(QtWidgets.QMainWindow):
                 if species in valid_species
             }
             for set_id, values in runtime.initial_text_by_set_id.items()
-            if any(species in valid_species for species in values)
+            if set_id not in proposal.materialized_set_ids
+            and set_id in surviving_sets
+            and any(species in valid_species for species in values)
         }
         if refresh_after_admission:
             bundle.editor_binding.render()
@@ -2015,11 +2018,14 @@ class MainWindow(QtWidgets.QMainWindow):
     def _run_admitted(self, tab_id: str) -> bool:
         bundle = self._tab_surfaces[str(tab_id)]
         selected = bundle.initial_actions.selected_run_set_ids()
-        if not selected or not self._computation_gate.is_idle:
+        if not self._computation_gate.is_idle:
             return False
         if self._simulation_work_active():
             return False
-        if bundle.initial_actions.has_invalid_cells(selected):
+        runtime = self._workspace_tab_registry.tab_runtime(tab_id)
+        if runtime.reactions_draft is None and (
+            not selected or bundle.initial_actions.has_invalid_cells(selected)
+        ):
             return False
         source = self._visible_source_for_tab(tab_id)
         return bool(source.reactions_text.strip())
@@ -2138,6 +2144,8 @@ class MainWindow(QtWidgets.QMainWindow):
         *,
         discard_invalid: bool,
         report_invalid: bool = True,
+        selected_by_tab: dict[str, tuple[str, ...]] | None = None,
+        superseded_by_tab: dict[str, tuple[str, ...]] | None = None,
     ) -> ProjectDocument | None:
         """Project captured widget drafts into one detached document candidate."""
 
@@ -2152,10 +2160,19 @@ class MainWindow(QtWidgets.QMainWindow):
                 item.set_id: dict(item.values)
                 for item in tab.initial_condition_sets
             }
+            species_roster = set(canonical_species_names(tab))
+            selected = None if selected_by_tab is None else selected_by_tab[target]
+            superseded = (superseded_by_tab or {}).get(target, ())
             for set_id, values in runtime.initial_text_by_set_id.items():
-                if set_id not in values_by_set:
+                if (
+                    set_id not in values_by_set
+                    or set_id in superseded
+                    or (selected is not None and set_id not in selected)
+                ):
                     continue
                 for species, raw in values.items():
+                    if species not in species_roster:
+                        continue
                     if not self._valid_initial_text(raw, species):
                         if discard_invalid:
                             continue
@@ -2193,6 +2210,7 @@ class MainWindow(QtWidgets.QMainWindow):
         document: ProjectDocument,
         *,
         discard_invalid: bool = False,
+        selected_by_tab: dict[str, tuple[str, ...]] | None = None,
     ) -> None:
         for target in tuple(dict.fromkeys(str(item) for item in tab_ids)):
             runtime = self._workspace_tab_registry.tab_runtime(target)
@@ -2200,6 +2218,11 @@ class MainWindow(QtWidgets.QMainWindow):
                 runtime.initial_text_by_set_id.clear()
             else:
                 for set_id, values in tuple(runtime.initial_text_by_set_id.items()):
+                    if (
+                        selected_by_tab is not None
+                        and set_id not in selected_by_tab[target]
+                    ):
+                        continue
                     remaining = {
                         species: raw
                         for species, raw in values.items()
@@ -2278,29 +2301,13 @@ class MainWindow(QtWidgets.QMainWindow):
             else str(tab_id)
         )
         bundle = self._tab_surfaces[target]
-        selected = bundle.initial_actions.selected_run_set_ids()
-        if not selected:
-            self.set_status_text("Select one or more Initial Conditions rows.")
-            return False
         if not self._computation_gate.is_idle:
-            self.set_status_text(
-                "Run rejected: another computation is active."
-            )
+            self.set_status_text("Run rejected: another computation is active.")
+            return False
+        capture_token = self._project_session.capture_content_token()
+        if self._capture_visible_tab_inputs(capture_token, tab_id=target) is None:
             return False
         if not self._confirm_discard_slider_preview(target, "Run"):
-            return False
-        if not self._settle_visible_tab_inputs(tab_id=target):
-            return False
-        selected = bundle.initial_actions.selected_run_set_ids()
-        if bundle.initial_actions.has_invalid_cells(selected):
-            self.set_status_text(
-                "Run blocked by invalid visible Initial Conditions in a selected row."
-            )
-            return False
-        if not self._computation_gate.is_idle:
-            self.set_status_text(
-                "Run rejected: another computation is active."
-            )
             return False
         capture_token = self._project_session.capture_content_token()
         document = self._project_session.document
@@ -2326,6 +2333,33 @@ class MainWindow(QtWidgets.QMainWindow):
                 f"Run cannot continue:\n\n{exc}",
             )
             return False
+        candidate_tab = source_proposal.proposed_document.tab(target)
+        surviving_ids = {item.set_id for item in candidate_tab.initial_condition_sets}
+        selected = (
+            source_proposal.materialized_set_ids[:1]
+            if source_proposal.materialized_set_ids
+            else tuple(
+                set_id for set_id in bundle.initial_actions.selected_run_set_ids()
+                if set_id in surviving_ids
+            )
+        )
+        if not selected:
+            self.set_status_text("Select one or more Initial Conditions rows.")
+            return False
+        candidate = self._captured_input_candidate(
+            source_proposal.proposed_document,
+            (target,),
+            discard_invalid=False,
+            report_invalid=False,
+            selected_by_tab={target: selected},
+            superseded_by_tab={target: source_proposal.materialized_set_ids},
+        )
+        if candidate is None:
+            self.set_status_text(
+                "Run blocked by invalid visible Initial Conditions or Run settings."
+            )
+            return False
+        source_proposal = replace(source_proposal, proposed_document=candidate)
         published = self._publish_source_proposal(
             target,
             visible_source,
@@ -2334,15 +2368,10 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         if published is None:
             return False
-        selected = bundle.initial_actions.selected_run_set_ids()
-        if not selected:
-            self.set_status_text("Select one or more Initial Conditions rows.")
-            return False
-        if bundle.initial_actions.has_invalid_cells(selected):
-            self.set_status_text(
-                "Run blocked by invalid visible Initial Conditions in a selected row."
-            )
-            return False
+        self._clear_settled_input_drafts(
+            (target,), candidate, selected_by_tab={target: selected}
+        )
+        self._refresh_tab_controls(target, preserve_reactions_editor=True)
         capture_tab = source_proposal.proposed_document.tab(target)
         try:
             targets = tuple(
@@ -2449,6 +2478,7 @@ class MainWindow(QtWidgets.QMainWindow):
             candidate,
             tab_ids,
             discard_invalid=discard_invalid_authoring,
+            superseded_by_tab=dict(materialized_by_tab),
         )
         if candidate is None:
             return None

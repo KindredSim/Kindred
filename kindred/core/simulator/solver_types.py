@@ -15,7 +15,7 @@ from kindred.core.species import (
     validate_runtime_concentration,
     validate_time_seconds,
 )
-from kindred.core.time_grid import build_time_grid, normalize_time_grid_policy
+from kindred.core.time_grid import normalize_time_grid_policy
 
 DEFAULT_SOLVER_NAME = "BDF"
 
@@ -221,11 +221,6 @@ class SimulationRequest:
             if not isinstance(self.grid, Mapping):
                 raise TypeError("grid must be a mapping or None.")
             normalized_grid = normalize_time_grid_policy(self.grid)
-            # Validate generated-grid representability at request construction,
-            # before any worker or solver invocation.  Explicit t_eval remains
-            # an exact output request and does not require realizing N.
-            if self.t_eval is None:
-                build_time_grid(start, end, normalized_grid)
             object.__setattr__(
                 self,
                 "grid",

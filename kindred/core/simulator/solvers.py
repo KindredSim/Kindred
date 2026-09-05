@@ -518,7 +518,6 @@ def _execute_scipy(
     ):
         raise SimulationCancelled()
     return SegmentRunResult(
-        identity=segment_identity,
         t=t_out,
         Y=Y_out,
         event_times=event_times,
@@ -608,13 +607,9 @@ def solve_ode(
             ScheduleExecutionRequest(
                 request=req,
                 rhs=rhs,
-                t0=t0,
-                t1=t1,
-                y0=y0,
                 t_eval=t_eval,
                 provenance=prov,
                 method=method,
-                schedule=req.intervention_execution,
             )
         )
     except _SimulationScientificUnavailabilitySignal as exc:

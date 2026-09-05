@@ -72,7 +72,6 @@ from .dsl_build_input import (
     DslSourceCoordinate,
     canonical_source_coordinate_name,
 )
-from .dsl_parameter_scan import DslParameterAnalysis
 
 if TYPE_CHECKING:
     from ..intervention_schedule import InterventionSchedule
@@ -376,7 +375,6 @@ class DslAnalysis:
     origins: tuple[DslSourceOrigin, ...]
     species_names: tuple[str, ...]
     observable_names: tuple[str, ...]
-    parameters: tuple[DslParameterAnalysis, ...]
     inline_initial_conditions: DslInitialConditionAdmission
     temperature_K: float
     energy_unit: str
@@ -424,17 +422,6 @@ class DslAnalysis:
             raise ValueError(
                 "DSL observable names must not duplicate model species names."
             )
-        if type(self.parameters) is not tuple or any(
-            type(item) is not DslParameterAnalysis
-            for item in self.parameters
-        ):
-            raise TypeError(
-                "DSL analysis parameters must be DslParameterAnalysis values."
-            )
-        if len({item.name for item in self.parameters}) != len(
-            self.parameters
-        ):
-            raise ValueError("DSL analysis parameter names must be unique.")
         if type(self.inline_initial_conditions) is not DslInitialConditionAdmission:
             raise TypeError(
                 "DSL inline initial conditions must be one typed admission."
@@ -2223,9 +2210,6 @@ def prepare_dsl_request_set(
         compile_intervention_schedule,
     )
     from kindred.core.simulator.dsl_build import build_mechanism_from_ir
-    from kindred.core.simulator.dsl_parameter_scan import (
-        extract_parameters_from_mechanism,
-    )
     from kindred.core.simulator.parameter_algebra_spec import (
         parse_parameter_algebra_spec_from_dsl_text,
     )
@@ -2263,7 +2247,6 @@ def prepare_dsl_request_set(
     except ValueError as exc:
         raise _DSLError(str(exc)) from exc
     setattr(mechanism, "_compiled_algebra_series", compiled_algebra_series)
-    definitions = tuple(extract_parameters_from_mechanism(mechanism))
     species_names = tuple(str(item) for item in mechanism.species_names())
     if intervention_schedule is not None:
         intervention_schedule.validate_species(species_names)
@@ -2293,7 +2276,6 @@ def prepare_dsl_request_set(
                 if str(name).strip()
             )
         ),
-        parameters=definitions,
         inline_initial_conditions=ir.inline_initial_conditions,
         temperature_K=float(ir.temperature_K),
         energy_unit=str(ir.energy_unit),

@@ -358,8 +358,8 @@ def validate_raw_dataset_record(record: RawDatasetRecord) -> RawDatasetRecord:
     if thawed_metadata.get("mapping_source") != "explicit":
         fail(f"Raw dataset {record.dataset_id!r} mapping source must be exactly 'explicit'.")
     sheet_name = thawed_metadata.get("sheet_name")
-    if sheet_name is not None and (not isinstance(sheet_name, str) or not sheet_name.strip()):
-        fail(f"Raw dataset {record.dataset_id!r} worksheet identity must be nonblank when present.")
+    if sheet_name is not None and (not isinstance(sheet_name, str) or not sheet_name):
+        fail(f"Raw dataset {record.dataset_id!r} worksheet identity must be nonempty when present.")
     return record
 
 

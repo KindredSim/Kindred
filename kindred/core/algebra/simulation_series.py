@@ -57,17 +57,6 @@ def _iter_identifiers(expr: ExprNode):
         return
 
 
-def _iter_call_names(expr: ExprNode):
-    if isinstance(expr, CallNode):
-        yield str(expr.name)
-        for arg in expr.args:
-            yield from _iter_call_names(arg)
-        return
-    if isinstance(expr, UnaryNode):
-        yield from _iter_call_names(expr.rhs)
-        return
-
-
 def _iter_species_refs(expr: ExprNode):
     if isinstance(expr, SpeciesRefNode):
         yield str(expr.name)
@@ -83,10 +72,6 @@ def _iter_species_refs(expr: ExprNode):
         for arg in expr.args:
             yield from _iter_species_refs(arg)
         return
-    if isinstance(expr, BinaryNode):
-        yield from _iter_call_names(expr.lhs)
-        yield from _iter_call_names(expr.rhs)
-        return
 
 
 def _reject_invalid_identifier_references(
@@ -98,15 +83,6 @@ def _reject_invalid_identifier_references(
 ) -> None:
     allowed = set(allowed_names or ())
     for stmt in block.lines:
-        unknown_functions = sorted(
-            set(_iter_call_names(stmt.expr))
-            - set(SymbolTable().functions())
-        )
-        if unknown_functions:
-            raise ValueError(
-                "Unknown Algebra function(s): "
-                + ", ".join(repr(name) for name in unknown_functions)
-            )
         unknown_species = sorted(
             set(_iter_species_refs(stmt.expr)) - set(species_names or ())
         )

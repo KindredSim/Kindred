@@ -10,6 +10,7 @@ from typing import Dict, List, Optional, Tuple
 from PySide6 import QtCore, QtWidgets
 from PySide6.QtCore import Qt
 
+from kindred.core.datasets.foundation import ImportedSource
 from kindred.core.datasets.source_rules import (
     PhysicalColumn,
 )
@@ -19,7 +20,6 @@ from kindred.core.datasets.excel_import import (
 )
 from kindred.gui.import_workflow import (
     ImportConfig,
-    ImportSourceSnapshot,
     SheetImportIntent,
     UnitDetection,
     UserImportIntent,
@@ -268,7 +268,7 @@ class DataManagerPanel(QtWidgets.QWidget):
 
         if not filenames:
             return
-        sources: List[ImportSourceSnapshot] = []
+        sources: List[ImportedSource] = []
         rejected_sources: List[Tuple[str, str]] = []
         for filepath in filenames:
             try:
@@ -343,7 +343,7 @@ class DataManagerPanel(QtWidgets.QWidget):
 
     def _collect_import_config(
         self,
-        source: ImportSourceSnapshot,
+        source: ImportedSource,
         remaining_count: int,
     ) -> ImportDialogResult:
         try:
@@ -368,7 +368,7 @@ class DataManagerPanel(QtWidgets.QWidget):
 
     def _build_remaining_file_config(
         self,
-        source: ImportSourceSnapshot,
+        source: ImportedSource,
         source_intent: SheetImportIntent,
         *,
         source_sheet_names: Tuple[str, ...] = (),
@@ -377,7 +377,7 @@ class DataManagerPanel(QtWidgets.QWidget):
 
         Raises ValueError if the source intent is incompatible with the file.
         """
-        file_type = source.file_type
+        file_type = source.original_format
 
         per_sheet_intents: Dict[Optional[str], SheetImportIntent] = {}
         per_sheet_detections: Dict[Optional[str], UnitDetection] = {}

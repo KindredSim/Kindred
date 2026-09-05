@@ -312,7 +312,7 @@ def prepare_fitting_execution_context(
     try:
         # Validate and realize the regular N grid before any exact observation
         # union/deduplication; an unrepresentable grid must fail prelaunch.
-        build_time_grid(t_start, t_end, prepared_solver_config.grid)
+        regular_grid = build_time_grid(t_start, t_end, prepared_solver_config.grid)
     except (TypeError, ValueError) as exc:
         raise ValueError("Fit regular grid cannot be realized on this time span.") from exc
     objective_times = np.asarray(tuple(objective_sample_times), dtype=float).reshape(-1)
@@ -329,7 +329,7 @@ def prepare_fitting_execution_context(
         for value in np.unique(
             np.concatenate(
                 (
-                    np.linspace(t_start, t_end, grid_n, dtype=float),
+                    regular_grid,
                     objective_times,
                 )
             )
@@ -372,7 +372,6 @@ def prepare_fitting_execution_context(
         schedule_names: set[str] = set()
         scalar_names: set[str] = set()
         unknown_names: set[str] = set()
-        mechanism_name_by_raw: dict[str, str] = {}
         invalid_messages: dict[str, str] = {}
         _classify_request_parameter_names(
             mechanism=mechanism,
@@ -383,7 +382,6 @@ def prepare_fitting_execution_context(
             schedule_names=schedule_names,
             scalar_names=scalar_names,
             unknown_names=unknown_names,
-            mechanism_name_by_raw=mechanism_name_by_raw,
             invalid_messages=invalid_messages,
             parameter_target_map=parameter_target_map,
             requested_parameter_names=mechanism_param_names,
@@ -391,26 +389,9 @@ def prepare_fitting_execution_context(
             derived_scalar_names=derived_scalar_names,
         )
         raise_unowned_request_parameter_values(
-            raw_values=raw_values,
-            mechanism_name_by_raw=mechanism_name_by_raw,
             unknown_names=unknown_names,
             invalid_messages=invalid_messages,
         )
-        canonical_by_raw = mechanism_name_by_raw
-        canonical_requested_param_names: list[str] = []
-        owner_to_raw: dict[str, str] = {}
-        for raw_name in mechanism_param_names:
-            raw = str(raw_name or "").strip()
-            if not raw:
-                continue
-            owner = str(canonical_by_raw.get(raw, raw))
-            previous = owner_to_raw.get(owner)
-            if previous is not None and previous != raw:
-                raise ValueError(
-                    f"Duplicate request parameter names {previous!r} and {raw!r} resolve to {owner!r}."
-                )
-            owner_to_raw[owner] = raw
-            canonical_requested_param_names.append(owner)
     except SimulationPreparationError as exc:
         raise fit_simulation_error_from_preparation_error(exc) from exc
     except ValueError as exc:
@@ -423,7 +404,7 @@ def prepare_fitting_execution_context(
         y0=tuple(float(value) for value in y0),
         t_span=(float(t_start), float(t_end)),
         solver_config=prepared_solver_config,
-        requested_parameter_names=tuple(canonical_requested_param_names),
+        requested_parameter_names=tuple(mechanism_param_names),
     )
     if (
         cancellation_control is not None

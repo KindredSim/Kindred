@@ -66,14 +66,8 @@ class AxisToolbar(QtWidgets.QWidget):
     def __init__(
         self,
         parent: Optional[QtWidgets.QWidget] = None,
-        *,
-        orientation: str = "horizontal"
     ) -> None:
         super().__init__(parent)
-        orientation = orientation.lower()
-        if orientation not in {"horizontal", "vertical"}:
-            raise ValueError("orientation must be 'horizontal' or 'vertical'")
-        self._orientation = orientation
         self._interactive_gesture_active = False
 
         self._x_combo = QtWidgets.QComboBox(self)
@@ -187,7 +181,6 @@ class AxisToolbar(QtWidgets.QWidget):
 
         # Labels
         x_label = QtWidgets.QLabel("X:", self)
-        y_label = QtWidgets.QLabel("Y:", self)
 
         # Axis range controls
         self._auto_range = QtWidgets.QCheckBox("Auto Range", self)
@@ -219,10 +212,7 @@ class AxisToolbar(QtWidgets.QWidget):
         self._manual_range_row.setVisible(False)
 
         # Layout
-        if self._orientation == "vertical":
-            self._build_vertical_layout(x_label, y_label)
-        else:
-            self._build_horizontal_layout(x_label, y_label)
+        self._build_horizontal_layout(x_label)
 
         # Wiring
         self._x_combo.currentIndexChanged.connect(self._on_x_changed)
@@ -593,9 +583,7 @@ class AxisToolbar(QtWidgets.QWidget):
     def _build_horizontal_layout(
         self,
         x_label: QtWidgets.QLabel,
-        y_label: QtWidgets.QLabel
     ) -> None:
-        y_label.setVisible(False)
         lay = QtWidgets.QHBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(8)
@@ -628,66 +616,6 @@ class AxisToolbar(QtWidgets.QWidget):
 
         lay.addStretch(1)
         lay.addWidget(self._options_btn, stretch=0)
-
-    def _build_vertical_layout(
-        self,
-        x_label: QtWidgets.QLabel,
-        y_label: QtWidgets.QLabel
-    ) -> None:
-        max_control_width = 150
-
-        self.setSizePolicy(QtWidgets.QSizePolicy.Fixed, QtWidgets.QSizePolicy.Expanding)
-        self._x_combo.setMaximumWidth(max_control_width)
-        self._y_list.setMaximumWidth(max_control_width)
-        for field in (self._x_min, self._x_max, self._y_min, self._y_max):
-            field.setMaximumWidth(70)
-
-        self._options_btn.setSizePolicy(QtWidgets.QSizePolicy.Fixed, QtWidgets.QSizePolicy.Fixed)
-        self._options_btn.setMaximumWidth(max_control_width)
-
-        lay = QtWidgets.QVBoxLayout(self)
-        lay.setContentsMargins(4, 6, 4, 6)
-        lay.setSpacing(6)
-
-        x_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
-        lay.addWidget(x_label, alignment=Qt.AlignmentFlag.AlignLeft)
-        lay.addWidget(self._x_combo, alignment=Qt.AlignmentFlag.AlignLeft)
-        lay.addWidget(QtWidgets.QLabel("X Unit:", self))
-        lay.addWidget(self._x_unit_combo, alignment=Qt.AlignmentFlag.AlignLeft)
-
-        lay.addWidget(self._pan_button, alignment=Qt.AlignmentFlag.AlignLeft)
-        lay.addWidget(
-            self._rectangle_zoom_button,
-            alignment=Qt.AlignmentFlag.AlignLeft,
-        )
-
-        lay.addWidget(y_label, alignment=Qt.AlignmentFlag.AlignLeft)
-        lay.addWidget(self._y_list)
-        lay.addWidget(QtWidgets.QLabel("Y Unit:", self))
-        lay.addWidget(self._y_unit_combo, alignment=Qt.AlignmentFlag.AlignLeft)
-
-        range_frame = QtWidgets.QFrame(self)
-        range_frame.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
-        range_layout = QtWidgets.QGridLayout(range_frame)
-        range_layout.setContentsMargins(0, 4, 0, 0)
-        range_layout.setHorizontalSpacing(4)
-        range_layout.setVerticalSpacing(2)
-
-        range_layout.addWidget(self._auto_range, 0, 0, 1, 2)
-
-        range_layout.addWidget(QtWidgets.QLabel("X min"), 1, 0)
-        range_layout.addWidget(self._x_min, 1, 1)
-        range_layout.addWidget(QtWidgets.QLabel("X max"), 2, 0)
-        range_layout.addWidget(self._x_max, 2, 1)
-
-        range_layout.addWidget(QtWidgets.QLabel("Y min"), 3, 0)
-        range_layout.addWidget(self._y_min, 3, 1)
-        range_layout.addWidget(QtWidgets.QLabel("Y max"), 4, 0)
-        range_layout.addWidget(self._y_max, 4, 1)
-
-        lay.addWidget(range_frame)
-        lay.addStretch()
-        lay.addWidget(self._options_btn, alignment=Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignBottom)
 
     def _update_y_selector_text(self) -> None:
         selected_labels = [
@@ -749,9 +677,8 @@ class AxisToolbar(QtWidgets.QWidget):
         self._x_max.setEnabled(enabled)
         self._y_min.setEnabled(enabled)
         self._y_max.setEnabled(enabled)
-        if self._orientation == "horizontal":
-            self._manual_range_row.setVisible(enabled)
-            self.updateGeometry()
+        self._manual_range_row.setVisible(enabled)
+        self.updateGeometry()
 
     def _on_auto_range_toggled(self, checked: bool) -> None:
         """Enable/disable manual range controls based on auto range checkbox."""
@@ -768,23 +695,15 @@ class AxisToolbar(QtWidgets.QWidget):
     # ----------------------- usability tweaks -----------------------
 
     def sizeHint(self) -> QtCore.QSize:
-        if self._orientation == "horizontal":
-            return QtCore.QSize(960, 56)
-        return QtCore.QSize(800, 150)
+        return QtCore.QSize(960, 56)
 
     def set_tab_order(self) -> None:
-        if self._orientation == "horizontal":
-            QtWidgets.QWidget.setTabOrder(self._x_combo, self._x_unit_combo)
-            QtWidgets.QWidget.setTabOrder(self._x_unit_combo, self._y_selector_btn)
-            QtWidgets.QWidget.setTabOrder(self._y_selector_btn, self._y_unit_combo)
-            QtWidgets.QWidget.setTabOrder(self._y_unit_combo, self._auto_range)
-            QtWidgets.QWidget.setTabOrder(self._auto_range, self._x_min)
-            QtWidgets.QWidget.setTabOrder(self._x_min, self._x_max)
-            QtWidgets.QWidget.setTabOrder(self._x_max, self._y_min)
-            QtWidgets.QWidget.setTabOrder(self._y_min, self._y_max)
-            QtWidgets.QWidget.setTabOrder(self._y_max, self._options_btn)
-            return
         QtWidgets.QWidget.setTabOrder(self._x_combo, self._x_unit_combo)
-        QtWidgets.QWidget.setTabOrder(self._x_unit_combo, self._y_list)
-        QtWidgets.QWidget.setTabOrder(self._y_list, self._y_unit_combo)
-        QtWidgets.QWidget.setTabOrder(self._y_unit_combo, self._options_btn)
+        QtWidgets.QWidget.setTabOrder(self._x_unit_combo, self._y_selector_btn)
+        QtWidgets.QWidget.setTabOrder(self._y_selector_btn, self._y_unit_combo)
+        QtWidgets.QWidget.setTabOrder(self._y_unit_combo, self._auto_range)
+        QtWidgets.QWidget.setTabOrder(self._auto_range, self._x_min)
+        QtWidgets.QWidget.setTabOrder(self._x_min, self._x_max)
+        QtWidgets.QWidget.setTabOrder(self._x_max, self._y_min)
+        QtWidgets.QWidget.setTabOrder(self._y_min, self._y_max)
+        QtWidgets.QWidget.setTabOrder(self._y_max, self._options_btn)

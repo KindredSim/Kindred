@@ -33,7 +33,6 @@ from kindred.core.exceptions import (
 )
 from kindred.core.fitting_optimization import fit_parameters
 from kindred.core.fitting_completion import FitExtensionProgress
-from kindred.core.objective import ObjectiveContext
 from kindred.core.fitting_method_policy import validate_fit_method
 from kindred.core.species import validate_evaluation_count
 from kindred.core.simulation_failure import (
@@ -157,7 +156,6 @@ def fit_global(
     )
     penalty_value = 1e6
     objective_total_points = int(sum(item.point_count for item in payloads))
-    context = ObjectiveContext()
 
     try:
         objective = _fit_execution.GlobalFitObjective(
@@ -167,7 +165,6 @@ def fit_global(
             weights=weights_norm,
             layout=layout,
             penalty_value=penalty_value,
-            ctx=context,
             progress_callback=progress_callback,
             cancellation_check=cancellation_check,
             cancellation_control=cancellation_control,
@@ -293,7 +290,6 @@ def fit_global(
             weights=weights_norm,
             layout=layout,
             penalty_value=penalty_value,
-            ctx=ObjectiveContext(),
             progress_callback=None,
             cancellation_check=cancellation_check,
             cancellation_control=cancellation_control,

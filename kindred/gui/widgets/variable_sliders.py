@@ -285,7 +285,6 @@ class VariableSliders(QtWidgets.QWidget):
         *,
         metadata: Optional[Dict[str, Dict[str, object]]] = None,
         preserve_visibility: bool = False,
-        visibility_scope_signature: object,
     ) -> None:
         """
         Set variables and create sliders.
@@ -304,7 +303,6 @@ class VariableSliders(QtWidgets.QWidget):
         current_names = set(normalized_variables)
         self._reconcile_visibility_scope(
             current_names,
-            visibility_scope_signature,
             metadata=normalized_metadata,
             preserve_visibility=preserve_visibility,
         )
@@ -676,7 +674,6 @@ class VariableSliders(QtWidgets.QWidget):
         *,
         metadata: Optional[Dict[str, Dict[str, object]]] = None,
         preserve_visibility: bool = True,
-        visibility_scope_signature: object,
     ) -> None:
         """Render a tab snapshot without treating widget values as canonical."""
         normalized_variables, normalized_metadata = (
@@ -690,7 +687,6 @@ class VariableSliders(QtWidgets.QWidget):
         if same_coordinates:
             self._reconcile_visibility_scope(
                 set(normalized_variables),
-                visibility_scope_signature,
                 metadata=normalized_metadata,
                 preserve_visibility=preserve_visibility,
             )
@@ -707,7 +703,6 @@ class VariableSliders(QtWidgets.QWidget):
             normalized_variables,
             metadata=normalized_metadata,
             preserve_visibility=preserve_visibility,
-            visibility_scope_signature=visibility_scope_signature,
         )
 
     def update_variable(self, name: str, value: float) -> None:
@@ -904,89 +899,20 @@ class VariableSliders(QtWidgets.QWidget):
     def _reconcile_visibility_scope(
         self,
         names: set[str],
-        supplied_signature: object,
         *,
         metadata: Dict[str, Dict[str, object]],
         preserve_visibility: bool,
     ) -> None:
         """Reconcile choices by stable parameter identity, not roster order."""
-        if set(metadata) != names:
-            raise ValueError(
-                "Parameter slider metadata names must match slider values."
+        signature = tuple(
+            (
+                name,
+                metadata[name]["family"],
+                metadata[name]["role"],
+                metadata[name]["scale"],
             )
-
-        metadata_identities: Dict[str, tuple[str, str, str]] = {}
-        for name in names:
-            meta = metadata[name]
-            try:
-                family = meta["family"]
-                role = meta["role"]
-                scale = meta["scale"]
-            except KeyError as exc:
-                raise ValueError(
-                    "Parameter slider metadata requires family, role, and scale."
-                ) from exc
-            if not all(
-                isinstance(field, str) for field in (family, role, scale)
-            ) or scale not in {"log", "linear"}:
-                raise ValueError(
-                    "Parameter slider metadata requires string family, role, "
-                    "and scale, with scale equal to log or linear."
-                )
-            metadata_identities[name] = (family, role, scale)
-
-        if supplied_signature is None:
-            raise ValueError(
-                "Parameter visibility scope requires structural identities."
-            )
-        try:
-            raw_signature = tuple(supplied_signature)
-        except (TypeError, ValueError) as exc:
-            raise ValueError(
-                "Parameter visibility scope must contain structural identities."
-            ) from exc
-
-        identities: list[tuple[str, str, str, str]] = []
-        seen_names: set[str] = set()
-        for identity in raw_signature:
-            if not isinstance(identity, (tuple, list)) or len(identity) != 4:
-                raise ValueError(
-                    "Parameter visibility scope identities must be "
-                    "(name, family, role, scale)."
-                )
-            canonical_name, family, role, scale = identity
-            if not all(
-                isinstance(field, str)
-                for field in (canonical_name, family, role, scale)
-            ) or scale not in {"log", "linear"}:
-                raise ValueError(
-                    "Parameter visibility scope identities must be "
-                    "(name, family, role, scale)."
-                )
-            if canonical_name in seen_names:
-                raise ValueError(
-                    "Parameter visibility scope requires one identity per name."
-                )
-            if canonical_name not in metadata_identities:
-                raise ValueError(
-                    "Parameter visibility scope names must match slider metadata."
-                )
-            if (family, role, scale) != metadata_identities[canonical_name]:
-                raise ValueError(
-                    "Parameter visibility scope identities must match slider "
-                    "metadata."
-                )
-            seen_names.add(canonical_name)
-            identities.append((canonical_name, family, role, scale))
-
-        if seen_names != names:
-            raise ValueError(
-                "Parameter visibility scope names must match slider values."
-            )
-
-        # Identity names are unique by the validation above, so name-keyed
-        # lookup below cannot collapse an ambiguous supplied signature.
-        signature = tuple(identities)
+            for name in names
+        )
 
         previous = self._visibility_scope_signature
         if not preserve_visibility or previous is None:
