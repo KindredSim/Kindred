@@ -935,6 +935,9 @@ class MainWindow(QtWidgets.QMainWindow):
                 visible,
             )
         )
+        plot.interventionLabelsVisibilityRequested.connect(
+            lambda visible: self._set_intervention_labels_visible(target, visible)
+        )
         plot.copyAllRequested.connect(
             lambda captured=target: self._copy_all_for_tab(captured)
         )
@@ -1349,6 +1352,7 @@ class MainWindow(QtWidgets.QMainWindow):
             intervention_annotations_visible=(
                 presentation.intervention_annotations_visible
             ),
+            intervention_labels_visible=presentation.intervention_labels_visible,
             mechanism_species=canonical_species_names(tab),
             active_overlay_layers=experimental_layers,
             color_by_axis_selection=color_by_axis_selection,
@@ -3988,17 +3992,24 @@ class MainWindow(QtWidgets.QMainWindow):
         visible: bool,
     ) -> None:
         if not self._mutation_input_admitted(
-            "Change Intervention Annotations"
+            "Change Intervention Indicators"
         ):
             return
-        state = self._workspace_tab_registry.presentation(tab_id)
-        self._workspace_tab_registry.set_presentation(
+        self._workspace_tab_registry.set_intervention_annotations_visible(
             tab_id,
-            replace(
-                state,
-                intervention_annotations_visible=bool(visible),
-            ),
+            visible,
         )
+        self._refresh_project_state()
+        self._render_results_for_tab(tab_id)
+
+    def _set_intervention_labels_visible(
+        self,
+        tab_id: str,
+        visible: bool,
+    ) -> None:
+        if not self._mutation_input_admitted("Change Intervention Labels"):
+            return
+        self._workspace_tab_registry.set_intervention_labels_visible(tab_id, visible)
         self._refresh_project_state()
         self._render_results_for_tab(tab_id)
 

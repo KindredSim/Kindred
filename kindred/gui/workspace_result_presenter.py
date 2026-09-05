@@ -576,6 +576,7 @@ class ResultRenderInput:
     reference_lines_visible: bool = True
     intervention_annotations: tuple[_DisplayAnnotation, ...] = ()
     intervention_annotations_visible: bool = True
+    intervention_labels_visible: bool = True
     unavailable_x_diagnostic: str | None = None
     completion_warning_details: tuple[tuple[str, tuple[str, ...]], ...] = ()
 
@@ -1267,6 +1268,7 @@ def compose_result_input(
     repository: ResultRepository,
     reference_lines_visible: bool,
     intervention_annotations_visible: bool,
+    intervention_labels_visible: bool,
     mechanism_species: Sequence[str],
     active_overlay_layers: Sequence[ExperimentalLayerInput] = (),
     color_by_axis_selection: Mapping[AxisSeriesSelection, str] = MappingProxyType({}),
@@ -1546,7 +1548,8 @@ def compose_result_input(
         axis_candidates=tuple(candidates),
         reference_lines_visible=bool(reference_lines_visible),
         intervention_annotations=owned_annotations,
-        intervention_annotations_visible=bool(intervention_annotations_visible and _is_time_selection(selected_x)),
+        intervention_annotations_visible=intervention_annotations_visible,
+        intervention_labels_visible=intervention_labels_visible,
         unavailable_x_diagnostic=_selected_x_unavailable_diagnostic(selected_x, unavailable_labels),
         completion_warning_details=tuple(warning_facts),
     )

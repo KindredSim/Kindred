@@ -1035,6 +1035,7 @@ def _encode_presentation(
         "intervention_annotations_visible": (
             state.intervention_annotations_visible
         ),
+        "intervention_labels_visible": state.intervention_labels_visible,
         "log_x": state.log_x,
         "log_y": state.log_y,
         "legend_visible": state.legend_visible,
@@ -1128,6 +1129,7 @@ def _decode_presentation(
             "selected_y_uses_default_all",
             "reference_lines_visible",
             "intervention_annotations_visible",
+            "intervention_labels_visible",
             "log_x",
             "log_y",
             "legend_visible",
@@ -1232,6 +1234,10 @@ def _decode_presentation(
         intervention_annotations_visible=_boolean(
             data["intervention_annotations_visible"],
             f"{label}.intervention_annotations_visible",
+        ),
+        intervention_labels_visible=_boolean(
+            data["intervention_labels_visible"],
+            f"{label}.intervention_labels_visible",
         ),
         log_x=_boolean(data["log_x"], f"{label}.log_x"),
         log_y=_boolean(data["log_y"], f"{label}.log_y"),

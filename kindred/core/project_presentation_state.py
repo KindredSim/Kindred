@@ -86,11 +86,19 @@ class ProjectPresentationState:
     selected_y_uses_default_all: bool = True
     reference_lines_visible: bool = True
     intervention_annotations_visible: bool = True
+    intervention_labels_visible: bool = True
     log_x: bool = False
     log_y: bool = False
     legend_visible: bool = True
     x_inverted: bool = False
     y_inverted: bool = False
+
+    def __post_init__(self) -> None:
+        if (
+            self.intervention_labels_visible
+            and not self.intervention_annotations_visible
+        ):
+            raise ValueError("Intervention labels require intervention indicators.")
 
     def reconciled(
         self,
@@ -183,6 +191,7 @@ class ProjectPresentationState:
             intervention_annotations_visible=(
                 self.intervention_annotations_visible
             ),
+            intervention_labels_visible=self.intervention_labels_visible,
             log_x=self.log_x,
             log_y=self.log_y,
             legend_visible=self.legend_visible,
@@ -214,6 +223,7 @@ def default_project_presentation_state(
         selected_x_series=SimulationSeriesAxisSelection("t"),
         reference_lines_visible=True,
         intervention_annotations_visible=True,
+        intervention_labels_visible=True,
     )
 
 
@@ -321,6 +331,7 @@ def validate_project_presentation_state(
         "selected_y_uses_default_all",
         "reference_lines_visible",
         "intervention_annotations_visible",
+        "intervention_labels_visible",
         "log_x",
         "log_y",
         "legend_visible",

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Callable, Iterable
 
 from kindred.core.mechanism_source import MechanismAuthoringSource
@@ -384,6 +384,38 @@ class WorkspaceTabRegistry:
         self._presentation_by_tab_id = tuple(
             (current_id, candidate if current_id == tab.tab_id else current)
             for current_id, current in self._presentation_by_tab_id
+        )
+
+    def set_intervention_annotations_visible(
+        self,
+        tab_id: str,
+        visible: bool,
+    ) -> None:
+        state = self.presentation(tab_id)
+        self.set_presentation(
+            tab_id,
+            replace(
+                state,
+                intervention_annotations_visible=visible,
+                intervention_labels_visible=visible,
+            ),
+        )
+
+    def set_intervention_labels_visible(
+        self,
+        tab_id: str,
+        visible: bool,
+    ) -> None:
+        state = self.presentation(tab_id)
+        self.set_presentation(
+            tab_id,
+            replace(
+                state,
+                intervention_annotations_visible=(
+                    visible or state.intervention_annotations_visible
+                ),
+                intervention_labels_visible=visible,
+            ),
         )
 
     def create_tab(

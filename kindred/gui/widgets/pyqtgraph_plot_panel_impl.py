@@ -188,6 +188,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
 
     referenceLayerVisibilityRequested = QtCore.Signal(bool)
     interventionAnnotationsVisibilityRequested = QtCore.Signal(bool)
+    interventionLabelsVisibilityRequested = QtCore.Signal(bool)
     copyAllRequested = QtCore.Signal()
     xSeriesRequested = QtCore.Signal(object)
     ySeriesRequested = QtCore.Signal(object)
@@ -552,7 +553,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
             bool(self._render_input and self._render_input.reference_lines_visible)
         )
         reference.toggled.connect(self.referenceLayerVisibilityRequested)
-        annotations = menu.addAction("Show Intervention Annotations")
+        annotations = menu.addAction("Show Intervention Indicators")
         annotations.setCheckable(True)
         annotations.setChecked(
             bool(
@@ -561,6 +562,12 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
             )
         )
         annotations.toggled.connect(self.interventionAnnotationsVisibilityRequested)
+        labels = menu.addAction("Show Intervention Labels")
+        labels.setCheckable(True)
+        labels.setChecked(
+            bool(self._render_input and self._render_input.intervention_labels_visible)
+        )
+        labels.toggled.connect(self.interventionLabelsVisibilityRequested)
         menu.exec(self._plot_widget.mapToGlobal(position))
 
     @QtCore.Slot()
@@ -2266,7 +2273,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
                 opacity *= 1.0 - foreground_opacity.get((set_id, start, end), 0.0)
                 if opacity <= _EPSILON:
                     continue
-            if role == "foreground":
+            if role == "foreground" and render_input.intervention_labels_visible:
                 occurrence = (
                     set_id, str(annotation.get("kind") or "intervention"),
                     annotation["declaration_ordinal"],
@@ -2310,6 +2317,10 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
             if key not in rendered:
                 self._remove_annotation_item(item)
         self._annotation_items = rendered
+
+        if not render_input.intervention_labels_visible:
+            self._clear_annotation_labels()
+            return
 
         existing_labels = self._annotation_labels
         rendered_labels: dict[
@@ -2434,9 +2445,12 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
     def _clear_annotation_items(self) -> None:
         for item in self._annotation_items.values():
             self._remove_annotation_item(item)
+        self._annotation_items.clear()
+        self._clear_annotation_labels()
+
+    def _clear_annotation_labels(self) -> None:
         for label, _anchor in self._annotation_labels.values():
             self._remove_annotation_item(label)
-        self._annotation_items.clear()
         self._annotation_labels.clear()
 
     @staticmethod
