@@ -748,7 +748,10 @@ def fit_candidate_tracker(candidate: FitCandidate) -> tuple[str, tuple[str, ...]
     shared, individual = _estimate_rows(candidate)
     initial = _initial_rows(candidate)
     metrics = _dataset_metrics(candidate)
-    lines: list[str] = []
+    lines: list[str] = [
+        result.message,
+        f"Optimizer converged: {str(result.optimizer_converged).lower()}",
+    ]
     tooltips: list[str] = []
     for row in (*shared, *individual, *initial):
         lines.append(_estimate_line(row))

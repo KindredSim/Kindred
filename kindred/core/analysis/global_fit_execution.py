@@ -1962,6 +1962,7 @@ class GlobalFitObjective:
         self._objective_calls = 0
         self._best_cost = float("inf")
         self._best_vector: np.ndarray | None = None
+        self.best_complete_facts: tuple[DatasetFitInfo, ...] = ()
         self._warned_objective_keys: set[tuple[str, str, str]] = set()
 
     @property
@@ -1995,6 +1996,22 @@ class GlobalFitObjective:
         if self._best_vector is None:
             return None
         return np.asarray(self._best_vector, dtype=float).copy()
+
+    def retain_complete_candidate(
+        self, vector: np.ndarray, facts: tuple[DatasetFitInfo, ...]
+    ) -> None:
+        """Retain matching scientific facts and coordinates on strict improvement."""
+        if tuple(info.dataset_id for info in facts) != tuple(
+            payload.dataset_id for payload in self._payloads
+        ):
+            return
+        cost = finite_sum_of_squares(
+            np.concatenate(tuple(info.weighted_residuals for info in facts))
+        )
+        if cost is not None and cost < self._best_cost:
+            self._best_cost = float(cost)
+            self._best_vector = np.asarray(vector, dtype=float).copy()
+            self.best_complete_facts = facts
 
     @staticmethod
     def format_params(params_map: Dict[str, float]) -> Dict[str, float]:
@@ -2280,9 +2297,6 @@ class GlobalFitObjective:
             publish_every_call: bool = False,
         ) -> None:
             self._objective_calls += 1
-            if improved:
-                self._best_cost = float(cost)
-                self._best_vector = np.asarray(optimizer_vector, dtype=float).reshape(-1).copy()
             if self._progress_callback is None:
                 return
             progress_vector = np.asarray(optimizer_vector, dtype=float).reshape(-1)
@@ -2456,8 +2470,6 @@ class GlobalFitObjective:
         artificial_block_indexes: set[int] = set()
         nondeadline_unavailability_recorded = False
         for item, evaluation in zip(dataset_inputs, simulation_evaluations, strict=True):
-            _raise_if_fitting_cancel_requested(self._cancellation_control)
-
             if isinstance(evaluation, ScientificUnavailable):
                 if (
                     item.payload.dataset_id not in timed_out_dataset_ids
@@ -2514,6 +2526,8 @@ class GlobalFitObjective:
         }
         complete_evaluations = len(candidate_evaluations) == len(dataset_inputs)
         improved = complete_evaluations and cost < self._best_cost
+        if improved:
+            self.retain_complete_candidate(params, tuple(simulation_evaluations))
         finalize_candidate(
             optimizer_vector=params,
             cost=cost,
@@ -2612,9 +2626,6 @@ def _assemble_fit_replay_state(
         }
         for payload in payloads
     }
-    dataset_info = []
-    total_points = 0
-    global_weighted_residual_blocks: List[np.ndarray] = []
 
     dataset_inputs: List[ObjectiveDatasetInput] = []
     for payload in payloads:
@@ -2697,8 +2708,46 @@ def _assemble_fit_replay_state(
                 stage="final_replay_simulation",
             )
 
-    for item, evaluation in zip(dataset_inputs, simulation_evaluations, strict=True):
-        payload = item.payload
+    return _assemble_fit_result_facts(
+        payloads=payloads,
+        layout=layout,
+        candidate_vector=candidate_vector,
+        facts=tuple(simulation_evaluations),
+        cancellation_check=cancellation_check,
+        cancellation_control=cancellation_control,
+        success=success,
+        message=message,
+        optimizer_diagnostic=optimizer_diagnostic,
+    )
+
+
+def _assemble_fit_result_facts(
+    *,
+    payloads: Sequence[FitDatasetSpec],
+    layout: FitParameterLayout,
+    candidate_vector: np.ndarray,
+    facts: tuple[DatasetFitInfo, ...],
+    cancellation_check: Optional[Callable[[], bool]],
+    cancellation_control: SimulationCancellationControl | None,
+    success: bool,
+    message: str,
+    optimizer_diagnostic: FactualCause | None,
+) -> _FitReplayState:
+    """Construct terminal metrics and values from complete scientific facts."""
+    layout.validate_optimizer_vector(candidate_vector)
+    fitted_params = layout.shared_param_dict_from_vector(candidate_vector)
+    combined_dataset_params = {
+        payload.dataset_id: {
+            **layout.centred_params_for_dataset(payload.dataset_id, candidate_vector),
+            **layout.dataset_var_params_for_dataset(payload.dataset_id, candidate_vector),
+            **layout.coupled_params_for_dataset(payload.dataset_id, candidate_vector),
+        }
+        for payload in payloads
+    }
+    dataset_info = []
+    total_points = 0
+    global_weighted_residual_blocks: List[np.ndarray] = []
+    for payload, evaluation in zip(payloads, facts, strict=True):
         ds_id = payload.dataset_id
         _raise_if_fitting_cancelled(cancellation_check)
         _raise_if_fitting_cancel_requested(cancellation_control)

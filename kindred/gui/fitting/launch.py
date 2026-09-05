@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, replace
-from typing import Iterable, Literal
+from typing import Iterable, Literal, Sequence
 
 import numpy as np
 
@@ -340,6 +340,42 @@ class FitParameterVariable:
             if self.scope == "shared"
             else self.per_dataset_config
         )
+
+
+def convert_fit_parameter_scope(
+    parameter: FitParameterVariable,
+    scope: str,
+    datasets: Sequence[FitDatasetLocalSettings],
+    *,
+    statistic: str = "arithmetic",
+) -> FitParameterVariable:
+    """Convert accepted local values together with their active configuration."""
+    active = parameter.selected_config
+    if scope == "shared" and parameter.scope != "shared":
+        roster = tuple(item.dataset_id for item in datasets if item.included) or tuple(
+            item.dataset_id for item in datasets
+        )
+        values = dict(active.dataset_values)
+        selected = tuple(values[dataset_id] for dataset_id in roster)
+        if not selected:
+            value = active.value
+        elif statistic == "geometric":
+            if any(value <= 0.0 for value in selected):
+                raise ValueError("Geometric Shared seed requires positive values.")
+            value = math.exp(math.fsum(math.log(value) for value in selected) / len(selected))
+        else:
+            value = math.fsum(value / len(selected) for value in selected)
+        active = replace(active, value=value, dataset_values=())
+    elif scope != "shared" and parameter.scope == "shared":
+        active = replace(
+            active,
+            dataset_values=tuple((item.dataset_id, active.value) for item in datasets),
+        )
+    return replace(
+        parameter,
+        scope=scope,
+        **{"shared_config" if scope == "shared" else "per_dataset_config": active},
+    )
 
 
 def _replace_fit_parameter(

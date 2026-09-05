@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import math
 from collections.abc import Callable, Sequence
 from dataclasses import replace
 
@@ -30,7 +29,7 @@ from kindred.gui.fitting.launch import (
     capture_fit_origin,
     create_initial_fit_setup,
     prune_fit_analysis_coordinates,
-    _replace_fit_parameter,
+    convert_fit_parameter_scope,
 )
 from kindred.gui.fitting.window import FittingWindow
 from kindred.gui.fitting.reporting import (
@@ -202,7 +201,7 @@ class FitSessionOwner(QtCore.QObject):
             return None
 
         window.executeRequested.connect(self.execute)
-        window.cancelRequested.connect(self.cancel)
+        window.stopRequested.connect(self.stop)
         window.pauseRequested.connect(self.pause)
         window.resumeRequested.connect(self.resume)
         window.resultsSummaryRequested.connect(self.results_summary)
@@ -419,17 +418,14 @@ class FitSessionOwner(QtCore.QObject):
         return True
 
     @QtCore.Slot()
-    def cancel(self) -> bool:
+    def stop(self) -> bool:
         if self._closing or self._application_close_fenced:
             return False
         worker = self._worker
         if worker is None:
             return False
-        worker.request_cancel()
-        self._set_status(
-            "Fit stop requested; the current terminal candidate will be "
-            "restored after settlement."
-        )
+        worker.request_stop()
+        self._set_status("Fit stop requested; retaining this run's best complete candidate.")
         return True
 
     @QtCore.Slot()
@@ -731,8 +727,8 @@ class FitSessionOwner(QtCore.QObject):
         self._candidate = candidate
         # Keep terminal actions disabled until the worker's finished callback
         # releases execution custody.  The candidate itself remains in owner
-        # custody so a failed/cancelled replacement can restore it.
-        self._set_status("Fit complete.")
+        # custody until finished releases the worker.
+        self._set_status(candidate.result.message)
 
     def _present_candidate(
         self,
@@ -758,12 +754,11 @@ class FitSessionOwner(QtCore.QObject):
                 curve_failure=curve_failure,
             )
             window.set_apply_available(self._candidate_can_apply(candidate))
-            window.set_shared_seed_available(self._candidate_can_seed_shared(candidate))
         except Exception as exc:
             self._set_status(f"Fit result presentation failed: {exc}")
         else:
             if announce:
-                self._set_status("Fit complete.")
+                self._set_status(candidate.result.message)
 
     def _restore_candidate_presentation(self) -> None:
         """Restore retained terminal Fit state after a transient attempt."""
@@ -775,74 +770,39 @@ class FitSessionOwner(QtCore.QObject):
 
     @QtCore.Slot(str)
     def seed_shared_fit(self, statistic: str) -> bool:
-        """Convert successful Per-dataset estimates into an idle Shared setup."""
+        """Convert local dataset-based values into an idle Shared setup."""
 
         self._require_thread()
-        candidate = self._candidate
         setup = self._accepted_setup()
         origin = self._current_origin()
         window = self._window
         if (
             self._closing
             or self._application_close_fenced
-            or candidate is None
             or setup is None
             or origin is None
             or window is None
             or self._worker is not None
         ):
             return False
-        if not self._candidate_can_seed_shared(candidate):
+        if not self._setup_can_seed_shared(setup):
             self._set_status(
-                "Shared Fit setup rejected: no successful Per-dataset estimates are available."
+                "Shared Fit setup rejected: no local dataset-based values are available."
             )
             return False
         statistic = str(statistic or "").strip().lower()
         if statistic not in {"arithmetic", "geometric"}:
             self._set_status("Shared Fit setup rejected: unknown seed statistic.")
             return False
-        included_ids = tuple(
-            item.dataset_id for item in setup.datasets if item.included
-        )
-        result_values = candidate.result.dataset_params
         parameters: list[FitParameterVariable] = []
         changed_parameter_names: list[str] = []
         try:
             for parameter in setup.parameters:
-                if (
-                    parameter.scope != "per_dataset"
-                    or not parameter.selected_config.fit
-                ):
+                if parameter.scope == "shared":
                     parameters.append(parameter)
                     continue
-                values = []
-                for dataset_id in included_ids:
-                    value = result_values.get(dataset_id, {}).get(parameter.name)
-                    if value is None or not isinstance(value, (int, float)):
-                        raise ValueError(
-                            f"Fit result omitted {parameter.name!r} for {dataset_id!r}."
-                        )
-                    value = float(value)
-                    if not math.isfinite(value):
-                        raise ValueError(
-                            f"Fit result contains a non-finite value for {parameter.name!r}."
-                        )
-                    values.append(value)
-                if statistic == "geometric":
-                    if any(value <= 0.0 for value in values):
-                        raise ValueError(
-                            f"Geometric Shared seed requires positive {parameter.name!r} values."
-                        )
-                    seed = math.exp(math.fsum(math.log(value) for value in values) / len(values))
-                else:
-                    seed = math.fsum(values) / len(values)
                 parameters.append(
-                    _replace_fit_parameter(
-                        parameter,
-                        scope="shared",
-                        initial=seed,
-                        dataset_values=(),
-                    )
+                    convert_fit_parameter_scope(parameter, "shared", setup.datasets, statistic=statistic)
                 )
                 changed_parameter_names.append(parameter.name)
         except (TypeError, ValueError, KeyError, ZeroDivisionError) as exc:
@@ -915,12 +875,11 @@ class FitSessionOwner(QtCore.QObject):
         return values
 
     @staticmethod
-    def _candidate_can_seed_shared(candidate: FitCandidate) -> bool:
+    def _setup_can_seed_shared(setup: FitSetupSnapshot) -> bool:
         return bool(
             any(
-                parameter.scope == "per_dataset"
-                and parameter.selected_config.fit
-                for parameter in candidate.setup_snapshot.parameters
+                parameter.scope != "shared"
+                for parameter in setup.parameters
             )
         )
 
@@ -1128,7 +1087,8 @@ class FitSessionOwner(QtCore.QObject):
             return
         if self._window is not None:
             self._clear_candidate_presentation(self._window)
-        self._set_status("Fit cancelled.")
+        self._invalidate_candidate_custody()
+        self._set_status("Fit stopped before any complete candidate was evaluated.")
 
     def _on_worker_finished(self, worker: GlobalFitWorker) -> None:
         """Release owner custody only after the direct terminal was emitted."""
@@ -1148,6 +1108,8 @@ class FitSessionOwner(QtCore.QObject):
         if self._window is not None and not self._application_close_fenced and not closing:
             self._window.set_executing(False)
             self._restore_candidate_presentation()
+            setup = self._accepted_setup()
+            self._window.set_shared_seed_available(setup is not None and self._setup_can_seed_shared(setup))
         self.execution_changed.emit(False)
         if worker is not None:
             worker.deleteLater()
@@ -1247,6 +1209,8 @@ class FitSessionOwner(QtCore.QObject):
         if not isinstance(setup, FitSetupSnapshot):
             raise TypeError("Accepted Fit setup must be FitSetupSnapshot.")
         self._setup_state = setup
+        if self._window is not None:
+            self._window.set_shared_seed_available(self._setup_can_seed_shared(setup))
 
     def _set_status(self, text: str) -> None:
         if self._application_close_fenced:

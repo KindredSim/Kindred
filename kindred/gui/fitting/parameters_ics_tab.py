@@ -40,6 +40,7 @@ from kindred.gui.fitting.launch import (
     fit_uncertainty_coordinates,
     prune_fit_analysis_coordinates,
     _replace_fit_parameter,
+    convert_fit_parameter_scope,
 )
 from kindred.gui.fitting.constants import (
     CENTRED_FIXED_EFFECTS_SCOPE_LABEL,
@@ -1334,21 +1335,9 @@ class ParametersIcsTab(QtWidgets.QWidget):
         if desired not in {"shared", "per_dataset", "centred_fixed_effects"}:
             self._restore_scope(parameter.scope)
             return
-        replacement = replace(parameter, scope=desired)
-        if desired == "centred_fixed_effects" and parameter.scope == "shared":
-            config = parameter.shared_config
-            if config is None:
-                self._restore_scope(parameter.scope)
-                return
-            dataset_ids = tuple(item.dataset_id for item in self._projected_setup.datasets)
-            replacement = replace(
-                parameter,
-                scope=desired,
-                per_dataset_config=replace(
-                    config,
-                    dataset_values=tuple((dataset_id, config.value) for dataset_id in dataset_ids),
-                ),
-            )
+        replacement = convert_fit_parameter_scope(
+            parameter, desired, self._projected_setup.datasets
+        )
         profile = prune_fit_analysis_coordinates(
             self._projected_setup.profile_likelihood,
             (parameter.name,),

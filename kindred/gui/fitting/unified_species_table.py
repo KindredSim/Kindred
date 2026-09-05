@@ -742,8 +742,36 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
             return ()
         return members
 
+    def _retain_departing_initials(
+        self, group: FitSharedInitialGroup, remaining: tuple[str, ...]
+    ) -> None:
+        for dataset_id in set(group.member_dataset_ids) - set(remaining):
+            mapped = self._mapped_dataset(dataset_id)
+            key = (mapped.set_id, group.species)
+            pending = self._pending_initial_rows.get(key)
+            # Only an explicit edit outranks the current group configuration.
+            if pending is not None and not pending.get("_from_group"):
+                continue
+            self._pending_initial_rows[key] = {
+                "_from_group": True,
+                "initial": self._float_text(group.initial),
+                "mode": group.tolerance.mode,
+                "lower": "" if group.tolerance.lower is None else self._float_text(group.tolerance.lower),
+                "upper": "" if group.tolerance.upper is None else self._float_text(group.tolerance.upper),
+                "log10": group.log10,
+            }
+            self._pending_initial_values[key] = {
+                "initial": group.initial, "tolerance": group.tolerance, "log10": group.log10,
+            }
+
     def _stage_shared_initial_group(self, group: FitSharedInitialGroup) -> None:
         identity = (group.species, group.origin_dataset_id)
+        previous = self._shared_initial_group(group.origin_dataset_id, group.species)
+        if previous is not None:
+            self._retain_departing_initials(
+                replace(group, member_dataset_ids=previous.member_dataset_ids),
+                group.member_dataset_ids,
+            )
         setup = self._current_setup()
         accepted = None if setup is None else next(
             (
@@ -760,6 +788,7 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
         self._refresh_visible_presentation()
 
     def _dissolve_shared_initial_group(self, group: FitSharedInitialGroup) -> None:
+        self._retain_departing_initials(group, ())
         identity = (group.species, group.origin_dataset_id)
         setup = self._current_setup()
         if setup is not None and any(
@@ -1440,6 +1469,11 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
             if group_origin and group is not None:
                 if initial.tolerance.mode == "disabled":
                     self._refresh_vary_global_availability(row)
+                    self._pending_initial_rows[key] = raw
+                    self._pending_initial_values[key] = {
+                        "initial": initial.initial, "tolerance": initial.tolerance,
+                        "log10": initial.log10,
+                    }
                     self._dissolve_shared_initial_group(group)
                     return
                 self._stage_shared_initial_group(
@@ -1856,6 +1890,9 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
                         continue
                     destination_key = (destination_mapped.set_id, species)
                     destination_raw = self._initial_raw(destination_initial)
+                    pending_destination = self._pending_initial_rows.get(destination_key)
+                    if pending_destination is not None:
+                        destination_raw["initial"] = pending_destination["initial"]
                     destination_raw.update(
                         {
                             "mode": source_tolerance.mode,
@@ -1876,7 +1913,7 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
                         copied_initial = FitInitialVariable(
                             set_id=destination_mapped.set_id,
                             species=species,
-                            initial=destination_initial.initial,
+                            initial=float(destination_raw["initial"]),
                             tolerance=source_tolerance,
                             log10=source_log10,
                         )
@@ -1906,7 +1943,7 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
                         else:
                             self._pending_initial_rows[destination_key] = destination_raw
                             self._pending_initial_values[destination_key] = {
-                                "initial": destination_initial.initial,
+                                "initial": copied_initial.initial,
                                 "tolerance": copied_initial.tolerance,
                                 "log10": copied_initial.log10,
                             }

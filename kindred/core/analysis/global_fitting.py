@@ -113,6 +113,8 @@ def fit_global(
     ] = None,
     cancellation_check: Optional[Callable[[], bool]] = None,
     cancellation_control: SimulationCancellationControl | None = None,
+    stop_check: Optional[Callable[[], bool]] = None,
+    starting_facts: tuple[_fit_execution.DatasetFitInfo, ...] = (),
     profile_likelihood: ProfileLikelihoodConfig | None = None,
     residual_bootstrap: ResidualBootstrapConfig | None = None,
     extension_progress_callback: Optional[
@@ -157,6 +159,21 @@ def fit_global(
     penalty_value = 1e6
     objective_total_points = int(sum(item.point_count for item in payloads))
 
+    def hard_cancelled() -> bool:
+        return bool(
+            (cancellation_check is not None and cancellation_check())
+            or (cancellation_control is not None and cancellation_control.cancel_requested())
+        )
+
+    def active_cancelled() -> bool:
+        return hard_cancelled() or bool(stop_check is not None and stop_check())
+
+    active_control = SimulationCancellationControl(
+        lambda: bool(
+            (cancellation_control is not None and cancellation_control.cancel_requested())
+            or (stop_check is not None and stop_check())
+        )
+    )
     try:
         objective = _fit_execution.GlobalFitObjective(
             fit_evaluators=evaluators,
@@ -166,119 +183,145 @@ def fit_global(
             layout=layout,
             penalty_value=penalty_value,
             progress_callback=progress_callback,
-            cancellation_check=cancellation_check,
-            cancellation_control=cancellation_control,
+            cancellation_check=active_cancelled,
+            cancellation_control=active_control,
             executor=executor,
         )
-        de_penalty = (
-            float((penalty_value**2) * max(1, objective_total_points))
-            if method == "differential_evolution"
-            else None
-        )
-        optimizer_result = fit_parameters(
-            objective,
-            layout.initial_params(),
-            bounds=layout.bounds_dict(),
-            method=method,
-            max_nfev=max_nfev,
-            seed=seed,
-            ftol=ftol,
-            xtol=xtol,
-            cancellation_check=cancellation_check,
-            de_penalty=de_penalty,
-        )
-        success = bool(optimizer_result.success)
-        message = str(optimizer_result.message)
-        optimizer_diagnostic: FactualCause | None = None
-        identifiability = str(
-            optimizer_result.identifiability_warning or ""
-        ).strip()
-        if identifiability:
-            optimizer_diagnostic = FactualCause(
-                domain="fit",
-                origin="identifiability",
-                code=None,
-                type="FittingIdentifiability",
-                message=identifiability,
-                details={"final_report_warning": True},
-            )
+        if starting_facts:
+            objective.retain_complete_candidate(layout.x0, starting_facts)
         keys = layout.opt_param_keys()
-        optimizer_endpoint_vector = np.asarray(
-            [optimizer_result.parameters[key] for key in keys],
-            dtype=float,
-        )
-        layout.validate_optimizer_vector(optimizer_endpoint_vector)
+        primary_stopped = False
+        try:
+            de_penalty = (
+                float((penalty_value**2) * max(1, objective_total_points))
+                if method == "differential_evolution"
+                else None
+            )
+            optimizer_result = fit_parameters(
+                objective,
+                layout.initial_params(),
+                bounds=layout.bounds_dict(),
+                method=method,
+                max_nfev=max_nfev,
+                seed=seed,
+                ftol=ftol,
+                xtol=xtol,
+                cancellation_check=active_cancelled,
+                de_penalty=de_penalty,
+            )
+            success = bool(optimizer_result.success)
+            message = str(optimizer_result.message)
+            optimizer_diagnostic: FactualCause | None = None
+            identifiability = str(
+                optimizer_result.identifiability_warning or ""
+            ).strip()
+            if identifiability:
+                optimizer_diagnostic = FactualCause(
+                    domain="fit",
+                    origin="identifiability",
+                    code=None,
+                    type="FittingIdentifiability",
+                    message=identifiability,
+                    details={"final_report_warning": True},
+                )
+            optimizer_endpoint_vector = np.asarray(
+                [optimizer_result.parameters[key] for key in keys],
+                dtype=float,
+            )
+            layout.validate_optimizer_vector(optimizer_endpoint_vector)
 
-        def replay(
-            candidate_vector: np.ndarray,
-            *,
-            converged: bool,
-        ) -> _fit_execution._FitReplayState:
-            return _fit_execution._assemble_fit_replay_state(
-                fit_evaluators=evaluators,
+            def replay(
+                candidate_vector: np.ndarray,
+                *,
+                converged: bool,
+            ) -> _fit_execution._FitReplayState:
+                return _fit_execution._assemble_fit_replay_state(
+                    fit_evaluators=evaluators,
+                    payloads=payloads,
+                    layout=layout,
+                    candidate_vector=candidate_vector,
+                    fixed_dataset_params=fixed_dataset_params,
+                    weights=weights_norm,
+                    cancellation_check=active_cancelled,
+                    cancellation_control=active_control,
+                    success=converged,
+                    message=message,
+                    optimizer_diagnostic=optimizer_diagnostic,
+                    executor=executor,
+                )
+
+            try:
+                # Scientific availability belongs to the actual optimizer endpoint
+                # replay.  A better fully evaluated probe must not replace it.
+                replay_state = replay(optimizer_endpoint_vector, converged=success)
+            except FitSimulationError as exc:
+                details = dict(getattr(exc, "details", None) or {})
+                if not details.get("scientific_unavailable"):
+                    raise
+                retained_best = objective.best_complete_vector
+                if retained_best is None:
+                    return ScientificUnavailable(
+                        producer=str(details.get("producer", "global_fit_replay")),
+                        stage=str(details.get("stage", "final_replay")),
+                        details=details,
+                        factual_cause=getattr(exc, "factual_cause", None),
+                    )
+                retained_best_vector = np.asarray(retained_best, dtype=float).reshape(-1)
+                layout.validate_optimizer_vector(retained_best_vector)
+                success = False
+                optimizer_diagnostic = FactualCause(
+                    domain="fit",
+                    origin="optimizer_endpoint",
+                    code=None,
+                    type="FittingUnavailableEndpointReplaced",
+                    message=(
+                        "The unavailable optimizer endpoint was replaced by the "
+                        "best scientifically available evaluated candidate."
+                    ),
+                    details={
+                        "endpoint_replaced": True,
+                        "settlement": "best_scientifically_available_evaluated_candidate",
+                    },
+                    cause=optimizer_diagnostic,
+                )
+                try:
+                    replay_state = replay(retained_best_vector, converged=False)
+                except FitSimulationError as fallback_exc:
+                    fallback_details = dict(
+                        getattr(fallback_exc, "details", None) or {}
+                    )
+                    if not fallback_details.get("scientific_unavailable"):
+                        raise
+                    return ScientificUnavailable(
+                        producer=str(
+                            fallback_details.get("producer", "global_fit_replay")
+                        ),
+                        stage=str(fallback_details.get("stage", "final_replay")),
+                        details=fallback_details,
+                        factual_cause=getattr(fallback_exc, "factual_cause", None),
+                    )
+        except (FittingCancelled, SimulationCancelled):
+            if hard_cancelled() or stop_check is None or not stop_check():
+                raise
+            retained_vector = objective.best_complete_vector
+            if retained_vector is None:
+                raise FittingCancelled()
+            primary_stopped = True
+            message = "Fit stopped. Best complete candidate retained."
+            replay_state = _fit_execution._assemble_fit_result_facts(
                 payloads=payloads,
                 layout=layout,
-                candidate_vector=candidate_vector,
-                fixed_dataset_params=fixed_dataset_params,
-                weights=weights_norm,
-                cancellation_check=cancellation_check,
+                candidate_vector=retained_vector,
+                facts=objective.best_complete_facts,
+                cancellation_check=hard_cancelled,
                 cancellation_control=cancellation_control,
-                success=converged,
+                success=False,
                 message=message,
-                optimizer_diagnostic=optimizer_diagnostic,
-                executor=executor,
-            )
-
-        try:
-            # Scientific availability belongs to the actual optimizer endpoint
-            # replay.  A better fully evaluated probe must not replace it.
-            replay_state = replay(optimizer_endpoint_vector, converged=success)
-        except FitSimulationError as exc:
-            details = dict(getattr(exc, "details", None) or {})
-            if not details.get("scientific_unavailable"):
-                raise
-            retained_best = objective.best_complete_vector
-            if retained_best is None:
-                return ScientificUnavailable(
-                    producer=str(details.get("producer", "global_fit_replay")),
-                    stage=str(details.get("stage", "final_replay")),
-                    details=details,
-                    factual_cause=getattr(exc, "factual_cause", None),
-                )
-            retained_best_vector = np.asarray(retained_best, dtype=float).reshape(-1)
-            layout.validate_optimizer_vector(retained_best_vector)
-            success = False
-            optimizer_diagnostic = FactualCause(
-                domain="fit",
-                origin="optimizer_endpoint",
-                code=None,
-                type="FittingUnavailableEndpointReplaced",
-                message=(
-                    "The unavailable optimizer endpoint was replaced by the "
-                    "best scientifically available evaluated candidate."
+                optimizer_diagnostic=FactualCause(
+                    domain="fit", origin="optimizer", code=None,
+                    type="FittingStopped", message=message, details={},
                 ),
-                details={
-                    "endpoint_replaced": True,
-                    "settlement": "best_scientifically_available_evaluated_candidate",
-                },
-                cause=optimizer_diagnostic,
             )
-            try:
-                replay_state = replay(retained_best_vector, converged=False)
-            except FitSimulationError as fallback_exc:
-                fallback_details = dict(
-                    getattr(fallback_exc, "details", None) or {}
-                )
-                if not fallback_details.get("scientific_unavailable"):
-                    raise
-                return ScientificUnavailable(
-                    producer=str(
-                        fallback_details.get("producer", "global_fit_replay")
-                    ),
-                    stage=str(fallback_details.get("stage", "final_replay")),
-                    details=fallback_details,
-                    factual_cause=getattr(fallback_exc, "factual_cause", None),
-                )
         vector = np.asarray(replay_state.optimizer_vector, dtype=float)
         # Post-fit methods receive a fresh objective without progress emission.
         # It retains the same evaluators, candidate/fatal taxonomy, coordinates,
@@ -291,13 +334,13 @@ def fit_global(
             layout=layout,
             penalty_value=penalty_value,
             progress_callback=None,
-            cancellation_check=cancellation_check,
-            cancellation_control=cancellation_control,
+            cancellation_check=active_cancelled,
+            cancellation_control=active_control,
             executor=executor,
         )
         profile_result: ProfileLikelihoodResult | None = None
         bootstrap_result: ResidualBootstrapResult | None = None
-        optional_analysis_stopped = False
+        optional_analysis_stopped = primary_stopped
         terminal_parameters = {
             key: float(vector[index])
             for index, key in enumerate(keys)
@@ -311,6 +354,8 @@ def fit_global(
                 ),
             )
             try:
+                if primary_stopped:
+                    raise FittingCancelled("Profile likelihood was not started after Fit stopped.")
                 profile_result = profile_likelihood_result(
                     objective=terminal_objective,
                     initial_parameters=terminal_parameters,
@@ -318,7 +363,7 @@ def fit_global(
                     config=profile_config,
                     decode_coordinate=layout.decode_coordinate,
                     base_residuals=replay_state.weighted_residuals,
-                    cancellation_check=cancellation_check,
+                    cancellation_check=active_cancelled,
                     progress_callback=extension_progress_callback,
                 )
             except (FittingCancelled, SimulationCancelled) as exc:
@@ -352,6 +397,12 @@ def fit_global(
                     ),
                 )
 
+            if primary_stopped:
+                profile_result = replace(
+                    profile_result,
+                    provenance={**profile_result.provenance, "settlement": "not_started_after_stop"},
+                )
+
         if residual_bootstrap is not None:
             def refit_bootstrap(
                 synthetic_payloads: Sequence[FitDatasetSpec],
@@ -379,8 +430,8 @@ def fit_global(
                     seed=replicate_seed,
                     progress_callback=None,
                     extension_progress_callback=None,
-                    cancellation_check=cancellation_check,
-                    cancellation_control=cancellation_control,
+                    cancellation_check=active_cancelled,
+                    cancellation_control=active_control,
                     optimizer_layout=layout,
                     executor=executor,
                 )
@@ -405,12 +456,10 @@ def fit_global(
                         payloads=payloads,
                         config=residual_bootstrap,
                         refit=refit_bootstrap,
-                        cancellation_check=cancellation_check,
+                        cancellation_check=active_cancelled,
                         progress_callback=extension_progress_callback,
                     )
-                    optional_analysis_stopped = bootstrap_result.status == "stopped"
                 except (FittingCancelled, SimulationCancelled) as exc:
-                    optional_analysis_stopped = True
                     bootstrap_result = residual_bootstrap_settlement_result(
                         config=residual_bootstrap,
                         status="stopped",
@@ -431,11 +480,24 @@ def fit_global(
                         ),
                     )
 
+        analysis_messages = []
+        for label, analysis in (
+            ("Profile likelihood", profile_result), ("Residual bootstrap", bootstrap_result)
+        ):
+            if analysis is not None and analysis.status == "stopped":
+                analysis_messages.append(
+                    f"{label} was not started after Stop."
+                    if analysis.provenance.get("settlement") == "not_started_after_stop"
+                    else f"{label} stopped."
+                )
         replay_state = replace(
             replay_state,
+            message=" ".join((replay_state.message, *analysis_messages)),
             profile_likelihood_result=profile_result,
             residual_bootstrap_result=bootstrap_result,
         )
+        if hard_cancelled():
+            raise FittingCancelled()
         result = _fit_execution._construct_global_fit_result(replay_state)
         return result
 

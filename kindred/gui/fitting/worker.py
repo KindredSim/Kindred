@@ -27,6 +27,7 @@ from kindred.core.analysis.global_fit_execution import (
     GlobalFitResult,
     ObjectiveDatasetInput,
     evaluate_dataset_simulation,
+    normalize_weights,
     fit_result_target_values,
     _select_fit_rows,
 )
@@ -1256,6 +1257,8 @@ def _execute_global_fit_model(
     extension_progress_callback: Callable[[FitExtensionProgress], None],
     cancellation_check: Callable[[], bool],
     cancellation_control: SimulationCancellationControl,
+    stop_check: Callable[[], bool],
+    starting_facts: tuple[DatasetFitInfo, ...],
     executor: ThreadPoolExecutor,
 ) -> GlobalFitResult | ScientificUnavailable:
     """Dispatch one exact ordinary or advanced Fit execution."""
@@ -1277,6 +1280,8 @@ def _execute_global_fit_model(
         "extension_progress_callback": extension_progress_callback,
         "cancellation_check": cancellation_check,
         "cancellation_control": cancellation_control,
+        "stop_check": stop_check,
+        "starting_facts": starting_facts,
         "profile_likelihood": request.setup.profile_likelihood,
         "residual_bootstrap": request.setup.residual_bootstrap,
     }
@@ -1319,8 +1324,9 @@ class GlobalFitWorker(QtCore.QThread):
             raise TypeError("request must be FitExecutionRequest.")
         self._request = request
         self._cancelled = Event()
+        self._stopped = Event()
         self._cancellation_control = SimulationCancellationControl(
-            self._cancelled.is_set
+            lambda: self._cancelled.is_set() or self._stopped.is_set()
         )
         self._pause_condition = Condition()
         self._paused = False
@@ -1345,13 +1351,17 @@ class GlobalFitWorker(QtCore.QThread):
         with self._pause_condition:
             self._paused = False
             self._pause_condition.notify_all()
-        self.requestInterruption()
 
-    def _checkpoint(self) -> bool:
+    def request_stop(self) -> None:
+        """Stop active work while retaining this run's complete best candidate."""
+        self._stopped.set()
+        self.resume()
+
+    def _checkpoint(self, *, honor_stop: bool = True) -> bool:
         with self._pause_condition:
-            while self._paused and not self._cancelled.is_set():
+            while self._paused and not (self._cancelled.is_set() or self._stopped.is_set()):
                 self._pause_condition.wait()
-        return self._cancelled.is_set()
+        return self._cancelled.is_set() or (honor_stop and self._stopped.is_set())
 
     def run(self) -> None:
         candidate: FitCandidate | None = None
@@ -1386,7 +1396,9 @@ class GlobalFitWorker(QtCore.QThread):
         # Publish one direct typed terminal only after every worker-owned
         # evaluator and executor has settled.  The owner receives the exact
         # candidate/cause/unavailability value; cancellation has no payload.
-        if failure is not None:
+        if self._cancelled.is_set():
+            self.cancelled.emit()
+        elif failure is not None:
             self.factual_failure.emit(failure)
         elif cancelled:
             self.cancelled.emit()
@@ -1463,6 +1475,7 @@ class GlobalFitWorker(QtCore.QThread):
         effective_local: dict[str, FitDatasetLocalSettings] = {}
         resolved_mode_items: list[tuple[str, str]] = []
         starting_evaluations = {}
+        starting_facts: list[DatasetFitInfo] = []
         execution_shared_variables = dispatch.ordinary_shared_variables
         execution_dataset_overrides = dispatch.ordinary_dataset_overrides
         execution_coupled_variables = dispatch.ordinary_coupled_variables
@@ -1481,10 +1494,18 @@ class GlobalFitWorker(QtCore.QThread):
             item.parameter_name
             for item in dispatch.ordinary_centred_variables
         )
-        starting_weights = (
+        starting_weights = normalize_weights(
+            [
+                _compile_dataset_spec(
+                    prepared_datasets[item.dataset_id],
+                    replace(item, parametric=replace(item.parametric, resolved_mode="monotone"))
+                    if item.parametric is not None and item.parametric.requested_mode == "auto"
+                    else item,
+                )
+                for item in included
+            ],
             {item.dataset_id: item.weight for item in included}
-            if setup.dataset_weight_mode == "user"
-            else {item.dataset_id: 1.0 for item in included}
+            if setup.dataset_weight_mode == "user" else None,
         )
         starting_futures = {}
         for local in included:
@@ -1559,6 +1580,7 @@ class GlobalFitWorker(QtCore.QThread):
                 raise TypeError("Fit evaluator did not return DatasetFitInfo.")
             if fit_info is not None:
                 starting_evaluations[dataset_id] = fit_info.simulation_result
+                starting_facts.append(fit_info)
             if (
                 local.parametric is not None
                 and local.parametric.requested_mode == "auto"
@@ -1611,10 +1633,10 @@ class GlobalFitWorker(QtCore.QThread):
         resolved_modes = tuple(
             sorted(resolved_mode_items)
         )
-        if self._checkpoint():
+        if self._checkpoint(honor_stop=False):
             raise FittingCancelled()
         self.auto_modes_resolved.emit(resolved_modes)
-        if self._checkpoint():
+        if self._checkpoint(honor_stop=False):
             raise FittingCancelled()
         try:
             initial_curves = _curves_from_live(
@@ -1629,12 +1651,12 @@ class GlobalFitWorker(QtCore.QThread):
             # projection without preventing the optimizer from exploring the
             # admitted domain.  Fatal Fit failures remain job-fatal.
             initial_curves = ()
-        if self._checkpoint():
+        if self._checkpoint(honor_stop=False):
             raise FittingCancelled()
         self.curves_updated.emit(
             initial_curves
         )
-        if self._checkpoint():
+        if self._checkpoint(honor_stop=False):
             raise FittingCancelled()
         self._last_curve_emit = time.monotonic()
         def progress(update: FitProgress) -> None:
@@ -1696,10 +1718,7 @@ class GlobalFitWorker(QtCore.QThread):
         extension_progress_value = 95
 
         def execution_cancellation_check() -> bool:
-            return self._checkpoint()
-
-        def execution_cancellation_poll() -> bool:
-            return self._cancelled.is_set()
+            return self._checkpoint(honor_stop=False)
 
         def extension_progress(update: FitExtensionProgress) -> None:
             nonlocal extension_progress_value
@@ -1754,10 +1773,10 @@ class GlobalFitWorker(QtCore.QThread):
                 raise FittingCancelled()
 
         execution_cancellation_control = SimulationCancellationControl(
-            execution_cancellation_poll
+            self._cancelled.is_set
         )
         for evaluator in evaluators.values():
-            evaluator.set_cancellation_control(execution_cancellation_control)
+            evaluator.set_cancellation_control(self._cancellation_control)
         result_or_unavailable = _execute_global_fit_model(
             request=request,
             evaluators=evaluators,
@@ -1767,6 +1786,8 @@ class GlobalFitWorker(QtCore.QThread):
             extension_progress_callback=extension_progress,
             cancellation_check=execution_cancellation_check,
             cancellation_control=execution_cancellation_control,
+            stop_check=self._stopped.is_set,
+            starting_facts=tuple(sorted(starting_facts, key=lambda info: info.dataset_id)),
             executor=self._executor,
         )
         if isinstance(result_or_unavailable, ScientificUnavailable):
@@ -1784,7 +1805,7 @@ class GlobalFitWorker(QtCore.QThread):
             resolved_modes=resolved_modes,
             evaluators=evaluators,
         )
-        self.progress.emit(100, "Fit complete")
+        self.progress.emit(100, result.message)
         return candidate
 
     def _live_update(self, best_progress: FitProgress) -> FitLiveUpdate:
