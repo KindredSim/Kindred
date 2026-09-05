@@ -8,7 +8,7 @@ Current contract
 - Helpers:
     heaviside(x) with heaviside(0)=0.0, clip(x, lo, hi), ifelse(cond, a, b)
 - Protected read-only symbols:
-    k_B, h, ħ, N_A, R, Rkcal, T
+    k_B, h, h_bar, N_A, R, Rkcal, T
 - No shadowing of species or builtins; parser/evaluator must emit E120.
 
 Notes
@@ -24,7 +24,7 @@ import math
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Mapping, Optional, Set
 
-from ..constants import k_B, h, hbar as ħ, N_A, R, Rkcal
+from ..constants import k_B, h, h_bar, N_A, R, Rkcal
 
 logger = logging.getLogger(__name__)
 
@@ -102,7 +102,7 @@ BUILTIN_FUNCTIONS: Dict[str, Callable[..., float]] = {
 }
 
 # Protected names are read-only within Algebra
-PROTECTED_NAMES: Set[str] = {"k_B", "h", "ħ", "N_A", "R", "Rkcal", "T"}
+PROTECTED_NAMES: Set[str] = {"k_B", "h", "h_bar", "N_A", "R", "Rkcal", "T"}
 
 # Names that cannot be defined by users either (functions)
 PROTECTED_FUNCTION_NAMES: Set[str] = set(BUILTIN_FUNCTIONS.keys())
@@ -136,7 +136,7 @@ class SymbolTable:
         self._values = {
             "k_B": float(k_B),
             "h": float(h),
-            "ħ": float(ħ),
+            "h_bar": float(h_bar),
             "N_A": float(N_A),
             "R": float(R),
             "Rkcal": float(Rkcal),

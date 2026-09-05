@@ -462,7 +462,7 @@ def forward_rate_symbolic_relation(
         if source_coordinate is not None:
             resolved = source_coordinate(role)
             # A source-coordinate owner may omit a role whose scientific
-            # value is a model default.  Omitted Eyring κ and degeneracy
+            # value is a model default.  Omitted Eyring kappa and degeneracy
             # remain their literal defaults, while authored values are
             # source-backed coordinates.
             if resolved is not None:
@@ -626,8 +626,8 @@ def eyring_rate(
     """
     Compute Eyring rate constant.
 
-    - Unimolecular: g * κ * (k_B T / h) * exp(-ΔG‡/(R T))  [1/s]
-    - n-molecular (n >= 2): multiply by 1/(C°^(n-1))        [1/(M^(n-1)*s)]
+    - Unimolecular: g * kappa * (k_B T / h) * exp(-dG_act/(R T))  [1/s]
+    - n-molecular (n >= 2): multiply by 1/(C0^(n-1))        [1/(M^(n-1)*s)]
     """
     T = validate_temperature(T, field="T")
     standard = _numeric_float(

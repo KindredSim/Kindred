@@ -6,15 +6,15 @@ Current contract
 - Steps may be bare or prefixed with `reaction:` or `equilibrium:`.
 - Irreversible arrows: `->` and `=>`; reversible arrows: `<->` and `<=>`.
 - Accepted keys with normalization:
-  degeneracy, κ, C°|C0, dG_act|ΔG‡, Ea, dG_eq|ΔG°, k|kf|kr, A,
+  degeneracy, kappa, C0, dG_act, Ea, dG_eq, k|kf|kr, A,
   energy=kcal/mol|kJ/mol|J/mol
 - Packaged preset sources use this same public syntax and remain admitted by
   the same parser.
 - Source-level `T=` is rejected; set nominal temperature in the mechanism tab.
-- If dG_eq/ΔG° is provided and Keq is omitted, compute concentration-form
-  Keq = exp(-ΔG°/(R*T)) * C0**delta_n with reaction-dependent units.
+- If dG_eq is provided and Keq is omitted, compute concentration-form
+  Keq = exp(-dG_eq/(R*T)) * C0**delta_n with reaction-dependent units.
 - Default per step is Eyring; Arrhenius override via A/Ea.
-- Units inferred from molecularity (1/(M^(n−1)*s)); bimolecular Eyring divides by C°.
+- Units inferred from molecularity (1/(M^(n−1)*s)); bimolecular Eyring divides by C0.
 
 Scope
 -----
@@ -100,17 +100,12 @@ _KEY_ALIASES: Dict[str, str] = {
     # temperature / states (keys are casefold-normalized)
     "t": "T",
     "degeneracy": "degeneracy",
-    "kappa": "κ",
-    "κ": "κ",
-    "c°": "C0",
+    "kappa": "kappa",
     "c0": "C0",
     # energies / model params
     "dg_act": "dG_act",
-    "δg‡": "dG_act",
-    "δg^‡": "dG_act",
     "ea": "Ea",
     "dg_eq": "dG_eq",
-    "δg°": "dG_eq",
     "a": "A",
     "k": "k",
     "keq": "Keq",
@@ -133,7 +128,7 @@ _COMMA_SEMI_SPLIT_RE = re.compile(r"[,;]")
 _SEMI_SPLIT_RE = re.compile(r"[;]")
 
 _REACTION_KNOWN_KEYS = frozenset(
-    {"κ", "degeneracy", "kf", "k", "kr", "A", "Ea", "Keq", "dG_eq", "dG_act"}
+    {"kappa", "degeneracy", "kf", "k", "kr", "A", "Ea", "Keq", "dG_eq", "dG_act"}
 )
 # ------------------------------ data models ----------------------------------
 
@@ -645,8 +640,7 @@ def _norm_key(k: str) -> str:
     # Bare uppercase K is not lowercase k and is not accepted as a Keq alias.
     if key == "K":
         return "K"
-    # Otherwise normalize to casefolded Unicode before lookup.  The table is
-    # stored in the same normalized form, including Greek Delta aliases.
+    # Match the ASCII key table without changing existing key-case handling.
     return _KEY_ALIASES.get(normalized, key)
 
 
@@ -940,9 +934,9 @@ def _forward_rate_family_from_params(
             line_content=line_content,
         )
     family = next(iter(families), "Eyring")
-    if "κ" in params and family != "Eyring":
+    if "kappa" in params and family != "Eyring":
         raise _DSLError(
-            "Per-step κ is valid only for an Eyring forward rate.",
+            "Per-step kappa is valid only for an Eyring forward rate.",
             line_number=line_number,
             line_content=line_content,
         )
@@ -1368,8 +1362,8 @@ def _source_coordinates_from_key_value_spans(
             if step.model != "Eyring":
                 continue
             canonical_role = role
-        elif role == "κ":
-            # κ is a physical Eyring coordinate only when explicitly
+        elif role == "kappa":
+            # kappa is a physical Eyring coordinate only when explicitly
             # authored.  Its source span remains tied to the original key
             # spelling; only the canonical authority name is normalized.
             if step.model != "Eyring":
@@ -1454,7 +1448,7 @@ def _parse_dsl_ir(text: str, *, units: UnitsModel | None = None) -> "DSLIR":
         key: str | None = None
         if lower.startswith("energy="):
             key = "energy"
-        elif lower.startswith("c0=") or lower.startswith("c°="):
+        elif lower.startswith("c0="):
             key = "C0"
         if key is None:
             continue
@@ -1497,7 +1491,7 @@ def _parse_dsl_ir(text: str, *, units: UnitsModel | None = None) -> "DSLIR":
                     line_content=raw,
                 ) from exc
             raise
-        notes.append(f"C° set to {standard_conc_M:g} M")
+        notes.append(f"C0 set to {standard_conc_M:g} M")
 
     for line_no, raw in enumerate(lines, start=1):
         line = raw.strip()
@@ -1776,7 +1770,7 @@ def _parse_reaction_like_step(
             line_number=line_number,
             line_content=line_content,
         )
-    kappa_raw = _float_or_none(params.get("κ"))
+    kappa_raw = _float_or_none(params.get("kappa"))
     if kappa_raw is not None:
         kappa = kappa_raw
     else:

@@ -21,7 +21,7 @@ class MechanismHighlighter(QtGui.QSyntaxHighlighter):
     - Keywords (reaction, equilibrium, time, etc.) - bold purple
     - Species names (A, B, ATP, etc.) - blue
     - Operators (->, =>, <->, <=>, +) - red bold
-    - Rate constants (k=, kf=, kr=, Keq=, local κ=) - green
+    - Rate constants (k=, kf=, kr=, Keq=, local kappa=) - green
     - Numbers (1.0, 1e-5, etc.) - orange
     - Comments (#...) - gray italic
     - Energy terms (Ea=, dG_act=, etc.) - cyan
@@ -103,13 +103,12 @@ class MechanismHighlighter(QtGui.QSyntaxHighlighter):
         number_pattern = r'\b\d+\.?\d*(?:[eE][+-]?\d+)?\b|\.\d+(?:[eE][+-]?\d+)?\b'
         self.rules.append((re.compile(number_pattern), 'number', True))
 
-        # 3. Rate constants (k=, kf=, kr=, Keq=, local kappa=, κ=)
+        # 3. Rate constants (k=, kf=, kr=, Keq=, local kappa=)
         rate_patterns = [
             (r'\bk\s*=', 0),                           # k=
             (r'\bk[fr]\s*=', re.IGNORECASE),           # kf=, kr=
             (r'\bKeq\s*=', re.IGNORECASE),             # Keq=
             (r'\bkappa\s*=', re.IGNORECASE),           # kappa=
-            (r'\bκ\s*=', 0),                           # κ= (Unicode kappa)
         ]
         for pattern, flags in rate_patterns:
             self.rules.append((re.compile(pattern, flags), 'rate', False))
@@ -117,8 +116,8 @@ class MechanismHighlighter(QtGui.QSyntaxHighlighter):
         # 4. Energy/thermodynamic terms (Ea=, dG_act=, dG_eq=, A=, T=, etc.)
         energy_terms = [
             r'\bEa\s*=', r'\bdG_act\s*=', r'\bdG_eq\s*=', r'\bA\s*=',
-            r'\bT\s*=', r'\benergy\s*=', r'\bΔG‡\s*=', r'\bΔG°\s*=',
-            r'\bC0\s*=', r'\bC°\s*=', r'\bdegeneracy\s*=',
+            r'\bT\s*=', r'\benergy\s*=',
+            r'\bC0\s*=', r'\bdegeneracy\s*=',
         ]
         for term in energy_terms:
             self.rules.append((re.compile(term, re.IGNORECASE), 'energy', True))

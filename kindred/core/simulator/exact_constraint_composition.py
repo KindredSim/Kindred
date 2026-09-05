@@ -14,7 +14,7 @@ from kindred.core.algebra.parser import (
     SpeciesRefNode,
     UnaryNode,
 )
-from kindred.core.constants import N_A, R, Rkcal, h, hbar, k_B
+from kindred.core.constants import N_A, R, Rkcal, h, h_bar, k_B
 from kindred.core.equilibrium_rate_authority import equilibrium_rate_symbolic_relations
 from kindred.core.kinetics import (
     forward_rate_model_for_equilibrium,
@@ -36,8 +36,7 @@ __all__ = [
 _EXACT_CONSTANTS = {
     "k_B": Fraction(str(k_B)),
     "h": Fraction(str(h)),
-    "hbar": Fraction(str(hbar)),
-    "ħ": Fraction(str(hbar)),
+    "h_bar": Fraction(str(h_bar)),
     "N_A": Fraction(str(N_A)),
     "R": Fraction(str(R)),
     "Rkcal": Fraction(str(Rkcal)),

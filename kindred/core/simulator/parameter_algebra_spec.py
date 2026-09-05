@@ -853,7 +853,14 @@ def _validate_retained_observable_program(
             raise DSLError(
                 "Unknown name(s) in observable expression: "
                 + ", ".join(repr(identifier) for identifier in sorted(unknown)),
-                suggestion="Observable expressions may reference retained parameters, mechanism coefficients, scalars, and supported constants.",
+                suggestion=(
+                    "In `let` expressions, use `[X]` for the current concentration of species `X` "
+                    "and `[X]_0` for its initial concentration. Bare names may reference declared "
+                    "parameters (for example, `a` from `param a = 5`), available reaction parameters "
+                    "(such as `k1`, `kf1`, `kr1`, `Keq1`, `A1`, `Ea1`, `dG_act1`, `dG_eq1`, or "
+                    "`kappa1`), values defined by other `let` statements, time `t`, temperature `T`, "
+                    "or the constants `k_B`, `h`, `h_bar`, `N_A`, `R`, and `Rkcal`."
+                ),
                 line_number=statement.line,
                 line_content=statement.line_text,
             )

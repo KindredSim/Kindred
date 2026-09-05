@@ -1,18 +1,18 @@
 """
-Kinetics mapping for Kindred: Eyring and Arrhenius, κ handling, and units.
+Kinetics mapping for Kindred: Eyring and Arrhenius, kappa handling, and units.
 
 Current contract
 ----------------
 - Units handling: temperature in K (default 298.15), standard states 1 M or 1 bar.
 - Eyring and Arrhenius mapping:
-    Eyring unimolecular: k [1/s] = κ * (k_B*T/h) * exp(-ΔG‡/(R*T))
-    Bimolecular and n-molecular: multiply by 1/(C°^(n-1)) to yield 1/(M^(n−1)*s)
+    Eyring unimolecular: k [1/s] = kappa * (k_B*T/h) * exp(-dG_act/(R*T))
+    Bimolecular and n-molecular: multiply by 1/(C0^(n-1)) to yield 1/(M^(n−1)*s)
     Arrhenius: k = A * exp(-Ea/(R*T))
     Units inferred from molecularity: 1/(M^(n−1)*s)
 - Preview output format: default 3 sig figs, scientific `e±NN`, ROUND_HALF_UP.
-- Locked conventions: constants, reaction-local Eyring κ default 1.0.
+- Locked conventions: constants, reaction-local Eyring kappa default 1.0.
 
-Core Arrhenius/Eyring/K(ΔG°) mappings live in :mod:`kindred.core.kinetics`.
+Core Arrhenius/Eyring/K(dG_eq) mappings live in :mod:`kindred.core.kinetics`.
 This module owns simulator DSL and GUI preview helpers only.
 """
 

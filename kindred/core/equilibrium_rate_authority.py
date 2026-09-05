@@ -157,7 +157,7 @@ def derive_fast_equilibrium_rates(
             standard_conc_M,
             delta_n,
         )
-        source = "derived(ΔG°)"
+        source = "derived(dG_eq)"
     else:
         try:
             equilibrium_constant = admit_keq(Keq, field="Keq")

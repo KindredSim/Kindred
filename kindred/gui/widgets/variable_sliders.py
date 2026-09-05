@@ -18,6 +18,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtCore import Signal
 
 from kindred.gui.interactive_preview import SliderInteractionKind
+from kindred.gui.display_name_policy import scientific_symbol_label
 
 from ..ui_helpers import (
     apply_slider_name_label_layout_policy,
@@ -549,6 +550,13 @@ class VariableSliders(QtWidgets.QWidget):
             display_name = str(meta["label"]).strip()
             if not display_name:
                 raise ValueError("Slider display names must be nonblank.")
+            role = meta.get("role")
+            if (meta.get("family"), role) in {
+                ("Eyring", "dG_act"),
+                ("Eyring", "kappa"),
+                ("equilibrium", "dG_eq"),
+            }:
+                display_name = scientific_symbol_label(role) + name[len(role):]
             return f"{display_name}{unit_suffix}{derived_suffix}"
         return f"{name}{unit_suffix}{derived_suffix}"
 

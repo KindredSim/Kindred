@@ -24,7 +24,22 @@ __all__ = [
     "compact_plot_title_label",
     "compact_text",
     "dataset_alias",
+    "scientific_symbol_label",
 ]
+
+_SCIENTIFIC_SYMBOL_LABELS = {
+    "h_bar": "ħ",
+    "kappa": "κ",
+    "dG_act": "ΔG‡",
+    "dG_eq": "ΔG°",
+    "C0": "C°",
+}
+
+
+def scientific_symbol_label(symbol: str) -> str:
+    """Project one exact scientific base symbol into its visible label."""
+    return _SCIENTIFIC_SYMBOL_LABELS.get(symbol, symbol)
+
 
 ELLIPSIS = "…"
 DATASET_LIST_LABEL_MAX_CHARS = 48
