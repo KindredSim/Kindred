@@ -23,7 +23,7 @@ from kindred.gui.display_name_policy import scientific_symbol_html, scientific_s
 
 from ..ui_helpers import (
     configure_compact_numeric_edit,
-    make_bounded_label,
+    set_bounded_label_text,
     make_placeholder_label,
     make_scroll_area,
 )
@@ -248,10 +248,15 @@ class VariableSliders(QtWidgets.QWidget):
             desc.setFont(desc_font)
             main_layout.addWidget(desc)
 
+        if self._embedded:
+            header = QtWidgets.QLabel("Parameters")
+            header.setStyleSheet("font-weight: bold;")
+            main_layout.addWidget(header)
+
         self._sliders_widget = QtWidgets.QWidget()
         self._sliders_layout = QtWidgets.QVBoxLayout(self._sliders_widget)
         self._sliders_layout.setContentsMargins(0, 0, 0, 0)
-        self._sliders_layout.setSpacing(6 if self._embedded else 8)
+        self._sliders_layout.setSpacing(14)
 
         if self._embedded:
             main_layout.addWidget(self._sliders_widget)
@@ -391,13 +396,15 @@ class VariableSliders(QtWidgets.QWidget):
             symbol_label.setText(symbol_html)
             symbol_label.setAccessibleName(spoken)
             symbol_label.setToolTip(literal_tooltip(full_label))
+            symbol_label.setSizePolicy(
+                QtWidgets.QSizePolicy.Fixed, QtWidgets.QSizePolicy.Preferred
+            )
             top_row.addWidget(symbol_label)
-            context = full_label[len(name):]
-        name_label = make_bounded_label(context, max_width=260)
-        name_label.setToolTip(full_label)
-        name_font = name_label.font()
-        name_font.setBold(True)
-        name_label.setFont(name_font)
+            context = full_label[len(name):].removeprefix(" — ").lstrip()
+        name_label = QtWidgets.QLabel()
+        set_bounded_label_text(
+            name_label, context, max_width=16777215, tooltip_text=full_label
+        )
         top_row.addWidget(name_label, 1)
 
         if meta.get("editable") is False:
@@ -407,7 +414,7 @@ class VariableSliders(QtWidgets.QWidget):
             value_label.setAlignment(QtCore.Qt.AlignRight)
         else:
             value_editor = _NumericValueEdit(self._format_value(value))
-            configure_compact_numeric_edit(value_editor, characters=8)
+            configure_compact_numeric_edit(value_editor, characters=15)
             value_editor.setAlignment(QtCore.Qt.AlignmentFlag.AlignRight)
             value_editor.editStarted.connect(
                 lambda item=name: self._on_editor_started(item)
@@ -562,6 +569,11 @@ class VariableSliders(QtWidgets.QWidget):
             display_name = str(meta["label"]).strip()
             if not display_name:
                 raise ValueError("Slider display names must be nonblank.")
+            if meta["family"] in {"Constant", "Arrhenius", "Eyring", "reverse"} and meta["role"] in {"k", "kf", "kr", "Keq"}:
+                # Only admitted reaction context gets display arrows. Authored
+                # scalar labels and canonical metadata remain literal.
+                identity, separator, context = display_name.partition(" — ")
+                display_name = identity + separator + context.replace(" <-> ", " ⇌ ").replace(" -> ", " → ")
             return f"{display_name}{unit_suffix}{derived_suffix}"
         return f"{name}{unit_suffix}{derived_suffix}"
 

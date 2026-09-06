@@ -7,7 +7,7 @@ from typing import Optional
 from PySide6 import QtWidgets
 from PySide6.QtCore import Qt, Signal
 
-from kindred.gui.display_name_policy import DATASET_LIST_LABEL_MAX_CHARS, compact_dataset_label
+from kindred.gui.display_name_policy import DATASET_LIST_LABEL_MAX_CHARS, compact_dataset_label, literal_tooltip
 
 
 class UnifiedDatasetList(QtWidgets.QWidget):
@@ -115,6 +115,21 @@ class UnifiedDatasetList(QtWidgets.QWidget):
             return None
         ds_id = str(item.data(Qt.UserRole) or "").strip()
         return ds_id if ds_id else None
+
+    def set_data_edit_issues(self, issues: dict[str, str | None]) -> None:
+        """Annotate existing rows without changing identity or inclusion."""
+
+        for row in range(self._list.count()):
+            item = self._list.item(row)
+            dataset_id = item.data(Qt.UserRole)
+            full = item.data(Qt.UserRole + 1)
+            display = compact_dataset_label(full, max_chars=DATASET_LIST_LABEL_MAX_CHARS).display
+            issue = (issues[dataset_id] or "Pending data changes") if dataset_id in issues else ""
+            prefix = ("Data error" if issues[dataset_id] else "Data pending") + " — " if dataset_id in issues else ""
+            item.setText(prefix + display)
+            detail = f"{full}\n{issue}" if issue else full
+            item.setData(Qt.AccessibleTextRole, detail)
+            item.setToolTip(literal_tooltip(f"{detail}\nDataset ID: {dataset_id}"))
 
     def select_dataset(self, dataset_id: str) -> None:
         if dataset_id == self.selected_dataset_id():

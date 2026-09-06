@@ -78,7 +78,6 @@ class ActiveSliderRenderProjection:
     projection: ParameterSliderProjection
     parameter_values: tuple[tuple[str, float], ...]
     targets: tuple[str, ...]
-    target_display_names: tuple[str, ...]
     species_values: tuple[tuple[str, float], ...]
     mixed_species: frozenset[str]
     preserve_visibility: bool
@@ -426,7 +425,6 @@ class TabSliderBinding(QtCore.QObject):
             projection,
             tuple(parameters.items()),
             targets,
-            tuple(tab.initial_condition_set(item).name for item in targets),
             tuple(species.items()),
             mixed,
             bool(preserve_visibility),
@@ -449,7 +447,6 @@ class TabSliderBinding(QtCore.QObject):
             self._species_sliders.render_values(
                 dict(prepared.species_values),
                 target_set_ids=prepared.targets,
-                target_display_names=prepared.target_display_names,
                 mixed_species=prepared.mixed_species,
                 preserve_visibility=prepared.preserve_visibility,
             )

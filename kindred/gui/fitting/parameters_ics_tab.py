@@ -475,7 +475,10 @@ class ParametersIcsTab(QtWidgets.QWidget):
         self._param_table.updateGeometry()
         roster = self._left_splitter.widget(0)
         roster.layout().invalidate()
-        available = self._left_splitter.height() - self._left_splitter.handleWidth()
+        available = (
+            self._left_splitter.contentsRect().height()
+            - self._left_splitter.handle(1).height()
+        )
         preferred = roster.sizeHint().height()
         self._left_splitter.setSizes([preferred, max(0, available - preferred)])
         self._roster_height_initialized = True

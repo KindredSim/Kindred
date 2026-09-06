@@ -74,11 +74,10 @@ class ConfigPanelFooter(QtWidgets.QWidget):
 
         self.hint_label = QtWidgets.QLabel("Changes take effect after Apply.")
         self.hint_label.setWordWrap(True)
-        self.hint_label.setStyleSheet("font-size: 11px;")
         layout.addWidget(self.hint_label)
 
         self.dirty_label = QtWidgets.QLabel("Pending changes")
-        self.dirty_label.setStyleSheet("font-weight: bold; font-size: 11px;")
+        self.dirty_label.setStyleSheet("font-weight: bold;")
         self.dirty_label.setVisible(False)
         layout.addWidget(self.dirty_label)
         if not self._show_dirty:
@@ -91,7 +90,7 @@ class ConfigPanelFooter(QtWidgets.QWidget):
 
         self.error_label = QtWidgets.QLabel("")
         self.error_label.setWordWrap(False)
-        self.error_label.setStyleSheet("font-weight: bold; font-size: 11px;")
+        self.error_label.setStyleSheet("font-weight: bold;")
         if error_object_name:
             self.error_label.setObjectName(str(error_object_name))
         self.error_label.setVisible(False)

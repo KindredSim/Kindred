@@ -232,6 +232,10 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
             revert_object_name="global_fit_species_table_revert",
         )
         group_layout.addWidget(self._footer, stretch=1)
+        self._footer.hint_label.setText(
+            "Apply and Revert affect pending targets, weights and initial conditions "
+            "across all datasets. Data settings use their own Apply and Revert."
+        )
         self._footer.applyRequested.connect(self._apply_presentation_edits)
         self._footer.revertRequested.connect(self._revert_presentation_edits)
 

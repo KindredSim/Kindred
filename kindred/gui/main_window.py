@@ -1166,7 +1166,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 for set_id in targets
             )
             bundle.editor.set_slider_edit_targets_summary(
-                "Slider edit targets: "
+                "Initial-condition sets: "
                 + (", ".join(target_names) if target_names else "none")
             )
 
@@ -2661,6 +2661,8 @@ class MainWindow(QtWidgets.QMainWindow):
         current_set_id = self._workspace_tab_registry.presentation(
             target
         ).current_set_id
+        if previous_set_id is not None and previous_set_id == current_set_id:
+            return
         if previous_set_id is not None and previous_set_id != current_set_id:
             self._workspace.plot_for_tab(target).retire_interactive_preview_targets(
                 (previous_set_id,)
@@ -2767,7 +2769,7 @@ class MainWindow(QtWidgets.QMainWindow):
         tab = self._workspace_tab_registry.tab(tab_id)
         names = [tab.initial_condition_set(set_id).name for set_id in targets]
         bundle.editor.set_slider_edit_targets_summary(
-            "Slider edit targets: " + (", ".join(names) if names else "none")
+            "Initial-condition sets: " + (", ".join(names) if names else "none")
         )
 
     @QtCore.Slot(str)

@@ -116,8 +116,6 @@ class BatchSpeciesSliders(QtWidgets.QWidget):
     def __init__(
         self,
         parent: QtWidgets.QWidget | None = None,
-        *,
-        embedded: bool = False,
     ) -> None:
         super().__init__(parent)
         self._rows: dict[str, _SpeciesSliderRow] = {}
@@ -133,17 +131,13 @@ class BatchSpeciesSliders(QtWidgets.QWidget):
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(5)
-        if not embedded:
-            title = QtWidgets.QLabel("Initial-concentration sliders", self)
-            font = title.font()
-            font.setBold(True)
-            title.setFont(font)
-            layout.addWidget(title)
-        self._target_label = make_bounded_label("Slider targets: none", self, max_width=520)
-        layout.addWidget(self._target_label)
+        title = QtWidgets.QLabel("Initial concentrations", self)
+        title.setStyleSheet("font-weight: bold;")
+        layout.addWidget(title)
         self._content = QtWidgets.QWidget(self)
         self._content_layout = QtWidgets.QVBoxLayout(self._content)
         self._content_layout.setContentsMargins(0, 0, 0, 0)
+        self._content_layout.setSpacing(14)
         layout.addWidget(self._content)
         layout.addStretch(1)
 
@@ -152,7 +146,6 @@ class BatchSpeciesSliders(QtWidgets.QWidget):
         values: Mapping[str, float],
         *,
         target_set_ids: Sequence[str],
-        target_display_names: Sequence[str] = (),
         mixed_species: Sequence[str] = (),
         display_names: Mapping[str, str] | None = None,
         preserve_visibility: bool = True,
@@ -178,23 +171,9 @@ class BatchSpeciesSliders(QtWidgets.QWidget):
             preserve_visibility=preserve_visibility,
         )
         self._target_set_ids = tuple(str(item) for item in target_set_ids)
-        target_names = tuple(str(item).strip() for item in target_display_names)
-        if self._target_set_ids and (
-            len(target_names) != len(self._target_set_ids)
-            or any(not name for name in target_names)
-        ):
-            raise ValueError(
-                "Slider target display names must be nonblank and exact."
-            )
         self._values = normalized
         self._display_names = normalized_display_names
         mixed = {str(name) for name in mixed_species}
-        target_text = (
-            ", ".join(target_names)
-            if self._target_set_ids
-            else "none"
-        )
-        set_bounded_label_text(self._target_label, f"Slider targets: {target_text}", max_width=520)
         same_rows = (
             tuple(normalized) == tuple(self._rows)
             and all(
@@ -261,7 +240,6 @@ class BatchSpeciesSliders(QtWidgets.QWidget):
             self._values.clear()
             self._display_names.clear()
             self._target_set_ids = ()
-            self._target_label.setText("Slider targets: none")
             self._sync_visibility()
             return
         self.render_values({}, target_set_ids=(), preserve_visibility=False)
@@ -288,7 +266,7 @@ class BatchSpeciesSliders(QtWidgets.QWidget):
         layout = QtWidgets.QGridLayout(container)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setColumnStretch(0, 1)
-        name_label = make_bounded_label(display_name, container, max_width=260)
+        name_label = make_bounded_label(display_name, container, max_width=16777215)
         if mixed:
             initial_text = "Multiple values"
         else:
@@ -296,7 +274,7 @@ class BatchSpeciesSliders(QtWidgets.QWidget):
         value_editor = _NumericValueEdit(initial_text, container)
         value_editor.setAccessibleName(f"{display_name} initial concentration")
         name_label.setBuddy(value_editor)
-        configure_compact_numeric_edit(value_editor, characters=8)
+        configure_compact_numeric_edit(value_editor, characters=15)
         value_editor.setAlignment(QtCore.Qt.AlignmentFlag.AlignRight)
         value_editor.editStarted.connect(
             lambda item=species: self._on_editor_started(item)
@@ -441,7 +419,7 @@ class BatchSpeciesSliders(QtWidgets.QWidget):
         row = self._rows.get(str(species))
         if row is None:
             return
-        set_bounded_label_text(row.name_label, self._display_names.get(str(species), str(species)), max_width=260)
+        set_bounded_label_text(row.name_label, self._display_names.get(str(species), str(species)), max_width=16777215)
         if self._editor_has_focus(species):
             return
         self._set_value_projection(

@@ -129,7 +129,14 @@ class ThemeManager:
         return True
 
     def _apply_physical(self, dark_mode: bool) -> None:
-        qdarktheme.setup_theme("dark" if dark_mode else "light")
+        qdarktheme.setup_theme(
+            "dark" if dark_mode else "light",
+            custom_colors={"[light]": {
+                "background": "#eef0f3",
+                "input.background": "#ffffff",
+                "border": "#a8afb9",
+            }},
+        )
         self._theme_target.set_theme(dark_mode=dark_mode)
 
     def _restore_previous_physical(

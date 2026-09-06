@@ -62,30 +62,6 @@ class DataTab(QtWidgets.QWidget):
         self._current_dataset_id = dataset_id
         self._project_controls()
 
-    def active_validation_errors(
-        self,
-        included_dataset_ids: Iterable[str],
-    ) -> tuple[str, ...]:
-        """Return validation errors for the normalized active dataset roster."""
-
-        active_dataset_ids = {
-            dataset_id
-            for item in included_dataset_ids
-            if (dataset_id := str(item or "").strip())
-        }
-        errors: list[str] = []
-        for dataset_id in sorted(active_dataset_ids):
-            pending = self._pending.get(dataset_id)
-            config = self._owned_settings(
-                pending
-                if pending is not None
-                else self._settings_getter(dataset_id)
-            )
-            error = self._validation_error(dataset_id, config)
-            if error:
-                errors.append(error)
-        return tuple(errors)
-
     def has_pending_edits(self, included_dataset_ids: Iterable[str]) -> bool:
         """Return whether an included dataset has an unapplied Data draft."""
 
@@ -95,6 +71,21 @@ class DataTab(QtWidgets.QWidget):
             if (dataset_id := str(item or "").strip())
         }
         return bool(included.intersection(self._pending))
+
+    def data_edit_issues(self, dataset_ids: Iterable[str]) -> dict[str, str | None]:
+        """Return errors or None for valid unapplied drafts; omit clean datasets."""
+
+        issues = {}
+        for dataset_id in dataset_ids:
+            config = self._pending.get(dataset_id)
+            if config is None:
+                config = self._settings_getter(dataset_id)
+            error = self._validation_error(dataset_id, self._owned_settings(config))
+            if error:
+                issues[dataset_id] = error
+            elif dataset_id in self._pending:
+                issues[dataset_id] = None
+        return issues
 
     def clear_pending_edits(self) -> None:
         """Discard every Data draft and refresh the visible controls."""
@@ -116,6 +107,7 @@ class DataTab(QtWidgets.QWidget):
 
         self._footer = ConfigPanelFooter(
             panel,
+            show_dirty=True,
             show_divider=False,
             show_reset=True,
             messages_position="after_body",
@@ -126,6 +118,9 @@ class DataTab(QtWidgets.QWidget):
             revert_object_name="global_fit_data_range_revert",
             reset_object_name="global_fit_data_range_reset",
         )
+        self._footer.hint_label.setText(
+            "Apply and Revert affect data settings for this dataset only."
+        )
         layout.addWidget(self._footer, stretch=1)
         controls = QtWidgets.QFormLayout()
         controls.setRowWrapPolicy(QtWidgets.QFormLayout.RowWrapPolicy.WrapLongRows)
@@ -134,6 +129,7 @@ class DataTab(QtWidgets.QWidget):
         self._min_edit = self._number_edit("global_fit_data_range_min")
         self._max_edit = self._number_edit("global_fit_data_range_max")
         self._start_edit = self._number_edit("global_fit_t_start")
+        self.setFocusProxy(self._start_edit)
         self._maximum_edit = QtWidgets.QSpinBox(self._footer)
         self._maximum_edit.setObjectName("global_fit_maximum_observations")
         self._maximum_edit.setRange(0, 0)

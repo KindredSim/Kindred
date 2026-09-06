@@ -164,7 +164,16 @@ class FittingWindow(QtWidgets.QDialog):
         self._run_block_reason_label.setSizePolicy(QtWidgets.QSizePolicy.Policy.Ignored, QtWidgets.QSizePolicy.Policy.Preferred)
         self._run_block_reason_label.setTextFormat(QtCore.Qt.TextFormat.PlainText)
         self._run_block_reason_label.hide()
-        status_column.addWidget(self._run_block_reason_label)
+        review_row = QtWidgets.QHBoxLayout()
+        review_row.addWidget(self._run_block_reason_label, 1)
+        self._review_data_button = QtWidgets.QPushButton("Review &Data Changes", footer)
+        self._review_data_button.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Fixed, QtWidgets.QSizePolicy.Policy.Fixed
+        )
+        self._review_data_button.setEnabled(False)
+        self._review_data_button.clicked.connect(self._review_data_changes)
+        review_row.addWidget(self._review_data_button, 0, QtCore.Qt.AlignmentFlag.AlignRight)
+        status_column.addLayout(review_row)
         column.addWidget(status_widget)
         self._progress = QtWidgets.QProgressBar(footer)
         self._progress.setRange(0, 100)
@@ -357,26 +366,33 @@ class FittingWindow(QtWidgets.QDialog):
     @property
     def has_invalid_setup_edits(self) -> bool:
         setup = self._projected_setup
-        data_errors = (
-            ()
+        data_issues = (
+            {}
             if setup is None
-            else self._data_tab.active_validation_errors(
+            else self._data_tab.data_edit_issues(
                 self._included_dataset_ids(setup)
             )
         )
+        return any(data_issues.values()) or self._has_invalid_parameter_or_species_edits()
+
+    def _has_invalid_parameter_or_species_edits(self) -> bool:
         return bool(
-            data_errors
-            or self._species_table.invalid_editor_keys
+            self._species_table.invalid_editor_keys
             or self._species_table.has_pending_initial_changes
             or self._params_ics_tab.has_invalid_edits
         )
 
     def _refresh_setup_validity(self) -> None:
-        invalid = self.has_invalid_setup_edits
+        setup = self._projected_setup
+        data_issues = self._data_tab.data_edit_issues(
+            dataset.dataset_id for dataset in setup.datasets
+        ) if setup is not None else {}
+        included = set(self._included_dataset_ids(setup)) if setup is not None else set()
+        active_issues = {key: value for key, value in data_issues.items() if key in included}
+        invalid = any(active_issues.values()) or self._has_invalid_parameter_or_species_edits()
         pending_targets = self.has_pending_target_changes
         pending_data = self.has_pending_data_changes
         structural = None
-        setup = self._projected_setup
         if (
             setup is not None
             and not invalid
@@ -405,14 +421,46 @@ class FittingWindow(QtWidgets.QDialog):
             reason = (
                 "Apply or revert pending Fit target and weight edits before running."
             )
-        elif pending_data:
-            reason = "Apply or revert pending Fit data edits before running."
         elif structural is not None:
             reason = structural
+        listing = self._data_targets_tab.unified_list
+        listing.set_data_edit_issues(data_issues)
+        self._review_data_button.setEnabled(bool(active_issues) and not self._is_executing())
+        accessible_reason = reason
+        if active_issues:
+            dataset_id, issue = next(iter(active_issues.items()))
+            issue = issue or "Pending data changes"
+            name = listing.dataset_display_name(dataset_id) or dataset_id
+            # Authored names and diagnostics cannot grow the footer unboundedly.
+            visible_name = " ".join(name.split())
+            visible_name = visible_name if len(visible_name) <= 60 else visible_name[:59] + "…"
+            visible_issue = " ".join(issue.split())
+            visible_issue = visible_issue if len(visible_issue) <= 160 else visible_issue[:159] + "…"
+            more = f" (+{len(active_issues) - 1} more)" if len(active_issues) > 1 else ""
+            reason = f"Data settings — {visible_name}: {visible_issue}{more} — Review Data Changes to resolve."
+            accessible_reason = "\n".join(
+                f"{listing.dataset_display_name(key) or key}: {value or 'Pending data changes'}"
+                for key, value in active_issues.items()
+            )
         self._run_block_reason_label.setVisible(bool(reason))
         self._run_block_reason_label.setText(reason)
-        self._run_block_reason_label.setAccessibleName(reason)
+        self._run_block_reason_label.setAccessibleName(accessible_reason)
         self._layout_footer()
+
+    def _review_data_changes(self) -> None:
+        setup = self._projected_setup
+        if setup is None:
+            return
+        issues = self._data_tab.data_edit_issues(self._included_dataset_ids(setup))
+        if not issues:
+            return
+        listing = self._data_targets_tab.unified_list
+        ids = list(issues)
+        current = listing.selected_dataset_id()
+        index = (ids.index(current) + 1) % len(ids) if current in ids else 0
+        self._tabs.setCurrentIndex(0)
+        listing.select_dataset(ids[index])
+        self._data_tab.setFocus(QtCore.Qt.FocusReason.ShortcutFocusReason)
 
     def _populate_dataset_list(self, snapshot: FitSetupSnapshot) -> None:
         by_id = {item.dataset_id: item for item in self._origin.mapped_datasets}

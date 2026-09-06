@@ -2585,7 +2585,9 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         presentation: _PlotPresentation,
     ) -> None:
         if state.auto:
-            self._plot_widget.autoRange()
+            # With no data, autoRange pads the existing range on every redraw.
+            if any(bound is not None for bound in self._plot_widget.getViewBox().childrenBounds()):
+                self._plot_widget.autoRange()
             self._plot_widget.enableAutoRange()
             return
         self._plot_widget.getPlotItem().getViewBox().disableAutoRange()

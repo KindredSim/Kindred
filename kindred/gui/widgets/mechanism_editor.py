@@ -169,7 +169,10 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
             "\n"
             "param k_derived = k_base * scale\n"
         )
-        self._reactions_text.setFont(QtGui.QFont("Courier New", 10))
+        source_font = QtGui.QFontDatabase.systemFont(QtGui.QFontDatabase.FixedFont)
+        source_font.setFamilies(["Cascadia Mono", "Consolas", "DejaVu Sans Mono", source_font.family()])
+        source_font.setPointSize(10)
+        self._reactions_text.setFont(source_font)
         self._reactions_text.setUndoRedoEnabled(True)  # Enable undo/redo
         self._reactions_text.undoAvailable.connect(
             self._emit_native_history_availability
@@ -198,7 +201,7 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
         reactions_layout.addWidget(self._validation_label)
         # Unified slider surface for interactive parameter adjustment
         self._variable_sliders = VariableSliders(embedded=True)
-        self._species_sliders = BatchSpeciesSliders(embedded=True)
+        self._species_sliders = BatchSpeciesSliders()
         self._slider_surface = make_scroll_area(self)
         self._slider_surface.setObjectName("unifiedSliderSurface")
         self._slider_surface_content = QtWidgets.QWidget(self._slider_surface)
@@ -267,11 +270,11 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
         slider_actions_layout.addWidget(self._slider_visibility_picker_btn, 0, 0, alignment=QtCore.Qt.AlignLeft)
         slider_actions_layout.setColumnStretch(4, 1)
         self._slider_edit_targets_label = make_bounded_label(
-            "Slider edit targets: none",
-            max_width=240,
+            "Initial-condition sets: none",
+            max_width=16777215,
         )
         self._slider_edit_targets_label.setToolTip(
-            "The set whose initial conditions are controlled by concentration sliders"
+            "Concentration sliders affect the current set and any pinned sets."
         )
         target_font = self._slider_edit_targets_label.font()
         target_font.setPointSize(max(1, target_font.pointSize() - 1))
@@ -492,19 +495,19 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
         return self._species_sliders
 
     def set_slider_edit_targets_summary(self, text: str) -> None:
-        summary = str(text or "Slider edit targets: none")
+        summary = str(text or "Initial-condition sets: none")
         base_tooltip = (
-            "The set whose initial conditions are controlled by concentration sliders"
+            "Concentration sliders affect the current set and any pinned sets."
         )
         tooltip = (
             base_tooltip
-            if summary == "Slider edit targets: none"
+            if summary == "Initial-condition sets: none"
             else f"{base_tooltip}\n\n{summary}"
         )
         set_bounded_label_text(
             self._slider_edit_targets_label,
             summary,
-            max_width=240,
+            max_width=16777215,
             tooltip_text=tooltip,
         )
 

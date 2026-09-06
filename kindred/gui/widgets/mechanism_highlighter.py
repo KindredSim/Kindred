@@ -22,10 +22,10 @@ class MechanismHighlighter(QtGui.QSyntaxHighlighter):
     Highlights:
     - Keywords (reaction, equilibrium, time, etc.) - bold purple
     - Species names (A, B, ATP, etc.) - blue
-    - Operators (->, =>, <->, <=>, +) - red bold
+    - Operators (->, =>, <->, <=>, +) - muted in light mode, red in dark mode
     - Rate constants (k=, kf=, kr=, Keq=, local kappa=) - green
     - Numbers (1.0, 1e-5, etc.) - orange
-    - Comments (#...) - gray italic
+    - Comments (#...) - gray
     - Energy terms (Ea=, dG_act=, etc.) - cyan
     - Initial conditions ([A]=) - magenta
 
@@ -49,8 +49,6 @@ class MechanismHighlighter(QtGui.QSyntaxHighlighter):
             text_format = QtGui.QTextCharFormat()
             if role in {"keyword", "operator", "rate", "energy", "initial"}:
                 text_format.setFontWeight(QtGui.QFont.Bold)
-            if role == "comment":
-                text_format.setFontItalic(True)
             self.formats[role] = text_format
 
         # Define highlighting rules (order matters — setFormat is last-wins,
@@ -125,7 +123,8 @@ class MechanismHighlighter(QtGui.QSyntaxHighlighter):
             "energy": ("#006a70", "#7ddde2"),
             "initial": ("#983172", "#ef9ed2"),
         }
-        semantic_roles = {"comment": "muted", "rate": "success", "operator": "error"}
+        semantic_roles = {"comment": "muted", "rate": "success", "operator": "error" if dark_mode else "muted"}
+        self.formats["operator"].setFontWeight(QtGui.QFont.Bold if dark_mode else QtGui.QFont.Normal)
         for role, text_format in self.formats.items():
             color = (
                 semantic_color(semantic_roles[role], dark_mode)
