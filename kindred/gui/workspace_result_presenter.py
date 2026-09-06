@@ -409,6 +409,7 @@ class ResultDataBlock:
     opacity: float = 1.0
     markers: bool = False
     point_size: float = 6.0
+    point_shape: str = "o"
     presentation_boundaries: tuple[SimulationPresentationBoundary, ...] = ()
 
     def __post_init__(self) -> None:
@@ -817,7 +818,7 @@ def _data_block(
         x_provenance=x_provenance,
         color_by_series=block.color_by_series,
         visible=block.visible, dashed=block.dashed, opacity=block.opacity,
-        markers=block.markers, point_size=block.point_size,
+        markers=block.markers, point_size=block.point_size, point_shape=block.point_shape,
         presentation_boundaries=block.presentation_boundaries,
     )
 
@@ -1272,6 +1273,7 @@ def compose_result_input(
     mechanism_species: Sequence[str],
     active_overlay_layers: Sequence[ExperimentalLayerInput] = (),
     color_by_axis_selection: Mapping[AxisSeriesSelection, str] = MappingProxyType({}),
+    experimental_point_shape: str = "o",
     experimental_point_size: float = 6.0,
     experimental_point_opacity: float = 0.85,
     selected_x_series: AxisSeriesSelection = SimulationSeriesAxisSelection("t"),
@@ -1500,6 +1502,7 @@ def compose_result_input(
                 x_provenance=x_provenance,
                 color_by_series=((experimental.raw_column, colors[y_axis]),),
                 opacity=point_opacity,
+                point_shape=experimental_point_shape,
                 markers=True,
                 point_size=point_size,
             )

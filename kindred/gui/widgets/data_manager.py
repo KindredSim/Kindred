@@ -47,6 +47,30 @@ __all__ = [
 ]
 
 
+class _DatasetList(QtWidgets.QListWidget):
+    """Keep one dataset row and its scrollbar reachable in a compact dock."""
+
+    def minimumSizeHint(self) -> QtCore.QSize:
+        hint = super().minimumSizeHint()
+        hint.setHeight(
+            self.fontMetrics().height() + 2 * self.frameWidth()
+            + self.style().pixelMetric(QtWidgets.QStyle.PixelMetric.PM_ScrollBarExtent)
+        )
+        return hint
+
+
+class _DatasetControls(QtWidgets.QScrollArea):
+    """Allow the control form to shrink to one font-sized action row."""
+
+    def minimumSizeHint(self) -> QtCore.QSize:
+        hint = super().minimumSizeHint()
+        hint.setHeight(
+            self.fontMetrics().height() + 8 + 2 * self.frameWidth()
+            + self.style().pixelMetric(QtWidgets.QStyle.PixelMetric.PM_ScrollBarExtent)
+        )
+        return hint
+
+
 class DataManagerPanel(QtWidgets.QWidget):
     """
     Import panel for loading and previewing committed experimental datasets.
@@ -100,19 +124,27 @@ class DataManagerPanel(QtWidgets.QWidget):
         self._origin_tab_id = origin_tab_id
 
         layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(6, 6, 6, 6)
+        layout.setSpacing(4)
 
         # Header
-        layout.addWidget(QtWidgets.QLabel("<b>Loaded Datasets</b>"))
+        header = QtWidgets.QLabel("No dataset selected")
+        self._dataset_heading = header
+        header.setWordWrap(True)
+        header_font = header.font()
+        header_font.setBold(True)
+        header.setFont(header_font)
+        layout.addWidget(header)
 
         # Dataset list
-        self._dataset_list = QtWidgets.QListWidget()
+        self._dataset_list = _DatasetList()
         self._dataset_list.setUniformItemSizes(True)
         self._dataset_list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         self._dataset_list.currentItemChanged.connect(self._on_dataset_selected)
         layout.addWidget(self._dataset_list)
 
         # Buttons
-        btn_layout = QtWidgets.QHBoxLayout()
+        btn_layout = QtWidgets.QGridLayout()
         self._load_btn = QtWidgets.QPushButton("Load Data")
         self._load_btn.setObjectName("loadDataButton")
         self._load_btn.clicked.connect(self._load_dataset)
@@ -122,11 +154,10 @@ class DataManagerPanel(QtWidgets.QWidget):
         self._remove_btn.clicked.connect(self._remove_dataset)
         self._export_original_btn = QtWidgets.QPushButton("Export Original…")
         self._export_original_btn.clicked.connect(self._export_original)
-        btn_layout.addWidget(self._load_btn)
-        btn_layout.addWidget(self._rename_btn)
-        btn_layout.addWidget(self._remove_btn)
-        btn_layout.addWidget(self._export_original_btn)
-        layout.addLayout(btn_layout)
+        layout.addWidget(self._load_btn)
+        btn_layout.addWidget(self._rename_btn, 0, 0)
+        btn_layout.addWidget(self._remove_btn, 0, 1)
+        btn_layout.addWidget(self._export_original_btn, 1, 0, 1, 2)
 
         mapping_group = QtWidgets.QGroupBox("Active-tab mapping")
         mapping_layout = QtWidgets.QVBoxLayout(mapping_group)
@@ -134,7 +165,7 @@ class DataManagerPanel(QtWidgets.QWidget):
         self._mapping_status.setTextFormat(QtCore.Qt.TextFormat.PlainText)
         self._mapping_status.setWordWrap(True)
         mapping_layout.addWidget(self._mapping_status)
-        mapping_actions = QtWidgets.QHBoxLayout()
+        mapping_actions = QtWidgets.QVBoxLayout()
         self._create_set_btn = QtWidgets.QPushButton("Create Set From t=0")
         self._create_set_btn.clicked.connect(
             lambda: self._emit_mapping_action("create_set_from_t0")
@@ -153,23 +184,30 @@ class DataManagerPanel(QtWidgets.QWidget):
         self._observation_mapping_btn.clicked.connect(self._request_observation_mapping)
         self._plot_overlay_btn = QtWidgets.QPushButton("Plot Overlay…")
         self._plot_overlay_btn.clicked.connect(self._request_plot_overlay)
-        observation_actions = QtWidgets.QHBoxLayout()
+        observation_actions = QtWidgets.QVBoxLayout()
         observation_actions.addWidget(self._observation_mapping_btn)
         observation_actions.addWidget(self._plot_overlay_btn)
         mapping_layout.addLayout(observation_actions)
         self._fit_include = QtWidgets.QCheckBox("Include mapped dataset in Fit")
         self._fit_include.toggled.connect(self._on_fit_include_toggled)
         mapping_layout.addWidget(self._fit_include)
-        layout.addWidget(mapping_group)
+        mapping_scroll = _DatasetControls(self)
+        mapping_scroll.setWidgetResizable(True)
+        controls = QtWidgets.QWidget(mapping_scroll)
+        controls_layout = QtWidgets.QVBoxLayout(controls)
+        controls_layout.setContentsMargins(0, 0, 0, 0)
+        controls_layout.addLayout(btn_layout)
+        controls_layout.addWidget(mapping_group)
+        mapping_scroll.setWidget(controls)
+        layout.addWidget(mapping_scroll, 1)
 
         # Preview area
-        layout.addWidget(QtWidgets.QLabel("Preview:"))
         self._preview_label = QtWidgets.QLabel("No dataset selected")
         self._preview_label.setTextFormat(QtCore.Qt.TextFormat.RichText)
-        self._preview_label.setContentsMargins(10, 10, 10, 10)
+        self._preview_label.setContentsMargins(0, 2, 0, 2)
         self._preview_label.setAlignment(Qt.AlignCenter)
         self._preview_label.setWordWrap(True)
-        layout.addWidget(self._preview_label)
+        controls_layout.insertWidget(0, self._preview_label)
         self._preview_label.hide()
 
         # Rendered global-catalog records for list/preview only.
@@ -201,8 +239,8 @@ class DataManagerPanel(QtWidgets.QWidget):
         self._snapshot = DataManagerSnapshot((), None, (), ())
         self._visible_records_by_id.clear()
         self._dataset_list.clear()
-        self._preview_label.setText("No dataset selected")
         self._preview_label.hide()
+        self._dataset_heading.setText("No dataset selected")
         self._mapping_status.setText("Select a dataset")
         self._set_mapping_controls_enabled(False)
         self._rename_btn.setEnabled(False)
@@ -233,8 +271,8 @@ class DataManagerPanel(QtWidgets.QWidget):
             str(record.dataset_id): record for record in snapshot.datasets
         }
         self._dataset_list.clear()
-        self._preview_label.setText("No dataset selected")
         self._preview_label.hide()
+        self._dataset_heading.setText("No dataset selected")
         selected_row = -1
         for row, record in enumerate(snapshot.datasets):
             compact = compact_dataset_label(record.display_name, max_chars=DATASET_LIST_LABEL_MAX_CHARS)
@@ -494,8 +532,8 @@ class DataManagerPanel(QtWidgets.QWidget):
     def _on_dataset_selected(self, current, previous):
         """Update preview when dataset is selected."""
         if not current:
-            self._preview_label.setText("No dataset selected")
             self._preview_label.hide()
+            self._dataset_heading.setText("No dataset selected")
             self._update_mapping_area()
             return
 
@@ -503,6 +541,7 @@ class DataManagerPanel(QtWidgets.QWidget):
         record = self._visible_records_by_id.get(dataset_id)
         if record is None:
             self._preview_label.hide()
+            self._dataset_heading.setText("No dataset selected")
             self._update_mapping_area()
             return
 
@@ -510,6 +549,7 @@ class DataManagerPanel(QtWidgets.QWidget):
             return html.escape(str(value), quote=True)
 
         name = escape(record.display_name)
+        self._dataset_heading.setText("Loaded Datasets")
         self._preview_label.show()
         unique_times = {
             time_value

@@ -3,18 +3,23 @@ from __future__ import annotations
 import sys
 from typing import Optional
 
-from PySide6 import QtCore, QtWidgets
+from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtGui import QDoubleValidator
 
 from kindred.gui.display_name_policy import (
     DATASET_LIST_LABEL_MAX_CHARS,
     CompactText,
+    literal_tooltip,
     compact_diagnostic_text,
     compact_text,
 )
 
 __all__ = [
-    "apply_slider_name_label_layout_policy",
+    "SCIENTIFIC_NAME_HTML_ROLE",
+    "ControlRowsLayout",
+    "configure_compact_numeric_edit",
+    "ScientificNameDelegate",
+    "clamp_initial_size",
     "make_bounded_label",
     "make_placeholder_label",
     "make_scroll_area",
@@ -30,6 +35,137 @@ _PLACEHOLDER_LABEL_STYLE = (
 DEFAULT_DYNAMIC_LABEL_MAX_WIDTH = 220
 DEFAULT_COMPACT_LABEL_MAX_CHARS = DATASET_LIST_LABEL_MAX_CHARS
 DEFAULT_COMPACT_LABEL_MAX_WIDTH = 220
+
+
+class ControlRowsLayout(QtWidgets.QLayout):
+    """Measure compact control strips at their allocated width before paint."""
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self._items = []
+        self.setContentsMargins(0, 0, 0, 0)
+        self.setSpacing(8)
+
+    def addItem(self, item) -> None:
+        self._items.append(item)
+        self.invalidate()
+
+    def count(self) -> int:
+        return len(self._items)
+
+    def itemAt(self, index):
+        return self._items[index] if 0 <= index < len(self._items) else None
+
+    def takeAt(self, index):
+        if 0 <= index < len(self._items):
+            item = self._items.pop(index)
+            self.invalidate()
+            return item
+        return None
+
+    def expandingDirections(self):
+        return QtCore.Qt.Orientation(0)
+
+    def hasHeightForWidth(self) -> bool:
+        return True
+
+    def heightForWidth(self, width: int) -> int:
+        return self._place(QtCore.QRect(0, 0, width, 0), apply=False)
+
+    def minimumHeightForWidth(self, width: int) -> int:
+        return self.heightForWidth(width)
+
+    def minimumSize(self) -> QtCore.QSize:
+        size = QtCore.QSize(0, 0)
+        for item in self._items:
+            if not item.isEmpty():
+                size = size.expandedTo(item.minimumSize())
+        margins = self.contentsMargins()
+        return size + QtCore.QSize(
+            margins.left() + margins.right(), margins.top() + margins.bottom()
+        )
+
+    def sizeHint(self) -> QtCore.QSize:
+        sizes = [item.sizeHint() for item in self._items if not item.isEmpty()]
+        margins = self.contentsMargins()
+        return QtCore.QSize(
+            sum(size.width() for size in sizes) + max(0, len(sizes) - 1) * self.spacing()
+            + margins.left() + margins.right(),
+            max((size.height() for size in sizes), default=0)
+            + margins.top() + margins.bottom(),
+        )
+
+    def setGeometry(self, rect: QtCore.QRect) -> None:
+        super().setGeometry(rect)
+        self._place(rect, apply=True)
+
+    def _place(self, rect: QtCore.QRect, *, apply: bool) -> int:
+        margins = self.contentsMargins()
+        area = rect.adjusted(margins.left(), margins.top(), -margins.right(), -margins.bottom())
+        x, y, row_height = area.x(), area.y(), 0
+        for item in self._items:
+            if item.isEmpty():
+                continue
+            size = item.sizeHint().boundedTo(item.maximumSize())
+            width = min(size.width(), max(0, area.width()))
+            if x > area.x() and x + width > area.right() + 1:
+                x = area.x()
+                y += row_height + self.spacing()
+                row_height = 0
+            height = item.heightForWidth(width) if item.hasHeightForWidth() else size.height()
+            if apply:
+                item_x = area.right() + 1 - width if item.alignment() & QtCore.Qt.AlignRight else x
+                item.setGeometry(QtCore.QRect(item_x, y, width, height))
+            x += width + self.spacing()
+            row_height = max(row_height, height)
+        return y + row_height - rect.y() + margins.bottom()
+
+
+class _CompactNumericSizing(QtCore.QObject):
+    def __init__(self, edit: QtWidgets.QLineEdit, characters: int | None) -> None:
+        super().__init__(edit)
+        self.edit = edit
+        self.characters = characters
+        edit.installEventFilter(self)
+        self.update()
+
+    def update(self) -> None:
+        edit = self.edit
+        if self.characters is None:
+            edit.setMinimumWidth(0)
+            edit.setMaximumWidth(16777215)
+            edit.setSizePolicy(QtWidgets.QSizePolicy.Maximum, QtWidgets.QSizePolicy.Fixed)
+            return
+        edit.setSizePolicy(QtWidgets.QSizePolicy.Fixed, QtWidgets.QSizePolicy.Fixed)
+        option = QtWidgets.QStyleOptionFrame()
+        edit.initStyleOption(option)
+        margins = edit.textMargins()
+        contents = QtCore.QSize(
+            edit.fontMetrics().horizontalAdvance("0" * self.characters)
+            + margins.left() + margins.right() + 4,
+            edit.fontMetrics().height(),
+        )
+        size = edit.style().sizeFromContents(
+            QtWidgets.QStyle.CT_LineEdit, option, contents, edit
+        )
+        edit.setFixedWidth(size.width())
+
+    def eventFilter(self, watched, event):
+        if event.type() in {QtCore.QEvent.FontChange, QtCore.QEvent.StyleChange}:
+            self.update()
+        return False
+
+
+def configure_compact_numeric_edit(
+    edit: QtWidgets.QLineEdit, *, characters: int | None,
+) -> None:
+    """Reserve a numeric viewport; None restores the native preferred width."""
+    sizing = getattr(edit, "_compact_numeric_sizing", None)
+    if sizing is None:
+        edit._compact_numeric_sizing = _CompactNumericSizing(edit, characters)
+    else:
+        sizing.characters = characters
+        sizing.update()
 
 
 def make_scroll_area(parent: Optional[QtWidgets.QWidget] = None) -> QtWidgets.QScrollArea:
@@ -54,73 +190,126 @@ def _apply_non_layout_bearing_label_policy(label: QtWidgets.QLabel, *, max_width
     label.setWordWrap(False)
 
 
-def apply_slider_name_label_layout_policy(label: QtWidgets.QLabel) -> None:
-    label.setMinimumWidth(1)
-    label.setSizePolicy(
-        QtWidgets.QSizePolicy.Preferred,
-        label.sizePolicy().verticalPolicy(),
-    )
+class _ResponsiveLabelText(QtCore.QObject):
+    """Keep the original literal text while projecting to the current label width."""
+
+    def __init__(self, label: QtWidgets.QLabel) -> None:
+        super().__init__(label)
+        self.label = label
+        self.visible = ""
+        self.last_tooltip = ""
+        self.compact = CompactText("", "", False)
+        self.tooltip = True
+        self.explicit_tooltip = ""
+        label.installEventFilter(self)
+
+    def update(self) -> None:
+        label = self.label
+        width = max(0, label.contentsRect().width() - 2 * label.margin())
+        self.visible = label.fontMetrics().elidedText(
+            self.compact.display, QtCore.Qt.ElideRight, width
+        )
+        label.setText(self.visible)
+        label.setAccessibleName(self.compact.full)
+        self.last_tooltip = (
+            self.explicit_tooltip
+            or (self.compact.full if self.compact.tooltip or self.visible != self.compact.full else "")
+        ) if self.tooltip else ""
+        self.last_tooltip = literal_tooltip(self.last_tooltip)
+        label.setToolTip(self.last_tooltip)
+
+    def eventFilter(self, watched, event):
+        if event.type() in {
+            QtCore.QEvent.Resize, QtCore.QEvent.FontChange,
+            QtCore.QEvent.StyleChange, QtCore.QEvent.Show, QtCore.QEvent.Paint,
+        }:
+            if self.label.text() != self.visible:
+                full = self.label.text()
+                self.compact = CompactText(full, full, False)
+            if self.label.toolTip() != self.last_tooltip:
+                self.explicit_tooltip = self.label.toolTip()
+            self.update()
+        return False
+
+
+def _set_label_projection(label, compact, *, max_width, tooltip, tooltip_text):
+    _apply_non_layout_bearing_label_policy(label, max_width=max_width)
+    label.setTextFormat(QtCore.Qt.PlainText)
+    projection = getattr(label, "_responsive_text", None)
+    if projection is None:
+        projection = _ResponsiveLabelText(label)
+        label._responsive_text = projection
+    projection.compact = compact
+    projection.tooltip = tooltip
+    projection.explicit_tooltip = str(tooltip_text or "")
+    projection.update()
 
 
 def set_bounded_label_text(
-    label: QtWidgets.QLabel,
-    text: str,
-    *,
+    label: QtWidgets.QLabel, text: str, *,
     max_width: int = DEFAULT_DYNAMIC_LABEL_MAX_WIDTH,
-    empty_text: str = "",
-    tooltip: bool = True,
+    empty_text: str = "", tooltip: bool = True,
     tooltip_text: str | None = None,
 ) -> None:
-    """Set single-line dynamic label text without letting content define layout width."""
-    full_text = str(text if text is not None else empty_text)
-    if not full_text:
-        full_text = str(empty_text)
-    explicit_tooltip = str(tooltip_text or "")
-    _apply_non_layout_bearing_label_policy(label, max_width=max_width)
-    width = max(24, int(max_width))
-    elided = label.fontMetrics().elidedText(full_text, QtCore.Qt.ElideRight, width)
-    label.setText(elided)
-    if bool(tooltip):
-        label.setToolTip(explicit_tooltip or (full_text if elided != full_text else ""))
-    else:
-        label.setToolTip("")
+    full = str(text if text is not None else empty_text) or str(empty_text)
+    _set_label_projection(label, CompactText(full, full, False),
+                          max_width=max_width, tooltip=tooltip, tooltip_text=tooltip_text)
 
 
 def set_compact_label_text(
-    label: QtWidgets.QLabel,
-    text: str,
-    *,
+    label: QtWidgets.QLabel, text: str, *,
     max_chars: int = DEFAULT_COMPACT_LABEL_MAX_CHARS,
     max_width: int = DEFAULT_COMPACT_LABEL_MAX_WIDTH,
-    empty_text: str = "",
-    tooltip: bool = True,
-    diagnostic: bool = False,
+    empty_text: str = "", tooltip: bool = True, diagnostic: bool = False,
     tooltip_text: str | None = None,
 ) -> CompactText:
-    """Apply the central compact-display policy to a QLabel.
-
-    Returns the compact policy result so callers can reuse the full/tooltip
-    value when needed.
-    """
     compact = (
-        compact_diagnostic_text(text, max_chars=max_chars)
-        if bool(diagnostic)
+        compact_diagnostic_text(text, max_chars=max_chars) if diagnostic
         else compact_text(text, max_chars=max_chars, empty_text=empty_text, mode="middle")
     )
-    _apply_non_layout_bearing_label_policy(label, max_width=max_width)
-    width = max(24, int(max_width))
-    visible = label.fontMetrics().elidedText(compact.display, QtCore.Qt.ElideRight, width)
-    width_elided = visible != compact.display
-    label.setText(visible)
-    explicit_tooltip = str(tooltip_text or "")
-    if bool(tooltip):
-        label.setToolTip(
-            explicit_tooltip
-            or (compact.full if (compact.was_elided or width_elided) else "")
-        )
-    else:
-        label.setToolTip("")
+    _set_label_projection(label, compact, max_width=max_width,
+                          tooltip=tooltip, tooltip_text=tooltip_text)
     return compact
+
+
+def clamp_initial_size(widget: QtWidgets.QWidget, width: int, height: int) -> None:
+    """Choose a preferred initial size within the current screen's work area."""
+    available = widget.screen().availableGeometry()
+    widget.resize(min(width, available.width()), min(height, available.height()))
+
+
+SCIENTIFIC_NAME_HTML_ROLE = int(QtCore.Qt.UserRole) + 173
+
+
+class ScientificNameDelegate(QtWidgets.QStyledItemDelegate):
+    """Paint explicit scientific markup while retaining the model's plain text."""
+
+    def paint(self, painter, option, index):
+        markup = index.data(SCIENTIFIC_NAME_HTML_ROLE)
+        if not markup:
+            super().paint(painter, option, index)
+            return
+        opt = QtWidgets.QStyleOptionViewItem(option)
+        self.initStyleOption(opt, index)
+        style = opt.widget.style() if opt.widget else QtWidgets.QApplication.style()
+        opt.text = ""
+        style.drawControl(QtWidgets.QStyle.CE_ItemViewItem, opt, painter, opt.widget)
+        rect = style.subElementRect(QtWidgets.QStyle.SE_ItemViewItemText, opt, opt.widget)
+        inset = max(opt.fontMetrics.horizontalAdvance(" "), style.pixelMetric(QtWidgets.QStyle.PM_FocusFrameHMargin))
+        rect.adjust(inset, 0, -inset, 0)
+        doc = QtGui.QTextDocument()
+        doc.setDocumentMargin(0)
+        doc.setDefaultFont(opt.font)
+        doc.setHtml(markup)
+        painter.save()
+        painter.setClipRect(rect)
+        painter.translate(rect.left(), rect.top() + max(0, (rect.height() - doc.size().height()) / 2))
+        context = QtGui.QAbstractTextDocumentLayout.PaintContext()
+        context.palette = opt.palette
+        if opt.state & QtWidgets.QStyle.State_Selected:
+            context.palette.setColor(QtGui.QPalette.Text, opt.palette.color(QtGui.QPalette.HighlightedText))
+        doc.documentLayout().draw(painter, context)
+        painter.restore()
 
 
 def make_bounded_label(

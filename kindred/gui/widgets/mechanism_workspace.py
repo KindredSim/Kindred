@@ -155,11 +155,12 @@ class ProjectWorkspaceWidget(QtWidgets.QMainWindow):
             self.addDockWidget(QtCore.Qt.DockWidgetArea(int(area)), dock)
         dock.show()
 
-    def recover_floating_docks(self, available: QtCore.QRect) -> None:
+    def recover_floating_docks(self) -> None:
+        available = tuple(screen.availableGeometry() for screen in QtWidgets.QApplication.screens())
         for dock in self._dock_by_identity.values():
             if not dock.isFloating():
                 continue
-            if available.isValid() and available.intersects(dock.frameGeometry()):
+            if any(rect.intersects(dock.frameGeometry()) for rect in available):
                 continue
             self.redock_dock(dock)
 
@@ -184,35 +185,14 @@ class ProjectWorkspaceWidget(QtWidgets.QMainWindow):
             self.apply_default_dock_arrangement()
         return restored
 
-    def reveal_dock(
-        self,
-        identity: str,
-        *,
-        available_geometry: QtCore.QRect | None = None,
-    ) -> QtWidgets.QDockWidget:
-        """Show and raise a named dock, repinning it when floating off-screen."""
-
+    def reveal_dock(self, identity: str) -> QtWidgets.QDockWidget:
+        """Show a named dock, preserving floating placement on any screen."""
         dock = self.dock_for_identity(identity)
-        if dock.isFloating():
-            available = available_geometry
-            if available is None or not available.isValid():
-                screen = dock.screen() or self.screen()
-                if screen is None:
-                    application = QtWidgets.QApplication.instance()
-                    screen = (
-                        application.primaryScreen()
-                        if isinstance(application, QtWidgets.QApplication)
-                        else None
-                    )
-                available = (
-                    screen.availableGeometry() if screen is not None else None
-                )
-            if (
-                available is not None
-                and available.isValid()
-                and not available.intersects(dock.frameGeometry())
-            ):
-                self.redock_dock(dock)
+        if dock.isFloating() and not any(
+            screen.availableGeometry().intersects(dock.frameGeometry())
+            for screen in QtWidgets.QApplication.screens()
+        ):
+            self.redock_dock(dock)
         dock.show()
         dock.raise_()
         if dock.isFloating():

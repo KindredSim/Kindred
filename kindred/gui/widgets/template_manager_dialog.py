@@ -7,12 +7,15 @@ mechanism templates.
 
 from __future__ import annotations
 
+from kindred.gui.display_name_policy import literal_tooltip
+
 import logging
 from dataclasses import replace
 from datetime import datetime
 from typing import Any, Callable, Dict, Optional
 
 from PySide6 import QtCore, QtGui, QtWidgets
+from kindred.gui.ui_helpers import clamp_initial_size, set_bounded_label_text
 
 from kindred.config.templates import Template, TemplateManager
 from kindred.core.mechanism_source import MechanismAuthoringSource
@@ -60,7 +63,7 @@ class TemplateEditorDialog(QtWidgets.QDialog):
         self.setWindowTitle(
             "Update Template" if self._is_edit_mode else "Create Template"
         )
-        self.resize(700, 600)
+        clamp_initial_size(self, 700, 600)
 
         layout = QtWidgets.QVBoxLayout(self)
 
@@ -76,6 +79,9 @@ class TemplateEditorDialog(QtWidgets.QDialog):
 
         # Category
         self._category_combo = QtWidgets.QComboBox()
+        self._category_combo.setSizeAdjustPolicy(QtWidgets.QComboBox.AdjustToMinimumContentsLengthWithIcon)
+        self._category_combo.setMinimumContentsLength(12)
+        self._category_combo.setMaximumWidth(240)
         self._category_combo.setEditable(True)
         self._category_combo.addItems([
             "General",
@@ -251,7 +257,7 @@ class TemplateManagerDialog(QtWidgets.QDialog):
         self._current_template: Optional[Template] = None
 
         self.setWindowTitle("Template Manager")
-        self.resize(1000, 700)
+        clamp_initial_size(self, 1000, 700)
 
         self._setup_ui()
         self._render_collection_state()
@@ -272,6 +278,9 @@ class TemplateManagerDialog(QtWidgets.QDialog):
 
         # Category filter
         self._category_combo = QtWidgets.QComboBox()
+        self._category_combo.setSizeAdjustPolicy(QtWidgets.QComboBox.AdjustToMinimumContentsLengthWithIcon)
+        self._category_combo.setMinimumContentsLength(12)
+        self._category_combo.setMaximumWidth(240)
         self._category_combo.addItem("All Categories", None)
         self._category_combo.currentIndexChanged.connect(self._on_category_changed)
         toolbar_layout.addWidget(QtWidgets.QLabel("Category:"))
@@ -311,17 +320,21 @@ class TemplateManagerDialog(QtWidgets.QDialog):
         details_layout = QtWidgets.QFormLayout(details_group)
 
         self._name_label = QtWidgets.QLabel()
-        self._name_label.setWordWrap(True)
+        set_bounded_label_text(self._name_label, "", max_width=520)
+
         details_layout.addRow("Name:", self._name_label)
 
         self._category_label = QtWidgets.QLabel()
+        set_bounded_label_text(self._category_label, "", max_width=520)
         details_layout.addRow("Category:", self._category_label)
 
         self._tags_label = QtWidgets.QLabel()
-        self._tags_label.setWordWrap(True)
+        set_bounded_label_text(self._tags_label, "", max_width=520)
+
         details_layout.addRow("Tags:", self._tags_label)
 
         self._author_label = QtWidgets.QLabel()
+        set_bounded_label_text(self._author_label, "", max_width=520)
         details_layout.addRow("Author:", self._author_label)
 
         self._modified_label = QtWidgets.QLabel()
@@ -329,7 +342,9 @@ class TemplateManagerDialog(QtWidgets.QDialog):
 
         self._description_text = QtWidgets.QTextEdit()
         self._description_text.setReadOnly(True)
+        self._description_text.setMinimumHeight(60)
         self._description_text.setMaximumHeight(80)
+        self._description_text.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Ignored)
         details_layout.addRow("Description:", self._description_text)
 
         preview_layout.addWidget(details_group)
@@ -348,40 +363,39 @@ class TemplateManagerDialog(QtWidgets.QDialog):
         layout.addWidget(splitter, stretch=1)
 
         # Bottom button bar
-        button_layout = QtWidgets.QHBoxLayout()
+        button_layout = QtWidgets.QGridLayout()
 
         self._create_btn = QtWidgets.QPushButton("Create from Current")
         self._create_btn.setToolTip(
             "Create a new template from the current mechanism"
         )
         self._create_btn.clicked.connect(self._on_create_clicked)
-        button_layout.addWidget(self._create_btn)
+        button_layout.addWidget(self._create_btn, 0, 0)
 
         self._update_btn = QtWidgets.QPushButton("Update")
         self._update_btn.clicked.connect(self._on_update_clicked)
-        button_layout.addWidget(self._update_btn)
+        button_layout.addWidget(self._update_btn, 0, 1)
 
         self._replace_btn = QtWidgets.QPushButton("Replace from Current")
         self._replace_btn.setToolTip(
             "Replace the selected template's mechanism with the current mechanism"
         )
         self._replace_btn.clicked.connect(self._on_replace_clicked)
-        button_layout.addWidget(self._replace_btn)
+        button_layout.addWidget(self._replace_btn, 0, 2)
 
         self._delete_btn = QtWidgets.QPushButton("Delete")
         self._delete_btn.clicked.connect(self._on_delete_clicked)
-        button_layout.addWidget(self._delete_btn)
+        button_layout.addWidget(self._delete_btn, 1, 0)
 
-        button_layout.addStretch()
 
         self._apply_btn = QtWidgets.QPushButton("Apply")
         self._apply_btn.setDefault(True)
         self._apply_btn.clicked.connect(self._on_apply_clicked)
-        button_layout.addWidget(self._apply_btn)
+        button_layout.addWidget(self._apply_btn, 1, 1)
 
         close_btn = QtWidgets.QPushButton("Close")
         close_btn.clicked.connect(self.close)
-        button_layout.addWidget(close_btn)
+        button_layout.addWidget(close_btn, 1, 2)
 
         layout.addLayout(button_layout)
 
@@ -492,6 +506,7 @@ class TemplateManagerDialog(QtWidgets.QDialog):
         categories = self._template_manager.get_categories()
         for category in categories:
             self._category_combo.addItem(category, category)
+            self._category_combo.setItemData(self._category_combo.count() - 1, literal_tooltip(category), QtCore.Qt.ToolTipRole)
 
         # Restore selection
         if current_category:

@@ -18,6 +18,7 @@ from kindred.gui.ui_helpers import (
     set_bounded_label_text,
 )
 
+from kindred.gui.display_name_policy import compact_text, literal_tooltip
 from kindred.gui.widgets.mechanism_highlighter import MechanismHighlighter
 from kindred.gui.widgets.variable_sliders import VariableSliders
 from kindred.gui.widgets.species_sliders import BatchSpeciesSliders
@@ -119,7 +120,6 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
 
         # Text editor for DSL
         reactions_header_row = QtWidgets.QHBoxLayout()
-        reactions_header_row.addStretch()
         self._revert_reactions_btn = QtWidgets.QPushButton("Revert", self)
         self._revert_reactions_btn.setObjectName("revertReactionsButton")
         self._revert_reactions_btn.setToolTip(
@@ -131,6 +131,7 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
         )
         reactions_header_row.addWidget(self._revert_reactions_btn)
         self.symbolic_calculator_btn = QtWidgets.QPushButton("Σ", self)
+        self.symbolic_calculator_btn.setAccessibleName("Open Symbolic Calculator")
         self.symbolic_calculator_btn.setObjectName("symbolicCalculatorOpenButton")
         self.symbolic_calculator_btn.setToolTip("Open the Symbolic Calculator panel")
         self.symbolic_calculator_btn.setStyleSheet("QPushButton { padding: 6px 12px; }")
@@ -150,6 +151,7 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
         self._run_btn.setFont(run_font)
         self._run_btn.setStyleSheet("QPushButton { padding: 6px 18px; }")
         self._run_btn.setEnabled(False)
+        reactions_header_row.addStretch(1)
         reactions_header_row.addWidget(self._run_btn)
         reactions_layout.addLayout(reactions_header_row)
 
@@ -209,8 +211,9 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
         self._slider_surface.setWidget(self._slider_surface_content)
 
         # Control row for slider settings
-        slider_actions_layout = QtWidgets.QHBoxLayout()
+        slider_actions_layout = QtWidgets.QGridLayout()
         slider_actions_layout.setSpacing(8)
+        slider_actions_layout.setAlignment(QtCore.Qt.AlignTop)
 
         # Fine mode toggle
         self._fine_btn = QtWidgets.QPushButton("Fine")
@@ -224,7 +227,7 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
         self._variable_sliders.fineModeReset.connect(
             self._sync_fine_button_state
         )
-        slider_actions_layout.addWidget(self._fine_btn)
+        slider_actions_layout.addWidget(self._fine_btn, 0, 1, alignment=QtCore.Qt.AlignLeft)
 
         # Override mode controls (Commit/Reset)
         self._commit_runtime_parameters_btn = QtWidgets.QPushButton("Apply")
@@ -235,7 +238,7 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
             "Apply current slider values to the canonical mechanism"
         )
         self._commit_runtime_parameters_btn.clicked.connect(self.sliderApplyRequested)
-        slider_actions_layout.addWidget(self._commit_runtime_parameters_btn)
+        slider_actions_layout.addWidget(self._commit_runtime_parameters_btn, 0, 2, alignment=QtCore.Qt.AlignLeft)
 
         self._reset_runtime_parameters_btn = QtWidgets.QPushButton("Reset")
         self._reset_runtime_parameters_btn.setObjectName("resetRuntimeParametersButton")
@@ -243,7 +246,7 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
             "Revert sliders to canonical mechanism values"
         )
         self._reset_runtime_parameters_btn.clicked.connect(self.sliderResetRequested)
-        slider_actions_layout.addWidget(self._reset_runtime_parameters_btn)
+        slider_actions_layout.addWidget(self._reset_runtime_parameters_btn, 0, 3, alignment=QtCore.Qt.AlignLeft)
         self.set_slider_draft_actions_enabled(False)
 
         # Visibility picker for the unified slider surface.
@@ -261,7 +264,8 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
             self._rebuild_slider_visibility_menu
         )
         self._slider_visibility_picker_btn.setMenu(self._slider_visibility_menu)
-        slider_actions_layout.addWidget(self._slider_visibility_picker_btn)
+        slider_actions_layout.addWidget(self._slider_visibility_picker_btn, 0, 0, alignment=QtCore.Qt.AlignLeft)
+        slider_actions_layout.setColumnStretch(4, 1)
         self._slider_edit_targets_label = make_bounded_label(
             "Slider edit targets: none",
             max_width=240,
@@ -272,8 +276,7 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
         target_font = self._slider_edit_targets_label.font()
         target_font.setPointSize(max(1, target_font.pointSize() - 1))
         self._slider_edit_targets_label.setFont(target_font)
-        slider_actions_layout.addWidget(self._slider_edit_targets_label)
-        slider_actions_layout.addStretch()
+        slider_actions_layout.addWidget(self._slider_edit_targets_label, 1, 0, 1, 5)
 
         # Bottom pane: slider header + controls + slider surface
         self._slider_pane_container = QtWidgets.QWidget()
@@ -282,17 +285,6 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
         slider_pane_layout.setContentsMargins(0, 0, 0, 0)
         slider_pane_layout.setSpacing(6)
         slider_pane_layout.addLayout(slider_actions_layout)
-        self._slider_empty_state_label = QtWidgets.QLabel(
-            "Choose sliders from Visible sliders."
-        )
-        self._slider_empty_state_label.setWordWrap(True)
-        self._slider_empty_state_label.setAlignment(
-            QtCore.Qt.AlignTop | QtCore.Qt.AlignLeft
-        )
-        empty_state_font = self._slider_empty_state_label.font()
-        empty_state_font.setPointSize(max(1, empty_state_font.pointSize() - 1))
-        self._slider_empty_state_label.setFont(empty_state_font)
-        slider_pane_layout.addWidget(self._slider_empty_state_label, stretch=1)
         slider_pane_layout.addWidget(self._slider_surface, stretch=1)
         self._slider_workspace_state = (False, False)
         self._slider_workspace_detached = False
@@ -542,23 +534,9 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
         self._variable_sliders.setVisible(visible_variable_entries > 0)
         self._species_sliders.setVisible(visible_species_entries > 0)
         self._slider_surface.setVisible(has_visible_entries)
-        self._slider_empty_state_label.setVisible(
-            has_available_entries and not has_visible_entries
-        )
         self._slider_visibility_picker_btn.setEnabled(has_available_entries)
         self._fine_btn.setVisible(has_variable_entries)
         self._slider_pane_container.setVisible(has_available_entries)
-
-        if has_available_entries and not has_visible_entries:
-            if has_variable_entries and has_species_entries:
-                helper = (
-                    "Choose mechanism or concentration sliders from Visible sliders."
-                )
-            elif has_variable_entries:
-                helper = "Choose mechanism sliders from Visible sliders."
-            else:
-                helper = "Choose concentration sliders from Visible sliders."
-            self._slider_empty_state_label.setText(helper)
 
         state = (has_available_entries, has_visible_entries)
         if self._slider_workspace_state == state:
@@ -589,6 +567,7 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
     def _rebuild_slider_visibility_menu(self) -> None:
         menu = self._slider_visibility_menu
         menu.clear()
+        menu.setToolTipsVisible(True)
 
         mechanism_entries = list(self._variable_sliders.slider_picker_entries())
         species_entries = list(self._species_sliders.slider_picker_entries())
@@ -652,7 +631,9 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
         header = menu.addAction(str(title))
         header.setEnabled(False)
         for key, label, visible in entries:
-            action = menu.addAction(str(label))
+            action = menu.addAction(compact_text(label, max_chars=48).display)
+            action.setToolTip(literal_tooltip(str(label)))
+            action.setStatusTip(str(label))
             action.setCheckable(True)
             action.setChecked(bool(visible))
             action.setData((str(entry_kind), str(key)))
@@ -670,6 +651,15 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
         elif str(entry_kind) == "species":
             self._species_sliders.set_species_visible(str(item_name), bool(visible))
         self._sync_slider_workspace_state()
+
+    def changeEvent(self, event: QtCore.QEvent) -> None:
+        super().changeEvent(event)
+        if event.type() in (QtCore.QEvent.PaletteChange, QtCore.QEvent.ApplicationPaletteChange):
+            if hasattr(self, "_reactions_highlighter"):
+                with QtCore.QSignalBlocker(self._reactions_text):
+                    self._reactions_highlighter.set_theme(
+                        dark_mode=self.palette().color(QtGui.QPalette.Text).lightness() > 128
+                    )
 
     def _on_text_changed(self):
         """Capture literal source edits without running scientific preparation."""
@@ -740,6 +730,7 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
             QtWidgets.QSizePolicy.Policy.Expanding,
             QtWidgets.QSizePolicy.Policy.Maximum,
         )
+        self._validation_label.setVisible(bool(full_text))
         self._validation_label.setText(full_text)
         self._validation_label.setToolTip(full_text if full_text else "")
 

@@ -8,7 +8,7 @@ import os
 from collections.abc import Iterable, Mapping, Sequence
 from types import MappingProxyType
 
-from PySide6 import QtCore, QtGui
+from PySide6 import QtCore, QtGui, QtWidgets
 
 from kindred.core.runtime_defaults import MAX_PARALLEL_WORKERS_CEILING
 from kindred.core.project_document import (
@@ -25,6 +25,7 @@ from kindred.core.project_document import (
     validate_tab_scientific_settings,
 )
 from kindred.core.simulator.solvers import normalize_solver_name
+from kindred.gui.theme_manager import readable_plot_color
 
 logger = logging.getLogger(__name__)
 
@@ -66,6 +67,7 @@ _DEFAULT_MECHANISM_PARAMETER_DEBOUNCE_MS = 80
 _DEFAULT_EQUILIBRIUM_K_DEBOUNCE_MS = 150
 
 _SPECIES_COLORS_KEY = "plot/species_colors"
+_EXPERIMENTAL_POINT_SHAPE_KEY = "plot/experimental_point_shape"
 _EXPERIMENTAL_POINT_SIZE_KEY = "plot/experimental_point_size"
 _EXPERIMENTAL_POINT_OPACITY_KEY = "plot/experimental_point_opacity"
 _WINDOW_LAYOUT_KEYS = {
@@ -90,6 +92,11 @@ _BASE_SPECIES_RGB: tuple[tuple[int, int, int], ...] = (
 
 class ConfigController(QtCore.QObject):
     """The sole QSettings-backed owner of admitted application settings."""
+
+    EXPERIMENTAL_POINT_SHAPES = (
+        ("Circle", "o"), ("Square", "s"), ("Triangle", "t"),
+        ("Diamond", "d"), ("Cross", "x"), ("Plus", "+"),
+    )
 
     applicationPlotPreferencesChanged = QtCore.Signal()
     recentProjectsChanged = QtCore.Signal()
@@ -666,7 +673,11 @@ class ConfigController(QtCore.QObject):
         if override is not None:
             return QtGui.QColor(override)
         slot = self._default_species_slot(canonical, known_species)
-        return QtGui.QColor(self._species_palette[slot])
+        # qdarktheme supplies application Text while styling Base per widget.
+        dark_mode = (
+            QtWidgets.QApplication.palette().color(QtGui.QPalette.Text).lightness() > 128
+        )
+        return readable_plot_color(self._species_palette[slot], dark_mode)
 
     def set_species_color(
         self,
@@ -690,6 +701,24 @@ class ConfigController(QtCore.QObject):
             snapshot=snapshot,
         )
         self.applicationPlotPreferencesChanged.emit()
+
+    def experimental_point_shape(self) -> str:
+        value = self._settings().value(_EXPERIMENTAL_POINT_SHAPE_KEY, "o")
+        return (
+            value
+            if value in tuple(code for _label, code in self.EXPERIMENTAL_POINT_SHAPES)
+            else "o"
+        )
+
+    def set_experimental_point_shape(self, shape: str) -> str:
+        if shape not in tuple(code for _label, code in self.EXPERIMENTAL_POINT_SHAPES):
+            raise ValueError("Unsupported experimental point shape.")
+        settings = self._settings()
+        snapshot = self._snapshot_settings(settings, (_EXPERIMENTAL_POINT_SHAPE_KEY,))
+        settings.setValue(_EXPERIMENTAL_POINT_SHAPE_KEY, shape)
+        self._sync_or_report(settings, "experimental point shape", snapshot=snapshot)
+        self.applicationPlotPreferencesChanged.emit()
+        return shape
 
     def experimental_point_size(self) -> int:
         value = self._setting(

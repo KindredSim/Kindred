@@ -1,29 +1,32 @@
 """Physical Fit Results and Summary views.
 
-The session owner retains the admitted Fit candidate.  This module only
-renders call-local values and emits ordinary action requests.  In particular,
-no candidate, result, report, projection, identity, or Apply policy is kept
-by either view.
+The session owner retains the admitted Fit candidate and Apply policy. These
+views retain only rendered text and immutable curve projections for display
+and copying; actions remain ordinary requests to the owner.
 """
 
 from __future__ import annotations
 
 import math
+import html
 from collections.abc import Callable, Mapping, Sequence
 from types import MappingProxyType
 
-from PySide6 import QtWidgets
+from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtCore import Qt, Signal
 
+from kindred.core.analysis.fit_evaluation_outcome import ScientificUnavailable
 from kindred.core.analysis.fit_statistics import FitMetric
 from kindred.gui.display_name_policy import (
-    STATUS_ITEM_LABEL_MAX_CHARS,
     TAB_LABEL_MAX_CHARS,
     compact_dataset_label,
-    compact_text,
     dataset_alias,
 )
-from kindred.gui.fitting.reporting import fit_candidate_tracker
+from kindred.gui.fitting.reporting import (
+    FitValueEntry, fit_candidate_presentation, fit_live_presentation, fit_overview,
+)
+from kindred.gui.fitting.launch import FitParameterVariable
+from kindred.gui.ui_helpers import ControlRowsLayout
 from kindred.gui.fitting.worker import FitCandidate, FitCurveDataset, FitLiveUpdate
 from kindred.gui.widgets.grid_plot_view import DatasetPlotPresentation, GridPlotView
 
@@ -45,16 +48,56 @@ def _format_metric(value: object) -> str:
         return "unavailable"
 
 
-def _display(value: object) -> str:
-    if value is None:
-        return "unavailable"
-    if isinstance(value, bool):
-        return str(value).lower()
-    if isinstance(value, float):
-        return f"{value:.6g}"
-    if isinstance(value, (tuple, list)):
-        return "[" + ", ".join(_display(item) for item in value) + "]"
-    return str(value)
+
+class _FitValueLabel(QtWidgets.QLabel):
+    """Copy literal selections without the wrapping characters we inserted."""
+
+    def __init__(self, parent: QtWidgets.QWidget) -> None:
+        super().__init__(parent)
+        self.copy_break_positions: list[int] = []
+
+    def _copy_selection(self) -> None:
+        if not self.hasSelectedText():
+            return
+        start = self.selectionStart()
+        # QTextCursor and QLabel selection offsets count UTF-16 code units.
+        selected = self.selectedText().encode("utf-16-le")
+        end = start + len(selected) // 2
+        for position in reversed(self.copy_break_positions):
+            if start <= position < end:
+                offset = (position - start) * 2
+                selected = selected[:offset] + selected[offset + 2:]
+        mime = QtCore.QMimeData()
+        mime.setText(selected.decode("utf-16-le"))
+        QtWidgets.QApplication.clipboard().setMimeData(mime)
+
+    def keyPressEvent(self, event: QtGui.QKeyEvent) -> None:
+        if event.matches(QtGui.QKeySequence.StandardKey.Copy):
+            self._copy_selection()
+            event.accept()
+        else:
+            super().keyPressEvent(event)
+
+    def contextMenuEvent(self, event: QtGui.QContextMenuEvent) -> None:
+        if not self.copy_break_positions:
+            super().contextMenuEvent(event)
+            return
+        menu = QtWidgets.QMenu()
+        menu.addAction("Copy", self._copy_selection).setEnabled(self.hasSelectedText())
+        menu.addAction("Select All", self._select_all)
+        menu.exec(event.globalPos())
+
+    def _select_all(self) -> None:
+        document = QtGui.QTextDocument()
+        document.setHtml(self.text())
+        self.setSelection(0, document.characterCount() - 1)
+
+
+class _SummaryBrowser(QtWidgets.QTextBrowser):
+    def createMimeDataFromSelection(self) -> QtCore.QMimeData:
+        data = QtCore.QMimeData()
+        data.setText(self.textCursor().selection().toPlainText())
+        return data
 
 
 class ResultsSummaryDialog(QtWidgets.QDialog):
@@ -71,147 +114,276 @@ class ResultsSummaryDialog(QtWidgets.QDialog):
         self.setWindowTitle("Results Summary")
         self.resize(560, 480)
         layout = QtWidgets.QVBoxLayout(self)
-        info_label = QtWidgets.QLabel("Review the most recent fit run.")
-        info_label.setWordWrap(True)
-        layout.addWidget(info_label)
-        self._body = QtWidgets.QTextEdit(self)
+        self._info_label = QtWidgets.QLabel("Review the most recent fit run.")
+        self._info_label.setWordWrap(True)
+        layout.addWidget(self._info_label)
+        self._displayed_html = ""
+        self._pending_html: str | None = None
+        self._body = _SummaryBrowser(self)
+        self._body.setOpenLinks(False)
+        self._body.setOpenExternalLinks(False)
         self._body.setObjectName("results_summary_body")
         self._body.setReadOnly(True)
+        self._body.setWordWrapMode(QtGui.QTextOption.WrapMode.WordWrap)
+        self._body.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self._body.selectionChanged.connect(self._flush_pending)
         self._body.setTextInteractionFlags(
             Qt.TextInteractionFlag.TextSelectableByMouse
+            | Qt.TextInteractionFlag.TextSelectableByKeyboard
         )
         layout.addWidget(self._body, stretch=1)
         self.refresh(summary or "")
 
-    def refresh(self, summary: str) -> None:
-        """Immediately render one call-local human-readable Summary string."""
+    def refresh(self, summary: str, *, reset: bool = False) -> None:
+        """Keep the reader's position; defer only the latest update during selection."""
+        summary = summary or "<p>No summary available.</p>"
+        if reset:
+            self._pending_html = None
+            self._replace_document(summary, preserve_scroll=False)
+        elif summary == self._displayed_html:
+            self._pending_html = None
+        elif self._body.textCursor().hasSelection():
+            self._pending_html = summary
+        else:
+            self._pending_html = None
+            self._replace_document(summary, preserve_scroll=True)
+        self._info_label.setText("An update is waiting. Clear the selection to show it."
+                                 if self._pending_html is not None else "Review the most recent fit run.")
 
-        self._body.setPlainText(
-            summary if summary else "No summary available."
-        )
+    def _replace_document(self, summary: str, *, preserve_scroll: bool) -> None:
+        horizontal = self._body.horizontalScrollBar()
+        vertical = self._body.verticalScrollBar()
+        positions = (horizontal.value(), vertical.value()) if preserve_scroll else (0, 0)
+        # setHtml clears selection; block that signal during this synchronous replacement.
+        with QtCore.QSignalBlocker(self._body):
+            self._body.setHtml(summary)
+        self._displayed_html = summary
+        horizontal.setValue(positions[0])
+        vertical.setValue(positions[1])
+
+    def _flush_pending(self) -> None:
+        if not self._body.textCursor().hasSelection() and self._pending_html is not None:
+            self.refresh(self._pending_html)
+
 
 class FitTrackerPanel(QtWidgets.QWidget):
-    """Compact physical live/terminal tracker."""
+    """Wrapping fit facts and a bounded viewport of complete fitted values."""
 
     def __init__(self, parent: QtWidgets.QWidget | None = None) -> None:
         super().__init__(parent)
         self.setObjectName("global_fit_tracker_panel")
-        self.setSizePolicy(
-            QtWidgets.QSizePolicy.Policy.Expanding,
-            QtWidgets.QSizePolicy.Policy.Fixed,
-        )
-        self.setMinimumHeight(108)
-        self.setMaximumHeight(240)
-        self._previous_cost: float | None = None
+        self.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding, QtWidgets.QSizePolicy.Policy.Fixed)
+        self._overview: tuple[str, ...] = ()
+        self._outcome = self._phase = self._model = ""
+        self._parameter_count = self._dataset_count = self._calls = 0
+        self._objective = "not evaluated"
+        self._values_html = ""
+        self._parameters: tuple[FitParameterVariable, ...] = ()
+        self._entries: tuple[FitValueEntry, ...] = ()
+        self._entry_labels: list[_FitValueLabel] = []
         layout = QtWidgets.QVBoxLayout(self)
-        layout.setContentsMargins(8, 6, 8, 6)
-        layout.setSpacing(4)
-        self._summary_label = QtWidgets.QLabel(self)
-        self._summary_label.setObjectName("global_fit_tracker_summary_label")
-        self._summary_label.setWordWrap(True)
-        self._summary_label.setTextInteractionFlags(
-            Qt.TextInteractionFlag.TextSelectableByMouse
-        )
-        layout.addWidget(self._summary_label)
-        self._params_label = QtWidgets.QLabel(self)
-        self._params_label.setObjectName("global_fit_tracker_params_label")
-        self._params_label.setWordWrap(True)
-        self._params_label.setTextInteractionFlags(
-            Qt.TextInteractionFlag.TextSelectableByMouse
-        )
-        layout.addWidget(self._params_label, stretch=1)
+        layout.setContentsMargins(8, 2, 8, 2)
+        layout.setSpacing(2)
+        self._summary_widget = QtWidgets.QWidget(self)
+        self._summary_layout = ControlRowsLayout(self._summary_widget)
+        self._summary_labels: list[QtWidgets.QLabel] = []
+        layout.addWidget(self._summary_widget)
+        self._values_scroll = QtWidgets.QScrollArea(self)
+        self._values_scroll.setObjectName("global_fit_tracker_values")
+        self._values_scroll.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
+        self._values_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._values_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self._values_scroll.setStyleSheet("QScrollArea#global_fit_tracker_values { border: 0; padding: 0; margin: 0; }")
+        self._values_scroll.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self._values_scroll.setAccessibleName("Fitted values; use arrow or Page keys to scroll")
+        self._values_widget = QtWidgets.QWidget()
+        self._values_layout = ControlRowsLayout(self._values_widget)
+        self._values_layout.setSpacing(8)
+        self._values_layout.setContentsMargins(0, 4, 0, 4)
+        self._values_scroll.setWidget(self._values_widget)
+        self._values_scroll.viewport().installEventFilter(self)
+        layout.addWidget(self._values_scroll)
         self.clear()
 
     def clear(self) -> None:
-        self._previous_cost = None
-        self._summary_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._summary_label.setStyleSheet("color: #888; font-size: 12px;")
-        self._summary_label.setText("Run a fit to see results here.")
-        self._params_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._params_label.setStyleSheet("color: #888; font-size: 11px;")
-        self._params_label.setText("")
+        self._overview = ()
+        self._outcome = self._phase = self._values_html = ""
+        self._objective = "not evaluated"
+        self._calls = 0
+        self._set_entries(())
+        for label in self._summary_labels:
+            label.hide()
+        self.hide()
 
-    def update_from_best(
-        self,
-        update: FitLiveUpdate,
-        *,
-        dataset_labels: Mapping[str, str] | None = None,
-    ) -> None:
-        cost = float(update.cost)
-        delta_text = ""
-        if self._previous_cost is not None and math.isfinite(cost):
-            delta_text = f" (delta {cost - self._previous_cost:.2e})"
-        if math.isfinite(cost):
-            self._previous_cost = cost
-        labels = dict(dataset_labels or {})
-        lines = [
-            f"{compact_text(name, max_chars=STATUS_ITEM_LABEL_MAX_CHARS).display}="
-            f"{float(value):.6g}"
-            for name, value in update.parameters
-        ]
-        tooltips = [f"Parameter ID: {name}" for name, _value in update.parameters]
-        for index, (dataset_id, values) in enumerate(update.scalar_values_by_dataset):
-            if not values:
+    def start(self, model: str, parameters: tuple[FitParameterVariable, ...], dataset_count: int) -> None:
+        self.clear()
+        self._model, self._parameters = model, parameters
+        self._parameter_count, self._dataset_count = len(parameters), dataset_count
+        self._values_scroll.verticalScrollBar().setValue(0)
+        self.set_phase("Starting", "Waiting for the first complete candidate")
+
+    def set_phase(self, phase: str, detail: str) -> None:
+        self._phase = phase
+        self._overview = fit_overview(phase, self._model, self._objective,
+                                     self._dataset_count, self._parameter_count)
+        self._outcome = detail
+        self._render()
+
+    def update_from_best(self, update: FitLiveUpdate, *, dataset_labels: Mapping[str, str],
+                         initial_labels: Mapping[str, str]) -> None:
+        entries, self._values_html = fit_live_presentation(update, self._parameters, dataset_labels, initial_labels)
+        self._set_entries(entries)
+        self._objective = _format_metric(update.cost)
+        self._calls = update.iteration
+        phase, detail = self._phase, self._outcome
+        if phase in {"Starting", "Running"}:
+            phase, detail = "Running", f"Objective calls {update.iteration} · Best complete candidate"
+        self.set_phase(phase, detail)
+
+    def set_summary(self, overview: tuple[str, ...], outcome: str, entries: tuple[FitValueEntry, ...]) -> None:
+        self._overview, self._outcome = overview, outcome
+        self._phase = ""
+        self._set_entries(entries)
+        self._render()
+
+    def summary_html(self) -> str:
+        if not self._overview:
+            return "<h2>Fit ready</h2><p>Run a fit to obtain results.</p>"
+        return (f"<h2>{html.escape(" | ".join(self._overview))}</h2><p>{html.escape(self._outcome)}</p>"
+                f"<p>Objective calls: {self._calls}</p>" + self._values_html)
+
+    def _set_entries(self, entries: tuple[FitValueEntry, ...]) -> None:
+        same_identity = tuple(entry[0] for entry in entries) == tuple(entry[0] for entry in self._entries)
+        self._entries = entries
+        if not same_identity:
+            while self._values_layout.count():
+                self._values_layout.takeAt(0).widget().deleteLater()
+            self._entry_labels = []
+            for _entry in entries:
+                label = _FitValueLabel(self._values_widget)
+                label.setTextFormat(Qt.TextFormat.RichText)
+                label.setWordWrap(True)
+                label.setMargin(0)
+                label.setIndent(0)
+                label.setStyleSheet("border: 0; padding: 0; margin: 0;")
+                label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+                label.setSizePolicy(QtWidgets.QSizePolicy.Policy.Fixed, QtWidgets.QSizePolicy.Policy.Fixed)
+                self._values_layout.addWidget(label)
+                label.show()
+                self._entry_labels.append(label)
+        self._values_scroll.setVisible(bool(entries))
+        self._layout_entries()
+
+    def _layout_entries(self) -> None:
+        if not self._entries:
+            self._values_scroll.setFixedHeight(0)
+            return
+        scroll = self._values_scroll.verticalScrollBar()
+        position = scroll.value()
+        gutter = self._values_scroll.style().pixelMetric(QtWidgets.QStyle.PixelMetric.PM_ScrollBarExtent)
+        width = max(1, self._values_scroll.maximumViewportSize().width() - gutter)
+        row_height = max(label.fontMetrics().lineSpacing() + 6 for label in self._entry_labels)
+        for label, (_identity, symbol, plain_symbol, context, value, unit) in zip(self._entry_labels, self._entries):
+            label.copy_break_positions.clear()
+            metrics = label.fontMetrics()
+            number = f"{value:.6g}"
+            suffix = "" if unit == "1" else " " + unit
+            numeric_width = metrics.horizontalAdvance("−8.88888e+308")
+            document = QtGui.QTextDocument()
+            document.setDefaultFont(label.font())
+            document.setDocumentMargin(0)
+            document.setHtml(symbol + " = ")
+            symbol_width = math.ceil(document.idealWidth()) + 4
+            context_budget = max(0, min(metrics.horizontalAdvance("M" * 28), width - symbol_width - numeric_width - 24))
+            compact = metrics.elidedText(" ".join((context + suffix).splitlines()), Qt.TextElideMode.ElideRight, context_budget)
+            prefix = html.escape(compact) + " · " if compact else ""
+            numeric_html = ' = <span style="white-space: nowrap">' + html.escape(number) + '</span>'
+            if symbol_width + numeric_width > width:
+                # Rich text retains scientific formatting; explicit opportunities
+                # let an authored unbroken name wrap without splitting its number.
+                document.setHtml(symbol)
+                cursor = QtGui.QTextCursor(document)
+                while cursor.movePosition(QtGui.QTextCursor.MoveOperation.NextCharacter):
+                    label.copy_break_positions.append(cursor.position())
+                    cursor.insertText("\u200b")
+                cursor.insertHtml(numeric_html)
+                label.setText(document.toHtml())
+            else:
+                label.setText(prefix + symbol + numeric_html)
+            label.setAccessibleName(f"{context} · {plain_symbol} = {number}{suffix}")
+            label.setToolTip(label.accessibleName())
+            entry_width = min(width, metrics.horizontalAdvance(compact + (" · " if compact else "")) + symbol_width + numeric_width)
+            label.setFixedWidth(entry_width)
+            label.setMinimumHeight(0)
+            label.setMaximumHeight(16777215)
+            label.setFixedHeight(max(row_height, label.heightForWidth(entry_width)))
+        self._values_layout.invalidate()
+        height = self._values_layout.heightForWidth(width)
+        cap = 3 * row_height + 2 * self._values_layout.spacing() + 8
+        self._values_widget.resize(width, height)
+        self._values_layout.setGeometry(QtCore.QRect(0, 0, width, height))
+        self._values_scroll.setFixedHeight(min(height, cap))
+        scroll.setValue(position)
+
+    def _render(self) -> None:
+        if not self._overview:
+            self.hide()
+            return
+        width = max(1, self.contentsRect().width() - 16)
+        fragments = list(self._overview)
+        model_index = len(fragments) - 1
+        if self._phase and self._calls:
+            fragments[2:2] = [f"Objective calls {self._calls}", "Best complete candidate"]
+            model_index += 2
+        if self._outcome and self._outcome != f"Objective calls {self._calls} · Best complete candidate":
+            fragments.append(self._outcome)
+        while len(self._summary_labels) < len(fragments):
+            label = QtWidgets.QLabel(self._summary_widget)
+            label.setTextFormat(Qt.TextFormat.PlainText)
+            label.setWordWrap(True)
+            label.setMargin(0)
+            label.setIndent(0)
+            label.setStyleSheet("border: 0; padding: 0; margin: 0;")
+            label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+            self._summary_layout.addWidget(label)
+            self._summary_labels.append(label)
+        for index, label in enumerate(self._summary_labels):
+            label.setVisible(index < len(fragments))
+            if index >= len(fragments):
                 continue
-            label = compact_dataset_label(
-                labels.get(dataset_id, dataset_alias(index)),
-                max_chars=STATUS_ITEM_LABEL_MAX_CHARS,
-            )
-            lines.append(
-                f"[{label.display}] "
-                + " | ".join(
-                    f"{compact_text(name, max_chars=STATUS_ITEM_LABEL_MAX_CHARS).display}="
-                    f"{float(value):.6g}"
-                    for name, value in values
-                )
-            )
-            tooltips.append(f"{label.full}: Dataset ID {dataset_id}")
-        for index, (set_id, values) in enumerate(update.initial_values_by_set):
-            if not values:
-                continue
-            label = compact_text(
-                f"Initial set {index + 1}",
-                max_chars=STATUS_ITEM_LABEL_MAX_CHARS,
-            )
-            lines.append(
-                f"[{label.display}] "
-                + " | ".join(
-                    f"{compact_text(name, max_chars=STATUS_ITEM_LABEL_MAX_CHARS).display}="
-                    f"{float(value):.6g}"
-                    for name, value in values
-                )
-            )
-            tooltips.append(f"{label.full}: Set ID {set_id}")
-        self._set_live_text(
-            f"Objective calls {int(update.iteration)} | Weighted objective SSQ "
-            f"{_format_metric(cost)}{delta_text}",
-            lines,
-            tooltips,
-        )
+            text = fragments[index]
+            metrics = label.fontMetrics()
+            # Bind only the authored model context; decisive facts wrap intact.
+            shown = metrics.elidedText(" ".join(text.splitlines()), Qt.TextElideMode.ElideRight,
+                                      min(width, metrics.horizontalAdvance("M" * 24))) if index == model_index else text
+            label.setText(shown)
+            label.setAccessibleName(text)
+            label.setToolTip(text)
+            label.setFixedWidth(min(width, metrics.horizontalAdvance(shown) + 4))
+            label.setMinimumHeight(0)
+            label.setMaximumHeight(16777215)
+            label.setFixedHeight(max(metrics.lineSpacing(), label.heightForWidth(label.width())))
+        self._summary_widget.setAccessibleName(" | ".join(fragments))
+        self._summary_layout.invalidate()
+        height = self._summary_layout.heightForWidth(width)
+        self._summary_widget.setFixedHeight(height)
+        self._summary_layout.setGeometry(QtCore.QRect(0, 0, width, height))
+        self.show()
+        self._layout_entries()
 
-    def update_final(self, candidate: FitCandidate) -> None:
-        """Render terminal values synchronously from the retained candidate."""
+    def eventFilter(self, watched: QtCore.QObject, event: QtCore.QEvent) -> bool:
+        if watched is self._values_scroll.viewport() and event.type() == QtCore.QEvent.Type.Resize:
+            self._layout_entries()
+        return super().eventFilter(watched, event)
 
-        summary, lines, tooltips = fit_candidate_tracker(candidate)
-        self._set_live_text(summary, lines, tooltips)
+    def resizeEvent(self, event: QtGui.QResizeEvent) -> None:
+        super().resizeEvent(event)
+        self._render()
 
-    def _set_live_text(
-        self,
-        summary_text: str,
-        parameter_lines: Sequence[str],
-        tooltip_lines: Sequence[str],
-    ) -> None:
-        self._summary_label.setAlignment(
-            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
-        )
-        self._summary_label.setStyleSheet("font-size: 12px; font-weight: 600;")
-        self._summary_label.setText(summary_text)
-        self._params_label.setAlignment(
-            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop
-        )
-        self._params_label.setStyleSheet("font-size: 11px;")
-        self._params_label.setText("\n".join(parameter_lines))
-        self._params_label.setToolTip("\n".join(tooltip_lines))
+    def changeEvent(self, event: QtCore.QEvent) -> None:
+        super().changeEvent(event)
+        if event.type() == QtCore.QEvent.Type.FontChange and hasattr(self, "_summary_widget"):
+            self._render()
 
 
 class RunResultsTab(QtWidgets.QWidget):
@@ -224,12 +396,17 @@ class RunResultsTab(QtWidgets.QWidget):
         parent: QtWidgets.QWidget | None = None,
         *,
         color_resolver: ColorResolver | None = None,
+        observation_style: tuple[str, float, float],
     ) -> None:
         super().__init__(parent)
+        self._observation_style = observation_style
         self._color_resolver = color_resolver
         self._summary_dialog: ResultsSummaryDialog | None = None
+        self._apply_reason = ""
+        self._summary_body = ""
+        self._summary_provenance = ""
+        self._progress = 0
         self._dark_mode = False
-        self._live_layout_locked = False
         self._copy_allowed = True
         self._curves: tuple[FitCurveDataset, ...] = ()
         self._dataset_presentation: Mapping[str, DatasetPlotPresentation] = (
@@ -245,19 +422,14 @@ class RunResultsTab(QtWidgets.QWidget):
         layout.setSpacing(8)
         self._tracker_panel = FitTrackerPanel(self)
         layout.addWidget(self._tracker_panel)
+        self._empty_label = QtWidgets.QLabel("Run a fit to see results here.", self)
+        self._empty_label.setWordWrap(True)
+        layout.addWidget(self._empty_label)
 
         self._render_diagnostic_label = QtWidgets.QLabel(self)
         self._render_diagnostic_label.setWordWrap(True)
         self._render_diagnostic_label.hide()
         layout.addWidget(self._render_diagnostic_label)
-        self._terminal_failure_label = QtWidgets.QLabel(self)
-        self._terminal_failure_label.setObjectName("global_fit_terminal_failure_label")
-        self._terminal_failure_label.setWordWrap(True)
-        self._terminal_failure_label.setTextInteractionFlags(
-            Qt.TextInteractionFlag.TextSelectableByMouse
-        )
-        self._terminal_failure_label.hide()
-        layout.addWidget(self._terminal_failure_label)
 
         self._subtabs = QtWidgets.QTabBar(self)
         self._subtabs.setObjectName("global_fit_results_subtabs")
@@ -270,14 +442,16 @@ class RunResultsTab(QtWidgets.QWidget):
         layout.addWidget(self._subtab_stack, stretch=1)
         self._subtabs.currentChanged.connect(self._on_subtab_changed)
 
-    def set_live_best(self, update: FitLiveUpdate) -> None:
-        self._tracker_panel.update_from_best(
-            update,
-            dataset_labels=self._dataset_labels,
-        )
+    def set_live_best(self, update: FitLiveUpdate, *, dataset_labels: Mapping[str, str],
+                      initial_labels: Mapping[str, str]) -> None:
+        self._empty_label.hide()
+        self._tracker_panel.update_from_best(update, dataset_labels=dataset_labels,
+                                             initial_labels=initial_labels)
+        self._refresh_summary()
 
     def set_live_curves(self, curves: Sequence[FitCurveDataset]) -> None:
         self._install_plot_projection(curves, {})
+        self._refresh_summary()
 
     def set_terminal_presentation(
         self,
@@ -288,14 +462,16 @@ class RunResultsTab(QtWidgets.QWidget):
         plot_presentation: Mapping[str, DatasetPlotPresentation] | None = None,
     ) -> bool:
         """Consume one call-local typed terminal presentation."""
-        self._terminal_failure_label.hide()
         if candidate is None:
+            self._summary_body = self._summary_provenance = ""
             self._tracker_panel.clear()
             self._render_diagnostic_label.clear()
             self._render_diagnostic_label.hide()
         else:
-            self._tracker_panel.update_final(candidate)
+            overview, outcome, self._summary_body, self._summary_provenance, entries = fit_candidate_presentation(candidate)
+            self._tracker_panel.set_summary(overview, outcome, entries)
         self._install_plot_projection(curves, plot_presentation or {})
+        self._refresh_summary()
         if curve_failure is not None:
             self._render_diagnostic_label.setText(
                 "Fit curves unavailable: " + str(curve_failure)
@@ -303,19 +479,42 @@ class RunResultsTab(QtWidgets.QWidget):
             self._render_diagnostic_label.show()
         return self.copy_eligible()
 
-    def render_results_summary(
-        self,
-        summary: str,
-    ) -> None:
-        """Render a synchronous owner-provided human-readable Summary."""
+    def set_apply_reason(self, reason: str) -> None:
+        self._apply_reason = reason
+        self._refresh_summary()
 
+    def set_progress(self, value: int) -> None:
+        self._progress = value
+        self._refresh_summary()
+
+    def _summary_html(self) -> str:
+        body = self._summary_body or self._tracker_panel.summary_html()
+        if not self._summary_body:
+            body += f"<p>Progress: {self._progress}%</p>"
+        body += ("<h3>Apply Fit to Project availability</h3><p>"
+                 + html.escape(self._apply_reason or "Apply is available for compatible shared estimates and fitted initial values.").replace("\n", "<br>") + "</p>")
+        view = self._subtab_stack.currentWidget()
+        if view is not None and self._curves:
+            legend, _plain = view.legend_text()
+            body += "<h3>Plot legend</h3><p>" + legend + "</p>"
+        return body + self._summary_provenance
+
+    def _refresh_summary(self) -> None:
         if self._summary_dialog is not None and self._summary_dialog.isVisible():
-            self._summary_dialog.refresh(summary)
+            self._summary_dialog.refresh(self._summary_html())
+
+    def render_results_summary(self) -> None:
+        """Show the current physical execution/terminal projection in one document."""
+        if self._summary_dialog is not None and self._summary_dialog.isVisible():
+            self._refresh_summary()
             self._summary_dialog.raise_()
             self._summary_dialog.activateWindow()
             return
-        dialog = ResultsSummaryDialog(summary, parent=self)
-        dialog.destroyed.connect(lambda: setattr(self, "_summary_dialog", None))
+        dialog = ResultsSummaryDialog(self._summary_html(), parent=self)
+        dialog.destroyed.connect(
+            lambda: setattr(self, "_summary_dialog", None)
+            if self._summary_dialog is dialog else None
+        )
         self._summary_dialog = dialog
         dialog.show()
 
@@ -323,15 +522,17 @@ class RunResultsTab(QtWidgets.QWidget):
         """Clear only physical result widgets; the owner controls custody."""
 
         self._tracker_panel.clear()
-        self._terminal_failure_label.clear()
-        self._terminal_failure_label.hide()
+        self._summary_body = self._summary_provenance = ""
+        self._empty_label.setText("Run a fit to see results here.")
+        self._empty_label.show()
         self._render_diagnostic_label.clear()
         self._render_diagnostic_label.hide()
         self._install_plot_projection((), {})
-        if self._summary_dialog is not None and self._summary_dialog.isVisible():
-            self._summary_dialog.close()
+        self._refresh_summary()
 
     def set_terminal_failure(self, failure: object) -> None:
+        self._empty_label.hide()
+        self._tracker_panel.clear()
         chain: list[str] = []
         current = failure
         while current is not None:
@@ -340,18 +541,16 @@ class RunResultsTab(QtWidgets.QWidget):
             message = getattr(current, "message", str(current))
             chain.append(f"{type(current).__name__}{code_text}: {message}")
             current = getattr(current, "cause", None)
-        self._terminal_failure_label.setText(
-            "Fit failed — " + " Caused by: ".join(chain)
-        )
-        payload = getattr(failure, "to_payload", None)
-        self._terminal_failure_label.setToolTip(
-            _display(payload() if callable(payload) else str(failure))
-        )
-        self._terminal_failure_label.show()
+        self.set_execution_status("Failed", getattr(failure, "message", str(failure)))
+        self._summary_body = "<h2>Fit failed</h2><p>" + html.escape(" Caused by: ".join(chain)).replace("\n", "<br>") + "</p>"
+        self._summary_provenance = ""
+        self._refresh_summary()
 
-    def set_terminal_unavailable(self, cause: object) -> None:
+    def set_terminal_unavailable(self, cause: ScientificUnavailable) -> None:
+        self._empty_label.hide()
+        self._tracker_panel.clear()
         chain: list[str] = []
-        current = cause
+        current = cause.factual_cause
         while current is not None:
             code = getattr(current, "code", None)
             code_text = f" [{code}]" if code else ""
@@ -360,9 +559,11 @@ class RunResultsTab(QtWidgets.QWidget):
                 f"{getattr(current, 'message', current)}"
             )
             current = getattr(current, "cause", None)
-        text = "Fit result scientifically unavailable — " + " Caused by: ".join(chain)
-        self._terminal_failure_label.setText(text)
-        self._terminal_failure_label.show()
+        self.set_execution_status("Scientifically unavailable",
+                                  cause.factual_cause.message if cause.factual_cause is not None else cause.stage)
+        self._summary_body = "<h2>Fit result scientifically unavailable</h2><p>" + html.escape(" Caused by: ".join(chain)).replace("\n", "<br>") + "</p>"
+        self._summary_provenance = ""
+        self._refresh_summary()
 
     def copy_eligible(self) -> bool:
         return self._copy_allowed and bool(self._curves)
@@ -405,14 +606,25 @@ class RunResultsTab(QtWidgets.QWidget):
             raise ValueError("The selected Fit dataset has no curves to copy.")
         view.copy_projection_to_clipboard(curves)
 
-    def set_live_layout_locked(self, running: bool) -> None:
-        self._live_layout_locked = bool(running)
+    def set_observation_style(self, shape: str, size: float, opacity: float) -> None:
+        self._observation_style = (shape, size, opacity)
         for plot_view in self._dataset_plot_views.values():
-            plot_view.set_live_layout_locked(self._live_layout_locked)
+            plot_view.set_observation_style(shape, size, opacity)
         if self._all_datasets_plot_view is not None:
-            self._all_datasets_plot_view.set_live_layout_locked(
-                self._live_layout_locked
-            )
+            self._all_datasets_plot_view.set_observation_style(shape, size, opacity)
+        self._refresh_summary()
+
+    def set_waiting(self, model: str, parameters: tuple[FitParameterVariable, ...], dataset_count: int) -> None:
+        self.clear_candidate()
+        self._progress = 0
+        self._tracker_panel.start(model, parameters, dataset_count)
+        if self._summary_dialog is not None and self._summary_dialog.isVisible():
+            self._summary_dialog.refresh(self._summary_html(), reset=True)
+
+    def set_execution_status(self, phase: str, detail: str) -> None:
+        self._empty_label.hide()
+        self._tracker_panel.set_phase(phase, detail)
+        self._refresh_summary()
 
     def set_dark_mode(self, enabled: bool) -> None:
         self._dark_mode = bool(enabled)
@@ -420,6 +632,7 @@ class RunResultsTab(QtWidgets.QWidget):
             plot_view.set_dark_mode(self._dark_mode)
         if self._all_datasets_plot_view is not None:
             self._all_datasets_plot_view.set_dark_mode(self._dark_mode)
+        self._refresh_summary()
 
     def _ensure_subtabs(self, curves: Sequence[FitCurveDataset]) -> None:
         ids = [("dataset", curve.dataset_id) for curve in curves]
@@ -456,25 +669,25 @@ class RunResultsTab(QtWidgets.QWidget):
                     "full_label": compact_label.full,
                 },
             )
-        self._all_datasets_plot_view = self._create_plot_view(
-            "global_fit_results_plot_all_datasets"
-        )
-        self._subtab_stack.addWidget(self._all_datasets_plot_view)
-        self._subtabs.addTab("All Datasets")
-        self._subtabs.setVisible(self._subtabs.count() > 0)
+        if len(curves) > 1:
+            self._all_datasets_plot_view = self._create_plot_view(
+                "global_fit_results_plot_all_datasets"
+            )
+            self._subtab_stack.addWidget(self._all_datasets_plot_view)
+            self._subtabs.addTab("All Datasets")
+        self._subtabs.setVisible(len(curves) > 1)
         self._subtabs.setCurrentIndex(0)
         self._subtab_stack.setCurrentIndex(0)
 
     def _create_plot_view(self, object_name: str) -> GridPlotView:
         plot_view = GridPlotView(
             color_resolver=self._color_resolver,
-            show_generic_controls=False,
+            observation_style=self._observation_style,
             parent=self,
         )
         plot_view.setObjectName(object_name)
         plot_view.copyFitDataRequested.connect(self.copy_dataset_to_clipboard)
         plot_view.set_dark_mode(self._dark_mode)
-        plot_view.set_live_layout_locked(self._live_layout_locked)
         plot_view.set_copy_allowed(self._copy_allowed)
         return plot_view
 
@@ -490,18 +703,15 @@ class RunResultsTab(QtWidgets.QWidget):
         self._curves = values
         self._dataset_presentation = MappingProxyType(dict(presentation))
         if values:
+            self._empty_label.hide()
             self._ensure_subtabs(values)
             rendered = self._refresh_active_plot_view()
         else:
-            # Terminal curve failure can leave the existing dataset tabs in
-            # place while Summary and Apply remain valid. Clear every
-            # physical view so an inactive tab cannot reveal its old curves.
-            for plot_view in self._dataset_plot_views.values():
-                plot_view.set_projection((), self._dataset_presentation)
-            if self._all_datasets_plot_view is not None:
-                self._all_datasets_plot_view.set_projection(
-                    (), self._dataset_presentation
-                )
+            self._dataset_tab_ids = []
+            self._dataset_labels = {}
+            self._dataset_plot_views = {}
+            self._all_datasets_plot_view = None
+            self._clear_subtabs()
             rendered = False
         self.copyAvailableChanged.emit(self.copy_eligible())
         return rendered
@@ -539,6 +749,7 @@ class RunResultsTab(QtWidgets.QWidget):
         if 0 <= int(index) < self._subtab_stack.count():
             self._subtab_stack.setCurrentIndex(int(index))
         self._refresh_active_plot_view()
+        self._refresh_summary()
         self.copyAvailableChanged.emit(self.copy_eligible())
 
     def _clear_subtabs(self) -> None:

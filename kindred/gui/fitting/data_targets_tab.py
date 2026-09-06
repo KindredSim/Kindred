@@ -11,7 +11,7 @@ from kindred.gui.fitting.unified_dataset_list import UnifiedDatasetList
 
 
 class DataTargetsTab(QtWidgets.QWidget):
-    """Unified master/detail container: dataset list left, one table right."""
+    """Keep dataset navigation beside the selected dataset's editors."""
 
     def __init__(
         self,
@@ -35,42 +35,28 @@ class DataTargetsTab(QtWidgets.QWidget):
 
         splitter = QtWidgets.QSplitter(Qt.Horizontal, self)
 
-        # LEFT: unified dataset list + Fit data panel, scrollable
-        left_panel = QtWidgets.QWidget()
-        left_layout = QtWidgets.QVBoxLayout(left_panel)
+        left = QtWidgets.QWidget(splitter)
+        left_layout = QtWidgets.QVBoxLayout(left)
         left_layout.setContentsMargins(0, 0, 0, 0)
         left_layout.setSpacing(6)
-
-        self.unified_list = UnifiedDatasetList(parent=left_panel)
+        self.unified_list = UnifiedDatasetList(parent=left)
         left_layout.addWidget(self.unified_list, stretch=1)
-
-        left_layout.addWidget(self.data_settings_panel)
-
-        left_scroll = QtWidgets.QScrollArea()
-        left_scroll.setWidgetResizable(True)
-        left_scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
-        left_scroll.setWidget(left_panel)
-        splitter.addWidget(left_scroll)
-
-        # RIGHT: one screenshot-authoritative unified species/IC presenter.
+        data_scroll = QtWidgets.QScrollArea(left)
+        data_scroll.setWidgetResizable(True)
+        data_scroll.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
+        data_scroll.setWidget(self.data_settings_panel)
+        data_scroll.setMinimumWidth(
+            self.data_settings_panel.minimumSizeHint().width()
+            + data_scroll.verticalScrollBar().sizeHint().width()
+        )
+        left_layout.addWidget(data_scroll, stretch=1)
+        splitter.addWidget(left)
         splitter.addWidget(self.species_table)
-
-        splitter.setCollapsible(0, False)
-        splitter.setCollapsible(1, False)
+        splitter.setChildrenCollapsible(False)
         splitter.setStretchFactor(0, 2)
         splitter.setStretchFactor(1, 5)
         splitter.setSizes([240, 620])
-
         layout.addWidget(splitter)
-
-        # Keep the unified presenter visible as one physical table.
-        sp = self.species_table.sizePolicy()
-        if sp.verticalPolicy() == QtWidgets.QSizePolicy.MinimumExpanding:
-            sp.setVerticalPolicy(QtWidgets.QSizePolicy.Preferred)
-            self.species_table.setSizePolicy(sp)
-
-        # Ensure the unified table does not collapse inside the splitter.
-        self.species_table.setMinimumHeight(300)
 
         # Wire unified list selection to both panels.
         self.unified_list.currentDatasetChanged.connect(self._on_unified_dataset_selected)

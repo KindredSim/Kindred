@@ -8,6 +8,8 @@ labels into labels, tabs, list rows, status/footer messages, or plot titles.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from html import escape
+import re
 
 __all__ = [
     "CompactText",
@@ -24,7 +26,10 @@ __all__ = [
     "compact_plot_title_label",
     "compact_text",
     "dataset_alias",
+    "literal_tooltip",
     "scientific_symbol_label",
+    "scientific_symbol_html",
+    "scientific_symbol_spoken",
 ]
 
 _SCIENTIFIC_SYMBOL_LABELS = {
@@ -39,6 +44,43 @@ _SCIENTIFIC_SYMBOL_LABELS = {
 def scientific_symbol_label(symbol: str) -> str:
     """Project one exact scientific base symbol into its visible label."""
     return _SCIENTIFIC_SYMBOL_LABELS.get(symbol, symbol)
+
+
+def literal_tooltip(text: str) -> str:
+    """Prevent Qt's automatic rich-text detection from interpreting authored text."""
+    return "<qt>" + escape(text).replace("\n", "<br>") + "</qt>" if "<" in text else text
+
+
+def _scientific_parts(symbol: str, family: str, role: str) -> tuple[str, str] | None:
+    if family == "time" and role in {"t_start", "t_end"} and symbol == role:
+        return "t", role[2:]
+    if role in {"k", "kf", "kr", "Keq"} and family in {
+        "Constant", "Arrhenius", "Eyring", "reverse", "equilibrium"
+    } and re.fullmatch(re.escape(role) + r"[0-9]+", symbol):
+        return ("K", "eq" + symbol[3:]) if role == "Keq" else ("k", symbol[1:])
+    if (family, role) in {
+        ("Eyring", "dG_act"), ("Eyring", "kappa"),
+        ("equilibrium", "dG_eq"),
+    } and re.fullmatch(re.escape(role) + r"[0-9]*", symbol):
+        return scientific_symbol_label(role), symbol[len(role):]
+    return None
+
+
+def scientific_symbol_html(symbol: str, *, family: str, role: str) -> str:
+    """Project only an explicitly classified scientific coordinate to rich text."""
+    parts = _scientific_parts(symbol, family, role)
+    if parts is None:
+        return escape(symbol)
+    base, subscript = parts
+    return f"<i>{escape(base)}</i>" + (f"<sub>{escape(subscript)}</sub>" if subscript else "")
+
+
+def scientific_symbol_spoken(symbol: str, *, family: str, role: str) -> str:
+    parts = _scientific_parts(symbol, family, role)
+    if parts is None:
+        return symbol
+    base, subscript = parts
+    return base + (f" subscript {subscript}" if subscript else "")
 
 
 ELLIPSIS = "…"

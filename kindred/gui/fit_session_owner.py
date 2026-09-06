@@ -31,10 +31,8 @@ from kindred.gui.fitting.launch import (
     prune_fit_analysis_coordinates,
     convert_fit_parameter_scope,
 )
+from kindred.gui.fitting.reporting import fit_completion_presentation
 from kindred.gui.fitting.window import FittingWindow
-from kindred.gui.fitting.reporting import (
-    fit_candidate_report_text,
-)
 from kindred.gui.fitting.worker import (
     FitCandidate,
     FitLiveUpdate,
@@ -66,6 +64,7 @@ class FitSessionOwner(QtCore.QObject):
         session: ProjectSession,
         registry: WorkspaceTabRegistry,
         gate: ComputationGate,
+        observation_style_getter: Callable[[], tuple[str, float, float]],
         color_resolver: ColorResolver | None = None,
         parent_widget: QtWidgets.QWidget | None = None,
         window_factory: WindowFactory = FittingWindow,
@@ -86,6 +85,7 @@ class FitSessionOwner(QtCore.QObject):
         self._registry = registry
         self._gate = gate
         self._color_resolver = color_resolver
+        self._observation_style_getter = observation_style_getter
         self._parent_widget = parent_widget
         self._window_factory = window_factory
         self._window: FittingWindow | None = None
@@ -97,6 +97,10 @@ class FitSessionOwner(QtCore.QObject):
         self._closing = False
         self._application_close_fenced = False
         self._application_close_settlement_pending = False
+
+    def refresh_plot_preferences(self) -> None:
+        if self._window is not None:
+            self._window.set_observation_style(*self._observation_style_getter())
 
     @property
     def project_defaults(self) -> FitDefaults:
@@ -173,6 +177,7 @@ class FitSessionOwner(QtCore.QObject):
                 origin,
                 close_handler=self._request_window_close,
                 color_resolver=fit_color_resolver,
+                observation_style=self._observation_style_getter(),
                 parent=self._parent_widget,
             )
         except (TypeError, ValueError, KeyError, LookupError) as exc:
@@ -190,7 +195,7 @@ class FitSessionOwner(QtCore.QObject):
             window.project_setup_snapshot(setup)
             window.set_initial_reset_available(setup)
             window.set_shared_seed_available(False)
-            window.set_apply_available(False)
+            window.set_apply_available(False, "Run a fit to obtain values to apply.")
         except (TypeError, ValueError, KeyError) as exc:
             window.deleteLater()
             self._window = None
@@ -306,7 +311,7 @@ class FitSessionOwner(QtCore.QObject):
                 lambda w=worker: self._on_cancelled(w)
             )
             worker.finished.connect(
-                lambda w=worker: self._on_worker_finished(w)
+                lambda w=worker, r=request: self._finish_worker(w, r)
             )
             self._worker = worker
             self._application_close_settlement_pending = True
@@ -367,7 +372,7 @@ class FitSessionOwner(QtCore.QObject):
             window=window,
         )
         self.execution_changed.emit(True)
-        self._set_status("Fit started.")
+        self._set_status("Fit started.", phase="Running", detail="Waiting for the first complete candidate")
         return True
 
     def _install_started_request_state(
@@ -425,7 +430,8 @@ class FitSessionOwner(QtCore.QObject):
         if worker is None:
             return False
         worker.request_stop()
-        self._set_status("Fit stop requested; retaining this run's best complete candidate.")
+        self._set_status("Fit stop requested; retaining this run's best complete candidate.",
+                         phase="Stopping", detail="Best complete candidate will be retained")
         return True
 
     @QtCore.Slot()
@@ -438,7 +444,8 @@ class FitSessionOwner(QtCore.QObject):
             return False
         self._worker.pause()
         self._set_status(
-            "Fit pause requested; the current evaluation will finish before execution pauses."
+            "Fit pause requested; the current evaluation will finish before execution pauses.",
+            phase="Pause requested", detail="Current evaluation is finishing"
         )
         return True
 
@@ -451,7 +458,7 @@ class FitSessionOwner(QtCore.QObject):
         ):
             return False
         self._worker.resume()
-        self._set_status("Fit resumed.")
+        self._set_status("Fit resumed.", phase="Running", detail="")
         return True
 
     @QtCore.Slot(object)
@@ -502,21 +509,18 @@ class FitSessionOwner(QtCore.QObject):
         if not isinstance(window, FittingWindow):
             raise TypeError("Fit candidate presentation requires FittingWindow.")
         window.clear_candidate()
+        window.set_apply_available(False, "Run a fit to obtain current values to apply.")
 
     @QtCore.Slot()
     def results_summary(self) -> bool:
         """Render the human-readable Summary from retained Fit facts."""
 
-        candidate = self._candidate
-        if candidate is None or self._window is None:
-            self._set_status("No completed Fit run is available.")
+        if self._window is None:
             return False
-        try:
-            self._window.render_results_summary(fit_candidate_report_text(candidate))
-            return True
-        except Exception as exc:
-            self._set_status(f"Fit Results Summary failed: {exc}")
-            return False
+        # Results already projects the current execution or terminal. Retained
+        # candidate custody may still belong to a previous attempt during retry.
+        self._window.render_results_summary()
+        return True
 
     @staticmethod
     def _candidate_curves(
@@ -675,9 +679,9 @@ class FitSessionOwner(QtCore.QObject):
             or self._worker is not worker
         ):
             return
-        if self._window is not None:
+        if self._window is not None and value < 100:
             self._window.set_progress(value)
-        self._set_status(text)
+        self._set_status(text, present=value < 100)
 
     def _on_best(self, worker: GlobalFitWorker, update: object) -> None:
         if (
@@ -728,13 +732,11 @@ class FitSessionOwner(QtCore.QObject):
         # Keep terminal actions disabled until the worker's finished callback
         # releases execution custody.  The candidate itself remains in owner
         # custody until finished releases the worker.
-        self._set_status(candidate.result.message)
+        self._set_status(candidate.result.message, present=False)
 
     def _present_candidate(
         self,
         candidate: FitCandidate,
-        *,
-        announce: bool = True,
     ) -> None:
         """Project one retained candidate into the terminal Fit presentation."""
 
@@ -748,25 +750,18 @@ class FitSessionOwner(QtCore.QObject):
             window.project_setup_snapshot(terminal_setup)
             window.set_last_fit_reset_available(terminal_setup)
             curves, curve_failure = self._candidate_curves(candidate)
+            _completion, complete = fit_completion_presentation(candidate)
+            if complete:
+                window.set_progress(100)
             window.set_terminal_presentation(
                 candidate,
                 curves=curves,
                 curve_failure=curve_failure,
             )
-            window.set_apply_available(self._candidate_can_apply(candidate))
+            apply_reason = self._candidate_apply_reason(candidate)
+            window.set_apply_available(not apply_reason, apply_reason)
         except Exception as exc:
             self._set_status(f"Fit result presentation failed: {exc}")
-        else:
-            if announce:
-                self._set_status(candidate.result.message)
-
-    def _restore_candidate_presentation(self) -> None:
-        """Restore retained terminal Fit state after a transient attempt."""
-
-        candidate = self._candidate
-        if candidate is None or self._window is None:
-            return
-        self._present_candidate(candidate, announce=False)
 
     @QtCore.Slot(str)
     def seed_shared_fit(self, statistic: str) -> bool:
@@ -884,19 +879,16 @@ class FitSessionOwner(QtCore.QObject):
         )
 
     @classmethod
-    def _candidate_can_apply(cls, candidate: FitCandidate) -> bool:
-        if any(
-            parameter.scope == "per_dataset"
-            and parameter.selected_config.fit
-            for parameter in candidate.setup_snapshot.parameters
-        ):
-            return False
+    def _candidate_apply_reason(cls, candidate: FitCandidate) -> str:
+        if any(parameter.scope == "per_dataset" and parameter.selected_config.fit
+               for parameter in candidate.setup_snapshot.parameters):
+            return "Configure an ordinary Shared Fit before applying per-dataset parameters."
         try:
             parameter_values = cls._candidate_publishable_parameter_values(candidate)
             initial_values = candidate.initial_values_by_set
-        except (TypeError, ValueError, KeyError):
-            return False
-        return bool(parameter_values or initial_values)
+        except (TypeError, ValueError, KeyError) as exc:
+            return f"Fit values cannot be applied: {exc}"
+        return "" if parameter_values or initial_values else "This fit has no fitted values to apply."
 
     @QtCore.Slot()
     def apply_fit_to_project(self) -> bool:
@@ -1004,7 +996,7 @@ class FitSessionOwner(QtCore.QObject):
         window.project_setup_snapshot(rebased_setup)
         window.set_last_fit_reset_available(rebased_last_fit_setup)
         self.project_document_changed.emit(origin.tab_id)
-        window.set_apply_available(False)
+        window.set_apply_available(False, "These Fit values have already been applied to the project.")
         self._set_status("Centred Fit applied: overall values published; dataset estimates not applied (recorded as mechanism-source provenance)." if centred_provenance else "Fit candidate applied to the project.")
         return True
 
@@ -1053,7 +1045,7 @@ class FitSessionOwner(QtCore.QObject):
         if self._window is not None:
             self._clear_candidate_presentation(self._window)
             self._window.set_terminal_failure(failure)
-        self._set_status(f"Fit failed: {failure.message}")
+        self._set_status(f"Fit failed: {failure.message}", present=False)
 
     def _on_unavailable(
         self,
@@ -1073,7 +1065,7 @@ class FitSessionOwner(QtCore.QObject):
         cause = unavailable.factual_cause
         self._set_status(
             "Fit result scientifically unavailable: "
-            + (cause.message if cause is not None else unavailable.stage)
+            + (cause.message if cause is not None else unavailable.stage), present=False
         )
 
     def _on_cancelled(self, worker: GlobalFitWorker) -> None:
@@ -1088,26 +1080,21 @@ class FitSessionOwner(QtCore.QObject):
         if self._window is not None:
             self._clear_candidate_presentation(self._window)
         self._invalidate_candidate_custody()
-        self._set_status("Fit stopped before any complete candidate was evaluated.")
+        self._set_status("Fit stopped before any complete candidate was evaluated.",
+                         phase="Stopped", detail="No complete candidate was evaluated")
 
-    def _on_worker_finished(self, worker: GlobalFitWorker) -> None:
-        """Release owner custody only after the direct terminal was emitted."""
-
-        self._finish_worker(expected=worker)
-
-    def _finish_worker(
-        self,
-        expected: GlobalFitWorker | None = None,
-    ) -> None:
+    def _finish_worker(self, expected: GlobalFitWorker, request: FitExecutionRequest) -> None:
+        """Release custody and present only this request's terminal candidate."""
         worker = self._worker
-        if expected is not None and worker is not expected:
+        if worker is not expected:
             return
         self._worker = None
         self._gate.release(self)
         closing = self._closing
         if self._window is not None and not self._application_close_fenced and not closing:
             self._window.set_executing(False)
-            self._restore_candidate_presentation()
+            if self._candidate is not None and self._candidate.request is request:
+                self._present_candidate(self._candidate)
             setup = self._accepted_setup()
             self._window.set_shared_seed_available(setup is not None and self._setup_can_seed_shared(setup))
         self.execution_changed.emit(False)
@@ -1212,7 +1199,8 @@ class FitSessionOwner(QtCore.QObject):
         if self._window is not None:
             self._window.set_shared_seed_available(self._setup_can_seed_shared(setup))
 
-    def _set_status(self, text: str) -> None:
+    def _set_status(self, text: str, *, phase: str | None = None,
+                    detail: str = "", present: bool = True) -> None:
         if self._application_close_fenced:
             return
         message = str(text)
@@ -1236,7 +1224,10 @@ class FitSessionOwner(QtCore.QObject):
                 )
         if self._window is not None:
             try:
-                self._window.set_status(message)
+                if phase is not None:
+                    self._window.set_execution_status(phase, detail)
+                elif present:
+                    self._window.set_status(message)
             except RuntimeError:
                 pass
         self.status_changed.emit(message)

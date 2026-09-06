@@ -6,7 +6,9 @@ from __future__ import annotations
 import re
 from typing import Optional
 
-from PySide6 import QtCore, QtGui
+from PySide6 import QtCore, QtGui, QtWidgets
+
+from kindred.gui.theme_manager import semantic_color
 
 from kindred.core.simulator.algebra_section import is_algebra_line
 
@@ -42,54 +44,14 @@ class MechanismHighlighter(QtGui.QSyntaxHighlighter):
         """
         super().__init__(parent)
 
-        # Define text formats
         self.formats = {}
-
-        # Keywords (reaction, equilibrium, etc.)
-        keyword_format = QtGui.QTextCharFormat()
-        keyword_format.setForeground(QtGui.QColor(147, 112, 219))  # Medium purple
-        keyword_format.setFontWeight(QtGui.QFont.Bold)
-        self.formats['keyword'] = keyword_format
-
-        # Species names (A, B, ATP, etc.)
-        species_format = QtGui.QTextCharFormat()
-        species_format.setForeground(QtGui.QColor(70, 130, 180))  # Steel blue
-        self.formats['species'] = species_format
-
-        # Operators (->, =>, <->, <=>, +)
-        operator_format = QtGui.QTextCharFormat()
-        operator_format.setForeground(QtGui.QColor(220, 20, 60))  # Crimson red
-        operator_format.setFontWeight(QtGui.QFont.Bold)
-        self.formats['operator'] = operator_format
-
-        # Rate constants (k=, kf=, kr=, Keq=)
-        rate_format = QtGui.QTextCharFormat()
-        rate_format.setForeground(QtGui.QColor(34, 139, 34))  # Forest green
-        rate_format.setFontWeight(QtGui.QFont.Bold)
-        self.formats['rate'] = rate_format
-
-        # Numbers (1.0, 1e-5, etc.)
-        number_format = QtGui.QTextCharFormat()
-        number_format.setForeground(QtGui.QColor(255, 140, 0))  # Dark orange
-        self.formats['number'] = number_format
-
-        # Comments (#...)
-        comment_format = QtGui.QTextCharFormat()
-        comment_format.setForeground(QtGui.QColor(128, 128, 128))  # Gray
-        comment_format.setFontItalic(True)
-        self.formats['comment'] = comment_format
-
-        # Energy terms (Ea=, dG_act=, dG_eq=, A=)
-        energy_format = QtGui.QTextCharFormat()
-        energy_format.setForeground(QtGui.QColor(0, 206, 209))  # Dark turquoise
-        energy_format.setFontWeight(QtGui.QFont.Bold)
-        self.formats['energy'] = energy_format
-
-        # Initial conditions ([A]=)
-        initial_format = QtGui.QTextCharFormat()
-        initial_format.setForeground(QtGui.QColor(199, 21, 133))  # Medium violet red
-        initial_format.setFontWeight(QtGui.QFont.Bold)
-        self.formats['initial'] = initial_format
+        for role in ("keyword", "species", "operator", "rate", "number", "comment", "energy", "initial"):
+            text_format = QtGui.QTextCharFormat()
+            if role in {"keyword", "operator", "rate", "energy", "initial"}:
+                text_format.setFontWeight(QtGui.QFont.Bold)
+            if role == "comment":
+                text_format.setFontItalic(True)
+            self.formats[role] = text_format
 
         # Define highlighting rules (order matters — setFormat is last-wins,
         # so broad catch-alls go first and specific patterns override them).
@@ -153,6 +115,25 @@ class MechanismHighlighter(QtGui.QSyntaxHighlighter):
 
         # 9. Comments (applied last — highest effective priority)
         self.rules.append((re.compile(r'#[^\n]*'), 'comment', True))
+        self.set_theme(dark_mode=QtWidgets.QApplication.palette().color(QtGui.QPalette.Text).lightness() > 128)
+
+    def set_theme(self, *, dark_mode: bool) -> None:
+        colors = {
+            "keyword": ("#7040a0", "#c5a0ef"),
+            "species": ("#246398", "#8bc5f2"),
+            "number": ("#925000", "#ffc078"),
+            "energy": ("#006a70", "#7ddde2"),
+            "initial": ("#983172", "#ef9ed2"),
+        }
+        semantic_roles = {"comment": "muted", "rate": "success", "operator": "error"}
+        for role, text_format in self.formats.items():
+            color = (
+                semantic_color(semantic_roles[role], dark_mode)
+                if role in semantic_roles
+                else QtGui.QColor(colors[role][int(dark_mode)])
+            )
+            text_format.setForeground(color)
+        self.rehighlight()
 
     def highlightBlock(self, text: str):
         """

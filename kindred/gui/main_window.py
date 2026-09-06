@@ -30,7 +30,11 @@ from kindred.core.dataset_mapping import (
     with_confirmed_observation_mapping,
     with_validated_fit_inclusion,
 )
-from kindred.core.datasets.observation_mapping import suggest_observation_mapping
+from kindred.core.datasets.observation_mapping import (
+    ObservationMappingError,
+    normalize_observation_mapping,
+    suggest_observation_mapping,
+)
 from kindred.core.mechanism_source import MechanismAuthoringSource
 from kindred.core.fitting_method_policy import SUPPORTED_FIT_METHODS
 from kindred.core.project_document import (
@@ -142,7 +146,7 @@ from kindred.gui.widgets.right_panel import RightPanelTabbed
 from kindred.gui.widgets.simulation_panel import SimulationPanel
 from kindred.gui.widgets.solver_settings import SimulationSettingsDialog
 from kindred.gui.widgets.symbolic_calculator_panel import SymbolicCalculatorPanel
-from kindred.gui.ui_helpers import setup_scientific_validator
+from kindred.gui.ui_helpers import clamp_initial_size, setup_scientific_validator
 from kindred.gui.workspace_result_presenter import (
     ResultRenderInput,
     VisibleResultSet,
@@ -166,7 +170,7 @@ logger = logging.getLogger(__name__)
 
 __all__ = ["MainWindow"]
 
-_ABOUT_DIALOG_MIN_WIDTH = 420
+_ABOUT_DIALOG_PREFERRED_WIDTH = 520
 _ABOUT_DIALOG_IMAGE_MAX_SIZE = 320
 
 
@@ -210,6 +214,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._run_action: QtGui.QAction | None = None
         self._new_project_action: QtGui.QAction | None = None
         self._open_project_action: QtGui.QAction | None = None
+        self._load_data_action: QtGui.QAction | None = None
         self._xlsx_export_action: QtGui.QAction | None = None
         self._diagnostic_log_dialog: QtWidgets.QDialog | None = None
         self._dataset_import_progress_dialog: QtWidgets.QProgressDialog | None = None
@@ -219,7 +224,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._current_row_refreshing: dict[str, ProjectDocument] = {}
         self.setObjectName("kindredMainWindow")
         self.setWindowTitle("Kindred")
-        self.resize(self._startup_size())
+        startup_size = self._startup_size()
+        clamp_initial_size(self, startup_size.width(), startup_size.height())
         self.setDockNestingEnabled(True)
 
         self._workspace = ProjectWorkspaceWidget(self)
@@ -262,6 +268,11 @@ class MainWindow(QtWidgets.QMainWindow):
             registry=self._workspace_tab_registry,
             gate=self._computation_gate,
             color_resolver=self.config_controller.species_color,
+            observation_style_getter=lambda: (
+                self.config_controller.experimental_point_shape(),
+                self.config_controller.experimental_point_size(),
+                self.config_controller.experimental_point_opacity(),
+            ),
             parent_widget=self,
             parent=self,
         )
@@ -410,6 +421,7 @@ class MainWindow(QtWidgets.QMainWindow):
         overlay_panel = DatasetOverlayPanel(
             self._workspace,
             color_for_species=self.config_controller.species_color,
+            experimental_point_shape=self.config_controller.experimental_point_shape,
             experimental_point_size=self.config_controller.experimental_point_size,
             experimental_point_opacity=(
                 self.config_controller.experimental_point_opacity
@@ -658,6 +670,9 @@ class MainWindow(QtWidgets.QMainWindow):
         bundle.overlay_panel.speciesColorRequested.connect(
             self._set_species_color
         )
+        bundle.overlay_panel.experimentalPointShapeRequested.connect(
+            self._set_experimental_point_shape
+        )
         bundle.overlay_panel.experimentalPointSizeRequested.connect(
             self._set_experimental_point_size
         )
@@ -701,6 +716,15 @@ class MainWindow(QtWidgets.QMainWindow):
             except Exception as exc:
                 logger.warning("Could not persist species color: %s", exc)
                 self.set_status_text(f"Species color was not persisted: {exc}")
+
+    def _set_experimental_point_shape(self, shape: str) -> None:
+        if self._mutation_input_admitted("Change Experimental Point Shape"):
+            try:
+                self.config_controller.set_experimental_point_shape(shape)
+            except Exception as exc:
+                logger.warning("Could not persist experimental point shape: %s", exc)
+                self.set_status_text(f"Experimental point shape was not persisted: {exc}")
+                self._refresh_application_plot_preferences()
 
     def _set_experimental_point_size(self, request: object) -> None:
         if self._mutation_input_admitted("Change Experimental Point Size"):
@@ -1164,6 +1188,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._refresh_project_state()
 
     def _refresh_application_plot_preferences(self) -> None:
+        self._fit_session_owner.refresh_plot_preferences()
         for tab in self._project_session.document.tabs:
             bundle = self._tab_surfaces.get(tab.tab_id)
             if bundle is None:
@@ -1356,6 +1381,7 @@ class MainWindow(QtWidgets.QMainWindow):
             mechanism_species=canonical_species_names(tab),
             active_overlay_layers=experimental_layers,
             color_by_axis_selection=color_by_axis_selection,
+            experimental_point_shape=self.config_controller.experimental_point_shape(),
             experimental_point_size=(
                 self.config_controller.experimental_point_size()
             ),
@@ -3874,7 +3900,8 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         explanation.setWordWrap(True)
         layout.addWidget(explanation)
-        form = QtWidgets.QFormLayout()
+        body = QtWidgets.QWidget(dialog)
+        form = QtWidgets.QFormLayout(body)
         editors: dict[str, QtWidgets.QComboBox] = {}
         for raw_observation_id, column in observations:
             combo = QtWidgets.QComboBox(dialog)
@@ -3889,28 +3916,43 @@ class MainWindow(QtWidgets.QMainWindow):
                 combo.setCurrentIndex(combo.findData(selected))
             form.addRow(column, combo)
             editors[raw_observation_id] = combo
-        layout.addLayout(form)
+        scroll = QtWidgets.QScrollArea(dialog)
+        scroll.setWidgetResizable(True)
+        scroll.setWidget(body)
+        layout.addWidget(scroll, 1)
+        feedback = QtWidgets.QLabel(dialog)
+        feedback.setTextFormat(QtCore.Qt.TextFormat.PlainText)
+        feedback.setWordWrap(True)
+        layout.addWidget(feedback)
+        mapping: tuple[tuple[str, str], ...] = ()
+
+        def accept_mapping() -> None:
+            nonlocal mapping
+            try:
+                mapping = normalize_observation_mapping(
+                    (
+                        (raw_id, combo.currentData())
+                        for raw_id, combo in editors.items()
+                        if combo.currentData() is not None
+                    ),
+                    raw_observations=observations,
+                    model_targets=targets,
+                )
+            except ObservationMappingError as exc:
+                feedback.setText(str(exc))
+                return
+            dialog.accept()
+
         buttons = QtWidgets.QDialogButtonBox(
             QtWidgets.QDialogButtonBox.StandardButton.Ok
             | QtWidgets.QDialogButtonBox.StandardButton.Cancel,
             parent=dialog,
         )
-        buttons.accepted.connect(dialog.accept)
+        buttons.accepted.connect(accept_mapping)
         buttons.rejected.connect(dialog.reject)
         layout.addWidget(buttons)
+        clamp_initial_size(dialog, 620, 520)
         if dialog.exec() != QtWidgets.QDialog.DialogCode.Accepted:
-            return None
-        mapping = tuple(
-            (raw_observation_id, str(combo.currentData()))
-            for raw_observation_id, combo in editors.items()
-            if combo.currentData() is not None
-        )
-        if len({target for _raw_id, target in mapping}) != len(mapping):
-            QtWidgets.QMessageBox.warning(
-                self,
-                title,
-                "Each model target may be mapped from at most one column.",
-            )
             return None
         return mapping
 
@@ -4169,7 +4211,7 @@ class MainWindow(QtWidgets.QMainWindow):
             QtGui.QKeySequence.StandardKey.SaveAs,
             "saveProjectAsAction",
         )
-        self._add_action(
+        self._load_data_action = self._add_action(
             file_menu,
             "Load Data...",
             lambda: self._selected_bundle().data_panel.trigger_load_dialog(),
@@ -4521,7 +4563,14 @@ class MainWindow(QtWidgets.QMainWindow):
         defaults = self._fit_session_owner.project_defaults
         dialog = QtWidgets.QDialog(self)
         dialog.setWindowTitle("Fitting Defaults")
-        form = QtWidgets.QFormLayout(dialog)
+        layout = QtWidgets.QVBoxLayout(dialog)
+        scroll = QtWidgets.QScrollArea(dialog)
+        scroll.setWidgetResizable(True)
+        body = QtWidgets.QWidget(scroll)
+        scroll.setWidget(body)
+        layout.addWidget(scroll, 1)
+        form = QtWidgets.QFormLayout(body)
+        form.setRowWrapPolicy(QtWidgets.QFormLayout.RowWrapPolicy.WrapLongRows)
         scope = QtWidgets.QComboBox(dialog)
         scope.addItem("Current project", "project")
         scope.addItem("New projects (application default)", "application")
@@ -4623,8 +4672,9 @@ class MainWindow(QtWidgets.QMainWindow):
 
         buttons.accepted.connect(accept_candidate)
         buttons.rejected.connect(dialog.reject)
-        form.addRow(buttons)
+        layout.addWidget(buttons)
         sync_method_controls()
+        clamp_initial_size(dialog, 600, 480)
         if dialog.exec() != QtWidgets.QDialog.DialogCode.Accepted:
             return False
         candidate = FitDefaults(
@@ -4787,13 +4837,7 @@ class MainWindow(QtWidgets.QMainWindow):
         bundle = self._tab_surfaces[str(tab_id)]
         if str(tab_id) == self._workspace_tab_registry.active_tab_id:
             self._calculator_stack.setCurrentWidget(bundle.calculator_panel)
-        screen = self.screen()
-        self._workspace.reveal_dock(
-            SYMBOLIC_CALCULATOR_DOCK_SPEC.identity_key,
-            available_geometry=(
-                screen.availableGeometry() if screen is not None else None
-            ),
-        )
+        self._workspace.reveal_dock(SYMBOLIC_CALCULATOR_DOCK_SPEC.identity_key)
 
     def _evaluate_symbolic(self, tab_id: str, query: str):
         bundle = self._tab_surfaces[str(tab_id)]
@@ -4814,10 +4858,12 @@ class MainWindow(QtWidgets.QMainWindow):
             )
             return
         try:
-            MechanismInspectorDialog(
+            dialog = MechanismInspectorDialog(
                 self._workspace_tab_registry.tab(tab_id).prepared_dsl,
                 self,
-            ).exec()
+            )
+            clamp_initial_size(dialog, 760, 560)
+            dialog.exec()
         except Exception as exc:
             QtWidgets.QMessageBox.warning(self, "Mechanism Inspector", str(exc))
 
@@ -4844,7 +4890,7 @@ class MainWindow(QtWidgets.QMainWindow):
         dialog = QtWidgets.QDialog(self)
         dialog.setObjectName("diagnosticLogDialog")
         dialog.setWindowTitle("Diagnostic Log")
-        dialog.resize(800, 560)
+        clamp_initial_size(dialog, 800, 560)
 
         layout = QtWidgets.QVBoxLayout(dialog)
         log_view = QtWidgets.QPlainTextEdit(dialog)
@@ -4938,9 +4984,14 @@ class MainWindow(QtWidgets.QMainWindow):
         dialog = QtWidgets.QDialog(self)
         dialog.setObjectName("aboutKindredDialog")
         dialog.setWindowTitle("About Kindred")
-        dialog.setMinimumWidth(_ABOUT_DIALOG_MIN_WIDTH)
 
-        layout = QtWidgets.QVBoxLayout(dialog)
+        outer = QtWidgets.QVBoxLayout(dialog)
+        scroll = QtWidgets.QScrollArea(dialog)
+        scroll.setWidgetResizable(True)
+        body = QtWidgets.QWidget(scroll)
+        scroll.setWidget(body)
+        outer.addWidget(scroll, 1)
+        layout = QtWidgets.QVBoxLayout(body)
         layout.setContentsMargins(24, 20, 24, 20)
         layout.setSpacing(12)
 
@@ -5021,7 +5072,8 @@ class MainWindow(QtWidgets.QMainWindow):
         layout.addWidget(title_label)
         layout.addWidget(version_label)
         layout.addWidget(body_label)
-        layout.addWidget(button_box)
+        outer.addWidget(button_box)
+        clamp_initial_size(dialog, _ABOUT_DIALOG_PREFERRED_WIDTH, 620)
         return dialog
 
     def _show_about(self) -> None:
@@ -5042,15 +5094,12 @@ class MainWindow(QtWidgets.QMainWindow):
                     raise ValueError("restore rejected stored geometry")
             except (EOFError, RuntimeError, TypeError, ValueError) as exc:
                 logger.warning("Ignoring invalid persisted window geometry: %s", exc)
-        if dock_state is not None:
-            self._workspace.restore_dock_layout(dock_state)
+        self._workspace.restore_dock_layout(dock_state)
+        QtCore.QTimer.singleShot(0, self._workspace.recover_floating_docks)
+        if not geometry and not restore_maximized:
+            preferred = self._startup_size()
             QtCore.QTimer.singleShot(
-                0,
-                lambda: self._workspace.recover_floating_docks(
-                    self.screen().availableGeometry()
-                    if self.screen() is not None
-                    else QtCore.QRect()
-                ),
+                0, lambda: clamp_initial_size(self, preferred.width(), preferred.height())
             )
         if restore_maximized:
             self.restore_persisted_maximized_state()
@@ -5091,6 +5140,7 @@ class MainWindow(QtWidgets.QMainWindow):
             )
         finally:
             action.setChecked(self._theme_manager.applied_dark_mode)
+        self._refresh_application_plot_preferences()
         return bool(applied)
 
     def _startup_size(self) -> QtCore.QSize:
@@ -5099,8 +5149,8 @@ class MainWindow(QtWidgets.QMainWindow):
             return QtCore.QSize(1440, 900)
         available = screen.availableGeometry()
         return QtCore.QSize(
-            max(960, int(available.width() * 0.86)),
-            max(700, int(available.height() * 0.88)),
+            int(available.width() * 0.86),
+            int(available.height() * 0.88),
         )
 
     def restore_persisted_maximized_state(self) -> None:
@@ -5205,6 +5255,10 @@ class MainWindow(QtWidgets.QMainWindow):
         if bundle is None:
             return
         mutation_admitted = self._mutation_input_admitted()
+        if self._load_data_action is not None:
+            self._load_data_action.setEnabled(
+                mutation_admitted and not self._dataset_import_staging.busy
+            )
         self._undo_action.setEnabled(
             mutation_admitted and bundle.editor.native_undo_available()
         )

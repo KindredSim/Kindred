@@ -14,6 +14,8 @@ from typing import Dict, List, Optional
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
+from kindred.gui.ui_helpers import clamp_initial_size, set_bounded_label_text
+from kindred.gui.theme_manager import semantic_color
 from kindred.core.datasets.foundation import ImportedSource
 from kindred.core.datasets.source_rules import PhysicalColumn
 from kindred.core.datasets.csv_import import read_csv_rows_from_bytes
@@ -38,7 +40,6 @@ __all__ = ["ImportConfigDialog", "ImportDialogResult"]
 
 _TIME_CANDIDATES = ["time", "time_s", "t", "Time", "T", "x"]
 _MAX_PREVIEW_ROWS = 20
-_UNIT_ROW_BG = QtGui.QColor(80, 65, 20)  # dark muted amber for dark-theme readability
 
 
 @dataclass
@@ -83,7 +84,7 @@ class ImportConfigDialog(QtWidgets.QDialog):
         self._previewed_sheet_name: Optional[str] = None
         self.setWindowTitle(f"Import: {source.original_filename}")
         self.setModal(True)
-        self.resize(700, 550)
+        clamp_initial_size(self, 700, 550)
 
         self._build_ui()
         self._load_preview()
@@ -106,7 +107,7 @@ class ImportConfigDialog(QtWidgets.QDialog):
         top_workspace_lay = QtWidgets.QVBoxLayout(self._top_workspace)
         top_workspace_lay.setContentsMargins(0, 0, 0, 0)
         top_workspace_lay.setSpacing(8)
-        self._top_splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Vertical, self._top_workspace)
+        self._top_splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal, self._top_workspace)
         self._top_splitter.setChildrenCollapsible(False)
         top_workspace_lay.addWidget(self._top_splitter)
         layout.addWidget(self._top_workspace)
@@ -115,19 +116,18 @@ class ImportConfigDialog(QtWidgets.QDialog):
         self._sheet_section = QtWidgets.QWidget(self._top_splitter)
         sheet_lay = QtWidgets.QVBoxLayout(self._sheet_section)
         sheet_lay.setContentsMargins(0, 0, 0, 0)
-        sheet_header_row = QtWidgets.QHBoxLayout()
+        sheet_header_row = QtWidgets.QGridLayout()
         sheet_header = QtWidgets.QLabel("<b>Sheets</b>", self._sheet_section)
-        sheet_header_row.addWidget(sheet_header)
-        sheet_header_row.addStretch(1)
+        sheet_header_row.addWidget(sheet_header, 0, 0, 1, 2)
         self._btn_select_all = QtWidgets.QPushButton("Select all", self._sheet_section)
         self._btn_invert_sheets = QtWidgets.QPushButton("Invert selection", self._sheet_section)
         self._btn_select_compatible = QtWidgets.QPushButton("Select compatible sheets", self._sheet_section)
-        sheet_header_row.addWidget(self._btn_select_all)
-        sheet_header_row.addWidget(self._btn_invert_sheets)
-        sheet_header_row.addWidget(self._btn_select_compatible)
+        sheet_header_row.addWidget(self._btn_select_all, 1, 0)
+        sheet_header_row.addWidget(self._btn_invert_sheets, 1, 1)
+        sheet_header_row.addWidget(self._btn_select_compatible, 2, 0, 1, 2)
         sheet_lay.addLayout(sheet_header_row)
         self._sheet_list = QtWidgets.QListWidget(self._sheet_section)
-        self._sheet_list.setMinimumHeight(90)
+        self._sheet_list.setMinimumHeight(36)
         sheet_lay.addWidget(self._sheet_list)
         self._sheet_section.setVisible(self._file_type == "xlsx")
 
@@ -143,32 +143,35 @@ class ImportConfigDialog(QtWidgets.QDialog):
         self._preview_table.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.NoSelection)
         preview_lay.addWidget(self._preview_table, 1)
         self._preview_error_label = QtWidgets.QLabel("", self._preview_section)
-        self._preview_error_label.setStyleSheet("QLabel { color: #c00; font-size: 11px; }")
+        set_bounded_label_text(self._preview_error_label, "", max_width=640)
+
         self._preview_error_label.hide()
         preview_lay.addWidget(self._preview_error_label)
         self._top_splitter.addWidget(self._sheet_section)
         self._top_splitter.addWidget(self._preview_section)
         self._top_splitter.setStretchFactor(0, 0)
         self._top_splitter.setStretchFactor(1, 1)
-        self._top_splitter.setSizes([110, 240])
+        self._top_splitter.setSizes([300, 400])
 
         # --- Time column ---
         time_row = QtWidgets.QHBoxLayout()
         time_row.addWidget(QtWidgets.QLabel("Time column:", self))
         self._time_combo = QtWidgets.QComboBox(self)
         self._time_combo.setMinimumWidth(120)
+        self._time_combo.setMaximumWidth(220)
+        self._time_combo.setSizeAdjustPolicy(QtWidgets.QComboBox.AdjustToMinimumContentsLengthWithIcon)
+        self._time_combo.setMinimumContentsLength(10)
         time_row.addWidget(self._time_combo)
         time_row.addStretch(1)
-        self._time_hint = QtWidgets.QLabel("", self)
-        self._time_hint.setStyleSheet("QLabel { color: #c00; font-size: 11px; }")
-        time_row.addWidget(self._time_hint)
         layout.addLayout(time_row)
 
         # --- Unit controls ---
         self._unit_info_label = QtWidgets.QLabel("", self)
+        set_bounded_label_text(self._unit_info_label, "", max_width=640)
         layout.addWidget(self._unit_info_label)
         self._unit_warning_label = QtWidgets.QLabel("", self)
-        self._unit_warning_label.setStyleSheet("QLabel { color: #c60; font-size: 11px; }")
+        set_bounded_label_text(self._unit_warning_label, "", max_width=640)
+
         self._unit_warning_label.hide()
         layout.addWidget(self._unit_warning_label)
 
@@ -204,31 +207,27 @@ class ImportConfigDialog(QtWidgets.QDialog):
         self._species_scroll.setWidgetResizable(True)
         self._species_scroll.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
         self._species_scroll.setWidget(self._species_container)
-        self._species_scroll.setMinimumHeight(120)
+        self._species_scroll.setMinimumHeight(72)
         self._species_scroll.setSizePolicy(
             QtWidgets.QSizePolicy.Policy.Preferred,
             QtWidgets.QSizePolicy.Policy.Expanding,
         )
         layout.addWidget(self._species_scroll, 1)
-        self._species_hint = QtWidgets.QLabel("", self)
-        self._species_hint.setStyleSheet("QLabel { color: #c00; font-size: 11px; }")
-        layout.addWidget(self._species_hint)
-
         # --- Apply to remaining ---
         self._apply_remaining_cb = QtWidgets.QCheckBox("", self)
         if self._file_type == "xlsx" and self._remaining_count > 0:
             self._apply_remaining_cb.setText(
-                "Apply these settings to all other sheets and remaining files"
+                "Use for other sheets and remaining files"
             )
             self._apply_remaining_cb.setVisible(True)
         elif self._file_type == "xlsx":
             self._apply_remaining_cb.setText(
-                "Apply these settings to all other sheets"
+                "Use for other sheets"
             )
             self._apply_remaining_cb.setVisible(True)
         elif self._remaining_count > 0:
             self._apply_remaining_cb.setText(
-                "Apply these settings to remaining files"
+                "Use for remaining files"
             )
             self._apply_remaining_cb.setVisible(True)
         else:
@@ -238,6 +237,8 @@ class ImportConfigDialog(QtWidgets.QDialog):
         # --- Buttons ---
         btn_row = QtWidgets.QHBoxLayout()
         btn_row.addStretch(1)
+        self._readiness_label = QtWidgets.QLabel(self)
+        layout.addWidget(self._readiness_label)
         self._btn_import = QtWidgets.QPushButton("Import", self)
         self._btn_skip = QtWidgets.QPushButton("Skip", self)
         self._btn_cancel = QtWidgets.QPushButton("Cancel All", self)
@@ -247,6 +248,7 @@ class ImportConfigDialog(QtWidgets.QDialog):
         layout.addLayout(btn_row)
 
         # --- Wiring ---
+        self._apply_feedback_palette()
         self._btn_import.clicked.connect(self._on_import)
         self._btn_skip.clicked.connect(self._on_skip)
         self._btn_cancel.clicked.connect(self._on_cancel)
@@ -600,7 +602,8 @@ class ImportConfigDialog(QtWidgets.QDialog):
             for c, val in enumerate(row):
                 item = QtWidgets.QTableWidgetItem(val)
                 if self._unit_row_detected and r == 0:
-                    item.setBackground(QtGui.QBrush(_UNIT_ROW_BG))
+                    item.setBackground(self.palette().brush(QtGui.QPalette.AlternateBase))
+                    item.setForeground(self.palette().brush(QtGui.QPalette.Text))
                 self._preview_table.setItem(r, c, item)
         self._preview_table.resizeColumnsToContents()
 
@@ -650,7 +653,7 @@ class ImportConfigDialog(QtWidgets.QDialog):
                     "Different concentration units detected "
                     "\u2014 each column will be converted independently."
                 )
-                self._unit_warning_label.setStyleSheet("QLabel { color: #8a8; font-size: 11px; }")
+
                 self._unit_warning_label.show()
             else:
                 self._unit_warning_label.clear()
@@ -856,6 +859,7 @@ class ImportConfigDialog(QtWidgets.QDialog):
         sheets_ok = True
         all_sheet_configs_ok = time_ok and species_ok
         incompatible_hint = ""
+        invalid_sheet_hint = ""
         if self._file_type == "xlsx":
             checked_sheet_names = self._get_checked_sheet_names()
             sheets_ok = bool(checked_sheet_names)
@@ -889,23 +893,29 @@ class ImportConfigDialog(QtWidgets.QDialog):
                     sheet_species_ok = self._state_has_valid_species_selection(state)
                     if not (sheet_time_ok and sheet_species_ok):
                         all_sheet_configs_ok = False
+                        requirement = "a time column" if not sheet_time_ok else "at least one species column"
+                        invalid_sheet_hint = f"{sheet_name}: select {requirement}"
                         break
 
         enabled = sheets_ok and all_sheet_configs_ok
         self._btn_import.setEnabled(enabled)
 
-        # Hints
-        if not time_ok:
-            self._time_hint.setText("Select a time column")
-        else:
-            self._time_hint.setText("")
+        reason = ""
+        if not sheets_ok:
+            reason = ("Select at least one sheet to import" if self._sheet_names
+                      else "No sheets are available in this workbook")
+        elif invalid_sheet_hint:
+            reason = invalid_sheet_hint
+        elif not time_ok and not enabled:
+            reason = "Select a time column"
+        elif not species_ok and not enabled:
+            reason = "Select at least one species column"
+        elif not enabled:
+            reason = invalid_sheet_hint or incompatible_hint
+        set_bounded_label_text(self._readiness_label, reason, max_width=640)
+        self._readiness_label.setVisible(bool(reason))
+        self._btn_import.setToolTip(reason)
 
-        if not species_ok:
-            self._species_hint.setText("Select at least one species column")
-        elif incompatible_hint:
-            self._species_hint.setText(incompatible_hint)
-        else:
-            self._species_hint.setText("")
         self._update_bulk_sheet_buttons(time_ok=time_ok, species_ok=species_ok)
 
     # ------------------------------------------------------------------
@@ -1200,6 +1210,27 @@ class ImportConfigDialog(QtWidgets.QDialog):
         if self._result is None:
             return ImportDialogResult(config=None, action="cancel")
         return self._result
+
+    def changeEvent(self, event: QtCore.QEvent) -> None:
+        super().changeEvent(event)
+        if event.type() in (QtCore.QEvent.PaletteChange, QtCore.QEvent.ApplicationPaletteChange):
+            self._apply_feedback_palette()
+
+    def _apply_feedback_palette(self) -> None:
+        dark = self.palette().color(QtGui.QPalette.Text).lightness() > 128
+        for name, role in (("_preview_error_label", "error"), ("_unit_warning_label", "warning"),
+                           ("_readiness_label", "warning")):
+            label = getattr(self, name, None)
+            if label is not None:
+                palette = label.palette()
+                palette.setColor(QtGui.QPalette.WindowText, semantic_color(role, dark))
+                label.setPalette(palette)
+        if hasattr(self, "_preview_table"):
+            for column in range(self._preview_table.columnCount()):
+                item = self._preview_table.item(0, column)
+                if item is not None and self._unit_row_detected:
+                    item.setBackground(self.palette().brush(QtGui.QPalette.AlternateBase))
+                    item.setForeground(self.palette().brush(QtGui.QPalette.Text))
 
     def resizeEvent(self, event: QtGui.QResizeEvent) -> None:
         super().resizeEvent(event)

@@ -8,6 +8,7 @@ define a versioned action graph, identity, or serialization format.
 from __future__ import annotations
 
 import dataclasses
+import html
 import math
 import statistics
 from collections.abc import Mapping
@@ -18,13 +19,16 @@ import numpy as np
 from kindred.core.analysis.fit_statistics import FitMetric
 from kindred.core.analysis.global_fit_execution import FitCoordinate
 from kindred.core.simulation_failure import FactualCause
+from kindred.gui.display_name_policy import scientific_symbol_html
 from kindred.gui.fitting.constants import INITIAL_PREFIX
-from kindred.gui.fitting.worker import FitCandidate
+from kindred.gui.fitting.launch import FitParameterVariable
+from kindred.gui.fitting.worker import FitCandidate, FitLiveUpdate, _fit_coordinate_display_label
 
 __all__ = [
-    "fit_bound_state",
-    "fit_candidate_report_text",
-    "fit_candidate_tracker",
+    "fit_candidate_presentation",
+    "fit_overview",
+    "fit_completion_presentation",
+    "fit_live_presentation",
 ]
 
 FitBoundState = Literal["lower", "upper", "interior"]
@@ -185,16 +189,6 @@ def _display(value: object) -> str:
     return str(value)
 
 
-def _display_coordinate(value: object) -> str:
-    if isinstance(value, FitCoordinate):
-        if value.scope == "centred_overall":
-            return f"Overall · {value.name}"
-        if value.scope == "centred_deviation":
-            return f"Deviation · {value.dataset_id}::{value.name}"
-        return value.display_name
-    return str(value)
-
-
 def _profile_endpoint(endpoint: object) -> dict[str, object]:
     return {
         "status": endpoint.status,
@@ -214,7 +208,6 @@ def _profile_endpoint(endpoint: object) -> dict[str, object]:
 def _profile_interval(coordinate: object, interval: object) -> dict[str, object]:
     return {
         "coordinate": _plain(coordinate),
-        "display_name": _display_coordinate(coordinate),
         "status": interval.status,
         "interval_kind": interval.interval_kind,
         "estimate": interval.estimate,
@@ -271,7 +264,6 @@ def _profile_data(candidate: FitCandidate) -> dict[str, object]:
 def _bootstrap_interval(coordinate: object, interval: object) -> dict[str, object]:
     return {
         "coordinate": _plain(coordinate),
-        "display_name": _display_coordinate(coordinate),
         "status": interval.status,
         "lower": interval.lower,
         "upper": interval.upper,
@@ -411,14 +403,23 @@ def _estimate_rows(candidate: FitCandidate) -> tuple[list[dict[str, object]], li
                 percentage_unavailable_reason=unavailable,
                 dataset_ids=list(settlement.dataset_ids),
                 captured_value_source=captured_source, nominal_value_source="Fit setup")
+            starts = dict(launch_configuration.dataset_values)
+            for dataset_id in settlement.dataset_ids:
+                value = float(settlement.dataset_values[dataset_id])
+                append_row(individual, kind="centred_effective", name=parameter.name,
+                    display_name=parameter.display_name, scope="Effective centred value",
+                    unit=parameter.unit, fitted_value=value, nominal_value=starts[dataset_id],
+                    minimum=configuration.minimum, maximum=configuration.maximum,
+                    bound_state=fit_bound_state(value, configuration.minimum, configuration.maximum, configuration.log10),
+                    dataset_id=dataset_id, dataset_display_name=display_names[dataset_id])
             deviation_bounds = math.log10(configuration.maximum) - math.log10(configuration.minimum) if configuration.log10 else configuration.maximum - configuration.minimum
             for deviation in settlement.deviations:
                 value = float(deviation.decoded_value)
                 absolute, percentage, unavailable = _change(value, 0.0)
                 dataset_id = str(deviation.coordinate.dataset_id)
                 append_row(individual, kind="centred_deviation", name=parameter.name,
-                    display_name=f"Deviation · {dataset_id}::{parameter.display_name}",
-                    scope="Centred dataset deviation (Fit-only)", unit="decades" if configuration.log10 else parameter.unit,
+                    display_name=parameter.display_name,
+                    scope="Log10-coordinate deviation" if configuration.log10 else "Linear-coordinate deviation", unit="decades" if configuration.log10 else parameter.unit,
                     captured_value=0.0, nominal_value=0.0, fitted_value=value,
                     minimum=-deviation_bounds, maximum=deviation_bounds,
                     bound_state=fit_bound_state(
@@ -630,174 +631,273 @@ def _known_input_context(candidate: FitCandidate) -> dict[str, object]:
         "known_condition_source": "captured Fit origin scientific settings"}
 
 
-def _estimate_line(row: Mapping[str, object]) -> str:
-    percentage = _display(row.get("percentage_change")) + "%" if row.get("percentage_change") is not None else str(row.get("percentage_unavailable_reason") or "unavailable")
-    location = f" [{row['dataset_id']}]" if row.get("dataset_id") is not None else ""
-    if row.get("set_id") is not None:
-        location = f" [{row['set_id']}]"
-    return (f"{row.get('display_name', row.get('name'))}{location}: fitted={_display(row.get('fitted_value'))}; "
-        f"nominal={_display(row.get('nominal_value'))}; Δ={_display(row.get('absolute_change'))}; Δ%={percentage}; "
-        f"bounds={_display(row.get('minimum'))}..{_display(row.get('maximum'))} ({row.get('bound_state')})")
-
-
-def _profile_lines(profile: Mapping[str, object]) -> tuple[str, ...]:
-    lines = [f"Profile likelihood: status={profile.get('status')}"]
-    if not profile.get("requested"):
-        return (*lines, "  not requested")
-    if profile.get("method"):
-        lines.append(f"  method: {profile['method']}")
-    if profile.get("unavailable_reason"):
-        lines.append(f"  unavailable reason: {profile['unavailable_reason']}")
-    if profile.get("diagnostic"):
-        lines.append(f"  diagnostic: {_display(profile['diagnostic'])}")
-    for interval in profile.get("intervals", ()):
-        if isinstance(interval, Mapping):
-            lines.append(f"  {interval.get('display_name', interval.get('coordinate'))}: status={interval.get('status')}; lower={_display(interval.get('lower'))}; upper={_display(interval.get('upper'))}; lower outcome={interval.get('lower_outcome')}; upper outcome={interval.get('upper_outcome')}")
-            for side in ("lower_resolution", "upper_resolution"):
-                endpoint = interval.get(side)
-                if isinstance(endpoint, Mapping) and endpoint.get("failure"):
-                    lines.append(f"    {side.removesuffix('_resolution')} failure: {_display(endpoint['failure'])}")
-    return tuple(lines)
-
-
-def _bootstrap_lines(bootstrap: Mapping[str, object]) -> tuple[str, ...]:
-    lines = [f"Residual Bootstrap: status={bootstrap.get('status')}"]
-    if not bootstrap.get("requested"):
-        return (*lines, "  not requested")
-    if bootstrap.get("method"):
-        lines.append(f"  method: {bootstrap['method']}")
-    lines.append(f"  replicates: {bootstrap.get('successful_replicates')} successful, {bootstrap.get('failed_replicates')} failed of {bootstrap.get('replicates')}")
-    if bootstrap.get("unavailable_reason"):
-        lines.append(f"  unavailable reason: {bootstrap['unavailable_reason']}")
-    if bootstrap.get("diagnostic"):
-        lines.append(f"  diagnostic: {_display(bootstrap['diagnostic'])}")
-    if bootstrap.get("first_failed_replicate_diagnostic"):
-        lines.append(
-            "  first failed replicate diagnostic: "
-            f"{_display(bootstrap['first_failed_replicate_diagnostic'])}"
-        )
-    if bootstrap.get("first_failed_replicate_unavailable"):
-        lines.append(
-            "  first failed replicate unavailable: "
-            f"{_display(bootstrap['first_failed_replicate_unavailable'])}"
-        )
-    for interval in bootstrap.get("intervals", ()):
-        if isinstance(interval, Mapping):
-            lines.append(f"  {interval.get('display_name', interval.get('coordinate'))}: status={interval.get('status')}; lower={_display(interval.get('lower'))}; upper={_display(interval.get('upper'))}; reason={_display(interval.get('reason'))}")
-    return tuple(lines)
-
-
-def _render_report(data: Mapping[str, object]) -> str:
-    lines = [f"Fit status: {data.get('status')}", f"Message: {data.get('message') or 'none'}",
-        f"Primary Fit model: {data.get('primary_model') or 'ordinary'}",
-        f"Optimizer converged: {str(data.get('optimizer_converged')).lower()}",
-        f"Weighted SSE: {_metric_text(data.get('weighted_sse'))}", f"Weighted MSE: {_metric_text(data.get('weighted_mse'))}"]
-    if data.get("optimizer_diagnostic"):
-        lines.append(f"Optimizer diagnostic: {_display(data['optimizer_diagnostic'])}")
-    for title, key in (("Shared estimates", "shared_estimates"), ("Per-dataset estimates", "per_dataset_estimates"), ("Initial estimates", "initial_estimates")):
-        rows = data.get(key, ())
-        if rows:
-            lines.append(f"{title}:")
-            lines.extend(f"  {_estimate_line(row)}" for row in rows if isinstance(row, Mapping))
-    aggregates = data.get("aggregates")
-    if aggregates:
-        lines.append("Aggregate metrics:")
-        for row in aggregates:
-            if isinstance(row, Mapping):
-                lines.append(f"  {row.get('display_name', row.get('name'))}: n={row.get('n')}; mean={_display(row.get('arithmetic_mean'))}; median={_display(row.get('median'))}; IQR={_display(row.get('iqr'))}; SD={_display(row.get('sample_sd'))}")
-    lines.append("Dataset metrics:")
-    for row in data.get("metrics_by_dataset", ()):
-        if not isinstance(row, Mapping):
-            continue
-        lines.append(f"  {row.get('dataset_display_name', row.get('dataset_id'))}: weighted SSE={_metric_text(row.get('weighted_sse'))}; weighted MSE={_metric_text(row.get('weighted_mse'))}; weighted RMSE={_metric_text(row.get('weighted_rmse'))}; weighted MAE={_metric_text(row.get('weighted_mae'))}; effective weight={_display(row.get('effective_weight'))}")
-        r_squared = row.get("r_squared_by_series")
-        if isinstance(r_squared, Mapping):
-            lines.extend(f"    R² {name}={_metric_text(metric)}" for name, metric in sorted(r_squared.items()))
-    weighting = data.get("weighting")
-    if isinstance(weighting, Mapping):
-        lines.append(f"Weighting mode: {weighting.get('dataset_weight_mode')}")
-        lines.append(f"Weighting rule: {weighting.get('combined_residual_weighting_rule')}")
-    lines.append("Profile likelihood:")
-    lines.extend(f"  {line}" for line in _profile_lines(data["profile_likelihood"]))
-    lines.append("Residual Bootstrap:")
-    lines.extend(f"  {line}" for line in _bootstrap_lines(data["residual_bootstrap"]))
-    known = data.get("known_input_context")
-    if isinstance(known, Mapping):
-        lines.append("Known input context:")
-        for key in ("temperature_K", "relative_tolerance", "absolute_tolerance", "analytic_jacobian_policy", "solver", "included_dataset_ids"):
-            if key in known:
-                lines.append(f"  {key}: {_display(known[key])}")
-        for condition in known.get("dataset_conditions", ()):
-            if isinstance(condition, Mapping):
-                lines.append(f"  dataset condition: {condition.get('dataset_id')}; included={_display(condition.get('included'))}; t_start={_display(condition.get('resolved_t_start'))}; range={_display((condition.get('data_range_min'), condition.get('data_range_max')))}")
-    return "\n".join(lines)
-
-
 def _metric_text(value: object) -> str:
     if not isinstance(value, Mapping):
         return _display(value)
     if bool(value.get("available")):
         return _display(value.get("value"))
-    return f"unavailable ({value.get('unavailable_reason')})"
+    return f"Unavailable: {value.get('unavailable_reason')}"
 
 
-def fit_candidate_tracker(candidate: FitCandidate) -> tuple[str, tuple[str, ...], tuple[str, ...]]:
-    """Return the small terminal tracker projection synchronously."""
+def _text(value: object) -> str:
+    return html.escape(_display(value)).replace("\n", "<br>")
 
+
+def _table(headers: tuple[str, ...], rows: object, *, rich_columns: tuple[int, ...] = ()) -> str:
+    return ('<table cellspacing="0" cellpadding="5"><tr>'
+            + "".join(f'<th align="left">{_text(header)}</th>' for header in headers)
+            + "</tr>" + "".join("<tr>" + "".join(
+                f'<td valign="top">{value if column in rich_columns else _text(value)}</td>'
+                for column, value in enumerate(row)
+            ) + "</tr>" for row in rows) + "</table>")
+
+
+def _diagnostic(value: object, labels: Mapping[str, str]) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, Mapping):
+        # Human failure chains retain every message, without a nested dict dump.
+        parts = [str(value[key]) for key in ("type", "message", "reason") if value.get(key)]
+        if value.get("cause"):
+            parts.append(_diagnostic(value["cause"], labels))
+        if not parts:
+            parts = [f"{key.replace('_', ' ')}: {_diagnostic(item, labels)}"
+                     for key, item in value.items() if item is not None]
+        text = " — ".join(parts)
+    elif isinstance(value, (list, tuple)):
+        text = "; ".join(_diagnostic(item, labels) for item in value)
+    else:
+        text = str(value)
+    for identity, name in labels.items():
+        text = text.replace(identity, name)
+    return text
+
+
+def _analysis_section(title: str, data: Mapping[str, object], labels: Mapping[str, str],
+                      symbols: Mapping[str, str]) -> str:
+    if not data["requested"]:
+        return ""
+    section = f"<h3>{_text(title)} — {_text(str(data['status']).replace('_', ' '))}</h3>"
+    for key in ("unavailable_reason", "diagnostic", "first_failed_replicate_diagnostic",
+                "first_failed_replicate_unavailable", "primary_fit_diagnostic", "primary_fit_unavailable"):
+        if data.get(key):
+            section += f"<p><b>{_text(key.replace('_', ' ').capitalize())}:</b> {_text(_diagnostic(data[key], labels))}</p>"
+    if "replicates" in data:
+        section += (f"<p>{_text(data['successful_replicates'])} successful; "
+                    f"{_text(data['failed_replicates'])} failed of {_text(data['replicates'])} replicates.</p>")
+    if data.get("method"):
+        section += f"<p>Method: {_text(data['method'])}; confidence level: {_text(data['confidence_level'])}.</p>"
+    rows = []
+    for interval in data["intervals"]:
+        coordinate = interval["coordinate"]
+        if isinstance(coordinate, Mapping):
+            name = symbols.get(str(coordinate["name"]), _text(coordinate["name"]))
+            dataset = coordinate.get("dataset_id")
+            if dataset:
+                name = f"{_text(labels[dataset])} · {name}"
+            if coordinate["scope"] == "centred_overall":
+                name = "Overall · " + name
+            elif coordinate["scope"] == "centred_deviation":
+                name = "Deviation · " + name
+        else:
+            name = _text(coordinate)
+        outcomes = [str(interval[key]) for key in ("reason", "lower_outcome", "upper_outcome") if interval.get(key)]
+        for side in ("lower", "upper"):
+            endpoint = interval.get(side + "_resolution")
+            if endpoint:
+                if endpoint.get("reason"):
+                    outcomes.append(f"{side}: {endpoint['reason']}")
+                if endpoint.get("failure"):
+                    outcomes.append(f"{side}: {_diagnostic(endpoint['failure'], labels)}")
+        if interval.get("endpoint_messages"):
+            outcomes.append(_diagnostic(interval["endpoint_messages"], labels))
+        rows.append((name, interval["lower"], interval["upper"], interval["status"], "; ".join(outcomes)))
+    if rows:
+        section += _table(("Parameter", "Lower", "Upper", "Outcome", "Details"), rows, rich_columns=(0,))
+    return section
+
+
+def _technical_rows(value: object, prefix: str = "") -> list[tuple[str, object]]:
+    """Lay out captured technical facts without embedding a dictionary dump."""
+    if isinstance(value, Mapping):
+        return [row for key, item in value.items()
+                for row in _technical_rows(item, f"{prefix} · {str(key).replace('_', ' ')}".strip(" ·"))]
+    if isinstance(value, (list, tuple)):
+        return [row for index, item in enumerate(value, 1)
+                for row in _technical_rows(item, f"{prefix} · {index}")]
+    return [(prefix, value)]
+
+
+def fit_overview(phase: str, model: str, objective: str, datasets: int, parameters: int) -> tuple[str, ...]:
+    """One compact count convention for live and terminal Fit presentation."""
+    return (phase, f"SSQ {objective}", f"{datasets} datasets", f"{parameters} parameters", model)
+
+
+# Identity, rich/plain symbol, complete context, value and unit. These are
+# call-local GUI entries, never retained scientific results.
+FitValueEntry = tuple[tuple[str, ...], str, str, str, float, str]
+
+
+def fit_completion_presentation(candidate: FitCandidate) -> tuple[str, bool]:
+    """Describe typed settlement facts and whether execution reached completion."""
     result = candidate.result
+    stopped = result.optimizer_diagnostic is not None and result.optimizer_diagnostic.type == "FittingStopped"
+    text = ("Fit stopped · Best complete candidate retained" if stopped else
+            "Fit converged" if result.optimizer_converged else
+            "Fit finished · Optimizer did not converge")
+    complete = not stopped
+    for label, requested, analysis in (
+        ("Profile", candidate.request.setup.profile_likelihood, result.profile_likelihood_result),
+        ("Bootstrap", candidate.request.setup.residual_bootstrap, result.residual_bootstrap_result),
+    ):
+        if requested is None:
+            continue
+        status = "unavailable" if analysis is None else analysis.status
+        if analysis is not None and analysis.provenance.get("settlement") == "not_started_after_stop":
+            status = "not started after Stop"
+        complete = complete and status == "available"
+        text += f" · {label} {'complete' if status == 'available' else status}"
+    return text, complete
+
+
+def fit_live_presentation(
+    update: FitLiveUpdate, parameters: tuple[FitParameterVariable, ...],
+    dataset_labels: Mapping[str, str], initial_labels: Mapping[str, str],
+) -> tuple[tuple[FitValueEntry, ...], str]:
+    """Use admitted parameter roles and the worker's coordinate-label producer."""
+    entries: list[FitValueEntry] = []
+    overall = dict(update.parameters)
+    scalars = {identity: dict(values) for identity, values in update.scalar_values_by_dataset}
+    initials = {identity: dict(values) for identity, values in update.initial_values_by_set}
+    def scalar(parameter: FitParameterVariable, context: str, identity: tuple[str, ...], value: float) -> None:
+        entries.append((identity, scientific_symbol_html(parameter.name, family=parameter.family, role=parameter.role),
+                        parameter.name, context, value, parameter.unit))
+    for parameter in parameters:
+        if parameter.scope not in {"shared", "centred_fixed_effects"}:
+            continue
+        scope = "centred_overall" if parameter.scope == "centred_fixed_effects" else "shared"
+        key = _fit_coordinate_display_label(FitCoordinate(scope, parameter.name))
+        if key in overall:
+            scalar(parameter, "Overall" if scope == "centred_overall" else "Shared", (scope, parameter.name), overall[key])
+    for dataset_id, label in dataset_labels.items():
+        values = scalars.get(dataset_id, {})
+        for parameter in parameters:
+            if parameter.name in values:
+                context = label + (" · Effective centred value" if parameter.scope == "centred_fixed_effects" else " · Per-dataset")
+                scalar(parameter, context, ("dataset", dataset_id, parameter.name), values[parameter.name])
+    for set_id, label in initial_labels.items():
+        for name, value in initials.get(set_id, {}).items():
+            entries.append((("initial", set_id, name), html.escape(name), name,
+                            label + " · Initial", value, "model concentration"))
+    body = '<h3>Best complete candidate</h3>' + _table(
+        ("Dataset / scope", "Parameter", "Value", "Unit"),
+        ((context, symbol, value, unit) for _identity, symbol, _plain_symbol, context, value, unit in entries), rich_columns=(1,))
+    return tuple(entries), body
+
+
+def fit_candidate_presentation(candidate: FitCandidate) -> tuple[tuple[str, ...], str, str, str, tuple[FitValueEntry, ...]]:
+    """Project one terminal into its compact header, document and last provenance."""
+    result = candidate.result
+    labels = {mapped.dataset_id: mapped.display_name for mapped in candidate.origin.mapped_datasets}
     shared, individual = _estimate_rows(candidate)
     initial = _initial_rows(candidate)
+    phase, _complete = fit_completion_presentation(candidate)
+    model = candidate.origin.tab_name
+    objective = _metric_text(_metric(result.weighted_residual_sse))
+    overview = fit_overview(phase, model, objective, len(result.dataset_info), len(candidate.request.setup.parameters))
+    termination = _diagnostic(result.message, labels)
+    body = f"<h2>{_text(phase)}</h2><p>{_text(model)}</p><p>{_text(termination)}</p>"
+    body += f"<p><b>Weighted residual SSE:</b> {_text(objective)} &nbsp; <b>Weighted MSE:</b> {_text(_metric_text(_metric(result.weighted_residual_mse)))}</p>"
+    model_kind = "Centred Fixed Effects" if result.primary_model == "centred_fixed_effects" else "Ordinary global fit"
+    body += f"<p>Model: {_text(model_kind)}.</p>"
+    body += f"<p>Optimizer {'converged' if result.optimizer_converged else 'did not converge'}.</p>"
+    if result.optimizer_diagnostic:
+        body += f"<p><b>Optimizer diagnostic:</b> {_text(_diagnostic(_plain(result.optimizer_diagnostic), labels))}</p>"
+    parameters = {parameter.name: parameter for parameter in candidate.setup_snapshot.parameters}
+    symbols = {name: scientific_symbol_html(name, family=parameter.family, role=parameter.role)
+               for name, parameter in parameters.items()}
+    def parameter_name(row: Mapping[str, object]) -> str:
+        name = str(row["name"])
+        if row.get("kind") == "initial" or name not in parameters:
+            return _text(row["display_name"])
+        label = parameters[name].display_name
+        symbol = symbols[name]
+        if symbol == html.escape(name):
+            return _text(label)
+        return symbol + (_text(label[len(name):]) if label.startswith(name)
+                         else " · " + _text(label))
+    def estimates(title: str, rows: list[dict[str, object]]) -> str:
+        if not rows:
+            return ""
+        return f"<h3>{_text(title)}</h3>" + _table(
+            ("Parameter", "Scope", "Estimate", "Unit", "Starting value", "Bounds", "Bound position"),
+            ((parameter_name(row), row["scope"], row["fitted_value"], row["unit"], row["nominal_value"],
+              f"{_display(row['minimum'])} to {_display(row['maximum'])}", row["bound_state"])
+             for row in rows), rich_columns=(0,))
+    body += estimates("Overall and shared estimates", shared)
+    effective = [row for row in individual if row["kind"] != "centred_deviation"] + initial
+    for mapped in candidate.origin.mapped_datasets:
+        rows = [row for row in effective if row.get("dataset_display_name") == mapped.display_name
+                and (row.get("dataset_id") == mapped.dataset_id or mapped.dataset_id in row.get("dataset_ids", ()))]
+        body += estimates(f"Effective values · {mapped.display_name}", rows)
+    deviations = [row for row in individual if row["kind"] == "centred_deviation"]
+    if deviations:
+        body += "<h3>Centred coordinate deviations (Fit only)</h3><p>Linear deviations use physical units; logarithmic deviations are in log10 coordinates (decades). Effective physical values above come directly from the retained settlement.</p>"
+        body += _table(("Dataset", "Parameter", "Coordinate", "Deviation", "Unit", "Starting deviation", "Bounds"),
+                       ((row["dataset_display_name"], parameter_name(row), row["scope"], row["fitted_value"], row["unit"],
+                         row["nominal_value"], f"{_display(row['minimum'])} to {_display(row['maximum'])}") for row in deviations), rich_columns=(1,))
+    aggregates = _aggregate_rows(individual)
+    if aggregates:
+        body += "<h3>Per-dataset estimate statistics</h3>" + _table(
+            ("Parameter", "Datasets", "Mean", "Median", "Sample SD", "IQR"),
+            ((parameter_name(row), row["n"], row["arithmetic_mean"], row["median"], row["sample_sd"], row["iqr"]) for row in aggregates), rich_columns=(0,))
     metrics = _dataset_metrics(candidate)
-    lines: list[str] = [
-        result.message,
-        f"Optimizer converged: {str(result.optimizer_converged).lower()}",
-    ]
-    tooltips: list[str] = []
-    for row in (*shared, *individual, *initial):
-        lines.append(_estimate_line(row))
-        if row.get("name"):
-            tooltips.append(f"Parameter ID: {row['name']}")
-    for row in metrics:
-        if isinstance(row, Mapping):
-            label = row.get("dataset_display_name", row.get("dataset_id"))
-            lines.append(
-                f"Metrics [{label}]: SSE={_metric_text(row.get('weighted_sse'))}; "
-                f"MSE={_metric_text(row.get('weighted_mse'))}; "
-                f"RMSE={_metric_text(row.get('weighted_rmse'))}"
-            )
-    return (
-        f"Fit status {result.status} | Weighted objective SSQ "
-        f"{_metric_text(_metric(result.weighted_residual_sse))}",
-        tuple(lines),
-        tuple(tooltips),
-    )
-
-
-def fit_candidate_report_text(candidate: FitCandidate) -> str:
-    """Return one synchronous human-readable Summary string."""
-
-    result = candidate.result
-    shared, individual = _estimate_rows(candidate)
-    metrics = _dataset_metrics(candidate)
-    data = {
-        "status": result.status,
-        "message": str(result.message),
-        "optimizer_converged": bool(result.optimizer_converged),
-        "optimizer_diagnostic": _plain(result.optimizer_diagnostic),
-        "primary_model": str(result.primary_model),
-        "weighted_sse": _metric(result.weighted_residual_sse),
-        "weighted_mse": _metric(result.weighted_residual_mse),
-        "shared_estimates": shared,
-        "per_dataset_estimates": individual,
-        "initial_estimates": _initial_rows(candidate),
-        "aggregates": _aggregate_rows(individual),
-        "metrics_by_dataset": metrics,
-        "weighting": {
-            "dataset_weight_mode": str(candidate.request.setup.dataset_weight_mode),
-            "combined_residual_weighting_rule": "weighted_residual = raw_residual * sqrt(normalized_effective_dataset_weight) * sqrt(normalized_target_weight)",
-        },
-        "profile_likelihood": _profile_data(candidate),
-        "residual_bootstrap": _bootstrap_data(candidate),
-        "known_input_context": _known_input_context(candidate),
-    }
-    return _render_report(data)
+    body += "<h3>Dataset metrics</h3>" + _table(
+        ("Dataset", "Weighted SSE", "Weighted MSE", "Weighted RMSE", "Weighted MAE", "Effective weight"),
+        ((row["dataset_display_name"], *(_metric_text(row[key]) for key in ("weighted_sse", "weighted_mse", "weighted_rmse", "weighted_mae")), row["effective_weight"]) for row in metrics))
+    r_squared = [(row["dataset_display_name"], name, _metric_text(value)) for row in metrics for name, value in row["r_squared_by_series"].items()]
+    if r_squared:
+        body += _table(("Dataset", "Series", "R²"), r_squared)
+    profile, bootstrap = _profile_data(candidate), _bootstrap_data(candidate)
+    body += _analysis_section("Profile likelihood", profile, labels, symbols)
+    body += _analysis_section("Residual bootstrap", bootstrap, labels, symbols)
+    body += "<h3>Apply effect</h3><p>Apply publishes compatible shared estimates and fitted initial values to the project."
+    if result.centred_fixed_effects_settlements:
+        body += " For centred parameters, only the overall value is published; dataset-specific effective values and deviations remain Fit results."
+    if any(parameter.scope == "per_dataset" for parameter in candidate.setup_snapshot.parameters):
+        body += " Per-dataset parameter values must first become Shared through Configure Shared Fit and an ordinary Shared Fit."
+    body += "</p>"
+    context = _known_input_context(candidate)
+    provenance = "<h3>Technical provenance</h3>" + _table(
+        ("Setting", "Captured value"), ((key.replace("_", " "), value) for key, value in context.items()
+                                          if key not in {"dataset_conditions", "included_dataset_ids"}))
+    provenance += _table(("Dataset", "Dataset ID", "Initial-condition set ID"),
+                         ((mapped.display_name, mapped.dataset_id, mapped.set_id) for mapped in candidate.origin.mapped_datasets))
+    provenance += _table(("Dataset ID", "Included", "Start time", "Data range"),
+                         ((row["dataset_id"], row["included"], row["resolved_t_start"],
+                           f"{row['data_range_min']} to {row['data_range_max']}") for row in context["dataset_conditions"]))
+    provenance += f"<p>Weighting mode: {_text(candidate.request.setup.dataset_weight_mode)}. Weighted residual = raw residual × √normalized dataset weight × √normalized target weight.</p>"
+    provenance += _table(("Estimate provenance", "Captured value"),
+                         _technical_rows(shared + individual + initial))
+    if aggregates:
+        provenance += _table(("Aggregate fact", "Value"), _technical_rows(aggregates))
+    for title, analysis in (("Profile likelihood", profile), ("Residual bootstrap", bootstrap)):
+        if analysis["requested"]:
+            provenance += f"<h4>{_text(title)} technical facts</h4>" + _table(
+                ("Fact", "Captured value"), _technical_rows(analysis))
+    entries: list[FitValueEntry] = []
+    ordered = shared + [row for mapped in candidate.origin.mapped_datasets
+                        for row in effective if mapped.dataset_id == row.get("dataset_id")
+                        or mapped.dataset_id in row.get("dataset_ids", ())]
+    for row in ordered:
+        name = str(row["name"])
+        initial_value = row["kind"] == "initial"
+        symbol = html.escape(name) if initial_value else symbols[name]
+        context = str(row["scope"])
+        dataset_id = (str(row.get("dataset_id") or next(iter(row.get("dataset_ids", ())), ""))
+                      if row.get("dataset_display_name") else "")
+        if row.get("dataset_display_name"):
+            context = str(row["dataset_display_name"]) + " · " + context
+        entries.append(((str(row["kind"]), dataset_id, name), symbol, name, context,
+                        float(row["fitted_value"]), str(row["unit"])))
+    return overview, phase, body, provenance, tuple(entries)

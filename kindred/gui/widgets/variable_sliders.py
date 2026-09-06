@@ -18,10 +18,11 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtCore import Signal
 
 from kindred.gui.interactive_preview import SliderInteractionKind
-from kindred.gui.display_name_policy import scientific_symbol_label
+from html import escape
+from kindred.gui.display_name_policy import scientific_symbol_html, scientific_symbol_spoken, literal_tooltip
 
 from ..ui_helpers import (
-    apply_slider_name_label_layout_policy,
+    configure_compact_numeric_edit,
     make_bounded_label,
     make_placeholder_label,
     make_scroll_area,
@@ -200,7 +201,6 @@ class VariableSliders(QtWidgets.QWidget):
         # Storage for variable values and slider metadata
         self._variables: Dict[str, float] = {}  # {name: value}
         self._sliders: Dict[str, QtWidgets.QSlider] = {}
-        self._labels: Dict[str, QtWidgets.QLabel] = {}
         self._value_labels: Dict[str, QtWidgets.QWidget] = {}
         self._slider_ranges: Dict[
             str, Tuple[float, float]
@@ -340,7 +340,6 @@ class VariableSliders(QtWidgets.QWidget):
         self._containers.clear()
         self._sliders.clear()
         self._slider_callbacks.clear()
-        self._labels.clear()
         self._value_labels.clear()
         self._slider_ranges.clear()
         self._range_labels.clear()
@@ -382,14 +381,24 @@ class VariableSliders(QtWidgets.QWidget):
         top_row = QtWidgets.QHBoxLayout()
         top_row.setSpacing(8)
 
-        name_label = make_bounded_label(self._format_label_text(name), max_width=260)
-        apply_slider_name_label_layout_policy(name_label)
+        full_label = self._format_label_text(name)
+        symbol_html = scientific_symbol_html(name, family=meta["family"], role=meta["role"])
+        spoken = scientific_symbol_spoken(name, family=meta["family"], role=meta["role"])
+        context = full_label
+        if symbol_html != escape(name) and full_label.startswith(name):
+            symbol_label = QtWidgets.QLabel(self)
+            symbol_label.setTextFormat(QtCore.Qt.RichText)
+            symbol_label.setText(symbol_html)
+            symbol_label.setAccessibleName(spoken)
+            symbol_label.setToolTip(literal_tooltip(full_label))
+            top_row.addWidget(symbol_label)
+            context = full_label[len(name):]
+        name_label = make_bounded_label(context, max_width=260)
+        name_label.setToolTip(full_label)
         name_font = name_label.font()
         name_font.setBold(True)
         name_label.setFont(name_font)
-        top_row.addWidget(name_label)
-
-        top_row.addStretch()
+        top_row.addWidget(name_label, 1)
 
         if meta.get("editable") is False:
             value_label: QtWidgets.QWidget = QtWidgets.QLabel(
@@ -398,7 +407,7 @@ class VariableSliders(QtWidgets.QWidget):
             value_label.setAlignment(QtCore.Qt.AlignRight)
         else:
             value_editor = _NumericValueEdit(self._format_value(value))
-            value_editor.setMinimumWidth(100)
+            configure_compact_numeric_edit(value_editor, characters=8)
             value_editor.setAlignment(QtCore.Qt.AlignmentFlag.AlignRight)
             value_editor.editStarted.connect(
                 lambda item=name: self._on_editor_started(item)
@@ -413,12 +422,16 @@ class VariableSliders(QtWidgets.QWidget):
                 lambda item=name: self._commit_editor(item)
             )
             value_label = value_editor
+        value_label.setAccessibleName(f"{spoken} value")
+        if isinstance(value_label, QtWidgets.QLineEdit):
+            name_label.setBuddy(value_label)
         top_row.addWidget(value_label)
 
         layout.addLayout(top_row)
 
         # Slider
         slider = _GrooveJumpSlider(QtCore.Qt.Horizontal)
+        slider.setAccessibleName(f"{spoken} slider")
         slider.setMinimumHeight(28)
         slider.setMinimum(0)
         slider.setMaximum(1000)  # 1000 steps for smooth control
@@ -478,7 +491,7 @@ class VariableSliders(QtWidgets.QWidget):
             slider.setEnabled(False)
             tip = "Derived parameter (computed). Edit its source parameters instead."
             slider.setToolTip(tip)
-            name_label.setToolTip(tip)
+            name_label.setToolTip(full_label + "\n" + tip)
             value_label.setToolTip(tip)
             name_label.setStyleSheet("font-style: italic;")
 
@@ -510,7 +523,6 @@ class VariableSliders(QtWidgets.QWidget):
 
         # Store references
         self._sliders[name] = slider
-        self._labels[name] = name_label
         self._value_labels[name] = value_label
         self._range_labels[name] = (min_label, max_label)
 
@@ -550,13 +562,6 @@ class VariableSliders(QtWidgets.QWidget):
             display_name = str(meta["label"]).strip()
             if not display_name:
                 raise ValueError("Slider display names must be nonblank.")
-            role = meta.get("role")
-            if (meta.get("family"), role) in {
-                ("Eyring", "dG_act"),
-                ("Eyring", "kappa"),
-                ("equilibrium", "dG_eq"),
-            }:
-                display_name = scientific_symbol_label(role) + name[len(role):]
             return f"{display_name}{unit_suffix}{derived_suffix}"
         return f"{name}{unit_suffix}{derived_suffix}"
 
@@ -794,11 +799,10 @@ class VariableSliders(QtWidgets.QWidget):
         entries: list[tuple[str, str, bool]] = []
         for name in self._variables:
             name_s = str(name)
-            label = self._labels.get(name_s)
             entries.append(
                 (
                     name_s,
-                    str(label.text()) if label is not None else name_s,
+                    self._format_label_text(name_s),
                     self.variable_visible(name_s),
                 )
             )

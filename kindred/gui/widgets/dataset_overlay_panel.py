@@ -9,7 +9,9 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtCore import Qt
 
 from kindred.core.datasets.foundation import RawDatasetRecord
+from kindred.gui.controllers.config_controller import ConfigController
 from kindred.gui.dataset_payload_snapshot import ActiveDatasetLinkSnapshot
+from kindred.gui.display_name_policy import literal_tooltip
 
 __all__ = ["DatasetOverlayPanel"]
 
@@ -19,6 +21,7 @@ class DatasetOverlayPanel(QtWidgets.QWidget):
 
     overlaySelectionRequested = QtCore.Signal(str, object)
     speciesColorRequested = QtCore.Signal(str, object, object)
+    experimentalPointShapeRequested = QtCore.Signal(str)
     experimentalPointSizeRequested = QtCore.Signal(int)
     experimentalPointOpacityRequested = QtCore.Signal(float)
 
@@ -27,6 +30,7 @@ class DatasetOverlayPanel(QtWidgets.QWidget):
         parent: QtWidgets.QWidget | None = None,
         *,
         color_for_species: Callable[[str, tuple[str, ...]], QtGui.QColor],
+        experimental_point_shape: Callable[[], str],
         experimental_point_size: Callable[[], int],
         experimental_point_opacity: Callable[[], float],
     ) -> None:
@@ -40,6 +44,7 @@ class DatasetOverlayPanel(QtWidgets.QWidget):
                 "DatasetOverlayPanel requires field-specific style callbacks."
             )
         self._color_for_species = color_for_species
+        self._experimental_point_shape = experimental_point_shape
         self._experimental_point_size = experimental_point_size
         self._experimental_point_opacity = experimental_point_opacity
         self._links_by_dataset_id: dict[str, ActiveDatasetLinkSnapshot] = {}
@@ -52,16 +57,12 @@ class DatasetOverlayPanel(QtWidgets.QWidget):
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(6, 6, 6, 6)
         layout.setSpacing(5)
-        header = QtWidgets.QLabel("Plot Overlays")
-        header.setStyleSheet("font-weight: bold;")
-        layout.addWidget(header)
 
         hint = QtWidgets.QLabel(
             "Experimental overlay membership is independent of row selection, "
             "simulated Plot membership, and Slider pins."
         )
         hint.setWordWrap(True)
-        hint.setStyleSheet("font-size: 11px; color: palette(mid);")
         layout.addWidget(hint)
 
         self._empty_label = QtWidgets.QLabel("No datasets loaded")
@@ -72,6 +73,10 @@ class DatasetOverlayPanel(QtWidgets.QWidget):
         self._tree = QtWidgets.QTreeWidget()
         self._tree.setColumnCount(2)
         self._tree.setHeaderLabels(["Dataset / Observation", "Color"])
+        self._tree.setAccessibleName("Experimental dataset overlays")
+        self._tree.header().setStretchLastSection(False)
+        self._tree.header().setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeMode.Stretch)
+        self._tree.header().setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
         self._tree.setSelectionMode(
             QtWidgets.QAbstractItemView.SelectionMode.SingleSelection
         )
@@ -79,23 +84,28 @@ class DatasetOverlayPanel(QtWidgets.QWidget):
         self._tree.hide()
         layout.addWidget(self._tree)
 
-        style_row = QtWidgets.QHBoxLayout()
-        style_row.addWidget(QtWidgets.QLabel("Point style"))
+        style_form = QtWidgets.QFormLayout()
+        style_form.setFieldGrowthPolicy(QtWidgets.QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+        self._shape_combo = QtWidgets.QComboBox()
+        self._shape_combo.setAccessibleName("Experimental point shape")
+        for label, code in ConfigController.EXPERIMENTAL_POINT_SHAPES:
+            self._shape_combo.addItem(label, code)
+        self._shape_combo.currentIndexChanged.connect(self._on_shape_changed)
+        style_form.addRow("Shape", self._shape_combo)
         self._size_spin = QtWidgets.QSpinBox()
+        self._size_spin.setAccessibleName("Experimental point size")
         self._size_spin.setRange(1, 20)
         self._size_spin.setValue(6)
         self._size_spin.valueChanged.connect(self._on_size_changed)
-        style_row.addWidget(QtWidgets.QLabel("Size"))
-        style_row.addWidget(self._size_spin)
+        style_form.addRow("Size", self._size_spin)
         self._opacity_spin = QtWidgets.QSpinBox()
+        self._opacity_spin.setAccessibleName("Experimental point opacity")
         self._opacity_spin.setRange(0, 100)
         self._opacity_spin.setSuffix("%")
         self._opacity_spin.setValue(71)
         self._opacity_spin.valueChanged.connect(self._on_opacity_changed)
-        style_row.addWidget(QtWidgets.QLabel("Opacity"))
-        style_row.addWidget(self._opacity_spin)
-        style_row.addStretch(1)
-        layout.addLayout(style_row)
+        style_form.addRow("Opacity", self._opacity_spin)
+        layout.addLayout(style_form)
 
     def render_snapshot(
         self,
@@ -131,6 +141,8 @@ class DatasetOverlayPanel(QtWidgets.QWidget):
                     else ()
                 )
                 parent = QtWidgets.QTreeWidgetItem([record.display_name, ""])
+                parent.setToolTip(0, literal_tooltip(record.display_name))
+                parent.setData(0, Qt.ItemDataRole.AccessibleTextRole, record.display_name)
                 parent.setData(0, Qt.UserRole, dataset_id)
                 parent.setFlags(Qt.ItemIsEnabled | Qt.ItemIsUserCheckable)
                 self._tree.addTopLevelItem(parent)
@@ -150,6 +162,9 @@ class DatasetOverlayPanel(QtWidgets.QWidget):
                         else column
                     )
                     child = QtWidgets.QTreeWidgetItem([display_name, ""])
+                    child.setToolTip(0, literal_tooltip(f"{record.display_name}: {display_name}"))
+                    child.setData(0, Qt.ItemDataRole.AccessibleTextRole, display_name)
+                    child.setData(0, Qt.ItemDataRole.AccessibleDescriptionRole, record.display_name)
                     child.setData(0, Qt.UserRole, dataset_id)
                     child.setData(
                         0,
@@ -248,7 +263,7 @@ class DatasetOverlayPanel(QtWidgets.QWidget):
             return
 
     def refresh_application_style_controls(self) -> None:
-        """Rerender only application-wide point-size and opacity controls."""
+        """Rerender application-wide experimental point style controls."""
 
         self._render_application_style()
 
@@ -289,8 +304,9 @@ class DatasetOverlayPanel(QtWidgets.QWidget):
         button = QtWidgets.QPushButton()
         button.setFixedSize(30, 20)
         button.setFlat(True)
+        button.setAccessibleName(f"Set display color for {raw_column}")
         button.setToolTip(
-            f"Set the global display color for {raw_column}."
+            literal_tooltip(f"Set the global display color for {raw_column}.")
         )
         button.clicked.connect(
             lambda _checked=False, key=(
@@ -401,6 +417,10 @@ class DatasetOverlayPanel(QtWidgets.QWidget):
         finally:
             self._tree.blockSignals(False)
 
+    def _on_shape_changed(self, _index: int) -> None:
+        if self._preferences_loaded:
+            self.experimentalPointShapeRequested.emit(self._shape_combo.currentData())
+
     def _on_size_changed(self, value: int) -> None:
         if not self._preferences_loaded:
             return
@@ -415,11 +435,14 @@ class DatasetOverlayPanel(QtWidgets.QWidget):
         size = int(self._experimental_point_size())
         opacity = float(self._experimental_point_opacity())
         self._preferences_loaded = True
+        self._shape_combo.blockSignals(True)
         self._size_spin.blockSignals(True)
         self._opacity_spin.blockSignals(True)
         try:
+            self._shape_combo.setCurrentIndex(self._shape_combo.findData(self._experimental_point_shape()))
             self._size_spin.setValue(size)
             self._opacity_spin.setValue(round(opacity * 100))
         finally:
             self._opacity_spin.blockSignals(False)
             self._size_spin.blockSignals(False)
+            self._shape_combo.blockSignals(False)

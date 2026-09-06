@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+from kindred.gui.display_name_policy import literal_tooltip
+
 from typing import Dict, Optional, Tuple
 
 from PySide6 import QtCore, QtWidgets
@@ -27,7 +29,7 @@ class ParameterStatisticsTable(QtWidgets.QTableWidget):
         self.setHorizontalHeaderLabels(["Name", "Value", "Unit"])
         header = self.horizontalHeader()
         header.setStretchLastSection(False)
-        header.setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(0, QtWidgets.QHeaderView.Stretch)
         header.setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeToContents)
         header.setSectionResizeMode(2, QtWidgets.QHeaderView.Stretch)
         self.setAlternatingRowColors(True)
@@ -66,8 +68,10 @@ class ParameterStatisticsTable(QtWidgets.QTableWidget):
         for row, name in enumerate(names):
             value, unit = parameters[name]
             self.item(row, 0).setText(str(name))
+            self.item(row, 0).setToolTip(literal_tooltip(str(name)))
             self.item(row, 1).setText(f"{float(value):.6g}")
             self.item(row, 2).setText(str(unit))
+            self.item(row, 2).setToolTip(literal_tooltip(str(unit)))
 
 
 def _param_sort_key(name: str):

@@ -14,7 +14,8 @@ from kindred.core.dataset_mapping import (
     OccupiedSetChoice,
     allocate_initial_condition_set_name,
 )
-from kindred.core.datasets.observation_mapping import suggest_observation_mapping
+from kindred.core.datasets.observation_mapping import suggest_observation_mapping, normalize_observation_mapping
+from kindred.gui.ui_helpers import clamp_initial_size
 from kindred.core.datasets.foundation import RawDatasetRecord
 from kindred.core.project_document import MechanismTabDocument
 
@@ -56,7 +57,7 @@ class DatasetMappingBatchDialog(QtWidgets.QDialog):
         self._rows: list[_DatasetMappingRow] = []
         self.setWindowTitle("Review Imported Dataset Mapping")
         self.setModal(True)
-        self.resize(900, 720)
+        clamp_initial_size(self, 900, 720)
         self._build_ui()
 
     def _build_ui(self) -> None:
@@ -333,6 +334,12 @@ class DatasetMappingBatchDialog(QtWidgets.QDialog):
                 (raw_id, str(combo.currentData()))
                 for raw_id, combo in row.observation_combos.items()
                 if combo.currentData() is not None
+            )
+            mapping = normalize_observation_mapping(
+                mapping,
+                raw_observations=tuple((series.raw_observation_id, series.column_name)
+                                       for series in row.record.observations),
+                model_targets=self._model_targets,
             )
             proposals.append(
                 DatasetMappingProposal(

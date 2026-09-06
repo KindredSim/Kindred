@@ -7,6 +7,17 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from kindred.gui.symbolic_calculator_owner import SymbolicCalculatorViewState
 
 
+class _CalculatorResultView(QtWidgets.QPlainTextEdit):
+    def minimumSizeHint(self) -> QtCore.QSize:
+        size = super().minimumSizeHint()
+        size.setHeight(
+            3 * self.fontMetrics().lineSpacing()
+            + 2 * self.frameWidth()
+            + int(2 * self.document().documentMargin())
+        )
+        return size
+
+
 class SymbolicCalculatorPanel(QtWidgets.QWidget):
     def __init__(
         self,
@@ -29,12 +40,6 @@ class SymbolicCalculatorPanel(QtWidgets.QWidget):
         layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(8)
 
-        header = QtWidgets.QLabel("Symbolic Calculator", self)
-        header_font = header.font()
-        header_font.setBold(True)
-        header.setFont(header_font)
-        layout.addWidget(header)
-
         self._status_label = QtWidgets.QLabel("", self)
         self._status_label.setWordWrap(True)
         layout.addWidget(self._status_label)
@@ -52,10 +57,9 @@ class SymbolicCalculatorPanel(QtWidgets.QWidget):
         query_row.addWidget(self._evaluate_button)
         layout.addLayout(query_row)
 
-        self._result_view = QtWidgets.QPlainTextEdit(self)
+        self._result_view = _CalculatorResultView(self)
         self._result_view.setObjectName("symbolicCalculatorResultView")
         self._result_view.setReadOnly(True)
-        self._result_view.setMinimumHeight(120)
         result_font = QtGui.QFont("Courier New", 10)
         self._result_view.setFont(result_font)
         layout.addWidget(self._result_view, stretch=1)

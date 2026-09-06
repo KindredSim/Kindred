@@ -6,11 +6,53 @@ import logging
 from collections.abc import Callable
 
 import qdarktheme
-from PySide6 import QtWidgets
+from PySide6 import QtGui, QtWidgets
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["ThemeManager"]
+__all__ = [
+    "ThemeManager", "semantic_color", "plot_background_color",
+    "plot_foreground_color", "readable_plot_color",
+]
+
+
+def semantic_color(role: str, dark_mode: bool) -> QtGui.QColor:
+    """Return readable accent text for the current light or dark surface."""
+    light, dark = {
+        "warning": ("#795400", "#ffd478"),
+        "error": ("#b42332", "#ff9aa5"),
+        "success": ("#216739", "#8cdda4"),
+        "muted": ("#555b63", "#bac1ca"),
+    }[role]
+    return QtGui.QColor(dark if dark_mode else light)
+
+
+def plot_background_color(dark_mode: bool) -> QtGui.QColor:
+    return QtGui.QColor("#1e1e1e" if dark_mode else "#ffffff")
+
+
+def plot_foreground_color(dark_mode: bool) -> QtGui.QColor:
+    return QtGui.QColor("#dddddd" if dark_mode else "#222222")
+
+
+def readable_plot_color(color: QtGui.QColor, dark_mode: bool) -> QtGui.QColor:
+    """Adjust generated colors for plot contrast while retaining their hue."""
+    def luminance(value: QtGui.QColor) -> float:
+        channels = [channel / 12.92 if channel <= 0.04045 else
+                    ((channel + 0.055) / 1.055) ** 2.4
+                    for channel in (value.redF(), value.greenF(), value.blueF())]
+        return sum(channel * weight for channel, weight in
+                   zip(channels, (0.2126, 0.7152, 0.0722)))
+
+    background = luminance(plot_background_color(dark_mode))
+    adjusted = QtGui.QColor(color)
+    for _ in range(32):
+        foreground = luminance(adjusted)
+        contrast = (max(background, foreground) + 0.05) / (min(background, foreground) + 0.05)
+        if contrast >= 4.5:
+            break
+        adjusted = adjusted.lighter(110) if dark_mode else adjusted.darker(110)
+    return adjusted
 
 
 class ThemeManager:

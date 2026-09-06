@@ -17,6 +17,9 @@ from kindred.core.project_presentation_state import (
     SimulationSeriesAxisSelection,
 )
 from kindred.core.result_repository import SimulationResultValue
+from kindred.gui.display_name_policy import literal_tooltip
+from kindred.gui.theme_manager import plot_background_color, plot_foreground_color
+from kindred.gui.ui_helpers import clamp_initial_size
 from kindred.gui.interactive_preview import InteractivePreviewRequest
 from kindred.gui.plot_config import (
     CONCENTRATION_DISPLAY_UNIT_FACTORS,
@@ -236,9 +239,12 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         self._plot_widget = pg.PlotWidget(self)
         self._plot_widget.setObjectName("plotViewport")
         self._plot_widget.plotItem.setContentsMargins(0, 0, 0, 10)
-        self._plot_widget.setBackground("w")
+        self._plot_widget.setBackground(plot_background_color(False))
         self._plot_widget.showGrid(x=True, y=True, alpha=0.25)
-        self._legend = self._plot_widget.addLegend(offset=(-10, 10))
+        self._legend = self._plot_widget.addLegend(
+            offset=(-10, 10),
+            labelTextColor=plot_foreground_color(self._plot_widget.backgroundBrush().color().lightness() < 128),
+        )
         self._plot_widget.getPlotItem().setMenuEnabled(False)
         self._plot_widget.setContextMenuPolicy(
             QtCore.Qt.ContextMenuPolicy.CustomContextMenu
@@ -265,7 +271,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
             "QLabel { border: 1px solid #b7791f; border-radius: 6px; "
             "padding: 2px 7px; color: #8a5a12; background: #fff7df; }"
         )
-        self._completion_warning_badge.setVisible(False)
+        self._clear_completion_warning()
 
         plot_host = QtWidgets.QWidget(self)
         plot_layout = QtWidgets.QVBoxLayout(plot_host)
@@ -1568,11 +1574,28 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
     def discard_interactive_display(self) -> None:
         self._clear_interactive_display(reset_currentness=True)
 
+    def _show_completion_warning_details(self) -> None:
+        dialog = QtWidgets.QDialog(self)
+        dialog.setWindowTitle("Completion warning details")
+        layout = QtWidgets.QVBoxLayout(dialog)
+        details = QtWidgets.QPlainTextEdit(dialog)
+        details.setReadOnly(True)
+        details.setAccessibleName("Completion warning details")
+        details.setPlainText(self._completion_warning_badge.accessibleDescription())
+        layout.addWidget(details)
+        buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.StandardButton.Close)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        clamp_initial_size(dialog, 560, 420)
+        dialog.exec()
+
     def _clear_completion_warning(self) -> None:
         self._completion_warning_badge.setText("")
         self._completion_warning_badge.setToolTip("")
+        self._completion_warning_badge.setAccessibleName("")
         self._completion_warning_badge.setAccessibleDescription("")
         self._completion_warning_badge.setVisible(False)
+        self._axis_toolbar.set_warning_details_available(False)
 
     @staticmethod
     def _has_time_x(render_input: ResultRenderInput) -> bool:
@@ -1982,7 +2005,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
                 if item is None:
                     if marker:
                         item = self._plot_widget.plot(
-                            x, y, pen=None, symbol="o",
+                            x, y, pen=None, symbol=(block.point_shape if block.markers else "o"),
                             symbolSize=(block.point_size if block.markers else 5.0),
                             symbolBrush=pg.mkBrush(color), symbolPen=pg.mkPen(color),
                             name=name if chunk_index == 0 else None,
@@ -1998,6 +2021,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
                     if marker:
                         item.setSymbolBrush(pg.mkBrush(color))
                         item.setSymbolPen(pg.mkPen(color))
+                        item.setSymbol(block.point_shape if block.markers else "o")
                         item.setSymbolSize(block.point_size if block.markers else 5.0)
                     else:
                         item.setPen(pg.mkPen(color=color, width=2, style=(QtCore.Qt.PenStyle.DashLine if block.dashed else QtCore.Qt.PenStyle.SolidLine)))
@@ -2113,29 +2137,23 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         render_input: ResultRenderInput,
     ) -> None:
         diagnostic = render_input.unavailable_x_diagnostic
-        visible = bool(diagnostic or render_input.completion_warning_details)
-        self._completion_warning_badge.setText(
-            "Selected X unavailable"
-            if diagnostic is not None
-            else "Completed with warnings"
-        )
+        has_warnings = bool(diagnostic or render_input.completion_warning_details)
         warning_details = render_input.completion_warning_tooltip
         details = "\n\n".join(
             detail
             for detail in (diagnostic, warning_details)
             if detail
         )
-        if not visible:
-            self._completion_warning_badge.setText("")
-            self._completion_warning_badge.setToolTip("")
-            self._completion_warning_badge.setAccessibleDescription("")
-            self._completion_warning_badge.setVisible(False)
+        if not has_warnings:
+            self._clear_completion_warning()
             return
-        self._completion_warning_badge.setToolTip(details if visible else "")
-        self._completion_warning_badge.setAccessibleDescription(
-            details if visible else ""
-        )
-        self._completion_warning_badge.setVisible(visible)
+        caption = "Selected X unavailable" if diagnostic is not None else "Completed with warnings"
+        self._completion_warning_badge.setText(caption)
+        self._completion_warning_badge.setAccessibleName(caption)
+        self._completion_warning_badge.setToolTip(literal_tooltip(details))
+        self._completion_warning_badge.setAccessibleDescription(details)
+        self._completion_warning_badge.setVisible(True)
+        self._axis_toolbar.set_warning_details_available(True)
 
     @staticmethod
     def _raw_to_view_coordinate(
@@ -2434,7 +2452,10 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         self._annotation_items.clear()
         self._annotation_labels.clear()
         self._rendered_point_roster = ()
-        self._legend = self._plot_widget.addLegend(offset=(-10, 10))
+        self._legend = self._plot_widget.addLegend(
+            offset=(-10, 10),
+            labelTextColor=plot_foreground_color(self._plot_widget.backgroundBrush().color().lightness() < 128),
+        )
 
     def _remove_annotation_item(self, item: object) -> None:
         try:
@@ -2502,7 +2523,9 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
     @QtCore.Slot(str, object)
     def _on_axis_option(self, action: str, value: object) -> None:
         normalized_action = str(action)
-        if normalized_action == "x_unit":
+        if normalized_action == "warning_details":
+            self._show_completion_warning_details()
+        elif normalized_action == "x_unit":
             self._apply_display_unit_change("x", str(value))
         elif normalized_action == "y_unit":
             self._apply_display_unit_change("y", str(value))
@@ -2644,8 +2667,10 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
 
     def set_theme(self, *, dark_mode: bool) -> None:
         dark = bool(dark_mode)
-        self._plot_widget.setBackground("#1e1e1e" if dark else "w")
-        foreground = "#dddddd" if dark else "#222222"
+        self._plot_widget.setBackground(plot_background_color(dark))
+        foreground = plot_foreground_color(dark)
+        if self._legend is not None:
+            self._legend.setLabelTextColor(foreground)
         for axis_name in ("left", "bottom"):
             axis = self._plot_widget.getPlotItem().getAxis(axis_name)
             axis.setPen(foreground)

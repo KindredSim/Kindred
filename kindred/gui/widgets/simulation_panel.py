@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from kindred.gui.display_name_policy import scientific_symbol_html, scientific_symbol_spoken
+
 import math
 from collections.abc import Callable
 
@@ -13,13 +15,104 @@ from kindred.core.project_document import (
     SUPPORTED_SOLVERS,
     validate_simulation_execution_settings,
 )
-from kindred.gui.ui_helpers import setup_scientific_validator
+from kindred.gui.ui_helpers import (
+    ControlRowsLayout, configure_compact_numeric_edit, setup_scientific_validator,
+)
 from kindred.gui.widgets.batch_initial_conditions_table import (
     BatchInitialConditionsTableModel,
     BatchInitialConditionsTableView,
 )
 
 __all__ = ["SimulationPanel"]
+
+
+class _ControlsScrollArea(QtWidgets.QScrollArea):
+    """Give wrapping controls their full content height and native overflow."""
+
+    def __init__(self, hosts: tuple[QtWidgets.QWidget, ...], parent) -> None:
+        super().__init__(parent)
+        self._hosts = hosts
+        self._content_height = 0
+        self._pending = False
+        self.setObjectName("initial_conditions_controls_scroll")
+        self.setStyleSheet(
+            "QScrollArea#initial_conditions_controls_scroll { border: none; padding: 0; margin: 0; }"
+        )
+        self.setFrameShape(QtWidgets.QFrame.NoFrame)
+        self.setWidgetResizable(True)
+        self.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+        self.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
+        self.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Preferred)
+        content = QtWidgets.QWidget(self)
+        layout = QtWidgets.QVBoxLayout(content)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(4)
+        layout.setSizeConstraint(QtWidgets.QLayout.SetNoConstraint)
+        for host in hosts:
+            layout.addWidget(host)
+            host.installEventFilter(self)
+            for control in host.findChildren(QtWidgets.QWidget):
+                control.installEventFilter(self)
+        self.setWidget(content)
+        content.installEventFilter(self)
+        self.viewport().installEventFilter(self)
+        self._schedule_measure()
+
+    def sizeHint(self) -> QtCore.QSize:
+        size = super().sizeHint()
+        size.setHeight(self._content_height)
+        return size
+
+    def minimumSizeHint(self) -> QtCore.QSize:
+        return QtCore.QSize(0, self.fontMetrics().height() + 8)
+
+    def eventFilter(self, watched, event):
+        if event.type() == QtCore.QEvent.FocusIn:
+            # Finish native focus scrolling first, then reveal the whole control
+            # (the style's smaller focus rectangle can leave its edges clipped).
+            QtCore.QTimer.singleShot(0, self, self._reveal_focused_control)
+        if event.type() in {
+            QtCore.QEvent.Resize, QtCore.QEvent.LayoutRequest,
+            QtCore.QEvent.Show, QtCore.QEvent.Hide,
+            QtCore.QEvent.FontChange, QtCore.QEvent.StyleChange,
+        }:
+            self._schedule_measure()
+        return super().eventFilter(watched, event)
+
+    def _reveal_focused_control(self) -> None:
+        control = self.focusWidget()
+        if control is not None and self.widget().isAncestorOf(control):
+            position = control.mapTo(self.widget(), QtCore.QPoint())
+            self.ensureVisible(
+                position.x(), position.y() + control.height() // 2,
+                0, (control.height() + 1) // 2,
+            )
+
+    def _schedule_measure(self) -> None:
+        if not self._pending:
+            self._pending = True
+            QtCore.QTimer.singleShot(0, self._measure)
+
+    def _measure(self) -> None:
+        self._pending = False
+        spacing = self.widget().layout().spacing() * (len(self._hosts) - 1)
+        # A scrollbar can itself force an extra wrap. Test the unobstructed
+        # viewport first so that extra row cannot keep an unnecessary bar alive.
+        width = self.maximumViewportSize().width()
+        heights = [max(0, host.layout().totalHeightForWidth(width)) for host in self._hosts]
+        if sum(heights) + spacing > self.viewport().height():
+            width = self.viewport().width()
+            heights = [max(0, host.layout().totalHeightForWidth(width)) for host in self._hosts]
+        for host, height in zip(self._hosts, heights):
+            if host.minimumHeight() != height or host.maximumHeight() != height:
+                host.setFixedHeight(height)
+        required = sum(heights) + spacing
+        if self.widget().minimumHeight() != required:
+            self.widget().setMinimumHeight(required)
+        if required != self._content_height:
+            self._content_height = required
+            self.setMaximumHeight(required)
+            self.updateGeometry()
 
 
 class SimulationPanel(QtWidgets.QWidget):
@@ -58,7 +151,8 @@ class SimulationPanel(QtWidgets.QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(4)
 
-        controls = QtWidgets.QHBoxLayout()
+        self._controls_host = QtWidgets.QWidget(self)
+        controls = ControlRowsLayout(self._controls_host)
         self.solver_method_combo = QtWidgets.QComboBox(self)
         self.solver_method_combo.addItems(list(SUPPORTED_SOLVERS))
         self.t_start_edit = self._number_edit("0.0", "Absolute Run start time")
@@ -67,15 +161,24 @@ class SimulationPanel(QtWidgets.QWidget):
         self.num_points_spinbox.setRange(*SIMULATION_POINT_RANGE)
         self.num_points_spinbox.setSingleStep(10)
         for label, widget in (
-            ("Solver:", self.solver_method_combo),
-            ("t_start:", self.t_start_edit),
-            ("t_end:", self.t_end_edit),
-            ("Points:", self.num_points_spinbox),
+            ("Solver", self.solver_method_combo),
+            ("t_start", self.t_start_edit),
+            ("t_end", self.t_end_edit),
+            ("Points", self.num_points_spinbox),
         ):
-            controls.addWidget(QtWidgets.QLabel(label, self))
-            controls.addWidget(widget)
-        controls.addStretch(1)
-        layout.addLayout(controls)
+            name = label
+            label_widget = QtWidgets.QLabel(label, self)
+            label_widget.setBuddy(widget)
+            if name in {"t_start", "t_end"}:
+                label_widget.setTextFormat(QtCore.Qt.RichText)
+                label_widget.setText(scientific_symbol_html(name, family="time", role=name))
+            widget.setAccessibleName(scientific_symbol_spoken(name, family="time", role=name))
+            group = QtWidgets.QWidget(self)
+            group_layout = QtWidgets.QHBoxLayout(group)
+            group_layout.setContentsMargins(0, 0, 0, 0)
+            group_layout.addWidget(label_widget)
+            group_layout.addWidget(widget)
+            controls.addWidget(group)
 
         self.solver_method_combo.currentTextChanged.connect(self._mark_candidate_dirty)
         self.t_start_edit.textEdited.connect(self._mark_candidate_dirty)
@@ -93,7 +196,8 @@ class SimulationPanel(QtWidgets.QWidget):
         self.t_end_edit.editingFinished.connect(self._settle_after_edit)
         self.num_points_spinbox.editingFinished.connect(self._settle_after_edit)
 
-        row_actions = QtWidgets.QHBoxLayout()
+        self._actions_host = QtWidgets.QWidget(self)
+        actions_layout = ControlRowsLayout(self._actions_host)
         self.add_batch_set_btn = self._button("Add Set", "addBatchSetButton")
         self.move_batch_up_btn = self._button("Move Up", "moveBatchSetUpButton")
         self.move_batch_down_btn = self._button("Move Down", "moveBatchSetDownButton")
@@ -102,17 +206,17 @@ class SimulationPanel(QtWidgets.QWidget):
         )
         self.run_btn = self._button("Run", "runSelectedButton")
         self.stop_btn = self._button("Stop", "stopButton")
-        for button in (
-            self.add_batch_set_btn,
-            self.move_batch_up_btn,
-            self.move_batch_down_btn,
-            self.delete_batch_set_btn,
-            self.run_btn,
-            self.stop_btn,
-        ):
-            row_actions.addWidget(button)
-        row_actions.addStretch(1)
-        layout.addLayout(row_actions)
+        action_buttons = (
+            self.add_batch_set_btn, self.move_batch_up_btn,
+            self.move_batch_down_btn, self.delete_batch_set_btn,
+            self.run_btn, self.stop_btn,
+        )
+        for button in action_buttons:
+            actions_layout.addWidget(button)
+        self._controls_scroll = _ControlsScrollArea(
+            (self._controls_host, self._actions_host), self
+        )
+        layout.addWidget(self._controls_scroll, 0)
 
         self.add_batch_set_btn.clicked.connect(self.addSetRequested)
         self.move_batch_up_btn.clicked.connect(
@@ -144,7 +248,7 @@ class SimulationPanel(QtWidgets.QWidget):
 
     def _number_edit(self, value: str, tooltip: str) -> QtWidgets.QLineEdit:
         edit = QtWidgets.QLineEdit(value, self)
-        edit.setMaximumWidth(120)
+        configure_compact_numeric_edit(edit, characters=6)
         edit.setToolTip(tooltip)
         setup_scientific_validator(edit)
         return edit

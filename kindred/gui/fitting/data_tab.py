@@ -7,10 +7,7 @@ from collections.abc import Callable, Iterable, Mapping
 
 from PySide6 import QtCore, QtWidgets
 
-from kindred.gui.display_name_policy import (
-    DATASET_LIST_LABEL_MAX_CHARS,
-    compact_dataset_label,
-)
+from kindred.gui.ui_helpers import set_bounded_label_text
 from kindred.gui.ui_helpers import setup_scientific_validator
 from kindred.gui.widgets.config_panel_footer import ConfigPanelFooter
 
@@ -112,7 +109,8 @@ class DataTab(QtWidgets.QWidget):
         panel.setObjectName("global_fit_data_range_panel")
         layout = QtWidgets.QVBoxLayout(panel)
         layout.setContentsMargins(0, 0, 0, 0)
-        self._header = QtWidgets.QLabel("Fit data (selected dataset: —)", panel)
+        self._header = QtWidgets.QLabel(panel)
+        set_bounded_label_text(self._header, "Fit data", max_width=16777215)
         self._header.setStyleSheet("font-weight: bold;")
         layout.addWidget(self._header)
 
@@ -129,7 +127,8 @@ class DataTab(QtWidgets.QWidget):
             reset_object_name="global_fit_data_range_reset",
         )
         layout.addWidget(self._footer, stretch=1)
-        controls = QtWidgets.QGridLayout()
+        controls = QtWidgets.QFormLayout()
+        controls.setRowWrapPolicy(QtWidgets.QFormLayout.RowWrapPolicy.WrapLongRows)
         controls.setHorizontalSpacing(6)
         controls.setVerticalSpacing(4)
         self._min_edit = self._number_edit("global_fit_data_range_min")
@@ -145,16 +144,9 @@ class DataTab(QtWidgets.QWidget):
         range_layout.addWidget(self._min_edit)
         range_layout.addWidget(QtWidgets.QLabel("to", range_widget))
         range_layout.addWidget(self._max_edit)
-        controls.addWidget(QtWidgets.QLabel("Simulation start", self._footer), 0, 0)
-        controls.addWidget(self._start_edit, 0, 1)
-        controls.addWidget(QtWidgets.QLabel("Data Range", self._footer), 1, 0)
-        controls.addWidget(range_widget, 1, 1)
-        controls.addWidget(
-            QtWidgets.QLabel("N:", self._footer),
-            2,
-            0,
-        )
-        controls.addWidget(self._maximum_edit, 2, 1)
+        controls.addRow("Simulation start", self._start_edit)
+        controls.addRow("Data Range", range_widget)
+        controls.addRow("N:", self._maximum_edit)
         self._x_combo = QtWidgets.QComboBox(self._footer)
         self._x_combo.setObjectName("global_fit_parametric_x")
         self._mode_combo = QtWidgets.QComboBox(self._footer)
@@ -162,18 +154,26 @@ class DataTab(QtWidgets.QWidget):
         self._mode_combo.addItem("Auto", "auto")
         self._mode_combo.addItem("Monotone", "monotone")
         self._mode_combo.addItem("Time-guided", "time_guided")
-        controls.addWidget(QtWidgets.QLabel("Parametric X", self._footer), 3, 0)
-        controls.addWidget(self._x_combo, 3, 1)
-        controls.addWidget(QtWidgets.QLabel("Mapping mode", self._footer), 4, 0)
-        controls.addWidget(self._mode_combo, 4, 1)
+        controls.addRow("Parametric X", self._x_combo)
+        controls.addRow("Mapping mode", self._mode_combo)
         self._resolved_mode_label = QtWidgets.QLabel("Resolved Auto: —", self._footer)
         self._resolved_mode_label.setObjectName("global_fit_parametric_resolved_mode")
-        self._resolved_mode_label.setStyleSheet("font-size: 11px;")
-        controls.addWidget(self._resolved_mode_label, 5, 0, 1, 2)
+        controls.addRow(self._resolved_mode_label)
         self._used_label = QtWidgets.QLabel("Used: —", self._footer)
         self._used_label.setObjectName("global_fit_used_count")
-        self._used_label.setStyleSheet("font-size: 11px;")
-        controls.addWidget(self._used_label, 6, 0, 1, 2)
+        controls.addRow(self._used_label)
+        for row in range(controls.rowCount()):
+            item = controls.itemAt(row, QtWidgets.QFormLayout.ItemRole.LabelRole)
+            if item is not None:
+                item.widget().setWordWrap(True)
+        self._resolved_mode_label.setWordWrap(True)
+        self._used_label.setWordWrap(True)
+        for editor in (self._min_edit, self._max_edit, self._start_edit):
+            editor.setMinimumWidth(editor.fontMetrics().horizontalAdvance("0.0000") + 16)
+            editor.setSizePolicy(
+                QtWidgets.QSizePolicy.Policy.Expanding,
+                QtWidgets.QSizePolicy.Policy.Fixed,
+            )
         self._footer.body_layout.addLayout(controls)
 
         self._start_edit.textChanged.connect(
@@ -208,16 +208,10 @@ class DataTab(QtWidgets.QWidget):
 
     def _project_controls(self) -> None:
         enabled = bool(self._current_dataset_id)
-        self._header.setText(
-            "Fit data (selected dataset: —)"
-            if not enabled
-            else "Fit data (selected dataset: "
-            + compact_dataset_label(
-                self._display_names.get(self._current_dataset_id, self._current_dataset_id),
-                max_chars=DATASET_LIST_LABEL_MAX_CHARS,
-            ).display
-            + ")"
-        )
+        label = self._display_names.get(self._current_dataset_id, self._current_dataset_id)
+        set_bounded_label_text(self._header,
+                               f"Fit data — {label}" if enabled else "Fit data — no dataset selected",
+                               max_width=16777215)
         self._header.setEnabled(enabled)
         for editor in (
             self._start_edit,

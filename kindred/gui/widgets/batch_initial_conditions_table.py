@@ -604,6 +604,12 @@ class BatchInitialConditionsTableView(QtWidgets.QTableView):
             )
 
     def keyPressEvent(self, event: QtGui.QKeyEvent) -> None:
+        if event.key() in (QtCore.Qt.Key_Space, QtCore.Qt.Key_Return, QtCore.Qt.Key_Enter):
+            model = self.model()
+            if (isinstance(model, BatchInitialConditionsTableModel)
+                    and model.request_run_settings_for_index(self.currentIndex())):
+                event.accept()
+                return
         if event.matches(QtGui.QKeySequence.StandardKey.Paste):
             model = self.model()
             index = self.currentIndex()

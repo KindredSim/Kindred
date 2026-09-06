@@ -50,6 +50,8 @@ from kindred.core.project_presentation_state import (
     SimulationSeriesAxisSelection,
 )
 from kindred.gui.plot_config import AxisSelectionCandidate
+from kindred.gui.ui_helpers import ControlRowsLayout
+from kindred.gui.display_name_policy import compact_text, literal_tooltip
 
 __all__ = ["AxisToolbar"]
 
@@ -71,8 +73,8 @@ class AxisToolbar(QtWidgets.QWidget):
         self._interactive_gesture_active = False
 
         self._x_combo = QtWidgets.QComboBox(self)
-        self._x_combo.setMinimumContentsLength(10)
-        self._x_combo.setSizeAdjustPolicy(QtWidgets.QComboBox.SizeAdjustPolicy.AdjustToContents)
+        self._x_combo.setMinimumContentsLength(4)
+        self._x_combo.setSizeAdjustPolicy(QtWidgets.QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
         self._x_combo.setMaximumWidth(220)
 
         self._x_unit_combo = QtWidgets.QComboBox(self)
@@ -92,10 +94,14 @@ class AxisToolbar(QtWidgets.QWidget):
         self._y_list.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self._y_list.setMaximumHeight(160)
         self._y_list.setMinimumWidth(220)
+        self._y_list.setMaximumWidth(420)
         self._locked_checked_y: frozenset[AxisSeriesSelection] = frozenset()
 
         self._y_selector_btn = QtWidgets.QToolButton(self)
         self._y_selector_btn.setText("Y: none")
+        self._y_selector_btn.setMaximumWidth(220)
+        self._y_selector_btn.setMinimumWidth(80)
+        self._y_selector_btn.setSizePolicy(QtWidgets.QSizePolicy.Preferred, QtWidgets.QSizePolicy.Fixed)
         self._y_selector_btn.setPopupMode(QtWidgets.QToolButton.ToolButtonPopupMode.InstantPopup)
         self._y_selector_btn.setToolButtonStyle(QtCore.Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
 
@@ -153,6 +159,12 @@ class AxisToolbar(QtWidgets.QWidget):
         self._options_btn.setIcon(QtGui.QIcon.fromTheme("preferences-other"))
 
         self._menu = QtWidgets.QMenu(self)
+        self._warning_details_action = self._menu.addAction("Warning details…")
+        self._warning_details_action.setEnabled(False)
+        self._warning_details_action.triggered.connect(
+            lambda: self.optionsRequested.emit("warning_details", None)
+        )
+        self._menu.addSeparator()
         self._action_downsampling = self._menu.addAction("Downsampling: 1k points/curve")
         self._action_downsampling.setCheckable(True)
         self._action_downsampling.setChecked(False)
@@ -181,6 +193,10 @@ class AxisToolbar(QtWidgets.QWidget):
 
         # Labels
         x_label = QtWidgets.QLabel("X:", self)
+        x_label.setBuddy(self._x_combo)
+        self._x_combo.setAccessibleName("X axis")
+        self._x_unit_combo.setAccessibleName("X axis unit")
+        self._y_unit_combo.setAccessibleName("Y axis unit")
 
         # Axis range controls
         self._auto_range = QtWidgets.QCheckBox("Auto Range", self)
@@ -236,6 +252,10 @@ class AxisToolbar(QtWidgets.QWidget):
         self._y_min.editingFinished.connect(self._on_range_changed)
         self._y_max.editingFinished.connect(self._on_range_changed)
 
+        for edit, name in ((self._x_min, "X minimum"), (self._x_max, "X maximum"),
+                           (self._y_min, "Y minimum"), (self._y_max, "Y maximum")):
+            edit.setAccessibleName(name)
+
         # Sensible defaults
         time_selection = SimulationSeriesAxisSelection("t")
         self.set_x_candidates(
@@ -285,6 +305,7 @@ class AxisToolbar(QtWidgets.QWidget):
                     candidate.label,
                     candidate.selection,
                 )
+                self._x_combo.setItemData(self._x_combo.count() - 1, literal_tooltip(candidate.label), Qt.ToolTipRole)
             self._x_combo.setCurrentIndex(identities.index(selected))
         finally:
             self._x_combo.blockSignals(False)
@@ -354,6 +375,7 @@ class AxisToolbar(QtWidgets.QWidget):
         self._y_list.clear()
         for candidate, checked in values:
             it = QtWidgets.QListWidgetItem(candidate.label)
+            it.setToolTip(literal_tooltip(candidate.label))
             it.setData(
                 Qt.ItemDataRole.UserRole,
                 candidate.selection,
@@ -362,17 +384,17 @@ class AxisToolbar(QtWidgets.QWidget):
             # Disable scalars as Y selections per spec
             if candidate.selection in disabled_set:
                 it.setFlags(it.flags() & ~Qt.ItemFlag.ItemIsEnabled)
-                it.setToolTip("Scalar values cannot be plotted as Y; use 'Add Guide from Scalar' in Options.")
+                it.setToolTip(literal_tooltip(candidate.label + "\nScalar values cannot be plotted as Y; use 'Add Guide from Scalar' in Options."))
                 it.setCheckState(Qt.CheckState.Unchecked)
             elif candidate.selection in locked_checked_by_identity:
                 it.setFlags(
                     it.flags() & ~Qt.ItemFlag.ItemIsUserCheckable
                 )
-                it.setToolTip(
-                    "Shown because this active overlay maps to "
+                it.setToolTip(literal_tooltip(
+                    candidate.label + "\nShown because this active overlay maps to "
                     f"{locked_checked_by_identity[candidate.selection]}; "
                     "disable it in Plot Overlays."
-                )
+                ))
                 it.setCheckState(Qt.CheckState.Checked)
             else:
                 it.setCheckState(Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked)
@@ -578,44 +600,56 @@ class AxisToolbar(QtWidgets.QWidget):
         self._y_min.setText(_format(y_min))
         self._y_max.setText(_format(y_max))
 
+    def set_warning_details_available(self, available: bool) -> None:
+        self._warning_details_action.setEnabled(available)
+
     # ----------------------- layout helpers -----------------------
 
     def _build_horizontal_layout(
         self,
         x_label: QtWidgets.QLabel,
     ) -> None:
-        lay = QtWidgets.QHBoxLayout(self)
-        lay.setContentsMargins(0, 0, 0, 0)
-        lay.setSpacing(8)
+        self._toolbar_rows = ControlRowsLayout(self)
+        self._toolbar_rows.setContentsMargins(0, 6, 0, 0)
+        self.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Preferred)
+        self._x_combo.setSizePolicy(QtWidgets.QSizePolicy.Preferred, QtWidgets.QSizePolicy.Fixed)
+        toolbar_groups = []
+        for label, editor in ((x_label, self._x_combo),
+                              (QtWidgets.QLabel("Unit:", self), self._x_unit_combo)):
+            group = QtWidgets.QWidget(self)
+            group_layout = QtWidgets.QHBoxLayout(group)
+            group_layout.setContentsMargins(0, 0, 0, 0)
+            group_layout.setSpacing(8)
+            group_layout.addWidget(label)
+            group_layout.addWidget(editor)
+            toolbar_groups.append(group)
+        toolbar_groups.append(self._y_selector_btn)
+        unit_group = QtWidgets.QWidget(self)
+        unit_layout = QtWidgets.QHBoxLayout(unit_group)
+        unit_layout.setContentsMargins(0, 0, 0, 0)
+        unit_layout.setSpacing(8)
+        unit_layout.addWidget(QtWidgets.QLabel("Unit:", self))
+        unit_layout.addWidget(self._y_unit_combo)
+        toolbar_groups.extend((unit_group, self._pan_button,
+                                     self._rectangle_zoom_button, self._auto_range))
 
-        x_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
-        lay.addWidget(x_label, stretch=0)
-        lay.addWidget(self._x_combo, stretch=0)
-        lay.addWidget(QtWidgets.QLabel("Unit:", self), stretch=0)
-        lay.addWidget(self._x_unit_combo, stretch=0)
-        lay.addWidget(self._y_selector_btn, stretch=0)
-        lay.addWidget(QtWidgets.QLabel("Unit:", self), stretch=0)
-        lay.addWidget(self._y_unit_combo, stretch=0)
-        lay.addWidget(self._pan_button, stretch=0)
-        lay.addWidget(self._rectangle_zoom_button, stretch=0)
-        lay.addWidget(self._auto_range, stretch=0)
-
-        range_layout = QtWidgets.QHBoxLayout(self._manual_range_row)
-        range_layout.setContentsMargins(0, 0, 0, 0)
+        range_layout = ControlRowsLayout(self._manual_range_row)
         range_layout.setSpacing(4)
-        range_layout.addWidget(QtWidgets.QLabel("X:", self._manual_range_row))
-        range_layout.addWidget(self._x_min)
-        range_layout.addWidget(QtWidgets.QLabel("to", self._manual_range_row))
-        range_layout.addWidget(self._x_max)
-        range_layout.addSpacing(8)
-        range_layout.addWidget(QtWidgets.QLabel("Y:", self._manual_range_row))
-        range_layout.addWidget(self._y_min)
-        range_layout.addWidget(QtWidgets.QLabel("to", self._manual_range_row))
-        range_layout.addWidget(self._y_max)
-        lay.addWidget(self._manual_range_row, stretch=0)
-
-        lay.addStretch(1)
-        lay.addWidget(self._options_btn, stretch=0)
+        for axis, lower, upper in (("X:", self._x_min, self._x_max),
+                                   ("Y:", self._y_min, self._y_max)):
+            group = QtWidgets.QWidget(self._manual_range_row)
+            pair = QtWidgets.QHBoxLayout(group)
+            pair.setContentsMargins(0, 0, 0, 0)
+            pair.setSpacing(4)
+            pair.addWidget(QtWidgets.QLabel(axis, group))
+            pair.addWidget(lower)
+            pair.addWidget(QtWidgets.QLabel("to", group))
+            pair.addWidget(upper)
+            range_layout.addWidget(group)
+        toolbar_groups.extend((self._manual_range_row, self._options_btn))
+        for widget in toolbar_groups:
+            self._toolbar_rows.addWidget(widget)
+        self._toolbar_rows.setAlignment(self._options_btn, Qt.AlignRight)
 
     def _update_y_selector_text(self) -> None:
         selected_labels = [
@@ -642,8 +676,9 @@ class AxisToolbar(QtWidgets.QWidget):
                 f"Y: {selected_labels[0]} +{len(selected_labels) - 1}"
             )
             tooltip = ", ".join(selected_labels)
-        self._y_selector_btn.setText(summary)
-        self._y_selector_btn.setToolTip(tooltip)
+        self._y_selector_btn.setText(compact_text(summary, max_chars=30).display)
+        self._y_selector_btn.setAccessibleName(summary)
+        self._y_selector_btn.setToolTip(literal_tooltip(tooltip))
         self._y_selector_btn.setEnabled(self._y_list.count() > 0)
 
     # ----------------------- internal wiring -----------------------
@@ -694,8 +729,11 @@ class AxisToolbar(QtWidgets.QWidget):
 
     # ----------------------- usability tweaks -----------------------
 
+    def minimumSizeHint(self) -> QtCore.QSize:
+        return self._toolbar_rows.minimumSize()
+
     def sizeHint(self) -> QtCore.QSize:
-        return QtCore.QSize(960, 56)
+        return QtCore.QSize(600, self._toolbar_rows.heightForWidth(600))
 
     def set_tab_order(self) -> None:
         QtWidgets.QWidget.setTabOrder(self._x_combo, self._x_unit_combo)

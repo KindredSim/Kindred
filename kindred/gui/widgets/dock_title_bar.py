@@ -5,6 +5,8 @@ from __future__ import annotations
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
+from kindred.gui.ui_helpers import set_bounded_label_text
+
 __all__ = ["DockTitleBar"]
 
 _MINIMIZE_GLYPH = "\u2014"  # em dash
@@ -42,13 +44,16 @@ class DockTitleBar(QtWidgets.QWidget):
         font = self._title_label.font()
         font.setBold(True)
         self._title_label.setFont(font)
+        set_bounded_label_text(self._title_label, str(title))
         layout.addWidget(self._title_label, stretch=1)
 
         self._minimize_btn = QtWidgets.QToolButton()
         self._minimize_btn.setObjectName("dockMinimizeButton")
         self._minimize_btn.setText(_MINIMIZE_GLYPH)
         self._minimize_btn.setAutoRaise(True)
-        self._minimize_btn.setFixedSize(20, 20)
+        self._minimize_btn.setToolTip("Minimize panel")
+        self._minimize_btn.setAccessibleName("Minimize panel")
+        self._minimize_btn.setFocusPolicy(QtCore.Qt.FocusPolicy.StrongFocus)
         self._minimize_btn.clicked.connect(self._toggle_minimize)
         layout.addWidget(self._minimize_btn)
 
@@ -56,20 +61,24 @@ class DockTitleBar(QtWidgets.QWidget):
         self._close_btn.setObjectName("dockCloseButton")
         self._close_btn.setText(_CLOSE_GLYPH)
         self._close_btn.setAutoRaise(True)
-        self._close_btn.setFixedSize(20, 20)
+        self._close_btn.setToolTip("Close panel")
+        self._close_btn.setAccessibleName("Close panel")
+        self._close_btn.setFocusPolicy(QtCore.Qt.FocusPolicy.StrongFocus)
         self._close_btn.clicked.connect(self._close_dock)
         layout.addWidget(self._close_btn)
 
         self._dock.visibilityChanged.connect(self._on_visibility_changed)
 
     def set_title(self, title: str) -> None:
-        self._title_label.setText(str(title))
+        set_bounded_label_text(self._title_label, str(title))
 
     def restore(self) -> None:
         if not self._minimized:
             return
         self._minimized = False
         self._minimize_btn.setText(_MINIMIZE_GLYPH)
+        self._minimize_btn.setToolTip("Minimize panel")
+        self._minimize_btn.setAccessibleName("Minimize panel")
         content = self._dock.widget()
         if content is not None:
             content.setVisible(True)
@@ -84,6 +93,8 @@ class DockTitleBar(QtWidgets.QWidget):
         else:
             self._minimized = True
             self._minimize_btn.setText(_RESTORE_GLYPH)
+            self._minimize_btn.setToolTip("Restore panel")
+            self._minimize_btn.setAccessibleName("Restore panel")
             self._dock_minimum_width_before_minimize = int(self._dock.minimumWidth())
             self._dock.setMinimumWidth(
                 max(
@@ -109,7 +120,7 @@ class DockTitleBar(QtWidgets.QWidget):
         spacing = int(layout.spacing()) if isinstance(layout, QtWidgets.QLayout) else 0
         label_hint = self._title_label.minimumSizeHint()
         button_width = self._minimize_btn.sizeHint().width() + self._close_btn.sizeHint().width()
-        width = margins.left() + label_hint.width() + button_width + margins.right() + (spacing * 2)
+        width = margins.left() + self.fontMetrics().averageCharWidth() * 6 + button_width + margins.right() + (spacing * 2)
         height = margins.top() + max(
             label_hint.height(),
             self._minimize_btn.sizeHint().height(),

@@ -15,10 +15,6 @@ from PySide6 import QtCore, QtWidgets
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QBrush, QColor, QFontMetrics, QPalette
 
-from kindred.gui.display_name_policy import (
-    DATASET_LIST_LABEL_MAX_CHARS,
-    compact_dataset_label,
-)
 from kindred.gui.fitting.contracts import FitTargetSelection, copy_target_selection
 from kindred.gui.fitting.launch import (
     FitDatasetLocalSettings,
@@ -223,6 +219,7 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
         group = QtWidgets.QGroupBox("Species Table", self)
         group.setObjectName("global_fit_unified_species_group")
         group_layout = QtWidgets.QVBoxLayout(group)
+        layout.addWidget(group, stretch=1)
 
         self._footer = ConfigPanelFooter(
             group,
@@ -238,13 +235,15 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
         self._footer.applyRequested.connect(self._apply_presentation_edits)
         self._footer.revertRequested.connect(self._revert_presentation_edits)
 
-        self._context_label = QtWidgets.QLabel("Selected dataset: —", group)
+        self._context_label = QtWidgets.QLabel("Targets and initial conditions", self)
         self._context_label.setStyleSheet("font-weight: bold;")
+        self._context_label.setWordWrap(True)
         self._footer.body_layout.addWidget(self._context_label)
 
         weighting_form = QtWidgets.QFormLayout()
         weighting_form.setContentsMargins(0, 0, 0, 0)
-        self._weight_mode_combo = QtWidgets.QComboBox(group)
+        weighting_form.setRowWrapPolicy(QtWidgets.QFormLayout.RowWrapPolicy.WrapLongRows)
+        self._weight_mode_combo = QtWidgets.QComboBox(self)
         self._weight_mode_combo.setObjectName("global_fit_weight_mode_combo")
         self._weight_mode_combo.addItem(
             "Implicit weights (1/N per dataset)",
@@ -253,7 +252,7 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
         self._weight_mode_combo.addItem("User weights only", "user")
         weighting_form.addRow("Weight mode:", self._weight_mode_combo)
 
-        self._dataset_weight_edit = QtWidgets.QLineEdit(group)
+        self._dataset_weight_edit = QtWidgets.QLineEdit(self)
         self._dataset_weight_edit.setObjectName("global_fit_dataset_weight_edit")
         setup_scientific_validator(self._dataset_weight_edit)
         weighting_form.addRow("Dataset weight:", self._dataset_weight_edit)
@@ -265,28 +264,26 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
             self._on_dataset_weight_text_changed
         )
 
-        bulk_row = QtWidgets.QHBoxLayout()
-        bulk_label = QtWidgets.QLabel("Bulk:", group)
-        bulk_label.setStyleSheet("font-size: 11px;")
-        bulk_row.addWidget(bulk_label)
-        self._bulk_all_button = QtWidgets.QPushButton("All", group)
+        bulk_row = QtWidgets.QGridLayout()
+        self._bulk_layout = bulk_row
+        self._bulk_all_button = QtWidgets.QPushButton("All", self)
         self._bulk_all_button.setObjectName("global_fit_fit_targets_bulk_all")
         self._bulk_all_button.clicked.connect(
             lambda: self._apply_bulk_action("all")
         )
-        self._bulk_none_button = QtWidgets.QPushButton("None", group)
+        self._bulk_none_button = QtWidgets.QPushButton("None", self)
         self._bulk_none_button.setObjectName("global_fit_fit_targets_bulk_none")
         self._bulk_none_button.clicked.connect(
             lambda: self._apply_bulk_action("none")
         )
-        self._bulk_invert_button = QtWidgets.QPushButton("Invert", group)
+        self._bulk_invert_button = QtWidgets.QPushButton("Invert", self)
         self._bulk_invert_button.setObjectName("global_fit_fit_targets_bulk_invert")
         self._bulk_invert_button.clicked.connect(
             lambda: self._apply_bulk_action("invert")
         )
         self._copy_targets_button = QtWidgets.QPushButton(
             "Copy Targets to Compatible",
-            group,
+            self,
         )
         self._copy_targets_button.setObjectName(
             "global_fit_fit_targets_copy_compatible"
@@ -296,7 +293,7 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
         )
         self._copy_species_weights_vary_ic_button = QtWidgets.QPushButton(
             "Copy Species Weights and Vary IC to Compatible",
-            group,
+            self,
         )
         self._copy_species_weights_vary_ic_button.setObjectName(
             "global_fit_copy_species_weights_vary_ic_compatible"
@@ -314,34 +311,81 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
             self._copy_targets_button,
             self._copy_species_weights_vary_ic_button,
         ):
-            bulk_row.addWidget(button)
-        bulk_row.addStretch(1)
+            button.setSizePolicy(QtWidgets.QSizePolicy.Policy.Maximum, QtWidgets.QSizePolicy.Policy.Fixed)
+        self._relayout_bulk_buttons()
         self._footer.body_layout.addLayout(bulk_row)
 
-        self._table = QtWidgets.QTableWidget(group)
+        self._table = QtWidgets.QTableWidget(self)
         self._table.setObjectName("global_fit_unified_species_table")
         self._table.setItemDelegate(_ValidationCellDelegate(self._table))
         self._table.setColumnCount(_Col.COUNT)
         self._table.setHorizontalHeaderLabels(_Col.HEADERS)
         header = self._table.horizontalHeader()
         header.setStretchLastSection(False)
-        # The presentation contract is a stable table, not a content-driven
-        # layout.  Fixed section modes also keep automation and screenshots
-        # independent of the current species name or numeric value.
-        fixed_widths = (72, 72, 140, 100, 220, 100, 82, 82, 82)
+        # Keep useful initial widths while allowing larger fonts and user resizing.
+        initial_widths = (72, 72, 140, 100, 220, 100, 82, 82, 82)
+        metrics = header.fontMetrics()
         for column in range(_Col.COUNT):
             header.setSectionResizeMode(
                 column,
-                QtWidgets.QHeaderView.ResizeMode.Fixed,
+                QtWidgets.QHeaderView.ResizeMode.Interactive,
             )
-            self._table.setColumnWidth(column, fixed_widths[column])
+            self._table.setColumnWidth(
+                column,
+                max(
+                    initial_widths[column],
+                    metrics.horizontalAdvance(_Col.HEADERS[column]) + 24,
+                ),
+            )
+        self._table.setMinimumHeight(
+            header.sizeHint().height()
+            + self._table.verticalHeader().defaultSectionSize()
+            + self._table.horizontalScrollBar().sizeHint().height() + 4
+        )
         self._table.verticalHeader().setVisible(False)
         self._table.setAlternatingRowColors(True)
-        self._table.setMinimumHeight(200)
         self._table.itemChanged.connect(self._on_table_item_changed)
         self._footer.body_layout.addWidget(self._table, stretch=1)
 
-        layout.addWidget(group, stretch=1)
+    def _relayout_bulk_buttons(self) -> None:
+        buttons = (
+            self._bulk_all_button,
+            self._bulk_none_button,
+            self._bulk_invert_button,
+            self._copy_targets_button,
+            self._copy_species_weights_vary_ic_button,
+        )
+        for button in buttons:
+            self._bulk_layout.removeWidget(button)
+        for index in range(6):
+            self._bulk_layout.setColumnStretch(index, 0)
+        metrics = self.fontMetrics()
+        wide = self.width() >= (
+            sum(metrics.horizontalAdvance(text) + 24 for text in (
+                "All", "None", "Invert", "Copy Targets to Compatible",
+                "Copy Species Weights and Vary IC to Compatible",
+            )) + 80
+        )
+        self._copy_targets_button.setText(
+            "Copy Targets to Compatible" if wide else "Copy Targets\nto Compatible"
+        )
+        self._copy_species_weights_vary_ic_button.setText(
+            "Copy Species Weights and Vary IC to Compatible" if wide
+            else "Copy Species Weights and Vary IC\nto Compatible"
+        )
+        if wide:
+            for column, button in enumerate(buttons):
+                self._bulk_layout.addWidget(button, 0, column)
+            self._bulk_layout.setColumnStretch(5, 1)
+        else:
+            for column, button in enumerate(buttons[:4]):
+                self._bulk_layout.addWidget(button, 0, column)
+            self._bulk_layout.addWidget(buttons[4], 1, 0, 1, 4)
+            self._bulk_layout.setColumnStretch(4, 1)
+
+    def resizeEvent(self, event) -> None:  # noqa: N802 - Qt override
+        super().resizeEvent(event)
+        self._relayout_bulk_buttons()
 
     # ------------------------------------------------------------------
     # Typed snapshot projection
@@ -903,7 +947,7 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
         dataset = self._current_dataset()
         self._table.setRowCount(0)
         if dataset is None:
-            self._context_label.setText("Selected dataset: —")
+            self._context_label.setToolTip("")
             return
 
         mapped = self._mapped_dataset(dataset.dataset_id)
@@ -920,13 +964,8 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
         if x_name is not None:
             selected.discard(x_name)
         weights = dict(dataset.target_weights)
-        compact = compact_dataset_label(
-            mapped.display_name,
-            max_chars=DATASET_LIST_LABEL_MAX_CHARS,
-        )
-        self._context_label.setText(f"Selected dataset: {compact.display}")
         self._context_label.setToolTip(
-            f"{compact.full}\nDataset ID: {dataset.dataset_id}\nSet ID: {mapped.set_id}"
+            f"{mapped.display_name}\nDataset ID: {dataset.dataset_id}\nSet ID: {mapped.set_id}"
         )
         row_species = self._row_species(dataset)
         self._table.setRowCount(len(row_species))
@@ -1997,19 +2036,14 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
     def _refresh_dataset_weight_editor(self) -> None:
         dataset = self._current_dataset()
         if dataset is None:
-            self._context_label.setText("Selected dataset: —")
+            self._context_label.setToolTip("")
             self._dataset_weight_edit.clear()
             self._weight_mode_combo.setEnabled(False)
             self._dataset_weight_edit.setEnabled(False)
             return
         mapped = self._mapped_dataset(dataset.dataset_id)
         label = mapped.display_name if mapped is not None else dataset.dataset_id
-        compact = compact_dataset_label(
-            label,
-            max_chars=DATASET_LIST_LABEL_MAX_CHARS,
-        )
-        self._context_label.setText(f"Selected dataset: {compact.display}")
-        tooltip = f"{compact.full}\nDataset ID: {dataset.dataset_id}"
+        tooltip = f"{label}\nDataset ID: {dataset.dataset_id}"
         if mapped is not None:
             tooltip += f"\nSet ID: {mapped.set_id}"
         self._context_label.setToolTip(tooltip)

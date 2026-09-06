@@ -8,6 +8,9 @@ from typing import Mapping, Sequence
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
+from kindred.gui.ui_helpers import (
+    configure_compact_numeric_edit, make_bounded_label, set_bounded_label_text,
+)
 from kindred.gui.interactive_preview import SliderInteractionKind
 from kindred.gui.species_sliders_logic import (
     compute_slider_max_option_c,
@@ -136,7 +139,7 @@ class BatchSpeciesSliders(QtWidgets.QWidget):
             font.setBold(True)
             title.setFont(font)
             layout.addWidget(title)
-        self._target_label = QtWidgets.QLabel("Slider targets: none", self)
+        self._target_label = make_bounded_label("Slider targets: none", self, max_width=520)
         layout.addWidget(self._target_label)
         self._content = QtWidgets.QWidget(self)
         self._content_layout = QtWidgets.QVBoxLayout(self._content)
@@ -191,7 +194,7 @@ class BatchSpeciesSliders(QtWidgets.QWidget):
             if self._target_set_ids
             else "none"
         )
-        self._target_label.setText(f"Slider targets: {target_text}")
+        set_bounded_label_text(self._target_label, f"Slider targets: {target_text}", max_width=520)
         same_rows = (
             tuple(normalized) == tuple(self._rows)
             and all(
@@ -284,13 +287,16 @@ class BatchSpeciesSliders(QtWidgets.QWidget):
         container = QtWidgets.QWidget(self._content)
         layout = QtWidgets.QGridLayout(container)
         layout.setContentsMargins(0, 0, 0, 0)
-        name_label = QtWidgets.QLabel(display_name, container)
+        layout.setColumnStretch(0, 1)
+        name_label = make_bounded_label(display_name, container, max_width=260)
         if mixed:
             initial_text = "Multiple values"
         else:
             initial_text = format_slider_value(value)
         value_editor = _NumericValueEdit(initial_text, container)
-        value_editor.setMinimumWidth(100)
+        value_editor.setAccessibleName(f"{display_name} initial concentration")
+        name_label.setBuddy(value_editor)
+        configure_compact_numeric_edit(value_editor, characters=8)
         value_editor.setAlignment(QtCore.Qt.AlignmentFlag.AlignRight)
         value_editor.editStarted.connect(
             lambda item=species: self._on_editor_started(item)
@@ -308,6 +314,7 @@ class BatchSpeciesSliders(QtWidgets.QWidget):
             QtCore.Qt.Orientation.Horizontal,
             container,
         )
+        slider.setAccessibleName(f"{display_name} initial concentration slider")
         slider.setRange(0, 10_000)
         maximum = compute_slider_max_option_c(
             v=value, row_max=max(self._values.values(), default=value)
@@ -434,7 +441,7 @@ class BatchSpeciesSliders(QtWidgets.QWidget):
         row = self._rows.get(str(species))
         if row is None:
             return
-        row.name_label.setText(self._display_names.get(str(species), str(species)))
+        set_bounded_label_text(row.name_label, self._display_names.get(str(species), str(species)), max_width=260)
         if self._editor_has_focus(species):
             return
         self._set_value_projection(

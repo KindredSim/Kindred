@@ -155,6 +155,10 @@ class ConfigPanelFooter(QtWidgets.QWidget):
                 buttons.addWidget(self.apply_button)
 
         layout.addLayout(buttons)
+        visible_buttons = [buttons.itemAt(i).widget() for i in range(buttons.count())
+                           if buttons.itemAt(i).widget() is not None]
+        for previous, following in zip(visible_buttons, visible_buttons[1:]):
+            QtWidgets.QWidget.setTabOrder(previous, following)
 
     @staticmethod
     def _normalize_button_order_tokens(order: Sequence[str]) -> tuple[str, ...]:

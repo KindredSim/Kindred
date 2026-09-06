@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from kindred.gui.display_name_policy import scientific_symbol_html, scientific_symbol_spoken
+
 import math
 
 from PySide6 import QtCore, QtWidgets
@@ -59,6 +61,11 @@ class SolverSettingsDialog(QtWidgets.QDialog):
             ("Integration points", self.integration_points_spin),
         ):
             form.addRow(label, widget)
+            name_label = form.labelForField(widget)
+            if label in {"t_start", "t_end"}:
+                name_label.setTextFormat(QtCore.Qt.RichText)
+                name_label.setText(scientific_symbol_html(label, family="time", role=label))
+            widget.setAccessibleName(scientific_symbol_spoken(label, family="time", role=label))
         layout.addLayout(form)
 
         self._buttons = QtWidgets.QDialogButtonBox(

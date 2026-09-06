@@ -12,6 +12,7 @@ from kindred.gui.fitting.contracts import (
 )
 from kindred.core.simulation_failure import FactualCause
 from kindred.core.analysis.fit_evaluation_outcome import ScientificUnavailable
+from kindred.gui.ui_helpers import clamp_initial_size, set_bounded_label_text
 from kindred.gui.fitting.data_tab import DataTab
 from kindred.gui.fitting.data_targets_tab import DataTargetsTab
 from kindred.gui.fitting.launch import (
@@ -52,6 +53,7 @@ class FittingWindow(QtWidgets.QDialog):
         origin: FitOriginSnapshot,
         *,
         close_handler: Callable[[], bool],
+        observation_style: tuple[str, float, float],
         color_resolver: Callable[[str], object] | None = None,
         parent: QtWidgets.QWidget | None = None,
     ) -> None:
@@ -61,6 +63,7 @@ class FittingWindow(QtWidgets.QDialog):
         self._origin = origin
         self._close_handler = close_handler
         self._color_resolver = color_resolver
+        self._observation_style = observation_style
         self._closing = False
         self._closing_after_cleanup = False
         self._paused = False
@@ -78,9 +81,10 @@ class FittingWindow(QtWidgets.QDialog):
             | QtCore.Qt.WindowType.WindowMinMaxButtonsHint
         )
         self._build_ui()
+        clamp_initial_size(self, 1280, 720)
 
     # ------------------------------------------------------------------
-    # Historical top-level presentation
+    # Top-level presentation
     # ------------------------------------------------------------------
 
     def _build_ui(self) -> None:
@@ -111,6 +115,7 @@ class FittingWindow(QtWidgets.QDialog):
         self._run_results_tab = RunResultsTab(
             parent=self,
             color_resolver=self._color_resolver,
+            observation_style=self._observation_style,
         )
         self._run_results_tab.set_dark_mode(self._current_results_dark_mode())
 
@@ -126,6 +131,8 @@ class FittingWindow(QtWidgets.QDialog):
         self._current_tab_stack = QtWidgets.QStackedWidget(self)
         self._current_tab_stack.setObjectName("global_fit_current_tab_stack")
         self._current_tab_stack.setMinimumWidth(320)
+        self._current_tab_stack.setSizePolicy(QtWidgets.QSizePolicy.Policy.Ignored,
+                                             QtWidgets.QSizePolicy.Policy.Ignored)
         self._current_tab_stack.addWidget(self._data_targets_tab)
         self._current_tab_stack.addWidget(self._params_ics_tab)
         self._current_tab_stack.addWidget(self._run_results_tab)
@@ -139,92 +146,118 @@ class FittingWindow(QtWidgets.QDialog):
     def _create_footer(self) -> QtWidgets.QWidget:
         footer = QtWidgets.QWidget(self)
         footer.setObjectName("global_fit_footer")
-        control_row = QtWidgets.QHBoxLayout(footer)
-        control_row.setContentsMargins(0, 0, 0, 0)
-        control_row.setSpacing(8)
-
-        status_widget = QtWidgets.QWidget(footer)
+        footer.setSizePolicy(QtWidgets.QSizePolicy.Policy.Ignored, QtWidgets.QSizePolicy.Policy.Preferred)
+        column = QtWidgets.QVBoxLayout(footer)
+        column.setContentsMargins(0, 0, 0, 0)
+        column.setSpacing(4)
+        self._status = QtWidgets.QLabel("Ready", footer)
+        self._status.setWordWrap(True)
+        self._status.setSizePolicy(QtWidgets.QSizePolicy.Policy.Ignored, QtWidgets.QSizePolicy.Policy.Preferred)
+        self._status.setTextFormat(QtCore.Qt.TextFormat.PlainText)
+        status_widget = self._status_widget = QtWidgets.QWidget(footer)
         status_column = QtWidgets.QVBoxLayout(status_widget)
         status_column.setContentsMargins(0, 0, 0, 0)
-        status_column.setSpacing(2)
-        self._status = QtWidgets.QLabel("Ready", footer)
-        self._status.setWordWrap(False)
-        self._status.setSizePolicy(
-            QtWidgets.QSizePolicy.Policy.Ignored,
-            QtWidgets.QSizePolicy.Policy.Preferred,
-        )
         status_column.addWidget(self._status)
-        self._run_block_reason_label = QtWidgets.QLabel(status_widget)
-        self._run_block_reason_label.setObjectName(
-            "global_fit_run_block_reason_label"
-        )
-        self._run_block_reason_label.setWordWrap(False)
-        self._run_block_reason_label.setStyleSheet("font-size: 11px;")
-        self._run_block_reason_label.setSizePolicy(
-            QtWidgets.QSizePolicy.Policy.Ignored,
-            QtWidgets.QSizePolicy.Policy.Preferred,
-        )
+        self._run_block_reason_label = QtWidgets.QLabel(footer)
+        self._run_block_reason_label.setObjectName("global_fit_run_block_reason_label")
+        self._run_block_reason_label.setWordWrap(True)
+        self._run_block_reason_label.setSizePolicy(QtWidgets.QSizePolicy.Policy.Ignored, QtWidgets.QSizePolicy.Policy.Preferred)
+        self._run_block_reason_label.setTextFormat(QtCore.Qt.TextFormat.PlainText)
         self._run_block_reason_label.hide()
         status_column.addWidget(self._run_block_reason_label)
-        control_row.addWidget(status_widget, stretch=3)
-
+        column.addWidget(status_widget)
         self._progress = QtWidgets.QProgressBar(footer)
         self._progress.setRange(0, 100)
         self._progress.setValue(0)
-        control_row.addWidget(self._progress, stretch=2)
+        self._progress.setFormat("%p%")
+        self._progress.setFixedWidth(self.fontMetrics().horizontalAdvance("100%") + 48)
 
-        actions = QtWidgets.QHBoxLayout()
-        actions.setContentsMargins(0, 0, 0, 0)
-        actions.setSpacing(6)
-        self._run_button = QtWidgets.QPushButton("Run Fit", footer)
+        actions = QtWidgets.QVBoxLayout()
+        self._footer_actions = actions
+        column.addLayout(actions)
+        self._footer_widgets = [self._progress]
+        self._run_button = QtWidgets.QPushButton("&Run Fit", footer)
         self._run_button.clicked.connect(self._request_execute)
-        self._cancel_button = QtWidgets.QPushButton("Stop", footer)
+        self._cancel_button = QtWidgets.QPushButton("&Stop", footer)
         self._cancel_button.setEnabled(False)
         self._cancel_button.clicked.connect(self.stopRequested)
-        self._pause_button = QtWidgets.QPushButton("Pause", footer)
+        self._pause_button = QtWidgets.QPushButton("&Pause", footer)
         self._pause_button.setEnabled(False)
         self._pause_button.clicked.connect(self._toggle_pause)
-        for button in (
-            self._run_button,
-            self._cancel_button,
-            self._pause_button,
-        ):
-            actions.addWidget(button)
-
-        self._results_summary_button = QtWidgets.QPushButton(
-            "Results Summary", footer
-        )
-        self._results_summary_button.setEnabled(False)
-        self._results_summary_button.clicked.connect(
-            self.resultsSummaryRequested
-        )
-        actions.addWidget(self._results_summary_button)
-
-        self._copy_button = QtWidgets.QPushButton("Copy Fit Curves", footer)
+        for button in (self._run_button, self._pause_button, self._cancel_button):
+            self._footer_widgets.append(button)
+        self._results_summary_button = QtWidgets.QPushButton("S&ummary", footer)
+        self._results_summary_button.clicked.connect(self.resultsSummaryRequested)
+        self._footer_widgets.append(self._results_summary_button)
+        self._copy_button = QtWidgets.QPushButton("&Copy Fit Curves", footer)
         self._copy_button.setEnabled(False)
-        self._copy_button.clicked.connect(
-            self._run_results_tab.copy_active_to_clipboard
-        )
-        actions.addWidget(self._copy_button)
-
-        self._apply_button = QtWidgets.QPushButton("Apply Fit to Project", footer)
+        self._copy_button.clicked.connect(self._run_results_tab.copy_active_to_clipboard)
+        self._footer_widgets.append(self._copy_button)
+        self._apply_button = QtWidgets.QPushButton("&Apply Fit to Project", footer)
         self._apply_button.setEnabled(False)
         self._apply_button.clicked.connect(self.applyRequested)
-        actions.addWidget(self._apply_button)
+        self._footer_widgets.append(self._apply_button)
         self._shared_seed_combo = QtWidgets.QComboBox(footer)
         self._shared_seed_combo.addItem("Arithmetic mean", "arithmetic")
         self._shared_seed_combo.addItem("Geometric mean", "geometric")
-        self._shared_seed_combo.setEnabled(False)
-        actions.addWidget(self._shared_seed_combo)
-        self._shared_seed_button = QtWidgets.QPushButton(
-            "Configure Shared Fit", footer
-        )
-        self._shared_seed_button.setEnabled(False)
-        self._shared_seed_button.clicked.connect(self._request_shared_seed)
-        actions.addWidget(self._shared_seed_button)
-
-        control_row.addLayout(actions)
+        self._footer_widgets.append(self._shared_seed_combo)
+        self._shared_seed_button = QtWidgets.QPushButton("Configure S&hared Fit", footer)
+        self._shared_seed_button.clicked.connect(
+            lambda: self.sharedSeedRequested.emit(self._shared_seed_combo.currentData()))
+        self._footer_widgets.append(self._shared_seed_button)
+        self.set_shared_seed_available(False)
+        reason_row = QtWidgets.QHBoxLayout()
+        self._apply_reason_label = QtWidgets.QLabel(footer)
+        reason_row.addWidget(self._apply_reason_label, 1)
+        column.addLayout(reason_row)
+        self.set_apply_available(False, "Run a fit to obtain values to apply.")
+        self._layout_footer()
         return footer
+
+    def _layout_footer(self) -> None:
+        self._status_widget.setVisible(bool(self._status.text() or self._run_block_reason_label.text()))
+        self._progress.setFixedWidth(self._progress.fontMetrics().horizontalAdvance("100%") + 48)
+        if hasattr(self, "_apply_reason_label"):
+            self._apply_reason_label.setFixedHeight(self._apply_reason_label.fontMetrics().lineSpacing())
+        available = max(1, self.width() - 32)
+        key = (available, tuple((widget.isHidden(), widget.sizeHint().width()) for widget in self._footer_widgets))
+        if key == getattr(self, "_footer_layout_key", None):
+            return
+        self._footer_layout_key = key
+        while self._footer_actions.count():
+            row = self._footer_actions.takeAt(0).layout()
+            while row.count():
+                row.takeAt(0)
+            row.deleteLater()
+        row = QtWidgets.QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        row.addStretch(1)
+        self._footer_actions.addLayout(row)
+        used = 0
+        for widget in self._footer_widgets:
+            if widget.isHidden():
+                continue
+            width = widget.sizeHint().width()
+            if used and used + width > available:
+                row = QtWidgets.QHBoxLayout()
+                row.setContentsMargins(0, 0, 0, 0)
+                row.addStretch(1)
+                self._footer_actions.addLayout(row)
+                used = 0
+            if isinstance(widget, (QtWidgets.QPushButton, QtWidgets.QComboBox)):
+                widget.setSizePolicy(QtWidgets.QSizePolicy.Policy.Fixed, QtWidgets.QSizePolicy.Policy.Fixed)
+            row.addWidget(widget)
+            used += width + 6
+
+    def event(self, event: QtCore.QEvent) -> bool:
+        if event.type() == QtCore.QEvent.Type.LayoutRequest and hasattr(self, "_footer_widgets"):
+            self._layout_footer()
+        return super().event(event)
+
+    def resizeEvent(self, event: QtGui.QResizeEvent) -> None:
+        super().resizeEvent(event)
+        if hasattr(self, "_footer_widgets"):
+            self._layout_footer()
 
     def _connect_leaf_signals(self) -> None:
         self._connect_origin_dependent_leaf_signals()
@@ -277,11 +310,6 @@ class FittingWindow(QtWidgets.QDialog):
         """Project Last Fit reset availability without retaining the snapshot."""
 
         self._params_ics_tab.set_last_fit_reset_available(snapshot)
-
-    def set_last_fit_presentation(self) -> None:
-        """Label retained Last Fit values as ordinary state."""
-
-        self._params_ics_tab.set_last_fit_presentation()
 
     def clear_pending_setup_edits(self) -> None:
         """Discard every leaf draft and refresh the complete Fit surface."""
@@ -383,6 +411,8 @@ class FittingWindow(QtWidgets.QDialog):
             reason = structural
         self._run_block_reason_label.setVisible(bool(reason))
         self._run_block_reason_label.setText(reason)
+        self._run_block_reason_label.setAccessibleName(reason)
+        self._layout_footer()
 
     def _populate_dataset_list(self, snapshot: FitSetupSnapshot) -> None:
         by_id = {item.dataset_id: item for item in self._origin.mapped_datasets}
@@ -685,6 +715,11 @@ class FittingWindow(QtWidgets.QDialog):
     def _request_execute(self) -> None:
         if self._closing:
             return
+        # Mnemonics do not move focus like a mouse click does. Let the focused
+        # editor settle through its normal signals before checking admission.
+        focused = self.focusWidget()
+        if focused is not None:
+            focused.clearFocus()
         if self.has_invalid_setup_edits:
             self.set_status(
                 "Fit setup contains an invalid edit; correct it before running."
@@ -720,17 +755,20 @@ class FittingWindow(QtWidgets.QDialog):
         was_executing = self._executing
         self._executing = bool(executing)
         if self._executing:
+            self._status.clear()
+            self._status.hide()
+            self._layout_footer()
             if not was_executing:
                 self._progress.setValue(0)
             self._paused = False
-            self._run_results_tab.set_live_curves(())
-            self._run_results_tab.set_live_layout_locked(True)
+            self._start_results_presentation()
+            self._tabs.setCurrentIndex(2)
             self._apply_button.setEnabled(False)
             self.set_shared_seed_available(False)
         else:
             self._paused = False
-            self._run_results_tab.set_live_layout_locked(False)
         self._refresh_copy_allowed()
+        self._results_summary_button.setEnabled(True)
         self._cancel_button.setEnabled(self._executing)
         self._pause_button.setText("Pause")
         self._pause_button.setEnabled(self._executing)
@@ -740,20 +778,53 @@ class FittingWindow(QtWidgets.QDialog):
         self._data_targets_tab.unified_list.set_running_state(self._executing)
         self._data_tab.setEnabled(not self._executing)
         self._refresh_setup_validity()
+        self._layout_footer()
+
+    def set_observation_style(self, shape: str, size: float, opacity: float) -> None:
+        self._observation_style = (shape, size, opacity)
+        self._run_results_tab.set_observation_style(shape, size, opacity)
 
     def set_progress(self, value: int) -> None:
-        self._progress.setValue(max(0, min(100, int(value))))
+        progress = max(0, min(100, int(value)))
+        self._progress.setValue(progress)
+        self._run_results_tab.set_progress(progress)
 
     def set_status(self, text: str) -> None:
         if self._closing and not self._closing_after_cleanup:
-            self._status.setText("Stopping…")
+            self.set_execution_status("Closing", "Stopping Fit before closing…")
             return
         self._status.setText(str(text))
+        self._status.setAccessibleName(str(text))
+        self._status.setToolTip(str(text))
+        self._status.setVisible(bool(text))
+        self._layout_footer()
+
+    def set_execution_status(self, phase: str, detail: str) -> None:
+        self._status.clear()
+        self._status.hide()
+        self._layout_footer()
+        self._run_results_tab.set_execution_status(phase, detail)
 
     def set_live_best(self, update: FitLiveUpdate) -> None:
         if not isinstance(update, FitLiveUpdate):
             raise TypeError("update must be FitLiveUpdate.")
-        self._run_results_tab.set_live_best(update)
+        setup = self._projected_setup
+        included = set() if setup is None else {
+            dataset.dataset_id for dataset in setup.datasets if dataset.included
+        }
+        labels = {} if setup is None else {
+            dataset.dataset_id: dataset.display_name
+            for dataset in setup.origin.mapped_datasets if dataset.dataset_id in included
+        }
+        initial_labels: dict[str, str] = {}
+        if setup is not None:
+            for mapped in setup.origin.mapped_datasets:
+                if mapped.dataset_id in included:
+                    previous = initial_labels.get(mapped.set_id)
+                    initial_labels[mapped.set_id] = (
+                        mapped.display_name if previous is None else previous + ", " + mapped.display_name
+                    )
+        self._run_results_tab.set_live_best(update, dataset_labels=labels, initial_labels=initial_labels)
 
     def set_live_curves(self, curves: tuple[FitCurveDataset, ...]) -> None:
         values = tuple(curves)
@@ -779,53 +850,64 @@ class FittingWindow(QtWidgets.QDialog):
     ) -> bool:
         """Consume one call-local typed candidate presentation."""
 
+        self._status.clear()
+        self._status.hide()
+        self._layout_footer()
         rendered = self._run_results_tab.set_terminal_presentation(
             candidate,
             curves=curves,
             curve_failure=curve_failure,
         )
         self._results_summary_button.setEnabled(candidate is not None)
-        self._apply_button.setEnabled(candidate is not None and not self._executing)
         self.set_resolved_auto_modes(
             () if candidate is None else candidate.resolved_auto_modes
         )
-        self.set_last_fit_presentation()
+        if candidate is not None:
+            self._params_ics_tab.set_last_fit_presentation({
+                settlement.parameter_name: settlement.overall_decoded_value
+                for settlement in candidate.result.centred_fixed_effects_settlements
+            })
+        self._layout_footer()
         self._tabs.setCurrentIndex(2)
         return bool(rendered)
 
-    def set_apply_available(self, available: bool) -> None:
-        self._apply_button.setEnabled(bool(available) and not self._executing)
+    def set_apply_available(self, available: bool, reason: str) -> None:
+        self._apply_button.setEnabled(available and not self._executing)
+        set_bounded_label_text(self._apply_reason_label, reason, max_width=16777215)
+        self._run_results_tab.set_apply_reason(reason)
+        self._layout_footer()
 
     def set_shared_seed_available(self, available: bool) -> None:
-        enabled = bool(available) and not self._executing
-        self._shared_seed_combo.setEnabled(enabled)
-        self._shared_seed_button.setEnabled(enabled)
+        for widget in (self._shared_seed_combo, self._shared_seed_button):
+            widget.setEnabled(available and not self._executing)
+        self._layout_footer()
 
-    def _request_shared_seed(self) -> None:
-        if self._closing or self._executing:
-            return
-        self.sharedSeedRequested.emit(
-            str(self._shared_seed_combo.currentData() or "arithmetic")
+    def _start_results_presentation(self) -> None:
+        setup = self._projected_setup
+        self._run_results_tab.set_waiting(
+            "Fit" if setup is None else setup.origin.tab_name,
+            () if setup is None else setup.parameters,
+            0 if setup is None else sum(dataset.included for dataset in setup.datasets),
         )
 
     def clear_candidate(self) -> None:
         self._clear_resolved_auto_modes()
         self._apply_button.setEnabled(False)
-        self._results_summary_button.setEnabled(False)
-        self.set_last_fit_presentation()
-        self._run_results_tab.clear_candidate()
+        self._results_summary_button.setEnabled(True)
+        if self._executing:
+            self._start_results_presentation()
+        else:
+            self._run_results_tab.clear_candidate()
 
-    def render_results_summary(
-        self,
-        summary: str,
-    ) -> None:
-        self._run_results_tab.render_results_summary(
-            summary,
-        )
+    def render_results_summary(self) -> None:
+        self._run_results_tab.render_results_summary()
 
     def set_terminal_failure(self, failure: FactualCause) -> None:
         """Present a worker failure while retaining its factual cause chain."""
 
+        self._status.clear()
+        self._status.hide()
+        self._layout_footer()
         self._run_results_tab.set_terminal_failure(failure)
         self._tabs.setCurrentIndex(2)
 
@@ -836,6 +918,9 @@ class FittingWindow(QtWidgets.QDialog):
         """Present scientific unavailability without classifying it as failure."""
 
         self.clear_candidate()
+        self._status.clear()
+        self._status.hide()
+        self._layout_footer()
         self._run_results_tab.set_terminal_unavailable(
             cause,
         )
@@ -863,6 +948,8 @@ class FittingWindow(QtWidgets.QDialog):
 
     def changeEvent(self, event: QtCore.QEvent) -> None:  # noqa: N802
         super().changeEvent(event)
+        if event.type() == QtCore.QEvent.Type.FontChange and hasattr(self, "_footer_widgets"):
+            self._layout_footer()
         if hasattr(self, "_run_results_tab") and event.type() in (
             QtCore.QEvent.Type.PaletteChange,
             QtCore.QEvent.Type.ApplicationPaletteChange,
@@ -888,7 +975,7 @@ class FittingWindow(QtWidgets.QDialog):
             return
         self._closing = True
         self._refresh_copy_allowed()
-        self._status.setText("Stopping…")
+        self.set_execution_status("Closing", "Stopping Fit before closing…")
         self._tabs.setEnabled(False)
         self._current_tab_stack.setEnabled(False)
         self._data_targets_tab.setEnabled(False)
