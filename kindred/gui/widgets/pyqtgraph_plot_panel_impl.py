@@ -203,13 +203,14 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         parent: QtWidgets.QWidget | None = None,
     ) -> None:
         super().__init__(parent)
+        self._interactive_gesture_active = False
         self._sampling_limit: int | None = None
         self._plot_items_by_key: dict[tuple[object, ...], object] = {}
         self._annotation_items: dict[_AnnotationKey, object] = {}
         self._annotation_labels: dict[
             tuple[object, ...], tuple[object, QtCore.QPointF]
         ] = {}
-        self._interaction_mode = "pan"
+        self._zoom_enabled = False
         self._presentation = _PlotPresentation()
         self._axis_range = _AxisRangeSession()
         self._x_time_unit = "s"
@@ -256,10 +257,9 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         self._axis_toolbar.xChanged.connect(self.xSeriesRequested.emit)
         self._axis_toolbar.ySelectionChanged.connect(self.ySeriesRequested.emit)
         self._axis_toolbar.axisRangeChanged.connect(self._apply_axis_range)
-        self._axis_toolbar.interactionModeRequested.connect(self._set_interaction_mode)
-        self._axis_toolbar.optionsRequested.connect(self._on_axis_option)
-        self._axis_toolbar.presentationOptionRequested.connect(
-            self._request_plot_presentation
+        self._axis_toolbar.unitChanged.connect(self._apply_display_unit_change)
+        self._plot_widget.getViewBox().sigRangeChangedManually.connect(
+            self._on_manual_navigation
         )
 
         self._completion_warning_badge = QtWidgets.QLabel(
@@ -271,6 +271,8 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
             "QLabel { border: 1px solid #b7791f; border-radius: 6px; "
             "padding: 2px 7px; color: #8a5a12; background: #fff7df; }"
         )
+        self._create_plot_context_menu()
+        self._apply_zoom_mode()
         self._clear_completion_warning()
 
         plot_host = QtWidgets.QWidget(self)
@@ -540,53 +542,120 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         """Project semantic Copy All eligibility into the physical menu."""
 
         self._copy_all_available = bool(available)
+        self._sync_plot_controls()
 
-    def _show_plot_context_menu(self, position: QtCore.QPoint) -> None:
-        menu = QtWidgets.QMenu(self)
-        copy_all = menu.addAction("Copy All")
-        copy_all.setEnabled(self._copy_all_available)
-        copy_all.triggered.connect(self.copyAllRequested.emit)
-        menu.addSeparator()
-        copy_rendered = menu.addAction("Copy Rendered Points")
-        copy_rendered.setEnabled(
+    def _create_plot_context_menu(self) -> None:
+        self._plot_menu = QtWidgets.QMenu(self)
+        self._plot_menu.setToolTipsVisible(True)
+        self._plot_actions: dict[str, QtGui.QAction] = {}
+        groups = (
+            (("copy_all", "Copy All"), ("copy_plotted", "Copy Plotted Data")),
+            (("zoom", "Zoom"), ("auto_range", "Auto Range")),
+            (
+                ("legend_visible", "Show Legend"),
+                ("reference_lines_visible", "Show Reference"),
+                ("intervention_annotations_visible", "Show Intervention Indicators"),
+                ("intervention_labels_visible", "Show Intervention Labels"),
+            ),
+            (
+                ("log_x", "Log X"), ("log_y", "Log Y"),
+                ("x_inverted", "Invert X Axis"), ("y_inverted", "Invert Y Axis"),
+            ),
+            (("sampling", "Downsampling: 1k points/curve"), ("warnings", "Warning details…")),
+        )
+        for index, group in enumerate(groups):
+            if index:
+                self._plot_menu.addSeparator()
+            for key, text in group:
+                action = self._plot_menu.addAction(text)
+                action.setCheckable(key not in {"copy_all", "copy_plotted", "warnings"})
+                self._plot_actions[key] = action
+        actions = self._plot_actions
+        actions["copy_all"].setToolTip(
+            "Copy full-resolution results and references for all initial-condition "
+            "sets in this mechanism, including data not currently shown, plus linked "
+            "experimental data. Uses canonical units and ignores plot selection and downsampling."
+        )
+        actions["copy_plotted"].setToolTip(
+            "Copy plotted series using the selected axes, display units, and downsampling. "
+            "Includes points outside the current view."
+        )
+        actions["zoom"].setToolTip("Drag a rectangle to zoom. When off, drag to pan.")
+        actions["auto_range"].setToolTip("Automatically scale axes to fit all visible data.")
+        actions["legend_visible"].setToolTip("Show the names and colors of the plotted curves.")
+        actions["reference_lines_visible"].setToolTip("Show reference curves alongside current results.")
+        actions["intervention_annotations_visible"].setToolTip(
+            "Show intervention lines and shaded regions. Turning this on or off "
+            "also turns labels on or off."
+        )
+        actions["intervention_labels_visible"].setToolTip(
+            "Show draggable text labels for interventions. Turning this on also enables indicators."
+        )
+        actions["log_x"].setToolTip("Display the X axis on a logarithmic scale.")
+        actions["log_y"].setToolTip("Display the Y axis on a logarithmic scale.")
+        actions["x_inverted"].setToolTip("Reverse the direction of the X axis.")
+        actions["y_inverted"].setToolTip("Reverse the direction of the Y axis.")
+        actions["sampling"].setToolTip(
+            "Plot about 1,000 points per curve, preserving intervention boundaries. "
+            "Copy All keeps full resolution."
+        )
+        actions["warnings"].setToolTip("View details of warnings for the current plot.")
+        actions["copy_all"].triggered.connect(self.copyAllRequested.emit)
+        actions["copy_plotted"].triggered.connect(self._copy_rendered_points_to_clipboard)
+        actions["zoom"].triggered.connect(self._set_zoom_enabled)
+        actions["auto_range"].triggered.connect(self._set_auto_range)
+        actions["reference_lines_visible"].triggered.connect(self.referenceLayerVisibilityRequested)
+        actions["intervention_annotations_visible"].triggered.connect(self.interventionAnnotationsVisibilityRequested)
+        actions["intervention_labels_visible"].triggered.connect(self.interventionLabelsVisibilityRequested)
+        for option in ("legend_visible", "log_x", "log_y", "x_inverted", "y_inverted"):
+            actions[option].triggered.connect(
+                lambda enabled, key=option: self._request_plot_presentation(key, enabled)
+            )
+        actions["sampling"].triggered.connect(self._set_coarse_sampling)
+        actions["warnings"].triggered.connect(self._show_completion_warning_details)
+        self._plot_menu.aboutToShow.connect(self._sync_plot_controls)
+
+    def _sync_plot_controls(self) -> None:
+        """Project current owner state; QAction.triggered emits user commands only."""
+        values = {
+            "zoom": self._zoom_enabled,
+            "auto_range": self._axis_range.auto,
+            "sampling": self._sampling_limit is not None,
+            "legend_visible": self._presentation.legend_visible,
+            "log_x": self._presentation.log_x,
+            "log_y": self._presentation.log_y,
+            "x_inverted": self._presentation.x_inverted,
+            "y_inverted": self._presentation.y_inverted,
+        }
+        for key in ("reference_lines_visible", "intervention_annotations_visible", "intervention_labels_visible"):
+            values[key] = bool(self._render_input and getattr(self._render_input, key))
+        for key, checked in values.items():
+            self._plot_actions[key].setChecked(checked)
+        self._plot_actions["copy_all"].setEnabled(self._copy_all_available)
+        self._plot_actions["copy_plotted"].setEnabled(
             any(chunk.x.size for block in self._rendered_point_roster for chunk in block.chunks)
         )
-        copy_rendered.triggered.connect(self._copy_rendered_points_to_clipboard)
-        menu.addSeparator()
-        reference = menu.addAction("Show Reference")
-        reference.setCheckable(True)
-        reference.setChecked(
-            bool(self._render_input and self._render_input.reference_lines_visible)
+        self._plot_actions["warnings"].setEnabled(bool(self._completion_warning_badge.text()))
+        self._plot_actions["auto_range"].setEnabled(not self._interactive_gesture_active)
+        self._axis_toolbar.set_manual_range_controls(
+            visible=not self._axis_range.auto,
+            enabled=not self._interactive_gesture_active,
         )
-        reference.toggled.connect(self.referenceLayerVisibilityRequested)
-        annotations = menu.addAction("Show Intervention Indicators")
-        annotations.setCheckable(True)
-        annotations.setChecked(
-            bool(
-                self._render_input
-                and self._render_input.intervention_annotations_visible
-            )
-        )
-        annotations.toggled.connect(self.interventionAnnotationsVisibilityRequested)
-        labels = menu.addAction("Show Intervention Labels")
-        labels.setCheckable(True)
-        labels.setChecked(
-            bool(self._render_input and self._render_input.intervention_labels_visible)
-        )
-        labels.toggled.connect(self.interventionLabelsVisibilityRequested)
-        menu.exec(self._plot_widget.mapToGlobal(position))
+
+    def _show_plot_context_menu(self, position: QtCore.QPoint) -> None:
+        self._plot_menu.exec(self._plot_widget.mapToGlobal(position))
 
     @QtCore.Slot()
     def _copy_rendered_points_to_clipboard(self) -> None:
         roster = self._rendered_point_roster
         try:
             if not any(chunk.x.size for block in roster for chunk in block.chunks):
-                raise ValueError("No rendered points are available to copy.")
+                raise ValueError("No plotted data is available to copy.")
             output = io.StringIO()
             output.writelines(_iter_rendered_point_tsv_chunks(roster))
             rendered_text = output.getvalue()
         except (TypeError, ValueError, OSError) as exc:
-            QtWidgets.QMessageBox.critical(self, "Copy Rendered Points", str(exc))
+            QtWidgets.QMessageBox.critical(self, "Copy Plotted Data", str(exc))
             return
         QtWidgets.QApplication.clipboard().setText(rendered_text)
 
@@ -702,7 +771,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
 
     def drop_tab_session_state(self) -> None:
         self.dispose_project_content()
-        self._interaction_mode = "pan"
+        self._zoom_enabled = False
         self._presentation = _PlotPresentation()
         self._sampling_limit = None
         self._axis_range = _AxisRangeSession()
@@ -715,15 +784,13 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
 
         self.dispose_project_content()
         self._end_interactive_gesture_session()
-        self._interaction_mode = "pan"
+        self._zoom_enabled = False
         self._presentation = _PlotPresentation()
         self._sampling_limit = None
         self._axis_range = _AxisRangeSession()
         self._x_time_unit = "s"
         self._x_concentration_unit = "M"
         self._y_concentration_unit = "M"
-        self._axis_toolbar.set_interaction_mode("pan")
-        self._axis_toolbar.set_coarse_sampling(False)
         self._axis_toolbar.set_axis_unit_choices(
             x_units=tuple(TIME_DISPLAY_UNIT_FACTORS),
             selected_x="s",
@@ -731,8 +798,8 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
             selected_y=None,
         )
         self._axis_toolbar.set_manual_ranges(None, None, None, None)
-        self._axis_toolbar.set_auto_range(True)
-        self._apply_interaction_mode("pan")
+        self._sync_plot_controls()
+        self._apply_zoom_mode()
 
     def dispose_project_content(self) -> None:
         """Stop plot-owned asynchronous work before project content teardown."""
@@ -1220,10 +1287,12 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         self._tick_interactive_display()
 
     def _begin_interactive_gesture_session(self) -> None:
-        self._axis_toolbar.set_interactive_gesture_active(True)
+        self._interactive_gesture_active = True
+        self._sync_plot_controls()
 
     def _end_interactive_gesture_session(self) -> None:
-        self._axis_toolbar.set_interactive_gesture_active(False)
+        self._interactive_gesture_active = False
+        self._sync_plot_controls()
 
     def _render_interactive_display(
         self,
@@ -1443,7 +1512,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
                 self._presentation,
                 annotations=(*static_annotations, *interactive_annotations),
             )
-        # Copy Rendered is a semantic settled projection. During a cross-fade
+        # Copy Plotted Data is a semantic settled projection. During a cross-fade
         # the transition source and target are both physical layers, but only
         # the target belongs in the copy roster; hidden static target items
         # are already represented by that projection above.
@@ -1595,7 +1664,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         self._completion_warning_badge.setAccessibleName("")
         self._completion_warning_badge.setAccessibleDescription("")
         self._completion_warning_badge.setVisible(False)
-        self._axis_toolbar.set_warning_details_available(False)
+        self._sync_plot_controls()
 
     @staticmethod
     def _has_time_x(render_input: ResultRenderInput) -> bool:
@@ -1728,19 +1797,16 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
             ],
             locked_checked=locked_checked,
         )
-        self._axis_toolbar.set_coarse_sampling(self._sampling_limit is not None)
-        interaction = self._interaction_mode
-        self._axis_toolbar.set_interaction_mode(interaction)
-        self._apply_interaction_mode(interaction)
+        self._apply_zoom_mode()
         presentation = self._presentation
         self._render_analysis(render_input)
         axis_range = self._axis_range
         self._axis_toolbar.set_manual_ranges(axis_range.x_min, axis_range.x_max, axis_range.y_min, axis_range.y_max)
-        self._axis_toolbar.set_auto_range(axis_range.auto)
         self._apply_plot_presentation(presentation, axis_range=axis_range)
         self._render_annotations(render_input, presentation)
         self._project_completion_warning(render_input)
         self._rendered_point_roster = tuple(rendered_points)
+        self._sync_plot_controls()
 
     def _update_plot_item_legend(self, item: object, name: str | None) -> None:
         # PyQtGraph 0.13.7 exposes PlotDataItem.name() as an opts-backed
@@ -2153,7 +2219,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         self._completion_warning_badge.setToolTip(literal_tooltip(details))
         self._completion_warning_badge.setAccessibleDescription(details)
         self._completion_warning_badge.setVisible(True)
-        self._axis_toolbar.set_warning_details_available(True)
+        self._sync_plot_controls()
 
     @staticmethod
     def _raw_to_view_coordinate(
@@ -2520,26 +2586,44 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         self._clear_annotation_items()
         self.apply_result_input(render_input)
 
-    @QtCore.Slot(str, object)
-    def _on_axis_option(self, action: str, value: object) -> None:
-        normalized_action = str(action)
-        if normalized_action == "warning_details":
-            self._show_completion_warning_details()
-        elif normalized_action == "x_unit":
-            self._apply_display_unit_change("x", str(value))
-        elif normalized_action == "y_unit":
-            self._apply_display_unit_change("y", str(value))
-        elif normalized_action == "sampling":
-            self._sampling_limit = 1000 if str(value) == "coarse" else None
-            render_input = self._render_input
-            if render_input is not None:
-                self.apply_result_input(render_input)
+    @QtCore.Slot(bool)
+    def _set_coarse_sampling(self, enabled: bool) -> None:
+        self._sampling_limit = 1000 if enabled else None
+        if self._render_input is not None:
+            self.apply_result_input(self._render_input)
+        self._sync_plot_controls()
+
+    def _capture_view_range(self) -> _AxisRangeSession:
+        current_x, current_y = self._plot_widget.getViewBox().viewRange()
+        return _AxisRangeSession(
+            auto=False,
+            x_min=self._view_to_raw_coordinate(current_x[0], log_enabled=self._presentation.log_x),
+            x_max=self._view_to_raw_coordinate(current_x[1], log_enabled=self._presentation.log_x),
+            y_min=self._view_to_raw_coordinate(current_y[0], log_enabled=self._presentation.log_y),
+            y_max=self._view_to_raw_coordinate(current_y[1], log_enabled=self._presentation.log_y),
+        )
+
+    @QtCore.Slot(bool)
+    def _set_auto_range(self, enabled: bool) -> None:
+        self._axis_range = _AxisRangeSession() if enabled else self._capture_view_range()
+        self._apply_axis_range_state(self._axis_range, self._presentation)
+        self._project_manual_ranges()
+
+    def _on_manual_navigation(self, _axes: object) -> None:
+        self._plot_widget.getViewBox().disableAutoRange()
+        self._axis_range = self._capture_view_range()
+        self._project_manual_ranges()
+
+    def _project_manual_ranges(self) -> None:
+        state = self._axis_range
+        self._axis_toolbar.set_manual_ranges(state.x_min, state.x_max, state.y_min, state.y_max)
+        self._sync_plot_controls()
 
     @QtCore.Slot()
     def _apply_axis_range(self) -> None:
         presentation = self._presentation
         x_min, x_max, y_min, y_max = self._axis_toolbar.get_manual_ranges()
-        auto = self._axis_toolbar.is_auto_range()
+        auto = self._axis_range.auto
         if not auto:
             current_x, current_y = (
                 self._plot_widget.getPlotItem().getViewBox().viewRange()
@@ -2620,20 +2704,15 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
                 padding=0,
             )
 
-    @QtCore.Slot(str)
-    def _set_interaction_mode(self, mode: str) -> None:
-        normalized = str(mode or "").strip().lower()
-        if normalized not in {"pan", "rectangle_zoom"}:
-            raise ValueError("Plot interaction mode must be Pan or Rectangle Zoom.")
-        self._interaction_mode = normalized
-        self._axis_toolbar.set_interaction_mode(normalized)
-        self._apply_interaction_mode(normalized)
+    @QtCore.Slot(bool)
+    def _set_zoom_enabled(self, enabled: bool) -> None:
+        self._zoom_enabled = enabled
+        self._apply_zoom_mode()
+        self._sync_plot_controls()
 
-    def _apply_interaction_mode(self, mode: str) -> None:
-        view_box = self._plot_widget.getPlotItem().getViewBox()
-        view_box.setMouseMode(
-            view_box.PanMode if str(mode) == "pan" else view_box.RectMode
-        )
+    def _apply_zoom_mode(self) -> None:
+        view_box = self._plot_widget.getViewBox()
+        view_box.setMouseMode(view_box.RectMode if self._zoom_enabled else view_box.PanMode)
 
     def _request_plot_presentation(
         self,
@@ -2655,13 +2734,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         item.setLogMode(x=state.log_x, y=state.log_y)
         item.invertX(state.x_inverted)
         item.invertY(state.y_inverted)
-        self._axis_toolbar.set_plot_presentation_state(
-            log_x=state.log_x,
-            log_y=state.log_y,
-            legend_visible=state.legend_visible,
-            x_inverted=state.x_inverted,
-            y_inverted=state.y_inverted,
-        )
+        self._sync_plot_controls()
         if self._legend is not None:
             self._legend.setVisible(state.legend_visible)
         if axis_range is not None:
@@ -2725,7 +2798,7 @@ def _iter_rendered_point_tsv_chunks(
         if any(chunk.x.size for chunk in block.chunks)
     )
     if not nonempty:
-        raise ValueError("No rendered points are available to copy.")
+        raise ValueError("No plotted data is available to copy.")
     block_specs: list[tuple[_RenderedPointBlock, tuple[str, ...], int, int, bool]] = []
     planned_rows = 0
     planned_width = 0
@@ -2767,7 +2840,7 @@ def _iter_rendered_point_tsv_chunks(
     planned_cells = (planned_rows + 1) * planned_width
     if planned_cells > _MAX_RENDERED_COPY_CELLS:
         raise ValueError(
-            "Rendered Copy payload exceeds the bounded cell limit "
+            "Copy Plotted Data payload exceeds the bounded cell limit "
             f"({_MAX_RENDERED_COPY_CELLS:,})."
         )
 
@@ -2870,7 +2943,7 @@ def _iter_rendered_point_tsv_chunks(
             total_characters += len(piece)
             if total_characters > _MAX_RENDERED_COPY_CHARACTERS:
                 raise ValueError(
-                    "Rendered Copy payload exceeds the bounded output-size limit."
+                    "Copy Plotted Data payload exceeds the bounded output-size limit."
                 )
             output_chunks.append(piece)
             output = io.StringIO()
@@ -2879,7 +2952,7 @@ def _iter_rendered_point_tsv_chunks(
     total_characters += len(piece)
     if total_characters > _MAX_RENDERED_COPY_CHARACTERS:
         raise ValueError(
-            "Rendered Copy payload exceeds the bounded output-size limit."
+            "Copy Plotted Data payload exceeds the bounded output-size limit."
         )
     if piece:
         output_chunks.append(piece)

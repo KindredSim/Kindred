@@ -5,18 +5,18 @@ Control-surface contract
 ------------------------
 - X dropdown: typed simulation or experimental identity, with `t` by default.
 - Y multi-select: all time-varying species and algebra series. Scalars disabled.
-- Options: sampling choice for plotting.
+- Display units and a separate row of compact manual axis limits.
 
 This widget provides a deterministic, fully functional control strip with:
 - A labeled X combobox
 - A labeled, checkable Y list
-- An Options toolbutton with a QMenu exposing actions/signals
+- Unit selectors and manual range editors
 
 Signals emitted
 --------------
 xChanged(selection: SimulationSeriesAxisSelection | ExperimentalAxisSelection)
 ySelectionChanged(selected: tuple[AxisSeriesSelection, ...])
-optionsRequested(action: str, data: object)  # e.g. "sampling"
+unitChanged(axis: str, unit: str)
 
 Public API
 ----------
@@ -24,8 +24,7 @@ set_x_candidates(candidates, *, selected)
 set_y_candidates(candidates, *, disabled=(), locked_checked=None)
 selected_y() -> tuple[AxisSeriesSelection, ...]
 current_x() -> AxisSeriesSelection
-is_auto_range() -> bool
-set_auto_range(enabled: bool) -> None
+set_manual_range_controls(*, visible: bool, enabled: bool) -> None
 get_manual_ranges() -> tuple[float|None, float|None, float|None, float|None]
 set_manual_ranges(x_min, x_max, y_min, y_max) -> None
 
@@ -40,7 +39,7 @@ from __future__ import annotations
 import math
 from typing import Mapping, Optional, Sequence
 
-from PySide6 import QtCore, QtGui, QtWidgets
+from PySide6 import QtCore, QtWidgets
 
 from PySide6.QtCore import Qt
 
@@ -50,7 +49,7 @@ from kindred.core.project_presentation_state import (
     SimulationSeriesAxisSelection,
 )
 from kindred.gui.plot_config import AxisSelectionCandidate
-from kindred.gui.ui_helpers import ControlRowsLayout
+from kindred.gui.ui_helpers import ControlRowsLayout, configure_compact_numeric_edit
 from kindred.gui.display_name_policy import compact_text, literal_tooltip
 
 __all__ = ["AxisToolbar"]
@@ -60,17 +59,14 @@ class AxisToolbar(QtWidgets.QWidget):
     # High-level signals
     xChanged = QtCore.Signal(object)
     ySelectionChanged = QtCore.Signal(object)
-    optionsRequested = QtCore.Signal(str, object)      # action, data
+    unitChanged = QtCore.Signal(str, str)
     axisRangeChanged = QtCore.Signal()                 # axis range manually changed
-    interactionModeRequested = QtCore.Signal(str)
-    presentationOptionRequested = QtCore.Signal(str, bool)
 
     def __init__(
         self,
         parent: Optional[QtWidgets.QWidget] = None,
     ) -> None:
         super().__init__(parent)
-        self._interactive_gesture_active = False
 
         self._x_combo = QtWidgets.QComboBox(self)
         self._x_combo.setMinimumContentsLength(4)
@@ -125,72 +121,6 @@ class AxisToolbar(QtWidgets.QWidget):
         self._y_menu.addAction(self._y_menu_action)
         self._y_selector_btn.setMenu(self._y_menu)
 
-        self._pan_button = QtWidgets.QToolButton(self)
-        self._pan_button.setText("Pan")
-        self._pan_button.setCheckable(True)
-        self._pan_button.setChecked(True)
-        self._pan_button.setToolTip("Drag to pan the current Plot view")
-        self._rectangle_zoom_button = QtWidgets.QToolButton(self)
-        self._rectangle_zoom_button.setText("Rectangle Zoom")
-        self._rectangle_zoom_button.setCheckable(True)
-        self._rectangle_zoom_button.setToolTip(
-            "Drag a rectangle to zoom the current Plot view"
-        )
-        self._interaction_group = QtGui.QActionGroup(self)
-        self._interaction_group.setExclusive(True)
-        for button in (self._pan_button, self._rectangle_zoom_button):
-            action = QtGui.QAction(button.text(), self._interaction_group)
-            action.setCheckable(True)
-            action.setChecked(button.isChecked())
-            button.setDefaultAction(action)
-        actions = self._interaction_group.actions()
-        actions[0].triggered.connect(
-            lambda: self._on_interaction_requested("pan")
-        )
-        actions[1].triggered.connect(
-            lambda: self._on_interaction_requested("rectangle_zoom")
-        )
-
-        self._options_btn = QtWidgets.QToolButton(self)
-        self._options_btn.setText("Options")
-        self._options_btn.setToolTip("Plot display options")
-        self._options_btn.setPopupMode(QtWidgets.QToolButton.ToolButtonPopupMode.InstantPopup)
-        self._options_btn.setToolButtonStyle(QtCore.Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
-        self._options_btn.setIcon(QtGui.QIcon.fromTheme("preferences-other"))
-
-        self._menu = QtWidgets.QMenu(self)
-        self._warning_details_action = self._menu.addAction("Warning details…")
-        self._warning_details_action.setEnabled(False)
-        self._warning_details_action.triggered.connect(
-            lambda: self.optionsRequested.emit("warning_details", None)
-        )
-        self._menu.addSeparator()
-        self._action_downsampling = self._menu.addAction("Downsampling: 1k points/curve")
-        self._action_downsampling.setCheckable(True)
-        self._action_downsampling.setChecked(False)
-        self._menu.addSeparator()
-        self._presentation_actions: dict[str, QtGui.QAction] = {}
-        for text, key, checked in (
-            ("Log X", "log_x", False),
-            ("Log Y", "log_y", False),
-            ("Show Legend", "legend_visible", True),
-            ("Invert X Axis", "x_inverted", False),
-            ("Invert Y Axis", "y_inverted", False),
-        ):
-            action = self._menu.addAction(text)
-            action.setCheckable(True)
-            action.setChecked(checked)
-            action.toggled.connect(
-                lambda enabled, option=key: (
-                    self.presentationOptionRequested.emit(
-                        option,
-                        bool(enabled),
-                    )
-                )
-            )
-            self._presentation_actions[key] = action
-        self._options_btn.setMenu(self._menu)
-
         # Labels
         x_label = QtWidgets.QLabel("X:", self)
         x_label.setBuddy(self._x_combo)
@@ -199,28 +129,24 @@ class AxisToolbar(QtWidgets.QWidget):
         self._y_unit_combo.setAccessibleName("Y axis unit")
 
         # Axis range controls
-        self._auto_range = QtWidgets.QCheckBox("Auto Range", self)
-        self._auto_range.setChecked(True)
-        self._auto_range.setToolTip("Auto-scale axes to fit all visible data")
-
         self._x_min = QtWidgets.QLineEdit(self)
         self._x_min.setPlaceholderText("X min")
-        self._x_min.setMaximumWidth(80)
+        configure_compact_numeric_edit(self._x_min, characters=11)
         self._x_min.setEnabled(False)
 
         self._x_max = QtWidgets.QLineEdit(self)
         self._x_max.setPlaceholderText("X max")
-        self._x_max.setMaximumWidth(80)
+        configure_compact_numeric_edit(self._x_max, characters=11)
         self._x_max.setEnabled(False)
 
         self._y_min = QtWidgets.QLineEdit(self)
         self._y_min.setPlaceholderText("Y min")
-        self._y_min.setMaximumWidth(80)
+        configure_compact_numeric_edit(self._y_min, characters=11)
         self._y_min.setEnabled(False)
 
         self._y_max = QtWidgets.QLineEdit(self)
         self._y_max.setPlaceholderText("Y max")
-        self._y_max.setMaximumWidth(80)
+        configure_compact_numeric_edit(self._y_max, characters=11)
         self._y_max.setEnabled(False)
 
         self._manual_range_row = QtWidgets.QWidget(self)
@@ -233,20 +159,15 @@ class AxisToolbar(QtWidgets.QWidget):
         # Wiring
         self._x_combo.currentIndexChanged.connect(self._on_x_changed)
         self._x_unit_combo.currentTextChanged.connect(
-            lambda unit: self._emit_option("x_unit", unit)
+            lambda unit: self.unitChanged.emit("x", unit)
         )
         self._y_unit_combo.currentTextChanged.connect(
-            lambda unit: self._emit_option("y_unit", unit)
+            lambda unit: self.unitChanged.emit("y", unit)
         )
         self._y_list.itemChanged.connect(self._on_y_item_changed)
         self._invert_y_selection_btn.clicked.connect(self.invert_y_selection)
 
-        self._action_downsampling.toggled.connect(
-            lambda on: self._emit_option("sampling", "coarse" if on else "dense")
-        )
-
         # Range control wiring
-        self._auto_range.toggled.connect(self._on_auto_range_toggled)
         self._x_min.editingFinished.connect(self._on_range_changed)
         self._x_max.editingFinished.connect(self._on_range_changed)
         self._y_min.editingFinished.connect(self._on_range_changed)
@@ -384,7 +305,7 @@ class AxisToolbar(QtWidgets.QWidget):
             # Disable scalars as Y selections per spec
             if candidate.selection in disabled_set:
                 it.setFlags(it.flags() & ~Qt.ItemFlag.ItemIsEnabled)
-                it.setToolTip(literal_tooltip(candidate.label + "\nScalar values cannot be plotted as Y; use 'Add Guide from Scalar' in Options."))
+                it.setToolTip(literal_tooltip(candidate.label + "\nScalar values cannot be plotted as Y."))
                 it.setCheckState(Qt.CheckState.Unchecked)
             elif candidate.selection in locked_checked_by_identity:
                 it.setFlags(
@@ -489,75 +410,13 @@ class AxisToolbar(QtWidgets.QWidget):
             raise TypeError("X selector lacks a typed axis identity.")
         return selection
 
-    def set_interaction_mode(self, mode: str) -> None:
-        normalized = str(mode or "").strip().lower()
-        if normalized not in {"pan", "rectangle_zoom"}:
-            raise ValueError("Interaction mode must be Pan or Rectangle Zoom.")
-        actions = self._interaction_group.actions()
-        blockers = [QtCore.QSignalBlocker(action) for action in actions]
-        try:
-            actions[0].setChecked(normalized == "pan")
-            actions[1].setChecked(normalized == "rectangle_zoom")
-        finally:
-            del blockers
-
-    def set_plot_presentation_state(
-        self,
-        *,
-        log_x: bool,
-        log_y: bool,
-        legend_visible: bool,
-        x_inverted: bool,
-        y_inverted: bool,
-    ) -> None:
-        values = {
-            "log_x": bool(log_x),
-            "log_y": bool(log_y),
-            "legend_visible": bool(legend_visible),
-            "x_inverted": bool(x_inverted),
-            "y_inverted": bool(y_inverted),
-        }
-        for key, value in values.items():
-            action = self._presentation_actions[key]
-            blocker = QtCore.QSignalBlocker(action)
-            try:
-                action.setChecked(value)
-            finally:
-                del blocker
-
-    def is_auto_range(self) -> bool:
-        """Return True if auto range is enabled."""
-        return self._auto_range.isChecked()
-
-    def set_auto_range(self, enabled: bool) -> None:
-        """Enable or disable auto range mode."""
-        checked = bool(enabled)
-        if self._auto_range.isChecked() == checked:
-            self._sync_manual_range_controls(checked)
-            return
-        self._auto_range.blockSignals(True)
-        try:
-            self._auto_range.setChecked(checked)
-        finally:
-            self._auto_range.blockSignals(False)
-        self._sync_manual_range_controls(checked)
-
-    def set_coarse_sampling(self, enabled: bool) -> None:
-        """Project the active tab's session-only Plot sampling choice."""
-
-        blocker = QtCore.QSignalBlocker(self._action_downsampling)
-        try:
-            self._action_downsampling.setChecked(bool(enabled))
-        finally:
-            del blocker
-
-    def set_interactive_gesture_active(self, active: bool) -> None:
-        """Freeze range-authoring controls for one slider display gesture."""
-
-        self._interactive_gesture_active = bool(active)
-        enabled = not self._interactive_gesture_active
-        self._auto_range.setEnabled(enabled)
-        self._sync_manual_range_controls(self._auto_range.isChecked())
+    def set_manual_range_controls(self, *, visible: bool, enabled: bool) -> None:
+        """Project the plot owner's range mode and gesture restriction."""
+        self._manual_range_row.setVisible(visible)
+        self._manual_range_row.setEnabled(visible and enabled)
+        for edit in (self._x_min, self._x_max, self._y_min, self._y_max):
+            edit.setEnabled(visible and enabled)
+        self.updateGeometry()
 
     def get_manual_ranges(self) -> tuple[Optional[float], Optional[float], Optional[float], Optional[float]]:
         """
@@ -593,15 +452,12 @@ class AxisToolbar(QtWidgets.QWidget):
             Axis limits. None means leave field empty.
         """
         def _format(value: Optional[float]) -> str:
-            return format(float(value), ".17g") if value is not None else ""
+            return format(float(value), ".6g") if value is not None else ""
 
         self._x_min.setText(_format(x_min))
         self._x_max.setText(_format(x_max))
         self._y_min.setText(_format(y_min))
         self._y_max.setText(_format(y_max))
-
-    def set_warning_details_available(self, available: bool) -> None:
-        self._warning_details_action.setEnabled(available)
 
     # ----------------------- layout helpers -----------------------
 
@@ -609,8 +465,13 @@ class AxisToolbar(QtWidgets.QWidget):
         self,
         x_label: QtWidgets.QLabel,
     ) -> None:
-        self._toolbar_rows = ControlRowsLayout(self)
-        self._toolbar_rows.setContentsMargins(0, 6, 0, 0)
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(0, 6, 0, 0)
+        layout.setSpacing(4)
+        selectors = QtWidgets.QWidget(self)
+        toolbar_rows = ControlRowsLayout(selectors)
+        layout.addWidget(selectors)
+        layout.addWidget(self._manual_range_row)
         self.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Preferred)
         self._x_combo.setSizePolicy(QtWidgets.QSizePolicy.Preferred, QtWidgets.QSizePolicy.Fixed)
         toolbar_groups = []
@@ -630,8 +491,7 @@ class AxisToolbar(QtWidgets.QWidget):
         unit_layout.setSpacing(8)
         unit_layout.addWidget(QtWidgets.QLabel("Unit:", self))
         unit_layout.addWidget(self._y_unit_combo)
-        toolbar_groups.extend((unit_group, self._pan_button,
-                                     self._rectangle_zoom_button, self._auto_range))
+        toolbar_groups.append(unit_group)
 
         range_layout = ControlRowsLayout(self._manual_range_row)
         range_layout.setSpacing(4)
@@ -646,10 +506,8 @@ class AxisToolbar(QtWidgets.QWidget):
             pair.addWidget(QtWidgets.QLabel("to", group))
             pair.addWidget(upper)
             range_layout.addWidget(group)
-        toolbar_groups.extend((self._manual_range_row, self._options_btn))
         for widget in toolbar_groups:
-            self._toolbar_rows.addWidget(widget)
-        self._toolbar_rows.setAlignment(self._options_btn, Qt.AlignRight)
+            toolbar_rows.addWidget(widget)
 
     def _update_y_selector_text(self) -> None:
         selected_labels = [
@@ -683,15 +541,9 @@ class AxisToolbar(QtWidgets.QWidget):
 
     # ----------------------- internal wiring -----------------------
 
-    def _emit_option(self, action: str, data: object) -> None:
-        self.optionsRequested.emit(action, data)
-
     def _on_x_changed(self, _index: int) -> None:
         if self._x_combo.count():
             self.xChanged.emit(self.current_x())
-
-    def _on_interaction_requested(self, mode: str) -> None:
-        self.interactionModeRequested.emit(str(mode))
 
     def _on_y_item_changed(self, item: QtWidgets.QListWidgetItem) -> None:
         selection = item.data(Qt.ItemDataRole.UserRole)
@@ -706,42 +558,15 @@ class AxisToolbar(QtWidgets.QWidget):
         self._update_y_selector_text()
         self.ySelectionChanged.emit(self.selected_y())
 
-    def _sync_manual_range_controls(self, auto_checked: bool) -> None:
-        enabled = not bool(auto_checked) and not self._interactive_gesture_active
-        self._x_min.setEnabled(enabled)
-        self._x_max.setEnabled(enabled)
-        self._y_min.setEnabled(enabled)
-        self._y_max.setEnabled(enabled)
-        self._manual_range_row.setVisible(enabled)
-        self.updateGeometry()
-
-    def _on_auto_range_toggled(self, checked: bool) -> None:
-        """Enable/disable manual range controls based on auto range checkbox."""
-        self._sync_manual_range_controls(bool(checked))
-        # Emit signal to update plot
-        self.axisRangeChanged.emit()
-
     def _on_range_changed(self) -> None:
-        """Called when any range text field is edited."""
-        # Only emit if auto range is disabled
-        if not self._auto_range.isChecked():
+        if self._manual_range_row.isEnabled():
             self.axisRangeChanged.emit()
-
-    # ----------------------- usability tweaks -----------------------
-
-    def minimumSizeHint(self) -> QtCore.QSize:
-        return self._toolbar_rows.minimumSize()
-
-    def sizeHint(self) -> QtCore.QSize:
-        return QtCore.QSize(600, self._toolbar_rows.heightForWidth(600))
 
     def set_tab_order(self) -> None:
         QtWidgets.QWidget.setTabOrder(self._x_combo, self._x_unit_combo)
         QtWidgets.QWidget.setTabOrder(self._x_unit_combo, self._y_selector_btn)
         QtWidgets.QWidget.setTabOrder(self._y_selector_btn, self._y_unit_combo)
-        QtWidgets.QWidget.setTabOrder(self._y_unit_combo, self._auto_range)
-        QtWidgets.QWidget.setTabOrder(self._auto_range, self._x_min)
+        QtWidgets.QWidget.setTabOrder(self._y_unit_combo, self._x_min)
         QtWidgets.QWidget.setTabOrder(self._x_min, self._x_max)
         QtWidgets.QWidget.setTabOrder(self._x_max, self._y_min)
         QtWidgets.QWidget.setTabOrder(self._y_min, self._y_max)
-        QtWidgets.QWidget.setTabOrder(self._y_max, self._options_btn)
