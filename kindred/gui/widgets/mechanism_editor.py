@@ -222,11 +222,13 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
         self._fine_btn = QtWidgets.QPushButton("Fine")
         self._fine_btn.setCheckable(True)
         self._fine_btn.setToolTip(
-            "Toggle fine adjustment mode for more precise slider control"
+            "Use smaller arrow-key and Page Up/Down steps for parameters and "
+            "initial concentrations. Mouse dragging continues to follow the pointer."
         )
         self._fine_btn.toggled.connect(
             lambda v: self._variable_sliders.set_fine_mode(v)
         )
+        self._fine_btn.toggled.connect(self._species_sliders.set_fine_mode)
         self._variable_sliders.fineModeReset.connect(
             self._sync_fine_button_state
         )
@@ -538,7 +540,7 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
         self._species_sliders.setVisible(visible_species_entries > 0)
         self._slider_surface.setVisible(has_visible_entries)
         self._slider_visibility_picker_btn.setEnabled(has_available_entries)
-        self._fine_btn.setVisible(has_variable_entries)
+        self._fine_btn.setEnabled(has_available_entries)
         self._slider_pane_container.setVisible(has_available_entries)
 
         state = (has_available_entries, has_visible_entries)
@@ -557,6 +559,7 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
 
     def _sync_fine_button_state(self, enabled: bool) -> None:
         """Project child Fine state without re-entering the toggle handler."""
+        self._species_sliders.set_fine_mode(enabled)
         blocker = QtCore.QSignalBlocker(self._fine_btn)
         try:
             self._fine_btn.setChecked(bool(enabled))

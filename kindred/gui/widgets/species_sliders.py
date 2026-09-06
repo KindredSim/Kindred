@@ -119,6 +119,7 @@ class BatchSpeciesSliders(QtWidgets.QWidget):
     ) -> None:
         super().__init__(parent)
         self._rows: dict[str, _SpeciesSliderRow] = {}
+        self._fine_mode = False
         self._values: dict[str, float] = {}
         self._display_names: dict[str, str] = {}
         self._hidden_species: set[str] = set()
@@ -140,6 +141,13 @@ class BatchSpeciesSliders(QtWidgets.QWidget):
         self._content_layout.setSpacing(14)
         layout.addWidget(self._content)
         layout.addStretch(1)
+
+    def set_fine_mode(self, enabled: bool) -> None:
+        """Adjust keyboard increments without changing values or mouse resolution."""
+        self._fine_mode = bool(enabled)
+        for row in self._rows.values():
+            row.slider.setSingleStep(1 if self._fine_mode else 50)
+            row.slider.setPageStep(50 if self._fine_mode else 1000)
 
     def render_values(
         self,
@@ -294,6 +302,8 @@ class BatchSpeciesSliders(QtWidgets.QWidget):
         )
         slider.setAccessibleName(f"{display_name} initial concentration slider")
         slider.setRange(0, 10_000)
+        slider.setSingleStep(1 if self._fine_mode else 50)
+        slider.setPageStep(50 if self._fine_mode else 1000)
         maximum = compute_slider_max_option_c(
             v=value, row_max=max(self._values.values(), default=value)
         )

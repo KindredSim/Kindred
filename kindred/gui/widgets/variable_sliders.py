@@ -68,24 +68,6 @@ class _NumericValueEdit(QtWidgets.QLineEdit):
 class _GrooveJumpSlider(QtWidgets.QSlider):
     """Horizontal slider with native click-anywhere groove behavior."""
 
-    def __init__(
-        self,
-        orientation: QtCore.Qt.Orientation | QtWidgets.QWidget = (
-            QtCore.Qt.Orientation.Horizontal
-        ),
-        parent: Optional[QtWidgets.QWidget] = None,
-    ) -> None:
-        if isinstance(orientation, QtWidgets.QWidget) and parent is None:
-            parent = orientation
-            orientation = QtCore.Qt.Orientation.Horizontal
-        super().__init__(orientation, parent)
-        self._fine_drag_mode = False
-        self._fine_drag_origin: tuple[float, int, int, int, int] | None = None
-
-    def set_fine_drag_mode(self, enabled: bool) -> None:
-        """Reduce handle-drag sensitivity without changing slider semantics."""
-        self._fine_drag_mode = bool(enabled)
-
     def _slider_geometry(
         self,
     ) -> tuple[QtWidgets.QStyleOptionSlider, QtCore.QRect, QtCore.QRect, int]:
@@ -106,21 +88,12 @@ class _GrooveJumpSlider(QtWidgets.QSlider):
         return option, groove, handle, max(1, groove.width() - handle.width())
 
     def mousePressEvent(self, event: QtGui.QMouseEvent) -> None:
-        self._fine_drag_origin = None
         if (
             event.button() == QtCore.Qt.MouseButton.LeftButton
             and self.orientation() == QtCore.Qt.Orientation.Horizontal
         ):
             option, groove, handle, span = self._slider_geometry()
-            if handle.contains(event.position().toPoint()):
-                self._fine_drag_origin = (
-                    float(event.position().x()),
-                    int(self.sliderPosition()),
-                    span,
-                    int(self.minimum()),
-                    int(self.maximum()),
-                )
-            else:
+            if not handle.contains(event.position().toPoint()):
                 position = int(
                     round(event.position().x() - groove.x() - handle.width() / 2)
                 )
@@ -136,31 +109,6 @@ class _GrooveJumpSlider(QtWidgets.QSlider):
                 event.accept()
                 return
         super().mousePressEvent(event)
-
-    def mouseMoveEvent(self, event: QtGui.QMouseEvent) -> None:
-        origin = self._fine_drag_origin
-        if (
-            self._fine_drag_mode
-            and origin is not None
-            and self.isSliderDown()
-            and event.buttons() & QtCore.Qt.MouseButton.LeftButton
-        ):
-            origin_x, origin_value, span, minimum, maximum = origin
-            option, _, _, _ = self._slider_geometry()
-            pointer_delta = float(event.position().x()) - origin_x
-            value_delta = pointer_delta * (maximum - minimum) / (span * 10.0)
-            slider_position = origin_value + int(
-                round(-value_delta if option.upsideDown else value_delta)
-            )
-            slider_position = max(minimum, min(maximum, slider_position))
-            self.setSliderPosition(slider_position)
-            event.accept()
-            return
-        super().mouseMoveEvent(event)
-
-    def mouseReleaseEvent(self, event: QtGui.QMouseEvent) -> None:
-        self._fine_drag_origin = None
-        super().mouseReleaseEvent(event)
 
 
 class VariableSliders(QtWidgets.QWidget):
@@ -852,7 +800,8 @@ class VariableSliders(QtWidgets.QWidget):
         Enable or disable fine mode for all sliders.
 
         Fine mode increases slider resolution from 1000 to 10000 steps,
-        allowing more precise adjustments while preserving current values.
+        with smaller keyboard steps and native mouse dragging. Current
+        scientific values are preserved when switching modes.
 
         Parameters
         ----------
@@ -878,7 +827,6 @@ class VariableSliders(QtWidgets.QWidget):
                 slider.setMaximum(new_max)
                 slider.setSingleStep(1 if enabled else 5)
                 slider.setPageStep(50 if enabled else 100)
-                slider.set_fine_drag_mode(enabled)
 
                 # Restore position for the same numeric value
                 slider.setValue(self._value_to_slider_pos(name, float(val)))
@@ -895,7 +843,6 @@ class VariableSliders(QtWidgets.QWidget):
                 slider.setMaximum(1000)
                 slider.setSingleStep(5)
                 slider.setPageStep(100)
-                slider.set_fine_drag_mode(False)
         if was_fine:
             self.fineModeReset.emit(False)
 
