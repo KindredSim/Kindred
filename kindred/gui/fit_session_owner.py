@@ -1130,7 +1130,6 @@ class FitSessionOwner(QtCore.QObject):
             return (
                 item.dataset_id,
                 item.set_id,
-                item.included_at_launch,
                 item.initial_values,
                 item.resolved_t_start,
                 tuple(

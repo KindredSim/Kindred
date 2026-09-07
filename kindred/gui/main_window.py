@@ -25,10 +25,8 @@ from kindred.core.dataset_mapping import (
     export_original_source,
     plan_dataset_to_set_mapping,
     plan_global_dataset_delete,
-    plan_leave_unmapped,
     validate_unique_dataset_name,
     with_confirmed_observation_mapping,
-    with_validated_fit_inclusion,
 )
 from kindred.core.datasets.observation_mapping import (
     ObservationMappingError,
@@ -420,6 +418,7 @@ class MainWindow(QtWidgets.QMainWindow):
         data_panel.set_import_busy(self._dataset_import_staging.busy)
         overlay_panel = DatasetOverlayPanel(
             self._workspace,
+            import_action=data_panel.import_action,
             color_for_species=self.config_controller.species_color,
             experimental_point_shape=self.config_controller.experimental_point_shape,
             experimental_point_size=self.config_controller.experimental_point_size,
@@ -643,19 +642,6 @@ class MainWindow(QtWidgets.QMainWindow):
                 dataset_id,
             )
         )
-        data.datasetPlotOverlayRequested.connect(
-            lambda dataset_id, captured=tab_id: self._show_plot_overlay(
-                captured,
-                dataset_id,
-            )
-        )
-        data.datasetFitInclusionRequested.connect(
-            lambda dataset_id, include, captured=tab_id: self._set_dataset_fit_inclusion(
-                captured,
-                dataset_id,
-                include,
-            )
-        )
         bundle.overlay_panel.overlaySelectionRequested.connect(
             lambda dataset_id, raw_observation_ids, captured=tab_id: self._set_overlay_selection(
                 captured,
@@ -685,6 +671,9 @@ class MainWindow(QtWidgets.QMainWindow):
         if bundle is None:
             return
         self._result_copy_eligible.pop(target, None)
+        if self._load_data_action is bundle.data_panel.import_action:
+            self._file_menu.removeAction(self._load_data_action)
+            self._load_data_action = None
         bundle.slider_binding.dispose()
         for stack, widget in (
             (self._mechanism_stack, bundle.editor_panel),
@@ -777,9 +766,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         application = QtWidgets.QApplication.instance()
         if isinstance(application, QtWidgets.QApplication):
-            application.focusChanged.connect(
-                lambda _old, _new: self._refresh_actions()
-            )
+            application.focusChanged.connect(self._refresh_actions)
         self._simulation_jobs.state_changed.connect(
             self._on_simulation_state_changed
         )
@@ -3615,8 +3602,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 self,
                 "Delete Dataset",
                 "This dataset is referenced by one or more mechanism tabs. "
-                "Delete it globally and clear every mapping, observation mapping, "
-                "overlay, and Fit inclusion?",
+                "Delete it globally and clear every initial-condition assignment, "
+                "observation mapping, and overlay?",
                 QtWidgets.QMessageBox.StandardButton.Yes
                 | QtWidgets.QMessageBox.StandardButton.Cancel,
                 QtWidgets.QMessageBox.StandardButton.Cancel,
@@ -3705,12 +3692,7 @@ class MainWindow(QtWidgets.QMainWindow):
         previous_set_ids: tuple[str, ...] = ()
         try:
             choice = DatasetMappingChoice(action)
-            description = (
-                "Leave Dataset Unmapped"
-                if choice is DatasetMappingChoice.LEAVE_UNMAPPED
-                else "Map Dataset"
-            )
-            if not self._accept_visible_source(tab_id, description=description):
+            if not self._accept_visible_source(tab_id, description="Map Dataset"):
                 return
             expected_token = self._project_session.capture_content_token()
             tab = self._workspace_tab_registry.tab(tab_id)
@@ -3778,21 +3760,8 @@ class MainWindow(QtWidgets.QMainWindow):
                     copy_plan=copy_plan,
                 )
                 candidate_tab = apply_dataset_set_mapping_plan(
-                    document=self._project_session.document,
                     tab=tab,
                     plan=plan,
-                    model_targets=canonical_observation_target_names(tab),
-                )
-            else:
-                plan = plan_leave_unmapped(
-                    links=tab.dataset_links,
-                    dataset_id=dataset_id,
-                )
-                candidate_tab = apply_dataset_set_mapping_plan(
-                    document=self._project_session.document,
-                    tab=tab,
-                    plan=plan,
-                    model_targets=canonical_observation_target_names(tab),
                 )
             result = self._workspace_tab_registry.replace_tab(
                 tab_id,
@@ -3839,7 +3808,6 @@ class MainWindow(QtWidgets.QMainWindow):
             if mapping is None:
                 return
             candidate = with_confirmed_observation_mapping(
-                document=self._project_session.document,
                 tab=tab,
                 dataset=dataset,
                 model_targets=model_targets,
@@ -3856,13 +3824,6 @@ class MainWindow(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.warning(self, "Observation Mapping", str(exc))
         if changed:
             self._refresh_dataset_views((tab_id,))
-
-    def _show_plot_overlay(self, tab_id: str, dataset_id: str) -> None:
-        bundle = self._tab_surfaces.get(str(tab_id))
-        if bundle is None:
-            return
-        bundle.right_panel.select_plot_overlays_page()
-        bundle.overlay_panel.navigate_to_dataset(dataset_id)
 
     def _prompt_observation_mapping(
         self,
@@ -3950,39 +3911,6 @@ class MainWindow(QtWidgets.QMainWindow):
         if dialog.exec() != QtWidgets.QDialog.DialogCode.Accepted:
             return None
         return mapping
-
-    def _set_dataset_fit_inclusion(
-        self,
-        tab_id: str,
-        dataset_id: str,
-        include: bool,
-    ) -> None:
-        try:
-            if not self._mutation_input_admitted("Change Fit Dataset Inclusion"):
-                return
-            if not self._accept_visible_source(
-                tab_id,
-                description="Change Fit Dataset Inclusion"
-            ):
-                return
-            tab = self._workspace_tab_registry.tab(tab_id)
-            candidate = with_validated_fit_inclusion(
-                document=self._project_session.document,
-                tab=tab,
-                dataset_id=dataset_id,
-                include=include,
-                model_targets=canonical_observation_target_names(tab),
-            )
-            expected_token = self._project_session.capture_content_token()
-            self._workspace_tab_registry.replace_tab(
-                tab_id,
-                candidate,
-                expected_token=expected_token,
-            )
-        except Exception as exc:
-            QtWidgets.QMessageBox.warning(self, "Fit Dataset", str(exc))
-        finally:
-            self._refresh_dataset_views((tab_id,))
 
     def _set_overlay_selection(
         self,
@@ -4206,13 +4134,8 @@ class MainWindow(QtWidgets.QMainWindow):
             QtGui.QKeySequence.StandardKey.SaveAs,
             "saveProjectAsAction",
         )
-        self._load_data_action = self._add_action(
-            file_menu,
-            "Load Data...",
-            lambda: self._selected_bundle().data_panel.trigger_load_dialog(),
-            "Ctrl+Shift+L",
-            "loadDataAction",
-        )
+        self._load_data_action = self._selected_bundle().data_panel.import_action
+        file_menu.addAction(self._load_data_action)
         self._xlsx_export_action = self._add_action(
             file_menu,
             "Export Results XLSX...",
@@ -5248,7 +5171,13 @@ class MainWindow(QtWidgets.QMainWindow):
         if bundle is None:
             return
         mutation_admitted = self._mutation_input_admitted()
-        if self._load_data_action is not None:
+        if self._xlsx_export_action is not None:
+            import_action = bundle.data_panel.import_action
+            if self._load_data_action is not import_action:
+                self._file_menu.insertAction(self._xlsx_export_action, import_action)
+                if self._load_data_action is not None:
+                    self._file_menu.removeAction(self._load_data_action)
+                self._load_data_action = import_action
             self._load_data_action.setEnabled(
                 mutation_admitted and not self._dataset_import_staging.busy
             )

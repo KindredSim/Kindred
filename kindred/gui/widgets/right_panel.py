@@ -55,8 +55,3 @@ class RightPanelTabbed(QtWidgets.QWidget):
         self._overlay_panel = overlay_panel
         self._overlay_panel.setObjectName("datasetOverlayPanel")
         self._tabs.addTab(self._overlay_panel, "Plot Overlays")
-
-    def select_plot_overlays_page(self) -> None:
-        """Show the existing Plot Overlays page without changing its state."""
-
-        self._tabs.setCurrentWidget(self._overlay_panel)

@@ -12,8 +12,34 @@ from kindred.core.datasets.foundation import RawDatasetRecord
 from kindred.gui.controllers.config_controller import ConfigController
 from kindred.gui.dataset_payload_snapshot import ActiveDatasetLinkSnapshot
 from kindred.gui.display_name_policy import literal_tooltip
+from kindred.gui.ui_helpers import ControlRowsLayout
 
 __all__ = ["DatasetOverlayPanel"]
+
+
+class _MarkerControls(QtWidgets.QWidget):
+    """Keep small marker settings on one row, wrapping when necessary."""
+
+    def __init__(self, fields):
+        super().__init__()
+        self._rows = ControlRowsLayout(self)
+        for title, control, tooltip in fields:
+            field = QtWidgets.QWidget()
+            row = QtWidgets.QHBoxLayout(field)
+            row.setContentsMargins(0, 0, 0, 0)
+            row.setSpacing(6)
+            label = QtWidgets.QLabel(title)
+            label.setBuddy(control)
+            label.setToolTip(tooltip)
+            control.setToolTip(tooltip)
+            row.addWidget(label)
+            row.addWidget(control)
+            self._rows.addWidget(field)
+        self.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self.setFixedHeight(self._rows.heightForWidth(self.width()))
 
 
 class DatasetOverlayPanel(QtWidgets.QWidget):
@@ -29,6 +55,7 @@ class DatasetOverlayPanel(QtWidgets.QWidget):
         self,
         parent: QtWidgets.QWidget | None = None,
         *,
+        import_action: QtGui.QAction,
         color_for_species: Callable[[str, tuple[str, ...]], QtGui.QColor],
         experimental_point_shape: Callable[[], str],
         experimental_point_size: Callable[[], int],
@@ -55,24 +82,31 @@ class DatasetOverlayPanel(QtWidgets.QWidget):
         self._has_rendered_snapshot = False
 
         layout = QtWidgets.QVBoxLayout(self)
-        layout.setContentsMargins(6, 6, 6, 6)
-        layout.setSpacing(5)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(8)
 
-        hint = QtWidgets.QLabel(
-            "Experimental overlay membership is independent of row selection, "
-            "simulated Plot membership, and Slider pins."
-        )
-        hint.setWordWrap(True)
-        layout.addWidget(hint)
-
-        self._empty_label = QtWidgets.QLabel("No datasets loaded")
-        self._empty_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._empty_label.setStyleSheet("font-style: italic; padding: 12px;")
-        layout.addWidget(self._empty_label)
+        self._empty = QtWidgets.QWidget()
+        empty_layout = QtWidgets.QVBoxLayout(self._empty)
+        empty_layout.addStretch()
+        label = QtWidgets.QLabel("Import experimental data to show it on plots.")
+        label.setWordWrap(True)
+        label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        empty_layout.addWidget(label)
+        import_button = QtWidgets.QPushButton(import_action.text())
+        import_button.setToolTip(import_action.toolTip())
+        import_button.setEnabled(import_action.isEnabled())
+        import_button.clicked.connect(import_action.trigger)
+        import_action.changed.connect(lambda: import_button.setEnabled(import_action.isEnabled()))
+        empty_layout.addWidget(import_button, 0, Qt.AlignmentFlag.AlignCenter)
+        formats = QtWidgets.QLabel("CSV or Excel files")
+        formats.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        empty_layout.addWidget(formats)
+        empty_layout.addStretch()
+        layout.addWidget(self._empty, 1)
 
         self._tree = QtWidgets.QTreeWidget()
         self._tree.setColumnCount(2)
-        self._tree.setHeaderLabels(["Dataset / Observation", "Color"])
+        self._tree.setHeaderLabels(["Show on plot", "Color"])
         self._tree.setAccessibleName("Experimental dataset overlays")
         self._tree.header().setStretchLastSection(False)
         self._tree.header().setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeMode.Stretch)
@@ -82,30 +116,44 @@ class DatasetOverlayPanel(QtWidgets.QWidget):
         )
         self._tree.itemChanged.connect(self._on_item_changed)
         self._tree.hide()
-        layout.addWidget(self._tree)
+        layout.addWidget(self._tree, 1)
 
-        style_form = QtWidgets.QFormLayout()
-        style_form.setFieldGrowthPolicy(QtWidgets.QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+        self._appearance = QtWidgets.QWidget()
+        appearance_layout = QtWidgets.QVBoxLayout(self._appearance)
+        appearance_layout.setContentsMargins(0, 0, 0, 0)
+        appearance_layout.setSpacing(6)
+        title = QtWidgets.QLabel("Marker appearance")
+        title_font = title.font()
+        title_font.setBold(True)
+        title.setFont(title_font)
+        appearance_layout.addWidget(title)
         self._shape_combo = QtWidgets.QComboBox()
         self._shape_combo.setAccessibleName("Experimental point shape")
         for label, code in ConfigController.EXPERIMENTAL_POINT_SHAPES:
             self._shape_combo.addItem(label, code)
         self._shape_combo.currentIndexChanged.connect(self._on_shape_changed)
-        style_form.addRow("Shape", self._shape_combo)
         self._size_spin = QtWidgets.QSpinBox()
         self._size_spin.setAccessibleName("Experimental point size")
         self._size_spin.setRange(1, 20)
         self._size_spin.setValue(6)
         self._size_spin.valueChanged.connect(self._on_size_changed)
-        style_form.addRow("Size", self._size_spin)
         self._opacity_spin = QtWidgets.QSpinBox()
-        self._opacity_spin.setAccessibleName("Experimental point opacity")
+        self._opacity_spin.setAccessibleName("Experimental point opacity (%)")
         self._opacity_spin.setRange(0, 100)
-        self._opacity_spin.setSuffix("%")
         self._opacity_spin.setValue(71)
         self._opacity_spin.valueChanged.connect(self._on_opacity_changed)
-        style_form.addRow("Opacity", self._opacity_spin)
-        layout.addLayout(style_form)
+        for spin in (self._size_spin, self._opacity_spin):
+            spin.setMinimumWidth(max(100, spin.sizeHint().width() + 24))
+        appearance_layout.addWidget(_MarkerControls([
+            ("Shape", self._shape_combo, "Shape of Experimental Data Markers."),
+            ("Size", self._size_spin, "Size of Marker (1–20)."),
+            ("Opacity (%)", self._opacity_spin, "Opacity of Marker (0–100%)."),
+        ]))
+        scope = QtWidgets.QLabel("Applies to experimental data in all plots.")
+        scope.setWordWrap(True)
+        appearance_layout.addWidget(scope)
+        layout.addWidget(self._appearance)
+        self._appearance.hide()
 
     def render_snapshot(
         self,
@@ -204,7 +252,8 @@ class DatasetOverlayPanel(QtWidgets.QWidget):
         self._has_rendered_snapshot = True
         has_records = bool(rendered_records)
         self._tree.setVisible(has_records)
-        self._empty_label.setVisible(not has_records)
+        self._empty.setVisible(not has_records)
+        self._appearance.setVisible(has_records)
         self._render_application_style()
         self._refresh_color_swatches()
         self._tree.verticalScrollBar().setValue(vertical_scroll)
@@ -223,7 +272,8 @@ class DatasetOverlayPanel(QtWidgets.QWidget):
             del blocker
         self._has_rendered_snapshot = False
         self._tree.hide()
-        self._empty_label.show()
+        self._empty.show()
+        self._appearance.hide()
 
     def render_overlay_selection(
         self,
@@ -245,22 +295,6 @@ class DatasetOverlayPanel(QtWidgets.QWidget):
             overlay_raw_observation_ids=selected,
         )
         self._render_authoritative_overlay_selection()
-
-    def navigate_to_dataset(self, dataset_id: str) -> None:
-        """Select and reveal one existing dataset without changing its state."""
-
-        target = str(dataset_id)
-        for index in range(self._tree.topLevelItemCount()):
-            item = self._tree.topLevelItem(index)
-            if str(item.data(0, Qt.UserRole)) != target:
-                continue
-            item.setExpanded(True)
-            self._tree.setCurrentItem(item)
-            self._tree.scrollToItem(
-                item,
-                QtWidgets.QAbstractItemView.ScrollHint.PositionAtCenter,
-            )
-            return
 
     def refresh_application_style_controls(self) -> None:
         """Rerender application-wide experimental point style controls."""

@@ -3,11 +3,10 @@
 
 from __future__ import annotations
 
-import html
 import logging
 from typing import Dict, List, Optional, Tuple
 
-from PySide6 import QtCore, QtWidgets
+from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtCore import Qt
 
 from kindred.core.datasets.foundation import ImportedSource
@@ -37,8 +36,14 @@ from kindred.core.datasets.foundation import (
     RawDatasetRecord,
     thaw_json_value,
 )
-from kindred.core.project_document import ProjectDocument
-from kindred.gui.display_name_policy import DATASET_LIST_LABEL_MAX_CHARS, compact_dataset_label
+from kindred.core.project_document import (
+    ProjectDocument,
+    canonical_observation_target_names,
+)
+from kindred.gui.ui_helpers import ControlRowsLayout
+from kindred.gui.display_name_policy import (
+    literal_tooltip,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -47,16 +52,24 @@ __all__ = [
 ]
 
 
-class _DatasetList(QtWidgets.QListWidget):
-    """Keep one dataset row and its scrollbar reachable in a compact dock."""
+class _DatasetSelector(QtWidgets.QComboBox):
+    """Keep the closed selector compact and expand filenames in its popup."""
 
-    def minimumSizeHint(self) -> QtCore.QSize:
-        hint = super().minimumSizeHint()
-        hint.setHeight(
-            self.fontMetrics().height() + 2 * self.frameWidth()
-            + self.style().pixelMetric(QtWidgets.QStyle.PixelMetric.PM_ScrollBarExtent)
-        )
-        return hint
+    def __init__(self):
+        super().__init__()
+        self.setSizeAdjustPolicy(QtWidgets.QComboBox.AdjustToMinimumContentsLengthWithIcon)
+        self.setMinimumContentsLength(6)
+        self.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
+        self.setMaxVisibleItems(12)
+
+    def showPopup(self):
+        text_width = max((self.fontMetrics().horizontalAdvance(self.itemText(i))
+                          for i in range(self.count())), default=0)
+        self.view().setMinimumWidth(min(
+            max(self.width(), text_width + 40),
+            self.screen().availableGeometry().width() - 24,
+        ))
+        super().showPopup()
 
 
 class _DatasetControls(QtWidgets.QScrollArea):
@@ -71,17 +84,167 @@ class _DatasetControls(QtWidgets.QScrollArea):
         return hint
 
 
+class _DatasetActions(QtWidgets.QWidget):
+    """Wrap the standard dataset buttons at the available dock width."""
+
+    def __init__(self, buttons):
+        super().__init__()
+        self._rows = ControlRowsLayout(self)
+        for button in buttons:
+            self._rows.addWidget(button)
+        self.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self.setFixedHeight(self._rows.heightForWidth(self.width()))
+
+
+class _MappingField(QtWidgets.QWidget):
+    """Keep each value and button together, including at enlarged font sizes."""
+
+    def __init__(self, value: QtWidgets.QWidget, action: QtWidgets.QPushButton):
+        super().__init__()
+        self._value = value
+        self._action = action
+        self._grid = QtWidgets.QGridLayout(self)
+        self._grid.setContentsMargins(0, 0, 0, 0)
+        self._grid.setSpacing(8)
+        self._grid.setSizeConstraint(QtWidgets.QLayout.SetNoConstraint)
+        self._grid.addWidget(value, 0, 0)
+        self._grid.addWidget(action, 0, 1)
+        self._grid.setColumnStretch(0, 1)
+        self._wide = True
+
+    def minimumSizeHint(self) -> QtCore.QSize:
+        return QtCore.QSize(
+            max(self._value.minimumWidth(), self._action.sizeHint().width()),
+            self._action.sizeHint().height(),
+        )
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        wide = self.width() >= self._value.minimumWidth() + self._action.sizeHint().width() + 8
+        if wide != self._wide:
+            self._wide = wide
+            self._grid.removeWidget(self._action)
+            self._grid.addWidget(self._action, 0 if wide else 1, 1 if wide else 0, Qt.AlignRight)
+            self.updateGeometry()
+
+
+class _DatasetName(QtWidgets.QLabel):
+    """Show a compact name while keeping its full text available."""
+
+    def set_name(self, name: str) -> None:
+        self._name = name
+        self.setTextFormat(Qt.PlainText)
+        self.setToolTip(literal_tooltip(name))
+        self.setAccessibleName(name)
+        self._elide()
+
+    def _elide(self) -> None:
+        self.setText(self.fontMetrics().elidedText(
+            getattr(self, "_name", ""), Qt.ElideRight, self.contentsRect().width()
+        ))
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._elide()
+
+
+def _source_label(text: str) -> QtWidgets.QLabel:
+    label = QtWidgets.QLabel(text)
+    label.setTextFormat(Qt.PlainText)
+    label.setWordWrap(True)
+    label.setTextInteractionFlags(Qt.TextSelectableByMouse | Qt.TextSelectableByKeyboard)
+    return label
+
+
+class _SourceDialog(QtWidgets.QDialog):
+    """Present the original file and measured units without internal metadata."""
+
+    def __init__(self, record: RawDatasetRecord, source: ImportedSource, parent):
+        super().__init__(parent)
+        self.setWindowTitle("File Details")
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setSpacing(8)
+        metadata = thaw_json_value(record.source_metadata)
+        original = QtWidgets.QGroupBox("Original file")
+        form = QtWidgets.QFormLayout(original)
+        form.setRowWrapPolicy(QtWidgets.QFormLayout.WrapLongRows)
+        form.setVerticalSpacing(6)
+        fields = [
+            ("Filename", source.original_filename),
+            ("Original filepath", source.original_filepath),
+            ("File type", "Excel (XLSX)" if source.original_format == "xlsx" else "CSV"),
+        ]
+        if "sheet_name" in metadata:
+            fields.append(("Worksheet", metadata["sheet_name"]))
+        source_names = {column["assigned_name"]: column["authored_name"] for column in metadata["physical_columns"]}
+        fields.extend([
+            ("Time column", source_names[metadata["time_column"]]),
+            ("Time unit", metadata.get("original_time_unit", "Not recorded")),
+            ("Time points", str(len({t for series in record.observations for t in series.t}))),
+        ])
+        for title, value in fields:
+            form.addRow(title, _source_label(value))
+        layout.addWidget(original)
+        layout.addWidget(QtWidgets.QLabel("Measured columns"))
+        table = QtWidgets.QTableWidget(len(record.observations), 2)
+        table.setAccessibleName("Measured columns and original units")
+        table.setHorizontalHeaderLabels(["Column in file", "Original unit"])
+        table.verticalHeader().hide()
+        table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+        table.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.Stretch)
+        units = metadata.get("original_concentration_units", {})
+        for row, series in enumerate(record.observations):
+            for column, value in enumerate((source_names[series.column_name], units.get(series.column_name, "Not recorded"))):
+                item = QtWidgets.QTableWidgetItem(value)
+                item.setToolTip(literal_tooltip(value))
+                table.setItem(row, column, item)
+        layout.addWidget(table, 1)
+        buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Close)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+        self.resize(600, 600)
+
+
+class _ICSetDialog(QtWidgets.QDialog):
+    CREATE_FROM_DATA = 2
+
+    def __init__(self, available_sets, current_set_id, parent):
+        super().__init__(parent)
+        self.setWindowTitle("Assign IC Set")
+        layout = QtWidgets.QVBoxLayout(self)
+        form = QtWidgets.QFormLayout()
+        self.sets = QtWidgets.QComboBox()
+        self.sets.setAccessibleName("Existing IC set")
+        for set_id, name in available_sets:
+            self.sets.addItem(name, set_id)
+        if current_set_id is not None:
+            self.sets.setCurrentIndex(self.sets.findData(current_set_id))
+        if not available_sets:
+            self.sets.addItem("No IC sets available")
+            self.sets.setEnabled(False)
+        form.addRow("Existing IC set", self.sets)
+        layout.addLayout(form)
+        create = QtWidgets.QPushButton("Create IC set from data at t=0…")
+        create.setAutoDefault(False)
+        create.clicked.connect(lambda: self.done(self.CREATE_FROM_DATA))
+        layout.addWidget(create, 0, Qt.AlignLeft)
+        buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Cancel)
+        assign = buttons.addButton("Assign", QtWidgets.QDialogButtonBox.AcceptRole)
+        assign.setEnabled(bool(available_sets) and self.sets.currentIndex() >= 0)
+        self.sets.currentIndexChanged.connect(lambda index: assign.setEnabled(bool(available_sets) and index >= 0))
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+        self.resize(440, self.sizeHint().height())
+
+
 class DataManagerPanel(QtWidgets.QWidget):
     """
-    Import panel for loading and previewing committed experimental datasets.
-
-    Features:
-    - Load CSV and Excel files with experimental data
-    - Auto-detect time column (tries: time, time_s, t, Time, T, x)
-    - Extract all numeric columns as species
-    - Preview loaded datasets
-    - Import configuration dialog with unit selection
-    - Multiple dataset support
+    Browse committed datasets and assign their initial sets and observations.
 
     The panel retains only rendered snapshots and import UI configuration.
     The application import owner retains workers and uncommitted output;
@@ -93,8 +256,6 @@ class DataManagerPanel(QtWidgets.QWidget):
     datasetExportOriginalRequested = QtCore.Signal(str)
     datasetMappingRequested = QtCore.Signal(str, str, object, object)
     datasetObservationMappingRequested = QtCore.Signal(str)
-    datasetPlotOverlayRequested = QtCore.Signal(str)
-    datasetFitInclusionRequested = QtCore.Signal(str, bool)
     datasetImportRequested = QtCore.Signal(str, object)
 
     def __init__(
@@ -124,98 +285,142 @@ class DataManagerPanel(QtWidgets.QWidget):
         self._origin_tab_id = origin_tab_id
 
         layout = QtWidgets.QVBoxLayout(self)
-        layout.setContentsMargins(6, 6, 6, 6)
-        layout.setSpacing(4)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(8)
 
-        # Header
-        header = QtWidgets.QLabel("No dataset selected")
-        self._dataset_heading = header
-        header.setWordWrap(True)
-        header_font = header.font()
-        header_font.setBold(True)
-        header.setFont(header_font)
-        layout.addWidget(header)
-
-        # Dataset list
-        self._dataset_list = _DatasetList()
-        self._dataset_list.setUniformItemSizes(True)
-        self._dataset_list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
-        self._dataset_list.currentItemChanged.connect(self._on_dataset_selected)
-        layout.addWidget(self._dataset_list)
-
-        # Buttons
-        btn_layout = QtWidgets.QGridLayout()
-        self._load_btn = QtWidgets.QPushButton("Load Data")
-        self._load_btn.setObjectName("loadDataButton")
-        self._load_btn.clicked.connect(self._load_dataset)
-        self._rename_btn = QtWidgets.QPushButton("Rename")
+        self.import_action = QtGui.QAction("Import Data…", self)
+        self.import_action.setToolTip("Import experimental data from CSV or Excel files.")
+        self.import_action.setObjectName("loadDataAction")
+        self.import_action.setShortcut(QtGui.QKeySequence("Ctrl+Shift+L"))
+        self.import_action.triggered.connect(self._load_dataset)
+        self.addAction(self.import_action)
+        self._import_btn = QtWidgets.QPushButton(self.import_action.text())
+        self._empty_import_btn = QtWidgets.QPushButton(self.import_action.text())
+        for button in (self._import_btn, self._empty_import_btn):
+            button.setToolTip(self.import_action.toolTip())
+            button.clicked.connect(self.import_action.trigger)
+        self.import_action.changed.connect(self._sync_import_buttons)
+        self._rename_btn = QtWidgets.QPushButton("Rename…")
+        self._rename_btn.setToolTip("Change this dataset’s name in Kindred. The original file is unchanged.")
         self._rename_btn.clicked.connect(self._rename_dataset)
-        self._remove_btn = QtWidgets.QPushButton("Delete")
-        self._remove_btn.clicked.connect(self._remove_dataset)
         self._export_original_btn = QtWidgets.QPushButton("Export Original…")
+        self._export_original_btn.setToolTip("Save a copy of the original imported file, with its original contents and units.")
         self._export_original_btn.clicked.connect(self._export_original)
-        layout.addWidget(self._load_btn)
-        btn_layout.addWidget(self._rename_btn, 0, 0)
-        btn_layout.addWidget(self._remove_btn, 0, 1)
-        btn_layout.addWidget(self._export_original_btn, 1, 0, 1, 2)
+        self._remove_btn = QtWidgets.QPushButton("Delete…")
+        self._remove_btn.setToolTip("Remove this dataset from the project, including its mappings and plot overlays across all tabs.")
+        self._remove_btn.clicked.connect(self._remove_dataset)
+        self._source_btn = QtWidgets.QPushButton("File Details…")
+        self._source_btn.setToolTip("View the original filename, import filepath, columns, and units.")
+        self._source_btn.clicked.connect(self._show_source)
+        self._browser = QtWidgets.QWidget()
+        browser_layout = QtWidgets.QVBoxLayout(self._browser)
+        browser_layout.setContentsMargins(0, 0, 0, 0)
+        browser_layout.setSpacing(8)
+        selector_row = QtWidgets.QFormLayout()
+        selector_row.setRowWrapPolicy(QtWidgets.QFormLayout.WrapLongRows)
+        self._dataset_selector = _DatasetSelector()
+        self._dataset_selector.setAccessibleName("Dataset")
+        self._dataset_selector.currentIndexChanged.connect(self._on_dataset_selected)
+        self._dataset_selector.setMinimumWidth(self.fontMetrics().horizontalAdvance("dataset"))
+        selector_row.addRow("Dataset", _MappingField(self._dataset_selector, self._import_btn))
+        browser_layout.addLayout(selector_row)
+        self._actions = _DatasetActions([
+            self._rename_btn, self._export_original_btn, self._source_btn, self._remove_btn,
+        ])
+        self._actions.layout().itemAt(3).setAlignment(Qt.AlignRight)
+        browser_layout.addWidget(self._actions)
+        self._browser.hide()
+        layout.addWidget(self._browser)
 
-        mapping_group = QtWidgets.QGroupBox("Active-tab mapping")
-        mapping_layout = QtWidgets.QVBoxLayout(mapping_group)
-        self._mapping_status = QtWidgets.QLabel("Select a dataset")
-        self._mapping_status.setTextFormat(QtCore.Qt.TextFormat.PlainText)
-        self._mapping_status.setWordWrap(True)
-        mapping_layout.addWidget(self._mapping_status)
-        mapping_actions = QtWidgets.QVBoxLayout()
-        self._create_set_btn = QtWidgets.QPushButton("Create Set From t=0")
-        self._create_set_btn.clicked.connect(
-            lambda: self._emit_mapping_action("create_set_from_t0")
-        )
-        self._map_existing_btn = QtWidgets.QPushButton("Map Existing")
-        self._map_existing_btn.clicked.connect(self._map_existing)
-        self._leave_unmapped_btn = QtWidgets.QPushButton("Leave Unmapped")
-        self._leave_unmapped_btn.clicked.connect(
-            lambda: self._emit_mapping_action("leave_unmapped")
-        )
-        mapping_actions.addWidget(self._create_set_btn)
-        mapping_actions.addWidget(self._map_existing_btn)
-        mapping_actions.addWidget(self._leave_unmapped_btn)
-        mapping_layout.addLayout(mapping_actions)
-        self._observation_mapping_btn = QtWidgets.QPushButton("Observation Mapping…")
-        self._observation_mapping_btn.clicked.connect(self._request_observation_mapping)
-        self._plot_overlay_btn = QtWidgets.QPushButton("Plot Overlay…")
-        self._plot_overlay_btn.clicked.connect(self._request_plot_overlay)
-        observation_actions = QtWidgets.QVBoxLayout()
-        observation_actions.addWidget(self._observation_mapping_btn)
-        observation_actions.addWidget(self._plot_overlay_btn)
-        mapping_layout.addLayout(observation_actions)
-        self._fit_include = QtWidgets.QCheckBox("Include mapped dataset in Fit")
-        self._fit_include.toggled.connect(self._on_fit_include_toggled)
-        mapping_layout.addWidget(self._fit_include)
-        mapping_scroll = _DatasetControls(self)
-        mapping_scroll.setWidgetResizable(True)
-        controls = QtWidgets.QWidget(mapping_scroll)
+        self._empty = QtWidgets.QWidget()
+        empty_layout = QtWidgets.QVBoxLayout(self._empty)
+        empty_layout.addStretch()
+        label = QtWidgets.QLabel("Import experimental data to get started.")
+        label.setWordWrap(True)
+        label.setAlignment(Qt.AlignCenter)
+        empty_layout.addWidget(label)
+        empty_layout.addWidget(self._empty_import_btn, 0, Qt.AlignCenter)
+        formats = QtWidgets.QLabel("CSV or Excel files")
+        formats.setAlignment(Qt.AlignCenter)
+        empty_layout.addWidget(formats)
+        empty_layout.addStretch()
+        layout.addWidget(self._empty)
+
+        self._details_scroll = _DatasetControls()
+        self._details_scroll.setWidgetResizable(True)
+        self._details_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self._details_scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
+        controls = QtWidgets.QWidget()
         controls_layout = QtWidgets.QVBoxLayout(controls)
         controls_layout.setContentsMargins(0, 0, 0, 0)
-        controls_layout.addLayout(btn_layout)
-        controls_layout.addWidget(mapping_group)
-        mapping_scroll.setWidget(controls)
-        layout.addWidget(mapping_scroll, 1)
-
-        # Preview area
-        self._preview_label = QtWidgets.QLabel("No dataset selected")
-        self._preview_label.setTextFormat(QtCore.Qt.TextFormat.RichText)
-        self._preview_label.setContentsMargins(0, 2, 0, 2)
-        self._preview_label.setAlignment(Qt.AlignCenter)
-        self._preview_label.setWordWrap(True)
-        controls_layout.insertWidget(0, self._preview_label)
-        self._preview_label.hide()
-
-        # Rendered global-catalog records for list/preview only.
+        controls_layout.setSpacing(8)
+        self._dataset_summary = _source_label("")
+        self._dataset_summary.setWordWrap(True)
+        form = QtWidgets.QFormLayout()
+        form.setRowWrapPolicy(QtWidgets.QFormLayout.WrapLongRows)
+        form.setHorizontalSpacing(8)
+        form.setVerticalSpacing(8)
+        self._tab_name = _DatasetName()
+        self._tab_name.setMinimumWidth(self.fontMetrics().horizontalAdvance("Mechanism"))
+        self._tab_name.setSizePolicy(QtWidgets.QSizePolicy.Ignored, QtWidgets.QSizePolicy.Preferred)
+        for title, value in (("Tab", self._tab_name), ("Data", self._dataset_summary)):
+            label = QtWidgets.QLabel(title)
+            label_font = label.font()
+            label_font.setBold(True)
+            label.setFont(label_font)
+            if title == "Tab":
+                label.setToolTip("The mechanism tab these mappings apply to.")
+            form.addRow(label, value)
+        self._change_set_btn = QtWidgets.QPushButton("Change IC Set…")
+        self._change_set_btn.setToolTip("Map this dataset to an existing initial-condition set, or create one from its values at t=0.")
+        self._change_set_btn.clicked.connect(self._change_ic_set)
+        self._set_value = _DatasetName()
+        self._observation_mapping_btn = QtWidgets.QPushButton("Map Columns…")
+        self._observation_mapping_btn.setToolTip("Choose which measured columns correspond to model species or observables in this tab.")
+        self._observation_mapping_btn.clicked.connect(self._request_observation_mapping)
+        self._observation_value = _source_label("")
+        for title, value, action, tooltip in (
+            ("Initial-condition set", self._set_value, self._change_set_btn,
+             "The initial-condition set mapped to this dataset in the current tab."),
+            ("Columns → Model", self._observation_value, self._observation_mapping_btn,
+             "Number of measured columns with a confirmed mapping to the model in the current tab."),
+        ):
+            value.setMinimumWidth(self.fontMetrics().horizontalAdvance("8 of 8 mapped"))
+            value.setSizePolicy(QtWidgets.QSizePolicy.Ignored, QtWidgets.QSizePolicy.Preferred)
+            label = QtWidgets.QLabel(title)
+            label_font = label.font()
+            label_font.setBold(True)
+            label.setFont(label_font)
+            label.setToolTip(tooltip)
+            form.addRow(label, _MappingField(value, action))
+        controls_layout.addLayout(form)
+        self._mapping_status = _source_label("")
+        controls_layout.addWidget(self._mapping_status)
+        controls_layout.addStretch()
+        self._details_scroll.setWidget(controls)
+        self._details_scroll.hide()
+        layout.addWidget(self._details_scroll, 1)
         self._snapshot = DataManagerSnapshot((), None, (), ())
         self._visible_records_by_id: Dict[str, RawDatasetRecord] = {}
-
+        self._mechanism_name = ""
+        self._mapping_available = False
         self._import_busy = False
-        self._set_mapping_controls_enabled(False)
+        self._update_mapping_area()
+
+    def _sync_import_buttons(self) -> None:
+        for button in (self._import_btn, self._empty_import_btn):
+            button.setEnabled(self.import_action.isEnabled())
+
+    def _show_source(self) -> None:
+        record = self._visible_records_by_id.get(self._selected_dataset_id())
+        if record is None:
+            return
+        selector = self._dataset_selector
+        dialog = _SourceDialog(record, selector.currentData(Qt.UserRole + 2), self)
+        try:
+            dialog.exec()
+        finally:
+            dialog.deleteLater()
 
     def _show_message(
         self,
@@ -238,60 +443,46 @@ class DataManagerPanel(QtWidgets.QWidget):
         """Clear only rendered Data state and revoke all Data actions."""
         self._snapshot = DataManagerSnapshot((), None, (), ())
         self._visible_records_by_id.clear()
-        self._dataset_list.clear()
-        self._preview_label.hide()
-        self._dataset_heading.setText("No dataset selected")
-        self._mapping_status.setText("Select a dataset")
-        self._set_mapping_controls_enabled(False)
-        self._rename_btn.setEnabled(False)
-        self._remove_btn.setEnabled(False)
-        self._export_original_btn.setEnabled(False)
-        self._plot_overlay_btn.setEnabled(False)
-        blocker = QtCore.QSignalBlocker(self._fit_include)
-        try:
-            self._fit_include.setChecked(False)
-        finally:
-            del blocker
-
-    def trigger_load_dialog(self) -> None:
-        """Programmatically invoke the load dialog (mirrors Load button)."""
-        self._load_dataset()
+        self._dataset_selector.clear()
+        self._browser.hide()
+        self._details_scroll.hide()
+        self._empty.show()
+        self._dataset_summary.clear()
+        self._mapping_available = False
+        self._mechanism_name = ""
+        self._update_mapping_area()
 
     def render_snapshot(
         self,
         snapshot: DataManagerSnapshot,
         document: ProjectDocument,
     ) -> None:
-        """Render one global-catalog/active-tab snapshot without retaining truth."""
-        if not isinstance(snapshot, DataManagerSnapshot):
-            raise TypeError("DataManagerPanel requires a DataManagerSnapshot.")
+        """Render the catalog while retaining the selected dataset identity."""
         selected_id = self._selected_dataset_id()
+        previous_row = self._dataset_selector.currentIndex()
         self._snapshot = snapshot
-        self._visible_records_by_id = {
-            str(record.dataset_id): record for record in snapshot.datasets
-        }
-        self._dataset_list.clear()
-        self._preview_label.hide()
-        self._dataset_heading.setText("No dataset selected")
+        tab = document.tab(snapshot.active_tab_id) if snapshot.active_tab_id is not None else None
+        self._mechanism_name = tab.name if tab is not None else ""
+        self._mapping_available = tab is not None and bool(canonical_observation_target_names(tab))
+        self._visible_records_by_id = {record.dataset_id: record for record in snapshot.datasets}
+        blocker = QtCore.QSignalBlocker(self._dataset_selector)
+        self._dataset_selector.clear()
         selected_row = -1
         for row, record in enumerate(snapshot.datasets):
-            compact = compact_dataset_label(record.display_name, max_chars=DATASET_LIST_LABEL_MAX_CHARS)
-            item = QtWidgets.QListWidgetItem(compact.display)
-            item.setToolTip(
-                f"<span>{html.escape(compact.full, quote=True)}</span>"
-            )
-            item.setData(Qt.UserRole, str(record.dataset_id))
-            item.setData(Qt.UserRole + 1, compact.full)
+            self._dataset_selector.addItem(record.display_name, record.dataset_id)
+            self._dataset_selector.setItemData(row, literal_tooltip(record.display_name), Qt.ToolTipRole)
+            self._dataset_selector.setItemData(row, record.display_name, Qt.AccessibleTextRole)
             source = document.imported_source(record.source_id)
-            item.setData(Qt.UserRole + 2, str(source.original_filename))
-            item.setData(Qt.UserRole + 3, str(source.original_format))
-            self._dataset_list.addItem(item)
-            if str(record.dataset_id) == selected_id:
+            self._dataset_selector.setItemData(row, source, Qt.UserRole + 2)
+            if record.dataset_id == selected_id:
                 selected_row = row
-        if selected_row >= 0:
-            self._dataset_list.setCurrentRow(selected_row)
-        self._load_btn.setEnabled(not self._import_busy)
-        self._update_mapping_area()
+        if snapshot.datasets:
+            self._dataset_selector.setCurrentIndex(selected_row if selected_row >= 0 else min(max(0, previous_row), len(snapshot.datasets) - 1))
+        del blocker
+        self._empty.setVisible(not snapshot.datasets)
+        self._browser.setVisible(bool(snapshot.datasets))
+        self._details_scroll.setVisible(bool(snapshot.datasets))
+        self._on_dataset_selected(self._dataset_selector.currentIndex())
 
     def _load_dataset(self):
         """Load dataset(s) using per-file import configuration."""
@@ -497,9 +688,9 @@ class DataManagerPanel(QtWidgets.QWidget):
         )
 
     def set_import_busy(self, busy: bool) -> None:
-        """Project application-global import custody onto this Load button."""
+        """Project application-global import custody onto every import entry."""
         self._import_busy = bool(busy)
-        self._load_btn.setEnabled(not self._import_busy)
+        self.import_action.setEnabled(not self._import_busy)
 
     def _remove_dataset(self):
         """Emit one global-delete intent; confirmation belongs to integration."""
@@ -529,108 +720,47 @@ class DataManagerPanel(QtWidgets.QWidget):
         if accepted:
             self.datasetRenameRequested.emit(dataset_id, str(value))
 
-    def _on_dataset_selected(self, current, previous):
-        """Update preview when dataset is selected."""
-        if not current:
-            self._preview_label.hide()
-            self._dataset_heading.setText("No dataset selected")
-            self._update_mapping_area()
-            return
-
-        dataset_id = str(current.data(Qt.UserRole) or "")
-        record = self._visible_records_by_id.get(dataset_id)
+    def _on_dataset_selected(self, index):
+        record = self._visible_records_by_id.get(self._selected_dataset_id())
+        self._dataset_selector.setToolTip(literal_tooltip(record.display_name) if record else "")
         if record is None:
-            self._preview_label.hide()
-            self._dataset_heading.setText("No dataset selected")
-            self._update_mapping_area()
-            return
-
-        def escape(value: object) -> str:
-            return html.escape(str(value), quote=True)
-
-        name = escape(record.display_name)
-        self._dataset_heading.setText("Loaded Datasets")
-        self._preview_label.show()
-        unique_times = {
-            time_value
-            for series in record.observations
-            for time_value in series.t
-        }
-        observation_labels = tuple(
-            escape(series.column_name) for series in record.observations
-        )
-
-        thawed_metadata = thaw_json_value(record.source_metadata)
-        metadata = dict(thawed_metadata) if isinstance(thawed_metadata, dict) else {}
-        mapping_source = escape(metadata.get("mapping_source", "normalized"))
-        source_filename = escape(current.data(Qt.UserRole + 2) or "")
-        source_format = escape(current.data(Qt.UserRole + 3) or "")
-        time_column = escape(metadata.get("time_column", "unknown"))
-        preview = f"<b>{name}</b><br>"
-        preview += (
-            f"Original source: {source_filename} "
-            f"({source_format})<br>"
-        )
-        preview += f"{escape(len(unique_times))} time points<br>"
-        preview += f"Time column: {time_column} ({mapping_source})<br>"
-        preview += (
-            f"{escape(len(observation_labels))} species: "
-            f"{', '.join(observation_labels[:5])}"
-        )
-        if len(observation_labels) > 5:
-            preview += f", ... ({escape(len(observation_labels)-5)} more)"
-
-        self._preview_label.setText(preview)
+            self._dataset_summary.clear()
+        else:
+            unique_times = {value for series in record.observations for value in series.t}
+            column_label = "column" if len(record.observations) == 1 else "columns"
+            self._dataset_summary.setText(
+                f"{len(unique_times)} time points · {len(record.observations)} measured {column_label}"
+            )
         self._update_mapping_area()
 
     def _selected_dataset_id(self) -> str:
-        current = self._dataset_list.currentItem()
-        return "" if current is None else str(current.data(Qt.UserRole) or "")
+        return self._dataset_selector.currentData() or ""
 
     def _active_link(self, dataset_id: str) -> ActiveDatasetLinkSnapshot | None:
         return self._snapshot.link_by_dataset_id().get(str(dataset_id))
 
-    def _set_mapping_controls_enabled(self, enabled: bool) -> None:
-        for widget in (
-            self._create_set_btn,
-            self._map_existing_btn,
-            self._leave_unmapped_btn,
-            self._observation_mapping_btn,
-            self._fit_include,
-        ):
-            widget.setEnabled(bool(enabled))
-
     def _update_mapping_area(self) -> None:
         dataset_id = self._selected_dataset_id()
         record = self._visible_records_by_id.get(dataset_id)
-        enabled = record is not None and self._snapshot.active_tab_id is not None
-        self._rename_btn.setEnabled(record is not None)
-        self._remove_btn.setEnabled(record is not None)
-        self._export_original_btn.setEnabled(record is not None)
-        self._plot_overlay_btn.setEnabled(record is not None)
-        self._set_mapping_controls_enabled(enabled)
+        enabled = record is not None and self._mapping_available
+        for action in (self._rename_btn, self._remove_btn, self._export_original_btn, self._source_btn):
+            action.setEnabled(record is not None)
+        self._change_set_btn.setEnabled(enabled)
+        self._observation_mapping_btn.setEnabled(enabled)
         link = self._active_link(dataset_id)
-        self._leave_unmapped_btn.setEnabled(
-            bool(enabled and (link is None or link.set_id is None))
-        )
-        self._fit_include.blockSignals(True)
-        try:
-            self._fit_include.setChecked(bool(link and link.include_in_fit))
-            self._fit_include.setEnabled(bool(enabled and link and link.set_id))
-        finally:
-            self._fit_include.blockSignals(False)
-        if record is None:
-            self._mapping_status.setText("Select a dataset")
-        elif self._snapshot.active_tab_id is None:
-            self._mapping_status.setText("No active mechanism tab; raw dataset remains available.")
-        elif link is None or link.set_id is None:
-            self._mapping_status.setText("Unmapped in the active mechanism tab")
+        self._set_value.set_name(link.set_name or link.set_id if link and link.set_id else "No IC set mapped")
+        mapped_ids = set(dict(link.observation_mapping)) if link else set()
+        total = len(record.observations) if record else 0
+        assigned = sum(series.raw_observation_id in mapped_ids for series in record.observations) if record else 0
+        self._observation_value.setText(f"{assigned} of {total} mapped")
+        self._tab_name.set_name(self._mechanism_name or "No active mechanism")
+        self._mapping_status.setVisible(not self._mapping_available)
+        if not self._mechanism_name:
+            self._mapping_status.setText("No active mechanism. Source files remain available; select a mechanism to assign data.")
+        elif not self._mapping_available:
+            self._mapping_status.setText("Apply a valid mechanism with observation targets to assign data.")
         else:
-            mapped_name = link.set_name or link.set_id
-            mapped_columns = len(link.observation_mapping)
-            self._mapping_status.setText(
-                f"Mapped to {mapped_name}; {mapped_columns} confirmed observation mapping(s)"
-            )
+            self._mapping_status.clear()
 
     def _emit_mapping_action(
         self,
@@ -649,29 +779,20 @@ class DataManagerPanel(QtWidgets.QWidget):
             occupied_choice,
         )
 
-    def _map_existing(self) -> None:
-        if not self._snapshot.available_sets:
-            self._show_message(
-                QtWidgets.QMessageBox.Icon.Information,
-                "Map Existing",
-                "The active mechanism tab has no available initial-condition set.",
-            )
+    def _change_ic_set(self) -> None:
+        link = self._active_link(self._selected_dataset_id())
+        dialog = _ICSetDialog(self._snapshot.available_sets, link.set_id if link else None, self)
+        try:
+            result = dialog.exec()
+            set_id = dialog.sets.currentData()
+            label = dialog.sets.currentText()
+        finally:
+            dialog.deleteLater()
+        if result == _ICSetDialog.CREATE_FROM_DATA:
+            self._emit_mapping_action("create_set_from_t0")
             return
-        labels = [name for _set_id, name in self._snapshot.available_sets]
-        label, accepted = QtWidgets.QInputDialog.getItem(
-            self,
-            "Map Existing",
-            "Initial-condition set:",
-            labels,
-            editable=False,
-        )
-        if not accepted:
+        if result != QtWidgets.QDialog.Accepted:
             return
-        set_id = next(
-            set_id
-            for set_id, name in self._snapshot.available_sets
-            if name == str(label)
-        )
         selected_dataset_id = self._selected_dataset_id()
         occupant = next(
             (
@@ -697,8 +818,7 @@ class DataManagerPanel(QtWidgets.QWidget):
                 "mechanism tab. Each dataset must use its own initial-condition set."
             )
             box.setInformativeText(
-                f'Moving the set unmaps "{occupant_name}" and turns off '
-                "its Fit inclusion."
+                f'Moving the set unmaps "{occupant_name}".'
             )
             override_button = box.addButton(
                 "Move set to this dataset",
@@ -732,20 +852,3 @@ class DataManagerPanel(QtWidgets.QWidget):
         if not dataset_id:
             return
         self.datasetObservationMappingRequested.emit(dataset_id)
-
-    def _request_plot_overlay(self) -> None:
-        dataset_id = self._selected_dataset_id()
-        if not dataset_id:
-            return
-        self.datasetPlotOverlayRequested.emit(dataset_id)
-
-    def _on_fit_include_toggled(self, checked: bool) -> None:
-        dataset_id = self._selected_dataset_id()
-        link = self._active_link(dataset_id)
-        if (
-            not dataset_id
-            or link is None
-            or link.set_id is None
-        ):
-            return
-        self.datasetFitInclusionRequested.emit(dataset_id, bool(checked))

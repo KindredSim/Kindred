@@ -30,7 +30,6 @@ from kindred.core.analysis.dataset_sampling import compute_sampled_indices
 from kindred.core.dataset_mapping import (
     resolve_fit_t_start,
 )
-from kindred.core.datasets import foundation as dataset_foundation
 from kindred.core.mechanism_source import (
     MechanismAuthoringSource,
     source_matches_analysis,
@@ -41,8 +40,6 @@ from kindred.core.project_document import (
     ProjectDocument,
     TabScientificSettings,
     canonical_initial_values,
-    canonical_observation_target_names,
-    canonical_species_names,
     validate_fit_solver,
 )
 from kindred.core.species import TIME_MAX_S, validate_concentration
@@ -156,7 +153,6 @@ class FitMappedDatasetSnapshot:
     set_name: str
     initial_values: tuple[tuple[str, float], ...]
     observations: tuple[FitObservationSnapshot, ...]
-    included_at_launch: bool
     resolved_t_start: float
 
     def __post_init__(self) -> None:
@@ -1114,7 +1110,7 @@ def create_initial_fit_setup(origin: FitOriginSnapshot) -> FitSetupSnapshot:
     datasets = tuple(
         FitDatasetLocalSettings(
             dataset_id=mapped.dataset_id,
-            included=mapped.included_at_launch,
+            included=False,
             t_start=mapped.resolved_t_start,
             data_range_min=min(
                 (
@@ -1202,8 +1198,6 @@ def capture_fit_origin(
     tab = document.tab(tab_id)
     if not isinstance(tab.prepared_dsl, PreparedDslRequestSet):
         raise ValueError("Fit requires an accepted visible mechanism.")
-    mechanism_species = canonical_species_names(tab)
-    observation_targets = canonical_observation_target_names(tab)
     selected_dataset_ids = (
         None
         if dataset_ids is None
@@ -1224,39 +1218,12 @@ def capture_fit_origin(
             continue
         dataset = document.dataset(dataset_id)
         initial_set = tab.initial_condition_set(link.set_id)
-        validated = (
-            dataset_foundation.validate_fit_inclusion(
-                dataset=dataset,
-                set_id=link.set_id,
-                observation_mapping=link.observation_mapping,
-                initial_values=dict(
-                    canonical_initial_values(tab, initial_set.set_id)
-                ),
-                mechanism_species=mechanism_species,
-                observation_targets=observation_targets,
-                resolved_t_start=resolve_fit_t_start(
-                    tab,
-                    initial_set.set_id,
-                    label=f"Fit snapshot for dataset {dataset.dataset_id!r}",
-                ),
-            )
-            if link.include_in_fit
-            else None
-        )
         by_raw_id = {
             observation.raw_observation_id: observation
             for observation in dataset.observations
         }
         observations: list[FitObservationSnapshot] = []
-        mapping = (
-            tuple(
-                (target.raw_observation_id, target.model_target)
-                for target in validated.targets
-            )
-            if validated is not None
-            else link.observation_mapping
-        )
-        for raw_observation_id, model_target in mapping:
+        for raw_observation_id, model_target in link.observation_mapping:
             observation = by_raw_id.get(raw_observation_id)
             if observation is None:
                 raise ValueError(
@@ -1281,17 +1248,10 @@ def capture_fit_origin(
                 set_name=initial_set.name,
                 initial_values=canonical_initial_values(tab, initial_set.set_id),
                 observations=tuple(observations),
-                included_at_launch=bool(link.include_in_fit),
-                resolved_t_start=(
-                    validated.resolved_t_start
-                    if validated is not None
-                    else resolve_fit_t_start(
-                        tab,
-                        initial_set.set_id,
-                        label=(
-                            f"Fit snapshot for dataset {dataset.dataset_id!r}"
-                        ),
-                    )
+                resolved_t_start=resolve_fit_t_start(
+                    tab,
+                    initial_set.set_id,
+                    label=f"Fit snapshot for dataset {dataset.dataset_id!r}",
                 ),
             )
         )

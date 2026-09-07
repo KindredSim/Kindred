@@ -72,18 +72,22 @@ class AxisToolbar(QtWidgets.QWidget):
         self._x_combo.setMinimumContentsLength(4)
         self._x_combo.setSizeAdjustPolicy(QtWidgets.QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
         self._x_combo.setMaximumWidth(220)
+        self._x_combo.setToolTip('Select X-axis Variable (time, species, or observables defined with "let … = …").')
 
         self._x_unit_combo = QtWidgets.QComboBox(self)
         self._x_unit_combo.setObjectName("axisToolbarXUnit")
         self._x_unit_combo.setMinimumWidth(64)
         self._x_unit_combo.setMaximumWidth(84)
+        self._x_unit_combo.setToolTip("Select units for the X axis and copied plot data. Available when plotting time or concentration.")
 
         self._y_unit_combo = QtWidgets.QComboBox(self)
         self._y_unit_combo.setObjectName("axisToolbarYUnit")
         self._y_unit_combo.setMinimumWidth(64)
         self._y_unit_combo.setMaximumWidth(84)
+        self._y_unit_combo.setToolTip("Select units for the Y axis and copied plot data. Available only when all plotted Y variables are concentrations.")
 
         self._y_list = QtWidgets.QListWidget(self)
+        self._y_list.setToolTip('Select Y-axis Variables (species or observables defined with "let … = …").')
         self._y_list.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.NoSelection)
         self._y_list.setAlternatingRowColors(True)
         self._y_list.setUniformItemSizes(True)
@@ -95,6 +99,7 @@ class AxisToolbar(QtWidgets.QWidget):
 
         self._y_selector_btn = QtWidgets.QToolButton(self)
         self._y_selector_btn.setText("Y: none")
+        self._y_selector_btn.setToolTip(self._y_list.toolTip())
         self._y_selector_btn.setMaximumWidth(220)
         self._y_selector_btn.setMinimumWidth(80)
         self._y_selector_btn.setSizePolicy(QtWidgets.QSizePolicy.Preferred, QtWidgets.QSizePolicy.Fixed)
@@ -477,6 +482,7 @@ class AxisToolbar(QtWidgets.QWidget):
         toolbar_groups = []
         for label, editor in ((x_label, self._x_combo),
                               (QtWidgets.QLabel("Unit:", self), self._x_unit_combo)):
+            label.setToolTip(editor.toolTip())
             group = QtWidgets.QWidget(self)
             group_layout = QtWidgets.QHBoxLayout(group)
             group_layout.setContentsMargins(0, 0, 0, 0)
@@ -489,7 +495,9 @@ class AxisToolbar(QtWidgets.QWidget):
         unit_layout = QtWidgets.QHBoxLayout(unit_group)
         unit_layout.setContentsMargins(0, 0, 0, 0)
         unit_layout.setSpacing(8)
-        unit_layout.addWidget(QtWidgets.QLabel("Unit:", self))
+        y_unit_label = QtWidgets.QLabel("Unit:", self)
+        y_unit_label.setToolTip(self._y_unit_combo.toolTip())
+        unit_layout.addWidget(y_unit_label)
         unit_layout.addWidget(self._y_unit_combo)
         toolbar_groups.append(unit_group)
 
@@ -536,7 +544,7 @@ class AxisToolbar(QtWidgets.QWidget):
             tooltip = ", ".join(selected_labels)
         self._y_selector_btn.setText(compact_text(summary, max_chars=30).display)
         self._y_selector_btn.setAccessibleName(summary)
-        self._y_selector_btn.setToolTip(literal_tooltip(tooltip))
+        self._y_selector_btn.setToolTip(literal_tooltip(self._y_list.toolTip() + "\n\n" + tooltip))
         self._y_selector_btn.setEnabled(self._y_list.count() > 0)
 
     # ----------------------- internal wiring -----------------------

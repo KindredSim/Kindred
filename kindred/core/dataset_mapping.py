@@ -21,7 +21,6 @@ from kindred.core.project_document import (
     InitialConditionSet,
     MechanismTabDocument,
     ProjectDocument,
-    canonical_initial_values,
     canonical_species_names,
     new_set_id,
 )
@@ -136,7 +135,7 @@ def resolve_fit_t_start(
     tab: MechanismTabDocument,
     set_id: str,
     *,
-    label: str = "Fit inclusion",
+    label: str = "Fit dataset",
 ) -> float:
     """Resolve and validate only the start-time scalar owned by Fit."""
 
@@ -267,7 +266,6 @@ def create_set_from_exact_zero(
         DatasetLink(
             set_id=clean_set_id,
             observation_mapping=normalized_mapping,
-            include_in_fit=False,
         ),
     )
 
@@ -340,7 +338,6 @@ def apply_dataset_mapping_batch(
     used_names = {item.name.casefold() for item in sets}
     for item in batch.proposals:
         dataset = records[item.dataset_id]
-        selected = current.get(item.dataset_id, DatasetLink())
         normalized_mapping = normalize_observation_mapping(
             item.observation_mapping,
             raw_observations=tuple(
@@ -355,7 +352,6 @@ def apply_dataset_mapping_batch(
             current[item.dataset_id] = DatasetLink(
                 set_id=None,
                 observation_mapping=normalized_mapping,
-                include_in_fit=False,
             )
             continue
         if item.action is DatasetMappingChoice.CREATE_SET:
@@ -394,7 +390,6 @@ def apply_dataset_mapping_batch(
             current[item.dataset_id] = DatasetLink(
                 set_id=new_set.set_id,
                 observation_mapping=normalized_mapping,
-                include_in_fit=False,
             )
             continue
         target = item.target_set_id
@@ -415,7 +410,6 @@ def apply_dataset_mapping_batch(
                 current[item.dataset_id] = DatasetLink(
                     set_id=None,
                     observation_mapping=normalized_mapping,
-                    include_in_fit=False,
                 )
                 continue
             if item.occupied_choice is OccupiedSetChoice.OVERRIDE:
@@ -423,7 +417,6 @@ def apply_dataset_mapping_batch(
                 current[occupant] = DatasetLink(
                     set_id=None,
                     observation_mapping=old.observation_mapping,
-                    include_in_fit=False,
                 )
             elif item.occupied_choice is OccupiedSetChoice.CREATE_COPY:
                 expected_name = allocate_initial_condition_set_name(
@@ -450,7 +443,6 @@ def apply_dataset_mapping_batch(
         current[item.dataset_id] = DatasetLink(
             set_id=destination,
             observation_mapping=normalized_mapping,
-            include_in_fit=selected.include_in_fit,
         )
     candidate = replace(
         tab,
@@ -461,25 +453,15 @@ def apply_dataset_mapping_batch(
             known_set_ids=(item.set_id for item in sets),
         ),
     )
-    return revalidate_fit_inclusions(
-        document=document,
-        tab=candidate,
-        model_targets=observation_targets,
-    )
+    return candidate
 
 
 def apply_dataset_set_mapping_plan(
     *,
-    document: ProjectDocument,
     tab: MechanismTabDocument,
     plan: DatasetSetMappingPlan,
-    model_targets: Sequence[str],
 ) -> MechanismTabDocument:
-    """Materialize a mapping plan and drop every newly invalid Fit inclusion.
-
-    model_targets is the accepted observation-target roster; mechanism species
-    are resolved from the canonical tab for Fit admission.
-    """
+    """Materialize the admitted mapping plan and its optional copied set."""
     if plan.canceled:
         return tab
     sets = tab.initial_condition_sets
@@ -502,16 +484,11 @@ def apply_dataset_set_mapping_plan(
         initial_condition_sets=tuple(sets),
         dataset_links=plan.links,
     )
-    return revalidate_fit_inclusions(
-        document=document,
-        tab=candidate,
-        model_targets=model_targets,
-    )
+    return candidate
 
 
 def with_confirmed_observation_mapping(
     *,
-    document: ProjectDocument,
     tab: MechanismTabDocument,
     dataset: dataset_foundation.RawDatasetRecord,
     model_targets: Sequence[str],
@@ -535,128 +512,9 @@ def with_confirmed_observation_mapping(
         DatasetLink(
             set_id=current.set_id,
             observation_mapping=normalized,
-            include_in_fit=current.include_in_fit,
         ),
     )
-    return revalidate_fit_inclusions(
-        document=document,
-        tab=candidate,
-        model_targets=model_targets,
-    )
-
-
-def _validate_current_fit_inclusion(
-    *,
-    document: ProjectDocument,
-    tab: MechanismTabDocument,
-    dataset_id: str,
-    model_targets: Sequence[str],
-) -> dataset_foundation.FitInclusionValidation:
-    """Resolve mapping-owned context before calling the lower pure validator."""
-    try:
-        dataset = document.dataset(dataset_id)
-    except KeyError as exc:
-        raise DatasetMappingError(
-            f"Dataset {dataset_id!r} is no longer present."
-        ) from exc
-    current = tab.dataset_link(dataset.dataset_id)
-    if current is None or current.set_id is None:
-        raise DatasetMappingError(
-            "Map the dataset to an initial-condition set before including it in Fit."
-        )
-    try:
-        initial_set = tab.initial_condition_set(current.set_id)
-    except KeyError as exc:
-        raise DatasetMappingError(
-            f"Mapped initial-condition set {current.set_id!r} is no longer present."
-        ) from exc
-    normalized_mapping = normalize_observation_mapping(
-        current.observation_mapping,
-        raw_observations=tuple(
-            (series.raw_observation_id, series.column_name)
-            for series in dataset.observations
-        ),
-        model_targets=model_targets,
-    )
-    if normalized_mapping != current.observation_mapping:
-        raise DatasetMappingError(
-            "Fit inclusion observation mapping is not canonical."
-        )
-    return dataset_foundation.validate_fit_inclusion(
-        dataset=dataset,
-        set_id=initial_set.set_id,
-        observation_mapping=normalized_mapping,
-        initial_values=dict(canonical_initial_values(tab, initial_set.set_id)),
-        mechanism_species=canonical_species_names(tab),
-        observation_targets=model_targets,
-        resolved_t_start=resolve_fit_t_start(
-            tab,
-            initial_set.set_id,
-            label=f"Fit inclusion for dataset {dataset.dataset_id!r}",
-        ),
-    )
-
-
-def revalidate_fit_inclusions(
-    *,
-    document: ProjectDocument,
-    tab: MechanismTabDocument,
-    model_targets: Sequence[str],
-) -> MechanismTabDocument:
-    """Remove invalid included links after any dataset/set prerequisite change."""
-    candidate = tab
-    for dataset_id, link in tab.dataset_links:
-        if not link.include_in_fit:
-            continue
-        try:
-            _validate_current_fit_inclusion(
-                document=document,
-                tab=candidate,
-                dataset_id=dataset_id,
-                model_targets=model_targets,
-            )
-        except (KeyError, TypeError, ValueError):
-            current = candidate.dataset_link(dataset_id)
-            if current is not None:
-                candidate = candidate.with_dataset_link(
-                    dataset_id,
-                    replace(current, include_in_fit=False),
-                )
     return candidate
-
-
-def with_validated_fit_inclusion(
-    *,
-    document: ProjectDocument,
-    tab: MechanismTabDocument,
-    dataset_id: str,
-    include: bool,
-    model_targets: Sequence[str],
-) -> MechanismTabDocument:
-    """Replace inclusion only after complete current-state validation."""
-    current = tab.dataset_link(dataset_id)
-    if not include:
-        if current is None:
-            return tab
-    else:
-        _validate_current_fit_inclusion(
-            document=document,
-            tab=tab,
-            dataset_id=dataset_id,
-            model_targets=model_targets,
-        )
-    if current is None:
-        raise DatasetMappingError(
-            f"Dataset {dataset_id!r} has no active-tab link."
-        )
-    return tab.with_dataset_link(
-        dataset_id,
-        DatasetLink(
-            set_id=current.set_id,
-            observation_mapping=current.observation_mapping,
-            include_in_fit=include,
-        ),
-    )
 
 
 def validate_unique_dataset_name(
@@ -709,12 +567,9 @@ def validate_partial_bijection(
                     f"Set '{set_id}' is mapped to both '{occupying_dataset}' and '{dataset_id}'."
                 )
             dataset_by_set[set_id] = dataset_id
-        elif raw_link.include_in_fit:
-            raise DatasetMappingError("An unmapped dataset cannot be included in Fit.")
         link = DatasetLink(
             set_id=set_id,
             observation_mapping=tuple(raw_link.observation_mapping),
-            include_in_fit=bool(raw_link.include_in_fit),
         )
         by_dataset[dataset_id] = link
     return tuple((key, by_dataset[key]) for key in sorted(by_dataset))
@@ -753,7 +608,6 @@ def plan_dataset_to_set_mapping(
             current[occupant_dataset_id] = DatasetLink(
                 set_id=None,
                 observation_mapping=occupant_link.observation_mapping,
-                include_in_fit=False,
             )
         elif occupied_choice == OccupiedSetChoice.CREATE_COPY:
             if copy_plan is None or copy_plan.source_set_id != target_set:
@@ -767,37 +621,11 @@ def plan_dataset_to_set_mapping(
     current[target_dataset] = DatasetLink(
         set_id=destination_set,
         observation_mapping=selected.observation_mapping,
-        include_in_fit=selected.include_in_fit,
     )
     return DatasetSetMappingPlan(
         links=validate_partial_bijection(current.items()),
         copied_set=copied_set,
     )
-
-
-def plan_leave_unmapped(
-    *,
-    links: Iterable[tuple[str, DatasetLink]],
-    dataset_id: str,
-) -> DatasetSetMappingPlan:
-    """Confirm that an already-unmapped raw record stays unmapped."""
-    target = str(dataset_id)
-    current = dict(validate_partial_bijection(links))
-    selected = current.get(target)
-    if selected is None:
-        return DatasetSetMappingPlan(
-            links=tuple((key, current[key]) for key in sorted(current))
-        )
-    if selected.set_id is not None:
-        raise DatasetMappingError(
-            "A mapped dataset cannot be left unmapped; remap it or delete it globally."
-        )
-    current[target] = DatasetLink(
-        set_id=None,
-        observation_mapping=selected.observation_mapping,
-        include_in_fit=False,
-    )
-    return DatasetSetMappingPlan(links=validate_partial_bijection(current.items()))
 
 
 def plan_global_dataset_delete(

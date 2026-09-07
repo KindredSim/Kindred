@@ -387,7 +387,6 @@ def _validate_initial_condition_set_carriers(
 class DatasetLink:
     set_id: str | None = None
     observation_mapping: tuple[tuple[str, str], ...] = ()
-    include_in_fit: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -508,7 +507,7 @@ class MechanismTabDocument:
                 dataset_id,
                 link
                 if link.set_id in retained_ids or link.set_id is None
-                else replace(link, set_id=None, include_in_fit=False),
+                else replace(link, set_id=None),
             )
             for dataset_id, link in self.dataset_links
         )
@@ -574,7 +573,6 @@ class MechanismTabDocument:
                 links[occupant] = replace(
                     old,
                     set_id=None,
-                    include_in_fit=False,
                 )
         links[target_dataset_id] = link
         return replace(self, dataset_links=tuple(links.items()))
@@ -1413,10 +1411,6 @@ def reconcile_tab_mechanism_source(
                 replace(
                     link,
                     observation_mapping=observation_mapping,
-                    include_in_fit=(
-                        link.include_in_fit
-                        and bool(observation_mapping)
-                    ),
                 ),
             )
         )
@@ -1811,7 +1805,6 @@ def validate_project_document(document: ProjectDocument) -> ProjectDocument:
     }
 
     global_set_ids: list[str] = []
-    mechanism_species_by_tab_id: dict[str, tuple[str, ...]] = {}
     hydrated_tabs: list[MechanismTabDocument] = []
     all_entity_ids = [document.project_id]
     all_entity_ids.extend(source.source_id for source in document.imported_sources)
@@ -1886,7 +1879,6 @@ def validate_project_document(document: ProjectDocument) -> ProjectDocument:
                 f"Tab {tab.tab_id!r} ({tab.name!r}) contains an invalid "
                 f"accepted mechanism: {exc}"
             ) from exc
-        mechanism_species_by_tab_id[tab.tab_id] = mechanism_species
         observation_targets = canonical_observation_target_names(tab)
         mechanism_species_set = frozenset(mechanism_species)
         admitted_initial_sets = _validate_initial_condition_set_carriers(
@@ -1951,21 +1943,15 @@ def validate_project_document(document: ProjectDocument) -> ProjectDocument:
                 raise TypeError(
                     "dataset_links must contain DatasetLink values."
                 )
-            _require_bool(
-                link.include_in_fit,
-                "DatasetLink.include_in_fit",
-            )
             if link.set_id is not None:
                 if link.set_id in set_ids:
                     mapped_set_ids.append(link.set_id)
-                elif not link.include_in_fit:
+                else:
                     raise ValueError(
                         f"Dataset {dataset_id!r} maps to missing set ID "
                         f"{link.set_id!r}."
                     )
 
-            if link.include_in_fit:
-                continue
             dataset = dataset_by_id.get(dataset_id)
             if dataset is None:
                 raise ValueError(
@@ -2002,61 +1988,4 @@ def validate_project_document(document: ProjectDocument) -> ProjectDocument:
         document,
         tabs=tuple(hydrated_tabs),
     )
-    for tab in hydrated_document.tabs:
-        for dataset_id, link in tab.dataset_links:
-            if not link.include_in_fit:
-                continue
-            dataset = dataset_by_id.get(dataset_id)
-            initial_set = (
-                None
-                if link.set_id is None
-                else next(
-                    (
-                        item
-                        for item in tab.initial_condition_sets
-                        if item.set_id == link.set_id
-                    ),
-                    None,
-                )
-            )
-            dataset_label = (
-                f"{dataset.display_name!r} (ID {dataset.dataset_id!r})"
-                if dataset is not None
-                else f"<missing> (ID {dataset_id!r})"
-            )
-            set_label = (
-                f"{initial_set.name!r} (ID {initial_set.set_id!r})"
-                if initial_set is not None
-                else f"<missing> (ID {link.set_id!r})"
-            )
-            try:
-                if dataset is None:
-                    raise ValueError(
-                        f"Dataset link references missing dataset ID {dataset_id!r}."
-                    )
-                if initial_set is None:
-                    raise ValueError(
-                        f"Mapped initial-condition set {link.set_id!r} is no longer present."
-                    )
-                resolved_settings = tab.resolved_execution_settings(
-                    initial_set.set_id
-                )
-                dataset_foundation.validate_fit_inclusion(
-                    dataset=dataset,
-                    set_id=initial_set.set_id,
-                    observation_mapping=link.observation_mapping,
-                    initial_values=dict(
-                        canonical_initial_values(tab, initial_set.set_id)
-                    ),
-                    mechanism_species=mechanism_species_by_tab_id[tab.tab_id],
-                    observation_targets=canonical_observation_target_names(tab),
-                    resolved_t_start=resolved_settings.t_start,
-                )
-            except (KeyError, TypeError, ValueError) as exc:
-                raise ValueError(
-                    "Invalid Fit inclusion for "
-                    f"tab {tab.name!r} (ID {tab.tab_id!r}), "
-                    f"dataset {dataset_label}, set {set_label}, "
-                    f"mapping {link.observation_mapping!r}: {exc}"
-                ) from exc
     return hydrated_document

@@ -327,6 +327,7 @@ def _encode_document(
             {
                 "source_id": source.source_id,
                 "original_filename": source.original_filename,
+                "original_filepath": source.original_filepath,
                 "original_format": source.original_format,
                 "source_member": source_member,
             }
@@ -398,7 +399,6 @@ def _encode_document(
                             for raw_observation_id, model_target
                             in link.observation_mapping
                         ],
-                        "include_in_fit": link.include_in_fit,
                     }
                     for dataset_id, link in tab.dataset_links
                 ],
@@ -647,7 +647,7 @@ def _decode_document(
         item = _exact_fields(
             raw_source,
             label,
-            {"source_id", "original_filename", "original_format", "source_member"},
+            {"source_id", "original_filename", "original_filepath", "original_format", "source_member"},
         )
         original_filename = _string(
             item["original_filename"], f"{label}.original_filename", nonblank=True
@@ -676,6 +676,7 @@ def _decode_document(
             ImportedSource(
                 source_id=source_id,
                 original_filename=original_filename,
+                original_filepath=_string(item["original_filepath"], f"{label}.original_filepath", nonblank=True),
                 original_format=original_format,
                 exact_source_bytes=source_bytes_by_member[source_member],
             )
@@ -940,7 +941,6 @@ def _decode_document(
                     "dataset_id",
                     "set_id",
                     "observation_mapping",
-                    "include_in_fit",
                 },
             )
             raw_set_id = link["set_id"]
@@ -968,10 +968,6 @@ def _decode_document(
                         observation_mapping=_decode_pair_array(
                             link["observation_mapping"],
                             f"{link_label}.observation_mapping",
-                        ),
-                        include_in_fit=_boolean(
-                            link["include_in_fit"],
-                            f"{link_label}.include_in_fit",
                         ),
                     ),
                 )

@@ -21,7 +21,6 @@ class ActiveDatasetLinkSnapshot:
     set_id: str | None
     set_name: str | None
     observation_mapping: tuple[tuple[str, str], ...]
-    include_in_fit: bool
     overlay_raw_observation_ids: tuple[str, ...] = ()
 
 
@@ -127,11 +126,6 @@ def build_data_manager_snapshot(
                 canonical_links[record.dataset_id].observation_mapping
                 if record.dataset_id in canonical_links
                 else ()
-            ),
-            include_in_fit=(
-                canonical_links[record.dataset_id].include_in_fit
-                if record.dataset_id in canonical_links
-                else False
             ),
             overlay_raw_observation_ids=tuple(
                 overlays.get(record.dataset_id, ())

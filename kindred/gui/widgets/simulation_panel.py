@@ -160,6 +160,10 @@ class SimulationPanel(QtWidgets.QWidget):
         self.num_points_spinbox = QtWidgets.QSpinBox(self)
         self.num_points_spinbox.setRange(*SIMULATION_POINT_RANGE)
         self.num_points_spinbox.setSingleStep(10)
+        self.num_points_spinbox.setToolTip(
+            "<qt>Number of evenly spaced points in simulation from "
+            "<i>t</i><sub>start</sub> to <i>t</i><sub>end</sub>, inclusive.</qt>"
+        )
         for label, widget in (
             ("Solver", self.solver_method_combo),
             ("t_start", self.t_start_edit),
@@ -169,6 +173,8 @@ class SimulationPanel(QtWidgets.QWidget):
             name = label
             label_widget = QtWidgets.QLabel(label, self)
             label_widget.setBuddy(widget)
+            if name == "Points":
+                label_widget.setToolTip(widget.toolTip())
             if name in {"t_start", "t_end"}:
                 label_widget.setTextFormat(QtCore.Qt.RichText)
                 label_widget.setText(scientific_symbol_html(name, family="time", role=name))

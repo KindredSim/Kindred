@@ -65,6 +65,7 @@ def capture_import_source(
         source_id=f"source-{uuid.uuid4().hex}",
         original_format=suffix[1:],
         original_filename=path.name,
+        original_filepath=str(path.absolute()),
         exact_source_bytes=source_bytes,
     )
     return validate_imported_source(source)
