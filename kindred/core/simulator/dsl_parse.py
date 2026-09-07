@@ -42,6 +42,7 @@ from ..equilibrium_rate_authority import (
     validate_equilibrium_rate_authority_flags,
 )
 from ..mechanism_source import (
+    INITIAL_PROVENANCE_PREFIX,
     MechanismAuthoringSource,
     normalize_source_for_analysis,
     source_matches_analysis,
@@ -954,7 +955,6 @@ _NAMED_INITIAL_BLOCK_START_RE = re.compile(
 _BRACKET_INITIAL_ASSIGNMENT_RE = re.compile(
     r"^\[(?P<species>[A-Za-z_][A-Za-z0-9_]*)\]\s*=\s*(?P<value>.+?)\s*$"
 )
-_INITIAL_PROVENANCE_PREFIX = "# Kindred IC provenance | "
 
 
 def _inline_initial_number(
@@ -1079,7 +1079,7 @@ def _commented_initial_source(
 ) -> str:
     rendered = [
         (
-            _INITIAL_PROVENANCE_PREFIX + line.rstrip()
+            INITIAL_PROVENANCE_PREFIX + line.rstrip()
             if index in claimed_indexes
             else line.rstrip()
         )

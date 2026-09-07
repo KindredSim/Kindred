@@ -12,6 +12,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtCore import Qt
 
 from kindred._version import __version__ as KINDRED_VERSION
+from kindred.gui.display_name_policy import compact_text, literal_tooltip
 from kindred.core.authored_source_errors import AuthoredSourceError
 from kindred.core.dataset_mapping import (
     DatasetMappingError,
@@ -3284,6 +3285,49 @@ class MainWindow(QtWidgets.QMainWindow):
                 f"Failed to load intervention example {example_id}:\n\n{exc}",
             )
 
+    def _populate_user_templates_menu(self) -> None:
+        menu = self._user_templates_menu
+        menu.clear()
+        templates = sorted(
+            self._template_manager.get_all_templates(),
+            key=lambda template: template.name.casefold(),
+        )
+        if not templates:
+            reason = self._template_manager.write_disabled_reason
+            action = menu.addAction(
+                "Templates unavailable" if reason else "No templates yet"
+            )
+            action.setEnabled(False)
+            if reason:
+                action.setToolTip(literal_tooltip(reason))
+        for template in templates:
+            label = compact_text(template.name, max_chars=60)
+            action = menu.addAction(label.display.replace("&", "&&"))
+            action.setToolTip(literal_tooltip(template.name))
+            action.setData(template.id)
+            action.triggered.connect(
+                lambda _checked=False, identity=template.id: self._load_user_template(
+                    identity
+                )
+            )
+
+    def _load_user_template(self, template_id: str) -> None:
+        template = self._template_manager.get_template(template_id)
+        if template is None:
+            return
+        try:
+            if self._accept_external_source(
+                self._workspace_tab_registry.active_tab_id,
+                template.source,
+                description=f"Apply template {template.name}",
+            ):
+                self.set_status_text(f"Applied template: {template.name}")
+        except Exception as exc:
+            logger.exception("Template could not be applied")
+            QtWidgets.QMessageBox.critical(
+                self, "Template Apply", f"The template could not be applied:\n\n{exc}"
+            )
+
     def _open_template_manager(self) -> None:
         if not self._mutation_input_admitted("Open Template Manager"):
             return
@@ -4242,6 +4286,9 @@ class MainWindow(QtWidgets.QMainWindow):
             "Ctrl+T",
             "templateManagerAction",
         )
+        self._user_templates_menu = examples.addMenu("User-Created Templates")
+        self._user_templates_menu.setToolTipsVisible(True)
+        self._user_templates_menu.aboutToShow.connect(self._populate_user_templates_menu)
 
         simulation = bar.addMenu("&Simulation")
         self._simulation_menu = simulation

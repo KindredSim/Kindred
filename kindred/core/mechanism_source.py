@@ -5,6 +5,15 @@ from typing import Mapping
 
 
 _PAYLOAD_FIELDS = frozenset({"reactions_text"})
+INITIAL_PROVENANCE_PREFIX = "# Kindred IC provenance | "
+
+
+def restore_initial_condition_declarations(text: str) -> str:
+    """Restore recorded IC source for reuse, preserving all other text."""
+    return "".join(
+        line.removeprefix(INITIAL_PROVENANCE_PREFIX)
+        for line in text.splitlines(keepends=True)
+    )
 
 
 def normalize_source_for_analysis(text: str) -> str:

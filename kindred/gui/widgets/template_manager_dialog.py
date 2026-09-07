@@ -18,7 +18,10 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from kindred.gui.ui_helpers import clamp_initial_size, set_bounded_label_text
 
 from kindred.config.templates import Template, TemplateManager
-from kindred.core.mechanism_source import MechanismAuthoringSource
+from kindred.core.mechanism_source import (
+    MechanismAuthoringSource,
+    restore_initial_condition_declarations,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -127,6 +130,13 @@ class TemplateEditorDialog(QtWidgets.QDialog):
 
         # Mechanism text editor
         layout.addWidget(QtWidgets.QLabel("Mechanism DSL*:"))
+        if not self._is_edit_mode and mechanism_source is not None:
+            review_note = QtWidgets.QLabel(
+                "Review the initial-condition declarations before saving. "
+                "Earlier declarations may need editing or removal."
+            )
+            review_note.setWordWrap(True)
+            layout.addWidget(review_note)
         self._mechanism_edit = QtWidgets.QPlainTextEdit()
         self._mechanism_edit.setFont(QtGui.QFont("Courier New", 10))
         if template:
@@ -577,7 +587,11 @@ class TemplateManagerDialog(QtWidgets.QDialog):
         """Create one new template from an admitted source candidate."""
         dialog = TemplateEditorDialog(
             parent=self,
-            mechanism_source=self._current_mechanism_source,
+            mechanism_source=MechanismAuthoringSource.from_parts(
+                reactions_text=restore_initial_condition_declarations(
+                    self._current_mechanism_source.reactions_text
+                )
+            ),
             operation="create",
         )
 
