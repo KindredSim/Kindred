@@ -204,6 +204,7 @@ def _encode_execution(
         "t_start": settings.t_start,
         "t_end": settings.t_end,
         "integration_points": settings.integration_points,
+        "use_authored_stops": settings.use_authored_stops,
     }
 
 
@@ -211,10 +212,11 @@ def _decode_execution(
     value: object,
     label: str,
 ) -> SimulationExecutionSettings:
-    data = _exact_fields(
-        value,
+    data = _object(value, label)
+    _exact_fields(
+        {**data, "use_authored_stops": data.get("use_authored_stops", False)},
         label,
-        {"solver", "t_start", "t_end", "integration_points"},
+        {"solver", "t_start", "t_end", "integration_points", "use_authored_stops"},
     )
     return SimulationExecutionSettings(
         solver=_string(
@@ -227,6 +229,9 @@ def _decode_execution(
         integration_points=_integer(
             data["integration_points"],
             f"{label}.integration_points",
+        ),
+        use_authored_stops=_boolean(
+            data.get("use_authored_stops", False), f"{label}.use_authored_stops",
         ),
     )
 

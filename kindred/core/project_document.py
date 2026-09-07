@@ -271,6 +271,7 @@ class SimulationExecutionSettings:
     t_start: float = 0.0
     t_end: float = 10.0
     integration_points: int = 100
+    use_authored_stops: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -949,6 +950,7 @@ def validate_simulation_execution_settings(
         f"{label}.integration_points",
         *_SIMULATION_POINT_RANGE,
     )
+    _require_bool(settings.use_authored_stops, f"{label}.use_authored_stops")
     return settings
 
 

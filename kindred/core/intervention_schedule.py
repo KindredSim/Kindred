@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from numbers import Real
 from types import MappingProxyType
 from typing import Any, Mapping, Sequence, TypeAlias
@@ -25,6 +25,9 @@ __all__ = [
     "InterventionSet",
     "InterventionTrigger",
     "InterventionTriggerAction",
+    "InterventionStopAction",
+    "SpeciesTriggerCondition",
+    "ObservableTriggerCondition",
     "coerce_intervention_schedule",
     "intervention_schedule_parameter_dependencies",
     "intervention_schedule_parameter_names",
@@ -963,51 +966,76 @@ class InterventionTriggerAction:
 
 
 @dataclass(frozen=True, slots=True)
+class SpeciesTriggerCondition:
+    name: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "name", _name(self.name, field="watch_species"))
+
+    def to_payload(self) -> dict[str, str]:
+        return {"watch_species": self.name}
+
+
+@dataclass(frozen=True, slots=True)
+class ObservableTriggerCondition:
+    name: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "name", _name(self.name, field="watch_observable"))
+
+    def to_payload(self) -> dict[str, str]:
+        return {"watch_observable": self.name}
+
+
+@dataclass(frozen=True, slots=True)
+class InterventionStopAction:
+    @property
+    def op(self) -> str:
+        return "stop"
+
+    @property
+    def is_parameterized(self) -> bool:
+        return False
+
+    def resolve_parameters(self, values: Mapping[str, Any]) -> InterventionStopAction:
+        return self
+
+    def to_payload(self) -> dict[str, str]:
+        return {"op": "stop"}
+
+
+@dataclass(frozen=True, slots=True)
 class InterventionTrigger:
-    watch_species: str
-    max_count: int
-    min_interval: float
-    then: InterventionTriggerAction
+    condition: SpeciesTriggerCondition | ObservableTriggerCondition
+    then: InterventionTriggerAction | InterventionStopAction
     threshold: float | None = None
     threshold_param: str | None = None
     direction: str = "either"
+    max_count: int | None = None
+    min_interval: float | None = None
     declaration_ordinal: int = 0
+    source_text: str | None = None
 
     def __post_init__(self) -> None:
-        object.__setattr__(
-            self, "watch_species", _name(self.watch_species, field="watch_species")
-        )
         threshold, threshold_param = _pair(
-            self.threshold,
-            self.threshold_param,
-            field="threshold",
-            domain="concentration",
+            self.threshold, self.threshold_param, field="threshold",
+            domain="concentration" if isinstance(self.condition, SpeciesTriggerCondition) else "signed",
         )
         object.__setattr__(self, "threshold", threshold)
         object.__setattr__(self, "threshold_param", threshold_param)
         direction = _enum(self.direction, field="direction")
         if direction not in _DIRECTIONS:
-            raise InterventionScheduleError(
-                "direction must be rising, falling, or either."
-            )
+            raise InterventionScheduleError("direction must be rising, falling, or either.")
         object.__setattr__(self, "direction", direction)
-        object.__setattr__(
-            self, "max_count", _positive_int(self.max_count, field="max_count")
-        )
-        object.__setattr__(
-            self,
-            "min_interval",
-            _nonnegative(self.min_interval, field="min_interval"),
-        )
-        if not isinstance(self.then, InterventionTriggerAction):
-            raise InterventionScheduleError(
-                "then must be one typed trigger action."
-            )
-        object.__setattr__(
-            self,
-            "declaration_ordinal",
-            _ordinal(self.declaration_ordinal, field="declaration_ordinal"),
-        )
+        if isinstance(self.then, InterventionStopAction):
+            if self.max_count is not None or self.min_interval is not None:
+                raise InterventionScheduleError("Stopping triggers do not permit max_count or min_interval.")
+        else:
+            if not isinstance(self.condition, SpeciesTriggerCondition):
+                raise InterventionScheduleError("Chemical triggers require watch_species.")
+            object.__setattr__(self, "max_count", _positive_int(self.max_count, field="max_count"))
+            object.__setattr__(self, "min_interval", _nonnegative(self.min_interval, field="min_interval"))
+        object.__setattr__(self, "declaration_ordinal", _ordinal(self.declaration_ordinal, field="declaration_ordinal"))
 
     @property
     def op(self) -> str:
@@ -1017,59 +1045,32 @@ class InterventionTrigger:
     def is_parameterized(self) -> bool:
         return self.threshold_param is not None or self.then.is_parameterized
 
-    def resolve_parameters(self, values: Mapping[str, Any]) -> "InterventionTrigger":
+    def resolve_parameters(self, values: Mapping[str, Any]) -> InterventionTrigger:
         try:
             then = self.then.resolve_parameters(values)
         except InterventionScheduleError as exc:
-            details = dict(getattr(exc, "details", {}) or {})
-            details["nested_location"] = {"path": "then"}
-            dependencies = tuple(
-                getattr(exc, "value_dependencies", ())
-                or details.get("value_dependencies", ())
-            )
             raise InterventionScheduleError(
-                str(exc),
-                operation=self.op,
-                declaration_ordinal=self.declaration_ordinal,
-                field=getattr(exc, "field", None),
-                nested_location=details["nested_location"],
-                domain=getattr(exc, "domain", None),
-                field_identities=getattr(exc, "field_identities", ()),
-                value_dependencies=dependencies,
-                details=details,
+                str(exc), operation=self.op, declaration_ordinal=self.declaration_ordinal,
+                field=exc.field, nested_location={"path": "then"}, domain=exc.domain,
+                field_identities=exc.field_identities, value_dependencies=exc.value_dependencies,
+                details=exc.details,
             ) from exc
-        return InterventionTrigger(
-            watch_species=self.watch_species,
+        return replace(
+            self, then=then, threshold_param=None,
             threshold=_resolved(
-                self.threshold,
-                self.threshold_param,
-                values,
-                field="threshold",
-                domain="concentration",
+                self.threshold, self.threshold_param, values, field="threshold",
+                domain="concentration" if isinstance(self.condition, SpeciesTriggerCondition) else "signed",
             ),
-            direction=self.direction,
-            max_count=self.max_count,
-            min_interval=self.min_interval,
-            then=then,
-            declaration_ordinal=self.declaration_ordinal,
         )
 
     def to_payload(self) -> dict[str, Any]:
         payload: dict[str, Any] = {
-            "op": "trigger",
-            "watch_species": self.watch_species,
-            "direction": self.direction,
-            "max_count": self.max_count,
-            "min_interval": self.min_interval,
-            "then": self.then.to_payload(),
-            "declaration_ordinal": self.declaration_ordinal,
+            "op": "trigger", **self.condition.to_payload(), "direction": self.direction,
+            "then": self.then.to_payload(), "declaration_ordinal": self.declaration_ordinal,
         }
-        _put_pair(
-            payload,
-            field="threshold",
-            value=self.threshold,
-            parameter=self.threshold_param,
-        )
+        if not isinstance(self.then, InterventionStopAction):
+            payload.update(max_count=self.max_count, min_interval=self.min_interval)
+        _put_pair(payload, field="threshold", value=self.threshold, parameter=self.threshold_param)
         return payload
 
 
@@ -1111,6 +1112,12 @@ class InterventionSchedule:
                 "Intervention operations must remain in authored ordinal order."
             )
         object.__setattr__(self, "operations", operations)
+
+    def without_stops(self) -> InterventionSchedule:
+        return InterventionSchedule(tuple(
+            item for item in self.operations
+            if not (isinstance(item, InterventionTrigger) and isinstance(item.then, InterventionStopAction))
+        ))
 
     @classmethod
     def from_payload(
@@ -1179,7 +1186,9 @@ class InterventionSchedule:
                     for item in operation.before + operation.during + operation.after
                 )
             elif isinstance(operation, InterventionTrigger):
-                names = (operation.watch_species, operation.then.species)
+                names = (() if isinstance(operation.condition, ObservableTriggerCondition) else (operation.condition.name,))
+                if isinstance(operation.then, InterventionTriggerAction):
+                    names += (operation.then.species,)
             else:
                 names = (operation.species,)
             for name in names:
@@ -1428,6 +1437,7 @@ def _operation_from_fields(
             {
                 "op",
                 "watch_species",
+                "watch_observable",
                 "threshold",
                 "threshold_param",
                 "direction",
@@ -1444,8 +1454,16 @@ def _operation_from_fields(
             then = _trigger_action_from_payload(raw_then)
         else:
             raise InterventionScheduleError("then must be one typed trigger action.")
+        if isinstance(then, InterventionStopAction) and ({"max_count", "min_interval"} & data.keys()):
+            raise InterventionScheduleError("Stopping triggers do not permit max_count or min_interval.")
+        if ("watch_species" in data) == ("watch_observable" in data):
+            raise InterventionScheduleError("Exactly one of watch_species and watch_observable is required.")
+        condition = (
+            SpeciesTriggerCondition(data["watch_species"])
+            if "watch_species" in data else ObservableTriggerCondition(data["watch_observable"])
+        )
         return InterventionTrigger(
-            watch_species=data.get("watch_species"),
+            condition=condition,
             threshold=data.get("threshold"),
             threshold_param=data.get("threshold_param"),
             direction=data.get("direction", "either"),
@@ -1501,10 +1519,13 @@ def _protocol_operation_from_fields(
     )
 
 
-def _trigger_action_from_payload(raw: Mapping[str, Any]) -> InterventionTriggerAction:
+def _trigger_action_from_payload(raw: Mapping[str, Any]) -> InterventionTriggerAction | InterventionStopAction:
     data = dict(raw)
     _literal_fields(data, context="trigger then")
     op = _enum(data.get("op"), field="op")
+    if op == "stop":
+        _reject_keys(data, frozenset({"op"}), context="stop action")
+        return InterventionStopAction()
     selected = {"set": "value", "jump": "delta"}.get(op)
     if selected is None:
         raise InterventionScheduleError(
@@ -1609,7 +1630,7 @@ def _parse_phase_envelope(
     )
 
 
-def _parse_trigger_envelope(value: str) -> InterventionTriggerAction:
+def _parse_trigger_envelope(value: str) -> InterventionTriggerAction | InterventionStopAction:
     inner = _unwrap_envelope(value, context="Trigger then")
     if "|" in inner:
         raise InterventionScheduleError(
@@ -1692,13 +1713,10 @@ def _admit_intervention_directives(
         _, rest = line.split(":", 1)
         try:
             fields = _parse_directive(rest, line_no=line_no)
-            operations.append(
-                _operation_from_fields(
-                    fields,
-                    declaration_ordinal=len(operations),
-                    parsed=True,
-                )
-            )
+            operation = _operation_from_fields(fields, declaration_ordinal=len(operations), parsed=True)
+            if isinstance(operation, InterventionTrigger):
+                operation = replace(operation, source_text=raw_line)
+            operations.append(operation)
         except InterventionScheduleError as exc:
             message = str(exc)
             if message.startswith(f"Line {line_no}:"):
@@ -1759,6 +1777,8 @@ def intervention_schedule_parameter_dependencies(
             continue
         if isinstance(operation, InterventionTrigger):
             add(declaration, None, "threshold", operation.threshold_param)
+            if isinstance(operation.then, InterventionStopAction):
+                continue
             selected = "value" if operation.then.op == "set" else "delta"
             add(
                 declaration,

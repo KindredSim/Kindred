@@ -1,4 +1,4 @@
-"""Complete four-field execution-settings editor for one exact IC set."""
+"""Complete execution-settings editor for one exact IC set."""
 
 from __future__ import annotations
 
@@ -66,6 +66,18 @@ class SolverSettingsDialog(QtWidgets.QDialog):
                 name_label.setTextFormat(QtCore.Qt.RichText)
                 name_label.setText(scientific_symbol_html(label, family="time", role=label))
             widget.setAccessibleName(scientific_symbol_spoken(label, family="time", role=label))
+        self._t_end_label = form.labelForField(self.t_end_edit)
+        self.use_authored_stops_check = QtWidgets.QCheckBox(
+            "Use authored stopping interventions", self
+        )
+        self._stopping_declarations: tuple[str, ...] = ()
+        self.stopping_info_button = QtWidgets.QPushButton("Authored rules…", self)
+        self.stopping_info_button.clicked.connect(self._show_stopping_declarations)
+        self.use_authored_stops_check.toggled.connect(self._refresh_endpoint_label)
+        form.addRow(self.use_authored_stops_check)
+        form.addRow(self.stopping_info_button)
+        self.set_stopping_declarations(())
+        self._refresh_endpoint_label()
         layout.addLayout(form)
 
         self._buttons = QtWidgets.QDialogButtonBox(
@@ -97,6 +109,30 @@ class SolverSettingsDialog(QtWidgets.QDialog):
         finally:
             del blockers
         self.integration_points_spin.setValue(settings.integration_points)
+        self.use_authored_stops_check.setChecked(settings.use_authored_stops)
+
+    def set_stopping_declarations(self, declarations: tuple[str, ...]) -> None:
+        self._stopping_declarations = declarations
+        self.stopping_info_button.setEnabled(bool(declarations))
+
+    def _show_stopping_declarations(self) -> None:
+        message = QtWidgets.QMessageBox(self)
+        message.setWindowTitle("Authored stopping interventions")
+        message.setTextFormat(QtCore.Qt.PlainText)
+        message.setText("\n".join(self._stopping_declarations))
+        message.setStandardButtons(QtWidgets.QMessageBox.Ok)
+        message.exec()
+
+    def _refresh_endpoint_label(self, *_args) -> None:
+        active = self.use_authored_stops_check.isChecked()
+        self._t_end_label.setText(
+            scientific_symbol_html("t_end", family="time", role="t_end")
+            + (" (maximum)" if active else " (fixed)")
+        )
+        self.t_end_edit.setToolTip(
+            "Maximum Run end time; an authored crossing may finish the run earlier."
+            if active else "Fixed Run end time; authored stopping interventions are bypassed."
+        )
 
     @staticmethod
     def _parse_time_edit(edit: QtWidgets.QLineEdit, field: str) -> float:
@@ -118,6 +154,7 @@ class SolverSettingsDialog(QtWidgets.QDialog):
             t_start=self._parse_time_edit(self.t_start_edit, "t_start"),
             t_end=self._parse_time_edit(self.t_end_edit, "t_end"),
             integration_points=int(self.integration_points_spin.value()),
+            use_authored_stops=self.use_authored_stops_check.isChecked(),
         )
         validate_simulation_execution_settings(candidate)
         return candidate
@@ -224,6 +261,27 @@ class SimulationSettingsDialog(QtWidgets.QDialog):
         science_form.addRow("", self.analytic_jacobian_check)
         science_form.addRow("", self.scientific_defaults_check)
         layout.addWidget(science_box)
+
+        stopping_box = QtWidgets.QGroupBox("Stopping interventions", self)
+        stopping_layout = QtWidgets.QVBoxLayout(stopping_box)
+        self.use_authored_stops_check = QtWidgets.QCheckBox(
+            "Use authored stopping interventions", stopping_box
+        )
+        self.use_authored_stops_check.setToolTip(
+            "When enabled, the Run end time is a maximum. When disabled, it is fixed. "
+            "Custom Initial Conditions settings keep their own preference."
+        )
+        self._stopping_declarations: tuple[str, ...] = ()
+        self.stopping_info_button = QtWidgets.QPushButton("Authored rules…", stopping_box)
+        self.stopping_info_button.clicked.connect(self._show_stopping_declarations)
+        self.stopping_defaults_check = QtWidgets.QCheckBox(
+            "Use this stopping preference for new projects and tabs.", stopping_box
+        )
+        stopping_layout.addWidget(self.use_authored_stops_check)
+        stopping_layout.addWidget(self.stopping_info_button)
+        stopping_layout.addWidget(self.stopping_defaults_check)
+        self.set_stopping_declarations(())
+        layout.addWidget(stopping_box)
 
         preview_box = QtWidgets.QGroupBox("Preview", self)
         preview_form = QtWidgets.QFormLayout(preview_box)
@@ -340,6 +398,27 @@ class SimulationSettingsDialog(QtWidgets.QDialog):
         spin.setValue(float(value))
         spin.setMaximumWidth(190)
         return spin
+
+    def set_stopping_declarations(self, declarations: tuple[str, ...]) -> None:
+        self._stopping_declarations = declarations
+        self.stopping_info_button.setEnabled(bool(declarations))
+
+    def _show_stopping_declarations(self) -> None:
+        message = QtWidgets.QMessageBox(self)
+        message.setWindowTitle("Authored stopping interventions")
+        message.setTextFormat(QtCore.Qt.PlainText)
+        message.setText("\n".join(self._stopping_declarations))
+        message.setStandardButtons(QtWidgets.QMessageBox.Ok)
+        message.exec()
+
+    def set_use_authored_stops(self, enabled: bool) -> None:
+        self.use_authored_stops_check.setChecked(enabled)
+
+    def use_authored_stops(self) -> bool:
+        return self.use_authored_stops_check.isChecked()
+
+    def persist_stopping_default_requested(self) -> bool:
+        return self.stopping_defaults_check.isChecked()
 
     def set_scientific_settings(self, settings: TabScientificSettings) -> None:
         validate_tab_scientific_settings(settings)

@@ -309,6 +309,10 @@ def _execute_scipy(
     boundary_terminal_flags: Sequence[bool],
 ) -> SegmentRunResult:
     base_kwargs: Dict[str, Any] = dict(t_eval=t_eval, rtol=float(req.rtol), atol=float(req.atol))
+    from kindred.core.intervention_schedule import InterventionStopAction
+    retain_dense = any(isinstance(item.then, InterventionStopAction) for item in req.intervention_execution.triggers)
+    if retain_dense:
+        base_kwargs["dense_output"] = True
     if req.max_step is not None:
         base_kwargs["max_step"] = float(req.max_step)
     if req.first_step is not None:
@@ -411,6 +415,8 @@ def _execute_scipy(
             req.cancellation_control is not None
             and req.cancellation_control.cancel_requested()
         ):
+            if retain_dense:
+                solved.sol = None
             raise SimulationCancelled()
         return solved
 
@@ -451,88 +457,96 @@ def _execute_scipy(
             },
         ) from exc
 
-    if not sol.success:
-        prov["solver_failure"] = str(sol.message)
-        t_fail = float(sol.t[-1]) if getattr(sol, "t", None) is not None and len(sol.t) > 0 else float(t0)
-        if req.candidate_evaluation:
-            raise _SimulationScientificUnavailabilitySignal(
-                _SimulationScientificUnavailability(
-                    producer="scipy",
-                    stage="solve_ivp_unsuccessful",
-                    details={
-                        "solver": req.solver,
-                        "time": t_fail,
-                        "message": str(sol.message),
-                    },
+    try:
+        if not sol.success:
+            dense_failure_time = float(sol.sol.ts[-1]) if retain_dense and sol.sol is not None else None
+            if retain_dense:
+                sol.sol = None
+            prov["solver_failure"] = str(sol.message)
+            t_fail = dense_failure_time if dense_failure_time is not None else (float(sol.t[-1]) if getattr(sol, "t", None) is not None and len(sol.t) > 0 else float(t0))
+            if req.candidate_evaluation:
+                raise _SimulationScientificUnavailabilitySignal(
+                    _SimulationScientificUnavailability(
+                        producer="scipy",
+                        stage="solve_ivp_unsuccessful",
+                        details={
+                            "solver": req.solver,
+                            "time": t_fail,
+                            "message": str(sol.message),
+                        },
+                    )
                 )
+            raise create_solver_error(
+                req.solver,
+                t_fail,
+                str(sol.message),
             )
-        raise create_solver_error(
-            req.solver,
-            t_fail,
-            str(sol.message),
-        )
 
-    prov["solver_used"] = method
-    # Detach SciPy's time vector at ingress.  The trajectory copy below is
-    # owned exactly once by project_nonnegative_trajectory; retain the exact
-    # pre-projection terminal column separately for continuation semantics.
-    t_out = np.asarray(sol.t, dtype=float).copy()
-    raw_trajectory = solver_trajectory_array(
-        sol.y,
-        y0=y0,
-        t_out=t_out,
-    )
-    raw_terminal_state = None
-    if (
-        t_out.size
-        and float(t_out[-1]) == float(t1)
-        and raw_trajectory.ndim == 2
-        and raw_trajectory.shape[1]
-    ):
-        raw_terminal_state = raw_trajectory[:, -1].copy()
-    Y_out, nonnegative_projection = project_nonnegative_trajectory(
-        raw_trajectory,
-        context="Simulation",
-    )
-    if nonnegative_projection.projected:
-        prov["nonnegative_projection"] = nonnegative_projection.to_payload()
-    event_count = len(boundary_events)
-    event_times = _normal_event_provenance(
-        getattr(sol, "t_events", None),
-        count=event_count,
-    )
-    raw_event_states, event_state_projection = (
-        _normal_event_states_with_projection(
-            getattr(sol, "y_events", None),
+        prov["solver_used"] = method
+        # Detach SciPy's time vector at ingress.  The trajectory copy below is
+        # owned exactly once by project_nonnegative_trajectory; retain the exact
+        # pre-projection terminal column separately for continuation semantics.
+        t_out = np.asarray(sol.t, dtype=float).copy()
+        raw_trajectory = solver_trajectory_array(
+            sol.y,
+            y0=y0,
+            t_out=t_out,
+        )
+        raw_terminal_state = None
+        if (
+            t_out.size
+            and float(t_out[-1]) == float(t1)
+            and raw_trajectory.ndim == 2
+            and raw_trajectory.shape[1]
+        ):
+            raw_terminal_state = raw_trajectory[:, -1].copy()
+        Y_out, nonnegative_projection = project_nonnegative_trajectory(
+            raw_trajectory,
+            context="Simulation",
+        )
+        if nonnegative_projection.projected:
+            prov["nonnegative_projection"] = nonnegative_projection.to_payload()
+        event_count = len(boundary_events)
+        event_times = _normal_event_provenance(
+            getattr(sol, "t_events", None),
             count=event_count,
-            species_count=int(np.asarray(y0, dtype=float).reshape(-1).size),
         )
-    )
-    if event_state_projection.projected:
-        prov["event_state_nonnegative_projection"] = (
-            event_state_projection.to_payload()
+        raw_event_states, event_state_projection = (
+            _normal_event_states_with_projection(
+                getattr(sol, "y_events", None),
+                count=event_count,
+                species_count=int(np.asarray(y0, dtype=float).reshape(-1).size),
+            )
         )
-    if (
-        req.cancellation_control is not None
-        and req.cancellation_control.cancel_requested()
-    ):
-        raise SimulationCancelled()
-    return SegmentRunResult(
-        t=t_out,
-        Y=Y_out,
-        event_times=event_times,
-        raw_event_states=raw_event_states,
-        raw_terminal_state=raw_terminal_state,
-        trajectory_projection=nonnegative_projection,
-        event_state_projection=event_state_projection,
-        solver_used=str(prov.get("solver_used") or method),
-        symbolic_jacobian_used=bool(
-            prov.get("symbolic_jacobian")
-        ),
-        jacobian_sparsity_hint=bool(
-            prov.get("jacobian_sparsity_hint")
-        ),
-    )
+        if event_state_projection.projected:
+            prov["event_state_nonnegative_projection"] = (
+                event_state_projection.to_payload()
+            )
+        if (
+            req.cancellation_control is not None
+            and req.cancellation_control.cancel_requested()
+        ):
+            raise SimulationCancelled()
+        return SegmentRunResult(
+            t=t_out,
+            Y=Y_out,
+            event_times=event_times,
+            raw_event_states=raw_event_states,
+            raw_terminal_state=raw_terminal_state,
+            trajectory_projection=nonnegative_projection,
+            event_state_projection=event_state_projection,
+            solver_used=str(prov.get("solver_used") or method),
+            dense_output=sol.sol if retain_dense else None,
+            symbolic_jacobian_used=bool(
+                prov.get("symbolic_jacobian")
+            ),
+            jacobian_sparsity_hint=bool(
+                prov.get("jacobian_sparsity_hint")
+            ),
+        )
+    finally:
+        if retain_dense:
+            sol.sol = None
 
 
 def _run_scipy_segment(request: SegmentExecutionRequest) -> SegmentRunResult:

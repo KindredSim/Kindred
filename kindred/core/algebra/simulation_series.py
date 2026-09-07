@@ -12,6 +12,7 @@ import numpy as np
 from kindred.core.algebra.evaluator import (
     AlgebraObservableError,
     EvaluationContext,
+    PreparedAlgebraStopEvaluator,
     evaluate_block_partial,
 )
 from kindred.core.algebra.parser import (
@@ -35,6 +36,7 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "compiled_algebra_for_mechanism",
     "compile_algebra_observables",
+    "prepare_algebra_stop_evaluator",
 ]
 
 
@@ -158,6 +160,26 @@ def compile_algebra_observables(
     return CompiledAlgebraSeries(
         block=algebra_block,
         observable_names=observable_names,
+    )
+
+
+def prepare_algebra_stop_evaluator(
+    compiled: CompiledAlgebraSeries,
+    *,
+    target_names: Tuple[str, ...],
+    species_names: Tuple[str, ...],
+    initials: Mapping[str, float],
+    symbol_values: Mapping[str, float],
+    runtime_symbol_names: set[str],
+) -> PreparedAlgebraStopEvaluator:
+    """Bind enabled stopping targets directly to the accepted retained AST."""
+    return PreparedAlgebraStopEvaluator(
+        compiled.block,
+        target_names=target_names,
+        species_names=species_names,
+        initials=initials,
+        symbol_values=symbol_values,
+        runtime_symbol_names=runtime_symbol_names,
     )
 
 

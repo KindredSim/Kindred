@@ -1209,6 +1209,10 @@ class InitialConditionsTableActions(QtCore.QObject):
             title=f"Custom Run Settings — {initial_set.name}",
         )
         dialog.set_execution_settings(seed)
+        dialog.set_stopping_declarations(
+            () if tab.prepared_dsl is None
+            else tab.prepared_dsl.authored_stop_declarations()
+        )
         if dialog.exec() != QtWidgets.QDialog.DialogCode.Accepted:
             self.render()
             return False

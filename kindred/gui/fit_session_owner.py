@@ -219,6 +219,20 @@ class FitSessionOwner(QtCore.QObject):
         window.show()
         window.raise_()
         window.activateWindow()
+        declarations = origin.prepared_dsl.authored_stop_declarations()
+        if declarations:
+            message = QtWidgets.QMessageBox(window)
+            message.setWindowTitle("Stopping interventions are ignored during fitting")
+            message.setIcon(QtWidgets.QMessageBox.Information)
+            message.setTextFormat(QtCore.Qt.PlainText)
+            message.setText(
+                "Fitting runs over the interval required by the experimental data.\n"
+                "These stopping interventions will be ignored:\n\n"
+                + "\n".join(declarations)
+                + "\n\nAll other interventions remain active."
+            )
+            message.setStandardButtons(QtWidgets.QMessageBox.Ok)
+            message.exec()
         self._set_status(f"Fit opened for {origin.tab_name}.")
         return window
 

@@ -83,7 +83,7 @@ __all__ = [
     "SimulationPreparationError",
     "build_simulation_request_from_prepared_run",
     "build_simulation_execution_request",
-    "prepare_simulation_worker_run",
+    "prepare_simulation_run",
     "fit_simulation_error_from_preparation_error",
     "prepare_preparation_failure",
     "raise_unowned_request_parameter_values",
@@ -141,6 +141,7 @@ def simulation_execution_requests_equal(
         and left.solver_config.atol == right.solver_config.atol
         and _simulation_container_values_equal(left.solver_config.grid, right.solver_config.grid)
         and left.solver_config.use_analytic_jacobian == right.solver_config.use_analytic_jacobian
+        and left.use_authored_stops == right.use_authored_stops
         and left.requested_parameter_names == right.requested_parameter_names
         and _simulation_container_values_equal(left.parameter_overrides, right.parameter_overrides)
     )
@@ -241,7 +242,7 @@ def raise_unowned_request_parameter_values(
 
 class SimulationPreparationError(RuntimeError):
     """
-    Error raised when preparing a SimulationWorker run payload/request fails.
+    Error raised when preparing a scientific execution request fails.
 
     The GUI worker maps `stage` values to user-facing messages while keeping the
     preparation logic in core.
@@ -308,6 +309,7 @@ class PreparedSimulationRun:
     request: SimulationExecutionRequest
     unresolved_intervention_schedule: InterventionSchedule | None = None
     cancellation_control: SimulationCancellationControl | None = None
+    stop_observable_value: Callable[[str, float, np.ndarray, float], float] | None = None
 
     def __post_init__(self) -> None:
         y0 = np.asarray(self.y0, dtype=float).reshape(-1).copy()
@@ -354,6 +356,7 @@ def build_simulation_request_from_prepared_run(
         cancellation_control=cancellation_control,
         t_eval=t_eval,
         candidate_evaluation=candidate_evaluation,
+        stop_observable_value=prepared_run.stop_observable_value,
     )
     _raise_if_cancelled(cancellation_control)
     return result
@@ -370,6 +373,7 @@ class SimulationExecutionRequest:
     solver_config: _PreparedSolverConfig
     requested_parameter_names: tuple[str, ...] = ()
     parameter_overrides: Mapping[str, float] | None = None
+    use_authored_stops: bool = False
 
     def __post_init__(self) -> None:
         if type(self.prepared_dsl) is not PreparedDslRequestSet:
@@ -462,7 +466,8 @@ class SimulationExecutionRequest:
 def _fresh_preparation_unresolved_intervention_schedule_for_request(
     execution_request: SimulationExecutionRequest,
 ) -> InterventionSchedule | None:
-    return execution_request.prepared_dsl.parameterized_intervention_schedule_for_binding()
+    schedule = execution_request.prepared_dsl.parameterized_intervention_schedule_for_binding()
+    return schedule if schedule is None or execution_request.use_authored_stops else schedule.without_stops()
 
 
 def _expanded_intervention_schedule_dependency_metadata(
@@ -595,6 +600,7 @@ def build_simulation_execution_request(
     t_span: tuple[float, float],
     solver_config: _PreparedSolverConfig,
     parameter_values: Mapping[str, float] | None = None,
+    use_authored_stops: bool = False,
 ) -> SimulationExecutionRequest:
     """Capture, isolate, and compile one direct Run/Preview target."""
 
@@ -680,6 +686,7 @@ def build_simulation_execution_request(
         solver_config=solver_config,
         requested_parameter_names=(),
         parameter_overrides=normalized_parameters,
+        use_authored_stops=use_authored_stops,
     )
     return request
 
@@ -1021,13 +1028,13 @@ def _apply_parameter_overrides_to_prepared_mechanism(
     return None
 
 
-def prepare_simulation_worker_run(
+def prepare_simulation_run(
     *,
     execution_request: SimulationExecutionRequest,
     cancellation_control: SimulationCancellationControl | None = None,
 ) -> PreparedSimulationRun:
     """
-    Prepare an execution-ready SimulationRequest for the GUI SimulationWorker.
+    Prepare the shared scientific execution request.
 
     This function is the single owner for:
     - Retaining the admitted DSL temperature schedule through execution
@@ -1071,6 +1078,8 @@ def prepare_simulation_worker_run(
     _raise_if_cancelled(cancellation_control)
 
     intervention_execution = execution_request.prepared_dsl.intervention_execution_contract()
+    if intervention_execution is not None and not execution_request.use_authored_stops:
+        intervention_execution = intervention_execution.without_stops()
     if unresolved_intervention_schedule is not None:
         if _schedule_parameters_deferred_to_prepared_request(
             execution_request,
@@ -1147,6 +1156,38 @@ def prepare_simulation_worker_run(
     except Exception as exc:
         raise SimulationPreparationError("initials_for_algebra", str(exc)) from exc
 
+    stop_observable_value = None
+    if intervention_execution is not None:
+        from kindred.core.intervention_schedule import ObservableTriggerCondition, InterventionStopAction
+        targets = tuple(dict.fromkeys(
+            item.condition.name for item in intervention_execution.triggers
+            if isinstance(item.then, InterventionStopAction) and isinstance(item.condition, ObservableTriggerCondition)
+        ))
+        if targets:
+            from kindred.core.algebra.simulation_series import compiled_algebra_for_mechanism, prepare_algebra_stop_evaluator
+            from kindred.core.simulation_algebra_context import prepare_simulation_algebra_symbols
+            static, runtime_names, symbols = prepare_simulation_algebra_symbols(
+                mechanism, parameter_algebra_spec=parameter_algebra_spec, temperature_schedule=temperature_schedule,
+            )
+            try:
+                evaluator = prepare_algebra_stop_evaluator(
+                    compiled_algebra_for_mechanism(mechanism), target_names=targets,
+                    species_names=tuple(species_names), initials=initials_for_algebra,
+                    symbol_values=static, runtime_symbol_names=set(runtime_names),
+                )
+            except Exception as exc:
+                declarations = tuple(
+                    (item.declaration_ordinal, item.condition.name)
+                    for item in intervention_execution.triggers
+                    if isinstance(item.then, InterventionStopAction) and isinstance(item.condition, ObservableTriggerCondition)
+                )
+                context = "; ".join(f"declaration {ordinal + 1}, quantity {name!r}" for ordinal, name in declarations)
+                raise SimulationPreparationError("stopping_intervention", f"Stopping {context}: {exc}",
+                                                 details={"stop_declarations": declarations}) from exc
+
+            def stop_observable_value(name: str, time: float, state: np.ndarray, symbol_time: float) -> float:
+                return evaluator.evaluate(name, time, state, symbols(symbol_time))
+
     request = execution_request
 
     return PreparedSimulationRun(
@@ -1162,6 +1203,7 @@ def prepare_simulation_worker_run(
         request=request,
         unresolved_intervention_schedule=unresolved_intervention_schedule,
         cancellation_control=cancellation_control,
+        stop_observable_value=stop_observable_value,
     )
 
 

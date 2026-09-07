@@ -8,7 +8,7 @@ from typing import Callable, Mapping, Protocol, Sequence
 import numpy as np
 
 from kindred.core.exceptions import SimulationCancelled, create_solver_error
-from kindred.core.intervention_schedule import InterventionScheduleError
+from kindred.core.intervention_schedule import (InterventionScheduleError, InterventionStopAction, SpeciesTriggerCondition, ObservableTriggerCondition)
 from kindred.core.intervention_schedule_compiler import (
     ExecutableFlux,
     ExecutableHold,
@@ -18,7 +18,7 @@ from kindred.core.intervention_schedule_compiler import (
     TriggerFiring,
     validate_boundary_conflicts,
 )
-from kindred.core.temperature import declared_temperature_step_boundaries
+from kindred.core.temperature import declared_temperature_step_boundaries, temperature_schedule_execution_identity
 from kindred.core.species import TIME_MAX_S
 from .nonnegative_invariant import (
     NonnegativeProjection,
@@ -31,6 +31,7 @@ from .solver_types import (
     _SimulationScientificUnavailabilitySignal,
     SimulationPresentationBoundary,
     SimulationRequest,
+    SimulationTermination,
 )
 
 
@@ -100,6 +101,7 @@ class SegmentRunResult:
     solver_used: str
     symbolic_jacobian_used: bool = False
     jacobian_sparsity_hint: bool = False
+    dense_output: Callable[[np.ndarray], np.ndarray] | None = None
 
     def __post_init__(self) -> None:
         t = np.asarray(self.t, dtype=float)
@@ -163,6 +165,8 @@ class _BoundaryApplicationResult:
     continuation_state: np.ndarray
     projection: NonnegativeProjection
     presentation_boundary: SimulationPresentationBoundary | None = None
+    termination: SimulationTermination | None = None
+    skipped_instants: tuple[ExecutableInstant, ...] = ()
 
 
 class BaseSegmentRunner(Protocol):
@@ -187,399 +191,406 @@ class InterventionScheduleExecutionOwner:
         t0, t1 = req.t_span
         t_eval = np.asarray(request.t_eval, dtype=float).reshape(-1)
         contract = req.intervention_execution
-        species_index = _species_index(req, contract)
-        current_y = np.asarray(req.y0, dtype=float).reshape(-1).copy()
-        cancellation_check = (
-            req.cancellation_control.cancel_requested
-            if req.cancellation_control is not None
-            else None
-        )
-        trigger_counts = [0 for _ in contract.triggers]
-        trigger_last_times: list[float | None] = [None for _ in contract.triggers]
-        trigger_firings: list[TriggerFiring] = []
-        outputs_t: list[np.ndarray] = []
-        outputs_y: list[np.ndarray] = []
-        output_segment_ids: list[np.ndarray] = []
-        output_segment_keys: list[tuple[str, ...]] = []
-        output_discontinuity_ids: list[np.ndarray] = []
-        presentation_boundaries: list[SimulationPresentationBoundary] = []
-        segment_solvers: list[str] = []
-        integration_segments: list[dict[str, object]] = []
-        segment_projections: dict[str, SegmentProjection] = {}
-        segment_count = 0
-        discontinuity_id = 0
-        temperature_boundaries = declared_temperature_step_boundaries(
-            req.temperature_schedule,
-            t_start=t0,
-            t_end=t1,
-        )
-
-        boundaries = {
-            t0,
-            t1,
-            *(
-                value
-                for value in contract.discontinuities
-                if t0 <= float(value) <= t1
-            ),
-            *temperature_boundaries,
-        }
-        if any(not math.isfinite(value) for value in boundaries):
-            raise InterventionScheduleError(
-                "Execution boundary arithmetic must remain finite."
+        has_stops = any(isinstance(item.then, InterventionStopAction) for item in contract.triggers)
+        dense_segments: list[tuple[SegmentIdentity, Callable[[np.ndarray], np.ndarray], tuple[ExecutableHold, ...], int]] = []
+        segment_result = None
+        dense = None
+        try:
+            species_index = _species_index(req, contract)
+            current_y = np.asarray(req.y0, dtype=float).reshape(-1).copy()
+            cancellation_check = (
+                req.cancellation_control.cancel_requested
+                if req.cancellation_control is not None
+                else None
             )
-        ordered_boundaries = sorted(boundaries)
+            trigger_counts = [0 for _ in contract.triggers]
+            trigger_last_times: list[float | None] = [None for _ in contract.triggers]
+            trigger_firings: list[TriggerFiring] = []
+            outputs_t: list[np.ndarray] = []
+            outputs_y: list[np.ndarray] = []
+            output_segment_ids: list[np.ndarray] = []
+            output_segment_keys: list[tuple[str, ...]] = []
+            output_discontinuity_ids: list[np.ndarray] = []
+            presentation_boundaries: list[SimulationPresentationBoundary] = []
+            segment_solvers: list[str] = []
+            integration_segments: list[dict[str, object]] = []
+            segment_projections: dict[str, SegmentProjection] = {}
+            segment_count = 0
+            discontinuity_id = 0
+            temperature_boundaries = declared_temperature_step_boundaries(
+                req.temperature_schedule,
+                t_start=t0,
+                t_end=t1,
+            )
 
-        _raise_if_cancelled(cancellation_check)
-        initial_state_transaction = t0 in contract.discontinuities
-        initial_boundary = _apply_boundary(
-            current_y,
-            boundary=t0,
-            contract=contract,
-            trigger_indices=(),
-            trigger_state=None,
-            input_is_raw_solver_state=False,
-            trigger_counts=trigger_counts,
-            trigger_last_times=trigger_last_times,
-            trigger_firings=trigger_firings,
-            species_index=species_index,
-            cancellation_check=cancellation_check,
-        )
-        current_y = initial_boundary.continuation_state
-        _append_presentation_boundary(
-            presentation_boundaries,
-            initial_boundary.presentation_boundary,
-        )
-        _append_identity_row(
-            outputs_t,
-            outputs_y,
-            output_segment_ids,
-            output_segment_keys,
-            output_discontinuity_ids,
-            t0,
-            current_y,
-            segment_id=0,
-            segment_key="integration:0",
-            discontinuity_id=discontinuity_id,
-        )
-        _raise_if_cancelled(cancellation_check)
-        segment_starts_after_discontinuity = initial_state_transaction
-        for boundary_index in range(len(ordered_boundaries) - 1):
-            outer_start = float(ordered_boundaries[boundary_index])
-            outer_end = float(ordered_boundaries[boundary_index + 1])
-            if outer_end <= outer_start:
-                continue
-            sub_start = outer_start
-            while sub_start < outer_end:
-                _raise_if_cancelled(cancellation_check)
-                next_rearm = _next_rearm_boundary(
-                    contract.triggers,
-                    segment_start=sub_start,
-                    segment_end=outer_end,
-                    trigger_counts=trigger_counts,
-                    trigger_last_times=trigger_last_times,
+            if has_stops:
+                temperature_identity = temperature_schedule_execution_identity(req.temperature_schedule)
+                if temperature_identity is not None and temperature_identity.get("type") == "piecewise_steps":
+                    temperature_boundaries = tuple(float(item["time"]) for item in temperature_identity["steps"]
+                                                   if t0 < float(item["time"]) <= t1)
+
+            boundaries = {
+                t0,
+                t1,
+                *(
+                    value
+                    for value in contract.discontinuities
+                    if t0 <= float(value) <= t1
+                ),
+                *temperature_boundaries,
+            }
+            if any(not math.isfinite(value) for value in boundaries):
+                raise InterventionScheduleError(
+                    "Execution boundary arithmetic must remain finite."
                 )
-                sub_end = outer_end if next_rearm is None else float(next_rearm)
-                active_fluxes = _active_fluxes(contract, sub_start)
-                active_holds = _active_holds(contract, sub_start)
-                current_y = _apply_holds(
-                    current_y,
-                    active_holds,
-                    species_index=species_index,
-                    cancellation_check=cancellation_check,
-                )
-                segment_rhs: Rhs2 = request.rhs
-                if active_fluxes or active_holds:
-                    segment_rhs = _InterventionRhs(
-                        request.rhs,
-                        fluxes=active_fluxes,
-                        holds=active_holds,
-                        species_index=species_index,
+            ordered_boundaries = sorted(boundaries)
+
+            _raise_if_cancelled(cancellation_check)
+            initial_state_transaction = t0 in contract.discontinuities
+            initial_boundary = _apply_boundary(
+                current_y,
+                boundary=t0,
+                contract=contract,
+                trigger_indices=(),
+                trigger_state=None,
+                input_is_raw_solver_state=False,
+                trigger_counts=trigger_counts,
+                trigger_last_times=trigger_last_times,
+                trigger_firings=trigger_firings,
+                species_index=species_index,
+                cancellation_check=cancellation_check,
+                observable_value=req.stop_observable_value,
+                temperature_step=t0 in temperature_boundaries,
+            )
+            current_y = initial_boundary.continuation_state
+            termination = initial_boundary.termination
+            skipped_instants = initial_boundary.skipped_instants
+            _append_presentation_boundary(
+                presentation_boundaries,
+                initial_boundary.presentation_boundary,
+            )
+            _append_identity_row(
+                outputs_t,
+                outputs_y,
+                output_segment_ids,
+                output_segment_keys,
+                output_discontinuity_ids,
+                t0,
+                current_y,
+                segment_id=0,
+                segment_key="integration:0",
+                discontinuity_id=discontinuity_id,
+            )
+            _raise_if_cancelled(cancellation_check)
+            segment_starts_after_discontinuity = initial_state_transaction
+            for boundary_index in range(len(ordered_boundaries) - 1):
+                if termination is not None:
+                    break
+                outer_start = float(ordered_boundaries[boundary_index])
+                outer_end = float(ordered_boundaries[boundary_index + 1])
+                if outer_end <= outer_start:
+                    continue
+                sub_start = outer_start
+                while sub_start < outer_end and termination is None:
+                    _raise_if_cancelled(cancellation_check)
+                    next_rearm = _next_rearm_boundary(
+                        contract.triggers,
+                        segment_start=sub_start,
+                        segment_end=outer_end,
+                        trigger_counts=trigger_counts,
+                        trigger_last_times=trigger_last_times,
                     )
-                trigger_callables, trigger_mapping = _trigger_callables(
-                    contract.triggers,
-                    species_index=species_index,
-                    segment_start=sub_start,
-                    segment_state=current_y,
-                    trigger_counts=trigger_counts,
-                    trigger_last_times=trigger_last_times,
-                )
-                # SciPy truncates a simultaneous active-event set at the first
-                # terminal event.  Register every trigger first as a
-                # non-terminal observer, then repeat the same callables as
-                # terminal stoppers.  The observer block therefore retains
-                # every exact equal-time root before the first stopper ends
-                # the segment.
-                trigger_observers = trigger_callables
-                trigger_stoppers = trigger_callables
-                purge_observers, purge_mapping = _purge_zero_crossing_events(
-                    active_fluxes,
-                    active_holds=active_holds,
-                    species_index=species_index,
-                    state=current_y,
-                )
-                purge_stoppers = purge_observers
-                segment_events = (
-                    trigger_observers
-                    + purge_observers
-                    + trigger_stoppers
-                    + purge_stoppers
-                )
-                segment_request = req
-                segment_terminal_flags = (
-                        tuple(False for _ in trigger_observers)
-                        + tuple(False for _ in purge_observers)
-                        + tuple(True for _ in trigger_stoppers)
-                        + tuple(True for _ in purge_stoppers)
-                )
-                if active_holds or active_fluxes:
-                    segment_symbolic_jacobian = segment_request.symbolic_jacobian
-                    transformed_jacobian = (
-                        None
-                        if segment_symbolic_jacobian.jacobian_func is None
-                        else _InterventionJacobian(
-                            segment_symbolic_jacobian.jacobian_func,
-                            rhs=segment_rhs,
-                            holds=active_holds,
-                            fluxes=active_fluxes,
-                            species_index=species_index,
-                        )
-                    )
-                    segment_request = replace(
-                        segment_request,
-                        symbolic_jacobian=replace(
-                            segment_symbolic_jacobian,
-                            jacobian_func=transformed_jacobian,
-                            jac_sparsity=_transform_jacobian_sparsity(
-                                segment_symbolic_jacobian.jac_sparsity,
-                                holds=active_holds,
-                                species_index=species_index,
-                                size=current_y.size,
-                            ),
-                        ),
-                    )
-                segment_request = _request_for_internal_segment(
-                    segment_request, t0=sub_start, t1=sub_end
-                )
-                requested = _requested_eval(
-                    t_eval,
-                    start=sub_start,
-                    end=sub_end,
-                    is_final=(sub_end == t1),
-                )
-                internal_eval = requested
-                if not internal_eval.size or float(internal_eval[-1]) != sub_end:
-                    internal_eval = np.concatenate(
-                        [internal_eval, np.array([sub_end], dtype=float)]
-                    )
-                segment_identity = SegmentIdentity(
-                    kind="integration",
-                    ordinal=segment_count,
-                    t_start=sub_start,
-                    t_end=sub_end,
-                )
-                segment_provenance = dict(request.provenance)
-                segment_provenance["intervention_segment_index"] = segment_count
-                _raise_if_cancelled(cancellation_check)
-                segment_result = self._segment_runner(
-                    SegmentExecutionRequest(
-                        identity=segment_identity,
-                        request=segment_request,
-                        rhs=segment_rhs,
-                        t0=sub_start,
-                        t1=sub_end,
-                        y0=current_y,
-                        t_eval=internal_eval,
-                        provenance=segment_provenance,
-                        method=request.method,
-                        boundary_events=segment_events,
-                        boundary_terminal_flags=segment_terminal_flags,
-                    )
-                )
-                _raise_if_cancelled(cancellation_check)
-                event_times = segment_result.event_times
-                event_states = segment_result.raw_event_states
-                if active_holds:
-                    event_states = tuple(
-                        tuple(
-                            _apply_holds(
-                                state,
-                                active_holds,
-                                species_index=species_index,
-                                cancellation_check=cancellation_check,
-                            )
-                            for state in states
-                        )
-                        for states in event_states
-                    )
-                trigger_hit = (
-                    _first_trigger_hit(
-                        event_times,
-                        event_states,
-                        trigger_mapping=trigger_mapping,
-                    )
-                )
-                purge_hit = (
-                    _first_purge_hit(
-                        event_times,
-                        event_states,
-                        purge_mapping=purge_mapping,
-                        event_offset=len(trigger_observers),
-                    )
-                )
-                if (
-                    trigger_hit is not None
-                    and purge_hit is not None
-                    and trigger_hit[0] == purge_hit[0]
-                ):
-                    trigger_hit = (
-                        trigger_hit[0],
-                        trigger_hit[1],
-                        purge_hit[2].copy(),
-                    )
-                if (
-                    purge_hit is not None
-                    and (
-                        trigger_hit is None
-                        or purge_hit[0] < trigger_hit[0]
-                    )
-                ):
-                    trigger_hit = None
-                seg_t = segment_result.t
-                seg_y = _apply_holds_to_trajectory(
-                    segment_result.Y,
-                    active_holds,
-                    species_index=species_index,
-                    cancellation_check=cancellation_check,
-                )
-                _validate_segment_output(
-                    seg_t,
-                    seg_y,
-                    species_count=current_y.size,
-                    solver=req.solver,
-                    time=sub_start,
-                )
-                actual_segment_end = (
-                    float(trigger_hit[0])
-                    if trigger_hit is not None
-                    else (
-                        float(purge_hit[0])
-                        if purge_hit is not None
-                        else (
-                            sub_end
-                        )
-                    )
-                )
-                segment_output_identity = replace(
-                    segment_identity,
-                    t_end=actual_segment_end,
-                )
-                _record_segment_projection(
-                    segment_projections,
-                    segment_result,
-                    identity=segment_output_identity,
-                )
-                if segment_count == 0:
-                    _record_continuation_projection(
-                        segment_projections,
-                        identity=segment_output_identity,
-                        projection=initial_boundary.projection,
-                    )
-                segment_solvers.append(
-                    str(segment_result.solver_used or request.method)
-                )
-                segment_payload: dict[str, object] = {
-                    "segment_id": segment_count,
-                    "segment_key": segment_output_identity.key,
-                    "segment_identity": segment_output_identity.to_payload(),
-                    "t_start": segment_output_identity.t_start,
-                    "t_end": segment_output_identity.t_end,
-                    "starts_after_discontinuity": bool(
-                        segment_starts_after_discontinuity
-                    ),
-                    "temperature_step_boundary": (
-                        segment_count > 0
-                        and sub_start in temperature_boundaries
-                    ),
-                    "symbolic_jacobian_used": bool(
-                        segment_result.symbolic_jacobian_used
-                    ),
-                    "jacobian_sparsity_hint": bool(
-                        segment_result.jacobian_sparsity_hint
-                    ),
-                }
-                integration_segments.append(segment_payload)
-                segment_count += 1
-                if trigger_hit is not None:
-                    root_time, trigger_indices, root_state = trigger_hit
-                    current_y = root_state.copy()
-                elif purge_hit is not None:
-                    current_y = purge_hit[2].copy()
-                else:
-                    if segment_result.raw_terminal_state is None:
-                        raise InterventionScheduleError(
-                            "Completed solver segment is missing its exact raw terminal state."
-                        )
+                    sub_end = outer_end if next_rearm is None else float(next_rearm)
+                    active_fluxes = _active_fluxes(contract, sub_start)
+                    active_holds = _active_holds(contract, sub_start)
                     current_y = _apply_holds(
-                        segment_result.raw_terminal_state,
+                        current_y,
                         active_holds,
                         species_index=species_index,
                         cancellation_check=cancellation_check,
                     )
-                scheduled_discontinuity = (
-                    trigger_hit is None
-                    and (
-                        purge_hit is None
-                        or purge_hit[0] == sub_end
-                    )
-                    and sub_end in contract.discontinuities
-                )
-                emit_count = min(requested.size, seg_t.size)
-                emit_t = seg_t[:emit_count]
-                emit_y = seg_y[:, :emit_count]
-                if trigger_hit is not None:
-                    emit_mask = emit_t < float(trigger_hit[0])
-                    emit_t = emit_t[emit_mask]
-                    emit_y = emit_y[:, emit_mask]
-                elif purge_hit is not None:
-                    emit_mask = emit_t < float(purge_hit[0])
-                    emit_t = emit_t[emit_mask]
-                    emit_y = emit_y[:, emit_mask]
-                elif scheduled_discontinuity:
-                    emit_mask = emit_t < float(sub_end)
-                    emit_t = emit_t[emit_mask]
-                    emit_y = emit_y[:, emit_mask]
-                _append_identity_samples(
-                    outputs_t,
-                    outputs_y,
-                    output_segment_ids,
-                    output_segment_keys,
-                    output_discontinuity_ids,
-                    emit_t,
-                    emit_y,
-                    segment_id=segment_identity.ordinal,
-                    segment_key=segment_identity.key,
-                    discontinuity_id=discontinuity_id,
-                )
-                if trigger_hit is None:
-                    if purge_hit is not None and purge_hit[0] < sub_end:
-                        _append_identity_row(
-                            outputs_t,
-                            outputs_y,
-                            output_segment_ids,
-                            output_segment_keys,
-                            output_discontinuity_ids,
-                            float(purge_hit[0]),
-                            np.asarray(purge_hit[2], dtype=float).reshape(-1),
-                            segment_id=segment_count,
-                            segment_key=f"integration:{segment_count}",
-                            discontinuity_id=discontinuity_id,
+                    segment_rhs: Rhs2 = request.rhs
+                    if active_fluxes or active_holds:
+                        segment_rhs = _InterventionRhs(
+                            request.rhs,
+                            fluxes=active_fluxes,
+                            holds=active_holds,
+                            species_index=species_index,
                         )
-                        sub_start = float(purge_hit[0])
-                        segment_starts_after_discontinuity = False
-                        continue
-                    if next_rearm is not None and sub_end < outer_end:
-                        if purge_hit is not None and purge_hit[0] == sub_end:
+                    trigger_callables, trigger_mapping = _trigger_callables(
+                        contract.triggers,
+                        species_index=species_index,
+                        segment_start=sub_start,
+                        segment_state=current_y,
+                        trigger_counts=trigger_counts,
+                        trigger_last_times=trigger_last_times,
+                        observable_value=req.stop_observable_value,
+                        segment_end=sub_end,
+                        temperature_step_at_end=sub_end in temperature_boundaries,
+                    )
+                    # SciPy truncates a simultaneous active-event set at the first
+                    # terminal event.  Register every trigger first as a
+                    # non-terminal observer, then repeat the same callables as
+                    # terminal stoppers.  The observer block therefore retains
+                    # every exact equal-time root before the first stopper ends
+                    # the segment.
+                    trigger_observers = trigger_callables
+                    trigger_stoppers = trigger_callables
+                    purge_observers, purge_mapping = _purge_zero_crossing_events(
+                        active_fluxes,
+                        active_holds=active_holds,
+                        species_index=species_index,
+                        state=current_y,
+                    )
+                    purge_stoppers = purge_observers
+                    segment_events = (
+                        trigger_observers
+                        + purge_observers
+                        + trigger_stoppers
+                        + purge_stoppers
+                    )
+                    segment_request = req
+                    segment_terminal_flags = (
+                            tuple(False for _ in trigger_observers)
+                            + tuple(False for _ in purge_observers)
+                            + tuple(True for _ in trigger_stoppers)
+                            + tuple(True for _ in purge_stoppers)
+                    )
+                    if active_holds or active_fluxes:
+                        segment_symbolic_jacobian = segment_request.symbolic_jacobian
+                        transformed_jacobian = (
+                            None
+                            if segment_symbolic_jacobian.jacobian_func is None
+                            else _InterventionJacobian(
+                                segment_symbolic_jacobian.jacobian_func,
+                                rhs=segment_rhs,
+                                holds=active_holds,
+                                fluxes=active_fluxes,
+                                species_index=species_index,
+                            )
+                        )
+                        segment_request = replace(
+                            segment_request,
+                            symbolic_jacobian=replace(
+                                segment_symbolic_jacobian,
+                                jacobian_func=transformed_jacobian,
+                                jac_sparsity=_transform_jacobian_sparsity(
+                                    segment_symbolic_jacobian.jac_sparsity,
+                                    holds=active_holds,
+                                    species_index=species_index,
+                                    size=current_y.size,
+                                ),
+                            ),
+                        )
+                    segment_request = _request_for_internal_segment(
+                        segment_request, t0=sub_start, t1=sub_end
+                    )
+                    requested = _requested_eval(
+                        t_eval,
+                        start=sub_start,
+                        end=sub_end,
+                        is_final=(sub_end == t1),
+                    )
+                    if has_stops:
+                        requested = np.empty(0, dtype=float)
+                    internal_eval = requested
+                    if not internal_eval.size or float(internal_eval[-1]) != sub_end:
+                        internal_eval = np.concatenate(
+                            [internal_eval, np.array([sub_end], dtype=float)]
+                        )
+                    segment_identity = SegmentIdentity(
+                        kind="integration",
+                        ordinal=segment_count,
+                        t_start=sub_start,
+                        t_end=sub_end,
+                    )
+                    segment_provenance = dict(request.provenance)
+                    segment_provenance["intervention_segment_index"] = segment_count
+                    _raise_if_cancelled(cancellation_check)
+                    segment_result = self._segment_runner(
+                        SegmentExecutionRequest(
+                            identity=segment_identity,
+                            request=segment_request,
+                            rhs=segment_rhs,
+                            t0=sub_start,
+                            t1=sub_end,
+                            y0=current_y,
+                            t_eval=internal_eval,
+                            provenance=segment_provenance,
+                            method=request.method,
+                            boundary_events=segment_events,
+                            boundary_terminal_flags=segment_terminal_flags,
+                        )
+                    )
+                    _raise_if_cancelled(cancellation_check)
+                    event_times = segment_result.event_times
+                    event_states = segment_result.raw_event_states
+                    if active_holds:
+                        event_states = tuple(
+                            tuple(
+                                _apply_holds(
+                                    state,
+                                    active_holds,
+                                    species_index=species_index,
+                                    cancellation_check=cancellation_check,
+                                )
+                                for state in states
+                            )
+                            for states in event_states
+                        )
+                    trigger_hit = (
+                        _first_trigger_hit(
+                            event_times,
+                            event_states,
+                            trigger_mapping=trigger_mapping,
+                        )
+                    )
+                    purge_hit = (
+                        _first_purge_hit(
+                            event_times,
+                            event_states,
+                            purge_mapping=purge_mapping,
+                            event_offset=len(trigger_observers),
+                        )
+                    )
+                    if (
+                        trigger_hit is not None
+                        and purge_hit is not None
+                        and trigger_hit[0] == purge_hit[0]
+                    ):
+                        trigger_hit = (
+                            trigger_hit[0],
+                            trigger_hit[1],
+                            purge_hit[2].copy(),
+                        )
+                    if (
+                        purge_hit is not None
+                        and (
+                            trigger_hit is None
+                            or purge_hit[0] < trigger_hit[0]
+                        )
+                    ):
+                        trigger_hit = None
+                    seg_t = segment_result.t
+                    seg_y = _apply_holds_to_trajectory(
+                        segment_result.Y,
+                        active_holds,
+                        species_index=species_index,
+                        cancellation_check=cancellation_check,
+                    )
+                    _validate_segment_output(
+                        seg_t,
+                        seg_y,
+                        species_count=current_y.size,
+                        solver=req.solver,
+                        time=sub_start,
+                    )
+                    actual_segment_end = (
+                        float(trigger_hit[0])
+                        if trigger_hit is not None
+                        else (
+                            float(purge_hit[0])
+                            if purge_hit is not None
+                            else (
+                                sub_end
+                            )
+                        )
+                    )
+                    segment_output_identity = replace(
+                        segment_identity,
+                        t_end=actual_segment_end,
+                    )
+                    if has_stops:
+                        dense_segments.append((segment_output_identity, segment_result.dense_output, active_holds, discontinuity_id))
+                    _record_segment_projection(
+                        segment_projections,
+                        segment_result,
+                        identity=segment_output_identity,
+                    )
+                    if segment_count == 0:
+                        _record_continuation_projection(
+                            segment_projections,
+                            identity=segment_output_identity,
+                            projection=initial_boundary.projection,
+                        )
+                    segment_solvers.append(
+                        str(segment_result.solver_used or request.method)
+                    )
+                    segment_payload: dict[str, object] = {
+                        "segment_id": segment_count,
+                        "segment_key": segment_output_identity.key,
+                        "segment_identity": segment_output_identity.to_payload(),
+                        "t_start": segment_output_identity.t_start,
+                        "t_end": segment_output_identity.t_end,
+                        "starts_after_discontinuity": bool(
+                            segment_starts_after_discontinuity
+                        ),
+                        "temperature_step_boundary": (
+                            segment_count > 0
+                            and sub_start in temperature_boundaries
+                        ),
+                        "symbolic_jacobian_used": bool(
+                            segment_result.symbolic_jacobian_used
+                        ),
+                        "jacobian_sparsity_hint": bool(
+                            segment_result.jacobian_sparsity_hint
+                        ),
+                    }
+                    integration_segments.append(segment_payload)
+                    segment_count += 1
+                    if trigger_hit is not None:
+                        root_time, trigger_indices, root_state = trigger_hit
+                        current_y = root_state.copy()
+                    elif purge_hit is not None:
+                        current_y = purge_hit[2].copy()
+                    else:
+                        if segment_result.raw_terminal_state is None:
+                            raise InterventionScheduleError(
+                                "Completed solver segment is missing its exact raw terminal state."
+                            )
+                        current_y = _apply_holds(
+                            segment_result.raw_terminal_state,
+                            active_holds,
+                            species_index=species_index,
+                            cancellation_check=cancellation_check,
+                        )
+                    scheduled_discontinuity = (
+                        trigger_hit is None
+                        and (
+                            purge_hit is None
+                            or purge_hit[0] == sub_end
+                        )
+                        and sub_end in contract.discontinuities
+                    )
+                    emit_count = min(requested.size, seg_t.size)
+                    emit_t = seg_t[:emit_count]
+                    emit_y = seg_y[:, :emit_count]
+                    if trigger_hit is not None:
+                        emit_mask = emit_t < float(trigger_hit[0])
+                        emit_t = emit_t[emit_mask]
+                        emit_y = emit_y[:, emit_mask]
+                    elif purge_hit is not None:
+                        emit_mask = emit_t < float(purge_hit[0])
+                        emit_t = emit_t[emit_mask]
+                        emit_y = emit_y[:, emit_mask]
+                    elif scheduled_discontinuity:
+                        emit_mask = emit_t < float(sub_end)
+                        emit_t = emit_t[emit_mask]
+                        emit_y = emit_y[:, emit_mask]
+                    _append_identity_samples(
+                        outputs_t,
+                        outputs_y,
+                        output_segment_ids,
+                        output_segment_keys,
+                        output_discontinuity_ids,
+                        emit_t,
+                        emit_y,
+                        segment_id=segment_identity.ordinal,
+                        segment_key=segment_identity.key,
+                        discontinuity_id=discontinuity_id,
+                    )
+                    if trigger_hit is None:
+                        if purge_hit is not None and purge_hit[0] < sub_end:
                             _append_identity_row(
                                 outputs_t,
                                 outputs_y,
@@ -592,230 +603,359 @@ class InterventionScheduleExecutionOwner:
                                 segment_key=f"integration:{segment_count}",
                                 discontinuity_id=discontinuity_id,
                             )
-                        boundary_result = _apply_boundary(
-                            current_y,
-                            boundary=sub_end,
-                            contract=contract,
-                            trigger_indices=(),
-                            trigger_state=None,
-                            input_is_raw_solver_state=True,
-                            trigger_counts=trigger_counts,
-                            trigger_last_times=trigger_last_times,
-                            trigger_firings=trigger_firings,
-                            species_index=species_index,
-                            cancellation_check=cancellation_check,
-                        )
-                        current_y = boundary_result.continuation_state
-                        _append_presentation_boundary(
-                            presentation_boundaries,
-                            boundary_result.presentation_boundary,
-                        )
-                        _raise_if_cancelled(cancellation_check)
-                        _record_continuation_projection(
-                            segment_projections,
-                            identity=segment_output_identity,
-                            projection=boundary_result.projection,
-                        )
-                        segment_starts_after_discontinuity = False
-                        sub_start = sub_end
-                        continue
-                    if sub_end == outer_end:
-                        boundary_result = _apply_boundary(
-                            current_y,
-                            boundary=outer_end,
-                            contract=contract,
-                            trigger_indices=(),
-                            trigger_state=None,
-                            input_is_raw_solver_state=True,
-                            trigger_counts=trigger_counts,
-                            trigger_last_times=trigger_last_times,
-                            trigger_firings=trigger_firings,
-                            species_index=species_index,
-                            cancellation_check=cancellation_check,
-                        )
-                        current_y = boundary_result.continuation_state
-                        _append_presentation_boundary(
-                            presentation_boundaries,
-                            boundary_result.presentation_boundary,
-                        )
-                        _raise_if_cancelled(cancellation_check)
-                        _record_continuation_projection(
-                            segment_projections,
-                            identity=segment_output_identity,
-                            projection=boundary_result.projection,
-                        )
-                        if scheduled_discontinuity:
-                            discontinuity_id += 1
-                            post_segment_id = (
-                                segment_output_identity.ordinal
-                                if outer_end == t1
-                                else segment_count
+                            sub_start = float(purge_hit[0])
+                            segment_starts_after_discontinuity = False
+                            continue
+                        if next_rearm is not None and sub_end < outer_end:
+                            if purge_hit is not None and purge_hit[0] == sub_end:
+                                _append_identity_row(
+                                    outputs_t,
+                                    outputs_y,
+                                    output_segment_ids,
+                                    output_segment_keys,
+                                    output_discontinuity_ids,
+                                    float(purge_hit[0]),
+                                    np.asarray(purge_hit[2], dtype=float).reshape(-1),
+                                    segment_id=segment_count,
+                                    segment_key=f"integration:{segment_count}",
+                                    discontinuity_id=discontinuity_id,
+                                )
+                            boundary_result = _apply_boundary(
+                                current_y,
+                                boundary=sub_end,
+                                contract=contract,
+                                trigger_indices=(),
+                                trigger_state=None,
+                                input_is_raw_solver_state=True,
+                                trigger_counts=trigger_counts,
+                                trigger_last_times=trigger_last_times,
+                                trigger_firings=trigger_firings,
+                                species_index=species_index,
+                                cancellation_check=cancellation_check,
+                                observable_value=req.stop_observable_value,
+                                temperature_step=sub_end in temperature_boundaries,
                             )
-                            _append_identity_row(
-                                outputs_t,
-                                outputs_y,
-                                output_segment_ids,
-                                output_segment_keys,
-                                output_discontinuity_ids,
-                                float(outer_end),
-                                np.asarray(current_y, dtype=float).reshape(-1),
-                                segment_id=post_segment_id,
-                                segment_key=f"integration:{post_segment_id}",
-                                discontinuity_id=discontinuity_id,
+                            current_y = boundary_result.continuation_state
+                            termination = boundary_result.termination
+                            skipped_instants = boundary_result.skipped_instants
+                            _append_presentation_boundary(
+                                presentation_boundaries,
+                                boundary_result.presentation_boundary,
                             )
-                            segment_starts_after_discontinuity = outer_end < t1
-                        elif (
-                            outer_end in temperature_boundaries
-                            and outer_end < t1
-                        ):
-                            _append_identity_row(
-                                outputs_t,
-                                outputs_y,
-                                output_segment_ids,
-                                output_segment_keys,
-                                output_discontinuity_ids,
-                                float(outer_end),
-                                np.asarray(current_y, dtype=float).reshape(-1),
-                                segment_id=segment_count,
-                                segment_key=f"integration:{segment_count}",
-                                discontinuity_id=discontinuity_id,
+                            _raise_if_cancelled(cancellation_check)
+                            _record_continuation_projection(
+                                segment_projections,
+                                identity=segment_output_identity,
+                                projection=boundary_result.projection,
                             )
                             segment_starts_after_discontinuity = False
-                        elif outer_end == t1:
-                            _append_identity_row(
-                                outputs_t,
-                                outputs_y,
-                                output_segment_ids,
-                                output_segment_keys,
-                                output_discontinuity_ids,
-                                float(outer_end),
-                                np.asarray(current_y, dtype=float).reshape(-1),
-                                segment_id=segment_output_identity.ordinal,
-                                segment_key=segment_output_identity.key,
-                                discontinuity_id=discontinuity_id,
+                            sub_start = sub_end
+                            if termination is not None:
+                                break
+                            continue
+                        if sub_end == outer_end:
+                            boundary_result = _apply_boundary(
+                                current_y,
+                                boundary=outer_end,
+                                contract=contract,
+                                trigger_indices=(),
+                                trigger_state=None,
+                                input_is_raw_solver_state=True,
+                                trigger_counts=trigger_counts,
+                                trigger_last_times=trigger_last_times,
+                                trigger_firings=trigger_firings,
+                                species_index=species_index,
+                                cancellation_check=cancellation_check,
+                                observable_value=req.stop_observable_value,
+                                temperature_step=outer_end in temperature_boundaries,
                             )
-                            segment_starts_after_discontinuity = False
-                        else:
-                            segment_starts_after_discontinuity = False
-                    break
-                root_time, trigger_indices, root_state = trigger_hit
-                boundary_result = _apply_boundary(
-                    current_y,
-                    boundary=root_time,
-                    contract=contract,
-                    trigger_indices=trigger_indices,
-                    trigger_state=root_state,
-                    input_is_raw_solver_state=True,
-                    trigger_counts=trigger_counts,
-                    trigger_last_times=trigger_last_times,
-                    trigger_firings=trigger_firings,
-                    species_index=species_index,
-                    cancellation_check=cancellation_check,
-                )
-                current_y = boundary_result.continuation_state
-                _append_presentation_boundary(
-                    presentation_boundaries,
-                    boundary_result.presentation_boundary,
-                )
-                _raise_if_cancelled(cancellation_check)
-                _record_continuation_projection(
-                    segment_projections,
-                    identity=segment_output_identity,
-                    projection=boundary_result.projection,
-                )
-                discontinuity_id += 1
-                post_segment_id = (
-                    segment_output_identity.ordinal
-                    if root_time == t1
-                    else segment_count
-                )
+                            current_y = boundary_result.continuation_state
+                            termination = boundary_result.termination
+                            skipped_instants = boundary_result.skipped_instants
+                            _append_presentation_boundary(
+                                presentation_boundaries,
+                                boundary_result.presentation_boundary,
+                            )
+                            _raise_if_cancelled(cancellation_check)
+                            _record_continuation_projection(
+                                segment_projections,
+                                identity=segment_output_identity,
+                                projection=boundary_result.projection,
+                            )
+                            if scheduled_discontinuity:
+                                discontinuity_id += 1
+                                post_segment_id = (
+                                    segment_output_identity.ordinal
+                                    if outer_end == t1 or termination is not None
+                                    else segment_count
+                                )
+                                _append_identity_row(
+                                    outputs_t,
+                                    outputs_y,
+                                    output_segment_ids,
+                                    output_segment_keys,
+                                    output_discontinuity_ids,
+                                    float(outer_end),
+                                    np.asarray(current_y, dtype=float).reshape(-1),
+                                    segment_id=post_segment_id,
+                                    segment_key=f"integration:{post_segment_id}",
+                                    discontinuity_id=discontinuity_id,
+                                )
+                                segment_starts_after_discontinuity = outer_end < t1
+                            elif (
+                                outer_end in temperature_boundaries
+                                and outer_end < t1
+                            ):
+                                post_segment_id = (
+                                    segment_output_identity.ordinal
+                                    if termination is not None
+                                    else segment_count
+                                )
+                                _append_identity_row(
+                                    outputs_t,
+                                    outputs_y,
+                                    output_segment_ids,
+                                    output_segment_keys,
+                                    output_discontinuity_ids,
+                                    float(outer_end),
+                                    np.asarray(current_y, dtype=float).reshape(-1),
+                                    segment_id=post_segment_id,
+                                    segment_key=f"integration:{post_segment_id}",
+                                    discontinuity_id=discontinuity_id,
+                                )
+                                segment_starts_after_discontinuity = False
+                            elif outer_end == t1:
+                                _append_identity_row(
+                                    outputs_t,
+                                    outputs_y,
+                                    output_segment_ids,
+                                    output_segment_keys,
+                                    output_discontinuity_ids,
+                                    float(outer_end),
+                                    np.asarray(current_y, dtype=float).reshape(-1),
+                                    segment_id=segment_output_identity.ordinal,
+                                    segment_key=segment_output_identity.key,
+                                    discontinuity_id=discontinuity_id,
+                                )
+                                segment_starts_after_discontinuity = False
+                            else:
+                                segment_starts_after_discontinuity = False
+                        break
+                    root_time, trigger_indices, root_state = trigger_hit
+                    boundary_result = _apply_boundary(
+                        current_y,
+                        boundary=root_time,
+                        contract=contract,
+                        trigger_indices=trigger_indices,
+                        trigger_state=root_state,
+                        input_is_raw_solver_state=True,
+                        trigger_counts=trigger_counts,
+                        trigger_last_times=trigger_last_times,
+                        trigger_firings=trigger_firings,
+                        species_index=species_index,
+                        cancellation_check=cancellation_check,
+                        observable_value=req.stop_observable_value,
+                        temperature_step=root_time in temperature_boundaries,
+                    )
+                    current_y = boundary_result.continuation_state
+                    termination = boundary_result.termination
+                    skipped_instants = boundary_result.skipped_instants
+                    _append_presentation_boundary(
+                        presentation_boundaries,
+                        boundary_result.presentation_boundary,
+                    )
+                    _raise_if_cancelled(cancellation_check)
+                    _record_continuation_projection(
+                        segment_projections,
+                        identity=segment_output_identity,
+                        projection=boundary_result.projection,
+                    )
+                    if termination is None or boundary_result.presentation_boundary is not None:
+                        discontinuity_id += 1
+                    post_segment_id = (
+                        segment_output_identity.ordinal
+                        if root_time == t1 or termination is not None
+                        else segment_count
+                    )
+                    _append_identity_row(
+                        outputs_t,
+                        outputs_y,
+                        output_segment_ids,
+                        output_segment_keys,
+                        output_discontinuity_ids,
+                        float(root_time),
+                        np.asarray(current_y, dtype=float).reshape(-1),
+                        segment_id=post_segment_id,
+                        segment_key=f"integration:{post_segment_id}",
+                        discontinuity_id=discontinuity_id,
+                    )
+                    segment_starts_after_discontinuity = root_time < t1
+                    sub_start = root_time
+
+            actual_end = t1 if termination is None else termination.actual_endpoint
+            if termination is None:
+                termination = SimulationTermination(t1, "endpoint")
+            if outputs_t:
+                output_t = np.concatenate(outputs_t)
+                output_y = np.concatenate(outputs_y, axis=1)
+            else:
+                output_t = np.empty(0, dtype=float)
+                output_y = np.empty((current_y.size, 0), dtype=float)
+            if not output_t.size or float(output_t[-1]) != actual_end:
                 _append_identity_row(
                     outputs_t,
                     outputs_y,
                     output_segment_ids,
                     output_segment_keys,
                     output_discontinuity_ids,
-                    float(root_time),
+                    actual_end,
                     np.asarray(current_y, dtype=float).reshape(-1),
-                    segment_id=post_segment_id,
-                    segment_key=f"integration:{post_segment_id}",
+                    segment_id=max(0, segment_count - 1),
+                    segment_key=f"integration:{max(0, segment_count - 1)}",
                     discontinuity_id=discontinuity_id,
                 )
-                segment_starts_after_discontinuity = root_time < t1
-                sub_start = root_time
+                output_t = np.concatenate(outputs_t)
+                output_y = np.concatenate(outputs_y, axis=1)
+            if has_stops:
+                from kindred.core.time_grid import build_time_grid
+                try:
+                    base_times = (np.array([t0], dtype=float) if actual_end == t0
+                                  else build_time_grid(t0, actual_end, req.grid))
+                except ValueError as exc:
+                    raise InterventionScheduleError(f"Actual-interval sampling failed: {exc}") from exc
+                boundary_ids, boundary_keys, boundary_discontinuities = _compose_direct_result_sample_identity(
+                    output_segment_ids, output_segment_keys, output_discontinuity_ids,
+                )
+                final_times = np.union1d(base_times, output_t)
+                final_states = np.empty((current_y.size, final_times.size), dtype=float)
+                final_ids = np.empty(final_times.size, dtype=np.int64)
+                final_keys = np.empty(final_times.size, dtype=object)
+                final_discontinuities = np.empty(final_times.size, dtype=np.int64)
 
-        if outputs_t:
-            output_t = np.concatenate(outputs_t)
-            output_y = np.concatenate(outputs_y, axis=1)
-        else:
-            output_t = np.empty(0, dtype=float)
-            output_y = np.empty((current_y.size, 0), dtype=float)
-        if not output_t.size or float(output_t[-1]) != t1:
-            _append_identity_row(
-                outputs_t,
-                outputs_y,
+                # Exact executor rows own intervention and termination boundaries.
+                boundary_rows = np.searchsorted(final_times, output_t)
+                final_states[:, boundary_rows] = output_y
+                final_ids[boundary_rows] = boundary_ids
+                final_keys[boundary_rows] = boundary_keys
+                final_discontinuities[boundary_rows] = boundary_discontinuities
+                needs_sampling = np.ones(final_times.size, dtype=bool)
+                needs_sampling[boundary_rows] = False
+                sample_rows = np.flatnonzero(needs_sampling)
+                sample_times = final_times[sample_rows]
+                next_sample = 0
+
+                for dense_index, (identity_record, dense, holds, discontinuity) in enumerate(dense_segments):
+                    _raise_if_cancelled(cancellation_check)
+                    # An internal endpoint belongs to the following segment. Use
+                    # executed bounds: SciPy's last step can extend past a root.
+                    sample_end = int(np.searchsorted(
+                        sample_times, identity_record.t_end,
+                        side="right" if dense_index + 1 == len(dense_segments) else "left",
+                    ))
+                    if sample_end == next_sample:
+                        continue
+                    if sample_times[next_sample] < identity_record.t_start:
+                        raise InterventionScheduleError("Actual-interval sample is outside its continuous segment.")
+                    projected_count = 0
+                    max_negative_magnitude = 0.0
+                    # Bound interpolation temporaries and check cancellation on
+                    # both sides of every group, including a short final group.
+                    for sample_start in range(next_sample, sample_end, 256):
+                        _raise_if_cancelled(cancellation_check)
+                        chunk_end = min(sample_start + 256, sample_end)
+                        rows = sample_rows[sample_start:chunk_end]
+                        raw_states = dense(sample_times[sample_start:chunk_end])
+                        _raise_if_cancelled(cancellation_check)
+                        raw_states = _apply_holds_to_trajectory(
+                            raw_states, holds, species_index=species_index,
+                            cancellation_check=cancellation_check,
+                        )
+                        projected, projection = project_nonnegative_trajectory(
+                            raw_states, context="Actual-interval sampling",
+                        )
+                        _raise_if_cancelled(cancellation_check)
+                        final_states[:, rows] = projected
+                        final_ids[rows] = identity_record.ordinal
+                        final_keys[rows] = identity_record.key
+                        final_discontinuities[rows] = discontinuity
+                        projected_count += projection.count
+                        max_negative_magnitude = max(
+                            max_negative_magnitude, projection.max_negative_magnitude,
+                        )
+                    _record_continuation_projection(
+                        segment_projections, identity=identity_record,
+                        projection=NonnegativeProjection(
+                            projected=bool(projected_count), count=projected_count,
+                            max_negative_magnitude=max_negative_magnitude,
+                        ),
+                    )
+                    next_sample = sample_end
+                if next_sample != sample_times.size:
+                    raise InterventionScheduleError("Actual-interval sample is outside its continuous segment.")
+                _raise_if_cancelled(cancellation_check)
+                output_t, output_y = final_times, final_states
+                output_segment_ids, output_segment_keys, output_discontinuity_ids = [final_ids], [tuple(final_keys)], [final_discontinuities]
+                dense_segments.clear()
+            if output_t.size > 1 and np.any(np.diff(output_t) <= 0.0):
+                raise InterventionScheduleError(
+                    "Public result row times must be strictly increasing."
+                )
+            _ensure_finite_nonnegative(
+                output_y,
+                solver=req.solver,
+                time=t0,
+                context="Scheduled simulation output",
+            )
+            # Concatenation creates the final owned buffers.  Freeze them here so
+            # the standalone result can adopt them without defensive recapture.
+            output_t.setflags(write=False)
+            output_y.setflags(write=False)
+            final_contract = replace(
+                contract,
+                trigger_firings=tuple(trigger_firings),
+                skipped_instants=skipped_instants,
+            )
+            provenance = request.provenance
+            _raise_if_cancelled(cancellation_check)
+            provenance["intervention_execution"] = final_contract.provenance_projection()
+            provenance["integration_segments"] = integration_segments
+            provenance["intervention_segments"] = segment_count
+            (
+                result_segment_ids,
+                result_segment_keys,
+                result_discontinuity_ids,
+            ) = _compose_direct_result_sample_identity(
                 output_segment_ids,
                 output_segment_keys,
                 output_discontinuity_ids,
-                t1,
-                np.asarray(current_y, dtype=float).reshape(-1),
-                segment_id=max(0, segment_count - 1),
-                segment_key=f"integration:{max(0, segment_count - 1)}",
-                discontinuity_id=discontinuity_id,
             )
-            output_t = np.concatenate(outputs_t)
-            output_y = np.concatenate(outputs_y, axis=1)
-        if output_t.size > 1 and np.any(np.diff(output_t) <= 0.0):
-            raise InterventionScheduleError(
-                "Public result row times must be strictly increasing."
+            _publish_segment_projection_provenance(
+                provenance,
+                segment_projections,
             )
-        _ensure_finite_nonnegative(
-            output_y,
-            solver=req.solver,
-            time=t0,
-            context="Scheduled simulation output",
-        )
-        # Concatenation creates the final owned buffers.  Freeze them here so
-        # the standalone result can adopt them without defensive recapture.
-        output_t.setflags(write=False)
-        output_y.setflags(write=False)
-        final_contract = contract.with_trigger_firings(trigger_firings)
-        provenance = request.provenance
-        _raise_if_cancelled(cancellation_check)
-        provenance["intervention_execution"] = final_contract.provenance_projection()
-        provenance["integration_segments"] = integration_segments
-        provenance["intervention_segments"] = segment_count
-        (
-            result_segment_ids,
-            result_segment_keys,
-            result_discontinuity_ids,
-        ) = _compose_direct_result_sample_identity(
-            output_segment_ids,
-            output_segment_keys,
-            output_discontinuity_ids,
-        )
-        _publish_segment_projection_provenance(
-            provenance,
-            segment_projections,
-        )
-        if segment_solvers:
-            distinct = list(dict.fromkeys(segment_solvers))
-            provenance["solver_used"] = (
-                distinct[0] if len(distinct) == 1 else "segmented"
+            if segment_solvers:
+                distinct = list(dict.fromkeys(segment_solvers))
+                provenance["solver_used"] = (
+                    distinct[0] if len(distinct) == 1 else "segmented"
+                )
+                if len(distinct) > 1:
+                    provenance["intervention_segment_solvers"] = segment_solvers
+            _raise_if_cancelled(cancellation_check)
+            return FinalSimulationOutput(
+                t=output_t,
+                Y=output_y,
+                provenance=provenance,
+                intervention_execution=final_contract,
+                presentation_boundaries=tuple(presentation_boundaries),
+                segment_ids=result_segment_ids,
+                segment_keys=result_segment_keys,
+                discontinuity_ids=result_discontinuity_ids,
+                termination=termination,
             )
-            if len(distinct) > 1:
-                provenance["intervention_segment_solvers"] = segment_solvers
-        _raise_if_cancelled(cancellation_check)
-        return FinalSimulationOutput(
-            t=output_t,
-            Y=output_y,
-            provenance=provenance,
-            intervention_execution=final_contract,
-            presentation_boundaries=tuple(presentation_boundaries),
-            segment_ids=result_segment_ids,
-            segment_keys=result_segment_keys,
-            discontinuity_ids=result_discontinuity_ids,
-        )
+        finally:
+            dense_segments.clear()
+            segment_result = None
+            dense = None
 
 
 def _append_presentation_boundary(
@@ -945,8 +1085,8 @@ def _species_index(
         *(item.species for item in contract.instants),
         *(item.species for item in contract.fluxes),
         *(item.species for item in contract.holds),
-        *(item.watch_species for item in contract.triggers),
-        *(item.then.species for item in contract.triggers),
+        *(item.condition.name for item in contract.triggers if isinstance(item.condition, SpeciesTriggerCondition)),
+        *(item.then.species for item in contract.triggers if not isinstance(item.then, InterventionStopAction)),
     }
     names = tuple(str(name) for name in (req.species_names or ()))
     if not names and referenced:
@@ -1044,6 +1184,34 @@ def _trigger_action_instant(
     )
 
 
+def _trigger_value(
+    trigger: ExecutableTrigger, time: float, state: np.ndarray,
+    *, species_index: Mapping[str, int],
+    observable_value: Callable[[str, float, np.ndarray, float], float] | None,
+    symbol_time: float | None = None,
+) -> float:
+    try:
+        if isinstance(trigger.condition, SpeciesTriggerCondition):
+            value = float(state[species_index[trigger.condition.name]])
+        else:
+            value = float(observable_value(trigger.condition.name, time, state, time if symbol_time is None else symbol_time))
+        if not math.isfinite(value):
+            raise ValueError("the watched quantity is not finite")
+        return value
+    except Exception as exc:
+        raise InterventionScheduleError(
+            f"Stopping declaration {trigger.declaration_ordinal + 1}, quantity {trigger.condition.name!r}: {exc}",
+            operation="trigger", declaration_ordinal=trigger.declaration_ordinal,
+            field="watch_observable" if isinstance(trigger.condition, ObservableTriggerCondition) else "watch_species",
+            details={"quantity": trigger.condition.name, "time": time},
+        ) from exc
+
+
+def _crossed(before: float, after: float, threshold: float, direction: str) -> bool:
+    return ((direction in {"rising", "either"} and before < threshold <= after)
+            or (direction in {"falling", "either"} and before > threshold >= after))
+
+
 def _apply_boundary(
     state: np.ndarray,
     *,
@@ -1057,157 +1225,114 @@ def _apply_boundary(
     trigger_firings: list[TriggerFiring],
     species_index: Mapping[str, int],
     cancellation_check: Callable[[], bool] | None,
+    observable_value: Callable[[str, float, np.ndarray, float], float] | None = None,
+    temperature_step: bool = False,
 ) -> _BoundaryApplicationResult:
     _raise_if_cancelled(cancellation_check)
-    current = (
-        np.asarray(trigger_state, dtype=float).reshape(-1).copy()
-        if trigger_state is not None
-        else np.asarray(state, dtype=float).reshape(-1).copy()
-    )
-    active_holds = _active_holds(contract, boundary)
-    persisting_holds = tuple(
-        hold for hold in active_holds if hold.start_time < boundary
-    )
-    current = _apply_holds(
-        current,
-        persisting_holds,
-        species_index=species_index,
-        cancellation_check=cancellation_check,
-    )
+    current = np.asarray(trigger_state if trigger_state is not None else state, dtype=float).reshape(-1).copy()
     exact_root = current.copy()
-    projectable_solver_negatives = (
-        exact_root < 0.0
-        if input_is_raw_solver_state
-        else np.zeros(exact_root.shape, dtype=bool)
-    )
+    projectable_solver_negatives = exact_root < 0.0 if input_is_raw_solver_state else np.zeros(exact_root.shape, dtype=bool)
+    stops = tuple(index for index, item in enumerate(contract.triggers) if isinstance(item.then, InterventionStopAction))
+    active_holds = _active_holds(contract, boundary)
+    if not stops:
+        current = _apply_holds(current, tuple(item for item in active_holds if item.start_time < boundary),
+                               species_index=species_index, cancellation_check=cancellation_check)
+        exact_root = current.copy()
+        projectable_solver_negatives = exact_root < 0.0 if input_is_raw_solver_state else np.zeros(exact_root.shape, dtype=bool)
     static = _static_instants_at(contract, boundary)
-    entering_holds = tuple(
-        hold for hold in active_holds if hold.start_time == boundary
-    )
-    trigger_instants = tuple(
-        _trigger_action_instant(contract.triggers[index], time=boundary)
-        for index in trigger_indices
-    )
-    validate_boundary_conflicts(
-        instants=static + trigger_instants,
-        entering_holds=entering_holds,
-        cancellation_check=cancellation_check,
-    )
-    stage_three = tuple(
-        sorted(
-            (
-                item
-                for item in static
-                if item.phase in {"ordinary", "before"}
-            ),
-            key=_instant_canonical_order,
-        )
-    )
-    stage_six = tuple(
-        sorted(
-            trigger_instants,
-            key=_instant_canonical_order,
-        )
-    )
-    stage_seven = tuple(
-        sorted(
-            (item for item in static if item.phase == "after"),
-            key=_instant_canonical_order,
-        )
-    )
-    current = _apply_instants(
-        current,
-        stage_three,
-        species_index=species_index,
-        cancellation_check=cancellation_check,
-    )
-    current = _apply_holds(
-        current,
-        active_holds,
-        species_index=species_index,
-        cancellation_check=cancellation_check,
-    )
-    new_firings: list[tuple[int, TriggerFiring]] = []
-    public_event_state: dict[str, float] | None = None
-    if stage_six:
-        # Keep the exact solver-root state local to the boundary transaction.
-        # It is the state used for trigger action/conflict/continuation
-        # semantics; only a projected copy may cross into the public firing
-        # payload.
-        raw_event_state = {
-            species: float(exact_root[index])
-            for species, index in species_index.items()
-        }
-        public_event_state = _project_public_event_state(raw_event_state)
-        current = _apply_instants(
-            current,
-            stage_six,
-            species_index=species_index,
-            cancellation_check=cancellation_check,
-        )
-        for index in trigger_indices:
-            trigger = contract.triggers[index]
-            next_count = trigger_counts[index] + 1
-            if public_event_state is None:
-                raise InterventionScheduleError(
-                    "Trigger public event state was not constructed."
-                )
-            new_firings.append(
-                (
-                    index,
-                    TriggerFiring(
-                        declaration_ordinal=trigger.declaration_ordinal,
-                        watch_species=trigger.watch_species,
-                        threshold=trigger.threshold,
-                        direction=trigger.direction,
-                        root_time=boundary,
-                        event_state=public_event_state,
-                        firing_ordinal=next_count,
-                        nested_action_payload=trigger.then.to_payload(),
-                    ),
-                )
-            )
-    current = _apply_instants(
-        current,
-        stage_seven,
-        species_index=species_index,
-        cancellation_check=cancellation_check,
-    )
-    current = _apply_holds(
-        current,
-        active_holds,
-        species_index=species_index,
-        cancellation_check=cancellation_check,
-    )
-    invalid_negative = (current < 0.0) & (
-        ~projectable_solver_negatives | (current < exact_root)
-    )
-    if np.any(invalid_negative):
-        raise InterventionScheduleError(
-            "Intervention boundary produced a scientifically invalid "
-            "negative continuation state."
-        )
-    continuation, projection = project_nonnegative_trajectory(
-        current.reshape(-1, 1),
-        context=f"Intervention continuation state at t={boundary:g}",
-    )
-    _raise_if_cancelled(cancellation_check)
-    for index, firing in new_firings:
+    entering_holds = tuple(item for item in active_holds if item.start_time == boundary)
+    chemical_indices = tuple(index for index in trigger_indices if index not in stops)
+    trigger_instants = tuple(_trigger_action_instant(contract.triggers[index], time=boundary) for index in chemical_indices)
+    if not stops:
+        validate_boundary_conflicts(instants=static + trigger_instants, entering_holds=entering_holds, cancellation_check=cancellation_check)
+    changed = False
+    executed_instants: list[ExecutableInstant] = []
+
+    def record(index: int) -> None:
+        trigger = contract.triggers[index]
         trigger_counts[index] += 1
         trigger_last_times[index] = boundary
-        trigger_firings.append(firing)
-    presentation_boundary = _presentation_boundary_if_changed(
-        time=boundary,
-        pre_state=exact_root,
-        post_state=current,
-        species_index=species_index,
-        changed=bool(stage_three or stage_six or stage_seven or entering_holds),
+        trigger_firings.append(TriggerFiring(
+            declaration_ordinal=trigger.declaration_ordinal, condition=trigger.condition,
+            threshold=trigger.threshold, direction=trigger.direction, root_time=boundary,
+            event_state=_project_public_event_state({name: float((current if isinstance(trigger.then, InterventionStopAction) else exact_root)[position]) for name, position in species_index.items()}),
+            firing_ordinal=trigger_counts[index], nested_action_payload=trigger.then.to_payload(),
+        ))
+
+    def finish(stop: int | None = None) -> _BoundaryApplicationResult:
+        invalid_negative = (current < 0.0) & (~projectable_solver_negatives | (current < exact_root))
+        if np.any(invalid_negative):
+            raise InterventionScheduleError("Intervention boundary produced a scientifically invalid negative continuation state.")
+        continuation, projection = project_nonnegative_trajectory(current.reshape(-1, 1), context=f"Intervention continuation state at t={boundary:g}")
+        termination = None
+        if stop is not None:
+            record(stop)
+            termination = SimulationTermination(boundary, "stop", contract.triggers[stop].declaration_ordinal)
+        return _BoundaryApplicationResult(
+            continuation.reshape(-1), projection,
+            _presentation_boundary_if_changed(time=boundary, pre_state=exact_root, post_state=current,
+                                              species_index=species_index, changed=changed),
+            termination,
+            skipped_instants=(
+                tuple(item for item in static if item not in executed_instants)
+                if stop is not None else ()
+            ),
+        )
+
+    def crossed_stop(before: np.ndarray, *, before_symbol_time: float | None = None) -> int | None:
+        for index in stops:
+            trigger = contract.triggers[index]
+            previous = _trigger_value(trigger, boundary, before, species_index=species_index,
+                                      observable_value=observable_value, symbol_time=before_symbol_time)
+            following = _trigger_value(trigger, boundary, current, species_index=species_index, observable_value=observable_value)
+            if _crossed(previous, following, trigger.threshold, trigger.direction):
+                return index
+        return None
+
+    eligible_stops = tuple(index for index in trigger_indices if index in stops)
+    if eligible_stops:
+        return finish(min(eligible_stops, key=lambda index: contract.triggers[index].declaration_ordinal))
+    if temperature_step and stops:
+        stop = crossed_stop(current, before_symbol_time=float(np.nextafter(boundary, -np.inf)))
+        if stop is not None:
+            return finish(stop)
+    executed_entering_holds: list[ExecutableHold] = []
+    stages = (
+        tuple(item for item in active_holds if item.start_time < boundary),
+        tuple(sorted((item for item in static if item.phase in {"ordinary", "before"}), key=_instant_canonical_order)),
+        active_holds,
+        tuple(sorted(trigger_instants, key=_instant_canonical_order)),
+        tuple(sorted((item for item in static if item.phase == "after"), key=_instant_canonical_order)),
+        active_holds,
     )
-    return _BoundaryApplicationResult(
-        continuation_state=continuation.reshape(-1),
-        projection=projection,
-        presentation_boundary=presentation_boundary,
-    )
+    trigger_by_declaration = {contract.triggers[index].declaration_ordinal: index for index in chemical_indices}
+    for stage in stages:
+        for action in stage:
+            _raise_if_cancelled(cancellation_check)
+            before = current.copy()
+            if isinstance(action, ExecutableInstant):
+                if stops:
+                    validate_boundary_conflicts(instants=(*executed_instants, action), entering_holds=executed_entering_holds, cancellation_check=cancellation_check)
+                current = _apply_instants(current, (action,), species_index=species_index, cancellation_check=cancellation_check)
+                executed_instants.append(action)
+                if action.declaration_ordinal in trigger_by_declaration:
+                    record(trigger_by_declaration[action.declaration_ordinal])
+            else:
+                if action in entering_holds and action not in executed_entering_holds:
+                    if stops:
+                        validate_boundary_conflicts(instants=executed_instants, entering_holds=(*executed_entering_holds, action), cancellation_check=cancellation_check)
+                    executed_entering_holds.append(action)
+                current = _apply_holds(current, (action,), species_index=species_index, cancellation_check=cancellation_check)
+            changed = changed or not np.array_equal(before, current)
+            if stops and not np.array_equal(before, current):
+                # Validate the executed prefix before admitting its terminal state.
+                invalid = (current < 0.0) & (~projectable_solver_negatives | (current < exact_root))
+                if np.any(invalid):
+                    raise InterventionScheduleError("Intervention boundary produced a scientifically invalid negative continuation state.")
+                stop = crossed_stop(before)
+                if stop is not None:
+                    return finish(stop)
+    return finish()
 
 
 def _instant_canonical_order(
@@ -1539,6 +1664,8 @@ def _next_eligible_time(
     counts: Sequence[int],
     last_times: Sequence[float | None],
 ) -> float | None:
+    if isinstance(trigger.then, InterventionStopAction):
+        return -math.inf
     if counts[index] >= trigger.max_count:
         return None
     last = last_times[index]
@@ -1560,6 +1687,9 @@ def _trigger_callables(
     segment_state: np.ndarray,
     trigger_counts: Sequence[int],
     trigger_last_times: Sequence[float | None],
+    observable_value: Callable[[str, float, np.ndarray, float], float] | None = None,
+    segment_end: float | None = None,
+    temperature_step_at_end: bool = False,
 ) -> tuple[tuple[Callable[[float, np.ndarray], float], ...], tuple[int, ...]]:
     callables: list[Callable[[float, np.ndarray], float]] = []
     mapping: list[int] = []
@@ -1572,9 +1702,8 @@ def _trigger_callables(
         )
         if ready is None or segment_start < ready:
             continue
-        species = species_index[trigger.watch_species]
         threshold = trigger.threshold
-        starts_at_threshold = float(segment_state[species]) == threshold
+        starts_at_threshold = _trigger_value(trigger, segment_start, segment_state, species_index=species_index, observable_value=observable_value) == threshold
         directions = (
             ("rising", "falling")
             if trigger.direction == "either"
@@ -1585,7 +1714,9 @@ def _trigger_callables(
             # At the immutable segment start, report the target side's sign so
             # the first departure can only be neutral or look like the
             # opposite direction, which SciPy ignores.  Every later evaluation
-            # is the pure threshold function, so analytic-Jacobian retry and a
+            # is the pure threshold function. A stopping target that remains
+            # exactly at its initial threshold stays neutral until departure.
+            # Thus analytic-Jacobian retry and a
             # fresh solve observe identical event semantics.  ``either`` uses
             # one rising and one falling event so genuine later crossings in
             # both directions remain observable.
@@ -1595,14 +1726,15 @@ def _trigger_callables(
                 time: float,
                 state: np.ndarray,
                 *,
-                _species: int = species,
+                _trigger: ExecutableTrigger = trigger,
                 _threshold: float = threshold,
                 _segment_start: float = float(segment_start),
                 _starts_at_threshold: bool = starts_at_threshold,
                 _neutral_value: float = neutral_value,
             ) -> float:
-                value = float(state[_species]) - _threshold
-                if _starts_at_threshold and float(time) == _segment_start:
+                symbol_time = float(np.nextafter(time, -np.inf)) if temperature_step_at_end and time == segment_end else time
+                value = _trigger_value(_trigger, time, state, species_index=species_index, observable_value=observable_value, symbol_time=symbol_time) - _threshold
+                if _starts_at_threshold and (float(time) == _segment_start or (isinstance(_trigger.then, InterventionStopAction) and value == 0.0)):
                     return _neutral_value
                 return value
 

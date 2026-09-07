@@ -59,6 +59,7 @@ __all__ = [
     "AlgebraObservableError",
     "evaluate_block",
     "evaluate_block_partial",
+    "PreparedAlgebraStopEvaluator",
 ]
 
 
@@ -441,6 +442,200 @@ class _Evaluator:
 
         # Should not reach here
         raise AlgebraError("internal evaluator error", code="E150", line=stmt.line, col=stmt.col, line_text=stmt.line_text)
+
+
+class _PointEvaluator(_Evaluator):
+    """Resolve retained dependencies while sharing the ordinary arithmetic."""
+
+    def __init__(self, prepared: PreparedAlgebraStopEvaluator, ctx: EvaluationContext):
+        super().__init__(prepared.block, ctx)
+        self.prepared = prepared
+
+    def quantity(self, name: str) -> float:
+        if name not in self.scalars:
+            stmt = self.prepared.statements[name]
+            try:
+                self.scalars[name] = _as_float(
+                    self._eval_expr(stmt.expr, 0, stmt=stmt), stmt=stmt
+                )
+            except AlgebraError as exc:
+                raise ValueError(f"Algebra quantity {name!r}: {exc}") from exc
+        return self.scalars[name]
+
+    def _eval_expr(self, node: ExprNode, i: int, *, stmt: LetStatement) -> float | bool:
+        if id(node) in self.prepared.static_values:
+            return self.prepared.static_values[id(node)]
+        if isinstance(node, IdentNode):
+            if node.name in self.prepared.statements:
+                return self.quantity(node.name)
+            if (
+                node.name in self.prepared.runtime_names
+                and node.name != "t"
+                and node.name not in self.symbol_series
+            ):
+                raise AlgebraNameError(
+                    f"missing runtime symbol {node.name!r}",
+                    line=stmt.line, col=stmt.col, line_text=stmt.line_text,
+                )
+        return super()._eval_expr(node, i, stmt=stmt)
+
+
+class PreparedAlgebraStopEvaluator:
+    """One run's selected retained LET targets and input-only subtree values.
+
+    Eligibility is deliberately separate from ordinary result evaluation. The
+    caller constructs this only for enabled stopping and supplies raw solver
+    state and the correct one-sided runtime symbols at each evaluation.
+    """
+
+    def __init__(
+        self,
+        block: AlgebraBlock,
+        *,
+        target_names: Tuple[str, ...],
+        species_names: Tuple[str, ...],
+        initials: Mapping[str, float],
+        symbol_values: Mapping[str, float],
+        runtime_symbol_names: Set[str],
+    ) -> None:
+        self.block = block
+        self.statements = {stmt.name: stmt for stmt in block.lines}
+        self.species_names = species_names
+        self.runtime_names = set(runtime_symbol_names) | {"t", "T"}
+        self.static_values: Dict[int, float | bool] = {}
+        self._dynamic: Dict[int, bool] = {}
+        self._admitted: Set[int] = set()
+        self._context = EvaluationContext(
+            t=np.array([0.0]),
+            species_series={},
+            initials=dict(initials),
+            species_names=set(species_names),
+            symtab=SymbolTable(),
+            symbol_values=dict(symbol_values),
+        )
+        static_evaluator = _PointEvaluator(self, self._context)
+        for name in target_names:
+            if name not in self.statements:
+                raise ValueError(f"stop target {name!r}: unknown authored Algebra quantity")
+            stmt = self.statements[name]
+            try:
+                self._admit(stmt.expr, stmt, static_evaluator)
+                if not self._is_dynamic(stmt.expr):
+                    static_evaluator.quantity(name)
+            except (AlgebraError, ValueError) as exc:
+                raise ValueError(f"stop target {name!r}: {exc}") from exc
+
+    def _is_dynamic(self, node: ExprNode) -> bool:
+        key = id(node)
+        if key not in self._dynamic:
+            if isinstance(node, SpeciesRefNode):
+                dynamic = node.kind == "now"
+            elif isinstance(node, IdentNode):
+                dynamic = (
+                    self._is_dynamic(self.statements[node.name].expr)
+                    if node.name in self.statements
+                    else node.name in self.runtime_names
+                )
+            elif isinstance(node, UnaryNode):
+                dynamic = self._is_dynamic(node.rhs)
+            elif isinstance(node, BinaryNode):
+                dynamic = self._is_dynamic(node.lhs) or self._is_dynamic(node.rhs)
+            elif isinstance(node, CallNode):
+                dynamic = any(self._is_dynamic(arg) for arg in node.args)
+            else:
+                dynamic = False
+            self._dynamic[key] = dynamic
+        return self._dynamic[key]
+
+    def _static_value(self, node: ExprNode, stmt: LetStatement, evaluator: _PointEvaluator) -> float | bool:
+        key = id(node)
+        if key not in self.static_values:
+            value = evaluator._eval_expr(node, 0, stmt=stmt)
+            self.static_values[key] = value if isinstance(value, bool) else _as_float(value, stmt=stmt)
+        return self.static_values[key]
+
+    def _safe_denominator(self, node: ExprNode, stmt: LetStatement, evaluator: _PointEvaluator) -> bool:
+        if not self._is_dynamic(node):
+            return _as_float(self._static_value(node, stmt, evaluator), stmt=stmt) != 0.0
+        if isinstance(node, IdentNode) and node.name in self.statements:
+            dependency = self.statements[node.name]
+            return self._safe_denominator(dependency.expr, dependency, evaluator)
+        if isinstance(node, CallNode) and node.name in {"min", "max"} and len(node.args) == 2:
+            bound = node.args[1]
+            if not self._is_dynamic(bound):
+                value = _as_float(self._static_value(bound, stmt, evaluator), stmt=stmt)
+                return value > 0.0 if node.name == "max" else value < 0.0
+        return False
+
+    def _admit(self, node: ExprNode, stmt: LetStatement, evaluator: _PointEvaluator) -> None:
+        if id(node) in self._admitted:
+            return
+        if not self._is_dynamic(node):
+            self._static_value(node, stmt, evaluator)
+            self._admitted.add(id(node))
+            return
+
+        def reject(reason: str) -> None:
+            raise AlgebraTypeError(
+                f"quantity {stmt.name!r} is unsupported as a stop target: {reason}",
+                line=stmt.line, col=stmt.col, line_text=stmt.line_text,
+            )
+
+        def admit_power(exponent: ExprNode) -> None:
+            if self._is_dynamic(exponent):
+                reject("the exponent must be an input-only nonnegative integer")
+            value = _as_float(self._static_value(exponent, stmt, evaluator), stmt=stmt)
+            if value < 0.0 or not value.is_integer():
+                reject("the exponent must be an input-only nonnegative integer")
+
+        if isinstance(node, IdentNode):
+            if node.name in self.statements:
+                dependency = self.statements[node.name]
+                self._admit(dependency.expr, dependency, evaluator)
+        elif isinstance(node, SpeciesRefNode):
+            pass
+        elif isinstance(node, UnaryNode):
+            if node.op not in {"+", "-"}:
+                reject(f"runtime operator {node.op!r}")
+            self._admit(node.rhs, stmt, evaluator)
+        elif isinstance(node, BinaryNode):
+            if node.op in {"^", "**"}:
+                admit_power(node.rhs)
+            elif node.op == "/":
+                if not self._safe_denominator(node.rhs, stmt, evaluator):
+                    reject("division needs a finite nonzero input-only denominator or a signed min/max guard")
+            elif node.op not in {"+", "-", "*"}:
+                reject(f"runtime operator {node.op!r}")
+            self._admit(node.lhs, stmt, evaluator)
+            self._admit(node.rhs, stmt, evaluator)
+        elif isinstance(node, CallNode):
+            if node.name == "pow" and len(node.args) == 2:
+                admit_power(node.args[1])
+            elif node.name not in {"abs", "min", "max", "clip", "exp", "expm1", "sin", "cos", "erf"}:
+                reject(f"runtime function {node.name!r}")
+            for arg in node.args:
+                self._admit(arg, stmt, evaluator)
+        else:
+            reject("runtime expression")
+        self._admitted.add(id(node))
+
+    def evaluate(
+        self, name: str, t: float, y: np.ndarray, runtime_symbols: Mapping[str, float]
+    ) -> float:
+        """Evaluate one selected quantity without changing caller-owned inputs."""
+        ctx = EvaluationContext(
+            t=np.array([t]),
+            species_series={species: np.array([y[index]]) for index, species in enumerate(self.species_names)},
+            initials=self._context.initials,
+            species_names=self._context.species_names,
+            symtab=self._context.symtab,
+            symbol_values=self._context.symbol_values,
+            symbol_series=runtime_symbols,
+        )
+        try:
+            return _PointEvaluator(self, ctx).quantity(name)
+        except (AlgebraError, ValueError) as exc:
+            raise ValueError(f"stop target {name!r}: {exc}") from exc
 
 
 # ----------------------------- public API ------------------------------------

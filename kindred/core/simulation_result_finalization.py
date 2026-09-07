@@ -5,24 +5,12 @@ from typing import Any, Mapping
 
 import numpy as np
 
-from kindred.core.equilibrium_rate_authority import effective_equilibrium_keq
-from kindred.core.mechanism_metadata import MechanismMetadataView
-from kindred.core.ode_builder import build_effective_rate_coefficient_evaluator
+from kindred.core.simulation_algebra_context import prepare_simulation_algebra_symbols
 from kindred.core.simulation_failure import FactualCause
 from kindred.core.result_repository import (
     SimulationResultValue,
 )
-from kindred.core.simulator.parameter_namespace import build_namespace_from_mechanism
 from kindred.core.simulator.solver_types import FinalSimulationOutput
-from kindred.core.simulator.step_indexing import get_step_index_map, iter_canonical_parameters
-from kindred.core.kinetics import (
-    ArrheniusRateModel,
-    EyringRateModel,
-    forward_rate_model_for_equilibrium,
-    forward_rate_model_for_reaction,
-)
-from kindred.core.mechanism_metadata import EquilibriumMetadataKeys
-from kindred.core.units import UnitsModel
 from kindred.core.temperature import (
     TemperatureScheduleProtocol,
 )
@@ -84,136 +72,6 @@ def _initials_for_algebra(
     }
 
 
-def _prepared_static_scalar_snapshot(
-    mechanism: object,
-    parameter_algebra_spec: object,
-) -> dict[str, float]:
-    """Read the complete static scalar map already bound during preparation."""
-
-    metadata = getattr(mechanism, "metadata", {}) or {}
-    if not isinstance(metadata, Mapping):
-        raise TypeError("prepared mechanism metadata must be a mapping.")
-    if parameter_algebra_spec is None:
-        raise TypeError(
-            "prepared scalar snapshot requires its retained parameter algebra spec."
-        )
-    assignment_names = getattr(
-        parameter_algebra_spec,
-        "param_assignment_names",
-        None,
-    )
-    if not callable(assignment_names):
-        raise TypeError(
-            "prepared parameter Algebra spec must expose assignment names."
-        )
-    mechanism_names = {
-        str(name)
-        for name in (
-            getattr(parameter_algebra_spec, "mechanism_param_names", ()) or ()
-        )
-    }
-    scalar_names = tuple(
-        sorted(
-            str(name)
-            for name in assignment_names()
-            if str(name) not in mechanism_names
-        )
-    )
-    raw_values = metadata.get("scalar_params")
-    scalar_values = raw_values if isinstance(raw_values, Mapping) else {}
-    raw_bindings = metadata.get("scalar_param_bindings")
-    scalar_bindings = raw_bindings if isinstance(raw_bindings, Mapping) else {}
-    values: dict[str, float] = {}
-    for name in scalar_names:
-        if name in scalar_bindings:
-            binding = scalar_bindings[name]
-            raw_value = binding() if callable(binding) else binding
-        elif name in scalar_values:
-            raw_value = scalar_values[name]
-        else:
-            raise ValueError(
-                f"prepared static scalar snapshot is missing {name!r}."
-            )
-        if type(raw_value) is bool:
-            raise TypeError(
-                f"prepared static scalar {name!r} must be numeric."
-            )
-        try:
-            value = float(raw_value)
-        except (TypeError, ValueError, OverflowError) as exc:
-            raise TypeError(
-                f"prepared static scalar {name!r} must be numeric."
-            ) from exc
-        if not np.isfinite(value):
-            raise ValueError(
-                f"prepared static scalar {name!r} must be finite."
-            )
-        values[name] = value
-    # Parser-admitted physical source coordinates are static Algebra symbols.
-    # Their values come from the typed model/thermodynamic authority; only
-    # calculated indexed readouts remain row-dependent below.
-    metadata_view = MechanismMetadataView.from_metadata(metadata)
-    energy_units = UnitsModel(energy_unit=metadata_view.energy_unit)
-    reactions = tuple(getattr(mechanism, "reactions", ()) or ())
-    equilibria = tuple(getattr(mechanism, "equilibria", ()) or ())
-    step_map = get_step_index_map(mechanism)
-    for coordinate in build_namespace_from_mechanism(mechanism).source_coordinates:
-        role = str(coordinate.role)
-        if role not in {
-            "A",
-            "Ea",
-            "dG_act",
-            "dG_eq",
-            "kappa",
-            "degeneracy",
-        }:
-            continue
-        source_index = coordinate.source_index
-        if source_index is None or not 0 <= int(source_index) < len(step_map):
-            continue
-        entry = step_map[int(source_index)]
-        kind = str(entry.get("kind") or "")
-        index_key = "reaction_index" if kind == "reaction" else "equilibrium_index"
-        try:
-            index = int(entry[index_key])
-        except (KeyError, TypeError, ValueError):
-            continue
-        model = None
-        if kind == "reaction" and 0 <= index < len(reactions):
-            model = forward_rate_model_for_reaction(
-                reactions[index],
-                default_standard_conc_M=float(metadata_view.standard_conc_M),
-            )
-        elif kind == "equilibrium" and 0 <= index < len(equilibria):
-            model = forward_rate_model_for_equilibrium(
-                equilibria[index],
-                temperature_K=None,
-                default_standard_conc_M=float(metadata_view.standard_conc_M),
-            )
-        value: float | None = None
-        if role == "A" and isinstance(model, ArrheniusRateModel):
-            value = float(model.A)
-        elif role == "Ea" and isinstance(model, ArrheniusRateModel):
-            value = float(energy_units.from_jmol(model.Ea_J_per_mol))
-        elif role == "dG_act" and isinstance(model, EyringRateModel):
-            value = float(energy_units.from_jmol(model.dG_act_J_per_mol))
-        elif role == "kappa" and isinstance(model, EyringRateModel):
-            value = float(model.kappa)
-        elif role == "degeneracy" and isinstance(model, EyringRateModel):
-            value = float(model.degeneracy)
-        elif role == "dG_eq" and kind == "equilibrium":
-            raw_dg = dict(getattr(equilibria[index], "metadata", {}) or {}).get(
-                EquilibriumMetadataKeys.DG_EQ_J_PER_MOL
-            )
-            try:
-                value = float(energy_units.from_jmol(float(raw_dg)))
-            except (TypeError, ValueError, OverflowError):
-                value = None
-        if value is not None and np.isfinite(value):
-            values[str(coordinate.canonical_name)] = float(value)
-    return values
-
-
 def build_simulation_row_algebra_context(
     mechanism: object,
     times: np.ndarray,
@@ -221,97 +79,16 @@ def build_simulation_row_algebra_context(
     parameter_algebra_spec: object,
     temperature_schedule: TemperatureScheduleProtocol | None,
 ) -> tuple[dict[str, np.ndarray], dict[str, float]]:
-    """Build the sole row-local temperature/coefficient/static context.
-
-    ``mechanism`` is the already prepared mechanism. Static ``param`` values
-    are read, never evaluated, at this boundary.
-    """
-
-    metadata = getattr(mechanism, "metadata", {}) or {}
-    if not isinstance(metadata, Mapping):
-        raise TypeError("prepared mechanism metadata must be a mapping.")
-    mechanism_metadata = MechanismMetadataView.from_metadata(metadata)
-    nominal_temperature = float(mechanism_metadata.temperature_K)
-    schedule = temperature_schedule
+    """Read row-local temperature, coefficients, and prepared static scalars."""
+    static, names, symbols = prepare_simulation_algebra_symbols(
+        mechanism, parameter_algebra_spec=parameter_algebra_spec,
+        temperature_schedule=temperature_schedule,
+    )
     row_times = np.asarray(times, dtype=float)
-    if row_times.ndim != 1 or row_times.size == 0:
-        raise ValueError("result row times must be a nonempty 1D array.")
-    if np.any(~np.isfinite(row_times)) or np.any(np.diff(row_times) <= 0.0):
+    if row_times.ndim != 1 or not row_times.size or np.any(~np.isfinite(row_times)) or np.any(np.diff(row_times) <= 0.0):
         raise ValueError("result row times must be finite and strictly increasing.")
-    temperatures = np.asarray(
-        [
-            float(schedule(float(time))) if schedule is not None else nominal_temperature
-            for time in row_times
-        ],
-        dtype=float,
-    )
-    if np.any(~np.isfinite(temperatures)) or np.any(temperatures <= 0.0):
-        raise ValueError(
-            "row temperature authority must be positive and finite."
-        )
-    coefficient_evaluator = build_effective_rate_coefficient_evaluator(mechanism)
-    reactions = list(getattr(mechanism, "reactions", ()) or ())
-    equilibria = list(getattr(mechanism, "equilibria", ()) or ())
-    namespace = build_namespace_from_mechanism(mechanism)
-    canonical_names = {
-        str(item.canonical_name) for item in namespace.ordered_items
-    }
-    coefficient_rows: dict[str, list[float]] = {}
-    canonical_parameters = tuple(iter_canonical_parameters(mechanism))
-    evaluation_temperatures = (
-        (nominal_temperature,)
-        if schedule is None
-        else temperatures
-    )
-    for temperature in evaluation_temperatures:
-        coefficients = coefficient_evaluator(float(temperature))
-        for name, entry, role in canonical_parameters:
-            kind = str(entry.get("kind") or "")
-            if kind == "reaction" and role == "k":
-                index = int(entry.get("reaction_index", -1))
-                value = coefficients.forward[index]
-            elif kind == "equilibrium":
-                index = int(entry.get("equilibrium_index", -1))
-                coefficient_index = len(reactions) + index
-                if role == "kf":
-                    value = coefficients.forward[coefficient_index]
-                elif role == "kr":
-                    value = coefficients.reverse[coefficient_index]
-                elif role == "Keq":
-                    value = effective_equilibrium_keq(
-                        equilibria[index], temperature_K=float(temperature)
-                    )
-                else:
-                    continue
-            else:
-                continue
-            if value is None:
-                raise ValueError(
-                    f"chemistry coefficient readout {name!r} is unavailable."
-                )
-            canonical_name = str(name)
-            if canonical_name not in canonical_names:
-                raise ValueError(
-                    f"chemistry coefficient {canonical_name!r} is outside the admitted namespace."
-                )
-            coefficient_rows.setdefault(canonical_name, []).append(float(value))
-    if schedule is None:
-        coefficient_rows = {
-            name: [values[0]] * temperatures.size
-            for name, values in coefficient_rows.items()
-        }
-    symbol_series = {"T": temperatures}
-    symbol_series.update(
-        {
-            name: np.asarray(values, dtype=float)
-            for name, values in coefficient_rows.items()
-            if len(values) == temperatures.size
-        }
-    )
-    return symbol_series, _prepared_static_scalar_snapshot(
-        mechanism,
-        parameter_algebra_spec,
-    )
+    rows = [symbols(float(time)) for time in row_times] if temperature_schedule is not None else [symbols(float(row_times[0]))] * len(row_times)
+    return {name: np.asarray([row[name] for row in rows], dtype=float) for name in names}, static
 
 
 def _algebra_cause(error: object) -> FactualCause:
@@ -473,4 +250,5 @@ def finalize_simulation_result(
         algebra_errors=finalized_algebra_errors,
         intervention_execution=getattr(result, "intervention_execution"),
         presentation_boundaries=result.presentation_boundaries,
+        termination=result.termination,
     )

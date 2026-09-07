@@ -9,7 +9,7 @@ from typing import Any, Iterable, Mapping
 import numpy as np
 
 from kindred.core.intervention_schedule_compiler import InterventionExecutionContract
-from kindred.core.simulator.solver_types import SimulationPresentationBoundary
+from kindred.core.simulator.solver_types import SimulationPresentationBoundary, SimulationTermination
 from kindred.core.simulation_failure import FactualCause
 from kindred.core.simulation_preparation import (
     SimulationExecutionRequest,
@@ -39,6 +39,7 @@ class SimulationResultValue:
     discontinuity_ids: np.ndarray
     intervention_execution: InterventionExecutionContract
     solver_provenance: Mapping[str, Any]
+    termination: SimulationTermination
     requested_algebra_outputs: tuple[str, ...] = ()
     succeeded_algebra_outputs: tuple[str, ...] = ()
     failed_algebra_outputs: tuple[str, ...] = ()

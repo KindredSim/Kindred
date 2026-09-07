@@ -19,25 +19,19 @@ from kindred.core.project_document import (
 from kindred.core.result_repository import ResultRepository, SimulationResultValue
 from kindred.core.runtime_defaults import MAX_PARALLEL_WORKERS_CEILING
 from kindred.core.simulation_preparation import (
-    PreparedSimulationRun,
     SimulationExecutionRequest,
-    SimulationPreparationError,
-    build_simulation_request_from_prepared_run,
     build_simulation_execution_request,
-    prepare_simulation_worker_run,
     simulation_execution_requests_equal,
 )
+from kindred.core.simulation_execution import execute_simulation
 from kindred.core.simulation_preparation_stages import build_solver_config
-from kindred.core.simulation_result_finalization import finalize_simulation_result
 from kindred.core.simulator.dsl_parse import PreparedDslRequestSet
-from kindred.core.simulator.solvers import solve_ode
 from kindred.core.simulator.solver_types import SimulationCancellationControl
 from kindred.gui.computation_gate import ComputationGate
 from kindred.gui.interactive_preview import (
     InteractivePreviewRequest,
     InteractivePreviewTarget,
 )
-from kindred.gui.parameter_enumeration import enumerate_parameter_coordinates
 from kindred.gui.workspace_tab_registry import ScientificDocumentDelta
 
 __all__ = [
@@ -170,84 +164,9 @@ def build_explicit_target(*, prepared_dsl: PreparedDslRequestSet, tab_id: str, s
         initial_values=initial_values,
         t_span=(execution_settings.t_start, execution_settings.t_end),
         solver_config=solver_config,
+        use_authored_stops=execution_settings.use_authored_stops,
     )
     return ExplicitRunTarget(tab_id, set_id, set_name, execution_request)
-
-
-def _captured_parameter_coordinates(request: SimulationExecutionRequest) -> tuple[tuple[str, float, str], ...]:
-    coordinates = enumerate_parameter_coordinates(request.prepared_dsl)
-    by_name = {coordinate.name: coordinate for coordinate in coordinates}
-    overrides = {str(name): float(value) for name, value in dict(request.parameter_overrides or {}).items()}
-    for name in overrides:
-        coordinate = by_name.get(name)
-        if coordinate is None:
-            raise ValueError(f"Preview parameter {name!r} is not a direct GUI coordinate.")
-        if not coordinate.writable or coordinate.derived:
-            raise ValueError(
-                f"Preview parameter {name!r} is owned by retained Algebra."
-            )
-    return tuple((coordinate.name, overrides.get(coordinate.name, float(coordinate.value)), coordinate.unit) for coordinate in coordinates)
-
-
-def _prepare_target(
-    target: ExplicitRunTarget | PreviewTarget | InteractivePreviewTarget,
-    *,
-    cancellation_control: SimulationCancellationControl,
-) -> tuple[PreparedSimulationRun, tuple[tuple[str, float, str], ...]]:
-    if cancellation_control.cancel_requested():
-        raise SimulationCancelled()
-    request = target.execution_request
-    parameters = _captured_parameter_coordinates(request)
-    prepared = prepare_simulation_worker_run(
-        execution_request=request,
-        cancellation_control=cancellation_control,
-    )
-    return prepared, parameters
-
-
-def _solve_prepared(prepared: PreparedSimulationRun, *, parameters: tuple[tuple[str, float, str], ...], cancellation_control: SimulationCancellationControl) -> SimulationResultValue:
-    if cancellation_control.cancel_requested():
-        raise SimulationCancelled()
-    intervention_execution = prepared.intervention_execution
-    if intervention_execution is None:
-        if (
-            prepared.unresolved_intervention_schedule is not None
-            and prepared.unresolved_intervention_schedule.is_parameterized
-        ):
-            message = (
-                "Prepared Run retained an unresolved parameterized "
-                "intervention schedule; no compiled execution contract is "
-                "available."
-            )
-        else:
-            message = (
-                "Prepared Run is missing its compiled intervention execution "
-                "contract."
-            )
-        raise SimulationPreparationError(
-            "intervention_schedule",
-            message,
-        )
-    solved = solve_ode(
-        build_simulation_request_from_prepared_run(
-            prepared,
-            y0=prepared.y0,
-            intervention_execution=intervention_execution,
-            symbolic_jacobian=prepared.symbolic_jacobian,
-            cancellation_control=cancellation_control,
-        )
-    )
-    if cancellation_control.cancel_requested():
-        raise SimulationCancelled()
-    result = finalize_simulation_result(
-        mechanism=prepared.mechanism, result=solved, species_names=list(prepared.species_names),
-        initials_for_algebra=prepared.initials_for_algebra, temperature_schedule=prepared.temperature_schedule,
-        parameter_algebra_spec=prepared.parameter_algebra_spec,
-        parameters=parameters,
-    )
-    if cancellation_control.cancel_requested():
-        raise SimulationCancelled()
-    return result
 
 
 class _DirectSimulationWorker(QtCore.QThread):
@@ -316,13 +235,9 @@ class _DirectSimulationWorker(QtCore.QThread):
         if self.cancelled:
             return _TargetTerminalOutcome(target, "cancelled", message="Simulation cancelled.")
         try:
-            prepared, parameters = _prepare_target(target, cancellation_control=self._control)
-        except SimulationCancelled:
-            return _TargetTerminalOutcome(target, "cancelled", message="Simulation cancelled.")
-        except BaseException as exc:  # noqa: BLE001
-            return _TargetTerminalOutcome(target, "failure", message=str(exc) or type(exc).__name__)
-        try:
-            result = _solve_prepared(prepared, parameters=parameters, cancellation_control=self._control)
+            result = execute_simulation(
+                target.execution_request, cancellation_control=self._control,
+            )
         except SimulationCancelled:
             return _TargetTerminalOutcome(target, "cancelled", message="Simulation cancelled.")
         except BaseException as exc:  # noqa: BLE001
@@ -1133,6 +1048,14 @@ class SimulationJobOwner(QtCore.QObject):
         if self._close_fenced:
             operation["outcomes"].append((target, "discarded"))
             return
+        termination = outcome.result.termination
+        cause = (
+            "authored stopping intervention"
+            if termination.cause == "stop" else "requested endpoint"
+        )
+        operation["details"].append(
+            f"{target.set_name}: completed at t={termination.actual_endpoint:g} s ({cause})"
+        )
         if interactive:
             self.interactive_result_ready.emit(
                 str(operation["tab_id"]),

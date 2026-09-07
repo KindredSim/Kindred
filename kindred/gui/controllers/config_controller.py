@@ -43,6 +43,7 @@ _RUN_SETTINGS_KEYS = {
     "t_start": "simulation/t_start",
     "t_end": "simulation/time",
     "integration_points": "simulation/points",
+    "use_authored_stops": "simulation/use_authored_stops",
 }
 _SCIENTIFIC_SETTINGS_KEYS = {
     "temperature": "simulation/temperature",
@@ -267,7 +268,7 @@ class ConfigController(QtCore.QObject):
             return default
 
     def application_run_defaults(self) -> SimulationExecutionSettings:
-        """Return the complete four-field default for a newly created tab."""
+        """Return the complete Run default for a newly created tab."""
         settings = self._settings()
         factory = default_simulation_execution_settings()
         try:
@@ -304,6 +305,10 @@ class ConfigController(QtCore.QObject):
                         int,
                     )
                 ),
+                use_authored_stops=bool(self._setting(
+                    settings, _RUN_SETTINGS_KEYS["use_authored_stops"],
+                    factory.use_authored_stops, bool,
+                )),
             )
             return validate_simulation_execution_settings(
                 candidate,
@@ -443,6 +448,17 @@ class ConfigController(QtCore.QObject):
             scientific_settings=self.application_scientific_defaults(),
             fit_defaults=self.application_fit_defaults(),
         )
+
+    def persist_run_defaults(
+        self, candidate: SimulationExecutionSettings,
+    ) -> SimulationExecutionSettings:
+        accepted = validate_simulation_execution_settings(candidate)
+        settings = self._settings()
+        snapshot = self._snapshot_settings(settings, tuple(_RUN_SETTINGS_KEYS.values()))
+        for field_name, key in _RUN_SETTINGS_KEYS.items():
+            settings.setValue(key, getattr(accepted, field_name))
+        self._sync_or_report(settings, "Run defaults", snapshot=snapshot)
+        return accepted
 
     def persist_scientific_defaults(
         self,

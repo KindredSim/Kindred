@@ -40,7 +40,7 @@ from kindred.core.simulation_preparation import (
     prepare_preparation_failure,
     raise_unowned_request_parameter_values,
     build_simulation_request_from_prepared_run,
-    prepare_simulation_worker_run,
+    prepare_simulation_run,
     SimulationPreparationError,
 )
 from kindred.core.simulator.parameter_coordinates import build_parameter_target_map
@@ -345,6 +345,8 @@ def prepare_fitting_execution_context(
     unresolved_intervention_schedule = coerce_intervention_schedule(
         prepared_dsl.parameterized_intervention_schedule_for_binding()
     )
+    if unresolved_intervention_schedule is not None:
+        unresolved_intervention_schedule = unresolved_intervention_schedule.without_stops()
     parameter_algebra_spec = prepared_dsl.parameter_algebra_spec_for_execution()
     species_names = tuple(mechanism.species_names())
     y0 = np.asarray([mechanism.species[sp].initial_conc for sp in species_names], dtype=float)
@@ -405,13 +407,14 @@ def prepare_fitting_execution_context(
         t_span=(float(t_start), float(t_end)),
         solver_config=prepared_solver_config,
         requested_parameter_names=tuple(mechanism_param_names),
+        use_authored_stops=False,
     )
     if (
         cancellation_control is not None
         and cancellation_control.cancel_requested()
     ):
         raise FittingCancelled()
-    prepared_run = prepare_simulation_worker_run(
+    prepared_run = prepare_simulation_run(
         execution_request=execution_request,
         cancellation_control=cancellation_control,
     )
@@ -535,7 +538,7 @@ class FittingEvaluator:
             # Every candidate, including the first, receives a fresh isolated
             # request and one canonical preparation.  A rejected candidate can
             # therefore never contaminate the next candidate.
-            prepared_run = prepare_simulation_worker_run(
+            prepared_run = prepare_simulation_run(
                 execution_request=replace(
                     prepared_request,
                     parameter_overrides=non_initial_parameters or None,

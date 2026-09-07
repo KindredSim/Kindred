@@ -627,6 +627,16 @@ class PreparedDslRequestSet:
     def parameterized_intervention_schedule_for_binding(self) -> InterventionSchedule | None:
         return self.__intervention_schedule
 
+    def authored_stop_declarations(self) -> tuple[str, ...]:
+        from kindred.core.intervention_schedule import InterventionStopAction
+        triggers = (
+            self.__intervention_schedule.triggers
+            if self.__intervention_schedule is not None
+            else self.__intervention_execution.triggers
+        )
+        return tuple(item.source_text for item in triggers
+                     if isinstance(item.then, InterventionStopAction) and item.source_text is not None)
+
     def intervention_execution_contract(self) -> InterventionExecutionContract | None:
         return self.__intervention_execution
 
@@ -2265,6 +2275,14 @@ def prepare_dsl_request_set(
     species_names = tuple(str(item) for item in mechanism.species_names())
     if intervention_schedule is not None:
         intervention_schedule.validate_species(species_names)
+        from kindred.core.intervention_schedule import ObservableTriggerCondition, InterventionScheduleError
+        observable_names = set(compiled_algebra_series.observable_names) if compiled_algebra_series is not None else set()
+        for trigger in intervention_schedule.triggers:
+            if isinstance(trigger.condition, ObservableTriggerCondition) and trigger.condition.name not in observable_names:
+                raise InterventionScheduleError(
+                    f"Unknown stopping observable: {trigger.condition.name}",
+                    operation="trigger", declaration_ordinal=trigger.declaration_ordinal, field="watch_observable",
+                )
     parameterized_intervention_schedule = (
         intervention_schedule
         if intervention_schedule is not None

@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from types import MappingProxyType
-from typing import Any, Callable, Iterable, Mapping, Optional, Protocol, Tuple
+from typing import Any, Callable, Iterable, Mapping, Optional, Protocol, Tuple, Literal
 
 import numpy as np
 
@@ -156,6 +156,13 @@ def _finite_state_pairs(
     return tuple(normalized)
 
 
+@dataclass(frozen=True, slots=True)
+class SimulationTermination:
+    actual_endpoint: float
+    cause: Literal["endpoint", "stop"]
+    stop_declaration_ordinal: int | None = None
+
+
 @dataclass(frozen=True)
 class SimulationRequest:
     rhs: ODERhs
@@ -175,6 +182,7 @@ class SimulationRequest:
     species_names: Optional[Tuple[str, ...]] = None
     cancellation_control: SimulationCancellationControl | None = None
     candidate_evaluation: bool = False
+    stop_observable_value: Callable[[str, float, np.ndarray, float], float] | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(
@@ -246,6 +254,7 @@ class FinalSimulationOutput:
     provenance: Mapping[str, object]
     intervention_execution: InterventionExecutionContract
     presentation_boundaries: tuple[SimulationPresentationBoundary, ...] = ()
+    termination: SimulationTermination
 
     def __post_init__(self) -> None:
         if not isinstance(self.intervention_execution, InterventionExecutionContract):

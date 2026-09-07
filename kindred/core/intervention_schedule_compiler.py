@@ -20,6 +20,9 @@ from kindred.core.intervention_schedule import (
     InterventionSet,
     InterventionTrigger,
     InterventionTriggerAction,
+    InterventionStopAction,
+    SpeciesTriggerCondition,
+    ObservableTriggerCondition,
     coerce_intervention_schedule,
     intervention_schedule_parameter_dependencies,
 )
@@ -236,12 +239,13 @@ class ExecutableHold:
 @dataclass(frozen=True, slots=True)
 class ExecutableTrigger:
     declaration_ordinal: int
-    watch_species: str
+    condition: SpeciesTriggerCondition | ObservableTriggerCondition
     threshold: float
     direction: str
-    max_count: int
-    min_interval: float
-    then: InterventionTriggerAction
+    max_count: int | None
+    min_interval: float | None
+    then: InterventionTriggerAction | InterventionStopAction
+    source_text: str | None = None
 
     @property
     def op(self) -> str:
@@ -251,11 +255,10 @@ class ExecutableTrigger:
         return {
             "op": "trigger",
             "declaration_ordinal": self.declaration_ordinal,
-            "watch_species": self.watch_species,
+            **self.condition.to_payload(),
             "threshold": self.threshold,
             "direction": self.direction,
-            "max_count": self.max_count,
-            "min_interval": self.min_interval,
+            **({"max_count": self.max_count, "min_interval": self.min_interval} if not isinstance(self.then, InterventionStopAction) else {}),
             "then": self.then.to_payload(),
         }
 
@@ -263,7 +266,7 @@ class ExecutableTrigger:
 @dataclass(frozen=True, slots=True)
 class TriggerFiring:
     declaration_ordinal: int
-    watch_species: str
+    condition: SpeciesTriggerCondition | ObservableTriggerCondition
     threshold: float
     direction: str
     root_time: float
@@ -299,7 +302,7 @@ class TriggerFiring:
     def to_payload(self) -> dict[str, Any]:
         return {
             "declaration_ordinal": self.declaration_ordinal,
-            "watch_species": self.watch_species,
+            **self.condition.to_payload(),
             "threshold": self.threshold,
             "direction": self.direction,
             "root_time": self.root_time,
@@ -320,6 +323,8 @@ class InterventionExecutionContract:
     segment_identity: tuple[tuple[float, float], ...] = ()
     protocol_lineage: tuple[Mapping[str, Any], ...] = ()
     trigger_firings: tuple[TriggerFiring, ...] = ()
+    # Scheduled instants left unexecuted at a stopping boundary.
+    skipped_instants: tuple[ExecutableInstant, ...] = ()
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -346,6 +351,18 @@ class InterventionExecutionContract:
         return not (
             self.instants or self.fluxes or self.holds or self.triggers
         )
+
+    def without_stops(self) -> InterventionExecutionContract:
+        retained = tuple(item for item in self.triggers if not isinstance(item.then, InterventionStopAction))
+        if len(retained) == len(self.triggers):
+            return self
+        ordinals = {item.declaration_ordinal for item in retained}
+        payload = {"operations": tuple(
+            item for item in self.declarative_payload.get("operations", ())
+            if item["op"] != "trigger" or item["declaration_ordinal"] in ordinals
+        )}
+        return replace(self, triggers=retained, declarative_payload=payload,
+                       trigger_firings=tuple(item for item in self.trigger_firings if item.declaration_ordinal in ordinals))
 
     def with_trigger_firings(
         self, firings: Sequence[TriggerFiring]
@@ -383,6 +400,9 @@ class InterventionExecutionContract:
             "trigger_firings": [
                 firing.to_payload() for firing in self.trigger_firings
             ],
+            "skipped_instants": [
+                instant.to_payload() for instant in self.skipped_instants
+            ],
         }
 
     def annotation_projection(
@@ -412,6 +432,8 @@ class InterventionExecutionContract:
             span = (start, end)
         annotations: list[Mapping[str, object]] = []
         for instant in self.instants:
+            if instant in self.skipped_instants:
+                continue
             if span is not None and not (
                 span[0] <= instant.time <= span[1]
             ):
@@ -467,7 +489,7 @@ class InterventionExecutionContract:
                         "time": firing.root_time,
                         "kind": "trigger",
                         "label": (
-                            f"trigger {firing.watch_species}: "
+                            f"trigger {firing.condition.name}: "
                             f"{nested_action_payload.get('op', '')} "
                             f"{nested_action_payload.get('species', '')}"
                         ).strip(),
@@ -865,7 +887,8 @@ def compile_intervention_schedule(
             triggers.append(
                 ExecutableTrigger(
                     declaration_ordinal=operation.declaration_ordinal,
-                    watch_species=operation.watch_species,
+                    condition=operation.condition,
+                    source_text=operation.source_text,
                     threshold=float(operation.threshold),
                     direction=operation.direction,
                     max_count=operation.max_count,
