@@ -336,6 +336,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self._connect_application_graph()
         self._load_settings()
         self._refresh_workspace_document()
+        from kindred.gui.tutorials import create_controller
+
+        self._tutorials = create_controller(
+            self, workspace=self._workspace, registry=self._workspace_tab_registry,
+            surfaces=self._tab_surfaces, examples_menu=self._examples_menu,
+            project_controller=self.project_controller, jobs=self._simulation_jobs,
+        )
         logger.info("Kindred MainWindow initialized with the direct owner graph")
 
     # ------------------------------------------------------------------
@@ -4289,6 +4296,10 @@ class MainWindow(QtWidgets.QMainWindow):
         )
 
         help_menu = bar.addMenu("&Help")
+        self._add_action(
+            help_menu, "Interactive Tutorials…", lambda: self._tutorials.open(),
+            None, "tutorialsAction",
+        )
         self._add_action(
             help_menu,
             "Documentation",
