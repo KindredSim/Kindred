@@ -10,22 +10,16 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtCore import Qt
 
 from kindred.core.datasets.foundation import ImportedSource
-from kindred.core.datasets.source_rules import (
-    PhysicalColumn,
-)
 from kindred.core.datasets.csv_import import read_csv_rows_from_bytes
 from kindred.core.datasets.excel_import import (
     ExcelWorkbookPair,
 )
 from kindred.gui.import_workflow import (
     ImportConfig,
-    SheetImportIntent,
-    UnitDetection,
-    UserImportIntent,
+    ImportSettings,
     capture_import_source,
-    detect_units_from_physical_row,
-    rebuild_intent_for_target,
-    resolve_import_plans,
+    classify_unit_row,
+    resolve_sheet_plan,
 )
 from kindred.gui.widgets.import_config_dialog import ImportConfigDialog, ImportDialogResult
 from kindred.gui.dataset_payload_snapshot import (
@@ -535,19 +529,18 @@ class DataManagerPanel(QtWidgets.QWidget):
                 index += 1
                 continue
             configs.append(result.config)
-            if result.config.file_intent.apply_to_remaining:
-                source_intent = result.config.remaining_file_template
-                if source_intent is None:
-                    raise RuntimeError(
-                        "apply_to_remaining is True but remaining_file_template is None"
-                    )
-                source_sheet_names = result.config.file_intent.sheet_names
+            source_settings = result.config.remaining_file_template
+            if source_settings is not None:
+                source_sheet_names = tuple(
+                    plan.sheet_name for plan in result.config.plans
+                    if plan.sheet_name is not None
+                )
                 for remaining_idx in range(index + 1, len(sources)):
                     remaining_source = sources[remaining_idx]
                     try:
                         remaining_config = self._build_remaining_file_config(
                             remaining_source,
-                            source_intent,
+                            source_settings,
                             source_sheet_names=source_sheet_names,
                         )
                     except (ValueError, OSError) as exc:
@@ -598,28 +591,14 @@ class DataManagerPanel(QtWidgets.QWidget):
     def _build_remaining_file_config(
         self,
         source: ImportedSource,
-        source_intent: SheetImportIntent,
+        source_settings: ImportSettings,
         *,
         source_sheet_names: Tuple[str, ...] = (),
     ) -> ImportConfig:
-        """Build an ImportConfig for a remaining file using the source intent.
-
-        Raises ValueError if the source intent is incompatible with the file.
-        """
-        file_type = source.original_format
-
-        per_sheet_intents: Dict[Optional[str], SheetImportIntent] = {}
-        per_sheet_detections: Dict[Optional[str], UnitDetection] = {}
-        per_sheet_columns: Dict[Optional[str], List[PhysicalColumn]] = {}
-        target_sheet_names: Tuple[str, ...] = ()
-
-        # Scope detection to source-selected columns only
-        selected_keys = set(source_intent.species_columns)
-        if source_intent.time_column:
-            selected_keys.add(source_intent.time_column)
-
-        if file_type == "csv":
-            columns_tuple, rows = read_csv_rows_from_bytes(
+        """Resolve shared choices against each remaining source's first row."""
+        plans = []
+        if source.original_format == "csv":
+            columns, rows = read_csv_rows_from_bytes(
                 source.exact_source_bytes,
                 source_label=source.original_filename,
             )
@@ -627,18 +606,8 @@ class DataManagerPanel(QtWidgets.QWidget):
                 first_row = next(iter(rows), None)
             finally:
                 rows.close()
-            columns = list(columns_tuple)
-            if first_row is not None:
-                det = detect_units_from_physical_row(
-                    first_row.values, list(selected_keys)
-                )
-            else:
-                det = UnitDetection.empty()
-            per_sheet_intents[None] = rebuild_intent_for_target(
-                source_intent, det,
-            )
-            per_sheet_detections[None] = det
-            per_sheet_columns[None] = columns
+            unit_row = classify_unit_row(first_row.values) if first_row else None
+            plans.append(resolve_sheet_plan(None, columns, unit_row, source_settings))
         else:
             with ExcelWorkbookPair(
                 source.exact_source_bytes,
@@ -647,10 +616,8 @@ class DataManagerPanel(QtWidgets.QWidget):
                 sheets = workbooks.sheet_names
                 if not sheets:
                     raise ValueError("Excel file has no sheets")
-                # Filter sheets by source's checked set
                 if source_sheet_names:
-                    source_set = set(source_sheet_names)
-                    sheets = [s for s in sheets if s in source_set]
+                    sheets = [name for name in sheets if name in source_sheet_names]
                     if not sheets:
                         raise ValueError("No matching sheets found")
                 for sheet_name in sheets:
@@ -659,33 +626,12 @@ class DataManagerPanel(QtWidgets.QWidget):
                         first_row = next(iter(rows), None)
                     finally:
                         rows.close()
-                    if first_row is None:
-                        per_sheet_columns[sheet_name] = []
-                        per_sheet_detections[sheet_name] = UnitDetection.empty()
-                    else:
-                        per_sheet_columns[sheet_name] = list(first_row.keys())
-                        per_sheet_detections[sheet_name] = detect_units_from_physical_row(
-                            dict(first_row), list(selected_keys)
-                        )
-                    per_sheet_intents[sheet_name] = rebuild_intent_for_target(
-                        source_intent, per_sheet_detections[sheet_name],
-                    )
-                target_sheet_names = tuple(sheets)
-
-        plans = resolve_import_plans(
-            source,
-            per_sheet_intents, per_sheet_detections, per_sheet_columns,
-        )
-
-        file_intent = UserImportIntent(
-            sheet_names=target_sheet_names,
-            apply_to_remaining=False,
-        )
-        return ImportConfig(
-            source=source,
-            file_intent=file_intent,
-            plans=tuple(plans),
-        )
+                    columns = tuple(first_row) if first_row is not None else ()
+                    unit_row = classify_unit_row(first_row) if first_row else None
+                    plans.append(resolve_sheet_plan(
+                        sheet_name, columns, unit_row, source_settings,
+                    ))
+        return ImportConfig(source=source, plans=tuple(plans))
 
     def set_import_busy(self, busy: bool) -> None:
         """Project application-global import custody onto every import entry."""
