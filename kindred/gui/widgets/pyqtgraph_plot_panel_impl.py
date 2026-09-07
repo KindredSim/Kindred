@@ -247,6 +247,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
             labelTextColor=plot_foreground_color(self._plot_widget.backgroundBrush().color().lightness() < 128),
         )
         self._plot_widget.getPlotItem().setMenuEnabled(False)
+        self._plot_widget.getPlotItem().hideButtons()
         self._plot_widget.setContextMenuPolicy(
             QtCore.Qt.ContextMenuPolicy.CustomContextMenu
         )

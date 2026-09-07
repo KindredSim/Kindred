@@ -470,12 +470,8 @@ class MainWindow(QtWidgets.QMainWindow):
             species_sliders=editor.species_sliders_widget(),
             slider_workspace_owner=editor,
             simulation_jobs=self._simulation_jobs,
-            parameter_preview_debounce_ms=(
-                self.config_controller.mechanism_parameter_debounce_ms()
-            ),
-            equilibrium_preview_debounce_ms=(
-                self.config_controller.equilibrium_k_debounce_ms()
-            ),
+            preview_points=self.config_controller.preview_points(),
+            preview_delay_ms=self.config_controller.preview_delay_ms(),
             parent=editor_panel,
         )
         bundle = _TabSurfaceBundle(
@@ -826,11 +822,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.config_controller.applicationPlotPreferencesChanged.connect(
             self._refresh_application_plot_preferences
         )
-        self.config_controller.mechanismParameterDebounceChanged.connect(
-            lambda _value: self._apply_slider_debounce_settings()
-        )
-        self.config_controller.equilibriumKDebounceChanged.connect(
-            lambda _value: self._apply_slider_debounce_settings()
+        self.config_controller.previewSettingsChanged.connect(
+            self._apply_slider_preview_settings
         )
         self.config_controller.resultCacheCapacityChanged.connect(
             self._resize_result_repositories
@@ -4426,12 +4419,12 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         tab_id = self._workspace_tab_registry.active_tab_id
         tab = self._workspace_tab_registry.tab(tab_id)
-        dialog = SimulationSettingsDialog(self)
-        dialog.set_scientific_settings(tab.scientific_settings)
-        dialog.set_preview_debounce(
-            self.config_controller.mechanism_parameter_debounce_ms(),
-            self.config_controller.equilibrium_k_debounce_ms(),
+        dialog = SimulationSettingsDialog(
+            self,
+            preview_points=self.config_controller.preview_points(),
+            preview_delay_ms=self.config_controller.preview_delay_ms(),
         )
+        dialog.set_scientific_settings(tab.scientific_settings)
         current_max = self.config_controller.run_user_maximum_preference()
         dialog.set_run_user_maximum(current_max)
         dialog.set_result_cache_capacity(
@@ -4442,7 +4435,7 @@ class MainWindow(QtWidgets.QMainWindow):
         changed = False
         try:
             settings = dialog.scientific_settings()
-            parameter_debounce, equilibrium_debounce = dialog.preview_debounce()
+            preview_points, preview_delay = dialog.preview_settings()
             run_maximum = dialog.run_user_maximum()
             cache_capacity = dialog.result_cache_capacity()
             persist_scientific_defaults = (
@@ -4474,12 +4467,8 @@ class MainWindow(QtWidgets.QMainWindow):
                     tab_id,
                     scientific_fields=changed_fields,
                 )
-            self.config_controller.set_mechanism_parameter_debounce_ms(
-                parameter_debounce
-            )
-            self.config_controller.set_equilibrium_k_debounce_ms(
-                equilibrium_debounce
-            )
+            self.config_controller.set_preview_points(preview_points)
+            self.config_controller.set_preview_delay_ms(preview_delay)
             self.config_controller.set_run_user_maximum(run_maximum)
             self.config_controller.set_result_cache_capacity(cache_capacity)
         except (TypeError, ValueError, KeyError, OverflowError) as exc:
@@ -5305,15 +5294,11 @@ class MainWindow(QtWidgets.QMainWindow):
                 and export_ready
             )
 
-    def _apply_slider_debounce_settings(self) -> None:
+    def _apply_slider_preview_settings(self) -> None:
         for bundle in self._tab_surfaces.values():
-            bundle.slider_binding.set_preview_debounce_intervals(
-                parameter_ms=(
-                    self.config_controller.mechanism_parameter_debounce_ms()
-                ),
-                equilibrium_K_ms=(
-                    self.config_controller.equilibrium_k_debounce_ms()
-                ),
+            bundle.slider_binding.set_preview_settings(
+                points=self.config_controller.preview_points(),
+                delay_ms=self.config_controller.preview_delay_ms(),
             )
 
     @QtCore.Slot(int)

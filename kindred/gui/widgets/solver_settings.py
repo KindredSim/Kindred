@@ -147,6 +147,9 @@ class SimulationSettingsDialog(QtWidgets.QDialog):
     def __init__(
         self,
         parent: QtWidgets.QWidget | None = None,
+        *,
+        preview_points: int,
+        preview_delay_ms: int,
     ) -> None:
         super().__init__(parent)
         self.setObjectName("simulationSettingsDialog")
@@ -166,6 +169,18 @@ class SimulationSettingsDialog(QtWidgets.QDialog):
         self.atol_edit = QtWidgets.QLineEdit("1e-12", science_box)
         setup_scientific_validator(self.rtol_edit)
         setup_scientific_validator(self.atol_edit)
+        self.temperature_spin.setToolTip(
+            "Temperature for this tab's simulations. Used by temperature-dependent "
+            "rate laws and thermodynamic calculations."
+        )
+        self.rtol_edit.setToolTip(
+            "Controls solver error relative to each concentration's magnitude. "
+            "Smaller values request greater accuracy and may increase computation time."
+        )
+        self.atol_edit.setToolTip(
+            "Controls solver error when concentrations are near zero. Smaller values "
+            "resolve smaller concentrations and may increase computation time."
+        )
         self.analytic_jacobian_check = QtWidgets.QCheckBox(
             "Prefer analytic Jacobian when supported",
             science_box,
@@ -183,6 +198,10 @@ class SimulationSettingsDialog(QtWidgets.QDialog):
             science_box,
         )
         self.scientific_defaults_check.setChecked(False)
+        self.scientific_defaults_check.setToolTip(
+            "Save this temperature, both tolerances, and the Jacobian preference as "
+            "defaults for new projects and tabs. Existing tabs keep their settings."
+        )
         science_form.addRow("Temperature (K)", self.temperature_spin)
         science_form.addRow("Relative tolerance", self.rtol_edit)
         science_form.addRow("Absolute tolerance", self.atol_edit)
@@ -192,26 +211,21 @@ class SimulationSettingsDialog(QtWidgets.QDialog):
 
         preview_box = QtWidgets.QGroupBox("Preview", self)
         preview_form = QtWidgets.QFormLayout(preview_box)
-        self.parameter_debounce_spin = self._integer_spin(
-            0,
-            1000,
-            80,
-            preview_box,
+        self.preview_points_spin = self._integer_spin(
+            *SIMULATION_POINT_RANGE, preview_points, preview_box,
         )
-        self.equilibrium_debounce_spin = self._integer_spin(
-            0,
-            1000,
-            150,
-            preview_box,
+        self.preview_delay_spin = self._integer_spin(
+            0, 1000, preview_delay_ms, preview_box,
         )
-        preview_form.addRow(
-            "Parameter debounce (ms)",
-            self.parameter_debounce_spin,
+        self.preview_points_spin.setToolTip(
+            "Output points for all slider previews, including release and typed changes."
         )
-        preview_form.addRow(
-            "Equilibrium debounce (ms)",
-            self.equilibrium_debounce_spin,
+        self.preview_delay_spin.setToolTip(
+            "Delay before requesting a preview while dragging any slider. "
+            "Release, clicks, and typed changes request a preview immediately."
         )
+        preview_form.addRow("Preview points", self.preview_points_spin)
+        preview_form.addRow("Preview delay (ms)", self.preview_delay_spin)
         layout.addWidget(preview_box)
 
         parallel_box = QtWidgets.QGroupBox("Parallel execution", self)
@@ -225,6 +239,15 @@ class SimulationSettingsDialog(QtWidgets.QDialog):
             MAX_PARALLEL_WORKERS_CEILING,
             1,
             parallel_box,
+        )
+        self.run_maximum_automatic_check.setToolTip(
+            "Choose parallel execution capacity from the available logical CPUs, "
+            "reserving one when possible and using at most 16 simultaneous simulations."
+        )
+        self.run_maximum_spin.setToolTip(
+            "Maximum number of initial-condition sets simulated simultaneously. "
+            "Execution also respects available CPU capacity and the number of sets. "
+            "Set to 1 for sequential execution."
         )
         self.run_maximum_automatic_check.toggled.connect(
             self.run_maximum_spin.setDisabled
@@ -241,16 +264,35 @@ class SimulationSettingsDialog(QtWidgets.QDialog):
             32,
             cache_box,
         )
+        self.cache_capacity_spin.setToolTip(
+            "Number of past simulation results kept in memory per mechanism tab. "
+            "Matching results can be restored when enabled for plotting. Larger "
+            "values use more memory; the least recently used entries are removed "
+            "when the cache is full."
+        )
         cache_form.addRow(
             "Explicit-result cache capacity",
             self.cache_capacity_spin,
         )
         layout.addWidget(cache_box)
 
+        for form in (science_form, preview_form, parallel_form, cache_form):
+            for row in range(form.rowCount()):
+                field = form.itemAt(row, QtWidgets.QFormLayout.ItemRole.FieldRole).widget()
+                label = form.labelForField(field)
+                if label is not None:
+                    label.setToolTip(field.toolTip())
+
         buttons = QtWidgets.QDialogButtonBox(
             QtWidgets.QDialogButtonBox.StandardButton.Ok
             | QtWidgets.QDialogButtonBox.StandardButton.Cancel,
             parent=self,
+        )
+        buttons.button(QtWidgets.QDialogButtonBox.StandardButton.Ok).setToolTip(
+            "Apply these settings and close."
+        )
+        buttons.button(QtWidgets.QDialogButtonBox.StandardButton.Cancel).setToolTip(
+            "Close without applying changes."
         )
         buttons.accepted.connect(self._accept_candidate)
         buttons.rejected.connect(self.reject)
@@ -309,15 +351,8 @@ class SimulationSettingsDialog(QtWidgets.QDialog):
 
         return bool(self.scientific_defaults_check.isChecked())
 
-    def set_preview_debounce(self, parameter: int, equilibrium: int) -> None:
-        self.parameter_debounce_spin.setValue(int(parameter))
-        self.equilibrium_debounce_spin.setValue(int(equilibrium))
-
-    def preview_debounce(self) -> tuple[int, int]:
-        return (
-            int(self.parameter_debounce_spin.value()),
-            int(self.equilibrium_debounce_spin.value()),
-        )
+    def preview_settings(self) -> tuple[int, int]:
+        return self.preview_points_spin.value(), self.preview_delay_spin.value()
 
     def set_run_user_maximum(self, value: int | None) -> None:
         self.run_maximum_spin.setRange(1, MAX_PARALLEL_WORKERS_CEILING)
@@ -348,7 +383,7 @@ class SimulationSettingsDialog(QtWidgets.QDialog):
     def _accept_candidate(self) -> None:
         try:
             self.scientific_settings()
-            self.preview_debounce()
+            self.preview_settings()
             self.run_user_maximum()
             self.result_cache_capacity()
         except (TypeError, ValueError, OverflowError) as exc:

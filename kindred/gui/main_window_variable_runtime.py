@@ -35,7 +35,6 @@ from kindred.gui.controllers.simulation_job_owner import (
 )
 from kindred.gui.interactive_preview import (
     InteractivePreviewRequest,
-    InteractivePreviewSampling,
     InteractivePreviewTarget,
     SliderInteractionKind,
 )
@@ -88,7 +87,6 @@ class _PendingGesture:
     kind: str
     name: str
     value: float
-    debounce_kind: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -157,8 +155,8 @@ class TabSliderBinding(QtCore.QObject):
         species_sliders,
         slider_workspace_owner: MechanismEditorTabbed,
         simulation_jobs,
-        parameter_preview_debounce_ms: int = 80,
-        equilibrium_preview_debounce_ms: int = 150,
+        preview_points: int,
+        preview_delay_ms: int,
         parent: QtCore.QObject | None = None,
     ) -> None:
         super().__init__(parent)
@@ -188,9 +186,7 @@ class TabSliderBinding(QtCore.QObject):
         self._interactive_stop_fenced = False
         self._defer_rejected_slider_restore = False
         self._deferred_restore_pending = False
-        self._parameter_preview_debounce_ms = int(parameter_preview_debounce_ms)
-        self._equilibrium_preview_debounce_ms = int(equilibrium_preview_debounce_ms)
-        self._species_preview_debounce_ms = 80
+        self.set_preview_settings(points=preview_points, delay_ms=preview_delay_ms)
         self._throttle_timer = QtCore.QTimer(self)
         self._throttle_timer.setSingleShot(True)
         self._throttle_timer.timeout.connect(self._on_throttle_timeout)
@@ -237,16 +233,9 @@ class TabSliderBinding(QtCore.QObject):
             if not self._disposed:
                 self.render(preserve_visibility=True)
 
-    def set_preview_debounce_intervals(
-        self, *, parameter_ms: int, equilibrium_K_ms: int
-    ) -> None:
-        parameter, equilibrium = int(parameter_ms), int(equilibrium_K_ms)
-        if not 0 <= parameter <= 1000 or not 0 <= equilibrium <= 1000:
-            raise ValueError("Slider debounce must be between 0 and 1000 ms.")
-        self._parameter_preview_debounce_ms, self._equilibrium_preview_debounce_ms = (
-            parameter,
-            equilibrium,
-        )
+    def set_preview_settings(self, *, points: int, delay_ms: int) -> None:
+        self._preview_points = points
+        self._preview_delay_ms = delay_ms
 
     @QtCore.Slot(str, float, object)
     def _on_parameter_interaction(
@@ -297,22 +286,6 @@ class TabSliderBinding(QtCore.QObject):
         )
         self._clear_gesture_state()
 
-    def _gesture_debounce_kind(self, kind: str, name: str) -> str:
-        if kind == "species":
-            return "species"
-        projection = self._projection
-        if projection is None:
-            tab = self._registry.tab(self._tab_id)
-            if isinstance(tab.prepared_dsl, PreparedDslRequestSet):
-                try:
-                    projection = build_parameter_slider_projection(tab.prepared_dsl)
-                except (TypeError, ValueError):
-                    projection = None
-        role = (
-            projection.metadata_dict().get(str(name), {}) if projection else {}
-        ).get("role")
-        return "equilibrium" if role == "Keq" else "parameter"
-
     def _record_raw_gesture(self, kind: str, name: str, value: float) -> None:
         if not math.isfinite(value) or (kind == "species" and value < 0):
             return
@@ -329,17 +302,11 @@ class TabSliderBinding(QtCore.QObject):
             str(kind),
             str(name),
             float(value),
-            self._gesture_debounce_kind(str(kind), str(name)),
         )
         if pending == self._latest_admissible_pending:
             return
         self._latest_admissible_pending = pending
-        interval = {
-            "parameter": self._parameter_preview_debounce_ms,
-            "equilibrium": self._equilibrium_preview_debounce_ms,
-            "species": self._species_preview_debounce_ms,
-        }[pending.debounce_kind]
-        self._throttle_timer.setInterval(interval)
+        self._throttle_timer.setInterval(self._preview_delay_ms)
         if not self._throttle_timer.isActive():
             self._throttle_timer.start()
 
@@ -740,20 +707,11 @@ class TabSliderBinding(QtCore.QObject):
         self,
         tab: MechanismTabDocument,
         targets: tuple[str, ...],
-        *,
-        sampling: InteractivePreviewSampling | None = None,
     ) -> tuple[tuple[str, str, SimulationExecutionRequest], ...]:
         runtime = self._registry.tab_runtime(tab.tab_id)
         output = []
         for set_id in targets:
             settings = tab.resolved_execution_settings(set_id)
-            if sampling is not None:
-                settings = replace(
-                    settings,
-                    integration_points=sampling.lightweight_integration_points(
-                        settings.integration_points
-                    ),
-                )
             initials = dict(canonical_initial_values(tab, set_id))
             initials.update(runtime.slider_species_drafts_by_set_id.get(set_id, {}))
             request = build_simulation_execution_request(
@@ -765,7 +723,7 @@ class TabSliderBinding(QtCore.QObject):
                     solver_input=settings.solver,
                     rtol=tab.scientific_settings.rtol,
                     atol=tab.scientific_settings.atol,
-                    grid={"N": settings.integration_points},
+                    grid={"N": self._preview_points},
                     use_analytic_jacobian=(
                         tab.scientific_settings.analytic_jacobian_policy
                     ),
@@ -854,14 +812,12 @@ class TabSliderBinding(QtCore.QObject):
         self,
         targets: Iterable[str],
         *,
-        sampling: InteractivePreviewSampling | None = None,
         tab: MechanismTabDocument | None = None,
     ) -> InteractivePreviewRequest | None:
         base = self._registry.tab(self._tab_id) if tab is None else tab
-        sampling = sampling or InteractivePreviewSampling()
         try:
             built = self._construct_preview_requests(
-                base, tuple(str(item) for item in targets), sampling=sampling
+                base, tuple(str(item) for item in targets)
             )
             return InteractivePreviewRequest(
                 base.tab_id,
@@ -869,7 +825,6 @@ class TabSliderBinding(QtCore.QObject):
                     InteractivePreviewTarget(set_id, set_name, request)
                     for set_id, set_name, request in built
                 ),
-                sampling,
             )
         except (TypeError, ValueError, KeyError) as exc:
             self.errorRaised.emit(f"Interactive Preview construction failed: {exc}")

@@ -13,6 +13,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from kindred.core.runtime_defaults import MAX_PARALLEL_WORKERS_CEILING
 from kindred.core.project_document import (
     FitDefaults,
+    SIMULATION_POINT_RANGE,
     ProjectDocument,
     SimulationExecutionSettings,
     TabScientificSettings,
@@ -59,12 +60,12 @@ _FIT_SETTINGS_KEYS = {
 }
 _RUN_USER_MAXIMUM_KEY = "simulation/run_user_maximum"
 _RESULT_CACHE_CAPACITY_KEY = "results/cache_capacity"
-_MECHANISM_PARAMETER_DEBOUNCE_KEY = "sliders/mechanism_parameter_debounce_ms"
-_EQUILIBRIUM_K_DEBOUNCE_KEY = "sliders/equilibrium_k_debounce_ms"
+_PREVIEW_POINTS_KEY = "sliders/preview_points"
+_PREVIEW_DELAY_KEY = "sliders/preview_delay_ms"
 _DEFAULT_RESULT_CACHE_CAPACITY = 32
 _QT_POSITIVE_INT_MAX = (1 << 31) - 1
-_DEFAULT_MECHANISM_PARAMETER_DEBOUNCE_MS = 80
-_DEFAULT_EQUILIBRIUM_K_DEBOUNCE_MS = 150
+_DEFAULT_PREVIEW_POINTS = 50
+_DEFAULT_PREVIEW_DELAY_MS = 150
 
 _SPECIES_COLORS_KEY = "plot/species_colors"
 _EXPERIMENTAL_POINT_SHAPE_KEY = "plot/experimental_point_shape"
@@ -101,8 +102,7 @@ class ConfigController(QtCore.QObject):
     applicationPlotPreferencesChanged = QtCore.Signal()
     recentProjectsChanged = QtCore.Signal()
     resultCacheCapacityChanged = QtCore.Signal(int)
-    mechanismParameterDebounceChanged = QtCore.Signal(int)
-    equilibriumKDebounceChanged = QtCore.Signal(int)
+    previewSettingsChanged = QtCore.Signal()
 
     def __init__(self, settings: QtCore.QSettings):
         super().__init__()
@@ -205,68 +205,50 @@ class ConfigController(QtCore.QObject):
             self.resultCacheCapacityChanged.emit(value)
         return value
 
-    def mechanism_parameter_debounce_ms(self) -> int:
-        return self._debounce_setting(
-            _MECHANISM_PARAMETER_DEBOUNCE_KEY,
-            _DEFAULT_MECHANISM_PARAMETER_DEBOUNCE_MS,
+    def preview_points(self) -> int:
+        return self._preview_setting(
+            _PREVIEW_POINTS_KEY, _DEFAULT_PREVIEW_POINTS, SIMULATION_POINT_RANGE,
         )
 
-    def set_mechanism_parameter_debounce_ms(self, value: int) -> int:
-        previous = self.mechanism_parameter_debounce_ms()
-        accepted = self._set_debounce_setting(
-            _MECHANISM_PARAMETER_DEBOUNCE_KEY,
-            value,
-            label="mechanism parameter debounce",
-            success_message="Parameter preview debounce set to {value} ms.",
-        )
-        if previous != accepted:
-            self.mechanismParameterDebounceChanged.emit(accepted)
-        return accepted
-
-    def equilibrium_k_debounce_ms(self) -> int:
-        return self._debounce_setting(
-            _EQUILIBRIUM_K_DEBOUNCE_KEY,
-            _DEFAULT_EQUILIBRIUM_K_DEBOUNCE_MS,
+    def set_preview_points(self, value: int) -> int:
+        return self._set_preview_setting(
+            _PREVIEW_POINTS_KEY, value, self.preview_points(),
+            SIMULATION_POINT_RANGE, label="Preview points",
         )
 
-    def set_equilibrium_k_debounce_ms(self, value: int) -> int:
-        previous = self.equilibrium_k_debounce_ms()
-        accepted = self._set_debounce_setting(
-            _EQUILIBRIUM_K_DEBOUNCE_KEY,
-            value,
-            label="equilibrium-K debounce",
-            success_message="Equilibrium preview debounce set to {value} ms.",
+    def preview_delay_ms(self) -> int:
+        return self._preview_setting(
+            _PREVIEW_DELAY_KEY, _DEFAULT_PREVIEW_DELAY_MS, (0, 1000),
         )
-        if previous != accepted:
-            self.equilibriumKDebounceChanged.emit(accepted)
-        return accepted
 
-    def _debounce_setting(self, key: str, default: int) -> int:
+    def set_preview_delay_ms(self, value: int) -> int:
+        return self._set_preview_setting(
+            _PREVIEW_DELAY_KEY, value, self.preview_delay_ms(),
+            (0, 1000), label="Preview delay (ms)",
+        )
+
+    def _preview_setting(
+        self, key: str, default: int, bounds: tuple[int, int],
+    ) -> int:
         parsed = self._parsed_int(self._settings().value(key, default))
-        if parsed is None:
-            return int(default)
-        return min(1000, max(0, parsed))
+        return default if parsed is None else min(bounds[1], max(bounds[0], parsed))
 
-    def _set_debounce_setting(
-        self,
-        key: str,
-        value: int,
-        *,
-        label: str,
-        success_message: str,
+    def _set_preview_setting(
+        self, key: str, value: int, previous: int, bounds: tuple[int, int],
+        *, label: str,
     ) -> int:
         if type(value) is not int:
             raise TypeError(f"{label} must be an integer.")
-        accepted = min(1000, max(0, value))
+        accepted = min(bounds[1], max(bounds[0], value))
         settings = self._settings()
         snapshot = self._snapshot_settings(settings, (key,))
         settings.setValue(key, accepted)
         self._sync_or_report(
-            settings,
-            label,
-            snapshot=snapshot,
-            success_message=success_message.format(value=accepted),
+            settings, label, snapshot=snapshot,
+            success_message=f"{label} set to {accepted}.",
         )
+        if previous != accepted:
+            self.previewSettingsChanged.emit()
         return accepted
 
     @staticmethod
