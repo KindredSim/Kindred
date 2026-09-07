@@ -57,6 +57,7 @@ from kindred.core.species import (
     TEMPERATURE_MAX_K,
     TEMPERATURE_MIN_K,
     validate_concentration,
+    validate_c0,
     validate_temperature,
     validate_time_seconds,
 )
@@ -276,10 +277,20 @@ class SimulationExecutionSettings:
 class TabScientificSettings:
     """Scientific settings that are shared by every execution in one tab."""
 
-    temperature: float = 298.15
+    temperature: float = UnitsModel.temperature_K
+    standard_conc_M: float = UnitsModel.standard_conc_M
+    energy_unit: str = UnitsModel.energy_unit
     rtol: float = 1e-6
     atol: float = 1e-12
     analytic_jacobian_policy: bool = True
+
+    @property
+    def default_units(self) -> UnitsModel:
+        return UnitsModel(
+            temperature_K=self.temperature,
+            standard_conc_M=self.standard_conc_M,
+            energy_unit=self.energy_unit,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -950,6 +961,9 @@ def validate_tab_scientific_settings(
     if not isinstance(settings, TabScientificSettings):
         raise TypeError(f"{label} must be TabScientificSettings.")
     validate_temperature(settings.temperature, field=f"{label}.temperature")
+    validate_c0(settings.standard_conc_M, field=f"{label}.standard_conc_M")
+    if settings.energy_unit not in {"J/mol", "kJ/mol", "kcal/mol"}:
+        raise ValueError(f"{label}.energy_unit must be J/mol, kJ/mol, or kcal/mol.")
     validate_scipy_rtol(
         settings.rtol,
         field=f"{label}.rtol",
@@ -1022,9 +1036,7 @@ def prepare_authored_source_admission(
             else prepare_dsl_request_set(
                 source.reactions_text,
                 initials={},
-                units=UnitsModel(
-                    temperature_K=scientific_settings.temperature,
-                ),
+                units=scientific_settings.default_units,
             )
         )
         _validate_exact_source_constraints(prepared_dsl)
@@ -1121,12 +1133,7 @@ def _prepared_dsl_matches_tab(tab: MechanismTabDocument) -> bool:
     analysis = prepared.analysis
     if not source_matches_analysis(tab.mechanism_source, analysis):
         return False
-    analysis_temperature = analysis.temperature_K
-    return (
-        type(analysis_temperature) in {int, float}
-        and float(analysis_temperature)
-        == float(tab.scientific_settings.temperature)
-    )
+    return prepared.default_units == tab.scientific_settings.default_units
 
 
 def retained_tab_mechanism_source(
@@ -1625,9 +1632,7 @@ def assess_tab_exact_correction(
         prepared = prepare_dsl_request_set(
             source.reactions_text,
             initials={},
-            units=UnitsModel(
-                temperature_K=tab.scientific_settings.temperature,
-            ),
+            units=tab.scientific_settings.default_units,
         )
         detached_tab = replace(
             tab,
@@ -1689,8 +1694,8 @@ def prepare_tab_scientific_settings(
 ) -> MechanismTabDocument:
     """Build one detached tab with settings-matching prepared science.
 
-    A temperature change is a genuine source-admission event and reparses
-    the unchanged canonical source under the new nominal temperature.  Other
+    A mechanism-default change reparses the unchanged canonical source under
+    the new defaults, with explicit DSL values taking precedence. Other
     scientific setting changes retain the already admitted prepared object by
     identity.  No state is published here; the registry owns the one
     ``replace_document`` publication and its single result fence.
@@ -1699,7 +1704,7 @@ def prepare_tab_scientific_settings(
     if not isinstance(tab, MechanismTabDocument):
         raise TypeError("tab must be a MechanismTabDocument.")
     validate_tab_scientific_settings(settings)
-    if settings.temperature == tab.scientific_settings.temperature:
+    if settings.default_units == tab.scientific_settings.default_units:
         prepared = tab.prepared_dsl
     else:
         prepared = prepare_authored_source_admission(

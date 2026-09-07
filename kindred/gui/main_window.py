@@ -4456,6 +4456,8 @@ class MainWindow(QtWidgets.QMainWindow):
                     field
                     for field in (
                         "temperature",
+                        "standard_conc_M",
+                        "energy_unit",
                         "rtol",
                         "atol",
                         "analytic_jacobian_policy",

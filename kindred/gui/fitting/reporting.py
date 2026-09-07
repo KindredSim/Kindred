@@ -622,7 +622,7 @@ def _known_input_context(candidate: FitCandidate) -> dict[str, object]:
     settings = candidate.origin.scientific_settings
     request = candidate.request
     request_setup = request.setup
-    return {"temperature_K": float(settings.temperature), "relative_tolerance": float(settings.rtol),
+    return {"temperature_K": float(candidate.origin.prepared_dsl.analysis.temperature_K), "relative_tolerance": float(settings.rtol),
         "absolute_tolerance": float(settings.atol), "analytic_jacobian_policy": bool(settings.analytic_jacobian_policy),
         "solver": str(request_setup.solver), "included_dataset_ids": list(request.dispatch.included_dataset_ids),
         "dataset_conditions": [{"dataset_id": item.dataset_id, "included": bool(item.included),

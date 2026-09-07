@@ -236,6 +236,8 @@ def _encode_science(
 ) -> dict[str, object]:
     return {
         "temperature": settings.temperature,
+        "standard_conc_M": settings.standard_conc_M,
+        "energy_unit": settings.energy_unit,
         "rtol": settings.rtol,
         "atol": settings.atol,
         "analytic_jacobian_policy": settings.analytic_jacobian_policy,
@@ -251,6 +253,8 @@ def _decode_science(
         label,
         {
             "temperature",
+            "standard_conc_M",
+            "energy_unit",
             "rtol",
             "atol",
             "analytic_jacobian_policy",
@@ -262,6 +266,8 @@ def _decode_science(
             f"{label}.temperature",
         ),
         rtol=_finite(data["rtol"], f"{label}.rtol"),
+        standard_conc_M=_finite(data["standard_conc_M"], f"{label}.standard_conc_M"),
+        energy_unit=_string(data["energy_unit"], f"{label}.energy_unit"),
         atol=_finite(data["atol"], f"{label}.atol"),
         analytic_jacobian_policy=_boolean(
             data["analytic_jacobian_policy"],

@@ -46,6 +46,8 @@ _RUN_SETTINGS_KEYS = {
 }
 _SCIENTIFIC_SETTINGS_KEYS = {
     "temperature": "simulation/temperature",
+    "standard_conc_M": "simulation/standard_conc_M",
+    "energy_unit": "simulation/energy_unit",
     "rtol": "simulation/rtol",
     "atol": "simulation/atol",
     "analytic_jacobian_policy": "simulation/use_analytic_jacobian",
@@ -319,6 +321,14 @@ class ConfigController(QtCore.QObject):
         factory = default_tab_scientific_settings()
         try:
             candidate = TabScientificSettings(
+                standard_conc_M=float(self._setting(
+                    settings, _SCIENTIFIC_SETTINGS_KEYS["standard_conc_M"],
+                    factory.standard_conc_M, float,
+                )),
+                energy_unit=str(self._setting(
+                    settings, _SCIENTIFIC_SETTINGS_KEYS["energy_unit"],
+                    factory.energy_unit, str,
+                )),
                 temperature=float(
                     self._setting(
                         settings,

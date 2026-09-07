@@ -10,7 +10,7 @@ Current contract
   energy=kcal/mol|kJ/mol|J/mol
 - Packaged preset sources use this same public syntax and remain admitted by
   the same parser.
-- Source-level `T=` is rejected; set nominal temperature in the mechanism tab.
+- Source-level `T=`, `C0=`, and `energy=` override supplied mechanism defaults.
 - If dG_eq is provided and Keq is omitted, compute concentration-form
   Keq = exp(-dG_eq/(R*T)) * C0**delta_n with reaction-dependent units.
 - Default per step is Eyring; Arrhenius override via A/Ea.
@@ -452,6 +452,7 @@ class PreparedDslRequestSet:
 
     __slots__ = (
         "analysis",
+        "default_units",
         "__mechanism",
         "__intervention_schedule",
         "__intervention_execution",
@@ -466,6 +467,7 @@ class PreparedDslRequestSet:
         self,
         *,
         analysis: DslAnalysis,
+        default_units: UnitsModel,
         mechanism: object,
         intervention_schedule: InterventionSchedule | None,
         intervention_execution: InterventionExecutionContract | None,
@@ -490,6 +492,7 @@ class PreparedDslRequestSet:
         elif intervention_execution is None:
             raise ValueError("Literal prepared DSL state requires its compiled intervention contract.")
         self.analysis = analysis
+        self.default_units = default_units
         self.__mechanism = mechanism
         self.__intervention_schedule = intervention_schedule
         self.__intervention_execution = intervention_execution
@@ -1414,18 +1417,10 @@ def _parse_dsl_ir(text: str, *, units: UnitsModel | None = None) -> "DSLIR":
     )
     notes: List[str] = []
 
-    # Parse temperature schedule if present
+    # Build the temperature schedule after resolving the nominal temperature.
     from ..temperature_dsl import parse_temperature_schedule
     from ..intervention_schedule import _admit_intervention_directives
 
-    temperature_schedule = (
-        parse_temperature_schedule(
-            temperature_directive,
-            nominal_temperature=temperature_K,
-        )
-        if temperature_directive is not None
-        else None
-    )
     intervention_schedule = _admit_intervention_directives(text)
 
     raw_lines = text.splitlines(keepends=True)
@@ -1450,8 +1445,23 @@ def _parse_dsl_ir(text: str, *, units: UnitsModel | None = None) -> "DSLIR":
             key = "energy"
         elif lower.startswith("c0="):
             key = "C0"
+        elif lower.startswith("t="):
+            key = "T"
         if key is None:
             continue
+        assignments = _parse_keyvals(
+            line,
+            reject_duplicate_canonical_keys=True,
+            line_number=line_no,
+            line_content=raw,
+        )
+        if set(assignments) != {key}:
+            raise _DSLError(
+                f"Global {key}= must be the only assignment on its line.",
+                suggestion="Put each global directive on a separate line.",
+                line_number=line_no,
+                line_content=raw,
+            )
         if key in global_directives:
             raise _DSLError(
                 f"Duplicate global {key} directive.",
@@ -1493,6 +1503,25 @@ def _parse_dsl_ir(text: str, *, units: UnitsModel | None = None) -> "DSLIR":
             raise
         notes.append(f"C0 set to {standard_conc_M:g} M")
 
+    if "T" in global_directives:
+        line_no, raw = global_directives["T"]
+        try:
+            values = _parse_keyvals(raw.strip(), reject_duplicate_canonical_keys=True)
+            temperature_K = validate_temperature(float(values.get("T", "")), field="T")
+        except (ValueError, _DSLError) as exc:
+            raise _DSLError(
+                str(exc), line_number=line_no, line_content=raw,
+            ) from exc
+        notes.append(f"T set to {temperature_K:g} K")
+
+    temperature_schedule = (
+        parse_temperature_schedule(
+            temperature_directive, nominal_temperature=temperature_K,
+        )
+        if temperature_directive is not None
+        else None
+    )
+
     for line_no, raw in enumerate(lines, start=1):
         line = raw.strip()
         lower = line.lower()
@@ -1509,14 +1538,6 @@ def _parse_dsl_ir(text: str, *, units: UnitsModel | None = None) -> "DSLIR":
         # Source-wide settings were resolved before lowering.
         if line_no in global_directive_lines:
             continue
-
-        if lower.startswith("t="):
-            raise _DSLError(
-                "Source-level T= is not supported; the mechanism tab "
-                "temperature is the nominal scientific authority.",
-                line_number=line_no,
-                line_content=raw,
-            )
 
         if line_no - 1 in inline_initial_line_indexes:
             continue
@@ -1696,8 +1717,7 @@ def _reject_per_step_globals(
     """Reject per-reaction T= and energy= overrides."""
     if "T" in params:
         raise _DSLError(
-            "Per-reaction T= is not supported; set the nominal temperature "
-            "in the mechanism tab.",
+            "Per-reaction T= is not supported; use a global T= directive.",
             line_number=line_number, line_content=line_content,
         )
     if "energy" in params:
@@ -2211,6 +2231,7 @@ def prepare_dsl_request_set(
         compile_algebra_observables,
     )
 
+    units = units or UnitsModel()
     payload = _dsl_admission_payload(text, units)
     normalized_text = str(payload["dsl"])
     ir = _parse_dsl_ir(text, units=units)
@@ -2279,6 +2300,7 @@ def prepare_dsl_request_set(
         metadata["parameter_algebra_spec"] = parameter_algebra_spec
     return PreparedDslRequestSet(
         analysis=analysis,
+        default_units=units,
         mechanism=mechanism,
         intervention_schedule=parameterized_intervention_schedule,
         intervention_execution=intervention_execution,

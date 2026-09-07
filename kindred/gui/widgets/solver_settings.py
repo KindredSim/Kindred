@@ -157,21 +157,35 @@ class SimulationSettingsDialog(QtWidgets.QDialog):
         self.setModal(True)
 
         layout = QtWidgets.QVBoxLayout(self)
-        science_box = QtWidgets.QGroupBox("Tab scientific", self)
+        science_box = QtWidgets.QGroupBox("Mechanism settings", self)
         science_form = QtWidgets.QFormLayout(science_box)
+        factory = TabScientificSettings()
         self.temperature_spin = self._positive_spin(
             minimum=TEMPERATURE_RANGE_K[0],
             maximum=TEMPERATURE_RANGE_K[1],
-            value=298.15,
+            value=factory.temperature,
             decimals=2,
         )
+        self.standard_conc_edit = QtWidgets.QLineEdit(str(factory.standard_conc_M), science_box)
+        setup_scientific_validator(self.standard_conc_edit)
+        self.energy_unit_combo = QtWidgets.QComboBox(science_box)
+        self.energy_unit_combo.addItems(["J/mol", "kJ/mol", "kcal/mol"])
+        self.energy_unit_combo.setCurrentText(factory.energy_unit)
         self.rtol_edit = QtWidgets.QLineEdit("1e-6", science_box)
         self.atol_edit = QtWidgets.QLineEdit("1e-12", science_box)
         setup_scientific_validator(self.rtol_edit)
         setup_scientific_validator(self.atol_edit)
         self.temperature_spin.setToolTip(
-            "Temperature for this tab's simulations. Used by temperature-dependent "
-            "rate laws and thermodynamic calculations."
+            "Default nominal temperature for this mechanism. An explicit T= directive "
+            "overrides it. Temperature schedules start from the resolved nominal temperature."
+        )
+        self.standard_conc_edit.setToolTip(
+            "Default standard-state concentration in M for Eyring rates and thermodynamic "
+            "equilibrium constants. An explicit C0= directive overrides it."
+        )
+        self.energy_unit_combo.setToolTip(
+            "Default units for authored energies. An explicit energy= directive overrides "
+            "this setting. Changing the units changes how existing energy numbers are interpreted."
         )
         self.rtol_edit.setToolTip(
             "Controls solver error relative to each concentration's magnitude. "
@@ -199,10 +213,12 @@ class SimulationSettingsDialog(QtWidgets.QDialog):
         )
         self.scientific_defaults_check.setChecked(False)
         self.scientific_defaults_check.setToolTip(
-            "Save this temperature, both tolerances, and the Jacobian preference as "
+            "Save these mechanism defaults, both tolerances, and the Jacobian preference as "
             "defaults for new projects and tabs. Existing tabs keep their settings."
         )
-        science_form.addRow("Temperature (K)", self.temperature_spin)
+        science_form.addRow("Default temperature (K)", self.temperature_spin)
+        science_form.addRow("Default standard concentration (M)", self.standard_conc_edit)
+        science_form.addRow("Default energy units", self.energy_unit_combo)
         science_form.addRow("Relative tolerance", self.rtol_edit)
         science_form.addRow("Absolute tolerance", self.atol_edit)
         science_form.addRow("", self.analytic_jacobian_check)
@@ -328,6 +344,8 @@ class SimulationSettingsDialog(QtWidgets.QDialog):
     def set_scientific_settings(self, settings: TabScientificSettings) -> None:
         validate_tab_scientific_settings(settings)
         self.temperature_spin.setValue(settings.temperature)
+        self.standard_conc_edit.setText(repr(float(settings.standard_conc_M)))
+        self.energy_unit_combo.setCurrentText(settings.energy_unit)
         self.rtol_edit.setText(repr(float(settings.rtol)))
         self.atol_edit.setText(repr(float(settings.atol)))
         self.analytic_jacobian_check.setChecked(settings.analytic_jacobian_policy)
@@ -336,10 +354,13 @@ class SimulationSettingsDialog(QtWidgets.QDialog):
         try:
             rtol = float(self.rtol_edit.text())
             atol = float(self.atol_edit.text())
+            standard_conc = float(self.standard_conc_edit.text())
         except (TypeError, ValueError, OverflowError) as exc:
-            raise ValueError("rtol and atol must be numbers.") from exc
+            raise ValueError("Standard concentration and tolerances must be numbers.") from exc
         candidate = TabScientificSettings(
             temperature=float(self.temperature_spin.value()),
+            standard_conc_M=standard_conc,
+            energy_unit=self.energy_unit_combo.currentText(),
             rtol=rtol,
             atol=atol,
             analytic_jacobian_policy=bool(self.analytic_jacobian_check.isChecked()),
