@@ -271,12 +271,11 @@ class SimulationExecutionSettings:
     t_start: float = 0.0
     t_end: float = 10.0
     integration_points: int = 100
-    use_authored_stops: bool = False
 
 
 @dataclass(frozen=True, slots=True)
 class TabScientificSettings:
-    """Scientific settings that are shared by every execution in one tab."""
+    """Mechanism settings shared within one tab; fitting always bypasses stops."""
 
     temperature: float = UnitsModel.temperature_K
     standard_conc_M: float = UnitsModel.standard_conc_M
@@ -284,6 +283,7 @@ class TabScientificSettings:
     rtol: float = 1e-6
     atol: float = 1e-12
     analytic_jacobian_policy: bool = True
+    use_authored_stops: bool = True
 
     @property
     def default_units(self) -> UnitsModel:
@@ -950,7 +950,6 @@ def validate_simulation_execution_settings(
         f"{label}.integration_points",
         *_SIMULATION_POINT_RANGE,
     )
-    _require_bool(settings.use_authored_stops, f"{label}.use_authored_stops")
     return settings
 
 
@@ -977,6 +976,7 @@ def validate_tab_scientific_settings(
         settings.analytic_jacobian_policy,
         f"{label}.analytic_jacobian_policy",
     )
+    _require_bool(settings.use_authored_stops, f"{label}.use_authored_stops")
     return settings
 
 

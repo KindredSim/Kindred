@@ -1027,6 +1027,7 @@ class MainWindow(QtWidgets.QMainWindow):
             "rtol",
             "atol",
             "analytic_jacobian_policy",
+            "use_authored_stops",
         }:
             try:
                 self._render_results_for_tab(target)
@@ -1080,10 +1081,6 @@ class MainWindow(QtWidgets.QMainWindow):
             "simulation settings",
             lambda: bundle.simulation_panel.render_run_defaults(
                 tab.run_defaults,
-                stopping_declarations=(
-                    () if tab.prepared_dsl is None
-                    else tab.prepared_dsl.authored_stop_declarations()
-                ),
                 run_admitted=self._run_admitted(target),
                 simulation_job_kind=self._current_simulation_job_kind(),
             ),
@@ -1958,10 +1955,6 @@ class MainWindow(QtWidgets.QMainWindow):
             tab = self._workspace_tab_registry.tab(tab_id)
             bundle.simulation_panel.render_run_defaults(
                 tab.run_defaults,
-                stopping_declarations=(
-                    () if tab.prepared_dsl is None
-                    else tab.prepared_dsl.authored_stop_declarations()
-                ),
                 run_admitted=self._run_admitted(tab_id),
                 simulation_job_kind=self._current_simulation_job_kind(),
             )
@@ -2593,10 +2586,6 @@ class MainWindow(QtWidgets.QMainWindow):
             bundle.simulation_panel.discard_run_defaults_draft()
             bundle.simulation_panel.render_run_defaults(
                 tab.run_defaults,
-                stopping_declarations=(
-                    () if tab.prepared_dsl is None
-                    else tab.prepared_dsl.authored_stop_declarations()
-                ),
                 run_admitted=self._run_admitted(bundle.tab_id),
                 simulation_job_kind=self._current_simulation_job_kind(),
             )
@@ -4418,7 +4407,6 @@ class MainWindow(QtWidgets.QMainWindow):
             preview_delay_ms=self.config_controller.preview_delay_ms(),
         )
         dialog.set_scientific_settings(tab.scientific_settings)
-        dialog.set_use_authored_stops(tab.run_defaults.use_authored_stops)
         dialog.set_stopping_declarations(
             () if tab.prepared_dsl is None
             else tab.prepared_dsl.authored_stop_declarations()
@@ -4433,32 +4421,27 @@ class MainWindow(QtWidgets.QMainWindow):
         changed = False
         try:
             settings = dialog.scientific_settings()
-            use_authored_stops = dialog.use_authored_stops()
             preview_points, preview_delay = dialog.preview_settings()
             run_maximum = dialog.run_user_maximum()
             cache_capacity = dialog.result_cache_capacity()
             persist_scientific_defaults = (
                 dialog.persist_scientific_defaults_requested()
             )
-            bundle = self._tab_surfaces[tab_id]
-            current_run_defaults = self._workspace_tab_registry.tab(tab_id).run_defaults
-            run_defaults = current_run_defaults
-            if use_authored_stops != current_run_defaults.use_authored_stops:
-                # Preserve the existing Run draft when changing its stopping
-                # preference through this second editor of the same settings.
-                run_defaults = replace(
-                    bundle.simulation_panel.current_settings_candidate(),
-                    use_authored_stops=use_authored_stops,
-                )
             previous_settings = self._workspace_tab_registry.tab(
                 tab_id
             ).scientific_settings
-            changed = bundle.initial_actions.set_tab_scientific_settings(settings)
-            if not changed and settings != previous_settings:
-                raise ValueError(
-                    "Scientific settings rejected: canonical project content "
-                    "changed before publication."
+            if settings != previous_settings:
+                result = self._workspace_tab_registry.set_scientific_settings(
+                    tab_id,
+                    settings,
+                    expected_token=self._workspace_tab_registry.capture_content_token(),
                 )
+                if result is None:
+                    raise ValueError(
+                        "Scientific settings rejected: canonical project content "
+                        "changed before publication."
+                    )
+                changed = True
             if changed:
                 changed_fields = frozenset(
                     field
@@ -4469,6 +4452,7 @@ class MainWindow(QtWidgets.QMainWindow):
                         "rtol",
                         "atol",
                         "analytic_jacobian_policy",
+                        "use_authored_stops",
                     )
                     if getattr(previous_settings, field)
                     != getattr(settings, field)
@@ -4477,15 +4461,6 @@ class MainWindow(QtWidgets.QMainWindow):
                     tab_id,
                     scientific_fields=changed_fields,
                 )
-            if run_defaults != current_run_defaults:
-                if self._set_workspace_run_defaults(tab_id, run_defaults) is None:
-                    raise ValueError("Run settings changed before publication.")
-                changed = True
-            if dialog.persist_stopping_default_requested():
-                self.config_controller.persist_run_defaults(replace(
-                    self.config_controller.application_run_defaults(),
-                    use_authored_stops=use_authored_stops,
-                ))
             self.config_controller.set_preview_points(preview_points)
             self.config_controller.set_preview_delay_ms(preview_delay)
             self.config_controller.set_run_user_maximum(run_maximum)

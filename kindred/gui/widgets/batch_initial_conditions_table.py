@@ -11,7 +11,6 @@ from kindred.core.project_document import (
     InitialConditionSet,
     MechanismTabDocument,
     SimulationExecutionSettings,
-    TabScientificSettings,
     canonical_species_names,
     new_set_id,
     next_set_name,
@@ -1148,22 +1147,6 @@ class InitialConditionsTableActions(QtCore.QObject):
         self.render()
         return result
 
-    def set_tab_scientific_settings(
-        self,
-        settings: TabScientificSettings,
-    ) -> bool:
-        tab = self._registry.tab(self._tab_id)
-        if settings == tab.scientific_settings:
-            return False
-        result = self._registry.set_scientific_settings(
-            self._tab_id,
-            settings,
-            expected_token=self._registry.capture_content_token(),
-        )
-        accepted = result is not None
-        self.render()
-        return accepted
-
     @QtCore.Slot(str, bool)
     def toggle_custom_run_settings(self, set_id: str, checked: bool) -> bool:
         tab = self._registry.tab(self._tab_id)
@@ -1209,10 +1192,6 @@ class InitialConditionsTableActions(QtCore.QObject):
             title=f"Custom Run Settings — {initial_set.name}",
         )
         dialog.set_execution_settings(seed)
-        dialog.set_stopping_declarations(
-            () if tab.prepared_dsl is None
-            else tab.prepared_dsl.authored_stop_declarations()
-        )
         if dialog.exec() != QtWidgets.QDialog.DialogCode.Accepted:
             self.render()
             return False

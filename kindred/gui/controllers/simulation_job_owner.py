@@ -164,7 +164,7 @@ def build_explicit_target(*, prepared_dsl: PreparedDslRequestSet, tab_id: str, s
         initial_values=initial_values,
         t_span=(execution_settings.t_start, execution_settings.t_end),
         solver_config=solver_config,
-        use_authored_stops=execution_settings.use_authored_stops,
+        use_authored_stops=scientific_settings.use_authored_stops,
     )
     return ExplicitRunTarget(tab_id, set_id, set_name, execution_request)
 
@@ -1049,13 +1049,11 @@ class SimulationJobOwner(QtCore.QObject):
             operation["outcomes"].append((target, "discarded"))
             return
         termination = outcome.result.termination
-        cause = (
-            "authored stopping intervention"
-            if termination.cause == "stop" else "requested endpoint"
-        )
-        operation["details"].append(
-            f"{target.set_name}: completed at t={termination.actual_endpoint:g} s ({cause})"
-        )
+        if termination.cause == "stop":
+            operation["details"].append(
+                f"{target.set_name}: completed at t={termination.actual_endpoint:g} s "
+                "(authored stopping intervention)"
+            )
         if interactive:
             self.interactive_result_ready.emit(
                 str(operation["tab_id"]),

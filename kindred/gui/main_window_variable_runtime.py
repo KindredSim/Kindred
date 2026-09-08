@@ -729,7 +729,7 @@ class TabSliderBinding(QtCore.QObject):
                     ),
                 ),
                 parameter_values=runtime.slider_parameter_draft or None,
-                use_authored_stops=settings.use_authored_stops,
+                use_authored_stops=tab.scientific_settings.use_authored_stops,
             )
             output.append((set_id, tab.initial_condition_set(set_id).name, request))
         return tuple(output)

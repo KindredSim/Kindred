@@ -157,13 +157,6 @@ class SimulationPanel(QtWidgets.QWidget):
         self.solver_method_combo.addItems(list(SUPPORTED_SOLVERS))
         self.t_start_edit = self._number_edit("0.0", "Absolute Run start time")
         self.t_end_edit = self._number_edit("10.0", "Absolute Run end time")
-        self.use_authored_stops_check = QtWidgets.QCheckBox(
-            "Use authored stopping interventions", self
-        )
-        self._stopping_declarations: tuple[str, ...] = ()
-        self.stopping_info_button = QtWidgets.QToolButton(self)
-        self.stopping_info_button.setText("Authored rules…")
-        self.stopping_info_button.clicked.connect(self._show_stopping_declarations)
         self.num_points_spinbox = QtWidgets.QSpinBox(self)
         self.num_points_spinbox.setRange(*SIMULATION_POINT_RANGE)
         self.num_points_spinbox.setSingleStep(10)
@@ -181,8 +174,6 @@ class SimulationPanel(QtWidgets.QWidget):
             name = label
             label_widget = QtWidgets.QLabel(label, self)
             label_widget.setBuddy(widget)
-            if name == "t_end":
-                self._t_end_label = label_widget
             if name == "Points":
                 label_widget.setToolTip(widget.toolTip())
             if name in {"t_start", "t_end"}:
@@ -195,17 +186,6 @@ class SimulationPanel(QtWidgets.QWidget):
             group_layout.addWidget(label_widget)
             group_layout.addWidget(widget)
             controls.addWidget(group)
-
-        stopping_group = QtWidgets.QWidget(self)
-        stopping_layout = QtWidgets.QHBoxLayout(stopping_group)
-        stopping_layout.setContentsMargins(0, 0, 0, 0)
-        stopping_layout.addWidget(self.use_authored_stops_check)
-        stopping_layout.addWidget(self.stopping_info_button)
-        controls.addWidget(stopping_group)
-        self.use_authored_stops_check.toggled.connect(self._mark_candidate_dirty)
-        self.use_authored_stops_check.toggled.connect(self._refresh_endpoint_label)
-        self.use_authored_stops_check.clicked.connect(self._settle_after_edit)
-        self._set_stopping_declarations(())
 
         self.solver_method_combo.currentTextChanged.connect(self._mark_candidate_dirty)
         self.t_start_edit.textEdited.connect(self._mark_candidate_dirty)
@@ -280,43 +260,14 @@ class SimulationPanel(QtWidgets.QWidget):
         setup_scientific_validator(edit)
         return edit
 
-    def _set_stopping_declarations(self, declarations: tuple[str, ...]) -> None:
-        self._stopping_declarations = declarations
-        self.stopping_info_button.setEnabled(bool(declarations))
-        self.stopping_info_button.setToolTip(
-            "View the authored stopping interventions for this mechanism."
-            if declarations else "This mechanism has no authored stopping interventions."
-        )
-
-    def _show_stopping_declarations(self) -> None:
-        message = QtWidgets.QMessageBox(self)
-        message.setWindowTitle("Authored stopping interventions")
-        message.setTextFormat(QtCore.Qt.PlainText)
-        message.setText("\n".join(self._stopping_declarations))
-        message.setStandardButtons(QtWidgets.QMessageBox.Ok)
-        message.exec()
-
-    def _refresh_endpoint_label(self, *_args) -> None:
-        active = self.use_authored_stops_check.isChecked()
-        self._t_end_label.setText(
-            scientific_symbol_html("t_end", family="time", role="t_end")
-            + (" (maximum)" if active else " (fixed)")
-        )
-        self.t_end_edit.setToolTip(
-            "Maximum Run end time; an authored crossing may finish the run earlier."
-            if active else "Fixed Run end time; authored stopping interventions are bypassed."
-        )
-
     def render_run_defaults(
         self,
         settings: SimulationExecutionSettings,
         *,
         run_admitted: bool,
         simulation_job_kind: str | None,
-        stopping_declarations: tuple[str, ...],
     ) -> None:
         validate_simulation_execution_settings(settings)
-        self._set_stopping_declarations(stopping_declarations)
         kind = None if simulation_job_kind is None else str(simulation_job_kind)
         if kind not in {None, "run", "preview"}:
             raise ValueError("simulation_job_kind must be None, 'run', or 'preview'.")
@@ -329,7 +280,6 @@ class SimulationPanel(QtWidgets.QWidget):
                 self.t_start_edit,
                 self.t_end_edit,
                 self.num_points_spinbox,
-                self.use_authored_stops_check,
             )
         )
         try:
@@ -385,7 +335,6 @@ class SimulationPanel(QtWidgets.QWidget):
             self.t_start_edit,
             self.t_end_edit,
             self.num_points_spinbox,
-            self.use_authored_stops_check,
         )
         if focused is None or not any(
             focused is control or control.isAncestorOf(focused)
@@ -560,7 +509,6 @@ class SimulationPanel(QtWidgets.QWidget):
             t_start=float(values["t_start"]),
             t_end=float(values["t_end"]),
             integration_points=int(values["integration_points"]),
-            use_authored_stops=self.use_authored_stops_check.isChecked(),
         )
         validate_simulation_execution_settings(candidate)
         return candidate
@@ -581,8 +529,6 @@ class SimulationPanel(QtWidgets.QWidget):
             self.t_start_edit.setText(repr(float(settings.t_start)))
             self.t_end_edit.setText(repr(float(settings.t_end)))
             self.num_points_spinbox.setValue(settings.integration_points)
-            self.use_authored_stops_check.setChecked(settings.use_authored_stops)
-            self._refresh_endpoint_label()
         finally:
             self._rendering = previous_rendering
 

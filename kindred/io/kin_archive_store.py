@@ -1,4 +1,4 @@
-"""Strict codec for the sole current ``kindred-kin-4`` archive."""
+"""Strict codec for the sole current ``kindred-kin-5`` archive."""
 
 from __future__ import annotations
 
@@ -56,7 +56,7 @@ __all__ = [
     "KinArchiveStore",
 ]
 
-CURRENT_PROJECT_FORMAT = "kindred-kin-4"
+CURRENT_PROJECT_FORMAT = "kindred-kin-5"
 _PROJECT_MEMBER = "project.json"
 _SOURCE_MEMBER_PREFIX = "sources/"
 _CANONICAL_ZIP_TIMESTAMP = (1980, 1, 1, 0, 0, 0)
@@ -204,7 +204,6 @@ def _encode_execution(
         "t_start": settings.t_start,
         "t_end": settings.t_end,
         "integration_points": settings.integration_points,
-        "use_authored_stops": settings.use_authored_stops,
     }
 
 
@@ -214,9 +213,9 @@ def _decode_execution(
 ) -> SimulationExecutionSettings:
     data = _object(value, label)
     _exact_fields(
-        {**data, "use_authored_stops": data.get("use_authored_stops", False)},
+        data,
         label,
-        {"solver", "t_start", "t_end", "integration_points", "use_authored_stops"},
+        {"solver", "t_start", "t_end", "integration_points"},
     )
     return SimulationExecutionSettings(
         solver=_string(
@@ -229,9 +228,6 @@ def _decode_execution(
         integration_points=_integer(
             data["integration_points"],
             f"{label}.integration_points",
-        ),
-        use_authored_stops=_boolean(
-            data.get("use_authored_stops", False), f"{label}.use_authored_stops",
         ),
     )
 
@@ -246,6 +242,7 @@ def _encode_science(
         "rtol": settings.rtol,
         "atol": settings.atol,
         "analytic_jacobian_policy": settings.analytic_jacobian_policy,
+        "use_authored_stops": settings.use_authored_stops,
     }
 
 
@@ -263,6 +260,7 @@ def _decode_science(
             "rtol",
             "atol",
             "analytic_jacobian_policy",
+            "use_authored_stops",
         },
     )
     return TabScientificSettings(
@@ -277,6 +275,9 @@ def _decode_science(
         analytic_jacobian_policy=_boolean(
             data["analytic_jacobian_policy"],
             f"{label}.analytic_jacobian_policy",
+        ),
+        use_authored_stops=_boolean(
+            data["use_authored_stops"], f"{label}.use_authored_stops",
         ),
     )
 

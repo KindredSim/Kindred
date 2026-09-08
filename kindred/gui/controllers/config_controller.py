@@ -43,7 +43,6 @@ _RUN_SETTINGS_KEYS = {
     "t_start": "simulation/t_start",
     "t_end": "simulation/time",
     "integration_points": "simulation/points",
-    "use_authored_stops": "simulation/use_authored_stops",
 }
 _SCIENTIFIC_SETTINGS_KEYS = {
     "temperature": "simulation/temperature",
@@ -52,6 +51,7 @@ _SCIENTIFIC_SETTINGS_KEYS = {
     "rtol": "simulation/rtol",
     "atol": "simulation/atol",
     "analytic_jacobian_policy": "simulation/use_analytic_jacobian",
+    "use_authored_stops": "simulation/use_authored_stops",
 }
 _FIT_SETTINGS_KEYS = {
     "method": "fitting/method",
@@ -305,10 +305,6 @@ class ConfigController(QtCore.QObject):
                         int,
                     )
                 ),
-                use_authored_stops=bool(self._setting(
-                    settings, _RUN_SETTINGS_KEYS["use_authored_stops"],
-                    factory.use_authored_stops, bool,
-                )),
             )
             return validate_simulation_execution_settings(
                 candidate,
@@ -366,6 +362,10 @@ class ConfigController(QtCore.QObject):
                         bool,
                     )
                 ),
+                use_authored_stops=bool(self._setting(
+                    settings, _SCIENTIFIC_SETTINGS_KEYS["use_authored_stops"],
+                    factory.use_authored_stops, bool,
+                )),
             )
             return validate_tab_scientific_settings(
                 candidate,
