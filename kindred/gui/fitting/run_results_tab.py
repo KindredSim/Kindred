@@ -181,6 +181,7 @@ class FitTrackerPanel(QtWidgets.QWidget):
         self._parameters: tuple[FitParameterVariable, ...] = ()
         self._entries: tuple[FitValueEntry, ...] = ()
         self._entry_labels: list[_FitValueLabel] = []
+        self._entry_layout_key: tuple | None = None
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(8, 2, 8, 2)
         layout.setSpacing(2)
@@ -211,6 +212,7 @@ class FitTrackerPanel(QtWidgets.QWidget):
         self._objective = "not evaluated"
         self._calls = 0
         self._set_entries(())
+        self._layout_entries()
         for label in self._summary_labels:
             label.hide()
         self.hide()
@@ -256,6 +258,7 @@ class FitTrackerPanel(QtWidgets.QWidget):
         same_identity = tuple(entry[0] for entry in entries) == tuple(entry[0] for entry in self._entries)
         self._entries = entries
         if not same_identity:
+            self._entry_layout_key = None
             while self._values_layout.count():
                 self._values_layout.takeAt(0).widget().deleteLater()
             self._entry_labels = []
@@ -272,7 +275,6 @@ class FitTrackerPanel(QtWidgets.QWidget):
                 label.show()
                 self._entry_labels.append(label)
         self._values_scroll.setVisible(bool(entries))
-        self._layout_entries()
 
     def _layout_entries(self) -> None:
         if not self._entries:
@@ -282,6 +284,11 @@ class FitTrackerPanel(QtWidgets.QWidget):
         position = scroll.value()
         gutter = self._values_scroll.style().pixelMetric(QtWidgets.QStyle.PixelMetric.PM_ScrollBarExtent)
         width = max(1, self._values_scroll.maximumViewportSize().width() - gutter)
+        key = (self._entries, width, gutter,
+               tuple(label.font().toString() for label in self._entry_labels))
+        if key == self._entry_layout_key:
+            return
+        self._entry_layout_key = key
         row_height = max(label.fontMetrics().lineSpacing() + 6 for label in self._entry_labels)
         for label, (_identity, symbol, plain_symbol, context, value, unit) in zip(self._entry_labels, self._entries):
             label.copy_break_positions.clear()
@@ -601,7 +608,7 @@ class RunResultsTab(QtWidgets.QWidget):
         curves = tuple(
             curve for curve in self._curves if curve.dataset_id == identity
         )
-        view = self._dataset_plot_views.get(("dataset", identity))
+        view = self._subtab_stack.currentWidget()
         if view is None or len(curves) != 1:
             raise ValueError("The selected Fit dataset has no curves to copy.")
         view.copy_projection_to_clipboard(curves)
@@ -639,11 +646,18 @@ class RunResultsTab(QtWidgets.QWidget):
         labels = {curve.dataset_id: curve.display_name for curve in curves}
         if ids == self._dataset_tab_ids and labels == self._dataset_labels:
             return
+        selected = self._active_plot_view_id()
         self._dataset_tab_ids = ids
         self._dataset_labels = labels
-        self._dataset_plot_views = {}
-        self._all_datasets_plot_view = None
-        self._clear_subtabs()
+        for identity in tuple(self._dataset_plot_views):
+            if identity not in ids:
+                self._remove_plot_view(self._dataset_plot_views.pop(identity))
+        if len(curves) < 2 and self._all_datasets_plot_view is not None:
+            self._remove_plot_view(self._all_datasets_plot_view)
+            self._all_datasets_plot_view = None
+        blocker = QtCore.QSignalBlocker(self._subtabs)
+        while self._subtabs.count():
+            self._subtabs.removeTab(self._subtabs.count() - 1)
         label_counts: dict[str, int] = {}
         for label in labels.values():
             label_counts[label] = label_counts.get(label, 0) + 1
@@ -652,11 +666,6 @@ class RunResultsTab(QtWidgets.QWidget):
             if label_counts[full_label] > 1:
                 full_label = f"{full_label} ({curve.dataset_id})"
             compact_label = compact_dataset_label(full_label, max_chars=TAB_LABEL_MAX_CHARS)
-            plot_view = self._create_plot_view(
-                f"global_fit_results_plot_{curve.dataset_id}"
-            )
-            self._dataset_plot_views[view_identity] = plot_view
-            self._subtab_stack.addWidget(plot_view)
             tab_index = self._subtabs.addTab(compact_label.display)
             self._subtabs.setTabToolTip(
                 tab_index, f"{compact_label.full}\nDataset ID: {curve.dataset_id}"
@@ -670,14 +679,12 @@ class RunResultsTab(QtWidgets.QWidget):
                 },
             )
         if len(curves) > 1:
-            self._all_datasets_plot_view = self._create_plot_view(
-                "global_fit_results_plot_all_datasets"
-            )
-            self._subtab_stack.addWidget(self._all_datasets_plot_view)
-            self._subtabs.addTab("All Datasets")
+            index = self._subtabs.addTab("All Datasets")
+            self._subtabs.setTabData(index, {"view_identity": ("aggregate", "all")})
         self._subtabs.setVisible(len(curves) > 1)
-        self._subtabs.setCurrentIndex(0)
-        self._subtab_stack.setCurrentIndex(0)
+        identities = ids + ([("aggregate", "all")] if len(curves) > 1 else [])
+        self._subtabs.setCurrentIndex(identities.index(selected) if selected in identities else 0)
+        del blocker
 
     def _create_plot_view(self, object_name: str) -> GridPlotView:
         plot_view = GridPlotView(
@@ -695,42 +702,37 @@ class RunResultsTab(QtWidgets.QWidget):
         self,
         curves: Sequence[FitCurveDataset],
         presentation: Mapping[str, DatasetPlotPresentation],
-    ) -> bool:
+    ) -> None:
         values = tuple(curves)
         ids = [item.dataset_id for item in values]
         if len(ids) != len(set(ids)):
             raise ValueError("Fit curve datasets must have unique dataset IDs.")
+        for index in range(self._subtab_stack.count()):
+            self._subtab_stack.widget(index).cancel_copy()
         self._curves = values
         self._dataset_presentation = MappingProxyType(dict(presentation))
         if values:
             self._empty_label.hide()
             self._ensure_subtabs(values)
-            rendered = self._refresh_active_plot_view()
+            self._refresh_active_plot_view()
         else:
             self._dataset_tab_ids = []
             self._dataset_labels = {}
-            self._dataset_plot_views = {}
-            self._all_datasets_plot_view = None
             self._clear_subtabs()
-            rendered = False
         self.copyAvailableChanged.emit(self.copy_eligible())
-        return rendered
 
     def _active_plot_view_id(self) -> tuple[str, str] | None:
         index = self._subtabs.currentIndex()
         if index < 0:
             return None
-        if index == len(self._dataset_tab_ids):
-            return ("aggregate", "all")
-        if 0 <= index < len(self._dataset_tab_ids):
-            return self._dataset_tab_ids[index]
-        return None
+        return self._subtabs.tabData(index)["view_identity"]
 
-    def _refresh_active_plot_view(self) -> bool:
+    def _refresh_active_plot_view(self) -> None:
         view_id = self._active_plot_view_id()
-        return bool(view_id is not None and self._refresh_plot_view(view_id))
+        if view_id is not None:
+            self._refresh_plot_view(view_id)
 
-    def _refresh_plot_view(self, view_id: tuple[str, str]) -> bool:
+    def _refresh_plot_view(self, view_id: tuple[str, str]) -> None:
         if view_id[0] == "aggregate":
             plot_view = self._all_datasets_plot_view
             curves = self._curves
@@ -740,23 +742,33 @@ class RunResultsTab(QtWidgets.QWidget):
                 curve for curve in self._curves if curve.dataset_id == view_id[1]
             )
         if plot_view is None:
-            return False
-        rendered = plot_view.set_projection(curves, self._dataset_presentation)
+            name = "all_datasets" if view_id[0] == "aggregate" else view_id[1]
+            plot_view = self._create_plot_view(f"global_fit_results_plot_{name}")
+            if view_id[0] == "aggregate":
+                self._all_datasets_plot_view = plot_view
+            else:
+                self._dataset_plot_views[view_id] = plot_view
+            self._subtab_stack.addWidget(plot_view)
+        self._subtab_stack.setCurrentWidget(plot_view)
+        plot_view.set_projection(curves, self._dataset_presentation)
         self.copyAvailableChanged.emit(self.copy_eligible())
-        return bool(rendered)
 
     def _on_subtab_changed(self, index: int) -> None:
-        if 0 <= int(index) < self._subtab_stack.count():
-            self._subtab_stack.setCurrentIndex(int(index))
         self._refresh_active_plot_view()
         self._refresh_summary()
         self.copyAvailableChanged.emit(self.copy_eligible())
 
     def _clear_subtabs(self) -> None:
-        while self._subtabs.count():
-            self._subtabs.removeTab(self._subtabs.count() - 1)
+        with QtCore.QSignalBlocker(self._subtabs):
+            while self._subtabs.count():
+                self._subtabs.removeTab(self._subtabs.count() - 1)
         while self._subtab_stack.count():
-            widget = self._subtab_stack.widget(0)
-            self._subtab_stack.removeWidget(widget)
-            widget.deleteLater()
+            self._remove_plot_view(self._subtab_stack.widget(0))
+        self._dataset_plot_views.clear()
+        self._all_datasets_plot_view = None
         self._subtabs.hide()
+
+    def _remove_plot_view(self, view: GridPlotView) -> None:
+        view.set_projection((), {})
+        self._subtab_stack.removeWidget(view)
+        view.deleteLater()
