@@ -479,7 +479,7 @@ class GettingStarted(Lesson):
                 "name_tab",
                 "Name the Tab",
                 "<p>A descriptive name helps you identify a mechanism when several tabs are open.</p>"
-                "<ol><li>Double-click the new tab’s name above the main plot.</li>"
+                "<ol><li>Right-click the new tab’s name above the main plot and choose <b>Rename…</b>.</li>"
                 "<li>Enter <b>Getting Started</b> and confirm.</li>"
                 "</ol>",
                 lambda: Highlight(self._dialog(QtWidgets.QInputDialog))

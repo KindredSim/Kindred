@@ -12,6 +12,8 @@ from kindred.core.project_document import (
     ProjectDocument,
     SimulationExecutionSettings,
     TabScientificSettings,
+    new_set_id,
+    new_tab_id,
     prepare_tab_scientific_settings,
 )
 from kindred.core.project_session import ProjectContentToken, ProjectSession
@@ -437,6 +439,86 @@ class WorkspaceTabRegistry:
             return None
         self._active_tab_id = created.tab_id
         return created
+
+    def copy_tab(
+        self,
+        tab_id: str,
+        *,
+        expected_token: ProjectContentToken,
+    ) -> MechanismTabDocument | None:
+        """Copy accepted setup and retained results without touching source drafts."""
+
+        document = self.document
+        source = document.tab(tab_id)
+        names = {tab.name.casefold() for tab in document.tabs}
+        base_name = f"{source.name} — Copy"
+        name, suffix = base_name, 2
+        while name.casefold() in names:
+            name = f"{base_name} {suffix}"
+            suffix += 1
+        set_ids = {
+            item.set_id: new_set_id() for item in source.initial_condition_sets
+        }
+        copied = replace(
+            source,
+            tab_id=new_tab_id(),
+            name=name,
+            initial_condition_sets=tuple(
+                replace(item, set_id=set_ids[item.set_id])
+                for item in source.initial_condition_sets
+            ),
+            run_overrides_by_set_id=tuple(
+                (set_ids[sid], settings)
+                for sid, settings in source.run_overrides_by_set_id
+            ),
+            dataset_links=tuple(
+                (
+                    did,
+                    replace(link, set_id=set_ids[link.set_id] if link.set_id else None),
+                )
+                for did, link in source.dataset_links
+            ),
+        )
+        state = self.presentation(tab_id)
+        presentation = replace(
+            state,
+            current_set_id=(
+                set_ids[state.current_set_id] if state.current_set_id else None
+            ),
+            plot_set_ids=tuple(set_ids[sid] for sid in state.plot_set_ids),
+            pinned_slider_set_ids=(),
+        )
+        source_runtime = self.tab_runtime(tab_id)
+        repository = source_runtime.result_repository
+        index = next(
+            i for i, tab in enumerate(document.tabs) if tab.tab_id == tab_id
+        ) + 1
+        candidate = replace(
+            document, tabs=(*document.tabs[:index], copied, *document.tabs[index:])
+        )
+        if self.replace_document(candidate, expected_token=expected_token) is None:
+            return None
+        self.set_presentation(copied.tab_id, presentation)
+        runtime = self.tab_runtime(copied.tab_id)
+        runtime.selected_run_set_ids = tuple(
+            set_ids[sid] for sid in source_runtime.selected_run_set_ids
+        )
+        if repository is not None and runtime.result_repository is not None:
+            runtime.result_repository.copy_accepted_runs_from(repository, set_ids)
+        self.select_tab(copied.tab_id)
+        return copied
+
+    def reorder_tabs(
+        self,
+        tab_ids: tuple[str, ...],
+        *,
+        expected_token: ProjectContentToken,
+    ) -> ProjectContentToken | None:
+        document = self.document
+        candidate = replace(
+            document, tabs=tuple(document.tab(tab_id) for tab_id in tab_ids)
+        )
+        return self.replace_document(candidate, expected_token=expected_token)
 
     def rename_tab(
         self,

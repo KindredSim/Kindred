@@ -755,6 +755,9 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self._workspace.tabActivated.connect(self._select_tab)
         self._workspace.createTabRequested.connect(self._create_tab)
+        self._workspace.tabMenuOpening.connect(self._finish_focused_tab_input)
+        self._workspace.copyTabRequested.connect(self._copy_tab)
+        self._workspace.reorderTabsRequested.connect(self._reorder_tabs)
         self._workspace.renameTabRequested.connect(self._rename_tab)
         self._workspace.closeTabRequested.connect(self._close_tab)
         self._workspace.plotCreated.connect(self._connect_workspace_plot)
@@ -1745,10 +1748,6 @@ class MainWindow(QtWidgets.QMainWindow):
                 runtime.has_dirty_drafts
                 or self._tab_surfaces[tab.tab_id].simulation_panel.has_run_defaults_draft,
             )
-            self._workspace.set_tab_close_enabled(
-                tab.tab_id,
-                len(tabs) > 1,
-            )
 
     # ------------------------------------------------------------------
     # Mechanism tab and retained-page intents
@@ -1788,6 +1787,39 @@ class MainWindow(QtWidgets.QMainWindow):
         self._apply_persisted_plot_state(tab.tab_id)
         self._refresh_tab_controls(tab.tab_id)
 
+    @QtCore.Slot()
+    def _finish_focused_tab_input(self) -> None:
+        # Finish only the focused field's ordinary editing interaction before
+        # reading accepted setup. Do not apply the tab's other pending drafts.
+        focused = QtWidgets.QApplication.focusWidget()
+        if focused is not None:
+            focused.clearFocus()
+
+    @QtCore.Slot(str)
+    def _copy_tab(self, tab_id: str) -> None:
+        if not self._mutation_input_admitted("Create Copy"):
+            return
+        self._finish_focused_tab_input()
+        tab = self._workspace_tab_registry.copy_tab(
+            tab_id,
+            expected_token=self._project_session.capture_content_token(),
+        )
+        if tab is None:
+            return
+        self._create_tab_surface(tab.tab_id)
+        self._refresh_workspace_tab_structure()
+        self._apply_persisted_plot_state(tab.tab_id)
+        self._refresh_tab_controls(tab.tab_id)
+
+    @QtCore.Slot(object)
+    def _reorder_tabs(self, tab_ids: tuple[str, ...]) -> None:
+        if self._mutation_input_admitted("Reorder Tabs"):
+            self._workspace_tab_registry.reorder_tabs(
+                tab_ids,
+                expected_token=self._project_session.capture_content_token(),
+            )
+        self._refresh_workspace_tab_structure()
+
     @QtCore.Slot(str, str)
     def _rename_tab(self, tab_id: str, name: str) -> None:
         if not self._mutation_input_admitted("Rename Tab"):
@@ -1807,11 +1839,11 @@ class MainWindow(QtWidgets.QMainWindow):
 
     @QtCore.Slot(str)
     def _close_tab(self, tab_id: str) -> None:
-        if not self._mutation_input_admitted("Close Tab"):
+        if not self._mutation_input_admitted("Delete Tab"):
             return
         document = self._project_session.document
         if len(document.tabs) <= 1:
-            self.set_status_text("The last mechanism tab cannot be closed.")
+            self.set_status_text("The last mechanism tab cannot be deleted.")
             return
         expected_token = self._project_session.capture_content_token()
         if self._capture_visible_tab_inputs(
@@ -1831,10 +1863,10 @@ class MainWindow(QtWidgets.QMainWindow):
         has_content = bool(has_content or bundle.simulation_panel.has_run_defaults_draft)
         if has_content:
             dialog = QtWidgets.QMessageBox(self)
-            dialog.setWindowTitle("Close Mechanism")
+            dialog.setWindowTitle("Delete Mechanism")
             dialog.setIcon(QtWidgets.QMessageBox.Icon.Warning)
             details = [
-                "Close this mechanism tab and discard its canonical content?"
+                "Delete this mechanism tab and discard its canonical content?"
             ]
             if runtime.reactions_draft is not None:
                 details.append("Visible Reactions edits will be discarded.")
@@ -1851,7 +1883,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 details.append("Slider Preview drafts will be discarded.")
             dialog.setText("\n\n".join(details))
             discard = dialog.addButton(
-                "Discard and Close",
+                "Delete",
                 QtWidgets.QMessageBox.ButtonRole.DestructiveRole,
             )
             dialog.addButton(QtWidgets.QMessageBox.StandardButton.Cancel)
@@ -2733,11 +2765,12 @@ class MainWindow(QtWidgets.QMainWindow):
             bundle.slider_binding.resolve_target_set_ids(),
         )
 
-    @QtCore.Slot(str, bool)
+    @QtCore.Slot(str, bool, bool)
     def _on_slider_draft_state_changed(
         self,
         tab_id: str,
         dirty: bool,
+        reset_enabled: bool,
     ) -> None:
         """Project only one exact tab binding's Slider Draft actions."""
 
@@ -2745,7 +2778,7 @@ class MainWindow(QtWidgets.QMainWindow):
         bundle = self._tab_surfaces.get(target)
         if bundle is None or bundle.slider_binding.tab_id != target:
             return
-        bundle.editor.set_slider_draft_actions_enabled(bool(dirty))
+        bundle.editor.set_slider_draft_actions_enabled(dirty, reset_enabled)
 
     @QtCore.Slot(str, object)
     def _refresh_slider_target_summary(

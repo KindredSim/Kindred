@@ -143,6 +143,30 @@ class ResultRepository:
     def tab_id(self) -> str:
         return self._tab_id
 
+    def copy_accepted_runs_from(
+        self, source: ResultRepository, set_ids: Mapping[str, str]
+    ) -> None:
+        """Populate a fresh repository for an identical accepted setup.
+
+        Reference retains the canonical Run while Slider Preview is active;
+        scientific invalidation clears that authority on accepted input changes.
+        Neither Preview nor historical cache entries establish Run authority.
+        """
+
+        self._cache_capacity = source._cache_capacity
+        for source_id, destination_id in set_ids.items():
+            entry = (
+                source._current_by_set_id[source_id]
+                if source_id in source._current_run_set_ids
+                else source._reference_by_set_id.get(source_id)
+            )
+            if entry is not None:
+                _, request, result = entry
+                self._current_by_set_id[destination_id] = (
+                    destination_id, request, result
+                )
+                self._current_run_set_ids.add(destination_id)
+
     def resize_cache_capacity(self, cache_capacity: int) -> None:
         """Apply a positive capacity immediately and trim this repository's LRU."""
 

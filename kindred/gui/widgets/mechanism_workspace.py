@@ -27,6 +27,9 @@ class ProjectWorkspaceWidget(QtWidgets.QMainWindow):
 
     tabActivated = QtCore.Signal(str)
     createTabRequested = QtCore.Signal()
+    tabMenuOpening = QtCore.Signal()
+    copyTabRequested = QtCore.Signal(str)
+    reorderTabsRequested = QtCore.Signal(object)
     renameTabRequested = QtCore.Signal(str, str)
     closeTabRequested = QtCore.Signal(str)
     plotCreated = QtCore.Signal(str, object)
@@ -52,11 +55,23 @@ class ProjectWorkspaceWidget(QtWidgets.QMainWindow):
         self._tab_bar.setDocumentMode(True)
         self._tab_bar.setExpanding(False)
         self._tab_bar.setMovable(False)
-        self._tab_bar.setTabsClosable(True)
+        # Mouse gestures are resolved before activation can settle editor drafts.
+        # Keyboard focus/navigation remains native; dragging never takes focus.
+        self._tab_bar.setFocusPolicy(QtCore.Qt.FocusPolicy.TabFocus)
+        self._tab_bar.setContextMenuPolicy(
+            QtCore.Qt.ContextMenuPolicy.CustomContextMenu
+        )
+        self._tab_bar.customContextMenuRequested.connect(self._on_tab_context_menu)
+        self._tab_press_position: QtCore.QPoint | None = None
+        self._tab_press_id: str | None = None
+        self._tab_dragging = False
+        self._tab_drag_position = QtCore.QPoint()
+        self._tab_scroll_timer = QtCore.QTimer(self)
+        self._tab_scroll_timer.setInterval(80)
+        self._tab_scroll_timer.timeout.connect(self._scroll_dragged_tab)
+        self._tab_bar.installEventFilter(self)
         self._tab_bar.currentChanged.connect(self._on_current_changed)
         self._tab_bar.tabBarClicked.connect(self._on_tab_clicked)
-        self._tab_bar.tabBarDoubleClicked.connect(self._on_tab_double_clicked)
-        self._tab_bar.tabCloseRequested.connect(self._on_close_requested)
         layout.addWidget(self._tab_bar)
 
         self._dark_mode = False
@@ -338,11 +353,6 @@ class ProjectWorkspaceWidget(QtWidgets.QMainWindow):
                 self._tab_bar.setTabText(plus_index, "+")
                 self._tab_bar.setTabData(plus_index, None)
                 self._tab_bar.setTabToolTip(plus_index, _CREATE_TAB_TOOLTIP)
-                self._tab_bar.setTabButton(
-                    plus_index,
-                    QtWidgets.QTabBar.ButtonPosition.RightSide,
-                    None,
-                )
                 active_index = self._index_for_tab_id(target_active)
                 self._tab_bar.setCurrentIndex(active_index)
             finally:
@@ -421,15 +431,6 @@ class ProjectWorkspaceWidget(QtWidgets.QMainWindow):
         for plot in self._plot_by_tab_id.values():
             plot.set_theme(dark_mode=self._dark_mode)
 
-    def set_tab_close_enabled(self, tab_id: str, enabled: bool) -> None:
-        index = self._index_for_tab_id(tab_id)
-        button = self._tab_bar.tabButton(
-            index,
-            QtWidgets.QTabBar.ButtonPosition.RightSide,
-        )
-        if button is not None:
-            button.setEnabled(bool(enabled))
-
     def set_tab_dirty(self, tab_id: str, dirty: bool) -> None:
         index = self._index_for_tab_id(tab_id)
         text = self._tab_bar.tabText(index).removesuffix(" *")
@@ -456,9 +457,158 @@ class ProjectWorkspaceWidget(QtWidgets.QMainWindow):
     def _mechanism_tab_count(self) -> int:
         return max(0, self._tab_bar.count() - 1)
 
+    def eventFilter(self, watched, event):  # noqa: N802 - Qt override
+        kind = event.type()
+        if self._tab_press_position is not None and (
+            kind in (QtCore.QEvent.Type.Hide, QtCore.QEvent.Type.WindowDeactivate,
+                     QtCore.QEvent.Type.UngrabMouse)
+        ):
+            self._end_tab_gesture()
+        if watched is not self._tab_bar:
+            return super().eventFilter(watched, event)
+        bar = self._tab_bar
+        if kind == QtCore.QEvent.Type.MouseButtonDblClick:
+            self._end_tab_gesture()
+            return True
+        if kind == QtCore.QEvent.Type.MouseButtonPress:
+            if event.button() not in (
+                QtCore.Qt.MouseButton.LeftButton, QtCore.Qt.MouseButton.RightButton,
+            ):
+                return False
+            index = bar.tabAt(event.position().toPoint())
+            if index < 0:
+                return False
+            if event.button() == QtCore.Qt.MouseButton.RightButton:
+                self._end_tab_gesture()
+                return True
+            self._tab_press_position = event.position().toPoint()
+            self._tab_press_id = bar.tabData(index)
+            self._tab_dragging = False
+            self.window().installEventFilter(self)
+            return True
+        if (
+            kind == QtCore.QEvent.Type.MouseMove
+            and self._tab_press_position is not None
+        ):
+            position = event.position().toPoint()
+            distance = (position - self._tab_press_position).manhattanLength()
+            if distance >= QtWidgets.QApplication.startDragDistance():
+                self._tab_dragging = True
+            if self._tab_dragging and self._tab_press_id is not None:
+                self._tab_drag_position = position
+                self._move_dragged_tab()
+                if self._edge_scroll_button() is not None:
+                    if not self._tab_scroll_timer.isActive():
+                        self._tab_scroll_timer.start()
+                else:
+                    self._tab_scroll_timer.stop()
+            return True
+        if (
+            kind == QtCore.QEvent.Type.MouseButtonRelease
+            and event.button() == QtCore.Qt.MouseButton.LeftButton
+        ):
+            if self._tab_press_position is None:
+                return True
+            dragging, tab_id = self._tab_dragging, self._tab_press_id
+            self._end_tab_gesture()
+            if not dragging:
+                index = bar.tabAt(event.position().toPoint())
+                if index >= 0 and bar.tabData(index) == tab_id:
+                    bar.tabBarClicked.emit(index)
+            return True
+        return super().eventFilter(watched, event)
+
+    def _end_tab_gesture(self) -> None:
+        self._tab_scroll_timer.stop()
+        moved = self._tab_dragging and self._tab_press_id is not None
+        self._tab_press_position = None
+        self._tab_press_id = None
+        self._tab_dragging = False
+        self.window().removeEventFilter(self)
+        if moved:
+            self.reorderTabsRequested.emit(
+                tuple(self._tab_bar.tabData(index)
+                      for index in range(self._mechanism_tab_count()))
+            )
+
+    def _move_dragged_tab(self) -> None:
+        bar = self._tab_bar
+        source = self._index_for_tab_id(self._tab_press_id)
+        target = bar.tabAt(self._tab_drag_position)
+        if target < 0:
+            return
+        target = min(target, self._mechanism_tab_count() - 1)
+        # Cross the neighbour's midpoint before moving. Hit-testing alone
+        # reverses the move when unequal tab widths rearrange under the pointer.
+        midpoint = bar.tabRect(target).center().x()
+        if target > source and self._tab_drag_position.x() < midpoint:
+            target -= 1
+        elif target < source and self._tab_drag_position.x() > midpoint:
+            target += 1
+        with QtCore.QSignalBlocker(bar):
+            bar.moveTab(source, target)
+
+    def _edge_scroll_button(self) -> QtWidgets.QToolButton | None:
+        bar = self._tab_bar
+        position = self._tab_drag_position
+        if not bar.rect().contains(position):
+            return None
+        buttons = [
+            button for button in bar.findChildren(QtWidgets.QToolButton)
+            if button.isVisible()
+        ]
+        margin = max(24, sum(button.width() for button in buttons))
+        arrow = (
+            QtCore.Qt.ArrowType.LeftArrow if position.x() < margin
+            else QtCore.Qt.ArrowType.RightArrow
+            if position.x() >= bar.width() - margin else None
+        )
+        return next(
+            (button for button in buttons
+             if button.arrowType() == arrow and button.isEnabled()), None
+        )
+
+    def _scroll_dragged_tab(self) -> None:
+        button = self._edge_scroll_button()
+        if button is None:
+            self._tab_scroll_timer.stop()
+            return
+        with QtCore.QSignalBlocker(self._tab_bar):
+            button.click()
+        self._move_dragged_tab()
+        if self._edge_scroll_button() is None:
+            self._tab_scroll_timer.stop()
+
+    def _on_tab_context_menu(self, position: QtCore.QPoint) -> None:
+        index = self._tab_bar.tabAt(position)
+        if index < 0:
+            return
+        tab_id = self._tab_bar.tabData(index)
+        if tab_id is None:
+            return
+        self.tabMenuOpening.emit()
+        menu = QtWidgets.QMenu(self)
+        rename = menu.addAction("Rename…")
+        copy = menu.addAction("Create copy")
+        delete = menu.addAction("Delete")
+        delete.setEnabled(self._mechanism_tab_count() > 1)
+        chosen = menu.exec(self._tab_bar.mapToGlobal(position))
+        if chosen is rename:
+            self._rename_tab(tab_id)
+        elif chosen is copy:
+            self.copyTabRequested.emit(tab_id)
+        elif chosen is delete:
+            self.closeTabRequested.emit(tab_id)
+        menu.deleteLater()
+
     def _on_tab_clicked(self, index: int) -> None:
-        if index == self._tab_bar.count() - 1:
+        if index < 0 or index >= self._tab_bar.count():
+            return
+        tab_id = self._tab_bar.tabData(index)
+        if tab_id is None:
             self.createTabRequested.emit()
+        else:
+            self.tabActivated.emit(tab_id)
 
     def _on_current_changed(self, index: int) -> None:
         if index < 0 or index >= self._mechanism_tab_count():
@@ -467,12 +617,8 @@ class ProjectWorkspaceWidget(QtWidgets.QMainWindow):
         if isinstance(tab_id, str) and tab_id:
             self.tabActivated.emit(tab_id)
 
-    def _on_tab_double_clicked(self, index: int) -> None:
-        if index < 0 or index >= self._mechanism_tab_count():
-            return
-        tab_id = self._tab_bar.tabData(index)
-        if not isinstance(tab_id, str) or not tab_id:
-            return
+    def _rename_tab(self, tab_id: str) -> None:
+        index = self._index_for_tab_id(tab_id)
         current_name = self._tab_bar.tabText(index).removesuffix(" *")
         name, accepted = QtWidgets.QInputDialog.getText(
             self,
@@ -483,12 +629,3 @@ class ProjectWorkspaceWidget(QtWidgets.QMainWindow):
         )
         if accepted:
             self.renameTabRequested.emit(tab_id, str(name))
-
-    def _on_close_requested(self, index: int) -> None:
-        if index < 0 or index >= self._mechanism_tab_count():
-            return
-        if self._mechanism_tab_count() <= 1:
-            return
-        tab_id = self._tab_bar.tabData(index)
-        if isinstance(tab_id, str) and tab_id:
-            self.closeTabRequested.emit(tab_id)

@@ -141,7 +141,7 @@ class TabSliderBinding(QtCore.QObject):
     """Own one tab's Slider drafts; the job owner owns computation custody."""
 
     draftStateChanged = QtCore.Signal(str, bool)
-    sliderDraftStateChanged = QtCore.Signal(str, bool)
+    sliderDraftStateChanged = QtCore.Signal(str, bool, bool)
     targetSetIdsChanged = QtCore.Signal(object)
     errorRaised = QtCore.Signal(str)
 
@@ -194,9 +194,11 @@ class TabSliderBinding(QtCore.QObject):
         self._gesture_capture = None
         self._latest_admissible_pending = None
         variable_sliders.interactionRequested.connect(self._on_parameter_interaction)
+        variable_sliders.editorValidityChanged.connect(self.publish_slider_draft_state)
         species_sliders.interactionRequested.connect(self._on_species_interaction)
         self._disposable_connections = (
             (variable_sliders.interactionRequested, self._on_parameter_interaction),
+            (variable_sliders.editorValidityChanged, self.publish_slider_draft_state),
             (species_sliders.interactionRequested, self._on_species_interaction),
         )
 
@@ -340,6 +342,11 @@ class TabSliderBinding(QtCore.QObject):
             )
         finally:
             self._defer_rejected_slider_restore = False
+        if accepted and interaction is SliderInteractionKind.EXACT_TYPED_COMMIT:
+            sliders = (
+                self._variable_sliders if kind == "parameter" else self._species_sliders
+            )
+            sliders.remember_editor_state(name)
         if not accepted and defer_rejected_restore:
             self._queue_rejected_slider_restore()
         return bool(accepted)
@@ -361,7 +368,11 @@ class TabSliderBinding(QtCore.QObject):
         )
 
     def publish_slider_draft_state(self) -> None:
-        self.sliderDraftStateChanged.emit(self._tab_id, self.has_slider_draft())
+        dirty = self.has_slider_draft()
+        self.sliderDraftStateChanged.emit(
+            self._tab_id, dirty,
+            dirty or self._variable_sliders.has_rejected_editor_text(),
+        )
 
     def prepare_render(
         self, *, preserve_visibility: bool = True
@@ -397,7 +408,9 @@ class TabSliderBinding(QtCore.QObject):
             bool(preserve_visibility),
         )
 
-    def apply_render_projection(self, prepared: ActiveSliderRenderProjection) -> None:
+    def apply_render_projection(
+        self, prepared: ActiveSliderRenderProjection, *, preserve_editor_drafts: bool = True
+    ) -> None:
         if not isinstance(prepared, ActiveSliderRenderProjection):
             raise TypeError("prepared must be ActiveSliderRenderProjection.")
         self._rendering = True
@@ -410,6 +423,7 @@ class TabSliderBinding(QtCore.QObject):
                 dict(prepared.parameter_values),
                 metadata=prepared.projection.metadata_dict(),
                 preserve_visibility=prepared.preserve_visibility,
+                preserve_editor_drafts=preserve_editor_drafts,
             )
             self._species_sliders.render_values(
                 dict(prepared.species_values),
@@ -443,10 +457,14 @@ class TabSliderBinding(QtCore.QObject):
                 interaction=SliderInteractionKind.EXACT_TYPED_COMMIT,
             )
 
-    def render(self, *, preserve_visibility: bool = True) -> bool:
+    def render(
+        self, *, preserve_visibility: bool = True, preserve_editor_drafts: bool = True
+    ) -> bool:
         try:
             prepared = self.prepare_render(preserve_visibility=preserve_visibility)
-            self.apply_render_projection(prepared)
+            self.apply_render_projection(
+                prepared, preserve_editor_drafts=preserve_editor_drafts
+            )
             self.settle_render_projection(prepared)
         except (TypeError, ValueError, RuntimeError) as exc:
             self.errorRaised.emit(f"Slider projection failed: {exc}")
@@ -611,6 +629,15 @@ class TabSliderBinding(QtCore.QObject):
                 field=f"Parameter {name!r}",
             )
         except (TypeError, ValueError) as exc:
+            if _interaction is SliderInteractionKind.EXACT_TYPED_COMMIT:
+                accepted_value = self._registry.tab_runtime(
+                    self._tab_id
+                ).slider_parameter_draft.get(
+                    name, prepared.projection.values_dict()[name]
+                )
+                self._variable_sliders.reject_editor_value(name, accepted_value)
+                self.errorRaised.emit(str(exc))
+                return False
             return self._reject_slider_action(str(exc))
         runtime = self._registry.tab_runtime(self._tab_id)
         before = dict(runtime.slider_parameter_draft)
@@ -896,7 +923,7 @@ class TabSliderBinding(QtCore.QObject):
         runtime.slider_parameter_draft.clear()
         runtime.slider_species_drafts_by_set_id.clear()
         if render:
-            self.render()
+            self.render(preserve_editor_drafts=False)
         self._emit_draft_state()
         return changed
 
@@ -915,14 +942,14 @@ class TabSliderBinding(QtCore.QObject):
         self._exact_preview_capture = None
 
     def reset_project_session(self) -> None:
-        """Drop retained gesture/capture state before a project replacement."""
+        """Clear retained gestures and editors for the replacement project."""
 
         self._cancel_deferred_restore()
         self._interactive_stop_fenced = True
         self._clear_gesture_state()
         self._simulation_jobs.retire_preview(self._tab_id)
         self._exact_preview_capture = None
-        self._projection = None
+        self.clear_projection()
         self._last_targets = ()
 
     def fence_stop(self) -> bool:
@@ -1076,6 +1103,7 @@ class TabSliderBinding(QtCore.QObject):
         targets = self.resolve_target_set_ids()
         changed = bool(
             runtime.slider_parameter_draft
+            or self._variable_sliders.has_rejected_editor_text()
             or any(
                 runtime.slider_species_drafts_by_set_id.get(item) for item in targets
             )
@@ -1085,7 +1113,7 @@ class TabSliderBinding(QtCore.QObject):
         for item in targets:
             runtime.slider_species_drafts_by_set_id.pop(item, None)
         if changed:
-            self.render()
+            self.render(preserve_editor_drafts=False)
         self._emit_draft_state()
         return changed
 

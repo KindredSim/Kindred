@@ -495,12 +495,14 @@ class BatchSpeciesSliders(QtWidgets.QWidget):
         row = self._rows.get(str(species))
         if row is None or not isinstance(row.value_label, _NumericValueEdit):
             return
-        self._editor_pre_edit_values[str(species)] = float(
-            self._values.get(str(species), 0.0)
-        )
-        self._editor_pre_edit_text[str(species)] = row.value_label.text()
+        self.remember_editor_state(species)
         self._last_committed_editor_text.pop(str(species), None)
         self._decorate_editor(str(species))
+
+    def remember_editor_state(self, species: str) -> None:
+        """Remember the current value and text for subsequent local Escape."""
+        self._editor_pre_edit_values[species] = self._values[species]
+        self._editor_pre_edit_text[species] = self._rows[species].value_label.text()
 
     def _on_editor_escape(self, species: str) -> None:
         species_s = str(species)

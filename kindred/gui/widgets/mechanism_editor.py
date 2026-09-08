@@ -252,7 +252,7 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
         )
         self._reset_runtime_parameters_btn.clicked.connect(self.sliderResetRequested)
         slider_actions_layout.addWidget(self._reset_runtime_parameters_btn, 0, 3, alignment=QtCore.Qt.AlignLeft)
-        self.set_slider_draft_actions_enabled(False)
+        self.set_slider_draft_actions_enabled(False, False)
 
         # Visibility picker for the unified slider surface.
         self._slider_visibility_picker_btn = QtWidgets.QToolButton()
@@ -785,10 +785,11 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
     def set_slider_draft_actions_enabled(
         self,
         dirty: bool,
+        reset_enabled: bool,
     ) -> None:
         enabled = bool(dirty)
         self._commit_runtime_parameters_btn.setEnabled(enabled)
-        self._reset_runtime_parameters_btn.setEnabled(enabled)
+        self._reset_runtime_parameters_btn.setEnabled(reset_enabled)
         self._commit_runtime_parameters_btn.setText(
             "Apply \N{BULLET}" if dirty else "Apply"
         )

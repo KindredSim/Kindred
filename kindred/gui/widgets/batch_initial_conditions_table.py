@@ -409,7 +409,7 @@ class BatchInitialConditionsTableModel(QtCore.QAbstractTableModel):
 
 
 class _InitialConditionsItemDelegate(QtWidgets.QStyledItemDelegate):
-    """Keep invalid numeric drafts in their active editor."""
+    """Keep rejected numeric edits available for correction."""
 
     def createEditor(  # noqa: N802 - Qt override
         self,
@@ -434,8 +434,7 @@ class _InitialConditionsItemDelegate(QtWidgets.QStyledItemDelegate):
             isinstance(editor, QtWidgets.QLineEdit)
             and event.type() == QtCore.QEvent.Type.KeyPress
             and isinstance(event, QtGui.QKeyEvent)
-            and event.key()
-            in (QtCore.Qt.Key.Key_Return, QtCore.Qt.Key.Key_Enter)
+            and event.key() in (QtCore.Qt.Key.Key_Return, QtCore.Qt.Key.Key_Enter)
         ):
             index = self._index_for_editor(editor)
             model = index.model()
@@ -473,9 +472,11 @@ class _InitialConditionsItemDelegate(QtWidgets.QStyledItemDelegate):
         return view.indexAt(center)
 
     def _update_editor_style(self, editor: QtWidgets.QLineEdit) -> None:
+        index = self._index_for_editor(editor)
         editor.setStyleSheet(
             _INVALID_EDITOR_STYLE
-            if not self._is_valid_concentration(editor.text())
+            if index.isValid() and index.column() != 0
+            and not self._is_valid_concentration(editor.text())
             else ""
         )
 
