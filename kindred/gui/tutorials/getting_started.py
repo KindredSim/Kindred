@@ -113,7 +113,9 @@ class GettingStarted(Lesson):
         "select_new_set",
         "run_new_set",
         "plot_sets",
+        "copy_all",
         "simplify_plot",
+        "copy_plotted",
         "pin_slider_set",
         "show_slider",
         "preview_target",
@@ -131,7 +133,9 @@ class GettingStarted(Lesson):
         "select_new_set",
         "run_new_set",
         "plot_sets",
+        "copy_all",
         "simplify_plot",
+        "copy_plotted",
         "pin_slider_set",
         "drag_slider",
         "fine_slider",
@@ -213,14 +217,17 @@ class GettingStarted(Lesson):
             return self._missing(
                 "This exercise needs the additional starting-condition set.", "add_set"
             )
-        if name in {"select_new_set", "run_new_set", "plot_sets", "simplify_plot"}:
+        if name in {
+            "select_new_set", "run_new_set", "plot_sets", "copy_all",
+            "simplify_plot", "copy_plotted",
+        }:
             repo = self.registry.tab_runtime(self.tab_id).result_repository
             if repo.current_result(self.preset_set) is None:
                 return self._missing(
                     "This exercise uses the preset's existing simulation.", "run_edited"
                 )
             if (
-                name in {"plot_sets", "simplify_plot"}
+                name in {"plot_sets", "copy_all", "simplify_plot", "copy_plotted"}
                 and repo.current_result(self.extra_set) is None
             ):
                 return self._missing(
@@ -824,6 +831,19 @@ class GettingStarted(Lesson):
                 manual=True,
             ),
             Step(
+                "copy_all",
+                "Copy All Results",
+                "<p>You can copy Kindred’s results directly to your clipboard, and then paste directly into a spreadsheet for analysis, reporting, or making your own figures.</p>"
+                "<ol><li>Keep <b>Plot</b> checked for both <b>preset_set1</b> and <b>Higher A</b>.</li>"
+                "<li>Right-click inside the plot and choose <b>Copy All</b>.</li>"
+                "<li>Paste into an empty sheet in Excel, LibreOffice Calc, or another spreadsheet application.</li>"
+                "<li>Find the results for both sets and the columns for <b>A</b>, <b>B</b>, and <b>total</b>.</li></ol>"
+                "<p><b>Copy All</b> includes all available results for the current mechanism tab—even sets and quantities hidden from the plot. It preserves full resolution and ignores plot downsampling and display-unit choices. Time is copied in seconds and species concentrations in M.</p>"
+                "<p>Inspect the pasted data, then choose <b>Continue</b>.</p>",
+                lambda: (initial(), plot()),
+                manual=True,
+            ),
+            Step(
                 "simplify_plot",
                 "Invert the Y Selection",
                 "<p><b>Invert selection</b> switches checked quantities off and unchecked quantities on. It changes which curves appear, not the axis direction.</p>"
@@ -832,6 +852,20 @@ class GettingStarted(Lesson):
                 "<li>Click <b>Invert selection</b> again. Only <b>B</b> and <b>total</b> are now selected.</li>"
                 "<li>Click it once more to return to <b>A only</b>, then close the selector.</li></ol>"
                 "<p>In <b>Initial Conditions</b>, leave <b>Plot</b> checked only for <b>preset_set1</b>. <b>Plot</b> chooses the sets and <b>Y</b> chooses the quantities.</p>",
+                lambda: (initial(), plot()),
+                manual=True,
+            ),
+            Step(
+                "copy_plotted",
+                "Copy Plotted Data",
+                "<p>Your plot should now show only <b>A</b> from <b>preset_set1</b>. You can copy this selection without exporting the other results.</p>"
+                "<ol><li>Check that only <b>A</b> is selected for Y and only <b>preset_set1</b> has <b>Plot</b> checked.</li>"
+                "<li>Right-click inside the plot and choose <b>Copy Plotted Data</b>.</li>"
+                "<li>Paste into another empty sheet and compare it with your earlier <b>Copy All</b> output.</li></ol>"
+                "<p><b>Copy Plotted Data</b> follows the plotted sets and quantities, selected X axis, display units, and plot downsampling. Here, it copies the plotted A series from preset_set1.</p>"
+                "<p>Zooming does <b>not</b> crop the copied data: points outside the current viewport are included.</p>"
+                "<p><b>Copy All</b> would still include both sets and their other quantities, even though they are now hidden.</p>"
+                "<p>Inspect the difference, then choose <b>Continue</b>.</p>",
                 lambda: (initial(), plot()),
                 manual=True,
             ),
