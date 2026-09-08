@@ -211,6 +211,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._result_copy_eligible: dict[str, bool] = {}
         self._dark_mode_action: QtGui.QAction | None = None
         self._run_action: QtGui.QAction | None = None
+        self._scan_action: QtGui.QAction | None = None
         self._new_project_action: QtGui.QAction | None = None
         self._open_project_action: QtGui.QAction | None = None
         self._load_data_action: QtGui.QAction | None = None
@@ -282,6 +283,11 @@ class MainWindow(QtWidgets.QMainWindow):
         for tab in self._project_session.document.tabs:
             self._create_tab_surface(tab.tab_id)
         self._xlsx_export_owner = XlsxExportOwner(parent=self)
+        from kindred.gui.chemical_space_scan_owner import ChemicalSpaceScanOwner
+
+        self._scan_owner = ChemicalSpaceScanOwner(self._computation_gate, self._xlsx_export_owner, self)
+        self._scan_owner.application_close_settlement_changed.connect(self._refresh_actions)
+        self._scan_owner.status.connect(self.set_status_text)
         self._xlsx_export_owner.succeeded.connect(
             self._on_xlsx_export_succeeded
         )
@@ -307,6 +313,7 @@ class MainWindow(QtWidgets.QMainWindow):
             dataset_imports=self._dataset_import_staging,
             fit_session=self._fit_session_owner,
             xlsx_exports=self._xlsx_export_owner,
+            scan=self._scan_owner,
             set_status_text=self.set_status_text,
             capture_visible_tab_inputs=(
                 lambda token: self._capture_visible_tab_inputs(token)
@@ -317,6 +324,7 @@ class MainWindow(QtWidgets.QMainWindow):
             discard_authoring=self._discard_authoring,
             discard_slider_drafts=self._discard_all_slider_drafts,
         )
+        self.project_controller.projectStateChanged.connect(self._scan_owner.project_state_changed)
 
         from kindred.config.templates import TemplateManager
 
@@ -2195,6 +2203,7 @@ class MainWindow(QtWidgets.QMainWindow):
         *,
         discard_invalid: bool,
         report_invalid: bool = True,
+        raise_invalid: bool = False,
         selected_by_tab: dict[str, tuple[str, ...]] | None = None,
         superseded_by_tab: dict[str, tuple[str, ...]] | None = None,
     ) -> ProjectDocument | None:
@@ -2227,6 +2236,9 @@ class MainWindow(QtWidgets.QMainWindow):
                     if not self._valid_initial_text(raw, species):
                         if discard_invalid:
                             continue
+                        if raise_invalid:
+                            baseline = tab.initial_condition_set(set_id).name
+                            raise ValueError(f"Baseline {baseline!r}, initial {species}: {raw!r} is not a valid concentration.")
                         if report_invalid:
                             QtWidgets.QMessageBox.warning(
                                 self,
@@ -2248,6 +2260,10 @@ class MainWindow(QtWidgets.QMainWindow):
                 try:
                     settings = panel.current_settings_candidate()
                 except (TypeError, ValueError) as exc:
+                    if raise_invalid:
+                        inherited = ", ".join(repr(item.name) for item in tab.initial_condition_sets
+                                              if item.set_id not in dict(tab.run_overrides_by_set_id))
+                        raise ValueError(f"Execution defaults (baselines: {inherited or 'none'}): {exc}") from exc
                     panel.settingsValidationFailed.emit(str(exc))
                     self.set_status_text(f"Run settings are invalid: {exc}")
                     return None
@@ -2483,6 +2499,7 @@ class MainWindow(QtWidgets.QMainWindow):
             active_fit=self._fit_session_owner.active,
             active_import=bool(self._dataset_import_staging.busy),
             active_xlsx_export=self._xlsx_export_owner.is_exporting,
+            active_scan=self._scan_owner.busy,
         )
 
     def _prepare_before_save(
@@ -3745,6 +3762,10 @@ class MainWindow(QtWidgets.QMainWindow):
                 "Cannot overwrite the destination of an active XLSX export.",
             )
             return
+        if self._scan_owner.owns_destination(path):
+            QtWidgets.QMessageBox.critical(
+                self, "Export Original Dataset", "Cannot overwrite the destination of an active Chemical Space Scan.")
+            return
         if self.project_controller.is_current_project_path(path):
             QtWidgets.QMessageBox.critical(
                 self,
@@ -4146,6 +4167,7 @@ class MainWindow(QtWidgets.QMainWindow):
             or self._fit_session_owner.active
             or self._dataset_import_staging.busy
             or self._xlsx_export_owner.is_exporting
+            or self._scan_owner.busy
         )
         if active_work:
             self.set_status_text(
@@ -4334,6 +4356,10 @@ class MainWindow(QtWidgets.QMainWindow):
             "runSimulationAction",
         )
         self._run_action.setShortcuts(["Ctrl+R", "F5"])
+        self._scan_action = self._add_action(
+            simulation, "Chemical Space Scan…", self._open_chemical_space_scan,
+            None, "chemicalSpaceScanAction",
+        )
         self._stop_action = self._add_action(
             simulation,
             "Stop",
@@ -4543,6 +4569,9 @@ class MainWindow(QtWidgets.QMainWindow):
 
         del tab_id  # Stop is application-wide even when requested by one tab.
         changed = False
+        if self._scan_owner.busy:
+            self._scan_owner.cancel()
+            changed = True
         for bundle in tuple(self._tab_surfaces.values()):
             changed = bundle.slider_binding.fence_stop() or changed
         for target in tuple(self._tab_surfaces):
@@ -4556,6 +4585,43 @@ class MainWindow(QtWidgets.QMainWindow):
         for bundle in tuple(self._tab_surfaces.values()):
             changed = bundle.slider_binding.settle_stop() or changed
         return bool(self._simulation_jobs.cancel_current() or changed)
+
+    def _capture_scan_session(self):
+        """Admit all visible authoring inputs once, without project publication."""
+        tab_id = self._workspace_tab_registry.active_tab_id
+        token = self._project_session.capture_content_token()
+        if self._capture_visible_tab_inputs(token, tab_id=tab_id) is None:
+            raise ValueError("The authoring inputs changed during session capture.")
+        document = self._project_session.document
+        runtime = self._workspace_tab_registry.tab_runtime(tab_id)
+        if runtime.reactions_draft is None:
+            proposal = retained_tab_mechanism_source(document, tab_id)
+        else:
+            proposal = self._prepare_source_reconciliation(
+                document, tab_id, self._visible_source_for_tab(tab_id),
+                description="Chemical Space Scan session capture", report_error=True,
+            )
+        if proposal is None:
+            raise ValueError("A Scan session was not created because source admission did not complete.")
+        candidate = self._captured_input_candidate(
+            proposal.proposed_document, (tab_id,), discard_invalid=False,
+            report_invalid=False, raise_invalid=True,
+            superseded_by_tab={tab_id: proposal.materialized_set_ids},
+        )
+        tab = candidate.tab(tab_id)
+        for baseline in tab.initial_condition_sets:
+            # Consume the ordinary complete-roster and settings authorities.
+            canonical_initial_values(tab, baseline.set_id)
+            tab.resolved_execution_settings(baseline.set_id)
+        return tab
+
+    def _open_chemical_space_scan(self) -> None:
+        if not self._mutation_input_admitted("Chemical Space Scan"):
+            return
+        try:
+            self._scan_owner.open(self._capture_scan_session)
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(self, "Chemical Space Scan", str(exc))
 
     def _run_global_fit(self) -> bool:
         if not self._mutation_input_admitted("Global Fit"):
@@ -5295,7 +5361,7 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         self._stop_action.setEnabled(
             mutation_admitted
-            and self._simulation_work_active()
+            and (self._simulation_work_active() or self._scan_owner.busy)
         )
         self._global_fit_action.setEnabled(
             mutation_admitted
@@ -5308,7 +5374,12 @@ class MainWindow(QtWidgets.QMainWindow):
             or self._fit_session_owner.active
             or self._dataset_import_staging.busy
             or self._xlsx_export_owner.is_exporting
+            or self._scan_owner.busy
         )
+        if self._scan_action is not None:
+            self._scan_action.setEnabled(
+                mutation_admitted and (self._scan_owner.dialog is not None or not active_work and self._computation_gate.is_idle)
+            )
         project_actions_enabled = mutation_admitted and not active_work
         if self._new_project_action is not None:
             self._new_project_action.setEnabled(project_actions_enabled)

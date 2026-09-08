@@ -473,7 +473,7 @@ class SimulationPanel(QtWidgets.QWidget):
                 if not math.isfinite(parsed):
                     raise ValueError
             except (TypeError, ValueError, OverflowError) as exc:
-                raise ValueError("Run start and end times must be numeric.") from exc
+                raise ValueError(f"{field}: {edit.text()!r} must be a finite number.") from exc
             values[field] = parsed
         points_edit = self.num_points_spinbox.lineEdit()
         projected_points = str(int(values["integration_points"]))
@@ -493,7 +493,7 @@ class SimulationPanel(QtWidgets.QWidget):
             if state is not QtGui.QValidator.State.Acceptable:
                 minimum, maximum = SIMULATION_POINT_RANGE
                 raise ValueError(
-                    "Integration points must be an integer between "
+                    f"Integration points {raw_text!r} must be an integer between "
                     f"{minimum} and {maximum}."
                 )
             try:
@@ -501,7 +501,7 @@ class SimulationPanel(QtWidgets.QWidget):
             except (TypeError, ValueError, OverflowError) as exc:
                 minimum, maximum = SIMULATION_POINT_RANGE
                 raise ValueError(
-                    "Integration points must be an integer between "
+                    f"Integration points {raw_text!r} must be an integer between "
                     f"{minimum} and {maximum}."
                 ) from exc
         candidate = SimulationExecutionSettings(
@@ -510,7 +510,11 @@ class SimulationPanel(QtWidgets.QWidget):
             t_end=float(values["t_end"]),
             integration_points=int(values["integration_points"]),
         )
-        validate_simulation_execution_settings(candidate)
+        try:
+            validate_simulation_execution_settings(candidate)
+        except ValueError as exc:
+            raise ValueError(f"t_start={values['t_start']!r}, t_end={values['t_end']!r}, "
+                             f"integration_points={values['integration_points']!r}: {exc}") from exc
         return candidate
 
     def _reproject_canonical(self) -> None:

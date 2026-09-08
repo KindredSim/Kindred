@@ -50,6 +50,7 @@ class ProjectTransientState:
     active_fit: bool = False
     active_import: bool = False
     active_xlsx_export: bool = False
+    active_scan: bool = False
 
     def __post_init__(self) -> None:
         for field_name in (
@@ -63,6 +64,7 @@ class ProjectTransientState:
             "active_fit",
             "active_import",
             "active_xlsx_export",
+            "active_scan",
         ):
             if type(getattr(self, field_name)) is not bool:
                 raise TypeError(f"{field_name} must be bool.")
@@ -88,6 +90,7 @@ class ProjectTransientState:
             or self.active_fit
             or self.active_import
             or self.active_xlsx_export
+            or self.active_scan
         )
 
     @property
@@ -148,6 +151,7 @@ class ProjectController(QtCore.QObject):
         dataset_imports: DatasetImportStaging,
         fit_session: FitSessionOwner,
         xlsx_exports: object,
+        scan: object,
         set_status_text: Callable[[str], None],
         admit_incoming_document: Callable[
             [ProjectDocument],
@@ -187,6 +191,7 @@ class ProjectController(QtCore.QObject):
         self._dataset_imports = dataset_imports
         self._fit_session = fit_session
         self._xlsx_exports = xlsx_exports
+        self._scan = scan
         self._set_status_text = set_status_text
         self._admit_incoming_document = admit_incoming_document
         self._capture_visible_tab_inputs = capture_visible_tab_inputs
@@ -210,6 +215,7 @@ class ProjectController(QtCore.QObject):
         self._xlsx_exports.application_close_settlement_changed.connect(
             self.notify_close_progress
         )
+        self._scan.application_close_settlement_changed.connect(self.notify_close_progress)
 
     def _set_status(self, text: str) -> None:
         self._set_status_text(str(text))
@@ -338,6 +344,8 @@ class ProjectController(QtCore.QObject):
             details.append("A dataset import is still active.")
         if transient.active_xlsx_export:
             details.append("An XLSX export is still active.")
+        if transient.active_scan:
+            details.append("A Chemical Space Scan is still active.")
         details.append(f"Choose once how to proceed before {request.action}.")
 
         dialog = QtWidgets.QMessageBox(self._parent_widget)
@@ -781,6 +789,9 @@ class ProjectController(QtCore.QObject):
                 f"Invalid project destination:\n\n{exc}",
             )
             return None
+        if self._scan.owns_destination(absolute_path):
+            self._show_error("Save Error", "Cannot overwrite the destination of an active Chemical Space Scan.")
+            return None
         committed_token = self._commit_saved_document(
             candidate,
             materialized_by_tab,
@@ -875,7 +886,12 @@ class ProjectController(QtCore.QObject):
                     "Idle Fit cleanup failed during application Close"
                 )
                 fit_idle_closed = False
-            if fit_idle_closed:
+            try:
+                scan_idle_closed = self._scan.close_idle_for_application_close()
+            except Exception:
+                logger.exception("Idle Scan cleanup failed during application Close")
+                scan_idle_closed = False
+            if fit_idle_closed and scan_idle_closed:
                 if not self._session.is_content_token_current(
                     disposition.content_token
                 ):
@@ -891,7 +907,7 @@ class ProjectController(QtCore.QObject):
             # cleanup problem. Continue through the normal owner settlement
             # path so Close remains pending until every owner is settled.
             self._set_status(
-                "Idle Fit cleanup did not finish; waiting for active work to settle."
+                "Idle window cleanup did not finish; waiting for active work to settle."
             )
         self._close_started = True
         self._close_pending = True
@@ -920,6 +936,10 @@ class ProjectController(QtCore.QObject):
             logger.exception(
                 "XLSX export admission fencing/cancellation failed during Close"
             )
+        try:
+            self._scan.cancel_for_application_close()
+        except Exception:
+            logger.exception("Chemical Space Scan cancellation failed during Close")
         self.notify_close_progress()
         return self._native_close_authorized
 
@@ -939,6 +959,7 @@ class ProjectController(QtCore.QObject):
             ("Dataset import", self._dataset_imports),
             ("Fit", self._fit_session),
             ("XLSX export", self._xlsx_exports),
+            ("Chemical Space Scan", self._scan),
         ):
             try:
                 owner_settled = owner.application_close_settled

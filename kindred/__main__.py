@@ -11,12 +11,13 @@ from __future__ import annotations
 import sys
 from multiprocessing import freeze_support
 
-from kindred.gui import startup as gui_startup
 from kindred.io.logging import setup_logging
 
 def main() -> int:
     """Launch the Kindred GUI and return the Qt event-loop exit code."""
     freeze_support()
+
+    from kindred.gui import startup as gui_startup
 
     if len(sys.argv) > 1:
         print("Kindred launches the desktop GUI and does not accept command-line arguments.", file=sys.stderr)

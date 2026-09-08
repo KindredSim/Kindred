@@ -6,12 +6,12 @@ from PySide6 import QtCore
 
 __all__ = ["ComputationGate", "ComputationKind"]
 
-ComputationKind = Literal["run", "preview", "fit"]
-_KINDS = frozenset({"run", "preview", "fit"})
+ComputationKind = Literal["run", "preview", "fit", "scan"]
+_KINDS = frozenset({"run", "preview", "fit", "scan"})
 
 
 class ComputationGate(QtCore.QObject):
-    """GUI-thread identity guard for global Run/Preview/executing-Fit exclusion."""
+    """GUI-thread identity guard for Run/Preview/Fit/Scan exclusion."""
 
     changed = QtCore.Signal()
 
@@ -35,7 +35,7 @@ class ComputationGate(QtCore.QObject):
         if owner is None:
             raise ValueError("ComputationGate owner must not be None.")
         if kind not in _KINDS:
-            raise ValueError("ComputationGate kind must be 'run', 'preview', or 'fit'.")
+            raise ValueError("ComputationGate kind must be 'run', 'preview', 'fit', or 'scan'.")
         if self._active_owner is not None:
             return False
         self._active_owner = owner
