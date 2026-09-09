@@ -70,39 +70,6 @@ _ANNOTATION_ACCENTS = ("#4E79A7", "#F28E2B", "#59A14F", "#E15759", "#B07AA1", "#
 
 
 @dataclass(frozen=True, slots=True)
-class _InteractiveDisplayLayer:
-    projection: InteractiveDisplayProjection
-    opacity: float
-
-
-@dataclass(frozen=True, slots=True)
-class _InteractiveDisplayTransition:
-    source: tuple[_InteractiveDisplayLayer, ...]
-    target: InteractiveDisplayProjection
-    started_at: float
-    interpolate: bool
-
-
-@dataclass(frozen=True, slots=True)
-class _InteractiveDisplayState:
-    layers: tuple[_InteractiveDisplayLayer, ...]
-
-
-def _same_interactive_topology(
-    left: InteractiveDisplayCurve,
-    right: InteractiveDisplayCurve,
-) -> bool:
-    if left.segment_ids is None or right.segment_ids is None:
-        return left.segment_ids is None and right.segment_ids is None
-    return bool(
-        np.array_equal(left.segment_ids, right.segment_ids)
-        and left.segment_keys == right.segment_keys
-        and np.array_equal(left.discontinuity_ids, right.discontinuity_ids)
-        and left.intervention_connectors == right.intervention_connectors
-    )
-
-
-@dataclass(frozen=True, slots=True)
 class _RenderedPointChunk:
     """One exact point chunk handed to a static or interactive plot item."""
 
@@ -224,8 +191,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         self._interactive_timer.setSingleShot(True)
         self._interactive_timer.timeout.connect(self._advance_interactive_display)
         self._interactive_items: dict[tuple[object, ...], Any] = {}
-        self._interactive_visible: tuple[_InteractiveDisplayLayer, ...] | None = None
-        self._interactive_transition: _InteractiveDisplayTransition | None = None
+        self._interactive_visible: InteractiveDisplayProjection | None = None
         self._interactive_pending: InteractiveDisplayProjection | None = None
         self._interactive_results: dict[str, SimulationResultValue] = {}
         self._interactive_request: InteractivePreviewRequest | None = None
@@ -337,7 +303,6 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
             elif (
                 self._interactive_visible
                 or self._interactive_pending is not None
-                or self._interactive_transition is not None
             ):
                 self._reconcile_cached_interactive_display(
                     previous_input,
@@ -346,7 +311,6 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
             if not (
                 self._interactive_results
                 or self._interactive_pending
-                or self._interactive_transition
                 or self._interactive_visible
                 or self._interactive_target_set_ids
             ):
@@ -371,17 +335,12 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         request identity and target roster remain admitted for later results.
         """
 
-        projections = tuple(
-            layer.projection for layer in self._interactive_visible or ()
+        projections = (
+            (self._interactive_visible,)
+            if self._interactive_visible is not None else ()
         )
         if self._interactive_pending is not None:
             projections = (*projections, self._interactive_pending)
-        if self._interactive_transition is not None:
-            projections = (
-                *projections,
-                self._interactive_transition.target,
-                *(layer.projection for layer in self._interactive_transition.source),
-            )
         if not projections:
             return
         if not self._cached_interactive_display_compatible(
@@ -392,37 +351,26 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
             self._clear_interactive_projection()
             return
 
-        visible = tuple(
-            _InteractiveDisplayLayer(
-                self._filter_cached_interactive_projection(
-                    layer.projection,
-                    render_input,
-                ),
-                layer.opacity,
+        visible = (
+            self._filter_cached_interactive_projection(
+                self._interactive_visible, render_input,
             )
-            for layer in self._interactive_visible or ()
-        )
-        visible = tuple(
-            layer for layer in visible if layer.projection is not None
+            if self._interactive_visible is not None else None
         )
         if not visible and self._interactive_pending is not None:
             # A pending source-less target has already been projected.  It is
             # safe to expose it as the retained frame after compatibility is
-            # established, while cancelling its obsolete transition custody.
-            projected = self._filter_cached_interactive_projection(
+            # established.
+            visible = self._filter_cached_interactive_projection(
                 self._interactive_pending,
                 render_input,
             )
-            if projected is not None:
-                visible = (_InteractiveDisplayLayer(projected, 1.0),)
         self._interactive_pending = None
-        self._interactive_transition = None
         self._cancel_interactive_tick()
         if not visible:
             self._clear_interactive_projection()
             return
-        state = _InteractiveDisplayState(visible)
-        if not self._render_interactive_display(state):
+        if not self._render_interactive_display(visible):
             return
         self._interactive_visible = visible
         self._interactive_rendered_frame = True
@@ -827,9 +775,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
     def _interactive_has_visible_frame(self) -> bool:
         return bool(
             self._interactive_visible
-            and any(
-                layer.projection.curves for layer in self._interactive_visible
-            )
+            and self._interactive_visible.curves
         )
 
     @property
@@ -837,7 +783,6 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         return bool(
             self._interactive_results
             or self._interactive_pending
-            or self._interactive_transition
         )
 
     def _offer_interactive_result(
@@ -876,16 +821,14 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
     ) -> None:
         """Replace aggregate authority while retaining the last rendered frame."""
 
-        # The visible frame and its physical items are the next transition's
-        # source. Only the pending target and aggregate belong to the old
-        # request and must be discarded.
+        # Keep the last drawn frame until a current result replaces it. An
+        # already scheduled tick must keep its deadline: restarting it for
+        # every new request can starve drawing during a fast drag.
         self._interactive_results.clear()
         self._interactive_pending = None
-        self._interactive_transition = None
         self._interactive_target_set_ids = target_set_ids
         self._interactive_request = request
         self._interactive_frozen = False
-        self._cancel_interactive_tick()
 
     def _offer_interactive_projection(
         self,
@@ -898,24 +841,8 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         self._interactive_tick_requested = False
         now = float(time.monotonic())
         if self._interactive_pending is not None and self._interactive_cadence_due(now):
-            target = self._interactive_pending
-            self._interactive_pending = None
-            source = self._interactive_visible or ()
-            self._interactive_transition = _InteractiveDisplayTransition(
-                source,
-                target,
-                now,
-                self._can_interpolate_interactive(source, target),
-            )
-        state = self._materialize_interactive(now)
-        if state is None:
-            return
-        if self._render_interactive_display(state):
-            self._interactive_visible = state.layers
-            self._interactive_last_presented_at = now
-            self._interactive_projection_sampling_limit = self._sampling_limit
-            self._interactive_projection_sampling_known = True
-        if self._interactive_transition is not None or self._interactive_pending is not None:
+            self._present_interactive_projection_now()
+        if self._interactive_pending is not None:
             self._schedule_interactive_tick()
 
     def _clear_interactive_display(self, *, reset_currentness: bool = False) -> None:
@@ -923,10 +850,9 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
             self._interactive_visible
             or self._interactive_rendered_frame
             or self._interactive_pending
-            or self._interactive_transition
         )
         if had_physical_state:
-            if not self._render_interactive_display(_InteractiveDisplayState(())):
+            if not self._render_interactive_display(None):
                 return
             self._interactive_visible = None
             self._interactive_rendered_frame = False
@@ -934,7 +860,6 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
             self._interactive_projection_sampling_limit = None
             self._interactive_projection_sampling_known = False
         self._interactive_pending = None
-        self._interactive_transition = None
         self._interactive_results.clear()
         self._interactive_target_set_ids = ()
         self._interactive_frozen = True
@@ -950,30 +875,23 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
             return False
         known = set(self._interactive_target_set_ids)
         known.update(self._interactive_results)
-        for layer in self._interactive_visible or ():
-            known.update(self._interactive_projection_target_ids(layer.projection))
+        known.update(self._interactive_projection_target_ids(self._interactive_visible))
         known.update(self._interactive_projection_target_ids(self._interactive_pending))
-        if self._interactive_transition is not None:
-            known.update(self._interactive_projection_target_ids(self._interactive_transition.target))
-            for layer in self._interactive_transition.source:
-                known.update(self._interactive_projection_target_ids(layer.projection))
         affected = targets.intersection(known)
         if not affected:
             return True
-        visible = tuple(
-            _InteractiveDisplayLayer(filtered, layer.opacity)
-            for layer in self._interactive_visible or ()
-            if (filtered := self._filter_interactive_projection(layer.projection, affected)) is not None
+        visible = (
+            self._filter_interactive_projection(self._interactive_visible, affected)
+            if self._interactive_visible is not None else None
         )
         if visible and self._render_input is not None:
             # Restore every retained item from semantic input first; rendering
             # the surviving transient targets will suppress only those targets.
             self._render_result_scene(self._render_input)
-        if not self._render_interactive_display(_InteractiveDisplayState(visible)):
+        if not self._render_interactive_display(visible):
             return False
         self._interactive_visible = visible or None
         self._interactive_pending = None
-        self._interactive_transition = None
         self._cancel_interactive_tick()
         self._interactive_results = {
             set_id: result
@@ -1017,10 +935,9 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
             self._rendered_point_roster if self._settling_static_input else None
         )
         self._interactive_pending = None
-        self._interactive_transition = None
         self._cancel_interactive_tick()
         if self._interactive_visible or self._interactive_rendered_frame:
-            self._render_interactive_display(_InteractiveDisplayState(()))
+            self._render_interactive_display(None)
         self._interactive_visible = None
         self._interactive_rendered_frame = False
         self._interactive_projection_sampling_limit = None
@@ -1035,13 +952,11 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         if projection is None:
             return
         self._interactive_pending = None
-        self._interactive_transition = None
         self._cancel_interactive_tick()
-        state = _InteractiveDisplayState(
-            (_InteractiveDisplayLayer(projection, 1.0),)
-        )
-        if self._render_interactive_display(state):
-            self._interactive_visible = state.layers
+        # Draw a completed result directly; interpolation between successive
+        # results adds lag and can restart indefinitely during dragging.
+        if self._render_interactive_display(projection):
+            self._interactive_visible = projection
             self._interactive_last_presented_at = float(time.monotonic())
             self._interactive_projection_sampling_limit = self._sampling_limit
             self._interactive_projection_sampling_known = True
@@ -1174,26 +1089,6 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         )
 
     @staticmethod
-    def _can_interpolate_interactive(
-        source: tuple[_InteractiveDisplayLayer, ...],
-        target: InteractiveDisplayProjection,
-    ) -> bool:
-        if len(source) != 1 or source[0].opacity < 1.0 - _EPSILON:
-            return False
-        source_curves = source[0].projection.curves
-        target_curves = target.curves
-        if tuple(curve.key for curve in source_curves) != tuple(curve.key for curve in target_curves):
-            return False
-        return all(
-            left.markers == right.markers
-            and left.x.shape == right.x.shape
-            and left.y.shape == right.y.shape
-            and np.array_equal(left.x, right.x)
-            and _same_interactive_topology(left, right)
-            for left, right in zip(source_curves, target_curves, strict=True)
-        )
-
-    @staticmethod
     def _annotation_signature(
         annotation: _DisplayAnnotation,
     ) -> _AnnotationKey:
@@ -1211,73 +1106,6 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
             0 if authored is None else int(authored)
         )
         return QtGui.QColor(_ANNOTATION_ACCENTS[index % len(_ANNOTATION_ACCENTS)])
-
-    def _materialize_interactive(
-        self,
-        now: float,
-    ) -> _InteractiveDisplayState | None:
-        if self._interactive_transition is None:
-            if self._interactive_visible is None:
-                return None
-            return _InteractiveDisplayState(self._interactive_visible)
-        transition = self._interactive_transition
-        progress = min(
-            1.0,
-            max(0.0, (now - transition.started_at) / 0.12),
-        )
-        eased = progress * progress * (3.0 - 2.0 * progress)
-        layers: tuple[_InteractiveDisplayLayer, ...]
-        if transition.interpolate:
-            projection = self._interpolate_interactive_projection(
-                transition.source[0].projection,
-                transition.target,
-                eased,
-            )
-            layers = (_InteractiveDisplayLayer(projection, 1.0),)
-        else:
-            layers = tuple(
-                _InteractiveDisplayLayer(
-                    item.projection,
-                    item.opacity * (1.0 - eased),
-                )
-                for item in transition.source
-                if item.opacity * (1.0 - eased) > _EPSILON
-            )
-            if eased > _EPSILON:
-                layers = (
-                    *layers,
-                    _InteractiveDisplayLayer(transition.target, eased),
-                )
-            if not layers:
-                layers = (_InteractiveDisplayLayer(transition.target, 1.0),)
-        if progress >= 1.0:
-            layers = (_InteractiveDisplayLayer(transition.target, 1.0),)
-            self._interactive_transition = None
-        return _InteractiveDisplayState(layers)
-
-    @staticmethod
-    def _interpolate_interactive_projection(
-        source: InteractiveDisplayProjection,
-        target: InteractiveDisplayProjection,
-        progress: float,
-    ) -> InteractiveDisplayProjection:
-        curves = tuple(
-            replace(left, y=left.y + (right.y - left.y) * progress)
-            for left, right in zip(source.curves, target.curves, strict=True)
-        )
-        annotations = tuple(
-            (role, set_id, payload, opacity * weight)
-            for values, weight in (
-                (source.intervention_annotations, 1.0 - progress),
-                (target.intervention_annotations, progress),
-            )
-            for role, set_id, payload, opacity in values
-            if opacity * weight > _EPSILON
-        )
-        return replace(
-            target, curves=curves,
-            intervention_annotations=PyQtGraphPlotPanel._merge_annotation_values(annotations),
-        )
 
     def _request_interactive_tick(self, delay_seconds: float) -> None:
         milliseconds = max(0, int(np.ceil(float(delay_seconds) * 1000.0)))
@@ -1297,10 +1125,10 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
 
     def _render_interactive_display(
         self,
-        state: _InteractiveDisplayState,
+        projection: InteractiveDisplayProjection | None,
     ) -> bool:
         self._rendered_point_roster = ()
-        if not state.layers:
+        if projection is None:
             self._release_interactive_display()
             return True
 
@@ -1310,15 +1138,13 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         render_input = self._render_input
         transient_set_ids = {
             str(curve.key[2])
-            for layer in state.layers
-            for curve in layer.projection.curves
+            for curve in projection.curves
             if len(curve.key) >= 3
             and curve.key[0:2] == ("simulation", "foreground")
         }
         transient_reference_set_ids = {
             str(curve.key[2])
-            for layer in state.layers
-            for curve in layer.projection.curves
+            for curve in projection.curves
             if len(curve.key) >= 3
             and curve.key[0:2] == ("simulation", "ghost")
         }
@@ -1326,9 +1152,8 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
             {("foreground", set_id) for set_id in transient_set_ids}
             | {("ghost", set_id) for set_id in transient_reference_set_ids}
             | {(role, set_id)
-            for layer in state.layers
             for role, set_id, _payload, _opacity
-            in layer.projection.intervention_annotations}
+            in projection.intervention_annotations}
         )
         _x_unit, _y_unit, x_scale, y_scale = (
             self._display_unit_state(render_input)
@@ -1351,138 +1176,135 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
                 )
                 if any(chunk.x.size for chunk in rendered_block.chunks):
                     rendered_points.append(rendered_block)
-        for layer_index, layer in enumerate(state.layers):
-            for curve in layer.projection.curves:
-                style = "marker" if curve.markers else "line"
-                color = QtGui.QColor(curve.color)
-                opacity = layer.opacity * curve.opacity
-                visual_break_indices = tuple(
-                    chunk_index
-                    for chunk_index, (start, _end) in enumerate(
-                        self._interactive_curve_chunks(curve)[1:], 1
-                    )
-                    if any(
-                        float(curve.x[start]) == float(connector[1])
-                        for connector in curve.intervention_connectors
-                    )
-                    or (
-                        render_input is not None
-                        and not self._has_time_x(render_input)
-                        and (
-                            curve.x[start] != curve.x[start - 1]
-                            or curve.y[start] != curve.y[start - 1]
-                        )
+        for curve in projection.curves:
+            style = "marker" if curve.markers else "line"
+            color = QtGui.QColor(curve.color)
+            opacity = curve.opacity
+            visual_break_indices = tuple(
+                chunk_index
+                for chunk_index, (start, _end) in enumerate(
+                    self._interactive_curve_chunks(curve)[1:], 1
+                )
+                if any(
+                    float(curve.x[start]) == float(connector[1])
+                    for connector in curve.intervention_connectors
+                )
+                or (
+                    render_input is not None
+                    and not self._has_time_x(render_input)
+                    and (
+                        curve.x[start] != curve.x[start - 1]
+                        or curve.y[start] != curve.y[start - 1]
                     )
                 )
-                for chunk_index, (start, end) in enumerate(
-                    self._interactive_curve_chunks(
-                        curve,
-                        visual_break_indices=visual_break_indices,
-                    )
-                ):
-                    displayed_x = self._scaled_display_values(
-                        curve.x[start:end],
-                        x_scale,
-                    )
-                    displayed_y = self._scaled_display_values(
-                        curve.y[start:end],
-                        y_scale,
-                    )
-                    # Retained static items own the stable legend rows.  The
-                    # transient projection supplies pixels only.
-                    curve_name = None
-                    item_key = (
-                        layer_index,
-                        *curve.key,
-                        "segment",
-                        chunk_index,
-                        style,
-                    )
-                    item = existing.get(item_key)
-                    if item is None:
-                        if curve.markers:
-                            item = self._plot_widget.plot(
-                                displayed_x,
-                                displayed_y,
-                                pen=None,
-                                symbol="o",
-                                symbolSize=curve.point_size,
-                                symbolBrush=pg.mkBrush(color),
-                                symbolPen=pg.mkPen(color),
-                                name=curve_name,
-                            )
-                        else:
-                            item = self._plot_widget.plot(
-                                displayed_x,
-                                displayed_y,
-                                pen=pg.mkPen(
-                                    color=color,
-                                    width=2,
-                                    style=(
-                                        QtCore.Qt.PenStyle.DashLine
-                                        if curve.dashed
-                                        else QtCore.Qt.PenStyle.SolidLine
-                                    ),
-                                ),
-                                name=curve_name,
-                            )
-                    else:
-                        item.setData(displayed_x, displayed_y)
-                        if curve.markers:
-                            item.setSymbolSize(curve.point_size)
-                            item.setSymbolBrush(pg.mkBrush(color))
-                            item.setSymbolPen(pg.mkPen(color))
-                        else:
-                            item.setPen(
-                                pg.mkPen(
-                                    color=color,
-                                    width=2,
-                                    style=(
-                                        QtCore.Qt.PenStyle.DashLine
-                                        if curve.dashed
-                                        else QtCore.Qt.PenStyle.SolidLine
-                                    ),
-                                )
-                            )
-                    self._update_plot_item_legend(item, curve_name)
-                    item.setOpacity(opacity)
-                    rendered[item_key] = item
-                for connector in curve.intervention_connectors:
-                    boundary_index, boundary_time, pre_value, post_value = connector
-                    displayed_time = boundary_time * x_scale
-                    displayed_pre = pre_value * y_scale
-                    displayed_post = post_value * y_scale
-                    item_key = (
-                        layer_index,
-                        *curve.key,
-                        "intervention-boundary",
-                        boundary_index,
-                    )
-                    item = existing.get(item_key)
-                    pen = pg.mkPen(
-                        color=color,
-                        width=2,
-                        style=(
-                            QtCore.Qt.PenStyle.DashLine
-                            if curve.dashed
-                            else QtCore.Qt.PenStyle.SolidLine
-                        ),
-                    )
-                    if item is None:
+            )
+            for chunk_index, (start, end) in enumerate(
+                self._interactive_curve_chunks(
+                    curve,
+                    visual_break_indices=visual_break_indices,
+                )
+            ):
+                displayed_x = self._scaled_display_values(
+                    curve.x[start:end],
+                    x_scale,
+                )
+                displayed_y = self._scaled_display_values(
+                    curve.y[start:end],
+                    y_scale,
+                )
+                # Retained static items own the stable legend rows.  The
+                # transient projection supplies pixels only.
+                curve_name = None
+                item_key = (
+                    *curve.key,
+                    "segment",
+                    chunk_index,
+                    style,
+                )
+                item = existing.get(item_key)
+                if item is None:
+                    if curve.markers:
                         item = self._plot_widget.plot(
-                            [displayed_time, displayed_time],
-                            [displayed_pre, displayed_post],
-                            pen=pen,
-                            name=None,
+                            displayed_x,
+                            displayed_y,
+                            pen=None,
+                            symbol="o",
+                            symbolSize=curve.point_size,
+                            symbolBrush=pg.mkBrush(color),
+                            symbolPen=pg.mkPen(color),
+                            name=curve_name,
                         )
                     else:
-                        item.setData(
-                            [displayed_time, displayed_time],
-                            [displayed_pre, displayed_post],
+                        item = self._plot_widget.plot(
+                            displayed_x,
+                            displayed_y,
+                            pen=pg.mkPen(
+                                color=color,
+                                width=2,
+                                style=(
+                                    QtCore.Qt.PenStyle.DashLine
+                                    if curve.dashed
+                                    else QtCore.Qt.PenStyle.SolidLine
+                                ),
+                            ),
+                            name=curve_name,
                         )
-                        item.setPen(pen)
-                    item.setOpacity(opacity)
-                    rendered[item_key] = item
+                else:
+                    item.setData(displayed_x, displayed_y)
+                    if curve.markers:
+                        item.setSymbolSize(curve.point_size)
+                        item.setSymbolBrush(pg.mkBrush(color))
+                        item.setSymbolPen(pg.mkPen(color))
+                    else:
+                        item.setPen(
+                            pg.mkPen(
+                                color=color,
+                                width=2,
+                                style=(
+                                    QtCore.Qt.PenStyle.DashLine
+                                    if curve.dashed
+                                    else QtCore.Qt.PenStyle.SolidLine
+                                ),
+                            )
+                        )
+                self._update_plot_item_legend(item, curve_name)
+                item.setOpacity(opacity)
+                rendered[item_key] = item
+            for connector in curve.intervention_connectors:
+                boundary_index, boundary_time, pre_value, post_value = connector
+                displayed_time = boundary_time * x_scale
+                displayed_pre = pre_value * y_scale
+                displayed_post = post_value * y_scale
+                item_key = (
+                    *curve.key,
+                    "intervention-boundary",
+                    boundary_index,
+                )
+                item = existing.get(item_key)
+                pen = pg.mkPen(
+                    color=color,
+                    width=2,
+                    style=(
+                        QtCore.Qt.PenStyle.DashLine
+                        if curve.dashed
+                        else QtCore.Qt.PenStyle.SolidLine
+                    ),
+                )
+                if item is None:
+                    item = self._plot_widget.plot(
+                        [displayed_time, displayed_time],
+                        [displayed_pre, displayed_post],
+                        pen=pen,
+                        name=None,
+                    )
+                else:
+                    item.setData(
+                        [displayed_time, displayed_time],
+                        [displayed_pre, displayed_post],
+                    )
+                    item.setPen(pen)
+                item.setOpacity(opacity)
+                rendered[item_key] = item
         for item_key, item in existing.items():
             if item_key not in rendered:
                 self._remove_interactive_plot_item(item)
@@ -1498,34 +1320,20 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
                 if annotation[:2] not in replaced_annotation_owners
             )
             interactive_annotations = tuple(
-                (role, set_id, payload, opacity * layer.opacity)
-                for layer in state.layers
+                (role, set_id, payload, opacity)
                 for role, set_id, payload, opacity
-                in layer.projection.intervention_annotations
-                if opacity * layer.opacity > _EPSILON
+                in projection.intervention_annotations
+                if opacity > _EPSILON
             )
-            if len(state.layers) > 1:
-                interactive_annotations = self._merge_annotation_values(
-                    interactive_annotations
-                )
             self._render_annotations(
                 render_input,
                 self._presentation,
                 annotations=(*static_annotations, *interactive_annotations),
             )
-        # Copy Plotted Data is a semantic settled projection. During a cross-fade
-        # the transition source and target are both physical layers, but only
-        # the target belongs in the copy roster; hidden static target items
-        # are already represented by that projection above.
-        settled_projection = (
-            self._interactive_transition.target
-            if self._interactive_transition is not None
-            else state.layers[-1].projection
-            if state.layers
-            else None
-        )
-        if render_input is not None and settled_projection is not None:
-            for curve in settled_projection.curves:
+        # The displayed projection contains completed results, so Copy uses
+        # those same sampled curves and their scientific provenance.
+        if render_input is not None:
+            for curve in projection.curves:
                 rendered_block = self._rendered_block_for_interactive_curve(
                     curve,
                     render_input,
@@ -1538,7 +1346,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         if rendered and not self._interactive_rendered_frame:
             self._begin_interactive_gesture_session()
         self._interactive_rendered_frame = bool(rendered)
-        return bool(rendered) or not state.layers
+        return bool(rendered)
 
     def _remove_interactive_plot_item(self, item: object) -> None:
         """Remove one stale transient item from the physical plot."""
