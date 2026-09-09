@@ -1,5 +1,5 @@
 # Pinned GUI runtime dependencies for Kindred
-# Supported Python versions: >=3.10,<3.13
+# Supported GUI Python versions: >=3.12,<3.13
 numpy==2.0.0
 scipy==1.13.1
 sympy==1.14.0

@@ -24,8 +24,9 @@ and examples.
 
 ## Installation
 
-Kindred requires Python 3.10, 3.11, or 3.12. From the repository root, create
-and activate a virtual environment, then install the application:
+Kindred is a Windows desktop application. Its GUI requires Python 3.12.
+From the repository root, use native Windows Python 3.12 to create an
+environment and install the application:
 
     python -m venv .venv
     python -m pip install --upgrade pip
@@ -35,6 +36,16 @@ The standard installation includes the required desktop and plotting
 dependencies, including PySide6 and PyQtGraph. The same pinned runtime set is
 listed in `requirements.txt` for environments that install dependencies from a
 requirements file.
+
+Fitting runs in a separate complete native Python 3.15t installation at
+`<GUI sys.prefix>\kindred-fitting-runtime\python\python.exe`. Its own scientific
+dependencies are separate from the GUI dependencies; the fitting entry point
+loads only Qt-free Kindred modules.
+
+The fitting runtime's Python version, archive checksum and dependency pins are
+defined in `pyproject.toml` under `[tool.kindred.fitting-runtime]`. The GUI's
+Python constraint and dependencies remain under `[project]`. The fitting
+runtime must use matching Kindred source and resources.
 
 ## Launch
 
@@ -60,6 +71,10 @@ Set `KINDRED_LOG_DIR` to choose another normal log directory. If that location
 cannot be opened, Kindred writes the log to the system temporary directory at
 `kindred/logs/kindred.log`. `LOG_LEVEL` or `KINDRED_LOG_LEVEL` may be set to
 `DEBUG`, `INFO`, `WARNING`, `ERROR`, or `CRITICAL`.
+
+Fitting checks for the required Python build, scientific dependencies and
+matching Kindred source. Launch errors report missing or incompatible runtime
+components and include available diagnostics from the fitting process.
 
 ## Basic workflow
 

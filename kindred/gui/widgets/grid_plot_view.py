@@ -16,7 +16,10 @@ from kindred.gui.display_name_policy import (
     PLOT_TITLE_LABEL_MAX_CHARS,
     compact_plot_title_label,
 )
-from kindred.gui.fitting.worker import FitCurveDataset, FitCurveYSemantic
+from kindred.gui.fitting.launch import FitExecutionRequest
+from kindred.gui.fitting.execution import (
+    FitCurveDataset, FitCurveYSemantic, _fit_curve_y_semantics, _observed_curve_parts,
+)
 from kindred.gui.theme_manager import plot_background_color, plot_foreground_color
 from kindred.gui.plot_config import require_pyqtgraph
 from kindred.gui.workspace_result_presenter import (
@@ -87,7 +90,6 @@ def _fit_copy_columns(
     segment_ids = dict(dataset.model_segment_ids)
     segment_keys = dict(dataset.model_segment_keys)
     discontinuity_ids = dict(dataset.model_discontinuity_ids)
-    selection = dict(dataset.model_selection_provenance)
     series_names = sorted(model_y)
     x_unit = "s" if dataset.x_name.casefold() == "t" else None
     _y_label, y_unit = _fit_y_axis_label(dataset.y_semantics, series_names)
@@ -121,15 +123,7 @@ def _fit_copy_columns(
         )
         for name in names:
             identity = {"model_target": name}
-            kinds = selection.get(name, ())
-            varying_selection = bool(kinds) and len(set(kinds)) > 1
-            if kinds and not varying_selection:
-                identity["selection_provenance"] = kinds[0]
             columns.append((header(label, name, identity, y_unit), model_y[name], "float"))
-            if varying_selection:
-                columns.append(
-                    (header(label, f"{name} — selection_provenance", {"model_target": name}), kinds, "text")
-                )
 
     observed_x = dict(dataset.observed_x)
     observed_y = dict(dataset.observed_y)
@@ -180,26 +174,15 @@ class GridPlotView(QtWidgets.QWidget):
         self._color_resolver = color_resolver
         self._color_by_species: Mapping[str, object] = MappingProxyType({})
         self._curves: tuple[FitCurveDataset, ...] = ()
-        self._dataset_presentation: Mapping[str, DatasetPlotPresentation] = (
-            MappingProxyType({})
-        )
         self._pg = pg
         self._legend_visible = True
         self._observation_style = observation_style
         self._plot_items: dict[str, object] = {}
-        self._slots: dict[str, object] = {}
+        self._request: FitExecutionRequest | None = None
+        self._dataset_ids: tuple[str, ...] = ()
         self._plot_series_items: dict[str, dict[tuple[str, str], object]] = {}
         self._structure_key: tuple = ()
         self._grid_key: tuple | None = None
-        self._jobs: list[tuple[str, str, str | None]] = []
-        self._cursor = 0
-        self._render_revision = 0
-        self._pass_revision = 0
-        self._render_pending = False
-        self._render_timer = QtCore.QTimer(self)
-        self._render_timer.setSingleShot(True)
-        self._render_timer.setInterval(1)
-        self._render_timer.timeout.connect(self._render_step)
         self._dark_mode = False
         self._copy_allowed = True
         self._copy_chunks = None
@@ -265,42 +248,68 @@ class GridPlotView(QtWidgets.QWidget):
         layout.addWidget(self._scroll)
 
 
+    def prepare(self, request: FitExecutionRequest, dataset_ids: tuple[str, ...]) -> None:
+        """Prepare observations and empty model items without running simulations."""
+        self.cancel_copy()
+        self._curves = ()
+        self._request = request
+        self._dataset_ids = dataset_ids
+        configs = {item.dataset_id: item for item in request.dispatch.prepared_datasets}
+        structure = tuple((identity, configs[identity].selected_observations,
+                           configs[identity].parametric_x_observation)
+                          for identity in dataset_ids)
+        changed = structure != self._structure_key
+        self._reconcile_structure(structure)
+        self._refresh_appearance()
+        for identity in dataset_ids:
+            for (kind, species), item in self._plot_series_items[identity].items():
+                if kind == "model":
+                    self._update_series(identity, kind, species, ((), (), (), (), ()))
+            if changed:
+                self._plot_items[identity].getViewBox().autoRange()
+        self._update_grid()
+        self._context_actions["copy"].setEnabled(False)
+
+    def finish_preparation(self) -> None:
+        """Lay out and paint hidden views too, then fix native axis gutters."""
+        self.ensurePolished()
+        self.layout().activate()
+        self.grab()  # Activate hidden scroll-area layouts at the stack viewport size.
+        self._update_grid()
+        self._canvas.grab()
+        for plot in self._plot_items.values():
+            for side in ("left", "bottom"):
+                axis = plot.getAxis(side)
+                if side == "left":
+                    axis.setWidth(axis.width())
+                else:
+                    axis.setHeight(axis.height())
+                axis.setStyle(autoExpandTextSpace=False, autoReduceTextSpace=False)
+        self._update_grid()
+        self._canvas.ci.layout.activate()
+        self._canvas.grab()
+
     def set_projection(
         self,
         curves: Iterable[FitCurveDataset],
         presentation: Mapping[str, DatasetPlotPresentation],
     ) -> None:
-        """Retain complete curves immediately; render the visible view incrementally."""
-
+        """Retain full Copy data and update only existing model-series data."""
         self.cancel_copy()
         self._curves = tuple(curves)
-        self._dataset_presentation = MappingProxyType(dict(presentation))
-        structure = tuple((curve.dataset_id, tuple(name for name, _ in curve.observed_y),
-                           tuple(name for name, _ in curve.model_y)) for curve in self._curves)
-        if structure != self._structure_key:
-            self._reconcile_structure(structure)
+        if not self._curves:
+            for identity, series in self._plot_series_items.items():
+                for kind, species in series:
+                    if kind == "model":
+                        self._update_series(identity, kind, species, ((), (), (), (), ()))
+        for curve in self._curves:
+            for species, y in curve.model_y:
+                self._update_series(curve.dataset_id, "model", species,
+                    (dict(curve.model_x)[species], y, dict(curve.model_segment_ids)[species],
+                     dict(curve.model_segment_keys)[species], dict(curve.model_discontinuity_ids)[species]))
+            if curve.dataset_id in presentation:
+                self._plot_items[curve.dataset_id].setToolTip(presentation[curve.dataset_id][1])
         self._context_actions["copy"].setEnabled(self.copy_eligible())
-        self._refresh_appearance()
-        self._update_grid()
-
-    def _schedule_render(self) -> None:
-        if self._render_pending and self.isVisible() and not self._render_timer.isActive():
-            self._render_timer.start()
-
-    def showEvent(self, event: QtGui.QShowEvent) -> None:
-        super().showEvent(event)
-        self._schedule_render()
-
-    def hideEvent(self, event: QtGui.QHideEvent) -> None:
-        self._render_timer.stop()
-        self._layout_timer.stop()
-        super().hideEvent(event)
-
-    def _plot_display_state_for_plot(self, plot: object) -> tuple[object, ...]:
-        state = plot.getViewBox().getState(copy=True)
-        return (state["mouseMode"], tuple(state["logMode"]), state["xInverted"],
-                state["yInverted"], tuple(state["autoRange"]),
-                tuple(tuple(axis) for axis in state["viewRange"]))
 
     def _prepare_context_menu(self, dataset_id: str) -> None:
         plot = self._plot_items[dataset_id]
@@ -358,23 +367,22 @@ class GridPlotView(QtWidgets.QWidget):
             return
         view_box = plot.getViewBox()
         if kind == "range":
-            view_box.enableAutoRange(x=True, y=True)
             view_box.autoRange()
+            view_box.enableAutoRange(x=False, y=False)
         elif kind in {"pan", "rect"} and checked:
             view_box.setMouseMode(pg.ViewBox.PanMode if kind == "pan" else pg.ViewBox.RectMode)
         elif kind == "legend":
             self._toggle_legend(checked)
             return
         elif kind in {"log_x", "log_y"}:
-            before = self._plot_display_state_for_plot(plot)
+            before = view_box.viewRange()
             plot.setLogMode(**{kind[-1]: bool(checked)})
-            auto_range = before[4]
-            view_box.enableAutoRange(x=auto_range[0], y=auto_range[1])
-            if not all(bool(item) for item in auto_range):
-                view_range = before[5]
-                view_box.setRange(
-                    xRange=view_range[0], yRange=view_range[1], padding=0,
-                    disableAutoRange=False)
+            view_box.autoRange()
+            view_box.enableAutoRange(x=False, y=False)
+            if kind == "log_x":
+                view_box.setYRange(*before[1], padding=0)
+            else:
+                view_box.setXRange(*before[0], padding=0)
         elif kind in {"invert_x", "invert_y"}:
             getattr(plot, f"invert{kind[-1].upper()}")(bool(checked))
         else:
@@ -527,8 +535,8 @@ class GridPlotView(QtWidgets.QWidget):
                 self._scroll.horizontalScrollBar().sizeHint().height() if horizontal else 0
             )
             capacity = max(1, (width - 18) // (panel_width + 6))
-            rows = max(1, math.ceil(len(self._curves) / capacity))
-            columns = max(1, math.ceil(len(self._curves) / rows))
+            rows = max(1, math.ceil(len(self._dataset_ids) / capacity))
+            columns = max(1, math.ceil(len(self._dataset_ids) / rows))
             minimum_width = columns * (panel_width + 6) + 18
             canvas_width = max(width, minimum_width)
             if rows == 1:
@@ -564,6 +572,8 @@ class GridPlotView(QtWidgets.QWidget):
         font = self.font()
         for axis_name in ("left", "bottom"):
             axis = plot.getAxis(axis_name)
+            if axis.style["tickFont"] != font:
+                axis.setWidth(None) if axis_name == "left" else axis.setHeight(None)
             axis.setTickFont(font)
             axis.setStyle(autoExpandTextSpace=True, autoReduceTextSpace=True)
             axis.label.setFont(font)
@@ -602,7 +612,7 @@ class GridPlotView(QtWidgets.QWidget):
         self._legend_label.setText(rich)
         self._legend_label.setFixedHeight(self.fontMetrics().lineSpacing())
         self._legend_label.setAccessibleName(plain)
-        self._legend_label.setVisible(self._legend_visible and bool(self._curves))
+        self._legend_label.setVisible(self._legend_visible and bool(self._dataset_ids))
 
     def resizeEvent(self, event: QtGui.QResizeEvent) -> None:
         super().resizeEvent(event)
@@ -644,105 +654,52 @@ class GridPlotView(QtWidgets.QWidget):
         return x_render, y_render
 
     def _reconcile_structure(self, structure: tuple) -> None:
-        self._render_timer.stop()
-        ids = {curve.dataset_id for curve in self._curves}
-        for identity in tuple(self._slots):
+        ids = set(self._dataset_ids)
+        for identity in tuple(self._plot_items):
             if identity in ids:
                 continue
             if self._context_target is not None and self._context_target[0] == identity:
                 self._context_target = None
                 self._context_menu.close()
-            slot = self._slots.pop(identity)
-            self._canvas.ci.removeItem(slot)
-            slot.deleteLater()
-            self._plot_items.pop(identity, None)
-            self._plot_series_items.pop(identity, None)
-        self._jobs = []
-        for identity, observed, model in structure:
-            if identity not in self._slots:
-                self._slots[identity] = self._pg.GraphicsWidget()
-            series = self._plot_series_items.get(identity, {})
-            active = {(kind, name) for kind, names in (("observed", observed), ("model", model))
-                      for name in names}
+            plot = self._plot_items.pop(identity)
+            self._canvas.ci.removeItem(plot)
+            plot.deleteLater()
+            self._plot_series_items.pop(identity)
+        for identity, observations, _x in structure:
+            names = tuple(item.model_target for item in observations)
+            if identity not in self._plot_items:
+                plot = self._pg.PlotItem(enableMenu=False)
+                plot.getViewBox().enableAutoRange(x=False, y=False)
+                self._plot_items[identity] = plot
+                self._plot_series_items[identity] = {}
+            series = self._plot_series_items[identity]
+            active = {(kind, name) for kind in ("observed", "model") for name in names}
             for key in tuple(series):
                 if key not in active:
                     item = series.pop(key)
                     self._plot_items[identity].removeItem(item)
                     item.deleteLater()
-            self._jobs.append((identity, "panel", None))
-            self._jobs.extend((identity, "observed", name) for name in observed)
-            self._jobs.extend((identity, "model", name) for name in model)
-            self._jobs.append((identity, "finish", None))
+        if structure != self._structure_key:
+            self._grid_key = None
         self._structure_key = structure
-        self._cursor = 0
-        self._grid_key = None
-        if not structure:
-            self._layout_timer.stop()
-            self._render_pending = False
 
-    def _render_step(self) -> None:
-        if not self.isVisible() or not self._render_pending:
-            return
-        if self._cursor == 0:
-            self._pass_revision = self._render_revision
-        identity, kind, species = self._jobs[self._cursor]
-        curve = next(curve for curve in self._curves if curve.dataset_id == identity)
-        if kind == "panel":
-            self._update_panel(curve)
-        elif kind == "finish":
-            plot = self._plot_items[identity]
-            if not plot.isVisible():
-                plot.show()
-                plot.getViewBox().autoRange()
-                plot.getViewBox().enableAutoRange(x=True, y=True)
-        else:
-            self._update_series(curve, kind, species)
-        self._cursor += 1
-        if self._cursor == len(self._jobs):
-            self._cursor = 0
-            self._render_pending = self._pass_revision != self._render_revision
-        self._schedule_render()
-
-    def _update_panel(self, curve: FitCurveDataset) -> None:
-        identity = curve.dataset_id
-        plot = self._plot_items.get(identity)
-        if plot is None:
-            placeholder = self._slots[identity]
-            row, column = self._canvas.ci.items[placeholder][0]
-            self._canvas.ci.removeItem(placeholder)
-            placeholder.deleteLater()
-            plot = self._pg.PlotItem(enableMenu=False)
-            policy = plot.sizePolicy()
-            policy.setRetainSizeWhenHidden(True)
-            plot.setSizePolicy(policy)
-            plot.hide()
-            plot.getViewBox().enableAutoRange(x=False, y=False)
-            self._canvas.ci.addItem(plot, row=row, col=column)
-            self._slots[identity] = self._plot_items[identity] = plot
-            self._plot_series_items[identity] = {}
-            for side in ("left", "bottom"):
-                plot.getAxis(side).geometryChanged.connect(self._layout_timer.start)
-        presentation = self._dataset_presentation.get(identity)
-        if presentation is None:
-            name = compact_plot_title_label(curve.display_name, max_chars=PLOT_TITLE_LABEL_MAX_CHARS)
-            title, tooltip = name.display, f"{name.full}\nDataset ID: {identity}"
-        else:
-            title, tooltip = presentation
-        names = tuple(dict.fromkeys(name for name, _ in (*curve.model_y, *curve.observed_y)))
-        label, units = _fit_y_axis_label(curve.y_semantics, names)
-        state = (curve.x_name, title, tooltip, label, units, len(self._curves) > 1,
+    def _update_panel(self, identity, display_name, x_name, y_semantics, names) -> None:
+        plot = self._plot_items[identity]
+        name = compact_plot_title_label(display_name, max_chars=PLOT_TITLE_LABEL_MAX_CHARS)
+        title, tooltip = name.display, f"{name.full}\nDataset ID: {identity}"
+        label, units = _fit_y_axis_label(y_semantics, names)
+        state = (x_name, title, tooltip, label, units, len(self._dataset_ids) > 1,
                  self._dark_mode, self.font().toString())
         if getattr(plot, "_kindred_appearance", None) != state:
-            self._configure_plot_static(plot, curve.x_name)
-            plot.setTitle(html.escape(title) if len(self._curves) > 1 else "",
+            self._configure_plot_static(plot, x_name)
+            plot.setTitle(html.escape(title) if len(self._dataset_ids) > 1 else "",
                           color=plot_foreground_color(self._dark_mode),
                           size=f"{self.font().pointSizeF()}pt")
             plot.setToolTip(tooltip)
             plot.setLabel("left", label, units=units)
             plot._kindred_appearance = state
 
-    def _update_series(self, curve: FitCurveDataset, kind: str, species: str) -> None:
-        identity = curve.dataset_id
+    def _update_series(self, identity: str, kind: str, species: str, data: tuple) -> None:
         series = self._plot_series_items[identity]
         key = (kind, species)
         item = series.get(key)
@@ -762,12 +719,6 @@ class GridPlotView(QtWidgets.QWidget):
             else:
                 item.setPen(self._pg.mkPen(color=color, width=2))
             item._kindred_style = style
-        if kind == "observed":
-            data = (dict(curve.observed_x)[species], dict(curve.observed_y)[species])
-        else:
-            data = (dict(curve.model_x)[species], dict(curve.model_y)[species],
-                    dict(curve.model_segment_ids)[species], dict(curve.model_segment_keys)[species],
-                    dict(curve.model_discontinuity_ids)[species])
         if getattr(item, "_kindred_data", None) != data:
             x, y = self._with_segment_gaps(*data) if kind == "model" else data
             item.setData(x, y)
@@ -781,7 +732,7 @@ class GridPlotView(QtWidgets.QWidget):
         super().changeEvent(event)
         if event.type() == QtCore.QEvent.Type.FontChange and hasattr(self, "_scroll"):
             self._refresh_appearance()
-            self._layout_timer.start(0)
+            self.finish_preparation()
 
     def set_dark_mode(self, enabled: bool) -> None:
         """Refresh background, labels, and resolved species colors together."""
@@ -791,7 +742,7 @@ class GridPlotView(QtWidgets.QWidget):
 
     def _update_grid(self) -> None:
         self._layout_timer.stop()
-        if not self._curves:
+        if not self._dataset_ids:
             return
         grid_size, canvas_size, available_height = self._grid_geometry()
         if (self._canvas.minimumSize() != canvas_size
@@ -801,25 +752,40 @@ class GridPlotView(QtWidgets.QWidget):
                     if grid_size[0] == 1 and canvas_size.height() <= available_height
                     else QtCore.Qt.AlignmentFlag.AlignTop)
         self._scroll.setAlignment(QtCore.Qt.AlignmentFlag.AlignHCenter | vertical)
-        key = (tuple(curve.dataset_id for curve in self._curves), grid_size)
+        key = (self._dataset_ids, grid_size)
         if key != self._grid_key:
-            for slot in self._slots.values():
+            for slot in self._plot_items.values():
                 if slot in self._canvas.ci.items:
                     self._canvas.ci.removeItem(slot)
-            for index, curve in enumerate(self._curves):
+            for index, identity in enumerate(self._dataset_ids):
                 row, column = divmod(index, grid_size[1])
-                self._canvas.ci.addItem(self._slots[curve.dataset_id], row=row, col=column)
+                self._canvas.ci.addItem(self._plot_items[identity], row=row, col=column)
             self._grid_key = key
 
     def _refresh_appearance(self) -> None:
+        request = self._request
+        if request is None:
+            return
+        configs = {item.dataset_id: item for item in request.dispatch.prepared_datasets}
+        mapped = {item.dataset_id: item for item in request.setup.origin.mapped_datasets}
         species_names = tuple(dict.fromkeys(
-            species for curve in self._curves
-            for species, _series in (*curve.model_y, *curve.observed_y)))
+            item.model_target for identity in self._dataset_ids
+            for item in configs[identity].selected_observations))
         if species_names and self._color_resolver is None:
             raise ValueError("Fit curves require an injected species-color resolver.")
         self._color_by_species = MappingProxyType({
             species: _color_value(self._color_resolver(species)) for species in species_names})
+        for identity in self._dataset_ids:
+            config = configs[identity]
+            names = tuple(item.model_target for item in config.selected_observations)
+            x = config.parametric_x_observation
+            self._update_panel(identity, mapped[identity].display_name,
+                "t" if x is None else x.model_target,
+                _fit_curve_y_semantics(request.setup.origin.prepared_dsl, names), names)
+            observed_x, observed_y = _observed_curve_parts(config.selected_observations, x_observations=x)
+            for species, y in observed_y:
+                self._update_series(identity, "observed", species, (dict(observed_x)[species], y))
+                item = self._plot_series_items[identity].get(("model", species))
+                data = getattr(item, "_kindred_data", ((), (), (), (), ()))
+                self._update_series(identity, "model", species, data)
         self._update_legend()
-        self._render_revision += 1
-        self._render_pending = bool(self._jobs)
-        self._schedule_render()

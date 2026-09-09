@@ -25,7 +25,7 @@ from kindred.gui.fitting.launch import (
 from kindred.gui.fitting.parameters_ics_tab import ParametersIcsTab
 from kindred.gui.fitting.run_results_tab import RunResultsTab
 from kindred.gui.fitting.unified_species_table import UnifiedSpeciesTable
-from kindred.gui.fitting.worker import FitCandidate, FitCurveDataset, FitLiveUpdate
+from kindred.gui.fitting.execution import FitCandidate, FitCurveDataset, FitLiveUpdate
 
 __all__ = ["FittingWindow"]
 
@@ -799,6 +799,11 @@ class FittingWindow(QtWidgets.QDialog):
         self._refresh_copy_allowed()
         self.pauseRequested.emit()
 
+    def prepare_fit_plots(self, request) -> None:
+        self._run_results_tab.prepare(request)
+        self.layout().activate()
+        self._run_results_tab.finish_preparation()
+
     def set_executing(self, executing: bool) -> None:
         was_executing = self._executing
         self._executing = bool(executing)
@@ -809,7 +814,8 @@ class FittingWindow(QtWidgets.QDialog):
             if not was_executing:
                 self._progress.setValue(0)
             self._paused = False
-            self._start_results_presentation()
+            if not was_executing:
+                self._start_results_presentation()
             self._tabs.setCurrentIndex(2)
             self._apply_button.setEnabled(False)
             self.set_shared_seed_available(False)

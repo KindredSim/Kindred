@@ -33,12 +33,8 @@ from kindred.gui.fitting.launch import (
 )
 from kindred.gui.fitting.reporting import fit_completion_presentation
 from kindred.gui.fitting.window import FittingWindow
-from kindred.gui.fitting.worker import (
-    FitCandidate,
-    FitLiveUpdate,
-    GlobalFitWorker,
-    project_fit_candidate_curves,
-)
+from kindred.gui.fitting.execution import FitCandidate, FitLiveUpdate
+from kindred.gui.fitting.worker import GlobalFitWorker
 from kindred.gui.workspace_tab_registry import WorkspaceTabRegistry
 
 __all__ = [
@@ -91,6 +87,7 @@ class FitSessionOwner(QtCore.QObject):
         self._window: FittingWindow | None = None
         self._worker: GlobalFitWorker | None = None
         self._candidate: FitCandidate | None = None
+        self._candidate_projection = None
         self._setup_state: FitSetupSnapshot | None = None
         self._initial_setup_snapshot: FitSetupSnapshot | None = None
         self._last_fit_setup_snapshot: FitSetupSnapshot | None = None
@@ -191,6 +188,7 @@ class FitSessionOwner(QtCore.QObject):
         self._initial_setup_snapshot = setup
         self._last_fit_setup_snapshot = None
         self._candidate = None
+        self._candidate_projection = None
         try:
             window.project_setup_snapshot(setup)
             window.set_initial_reset_available(setup)
@@ -295,11 +293,13 @@ class FitSessionOwner(QtCore.QObject):
             self._gate.release(self)
             self._set_status(f"Fit preparation failed before dispatch: {exc}")
             return False
-        start_attempted = False
         try:
             # The worker object is the sole callback fence.  Queued callbacks
             # from a settled/replaced QThread are harmless because every
             # callback checks exact QObject custody before touching state.
+            worker.execution_started.connect(
+                lambda w=worker, r=request: self._on_execution_started(w, r)
+            )
             worker.progress.connect(
                 lambda value, text, w=worker: self._on_progress(w, value, text)
             )
@@ -329,65 +329,41 @@ class FitSessionOwner(QtCore.QObject):
             )
             self._worker = worker
             self._application_close_settlement_pending = True
-            start_attempted = True
+            window.set_executing(True)
+            self.execution_changed.emit(True)
+            self._set_status("Preparing Fit plots.", phase="Preparing", detail="Preparing all dataset views")
+            window.prepare_fit_plots(request)
+        except Exception as exc:
+            self._set_status(f"Fit preparation failed before dispatch: {exc}")
+            self._finish_worker(worker, request)
+            return False
+        QtCore.QTimer.singleShot(0, lambda: self._launch_worker(worker, request))
+        return True
+
+    def _launch_worker(self, worker: GlobalFitWorker, request: FitExecutionRequest) -> None:
+        if self._worker is not worker:
+            return
+        if self._closing or self._application_close_fenced:
+            self._finish_worker(worker, request)
+            return
+        try:
             worker.start()
         except Exception as exc:
-            running: bool | None = False if not start_attempted else None
-            finished: bool | None = False if not start_attempted else None
-            if start_attempted:
-                try:
-                    running = bool(worker.isRunning())
-                except Exception:
-                    running = None
-                try:
-                    finished = bool(worker.isFinished())
-                except Exception:
-                    finished = None
-            verified_unstarted = running is False and finished is False
-            if verified_unstarted:
-                if self._worker is worker:
-                    self._worker = None
-                self._gate.release(self)
-                worker.deleteLater()
-                self._notify_application_close_settled()
-                window.set_executing(False)
-                self._set_status(
-                    f"Fit dispatch failed before QThread start: {exc}"
-                )
-                return False
-
-            if running is True or finished is True:
-                window.set_executing(True)
-                self._install_started_request_state(
-                    setup=setup,
-                    window=window,
-                )
-                custody_state = "running" if running is True else "finished"
+            self._set_status(f"Fit QThread start failed: {exc}")
+            # A native thread may have started before a wrapper raised. Keep
+            # its custody until finished, just as for a normal cancellation.
+            if worker.isRunning() or worker.isFinished():
+                worker.request_cancel()
             else:
-                # Native state is ambiguous: retain the exact request/setup
-                # before any queued worker callback can publish against the
-                # old local state.  Worker and gate custody remains retained.
-                window.set_executing(True)
-                self._install_started_request_state(
-                    setup=setup,
-                    window=window,
-                )
-                custody_state = "unknown"
-            self.execution_changed.emit(True)
-            self._set_status(
-                "Fit QThread start raised; native state is "
-                f"{custody_state}. Retaining worker and computation gate for "
-                f"native terminal cleanup: {exc}"
-            )
-            return True
-        window.set_executing(True)
-        self._install_started_request_state(
-            setup=setup,
-            window=window,
-        )
-        self.execution_changed.emit(True)
+                self._finish_worker(worker, request)
+
+    def _on_execution_started(self, worker: GlobalFitWorker, request: FitExecutionRequest) -> None:
+        if self._worker is not worker or self._closing or self._application_close_fenced:
+            return
+        window = self._window
+        if window is not None:
+            self._install_started_request_state(setup=request.setup, window=window)
         self._set_status("Fit started.", phase="Running", detail="Waiting for the first complete candidate")
-        return True
 
     def _install_started_request_state(
         self,
@@ -404,7 +380,6 @@ class FitSessionOwner(QtCore.QObject):
         # Execution owns the physical presentation until terminal settlement;
         # custody remains in ``self._candidate`` for a failed or cancelled
         # replacement attempt.
-        self._clear_candidate_presentation(window)
 
     @QtCore.Slot(object)
     def _on_setup_snapshot(self, snapshot: object) -> bool:
@@ -536,24 +511,11 @@ class FitSessionOwner(QtCore.QObject):
         self._window.render_results_summary()
         return True
 
-    @staticmethod
-    def _candidate_curves(
-        candidate: FitCandidate,
-    ) -> tuple[tuple[object, ...], str | None]:
-        """Project terminal curves independently from report/UI admission."""
-
-        try:
-            curves = tuple(project_fit_candidate_curves(candidate))
-        except Exception as exc:  # noqa: BLE001
-            return (), f"{type(exc).__name__}: {exc}"
-        if not curves:
-            return (), "Fit result produced no curve datasets."
-        return curves, None
-
     def _invalidate_candidate_custody(self) -> None:
         """Release the current terminal candidate."""
 
         self._candidate = None
+        self._candidate_projection = None
 
     def set_project_defaults(self, defaults: FitDefaults) -> bool:
         self._require_thread()
@@ -743,6 +705,7 @@ class FitSessionOwner(QtCore.QObject):
         ):
             return
         self._candidate = candidate
+        self._candidate_projection = worker.terminal_projection
         # Keep terminal actions disabled until the worker's finished callback
         # releases execution custody.  The candidate itself remains in owner
         # custody until finished releases the worker.
@@ -763,7 +726,7 @@ class FitSessionOwner(QtCore.QObject):
         try:
             window.project_setup_snapshot(terminal_setup)
             window.set_last_fit_reset_available(terminal_setup)
-            curves, curve_failure = self._candidate_curves(candidate)
+            curves, curve_failure = self._candidate_projection
             _completion, complete = fit_completion_presentation(candidate)
             if complete:
                 window.set_progress(100)
@@ -1107,8 +1070,12 @@ class FitSessionOwner(QtCore.QObject):
         closing = self._closing
         if self._window is not None and not self._application_close_fenced and not closing:
             self._window.set_executing(False)
-            if self._candidate is not None and self._candidate.request is request:
-                self._present_candidate(self._candidate)
+            if self._candidate is not None:
+                if self._candidate.request is request:
+                    self._present_candidate(self._candidate)
+                elif not worker.process_started:
+                    self._window.prepare_fit_plots(self._candidate.request)
+                    self._present_candidate(self._candidate)
             setup = self._accepted_setup()
             self._window.set_shared_seed_available(setup is not None and self._setup_can_seed_shared(setup))
         self.execution_changed.emit(False)

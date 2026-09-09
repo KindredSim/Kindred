@@ -25,9 +25,9 @@ from kindred.gui.display_name_policy import (
 from kindred.gui.fitting.reporting import (
     FitValueEntry, fit_candidate_presentation, fit_live_presentation, fit_overview,
 )
-from kindred.gui.fitting.launch import FitParameterVariable
+from kindred.gui.fitting.launch import FitExecutionRequest, FitParameterVariable
 from kindred.gui.ui_helpers import ControlRowsLayout
-from kindred.gui.fitting.worker import FitCandidate, FitCurveDataset, FitLiveUpdate
+from kindred.gui.fitting.execution import FitCandidate, FitCurveDataset, FitLiveUpdate
 from kindred.gui.widgets.grid_plot_view import DatasetPlotPresentation, GridPlotView
 
 __all__ = ["FitTrackerPanel", "ResultsSummaryDialog", "RunResultsTab"]
@@ -525,7 +525,7 @@ class RunResultsTab(QtWidgets.QWidget):
         self._summary_dialog = dialog
         dialog.show()
 
-    def clear_candidate(self) -> None:
+    def clear_candidate(self, *, keep_plots: bool = False) -> None:
         """Clear only physical result widgets; the owner controls custody."""
 
         self._tracker_panel.clear()
@@ -535,6 +535,10 @@ class RunResultsTab(QtWidgets.QWidget):
         self._render_diagnostic_label.clear()
         self._render_diagnostic_label.hide()
         self._install_plot_projection((), {})
+        if not keep_plots:
+            self._dataset_tab_ids = []
+            self._dataset_labels = {}
+            self._clear_subtabs()
         self._refresh_summary()
 
     def set_terminal_failure(self, failure: object) -> None:
@@ -622,7 +626,7 @@ class RunResultsTab(QtWidgets.QWidget):
         self._refresh_summary()
 
     def set_waiting(self, model: str, parameters: tuple[FitParameterVariable, ...], dataset_count: int) -> None:
-        self.clear_candidate()
+        self.clear_candidate(keep_plots=True)
         self._progress = 0
         self._tracker_panel.start(model, parameters, dataset_count)
         if self._summary_dialog is not None and self._summary_dialog.isVisible():
@@ -641,7 +645,38 @@ class RunResultsTab(QtWidgets.QWidget):
             self._all_datasets_plot_view.set_dark_mode(self._dark_mode)
         self._refresh_summary()
 
-    def _ensure_subtabs(self, curves: Sequence[FitCurveDataset]) -> None:
+    def prepare(self, request: FitExecutionRequest) -> None:
+        self._ensure_subtabs(request)
+        ids = request.dispatch.included_dataset_ids
+        for identity in self._dataset_tab_ids + ([("aggregate", "all")] if len(ids) > 1 else []):
+            aggregate = identity[0] == "aggregate"
+            view = self._all_datasets_plot_view if aggregate else self._dataset_plot_views.get(identity)
+            if view is None:
+                view = self._create_plot_view(f"global_fit_results_plot_{identity[1]}")
+                if aggregate:
+                    self._all_datasets_plot_view = view
+                else:
+                    self._dataset_plot_views[identity] = view
+                self._subtab_stack.addWidget(view)
+            view.prepare(request, ids if aggregate else (identity[1],))
+        self._empty_label.hide()
+        self._refresh_active_plot_view()
+
+    def finish_preparation(self) -> None:
+        self.layout().activate()
+        size = self._subtab_stack.contentsRect().size()
+        for index in range(self._subtab_stack.count()):
+            view = self._subtab_stack.widget(index)
+            view.resize(size)
+            view.finish_preparation()
+        # Paint the selected, displayed canvas before the owner queues launch.
+        view = self._subtab_stack.currentWidget()
+        if view is not None:
+            view._canvas.viewport().repaint()
+
+    def _ensure_subtabs(self, request: FitExecutionRequest) -> None:
+        mapped = {item.dataset_id: item for item in request.setup.origin.mapped_datasets}
+        curves = tuple(mapped[identity] for identity in request.dispatch.included_dataset_ids)
         ids = [("dataset", curve.dataset_id) for curve in curves]
         labels = {curve.dataset_id: curve.display_name for curve in curves}
         if ids == self._dataset_tab_ids and labels == self._dataset_labels:
@@ -713,12 +748,10 @@ class RunResultsTab(QtWidgets.QWidget):
         self._dataset_presentation = MappingProxyType(dict(presentation))
         if values:
             self._empty_label.hide()
-            self._ensure_subtabs(values)
             self._refresh_active_plot_view()
         else:
-            self._dataset_tab_ids = []
-            self._dataset_labels = {}
-            self._clear_subtabs()
+            for index in range(self._subtab_stack.count()):
+                self._subtab_stack.widget(index).set_projection((), {})
         self.copyAvailableChanged.emit(self.copy_eligible())
 
     def _active_plot_view_id(self) -> tuple[str, str] | None:
@@ -742,13 +775,7 @@ class RunResultsTab(QtWidgets.QWidget):
                 curve for curve in self._curves if curve.dataset_id == view_id[1]
             )
         if plot_view is None:
-            name = "all_datasets" if view_id[0] == "aggregate" else view_id[1]
-            plot_view = self._create_plot_view(f"global_fit_results_plot_{name}")
-            if view_id[0] == "aggregate":
-                self._all_datasets_plot_view = plot_view
-            else:
-                self._dataset_plot_views[view_id] = plot_view
-            self._subtab_stack.addWidget(plot_view)
+            return
         self._subtab_stack.setCurrentWidget(plot_view)
         plot_view.set_projection(curves, self._dataset_presentation)
         self.copyAvailableChanged.emit(self.copy_eligible())

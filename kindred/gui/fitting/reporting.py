@@ -22,7 +22,7 @@ from kindred.core.simulation_failure import FactualCause
 from kindred.gui.display_name_policy import scientific_symbol_html
 from kindred.gui.fitting.constants import INITIAL_PREFIX
 from kindred.gui.fitting.launch import FitParameterVariable
-from kindred.gui.fitting.worker import FitCandidate, FitLiveUpdate, _fit_coordinate_display_label
+from kindred.gui.fitting.execution import FitCandidate, FitLiveUpdate, _fit_coordinate_display_label
 
 __all__ = [
     "fit_candidate_presentation",
