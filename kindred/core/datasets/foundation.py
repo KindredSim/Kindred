@@ -111,6 +111,7 @@ def validate_raw_observation_id(
 class ObservationSeries:
     raw_observation_id: str
     column_name: str
+    # Empty means no recorded experimental time; rows remain the observation identity.
     t: tuple[float, ...]
     y: tuple[float, ...]
     source_rows: tuple[int, ...]
@@ -119,10 +120,11 @@ class ObservationSeries:
         validate_raw_observation_id(self.raw_observation_id)
         if type(self.t) is not tuple or type(self.y) is not tuple:
             raise TypeError("ObservationSeries t/y must be immutable tuples.")
-        if len(self.t) != len(self.y) or not self.t:
-            raise ValueError("ObservationSeries t/y must be equal and nonempty.")
-        for index, (time, value) in enumerate(zip(self.t, self.y, strict=True)):
+        if not self.y or (self.t and len(self.t) != len(self.y)):
+            raise ValueError("ObservationSeries requires values and either aligned recorded times or no times.")
+        for index, time in enumerate(self.t):
             validate_imported_time_seconds(time, field=f"observation time[{index}]")
+        for index, value in enumerate(self.y):
             validate_observation(value, field=f"observation value[{index}]")
 
 
@@ -278,9 +280,9 @@ def validate_raw_dataset_record(record: RawDatasetRecord) -> RawDatasetRecord:
         if type(series.t) is not tuple or type(series.y) is not tuple or type(series.source_rows) is not tuple:
             fail(f"Raw dataset {record.dataset_id!r} observation {name!r} must own immutable t/y/source_rows tuples.")
         if (
-            not series.t
-            or len(series.t) != len(series.y)
-            or len(series.t) != len(series.source_rows)
+            not series.y
+            or (series.t and len(series.t) != len(series.y))
+            or len(series.y) != len(series.source_rows)
         ):
             fail(f"Raw dataset {record.dataset_id!r} observation {name!r} must retain equal nonempty time/value tuples aligned with source rows.")
         if any(type(row) is not int or row <= 0 for row in series.source_rows):
@@ -293,9 +295,12 @@ def validate_raw_dataset_record(record: RawDatasetRecord) -> RawDatasetRecord:
     physical_assigned = {assigned_name for _source_index, _authored_name, assigned_name in physical_rows}
     time_column = thawed_metadata.get("time_column")
     if (
-        not isinstance(time_column, str)
-        or time_column not in physical_assigned
-        or time_column in observation_names
+        (time_column is not None and (
+            not isinstance(time_column, str)
+            or time_column not in physical_assigned
+            or time_column in observation_names
+        ))
+        or any(bool(series.t) != (time_column is not None) for series in record.observations)
         or any(name not in physical_assigned for name in observation_names)
     ):
         fail(f"Raw dataset {record.dataset_id!r} time/observation columns do not reference retained physical source columns.")

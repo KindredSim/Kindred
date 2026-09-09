@@ -359,7 +359,7 @@ class ImportConfigDialog(QtWidgets.QDialog):
         set_bounded_label_text(self._preview_label, f"Preview: {name}", max_width=1000)
         with QtCore.QSignalBlocker(self._time_combo):
             self._time_combo.clear()
-            self._time_combo.addItem("Select a column", -1)
+            self._time_combo.addItem("No experimental time", -1)
             for column in sheet.columns:
                 self._time_combo.addItem(column.assigned_name, column.source_index)
                 self._time_combo.setItemData(
@@ -445,7 +445,7 @@ class ImportConfigDialog(QtWidgets.QDialog):
             except ValueError as exc:
                 info = str(exc)
         else:
-            info = "Select the physical time column."
+            info = "No recorded time; observations can be fitted against a measured X quantity."
         set_bounded_label_text(self._unit_info_label, info, max_width=640)
 
     def _render_species(self) -> None:
@@ -570,7 +570,7 @@ class ImportConfigDialog(QtWidgets.QDialog):
 
     def _select_compatible_sheets(self) -> None:
         settings = self._current_sheet.settings
-        required = settings.species_columns | {settings.time_column}
+        required = (settings.species_columns | {settings.time_column}) - {None}
         with QtCore.QSignalBlocker(self._sheet_list):
             for index, sheet in enumerate(self._sheets):
                 sheet.included = required <= set(sheet.columns)
@@ -589,7 +589,7 @@ class ImportConfigDialog(QtWidgets.QDialog):
                 current.settings if shared and current is not None else sheet.settings
             )
             label = sheet.name or self._source.original_filename
-            if settings.time_column not in sheet.columns:
+            if settings.time_column is not None and settings.time_column not in sheet.columns:
                 reason = f"{label}: select a time column present in this sheet."
                 break
             species = settings.species_columns - {settings.time_column}
@@ -607,7 +607,7 @@ class ImportConfigDialog(QtWidgets.QDialog):
         self._readiness_label.setVisible(bool(reason))
         source_ready = (
             current is not None
-            and current.settings.time_column in current.columns
+            and (current.settings.time_column is None or current.settings.time_column in current.columns)
             and bool(current.settings.species_columns - {current.settings.time_column})
         )
         self._btn_select_compatible.setEnabled(shared and source_ready)

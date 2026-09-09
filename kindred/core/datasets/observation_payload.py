@@ -121,9 +121,9 @@ def immutable_dataset_payload(
         times = tuple(raw_spec.get("t", ()))
         values = tuple(raw_spec.get("y", ()))
         rows = _as_source_row_tuple(raw_spec.get("source_rows", ()))
-        if not times or len(times) != len(values) or len(times) != len(rows):
+        if not values or (times and len(times) != len(values)) or len(values) != len(rows):
             raise ValueError(
-                f"Observation series {name!r} requires equal nonempty time, "
+                f"Observation series {name!r} requires optional aligned time and equal nonempty "
                 "value, and source-row sequences."
             )
         if len(set(rows)) != len(rows):

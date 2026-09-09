@@ -31,8 +31,8 @@ import numpy as np
 
 from kindred.core.analysis.parametric_alignment import (
     CandidateParametricAlignmentError,
-    ParametricXProjection,
-    align_parametric_x,
+    ParametricProjection,
+    align_parametric,
     project_parametric_y,
 )
 from kindred.core.analysis.dataset_parameter_overrides import (
@@ -356,7 +356,7 @@ class DatasetFitInfo:
     model_observation_ids: Mapping[str, tuple[str, ...]]
     model_raw_columns: Mapping[str, tuple[str, ...]]
     model_source_rows: Mapping[str, tuple[int, ...]]
-    x_projection: ParametricXProjection | None
+    x_projection: ParametricProjection | None
 
     def __post_init__(self) -> None:
         # The evaluator owns admission of these typed values.  Keep the
@@ -867,12 +867,11 @@ def _payload_x_observations(payload: FitDatasetSpec) -> Dict[str, object]:
     source = payload.x_observations
     rows = payload.x_source_rows
     by_row = {
-        int(row): (float(time), float(value))
-        for row, time, value in zip(source.source_rows, source.t, source.y, strict=True)
+        int(row): float(value)
+        for row, value in zip(source.source_rows, source.y, strict=True)
     }
     return {
-        "t": np.asarray([by_row[row][0] for row in rows], dtype=float),
-        "x": np.asarray([by_row[row][1] for row in rows], dtype=float),
+        "x": np.asarray([by_row[row] for row in rows], dtype=float),
         "source_rows": rows,
         "raw_observation_id": source.raw_observation_id,
         "raw_column": source.raw_column,
@@ -1595,16 +1594,19 @@ def _build_dataset_fit_info(
     dataset_id = payload.dataset_id
     observations = _payload_observations(payload)
     x_name = payload.x_name
-    x_projection: ParametricXProjection | None = None
+    x_projection: ParametricProjection | None = None
     sim_time = np.asarray(simulation.t, dtype=float)
     segment_ids = np.asarray(simulation.segment_ids, dtype=np.int64)
     segment_keys = tuple(simulation.segment_keys)
     discontinuity_ids = np.asarray(simulation.discontinuity_ids, dtype=np.int64)
+    target_multipliers = _normalized_target_weight_multipliers(
+        species_list=payload.target_roster,
+        target_weights=dict(payload.target_weights),
+    )
     if x_name != "t":
         x_observations = _payload_x_observations(payload)
         try:
-            x_projection = align_parametric_x(
-                observation_time=x_observations["t"],
+            x_projection = align_parametric(
                 observed_x=x_observations["x"],
                 source_rows=x_observations["source_rows"],
                 model_time=sim_time,
@@ -1612,7 +1614,9 @@ def _build_dataset_fit_info(
                 segment_ids=segment_ids,
                 segment_keys=segment_keys,
                 discontinuity_ids=discontinuity_ids,
-                mode=payload.x_mode,
+                observations=payload.observations,
+                model_y={name: fit_result_target_values(simulation, name) for name in payload.species_list},
+                multipliers=target_multipliers,
                 dataset_label=dataset_id,
                 x_name=x_name,
             )
@@ -1627,10 +1631,6 @@ def _build_dataset_fit_info(
             )) from exc
     _raise_if_fitting_cancel_requested(cancellation_control)
 
-    target_multipliers = _normalized_target_weight_multipliers(
-        species_list=payload.target_roster,
-        target_weights=dict(payload.target_weights),
-    )
     dataset_weight = _objective_dataset_weight_multiplier(weights.get(dataset_id, 1.0))
     raw_blocks: list[np.ndarray] = []
     weighted_blocks: list[np.ndarray] = []
@@ -1667,11 +1667,7 @@ def _build_dataset_fit_info(
             y_projection = x_projection.subset(species_obs["source_rows"])
             y_sim = project_parametric_y(
                 projection=y_projection,
-                model_time=sim_time,
                 model_y=np.asarray(model_values, dtype=float),
-                segment_ids=segment_ids,
-                segment_keys=segment_keys,
-                discontinuity_ids=discontinuity_ids,
             )
             selected = (
                 y_projection.selected_model_x,

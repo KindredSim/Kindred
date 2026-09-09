@@ -432,7 +432,9 @@ class ResultDataBlock:
             if name in names:
                 raise ValueError(f"data block contains duplicate series {name!r}.")
             values = raw_values
-            if values.size != time.size:
+            if values.size != time.size and not (
+                self.kind is ResultLayerKind.EXPERIMENTAL and time.size == 0
+            ):
                 raise ValueError(f"data series {name!r} length does not match time.")
             names.add(name)
             normalized.append((name, values))
@@ -789,6 +791,8 @@ def _data_block(
 ) -> ResultDataBlock | None:
     series_axis_map = dict(block.series_axes)
     if _is_time_selection(x_axis):
+        if block.t.size == 0:
+            return None
         x_values, x_name = block.t, "t"
         x_provenance: Mapping[str, object] = MappingProxyType({})
     elif isinstance(x_axis, SimulationSeriesAxisSelection) and block.kind is not ResultLayerKind.EXPERIMENTAL:
@@ -973,7 +977,7 @@ def _planned_xlsx_worksheet_dimensions(
         dimensions.append(
             (
                 title,
-                int(block.t.size) + 1,
+                int(block.series[0][1].size) + 1,
                 identity_column_count + len(block.series),
             )
         )
@@ -1447,7 +1451,7 @@ def compose_result_input(
         x_values.setflags(write=False)
         y_values.setflags(write=False)
         source_rows.setflags(write=False)
-        unavailable = False
+        unavailable = _is_time_selection(selected_x) and not experimental.t
         if not _is_time_selection(selected_x):
             x_source = (
                 next(
@@ -1765,7 +1769,7 @@ def write_xlsx(
                     *(name for name, _values in block.series),
                 ),
             )
-            for index in range(block.t.size):
+            for index in range(block.series[0][1].size):
                 if cancellation_check is not None and index % 256 == 0:
                     cancellation_check()
                 if block.kind is ResultLayerKind.EXPERIMENTAL:
@@ -1779,7 +1783,7 @@ def write_xlsx(
                 _append_xlsx_row(
                     sheet,
                     (
-                        float(block.t[index]),
+                        float(block.t[index]) if block.t.size else None,
                         *identity_values,
                         *(float(values[index]) for _name, values in block.series),
                     ),

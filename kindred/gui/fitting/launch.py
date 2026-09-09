@@ -102,6 +102,8 @@ def _finite(value: object, field: str) -> float:
 
 def fit_execution_span(t_start: object, t_end: object) -> tuple[float, float]:
     """Validate and return a strictly positive Fit solver span."""
+    if t_start is None or t_end is None:
+        raise ValueError("Enter both Simulation start and Simulation end.")
     start = _finite(t_start, "Fit execution start")
     end = _finite(t_end, "Fit execution end")
     if start < 0.0 or end < 0.0 or end > TIME_MAX_S or start > TIME_MAX_S:
@@ -573,7 +575,8 @@ class FitSharedInitialGroup:
 class FitDatasetLocalSettings:
     dataset_id: str
     included: bool
-    t_start: float
+    t_start: float | None
+    simulation_end: float | None = None
     data_range_min: float = 0.0
     data_range_max: float = 0.0
     maximum_observations_per_target: int | None = None
@@ -585,12 +588,14 @@ class FitDatasetLocalSettings:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "dataset_id", _required(self.dataset_id, "dataset ID"))
-        t_start = _finite(self.t_start, "Fit simulation start")
-        if t_start < 0.0:
+        t_start = None if self.t_start is None else _finite(self.t_start, "Fit simulation start")
+        if t_start is not None and t_start < 0.0:
             raise ValueError("Fit simulation start must be nonnegative.")
+        simulation_end = None if self.simulation_end is None else _finite(self.simulation_end, "Simulation end")
+        object.__setattr__(self, "simulation_end", simulation_end)
         low = _finite(self.data_range_min, "Data Range minimum")
         high = _finite(self.data_range_max, "Data Range maximum")
-        if high < low:
+        if self.parametric is None and high < low:
             raise ValueError("Data Range maximum must be >= minimum.")
         maximum = (
             None
@@ -866,7 +871,7 @@ class FitPreparedDatasetConfig:
             )
         retained_times = tuple(float(value) for value in self.retained_times)
         if (
-            not retained_times
+            (not retained_times and self.parametric_x_observation is None)
             or any(not math.isfinite(value) for value in retained_times)
             or any(right <= left for left, right in zip(retained_times, retained_times[1:]))
         ):
@@ -1086,7 +1091,15 @@ def create_initial_fit_setup(origin: FitOriginSnapshot) -> FitSetupSnapshot:
         FitDatasetLocalSettings(
             dataset_id=mapped.dataset_id,
             included=False,
-            t_start=mapped.resolved_t_start,
+            t_start=(
+                mapped.resolved_t_start
+                if any(observation.t for observation in mapped.observations)
+                else None
+            ),
+            simulation_end=max(
+                (value for observation in mapped.observations for value in observation.t),
+                default=None,
+            ),
             data_range_min=min(
                 (
                     value
@@ -1312,38 +1325,33 @@ def selected_observations(
     selected: list[FitSelectedObservation] = []
     for target in local.target_species:
         observation = observations_by_target[target]
+        if x_rows is None and not observation.t:
+            raise ValueError(
+                f"Dataset {mapped.display_name!r} has no recorded time. Select a measured X quantity."
+            )
         usable = tuple(
-            index
-            for index, (time_value, source_row) in enumerate(
-                zip(observation.t, observation.source_rows)
-            )
-            if (
-                time_value >= local.t_start
-                and local.data_range_min <= time_value <= local.data_range_max
-                and (x_rows is None or source_row in x_rows)
-            )
+            index for index, row in enumerate(observation.source_rows)
+            if (row in x_rows if x_rows is not None else (
+                local.data_range_min <= observation.t[index] <= local.data_range_max
+            ))
         )
         if not usable:
-            pairing = (
-                " and Parametric-X physical-row pairing"
-                if x_rows is not None
-                else ""
-            )
+            selection = "Parametric-X physical-row pairing" if x_rows is not None else "Data Range"
             raise ValueError(
                 f"Dataset {mapped.display_name!r} target {target!r} has "
-                "zero usable observations after Data Range, Simulation "
-                f"start{pairing}."
+                f"zero usable observations after {selection}."
             )
         maximum = local.maximum_observations_per_target
         indices = usable
         if maximum is not None:
-            indices = tuple(
-                usable[index]
-                for index in compute_sampled_indices(
+            # Sampling selects observations, never supplies a numerical time.
+            # A/Y selection is independent of any recorded time column.
+            indices = tuple(usable[index] for index in np.unique(
+                np.linspace(0, len(usable) - 1, min(maximum, len(usable)), dtype=int)
+            )) if x_rows is not None else tuple(
+                usable[index] for index in compute_sampled_indices(
                     t=np.asarray([observation.t[index] for index in usable]),
-                    t_min=-math.inf,
-                    t_max=math.inf,
-                    n_points=maximum,
+                    t_min=-math.inf, t_max=math.inf, n_points=maximum,
                 )
             )
         selected.append(
@@ -1351,7 +1359,7 @@ def selected_observations(
                 raw_observation_id=observation.raw_observation_id,
                 raw_column=observation.raw_column,
                 model_target=target,
-                t=tuple(float(observation.t[index]) for index in indices),
+                t=tuple(float(observation.t[index]) for index in indices) if observation.t else (),
                 y=tuple(float(observation.y[index]) for index in indices),
                 source_rows=tuple(
                     int(observation.source_rows[index]) for index in indices
@@ -1486,7 +1494,7 @@ def _selected_parametric_x_observation(
         raw_observation_id=x_source.raw_observation_id,
         raw_column=x_source.raw_column,
         model_target=parametric.x_name,
-        t=tuple(float(x_source.t[index]) for index in indices),
+        t=tuple(float(x_source.t[index]) for index in indices) if x_source.t else (),
         y=tuple(float(x_source.y[index]) for index in indices),
         source_rows=tuple(int(x_source.source_rows[index]) for index in indices),
     )
@@ -1535,11 +1543,6 @@ def _prepare_fit_datasets(
                 f"Dataset {mapped.display_name!r} mapped set identity is not "
                 "retained by the accepted initial-condition rows."
             )
-        if local.data_range_max <= local.t_start:
-            raise ValueError(
-                f"Dataset {mapped.display_name!r} Fit interval requires Data "
-                "Range maximum to be greater than Simulation start."
-            )
         captured_by_raw = {
             item.raw_observation_id: item for item in mapped.observations
         }
@@ -1557,19 +1560,23 @@ def _prepare_fit_datasets(
                 )
         selected = selected_observations(mapped, local)
         x_observation = _selected_parametric_x_observation(mapped, local, selected)
-        retained_times = tuple(
+        retained_times = (() if local.parametric is not None else tuple(
             sorted({float(value) for item in selected for value in item.t})
-        )
+        ))
         execution_t_start, execution_t_end = fit_execution_span(
-            local.t_start, local.data_range_max
+            local.t_start, local.simulation_end
         )
-        grid_points = (
-            max(100, len(retained_times))
-            if local.parametric is not None
-            else 100
-        )
+        if any(
+            value < execution_t_start or value > execution_t_end
+            for value in retained_times
+        ):
+            raise ValueError(
+                f"Dataset {mapped.display_name!r} has selected experimental times "
+                "outside the Simulation interval. Adjust the interval or Data Range."
+            )
+        grid_points = 100
         policy = (
-            "parametric_regular_grid_union_retained_endpoints"
+            "parametric_regular_grid"
             if local.parametric is not None
             else "fit_internal_regular_grid_union_retained_endpoints"
         )

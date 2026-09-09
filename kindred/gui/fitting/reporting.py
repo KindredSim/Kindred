@@ -626,8 +626,11 @@ def _known_input_context(candidate: FitCandidate) -> dict[str, object]:
         "absolute_tolerance": float(settings.atol), "analytic_jacobian_policy": bool(settings.analytic_jacobian_policy),
         "solver": str(request_setup.solver), "included_dataset_ids": list(request.dispatch.included_dataset_ids),
         "dataset_conditions": [{"dataset_id": item.dataset_id, "included": bool(item.included),
-            "resolved_t_start": float(item.t_start), "data_range_min": float(item.data_range_min),
-            "data_range_max": float(item.data_range_max)} for item in request_setup.datasets],
+            "simulation_start": item.t_start,
+            "simulation_end": item.simulation_end,
+            "x_quantity": item.parametric.x_name if item.parametric else "t",
+            "data_range_min": None if item.parametric else float(item.data_range_min),
+            "data_range_max": None if item.parametric else float(item.data_range_max)} for item in request_setup.datasets],
         "known_condition_source": "captured Fit origin scientific settings"}
 
 
@@ -873,9 +876,13 @@ def fit_candidate_presentation(candidate: FitCandidate) -> tuple[tuple[str, ...]
                                           if key not in {"dataset_conditions", "included_dataset_ids"}))
     provenance += _table(("Dataset", "Dataset ID", "Initial-condition set ID"),
                          ((mapped.display_name, mapped.dataset_id, mapped.set_id) for mapped in candidate.origin.mapped_datasets))
-    provenance += _table(("Dataset ID", "Included", "Start time", "Data range"),
-                         ((row["dataset_id"], row["included"], row["resolved_t_start"],
+    provenance += _table(("Dataset ID", "Included", "X quantity", "Simulation interval", "Experimental time range"),
+                         ((row["dataset_id"], row["included"], row["x_quantity"],
+                           f"{row['simulation_start']} to {row['simulation_end']}",
+                           "All paired observations" if row["data_range_min"] is None else
                            f"{row['data_range_min']} to {row['data_range_max']}") for row in context["dataset_conditions"]))
+    if any(item.parametric is not None for item in candidate.request.setup.datasets if item.included):
+        provenance += "<p>Measured-X fitting jointly matches weighted X and Y discrepancies on uninterrupted simulation segments. Recorded time is unused. Matched locations do not identify experimental times or establish absolute rate identifiability.</p>"
     provenance += f"<p>Weighting mode: {_text(candidate.request.setup.dataset_weight_mode)}. Weighted residual = raw residual × √normalized dataset weight × √normalized target weight.</p>"
     provenance += _table(("Estimate provenance", "Captured value"),
                          _technical_rows(shared + individual + initial))

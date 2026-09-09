@@ -524,16 +524,12 @@ class FittingWindow(QtWidgets.QDialog):
             return self._fit_default_settings_for_dataset(dataset_id)
         return {
             "t_start": dataset.t_start,
+            "simulation_end": dataset.simulation_end,
             "data_range_min": dataset.data_range_min,
             "data_range_max": dataset.data_range_max,
             "maximum_observations_per_target": dataset.maximum_observations_per_target,
             "parametric_x": (
                 dataset.parametric.x_name if dataset.parametric is not None else "t"
-            ),
-            "parametric_mode": (
-                dataset.parametric.requested_mode
-                if dataset.parametric is not None
-                else "auto"
             ),
             "eligible_parametric_x": self._eligible_parametric_x(dataset_id),
         }
@@ -579,22 +575,22 @@ class FittingWindow(QtWidgets.QDialog):
         mapped = self._mapped_dataset(dataset_id)
         if mapped is None:
             return {
-                "t_start": 0.0,
+                "t_start": None,
+                "simulation_end": None,
                 "data_range_min": 0.0,
                 "data_range_max": 0.0,
                 "maximum_observations_per_target": None,
                 "parametric_x": "t",
-                "parametric_mode": "auto",
                 "eligible_parametric_x": (),
             }
         times = [float(value) for item in mapped.observations for value in item.t]
         return {
-            "t_start": mapped.resolved_t_start,
+            "t_start": mapped.resolved_t_start if times else None,
+            "simulation_end": max(times, default=None),
             "data_range_min": min(times, default=mapped.resolved_t_start),
             "data_range_max": max(times, default=mapped.resolved_t_start),
             "maximum_observations_per_target": None,
             "parametric_x": "t",
-            "parametric_mode": "auto",
             "eligible_parametric_x": self._eligible_parametric_x(dataset_id),
         }
 
@@ -646,7 +642,8 @@ class FittingWindow(QtWidgets.QDialog):
             )
         return replace(
             current,
-            t_start=float(config.get("t_start", current.t_start)),
+            t_start=config.get("t_start", current.t_start),
+            simulation_end=config.get("simulation_end", current.simulation_end),
             data_range_min=float(
                 config.get("data_range_min", current.data_range_min)
             ),
@@ -705,7 +702,7 @@ class FittingWindow(QtWidgets.QDialog):
             "data_range_max",
             "maximum_observations_per_target",
             "parametric_x",
-            "parametric_mode",
+            "simulation_end",
         }
         if set(config) != expected_fields:
             self.set_status("Data settings edit carried invalid fields.")
@@ -732,12 +729,9 @@ class FittingWindow(QtWidgets.QDialog):
         x_name = str(config.get("parametric_x", "t") or "t")
         if x_name == "t":
             return None
-        mode = str(config.get("parametric_mode", "auto") or "auto")
         return FitParametricSettings(
             dataset_id=dataset_id,
             x_name=x_name,
-            requested_mode=mode,
-            resolved_mode=None if mode == "auto" else mode,
         )
 
     # ------------------------------------------------------------------
@@ -886,15 +880,6 @@ class FittingWindow(QtWidgets.QDialog):
             raise TypeError("curves must contain FitCurveDataset values.")
         self._run_results_tab.set_live_curves(values)
 
-    def set_resolved_auto_modes(
-        self,
-        modes: tuple[tuple[str, str], ...],
-    ) -> None:
-        self._data_tab.set_resolved_auto_modes(modes)
-
-    def _clear_resolved_auto_modes(self) -> None:
-        self._data_tab.set_resolved_auto_modes(())
-
     def set_terminal_presentation(
         self,
         candidate: FitCandidate | None,
@@ -913,9 +898,6 @@ class FittingWindow(QtWidgets.QDialog):
             curve_failure=curve_failure,
         )
         self._results_summary_button.setEnabled(candidate is not None)
-        self.set_resolved_auto_modes(
-            () if candidate is None else candidate.resolved_auto_modes
-        )
         if candidate is not None:
             self._params_ics_tab.set_last_fit_presentation({
                 settlement.parameter_name: settlement.overall_decoded_value
@@ -945,7 +927,6 @@ class FittingWindow(QtWidgets.QDialog):
         )
 
     def clear_candidate(self) -> None:
-        self._clear_resolved_auto_modes()
         self._apply_button.setEnabled(False)
         self._results_summary_button.setEnabled(True)
         if self._executing:

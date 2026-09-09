@@ -475,7 +475,10 @@ def _replay_imported_dataset(
         raise ValueError(f"{label}.source_metadata.observation_columns must be an array of names.")
     by_name = {column.assigned_name: column for column in columns}
     try:
-        time_column = by_name[str(metadata["time_column"])]
+        time_column = (
+            None if metadata["time_column"] is None
+            else by_name[str(metadata["time_column"])]
+        )
         species_columns = tuple(by_name[str(name)] for name in observation_names)
     except KeyError as exc:
         raise ValueError(f"{label}.source_metadata references an unknown physical column.") from exc

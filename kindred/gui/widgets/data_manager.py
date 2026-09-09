@@ -175,8 +175,8 @@ class _SourceDialog(QtWidgets.QDialog):
             fields.append(("Worksheet", metadata["sheet_name"]))
         source_names = {column["assigned_name"]: column["authored_name"] for column in metadata["physical_columns"]}
         fields.extend([
-            ("Time column", source_names[metadata["time_column"]]),
-            ("Time unit", metadata.get("original_time_unit", "Not recorded")),
+            ("Time column", source_names.get(metadata["time_column"], "Not recorded")),
+            ("Time unit", metadata.get("original_time_unit", "Not recorded") if metadata["time_column"] is not None else "Not recorded"),
             ("Time points", str(len({t for series in record.observations for t in series.t}))),
         ])
         for title, value in fields:
@@ -672,10 +672,11 @@ class DataManagerPanel(QtWidgets.QWidget):
         if record is None:
             self._dataset_summary.clear()
         else:
-            unique_times = {value for series in record.observations for value in series.t}
+            rows = {row for series in record.observations for row in series.source_rows}
+            timing = "recorded time" if any(series.t for series in record.observations) else "no recorded time"
             column_label = "column" if len(record.observations) == 1 else "columns"
             self._dataset_summary.setText(
-                f"{len(unique_times)} time points · {len(record.observations)} measured {column_label}"
+                f"{len(rows)} observations · {len(record.observations)} measured {column_label} · {timing}"
             )
         self._update_mapping_area()
 

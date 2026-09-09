@@ -439,6 +439,7 @@ def fit_global(
             if optional_analysis_stopped:
                 bootstrap_result = residual_bootstrap_settlement_result(
                     config=residual_bootstrap,
+                    payloads=payloads,
                     status="stopped",
                     settlement="not_started_after_stop",
                     cause=factual_cause_from_exception(
@@ -462,6 +463,7 @@ def fit_global(
                 except (FittingCancelled, SimulationCancelled) as exc:
                     bootstrap_result = residual_bootstrap_settlement_result(
                         config=residual_bootstrap,
+                        payloads=payloads,
                         status="stopped",
                         settlement="stopped",
                         cause=factual_cause_from_exception(
@@ -471,6 +473,7 @@ def fit_global(
                 except Exception as exc:
                     bootstrap_result = residual_bootstrap_settlement_result(
                         config=residual_bootstrap,
+                        payloads=payloads,
                         status="failed",
                         settlement="failed",
                         cause=factual_cause_from_exception(

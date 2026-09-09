@@ -115,9 +115,10 @@ def sharing_settings(
     unit_row: Mapping[PhysicalColumn, object] | None,
 ) -> ImportSettings:
     """Detach choices and retain source-effective fallbacks without editing drafts."""
-    if settings.time_column is None:
-        raise ValueError("Select one physical time column.")
-    time_unit, _ = resolve_column_unit(settings.time_column, "time", unit_row, settings)
+    time_unit = (
+        resolve_column_unit(settings.time_column, "time", unit_row, settings)[0]
+        if settings.time_column is not None else "s"
+    )
     fallbacks = {
         column: resolve_column_unit(column, "concentration", unit_row, settings)[0]
         for column in settings.species_columns
@@ -136,7 +137,7 @@ class ResolvedSheetPlan:
     """Fully resolved import plan for a single sheet (or CSV file)."""
 
     sheet_name: Optional[str]
-    time_column: PhysicalColumn
+    time_column: PhysicalColumn | None
     species_columns: Tuple[PhysicalColumn, ...]
     skip_unit_row: bool
     time_factor: float
@@ -172,19 +173,18 @@ def resolve_sheet_plan(
     settings: ImportSettings,
 ) -> ResolvedSheetPlan:
     time_column = settings.time_column
-    if time_column is None:
-        raise ValueError("Select one physical time column.")
     species = settings.species_columns - {time_column}
     if not species:
         raise ValueError("Select at least one species column.")
-    for column in {time_column, *species}:
+    for column in ({time_column, *species} - {None}):
         if column not in columns:
             raise ValueError(
                 f"Column {column.assigned_name!r} not found in sheet {sheet_name!r}."
             )
     ordered_species = tuple(column for column in columns if column in species)
-    time_unit, time_factor = resolve_column_unit(
-        time_column, "time", unit_row, settings
+    time_unit, time_factor = (
+        resolve_column_unit(time_column, "time", unit_row, settings)
+        if time_column is not None else ("s", 1.0)
     )
     concentrations = {
         column.assigned_name: resolve_column_unit(

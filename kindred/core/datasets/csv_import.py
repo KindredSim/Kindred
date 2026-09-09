@@ -123,7 +123,7 @@ def parse_physical_rows(
     rows: Iterable[Mapping[PhysicalColumn, object] | PhysicalRow],
     *,
     columns: Sequence[PhysicalColumn],
-    time_column: PhysicalColumn,
+    time_column: PhysicalColumn | None,
     species_columns: Sequence[PhysicalColumn],
     interruption_checker: Callable[[], bool] | None = None,
     source_label: str | None = None,
@@ -168,9 +168,9 @@ def parse_physical_rows(
 
     first, first_row_source = _row_values_and_source_row(first_item, 0)
 
-    if not isinstance(time_column, PhysicalColumn):
+    if time_column is not None and not isinstance(time_column, PhysicalColumn):
         raise TypeError("An exact admitted PhysicalColumn time column is required.")
-    if time_column not in physical_columns:
+    if time_column is not None and time_column not in physical_columns:
         raise ValueError("The admitted time column is absent from the source.")
     resolved_time = time_column
     resolved_species = tuple(species_columns)
@@ -251,30 +251,31 @@ def parse_physical_rows(
         ):
             continue
         saw_nonempty_row = True
-        raw_time = _cell(row, resolved_time)
-        if not raw_time:
-            raise ValueError(
-                f"{_source_prefix()}row {row_index}, time column "
-                f"{resolved_time.assigned_name!r}: missing value."
-            )
-        try:
-            parsed_time = float(raw_time) * resolved_time_factor
-        except (TypeError, ValueError) as exc:
-            raise ValueError(
-                f"{_source_prefix()}row {row_index}, time column "
-                f"{resolved_time.assigned_name!r}: invalid numeric value "
-                f"{raw_time!r}."
-            ) from exc
-        try:
-            parsed_time = validate_imported_time_seconds(
-                parsed_time,
-                field=(
+        if resolved_time is not None:
+            raw_time = _cell(row, resolved_time)
+            if not raw_time:
+                raise ValueError(
                     f"{_source_prefix()}row {row_index}, time column "
-                    f"{resolved_time.assigned_name!r}"
-                ),
-            )
-        except (TypeError, ValueError) as exc:
-            raise ValueError(str(exc)) from exc
+                    f"{resolved_time.assigned_name!r}: missing value."
+                )
+            try:
+                parsed_time = float(raw_time) * resolved_time_factor
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"{_source_prefix()}row {row_index}, time column "
+                    f"{resolved_time.assigned_name!r}: invalid numeric value "
+                    f"{raw_time!r}."
+                ) from exc
+            try:
+                parsed_time = validate_imported_time_seconds(
+                    parsed_time,
+                    field=(
+                        f"{_source_prefix()}row {row_index}, time column "
+                        f"{resolved_time.assigned_name!r}"
+                    ),
+                )
+            except (TypeError, ValueError) as exc:
+                raise ValueError(str(exc)) from exc
 
         for column in resolved_species:
             _raise_if_interrupted()
@@ -303,7 +304,8 @@ def parse_physical_rows(
             except (TypeError, ValueError) as exc:
                 raise ValueError(str(exc)) from exc
             spec = observations_by_column[column]
-            spec["t"].append(parsed_time)
+            if resolved_time is not None:
+                spec["t"].append(parsed_time)
             spec["y"].append(parsed_value)
             spec["source_rows"].append(row_index)
 
@@ -315,7 +317,7 @@ def parse_physical_rows(
     for column in resolved_species:
         _raise_if_interrupted()
         spec = observations_by_column[column]
-        if not spec["t"]:
+        if not spec["y"]:
             continue
         retained_columns.append(column)
         observations[column.assigned_name] = {
@@ -328,7 +330,7 @@ def parse_physical_rows(
         raise ValueError("No numeric observation columns were found.")
 
     metadata: dict[str, object] = {
-        "time_column": resolved_time.assigned_name,
+        "time_column": resolved_time.assigned_name if resolved_time is not None else None,
         "observation_columns": [
             column.assigned_name for column in retained_columns
         ],

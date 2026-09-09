@@ -17,7 +17,7 @@ _TERMINAL_EVENTS = frozenset({
     "candidate_ready", "factual_failure", "scientific_unavailable", "cancelled",
 })
 _LIVE_EVENTS = frozenset({
-    "progress", "auto_modes_resolved", "best_updated", "curves_updated",
+    "progress", "best_updated", "curves_updated",
 })
 
 
@@ -26,7 +26,6 @@ class GlobalFitWorker(QtCore.QThread):
 
     execution_started = QtCore.Signal()
     progress = QtCore.Signal(int, str)
-    auto_modes_resolved = QtCore.Signal(object)
     best_updated = QtCore.Signal(object)
     curves_updated = QtCore.Signal(object)
     candidate_ready = QtCore.Signal(object)

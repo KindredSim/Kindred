@@ -141,8 +141,10 @@ class FitCurveDataset:
     y_semantics: tuple[tuple[str, FitCurveYSemantic], ...]
     model_x: tuple[tuple[str, tuple[float, ...]], ...]
     model_y: tuple[tuple[str, tuple[float, ...]], ...]
+    model_time: tuple[float, ...]
     observed_x: tuple[tuple[str, tuple[float, ...]], ...]
     observed_y: tuple[tuple[str, tuple[float, ...]], ...]
+    observed_time: tuple[tuple[str, tuple[float, ...]], ...]
     model_segment_ids: tuple[tuple[str, tuple[int, ...]], ...]
     model_segment_keys: tuple[tuple[str, tuple[str, ...]], ...]
     model_discontinuity_ids: tuple[tuple[str, tuple[int, ...]], ...]
@@ -301,7 +303,6 @@ class FitCandidate:
     request: FitExecutionRequest
     result: GlobalFitResult
     setup_snapshot: FitSetupSnapshot
-    resolved_auto_modes: tuple[tuple[str, str], ...]
 
     def __post_init__(self) -> None:
         if not isinstance(self.request, FitExecutionRequest):
@@ -310,13 +311,6 @@ class FitCandidate:
             raise TypeError("Fit candidate result must be canonical.")
         nominal_setup = self.setup_snapshot
         dispatch = self.request.dispatch
-        resolved_auto_modes = tuple(
-            (str(dataset_id or "").strip(), str(mode or "").strip())
-            for dataset_id, mode in self.resolved_auto_modes
-        )
-        resolved_dataset_ids = [
-            dataset_id for dataset_id, _mode in resolved_auto_modes
-        ]
         expected_dataset_ids = {
             item.dataset_id
             for item in nominal_setup.datasets
@@ -343,34 +337,6 @@ class FitCandidate:
                 "Fit candidate terminal rosters must exactly match the "
                 "included datasets."
             )
-        expected_auto_dataset_ids = {
-            item.dataset_id
-            for item in nominal_setup.datasets
-            if (
-                item.included
-                and item.parametric is not None
-                and item.parametric.requested_mode == "auto"
-            )
-        }
-        if (
-            any(not dataset_id for dataset_id in resolved_dataset_ids)
-            or len(resolved_dataset_ids) != len(set(resolved_dataset_ids))
-            or set(resolved_dataset_ids) != expected_auto_dataset_ids
-            or any(
-                mode not in {"monotone", "time_guided"}
-                for _dataset_id, mode in resolved_auto_modes
-            )
-        ):
-            raise ValueError(
-                "Fit candidate resolved parametric modes must exactly match "
-                "the included parametric datasets."
-            )
-        object.__setattr__(
-            self,
-            "resolved_auto_modes",
-            resolved_auto_modes,
-        )
-
     @property
     def origin(self) -> FitOriginSnapshot:
         return self.request.setup.origin
@@ -453,11 +419,6 @@ def _compile_dataset_spec(
     local: FitDatasetLocalSettings,
 ) -> FitDatasetSpec:
     parametric = local.parametric
-    if parametric is not None and parametric.resolved_mode is None:
-        raise ValueError(
-            f"Dataset {prepared.dataset_id!r}: Auto parametric mode must be "
-            "resolved once before execution lowering."
-        )
     selected = prepared.selected_observations
     observation_map = {
         item.model_target: _series_from_selected(item)
@@ -483,11 +444,6 @@ def _compile_dataset_spec(
         observations=observation_map,
         target_weights=dict(local.target_weights),
         x_name=parametric.x_name if parametric is not None else "t",
-        x_mode=(
-            parametric.resolved_mode
-            if parametric is not None
-            else "monotone"
-        ),
         x_observations=x_observations,
     )
 
@@ -867,8 +823,10 @@ def _curves_from_simulations(
                 y_semantics=_fit_curve_y_semantics(request.setup.origin.prepared_dsl, model_names),
                 model_x=model_x,
                 model_y=model_y,
+                model_time=tuple(float(value) for value in simulation.t),
                 observed_x=observed_x,
                 observed_y=observed_y,
+                observed_time=tuple((item.model_target, item.t) for item in selected),
                 model_segment_ids=model_segment_ids,
                 model_segment_keys=model_segment_keys,
                 model_discontinuity_ids=model_discontinuity_ids,
@@ -917,7 +875,6 @@ def _assemble_fit_terminal(
     included_ids: tuple[str, ...],
     effective_local: Mapping[str, FitDatasetLocalSettings],
     setup_snapshot: FitSetupSnapshot,
-    resolved_modes: tuple[tuple[str, str], ...],
     evaluators: Mapping[str, FittingEvaluator],
 ) -> FitCandidate:
     """Validate terminal provenance and build the sole retained candidate."""
@@ -1037,7 +994,6 @@ def _assemble_fit_terminal(
         request=request,
         result=result,
         setup_snapshot=terminal_setup,
-        resolved_auto_modes=resolved_modes,
     )
     return candidate
 
@@ -1254,7 +1210,6 @@ class _FitExecution(_FitControl):
         )
 
         effective_local: dict[str, FitDatasetLocalSettings] = {}
-        resolved_mode_items: list[tuple[str, str]] = []
         starting_evaluations = {}
         starting_facts: list[DatasetFitInfo] = []
         execution_shared_variables = dispatch.ordinary_shared_variables
@@ -1279,9 +1234,7 @@ class _FitExecution(_FitControl):
             [
                 _compile_dataset_spec(
                     prepared_datasets[item.dataset_id],
-                    replace(item, parametric=replace(item.parametric, resolved_mode="monotone"))
-                    if item.parametric is not None and item.parametric.requested_mode == "auto"
-                    else item,
+                    item,
                 )
                 for item in included
             ],
@@ -1322,18 +1275,9 @@ class _FitExecution(_FitControl):
                 )
                 for name in starting_values
             }
-            starting_local = local
-            if (
-                local.parametric is not None
-                and local.parametric.requested_mode == "auto"
-            ):
-                starting_local = replace(
-                    local,
-                    parametric=replace(local.parametric, resolved_mode="monotone"),
-                )
             starting_payload = _compile_dataset_spec(
                 prepared_datasets[local.dataset_id],
-                starting_local,
+                local,
             )
             starting_input = ObjectiveDatasetInput(
                 payload=starting_payload,
@@ -1362,47 +1306,6 @@ class _FitExecution(_FitControl):
             if fit_info is not None:
                 starting_evaluations[dataset_id] = fit_info.simulation_result
                 starting_facts.append(fit_info)
-            if (
-                local.parametric is not None
-                and local.parametric.requested_mode == "auto"
-            ):
-                if fit_info is None:
-                    # A candidate-domain failure removes the starting
-                    # trajectory, so Auto must choose the deterministic
-                    # Time-guided admission for subsequent candidates.
-                    resolved_mode = "time_guided"
-                    chosen = replace(
-                        local,
-                        parametric=replace(
-                            local.parametric,
-                            resolved_mode=resolved_mode,
-                        ),
-                    )
-                else:
-                    resolved_mode = "monotone"
-                    chosen = replace(
-                        local,
-                        parametric=replace(
-                            local.parametric,
-                            resolved_mode=resolved_mode,
-                        ),
-                    )
-            if (
-                chosen.parametric is not None
-                and chosen.parametric.requested_mode == "auto"
-            ):
-                resolved_mode = chosen.parametric.resolved_mode
-                if resolved_mode is None:
-                    raise ValueError(
-                        f"Dataset {mapped.display_name!r}: parametric mode "
-                        "remained unresolved after starting evaluation."
-                    )
-                resolved_mode_items.append(
-                    (
-                        chosen.dataset_id,
-                        resolved_mode,
-                    )
-                )
             effective_local[local.dataset_id] = chosen
         datasets = [
             _compile_dataset_spec(
@@ -1411,12 +1314,6 @@ class _FitExecution(_FitControl):
             )
             for item in included
         ]
-        resolved_modes = tuple(
-            sorted(resolved_mode_items)
-        )
-        if self._checkpoint(honor_stop=False):
-            raise FittingCancelled()
-        self._emit("auto_modes_resolved", resolved_modes)
         if self._checkpoint(honor_stop=False):
             raise FittingCancelled()
         initial_curves = _curves_from_simulations(
@@ -1575,7 +1472,6 @@ class _FitExecution(_FitControl):
             included_ids=included_ids,
             effective_local=effective_local,
             setup_snapshot=setup,
-            resolved_modes=resolved_modes,
             evaluators=evaluators,
         )
         self._emit("progress", 100, result.message)

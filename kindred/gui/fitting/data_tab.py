@@ -1,4 +1,4 @@
-"""Fit-local Data Range and dataset-local start controls."""
+"""Fit-local simulation interval and retained-observation controls."""
 
 from __future__ import annotations
 
@@ -7,6 +7,7 @@ from collections.abc import Callable, Iterable, Mapping
 
 from PySide6 import QtCore, QtWidgets
 
+from kindred.gui.fitting.launch import fit_execution_span
 from kindred.gui.ui_helpers import set_bounded_label_text
 from kindred.gui.ui_helpers import setup_scientific_validator
 from kindred.gui.widgets.config_panel_footer import ConfigPanelFooter
@@ -21,7 +22,7 @@ class DataTab(QtWidgets.QWidget):
         "data_range_max",
         "maximum_observations_per_target",
         "parametric_x",
-        "parametric_mode",
+        "simulation_end",
     )
 
     fitSettingsApplied = QtCore.Signal(str, dict)
@@ -46,7 +47,6 @@ class DataTab(QtWidgets.QWidget):
         self._display_names: dict[str, str] = {}
         self._pending: dict[str, dict[str, object]] = {}
         self._invalid_raw: dict[tuple[str, str], str] = {}
-        self._resolved_auto_modes: dict[str, str] = {}
         self._changed_fields: dict[str, set[str]] = {}
         self._refreshing = False
 
@@ -129,6 +129,7 @@ class DataTab(QtWidgets.QWidget):
         self._min_edit = self._number_edit("global_fit_data_range_min")
         self._max_edit = self._number_edit("global_fit_data_range_max")
         self._start_edit = self._number_edit("global_fit_t_start")
+        self._end_edit = self._number_edit("global_fit_simulation_end")
         self.setFocusProxy(self._start_edit)
         self._maximum_edit = QtWidgets.QSpinBox(self._footer)
         self._maximum_edit.setObjectName("global_fit_maximum_observations")
@@ -141,20 +142,14 @@ class DataTab(QtWidgets.QWidget):
         range_layout.addWidget(QtWidgets.QLabel("to", range_widget))
         range_layout.addWidget(self._max_edit)
         controls.addRow("Simulation start", self._start_edit)
+        controls.addRow("Simulation end", self._end_edit)
         controls.addRow("Data Range", range_widget)
+        self._controls = controls
+        self._range_widget = range_widget
         controls.addRow("N:", self._maximum_edit)
         self._x_combo = QtWidgets.QComboBox(self._footer)
         self._x_combo.setObjectName("global_fit_parametric_x")
-        self._mode_combo = QtWidgets.QComboBox(self._footer)
-        self._mode_combo.setObjectName("global_fit_parametric_mode")
-        self._mode_combo.addItem("Auto", "auto")
-        self._mode_combo.addItem("Monotone", "monotone")
-        self._mode_combo.addItem("Time-guided", "time_guided")
-        controls.addRow("Parametric X", self._x_combo)
-        controls.addRow("Mapping mode", self._mode_combo)
-        self._resolved_mode_label = QtWidgets.QLabel("Resolved Auto: —", self._footer)
-        self._resolved_mode_label.setObjectName("global_fit_parametric_resolved_mode")
-        controls.addRow(self._resolved_mode_label)
+        controls.addRow("X quantity", self._x_combo)
         self._used_label = QtWidgets.QLabel("Used: —", self._footer)
         self._used_label.setObjectName("global_fit_used_count")
         controls.addRow(self._used_label)
@@ -162,9 +157,8 @@ class DataTab(QtWidgets.QWidget):
             item = controls.itemAt(row, QtWidgets.QFormLayout.ItemRole.LabelRole)
             if item is not None:
                 item.widget().setWordWrap(True)
-        self._resolved_mode_label.setWordWrap(True)
         self._used_label.setWordWrap(True)
-        for editor in (self._min_edit, self._max_edit, self._start_edit):
+        for editor in (self._min_edit, self._max_edit, self._start_edit, self._end_edit):
             editor.setMinimumWidth(editor.fontMetrics().horizontalAdvance("0.0000") + 16)
             editor.setSizePolicy(
                 QtWidgets.QSizePolicy.Policy.Expanding,
@@ -174,6 +168,9 @@ class DataTab(QtWidgets.QWidget):
 
         self._start_edit.textChanged.connect(
             lambda *_args: self._controls_changed("t_start")
+        )
+        self._end_edit.textChanged.connect(
+            lambda *_args: self._controls_changed("simulation_end")
         )
         self._min_edit.textChanged.connect(
             lambda *_args: self._controls_changed("data_range_min")
@@ -186,9 +183,6 @@ class DataTab(QtWidgets.QWidget):
         )
         self._x_combo.currentIndexChanged.connect(
             lambda *_args: self._controls_changed("parametric_x")
-        )
-        self._mode_combo.currentIndexChanged.connect(
-            lambda *_args: self._controls_changed("parametric_mode")
         )
         self._footer.applyRequested.connect(self._apply)
         self._footer.revertRequested.connect(self._revert)
@@ -211,6 +205,7 @@ class DataTab(QtWidgets.QWidget):
         self._header.setEnabled(enabled)
         for editor in (
             self._start_edit,
+            self._end_edit,
             self._min_edit,
             self._max_edit,
             self._maximum_edit,
@@ -221,7 +216,6 @@ class DataTab(QtWidgets.QWidget):
             self._footer.reset_button.setEnabled(enabled)
         if not enabled:
             self._used_label.setText("Used: —")
-            self._resolved_mode_label.setText("Resolved Auto: —")
             self._footer.set_error(None)
             self._footer.set_dirty(False)
             return
@@ -235,9 +229,13 @@ class DataTab(QtWidgets.QWidget):
             self._start_edit.setText(
                 self._invalid_raw.get(
                     (self._current_dataset_id, "t_start"),
-                    self._format(config.get("t_start", 0.0)),
+                    self._format(config.get("t_start")),
                 )
             )
+            self._end_edit.setText(self._invalid_raw.get(
+                (self._current_dataset_id, "simulation_end"),
+                self._format(config.get("simulation_end")),
+            ))
             self._min_edit.setText(
                 self._invalid_raw.get(
                     (self._current_dataset_id, "data_range_min"),
@@ -273,19 +271,6 @@ class DataTab(QtWidgets.QWidget):
                 )
                 selected_index = self._x_combo.count() - 1
             self._x_combo.setCurrentIndex(selected_index)
-            self._mode_combo.clear()
-            self._mode_combo.addItem("Auto", "auto")
-            self._mode_combo.addItem("Monotone", "monotone")
-            self._mode_combo.addItem("Time-guided", "time_guided")
-            requested_mode = str(config.get("parametric_mode", "auto") or "auto")
-            mode_index = self._mode_combo.findData(requested_mode)
-            if mode_index < 0:
-                self._mode_combo.addItem(
-                    f"{requested_mode} (unavailable)",
-                    requested_mode,
-                )
-                mode_index = self._mode_combo.count() - 1
-            self._mode_combo.setCurrentIndex(mode_index)
         finally:
             self._refreshing = False
         self._refresh_parametric_presentation()
@@ -293,7 +278,7 @@ class DataTab(QtWidgets.QWidget):
 
     @staticmethod
     def _format(value: object) -> str:
-        return repr(float(value))
+        return "" if value is None else repr(float(value))
 
     def _available_observation_limit(
         self,
@@ -309,7 +294,7 @@ class DataTab(QtWidgets.QWidget):
         except (TypeError, ValueError, OverflowError):
             return 0
         return max(
-            (len(getattr(item, "t", ())) for item in retained),
+            (len(getattr(item, "y", ())) for item in retained),
             default=0,
         )
 
@@ -348,6 +333,7 @@ class DataTab(QtWidgets.QWidget):
             changed.add(changed_field)
         controls = (
             ("t_start", self._start_edit),
+            ("simulation_end", self._end_edit),
             ("data_range_min", self._min_edit),
             ("data_range_max", self._max_edit),
         )
@@ -355,6 +341,10 @@ class DataTab(QtWidgets.QWidget):
             if field not in changed:
                 continue
             raw = editor.text()
+            if not raw.strip() and field in {"t_start", "simulation_end"}:
+                config[field] = None
+                self._invalid_raw.pop((dataset_id, field), None)
+                continue
             try:
                 value = float(raw)
                 if not math.isfinite(value):
@@ -371,8 +361,6 @@ class DataTab(QtWidgets.QWidget):
             )
         if "parametric_x" in changed:
             config["parametric_x"] = str(self._x_combo.currentData() or "t")
-        if "parametric_mode" in changed:
-            config["parametric_mode"] = str(self._mode_combo.currentData() or "auto")
         self._pending[dataset_id] = config
         return config
 
@@ -384,20 +372,25 @@ class DataTab(QtWidgets.QWidget):
             config.get("data_range_max"),
             config.get("maximum_observations_per_target"),
             config.get("parametric_x", "t"),
-            config.get("parametric_mode", "auto"),
+            config.get("simulation_end"),
         )
 
     def _validation_error(self, dataset_id: str, config: Mapping[str, object]) -> str | None:
         accepted = self._settings_getter(dataset_id)
-        for field in ("t_start", "data_range_min", "data_range_max"):
+        is_time = str(config.get("parametric_x", "t") or "t") == "t"
+        active_fields = ("t_start", "simulation_end")
+        if is_time:
+            active_fields += ("data_range_min", "data_range_max")
+        for field in active_fields:
             if (dataset_id, field) in self._invalid_raw:
                 return "Fit data values must be finite."
         try:
-            if float(config["t_start"]) < 0.0:
-                return "Simulation start must be finite and nonnegative."
-            if float(config["data_range_min"]) > float(config["data_range_max"]):
+            start, end = fit_execution_span(config["t_start"], config["simulation_end"])
+            if is_time and float(config["data_range_min"]) > float(config["data_range_max"]):
                 return "Data Range minimum must be ≤ maximum."
-        except (KeyError, TypeError, ValueError):
+        except ValueError as exc:
+            return str(exc)
+        except (KeyError, TypeError):
             return "Complete the Fit data values before applying."
         maximum = config.get("maximum_observations_per_target")
         if maximum not in (None, 0):
@@ -412,19 +405,13 @@ class DataTab(QtWidgets.QWidget):
             return str(exc)
         if not retained:
             return "Select at least one retained observation target."
-        try:
-            if float(config["data_range_max"]) <= float(config["t_start"]):
-                return "Data Range maximum must be greater than Simulation start."
-        except (KeyError, TypeError, ValueError, OverflowError):
-            return "Accepted Simulation start is invalid."
+        if is_time and any(value < start or value > end for item in retained for value in item.t):
+            return "Selected experimental times are outside the Simulation interval. Adjust the interval or Data Range."
         selected_x = str(config.get("parametric_x", "t") or "t")
         if selected_x != "t" and selected_x not in tuple(
             str(item) for item in accepted.get("eligible_parametric_x", ())
         ):
             return "Parametric X must be an eligible non-Y experimental series."
-        selected_mode = str(config.get("parametric_mode", "auto") or "auto")
-        if selected_mode not in {"auto", "monotone", "time_guided"}:
-            return "Parametric mapping mode is invalid."
         return None
 
     def _controls_changed(self, changed_field: str | None = None) -> None:
@@ -449,7 +436,7 @@ class DataTab(QtWidgets.QWidget):
         self._refresh_parametric_presentation()
         error = self._validation_error(self._current_dataset_id, config)
         try:
-            used = sum(len(item.t) for item in self._retained_observations_getter(self._current_dataset_id, config))
+            used = sum(len(item.y) for item in self._retained_observations_getter(self._current_dataset_id, config))
             self._used_label.setText(f"Used: {used} observations")
         except ValueError:
             self._used_label.setText("Used: —")
@@ -459,7 +446,14 @@ class DataTab(QtWidgets.QWidget):
         )
         dirty = (
             self._signature(config) != self._signature(applied)
-            or any(key[0] == self._current_dataset_id for key in self._invalid_raw)
+            or any(
+                dataset_id == self._current_dataset_id
+                and (
+                    config.get("parametric_x", "t") == "t"
+                    or field not in {"data_range_min", "data_range_max"}
+                )
+                for dataset_id, field in self._invalid_raw
+            )
         )
         if dirty:
             self._pending[self._current_dataset_id] = config
@@ -498,6 +492,7 @@ class DataTab(QtWidgets.QWidget):
         defaults = self._owned_settings(
             self._default_settings_getter(self._current_dataset_id)
         )
+        defaults["parametric_x"] = str(self._x_combo.currentData() or "t")
         self._pending[self._current_dataset_id] = defaults
         self._changed_fields[self._current_dataset_id] = set(self._OWNED_FIELDS)
         for key in tuple(self._invalid_raw):
@@ -505,24 +500,6 @@ class DataTab(QtWidgets.QWidget):
                 self._invalid_raw.pop(key, None)
         self._project_controls()
 
-    def set_resolved_auto_modes(
-        self,
-        modes: tuple[tuple[str, str], ...],
-    ) -> None:
-        self._resolved_auto_modes = dict(modes)
-        self._refresh_parametric_presentation()
-
     def _refresh_parametric_presentation(self) -> None:
         is_time = str(self._x_combo.currentData() or "t") == "t"
-        self._mode_combo.setEnabled(bool(self._current_dataset_id) and not is_time)
-        mode = self._resolved_auto_modes.get(self._current_dataset_id)
-        pending = self._pending.get(self._current_dataset_id)
-        if pending is not None and self._signature(pending) != self._signature(
-            self._owned_settings(self._settings_getter(self._current_dataset_id))
-        ):
-            mode = None
-        display = {
-            "monotone": "Monotone",
-            "time_guided": "Time-guided",
-        }.get(mode, "—")
-        self._resolved_mode_label.setText(f"Resolved Auto: {display}")
+        self._controls.setRowVisible(self._range_widget, is_time)

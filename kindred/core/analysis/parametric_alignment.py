@@ -1,27 +1,21 @@
-"""Canonical discontinuity-safe parametric-X projections.
+"""Joint weighted matching to uninterrupted linear simulation segments.
 
-The projection is the single alignment authority shared by objective evaluation
-and terminal replay.  It carries physical source-row identity all the way to
-the selected model sample and never manufactures an extrapolated point.
+A location is a geometric projection, not an identified experimental time.
+Ties retain the first equally good location without asserting uniqueness.
 """
 
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
-from typing import Literal
+from dataclasses import dataclass, fields
 
 import numpy as np
 
+from kindred.core.analysis.fit_dataset_payload import FitObservationSeries
 from kindred.core.exceptions import FitCandidateDomainError, FitSimulationError
 
-__all__ = [
-    "CandidateParametricAlignmentError",
-    "DeterministicParametricResolutionError",
-    "ParametricXProjection",
-    "align_parametric_x",
-    "project_parametric_y",
-]
+__all__ = ["CandidateParametricAlignmentError", "ParametricProjection",
+           "align_parametric", "project_parametric_y"]
 
 
 class CandidateParametricAlignmentError(FitCandidateDomainError):
@@ -59,455 +53,132 @@ class CandidateParametricAlignmentError(FitCandidateDomainError):
         super().__init__(message, stage="parametric_x_alignment", details=details)
 
 
-class DeterministicParametricResolutionError(CandidateParametricAlignmentError):
-    """Monotone mode cannot resolve a unique physical branch."""
-
-
-def _vector(name: str, values: object) -> np.ndarray:
-    try:
-        array = np.asarray(values, dtype=float).reshape(-1)
-    except (TypeError, ValueError) as exc:
-        raise FitSimulationError(f"Invalid {name} array: {exc}") from exc
-    if array.size == 0 or not np.all(np.isfinite(array)):
-        raise FitSimulationError(f"{name} must be finite and nonempty.")
-    return array
-
-
-def _freeze_float(values: object) -> np.ndarray:
-    array = np.asarray(values, dtype=float).reshape(-1).copy()
-    array.setflags(write=False)
-    return array
-
-
-def _freeze_int(values: object) -> np.ndarray:
-    array = np.asarray(values, dtype=np.int64).reshape(-1).copy()
-    array.setflags(write=False)
-    return array
-
-
-def _physical_x_tolerance(*operands: float) -> float:
-    """Return a scale-relative tolerance for a physical-X comparison."""
-
-    return 16.0 * np.finfo(float).eps * max(abs(float(value)) for value in operands)
-
-
 @dataclass(frozen=True, slots=True)
-class ParametricXProjection:
-    """Immutable one-row-per-canonical-X projection."""
+class ParametricProjection:
+    """One shared curve location per physical row within the owning dataset."""
 
     source_rows: tuple[int, ...]
-    observation_time: np.ndarray
-    observed_x: np.ndarray
-    selected_time: np.ndarray
     selected_model_x: np.ndarray
     delta_x: np.ndarray
     segment_ids: np.ndarray
     segment_keys: tuple[str, ...]
     discontinuity_ids: np.ndarray
-    match_kinds: tuple[Literal["exact_crossing", "finite_projection"], ...]
-    sample_kinds: tuple[Literal["direct", "interpolated"], ...]
-    model_rows: tuple[int, ...]
+    left_rows: np.ndarray
+    right_rows: np.ndarray
+    fractions: np.ndarray
 
     def __post_init__(self) -> None:
-        rows = tuple(int(item) for item in self.source_rows)
-        if (
-            not rows
-            or len(rows) != len(set(rows))
-            or any(item <= 0 for item in rows)
-        ):
-            raise ValueError("Parametric X projection requires unique positive source rows.")
-        arrays = {
-            "observation_time": _freeze_float(self.observation_time),
-            "observed_x": _freeze_float(self.observed_x),
-            "selected_time": _freeze_float(self.selected_time),
-            "selected_model_x": _freeze_float(self.selected_model_x),
-            "delta_x": _freeze_float(self.delta_x),
-            "segment_ids": _freeze_int(self.segment_ids),
-            "discontinuity_ids": _freeze_int(self.discontinuity_ids),
-        }
-        size = len(rows)
-        if any(value.size != size for value in arrays.values()):
-            raise ValueError("Parametric X projection arrays must have one row per source row.")
-        keys = tuple(str(item or "").strip() for item in self.segment_keys)
-        match = tuple(str(item) for item in self.match_kinds)
-        sample = tuple(str(item) for item in self.sample_kinds)
-        model_rows = tuple(int(item) for item in self.model_rows)
-        if (
-            len(keys) != size
-            or len(match) != size
-            or len(sample) != size
-            or len(model_rows) != size
-            or any(not item for item in keys)
-            or any(item not in {"exact_crossing", "finite_projection"} for item in match)
-            or any(item not in {"direct", "interpolated"} for item in sample)
-            or any(item < 0 for item in arrays["segment_ids"])
-            or any(item < 0 for item in arrays["discontinuity_ids"])
-            or any(item < 0 for item in model_rows)
-        ):
-            raise ValueError("Parametric X projection identity is malformed.")
-        if not np.allclose(
-            arrays["delta_x"],
-            arrays["selected_model_x"] - arrays["observed_x"],
-            rtol=0.0,
-            atol=0.0,
-        ):
-            raise ValueError("Parametric X projection delta_x is not canonical.")
-        for name, value in arrays.items():
-            object.__setattr__(self, name, value)
-        object.__setattr__(self, "source_rows", rows)
-        object.__setattr__(self, "segment_keys", keys)
-        object.__setattr__(self, "match_kinds", match)
-        object.__setattr__(self, "sample_kinds", sample)
-        object.__setattr__(self, "model_rows", model_rows)
+        for field in fields(self):
+            value = getattr(self, field.name)
+            if isinstance(value, np.ndarray):
+                value.setflags(write=False)
 
     @property
     def size(self) -> int:
         return len(self.source_rows)
 
-    def subset(self, source_rows: Sequence[int]) -> "ParametricXProjection":
-        """Return the same projection restricted by physical source-row order."""
+    @property
+    def sample_kinds(self) -> tuple[str, ...]:
+        return tuple("direct" if f == 0.0 or f == 1.0 else "interpolated"
+                     for f in self.fractions)
 
+    def subset(self, source_rows: Sequence[int]) -> "ParametricProjection":
         positions = {row: index for index, row in enumerate(self.source_rows)}
-        try:
-            indexes = tuple(positions[int(row)] for row in source_rows)
-        except KeyError as exc:
-            raise FitSimulationError("Y references an X source row outside the projection.") from exc
-        return ParametricXProjection(
-            source_rows=tuple(int(row) for row in source_rows),
-            observation_time=self.observation_time[list(indexes)],
-            observed_x=self.observed_x[list(indexes)],
-            selected_time=self.selected_time[list(indexes)],
-            selected_model_x=self.selected_model_x[list(indexes)],
-            delta_x=self.delta_x[list(indexes)],
-            segment_ids=self.segment_ids[list(indexes)],
-            segment_keys=tuple(self.segment_keys[index] for index in indexes),
-            discontinuity_ids=self.discontinuity_ids[list(indexes)],
-            match_kinds=tuple(self.match_kinds[index] for index in indexes),
-            sample_kinds=tuple(self.sample_kinds[index] for index in indexes),
-            model_rows=tuple(self.model_rows[index] for index in indexes),
-        )
+        indexes = [positions[row] for row in source_rows]
+        return ParametricProjection(**{
+            field.name: (tuple(getattr(self, field.name)[i] for i in indexes)
+                         if field.name in {"source_rows", "segment_keys"}
+                         else getattr(self, field.name)[indexes])
+            for field in fields(self)
+        })
 
 
-def _validate_model(
+def align_parametric(
     *,
-    t_model: object,
-    x_model: object,
-    segment_ids: object,
-    segment_keys: Sequence[str],
-    discontinuity_ids: object,
-    dataset_label: str,
-    x_name: str,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, tuple[str, ...], np.ndarray]:
-    t = _vector("model time", t_model)
-    x = _vector(f"model X {x_name!r}", x_model)
-    segments = np.asarray(segment_ids, dtype=np.int64).reshape(-1)
-    discontinuities = np.asarray(discontinuity_ids, dtype=np.int64).reshape(-1)
-    keys = tuple(str(item or "").strip() for item in segment_keys)
-    if (
-        t.size < 2
-        or x.size != t.size
-        or segments.size != t.size
-        or discontinuities.size != t.size
-        or len(keys) != t.size
-        or any(not item for item in keys)
-        or np.any(segments < 0)
-        or np.any(discontinuities < 0)
-        or np.any(np.diff(segments) < 0)
-        or np.any(np.diff(discontinuities) < 0)
-    ):
-        raise FitSimulationError(
-            f"Dataset {dataset_label!r}: model X/time/segment identity is malformed."
-        )
-    same = (
-        (segments[1:] == segments[:-1])
-        & (discontinuities[1:] == discontinuities[:-1])
-        & np.fromiter(
-            (left == right for left, right in zip(keys, keys[1:])),
-            dtype=bool,
-            count=t.size - 1,
-        )
-    )
-    if np.any(np.diff(t)[same] <= 0.0):
-        raise FitSimulationError(
-            f"Dataset {dataset_label!r}: model time must increase inside each "
-            "uninterrupted segment."
-        )
-    return t, x, segments, keys, discontinuities
-
-
-def _intervals(
-    t: np.ndarray,
-    segments: np.ndarray,
-    keys: tuple[str, ...],
-    discontinuities: np.ndarray,
-) -> list[tuple[int, int]]:
-    valid = (
-        (segments[1:] == segments[:-1])
-        & (discontinuities[1:] == discontinuities[:-1])
-        & np.fromiter(
-            (left == right for left, right in zip(keys, keys[1:])),
-            dtype=bool,
-            count=t.size - 1,
-        )
-    )
-    return [(index, index + 1) for index in np.flatnonzero(valid)]
-
-
-def align_parametric_x(
-    *,
-    observation_time: object,
-    observed_x: object,
+    observed_x: np.ndarray,
     source_rows: Sequence[int],
-    model_time: object,
-    model_x: object,
-    segment_ids: object,
+    observations: Mapping[str, FitObservationSeries],
+    model_x: np.ndarray,
+    model_y: Mapping[str, np.ndarray],
+    model_time: np.ndarray,
+    segment_ids: np.ndarray,
     segment_keys: Sequence[str],
-    discontinuity_ids: object,
-    mode: str,
+    discontinuity_ids: np.ndarray,
+    multipliers: Mapping[str, float],
     dataset_label: str,
     x_name: str,
-) -> ParametricXProjection:
-    """Resolve one canonical X roster without extrapolation or branch switching."""
+) -> ParametricProjection:
+    """Minimize sum((weight multiplier * discrepancy)**2) on each segment.
 
-    obs_t = _vector("observation time", observation_time)
-    obs_x = _vector("observed X", observed_x)
-    rows = tuple(int(item) for item in source_rows)
-    if (
-        obs_t.size != obs_x.size
-        or len(rows) != obs_t.size
-        or len(rows) != len(set(rows))
-        or any(item <= 0 for item in rows)
-    ):
-        raise FitSimulationError(
-            f"Dataset {dataset_label!r}: X observation identity is malformed."
-        )
-    mode_norm = str(mode or "").strip().lower()
-    if mode_norm not in {"monotone", "time_guided"}:
-        raise FitSimulationError(f"Dataset {dataset_label!r}: unsupported X mode {mode!r}.")
-    t, x, segments, keys, discontinuities = _validate_model(
-        t_model=model_time,
-        x_model=model_x,
-        segment_ids=segment_ids,
-        segment_keys=segment_keys,
-        discontinuity_ids=discontinuity_ids,
-        dataset_label=dataset_label,
-        x_name=x_name,
-    )
-    intervals = _intervals(t, segments, keys, discontinuities)
-    if not intervals:
-        raise DeterministicParametricResolutionError(
-            f"Dataset {dataset_label!r}: no uninterrupted model interval can resolve X.",
-            dataset_label=dataset_label,
-            x_name=x_name,
-        )
-    # Comparisons live in the physical X unit, while endpoint/direct
-    # classification lives in the dimensionless interpolation fraction.  A
-    # large X scale must not turn a genuine midpoint into a direct sample.
-    fraction_tolerance = 16.0 * np.finfo(float).eps
-    # Monotone means every uninterrupted branch is strictly monotone and time
-    # cannot be used to settle a duplicate branch.
-    if mode_norm == "monotone":
-        for branch in dict.fromkeys((keys[left], int(discontinuities[left])) for left, _ in intervals):
-            branch_rows = [
-                index
-                for index, branch_value in enumerate(zip(keys, discontinuities))
-                if (branch_value[0], int(branch_value[1])) == branch
-            ]
-            if len(branch_rows) >= 2:
-                differences = np.diff(x[branch_rows])
-                tolerances = np.asarray(
-                    [
-                        _physical_x_tolerance(left, right)
-                        for left, right in zip(
-                            x[branch_rows][:-1], x[branch_rows][1:], strict=True
-                        )
-                    ]
-                )
-                if not np.all(differences > tolerances) and not np.all(
-                    differences < -tolerances
-                ):
-                    raise DeterministicParametricResolutionError(
-                        f"Dataset {dataset_label!r}: X(t) is not strictly monotone.",
-                        dataset_label=dataset_label,
-                        x_name=x_name,
-                    )
-
-    selected: list[tuple[float, float, float, int, str, int, str, str, int]] = []
-    for value_t, value_x in zip(obs_t, obs_x, strict=True):
-        exact: list[tuple[float, float, float, int, str, int, str, str, int]] = []
-        mismatch: list[tuple[float, float, float, int, str, int, str, str, int]] = []
-        for left, right in intervals:
-            x_left, x_right = float(x[left]), float(x[right])
-            low, high = min(x_left, x_right), max(x_left, x_right)
-            if (
-                value_x >= low - _physical_x_tolerance(value_x, low)
-                and value_x <= high + _physical_x_tolerance(value_x, high)
-            ):
-                width = x_right - x_left
-                width_tolerance = _physical_x_tolerance(x_left, x_right)
-                if abs(width) <= width_tolerance:
-                    continue
-                fraction = min(1.0, max(0.0, float((value_x - x_left) / width)))
-                selected_t = float(t[left] + fraction * (t[right] - t[left]))
-                selected_x = float(x[left] + fraction * width)
-                sample = "direct" if fraction <= fraction_tolerance or 1.0 - fraction <= fraction_tolerance else "interpolated"
-                model_row = left if fraction < 0.5 else right
-                exact.append(
-                    (
-                        abs(selected_x - float(value_x)),
-                        selected_t,
-                        selected_x,
-                        model_row,
-                        keys[left],
-                        int(segments[left]),
-                        int(discontinuities[left]),
-                        sample,
-                        0,
-                    )
-                )
-            # Bounded projection onto the interval; no extrapolation.
-            fraction = (
-                0.0
-                if abs(x_right - x_left) <= _physical_x_tolerance(x_left, x_right)
-                else min(
-                    1.0,
-                    max(0.0, float((value_x - x_left) / (x_right - x_left))),
-                )
-            )
-            projected_x = float(x_left + fraction * (x_right - x_left))
-            projected_t = float(t[left] + fraction * (t[right] - t[left]))
-            sample = "direct" if fraction <= fraction_tolerance or 1.0 - fraction <= fraction_tolerance else "interpolated"
-            model_row = left if fraction < 0.5 else right
-            mismatch.append(
-                (
-                    abs(projected_x - float(value_x)),
-                    projected_t,
-                    projected_x,
-                    model_row,
-                    keys[left],
-                    int(segments[left]),
-                    int(discontinuities[left]),
-                    sample,
-                    1,
-                )
-            )
-        def deduplicate(
-            values: list[tuple[float, float, float, int, str, int, str, str, int]],
-        ) -> list[tuple[float, float, float, int, str, int, str, str, int]]:
-            unique: dict[tuple[float, float, int, str, int], tuple[float, float, float, int, str, int, str, str, int]] = {}
-            for item in values:
-                key = (item[1], item[2], item[5], item[4], item[6])
-                current = unique.get(key)
-                if current is None or item[3] < current[3]:
-                    unique[key] = item
-            return list(unique.values())
-
-        candidates = deduplicate(exact or mismatch)
-        if not candidates:
+    Every available selected quantity contributes once. Recorded observation
+    time is deliberately absent. Endpoints also participate, including isolated
+    samples beside a jump. No segment crosses an executor-issued boundary.
+    """
+    names = tuple(sorted(observations))
+    model = np.column_stack((model_x, *(model_y[name] for name in names)))
+    if not model.size or not np.all(np.isfinite(model)):
+        raise FitSimulationError(f"Dataset {dataset_label!r}: model quantities must be finite.")
+    segments = np.asarray(segment_ids)
+    discontinuities = np.asarray(discontinuity_ids)
+    keys = tuple(segment_keys)
+    continuous = ((segments[1:] == segments[:-1])
+                  & (discontinuities[1:] == discontinuities[:-1])
+                  & np.asarray([a == b for a, b in zip(keys, keys[1:])]))
+    if np.any(np.diff(model_time)[continuous] <= 0.0):
+        raise FitSimulationError("Model time must increase within uninterrupted segments.")
+    # Direct samples guarantee bounded matches even when no adjacent pair is valid.
+    samples = np.arange(len(model))
+    adjacent = np.flatnonzero(continuous)
+    left = np.concatenate((samples, adjacent))
+    right = np.concatenate((samples, adjacent + 1))
+    observed_by_row = {
+        name: dict(zip(observations[name].source_rows, observations[name].y, strict=True))
+        for name in names
+    }
+    weight = np.asarray([multipliers[x_name], *(multipliers[name] for name in names)])
+    chosen_rows: list[int] = []
+    chosen_fractions: list[float] = []
+    for row, x_value in zip(source_rows, observed_x, strict=True):
+        observed = np.asarray([x_value, *(observed_by_row[name].get(row, np.nan) for name in names)])
+        available = np.isfinite(observed)
+        start = model[left][:, available]
+        direction = (model[right][:, available] - start) * weight[available]
+        offset = (observed[available] - start) * weight[available]
+        # Scale the calculation together, preserving the weighted minimizer.
+        scale = max(float(np.max(np.abs(direction))), float(np.max(np.abs(offset))))
+        if scale:
+            direction = direction / scale
+            offset = offset / scale
+        denominator = np.sum(direction * direction, axis=1)
+        fraction = np.clip(np.divide(
+            np.sum(offset * direction, axis=1), denominator,
+            out=np.zeros_like(denominator), where=denominator > 0.0,
+        ), 0.0, 1.0)
+        errors = offset - fraction[:, None] * direction
+        costs = np.sum(errors * errors, axis=1)
+        chosen = int(np.argmin(costs))
+        if not np.isfinite(costs[chosen]):
             raise CandidateParametricAlignmentError(
-                f"Dataset {dataset_label!r}: no bounded model projection exists for X={float(value_x):.6g}.",
-                dataset_label=dataset_label,
-                x_name=x_name,
-                failed_observed_value=float(value_x),
+                "Joint curve matching produced nonfinite discrepancies.",
+                dataset_label=dataset_label, x_name=x_name,
             )
-        if mode_norm == "time_guided":
-            chosen = min(candidates, key=lambda item: (abs(item[1] - float(value_t)), item[1], item[3]))
-        else:
-            best = min(candidates, key=lambda item: item[0])
-            tied = [
-                item
-                for item in candidates
-                if abs(item[0] - best[0])
-                <= _physical_x_tolerance(item[0], best[0], value_x, item[2], best[2])
-            ]
-            if len(tied) != 1:
-                raise DeterministicParametricResolutionError(
-                    f"Dataset {dataset_label!r}: X={float(value_x):.6g} has unresolved equal branches.",
-                    dataset_label=dataset_label,
-                    x_name=x_name,
-                    failed_observed_value=float(value_x),
-                )
-            chosen = tied[0]
-        selected.append(chosen)
-
-    return ParametricXProjection(
-        source_rows=rows,
-        observation_time=obs_t,
-        observed_x=obs_x,
-        selected_time=np.asarray([item[1] for item in selected]),
-        selected_model_x=np.asarray([item[2] for item in selected]),
-        delta_x=np.asarray([item[2] - value for item, value in zip(selected, obs_x, strict=True)]),
-        segment_ids=np.asarray([item[5] for item in selected], dtype=np.int64),
-        segment_keys=tuple(item[4] for item in selected),
-        discontinuity_ids=np.asarray([item[6] for item in selected], dtype=np.int64),
-        match_kinds=tuple("exact_crossing" if item[8] == 0 else "finite_projection" for item in selected),
-        sample_kinds=tuple(item[7] for item in selected),
-        model_rows=tuple(item[3] for item in selected),
+        chosen_rows.append(chosen)
+        chosen_fractions.append(float(fraction[chosen]))
+    selected_left = left[chosen_rows]
+    selected_right = right[chosen_rows]
+    fractions = np.asarray(chosen_fractions)
+    selected_x = model_x[selected_left] + fractions * (model_x[selected_right] - model_x[selected_left])
+    return ParametricProjection(
+        source_rows=tuple(source_rows), selected_model_x=selected_x,
+        delta_x=selected_x - observed_x,
+        segment_ids=segments[selected_left],
+        segment_keys=tuple(keys[i] for i in selected_left),
+        discontinuity_ids=discontinuities[selected_left],
+        left_rows=selected_left, right_rows=selected_right, fractions=fractions,
     )
 
 
-def project_parametric_y(
-    *,
-    projection: ParametricXProjection,
-    model_time: object,
-    model_y: object,
-    segment_ids: object,
-    segment_keys: Sequence[str],
-    discontinuity_ids: object,
-) -> np.ndarray:
-    """Evaluate one model Y at an existing X projection, within its segment."""
-
-    t = _vector("model time", model_time)
-    y = _vector("model Y", model_y)
-    segments = np.asarray(segment_ids, dtype=np.int64).reshape(-1)
-    discontinuities = np.asarray(discontinuity_ids, dtype=np.int64).reshape(-1)
-    keys = tuple(str(item or "").strip() for item in segment_keys)
-    if (
-        y.size != t.size
-        or segments.size != t.size
-        or discontinuities.size != t.size
-        or len(keys) != t.size
-    ):
-        raise FitSimulationError("Parametric Y projection received malformed model identity.")
-    result: list[float] = []
-    for selected_t, segment, key, discontinuity, row, sample_kind in zip(
-        projection.selected_time,
-        projection.segment_ids,
-        projection.segment_keys,
-        projection.discontinuity_ids,
-        projection.model_rows,
-        projection.sample_kinds,
-        strict=True,
-    ):
-        if row < 0 or row >= t.size:
-            raise FitSimulationError("Parametric X projection model row is out of bounds.")
-        if (
-            int(segments[row]) != int(segment)
-            or keys[row] != key
-            or int(discontinuities[row]) != int(discontinuity)
-        ):
-            raise FitSimulationError("Parametric projection crossed a discontinuity.")
-        if sample_kind == "direct":
-            result.append(float(y[row]))
-            continue
-        if selected_t >= t[row] and row + 1 < t.size:
-            other = row + 1
-        elif row > 0:
-            other = row - 1
-        else:
-            raise FitSimulationError("Parametric projection cannot resolve model Y.")
-        if (
-            int(segments[other]) != int(segment)
-            or keys[other] != key
-            or int(discontinuities[other]) != int(discontinuity)
-        ):
-            raise FitSimulationError("Parametric Y interpolation crossed a discontinuity.")
-        width = float(t[other] - t[row])
-        if width == 0.0:
-            raise FitSimulationError("Parametric model time interval is degenerate.")
-        fraction = float((selected_t - t[row]) / width)
-        result.append(float(y[row] + fraction * (y[other] - y[row])))
-    values = np.asarray(result, dtype=float)
-    if not np.all(np.isfinite(values)):
-        raise FitSimulationError("Parametric Y projection produced non-finite values.")
-    return values
+def project_parametric_y(*, projection: ParametricProjection, model_y: np.ndarray) -> np.ndarray:
+    """Use the already selected location for another quantity of the same row."""
+    left = model_y[projection.left_rows]
+    return left + projection.fractions * (model_y[projection.right_rows] - left)

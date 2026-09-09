@@ -91,7 +91,7 @@ def _fit_copy_columns(
     segment_keys = dict(dataset.model_segment_keys)
     discontinuity_ids = dict(dataset.model_discontinuity_ids)
     series_names = sorted(model_y)
-    x_unit = "s" if dataset.x_name.casefold() == "t" else None
+    x_unit = "s" if dataset.x_name == "t" else None
     _y_label, y_unit = _fit_y_axis_label(dataset.y_semantics, series_names)
     model_groups: dict[tuple[object, ...], list[str]] = {}
     for name in series_names:
@@ -111,6 +111,12 @@ def _fit_copy_columns(
         columns.append(
             (header(label, dataset.x_name, x_identity, x_unit), model_x[first], "float")
         )
+        if x_unit is None:
+            columns.append((
+                header(label, "Model integration time", {"time_kind": "model"}, "s"),
+                dataset.model_time,
+                "float",
+            ))
         columns.extend(
             (
                 encode_clipboard_text(f"{label} — {field}"), values, kind,
@@ -127,6 +133,7 @@ def _fit_copy_columns(
 
     observed_x = dict(dataset.observed_x)
     observed_y = dict(dataset.observed_y)
+    observed_time = dict(dataset.observed_time)
     observation_ids = dict(dataset.observed_observation_ids)
     raw_columns = dict(dataset.observed_raw_columns)
     source_rows = dict(dataset.observed_source_rows)
@@ -146,6 +153,15 @@ def _fit_copy_columns(
             "raw_column": raw_columns[name],
             "model_target": name,
         }
+        if x_unit is None:
+            columns.append((
+                header(label, "Recorded experimental time", {
+                    "raw_observation_id": observation_ids[name],
+                    "time_kind": "recorded_experimental",
+                }, "s"),
+                observed_time[name],
+                "float",
+            ))
         columns.extend(
             (
                 (header(label, dataset.x_name, x_identity, x_unit), observed_x[name], "float"),
@@ -563,8 +579,8 @@ class GridPlotView(QtWidgets.QWidget):
         """Apply common font-scaled axes and grid geometry."""
 
         plot.setMenuEnabled(False)
-        x_label = "Time" if x_name.casefold() == "t" else x_name
-        if x_name.casefold() == "t":
+        x_label = "Time" if x_name == "t" else x_name
+        if x_name == "t":
             plot.setLabel("bottom", x_label, units="s")
         else:
             plot.setLabel("bottom", html.escape(x_label))

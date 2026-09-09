@@ -3,9 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from typing import Literal
 
-FitResolvedXMode = Literal["monotone", "time_guided"]
 
 __all__ = [
     "FitParametricSettings",
@@ -25,23 +23,12 @@ def _name(value: object, field: str) -> str:
 class FitParametricSettings:
     dataset_id: str
     x_name: str
-    requested_mode: Literal["auto", "monotone", "time_guided"]
-    resolved_mode: FitResolvedXMode | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "dataset_id", _name(self.dataset_id, "dataset ID"))
         object.__setattr__(self, "x_name", _name(self.x_name, "X series"))
         if self.x_name == "t":
             raise ValueError("Parametric-X settings cannot target time.")
-        if self.requested_mode not in {"auto", "monotone", "time_guided"}:
-            raise ValueError("Unknown parametric-X mode.")
-        if self.requested_mode == "auto":
-            if self.resolved_mode not in {None, "monotone", "time_guided"}:
-                raise ValueError("Unknown resolved parametric-X mode.")
-        elif self.requested_mode != self.resolved_mode:
-            raise ValueError(
-                "An explicit parametric-X mode cannot resolve to another mode."
-            )
 
 
 @dataclass(frozen=True, slots=True)

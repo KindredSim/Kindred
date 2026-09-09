@@ -263,8 +263,8 @@ def validate_fit_solver(value: object) -> str:
 class SimulationExecutionSettings:
     """Complete per-target Run/Preview settings.
 
-    Fit resolves only ``t_start`` at its inclusion boundary and does not carry
-    this Run-owned aggregate.
+    Fit owns its simulation interval and does not carry this Run-owned
+    aggregate.
     """
 
     solver: str = "BDF"

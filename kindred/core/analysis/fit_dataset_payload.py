@@ -62,7 +62,7 @@ class FitObservationSeries:
                 "Fit observation source rows must be an exact integer tuple."
             )
         rows = self.source_rows
-        if t.size == 0 or t.size != y.size or len(rows) != y.size:
+        if y.size == 0 or (t.size and t.size != y.size) or len(rows) != y.size:
             raise ValueError(
                 "Fit observation time, value, and source-row arrays must have "
                 "the same nonzero length."
@@ -111,7 +111,6 @@ class FitDatasetSpec:
     observations: Mapping[str, FitObservationSeries]
     target_weights: Mapping[str, float] = field(default_factory=dict)
     x_name: str = "t"
-    x_mode: str = "monotone"
     # One immutable X capture. Its `y` member stores captured X values; using
     # the same row-aligned DTO keeps raw identity and physical source-row
     # custody identical for Y and X.
@@ -147,10 +146,10 @@ class FitDatasetSpec:
                 "raw observation IDs."
             )
         x_name = str(self.x_name or "t").strip() or "t"
-        x_mode = str(self.x_mode or "").strip().lower()
         x_series: FitObservationSeries | None = None
         if x_name == "t":
-            x_mode = "monotone"
+            if any(series.t.size == 0 for series in observation_map.values()):
+                raise ValueError("Time-X fitting requires recorded experimental times.")
             if self.x_observations is not None:
                 raise ValueError("Time-X Fit captures must not contain an X block.")
         else:
@@ -158,11 +157,6 @@ class FitDatasetSpec:
                 raise ValueError(
                     f"Dataset {dataset_id!r} cannot fit its parametric X "
                     "series as a Y target."
-                )
-            if x_mode not in {"monotone", "time_guided"}:
-                raise ValueError(
-                    f"Dataset {dataset_id!r} requires a resolved parametric-X "
-                    "mode of 'monotone' or 'time_guided'."
                 )
             x_series = self.x_observations
             if not isinstance(x_series, FitObservationSeries):
@@ -198,7 +192,6 @@ class FitDatasetSpec:
         )
         object.__setattr__(self, "target_weights", MappingProxyType(weights))
         object.__setattr__(self, "x_name", x_name)
-        object.__setattr__(self, "x_mode", x_mode)
         object.__setattr__(self, "x_observations", x_series)
 
     @property

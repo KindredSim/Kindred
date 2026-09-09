@@ -11,7 +11,7 @@ import math
 from dataclasses import dataclass, field
 from statistics import NormalDist
 from types import MappingProxyType
-from typing import Callable, Literal, Mapping, Sequence, cast
+from typing import Callable, Literal, Mapping, Sequence
 
 import numpy as np
 
@@ -53,7 +53,7 @@ __all__ = [
 
 
 _PROFILE_METHOD = "weighted-Gaussian profile likelihood"
-_BOOTSTRAP_METHOD = "stratified within-dataset/target residual bootstrap"
+_BOOTSTRAP_METHOD = "stratified residual bootstrap"
 _PROFILE_MAX_POINTS_PER_SIDE = 10_000
 _BOOTSTRAP_MAX_REPLICATES = 1_000_000
 BOOTSTRAP_SEED_RANGE = (0, 2_000_000_000)
@@ -633,7 +633,7 @@ class ResidualBootstrapResult:
         if not method:
             raise ValueError("Bootstrap results require a named method.")
         object.__setattr__(self, "status", status)
-        object.__setattr__(self, "method", _BOOTSTRAP_METHOD)
+        object.__setattr__(self, "method", method)
         object.__setattr__(self, "requested_parameters", names)
         object.__setattr__(self, "seed", seed)
         object.__setattr__(self, "replicates", replicates)
@@ -679,9 +679,33 @@ def profile_likelihood_settlement_result(
     )
 
 
+def _bootstrap_resampling_descriptions(
+    payloads: Sequence[FitDatasetSpec],
+) -> tuple[str, str]:
+    """Describe each dataset's actual donor grouping and centering policy."""
+    resampling: list[str] = []
+    centering: list[str] = []
+    for payload in payloads:
+        label = f"Dataset {payload.dataset_id!r} (X={payload.x_name})"
+        if payload.x_name == "t":
+            resampling.append(f"{label}: independent residual-index draws per target")
+            centering.append(f"{label}: arithmetic mean subtraction per target")
+        else:
+            resampling.append(
+                f"{label}: joint X/Y residual-vector donor draws within each "
+                "missing-value pattern; one donor row shared by all available quantities"
+            )
+            centering.append(
+                f"{label}: arithmetic mean subtraction per quantity within each "
+                "missing-value pattern"
+            )
+    return "; ".join(resampling), "; ".join(centering)
+
+
 def residual_bootstrap_settlement_result(
     *,
     config: ResidualBootstrapConfig,
+    payloads: Sequence[FitDatasetSpec],
     status: Literal["stopped", "failed"],
     cause: FactualCause,
     settlement: str,
@@ -695,6 +719,7 @@ def residual_bootstrap_settlement_result(
         config.minimum_successful_replicates,
         int(math.ceil(config.replicates * config.minimum_success_fraction)),
     )
+    resampling, centering = _bootstrap_resampling_descriptions(payloads)
     return ResidualBootstrapResult(
         status=status,
         method=_BOOTSTRAP_METHOD,
@@ -702,9 +727,9 @@ def residual_bootstrap_settlement_result(
         seed=config.seed,
         replicates=config.replicates,
         confidence_level=config.confidence_level,
-        resampling="within each dataset/target residual stratum",
+        resampling=resampling,
         draw_algorithm="numpy.default_rng(seed) residual-index draws",
-        residual_centering="independent arithmetic mean subtraction within each dataset/target stratum",
+        residual_centering=centering,
         replicate_execution="full global refit",
         refit_validity="scientifically available completed refits count regardless of optimizer convergence",
         minimum_successful_replicates=config.minimum_successful_replicates,
@@ -1512,74 +1537,58 @@ def _bootstrap_payloads(
     *,
     payloads: Sequence[FitDatasetSpec],
     fitted_info: Mapping[str, object],
-    aligned_observed_x_by_dataset: Mapping[str, np.ndarray],
-    projection_positions_by_dataset: Mapping[str, np.ndarray],
     rng: np.random.Generator,
 ) -> tuple[FitDatasetSpec, ...]:
     captured: list[FitDatasetSpec] = []
     for payload in payloads:
-        info = fitted_info.get(payload.dataset_id)
-        if not isinstance(info, _fit_execution.DatasetFitInfo):
-            raise ValueError(
-                f"Bootstrap terminal facts omitted dataset {payload.dataset_id!r}."
-            )
-        dataset_model = info.model_series
-        observations: dict[str, FitObservationSeries] = {}
-        for target in payload.species_list:
-            source = payload.observations[target]
-            model = np.asarray(dataset_model.get(target), dtype=float).reshape(-1)
-            observed = np.asarray(source.y, dtype=float).reshape(-1)
-            if model.size != observed.size or not np.all(np.isfinite(model)):
-                raise ValueError(
-                    f"Bootstrap terminal model is misaligned for "
-                    f"{payload.dataset_id!r}/{target!r}."
-                )
-            residuals = observed - model
-            centred_residuals = residuals - float(np.mean(residuals))
-            indexes = rng.integers(0, centred_residuals.size, size=centred_residuals.size)
-            resampled_y = model + centred_residuals[indexes]
-            observations[target] = FitObservationSeries(
-                raw_observation_id=source.raw_observation_id,
-                raw_column=source.raw_column,
-                t=source.t,
-                y=resampled_y,
-                source_rows=source.source_rows,
-            )
-        x_observations = None
+        info = fitted_info[payload.dataset_id]
+        sources = dict(payload.observations)
+        models = dict(info.model_series)
         if payload.x_name != "t":
-            if payload.x_observations is None or info.x_projection is None:
-                raise ValueError(
-                    f"Bootstrap dataset {payload.dataset_id!r} omitted its canonical X model."
-                )
+            sources[payload.x_name] = payload.x_observations
             projection = info.x_projection
-            x_source = payload.x_observations
-            observed_x = aligned_observed_x_by_dataset[payload.dataset_id]
-            x_residuals = observed_x - np.asarray(projection.selected_model_x, dtype=float)
-            centered_x = x_residuals - float(np.mean(x_residuals))
-            indexes = rng.integers(0, centered_x.size, size=centered_x.size)
-            synthetic_x = np.asarray(projection.selected_model_x, dtype=float) + centered_x[indexes]
-            projection_positions = projection_positions_by_dataset[payload.dataset_id]
-            full_values = np.asarray(x_source.y, dtype=float).copy()
-            projected = projection_positions >= 0
-            full_values[projected] = synthetic_x[projection_positions[projected]]
-            x_observations = FitObservationSeries(
-                raw_observation_id=x_source.raw_observation_id,
-                raw_column=x_source.raw_column,
-                t=x_source.t,
-                y=full_values,
-                source_rows=x_source.source_rows,
-            )
-        captured.append(
-            FitDatasetSpec(
-                dataset_id=payload.dataset_id,
-                species_list=payload.species_list,
-                observations=observations,
-                target_weights=payload.target_weights,
-                x_name=payload.x_name,
-                x_mode=payload.x_mode,
-                x_observations=x_observations,
-            )
-        )
+            x_by_row = dict(zip(projection.source_rows, projection.selected_model_x, strict=True))
+            models[payload.x_name] = np.asarray([
+                x_by_row[row] for row in payload.x_observations.source_rows
+            ])
+        synthetic = {name: np.asarray(source.y).copy() for name, source in sources.items()}
+        if payload.x_name == "t":
+            for name, source in sources.items():
+                model = models[name]
+                residual = source.y - model
+                residual = residual - np.mean(residual)
+                indexes = rng.integers(0, len(residual), size=len(residual))
+                synthetic[name] = model + residual[indexes]
+        else:
+            # Resample complete residual vectors jointly. Group by observed
+            # quantities so missing cells never borrow another column's row.
+            positions = {name: {row: i for i, row in enumerate(source.source_rows)}
+                         for name, source in sources.items()}
+            patterns: dict[tuple[str, ...], list[int]] = {}
+            for row in info.x_projection.source_rows:
+                pattern = tuple(name for name in sorted(sources) if row in positions[name])
+                patterns.setdefault(pattern, []).append(row)
+            for pattern, rows in patterns.items():
+                donors = rng.integers(0, len(rows), size=len(rows))
+                for name in pattern:
+                    indexes = np.asarray([positions[name][row] for row in rows])
+                    model = np.asarray(models[name])[indexes]
+                    residual = sources[name].y[indexes] - model
+                    residual = residual - np.mean(residual)
+                    synthetic[name][indexes] = model + residual[donors]
+        series = {
+            name: FitObservationSeries(
+                raw_observation_id=source.raw_observation_id,
+                raw_column=source.raw_column, t=source.t,
+                y=synthetic[name], source_rows=source.source_rows,
+            ) for name, source in sources.items()
+        }
+        captured.append(FitDatasetSpec(
+            dataset_id=payload.dataset_id, species_list=payload.species_list,
+            observations={name: series[name] for name in payload.species_list},
+            target_weights=payload.target_weights, x_name=payload.x_name,
+            x_observations=series.get(payload.x_name),
+        ))
     return tuple(captured)
 
 
@@ -1633,6 +1642,7 @@ def residual_bootstrap_result(
     ) -> ResidualBootstrapResult:
         """Build one bounded Bootstrap settlement from current call-local facts."""
 
+        resampling, centering = _bootstrap_resampling_descriptions(payloads)
         return ResidualBootstrapResult(
             status=status,
             method=_BOOTSTRAP_METHOD,
@@ -1642,14 +1652,9 @@ def residual_bootstrap_result(
             seed=config.seed,
             replicates=config.replicates,
             confidence_level=config.confidence_level,
-            resampling="within each dataset/target residual stratum",
-            draw_algorithm=(
-                "numpy.default_rng(seed).integers(0, stratum_residual_count); "
-                "integer draws sample independently mean-centered residuals"
-            ),
-            residual_centering=(
-                "independent arithmetic mean subtraction within each dataset/target stratum"
-            ),
+            resampling=resampling,
+            draw_algorithm="numpy.default_rng(seed) residual-index draws",
+            residual_centering=centering,
             replicate_execution="full global refit",
             refit_validity="scientifically available completed refits count regardless of optimizer convergence",
             minimum_successful_replicates=config.minimum_successful_replicates,
@@ -1749,48 +1754,6 @@ def residual_bootstrap_result(
     for name in config.parameter_names:
         _parameter_value(terminal_result, name)
 
-    aligned_observed_x_by_dataset: dict[str, np.ndarray] = {}
-    projection_positions_by_dataset: dict[str, np.ndarray] = {}
-    for payload in payloads:
-        if payload.x_name == "t":
-            continue
-        if payload.x_observations is None:
-            raise ValueError(
-                f"Bootstrap dataset {payload.dataset_id!r} omitted its canonical X model."
-            )
-        info = cast(_fit_execution.DatasetFitInfo, fitted_info[payload.dataset_id])
-        projection = info.x_projection
-        if projection is None:
-            raise ValueError(
-                f"Bootstrap dataset {payload.dataset_id!r} omitted its canonical X model."
-            )
-        observed_by_row = {
-            int(row): float(value)
-            for row, value in zip(
-                payload.x_observations.source_rows,
-                payload.x_observations.y,
-                strict=True,
-            )
-        }
-        aligned = np.asarray(
-            [observed_by_row[int(row)] for row in projection.source_rows],
-            dtype=float,
-        )
-        aligned.setflags(write=False)
-        aligned_observed_x_by_dataset[payload.dataset_id] = aligned
-        projection_positions_by_row = {
-            int(row): index
-            for index, row in enumerate(projection.source_rows)
-        }
-        projection_positions = np.asarray(
-            [
-                projection_positions_by_row.get(int(row), -1)
-                for row in payload.x_observations.source_rows
-            ],
-            dtype=np.intp,
-        )
-        projection_positions.setflags(write=False)
-        projection_positions_by_dataset[payload.dataset_id] = projection_positions
     rng = np.random.default_rng(config.seed)
     successes: dict[str, list[float]] = {
         name: [] for name in config.parameter_names
@@ -1805,8 +1768,6 @@ def residual_bootstrap_result(
             synthetic = _bootstrap_payloads(
                 payloads=payloads,
                 fitted_info=fitted_info,
-                aligned_observed_x_by_dataset=aligned_observed_x_by_dataset,
-                projection_positions_by_dataset=projection_positions_by_dataset,
                 rng=rng,
             )
             fitted = refit(synthetic, index)

@@ -303,9 +303,6 @@ class FitSessionOwner(QtCore.QObject):
             worker.progress.connect(
                 lambda value, text, w=worker: self._on_progress(w, value, text)
             )
-            worker.auto_modes_resolved.connect(
-                lambda modes, w=worker: self._on_auto_modes(w, modes)
-            )
             worker.best_updated.connect(
                 lambda update, w=worker: self._on_best(w, update)
             )
@@ -669,20 +666,6 @@ class FitSessionOwner(QtCore.QObject):
             return
         if self._window is not None:
             self._window.set_live_best(update)
-
-    def _on_auto_modes(
-        self,
-        worker: GlobalFitWorker,
-        modes: tuple[tuple[str, str], ...],
-    ) -> None:
-        if (
-            self._application_close_fenced
-            or self._closing
-            or self._worker is not worker
-        ):
-            return
-        if self._window is not None:
-            self._window.set_resolved_auto_modes(modes)
 
     def _on_live_curves(self, worker: GlobalFitWorker, curves: object) -> None:
         if (
