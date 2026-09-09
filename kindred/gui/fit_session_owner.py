@@ -841,6 +841,8 @@ class FitSessionOwner(QtCore.QObject):
             values[parameter.name] = admit_gui_parameter_value(
                 raw_value,
                 scientific_category=parameter.scientific_category,
+                role=parameter.role,
+                unit=parameter.unit,
                 allow_exact_zero=parameter.allow_exact_zero,
                 field=f"fitted parameter {parameter.name!r}",
             )

@@ -12,15 +12,18 @@ import math
 from typing import Literal
 
 from kindred.core.simulator.dsl_parse import PreparedDslRequestSet
+from kindred.core.simulator.parameter_coordinates import admit_physical_coordinate_value
 from kindred.core.simulation_parameters import enumerate_simulation_parameters
 from kindred.core.units import (
     ARRHENIUS_A_MAX,
+    ENERGY_ABS_MAX_J_PER_MOL,
     KEQ_MIN,
     KEQ_MAX,
     RATE_MIN,
     RATE_MAX,
     admit_keq,
     admit_rate,
+    UnitsModel,
 )
 
 __all__ = [
@@ -43,6 +46,8 @@ def admit_gui_parameter_value(
     *,
     scientific_category: GuiParameterScientificCategory,
     allow_exact_zero: bool,
+    role: str,
+    unit: str,
     field: str,
 ) -> float:
     """Admit one GUI/Fit scalar through its accepted scientific authority."""
@@ -68,6 +73,13 @@ def admit_gui_parameter_value(
             raise TypeError(f"{field} must be numeric.") from exc
         if not math.isfinite(parsed):
             raise ValueError(f"{field} must be finite.")
+        if role != "scalar":
+            admit_physical_coordinate_value(
+                parsed, role=role, energy_unit=unit, field=field,
+            )
+            # GUI values retain authored units; only scientific execution
+            # consumes the admission function's J/mol energy result.
+            return parsed
         if parsed == 0.0 and not allow_exact_zero:
             raise ValueError(f"{field} must be nonzero.")
         return float(parsed)
@@ -148,18 +160,21 @@ class GuiParameterCoordinate:
             self.value,
             scientific_category=self.scientific_category,
             allow_exact_zero=self.allow_exact_zero,
+            role=self.role, unit=self.unit,
             field=f"{name} value",
         )
         minimum = admit_gui_parameter_value(
             self.minimum,
             scientific_category=self.scientific_category,
             allow_exact_zero=self.allow_exact_zero,
+            role=self.role, unit=self.unit,
             field=f"{name} minimum",
         )
         maximum = admit_gui_parameter_value(
             self.maximum,
             scientific_category=self.scientific_category,
             allow_exact_zero=self.allow_exact_zero,
+            role=self.role, unit=self.unit,
             field=f"{name} maximum",
         )
         if minimum >= maximum or not minimum <= value <= maximum:
@@ -193,6 +208,10 @@ def enumerate_parameter_coordinates(
             low, high = _positive_bounds(value, minimum=RATE_MIN, maximum=ARRHENIUS_A_MAX)
         elif item.role == "kappa":
             low, high = _kappa_bounds(value)
+        elif item.role in {"Ea", "dG_act", "dG_eq"}:
+            limit = UnitsModel(energy_unit=item.unit).from_jmol(ENERGY_ABS_MAX_J_PER_MOL)
+            low, high = _signed_bounds(value)
+            low, high = max(low, -limit), min(high, limit)
         else:
             low, high = _signed_bounds(value)
         display_name = item.name

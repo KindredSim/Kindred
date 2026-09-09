@@ -1231,6 +1231,8 @@ class ParametersIcsTab(QtWidgets.QWidget):
             admit_gui_parameter_value(
                 parsed,
                 scientific_category=parameter.scientific_category,
+                role=parameter.role,
+                unit=parameter.unit,
                 allow_exact_zero=parameter.allow_exact_zero,
                 field=f"{parameter.name} value for dataset {dataset_id}",
             )

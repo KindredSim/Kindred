@@ -8,6 +8,7 @@ operates on an objective callable that returns residual vectors.
 from __future__ import annotations
 
 import logging
+import warnings
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Mapping, Optional, Tuple
 
@@ -342,11 +343,24 @@ def fit_parameters(
                 diff_step=diff_step,
                 verbose=0,
             )
-            result = least_squares(wrapped_objective, x0, **lsq_kwargs)
+            with warnings.catch_warnings():
+                # The zero-only gradient stop deliberately sits below epsilon.
+                warnings.filterwarnings(
+                    "ignore",
+                    message=(
+                        r"^Setting `gtol` below the machine epsilon .* effectively "
+                        r"disables the corresponding termination condition\.$"
+                    ),
+                    category=UserWarning,
+                    module=r"^scipy\.optimize\._lsq\.least_squares$",
+                )
+                result = least_squares(wrapped_objective, x0, **lsq_kwargs)
 
             x_opt = result.x
             success = bool(result.success)
             message = str(result.message)
+            if result.status == 1:
+                message = "Fit stopped at zero computed first-order optimality."
             try:
                 J = result.jac
                 param_count = len(x_opt)

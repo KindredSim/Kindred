@@ -955,10 +955,6 @@ def _assemble_fit_terminal(
         raise ValueError(
             "Fit terminal parameter results do not exactly match the included datasets."
         )
-    policies = {
-        (item.dataset_id, item.parameter_name): item
-        for item in request.dispatch.physical_coordinate_policies
-    }
     fixed_by_dataset = {
         dataset_id: dict(values)
         for dataset_id, values in request.dispatch.fixed_by_dataset
@@ -975,30 +971,21 @@ def _assemble_fit_terminal(
                     for dataset_id in included_ids
                 )
             )
-            policy = policies.get((None, parameter.name))
-            if policy is None:
-                raise ValueError(
-                    f"Fit terminal lost physical policy for {parameter.name!r}."
-                )
             for value in values:
                 admitted = admit_gui_parameter_value(
                     value,
-                    scientific_category=policy.scientific_category,
-                    allow_exact_zero=policy.allow_exact_zero,
+                    scientific_category=parameter.scientific_category,
+                    role=parameter.role,
+                    unit=parameter.unit,
+                    allow_exact_zero=parameter.allow_exact_zero,
                     field=f"terminal fitted {parameter.name!r}",
                 )
-                if not policy.minimum <= admitted <= policy.maximum:
+                if not parameter.selected_config.minimum <= admitted <= parameter.selected_config.maximum:
                     raise ValueError(
                         f"Terminal fitted {parameter.name!r} violates retained bounds."
                     )
         else:
             for dataset_id in included_ids:
-                policy = policies.get((dataset_id, parameter.name))
-                if policy is None:
-                    raise ValueError(
-                        f"Fit terminal lost physical policy for {dataset_id!r} "
-                        f"{parameter.name!r}."
-                    )
                 source_values = (
                     result.dataset_params
                     if parameter.selected_config.fit
@@ -1006,11 +993,13 @@ def _assemble_fit_terminal(
                 )
                 admitted = admit_gui_parameter_value(
                     source_values[dataset_id][parameter.name],
-                    scientific_category=policy.scientific_category,
-                    allow_exact_zero=policy.allow_exact_zero,
+                    scientific_category=parameter.scientific_category,
+                    role=parameter.role,
+                    unit=parameter.unit,
+                    allow_exact_zero=parameter.allow_exact_zero,
                     field=f"terminal fitted {dataset_id!r} {parameter.name!r}",
                 )
-                if not policy.minimum <= admitted <= policy.maximum:
+                if not parameter.selected_config.minimum <= admitted <= parameter.selected_config.maximum:
                     raise ValueError(
                         f"Terminal fitted {dataset_id!r} {parameter.name!r} "
                         "violates retained bounds."

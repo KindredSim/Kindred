@@ -711,7 +711,7 @@ class SimulationJobOwner(QtCore.QObject):
         self._pending_preview = capture
         self._mark_unsettled()
         operation = self._operation
-        if operation is None or operation["purpose"] != "preview-prerequisite":
+        if operation is None or operation["purpose"] != "preview-reference":
             self._retire_if_affected(
                 tab,
                 (target.set_id for target in capture.targets),
@@ -722,7 +722,10 @@ class SimulationJobOwner(QtCore.QObject):
             return False
         return self._redrive_pending_preview()
 
-    def _redrive_pending_preview(self) -> bool:
+    def _redrive_pending_preview(
+        self,
+        reference_outcomes: tuple[tuple[ExplicitRunTarget, str], ...] = (),
+    ) -> bool:
         capture = self._pending_preview
         if capture is None or self._worker is not None or not self._gate.is_idle or self._close_fenced:
             return False
@@ -732,7 +735,21 @@ class SimulationJobOwner(QtCore.QObject):
 
         repository = self._repository(tab_id)
         preview_ids = set(repository.preview_set_ids())
-        matching: set[str] = set()
+        # Attempts belong only to this pending Preview cycle. A failed Reference
+        # must not be retried before the exact candidate gets to execute.
+        reference_outcomes = tuple(
+            (attempt, state)
+            for attempt, state in reference_outcomes
+            if any(
+                target.set_id == attempt.set_id
+                and simulation_execution_requests_equal(
+                    target.canonical_run_target.execution_request,
+                    attempt.execution_request,
+                )
+                for target in targets
+            )
+        )
+        matching = {attempt.set_id for attempt, _state in reference_outcomes}
         for target in targets:
             reference_request = repository.reference_request(target.set_id)
             reference_result = repository.reference_result(target.set_id)
@@ -771,7 +788,8 @@ class SimulationJobOwner(QtCore.QObject):
                 "run",
                 tuple(target.canonical_run_target for target in missing_targets),
                 max_parallel=self._capacity(len(missing_targets)),
-                purpose="preview-prerequisite",
+                purpose="preview-reference",
+                payload=reference_outcomes,
             )
             if not started:
                 self._pending_preview = None
@@ -788,6 +806,12 @@ class SimulationJobOwner(QtCore.QObject):
         )
         if not started:
             self._pending_preview = capture
+        else:
+            self._operation["details"].extend(
+                f"Reference unavailable for {target.set_name}"
+                for target, state in reference_outcomes
+                if state == "failure"
+            )
         return started
 
     def request_interactive_preview(
@@ -1086,7 +1110,7 @@ class SimulationJobOwner(QtCore.QObject):
         if self.sender() is not self._worker:
             return
         operation = self._operation
-        prerequisite_failed = False
+        reference_outcomes: tuple[tuple[ExplicitRunTarget, str], ...] = ()
         operation_kind = "run"
         operation_purpose: str | None = None
         operation_tab_id: str | None = None
@@ -1158,25 +1182,22 @@ class SimulationJobOwner(QtCore.QObject):
                 if target.set_id not in removed_ids
             )
             target_ids = tuple(dict.fromkeys(target_ids))
-            if operation_purpose == "preview-prerequisite":
-                prerequisite_failed = summary.state != "success"
-                if prerequisite_failed:
-                    pending = self._pending_preview
-                    self._pending_preview = None
-                    if pending is not None and pending.tab_id == str(operation["tab_id"]):
-                        target_ids = tuple(
-                            dict.fromkeys(
-                                (
-                                    *target_ids,
-                                    *(
-                                        target.set_id
-                                        for target in pending.targets
-                                        if target.set_id not in removed_ids
-                                    ),
-                                )
-                            )
-                        )
-                    reconcile_target_ids = target_ids
+            if operation_purpose == "preview-reference":
+                pending = self._pending_preview
+                if (
+                    pending is not None
+                    and pending.tab_id == operation_tab_id
+                    and self._operation_is_current(int(operation["generation"]))
+                ):
+                    reference_outcomes = (
+                        *operation["payload"],
+                        *(
+                            (target, outcome_state)
+                            for target, outcome_state in operation["outcomes"]
+                            if outcome_state in {"success", "failure"}
+                            and target.set_id not in removed_ids
+                        ),
+                    )
 
             elif (
                 operation_kind == "preview"
@@ -1201,27 +1222,17 @@ class SimulationJobOwner(QtCore.QObject):
         self.state_changed.emit()
         self._emit_settled_if_complete()
         if not self._close_fenced:
-            if prerequisite_failed:
-                if operation_tab_id is not None and reconcile_target_ids:
-                    self.reconcile_canonical_targets(
-                        operation_tab_id,
-                        reconcile_target_ids,
-                    )
+            if operation_purpose == "preview-reference":
                 self.status_changed.emit(
-                    "Preview baseline "
-                    + ("cancelled" if summary.state == "cancelled" else "failed")
-                    + "; draft and stable results were preserved."
+                    "Reference " + self._terminal_status(summary)
                 )
+                # Continue synchronously after releasing the worker and gate;
+                # queued redrives then see the new worker or an empty request.
+                self._redrive_pending_preview(reference_outcomes)
                 if self._pending_interactive_preview is not None:
                     QtCore.QTimer.singleShot(
-                        0,
-                        self._redrive_pending_interactive_preview,
+                        0, self._redrive_pending_interactive_preview,
                     )
-            elif operation_purpose == "preview-prerequisite":
-                self.status_changed.emit(
-                    "Preview baseline ready; starting exact Preview."
-                )
-                QtCore.QTimer.singleShot(0, self._redrive_pending_preview)
             elif operation_purpose == "interactive-preview":
                 self.status_changed.emit(self._terminal_status(summary))
                 if self._pending_interactive_preview is not None:

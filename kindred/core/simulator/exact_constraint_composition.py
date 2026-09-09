@@ -124,9 +124,10 @@ class ExactMonomial:
     def scale(self, factor: Fraction) -> "ExactMonomial":
         """Scale a scalar expression by an exact factor.
 
-        Exponential arguments are part of the expression tree.  Scaling only
-        their top-level coefficient (while retaining their variable powers)
-        is the algebraically correct operation for ``q * (a*T**p)``.
+        Scalar multiplication changes the coefficient, preserving variable
+        powers and exponential factors: ``q * (c*exp(E)) = (q*c)*exp(E)``.
+        Raising an expression to a power scales its exponential arguments
+        separately in ``power``.
         """
 
         factor = Fraction(factor)
@@ -137,7 +138,7 @@ class ExactMonomial:
         return ExactMonomial(
             self.coefficient * factor,
             self.powers,
-            tuple(argument.scale(factor) for argument in self.exponentials),
+            self.exponentials,
         )
 
     @staticmethod

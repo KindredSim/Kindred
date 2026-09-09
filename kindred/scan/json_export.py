@@ -4,14 +4,15 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import fields, is_dataclass, asdict
 from datetime import datetime, timezone
-from importlib.metadata import version, PackageNotFoundError
 import json
 import os
 from pathlib import Path
 import tempfile
 
 import numpy as np
+import scipy
 
+from kindred._version import __version__ as KINDRED_VERSION
 from kindred.scan.config import START, END
 
 
@@ -84,12 +85,8 @@ class JsonScanWriter:
         except BaseException:
             os.close(descriptor)
             raise
-        versions = {}
-        for package in ("kindred", "numpy", "scipy"):
-            try:
-                versions[package] = version(package)
-            except PackageNotFoundError:
-                versions[package] = "uninstalled source tree"
+        versions = {"kindred": KINDRED_VERSION, "numpy": np.__version__,
+                    "scipy": scipy.__version__}
         header = {"schema_version": 1, "created_utc": datetime.now(timezone.utc).isoformat(),
                   "versions": versions, "configuration": asdict(config),
                   "effective_ranges": plain(design.effective_ranges),

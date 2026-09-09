@@ -87,7 +87,11 @@ class ImportConfigDialog(QtWidgets.QDialog):
         self.setWindowTitle(f"Import: {source.original_filename}")
         self.setModal(True)
         self._build_ui(remaining_count)
-        self._load_preview()
+        try:
+            self._load_preview()
+        except Exception:
+            self.deleteLater()
+            raise
         clamp_initial_size(self, 760, 620)
 
     def _build_ui(self, remaining_count: int) -> None:

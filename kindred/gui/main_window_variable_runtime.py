@@ -625,6 +625,8 @@ class TabSliderBinding(QtCore.QObject):
             value_f = admit_gui_parameter_value(
                 value,
                 scientific_category=coordinate.scientific_category,
+                role=coordinate.role,
+                unit=coordinate.unit,
                 allow_exact_zero=coordinate.allow_exact_zero,
                 field=f"Parameter {name!r}",
             )

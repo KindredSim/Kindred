@@ -3606,13 +3606,16 @@ class MainWindow(QtWidgets.QMainWindow):
                 model_targets=model_targets,
                 parent=self,
             )
-            mapping_expected_token = self._project_session.capture_content_token()
-            if review.exec() != QtWidgets.QDialog.DialogCode.Accepted:
-                self.set_status_text(
-                    message + " Mapping canceled; raw data remains unmapped."
-                )
-                return
-            batch = review.proposal()
+            try:
+                mapping_expected_token = self._project_session.capture_content_token()
+                if review.exec() != QtWidgets.QDialog.DialogCode.Accepted:
+                    self.set_status_text(
+                        message + " Mapping canceled; raw data remains unmapped."
+                    )
+                    return
+                batch = review.proposal()
+            finally:
+                review.deleteLater()
             candidate_tab = apply_dataset_mapping_batch(
                 document=self._project_session.document,
                 tab=tab,

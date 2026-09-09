@@ -63,6 +63,7 @@ __all__ = [
     "build_parameter_target_map",
     "apply_mechanism_coordinate_values",
     "read_mechanism_parameter_values",
+    "admit_physical_coordinate_value",
 ]
 
 
@@ -115,15 +116,26 @@ def build_parameter_target_map(
     return targets
 
 
-def _admit_energy_coordinate(
-    mechanism: object,
+def admit_physical_coordinate_value(
     value: object,
     *,
+    role: str,
+    energy_unit: str,
     field: str,
 ) -> float:
-    energy_unit = MechanismMetadataView.from_metadata(
-        getattr(mechanism, "metadata", {}) or {}
-    ).energy_unit
+    """Admit a physical coordinate, lowering authored energies to J/mol."""
+    if role == "A":
+        return admit_arrhenius_prefactor(value, field=field)
+    if role == "kappa":
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(f"{field} must be positive and finite") from exc
+        if type(value) is bool or not math.isfinite(numeric) or numeric <= 0.0:
+            raise ValueError(f"{field} must be positive and finite")
+        return numeric
+    if role not in {"Ea", "dG_act", "dG_eq"}:
+        raise ValueError(f"Unsupported source coordinate role {role!r}")
     conversion = {
         "J/mol": lambda raw: float(raw),
         "kJ/mol": kjmol_to_jmol,
@@ -147,19 +159,12 @@ def _admit_coordinate_value(
     """Admit one value in its target's concrete scientific context."""
 
     if route == "physical":
-        if role == "A":
-            return admit_arrhenius_prefactor(value, field=name)
-        if role in {"Ea", "dG_act", "dG_eq"}:
-            return _admit_energy_coordinate(mechanism, value, field=name)
-        if role == "kappa":
-            try:
-                numeric = float(value)
-            except (TypeError, ValueError, OverflowError) as exc:
-                raise ValueError(f"{name} must be positive and finite") from exc
-            if type(value) is bool or not math.isfinite(numeric) or numeric <= 0.0:
-                raise ValueError(f"{name} must be positive and finite")
-            return numeric
-        raise ValueError(f"Unsupported source coordinate role {role!r}")
+        return admit_physical_coordinate_value(
+            value, role=role, field=name,
+            energy_unit=MechanismMetadataView.from_metadata(
+                getattr(mechanism, "metadata", {}) or {}
+            ).energy_unit,
+        )
 
     if role == "Keq":
         return admit_keq(value, field=name)

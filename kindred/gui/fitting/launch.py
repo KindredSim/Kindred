@@ -64,7 +64,6 @@ __all__ = [
     "FitSolver",
     "FitExecutionRequest",
     "FitPreparedDatasetConfig",
-    "FitPhysicalCoordinatePolicy",
     "FitSharedInitialGroup",
     "FitInitialVariable",
     "FitMappedDatasetSnapshot",
@@ -241,6 +240,8 @@ def _admit_fit_parameter_configuration(
     configuration: FitParameterConfiguration,
     *,
     parameter_name: str,
+    role: str,
+    unit: str,
     scientific_category: GuiParameterScientificCategory,
     allow_exact_zero: bool,
 ) -> FitParameterConfiguration:
@@ -253,6 +254,8 @@ def _admit_fit_parameter_configuration(
         return admit_gui_parameter_value(
             value,
             scientific_category=scientific_category,
+            role=role,
+            unit=unit,
             allow_exact_zero=allow_exact_zero,
             field=f"{parameter_name} {field}",
         )
@@ -310,12 +313,16 @@ class FitParameterVariable:
         shared_config = _admit_fit_parameter_configuration(
             self.shared_config,
             parameter_name=self.name,
+            role=self.role,
+            unit=self.unit,
             scientific_category=scientific_category,
             allow_exact_zero=self.allow_exact_zero,
         )
         per_dataset_config = _admit_fit_parameter_configuration(
             self.per_dataset_config,
             parameter_name=self.name,
+            role=self.role,
+            unit=self.unit,
             scientific_category=scientific_category,
             allow_exact_zero=self.allow_exact_zero,
         )
@@ -872,37 +879,6 @@ class FitPreparedDatasetConfig:
 
 
 @dataclass(frozen=True, slots=True)
-class FitPhysicalCoordinatePolicy:
-    """Retained physical admission policy for one Fit scalar coordinate."""
-
-    parameter_name: str
-    dataset_id: str | None
-    scientific_category: GuiParameterScientificCategory
-    allow_exact_zero: bool
-    minimum: float
-    maximum: float
-
-    def __post_init__(self) -> None:
-        object.__setattr__(self, "parameter_name", _required(self.parameter_name, "physical Fit coordinate"))
-        if self.dataset_id is not None:
-            object.__setattr__(self, "dataset_id", _required(self.dataset_id, "physical Fit dataset ID"))
-        if self.scientific_category not in {"rate", "equilibrium_constant", "finite_scalar"}:
-            raise ValueError("Physical Fit coordinate category is invalid.")
-        admit_gui_parameter_value(
-            self.minimum,
-            scientific_category=self.scientific_category,
-            allow_exact_zero=self.allow_exact_zero,
-            field=f"{self.parameter_name} retained minimum",
-        )
-        admit_gui_parameter_value(
-            self.maximum,
-            scientific_category=self.scientific_category,
-            allow_exact_zero=self.allow_exact_zero,
-            field=f"{self.parameter_name} retained maximum",
-        )
-
-
-@dataclass(frozen=True, slots=True)
 class _FitDispatchCompilation:
     """Private immutable lowering retained only by an admitted Fit request."""
 
@@ -913,7 +889,6 @@ class _FitDispatchCompilation:
     fixed_by_dataset: tuple[tuple[str, tuple[tuple[str, float], ...]], ...]
     ordinary_dataset_overrides: tuple[FitDatasetParameterOverrides, ...]
     candidate_names: tuple[str, ...]
-    physical_coordinate_policies: tuple[FitPhysicalCoordinatePolicy, ...]
     ordinary_optimizer_layout: FitParameterLayout | None
     ordinary_centred_variables: tuple[FitCentredFixedEffectsParamSpec, ...]
 
@@ -1660,22 +1635,9 @@ def _compile_fit_dispatch(
     fixed_by_dataset: dict[str, dict[str, float]] = {
         dataset_id: {} for dataset_id in included_ids
     }
-    physical_policies: list[FitPhysicalCoordinatePolicy] = []
     for parameter in setup.parameters:
         config = parameter.selected_config
         dataset_values = dict(config.dataset_values)
-        target_ids = (None,) if parameter.scope == "shared" else included_ids
-        for dataset_id in target_ids:
-            physical_policies.append(
-                FitPhysicalCoordinatePolicy(
-                    parameter_name=parameter.name,
-                    dataset_id=dataset_id,
-                    scientific_category=parameter.scientific_category,
-                    allow_exact_zero=parameter.allow_exact_zero,
-                    minimum=config.minimum,
-                    maximum=config.maximum,
-                )
-            )
         if config.fit and parameter.scope == "shared":
             shared_variables.append(
                 FitSharedVariableParamSpec(
@@ -1824,7 +1786,6 @@ def _compile_fit_dispatch(
                 if not parameter.name.startswith(INITIAL_PREFIX)
             )
         ),
-        physical_coordinate_policies=tuple(physical_policies),
         ordinary_optimizer_layout=layout,
     )
 

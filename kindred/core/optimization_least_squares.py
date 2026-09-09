@@ -27,6 +27,9 @@ def build_least_squares_kwargs(
     kwargs: dict[str, Any] = {
         "ftol": ftol_f,
         "xtol": xtol_f,
+        # SciPy tests optimality < gtol. The smallest positive float admits
+        # only computed zero, without stopping on small concentration scales.
+        "gtol": math.ulp(0.0),
         "max_nfev": int(max_nfev),
         "verbose": int(verbose),
     }

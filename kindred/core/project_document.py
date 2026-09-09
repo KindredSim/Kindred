@@ -1014,6 +1014,15 @@ def validate_fit_defaults(defaults: FitDefaults) -> FitDefaults:
             f"fit_defaults.{field_name}",
             strictly_positive=True,
         )
+    # With the zero-only gradient stop, SciPy requires at least one exposed
+    # tolerance at or above binary64 epsilon. This is a pair restriction:
+    # either tolerance may be smaller when the other satisfies the minimum.
+    epsilon = math.ulp(1.0)
+    if defaults.method in {"trf", "dogbox"} and max(defaults.ftol, defaults.xtol) < epsilon:
+        raise ValueError(
+            "TRF and Dogbox require at least one convergence tolerance "
+            f"(ftol or xtol) to be at least {epsilon:.17g}."
+        )
     _require_bool(defaults.use_seed, "fit_defaults.use_seed")
     _require_int(
         defaults.seed,
