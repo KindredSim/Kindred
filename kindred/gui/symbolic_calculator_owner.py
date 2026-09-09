@@ -197,6 +197,15 @@ class SymbolicCalculatorOwner:
             if prepared_dsl is None:
                 return None, False, "Canonical mechanism is empty."
             source = self._canonical_source()
+            snapshot = self._snapshot
+            if (
+                snapshot is not None
+                and snapshot.prepared_dsl is prepared_dsl
+                and snapshot.source == source.reactions_text
+            ):
+                # Slider drafts leave accepted science unchanged. Reuse its
+                # snapshot instead of rebuilding symbolic expressions in Qt.
+                return snapshot, True, ""
             if not source_matches_analysis(source, prepared_dsl.analysis):
                 return (
                     None,

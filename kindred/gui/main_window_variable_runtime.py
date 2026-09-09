@@ -308,9 +308,9 @@ class TabSliderBinding(QtCore.QObject):
         if pending == self._latest_admissible_pending:
             return
         self._latest_admissible_pending = pending
-        self._throttle_timer.setInterval(self._preview_delay_ms)
         if not self._throttle_timer.isActive():
-            self._throttle_timer.start()
+            # Updating an active timer's interval would postpone dispatch.
+            self._throttle_timer.start(self._preview_delay_ms)
 
     def _accept_and_submit(
         self,
