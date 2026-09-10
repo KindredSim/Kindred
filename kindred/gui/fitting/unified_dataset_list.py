@@ -131,15 +131,6 @@ class UnifiedDatasetList(QtWidgets.QWidget):
             item.setData(Qt.AccessibleTextRole, detail)
             item.setToolTip(literal_tooltip(f"{detail}\nDataset ID: {dataset_id}"))
 
-    def select_dataset(self, dataset_id: str) -> None:
-        if dataset_id == self.selected_dataset_id():
-            return
-        self._list.blockSignals(True)
-        found = self._select_by_id(dataset_id)
-        self._list.blockSignals(False)
-        if found:
-            self.currentDatasetChanged.emit(dataset_id)
-
     def dataset_display_name(self, dataset_id: str | None = None) -> str | None:
         """Return the full bounded-row source label, never the stable ID role."""
 

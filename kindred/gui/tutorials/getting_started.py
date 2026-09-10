@@ -961,7 +961,7 @@ class GettingStarted(Lesson):
             Step(
                 "fine_slider",
                 "Make Fine Slider Adjustments",
-                "<p><b>Fine</b> provides finer slider increments and smaller keyboard adjustments. Dragging still covers the same value range.</p>"
+                "<p><b>Fine</b> makes mouse dragging ten times slower, keeping the cursor attached to the slider handle. It also provides smaller keyboard adjustments.</p>"
                 "<ol><li>Enable <b>Fine</b> in Interactive Sliders.</li>"
                 "<li>Drag the <b>k1</b> handle a short distance and release it.</li>"
                 "<li>With the slider focused, press the <b>Left</b> or <b>Right</b> arrow key to make small adjustments. Watch the value change.</li>"

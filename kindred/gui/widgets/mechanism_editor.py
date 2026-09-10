@@ -222,8 +222,9 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
         self._fine_btn = QtWidgets.QPushButton("Fine")
         self._fine_btn.setCheckable(True)
         self._fine_btn.setToolTip(
-            "Use smaller arrow-key and Page Up/Down steps for parameters and "
-            "initial concentrations. Mouse dragging continues to follow the pointer."
+            "Drag parameters and initial concentrations at one-tenth normal sensitivity "
+            "with the cursor attached to the handle. Also use smaller arrow-key "
+            "and Page Up/Down steps."
         )
         self._fine_btn.toggled.connect(
             lambda v: self._variable_sliders.set_fine_mode(v)

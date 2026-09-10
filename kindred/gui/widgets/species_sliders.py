@@ -12,6 +12,7 @@ from kindred.gui.ui_helpers import (
     configure_compact_numeric_edit, make_bounded_label, set_bounded_label_text,
 )
 from kindred.gui.interactive_preview import SliderInteractionKind
+from kindred.gui.widgets.fine_drag_slider import FineDragSlider
 from kindred.gui.species_sliders_logic import (
     compute_slider_max_option_c,
     _scale_finite_gui_range,
@@ -42,51 +43,11 @@ def format_slider_value(value: float) -> str:
     return f"{value_f:.2f}"
 
 
-class _GrooveJumpSlider(QtWidgets.QSlider):
-    """Native slider whose groove accepts an exact click-anywhere jump."""
-
-    def mousePressEvent(self, event: QtGui.QMouseEvent) -> None:
-        if (
-            event.button() == QtCore.Qt.MouseButton.LeftButton
-            and self.orientation() == QtCore.Qt.Orientation.Horizontal
-        ):
-            option = QtWidgets.QStyleOptionSlider()
-            self.initStyleOption(option)
-            groove = self.style().subControlRect(
-                QtWidgets.QStyle.ComplexControl.CC_Slider,
-                option,
-                QtWidgets.QStyle.SubControl.SC_SliderGroove,
-                self,
-            )
-            handle = self.style().subControlRect(
-                QtWidgets.QStyle.ComplexControl.CC_Slider,
-                option,
-                QtWidgets.QStyle.SubControl.SC_SliderHandle,
-                self,
-            )
-            if not handle.contains(event.position().toPoint()):
-                span = max(1, groove.width() - handle.width())
-                position = int(
-                    round(event.position().x() - groove.x() - handle.width() / 2)
-                )
-                value = QtWidgets.QStyle.sliderValueFromPosition(
-                    self.minimum(),
-                    self.maximum(),
-                    max(0, min(position, span)),
-                    span,
-                    option.upsideDown,
-                )
-                self.setValue(value)
-                event.accept()
-                return
-        super().mousePressEvent(event)
-
-
 @dataclass(slots=True)
 class _SpeciesSliderRow:
     container: QtWidgets.QWidget
     name_label: QtWidgets.QLabel
-    slider: QtWidgets.QSlider
+    slider: FineDragSlider
     value_label: QtWidgets.QWidget
     maximum: float
     maximum_label: QtWidgets.QLabel
@@ -143,11 +104,12 @@ class BatchSpeciesSliders(QtWidgets.QWidget):
         layout.addStretch(1)
 
     def set_fine_mode(self, enabled: bool) -> None:
-        """Adjust keyboard increments without changing values or mouse resolution."""
+        """Adjust keyboard steps and mouse sensitivity without changing values."""
         self._fine_mode = bool(enabled)
         for row in self._rows.values():
             row.slider.setSingleStep(1 if self._fine_mode else 50)
             row.slider.setPageStep(50 if self._fine_mode else 1000)
+            row.slider.set_fine_mode(self._fine_mode)
 
     def render_values(
         self,
@@ -266,11 +228,13 @@ class BatchSpeciesSliders(QtWidgets.QWidget):
         self.render_values({}, target_set_ids=(), preserve_visibility=False)
 
     def _clear_rows(self) -> None:
+        self._active_presses.clear()
         for row in self._rows.values():
+            with QtCore.QSignalBlocker(row.slider):
+                row.slider.end_drag()
             self._content_layout.removeWidget(row.container)
             row.container.deleteLater()
         self._rows.clear()
-        self._active_presses.clear()
         self._editor_pre_edit_values.clear()
         self._editor_pre_edit_text.clear()
         self._last_committed_editor_text.clear()
@@ -309,7 +273,7 @@ class BatchSpeciesSliders(QtWidgets.QWidget):
         value_editor.editingFinished.connect(
             lambda item=species: self._commit_editor(item)
         )
-        slider = _GrooveJumpSlider(
+        slider = FineDragSlider(
             QtCore.Qt.Orientation.Horizontal,
             container,
         )
@@ -317,6 +281,7 @@ class BatchSpeciesSliders(QtWidgets.QWidget):
         slider.setRange(0, 10_000)
         slider.setSingleStep(1 if self._fine_mode else 50)
         slider.setPageStep(50 if self._fine_mode else 1000)
+        slider.set_fine_mode(self._fine_mode)
         maximum = compute_slider_max_option_c(
             v=value, row_max=max(self._values.values(), default=value)
         )

@@ -164,16 +164,7 @@ class FittingWindow(QtWidgets.QDialog):
         self._run_block_reason_label.setSizePolicy(QtWidgets.QSizePolicy.Policy.Ignored, QtWidgets.QSizePolicy.Policy.Preferred)
         self._run_block_reason_label.setTextFormat(QtCore.Qt.TextFormat.PlainText)
         self._run_block_reason_label.hide()
-        review_row = QtWidgets.QHBoxLayout()
-        review_row.addWidget(self._run_block_reason_label, 1)
-        self._review_data_button = QtWidgets.QPushButton("Review &Data Changes", footer)
-        self._review_data_button.setSizePolicy(
-            QtWidgets.QSizePolicy.Policy.Fixed, QtWidgets.QSizePolicy.Policy.Fixed
-        )
-        self._review_data_button.setEnabled(False)
-        self._review_data_button.clicked.connect(self._review_data_changes)
-        review_row.addWidget(self._review_data_button, 0, QtCore.Qt.AlignmentFlag.AlignRight)
-        status_column.addLayout(review_row)
+        status_column.addWidget(self._run_block_reason_label)
         column.addWidget(status_widget)
         self._progress = QtWidgets.QProgressBar(footer)
         self._progress.setRange(0, 100)
@@ -425,7 +416,6 @@ class FittingWindow(QtWidgets.QDialog):
             reason = structural
         listing = self._data_targets_tab.unified_list
         listing.set_data_edit_issues(data_issues)
-        self._review_data_button.setEnabled(bool(active_issues) and not self._is_executing())
         accessible_reason = reason
         if active_issues:
             dataset_id, issue = next(iter(active_issues.items()))
@@ -437,7 +427,7 @@ class FittingWindow(QtWidgets.QDialog):
             visible_issue = " ".join(issue.split())
             visible_issue = visible_issue if len(visible_issue) <= 160 else visible_issue[:159] + "…"
             more = f" (+{len(active_issues) - 1} more)" if len(active_issues) > 1 else ""
-            reason = f"Data settings — {visible_name}: {visible_issue}{more} — Review Data Changes to resolve."
+            reason = f"Data settings — {visible_name}: {visible_issue}{more} — Resolve in Data and Targets."
             accessible_reason = "\n".join(
                 f"{listing.dataset_display_name(key) or key}: {value or 'Pending data changes'}"
                 for key, value in active_issues.items()
@@ -446,21 +436,6 @@ class FittingWindow(QtWidgets.QDialog):
         self._run_block_reason_label.setText(reason)
         self._run_block_reason_label.setAccessibleName(accessible_reason)
         self._layout_footer()
-
-    def _review_data_changes(self) -> None:
-        setup = self._projected_setup
-        if setup is None:
-            return
-        issues = self._data_tab.data_edit_issues(self._included_dataset_ids(setup))
-        if not issues:
-            return
-        listing = self._data_targets_tab.unified_list
-        ids = list(issues)
-        current = listing.selected_dataset_id()
-        index = (ids.index(current) + 1) % len(ids) if current in ids else 0
-        self._tabs.setCurrentIndex(0)
-        listing.select_dataset(ids[index])
-        self._data_tab.setFocus(QtCore.Qt.FocusReason.ShortcutFocusReason)
 
     def _populate_dataset_list(self, snapshot: FitSetupSnapshot) -> None:
         by_id = {item.dataset_id: item for item in self._origin.mapped_datasets}

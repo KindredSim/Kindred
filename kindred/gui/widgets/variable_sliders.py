@@ -18,6 +18,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtCore import Signal
 
 from kindred.gui.interactive_preview import SliderInteractionKind
+from kindred.gui.widgets.fine_drag_slider import FineDragSlider
 from html import escape
 from kindred.gui.display_name_policy import scientific_symbol_html, scientific_symbol_spoken, literal_tooltip
 
@@ -65,52 +66,6 @@ class _NumericValueEdit(QtWidgets.QLineEdit):
         super().keyPressEvent(event)
 
 
-class _GrooveJumpSlider(QtWidgets.QSlider):
-    """Horizontal slider with native click-anywhere groove behavior."""
-
-    def _slider_geometry(
-        self,
-    ) -> tuple[QtWidgets.QStyleOptionSlider, QtCore.QRect, QtCore.QRect, int]:
-        option = QtWidgets.QStyleOptionSlider()
-        self.initStyleOption(option)
-        groove = self.style().subControlRect(
-            QtWidgets.QStyle.ComplexControl.CC_Slider,
-            option,
-            QtWidgets.QStyle.SubControl.SC_SliderGroove,
-            self,
-        )
-        handle = self.style().subControlRect(
-            QtWidgets.QStyle.ComplexControl.CC_Slider,
-            option,
-            QtWidgets.QStyle.SubControl.SC_SliderHandle,
-            self,
-        )
-        return option, groove, handle, max(1, groove.width() - handle.width())
-
-    def mousePressEvent(self, event: QtGui.QMouseEvent) -> None:
-        if (
-            event.button() == QtCore.Qt.MouseButton.LeftButton
-            and self.orientation() == QtCore.Qt.Orientation.Horizontal
-        ):
-            option, groove, handle, span = self._slider_geometry()
-            if not handle.contains(event.position().toPoint()):
-                position = int(
-                    round(event.position().x() - groove.x() - handle.width() / 2)
-                )
-                self.setValue(
-                    QtWidgets.QStyle.sliderValueFromPosition(
-                        self.minimum(),
-                        self.maximum(),
-                        max(0, min(position, span)),
-                        span,
-                        option.upsideDown,
-                    )
-                )
-                event.accept()
-                return
-        super().mousePressEvent(event)
-
-
 class VariableSliders(QtWidgets.QWidget):
     """
     Interactive sliders for mechanism variables.
@@ -149,7 +104,7 @@ class VariableSliders(QtWidgets.QWidget):
 
         # Storage for variable values and slider metadata
         self._variables: Dict[str, float] = {}  # {name: value}
-        self._sliders: Dict[str, QtWidgets.QSlider] = {}
+        self._sliders: Dict[str, FineDragSlider] = {}
         self._value_labels: Dict[str, QtWidgets.QWidget] = {}
         self._slider_ranges: Dict[
             str, Tuple[float, float]
@@ -384,13 +339,14 @@ class VariableSliders(QtWidgets.QWidget):
         layout.addLayout(top_row)
 
         # Slider
-        slider = _GrooveJumpSlider(QtCore.Qt.Horizontal)
+        slider = FineDragSlider(QtCore.Qt.Horizontal)
         slider.setAccessibleName(f"{spoken} slider")
         slider.setMinimumHeight(28)
         slider.setMinimum(0)
         slider.setMaximum(1000)  # 1000 steps for smooth control
         slider.setSingleStep(5)
         slider.setPageStep(100)
+        slider.set_fine_mode(self._fine_mode)
         self._slider_scales[name] = "linear" if scale == "linear" else "log"
 
         if scale == "linear":
@@ -808,7 +764,7 @@ class VariableSliders(QtWidgets.QWidget):
         Enable or disable fine mode for all sliders.
 
         Fine mode increases slider resolution from 1000 to 10000 steps,
-        with smaller keyboard steps and native mouse dragging. Current
+        with smaller keyboard steps and tenfold slower mouse dragging. Current
         scientific values are preserved when switching modes.
 
         Parameters
@@ -838,6 +794,7 @@ class VariableSliders(QtWidgets.QWidget):
 
                 # Restore position for the same numeric value
                 slider.setValue(self._value_to_slider_pos(name, float(val)))
+                slider.set_fine_mode(enabled)
 
         logger.info(f"Fine mode {'enabled' if enabled else 'disabled'}")
 
@@ -845,8 +802,11 @@ class VariableSliders(QtWidgets.QWidget):
         """Return child sliders to quiet Normal state before a rebuild/clear."""
         was_fine = bool(self._fine_mode)
         self._fine_mode = False
+        self._active_presses.clear()
         for slider in self._sliders.values():
             with QtCore.QSignalBlocker(slider):
+                slider.end_drag()
+                slider.set_fine_mode(False)
                 slider.setMinimum(0)
                 slider.setMaximum(1000)
                 slider.setSingleStep(5)
