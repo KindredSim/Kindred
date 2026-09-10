@@ -17,6 +17,7 @@ from kindred.core.intervention_schedule_compiler import (
     InterventionExecutionContract,
     TriggerFiring,
     validate_boundary_conflicts,
+    resolve_executable_values,
 )
 from kindred.core.temperature import declared_temperature_step_boundaries, temperature_schedule_execution_identity
 from kindred.core.species import TIME_MAX_S
@@ -206,6 +207,7 @@ class InterventionScheduleExecutionOwner:
             trigger_counts = [0 for _ in contract.triggers]
             trigger_last_times: list[float | None] = [None for _ in contract.triggers]
             trigger_firings: list[TriggerFiring] = []
+            executed_values: dict[ExecutableInstant, ExecutableInstant] = {}
             outputs_t: list[np.ndarray] = []
             outputs_y: list[np.ndarray] = []
             output_segment_ids: list[np.ndarray] = []
@@ -261,7 +263,7 @@ class InterventionScheduleExecutionOwner:
                 cancellation_check=cancellation_check,
                 observable_value=req.stop_observable_value,
                 temperature_step=t0 in temperature_boundaries,
-            )
+            parameter_values=req.parameter_values_at_time, executed_values=executed_values,)
             current_y = initial_boundary.continuation_state
             termination = initial_boundary.termination
             skipped_instants = initial_boundary.skipped_instants
@@ -308,15 +310,17 @@ class InterventionScheduleExecutionOwner:
                         active_holds,
                         species_index=species_index,
                         cancellation_check=cancellation_check,
-                    )
+                    time=sub_start, parameter_values=req.parameter_values_at_time,)
+                    def symbol_time(time, end=sub_end):
+                        return float(np.nextafter(time, -np.inf)) if time == end and end in temperature_boundaries else time
                     segment_rhs: Rhs2 = request.rhs
-                    if active_fluxes or active_holds:
+                    if active_fluxes or active_holds or sub_end in temperature_boundaries:
                         segment_rhs = _InterventionRhs(
                             request.rhs,
                             fluxes=active_fluxes,
                             holds=active_holds,
                             species_index=species_index,
-                        )
+                        parameter_values=req.parameter_values_at_time, symbol_time=symbol_time,)
                     trigger_callables, trigger_mapping = _trigger_callables(
                         contract.triggers,
                         species_index=species_index,
@@ -327,7 +331,7 @@ class InterventionScheduleExecutionOwner:
                         observable_value=req.stop_observable_value,
                         segment_end=sub_end,
                         temperature_step_at_end=sub_end in temperature_boundaries,
-                    )
+                    parameter_values=req.parameter_values_at_time, holds=active_holds,)
                     # SciPy truncates a simultaneous active-event set at the first
                     # terminal event.  Register every trigger first as a
                     # non-terminal observer, then repeat the same callables as
@@ -341,6 +345,7 @@ class InterventionScheduleExecutionOwner:
                         active_holds=active_holds,
                         species_index=species_index,
                         state=current_y,
+                        segment_start=sub_start,
                     )
                     purge_stoppers = purge_observers
                     segment_events = (
@@ -356,7 +361,7 @@ class InterventionScheduleExecutionOwner:
                             + tuple(True for _ in trigger_stoppers)
                             + tuple(True for _ in purge_stoppers)
                     )
-                    if active_holds or active_fluxes:
+                    if active_holds or active_fluxes or sub_end in temperature_boundaries:
                         segment_symbolic_jacobian = segment_request.symbolic_jacobian
                         transformed_jacobian = (
                             None
@@ -433,10 +438,10 @@ class InterventionScheduleExecutionOwner:
                                     active_holds,
                                     species_index=species_index,
                                     cancellation_check=cancellation_check,
-                                )
-                                for state in states
+                                time=symbol_time(event_time), parameter_values=req.parameter_values_at_time,)
+                                for event_time, state in zip(times, states, strict=True)
                             )
-                            for states in event_states
+                            for times, states in zip(event_times, event_states, strict=True)
                         )
                     trigger_hit = (
                         _first_trigger_hit(
@@ -477,7 +482,7 @@ class InterventionScheduleExecutionOwner:
                         active_holds,
                         species_index=species_index,
                         cancellation_check=cancellation_check,
-                    )
+                    times=[symbol_time(float(t)) for t in seg_t], parameter_values=req.parameter_values_at_time,)
                     _validate_segment_output(
                         seg_t,
                         seg_y,
@@ -553,7 +558,7 @@ class InterventionScheduleExecutionOwner:
                             active_holds,
                             species_index=species_index,
                             cancellation_check=cancellation_check,
-                        )
+                        time=symbol_time(sub_end), parameter_values=req.parameter_values_at_time,)
                     scheduled_discontinuity = (
                         trigger_hit is None
                         and (
@@ -634,7 +639,7 @@ class InterventionScheduleExecutionOwner:
                                 cancellation_check=cancellation_check,
                                 observable_value=req.stop_observable_value,
                                 temperature_step=sub_end in temperature_boundaries,
-                            )
+                            parameter_values=req.parameter_values_at_time, executed_values=executed_values,)
                             current_y = boundary_result.continuation_state
                             termination = boundary_result.termination
                             skipped_instants = boundary_result.skipped_instants
@@ -668,7 +673,7 @@ class InterventionScheduleExecutionOwner:
                                 cancellation_check=cancellation_check,
                                 observable_value=req.stop_observable_value,
                                 temperature_step=outer_end in temperature_boundaries,
-                            )
+                            parameter_values=req.parameter_values_at_time, executed_values=executed_values,)
                             current_y = boundary_result.continuation_state
                             termination = boundary_result.termination
                             skipped_instants = boundary_result.skipped_instants
@@ -756,7 +761,7 @@ class InterventionScheduleExecutionOwner:
                         cancellation_check=cancellation_check,
                         observable_value=req.stop_observable_value,
                         temperature_step=root_time in temperature_boundaries,
-                    )
+                    parameter_values=req.parameter_values_at_time, executed_values=executed_values,)
                     current_y = boundary_result.continuation_state
                     termination = boundary_result.termination
                     skipped_instants = boundary_result.skipped_instants
@@ -869,7 +874,7 @@ class InterventionScheduleExecutionOwner:
                         raw_states = _apply_holds_to_trajectory(
                             raw_states, holds, species_index=species_index,
                             cancellation_check=cancellation_check,
-                        )
+                        times=sample_times[sample_start:chunk_end], parameter_values=req.parameter_values_at_time,)
                         projected, projection = project_nonnegative_trajectory(
                             raw_states, context="Actual-interval sampling",
                         )
@@ -913,6 +918,7 @@ class InterventionScheduleExecutionOwner:
             final_contract = replace(
                 contract,
                 trigger_firings=tuple(trigger_firings),
+                instants=tuple(executed_values.get(item, item) for item in contract.instants),
                 skipped_instants=skipped_instants,
             )
             provenance = request.provenance
@@ -1134,6 +1140,7 @@ def _purge_zero_crossing_events(
     active_holds: Sequence[ExecutableHold],
     species_index: Mapping[str, int],
     state: np.ndarray,
+    segment_start: float = 0.0,
 ) -> tuple[
     tuple[Callable[[float, np.ndarray], float], ...],
     tuple[int, ...],
@@ -1143,25 +1150,27 @@ def _purge_zero_crossing_events(
     purge_indices: set[int] = set()
     for flux in fluxes:
         index = species_index[flux.species]
-        if flux.flux_rate < 0.0:
+        if flux.flux_rate_param is not None or flux.flux_rate < 0.0:
             purge_indices.add(index)
     held = {species_index[hold.species] for hold in active_holds}
     values = np.asarray(state, dtype=float).reshape(-1)
-    indices = tuple(
-        index
-        for index in sorted(purge_indices)
-        if values[index] > 0.0
-        and index not in held
-    )
+    indices = tuple(index for index in sorted(purge_indices) if index not in held)
+    initial_values = values.copy()
     events: list[Callable[[float, np.ndarray], float]] = []
     for index in indices:
+
         def _zero_crossing(
             _time: float,
             values: np.ndarray,
             *,
             _index: int = index,
         ) -> float:
-            return float(values[_index])
+            value = float(values[_index])
+            if initial_values[_index] == 0.0 and (
+                _time == segment_start or value == 0.0
+            ):
+                return -1.0
+            return value
 
         _zero_crossing.terminal = True  # type: ignore[attr-defined]
         _zero_crossing.direction = -1.0  # type: ignore[attr-defined]
@@ -1177,8 +1186,8 @@ def _trigger_action_instant(
         op=action.op,
         species=action.species,
         time=time,
-        value=action.value,
-        delta=action.delta,
+        value=action.value, value_param=action.value_param,
+        delta=action.delta, delta_param=action.delta_param,
         declaration_ordinal=trigger.declaration_ordinal,
         phase="ordinary",
     )
@@ -1227,36 +1236,34 @@ def _apply_boundary(
     cancellation_check: Callable[[], bool] | None,
     observable_value: Callable[[str, float, np.ndarray, float], float] | None = None,
     temperature_step: bool = False,
+    parameter_values=None, executed_values=None,
 ) -> _BoundaryApplicationResult:
+    if executed_values is None:
+        executed_values = {}
     _raise_if_cancelled(cancellation_check)
     current = np.asarray(trigger_state if trigger_state is not None else state, dtype=float).reshape(-1).copy()
     exact_root = current.copy()
     projectable_solver_negatives = exact_root < 0.0 if input_is_raw_solver_state else np.zeros(exact_root.shape, dtype=bool)
     stops = tuple(index for index, item in enumerate(contract.triggers) if isinstance(item.then, InterventionStopAction))
     active_holds = _active_holds(contract, boundary)
-    if not stops:
-        current = _apply_holds(current, tuple(item for item in active_holds if item.start_time < boundary),
-                               species_index=species_index, cancellation_check=cancellation_check)
-        exact_root = current.copy()
-        projectable_solver_negatives = exact_root < 0.0 if input_is_raw_solver_state else np.zeros(exact_root.shape, dtype=bool)
     static = _static_instants_at(contract, boundary)
     entering_holds = tuple(item for item in active_holds if item.start_time == boundary)
     chemical_indices = tuple(index for index in trigger_indices if index not in stops)
     trigger_instants = tuple(_trigger_action_instant(contract.triggers[index], time=boundary) for index in chemical_indices)
     if not stops:
-        validate_boundary_conflicts(instants=static + trigger_instants, entering_holds=entering_holds, cancellation_check=cancellation_check)
+        validate_boundary_conflicts(instants=_resolve_items(static + trigger_instants, boundary, parameter_values), entering_holds=_resolve_items(entering_holds, boundary, parameter_values), cancellation_check=cancellation_check)
     changed = False
     executed_instants: list[ExecutableInstant] = []
 
-    def record(index: int) -> None:
+    def record(index: int, action=None) -> None:
         trigger = contract.triggers[index]
         trigger_counts[index] += 1
         trigger_last_times[index] = boundary
         trigger_firings.append(TriggerFiring(
             declaration_ordinal=trigger.declaration_ordinal, condition=trigger.condition,
-            threshold=trigger.threshold, direction=trigger.direction, root_time=boundary,
+            threshold=_resolve_items((trigger,), float(np.nextafter(boundary, -np.inf)) if temperature_step and index in trigger_indices else boundary, parameter_values)[0].threshold, direction=trigger.direction, root_time=boundary,
             event_state=_project_public_event_state({name: float((current if isinstance(trigger.then, InterventionStopAction) else exact_root)[position]) for name, position in species_index.items()}),
-            firing_ordinal=trigger_counts[index], nested_action_payload=trigger.then.to_payload(),
+            firing_ordinal=trigger_counts[index], nested_action_payload=trigger.then.to_payload() if action is None else {"op": action.op, "species": action.species, "value" if action.op == "set" else "delta": action.value if action.op == "set" else action.delta},
         ))
 
     def finish(stop: int | None = None) -> _BoundaryApplicationResult:
@@ -1274,7 +1281,7 @@ def _apply_boundary(
                                               species_index=species_index, changed=changed),
             termination,
             skipped_instants=(
-                tuple(item for item in static if item not in executed_instants)
+                tuple(item for item in static if item not in executed_values)
                 if stop is not None else ()
             ),
         )
@@ -1285,7 +1292,9 @@ def _apply_boundary(
             previous = _trigger_value(trigger, boundary, before, species_index=species_index,
                                       observable_value=observable_value, symbol_time=before_symbol_time)
             following = _trigger_value(trigger, boundary, current, species_index=species_index, observable_value=observable_value)
-            if _crossed(previous, following, trigger.threshold, trigger.direction):
+            previous_threshold = _resolve_items((trigger,), boundary if before_symbol_time is None else before_symbol_time, parameter_values)[0].threshold
+            following_threshold = _resolve_items((trigger,), boundary, parameter_values)[0].threshold
+            if _crossed(previous - previous_threshold, following - following_threshold, 0.0, trigger.direction):
                 return index
         return None
 
@@ -1293,10 +1302,14 @@ def _apply_boundary(
     if eligible_stops:
         return finish(min(eligible_stops, key=lambda index: contract.triggers[index].declaration_ordinal))
     if temperature_step and stops:
-        stop = crossed_stop(current, before_symbol_time=float(np.nextafter(boundary, -np.inf)))
+        before_temperature = current.copy()
+        current = _apply_holds(current, tuple(item for item in active_holds if item.start_time < boundary), species_index=species_index, cancellation_check=cancellation_check, time=boundary, parameter_values=parameter_values)
+        changed = not np.array_equal(before_temperature, current)
+        stop = crossed_stop(before_temperature, before_symbol_time=float(np.nextafter(boundary, -np.inf)))
         if stop is not None:
             return finish(stop)
     executed_entering_holds: list[ExecutableHold] = []
+    activated_holds = list(item for item in active_holds if item.start_time < boundary)
     stages = (
         tuple(item for item in active_holds if item.start_time < boundary),
         tuple(sorted((item for item in static if item.phase in {"ordinary", "before"}), key=_instant_canonical_order)),
@@ -1310,15 +1323,24 @@ def _apply_boundary(
         for action in stage:
             _raise_if_cancelled(cancellation_check)
             before = current.copy()
+            original = action
+            action = _resolve_items((action,), boundary, parameter_values)[0]
             if isinstance(action, ExecutableInstant):
                 if stops:
                     validate_boundary_conflicts(instants=(*executed_instants, action), entering_holds=executed_entering_holds, cancellation_check=cancellation_check)
                 current = _apply_instants(current, (action,), species_index=species_index, cancellation_check=cancellation_check)
                 executed_instants.append(action)
+                executed_values[original] = action
                 if action.declaration_ordinal in trigger_by_declaration:
-                    record(trigger_by_declaration[action.declaration_ordinal])
+                    record(trigger_by_declaration[action.declaration_ordinal], action)
             else:
-                if action in entering_holds and action not in executed_entering_holds:
+                if original not in activated_holds:
+                    activated_holds.append(original)
+                _validate_resolved_holds(
+                    _resolve_items(activated_holds, boundary, parameter_values),
+                    time=boundary, cancellation_check=cancellation_check,
+                )
+                if original in entering_holds and action not in executed_entering_holds:
                     if stops:
                         validate_boundary_conflicts(instants=executed_instants, entering_holds=(*executed_entering_holds, action), cancellation_check=cancellation_check)
                     executed_entering_holds.append(action)
@@ -1445,16 +1467,31 @@ def _apply_instants(
     return output
 
 
-def _apply_holds(
-    state: np.ndarray,
-    holds: Sequence[ExecutableHold],
-    *,
-    species_index: Mapping[str, int],
-    cancellation_check: Callable[[], bool] | None,
-) -> np.ndarray:
-    if not holds:
-        return state
-    output = np.asarray(state, dtype=float).reshape(-1).copy()
+def _resolve_items(items, time, parameter_values):
+    roots = tuple(sorted({
+        name
+        for item in items
+        for field in ("value", "delta", "flux_rate", "threshold")
+        if (name := getattr(item, f"{field}_param", None)) is not None
+    }))
+    if not roots:
+        return tuple(items)
+    try:
+        values = parameter_values(time, roots) if parameter_values is not None else {}
+        return tuple(
+            resolve_executable_values(item, values, time=time) for item in items
+        )
+    except Exception as exc:
+        if isinstance(exc, SimulationCancelled):
+            raise
+        raise InterventionScheduleError(
+            f"Intervention values at t={time:g}: {exc}", details={"time": time}
+        ) from exc
+
+
+def _validate_resolved_holds(holds, *, time, cancellation_check):
+    """Admit simultaneous held concentrations before projecting any state."""
+    used = {}
     for hold in holds:
         _raise_if_cancelled(cancellation_check)
         value = float(hold.value)
@@ -1462,32 +1499,47 @@ def _apply_holds(
             raise InterventionScheduleError(
                 "Intervention hold produced an invalid state."
             )
-        output[species_index[hold.species]] = value
-        _raise_if_cancelled(cancellation_check)
+        if hold.species in used and used[hold.species] != value:
+            raise InterventionScheduleError(
+                f"Overlapping holds for {hold.species} differ at t={time:g}."
+            )
+        used[hold.species] = value
+
+
+def _apply_holds(
+    state, holds, *, species_index, cancellation_check, time=0.0, parameter_values=None
+):
+    if not holds:
+        return state
+    resolved = _resolve_items(holds, time, parameter_values)
+    _validate_resolved_holds(resolved, time=time, cancellation_check=cancellation_check)
+    output = np.asarray(state, dtype=float).reshape(-1).copy()
+    for hold in resolved:
+        output[species_index[hold.species]] = hold.value
     return output
 
 
 def _apply_holds_to_trajectory(
-    states: object,
-    holds: Sequence[ExecutableHold],
+    states,
+    holds,
     *,
-    species_index: Mapping[str, int],
-    cancellation_check: Callable[[], bool] | None,
-) -> np.ndarray:
-    if not holds:
-        return np.asarray(states, dtype=float)
+    species_index,
+    cancellation_check,
+    times=None,
+    parameter_values=None,
+):
     output = np.asarray(states, dtype=float).copy()
-    if output.ndim != 2:
+    if not holds:
         return output
-    for hold in holds:
-        _raise_if_cancelled(cancellation_check)
-        value = float(hold.value)
-        if not math.isfinite(value) or value < 0.0:
-            raise InterventionScheduleError(
-                "Intervention hold produced an invalid published state."
-            )
-        output[species_index[hold.species], :] = value
-    _raise_if_cancelled(cancellation_check)
+    for column in range(output.shape[1]):
+        output[:, column] = _apply_holds(
+            output[:, column],
+            holds,
+            species_index=species_index,
+            cancellation_check=cancellation_check,
+            time=0.0 if times is None else float(times[column]),
+            parameter_values=parameter_values,
+        )
     return output
 
 
@@ -1499,48 +1551,61 @@ class _InterventionRhs:
         fluxes: Sequence[ExecutableFlux],
         holds: Sequence[ExecutableHold],
         species_index: Mapping[str, int],
+        parameter_values=None,
+        symbol_time=None,
     ) -> None:
         self._rhs = rhs
         self._fluxes = tuple(fluxes)
         self._holds = tuple(holds)
         self._species_index = dict(species_index)
-        signed_flux_by_index: dict[int, float] = {}
-        has_negative_flux: set[int] = set()
-        for flux in self._fluxes:
+        self._parameter_values = parameter_values
+        self._symbol_time = symbol_time or (lambda time: time)
+
+    def _flux_values(self, time):
+        sums = {}
+        negative = set()
+        for flux in _resolve_items(
+            self._fluxes, self._symbol_time(time), self._parameter_values
+        ):
             index = self._species_index[flux.species]
-            signed_flux_by_index[index] = (
-                signed_flux_by_index.get(index, 0.0) + float(flux.flux_rate)
-            )
+            sums[index] = sums.get(index, 0.0) + float(flux.flux_rate)
             if flux.flux_rate < 0.0:
-                has_negative_flux.add(index)
-        self._signed_flux_by_index = signed_flux_by_index
-        self._purge_indices = frozenset(has_negative_flux)
+                negative.add(index)
+        return sums, negative
 
     def _base_evaluation_state(
         self,
         state: np.ndarray,
+        time: float = 0.0,
     ) -> tuple[np.ndarray, set[int]]:
         raw = np.asarray(state, dtype=float).reshape(-1)
         evaluation_state = raw.copy()
         fixed: set[int] = set()
-        for hold in self._holds:
-            index = self._species_index[hold.species]
-            evaluation_state[index] = float(hold.value)
-            fixed.add(index)
-        for index in self._purge_indices:
+        evaluation_state = _apply_holds(
+            evaluation_state,
+            self._holds,
+            species_index=self._species_index,
+            cancellation_check=None,
+            time=self._symbol_time(time),
+            parameter_values=self._parameter_values,
+        )
+        fixed = {self._species_index[hold.species] for hold in self._holds}
+        _sums, negative = self._flux_values(time)
+        for index in negative:
             if evaluation_state[index] < 0.0:
                 evaluation_state[index] = 0.0
         return evaluation_state, fixed
 
     def __call__(self, time: float, state: np.ndarray) -> np.ndarray:
         raw_state = np.asarray(state, dtype=float).reshape(-1)
-        evaluation_state, fixed = self._base_evaluation_state(raw_state)
+        evaluation_state, fixed = self._base_evaluation_state(raw_state, time)
         derivative = np.asarray(
-            self._rhs(time, evaluation_state), dtype=float
+            self._rhs(self._symbol_time(time), evaluation_state), dtype=float
         ).copy()
-        for index, rate in self._signed_flux_by_index.items():
+        sums, negative = self._flux_values(time)
+        for index, rate in sums.items():
             candidate = float(derivative[index]) + rate
-            if index in self._purge_indices and raw_state[index] <= 0.0:
+            if index in negative and raw_state[index] <= 0.0:
                 derivative[index] = max(0.0, candidate)
             else:
                 derivative[index] = candidate
@@ -1556,14 +1621,17 @@ class _InterventionRhs:
         """Return rows and columns masked by the active purge branch."""
 
         raw_state = np.asarray(state, dtype=float).reshape(-1)
-        evaluation_state, _fixed = self._base_evaluation_state(raw_state)
-        derivative = np.asarray(self._rhs(time, evaluation_state), dtype=float)
+        evaluation_state, _fixed = self._base_evaluation_state(raw_state, time)
+        derivative = np.asarray(
+            self._rhs(self._symbol_time(time), evaluation_state), dtype=float
+        )
         zero_rows: set[int] = set()
         zero_columns: set[int] = set()
-        for index in self._purge_indices:
+        sums, negative = self._flux_values(time)
+        for index in negative:
             if raw_state[index] < 0.0:
                 zero_columns.add(index)
-            rate = self._signed_flux_by_index[index]
+            rate = sums[index]
             if raw_state[index] > 0.0:
                 continue
             candidate = float(derivative[index]) + rate
@@ -1591,18 +1659,18 @@ class _InterventionJacobian:
         self._fluxes = tuple(fluxes)
         self._species_index = dict(species_index)
 
-    def _evaluate_state(self, state: np.ndarray) -> tuple[np.ndarray, set[int]]:
+    def _evaluate_state(self, state: np.ndarray, time: float) -> tuple[np.ndarray, set[int]]:
         values = np.asarray(state, dtype=float).reshape(-1)
         held = {
             self._species_index[hold.species]
             for hold in self._holds
         }
-        used, _fixed = self._rhs._base_evaluation_state(values)
+        used, _fixed = self._rhs._base_evaluation_state(values, time)
         return used, held
 
     def __call__(self, time: float, state: np.ndarray) -> np.ndarray:
-        used, held = self._evaluate_state(state)
-        matrix = np.asarray(self._jacobian(float(time), used), dtype=float).copy()
+        used, held = self._evaluate_state(state, time)
+        matrix = np.asarray(self._jacobian(self._rhs._symbol_time(float(time)), used), dtype=float).copy()
         size = used.size
         if matrix.shape != (size, size):
             raise ValueError(
@@ -1690,6 +1758,7 @@ def _trigger_callables(
     observable_value: Callable[[str, float, np.ndarray, float], float] | None = None,
     segment_end: float | None = None,
     temperature_step_at_end: bool = False,
+    parameter_values=None, holds=(),
 ) -> tuple[tuple[Callable[[float, np.ndarray], float], ...], tuple[int, ...]]:
     callables: list[Callable[[float, np.ndarray], float]] = []
     mapping: list[int] = []
@@ -1702,8 +1771,8 @@ def _trigger_callables(
         )
         if ready is None or segment_start < ready:
             continue
-        threshold = trigger.threshold
-        starts_at_threshold = _trigger_value(trigger, segment_start, segment_state, species_index=species_index, observable_value=observable_value) == threshold
+        threshold = _resolve_items((trigger,), segment_start, parameter_values)[0].threshold
+        starts_at_threshold = _trigger_value(trigger, segment_start, _apply_holds(segment_state, holds, species_index=species_index, cancellation_check=None, time=segment_start, parameter_values=parameter_values), species_index=species_index, observable_value=observable_value) == threshold
         directions = (
             ("rising", "falling")
             if trigger.direction == "either"
@@ -1733,7 +1802,9 @@ def _trigger_callables(
                 _neutral_value: float = neutral_value,
             ) -> float:
                 symbol_time = float(np.nextafter(time, -np.inf)) if temperature_step_at_end and time == segment_end else time
-                value = _trigger_value(_trigger, time, state, species_index=species_index, observable_value=observable_value, symbol_time=symbol_time) - _threshold
+                state = _apply_holds(state, holds, species_index=species_index, cancellation_check=None, time=symbol_time, parameter_values=parameter_values)
+                threshold = _resolve_items((_trigger,), symbol_time, parameter_values)[0].threshold
+                value = _trigger_value(_trigger, time, state, species_index=species_index, observable_value=observable_value, symbol_time=symbol_time) - threshold
                 if _starts_at_threshold and (float(time) == _segment_start or (isinstance(_trigger.then, InterventionStopAction) and value == 0.0)):
                     return _neutral_value
                 return value

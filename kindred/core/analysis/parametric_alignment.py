@@ -12,7 +12,8 @@ from dataclasses import dataclass, fields
 import numpy as np
 
 from kindred.core.analysis.fit_dataset_payload import FitObservationSeries
-from kindred.core.exceptions import FitCandidateDomainError, FitSimulationError
+from kindred.core.exceptions import FitCandidateDomainError, FitSimulationError, FittingCancelled
+from kindred.core.simulator.solver_types import SimulationCancellationControl
 
 __all__ = ["CandidateParametricAlignmentError", "ParametricProjection",
            "align_parametric", "project_parametric_y"]
@@ -107,6 +108,7 @@ def align_parametric(
     multipliers: Mapping[str, float],
     dataset_label: str,
     x_name: str,
+    cancellation_control: SimulationCancellationControl | None,
 ) -> ParametricProjection:
     """Minimize sum((weight multiplier * discrepancy)**2) on each segment.
 
@@ -114,6 +116,8 @@ def align_parametric(
     time is deliberately absent. Endpoints also participate, including isolated
     samples beside a jump. No segment crosses an executor-issued boundary.
     """
+    if cancellation_control is not None and cancellation_control.cancel_requested():
+        raise FittingCancelled()
     names = tuple(sorted(observations))
     model = np.column_stack((model_x, *(model_y[name] for name in names)))
     if not model.size or not np.all(np.isfinite(model)):
@@ -139,6 +143,8 @@ def align_parametric(
     chosen_rows: list[int] = []
     chosen_fractions: list[float] = []
     for row, x_value in zip(source_rows, observed_x, strict=True):
+        if cancellation_control is not None and cancellation_control.cancel_requested():
+            raise FittingCancelled()
         observed = np.asarray([x_value, *(observed_by_row[name].get(row, np.nan) for name in names)])
         available = np.isfinite(observed)
         start = model[left][:, available]

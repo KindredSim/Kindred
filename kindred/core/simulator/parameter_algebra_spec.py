@@ -316,13 +316,16 @@ class ParameterAlgebraSpec:
     scalar_input_names: Set[str] = field(default_factory=set)
     parameter_block: AlgebraBlock | None = None
     observable_block: AlgebraBlock | None = None
-    # One admitted graph for parameter Algebra.  Mapping insertion order is the
-    # retained dependency order; each value contains only direct references to
-    # another ``param`` assignment.  Protected constants and mechanism leaves
-    # are intentionally absent from these dependency tuples.
+    # Authored-assignment projection for symbolic/source consumers. Numerical
+    # ordering and classification use evaluation_dependencies, which also
+    # includes chemistry readouts and their canonical source coordinates.
     parameter_dependencies: Mapping[str, Tuple[str, ...]] = field(
         default_factory=dict
     )
+    evaluation_dependencies: Mapping[str, Tuple[str, ...]] = field(default_factory=dict)
+    chemistry_dependencies: Mapping[str, Tuple[str, ...]] = field(default_factory=dict)
+    temperature_dependent_names: frozenset[str] = frozenset()
+    identity_checks: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "param_statements", tuple(self.param_statements))
@@ -337,6 +340,10 @@ class ParameterAlgebraSpec:
             "parameter_dependencies",
             MappingProxyType(dependencies),
         )
+        for field_name in ("evaluation_dependencies", "chemistry_dependencies"):
+            object.__setattr__(self, field_name, MappingProxyType({name: tuple(deps) for name, deps in getattr(self, field_name).items()}))
+        object.__setattr__(self, "temperature_dependent_names", frozenset(self.temperature_dependent_names))
+        object.__setattr__(self, "identity_checks", tuple(self.identity_checks))
 
     def __deepcopy__(self, memo: dict[int, object]) -> "ParameterAlgebraSpec":
         import copy
@@ -352,6 +359,8 @@ class ParameterAlgebraSpec:
                 name: tuple(dependencies)
                 for name, dependencies in self.parameter_dependencies.items()
             },
+            dict(self.evaluation_dependencies), dict(self.chemistry_dependencies),
+            self.temperature_dependent_names, self.identity_checks,
         )
         memo[id(self)] = clone
         return clone
@@ -370,6 +379,8 @@ class ParameterAlgebraSpec:
                     name: tuple(dependencies)
                     for name, dependencies in self.parameter_dependencies.items()
                 },
+                dict(self.evaluation_dependencies), dict(self.chemistry_dependencies),
+                self.temperature_dependent_names, self.identity_checks,
             ),
         )
 
@@ -386,9 +397,11 @@ class ParameterAlgebraSpec:
         requested = str(name)
         if requested not in self.parameter_dependencies:
             raise KeyError(f"Unknown parameter assignment {requested!r}.")
+        if requested in self.identity_checks:
+            return "source identity"
         if requested in self.mechanism_param_names:
             return "mechanism-bound"
-        if self.parameter_dependencies[requested]:
+        if self.evaluation_dependencies.get(requested, self.parameter_dependencies[requested]):
             return "derived scalar"
         return "independent scalar"
 
@@ -405,6 +418,88 @@ class ParameterAlgebraSpec:
             builtin_function_names=set(symtab.functions().keys()),
             protected_symbol_names=set(symtab.protected_names()),
         )
+
+
+def admit_parameter_evaluation_graph(
+    spec: ParameterAlgebraSpec, mechanism: object
+) -> ParameterAlgebraSpec:
+    """Compose authored definitions with typed chemistry before publication."""
+    from graphlib import CycleError, TopologicalSorter
+    from .parameter_coordinates import (
+        build_parameter_target_map,
+        chemistry_parameter_dependencies,
+    )
+    from .exact_constraint_composition import proves_redundant_parameter
+    from kindred.core.equilibrium_rate_authority import (
+        require_step_entry_authored_role_is_editable,
+    )
+
+    targets = build_parameter_target_map(mechanism)
+    chemistry = chemistry_parameter_dependencies(mechanism, targets)
+    statements = {statement.name: statement for statement in spec.parameter_block.lines}
+    names = set(targets) | set(statements) | {"T"}
+    graph = {name: () for name in sorted(names)}
+    graph.update(chemistry)
+    for name, statement in statements.items():
+        if name in chemistry:
+            raise DSLError(
+                f"{name} is a chemistry-derived readout, not an editable source coordinate.",
+                line_number=statement.line,
+                line_content=statement.line_text,
+            )
+        if name in targets:
+            route, kind, _index, role, entry = targets[name]
+            if entry.get("locked", False):
+                raise DSLError(
+                    f"Mechanism coordinate {name!r} is locked and not writable."
+                )
+            if kind == "equilibrium" and (route == "indexed" or role == "dG_eq"):
+                require_step_entry_authored_role_is_editable(
+                    entry, role, parameter_name=name
+                )
+        graph[name] = tuple(
+            dict.fromkeys(
+                dep for dep in _iter_expr_identifiers(statement.expr) if dep in names
+            )
+        )
+    identities: list[str] = []
+    while True:
+        try:
+            order = tuple(TopologicalSorter(graph).static_order())
+            break
+        except CycleError as exc:
+            cycle = exc.args[1]
+            candidate = next(
+                (
+                    name
+                    for name in sorted(set(cycle))
+                    if name in statements
+                    and name in targets
+                    and name not in chemistry
+                    and proves_redundant_parameter(
+                        mechanism, statements, name, identities
+                    )
+                ),
+                None,
+            )
+            if candidate is None:
+                raise DSLError(
+                    "Circular parameter definition through chemistry: "
+                    + " -> ".join(cycle)
+                ) from exc
+            graph[candidate] = ()
+            identities.append(candidate)
+    dynamic = {"T"}
+    for name in order:
+        if any(dep in dynamic for dep in graph.get(name, ())):
+            dynamic.add(name)
+    return replace(
+        spec,
+        evaluation_dependencies={name: graph.get(name, ()) for name in order},
+        chemistry_dependencies=chemistry,
+        temperature_dependent_names=frozenset(dynamic),
+        identity_checks=tuple(identities),
+    )
 
 
 def _iter_expr_identifiers(expr: ExprNode):
@@ -667,102 +762,9 @@ def _validate_retained_parameter_program(
     for name in block.evaluation_order:
         visit(name, [])
 
-    # Catch domains that become statically decidable through a chain of
-    # literal/constant assignments (for example ``param a = 0`` followed by
-    # ``param b = 1 / a``), across the static dependency chain.
-    static_names: set[str] = set()
-    pending = list(assignments)
-    changed = True
-    statement_by_name = {
-        str(assignment.name): statement
-        for assignment, statement in zip(assignments, block.lines)
-    }
-    while changed:
-        changed = False
-        for assignment in pending:
-            name = str(assignment.name)
-            if name in static_names:
-                continue
-            statement = statement_by_name[name]
-            idents = set(_iter_expr_identifiers(statement.expr))
-            if statement.expr.has_species_ref() or (idents & {"T", "t"}):
-                continue
-            external = idents - defined - allowed_constants
-            if external:
-                continue
-            if all(dependency in static_names for dependency in dependencies.get(name, ())):
-                static_names.add(name)
-                changed = True
-    if static_names:
-        ordered_static_names: list[str] = []
-        ordered_seen: set[str] = set()
-
-        def append_static(name: str) -> None:
-            if name in ordered_seen:
-                return
-            for dependency in dependencies.get(name, ()):
-                if dependency in static_names:
-                    append_static(dependency)
-            ordered_seen.add(name)
-            ordered_static_names.append(name)
-
-        for assignment in assignments:
-            if str(assignment.name) in static_names:
-                append_static(str(assignment.name))
-        static_statements = tuple(
-            statement_by_name[name]
-            for name in ordered_static_names
-        )
-        try:
-            import numpy as np
-
-            from kindred.core.algebra.evaluator import EvaluationContext, evaluate_block
-
-            static_series, static_scalars = evaluate_block(
-                AlgebraBlock(
-                    lines=static_statements,
-                    ast=tuple(statement.expr for statement in static_statements),
-                    static_values={},
-                ),
-                EvaluationContext(
-                    t=np.array([0.0]),
-                    species_series={},
-                    initials={},
-                    species_names=set(),
-                    symtab=SymbolTable(),
-                ),
-            )
-            for name in ordered_static_names:
-                if name not in namespace.mechanism_param_names:
-                    continue
-                if name in static_scalars:
-                    value = float(static_scalars[name])
-                else:
-                    values = static_series.get(name)
-                    if values is None or values.size != 1:
-                        raise ValueError(
-                            f"Static mechanism parameter {name!r} has no scalar value."
-                        )
-                    value = float(values[0])
-                if not np.isfinite(value):
-                    raise ValueError(
-                        f"Mechanism parameter {name!r} must be a finite real."
-                    )
-        except Exception as exc:
-            name = next(
-                (
-                    str(statement.name)
-                    for statement in static_statements
-                    if int(getattr(exc, "line", 0) or 0) == int(statement.line)
-                ),
-                str(static_statements[0].name),
-            )
-            assignment = next(item for item in assignments if item.name == name)
-            raise DSLError(
-                f"Static parameter expression for {name!r} is invalid: {exc}",
-                line_number=assignment.line_number,
-                line_content=assignment.line_content,
-            ) from exc
+    # Defaults with no parameter references are admitted above. Derived
+    # expressions are checked when consumed, even when their dependencies are
+    # temperature-independent; an unused intervention must not force them.
 
     # ``ordered_names`` is the admitted evaluation order, and each tuple is
     # the direct identifier order retained from that assignment's AST.

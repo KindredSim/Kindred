@@ -22,6 +22,8 @@ from kindred.core.equilibrium_rate_authority import (
     effective_equilibrium_reverse_rate,
     normalize_existing_equilibrium_rate_authority,
     require_step_entry_authored_role_is_editable,
+    derived_equilibrium_ratio_from_directional_rates,
+    effective_reverse_rate_from_keq,
 )
 from kindred.core.kinetics import (
     ArrheniusRateModel,
@@ -30,12 +32,15 @@ from kindred.core.kinetics import (
     ForwardRateModel,
     forward_rate_model_for_equilibrium,
     forward_rate_model_for_reaction,
+    forward_rate_at_temperature,
 )
 from kindred.core.mechanism_metadata import (
     EquilibriumMetadataKeys,
     MechanismMetadataView,
 )
 from kindred.core.rate_binding import ForwardRateBinding, RateBinding
+from kindred.core.stoichiometry import directional_order_fraction
+from kindred.core.thermodynamics import concentration_Keq_from_deltaG_eq
 from kindred.core.simulator.dsl_build_input import source_coordinate_capabilities
 from kindred.core.simulator.errors import DSLError
 from kindred.core.simulator.parameter_namespace import build_namespace_from_mechanism
@@ -114,6 +119,142 @@ def build_parameter_target_map(
             entry,
         )
     return targets
+
+
+def chemistry_parameter_dependencies(
+    mechanism: object, targets: Mapping[str, ParameterTarget]
+) -> dict[str, tuple[str, ...]]:
+    """Describe derived readouts using the admitted typed chemistry authority."""
+    dependencies: dict[str, tuple[str, ...]] = {}
+    metadata = MechanismMetadataView.from_metadata(mechanism.metadata)
+    for name, (_route, kind, index, role, entry) in targets.items():
+        step = (
+            mechanism.reactions[index]
+            if kind == "reaction"
+            else mechanism.equilibria[index]
+        )
+        source = dict(entry.get("source_coordinates") or {})
+        number = entry["step_index"]
+        if role in {"k", "kf"}:
+            model = (
+                forward_rate_model_for_reaction(
+                    step, default_standard_conc_M=metadata.standard_conc_M
+                )
+                if kind == "reaction"
+                else forward_rate_model_for_equilibrium(
+                    step,
+                    temperature_K=None,
+                    default_standard_conc_M=metadata.standard_conc_M,
+                )
+            )
+            roles = (
+                ("A", "Ea")
+                if isinstance(model, ArrheniusRateModel)
+                else ("dG_act", "kappa", "degeneracy")
+                if isinstance(model, EyringRateModel)
+                else ()
+            )
+            if roles:
+                dependencies[name] = tuple(source[r] for r in roles if r in source) + (
+                    "T",
+                )
+        elif kind == "equilibrium":
+            authority = normalize_existing_equilibrium_rate_authority(step)
+            if role == "kr" and authority.kind == EquilibriumRateAuthorityKind.KEQ:
+                dependencies[name] = (f"kf{number}", f"Keq{number}")
+            elif role == "Keq":
+                if authority.kind == EquilibriumRateAuthorityKind.KR:
+                    dependencies[name] = (f"kf{number}", f"kr{number}")
+                elif (
+                    authority.dG_eq_J_per_mol is not None
+                    and not authority.has_explicit_keq_param
+                ):
+                    dependencies[name] = (source["dG_eq"], "T")
+    return dependencies
+
+
+def bind_chemistry_readout(
+    mechanism: object, target: ParameterTarget, values: dict[str, float]
+):
+    """Bind an owned calculation without copying formulas or mutating a step."""
+    _route, kind, index, role, entry = target
+    step = (
+        mechanism.reactions[index]
+        if kind == "reaction"
+        else mechanism.equilibria[index]
+    )
+    metadata = MechanismMetadataView.from_metadata(mechanism.metadata)
+    source = dict(entry.get("source_coordinates") or {})
+    number = entry["step_index"]
+    if role in {"k", "kf"}:
+        model = (
+            forward_rate_model_for_reaction(
+                step, default_standard_conc_M=metadata.standard_conc_M
+            )
+            if kind == "reaction"
+            else forward_rate_model_for_equilibrium(
+                step,
+                temperature_K=None,
+                default_standard_conc_M=metadata.standard_conc_M,
+            )
+        )
+        fields = {
+            "A": "A",
+            "Ea": "Ea_J_per_mol",
+            "dG_act": "dG_act_J_per_mol",
+            "kappa": "kappa",
+            "degeneracy": "degeneracy",
+        }
+
+        def forward():
+            updates = {}
+            for coordinate, field in fields.items():
+                if coordinate in source:
+                    value = values[source[coordinate]]
+                    updates[field] = (
+                        int(value)
+                        if coordinate == "degeneracy"
+                        else admit_physical_coordinate_value(
+                            value,
+                            role=coordinate,
+                            energy_unit=metadata.energy_unit,
+                            field=source[coordinate],
+                        )
+                    )
+            return forward_rate_at_temperature(replace(model, **updates), values["T"])
+
+        return forward
+    if role == "kr":
+        return lambda: float(
+            effective_reverse_rate_from_keq(
+                values[f"kf{number}"], values[f"Keq{number}"]
+            )
+        )
+    authority = normalize_existing_equilibrium_rate_authority(step)
+    if authority.kind == EquilibriumRateAuthorityKind.KR:
+        return lambda: derived_equilibrium_ratio_from_directional_rates(
+            values[f"kf{number}"], values[f"kr{number}"]
+        )
+    delta_n = float(
+        directional_order_fraction(step.stoich_back)
+        - directional_order_fraction(step.stoich_forward)
+    )
+    standard_conc = float(
+        step.metadata.get(
+            EquilibriumMetadataKeys.STANDARD_CONC_M, metadata.standard_conc_M
+        )
+    )
+    return lambda: concentration_Keq_from_deltaG_eq(
+        admit_physical_coordinate_value(
+            values[source["dG_eq"]],
+            role="dG_eq",
+            energy_unit=metadata.energy_unit,
+            field=source["dG_eq"],
+        ),
+        values["T"],
+        standard_conc,
+        delta_n,
+    )
 
 
 def admit_physical_coordinate_value(
@@ -567,7 +708,7 @@ def read_mechanism_parameter_values(
                     step,
                     temperature_K=float(metadata.temperature_K),
                 )
-        elif source_coordinate_capabilities(role).algebra_target:
+        elif source_coordinate_capabilities(role).algebra_target or role == "degeneracy":
             if kind == "reaction":
                 model = forward_rate_model_for_reaction(
                     step,
@@ -587,6 +728,8 @@ def read_mechanism_parameter_values(
                 value = float(energy_units.from_jmol(model.dG_act_J_per_mol))
             elif role == "kappa" and isinstance(model, EyringRateModel):
                 value = float(model.kappa)
+            elif role == "degeneracy" and isinstance(model, EyringRateModel):
+                value = float(model.degeneracy)
             elif role == "dG_eq" and kind == "equilibrium":
                 value = _value(
                     getattr(step, "metadata", {}).get(

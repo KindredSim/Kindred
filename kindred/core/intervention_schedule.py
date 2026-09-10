@@ -261,6 +261,15 @@ def _pair(
     return validator(value, field=field), None
 
 
+def _resolved_payload(value, parameter, values, *, field, domain, runtime_parameters):
+    if parameter in runtime_parameters:
+        return {field: None, f"{field}_param": parameter}
+    return {
+        field: _resolved(value, parameter, values, field=field, domain=domain),
+        f"{field}_param": None,
+    }
+
+
 def _resolved(
     value: float | None,
     parameter: str | None,
@@ -361,15 +370,15 @@ class InterventionSet:
     def is_parameterized(self) -> bool:
         return self.time_param is not None or self.value_param is not None
 
-    def resolve_parameters(self, values: Mapping[str, Any]) -> "InterventionSet":
+    def resolve_parameters(self, values: Mapping[str, Any], *, runtime_parameters: frozenset[str] = frozenset()) -> "InterventionSet":
         return InterventionSet(
             species=self.species,
             time=_resolved(
                 self.time, self.time_param, values, field="time", domain="nonnegative"
             ),
-            value=_resolved(
+            **_resolved_payload(
                 self.value, self.value_param, values, field="value", domain="concentration"
-            ),
+            , runtime_parameters=runtime_parameters),
             declaration_ordinal=self.declaration_ordinal,
         )
 
@@ -419,15 +428,15 @@ class InterventionJump:
     def is_parameterized(self) -> bool:
         return self.time_param is not None or self.delta_param is not None
 
-    def resolve_parameters(self, values: Mapping[str, Any]) -> "InterventionJump":
+    def resolve_parameters(self, values: Mapping[str, Any], *, runtime_parameters: frozenset[str] = frozenset()) -> "InterventionJump":
         return InterventionJump(
             species=self.species,
             time=_resolved(
                 self.time, self.time_param, values, field="time", domain="nonnegative"
             ),
-            delta=_resolved(
+            **_resolved_payload(
                 self.delta, self.delta_param, values, field="delta", domain="signed"
-            ),
+            , runtime_parameters=runtime_parameters),
             declaration_ordinal=self.declaration_ordinal,
         )
 
@@ -497,7 +506,7 @@ class InterventionFlux:
             )
         )
 
-    def resolve_parameters(self, values: Mapping[str, Any]) -> "InterventionFlux":
+    def resolve_parameters(self, values: Mapping[str, Any], *, runtime_parameters: frozenset[str] = frozenset()) -> "InterventionFlux":
         start_time = _resolved(
             self.start_time,
             self.start_time_param,
@@ -531,13 +540,13 @@ class InterventionFlux:
             species=self.species,
             start_time=start_time,
             end_time=end_time,
-            flux_rate=_resolved(
+            **_resolved_payload(
                 self.flux_rate,
                 self.flux_rate_param,
                 values,
                 field="flux_rate",
                 domain="signed",
-            ),
+            runtime_parameters=runtime_parameters),
             declaration_ordinal=self.declaration_ordinal,
         )
 
@@ -608,7 +617,7 @@ class InterventionHold:
             )
         )
 
-    def resolve_parameters(self, values: Mapping[str, Any]) -> "InterventionHold":
+    def resolve_parameters(self, values: Mapping[str, Any], *, runtime_parameters: frozenset[str] = frozenset()) -> "InterventionHold":
         start_time = _resolved(
             self.start_time,
             self.start_time_param,
@@ -642,13 +651,13 @@ class InterventionHold:
             species=self.species,
             start_time=start_time,
             end_time=end_time,
-            value=_resolved(
+            **_resolved_payload(
                 self.value,
                 self.value_param,
                 values,
                 field="value",
                 domain="concentration",
-            ),
+            runtime_parameters=runtime_parameters),
             declaration_ordinal=self.declaration_ordinal,
         )
 
@@ -727,7 +736,7 @@ class InterventionProtocolOperation:
         )
 
     def resolve_parameters(
-        self, values: Mapping[str, Any]
+        self, values: Mapping[str, Any], *, runtime_parameters: frozenset[str] = frozenset()
     ) -> "InterventionProtocolOperation":
         selected = {"set": "value", "hold": "value", "jump": "delta", "flux": "flux_rate"}[self.op]
         kwargs: dict[str, Any] = {
@@ -736,13 +745,8 @@ class InterventionProtocolOperation:
             "species": self.species,
             "authored_ordinal": self.authored_ordinal,
         }
-        kwargs[selected] = _resolved(
-            getattr(self, selected),
-            getattr(self, f"{selected}_param"),
-            values,
-            field=selected,
-            domain="concentration" if selected == "value" else "signed",
-        )
+        kwargs.update(_resolved_payload(getattr(self, selected), getattr(self, f"{selected}_param"), values,
+            field=selected, domain="concentration" if selected == "value" else "signed", runtime_parameters=runtime_parameters))
         return InterventionProtocolOperation(**kwargs)
 
     def to_payload(self) -> dict[str, Any]:
@@ -830,13 +834,13 @@ class InterventionProtocol:
             for operation in self.before + self.during + self.after
         )
 
-    def resolve_parameters(self, values: Mapping[str, Any]) -> "InterventionProtocol":
+    def resolve_parameters(self, values: Mapping[str, Any], *, runtime_parameters: frozenset[str] = frozenset()) -> "InterventionProtocol":
         resolved_phases: dict[str, tuple[InterventionProtocolOperation, ...]] = {}
         for phase in ("before", "during", "after"):
             resolved_items: list[InterventionProtocolOperation] = []
             for nested in getattr(self, phase):
                 try:
-                    resolved_items.append(nested.resolve_parameters(values))
+                    resolved_items.append(nested.resolve_parameters(values, runtime_parameters=runtime_parameters))
                 except InterventionScheduleError as exc:
                     details = dict(getattr(exc, "details", {}) or {})
                     details["nested_location"] = {
@@ -936,21 +940,14 @@ class InterventionTriggerAction:
         return self.value_param is not None or self.delta_param is not None
 
     def resolve_parameters(
-        self, values: Mapping[str, Any]
+        self, values: Mapping[str, Any], *, runtime_parameters: frozenset[str] = frozenset()
     ) -> "InterventionTriggerAction":
         selected = "value" if self.op == "set" else "delta"
         return InterventionTriggerAction(
             op=self.op,
             species=self.species,
-            **{
-                selected: _resolved(
-                    getattr(self, selected),
-                    getattr(self, f"{selected}_param"),
-                    values,
-                    field=selected,
-                    domain="concentration" if selected == "value" else "signed",
-                )
-            },
+            **_resolved_payload(getattr(self, selected), getattr(self, f"{selected}_param"), values,
+                field=selected, domain="concentration" if selected == "value" else "signed", runtime_parameters=runtime_parameters),
         )
 
     def to_payload(self) -> dict[str, Any]:
@@ -997,7 +994,7 @@ class InterventionStopAction:
     def is_parameterized(self) -> bool:
         return False
 
-    def resolve_parameters(self, values: Mapping[str, Any]) -> InterventionStopAction:
+    def resolve_parameters(self, values: Mapping[str, Any], *, runtime_parameters: frozenset[str] = frozenset()) -> InterventionStopAction:
         return self
 
     def to_payload(self) -> dict[str, str]:
@@ -1045,9 +1042,9 @@ class InterventionTrigger:
     def is_parameterized(self) -> bool:
         return self.threshold_param is not None or self.then.is_parameterized
 
-    def resolve_parameters(self, values: Mapping[str, Any]) -> InterventionTrigger:
+    def resolve_parameters(self, values: Mapping[str, Any], *, runtime_parameters: frozenset[str] = frozenset()) -> InterventionTrigger:
         try:
-            then = self.then.resolve_parameters(values)
+            then = self.then.resolve_parameters(values, runtime_parameters=runtime_parameters)
         except InterventionScheduleError as exc:
             raise InterventionScheduleError(
                 str(exc), operation=self.op, declaration_ordinal=self.declaration_ordinal,
@@ -1056,11 +1053,11 @@ class InterventionTrigger:
                 details=exc.details,
             ) from exc
         return replace(
-            self, then=then, threshold_param=None,
-            threshold=_resolved(
+            self, then=then,
+            **_resolved_payload(
                 self.threshold, self.threshold_param, values, field="threshold",
                 domain="concentration" if isinstance(self.condition, SpeciesTriggerCondition) else "signed",
-            ),
+            runtime_parameters=runtime_parameters),
         )
 
     def to_payload(self) -> dict[str, Any]:
@@ -1156,6 +1153,7 @@ class InterventionSchedule:
         parameter_values: Mapping[str, Any] | None,
         *,
         dependency_metadata: InterventionScheduleDependencyMetadata | None = None,
+        runtime_parameters: frozenset[str] = frozenset(),
     ) -> "InterventionSchedule":
         if not self.is_parameterized:
             return self
@@ -1164,7 +1162,7 @@ class InterventionSchedule:
         resolved: list[InterventionOperation] = []
         for item in self.operations:
             try:
-                resolved.append(item.resolve_parameters(values))
+                resolved.append(item.resolve_parameters(values, runtime_parameters=runtime_parameters))
             except InterventionScheduleError as exc:
                 raise _annotate_schedule_resolution_error(
                     exc,

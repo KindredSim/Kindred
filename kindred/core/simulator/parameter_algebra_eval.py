@@ -1,200 +1,161 @@
-"""Runtime evaluation of the admitted parameter Algebra program.
-
-The parser owns admission, canonical AST retention, and the parameter
-dependency mapping.  This module only consumes those retained facts; it does
-not parse source text or rediscover dependencies from expression trees.
-"""
-
+"""Bind the admitted chemistry/Algebra order to current candidate values."""
 from __future__ import annotations
 
-import math
-from collections.abc import Mapping, Sequence
-from typing import Dict
-
-import numpy as np
+from collections.abc import Mapping
 
 from kindred.core.algebra.errors import AlgebraError
-from kindred.core.algebra.evaluator import EvaluationContext, evaluate_block
-from kindred.core.algebra.parser import AlgebraBlock
-from kindred.core.algebra.symbols import SymbolTable
+from kindred.core.algebra.evaluator import bind_scalar_expression_evaluator
+from kindred.core.exceptions import KineticRuntimeDomainError
+from kindred.core.mechanism_metadata import MechanismMetadataView
 from kindred.core.simulator.errors import DSLError
-from kindred.core.simulator.parameter_algebra_spec import (
-    ParameterAlgebraSpec,
+from kindred.core.simulator.parameter_algebra_spec import ParameterAlgebraSpec, _iter_expr_identifiers
+from kindred.core.simulator.parameter_coordinates import (
+    build_parameter_target_map, read_mechanism_parameter_values, bind_chemistry_readout,
+    _admit_coordinate_value,
 )
 
-__all__ = [
-    "evaluate_parameter_algebra",
-    "evaluate_parameter_algebra_in_context",
-]
 
-
-def _retained_block(
+def bind_parameter_evaluation(
     spec: ParameterAlgebraSpec,
-    names: Sequence[str],
-) -> AlgebraBlock:
-    retained = spec.parameter_block
-    if retained is None:
-        raise DSLError(
-            "Parameter algebra has no retained admitted AST.",
-            suggestion="Re-admit the mechanism source before evaluating parameter algebra.",
-        )
-    statements_by_name = {
-        str(statement.name): statement
-        for statement in retained.lines
-    }
-    ordered_names = tuple(str(name) for name in names)
-    missing = [name for name in ordered_names if name not in statements_by_name]
-    if missing:
-        raise DSLError(
-            "Parameter algebra is missing retained assignment(s): "
-            + ", ".join(repr(name) for name in missing)
-        )
-    lines = tuple(statements_by_name[name] for name in ordered_names)
-    static_values = retained.static_value_map()
-    return AlgebraBlock(
-        lines=lines,
-        ast=tuple(statement.expr for statement in lines),
-        static_values={
-            name: value
-            for name, value in static_values.items()
-            if name in ordered_names
-        },
-        evaluation_order=ordered_names,
+    mechanism: object,
+    base_values: Mapping[str, float] | None = None,
+):
+    """Bind once; evaluate requested dependency closures at the current temperature."""
+    targets = build_parameter_target_map(mechanism)
+    graph = spec.evaluation_dependencies
+    statements = {statement.name: statement for statement in spec.parameter_block.lines}
+    leaves = {
+        name for name, deps in graph.items() if not deps and name not in statements
+    } | set(spec.identity_checks)
+    values = read_mechanism_parameter_values(
+        mechanism, names=leaves, parameter_target_map=targets
     )
-
-
-def _symbol_table(
-    spec: ParameterAlgebraSpec,
-    base_values: Mapping[str, float],
-) -> SymbolTable:
-    symtab = SymbolTable()
-    admitted_names = (
-        set(spec.mechanism_param_names)
-        | set(spec.scalar_input_names)
-        | set(spec.param_assignment_names())
-    )
-    for raw_name, raw_value in base_values.items():
-        name = str(raw_name)
-        if name not in admitted_names or name in symtab.protected_names():
-            continue
-        try:
-            symtab.define_user(name, float(raw_value), species_names=set())
-        except (TypeError, ValueError, OverflowError) as exc:
-            raise DSLError(f"Invalid parameter algebra input {name!r}: {exc}") from exc
-    return symtab
-
-
-def _evaluate_names(
-    spec: ParameterAlgebraSpec,
-    names: Sequence[str],
-    *,
-    base_values: Mapping[str, float],
-) -> Dict[str, float]:
-    if not names:
-        return {}
-    block = _retained_block(spec, names)
-    context = EvaluationContext(
-        t=np.array([0.0]),
-        species_series={},
-        initials={},
-        species_names=set(),
-        symtab=_symbol_table(spec, base_values),
-    )
-    try:
-        series, scalars = evaluate_block(block, context)
-    except AlgebraError as exc:
-        assignment = next(
-            (
-                item
-                for item in spec.param_statements
-                if int(getattr(item, "line_number", 0) or 0)
-                == int(getattr(exc, "line", 0) or 0)
-            ),
-            None,
-        )
-        if assignment is not None:
-            raise DSLError(
-                str(exc),
-                line_number=assignment.line_number,
-                line_content=assignment.line_content,
-            ) from exc
-        raise DSLError(str(exc)) from exc
-
-    values: Dict[str, float] = {}
-    for name in names:
-        if name in scalars:
-            value = float(scalars[name])
-        else:
-            values_array = series.get(name)
-            if values_array is None or values_array.size < 1:
-                raise DSLError(f"Failed to evaluate parameter assignment {name!r}.")
-            value = float(values_array[0])
-        if not math.isfinite(value):
-            raise DSLError(
-                f"Parameter assignment {name!r} evaluated to a non-finite value: {value!r}"
-            )
-        values[name] = value
-    return values
-
-
-def evaluate_parameter_algebra_in_context(
-    spec: ParameterAlgebraSpec,
-    *,
-    base_values: Dict[str, float],
-) -> Dict[str, float]:
-    """Evaluate all admitted assignments using the retained graph and AST."""
-
-    if not isinstance(spec, ParameterAlgebraSpec):
-        raise TypeError("spec must be a ParameterAlgebraSpec.")
-    mapping = spec.parameter_dependencies
-    if not mapping:
-        return {}
-
-    independent_names = tuple(
-        name
-        for name in mapping
+    metadata = mechanism.metadata
+    independent = {
+        name for name in spec.parameter_dependencies
         if spec.parameter_assignment_kind(name) == "independent scalar"
-    )
-    missing_defaults = tuple(
-        name for name in independent_names if name not in base_values
-    )
-    if missing_defaults:
-        defaults = _evaluate_names(
-            spec,
-            missing_defaults,
-            base_values=base_values,
-        )
-        base_values.update(defaults)
-
-    dependent_names = tuple(
-        name
-        for name in mapping
-        if name not in independent_names
-    )
-    derived = _evaluate_names(
-        spec,
-        dependent_names,
-        base_values=base_values,
-    )
-    return {
-        name: float(base_values[name])
-        for name in independent_names
-    } | derived
-
-
-def evaluate_parameter_algebra(
-    spec: ParameterAlgebraSpec,
-    *,
-    base_values: Dict[str, float],
-) -> Dict[str, float]:
-    """Evaluate only mechanism-bound and derived scalar assignments."""
-
-    values = evaluate_parameter_algebra_in_context(
-        spec,
-        base_values=base_values,
-    )
-    return {
-        name: value
-        for name, value in values.items()
-        if spec.parameter_assignment_kind(name) != "independent scalar"
     }
+    for name, value in dict(metadata.get("scalar_params") or {}).items():
+        if name in independent:
+            values[name] = float(value)
+    for name, binding in dict(metadata.get("scalar_param_bindings") or {}).items():
+        if name in independent:
+            values[name] = float(binding())
+    values.update(base_values or {})
+    values["T"] = float(MechanismMetadataView.from_metadata(metadata).temperature_K)
+    expression = bind_scalar_expression_evaluator(spec.parameter_block, values)
+    operations = {}
+    for name in graph:
+        if name in spec.identity_checks:
+            continue
+        if name in statements:
+            if (
+                spec.parameter_assignment_kind(name) == "independent scalar"
+                and name in values
+            ):
+                continue
+            operations[name] = lambda statement=statements[name]: expression(statement)
+        elif name in spec.chemistry_dependencies:
+            operations[name] = bind_chemistry_readout(mechanism, targets[name], values)
+
+    def dependencies(name: str) -> tuple[str, ...]:
+        result = set()
+
+        def visit(current):
+            deps = graph.get(current, ())
+            if not deps:
+                result.add(current)
+            else:
+                for dependency in deps:
+                    visit(dependency)
+
+        visit(name)
+        return tuple(sorted(result))
+
+    def calculate(name: str, operation, *, check: bool = False) -> None:
+        try:
+            value = float(operation())
+            if name in targets and name in statements:
+                route, kind, index, role, _entry = targets[name]
+                _admit_coordinate_value(
+                    mechanism,
+                    name,
+                    value,
+                    route=route,
+                    kind=kind,
+                    index=index,
+                    role=role,
+                )
+            if not check:
+                values[name] = value
+        except AlgebraError as exc:
+            error = DSLError(
+                str(exc),
+                line_number=statements[name].line,
+                line_content=statements[name].line_text,
+            )
+            error.details.update(
+                assignment=name,
+                value_dependencies=dependencies(name),
+                parameter_names=dependencies(name),
+            )
+            raise error from exc
+        except (ArithmeticError, ValueError) as exc:
+            raise KineticRuntimeDomainError(
+                f"Parameter {name}: {exc}",
+                parameter_names=dependencies(name),
+                details={"assignment": name, "value_dependencies": dependencies(name)},
+            ) from exc
+
+    dynamic = set(operations) & spec.temperature_dependent_names
+    check_dependencies = {
+        name: tuple(_iter_expr_identifiers(statements[name].expr))
+        for name in spec.identity_checks
+    }
+    dynamic_checks = {
+        name for name, deps in check_dependencies.items()
+        if set(deps) & spec.temperature_dependent_names
+    }
+    closures: dict[tuple[str, ...], tuple[str, ...]] = {}
+    completed: set[str] = set()
+    checked: set[str] = set()
+    last_temperature = None
+
+    def evaluate(temperature: float, requested_names: tuple[str, ...]) -> dict[str, float]:
+        nonlocal last_temperature
+        if temperature != last_temperature:
+            completed.difference_update(dynamic)
+            checked.difference_update(dynamic_checks)
+            for name in dynamic:
+                values.pop(name, None)
+            values["T"] = float(temperature)
+            last_temperature = temperature
+        if requested_names not in closures:
+            required: set[str] = set()
+
+            def visit(name: str) -> None:
+                if name in required:
+                    return
+                required.add(name)
+                for dependency in graph.get(name, ()):
+                    visit(dependency)
+
+            for name in requested_names:
+                visit(name)
+            for deps in check_dependencies.values():
+                for name in deps:
+                    visit(name)
+            closures[requested_names] = tuple(name for name in operations if name in required)
+        for name in closures[requested_names]:
+            if name in completed:
+                continue
+            calculate(name, operations[name])
+            completed.add(name)
+        for name in spec.identity_checks:
+            if name in checked:
+                continue
+            calculate(name, lambda name=name: expression(statements[name]), check=True)
+            checked.add(name)
+        return {name: values[name] for name in requested_names}
+
+    return evaluate

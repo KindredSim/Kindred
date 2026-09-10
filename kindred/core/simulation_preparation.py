@@ -20,9 +20,6 @@ from kindred.core.exceptions import (
     SimulationCancelled,
 )
 from kindred.core.species import validate_concentration, validate_time_seconds
-from kindred.core.mechanism_metadata import (
-    EquilibriumMetadataKeys,
-)
 from kindred.core.temperature import (
     TemperatureScheduleProtocol,
 )
@@ -310,6 +307,7 @@ class PreparedSimulationRun:
     unresolved_intervention_schedule: InterventionSchedule | None = None
     cancellation_control: SimulationCancellationControl | None = None
     stop_observable_value: Callable[[str, float, np.ndarray, float], float] | None = None
+    parameter_values_at_time: Callable[[float, tuple[str, ...]], Mapping[str, float]] | None = None
 
     def __post_init__(self) -> None:
         y0 = np.asarray(self.y0, dtype=float).reshape(-1).copy()
@@ -357,6 +355,7 @@ def build_simulation_request_from_prepared_run(
         t_eval=t_eval,
         candidate_evaluation=candidate_evaluation,
         stop_observable_value=prepared_run.stop_observable_value,
+        parameter_values_at_time=prepared_run.parameter_values_at_time,
     )
     _raise_if_cancelled(cancellation_control)
     return result
@@ -480,7 +479,7 @@ def _expanded_intervention_schedule_dependency_metadata(
     direct_metadata = intervention_schedule_parameter_dependencies(schedule)
     if not direct_metadata:
         return direct_metadata
-    admitted_dependencies = getattr(parameter_algebra_spec, "parameter_dependencies", {})
+    admitted_dependencies = getattr(parameter_algebra_spec, "evaluation_dependencies", {})
     if not isinstance(admitted_dependencies, Mapping):
         admitted_dependencies = {}
 
@@ -522,6 +521,7 @@ def _resolve_intervention_schedule_for_request(
     *,
     parameter_values: Mapping[str, Any] | None = None,
     dependency_metadata: InterventionScheduleDependencyMetadata | None = None,
+    runtime_parameters: frozenset[str] = frozenset(),
 ) -> InterventionSchedule | None:
     if schedule is None:
         return None
@@ -535,6 +535,7 @@ def _resolve_intervention_schedule_for_request(
         return schedule.resolve_parameters(
             values,
             dependency_metadata=dependency_metadata,
+            runtime_parameters=runtime_parameters,
         )
     except InterventionScheduleError as exc:
         details = dict(getattr(exc, "details", {}) or {})
@@ -585,6 +586,8 @@ def _schedule_parameters_deferred_to_prepared_request(
     for identity, direct_names in intervention_schedule_parameter_dependencies(
         unresolved_intervention_schedule
     ).items():
+        if identity[2] not in {"time", "start_time", "end_time"}:
+            continue
         expanded_names = set(expanded_metadata.get(identity, ()))
         if not expanded_names.intersection(requested_names - supplied_names):
             continue
@@ -763,174 +766,6 @@ def _parameter_algebra_scalar_authority_names(spec: Any) -> tuple[frozenset[str]
     return frozenset(independent), frozenset(derived)
 
 
-def _scalar_schedule_resolution_values_from_mechanism(mechanism: Any) -> Dict[str, float]:
-    meta = getattr(mechanism, "metadata", None)
-    if not isinstance(meta, dict):
-        return {}
-    values: Dict[str, float] = {}
-    scalar_params = meta.get("scalar_params")
-    if isinstance(scalar_params, Mapping):
-        for raw_name, raw_value in scalar_params.items():
-            try:
-                value = float(raw_value)
-            except (TypeError, ValueError, OverflowError):
-                continue
-            if np.isfinite(value):
-                values[str(raw_name)] = float(value)
-    scalar_bindings = meta.get("scalar_param_bindings")
-    if isinstance(scalar_bindings, Mapping):
-        for raw_name, binding in scalar_bindings.items():
-            try:
-                value = float(binding()) if callable(binding) else float(binding)
-            except (TypeError, ValueError, OverflowError):
-                continue
-            if np.isfinite(value):
-                values[str(raw_name)] = float(value)
-    return values
-
-
-def _schedule_resolution_values_for_request(
-    unresolved_intervention_schedule: InterventionSchedule | None,
-    *,
-    raw_values: Mapping[str, float] | None = None,
-    parameter_target_map: Mapping[str, ParameterTarget] | None = None,
-    mechanism: Any | None = None,
-) -> Dict[str, float] | None:
-    values: Dict[str, float] = {
-        str(name): float(value)
-        for name, value in (raw_values or {}).items()
-        if str(name).strip()
-    }
-    referenced = set(intervention_schedule_parameter_names(unresolved_intervention_schedule))
-    if mechanism is not None:
-        if referenced:
-            if parameter_target_map is None:
-                raise SimulationPreparationError(
-                    "intervention_schedule",
-                    "Intervention schedule resolution requires the admitted preparation target map.",
-                )
-            values.update(
-                _effective_mechanism_schedule_values(
-                    mechanism,
-                    names={str(name) for name in referenced if str(name)},
-                    parameter_target_map=parameter_target_map,
-                )
-            )
-            values.update(_scalar_schedule_resolution_values_from_mechanism(mechanism))
-    return values if values else None
-
-
-def _effective_mechanism_schedule_values(
-    mechanism: Any,
-    *,
-    names: Iterable[str],
-    parameter_target_map: Mapping[str, ParameterTarget],
-) -> dict[str, float]:
-    """Read indexed schedule coordinates from the effective rate authority."""
-
-    from kindred.core.equilibrium_rate_authority import (
-        effective_equilibrium_keq,
-        effective_equilibrium_reverse_rate,
-    )
-    from kindred.core.ode_builder import build_effective_rate_coefficient_evaluator
-    from kindred.core.mechanism_metadata import MechanismMetadataView
-    from kindred.core.kinetics import (
-        ArrheniusRateModel,
-        EyringRateModel,
-        forward_rate_model_for_equilibrium,
-        forward_rate_model_for_reaction,
-    )
-    from kindred.core.units import UnitsModel
-
-    target_map = parameter_target_map
-    requested = {str(name).strip() for name in names if str(name).strip()}
-    if not requested:
-        return {}
-    temperature = float(
-        MechanismMetadataView.from_metadata(
-            getattr(mechanism, "metadata", {}) or {}
-        ).temperature_K
-    )
-    coefficients = build_effective_rate_coefficient_evaluator(mechanism)(temperature)
-    reaction_count = len(getattr(mechanism, "reactions", ()) or ())
-    reactions = getattr(mechanism, "reactions", ()) or ()
-    equilibria = getattr(mechanism, "equilibria", ()) or ()
-    metadata = MechanismMetadataView.from_metadata(
-        getattr(mechanism, "metadata", {}) or {}
-    )
-    units = UnitsModel(energy_unit=metadata.energy_unit)
-    values: dict[str, float] = {}
-    for raw_name in requested:
-        target = target_map.get(raw_name)
-        if target is None:
-            continue
-        route, kind, index, role, _entry = target
-        if route == "physical":
-            if role == "dG_eq" and kind == "equilibrium":
-                raw_dg = dict(
-                    getattr(equilibria[index], "metadata", {}) or {}
-                ).get(EquilibriumMetadataKeys.DG_EQ_J_PER_MOL)
-                try:
-                    value = units.from_jmol(float(raw_dg))
-                except (TypeError, ValueError, OverflowError):
-                    continue
-                if np.isfinite(value):
-                    values[raw_name] = float(value)
-                continue
-            if kind == "reaction":
-                if not 0 <= index < len(reactions):
-                    continue
-                model = forward_rate_model_for_reaction(
-                    reactions[index],
-                    default_standard_conc_M=float(metadata.standard_conc_M),
-                )
-            elif kind == "equilibrium":
-                if not 0 <= index < len(equilibria):
-                    continue
-                model = forward_rate_model_for_equilibrium(
-                    equilibria[index],
-                    temperature_K=None,
-                    default_standard_conc_M=float(metadata.standard_conc_M),
-                )
-            else:
-                continue
-            value: float | None = None
-            if role == "A" and isinstance(model, ArrheniusRateModel):
-                value = float(model.A)
-            elif role == "Ea" and isinstance(model, ArrheniusRateModel):
-                value = float(units.from_jmol(model.Ea_J_per_mol))
-            elif role == "dG_act" and isinstance(model, EyringRateModel):
-                value = float(units.from_jmol(model.dG_act_J_per_mol))
-            elif role == "kappa" and isinstance(model, EyringRateModel):
-                value = float(model.kappa)
-            if value is not None and np.isfinite(value):
-                values[raw_name] = value
-            continue
-        if route != "indexed":
-            continue
-        if kind == "reaction" and role == "k":
-            values[raw_name] = float(coefficients.forward[index])
-        elif kind == "equilibrium":
-            coefficient_index = reaction_count + index
-            if role == "kf":
-                values[raw_name] = float(coefficients.forward[coefficient_index])
-            elif role == "kr":
-                reverse = effective_equilibrium_reverse_rate(
-                    equilibria[index],
-                    temperature_K=temperature,
-                )
-                if reverse is not None:
-                    values[raw_name] = float(reverse)
-            elif role == "Keq":
-                equilibrium_constant = effective_equilibrium_keq(
-                    equilibria[index],
-                    temperature_K=temperature,
-                )
-                if equilibrium_constant is not None:
-                    values[raw_name] = float(equilibrium_constant)
-    return values
-
-
 def invalid_request_parameter_identifier_message(mechanism: Any, name: str) -> str | None:
     name_s = str(name or "").strip()
     if not name_s:
@@ -1066,7 +901,7 @@ def prepare_simulation_run(
         )
     )
     try:
-        request_parameter_values = _bind_request_parameter_overrides(
+        _bind_request_parameter_overrides(
             mechanism=mechanism,
             parameter_algebra_spec=parameter_algebra_spec,
             parameter_overrides=execution_request.parameter_overrides,
@@ -1076,6 +911,11 @@ def prepare_simulation_run(
     except SimulationPreparationError:
         raise
     _raise_if_cancelled(cancellation_control)
+
+    try:
+        _coefficient_evaluator, rhs = topology.bind_target(mechanism)
+    except Exception as exc:
+        raise SimulationPreparationError("ode_build", str(exc)) from exc
 
     intervention_execution = execution_request.prepared_dsl.intervention_execution_contract()
     if intervention_execution is not None and not execution_request.use_authored_stops:
@@ -1093,20 +933,27 @@ def prepare_simulation_run(
                     unresolved_intervention_schedule,
                     parameter_algebra_spec=parameter_algebra_spec,
                 )
+                direct_dependencies = intervention_schedule_parameter_dependencies(unresolved_intervention_schedule)
+                clock_fields = {"time", "start_time", "end_time"}
+                clock_roots = tuple(sorted({
+                    name for identity, names in direct_dependencies.items()
+                    if identity[2] in clock_fields for name in names
+                }))
+                payload_names = frozenset(
+                    name for identity, names in direct_dependencies.items()
+                    if identity[2] not in clock_fields for name in names
+                )
                 resolved_schedule = _resolve_intervention_schedule_for_request(
                     unresolved_intervention_schedule,
-                    parameter_values=_schedule_resolution_values_for_request(
-                        unresolved_intervention_schedule,
-                        raw_values=request_parameter_values,
-                        parameter_target_map=parameter_target_map,
-                        mechanism=mechanism,
-                    ),
+                    parameter_values=_coefficient_evaluator.parameter_values(_coefficient_evaluator.nominal_temperature_K, clock_roots),
+                    runtime_parameters=payload_names,
                     dependency_metadata=dependency_metadata,
                 )
                 if resolved_schedule is not None:
                     resolved_schedule.validate_species(species_names)
                 intervention_execution = compile_intervention_schedule(
                     resolved_schedule,
+                    authored_payload=unresolved_intervention_schedule.to_payload(),
                     cancellation_check=(
                         cancellation_control.cancel_requested
                         if cancellation_control is not None
@@ -1132,11 +979,6 @@ def prepare_simulation_run(
                     details=structured_details,
                 ) from exc
 
-    if rhs is None:
-        try:
-            _coefficient_evaluator, rhs = topology.bind_target(mechanism)
-        except Exception as exc:
-            raise SimulationPreparationError("ode_build", str(exc)) from exc
     _raise_if_cancelled(cancellation_control)
 
     try:
@@ -1156,6 +998,11 @@ def prepare_simulation_run(
     except Exception as exc:
         raise SimulationPreparationError("initials_for_algebra", str(exc)) from exc
 
+    from kindred.core.simulation_algebra_context import prepare_simulation_algebra_symbols, runtime_algebra_symbol_names
+    runtime_names = runtime_algebra_symbol_names(parameter_algebra_spec)
+    symbols = prepare_simulation_algebra_symbols(
+        temperature_schedule=temperature_schedule, coefficient_evaluator=_coefficient_evaluator,
+    )
     stop_observable_value = None
     if intervention_execution is not None:
         from kindred.core.intervention_schedule import ObservableTriggerCondition, InterventionStopAction
@@ -1165,13 +1012,20 @@ def prepare_simulation_run(
         ))
         if targets:
             from kindred.core.algebra.simulation_series import compiled_algebra_for_mechanism, prepare_algebra_stop_evaluator
-            from kindred.core.simulation_algebra_context import prepare_simulation_algebra_symbols
-            static, runtime_names, symbols = prepare_simulation_algebra_symbols(
-                mechanism, parameter_algebra_spec=parameter_algebra_spec, temperature_schedule=temperature_schedule,
-            )
             try:
+                compiled = compiled_algebra_for_mechanism(mechanism)
+                target_roots = {
+                    name: tuple(root for root in compiled.parameter_roots(name)
+                                if root in parameter_algebra_spec.evaluation_dependencies)
+                    for name in targets
+                }
+                static_roots = tuple(sorted({
+                    root for roots in target_roots.values() for root in roots
+                    if root not in runtime_names
+                }))
+                static = _coefficient_evaluator.parameter_values(_coefficient_evaluator.nominal_temperature_K, static_roots)
                 evaluator = prepare_algebra_stop_evaluator(
-                    compiled_algebra_for_mechanism(mechanism), target_names=targets,
+                    compiled, target_names=targets,
                     species_names=tuple(species_names), initials=initials_for_algebra,
                     symbol_values=static, runtime_symbol_names=set(runtime_names),
                 )
@@ -1186,7 +1040,7 @@ def prepare_simulation_run(
                                                  details={"stop_declarations": declarations}) from exc
 
             def stop_observable_value(name: str, time: float, state: np.ndarray, symbol_time: float) -> float:
-                return evaluator.evaluate(name, time, state, symbols(symbol_time))
+                return evaluator.evaluate(name, time, state, symbols(symbol_time, target_roots[name]))
 
     request = execution_request
 
@@ -1204,6 +1058,7 @@ def prepare_simulation_run(
         unresolved_intervention_schedule=unresolved_intervention_schedule,
         cancellation_control=cancellation_control,
         stop_observable_value=stop_observable_value,
+        parameter_values_at_time=symbols,
     )
 
 

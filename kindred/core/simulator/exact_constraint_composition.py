@@ -13,11 +13,13 @@ from kindred.core.algebra.parser import (
     NumberNode,
     SpeciesRefNode,
     UnaryNode,
+    _iter_identifiers,
 )
 from kindred.core.constants import N_A, R, Rkcal, h, h_bar, k_B
 from kindred.core.equilibrium_rate_authority import equilibrium_rate_symbolic_relations
 from kindred.core.kinetics import (
     forward_rate_model_for_equilibrium,
+    forward_rate_model_for_reaction,
     forward_rate_symbolic_relation,
 )
 from kindred.core.simulator.step_indexing import (
@@ -408,6 +410,7 @@ def _mechanism_relations(
 
     relations: dict[str, ExactMonomial] = {}
     equilibria = tuple(getattr(mechanism, "equilibria", ()) or ())
+    reactions = tuple(getattr(mechanism, "reactions", ()) or ())
     temperature = ExactMonomial(Fraction(1), (("T", Fraction(1)),))
     standard_concentration = ExactMonomial(
         Fraction(1), (("C0", Fraction(1)),)
@@ -423,14 +426,13 @@ def _mechanism_relations(
         return ExactMonomial(Fraction(1), (), (value,))
 
     for entry in get_step_index_map(mechanism):
-        if str(entry.get("kind") or "") != "equilibrium":
-            continue
+        kind = str(entry.get("kind") or "")
         try:
-            index = int(entry.get("equilibrium_index"))
+            index = int(entry.get("reaction_index" if kind == "reaction" else "equilibrium_index"))
             step = int(entry.get("step_index"))
         except (TypeError, ValueError):
             continue
-        if not 0 <= index < len(equilibria):
+        if not 0 <= index < len(reactions if kind == "reaction" else equilibria):
             continue
         kf, kr, keq = f"kf{step}", f"kr{step}", f"Keq{step}"
         source_coordinates = {
@@ -468,7 +470,7 @@ def _mechanism_relations(
             return ExactMonomial(Fraction(1), ((name, Fraction(1)),))
 
         try:
-            forward_model = forward_rate_model_for_equilibrium(
+            forward_model = forward_rate_model_for_reaction(reactions[index], default_standard_conc_M=1.0) if kind == "reaction" else forward_rate_model_for_equilibrium(
                 equilibria[index],
                 temperature_K=None,
                 default_standard_conc_M=1.0,
@@ -481,6 +483,11 @@ def _mechanism_relations(
                 source_coordinate=source_coordinate,
                 standard_concentration=standard_concentration,
             )
+            if kind == "reaction":
+                name = f"k{step}"
+                if projected != ExactMonomial(Fraction(1), ((name, Fraction(1)),)):
+                    relations[name] = projected
+                continue
             equilibrium_relations = equilibrium_rate_symbolic_relations(
                 equilibria[index],
                 forward_relation=projected,
@@ -664,7 +671,7 @@ def _algebra_relations(
             unresolved.add(name)
             continue
         kind = str(assignment_kind(name))
-        if kind == "independent scalar":
+        if kind in {"independent scalar", "source identity"}:
             # An independent scalar is an exact symbolic leaf.  Its numeric
             # execution seed is intentionally not consumed here.
             continue
@@ -682,6 +689,88 @@ def _algebra_relations(
     return relations, unresolved
 
 
+def proves_redundant_parameter(
+    mechanism: object,
+    statements: Mapping[str, object],
+    target: str,
+    discharged: list[str],
+) -> bool:
+    """Prove a source identity without numeric defaults or branch cancellation."""
+    relations = _mechanism_relations(mechanism)
+    sources = {
+        name
+        for entry in get_step_index_map(mechanism)
+        for name in dict(entry.get("source_coordinates") or {}).values()
+    }
+    names = set(statements) | set(relations) | sources
+    visited: set[str] = set()
+
+    def symbols(value):
+        found = {name for name, _power in value.powers}
+        for child in (*value.exponentials, *value.sum_terms):
+            found.update(symbols(child))
+        return found
+
+    def eligible(expr: object) -> bool:
+        if isinstance(expr, (NumberNode, IdentNode)):
+            return True
+        if isinstance(expr, UnaryNode):
+            return expr.op in {"+", "-"} and eligible(expr.rhs)
+        if not isinstance(expr, BinaryNode) or expr.op not in {
+            "+",
+            "-",
+            "*",
+            "/",
+            "^",
+            "**",
+        }:
+            return False
+        if expr.op in {"^", "**"}:
+            exponent = _exact_monomial_from_ast(expr.rhs, canonical_names=set())
+            if (
+                exponent is None
+                or exponent.powers
+                or exponent.exponentials
+                or exponent.sum_terms
+                or exponent.coefficient.denominator != 1
+            ):
+                return False
+        return eligible(expr.lhs) and eligible(expr.rhs)
+
+    def visit(name: str) -> bool:
+        if name in visited or name in discharged:
+            return True
+        visited.add(name)
+        statement = statements.get(name)
+        if statement is None:
+            # Chemistry may lead to further authored coordinates.
+            relation = relations.get(name)
+            if relation is not None:
+                return all(visit(dep) for dep in symbols(relation) if dep != target)
+            return True
+        references = set(_iter_identifiers(statement.expr)) & names
+        if name not in sources and not references:
+            return True  # Adjustable scalar default, never an exact relation.
+        if not eligible(statement.expr):
+            return False
+        lowered = _exact_monomial_from_ast(statement.expr, canonical_names=names)
+        if lowered is None:
+            return False
+        if name != target:
+            relations[name] = lowered
+        return all(visit(dep) for dep in references if dep != target)
+
+    if not visit(target):
+        return False
+    relations.pop(target, None)
+    for name in discharged:
+        relations.pop(name, None)
+    rhs = _exact_monomial_from_ast(statements[target].expr, canonical_names=names)
+    return rhs is not None and _substitute(rhs, relations, set()) == ExactMonomial(
+        Fraction(1), ((target, Fraction(1)),)
+    )
+
+
 def compose_exact_constraints(
     mechanism: object,
     *,
@@ -692,7 +781,8 @@ def compose_exact_constraints(
     topology = analyze_wegscheider_topology(mechanism)
     relations = _mechanism_relations(mechanism)
     algebra, unresolved = _algebra_relations(parameter_algebra_spec)
-    relations.update(algebra)
+    relations.update({name: value for name, value in algebra.items()
+                      if name not in getattr(parameter_algebra_spec, "identity_checks", ())})
     result: list[ExactConstraint] = []
     for cycle in topology.cycles:
         initial = ExactMonomial(

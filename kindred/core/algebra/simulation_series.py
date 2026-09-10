@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import logging
 import math
-from typing import Dict, Mapping, Tuple
+from typing import Callable, Dict, Mapping, Tuple
 
 import numpy as np
 
@@ -112,6 +112,25 @@ class CompiledAlgebraSeries:
     block: AlgebraBlock
     observable_names: Tuple[str, ...]
 
+    def parameter_roots(self, name: str) -> tuple[str, ...]:
+        """External identifiers required by one retained observable closure."""
+        statements = {stmt.name: stmt for stmt in self.block.lines}
+        roots: set[str] = set()
+        visited: set[str] = set()
+
+        def visit(current: str) -> None:
+            if current in visited:
+                return
+            visited.add(current)
+            if current not in statements:
+                roots.add(current)
+                return
+            for dependency in _iter_identifiers(statements[current].expr):
+                visit(dependency)
+
+        visit(name)
+        return tuple(sorted(roots))
+
 
 def compiled_algebra_for_mechanism(
     mechanism: object,
@@ -190,6 +209,8 @@ def _build_simulation_context(
     initials: Dict[str, float],
     symbol_series: Mapping[str, np.ndarray | float],
     symbol_values: Mapping[str, float],
+    symbol_resolver: Callable[[str], float | np.ndarray | None] | None,
+    runtime_symbol_names: frozenset[str],
 ) -> EvaluationContext:
     """Build one row-aligned context for the retained Algebra program."""
     t_arr = np.asarray(t, dtype=float).reshape(-1)
@@ -204,6 +225,8 @@ def _build_simulation_context(
         symtab=symtab,
         symbol_series=runtime_series,
         symbol_values={str(name): float(value) for name, value in symbol_values.items()},
+        symbol_resolver=symbol_resolver,
+        runtime_symbol_names=runtime_symbol_names,
     )
 
 
@@ -215,6 +238,8 @@ def evaluate_compiled_algebra_series_for_simulation_partial(
     initials: Dict[str, float],
     symbol_series: Mapping[str, np.ndarray | float],
     symbol_values: Mapping[str, float],
+    symbol_resolver: Callable[[str], float | np.ndarray | None] | None = None,
+    runtime_symbol_names: frozenset[str] = frozenset(),
 ) -> Tuple[Dict[str, np.ndarray], Dict[str, float], list[AlgebraObservableError]]:
     """Evaluate retained observables while preserving per-observable failures."""
     ctx = _build_simulation_context(
@@ -223,6 +248,8 @@ def evaluate_compiled_algebra_series_for_simulation_partial(
         initials=initials,
         symbol_series=symbol_series,
         symbol_values=symbol_values,
+        symbol_resolver=symbol_resolver,
+        runtime_symbol_names=runtime_symbol_names,
     )
     series, scalars, errors = evaluate_block_partial(compiled.block, ctx)
     series_out = {str(name): np.asarray(values, dtype=float).reshape(-1) for name, values in (series or {}).items()}

@@ -657,7 +657,7 @@ class FittingEvaluator:
                 result=result,
                 species_names=list(prepared_run.species_names),
                 initials_for_algebra=initials_map,
-                temperature_schedule=prepared_run.temperature_schedule,
+                parameter_values_at_time=prepared_run.parameter_values_at_time,
                 parameter_algebra_spec=prepared_run.parameter_algebra_spec,
                 solver_provenance_updates={
                     "fit_sampling_policy": self._context.fit_sampling_policy,
@@ -685,15 +685,6 @@ class FittingEvaluator:
         if not isinstance(result_execution, InterventionExecutionContract):
             raise FitSimulationError(
                 "Fitting result is missing its intervention execution contract.",
-                details={"fatal": True, "stage": "intervention_execution"},
-            )
-        if (
-            result_execution.with_trigger_firings(())
-            != intervention_execution.with_trigger_firings(())
-        ):
-            raise FitSimulationError(
-                "Fitting result intervention execution conflicts with the "
-                "resolved request contract.",
                 details={"fatal": True, "stage": "intervention_execution"},
             )
         self._raise_if_cancel_requested()

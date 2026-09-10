@@ -18,14 +18,11 @@ from typing import Callable, Mapping, Optional
 import numpy as np
 
 from .equilibrium_rate_authority import (
-    EquilibriumRateAuthorityKind,
-    effective_equilibrium_keq,
     json_safe_equilibrium_authority_payload,
     normalize_existing_equilibrium_rate_authority,
 )
 from .exceptions import KineticRuntimeDomainError
 from .mechanism import Equilibrium, FrozenDict, Mechanism, Reaction
-from .rate_binding import ForwardRateBinding, RateBinding as _RateBinding
 from .species import validate_temperature
 from .simulator.solver_types import (
     SimulationScientificUnavailability,
@@ -36,7 +33,6 @@ from .kinetics import (
     ConstantRateModel,
     EyringRateModel,
     ForwardRateModel,
-    forward_rate_at_temperature,
     forward_rate_family,
     forward_rate_model_for_equilibrium,
     forward_rate_model_for_reaction,
@@ -71,12 +67,6 @@ def _stoichiometric_flux_product(
         return np.sum(products, axis=1, dtype=float)
     np.sum(products, axis=1, out=out)
     return out.copy()
-
-
-def _evaluate_rate_binding(binding: _RateBinding, temperature_K: float) -> float:
-    if bool(getattr(binding, "accepts_runtime_temperature", False)):
-        return float(binding(float(temperature_K)))  # type: ignore[call-arg]
-    return float(binding())
 
 
 def _forward_rate_model_payload(model: ForwardRateModel) -> dict[str, object]:
@@ -117,7 +107,8 @@ class EffectiveRateCoefficientEvaluator:
     nominal_temperature_K: float
     step_kinds: tuple[str, ...]
     authority_snapshot: tuple[Mapping[str, object], ...]
-    _evaluators: tuple[Callable[[float], tuple[float, float]], ...]
+    parameter_values: Callable[[float, tuple[str, ...]], dict[str, float]]
+    _parameter_names: tuple[tuple[str, str | None], ...]
 
     def __post_init__(self) -> None:
         frozen_snapshot: list[Mapping[str, object]] = []
@@ -135,7 +126,6 @@ class EffectiveRateCoefficientEvaluator:
             tuple(frozen_snapshot),
         )
         object.__setattr__(self, "step_kinds", tuple(self.step_kinds))
-        object.__setattr__(self, "_evaluators", tuple(self._evaluators))
 
     def __call__(self, temperature_K: float) -> EffectiveRateCoefficients:
         def failure_details(index: int | None = None) -> dict[str, object]:
@@ -179,29 +169,10 @@ class EffectiveRateCoefficientEvaluator:
                 stage="scheduled_temperature",
                 details=failure_details(),
             ) from exc
-        pairs: list[tuple[float, float]] = []
-        for index, evaluator in enumerate(self._evaluators):
-            try:
-                pairs.append(evaluator(temperature))
-            except KineticRuntimeDomainError as exc:
-                details = dict(getattr(exc, "details", {}) or {})
-                details.update(failure_details(index))
-                raise KineticRuntimeDomainError(
-                    str(getattr(exc, "message", None) or exc),
-                    stage=str(details.get("stage") or "kinetic_lowering"),
-                    parameter_names=tuple(details.get("parameter_names", ())),
-                    details=details,
-                ) from exc
-            except (ArithmeticError, ValueError) as exc:
-                details = failure_details(index)
-                raise KineticRuntimeDomainError(
-                    f"Runtime kinetic lowering is outside the admitted domain: {exc}",
-                    stage="kinetic_lowering",
-                    parameter_names=tuple(details.get("parameter_names", ())),
-                    details=details,
-                ) from exc
-        forward = tuple(float(pair[0]) for pair in pairs)
-        reverse = tuple(float(pair[1]) for pair in pairs)
+        roots = tuple(name for pair in self._parameter_names for name in pair if name is not None)
+        values = self.parameter_values(temperature, roots)
+        forward = tuple(float(values[name]) for name, _reverse in self._parameter_names)
+        reverse = tuple(float(values[name]) if name else 0.0 for _forward, name in self._parameter_names)
         if not (
             len(self.step_kinds)
             == len(forward)
@@ -256,172 +227,41 @@ def build_effective_rate_coefficient_evaluator(
     )
     nominal_temperature = float(mech_meta.temperature_K)
     default_standard_conc = float(mech_meta.standard_conc_M)
-    evaluators: list[Callable[[float], tuple[float, float]]] = []
-    step_kinds: list[str] = []
-    snapshots: list[Mapping[str, object]] = []
+    from .simulator.parameter_algebra_eval import bind_parameter_evaluation
+    from .simulator.parameter_algebra_spec import admit_parameter_evaluation_graph, parse_parameter_algebra_spec_from_dsl_text
+    from .simulator.parameter_namespace import build_namespace_from_mechanism
+    from .simulator.step_indexing import get_step_index_map
 
-    for reaction in mechanism.reactions:
-        model = forward_rate_model_for_reaction(
-            reaction,
-            default_standard_conc_M=default_standard_conc,
-        )
-        binding = (
-            reaction.rate
-            if isinstance(reaction.rate, _RateBinding)
-            else None
-        )
-        if binding is not None:
-            if not isinstance(binding, ForwardRateBinding) and not isinstance(
-                model, ConstantRateModel
-            ):
-                raise ValueError(
-                    "Arrhenius/Eyring reaction authority requires a "
-                    "family-preserving ForwardRateBinding."
-                )
-            if isinstance(binding, ForwardRateBinding):
-                snapshot = {
-                    "kind": "reaction",
-                    "binding_name": str(binding.name),
-                    "forward_model": _forward_rate_model_payload(
-                        binding.model
-                    ),
-                }
-            else:
-                snapshot = {
-                    "kind": "reaction",
-                    "binding_name": str(binding.name),
-                    "binding_value": float(binding()),
-                }
-
-            def reaction_coefficients(
-                temperature_K: float,
-                *,
-                _binding: _RateBinding = binding,
-            ) -> tuple[float, float]:
-                return (
-                    _evaluate_rate_binding(_binding, temperature_K),
-                    0.0,
-                )
-
-        else:
-            snapshot = {
-                "kind": "reaction",
-                "forward_model": _forward_rate_model_payload(model),
-            }
-
-            def reaction_coefficients(
-                temperature_K: float,
-                *,
-                _model: ForwardRateModel = model,
-            ) -> tuple[float, float]:
-                return (
-                    forward_rate_at_temperature(_model, temperature_K),
-                    0.0,
-                )
-
-        evaluators.append(reaction_coefficients)
-        step_kinds.append("reaction")
-        snapshots.append(snapshot)
-
-    for equilibrium in mechanism.equilibria:
-        authority = normalize_existing_equilibrium_rate_authority(
-            equilibrium
-        )
-        forward_binding = (
-            equilibrium.kf
-            if isinstance(equilibrium.kf, _RateBinding)
-            else None
-        )
-        if isinstance(forward_binding, ForwardRateBinding):
-            forward_model = forward_binding.model
-        else:
-            forward_model = forward_rate_model_for_equilibrium(
-                equilibrium,
-                temperature_K=nominal_temperature,
-                default_standard_conc_M=default_standard_conc,
-            )
-            if forward_binding is not None and not isinstance(
-                forward_model, ConstantRateModel
-            ):
-                raise ValueError(
-                    "Arrhenius/Eyring equilibrium forward authority requires "
-                    "a family-preserving ForwardRateBinding."
-                )
-        snapshot = {
-            "kind": "equilibrium",
-            "forward_model": _forward_rate_model_payload(forward_model),
-            "forward_binding_name": (
-                str(forward_binding.name)
-                if isinstance(forward_binding, _RateBinding)
-                else None
-            ),
-            "authority": json_safe_equilibrium_authority_payload(
-                dict(authority.identity_items())
-            ),
-            "reverse_binding_name": (
-                str(authority.kr.name)
-            if isinstance(authority.kr, _RateBinding)
-                else None
-            ),
-            "reverse_model": (
-                _forward_rate_model_payload(authority.kr.model)
-                if isinstance(authority.kr, ForwardRateBinding)
-                else None
-            ),
-        }
-
-        def equilibrium_coefficients(
-            temperature_K: float,
-            *,
-            _equilibrium: Equilibrium = equilibrium,
-            _authority=authority,
-            _forward_binding: _RateBinding | None = forward_binding,
-            _forward_model: ForwardRateModel = forward_model,
-        ) -> tuple[float, float]:
-            forward = (
-                _evaluate_rate_binding(
-                    _forward_binding,
-                    temperature_K,
-                )
-                if _forward_binding is not None
-                else forward_rate_at_temperature(
-                    _forward_model,
-                    temperature_K,
-                )
-            )
-            if _authority.kind == EquilibriumRateAuthorityKind.KR:
-                reverse = _authority.effective_reverse_rate()
-                if isinstance(reverse, _RateBinding):
-                    reverse = _evaluate_rate_binding(
-                        reverse,
-                        temperature_K,
-                    )
-                elif callable(reverse):
-                    reverse = float(reverse())
-            else:
-                equilibrium_constant = effective_equilibrium_keq(
-                    _equilibrium,
-                    temperature_K=temperature_K,
-                )
-                if equilibrium_constant is None:
-                    raise ValueError(
-                        "Equilibrium missing usable Keq/dG_eq authority."
-                    )
-                reverse = _authority.effective_reverse_rate(
-                    Keq=equilibrium_constant,
-                    kf=forward,
-                )
-            return float(forward), float(reverse)
-
-        evaluators.append(equilibrium_coefficients)
-        step_kinds.append("equilibrium")
-        snapshots.append(snapshot)
-
+    spec = mechanism.metadata.get("parameter_algebra_spec")
+    if spec is None:
+        spec = admit_parameter_evaluation_graph(parse_parameter_algebra_spec_from_dsl_text(
+            "", mechanism_namespace=build_namespace_from_mechanism(mechanism)), mechanism)
+    evaluate = bind_parameter_evaluation(spec, mechanism)
+    entries = {(entry["kind"], int(entry["reaction_index" if entry["kind"] == "reaction" else "equilibrium_index"])): entry
+               for entry in get_step_index_map(mechanism)}
+    step_kinds = []
+    snapshots = []
+    names = []
+    for kind, steps in (("reaction", mechanism.reactions), ("equilibrium", mechanism.equilibria)):
+        for index, step in enumerate(steps):
+            number = entries[kind, index]["step_index"]
+            forward_name = f"k{number}" if kind == "reaction" else f"kf{number}"
+            reverse_name = None if kind == "reaction" else f"kr{number}"
+            model = (forward_rate_model_for_reaction(step, default_standard_conc_M=default_standard_conc)
+                     if kind == "reaction" else forward_rate_model_for_equilibrium(step, temperature_K=None, default_standard_conc_M=default_standard_conc))
+            snapshot = {"kind": kind, "forward_model": _forward_rate_model_payload(model),
+                        "binding_name" if kind == "reaction" else "forward_binding_name": forward_name,
+                        "value_dependencies": tuple(spec.evaluation_dependencies.get(forward_name, ())),
+                        "temperature_dependent": forward_name in spec.temperature_dependent_names}
+            if kind == "equilibrium":
+                authority = normalize_existing_equilibrium_rate_authority(step)
+                snapshot.update(authority=json_safe_equilibrium_authority_payload(dict(authority.identity_items())), reverse_binding_name=reverse_name)
+            names.append((forward_name, reverse_name))
+            step_kinds.append(kind)
+            snapshots.append(snapshot)
     return EffectiveRateCoefficientEvaluator(
-        nominal_temperature_K=nominal_temperature,
-        step_kinds=tuple(step_kinds),
-        authority_snapshot=tuple(snapshots),
-        _evaluators=tuple(evaluators),
+        nominal_temperature_K=nominal_temperature, step_kinds=tuple(step_kinds),
+        authority_snapshot=tuple(snapshots), parameter_values=evaluate, _parameter_names=tuple(names),
     )
 
 

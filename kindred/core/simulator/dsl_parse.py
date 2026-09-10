@@ -2259,6 +2259,8 @@ def prepare_dsl_request_set(
         text,
         mechanism_namespace=mechanism_namespace,
     )
+    from .parameter_algebra_spec import admit_parameter_evaluation_graph
+    parameter_algebra_spec = admit_parameter_evaluation_graph(parameter_algebra_spec, mechanism)
     # The retained spec is the sole admitted Algebra program.  Compile the
     # observable partition from its retained ASTs; passing raw source here (or
     # in the builder) would reparse the same Algebra text and violate the

@@ -1,26 +1,22 @@
 from __future__ import annotations
 
 from types import MappingProxyType
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
 import numpy as np
 
-from kindred.core.simulation_algebra_context import prepare_simulation_algebra_symbols
+from kindred.core.simulation_algebra_context import runtime_algebra_symbol_names
 from kindred.core.simulation_failure import FactualCause
 from kindred.core.result_repository import (
     SimulationResultValue,
 )
 from kindred.core.simulator.solver_types import FinalSimulationOutput
-from kindred.core.temperature import (
-    TemperatureScheduleProtocol,
-)
 from kindred.core.algebra.simulation_series import (
     compiled_algebra_for_mechanism,
     evaluate_compiled_algebra_series_for_simulation_partial,
 )
 
 __all__ = [
-    "build_simulation_row_algebra_context",
     "finalize_simulation_result",
 ]
 
@@ -72,25 +68,6 @@ def _initials_for_algebra(
     }
 
 
-def build_simulation_row_algebra_context(
-    mechanism: object,
-    times: np.ndarray,
-    *,
-    parameter_algebra_spec: object,
-    temperature_schedule: TemperatureScheduleProtocol | None,
-) -> tuple[dict[str, np.ndarray], dict[str, float]]:
-    """Read row-local temperature, coefficients, and prepared static scalars."""
-    static, names, symbols = prepare_simulation_algebra_symbols(
-        mechanism, parameter_algebra_spec=parameter_algebra_spec,
-        temperature_schedule=temperature_schedule,
-    )
-    row_times = np.asarray(times, dtype=float)
-    if row_times.ndim != 1 or not row_times.size or np.any(~np.isfinite(row_times)) or np.any(np.diff(row_times) <= 0.0):
-        raise ValueError("result row times must be finite and strictly increasing.")
-    rows = [symbols(float(time)) for time in row_times] if temperature_schedule is not None else [symbols(float(row_times[0]))] * len(row_times)
-    return {name: np.asarray([row[name] for row in rows], dtype=float) for name in names}, static
-
-
 def _algebra_cause(error: object) -> FactualCause:
     """Project one expected per-observable Algebra failure."""
 
@@ -134,7 +111,7 @@ def finalize_simulation_result(
     result: FinalSimulationOutput,
     species_names: list[str],
     initials_for_algebra: Mapping[str, Any] | None,
-    temperature_schedule: TemperatureScheduleProtocol | None,
+    parameter_values_at_time: Callable[[float, tuple[str, ...]], Mapping[str, float]],
     parameter_algebra_spec: object,
     parameters: tuple[tuple[str, float, str], ...] = (),
     solver_provenance_updates: Mapping[str, object] | None = None,
@@ -172,12 +149,24 @@ def finalize_simulation_result(
             name: result_y[index, :]
             for index, name in enumerate(base_species_names)
         }
-        symbol_series, symbol_values = build_simulation_row_algebra_context(
-            mechanism,
-            result_time,
-            temperature_schedule=temperature_schedule,
-            parameter_algebra_spec=parameter_algebra_spec,
-        )
+        runtime_names = runtime_algebra_symbol_names(parameter_algebra_spec)
+        symbol_failures: dict[str, Exception] = {}
+
+        def resolve_symbol(name: str) -> float | np.ndarray | None:
+            if name not in parameter_algebra_spec.evaluation_dependencies:
+                return None
+            if name in symbol_failures:
+                raise symbol_failures[name]
+            try:
+                if name in runtime_names:
+                    return np.asarray([
+                        parameter_values_at_time(float(time), (name,))[name]
+                        for time in result_time
+                    ], dtype=float)
+                return parameter_values_at_time(float(result_time[0]), (name,))[name]
+            except Exception as exc:
+                symbol_failures[name] = exc
+                raise
         initials = _initials_for_algebra(
             mechanism,
             base_species_names,
@@ -189,8 +178,10 @@ def finalize_simulation_result(
                 t=result_time,
                 species_series=species_series,
                 initials=initials,
-                symbol_series=symbol_series,
-                symbol_values=symbol_values,
+                symbol_series={},
+                symbol_values={},
+                symbol_resolver=resolve_symbol,
+                runtime_symbol_names=runtime_names,
             )
         )
         finalized_algebra_errors = tuple(

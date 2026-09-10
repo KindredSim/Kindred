@@ -1517,22 +1517,6 @@ def _parameter_value(result: object, name: object) -> float:
 _BootstrapRefitOutcome = _fit_execution.GlobalFitResult | ScientificUnavailable
 
 
-def _refit_scientifically_available(
-    result: object,
-) -> tuple[bool, Mapping[str, object] | None]:
-    """Classify one completed refit by scientific availability only."""
-
-    if isinstance(result, ScientificUnavailable):
-        return False, {
-            "status": "scientific_unavailable",
-            "cause": result,
-        }
-    # The refit callback is an admitted typed internal route.  Its concrete
-    # result owner has already established scientific availability; optimizer
-    # convergence is only a fact on that owner, never a second admission gate.
-    return True, None
-
-
 def _bootstrap_payloads(
     *,
     payloads: Sequence[FitDatasetSpec],
@@ -1619,7 +1603,6 @@ def residual_bootstrap_result(
         raise TypeError("Residual bootstrap requires ResidualBootstrapConfig.")
     if not config.parameter_names:
         raise ValueError("Ordinary residual Bootstrap requires at least one coordinate.")
-    primary_available, primary_failure = _refit_scientifically_available(terminal_result)
     completed = 0
     successful = 0
     failed = 0
@@ -1719,25 +1702,12 @@ def residual_bootstrap_result(
     progress_cause = emit_progress(stage="primary_complete")
     if progress_cause is not None:
         return finish(stopped_result(progress_cause))
-    if not primary_available:
-        primary_cause = (
-            primary_failure.get("cause")
-            if isinstance(primary_failure, Mapping)
-            and isinstance(primary_failure.get("cause"), FactualCause)
-            else None
-        )
-        primary_unavailable = (
-            primary_failure.get("cause")
-            if isinstance(primary_failure, Mapping)
-            and isinstance(primary_failure.get("cause"), ScientificUnavailable)
-            else None
-        )
+    if isinstance(terminal_result, ScientificUnavailable):
         return finish(build_result(
             "unavailable",
-            primary_fit_diagnostic=primary_cause,
-            primary_fit_unavailable=primary_unavailable,
+            primary_fit_unavailable=terminal_result,
             unavailable_reason="Residual bootstrap requires a scientifically available primary Fit.",
-            provenance={"primary_fit": primary_failure or {"status": "scientific_unavailable"}},
+            provenance={"primary_fit": {"status": "scientific_unavailable", "cause": terminal_result}},
         ))
     terminal_infos = getattr(terminal_result, "dataset_info", None)
     if not isinstance(terminal_infos, (tuple, list)) or not terminal_infos:
@@ -1787,49 +1757,11 @@ def residual_bootstrap_result(
                 diagnostic=first_failed_replicate_diagnostic,
                 provenance={"replicate": index, "settlement": "failed"},
             ))
-        scientifically_available, failure = _refit_scientifically_available(fitted)
-        if not scientifically_available:
+        if isinstance(fitted, ScientificUnavailable):
             completed += 1
             failed += 1
-            raw_failure = failure.get("cause") if isinstance(failure, Mapping) else None
-            if (
-                first_failed_replicate_diagnostic is None
-                and isinstance(raw_failure, FactualCause)
-            ):
-                first_failed_replicate_diagnostic = raw_failure
-            if (
-                first_failed_replicate_unavailable is None
-                and isinstance(raw_failure, ScientificUnavailable)
-            ):
-                first_failed_replicate_unavailable = raw_failure
-            if isinstance(failure, Mapping) and failure.get("status") == "fatal":
-                raw_cause = failure.get("cause")
-                cause = (
-                    raw_cause
-                    if isinstance(raw_cause, FactualCause)
-                    else FactualCause(
-                        domain="fit",
-                        origin="bootstrap",
-                        code=None,
-                        type="FatalBootstrapRefit",
-                        message="Fatal Bootstrap refit failed.",
-                    )
-                )
-                if not isinstance(cause, FactualCause):
-                    cause = FactualCause(
-                        domain="fit",
-                        origin="bootstrap",
-                        code=None,
-                        type="FatalBootstrapRefit",
-                        message="Fatal Bootstrap refit failed.",
-                    )
-                if first_failed_replicate_diagnostic is None:
-                    first_failed_replicate_diagnostic = cause
-                return finish(build_result(
-                    "failed",
-                    diagnostic=cause,
-                    provenance={"replicate": index, "settlement": "failed"},
-                ))
+            if first_failed_replicate_unavailable is None:
+                first_failed_replicate_unavailable = fitted
             progress_cause = emit_progress(completed=index + 1)
             if progress_cause is not None:
                 return finish(stopped_result(progress_cause))

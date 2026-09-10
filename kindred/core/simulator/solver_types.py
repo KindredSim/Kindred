@@ -183,6 +183,7 @@ class SimulationRequest:
     cancellation_control: SimulationCancellationControl | None = None
     candidate_evaluation: bool = False
     stop_observable_value: Callable[[str, float, np.ndarray, float], float] | None = None
+    parameter_values_at_time: Callable[[float, tuple[str, ...]], Mapping[str, float]] | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(

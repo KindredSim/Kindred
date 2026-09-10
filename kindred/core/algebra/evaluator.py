@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Mapping, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Set, Tuple
 
 import numpy as np
 
@@ -60,6 +60,7 @@ __all__ = [
     "evaluate_block",
     "evaluate_block_partial",
     "PreparedAlgebraStopEvaluator",
+    "bind_scalar_expression_evaluator",
 ]
 
 
@@ -91,9 +92,13 @@ class EvaluationContext:
         is broadcast to the supplied grid; an array must have exactly the
         same length as ``t``.
     symbol_values : mapping, optional
-        The admitted static scalar snapshot available to observable ``let``
-        expressions. Fit candidates must prepare this complete snapshot before
-        solving; row evaluation never overrides retained ``param`` assignments.
+        Already evaluated static symbols. Missing scientific symbols can be
+        resolved on first use inside the consuming observable's error boundary.
+    symbol_resolver : callable, optional
+        Resolve a scientific symbol to a scalar or row-aligned array, or None
+        when the name is not a scientific parameter.
+    runtime_symbol_names : set
+        Row-dependent symbols, classified before their values are evaluated.
     """
     t: np.ndarray
     species_series: Mapping[str, np.ndarray]
@@ -102,6 +107,8 @@ class EvaluationContext:
     symtab: SymbolTable
     symbol_series: Mapping[str, np.ndarray] = field(default_factory=dict)
     symbol_values: Mapping[str, float] = field(default_factory=dict)
+    symbol_resolver: Callable[[str], float | np.ndarray | None] | None = None
+    runtime_symbol_names: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -158,6 +165,21 @@ def _as_float(x: Any, *, stmt: LetStatement) -> float:
 # ----------------------------- evaluator core --------------------------------
 
 
+def bind_scalar_expression_evaluator(block: AlgebraBlock, values: dict[str, float]):
+    """Bind admitted scalar AST arithmetic to one current numerical map."""
+    context = EvaluationContext(
+        t=np.array([0.0]), species_series={}, initials={},
+        species_names=set(), symtab=SymbolTable(),
+    )
+    evaluator = _Evaluator(block, context)
+    evaluator.symbol_values = values
+
+    def evaluate(statement: LetStatement) -> float:
+        return _as_float(evaluator._eval_expr(statement.expr, 0, stmt=statement), stmt=statement)
+
+    return evaluate
+
+
 class _Evaluator:
     def __init__(self, block: AlgebraBlock, ctx: EvaluationContext) -> None:
         self.block = block
@@ -181,7 +203,7 @@ class _Evaluator:
         # dependency classification for user-defined symbols
         # Runtime row-aligned symbols are dynamic roots even when their values
         # happen to be constant over one particular grid.
-        self.timevary: Set[str] = {"t"} | set(self.symbol_series)
+        self.timevary: Set[str] = {"t"} | set(self.symbol_series) | set(ctx.runtime_symbol_names)
 
     def _scalar_let_names(self) -> Set[str]:
         """Classify the complete retained let DAG by row dependence.
@@ -329,6 +351,21 @@ class _Evaluator:
                 return float(self.symbol_series[name][i])
             if name in self.symbol_values:
                 return float(self.symbol_values[name])
+            if self.ctx.symbol_resolver is not None:
+                resolved = self.ctx.symbol_resolver(name)
+                if resolved is not None:
+                    arr = np.asarray(resolved, dtype=float)
+                    if arr.ndim == 0:
+                        value = _as_float(float(arr), stmt=stmt)
+                        self.symbol_values[name] = value
+                        return value
+                    if arr.ndim != 1 or arr.size != self.N or np.any(~np.isfinite(arr)):
+                        raise AlgebraTypeError(
+                            f"symbol_series[{name!r}] must be finite and row-aligned",
+                            line=stmt.line, col=stmt.col, line_text=stmt.line_text,
+                        )
+                    self.symbol_series[name] = arr
+                    return float(arr[i])
             # protected or previously defined user scalar in symtab
             if self.ctx.symtab.has(name):
                 return float(self.ctx.symtab.get(name))

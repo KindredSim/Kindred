@@ -532,11 +532,7 @@ class TabSliderBinding(QtCore.QObject):
             self._registry.tab(self._tab_id),
             self._registry.tab_runtime(self._tab_id),
         )
-        if (
-            runtime.reactions_draft is not None
-            or not targets
-            or not self._preview_inputs_valid(targets)
-        ):
+        if runtime.reactions_draft is not None or not targets:
             return None
         if not isinstance(tab.prepared_dsl, PreparedDslRequestSet):
             return None
@@ -548,38 +544,6 @@ class TabSliderBinding(QtCore.QObject):
             return None
         return _PreviewPreflight(tab, projection, tuple(targets))
 
-    def _preview_inputs_valid(self, targets: tuple[str, ...]) -> bool:
-        runtime = self._registry.tab_runtime(self._tab_id)
-        invalid = tuple(
-            set_id
-            for set_id in targets
-            if any(
-                not self._valid_initial_text(raw, species)
-                for species, raw in runtime.initial_text_by_set_id.get(
-                    set_id,
-                    {},
-                ).items()
-            )
-        )
-        if invalid:
-            self.errorRaised.emit(
-                "Preview blocked by invalid visible Initial Conditions in: "
-                + ", ".join(invalid)
-            )
-            return False
-        return True
-
-    @staticmethod
-    def _valid_initial_text(raw: object, species: str) -> bool:
-        try:
-            validate_concentration(
-                float(raw),
-                field=f"initial concentration for {species}",
-            )
-        except (TypeError, ValueError, OverflowError):
-            return False
-        return True
-
     def _captured_gesture_transaction(
         self, capture: _GestureCapture, targets: tuple[str, ...]
     ) -> _PreviewPreflight | None:
@@ -588,8 +552,6 @@ class TabSliderBinding(QtCore.QObject):
             or capture.targets != tuple(targets)
             or self._registry.tab(self._tab_id) is not capture.tab
         ):
-            return None
-        if not self._preview_inputs_valid(targets):
             return None
         return _PreviewPreflight(capture.tab, capture.projection, capture.targets)
 
@@ -1028,8 +990,6 @@ class TabSliderBinding(QtCore.QObject):
         targets = self.resolve_target_set_ids()
         if not targets:
             return self._reject("Slider Apply requires at least one target set.")
-        if not self._preview_inputs_valid(targets):
-            return False
         if not runtime.slider_parameter_draft and not any(
             runtime.slider_species_drafts_by_set_id.get(item) for item in targets
         ):

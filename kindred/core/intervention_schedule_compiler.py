@@ -25,6 +25,7 @@ from kindred.core.intervention_schedule import (
     ObservableTriggerCondition,
     coerce_intervention_schedule,
     intervention_schedule_parameter_dependencies,
+    _resolved,
 )
 
 __all__ = [
@@ -37,6 +38,38 @@ __all__ = [
     "compile_intervention_schedule",
     "validate_boundary_conflicts",
 ]
+
+
+def resolve_executable_values(item, values: Mapping[str, float], *, time: float):
+    """Resolve a retained live payload at its scientific consumption point."""
+    updates = {}
+    for field in ("value", "delta", "flux_rate", "threshold"):
+        parameter = getattr(item, f"{field}_param", None)
+        if parameter is None:
+            continue
+        domain = (
+            "concentration"
+            if field == "value"
+            or (
+                field == "threshold"
+                and isinstance(item.condition, SpeciesTriggerCondition)
+            )
+            else "signed"
+        )
+        try:
+            updates[field] = _resolved(
+                None, parameter, values, field=field, domain=domain
+            )
+        except (ValueError, ArithmeticError) as exc:
+            raise InterventionScheduleError(
+                str(exc),
+                declaration_ordinal=item.declaration_ordinal,
+                field=field,
+                value_dependencies=(parameter,),
+                details={"time": time},
+            ) from exc
+        updates[f"{field}_param"] = None
+    return replace(item, **updates) if updates else item
 
 
 def _finite_derived(value: object, *, context: str) -> float:
@@ -150,6 +183,8 @@ class ExecutableInstant:
     declaration_ordinal: int
     value: float | None = None
     delta: float | None = None
+    value_param: str | None = None
+    delta_param: str | None = None
     phase: str = "ordinary"
     window_ordinal: int | None = None
     authored_ordinal: int | None = None
@@ -169,6 +204,11 @@ class ExecutableInstant:
             payload["window_ordinal"] = self.window_ordinal
         if self.authored_ordinal is not None:
             payload["authored_ordinal"] = self.authored_ordinal
+        for field in ("value", "delta", "flux_rate"):
+            parameter = getattr(self, f"{field}_param", None)
+            if parameter is not None:
+                payload.pop(field, None)
+                payload[f"{field}_param"] = parameter
         return payload
 
 
@@ -177,8 +217,9 @@ class ExecutableFlux:
     species: str
     start_time: float
     end_time: float
-    flux_rate: float
+    flux_rate: float | None
     declaration_ordinal: int
+    flux_rate_param: str | None = None
     phase: str = "ordinary"
     window_ordinal: int | None = None
     authored_ordinal: int | None = None
@@ -201,6 +242,11 @@ class ExecutableFlux:
             payload["window_ordinal"] = self.window_ordinal
         if self.authored_ordinal is not None:
             payload["authored_ordinal"] = self.authored_ordinal
+        for field in ("value", "delta", "flux_rate"):
+            parameter = getattr(self, f"{field}_param", None)
+            if parameter is not None:
+                payload.pop(field, None)
+                payload[f"{field}_param"] = parameter
         return payload
 
 
@@ -209,8 +255,9 @@ class ExecutableHold:
     species: str
     start_time: float
     end_time: float
-    value: float
+    value: float | None
     declaration_ordinal: int
+    value_param: str | None = None
     phase: str = "ordinary"
     window_ordinal: int | None = None
     authored_ordinal: int | None = None
@@ -233,6 +280,11 @@ class ExecutableHold:
             payload["window_ordinal"] = self.window_ordinal
         if self.authored_ordinal is not None:
             payload["authored_ordinal"] = self.authored_ordinal
+        for field in ("value", "delta", "flux_rate"):
+            parameter = getattr(self, f"{field}_param", None)
+            if parameter is not None:
+                payload.pop(field, None)
+                payload[f"{field}_param"] = parameter
         return payload
 
 
@@ -240,12 +292,13 @@ class ExecutableHold:
 class ExecutableTrigger:
     declaration_ordinal: int
     condition: SpeciesTriggerCondition | ObservableTriggerCondition
-    threshold: float
+    threshold: float | None
     direction: str
     max_count: int | None
     min_interval: float | None
     then: InterventionTriggerAction | InterventionStopAction
     source_text: str | None = None
+    threshold_param: str | None = None
 
     @property
     def op(self) -> str:
@@ -256,7 +309,7 @@ class ExecutableTrigger:
             "op": "trigger",
             "declaration_ordinal": self.declaration_ordinal,
             **self.condition.to_payload(),
-            "threshold": self.threshold,
+            **({"threshold_param": self.threshold_param} if self.threshold_param else {"threshold": self.threshold}),
             "direction": self.direction,
             **({"max_count": self.max_count, "min_interval": self.min_interval} if not isinstance(self.then, InterventionStopAction) else {}),
             "then": self.then.to_payload(),
@@ -515,14 +568,14 @@ def _instant_from_direct(
             op="set",
             species=operation.species,
             time=float(operation.time),
-            value=float(operation.value),
+            value=operation.value, value_param=operation.value_param,
             declaration_ordinal=operation.declaration_ordinal,
         )
     return ExecutableInstant(
         op="jump",
         species=operation.species,
         time=float(operation.time),
-        delta=float(operation.delta),
+        delta=operation.delta, delta_param=operation.delta_param,
         declaration_ordinal=operation.declaration_ordinal,
     )
 
@@ -538,8 +591,8 @@ def _protocol_instant(
         op=operation.op,
         species=operation.species,
         time=time,
-        value=operation.value,
-        delta=operation.delta,
+        value=operation.value, value_param=operation.value_param,
+        delta=operation.delta, delta_param=operation.delta_param,
         declaration_ordinal=protocol.declaration_ordinal,
         phase=operation.phase,
         window_ordinal=window_ordinal,
@@ -565,8 +618,8 @@ def _protocol_interval(
         "authored_ordinal": operation.authored_ordinal,
     }
     if operation.op == "flux":
-        return ExecutableFlux(flux_rate=float(operation.flux_rate), **common)
-    return ExecutableHold(value=float(operation.value), **common)
+        return ExecutableFlux(flux_rate=operation.flux_rate, flux_rate_param=operation.flux_rate_param, **common)
+    return ExecutableHold(value=operation.value, value_param=operation.value_param, **common)
 
 
 def _lineage(
@@ -838,13 +891,14 @@ def compile_intervention_schedule(
     *,
     cancellation_check: Callable[[], bool] | None = None,
     dependency_metadata: InterventionScheduleDependencyMetadata | None = None,
+    authored_payload: Mapping[str, Any] | None = None,
 ) -> InterventionExecutionContract:
     _raise_if_cancelled(cancellation_check)
     schedule_obj = coerce_intervention_schedule(schedule) or InterventionSchedule()
     dependency_metadata = dependency_metadata or intervention_schedule_parameter_dependencies(
         schedule_obj
     )
-    if schedule_obj.is_parameterized:
+    if any(field in {"time", "start_time", "end_time"} for _ordinal, _nested, field in intervention_schedule_parameter_dependencies(schedule_obj)):
         schedule_field_identities = tuple(dependency_metadata)
         raise InterventionScheduleError(
             "Parameterized intervention schedule must be resolved before compilation.",
@@ -869,7 +923,7 @@ def compile_intervention_schedule(
                     species=operation.species,
                     start_time=float(operation.start_time),
                     end_time=float(operation.end_time),
-                    flux_rate=float(operation.flux_rate),
+                    flux_rate=operation.flux_rate, flux_rate_param=operation.flux_rate_param,
                     declaration_ordinal=operation.declaration_ordinal,
                 )
             )
@@ -879,7 +933,7 @@ def compile_intervention_schedule(
                     species=operation.species,
                     start_time=float(operation.start_time),
                     end_time=float(operation.end_time),
-                    value=float(operation.value),
+                    value=operation.value, value_param=operation.value_param,
                     declaration_ordinal=operation.declaration_ordinal,
                 )
             )
@@ -889,7 +943,7 @@ def compile_intervention_schedule(
                     declaration_ordinal=operation.declaration_ordinal,
                     condition=operation.condition,
                     source_text=operation.source_text,
-                    threshold=float(operation.threshold),
+                    threshold=operation.threshold, threshold_param=operation.threshold_param,
                     direction=operation.direction,
                     max_count=operation.max_count,
                     min_interval=operation.min_interval,
@@ -1120,7 +1174,7 @@ def compile_intervention_schedule(
             value_dependencies=_all_schedule_dependencies(dependency_metadata),
         )
     segments = tuple(zip(discontinuities, discontinuities[1:]))
-    declarative_payload = schedule_obj.to_payload()
+    declarative_payload = schedule_obj.to_payload() if authored_payload is None else authored_payload
     return InterventionExecutionContract(
         declarative_payload=declarative_payload,
         instants=tuple(instants),
@@ -1173,8 +1227,8 @@ def validate_boundary_conflicts(
                 operations=tuple((*sets, *jumps)),
             )
         absolute_values = [
-            *(float(item.value) for item in sets),
-            *(float(item.value) for item in holds),
+            *(float(item.value) for item in sets if item.value_param is None),
+            *(float(item.value) for item in holds if item.value_param is None),
         ]
         if absolute_values and any(
             value != absolute_values[0] for value in absolute_values[1:]
@@ -1216,7 +1270,7 @@ def _validate_hold_overlaps(
             if left.species != right.species:
                 continue
             if left.start_time < right.end_time and right.start_time < left.end_time:
-                if left.value != right.value:
+                if left.value_param is None and right.value_param is None and left.value != right.value:
                     raise _annotated_schedule_error(
                         InterventionScheduleError(
                             "Overlapping holds for "

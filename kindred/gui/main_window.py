@@ -1729,24 +1729,6 @@ class MainWindow(QtWidgets.QMainWindow):
             )
         return result
 
-    def _retire_preview_for_source_change(self, tab_id: str) -> None:
-        """Retire all pending Preview work before accepting newer source facts."""
-
-        target = str(tab_id)
-        bundle = self._tab_surfaces.get(target)
-        if bundle is not None:
-            self._workspace.plot_for_tab(target).retire_interactive_preview_targets(
-                tuple(
-                    dict.fromkeys(
-                        (
-                            *bundle.slider_binding.active_preview_set_ids,
-                            *bundle.slider_binding.resolve_target_set_ids(),
-                        )
-                    )
-                )
-            )
-            bundle.slider_binding.cancel_pending_preview_intent()
-
     def _render_tab_state(self) -> None:
         tabs = self._project_session.document.tabs
         for tab in tabs:
@@ -2653,7 +2635,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         runtime = self._workspace_tab_registry.tab_runtime(tab_id)
         if runtime.reactions_draft is not None:
-            self._retire_preview_for_source_change(tab_id)
+            self._tab_surfaces[tab_id].slider_binding.fence_stop()
         # Reactions drafts invalidate only the calculator's current snapshot;
         # reverting the draft immediately rebuilds from the current
         # prepared-object identity. Slider and notes drafts leave executable identity

@@ -1619,6 +1619,7 @@ def _build_dataset_fit_info(
                 multipliers=target_multipliers,
                 dataset_label=dataset_id,
                 x_name=x_name,
+                cancellation_control=cancellation_control,
             )
         except CandidateParametricAlignmentError as exc:
             raise _DatasetFitUnavailable(ScientificUnavailable(
