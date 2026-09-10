@@ -217,6 +217,8 @@ class EffectiveRateCoefficientEvaluator:
 
 def build_effective_rate_coefficient_evaluator(
     mechanism: Mechanism,
+    *,
+    base_values: Mapping[str, float] | None = None,
 ) -> EffectiveRateCoefficientEvaluator:
     """Build the sole effective-rate authority consumed by RHS and Jacobian."""
 
@@ -236,7 +238,7 @@ def build_effective_rate_coefficient_evaluator(
     if spec is None:
         spec = admit_parameter_evaluation_graph(parse_parameter_algebra_spec_from_dsl_text(
             "", mechanism_namespace=build_namespace_from_mechanism(mechanism)), mechanism)
-    evaluate = bind_parameter_evaluation(spec, mechanism)
+    evaluate = bind_parameter_evaluation(spec, mechanism, base_values=base_values)
     entries = {(entry["kind"], int(entry["reaction_index" if entry["kind"] == "reaction" else "equilibrium_index"])): entry
                for entry in get_step_index_map(mechanism)}
     step_kinds = []
@@ -350,6 +352,8 @@ class CompiledOdeTopology:
     def bind_target(
         self,
         mechanism: Mechanism,
+        *,
+        base_values: Mapping[str, float] | None = None,
     ) -> tuple[EffectiveRateCoefficientEvaluator, Callable[..., np.ndarray]]:
         """Bind one target's rate authority and mutable RHS workspace."""
 
@@ -357,7 +361,9 @@ class CompiledOdeTopology:
             raise ValueError("Target mechanism species order conflicts with compiled ODE topology.")
         if len(mechanism.reactions) + len(mechanism.equilibria) != len(self.step_kinds):
             raise ValueError("Target mechanism step order conflicts with compiled ODE topology.")
-        coefficient_evaluator = build_effective_rate_coefficient_evaluator(mechanism)
+        coefficient_evaluator = build_effective_rate_coefficient_evaluator(
+            mechanism, base_values=base_values
+        )
         return coefficient_evaluator, _build_bound_ode_rhs(
             self,
             mechanism,

@@ -668,7 +668,6 @@ class VariableSliders(QtWidgets.QWidget):
                     self._set_value_projection(
                         name, value, editor_text=self._format_value(value), emit=False
                     )
-                    self._on_editor_started(name)
                 elif name in self._active_presses:
                     self.update_variable_readout(name, value)
                 elif self._editor_has_focus(name):
@@ -676,12 +675,16 @@ class VariableSliders(QtWidgets.QWidget):
                 else:
                     self.update_variable(name, value)
             self._sync_visibility_state()
-            return
-        self.set_variables(
-            normalized_variables,
-            metadata=normalized_metadata,
-            preserve_visibility=preserve_visibility,
-        )
+        else:
+            self.set_variables(
+                normalized_variables,
+                metadata=normalized_metadata,
+                preserve_visibility=preserve_visibility,
+            )
+        if not preserve_editor_drafts:
+            for name in normalized_variables:
+                self.remember_editor_state(name)
+                self._last_committed_editor_text[name] = self._value_labels[name].text()
 
     def update_variable(self, name: str, value: float) -> None:
         """

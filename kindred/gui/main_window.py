@@ -1029,6 +1029,7 @@ class MainWindow(QtWidgets.QMainWindow):
         *,
         scientific_fields: frozenset[str] | None = None,
         preserve_reactions_editor: bool = False,
+        preserve_slider_editor_drafts: bool = True,
     ) -> None:
         """Refresh a tab, narrowing scientific-settings invalidation when known."""
 
@@ -1099,7 +1100,10 @@ class MainWindow(QtWidgets.QMainWindow):
         slider_projection: ActiveSliderRenderProjection | None = None
         try:
             slider_projection = bundle.slider_binding.prepare_render()
-            bundle.slider_binding.apply_render_projection(slider_projection)
+            bundle.slider_binding.apply_render_projection(
+                slider_projection,
+                preserve_editor_drafts=preserve_slider_editor_drafts,
+            )
             bundle.slider_binding.settle_render_projection(slider_projection)
         except Exception as exc:
             logger.exception("Tab %s Slider refresh failed", target)
@@ -2803,12 +2807,22 @@ class MainWindow(QtWidgets.QMainWindow):
             return False
         self._slider_apply_refreshing.add(target)
         try:
-            accepted = bundle.slider_binding.apply()
+            token = self._workspace_tab_registry.capture_content_token()
+            if bundle.initial_actions.capture_active_editor(
+                expected_token=token,
+            ) is None:
+                return False
+            visible_source = self._visible_source_for_tab(target)
+            if not bundle.slider_binding.apply():
+                return False
+            bundle.editor_binding.apply_accepted_source_rewrite(
+                visible_source,
+                self._workspace_tab_registry.tab(target).mechanism_source,
+            )
+            self._workspace_tab_registry.tab_runtime(target).reactions_draft = None
         finally:
             self._slider_apply_refreshing.discard(target)
-        if not accepted:
-            return False
-        self._refresh_tab_controls(target)
+        self._refresh_tab_controls(target, preserve_slider_editor_drafts=False)
         self.set_status_text("Slider values applied; exact Preview promoted to current results.")
         return True
 

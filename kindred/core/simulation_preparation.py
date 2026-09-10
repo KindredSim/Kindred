@@ -15,6 +15,7 @@ from typing import Any, Callable, Dict, Iterable, Mapping, Optional
 
 import numpy as np
 
+from kindred.core.algebra.symbols import PROTECTED_NAMES
 from kindred.core.exceptions import (
     FitSimulationError,
     SimulationCancelled,
@@ -175,6 +176,7 @@ def _classify_request_parameter_names(
         name = str(requested_name or "").strip()
         if name and name not in classification_names:
             classification_names.append(name)
+    write_names = set(classification_names)
     schedule_names.update(intervention_schedule_parameter_names(unresolved_intervention_schedule))
     for schedule_name in schedule_names:
         name = str(schedule_name or "").strip()
@@ -193,6 +195,11 @@ def _classify_request_parameter_names(
         if str(name or "").strip()
     }
     for name in classification_names:
+        if name in write_names and name in PROTECTED_NAMES:
+            invalid_messages[name] = (
+                f"protected symbol {name!r} cannot be overridden or fitted."
+            )
+            continue
         claimed = False
         target = parameter_target_map.get(name)
         if target is not None:
@@ -901,7 +908,7 @@ def prepare_simulation_run(
         )
     )
     try:
-        _bind_request_parameter_overrides(
+        schedule_only_values = _bind_request_parameter_overrides(
             mechanism=mechanism,
             parameter_algebra_spec=parameter_algebra_spec,
             parameter_overrides=execution_request.parameter_overrides,
@@ -913,7 +920,9 @@ def prepare_simulation_run(
     _raise_if_cancelled(cancellation_control)
 
     try:
-        _coefficient_evaluator, rhs = topology.bind_target(mechanism)
+        _coefficient_evaluator, rhs = topology.bind_target(
+            mechanism, base_values=schedule_only_values
+        )
     except Exception as exc:
         raise SimulationPreparationError("ode_build", str(exc)) from exc
 
@@ -1070,7 +1079,7 @@ def _bind_request_parameter_overrides(
     unresolved_intervention_schedule: Any,
     parameter_target_map: Mapping[str, ParameterTarget],
 ) -> Mapping[str, float]:
-    """Bind one request through the fixed preparation-owned parameter path."""
+    """Apply owned coordinates and return admitted schedule-only bindings."""
 
     declared_scalar_names, derived_scalar_names = (
         _parameter_algebra_scalar_authority_names(
@@ -1107,4 +1116,8 @@ def _bind_request_parameter_overrides(
         invalid_parameter_identifier_messages=invalid_messages,
         parameter_target_map=parameter_target_map,
     )
-    return dict(raw_values)
+    return {
+        name: value
+        for name, value in raw_values.items()
+        if name in schedule_names and name not in mechanism_names | scalar_names
+    }

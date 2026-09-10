@@ -1309,7 +1309,6 @@ def _apply_boundary(
         if stop is not None:
             return finish(stop)
     executed_entering_holds: list[ExecutableHold] = []
-    activated_holds = list(item for item in active_holds if item.start_time < boundary)
     stages = (
         tuple(item for item in active_holds if item.start_time < boundary),
         tuple(sorted((item for item in static if item.phase in {"ordinary", "before"}), key=_instant_canonical_order)),
@@ -1334,12 +1333,6 @@ def _apply_boundary(
                 if action.declaration_ordinal in trigger_by_declaration:
                     record(trigger_by_declaration[action.declaration_ordinal], action)
             else:
-                if original not in activated_holds:
-                    activated_holds.append(original)
-                _validate_resolved_holds(
-                    _resolve_items(activated_holds, boundary, parameter_values),
-                    time=boundary, cancellation_check=cancellation_check,
-                )
                 if original in entering_holds and action not in executed_entering_holds:
                     if stops:
                         validate_boundary_conflicts(instants=executed_instants, entering_holds=(*executed_entering_holds, action), cancellation_check=cancellation_check)
@@ -1489,33 +1482,21 @@ def _resolve_items(items, time, parameter_values):
         ) from exc
 
 
-def _validate_resolved_holds(holds, *, time, cancellation_check):
-    """Admit simultaneous held concentrations before projecting any state."""
-    used = {}
-    for hold in holds:
-        _raise_if_cancelled(cancellation_check)
-        value = float(hold.value)
-        if not math.isfinite(value) or value < 0.0:
-            raise InterventionScheduleError(
-                "Intervention hold produced an invalid state."
-            )
-        if hold.species in used and used[hold.species] != value:
-            raise InterventionScheduleError(
-                f"Overlapping holds for {hold.species} differ at t={time:g}."
-            )
-        used[hold.species] = value
-
-
 def _apply_holds(
     state, holds, *, species_index, cancellation_check, time=0.0, parameter_values=None
 ):
     if not holds:
         return state
     resolved = _resolve_items(holds, time, parameter_values)
-    _validate_resolved_holds(resolved, time=time, cancellation_check=cancellation_check)
     output = np.asarray(state, dtype=float).reshape(-1).copy()
     for hold in resolved:
-        output[species_index[hold.species]] = hold.value
+        _raise_if_cancelled(cancellation_check)
+        value = float(hold.value)
+        if not math.isfinite(value) or value < 0.0:
+            raise InterventionScheduleError(
+                "Intervention hold produced an invalid state."
+            )
+        output[species_index[hold.species]] = value
     return output
 
 

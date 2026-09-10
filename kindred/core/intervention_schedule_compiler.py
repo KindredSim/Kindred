@@ -103,9 +103,13 @@ def _protocol_boundary(
     value_dependencies: Sequence[str] = (),
 ) -> float:
     try:
-        value = start + every * index
-        if duration is not None:
-            value += duration
+        if duration == every:
+            # Adjacent windows share exactly the same binary64 boundary.
+            value = start + every * (index + 1)
+        else:
+            value = start + every * index
+            if duration is not None:
+                value += duration
     except (OverflowError, ValueError) as exc:
         raise InterventionScheduleError(
             "Protocol boundary arithmetic must remain finite.",
@@ -1147,14 +1151,14 @@ def compile_intervention_schedule(
         )
     )
     triggers.sort(key=lambda item: item.declaration_ordinal)
-    validate_boundary_conflicts(
-        instants=instants,
-        entering_holds=holds,
+    _validate_hold_overlaps(
+        holds,
         cancellation_check=cancellation_check,
         dependency_metadata=dependency_metadata,
     )
-    _validate_hold_overlaps(
-        holds,
+    validate_boundary_conflicts(
+        instants=instants,
+        entering_holds=holds,
         cancellation_check=cancellation_check,
         dependency_metadata=dependency_metadata,
     )
@@ -1270,15 +1274,17 @@ def _validate_hold_overlaps(
             if left.species != right.species:
                 continue
             if left.start_time < right.end_time and right.start_time < left.end_time:
-                if left.value_param is None and right.value_param is None and left.value != right.value:
-                    raise _annotated_schedule_error(
-                        InterventionScheduleError(
-                            "Overlapping holds for "
-                            f"{left.species} must have equal resolved values."
-                        ),
-                        operation=None,
-                        dependency_metadata=dependency_metadata,
-                        field="value",
-                        fields=("start_time", "end_time", "value", "delta", "time"),
-                        operations=(left, right),
-                    )
+                raise _annotated_schedule_error(
+                    InterventionScheduleError(
+                        f"Overlapping holds for {left.species}: "
+                        f"declaration {left.declaration_ordinal + 1} "
+                        f"[{left.start_time!r}, {left.end_time!r}) and "
+                        f"declaration {right.declaration_ordinal + 1} "
+                        f"[{right.start_time!r}, {right.end_time!r}). "
+                        "Only one hold per species may be active at a time."
+                    ),
+                    operation=None,
+                    dependency_metadata=dependency_metadata,
+                    fields=("start_time", "end_time"),
+                    operations=(left, right),
+                )

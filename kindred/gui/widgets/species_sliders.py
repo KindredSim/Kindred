@@ -157,6 +157,7 @@ class BatchSpeciesSliders(QtWidgets.QWidget):
         mixed_species: Sequence[str] = (),
         display_names: Mapping[str, str] | None = None,
         preserve_visibility: bool = True,
+        preserve_editor_drafts: bool = True,
     ) -> None:
         normalized: dict[str, float] = {}
         normalized_display_names: dict[str, str] = {}
@@ -205,6 +206,18 @@ class BatchSpeciesSliders(QtWidgets.QWidget):
                     display_name=normalized_display_names[species],
                     mixed=species in mixed,
                 )
+        if not preserve_editor_drafts:
+            for species, value in normalized.items():
+                text = "Multiple values" if species in mixed else format_slider_value(value)
+                self._set_value_projection(
+                    species, value, editor_text=text, emit=False
+                )
+                if species in mixed:
+                    editor = self._rows[species].value_label
+                    editor.setProperty("invalidNumeric", False)
+                    editor.setStyleSheet("")
+                self.remember_editor_state(species)
+                self._last_committed_editor_text[species] = text
         self._sync_visibility()
 
     def slider_picker_entries(self) -> list[tuple[str, str, bool]]:

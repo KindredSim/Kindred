@@ -239,8 +239,12 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
         self._commit_runtime_parameters_btn.setObjectName(
             "commitRuntimeParametersButton"
         )
+        # A mouse Apply accepts the Preview, not the focused editor's draft.
+        self._commit_runtime_parameters_btn.setFocusPolicy(QtCore.Qt.TabFocus)
         self._commit_runtime_parameters_btn.setToolTip(
-            "Apply current slider values to the canonical mechanism"
+            "Accept the exact Preview, replacing pending Reactions text and "
+            "initial-condition drafts for the applied sets. Reactions Undo "
+            "can recover replaced text."
         )
         self._commit_runtime_parameters_btn.clicked.connect(self.sliderApplyRequested)
         slider_actions_layout.addWidget(self._commit_runtime_parameters_btn, 0, 2, alignment=QtCore.Qt.AlignLeft)
@@ -438,7 +442,8 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
             "<pre>intervention: op=set; species=A; time=1.0; value=2.0</pre>"
             "<p>Without active stops, Kindred validates all static and exact-root trigger candidates before mutation. Ending intervals end, ordinary and protocol-before operations run in authored order, entering holds are established, trigger actions run in declaration order, and protocol-after operations run in authored order.</p>"
             "<p>With active stops, an eligible stop interrupts this order immediately. Each executed chemical action can make a stop eligible before the next action; the causing action remains applied. See Stopping Order and Output above.</p>"
-            "<p>Conflicts reject unequal absolute sets, set plus jump, unequal overlapping holds for one species, and a hold start that is not an equal set. Equal overlapping holds are compatible.</p>"
+            "<p>Only one hold per species may be active at a time. After resolving time parameters, Kindred rejects overlapping hold intervals before integration, even if their values agree or an earlier stop would skip them. Adjacent intervals may share an endpoint, and different species may be held simultaneously.</p>"
+            "<p>Other conflicts reject unequal absolute sets, set plus jump, and a hold start that is not an equal set.</p>"
             "<p>Scheduled changes, holds, trigger actions, sampled output, and manual sign checks do not create chemical-trigger roots. Active stopping interventions also check crossings immediately after each chemical action.</p>"
             "<h2>Intervention Parameters and Protected Names</h2>"
             "<p>Only the documented parameter fields may be replaced by named values, and indexed mechanism names retain their step meaning.</p>"

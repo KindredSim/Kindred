@@ -430,6 +430,7 @@ class TabSliderBinding(QtCore.QObject):
                 target_set_ids=prepared.targets,
                 mixed_species=prepared.mixed_species,
                 preserve_visibility=prepared.preserve_visibility,
+                preserve_editor_drafts=preserve_editor_drafts,
             )
         finally:
             del sb
@@ -995,10 +996,6 @@ class TabSliderBinding(QtCore.QObject):
         ):
             self.publish_slider_draft_state()
             return False
-        if runtime.reactions_draft is not None:
-            return self._reject(
-                "Slider Apply requires settled accepted Reactions before Apply."
-            )
         if self._simulation_jobs.busy:
             return self._reject(
                 "Slider Apply requires the exact Preview to settle first."
@@ -1056,6 +1053,7 @@ class TabSliderBinding(QtCore.QObject):
         runtime.slider_parameter_draft.clear()
         for set_id in targets:
             runtime.slider_species_drafts_by_set_id.pop(set_id, None)
+            runtime.initial_text_by_set_id.pop(set_id, None)
         self._exact_preview_capture = None
         self._emit_draft_state()
         return True
