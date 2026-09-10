@@ -261,6 +261,7 @@ class GridPlotView(QtWidgets.QWidget):
         self._scroll.setWidget(self._canvas)
         self._scroll.setAlignment(QtCore.Qt.AlignmentFlag.AlignTop)
         self._scroll.viewport().installEventFilter(self)
+        self._canvas.viewport().installEventFilter(self)
         layout.addWidget(self._scroll)
 
 
@@ -361,6 +362,13 @@ class GridPlotView(QtWidgets.QWidget):
         self._context_target = None
 
     def eventFilter(self, watched: object, event: QtCore.QEvent) -> bool:
+        if (event.type() == QtCore.QEvent.Type.Wheel
+                and watched is self._canvas.viewport()
+                and len(self._dataset_ids) > 1):
+            # Scroll the dataset grid before the plot or its axes consume the wheel.
+            self._scroll.wheelEvent(event)
+            event.accept()
+            return True
         if watched is self._scroll.viewport() and event.type() == QtCore.QEvent.Type.Resize:
             self._layout_timer.start(0)
         if watched is self._canvas.scene() and event.type() == QtCore.QEvent.Type.GraphicsSceneContextMenu:
