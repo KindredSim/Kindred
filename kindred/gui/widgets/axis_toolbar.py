@@ -24,7 +24,7 @@ set_x_candidates(candidates, *, selected)
 set_y_candidates(candidates, *, disabled=(), locked_checked=None)
 selected_y() -> tuple[AxisSeriesSelection, ...]
 current_x() -> AxisSeriesSelection
-set_manual_range_controls(*, visible: bool, enabled: bool) -> None
+set_manual_range_controls(*, auto_x: bool, auto_y: bool, enabled: bool) -> None
 get_manual_ranges() -> tuple[float|None, float|None, float|None, float|None]
 set_manual_ranges(x_min, x_max, y_min, y_max) -> None
 
@@ -60,7 +60,7 @@ class AxisToolbar(QtWidgets.QWidget):
     xChanged = QtCore.Signal(object)
     ySelectionChanged = QtCore.Signal(object)
     unitChanged = QtCore.Signal(str, str)
-    axisRangeChanged = QtCore.Signal()                 # axis range manually changed
+    axisRangeChanged = QtCore.Signal(str)
 
     def __init__(
         self,
@@ -173,10 +173,9 @@ class AxisToolbar(QtWidgets.QWidget):
         self._invert_y_selection_btn.clicked.connect(self.invert_y_selection)
 
         # Range control wiring
-        self._x_min.editingFinished.connect(self._on_range_changed)
-        self._x_max.editingFinished.connect(self._on_range_changed)
-        self._y_min.editingFinished.connect(self._on_range_changed)
-        self._y_max.editingFinished.connect(self._on_range_changed)
+        for axis, edits in (("x", (self._x_min, self._x_max)), ("y", (self._y_min, self._y_max))):
+            for edit in edits:
+                edit.editingFinished.connect(lambda key=axis: self._on_range_changed(key))
 
         for edit, name in ((self._x_min, "X minimum"), (self._x_max, "X maximum"),
                            (self._y_min, "Y minimum"), (self._y_max, "Y maximum")):
@@ -335,11 +334,14 @@ class AxisToolbar(QtWidgets.QWidget):
         selected_x: str | None,
         y_units: Sequence[str],
         selected_y: str | None,
+        transformed: bool = False,
     ) -> None:
         """Project the available display-only units without emitting intent."""
 
         self._set_unit_combo(self._x_unit_combo, x_units, selected_x)
         self._set_unit_combo(self._y_unit_combo, y_units, selected_y)
+        self._x_unit_label.setText("Source X unit:" if transformed else "Unit:")
+        self._y_unit_label.setText("Source Y unit:" if transformed else "Unit:")
 
     @staticmethod
     def _set_unit_combo(
@@ -415,12 +417,15 @@ class AxisToolbar(QtWidgets.QWidget):
             raise TypeError("X selector lacks a typed axis identity.")
         return selection
 
-    def set_manual_range_controls(self, *, visible: bool, enabled: bool) -> None:
+    def set_manual_range_controls(self, *, auto_x: bool, auto_y: bool, enabled: bool) -> None:
         """Project the plot owner's range mode and gesture restriction."""
+        visible = not (auto_x and auto_y)
         self._manual_range_row.setVisible(visible)
         self._manual_range_row.setEnabled(visible and enabled)
-        for edit in (self._x_min, self._x_max, self._y_min, self._y_max):
-            edit.setEnabled(visible and enabled)
+        for axis, auto, edits in (("X", auto_x, (self._x_min, self._x_max)), ("Y", auto_y, (self._y_min, self._y_max))):
+            self._range_labels[axis].setText(f"{axis} ({'automatic' if auto else 'manual'}):")
+            for edit in edits:
+                edit.setEnabled(not auto and enabled)
         self.updateGeometry()
 
     def get_manual_ranges(self) -> tuple[Optional[float], Optional[float], Optional[float], Optional[float]]:
@@ -480,8 +485,9 @@ class AxisToolbar(QtWidgets.QWidget):
         self.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Preferred)
         self._x_combo.setSizePolicy(QtWidgets.QSizePolicy.Preferred, QtWidgets.QSizePolicy.Fixed)
         toolbar_groups = []
+        self._x_unit_label = QtWidgets.QLabel("Unit:", self)
         for label, editor in ((x_label, self._x_combo),
-                              (QtWidgets.QLabel("Unit:", self), self._x_unit_combo)):
+                              (self._x_unit_label, self._x_unit_combo)):
             label.setToolTip(editor.toolTip())
             group = QtWidgets.QWidget(self)
             group_layout = QtWidgets.QHBoxLayout(group)
@@ -495,21 +501,23 @@ class AxisToolbar(QtWidgets.QWidget):
         unit_layout = QtWidgets.QHBoxLayout(unit_group)
         unit_layout.setContentsMargins(0, 0, 0, 0)
         unit_layout.setSpacing(8)
-        y_unit_label = QtWidgets.QLabel("Unit:", self)
-        y_unit_label.setToolTip(self._y_unit_combo.toolTip())
-        unit_layout.addWidget(y_unit_label)
+        self._y_unit_label = QtWidgets.QLabel("Unit:", self)
+        self._y_unit_label.setToolTip(self._y_unit_combo.toolTip())
+        unit_layout.addWidget(self._y_unit_label)
         unit_layout.addWidget(self._y_unit_combo)
         toolbar_groups.append(unit_group)
 
         range_layout = ControlRowsLayout(self._manual_range_row)
         range_layout.setSpacing(4)
-        for axis, lower, upper in (("X:", self._x_min, self._x_max),
-                                   ("Y:", self._y_min, self._y_max)):
+        self._range_labels = {}
+        for axis, lower, upper in (("X", self._x_min, self._x_max),
+                                   ("Y", self._y_min, self._y_max)):
             group = QtWidgets.QWidget(self._manual_range_row)
             pair = QtWidgets.QHBoxLayout(group)
             pair.setContentsMargins(0, 0, 0, 0)
             pair.setSpacing(4)
-            pair.addWidget(QtWidgets.QLabel(axis, group))
+            self._range_labels[axis] = QtWidgets.QLabel(axis, group)
+            pair.addWidget(self._range_labels[axis])
             pair.addWidget(lower)
             pair.addWidget(QtWidgets.QLabel("to", group))
             pair.addWidget(upper)
@@ -566,9 +574,9 @@ class AxisToolbar(QtWidgets.QWidget):
         self._update_y_selector_text()
         self.ySelectionChanged.emit(self.selected_y())
 
-    def _on_range_changed(self) -> None:
+    def _on_range_changed(self, axis: str) -> None:
         if self._manual_range_row.isEnabled():
-            self.axisRangeChanged.emit()
+            self.axisRangeChanged.emit(axis)
 
     def set_tab_order(self) -> None:
         QtWidgets.QWidget.setTabOrder(self._x_combo, self._x_unit_combo)

@@ -14,6 +14,7 @@ import numpy as np
 from PySide6 import QtCore, QtGui, QtWidgets
 
 from kindred.core.project_presentation_state import (
+    ProjectPresentationState,
     SimulationSeriesAxisSelection,
 )
 from kindred.core.result_repository import SimulationResultValue
@@ -45,28 +46,104 @@ pg = require_pyqtgraph(context="Kindred GUI")
 __all__ = ["PyQtGraphPlotPanel"]
 
 
-@dataclass(frozen=True, slots=True)
-class _PlotPresentation:
-    log_x: bool = False
-    log_y: bool = False
-    legend_visible: bool = True
-    x_inverted: bool = False
-    y_inverted: bool = False
+class _PlotDataItem(pg.PlotDataItem):
+    """Treat scatter axes with no finite mapped samples as having no bounds."""
+
+    def dataBounds(self, ax, frac=1.0, orthoRange=None):
+        if not self.curve.isVisible() and self.scatter.isVisible():
+            # 0.13.7 checks for empty scatter data before, but not after,
+            # filtering nonfinite values for percentiles. Log mapping can
+            # remove every finite value, including within a visible-X window.
+            data = self.scatter.data
+            values = data["x" if ax == 0 else "y"]
+            if orthoRange is not None:
+                other = data["y" if ax == 0 else "x"]
+                values = values[(other >= orthoRange[0]) & (other <= orthoRange[1])]
+            if not np.isfinite(values).any():
+                return (None, None)
+        return super().dataBounds(ax, frac=frac, orthoRange=orthoRange)
+
+
+class _PlotViewBox(pg.ViewBox):
+    """Keep native gestures, with effective axis masks for axis drags and rectangles."""
+
+    def childrenBounds(self, frac=None, orthoRange=(None, None), items=None):
+        items = self.addedItems if items is None else items
+        # 0.13.7 ScatterPlotItem caches restricted bounds as unrestricted
+        # bounds. Clear that cache before asking native code for the bounds.
+        for item in items:
+            if isinstance(item, pg.PlotDataItem):
+                item.scatter.bounds = [None, None]
+        return super().childrenBounds(frac=frac, orthoRange=orthoRange, items=items)
+
+    def mouseDragEvent(self, event: object, axis: int | None = None) -> None:
+        enabled = self.state["mouseEnabled"]
+        # 0.13.7 emits mouseEnabled instead of its axis-local drag mask.
+        # Narrow the native gesture itself so right drags also leave the other
+        # axis automatic; restore the user's locks when this event returns.
+        self.state["mouseEnabled"] = [
+            value and (axis is None or index == axis)
+            for index, value in enumerate(enabled)
+        ]
+        try:
+            super().mouseDragEvent(event, axis=axis)
+        finally:
+            self.state["mouseEnabled"] = enabled
+
+    def showAxRect(self, rect: QtCore.QRectF, **kwargs: object) -> None:
+        rect = rect.normalized()
+        ranges = {}
+        if self.state["mouseEnabled"][0]:
+            ranges["xRange"] = (rect.left(), rect.right())
+        if self.state["mouseEnabled"][1]:
+            ranges["yRange"] = (rect.top(), rect.bottom())
+        if ranges:
+            self.setRange(**ranges, **kwargs)
+            self.sigRangeChangedManually.emit(self.state["mouseEnabled"])
 
 
 @dataclass(frozen=True, slots=True)
 class _AxisRangeSession:
-    auto: bool = True
+    auto_x: bool = True
+    auto_y: bool = True
+    mouse_x: bool = True
+    mouse_y: bool = True
+    fraction_x: float = 1.0
+    fraction_y: float = 1.0
+    pan_x: bool = False
+    pan_y: bool = False
+    visible_x: bool = False
     x_min: float | None = None
     x_max: float | None = None
     y_min: float | None = None
     y_max: float | None = None
 
 
+@dataclass(slots=True)
+class _AnnotationLabel:
+    item: Any
+    anchor: QtCore.QPointF
+    event_x: float
+    lane: int
+
+
 _EPSILON = 1e-9
 _DisplayAnnotation = tuple[str, str, Mapping[str, object], float]
 _AnnotationKey = tuple[str, str, tuple[tuple[str, str], ...]]
 _ANNOTATION_ACCENTS = ("#4E79A7", "#F28E2B", "#59A14F", "#E15759", "#B07AA1", "#76B7B2")
+
+
+def _transform_samples(x: np.ndarray, y: np.ndarray, transform: str) -> tuple[np.ndarray, np.ndarray]:
+    """Native adjacent-difference mapping, with undefined pairs kept as breaks."""
+    if transform == "original":
+        return x, y
+    with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
+        dx, dy = np.diff(x), np.diff(y)
+        valid = np.isfinite(x[:-1]) & np.isfinite(x[1:]) & np.isfinite(y[:-1]) & np.isfinite(y[1:]) & np.isfinite(dx) & np.isfinite(dy) & (dx != 0)
+        derivative = np.full(dx.shape, np.nan, dtype=float)
+        np.divide(dy, dx, out=derivative, where=valid)
+        derivative[~np.isfinite(derivative)] = np.nan
+    return (y[:-1] if transform == "phase" else x[:-1]), derivative
 
 
 @dataclass(frozen=True, slots=True)
@@ -76,6 +153,7 @@ class _RenderedPointChunk:
     x: np.ndarray
     series: tuple[tuple[str, np.ndarray], ...]
     source_row: np.ndarray | None = None
+    source_row_end: np.ndarray | None = None
     segment_ids: np.ndarray | None = None
     segment_keys: tuple[str, ...] | None = None
     discontinuity_ids: np.ndarray | None = None
@@ -90,7 +168,7 @@ class _RenderedPointChunk:
             values.setflags(write=False)
             if values.size != x.size:
                 raise ValueError("rendered point series must align with X.")
-        for name in ("source_row", "segment_ids", "discontinuity_ids"):
+        for name in ("source_row", "source_row_end", "segment_ids", "discontinuity_ids"):
             values = getattr(self, name)
             if values is None:
                 continue
@@ -121,6 +199,8 @@ class _RenderedPointBlock:
     x_provenance: Mapping[str, object]
     series_provenance: tuple[tuple[str, Mapping[str, object]], ...]
     chunks: tuple[_RenderedPointChunk, ...]
+    derivative_wrt: str | None = None
+    derivative_numerator_unit: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "block_id", str(self.block_id))
@@ -162,7 +242,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
     copyAllRequested = QtCore.Signal()
     xSeriesRequested = QtCore.Signal(object)
     ySeriesRequested = QtCore.Signal(object)
-    plotPresentationIntentRequested = QtCore.Signal(str, bool)
+    plotPresentationIntentRequested = QtCore.Signal(str, object)
     resultDiagnostic = QtCore.Signal(str)
 
     def __init__(
@@ -174,12 +254,11 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         self._sampling_limit: int | None = None
         self._plot_items_by_key: dict[tuple[object, ...], object] = {}
         self._annotation_items: dict[_AnnotationKey, object] = {}
-        self._annotation_labels: dict[
-            tuple[object, ...], tuple[object, QtCore.QPointF]
-        ] = {}
+        self._annotation_labels: dict[tuple[object, ...], _AnnotationLabel] = {}
         self._zoom_enabled = False
-        self._presentation = _PlotPresentation()
+        self._presentation = ProjectPresentationState()
         self._axis_range = _AxisRangeSession()
+        self._refit_axes = (False, False)
         self._x_time_unit = "s"
         self._x_concentration_unit = "M"
         self._y_concentration_unit = "M"
@@ -203,7 +282,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         self._interactive_projection_sampling_limit: int | None = None
         self._interactive_projection_sampling_known = False
 
-        self._plot_widget = pg.PlotWidget(self)
+        self._plot_widget = pg.PlotWidget(self, viewBox=_PlotViewBox())
         self._plot_widget.setObjectName("plotViewport")
         self._plot_widget.plotItem.setContentsMargins(0, 0, 0, 10)
         self._plot_widget.setBackground(plot_background_color(False))
@@ -227,6 +306,9 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         self._axis_toolbar.unitChanged.connect(self._apply_display_unit_change)
         self._plot_widget.getViewBox().sigRangeChangedManually.connect(
             self._on_manual_navigation
+        )
+        self._plot_widget.getViewBox().sigRangeChanged.connect(
+            self._position_annotation_labels
         )
 
         self._completion_warning_badge = QtWidgets.QLabel(
@@ -274,6 +356,11 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
 
         return self._analysis_tabs
 
+    def _add_plot_data(self, x, y, **options) -> _PlotDataItem:
+        item = _PlotDataItem(x, y, **options)
+        self._plot_widget.addItem(item)
+        return item
+
     def apply_result_input(self, render_input: ResultRenderInput) -> None:
         """Retain and draw one immutable result input and its live aggregate."""
 
@@ -315,6 +402,10 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
                 or self._interactive_target_set_ids
             ):
                 self._end_interactive_gesture_session()
+            if any(self._refit_axes):
+                self._fit_axes_once(self._refit_axes)
+                self._refit_axes = (False, False)
+                self._apply_axis_range_state(self._axis_range, self._presentation)
             if render_input.unavailable_x_diagnostic is not None:
                 self.resultDiagnostic.emit(render_input.unavailable_x_diagnostic)
         finally:
@@ -370,10 +461,8 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         if not visible:
             self._clear_interactive_projection()
             return
-        if not self._render_interactive_display(visible):
-            return
+        self._render_interactive_display(visible)
         self._interactive_visible = visible
-        self._interactive_rendered_frame = True
         self._interactive_projection_sampling_limit = self._sampling_limit
         self._interactive_projection_sampling_known = True
 
@@ -497,28 +586,52 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         self._plot_menu = QtWidgets.QMenu(self)
         self._plot_menu.setToolTipsVisible(True)
         self._plot_actions: dict[str, QtGui.QAction] = {}
+        self._plot_percentages: dict[str, QtWidgets.QDoubleSpinBox] = {}
+        appearance = self._plot_menu.addMenu("Appearance")
+        transforms = self._plot_menu.addMenu("Transform")
+        axes = self._plot_menu.addMenu("Axes")
+        axis_menus = {axis: axes.addMenu(f"{axis.upper()} Axis") for axis in ("x", "y")}
+        # PySide transfers menu ownership to wrappers returned by menuAction;
+        # retain both so inspecting actions cannot destroy a nested menu.
+        self._plot_submenus = {
+            menu.menuAction(): menu for menu in (appearance, transforms, axes, *axis_menus.values())
+        }
+        for menu in self._plot_submenus.values():
+            menu.setToolTipsVisible(True)
         groups = (
-            (("copy_all", "Copy All"), ("copy_plotted", "Copy Plotted Data")),
-            (("zoom", "Zoom"), ("auto_range", "Auto Range")),
-            (
-                ("legend_visible", "Show Legend"),
-                ("reference_lines_visible", "Show Reference"),
-                ("intervention_annotations_visible", "Show Intervention Indicators"),
-                ("intervention_labels_visible", "Show Intervention Labels"),
-            ),
-            (
-                ("log_x", "Log X"), ("log_y", "Log Y"),
-                ("x_inverted", "Invert X Axis"), ("y_inverted", "Invert Y Axis"),
-            ),
-            (("sampling", "Downsampling: 1k points/curve"), ("warnings", "Warning details…")),
+            (self._plot_menu, (("copy_all", "Copy All"), ("copy_plotted", "Copy Plotted Data"),
+                              ("fit_once", "Fit Once"), ("zoom", "Zoom"), ("auto_range", "Auto Range"))),
+            (appearance, (("show_grid", "Show Grid"), ("grid_x", "X Grid"), ("grid_y", "Y Grid"),
+                          ("simulation_markers", "Simulation Sample Markers"),
+                          ("legend_visible", "Show Legend"), ("reference_lines_visible", "Show Reference"),
+                          ("intervention_annotations_visible", "Show Intervention Indicators"),
+                          ("intervention_labels_visible", "Show Intervention Labels"))),
+            (transforms, (("original", "Original"), ("derivative", "Derivative (dy/dx)"),
+                          ("phase", "Derivative versus Y"))),
+            (axes, (("visible_x", "Fit Y to Visible X"),)),
+            (self._plot_menu, (("sampling", "Downsampling: 1k points/curve"), ("warnings", "Warning details…"))),
         )
-        for index, group in enumerate(groups):
-            if index:
-                self._plot_menu.addSeparator()
+        for menu, group in groups:
             for key, text in group:
-                action = self._plot_menu.addAction(text)
-                action.setCheckable(key not in {"copy_all", "copy_plotted", "warnings"})
+                action = menu.addAction(text)
+                action.setCheckable(key not in {"copy_all", "copy_plotted", "fit_once", "warnings"})
                 self._plot_actions[key] = action
+        for axis, menu in axis_menus.items():
+            for key, label in ((f"auto_{axis}", "Auto Range"), (f"mouse_{axis}", "Mouse Navigation"),
+                               (f"pan_{axis}", "Auto Pan"), (f"log_{axis}", "Log Scale"),
+                               (f"{axis}_inverted", "Invert Axis")):
+                action = menu.addAction(label)
+                action.setCheckable(True)
+                self._plot_actions[key] = action
+            self._add_plot_percentage(menu, f"fraction_{axis}", "Auto-range coverage", minimum=1)
+        self._add_plot_percentage(appearance, "grid_opacity", "Grid opacity")
+        self._add_plot_percentage(appearance, "simulation_opacity", "Simulation opacity")
+        transform_group = QtGui.QActionGroup(self)
+        transform_group.setExclusive(True)
+        for transform in ("original", "derivative", "phase"):
+            action = self._plot_actions[transform]
+            transform_group.addAction(action)
+            action.triggered.connect(lambda _checked, value=transform: self._request_plot_presentation("plot_transform", value))
         actions = self._plot_actions
         actions["copy_all"].setToolTip(
             "Copy full-resolution results and references for all initial-condition "
@@ -553,10 +666,15 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         actions["copy_plotted"].triggered.connect(self._copy_rendered_points_to_clipboard)
         actions["zoom"].triggered.connect(self._set_zoom_enabled)
         actions["auto_range"].triggered.connect(self._set_auto_range)
+        actions["fit_once"].triggered.connect(self._fit_once)
+        for key in ("auto_x", "auto_y", "mouse_x", "mouse_y", "pan_x", "pan_y", "visible_x"):
+            actions[key].triggered.connect(lambda enabled, option=key: self._set_navigation(option, enabled))
+        actions["visible_x"].setToolTip("Hold X and automatically fit Y to samples within X. Manual Y navigation ends this mode.")
+        actions["fit_once"].setToolTip("Fit all displayed data once, then keep both axes manual.")
         actions["reference_lines_visible"].triggered.connect(self.referenceLayerVisibilityRequested)
         actions["intervention_annotations_visible"].triggered.connect(self.interventionAnnotationsVisibilityRequested)
         actions["intervention_labels_visible"].triggered.connect(self.interventionLabelsVisibilityRequested)
-        for option in ("legend_visible", "log_x", "log_y", "x_inverted", "y_inverted"):
+        for option in ("legend_visible", "log_x", "log_y", "x_inverted", "y_inverted", "show_grid", "grid_x", "grid_y", "simulation_markers"):
             actions[option].triggered.connect(
                 lambda enabled, key=option: self._request_plot_presentation(key, enabled)
             )
@@ -564,30 +682,60 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         actions["warnings"].triggered.connect(self._show_completion_warning_details)
         self._plot_menu.aboutToShow.connect(self._sync_plot_controls)
 
+    def _add_plot_percentage(self, menu: QtWidgets.QMenu, key: str, label: str, *, minimum: int = 0) -> None:
+        host = QtWidgets.QWidget(menu)
+        layout = QtWidgets.QHBoxLayout(host)
+        layout.addWidget(QtWidgets.QLabel(label, host))
+        spin = QtWidgets.QDoubleSpinBox(host)
+        spin.setRange(minimum, 100)
+        spin.setDecimals(0)
+        spin.setSuffix(" %")
+        spin.setKeyboardTracking(False)
+        spin.setAccessibleName(label)
+        layout.addWidget(spin)
+        action = QtWidgets.QWidgetAction(menu)
+        action.setDefaultWidget(host)
+        menu.addAction(action)
+        self._plot_percentages[key] = spin
+        if key.startswith("fraction_"):
+            spin.valueChanged.connect(lambda value: self._set_navigation(key, value / 100))
+            spin.setToolTip("Central percentage of each curve's samples used for automatic bounds.")
+        else:
+            spin.valueChanged.connect(lambda value: self._request_plot_presentation(key, value / 100))
+
     def _sync_plot_controls(self) -> None:
-        """Project current owner state; QAction.triggered emits user commands only."""
+        """Project accepted presentation and plot-session navigation."""
+        state = self._axis_range
         values = {
             "zoom": self._zoom_enabled,
-            "auto_range": self._axis_range.auto,
+            "auto_range": state.auto_x and state.auto_y,
             "sampling": self._sampling_limit is not None,
-            "legend_visible": self._presentation.legend_visible,
-            "log_x": self._presentation.log_x,
-            "log_y": self._presentation.log_y,
-            "x_inverted": self._presentation.x_inverted,
-            "y_inverted": self._presentation.y_inverted,
+            "show_grid": self._presentation.grid_x and self._presentation.grid_y,
         }
+        for key in ("legend_visible", "log_x", "log_y", "x_inverted", "y_inverted", "grid_x", "grid_y", "simulation_markers"):
+            values[key] = getattr(self._presentation, key)
+        for key in ("auto_x", "auto_y", "mouse_x", "mouse_y", "pan_x", "pan_y", "visible_x"):
+            values[key] = getattr(state, key)
+        for key in ("original", "derivative", "phase"):
+            values[key] = self._presentation.plot_transform == key
         for key in ("reference_lines_visible", "intervention_annotations_visible", "intervention_labels_visible"):
             values[key] = bool(self._render_input and getattr(self._render_input, key))
         for key, checked in values.items():
             self._plot_actions[key].setChecked(checked)
+        for key, spin in self._plot_percentages.items():
+            with QtCore.QSignalBlocker(spin):
+                spin.setValue(100 * getattr(state if key.startswith("fraction_") else self._presentation, key))
+            if key.startswith("fraction_"):
+                spin.setEnabled(not self._interactive_gesture_active)
         self._plot_actions["copy_all"].setEnabled(self._copy_all_available)
         self._plot_actions["copy_plotted"].setEnabled(
             any(chunk.x.size for block in self._rendered_point_roster for chunk in block.chunks)
         )
         self._plot_actions["warnings"].setEnabled(bool(self._completion_warning_badge.text()))
-        self._plot_actions["auto_range"].setEnabled(not self._interactive_gesture_active)
+        for key in ("auto_range", "auto_x", "auto_y", "fit_once", "visible_x", "pan_x", "pan_y"):
+            self._plot_actions[key].setEnabled(not self._interactive_gesture_active)
         self._axis_toolbar.set_manual_range_controls(
-            visible=not self._axis_range.auto,
+            auto_x=state.auto_x, auto_y=state.auto_y,
             enabled=not self._interactive_gesture_active,
         )
 
@@ -694,36 +842,39 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         self._clear_interactive_display(reset_currentness=True)
         return True
 
-    def set_persisted_plot_state(
-        self,
-        *,
-        log_x: bool,
-        log_y: bool,
-        legend_visible: bool,
-        x_inverted: bool,
-        y_inverted: bool,
-    ) -> None:
-        """Apply one Integration-owned persisted Plot projection."""
-
-        state = _PlotPresentation(
-            log_x=bool(log_x),
-            log_y=bool(log_y),
-            legend_visible=bool(legend_visible),
-            x_inverted=bool(x_inverted),
-            y_inverted=bool(y_inverted),
-        )
+    def set_persisted_plot_state(self, state: ProjectPresentationState) -> None:
+        """Project the registry's accepted choices; the next render refits changed coordinates."""
+        old = self._presentation.plot_transform
+        new = state.plot_transform
+        if old != new:
+            self._refit_axes = (
+                self._refit_axes[0] or "phase" in (old, new),
+                self._refit_axes[1] or "original" in (old, new),
+            )
+        for index, axis in enumerate(("x", "y")):
+            if (
+                getattr(state, f"log_{axis}")
+                and not getattr(self._presentation, f"log_{axis}")
+                and not getattr(self._axis_range, f"auto_{axis}")
+            ):
+                low = getattr(self._axis_range, f"{axis}_min")
+                high = getattr(self._axis_range, f"{axis}_max")
+                if low is None or high is None or not 0 < low < high:
+                    self._refit_axes = tuple(
+                        pending or current == index
+                        for current, pending in enumerate(self._refit_axes)
+                    )
         self._presentation = state
         self._apply_plot_presentation(state)
-        if self._render_input is not None:
-            self._clear_annotation_items()
-            self._render_annotations(self._render_input, state)
 
     def drop_tab_session_state(self) -> None:
         self.dispose_project_content()
         self._zoom_enabled = False
-        self._presentation = _PlotPresentation()
+        self._presentation = ProjectPresentationState()
         self._sampling_limit = None
         self._axis_range = _AxisRangeSession()
+        self._refit_axes = (False, False)
+        self._apply_axis_range_state(self._axis_range, self._presentation)
         self._x_time_unit = "s"
         self._x_concentration_unit = "M"
         self._y_concentration_unit = "M"
@@ -734,9 +885,11 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         self.dispose_project_content()
         self._end_interactive_gesture_session()
         self._zoom_enabled = False
-        self._presentation = _PlotPresentation()
+        self._presentation = ProjectPresentationState()
         self._sampling_limit = None
         self._axis_range = _AxisRangeSession()
+        self._refit_axes = (False, False)
+        self._apply_axis_range_state(self._axis_range, self._presentation)
         self._x_time_unit = "s"
         self._x_concentration_unit = "M"
         self._y_concentration_unit = "M"
@@ -757,6 +910,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         self._copy_all_available = False
         self._rendered_point_roster = ()
         self._clear_interactive_display(reset_currentness=True)
+        self._clear_annotation_items()
 
     def clear_result_input(self) -> None:
         """Clear the current result scene and its transient display."""
@@ -852,8 +1006,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
             or self._interactive_pending
         )
         if had_physical_state:
-            if not self._render_interactive_display(None):
-                return
+            self._render_interactive_display(None)
             self._interactive_visible = None
             self._interactive_rendered_frame = False
             self._interactive_last_presented_at = None
@@ -888,8 +1041,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
             # Restore every retained item from semantic input first; rendering
             # the surviving transient targets will suppress only those targets.
             self._render_result_scene(self._render_input)
-        if not self._render_interactive_display(visible):
-            return False
+        self._render_interactive_display(visible)
         self._interactive_visible = visible or None
         self._interactive_pending = None
         self._cancel_interactive_tick()
@@ -908,7 +1060,6 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
             or self._interactive_visible
             or self._interactive_target_set_ids
         )
-        self._interactive_rendered_frame = bool(self._interactive_visible)
         if not self._interactive_visible:
             self._interactive_projection_sampling_limit = None
             self._interactive_projection_sampling_known = False
@@ -955,11 +1106,11 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         self._cancel_interactive_tick()
         # Draw a completed result directly; interpolation between successive
         # results adds lag and can restart indefinitely during dragging.
-        if self._render_interactive_display(projection):
-            self._interactive_visible = projection
-            self._interactive_last_presented_at = float(time.monotonic())
-            self._interactive_projection_sampling_limit = self._sampling_limit
-            self._interactive_projection_sampling_known = True
+        self._render_interactive_display(projection)
+        self._interactive_visible = projection
+        self._interactive_last_presented_at = float(time.monotonic())
+        self._interactive_projection_sampling_limit = self._sampling_limit
+        self._interactive_projection_sampling_known = True
 
     def _compose_interactive_batch(self) -> InteractiveDisplayProjection | None:
         if self._render_input is None or not self._interactive_results:
@@ -1126,11 +1277,13 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
     def _render_interactive_display(
         self,
         projection: InteractiveDisplayProjection | None,
-    ) -> bool:
+    ) -> None:
+        """Apply the projection, including a valid frame with no drawable samples."""
         self._rendered_point_roster = ()
         if projection is None:
             self._release_interactive_display()
-            return True
+            self._interactive_rendered_frame = False
+            return
 
         existing = dict(self._interactive_items)
         rendered: dict[tuple[object, ...], Any] = {}
@@ -1175,7 +1328,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
                     self._sampling_limit,
                 )
                 if any(chunk.x.size for chunk in rendered_block.chunks):
-                    rendered_points.append(rendered_block)
+                    rendered_points.extend(self._transformed_blocks(rendered_block))
         for curve in projection.curves:
             style = "marker" if curve.markers else "line"
             color = QtGui.QColor(curve.color)
@@ -1201,7 +1354,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
             for chunk_index, (start, end) in enumerate(
                 self._interactive_curve_chunks(
                     curve,
-                    visual_break_indices=visual_break_indices,
+                    visual_break_indices=visual_break_indices if self._presentation.plot_transform == "original" else None,
                 )
             ):
                 displayed_x = self._scaled_display_values(
@@ -1212,6 +1365,9 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
                     curve.y[start:end],
                     y_scale,
                 )
+                displayed_x, displayed_y = _transform_samples(displayed_x, displayed_y, self._presentation.plot_transform)
+                if not np.any(np.isfinite(displayed_x) & np.isfinite(displayed_y)):
+                    continue
                 # Retained static items own the stable legend rows.  The
                 # transient projection supplies pixels only.
                 curve_name = None
@@ -1224,7 +1380,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
                 item = existing.get(item_key)
                 if item is None:
                     if curve.markers:
-                        item = self._plot_widget.plot(
+                        item = self._add_plot_data(
                             displayed_x,
                             displayed_y,
                             pen=None,
@@ -1232,10 +1388,10 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
                             symbolSize=curve.point_size,
                             symbolBrush=pg.mkBrush(color),
                             symbolPen=pg.mkPen(color),
-                            name=curve_name,
+                            name=curve_name, connect="finite",
                         )
                     else:
-                        item = self._plot_widget.plot(
+                        item = self._add_plot_data(
                             displayed_x,
                             displayed_y,
                             pen=pg.mkPen(
@@ -1247,10 +1403,10 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
                                     else QtCore.Qt.PenStyle.SolidLine
                                 ),
                             ),
-                            name=curve_name,
+                            name=curve_name, connect="finite",
                         )
                 else:
-                    item.setData(displayed_x, displayed_y)
+                    item.setData(displayed_x, displayed_y, connect="finite")
                     if curve.markers:
                         item.setSymbolSize(curve.point_size)
                         item.setSymbolBrush(pg.mkBrush(color))
@@ -1268,9 +1424,9 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
                             )
                         )
                 self._update_plot_item_legend(item, curve_name)
-                item.setOpacity(opacity)
+                self._style_simulation_item(item, True, color, opacity, singleton=displayed_x.size == 1)
                 rendered[item_key] = item
-            for connector in curve.intervention_connectors:
+            for connector in (curve.intervention_connectors if self._presentation.plot_transform == "original" else ()):
                 boundary_index, boundary_time, pre_value, post_value = connector
                 displayed_time = boundary_time * x_scale
                 displayed_pre = pre_value * y_scale
@@ -1291,7 +1447,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
                     ),
                 )
                 if item is None:
-                    item = self._plot_widget.plot(
+                    item = self._add_plot_data(
                         [displayed_time, displayed_time],
                         [displayed_pre, displayed_post],
                         pen=pen,
@@ -1303,7 +1459,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
                         [displayed_pre, displayed_post],
                     )
                     item.setPen(pen)
-                item.setOpacity(opacity)
+                item.setOpacity(opacity * self._presentation.simulation_opacity)
                 rendered[item_key] = item
         for item_key, item in existing.items():
             if item_key not in rendered:
@@ -1341,12 +1497,11 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
                 if rendered_block is not None and any(
                     chunk.x.size for chunk in rendered_block.chunks
                 ):
-                    rendered_points.append(rendered_block)
+                    rendered_points.extend(self._transformed_blocks(rendered_block))
         self._rendered_point_roster = tuple(rendered_points)
         if rendered and not self._interactive_rendered_frame:
             self._begin_interactive_gesture_session()
         self._interactive_rendered_frame = bool(rendered)
-        return bool(rendered)
 
     def _remove_interactive_plot_item(self, item: object) -> None:
         """Remove one stale transient item from the physical plot."""
@@ -1527,6 +1682,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
             selected_x=x_unit,
             y_units=y_units,
             selected_y=y_unit,
+            transformed=self._presentation.plot_transform != "original",
         )
 
     def _display_axis_labels(
@@ -1547,7 +1703,24 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
             if y_unit is not None
             else render_input.y_label
         )
+        if self._presentation.plot_transform != "original":
+            derivative_label = f"d({y_label}) / d({x_label})"
+            if self._presentation.plot_transform == "phase":
+                x_label = y_label
+            y_label = derivative_label
         return x_label, y_label
+
+    @staticmethod
+    def _derivative_unit(x_unit: str | None, y_unit: str | None) -> str | None:
+        return f"{y_unit}/{x_unit}" if x_unit is not None and y_unit is not None else None
+
+    def _coordinate_scales(self, render_input: ResultRenderInput) -> tuple[float, float]:
+        _x_unit, _y_unit, x_scale, y_scale = self._display_unit_state(render_input)
+        transform = self._presentation.plot_transform
+        return (
+            y_scale if transform == "phase" else x_scale,
+            y_scale if transform == "original" else y_scale / x_scale,
+        )
 
     @staticmethod
     def _scaled_display_values(values: np.ndarray, scale: float) -> np.ndarray:
@@ -1802,6 +1975,44 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
             chunks=curve_chunks,
         )
 
+    def _transformed_blocks(self, block: _RenderedPointBlock) -> tuple[_RenderedPointBlock, ...]:
+        transform = self._presentation.plot_transform
+        if transform == "original":
+            return (block,)
+        names = tuple(name for name, _ in block.chunks[0].series) if block.chunks else ()
+        groups = tuple((name,) for name in names) if transform == "phase" else (names,)
+        denominator = f"{block.x_name} ({block.x_unit})" if block.x_unit else block.x_name
+        if block.x_provenance:
+            denominator += " [provenance=" + json.dumps(dict(block.x_provenance), sort_keys=True, separators=(",", ":")) + "]"
+        result = []
+        for group in groups:
+            chunks = []
+            for chunk in block.chunks:
+                series = dict(chunk.series)
+                mapped = tuple((name, _transform_samples(chunk.x, series[name], transform)) for name in group)
+                if not mapped:
+                    continue
+                chunks.append(_RenderedPointChunk(
+                    x=mapped[0][1][0],
+                    series=tuple((name, coordinates[1]) for name, coordinates in mapped),
+                    source_row=None if chunk.source_row is None else chunk.source_row[:-1],
+                    source_row_end=None if chunk.source_row is None else chunk.source_row[1:],
+                    segment_ids=None if chunk.segment_ids is None else chunk.segment_ids[:-1],
+                    segment_keys=None if chunk.segment_keys is None else chunk.segment_keys[:-1],
+                    discontinuity_ids=None if chunk.discontinuity_ids is None else chunk.discontinuity_ids[:-1],
+                ))
+            provenance = dict(block.series_provenance)
+            result.append(replace(
+                block, chunks=tuple(chunks), derivative_wrt=denominator,
+                derivative_numerator_unit=block.y_unit,
+                x_name=f"{group[0]} [phase; left endpoint]" if transform == "phase" else f"{block.x_name} [left endpoint]",
+                x_unit=block.y_unit if transform == "phase" else block.x_unit,
+                y_unit=self._derivative_unit(block.x_unit, block.y_unit),
+                x_provenance=provenance.get(group[0], {}) if transform == "phase" else block.x_provenance,
+                series_provenance=tuple((name, provenance.get(name, {})) for name in group),
+            ))
+        return tuple(result)
+
     def _render_layer(
         self,
         block: ResultDataBlock,
@@ -1815,6 +2026,8 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
             block,
             sampling_limit,
         )
+        transformed_blocks = self._transformed_blocks(rendered_block)
+        transform = self._presentation.plot_transform
         colors = dict(block.color_by_series)
         item_store = rendered_items if rendered_items is not None else {}
         existing_store = existing_items if existing_items is not None else {}
@@ -1859,11 +2072,12 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
             }
         for series_name, _values in block.series:
             color = colors[series_name]
+            rendered_chunks = next((item.chunks for item in transformed_blocks if item.chunks and series_name in dict(item.chunks[0].series)), ())
             physical_chunks: list[tuple[np.ndarray, np.ndarray]] = []
             for chunk_index, chunk in enumerate(rendered_chunks):
                 x = chunk.x
                 y = dict(chunk.series)[series_name]
-                if chunk_index and chunk_index not in visual_breaks[series_name]:
+                if transform == "original" and chunk_index and chunk_index not in visual_breaks[series_name]:
                     prior_x, prior_y = physical_chunks[-1]
                     physical_chunks[-1] = (
                         np.concatenate((prior_x, x)),
@@ -1871,28 +2085,33 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
                     )
                 else:
                     physical_chunks.append((x, y))
+            legend_pending = True
             for chunk_index, (x, y) in enumerate(physical_chunks):
+                if not np.any(np.isfinite(x) & np.isfinite(y)):
+                    continue
                 singleton = x.size == 1
                 marker = bool(block.markers or singleton)
                 item_key = (role, series_name, chunk_index, "marker" if marker else "line")
                 item = existing_store.get(item_key)
                 name = f"{block.label}: {series_name}"
+                legend_name = name if legend_pending else None
+                legend_pending = False
                 if item is None:
                     if marker:
-                        item = self._plot_widget.plot(
+                        item = self._add_plot_data(
                             x, y, pen=None, symbol=(block.point_shape if block.markers else "o"),
                             symbolSize=(block.point_size if block.markers else 5.0),
                             symbolBrush=pg.mkBrush(color), symbolPen=pg.mkPen(color),
-                            name=name if chunk_index == 0 else None,
+                            name=legend_name, connect="finite",
                         )
                     else:
-                        item = self._plot_widget.plot(
+                        item = self._add_plot_data(
                             x, y,
                             pen=pg.mkPen(color=color, width=2, style=(QtCore.Qt.PenStyle.DashLine if block.dashed else QtCore.Qt.PenStyle.SolidLine)),
-                            name=name if chunk_index == 0 else None,
+                            name=legend_name, connect="finite",
                         )
                 else:
-                    item.setData(x, y)
+                    item.setData(x, y, connect="finite")
                     if marker:
                         item.setSymbolBrush(pg.mkBrush(color))
                         item.setSymbolPen(pg.mkPen(color))
@@ -1900,14 +2119,16 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
                         item.setSymbolSize(block.point_size if block.markers else 5.0)
                     else:
                         item.setPen(pg.mkPen(color=color, width=2, style=(QtCore.Qt.PenStyle.DashLine if block.dashed else QtCore.Qt.PenStyle.SolidLine)))
-                self._update_plot_item_legend(item, name if chunk_index == 0 else None)
+                self._update_plot_item_legend(item, legend_name)
                 item.setVisible(True)
-                item.setOpacity(block.opacity)
+                self._style_simulation_item(item, block.kind is not ResultLayerKind.EXPERIMENTAL, color, block.opacity, singleton=singleton)
                 item_store[item_key] = item
         if rendered_points is not None and any(
             chunk.x.size for chunk in rendered_block.chunks
         ):
-            rendered_points.append(rendered_block)
+            rendered_points.extend(transformed_blocks)
+        if transform != "original":
+            return
         render_input = self._render_input
         _x_unit, _y_unit, x_scale, y_scale = (
             self._display_unit_state(render_input)
@@ -1923,13 +2144,23 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
             displayed_post = post_value * y_scale
             item = existing_store.get(item_key)
             if item is None:
-                item = self._plot_widget.plot([displayed_time, displayed_time], [displayed_pre, displayed_post], pen=pen, name=None)
+                item = self._add_plot_data([displayed_time, displayed_time], [displayed_pre, displayed_post], pen=pen, name=None)
             else:
                 item.setData([displayed_time, displayed_time], [displayed_pre, displayed_post])
                 item.setPen(pen)
             item.setVisible(True)
-            item.setOpacity(block.opacity)
+            item.setOpacity(block.opacity * self._presentation.simulation_opacity)
             item_store[item_key] = item
+
+    def _style_simulation_item(self, item: object, simulation: bool, color: object, opacity: float, *, singleton: bool) -> None:
+        if simulation:
+            item.setSymbol("o" if self._presentation.simulation_markers or singleton else None)
+            if self._presentation.simulation_markers or singleton:
+                item.setSymbolSize(5)
+                item.setSymbolBrush(pg.mkBrush(color))
+                item.setSymbolPen(pg.mkPen(color))
+            opacity *= self._presentation.simulation_opacity
+        item.setOpacity(opacity)
 
     @staticmethod
     def _intervention_connector_entries(
@@ -2076,7 +2307,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
     def _render_annotations(
         self,
         render_input: ResultRenderInput,
-        presentation: _PlotPresentation,
+        presentation: ProjectPresentationState,
         *,
         annotations: Sequence[_DisplayAnnotation] | None = None,
     ) -> None:
@@ -2100,10 +2331,11 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         self,
         render_input: ResultRenderInput,
         annotations: Sequence[_DisplayAnnotation],
-        presentation: _PlotPresentation,
+        presentation: ProjectPresentationState,
     ) -> None:
         if (
             not render_input.intervention_annotations_visible
+            or self._presentation.plot_transform == "phase"
             or not self._has_time_x(render_input)
         ):
             self._clear_annotation_items()
@@ -2141,15 +2373,6 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
                 continue
             entries.append((self._annotation_signature(owned), owned, time, None))
 
-        view_range = self._plot_widget.getPlotItem().getViewBox().viewRange()
-        x_min, x_max = (float(value) for value in view_range[0])
-        y_min, y_max = (float(value) for value in view_range[1])
-        x_span = x_max - x_min
-        y_span = y_max - y_min
-        if not np.isfinite(x_span) or x_span <= 0.0:
-            x_span = 1.0
-        if not np.isfinite(y_span) or y_span <= 0.0:
-            y_min, y_max, y_span = 0.0, 1.0, 1.0
         foreground_opacity: dict[tuple[object, ...], float] = {}
         for _key, (role, set_id, _payload, opacity), start, end in entries:
             if role == "foreground":
@@ -2216,22 +2439,9 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
             return
 
         existing_labels = self._annotation_labels
-        rendered_labels: dict[
-            tuple[object, ...], tuple[object, QtCore.QPointF]
-        ] = {}
+        rendered_labels: dict[tuple[object, ...], _AnnotationLabel] = {}
         for lane, (occurrence, candidate) in enumerate(label_candidates.items()):
             annotation, weighted_start, weight = candidate
-            lane_offset = 0.10 + 0.08 * (lane % 4)
-            label_y = (
-                y_min + y_span * lane_offset
-                if presentation.y_inverted
-                else y_max - y_span * lane_offset
-            )
-            anchor = QtCore.QPointF(
-                weighted_start / weight
-                + x_span * (-0.012 if presentation.x_inverted else 0.012),
-                label_y,
-            )
             prior = existing_labels.get(occurrence)
             accent = self._annotation_accent(annotation)
             if prior is None:
@@ -2245,20 +2455,41 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
                 )
                 label.setZValue(11)
                 self._plot_widget.addItem(label, ignoreBounds=True)
-                offset = QtCore.QPointF()
+                prior = _AnnotationLabel(label, QtCore.QPointF(label.pos()), weighted_start / weight, lane)
             else:
-                label, prior_anchor = prior
-                offset = label.pos() - prior_anchor
+                label = prior.item
                 label.setText(str(annotation.get("label") or "intervention"))
                 label.border = pg.mkPen(accent)
                 label.update()
-            label.setPos(anchor + offset)
+            prior.event_x = weighted_start / weight
+            prior.lane = lane
             label.setOpacity(min(1.0, weight))
-            rendered_labels[occurrence] = (label, anchor)
-        for occurrence, (label, _anchor) in existing_labels.items():
-            if occurrence not in rendered_labels:
-                self._remove_annotation_item(label)
+            rendered_labels[occurrence] = prior
         self._annotation_labels = rendered_labels
+        for occurrence, record in existing_labels.items():
+            if occurrence not in rendered_labels:
+                self._remove_annotation_item(record.item)
+        self._position_annotation_labels()
+
+    def _position_annotation_labels(self) -> None:
+        view_range = self._plot_widget.getViewBox().viewRange()
+        x_span = float(view_range[0][1] - view_range[0][0])
+        y_min, y_max = (float(value) for value in view_range[1])
+        y_span = y_max - y_min
+        if not np.isfinite(x_span) or x_span <= 0.0:
+            x_span = 1.0
+        if not np.isfinite(y_span) or y_span <= 0.0:
+            y_min, y_max, y_span = 0.0, 1.0, 1.0
+        for record in self._annotation_labels.values():
+            lane_offset = 0.10 + 0.08 * (record.lane % 4)
+            anchor = QtCore.QPointF(
+                record.event_x + x_span * (-0.012 if self._presentation.x_inverted else 0.012),
+                y_min + y_span * lane_offset
+                if self._presentation.y_inverted else y_max - y_span * lane_offset,
+            )
+            offset = record.item.pos() - record.anchor
+            record.anchor = anchor
+            record.item.setPos(anchor + offset)
 
     @staticmethod
     def _sample_indices(
@@ -2322,10 +2553,10 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         )
 
     def _clear_plot_items(self) -> None:
+        self._annotation_labels.clear()
         self._plot_widget.clear()
         self._plot_items_by_key.clear()
         self._annotation_items.clear()
-        self._annotation_labels.clear()
         self._rendered_point_roster = ()
         self._legend = self._plot_widget.addLegend(
             offset=(-10, 10),
@@ -2345,9 +2576,9 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         self._clear_annotation_labels()
 
     def _clear_annotation_labels(self) -> None:
-        for label, _anchor in self._annotation_labels.values():
-            self._remove_annotation_item(label)
-        self._annotation_labels.clear()
+        labels, self._annotation_labels = self._annotation_labels, {}
+        for record in labels.values():
+            self._remove_annotation_item(record.item)
 
     @staticmethod
     def _scaled_optional(value: float | None, ratio: float) -> float | None:
@@ -2357,9 +2588,8 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         render_input = self._render_input
         if render_input is None:
             return
-        _old_x_unit, _old_y_unit, old_x_scale, old_y_scale = (
-            self._display_unit_state(render_input)
-        )
+        self._axis_range = self._capture_view_range()
+        old_x_scale, old_y_scale = self._coordinate_scales(render_input)
         if axis == "x" and self._has_time_x(render_input):
             if unit not in TIME_DISPLAY_UNIT_FACTORS:
                 return
@@ -2374,9 +2604,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
             self._y_concentration_unit = unit
         else:
             return
-        _new_x_unit, _new_y_unit, new_x_scale, new_y_scale = (
-            self._display_unit_state(render_input)
-        )
+        new_x_scale, new_y_scale = self._coordinate_scales(render_input)
         x_ratio = new_x_scale / old_x_scale
         y_ratio = new_y_scale / old_y_scale
         self._axis_range = replace(
@@ -2404,8 +2632,8 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
 
     def _capture_view_range(self) -> _AxisRangeSession:
         current_x, current_y = self._plot_widget.getViewBox().viewRange()
-        return _AxisRangeSession(
-            auto=False,
+        return replace(
+            self._axis_range,
             x_min=self._view_to_raw_coordinate(current_x[0], log_enabled=self._presentation.log_x),
             x_max=self._view_to_raw_coordinate(current_x[1], log_enabled=self._presentation.log_x),
             y_min=self._view_to_raw_coordinate(current_y[0], log_enabled=self._presentation.log_y),
@@ -2414,12 +2642,56 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
 
     @QtCore.Slot(bool)
     def _set_auto_range(self, enabled: bool) -> None:
-        self._axis_range = _AxisRangeSession() if enabled else self._capture_view_range()
+        self._axis_range = replace(self._capture_view_range(), auto_x=enabled, auto_y=enabled, visible_x=False)
         self._apply_axis_range_state(self._axis_range, self._presentation)
         self._project_manual_ranges()
 
-    def _on_manual_navigation(self, _axes: object) -> None:
-        self._plot_widget.getViewBox().disableAutoRange()
+    def _set_navigation(self, option: str, value: bool | float) -> None:
+        state = self._capture_view_range()
+        changes = {option: value}
+        if option == "visible_x" and value:
+            changes.update(auto_x=False, auto_y=True, pan_y=False)
+        elif (option == "auto_y" and not value) or (option in ("auto_x", "pan_y") and value):
+            changes["visible_x"] = False
+        self._axis_range = replace(state, **changes)
+        self._apply_axis_range_state(self._axis_range, self._presentation)
+        self._project_manual_ranges()
+
+    def _fit_axes_once(self, axes: tuple[bool, bool]) -> None:
+        view = self._plot_widget.getViewBox()
+        bounds = view.childrenBounds()
+        ranges = {
+            f"{axis}Range": bounds[index]
+            for index, axis in enumerate(("x", "y"))
+            if axes[index] and bounds[index] is not None
+            and all(value is not None and np.isfinite(value) for value in bounds[index])
+        }
+        if ranges:
+            view.setRange(**ranges, disableAutoRange=False)
+        self._axis_range = self._capture_view_range()
+        self._project_manual_ranges()
+
+    @QtCore.Slot()
+    def _fit_once(self) -> None:
+        view = self._plot_widget.getViewBox()
+        view.disableAutoRange()
+        view.setAutoVisible(x=False, y=False)
+        self._axis_range = replace(self._axis_range, auto_x=False, auto_y=False, visible_x=False)
+        self._fit_axes_once((True, True))
+
+    def _on_manual_navigation(self, axes: Sequence[bool]) -> None:
+        view = self._plot_widget.getViewBox()
+        state = self._capture_view_range()
+        self._axis_range = replace(
+            state, auto_x=state.auto_x and not axes[0], auto_y=state.auto_y and not axes[1],
+            visible_x=state.visible_x and not axes[1],
+        )
+        view.enableAutoRange(x=self._axis_range.fraction_x if self._axis_range.auto_x else False,
+                             y=self._axis_range.fraction_y if self._axis_range.auto_y else False)
+        if view.state["autoVisibleOnly"][1] != self._axis_range.visible_x:
+            view.setAutoVisible(x=False, y=self._axis_range.visible_x)
+        elif self._axis_range.visible_x:
+            view.updateAutoRange()
         self._axis_range = self._capture_view_range()
         self._project_manual_ranges()
 
@@ -2428,90 +2700,41 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         self._axis_toolbar.set_manual_ranges(state.x_min, state.x_max, state.y_min, state.y_max)
         self._sync_plot_controls()
 
-    @QtCore.Slot()
-    def _apply_axis_range(self) -> None:
-        presentation = self._presentation
-        x_min, x_max, y_min, y_max = self._axis_toolbar.get_manual_ranges()
-        auto = self._axis_range.auto
-        if not auto:
-            current_x, current_y = (
-                self._plot_widget.getPlotItem().getViewBox().viewRange()
-            )
-            if x_min is None or x_max is None or x_max <= x_min:
-                x_min = self._view_to_raw_coordinate(
-                    current_x[0],
-                    log_enabled=presentation.log_x,
-                )
-                x_max = self._view_to_raw_coordinate(
-                    current_x[1],
-                    log_enabled=presentation.log_x,
-                )
-            if y_min is None or y_max is None or y_max <= y_min:
-                y_min = self._view_to_raw_coordinate(
-                    current_y[0],
-                    log_enabled=presentation.log_y,
-                )
-                y_max = self._view_to_raw_coordinate(
-                    current_y[1],
-                    log_enabled=presentation.log_y,
-                )
-        state = _AxisRangeSession(
-            auto=auto,
-            x_min=x_min,
-            x_max=x_max,
-            y_min=y_min,
-            y_max=y_max,
-        )
-        self._axis_range = state
-        if not auto:
-            self._axis_toolbar.set_manual_ranges(
-                state.x_min,
-                state.x_max,
-                state.y_min,
-                state.y_max,
-            )
-        self._apply_axis_range_state(state, presentation)
-
-    def _apply_axis_range_state(
-        self,
-        state: _AxisRangeSession,
-        presentation: _PlotPresentation,
-    ) -> None:
-        if state.auto:
-            # With no data, autoRange pads the existing range on every redraw.
-            if any(bound is not None for bound in self._plot_widget.getViewBox().childrenBounds()):
-                self._plot_widget.autoRange()
-            self._plot_widget.enableAutoRange()
+    @QtCore.Slot(str)
+    def _apply_axis_range(self, axis: str) -> None:
+        values = self._axis_toolbar.get_manual_ranges()
+        low, high = values[:2] if axis == "x" else values[2:]
+        state = self._capture_view_range()
+        if getattr(self._presentation, f"log_{axis}") and (
+            (low is not None and low <= 0) or (high is not None and high <= 0)
+        ):
+            self._axis_range = state
+            self._project_manual_ranges()
+            self.resultDiagnostic.emit(f"{axis.upper()} limits must be positive for logarithmic display.")
             return
-        self._plot_widget.getPlotItem().getViewBox().disableAutoRange()
-        x_min = self._raw_to_view_coordinate(
-            state.x_min,
-            log_enabled=presentation.log_x,
-        )
-        x_max = self._raw_to_view_coordinate(
-            state.x_max,
-            log_enabled=presentation.log_x,
-        )
-        if x_min is not None and x_max is not None and x_max > x_min:
-            self._plot_widget.setXRange(
-                x_min,
-                x_max,
-                padding=0,
-            )
-        y_min = self._raw_to_view_coordinate(
-            state.y_min,
-            log_enabled=presentation.log_y,
-        )
-        y_max = self._raw_to_view_coordinate(
-            state.y_max,
-            log_enabled=presentation.log_y,
-        )
-        if y_min is not None and y_max is not None and y_max > y_min:
-            self._plot_widget.setYRange(
-                y_min,
-                y_max,
-                padding=0,
-            )
+        if low is not None and high is not None and high > low:
+            state = replace(state, **{f"{axis}_min": low, f"{axis}_max": high})
+        self._axis_range = state
+        self._apply_axis_range_state(state, self._presentation)
+        self._project_manual_ranges()
+
+    def _apply_axis_range_state(self, state: _AxisRangeSession, presentation: ProjectPresentationState) -> None:
+        view = self._plot_widget.getViewBox()
+        view.setMouseEnabled(x=state.mouse_x, y=state.mouse_y)
+        view.enableAutoRange(x=state.fraction_x if state.auto_x else False,
+                             y=state.fraction_y if state.auto_y else False)
+        for axis in ("x", "y"):
+            if getattr(state, f"auto_{axis}"):
+                continue
+            low = self._raw_to_view_coordinate(getattr(state, f"{axis}_min"), log_enabled=getattr(presentation, f"log_{axis}"))
+            high = self._raw_to_view_coordinate(getattr(state, f"{axis}_max"), log_enabled=getattr(presentation, f"log_{axis}"))
+            if low is not None and high is not None and high > low:
+                view.setRange(**{f"{axis}Range": (low, high)}, padding=0, disableAutoRange=False)
+        if view.state["autoPan"] != [state.pan_x, state.pan_y]:
+            view.setAutoPan(x=state.pan_x, y=state.pan_y)
+        if view.state["autoVisibleOnly"] != [False, state.visible_x]:
+            view.setAutoVisible(x=False, y=state.visible_x)
+        view.updateAutoRange()
 
     @QtCore.Slot(bool)
     def _set_zoom_enabled(self, enabled: bool) -> None:
@@ -2526,16 +2749,16 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
     def _request_plot_presentation(
         self,
         option: str,
-        enabled: bool,
+        value: bool | float | str,
     ) -> None:
         # The WorkspaceTabRegistry is the sole accepted presentation owner.
         # Do not mutate local state or visible pyqtgraph items until it has
         # validated and stored this intent.
-        self.plotPresentationIntentRequested.emit(str(option), bool(enabled))
+        self.plotPresentationIntentRequested.emit(option, value)
 
     def _apply_plot_presentation(
         self,
-        state: _PlotPresentation,
+        state: ProjectPresentationState,
         *,
         axis_range: _AxisRangeSession | None = None,
     ) -> None:
@@ -2543,6 +2766,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         item.setLogMode(x=state.log_x, y=state.log_y)
         item.invertX(state.x_inverted)
         item.invertY(state.y_inverted)
+        item.showGrid(x=state.grid_x, y=state.grid_y, alpha=state.grid_opacity)
         self._sync_plot_controls()
         if self._legend is not None:
             self._legend.setVisible(state.legend_visible)
@@ -2623,7 +2847,7 @@ def _iter_rendered_point_tsv_chunks(
         if block.kind == ResultLayerKind.EXPERIMENTAL.value:
             if any(chunk.source_row is None for chunk in chunks):
                 raise ValueError("experimental rendered points lack source_row.")
-            metadata_width = 1
+            metadata_width = 2 if block.derivative_wrt is not None else 1
         else:
             if any(
                 chunk.segment_ids is None
@@ -2670,6 +2894,8 @@ def _iter_rendered_point_tsv_chunks(
             if any(chunk.source_row is None for chunk in chunks):
                 raise ValueError("experimental rendered points lack source_row.")
             headers.append(encode_clipboard_text(f"{block.label} — source_row"))
+            if block.derivative_wrt is not None:
+                headers.append(encode_clipboard_text(f"{block.label} — source_row_end"))
         else:
             if any(
                 chunk.segment_ids is None
@@ -2691,7 +2917,11 @@ def _iter_rendered_point_tsv_chunks(
         headers.extend(
             _rendered_column_header(
                 block.label,
-                name,
+                (
+                    f"d({name}{' (' + block.derivative_numerator_unit + ')' if block.derivative_numerator_unit else ''})"
+                    f"/d({block.derivative_wrt}) [adjacent samples]"
+                    if block.derivative_wrt is not None else name
+                ),
                 provenance_by_name.get(name, MappingProxyType({})),
                 block.y_unit,
             )
@@ -2711,6 +2941,8 @@ def _iter_rendered_point_tsv_chunks(
                 row: list[str] = [repr(float(chunk.x[index]))]
                 if block.kind == ResultLayerKind.EXPERIMENTAL.value:
                     row.append(str(int(chunk.source_row[index])))
+                    if block.derivative_wrt is not None:
+                        row.append(str(int(chunk.source_row_end[index])))
                 else:
                     row.extend(
                         (

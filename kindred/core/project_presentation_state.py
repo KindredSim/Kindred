@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 from typing import TypeAlias
 
 from kindred.core.project_document import (
@@ -92,6 +93,12 @@ class ProjectPresentationState:
     legend_visible: bool = True
     x_inverted: bool = False
     y_inverted: bool = False
+    grid_x: bool = True
+    grid_y: bool = True
+    grid_opacity: float = 0.25
+    plot_transform: str = "original"
+    simulation_markers: bool = False
+    simulation_opacity: float = 1.0
 
     def __post_init__(self) -> None:
         if (
@@ -197,6 +204,12 @@ class ProjectPresentationState:
             legend_visible=self.legend_visible,
             x_inverted=self.x_inverted,
             y_inverted=self.y_inverted,
+            grid_x=self.grid_x,
+            grid_y=self.grid_y,
+            grid_opacity=self.grid_opacity,
+            plot_transform=self.plot_transform,
+            simulation_markers=self.simulation_markers,
+            simulation_opacity=self.simulation_opacity,
         )
 
     def is_default_for(self, tab: MechanismTabDocument) -> bool:
@@ -337,9 +350,18 @@ def validate_project_presentation_state(
         "legend_visible",
         "x_inverted",
         "y_inverted",
+        "grid_x",
+        "grid_y",
+        "simulation_markers",
     ):
         if type(getattr(state, field_name)) is not bool:
             raise TypeError(f"{field_name} must be a bool.")
+    for field_name in ("grid_opacity", "simulation_opacity"):
+        value = getattr(state, field_name)
+        if type(value) not in (int, float) or not math.isfinite(value) or not 0 <= value <= 1:
+            raise ValueError(f"{field_name} must be a finite number between 0 and 1.")
+    if state.plot_transform not in ("original", "derivative", "phase"):
+        raise ValueError("plot_transform must be original, derivative, or phase.")
     set_ids = {item.set_id for item in tab.initial_condition_sets}
     if (
         state.current_set_id is not None

@@ -1052,6 +1052,12 @@ def _encode_presentation(
         "legend_visible": state.legend_visible,
         "x_inverted": state.x_inverted,
         "y_inverted": state.y_inverted,
+        "grid_x": state.grid_x,
+        "grid_y": state.grid_y,
+        "grid_opacity": state.grid_opacity,
+        "plot_transform": state.plot_transform,
+        "simulation_markers": state.simulation_markers,
+        "simulation_opacity": state.simulation_opacity,
     }
 
 
@@ -1146,6 +1152,12 @@ def _decode_presentation(
             "legend_visible",
             "x_inverted",
             "y_inverted",
+            "grid_x",
+            "grid_y",
+            "grid_opacity",
+            "plot_transform",
+            "simulation_markers",
+            "simulation_opacity",
         },
     )
     overlays: list[tuple[str, tuple[str, ...]]] = []
@@ -1264,6 +1276,12 @@ def _decode_presentation(
             data["y_inverted"],
             f"{label}.y_inverted",
         ),
+        grid_x=_boolean(data["grid_x"], f"{label}.grid_x"),
+        grid_y=_boolean(data["grid_y"], f"{label}.grid_y"),
+        grid_opacity=_finite(data["grid_opacity"], f"{label}.grid_opacity"),
+        plot_transform=_string(data["plot_transform"], f"{label}.plot_transform"),
+        simulation_markers=_boolean(data["simulation_markers"], f"{label}.simulation_markers"),
+        simulation_opacity=_finite(data["simulation_opacity"], f"{label}.simulation_opacity"),
     )
 
 

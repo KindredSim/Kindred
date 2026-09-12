@@ -1304,11 +1304,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _apply_persisted_plot_state(self, tab_id: str) -> None:
         state = self._workspace_tab_registry.presentation(tab_id)
         self._workspace.plot_for_tab(tab_id).set_persisted_plot_state(
-            log_x=state.log_x,
-            log_y=state.log_y,
-            legend_visible=state.legend_visible,
-            x_inverted=state.x_inverted,
-            y_inverted=state.y_inverted,
+            state,
         )
 
     def _compose_result_input(
@@ -4118,22 +4114,19 @@ class MainWindow(QtWidgets.QMainWindow):
         self,
         tab_id: str,
         option: str,
-        enabled: bool,
+        value: bool | float | str,
     ) -> None:
         if not self._mutation_input_admitted("Change Plot Presentation"):
             return
         state = self._workspace_tab_registry.presentation(tab_id)
-        next_state = replace(state, **{str(option): bool(enabled)})
+        changes = {"grid_x": value, "grid_y": value} if option == "show_grid" else {option: value}
+        next_state = replace(state, **changes)
         self._workspace_tab_registry.set_presentation(
             tab_id,
             next_state,
         )
         self._workspace.plot_for_tab(tab_id).set_persisted_plot_state(
-            log_x=next_state.log_x,
-            log_y=next_state.log_y,
-            legend_visible=next_state.legend_visible,
-            x_inverted=next_state.x_inverted,
-            y_inverted=next_state.y_inverted,
+            next_state,
         )
         self._refresh_project_state()
         self._render_results_for_tab(tab_id)
