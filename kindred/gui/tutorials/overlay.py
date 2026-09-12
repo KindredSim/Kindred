@@ -57,6 +57,9 @@ def menu_target(
     # the Python menu wrapper while its Qt object remains alive. Resolve child
     # menus through their actual Qt parent instead of borrowing that wrapper.
     if action_matches is not None:
+        action = next((item for item in menu.actions() if action_matches(item)), None)
+        if action is not None and menu.isVisible():
+            return Highlight(menu, lambda: menu.actionGeometry(action))
         for child in menu.findChildren(
             QtWidgets.QMenu, options=QtCore.Qt.FindChildOption.FindDirectChildrenOnly
         ):

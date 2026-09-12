@@ -349,7 +349,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self._tutorials = create_controller(
             self, workspace=self._workspace, registry=self._workspace_tab_registry,
-            surfaces=self._tab_surfaces, examples_menu=self._examples_menu,
+            surfaces=self._tab_surfaces, examples_menu=self._examples_menu, file_menu=self._file_menu,
             project_controller=self.project_controller, jobs=self._simulation_jobs,
         )
         logger.info("Kindred MainWindow initialized with the direct owner graph")

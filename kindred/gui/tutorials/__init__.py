@@ -3,9 +3,19 @@
 from functools import partial
 
 from kindred.gui.tutorials.controller import TutorialController
-from kindred.gui.tutorials.getting_started import GettingStarted
+from kindred.gui.tutorials.explore_plot import ExplorePlot
+from kindred.gui.tutorials.interactive_sliders import InteractiveSliders
+from kindred.gui.tutorials.quick_start import QuickStart
+from kindred.gui.tutorials.reactions_and_initials import ReactionsAndInitialConditions
+from kindred.gui.tutorials.templates import CreateAndReuseTemplates
 
-LESSONS = (GettingStarted,)
+LESSONS = (
+    QuickStart,
+    ReactionsAndInitialConditions,
+    ExplorePlot,
+    InteractiveSliders,
+    CreateAndReuseTemplates,
+)
 
 
 def create_controller(window, **existing_owners) -> TutorialController:

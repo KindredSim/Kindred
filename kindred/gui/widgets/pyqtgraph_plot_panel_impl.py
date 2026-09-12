@@ -670,7 +670,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
             "Downsampling affects this calculation."
         )
         actions["phase"].setToolTip(
-            "Show the numerical derivative against each curve's original Y values. "
+            "Show the numerical derivative against the original Y values for each curve. "
             "Intervention lines, shaded regions, and labels are hidden in this view."
         )
         for axis in ("x", "y"):
