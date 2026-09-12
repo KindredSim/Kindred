@@ -623,9 +623,20 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
                 action = menu.addAction(label)
                 action.setCheckable(True)
                 self._plot_actions[key] = action
-            self._add_plot_percentage(menu, f"fraction_{axis}", "Auto-range coverage", minimum=1)
-        self._add_plot_percentage(appearance, "grid_opacity", "Grid opacity")
-        self._add_plot_percentage(appearance, "simulation_opacity", "Simulation opacity")
+            self._add_plot_percentage(
+                menu, f"fraction_{axis}", "Auto-range coverage", minimum=1,
+                tooltip="Choose the central percentage of each curve used to adjust the axis automatically. "
+                "Lower percentages can leave extreme values outside the view. The plotted and copied data stay unchanged.",
+            )
+        self._add_plot_percentage(
+            appearance, "grid_opacity", "Grid opacity",
+            tooltip="Adjust how clearly the grid lines appear. At 0%, the grid is invisible.",
+        )
+        self._add_plot_percentage(
+            appearance, "simulation_opacity", "Simulation opacity",
+            tooltip="Adjust the visibility of simulation curves and their points. At 100%, references and previews "
+            "keep their usual transparency. At 0%, the curves and points are invisible.",
+        )
         transform_group = QtGui.QActionGroup(self)
         transform_group.setExclusive(True)
         for transform in ("original", "derivative", "phase"):
@@ -634,34 +645,69 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
             action.triggered.connect(lambda _checked, value=transform: self._request_plot_presentation("plot_transform", value))
         actions = self._plot_actions
         actions["copy_all"].setToolTip(
-            "Copy full-resolution results and references for all initial-condition "
-            "sets in this mechanism, including data not currently shown, plus linked "
-            "experimental data. Uses canonical units and ignores plot selection and downsampling."
+            "Copy all available results, references, and linked experimental data for this mechanism tab, "
+            "including hidden sets and quantities. Use original values, standard units, and every recorded point."
         )
         actions["copy_plotted"].setToolTip(
-            "Copy plotted series using the selected axes, display units, and downsampling. "
-            "Includes points outside the current view."
+            "Copy the selected curves using the current transform, units, and sampling. "
+            "Include points outside the visible area."
         )
-        actions["zoom"].setToolTip("Drag a rectangle to zoom. When off, drag to pan.")
-        actions["auto_range"].setToolTip("Automatically scale axes to fit all visible data.")
-        actions["legend_visible"].setToolTip("Show the names and colors of the plotted curves.")
-        actions["reference_lines_visible"].setToolTip("Show reference curves alongside current results.")
+        actions["zoom"].setToolTip("Drag with the left mouse button to select a zoom area. Turn this off to drag the view instead.")
+        actions["auto_range"].setToolTip(
+            "Automatically adjust both axes using their coverage and Auto Pan settings. "
+            "Turn this off to keep the current limits for manual adjustment."
+        )
+        actions["show_grid"].setToolTip("Show or hide both grid directions. This is checked when both directions are enabled.")
+        actions["grid_x"].setToolTip("Show vertical grid lines at the X axis ticks.")
+        actions["grid_y"].setToolTip("Show horizontal grid lines at the Y axis ticks.")
+        actions["simulation_markers"].setToolTip(
+            "Show points along simulation and reference curves. Downsampling changes which points are shown. "
+            "Experimental markers have separate settings."
+        )
+        actions["original"].setToolTip("Show the selected quantities without calculating derivatives. Log scale settings still apply.")
+        actions["derivative"].setToolTip(
+            "Show the change in Y divided by the change in X between neighboring plotted points. "
+            "Downsampling affects this calculation."
+        )
+        actions["phase"].setToolTip(
+            "Show the numerical derivative against each curve's original Y values. "
+            "Intervention lines, shaded regions, and labels are hidden in this view."
+        )
+        for axis in ("x", "y"):
+            actions[f"auto_{axis}"].setToolTip(
+                "Automatically adjust this axis using its coverage and Auto Pan settings. "
+                "Turn this off to keep its current limits for manual adjustment."
+            )
+            actions[f"mouse_{axis}"].setToolTip(
+                "Allow mouse dragging and scrolling to move or scale this axis. Turn this off to lock mouse movement "
+                "on this axis. Automatic adjustments can still move it."
+            )
+            actions[f"pan_{axis}"].setToolTip(
+                "Keep the current range width and move its center to follow the data. Requires Auto Range. "
+                "Coverage controls how much of the data determines the center."
+            )
+            actions[f"log_{axis}"].setToolTip(
+                "Use a logarithmic scale. Only positive values can appear, and manual limits must be positive. "
+                "Invalid manual limits are fitted again where data is available. The axis stays manual."
+            )
+        actions["legend_visible"].setToolTip("Show curve names and colors.")
+        actions["reference_lines_visible"].setToolTip(
+            "Show curves from the accepted model alongside Slider previews."
+        )
         actions["intervention_annotations_visible"].setToolTip(
-            "Show intervention lines and shaded regions. Turning this on or off "
-            "also turns labels on or off."
+            "Show intervention lines and shaded regions. Changing this setting also turns intervention labels on or off."
         )
         actions["intervention_labels_visible"].setToolTip(
-            "Show draggable text labels for interventions. Turning this on also enables indicators."
+            "Show intervention labels that you can drag to a new position. "
+            "Turning this on also shows the intervention lines and shaded regions."
         )
-        actions["log_x"].setToolTip("Display the X axis on a logarithmic scale.")
-        actions["log_y"].setToolTip("Display the Y axis on a logarithmic scale.")
-        actions["x_inverted"].setToolTip("Reverse the direction of the X axis.")
-        actions["y_inverted"].setToolTip("Reverse the direction of the Y axis.")
+        actions["x_inverted"].setToolTip("Reverse the direction of this axis.")
+        actions["y_inverted"].setToolTip("Reverse the direction of this axis.")
         actions["sampling"].setToolTip(
-            "Plot about 1,000 points per curve, preserving intervention boundaries. "
-            "Copy All keeps full resolution."
+            "Display about 1,000 points per curve while preserving intervention boundaries. "
+            "This affects displayed derivatives and Copy Plotted Data. Copy All keeps every point."
         )
-        actions["warnings"].setToolTip("View details of warnings for the current plot.")
+        actions["warnings"].setToolTip("Read the warnings for the current plot.")
         actions["copy_all"].triggered.connect(self.copyAllRequested.emit)
         actions["copy_plotted"].triggered.connect(self._copy_rendered_points_to_clipboard)
         actions["zoom"].triggered.connect(self._set_zoom_enabled)
@@ -669,8 +715,11 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         actions["fit_once"].triggered.connect(self._fit_once)
         for key in ("auto_x", "auto_y", "mouse_x", "mouse_y", "pan_x", "pan_y", "visible_x"):
             actions[key].triggered.connect(lambda enabled, option=key: self._set_navigation(option, enabled))
-        actions["visible_x"].setToolTip("Hold X and automatically fit Y to samples within X. Manual Y navigation ends this mode.")
-        actions["fit_once"].setToolTip("Fit all displayed data once, then keep both axes manual.")
+        actions["visible_x"].setToolTip(
+            "Automatically adjust Y to the data within the visible X range. X stays manual and Y Auto Pan turns off. "
+            "Moving Y manually, enabling X Auto Range, or enabling Y Auto Pan ends this mode."
+        )
+        actions["fit_once"].setToolTip("Fit all displayed data once, then leave both axes under manual control.")
         actions["reference_lines_visible"].triggered.connect(self.referenceLayerVisibilityRequested)
         actions["intervention_annotations_visible"].triggered.connect(self.interventionAnnotationsVisibilityRequested)
         actions["intervention_labels_visible"].triggered.connect(self.interventionLabelsVisibilityRequested)
@@ -682,10 +731,11 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         actions["warnings"].triggered.connect(self._show_completion_warning_details)
         self._plot_menu.aboutToShow.connect(self._sync_plot_controls)
 
-    def _add_plot_percentage(self, menu: QtWidgets.QMenu, key: str, label: str, *, minimum: int = 0) -> None:
+    def _add_plot_percentage(self, menu: QtWidgets.QMenu, key: str, label: str, *, tooltip: str, minimum: int = 0) -> None:
         host = QtWidgets.QWidget(menu)
         layout = QtWidgets.QHBoxLayout(host)
-        layout.addWidget(QtWidgets.QLabel(label, host))
+        caption = QtWidgets.QLabel(label, host)
+        layout.addWidget(caption)
         spin = QtWidgets.QDoubleSpinBox(host)
         spin.setRange(minimum, 100)
         spin.setDecimals(0)
@@ -695,11 +745,12 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         layout.addWidget(spin)
         action = QtWidgets.QWidgetAction(menu)
         action.setDefaultWidget(host)
+        for target in (action, host, caption, spin):
+            target.setToolTip(tooltip)
         menu.addAction(action)
         self._plot_percentages[key] = spin
         if key.startswith("fraction_"):
             spin.valueChanged.connect(lambda value: self._set_navigation(key, value / 100))
-            spin.setToolTip("Central percentage of each curve's samples used for automatic bounds.")
         else:
             spin.valueChanged.connect(lambda value: self._request_plot_presentation(key, value / 100))
 

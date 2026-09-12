@@ -304,7 +304,7 @@ class DataManagerPanel(QtWidgets.QWidget):
         self._remove_btn.setToolTip("Remove this dataset from the project, including its mappings and plot overlays across all tabs.")
         self._remove_btn.clicked.connect(self._remove_dataset)
         self._source_btn = QtWidgets.QPushButton("File Details…")
-        self._source_btn.setToolTip("View the original filename, import filepath, columns, and units.")
+        self._source_btn.setToolTip("View the original filename, import file path, columns, and units.")
         self._source_btn.clicked.connect(self._show_source)
         self._browser = QtWidgets.QWidget()
         browser_layout = QtWidgets.QVBoxLayout(self._browser)

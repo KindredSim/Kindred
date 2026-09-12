@@ -51,16 +51,16 @@ class SpeciesStatisticsTable(QtWidgets.QTableWidget):
 
         # Add tooltips to explain each column
         header = self.horizontalHeader()
-        header.setToolTip("Species: Chemical species name")
         self.horizontalHeaderItem(0).setToolTip("Species name")
-        self.horizontalHeaderItem(1).setToolTip("Final concentration at t_end")
+        self.horizontalHeaderItem(1).setToolTip("Concentration at the last returned simulation sample.")
         self.horizontalHeaderItem(2).setToolTip("Maximum concentration reached")
         self.horizontalHeaderItem(3).setToolTip("Time at which maximum concentration occurs")
         self.horizontalHeaderItem(4).setToolTip(
-            "Concentration-Time Curve (fixed-policy scalar):\n"
-            "• Species → 0: ∫C dt\n"
-            "• Species → C_final: ∫|C - C_final| dt\n"
-            "Nonfinite numerical results are unavailable."
+            "Concentration-time integral. If the final concentration is zero, "
+            "integrate the concentration over time. Otherwise, integrate its "
+            "absolute difference from the final concentration. Unavailable for "
+            "simulations with interventions or when the calculation produces a "
+            "nonfinite result."
         )
 
         header.setStretchLastSection(False)

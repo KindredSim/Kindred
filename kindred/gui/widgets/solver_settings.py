@@ -43,6 +43,9 @@ class SolverSettingsDialog(QtWidgets.QDialog):
         form = QtWidgets.QFormLayout()
         self.solver_combo = QtWidgets.QComboBox(self)
         self.solver_combo.addItems(list(SUPPORTED_SOLVERS))
+        self.solver_combo.setToolTip(
+            "Choose the numerical method used to calculate the simulation."
+        )
         self.t_start_edit = self._time_edit(
             "0",
             "Absolute Run start time",
@@ -54,6 +57,11 @@ class SolverSettingsDialog(QtWidgets.QDialog):
         self.integration_points_spin = QtWidgets.QSpinBox(self)
         self.integration_points_spin.setRange(*SIMULATION_POINT_RANGE)
         self.integration_points_spin.setSingleStep(10)
+        self.integration_points_spin.setToolTip(
+            "Number of evenly spaced base samples over the completed interval, "
+            "including both endpoints. Intervention boundary rows are additional. "
+            "A stop at the start returns one sample."
+        )
         for label, widget in (
             ("Solver", self.solver_combo),
             ("t_start", self.t_start_edit),
@@ -306,8 +314,8 @@ class SimulationSettingsDialog(QtWidgets.QDialog):
         self.cache_capacity_spin.setToolTip(
             "Number of past simulation results kept in memory per mechanism tab. "
             "Matching results can be restored when enabled for plotting. Larger "
-            "values use more memory; the least recently used entries are removed "
-            "when the cache is full."
+            "values use more memory. When the cache is full, the least recently "
+            "used results are removed."
         )
         cache_form.addRow(
             "Explicit-result cache capacity",

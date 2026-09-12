@@ -211,6 +211,7 @@ class GridPlotView(QtWidgets.QWidget):
         self._layout_timer.timeout.connect(self._update_grid)
 
         self._context_menu = QtWidgets.QMenu(self)
+        self._context_menu.setToolTipsVisible(True)
         self._context_actions = {
             key: self._context_menu.addAction(label)
             for key, label in (
@@ -225,6 +226,9 @@ class GridPlotView(QtWidgets.QWidget):
                 ("invert_y", "Invert Y"),
             )
         }
+        self._context_actions["range"].setToolTip(
+            "Fit both axes to the data once. Automatic ranging remains off afterward."
+        )
         for action in tuple(self._context_actions.values())[2:]:
             action.setCheckable(True)
         self._mouse_mode_group = QtGui.QActionGroup(self)

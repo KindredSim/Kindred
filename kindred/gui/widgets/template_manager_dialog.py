@@ -471,7 +471,7 @@ class TemplateManagerDialog(QtWidgets.QDialog):
 
         self._apply_btn.setEnabled(selected)
         self._apply_btn.setToolTip(
-            "Apply the selected template to its captured destination tab."
+            "Load the selected template into the mechanism tab this manager was opened for."
             if selected
             else "Select a template first."
         )

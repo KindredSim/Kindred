@@ -253,7 +253,7 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
         self._reset_runtime_parameters_btn = QtWidgets.QPushButton("Reset")
         self._reset_runtime_parameters_btn.setObjectName("resetRuntimeParametersButton")
         self._reset_runtime_parameters_btn.setToolTip(
-            "Revert sliders to canonical mechanism values"
+            "Reset sliders to the accepted model values."
         )
         self._reset_runtime_parameters_btn.clicked.connect(self.sliderResetRequested)
         slider_actions_layout.addWidget(self._reset_runtime_parameters_btn, 0, 3, alignment=QtCore.Qt.AlignLeft)
@@ -264,7 +264,7 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
         self._slider_visibility_picker_btn.setText("Visible sliders")
         self._slider_visibility_picker_btn.setObjectName("sliderVisibilityPickerButton")
         self._slider_visibility_picker_btn.setToolTip(
-            "Choose which mechanism parameters to show as interactive sliders"
+            "Choose which parameters and initial concentrations appear as sliders."
         )
         self._slider_visibility_picker_btn.setPopupMode(
             QtWidgets.QToolButton.ToolButtonPopupMode.InstantPopup

@@ -138,12 +138,13 @@ class ExactCorrectionBasisDialog(QtWidgets.QDialog):
                     Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked
                 )
                 if checked:
-                    description = "Selected as a dependent parameter; uncheck to change the basis."
+                    description = "Selected as a dependent parameter. Uncheck it to change the selection."
                 elif not target.eligible:
                     description = self._intrinsic_unavailability(target)
                 elif enabled:
                     description = (
-                        "Can be selected while retaining a valid full-rank completion."
+                        "This parameter can be selected while keeping a valid "
+                        "solution of the correction equations possible."
                     )
                 else:
                     description = (

@@ -81,7 +81,7 @@ _VARY_IC_CHOICES: tuple[tuple[str, str, str], ...] = (
 )
 
 _ZERO_IC_PERCENT_MESSAGE = (
-    "A zero Starting IC cannot use a percentage Vary IC mode; choose "
+    "A zero Starting IC cannot use a percentage Vary IC mode. Choose "
     "Absolute Minimum / Maximum (in M)."
 )
 

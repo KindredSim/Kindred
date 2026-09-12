@@ -155,6 +155,9 @@ class SimulationPanel(QtWidgets.QWidget):
         controls = ControlRowsLayout(self._controls_host)
         self.solver_method_combo = QtWidgets.QComboBox(self)
         self.solver_method_combo.addItems(list(SUPPORTED_SOLVERS))
+        self.solver_method_combo.setToolTip(
+            "Choose the numerical method used to calculate the simulation."
+        )
         self.t_start_edit = self._number_edit("0.0", "Absolute Run start time")
         self.t_end_edit = self._number_edit("10.0", "Absolute Run end time")
         self.num_points_spinbox = QtWidgets.QSpinBox(self)

@@ -78,13 +78,11 @@ class AxisToolbar(QtWidgets.QWidget):
         self._x_unit_combo.setObjectName("axisToolbarXUnit")
         self._x_unit_combo.setMinimumWidth(64)
         self._x_unit_combo.setMaximumWidth(84)
-        self._x_unit_combo.setToolTip("Select units for the X axis and copied plot data. Available when plotting time or concentration.")
 
         self._y_unit_combo = QtWidgets.QComboBox(self)
         self._y_unit_combo.setObjectName("axisToolbarYUnit")
         self._y_unit_combo.setMinimumWidth(64)
         self._y_unit_combo.setMaximumWidth(84)
-        self._y_unit_combo.setToolTip("Select units for the Y axis and copied plot data. Available only when all plotted Y variables are concentrations.")
 
         self._y_list = QtWidgets.QListWidget(self)
         self._y_list.setToolTip('Select Y-axis Variables (species or observables defined with "let … = …").')
@@ -116,7 +114,7 @@ class AxisToolbar(QtWidgets.QWidget):
         self._y_popup_label = QtWidgets.QLabel("Visible series", self._y_popup_container)
         self._invert_y_selection_btn = QtWidgets.QPushButton("Invert selection", self._y_popup_container)
         self._invert_y_selection_btn.setObjectName("axisToolbarInvertYSelectionButton")
-        self._invert_y_selection_btn.setToolTip("Invert the selected Y series")
+        self._invert_y_selection_btn.setToolTip("Select the unselected Y series and deselect the selected ones.")
         y_popup_layout.addWidget(self._y_popup_label)
         y_popup_layout.addWidget(self._invert_y_selection_btn)
         y_popup_layout.addWidget(self._y_list)
@@ -316,9 +314,9 @@ class AxisToolbar(QtWidgets.QWidget):
                     it.flags() & ~Qt.ItemFlag.ItemIsUserCheckable
                 )
                 it.setToolTip(literal_tooltip(
-                    candidate.label + "\nShown because this active overlay maps to "
-                    f"{locked_checked_by_identity[candidate.selection]}; "
-                    "disable it in Plot Overlays."
+                    candidate.label + "\nShown because an active overlay maps to "
+                    f"{locked_checked_by_identity[candidate.selection]}. "
+                    "Turn off that overlay in Plot Overlays to hide this series."
                 ))
                 it.setCheckState(Qt.CheckState.Checked)
             else:
@@ -342,6 +340,23 @@ class AxisToolbar(QtWidgets.QWidget):
         self._set_unit_combo(self._y_unit_combo, y_units, selected_y)
         self._x_unit_label.setText("Source X unit:" if transformed else "Unit:")
         self._y_unit_label.setText("Source Y unit:" if transformed else "Unit:")
+        x_tooltip = (
+            "Choose the units for the original X quantity. This changes the \"per X\" part of dy/dx. "
+            "For example, changing seconds to minutes changes a rate per second to a rate per minute."
+            if transformed else
+            "Choose the units for the horizontal axis and Copy Plotted Data. Available for time or concentration."
+        )
+        y_tooltip = (
+            "Choose the units for the original Y quantities. This changes the Y part of dy/dx. "
+            "In Derivative versus Y, it also changes the horizontal axis units."
+            if transformed else
+            "Choose the concentration units for the vertical axis and Copy Plotted Data. "
+            "Available when all selected Y quantities are concentrations."
+        )
+        for widget in (self._x_unit_combo, self._x_unit_label):
+            widget.setToolTip(x_tooltip)
+        for widget in (self._y_unit_combo, self._y_unit_label):
+            widget.setToolTip(y_tooltip)
 
     @staticmethod
     def _set_unit_combo(

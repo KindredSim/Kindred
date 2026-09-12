@@ -353,12 +353,10 @@ class BatchInitialConditionsTableModel(QtCore.QAbstractTableModel):
                 return "Show this exact set in the active mechanism plot."
             if column == self.custom_column():
                 return (
-                    "Use one complete four-field override for this set"
-                    if row.custom_run_settings
-                    else "Create one complete four-field override for this set"
+                    "Use a separate solver, start time, end time, and output-point count for this set."
                 )
             if column == self.run_gear_column() and row.custom_run_settings:
-                return "Edit this set's complete four-field override"
+                return "Edit the solver, start time, end time, and output-point count for this set."
         return None
 
     def setData(
