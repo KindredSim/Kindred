@@ -569,6 +569,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
             menu.setToolTipsVisible(True)
         groups = (
             (self._plot_menu, (("copy_all", "Copy All"), ("copy_plotted", "Copy Plotted Data"),
+                              ("copy_visible", "Copy Visible Data"),
                               ("fit_once", "Fit Once"), ("zoom", "Zoom"), ("auto_range", "Auto Range"))),
             (appearance, (("show_grid", "Show Grid"), ("grid_x", "X Grid"), ("grid_y", "Y Grid"),
                           ("simulation_markers", "Simulation Sample Markers"),
@@ -583,7 +584,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         for menu, group in groups:
             for key, text in group:
                 action = menu.addAction(text)
-                action.setCheckable(key not in {"copy_all", "copy_plotted", "fit_once", "warnings"})
+                action.setCheckable(key not in {"copy_all", "copy_plotted", "copy_visible", "fit_once", "warnings"})
                 self._plot_actions[key] = action
         for axis, menu in axis_menus.items():
             for key, label in ((f"auto_{axis}", "Auto Range"), (f"mouse_{axis}", "Mouse Navigation"),
@@ -595,7 +596,8 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
             self._add_plot_percentage(
                 menu, f"fraction_{axis}", "Auto-range coverage", minimum=1,
                 tooltip="Choose the central percentage of each curve used to adjust the axis automatically. "
-                "Lower percentages can leave extreme values outside the view. The plotted and copied data stay unchanged.",
+                "Lower percentages can leave extreme values outside the view. "
+                "Copy Plotted Data keeps those points; Copy Visible Data uses the current view.",
             )
         self._add_plot_percentage(
             appearance, "grid_opacity", "Grid opacity",
@@ -621,6 +623,11 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
             "Copy the selected curves using the current transform, units, and sampling. "
             "Include points outside the visible area."
         )
+        actions["copy_visible"].setToolTip(
+            "Copy existing plotted samples inside both current axis limits, using the current "
+            "transform, units, and sampling. Do not interpolate points at the view boundaries."
+        )
+        actions["copy_visible"].setEnabled(False)
         actions["zoom"].setToolTip("Drag with the left mouse button to select a zoom area. Turn this off to drag the view instead.")
         actions["auto_range"].setToolTip(
             "Automatically adjust both axes using their coverage and Auto Pan settings. "
@@ -674,11 +681,12 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         actions["y_inverted"].setToolTip("Reverse the direction of this axis.")
         actions["sampling"].setToolTip(
             "Display about 1,000 points per curve while preserving intervention boundaries. "
-            "This affects displayed derivatives and Copy Plotted Data. Copy All keeps every point."
+            "This affects displayed derivatives, Copy Plotted Data, and Copy Visible Data. Copy All keeps every point."
         )
         actions["warnings"].setToolTip("Read the warnings for the current plot.")
         actions["copy_all"].triggered.connect(self.copyAllRequested.emit)
         actions["copy_plotted"].triggered.connect(self._copy_rendered_points_to_clipboard)
+        actions["copy_visible"].triggered.connect(self._copy_visible_points_to_clipboard)
         actions["zoom"].triggered.connect(self._set_zoom_enabled)
         actions["auto_range"].triggered.connect(self._set_auto_range)
         actions["fit_once"].triggered.connect(self._fit_once)
@@ -699,6 +707,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         actions["sampling"].triggered.connect(self._set_coarse_sampling)
         actions["warnings"].triggered.connect(self._show_completion_warning_details)
         self._plot_menu.aboutToShow.connect(self._sync_plot_controls)
+        self._plot_menu.aboutToShow.connect(self._refresh_visible_copy_availability)
 
     def _add_plot_percentage(self, menu: QtWidgets.QMenu, key: str, label: str, *, tooltip: str, minimum: int = 0) -> None:
         host = QtWidgets.QWidget(menu)
@@ -761,6 +770,32 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
 
     def _show_plot_context_menu(self, position: QtCore.QPoint) -> None:
         self._plot_menu.exec(self._plot_widget.mapToGlobal(position))
+
+    @QtCore.Slot()
+    def _refresh_visible_copy_availability(self) -> None:
+        self._plot_actions["copy_visible"].setEnabled(_has_visible_samples(
+            self._rendered_point_roster,
+            self._plot_widget.getViewBox().viewRange(),
+            log_x=self._presentation.log_x, log_y=self._presentation.log_y,
+        ))
+
+    @QtCore.Slot()
+    def _copy_visible_points_to_clipboard(self) -> None:
+        roster = self._rendered_point_roster
+        view_range = self._plot_widget.getViewBox().viewRange()
+        log_x, log_y = self._presentation.log_x, self._presentation.log_y
+        try:
+            visible = _visible_point_roster(roster, view_range, log_x=log_x, log_y=log_y)
+            if not visible:
+                self.resultDiagnostic.emit("No plotted samples are inside the current view.")
+                return
+            output = io.StringIO()
+            output.writelines(_iter_rendered_point_tsv_chunks(visible, action_name="Copy Visible Data"))
+            rendered_text = output.getvalue()
+        except (TypeError, ValueError, OSError) as exc:
+            QtWidgets.QMessageBox.critical(self, "Copy Visible Data", str(exc))
+            return
+        QtWidgets.QApplication.clipboard().setText(rendered_text)
 
     @QtCore.Slot()
     def _copy_rendered_points_to_clipboard(self) -> None:
@@ -2803,10 +2838,72 @@ _MAX_RENDERED_COPY_CELLS = 1_000_000
 _MAX_RENDERED_COPY_CHARACTERS = 64 * 1024 * 1024
 
 
+def _visible_sample_mask(
+    x: np.ndarray, y: np.ndarray, view_range: Sequence[Sequence[float]],
+    *, log_x: bool, log_y: bool,
+) -> np.ndarray:
+    """Compare existing samples in the native ViewBox coordinate space."""
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        mapped_x = np.log10(x) if log_x else x
+        mapped_y = np.log10(y) if log_y else y
+    return (
+        np.isfinite(mapped_x) & np.isfinite(mapped_y)
+        & (mapped_x >= view_range[0][0]) & (mapped_x <= view_range[0][1])
+        & (mapped_y >= view_range[1][0]) & (mapped_y <= view_range[1][1])
+    )
+
+
+def _has_visible_samples(
+    roster: Sequence[_RenderedPointBlock], view_range: Sequence[Sequence[float]],
+    *, log_x: bool, log_y: bool,
+) -> bool:
+    """Stop at the first matching batch; never construct export columns."""
+
+    for block in roster:
+        for chunk in block.chunks:
+            for _name, y in chunk.series:
+                for start in range(0, chunk.x.size, 4096):
+                    sample = slice(start, start + 4096)
+                    if _visible_sample_mask(
+                        chunk.x[sample], y[sample], view_range, log_x=log_x, log_y=log_y,
+                    ).any():
+                        return True
+    return False
+
+
+def _visible_point_roster(
+    roster: Sequence[_RenderedPointBlock], view_range: Sequence[Sequence[float]],
+    *, log_x: bool, log_y: bool,
+) -> tuple[_RenderedPointBlock, ...]:
+    """Create call-local, independently paired series for the existing serializer."""
+
+    visible = []
+    for block in roster:
+        units = dict(block.y_units)
+        for name, label in block.y_names:
+            chunks = []
+            for chunk in block.chunks:
+                y = dict(chunk.series)[name]
+                mask = _visible_sample_mask(chunk.x, y, view_range, log_x=log_x, log_y=log_y)
+                if mask.any():
+                    chunks.append(_RenderedPointChunk(
+                        x=chunk.x[mask], series=((name, y[mask]),),
+                        sample_time=None if chunk.sample_time is None else chunk.sample_time[mask],
+                    ))
+            if chunks:
+                visible.append(replace(
+                    block, chunks=tuple(chunks), y_names=((name, label),),
+                    y_units=((name, units[name]),),
+                ))
+    return tuple(visible)
+
+
 def _iter_rendered_point_tsv_chunks(
     roster: Sequence[_RenderedPointBlock],
     *,
     rows_per_chunk: int = 2048,
+    action_name: str = "Copy Plotted Data",
 ) -> tuple[str, ...]:
     """Serialize the captured roster as one rectangular TSV table."""
 
@@ -2844,7 +2941,7 @@ def _iter_rendered_point_tsv_chunks(
     planned_cells = (planned_rows + 1) * planned_width
     if planned_cells > _MAX_RENDERED_COPY_CELLS:
         raise ValueError(
-            "Copy Plotted Data payload exceeds the bounded cell limit "
+            f"{action_name} payload exceeds the bounded cell limit "
             f"({_MAX_RENDERED_COPY_CELLS:,})."
         )
 
@@ -2915,7 +3012,7 @@ def _iter_rendered_point_tsv_chunks(
             total_characters += len(piece)
             if total_characters > _MAX_RENDERED_COPY_CHARACTERS:
                 raise ValueError(
-                    "Copy Plotted Data payload exceeds the bounded output-size limit."
+                    f"{action_name} payload exceeds the bounded output-size limit."
                 )
             output_chunks.append(piece)
             output = io.StringIO()
@@ -2924,7 +3021,7 @@ def _iter_rendered_point_tsv_chunks(
     total_characters += len(piece)
     if total_characters > _MAX_RENDERED_COPY_CHARACTERS:
         raise ValueError(
-            "Copy Plotted Data payload exceeds the bounded output-size limit."
+            f"{action_name} payload exceeds the bounded output-size limit."
         )
     if piece:
         output_chunks.append(piece)
