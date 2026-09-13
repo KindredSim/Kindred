@@ -215,6 +215,7 @@ class GridPlotView(QtWidgets.QWidget):
 
         self._canvas = pg.GraphicsLayoutWidget(self)
         self._canvas.scene().installEventFilter(self)
+        self._canvas.scene().sigMouseClicked.connect(self._on_plot_click)
         try:
             self._canvas.useOpenGL(False)
         except (AttributeError, RuntimeError):
@@ -327,6 +328,11 @@ class GridPlotView(QtWidgets.QWidget):
         self._context_menu.exec(global_position)
         self._context_target = None
 
+    def _on_plot_click(self, event: object) -> None:
+        if event.button() == QtCore.Qt.MouseButton.RightButton and not event.isAccepted():
+            event.accept()
+            self._show_context_menu(event.scenePos(), event.screenPos().toPoint())
+
     def eventFilter(self, watched: object, event: QtCore.QEvent) -> bool:
         if (event.type() == QtCore.QEvent.Type.Wheel
                 and watched is self._canvas.viewport()
@@ -338,7 +344,8 @@ class GridPlotView(QtWidgets.QWidget):
         if watched is self._scroll.viewport() and event.type() == QtCore.QEvent.Type.Resize:
             self._layout_timer.start(0)
         if watched is self._canvas.scene() and event.type() == QtCore.QEvent.Type.GraphicsSceneContextMenu:
-            self._show_context_menu(event.scenePos(), event.screenPos())
+            if event.reason() != QtWidgets.QGraphicsSceneContextMenuEvent.Reason.Mouse:
+                self._show_context_menu(event.scenePos(), event.screenPos())
             event.accept()
             return True
         return super().eventFilter(watched, event)

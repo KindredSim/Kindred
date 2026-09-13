@@ -262,12 +262,8 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         )
         self._plot_widget.getPlotItem().setMenuEnabled(False)
         self._plot_widget.getPlotItem().hideButtons()
-        self._plot_widget.setContextMenuPolicy(
-            QtCore.Qt.ContextMenuPolicy.CustomContextMenu
-        )
-        self._plot_widget.customContextMenuRequested.connect(
-            self._show_plot_context_menu
-        )
+        self._plot_widget.scene().installEventFilter(self)
+        self._plot_widget.scene().sigMouseClicked.connect(self._on_plot_click)
         self._axis_toolbar = AxisToolbar(self)
         self._axis_toolbar.xChanged.connect(self.xSeriesRequested.emit)
         self._axis_toolbar.ySelectionChanged.connect(self.ySeriesRequested.emit)
@@ -768,8 +764,19 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
             enabled=not self._interactive_gesture_active,
         )
 
-    def _show_plot_context_menu(self, position: QtCore.QPoint) -> None:
-        self._plot_menu.exec(self._plot_widget.mapToGlobal(position))
+    def _on_plot_click(self, event: object) -> None:
+        if event.button() == QtCore.Qt.MouseButton.RightButton:
+            event.accept()
+            self._plot_menu.popup(event.screenPos().toPoint())
+
+    def eventFilter(self, watched: object, event: QtCore.QEvent) -> bool:
+        if watched is self._plot_widget.scene() and event.type() == QtCore.QEvent.Type.GraphicsSceneContextMenu:
+            # Mouse menus belong to the scene's click/drag recognizer.
+            if event.reason() != QtWidgets.QGraphicsSceneContextMenuEvent.Reason.Mouse:
+                self._plot_menu.popup(event.screenPos())
+            event.accept()
+            return True
+        return super().eventFilter(watched, event)
 
     @QtCore.Slot()
     def _refresh_visible_copy_availability(self) -> None:
@@ -2502,6 +2509,8 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
                 label.setFlag(
                     QtWidgets.QGraphicsItem.GraphicsItemFlag.ItemIsMovable, True
                 )
+                # Keep right clicks/drags with the scene's plot navigation.
+                label.setAcceptedMouseButtons(QtCore.Qt.MouseButton.LeftButton)
                 label.setZValue(11)
                 self._plot_widget.addItem(label, ignoreBounds=True)
                 prior = _AnnotationLabel(label, QtCore.QPointF(label.pos()), weighted_start / weight, lane)
