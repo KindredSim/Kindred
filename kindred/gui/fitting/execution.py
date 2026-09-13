@@ -53,6 +53,7 @@ from kindred.core.simulation_failure import (
     factual_cause_from_exception,
 )
 from kindred.core.simulator.dsl_parse import PreparedDslRequestSet
+from kindred.gui.curve_copy_headers import observable_copy_definitions
 from kindred.gui.fitting.constants import INITIAL_PREFIX
 from kindred.gui.fitting.launch import (
     FitDatasetLocalSettings,
@@ -149,6 +150,9 @@ class FitCurveDataset:
     model_segment_keys: tuple[tuple[str, tuple[str, ...]], ...]
     model_discontinuity_ids: tuple[tuple[str, tuple[int, ...]], ...]
     observed_raw_columns: tuple[tuple[str, str], ...]
+    model_definitions: tuple[tuple[str, str], ...]
+    x_semantic: FitCurveYSemantic
+    observed_x_name: str | None
     x_name: str = "t"
 
     def __post_init__(self) -> None:
@@ -765,6 +769,9 @@ def _curves_from_simulations(
     prepared_by_id = {
         item.dataset_id: item for item in request.dispatch.prepared_datasets
     }
+    if not any(evaluations.get(dataset_id) is not None for dataset_id in request.dispatch.included_dataset_ids):
+        return ()
+    model_definitions = observable_copy_definitions(request.setup.origin.prepared_dsl)
     curves: list[FitCurveDataset] = []
     for dataset_id in request.dispatch.included_dataset_ids:
         simulation = evaluations.get(dataset_id)
@@ -816,6 +823,12 @@ def _curves_from_simulations(
                 dataset_id=dataset_id,
                 display_name=mapped.display_name,
                 y_semantics=_fit_curve_y_semantics(request.setup.origin.prepared_dsl, model_names),
+                model_definitions=model_definitions,
+                x_semantic=_fit_curve_y_semantics(request.setup.origin.prepared_dsl, (x_name,))[0][1],
+                observed_x_name=(
+                    None if prepared.parametric_x_observation is None
+                    else prepared.parametric_x_observation.raw_column
+                ),
                 model_x=model_x,
                 model_y=model_y,
                 model_time=tuple(float(value) for value in simulation.t),

@@ -16,6 +16,7 @@ from kindred.core.project_presentation_state import (
     SimulationSeriesAxisSelection,
 )
 from kindred.core.result_repository import SimulationResultValue
+from kindred.gui.curve_copy_headers import copy_column_header, copy_series_label
 from kindred.gui.display_name_policy import literal_tooltip
 from kindred.gui.theme_manager import plot_background_color, plot_foreground_color
 from kindred.gui.ui_helpers import clamp_initial_size
@@ -183,10 +184,10 @@ class _RenderedPointBlock:
     x_name: str
     x_is_time: bool
     x_unit: str | None
-    y_unit: str | None
+    y_names: tuple[tuple[str, str], ...]
+    y_units: tuple[tuple[str, str | None], ...]
     chunks: tuple[_RenderedPointChunk, ...]
-    derivative_wrt: str | None = None
-    derivative_numerator_unit: str | None = None
+    left_endpoint: bool = False
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "block_id", str(self.block_id))
@@ -197,11 +198,6 @@ class _RenderedPointBlock:
             self,
             "x_unit",
             None if self.x_unit is None else str(self.x_unit),
-        )
-        object.__setattr__(
-            self,
-            "y_unit",
-            None if self.y_unit is None else str(self.y_unit),
         )
         object.__setattr__(self, "chunks", tuple(self.chunks))
 
@@ -1514,10 +1510,16 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         # The displayed projection contains completed results, so Copy uses
         # those same sampled curves and their corresponding time.
         if render_input is not None:
+            definitions_by_source = {
+                (block.kind, block.block_id): dict(block.copy_definitions)
+                for block in render_input.blocks
+                if block.kind is not ResultLayerKind.EXPERIMENTAL
+            }
             for curve in projection.curves:
                 rendered_block = self._rendered_block_for_interactive_curve(
                     curve,
                     render_input,
+                    definitions_by_source,
                 )
                 if rendered_block is not None and any(
                     chunk.x.size for chunk in rendered_block.chunks
@@ -1851,6 +1853,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         sampling_limit: int | None,
     ) -> tuple[_RenderedPointBlock, tuple[_RenderedPointChunk, ...]]:
         sample, chunks = self._sample_and_chunks(block, sampling_limit)
+        definitions = dict(block.copy_definitions)
         render_input = self._render_input
         x_unit, y_unit, x_scale, y_scale = (
             self._display_unit_state(render_input)
@@ -1884,21 +1887,43 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
             ),
             label=block.label,
             kind=block.kind.value,
-            x_name=block.x_name,
+            x_name=copy_series_label(block.x_name, definition=definitions.get(block.x_name)),
             x_is_time=(
                 isinstance(block.x_axis, SimulationSeriesAxisSelection)
                 and block.x_axis.series_name == "t"
             ),
-            x_unit=x_unit,
-            y_unit=y_unit,
+            x_unit=self._copy_x_unit(block, x_unit),
+            y_names=tuple(
+                (name, copy_series_label(name, definition=definitions.get(name)))
+                for name, _ in sampled_series
+            ),
+            y_units=tuple(
+                (name, self._copy_concentration_unit(block, name, y_unit))
+                for name, _ in sampled_series
+            ),
             chunks=rendered_chunks,
         )
         return rendered_block, rendered_chunks
+
+    @staticmethod
+    def _copy_concentration_unit(
+        block: ResultDataBlock, name: str, display_unit: str | None,
+    ) -> str | None:
+        # Mixed axes retain canonical concentrations even without an axis unit.
+        if block.kind is ResultLayerKind.EXPERIMENTAL or name in block.concentration_names:
+            return display_unit or "M"
+        return None
+
+    def _copy_x_unit(self, block: ResultDataBlock, display_unit: str | None) -> str | None:
+        if isinstance(block.x_axis, SimulationSeriesAxisSelection) and block.x_axis.series_name == "t":
+            return display_unit
+        return self._copy_concentration_unit(block, block.x_name, display_unit)
 
     def _rendered_block_for_interactive_curve(
         self,
         curve: object,
         render_input: ResultRenderInput,
+        definitions_by_source: Mapping[tuple[ResultLayerKind, str], Mapping[str, str]],
     ) -> _RenderedPointBlock | None:
         key = tuple(curve.key)
         if len(key) < 4 or key[0] != "simulation":
@@ -1927,6 +1952,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
             )
         if source is None:
             return None
+        definitions = definitions_by_source[(source.kind, source.block_id)]
         x_unit, y_unit, x_scale, y_scale = self._display_unit_state(
             render_input
         )
@@ -1954,13 +1980,16 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
             group_id=set_id,
             label=source.label,
             kind=source.kind.value,
-            x_name=source.x_name,
+            x_name=copy_series_label(source.x_name, definition=definitions.get(source.x_name)),
             x_is_time=(
                 isinstance(source.x_axis, SimulationSeriesAxisSelection)
                 and source.x_axis.series_name == "t"
             ),
-            x_unit=x_unit,
-            y_unit=y_unit,
+            x_unit=self._copy_x_unit(source, x_unit),
+            y_names=((series_name, copy_series_label(
+                series_name, definition=definitions.get(series_name),
+            )),),
+            y_units=((series_name, self._copy_concentration_unit(source, series_name, y_unit)),),
             chunks=curve_chunks,
         )
 
@@ -1970,7 +1999,8 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
             return (block,)
         names = tuple(name for name, _ in block.chunks[0].series) if block.chunks else ()
         groups = tuple((name,) for name in names) if transform == "phase" else (names,)
-        denominator = f"{block.x_name} ({block.x_unit})" if block.x_unit else block.x_name
+        denominator = copy_series_label(block.x_name, block.x_unit)
+        y_names, y_units = dict(block.y_names), dict(block.y_units)
         result = []
         for group in groups:
             chunks = []
@@ -1985,12 +2015,15 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
                     sample_time=None if chunk.sample_time is None else chunk.sample_time[:-1],
                 ))
             result.append(replace(
-                block, chunks=tuple(chunks), derivative_wrt=denominator,
-                derivative_numerator_unit=block.y_unit,
-                x_name=f"{group[0]} [phase; left endpoint]" if transform == "phase" else f"{block.x_name} [left endpoint]",
+                block, chunks=tuple(chunks), left_endpoint=True,
+                x_name=f"{y_names[group[0]]} [phase; left endpoint]" if transform == "phase" else f"{block.x_name} [left endpoint]",
                 x_is_time=block.x_is_time and transform != "phase",
-                x_unit=block.y_unit if transform == "phase" else block.x_unit,
-                y_unit=self._derivative_unit(block.x_unit, block.y_unit),
+                x_unit=y_units[group[0]] if transform == "phase" else block.x_unit,
+                y_names=tuple(
+                    (name, f"d({copy_series_label(y_names[name], y_units[name])})/d({denominator}) [adjacent samples]")
+                    for name in group
+                ),
+                y_units=tuple((name, self._derivative_unit(block.x_unit, y_units[name])) for name in group),
             ))
         return tuple(result)
 
@@ -2770,15 +2803,6 @@ _MAX_RENDERED_COPY_CELLS = 1_000_000
 _MAX_RENDERED_COPY_CHARACTERS = 64 * 1024 * 1024
 
 
-def _rendered_column_header(
-    label: str,
-    name: str,
-    unit: str | None,
-) -> str:
-    displayed_name = f"{name} ({unit})" if unit is not None else name
-    return encode_clipboard_text(f"{label}::{displayed_name}")
-
-
 def _iter_rendered_point_tsv_chunks(
     roster: Sequence[_RenderedPointBlock],
     *,
@@ -2829,27 +2853,18 @@ def _iter_rendered_point_tsv_chunks(
         if separator:
             combined_headers.append("")
         chunks = tuple(chunk for chunk in block.chunks if chunk.x.size)
-        time_name = "Time [left endpoint]" if block.derivative_wrt is not None else "Time"
+        time_name = "Time [left endpoint]" if block.left_endpoint else "Time"
         headers = []
         if not block.x_is_time and chunks[0].sample_time is not None:
-            headers.append(_rendered_column_header(block.label, time_name, "s"))
-        headers.append(
-            _rendered_column_header(
-                block.label,
-                time_name if block.x_is_time else block.x_name,
-                block.x_unit,
-            )
-        )
+            headers.append(encode_clipboard_text(copy_column_header(block.label, time_name, "s")))
+        headers.append(encode_clipboard_text(copy_column_header(
+            block.label,
+            time_name if block.x_is_time else block.x_name,
+            block.x_unit,
+        )))
+        y_names, y_units = dict(block.y_names), dict(block.y_units)
         headers.extend(
-            _rendered_column_header(
-                block.label,
-                (
-                    f"d({name}{' (' + block.derivative_numerator_unit + ')' if block.derivative_numerator_unit else ''})"
-                    f"/d({block.derivative_wrt}) [adjacent samples]"
-                    if block.derivative_wrt is not None else name
-                ),
-                block.y_unit,
-            )
+            encode_clipboard_text(copy_column_header(block.label, y_names[name], y_units[name]))
             for name in series_names
         )
         # Extend the one combined header in roster order.  Each block remains

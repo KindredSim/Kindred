@@ -28,6 +28,8 @@ from kindred.core.result_repository import (
     SimulationResultValue,
 )
 from kindred.core.simulator.solver_types import SimulationPresentationBoundary
+from kindred.core.simulator.dsl_parse import PreparedDslRequestSet
+from kindred.gui.curve_copy_headers import observable_copy_definitions
 from kindred.gui.dataset_payload_snapshot import ExperimentalLayerInput
 from kindred.gui.plot_config import AxisSelectionCandidate
 
@@ -407,6 +409,8 @@ class ResultDataBlock:
     discontinuity_ids: np.ndarray | None
     source_row: np.ndarray | None
     x_name: str = "t"
+    copy_definitions: tuple[tuple[str, str], ...] = ()
+    concentration_names: tuple[str, ...] = ()
     series_provenance: tuple[tuple[str, Mapping[str, object]], ...] = ()
     x_provenance: Mapping[str, object] = MappingProxyType({})
     color_by_series: tuple[tuple[str, str], ...] = ()
@@ -649,6 +653,7 @@ def _result_block(
     set_id: str,
     label: str,
     result: SimulationResultValue,
+    prepared_dsl: PreparedDslRequestSet,
     kind: ResultLayerKind,
     color_by_axis_selection: Mapping[AxisSeriesSelection, str],
     visible: bool = True,
@@ -667,6 +672,8 @@ def _result_block(
     return ResultDataBlock(
         block_id=set_id, label=display_label, kind=kind, t=result.t,
         sample_time=result.t,
+        copy_definitions=observable_copy_definitions(prepared_dsl),
+        concentration_names=tuple(prepared_dsl.analysis.species_names),
         series=series, series_axes=series_axes,
         x_axis=SimulationSeriesAxisSelection("t"), result=result,
         segment_ids=result.segment_ids, segment_keys=result.segment_keys,
@@ -715,6 +722,7 @@ def compose_canonical_export_blocks(
                     set_id=set_id,
                     label=initial_set.name,
                     result=current,
+                    prepared_dsl=repository.current_request(set_id).prepared_dsl,
                     kind=kind,
                     color_by_axis_selection={
                         SimulationSeriesAxisSelection(name): "#000000"
@@ -729,6 +737,7 @@ def compose_canonical_export_blocks(
                     set_id=set_id,
                     label=initial_set.name,
                     result=reference,
+                    prepared_dsl=repository.reference_request(set_id).prepared_dsl,
                     kind=ResultLayerKind.REFERENCE,
                     color_by_axis_selection={
                         SimulationSeriesAxisSelection(name): "#000000"
@@ -826,6 +835,8 @@ def _data_block(
         segment_ids=block.segment_ids, segment_keys=block.segment_keys,
         discontinuity_ids=block.discontinuity_ids, source_row=block.source_row,
         x_name=x_name,
+        copy_definitions=block.copy_definitions,
+        concentration_names=block.concentration_names,
         series_provenance=tuple((name, payload) for name, payload in block.series_provenance if name in names),
         x_provenance=x_provenance,
         color_by_series=block.color_by_series,
@@ -1400,6 +1411,7 @@ def compose_result_input(
         if foreground is not None:
             semantic = _result_block(
                 set_id=visible.set_id, label=visible.label, result=foreground,
+                prepared_dsl=repository.current_request(visible.set_id).prepared_dsl,
                 kind=foreground_kind, color_by_axis_selection=colors,
             )
             for name, selection in semantic.series_axes:
@@ -1423,6 +1435,7 @@ def compose_result_input(
         if reference is not None:
             reference_semantic = _result_block(
                 set_id=visible.set_id, label=visible.label, result=reference,
+                prepared_dsl=repository.reference_request(visible.set_id).prepared_dsl,
                 kind=ResultLayerKind.REFERENCE,
                 color_by_axis_selection=colors, visible=bool(reference_lines_visible),
             )

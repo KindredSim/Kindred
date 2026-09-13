@@ -11,6 +11,7 @@ from typing import TypeAlias
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
+from kindred.gui.curve_copy_headers import copy_column_header
 from kindred.gui.display_name_policy import (
     PLOT_TITLE_LABEL_MAX_CHARS,
     compact_plot_title_label,
@@ -70,9 +71,9 @@ def _fit_copy_columns(
         label: str,
         name: str,
         unit: str | None = None,
+        definition: str | None = None,
     ) -> str:
-        displayed_name = f"{name} ({unit})" if unit is not None else name
-        return encode_clipboard_text(f"{label}::{displayed_name}")
+        return encode_clipboard_text(copy_column_header(label, name, unit, definition))
 
     model_x = dict(dataset.model_x)
     model_y = dict(dataset.model_y)
@@ -80,8 +81,12 @@ def _fit_copy_columns(
     segment_keys = dict(dataset.model_segment_keys)
     discontinuity_ids = dict(dataset.model_discontinuity_ids)
     series_names = sorted(model_y)
-    x_unit = "s" if dataset.x_name == "t" else None
-    _y_label, y_unit = _fit_y_axis_label(dataset.y_semantics, series_names)
+    x_is_time = dataset.x_name == "t"
+    x_unit = "s" if x_is_time else (
+        "M" if dataset.x_semantic is FitCurveYSemantic.CONCENTRATION else None
+    )
+    semantics = dict(dataset.y_semantics)
+    definitions = dict(dataset.model_definitions)
     model_groups: dict[tuple[object, ...], list[str]] = {}
     for name in series_names:
         # Repeated X values on different execution segments are separate grids.
@@ -96,17 +101,18 @@ def _fit_copy_columns(
         suffix = f" {index}" if len(model_groups) > 1 else ""
         label = f"{dataset_label} — Model{suffix}"
         first = names[0]
-        if x_unit is None:
+        if not x_is_time:
             columns.append((
                 header(label, "Time", "s"),
                 dataset.model_time,
             ))
         columns.append((
-            header(label, "Time" if x_unit is not None else dataset.x_name, x_unit),
+            header(label, "Time" if x_is_time else dataset.x_name, x_unit, definitions.get(dataset.x_name)),
             model_x[first],
         ))
         for name in names:
-            columns.append((header(label, name, y_unit), model_y[name]))
+            unit = "M" if semantics[name] is FitCurveYSemantic.CONCENTRATION else None
+            columns.append((header(label, name, unit, definitions.get(name)), model_y[name]))
 
     observed_x = dict(dataset.observed_x)
     observed_y = dict(dataset.observed_y)
@@ -114,15 +120,15 @@ def _fit_copy_columns(
     raw_columns = dict(dataset.observed_raw_columns)
     for name in sorted(observed_y):
         label = f"{dataset_label} — Observed {name}"
-        if x_unit is None and observed_time[name]:
+        if not x_is_time and observed_time[name]:
             columns.append((
                 header(label, "Time", "s"),
                 observed_time[name],
             ))
         columns.extend(
             (
-                (header(label, "Time" if x_unit is not None else dataset.x_name, x_unit), observed_x[name]),
-                (header(label, raw_columns[name], y_unit), observed_y[name]),
+                (header(label, "Time" if x_is_time else dataset.observed_x_name, "s" if x_is_time else "M"), observed_x[name]),
+                (header(label, raw_columns[name], "M"), observed_y[name]),
             )
         )
     return columns
