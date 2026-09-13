@@ -11,11 +11,10 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 from fractions import Fraction
-from typing import Callable, Mapping, TypeAlias
+from typing import Callable, TypeAlias
 
 from .constants import R, h, k_B
 from .species import validate_c0, validate_temperature
-from .stoichiometry import directional_order_fraction
 from .units import (
     admit_arrhenius_prefactor,
     admit_energy_j_per_mol,
@@ -32,10 +31,8 @@ __all__ = [
     "ForwardRateModel",
     "forward_rate_at_temperature",
     "forward_rate_family",
-    "forward_rate_model_for_equilibrium",
-    "forward_rate_model_for_reaction",
+    "forward_rate_model_payload",
     "forward_rate_symbolic_relation",
-    "write_reference_rate",
 ]
 
 
@@ -99,6 +96,7 @@ class EyringRateModel:
         )
         object.__setattr__(self, "standard_conc_M", standard)
         _positive_integer(self.degeneracy, field="Eyring degeneracy")
+        object.__setattr__(self, "molecularity", _directional_order(self.molecularity))
 
 
 ForwardRateModel: TypeAlias = (
@@ -149,251 +147,26 @@ def forward_rate_family(model: ForwardRateModel) -> str:
     raise TypeError("model must be one typed forward-rate model.")
 
 
-def _decode_forward_rate_model(
-    payload: Mapping[str, object],
-    *,
-    family: str,
-    constant_rate: object | None,
-    molecularity: object,
-    default_standard_conc_M: float = 1.0,
-) -> ForwardRateModel:
-    """Decode one final Constant/Arrhenius/Eyring authority.
-
-    ``constant_rate`` is used only for the Constant family. Energy-authored
-    families must carry their complete authored coordinates in ``payload``;
-    they never fall back to a scalar rate evaluated at one temperature.
-    """
-
-    fields = dict(payload)
-    order = _directional_order(molecularity)
-    allowed_fields = {
-        "Constant": frozenset({"k"}),
-        "Arrhenius": frozenset({"A", "Ea_J_per_mol"}),
-        "Eyring": frozenset(
-            {
-                "dG_act_J_per_mol",
-                "kappa",
-                "standard_conc_M",
-                "degeneracy",
-            }
-        ),
-    }
-    if family not in allowed_fields:
-        raise ValueError(f"Unsupported forward-rate family {family!r}.")
-    unexpected = sorted(set(fields).difference(allowed_fields[family]))
-    if unexpected:
-        raise ValueError(
-            f"{family} forward-rate authority has unsupported field(s): "
-            + ", ".join(unexpected)
-        )
-
-    if family == "Constant":
-        raw_rate = fields.get("k")
-        if raw_rate is None:
-            raw_rate = constant_rate
-        if raw_rate is None:
-            raise ValueError("Constant forward-rate authority requires k.")
-        model: ForwardRateModel = ConstantRateModel(
-            k=_numeric_float(raw_rate, field="Constant k")
-        )
-    elif family == "Arrhenius":
-        if fields.get("A") is None:
-            raise ValueError("Arrhenius forward-rate authority requires A.")
-        raw_ea = fields.get("Ea_J_per_mol")
-        if raw_ea is None:
-            raise ValueError(
-                "Arrhenius forward-rate authority requires Ea_J_per_mol."
-            )
-        model = ArrheniusRateModel(
-            A=_numeric_float(fields["A"], field="Arrhenius A"),
-            Ea_J_per_mol=_numeric_float(
-                raw_ea,
-                field="Arrhenius Ea_J_per_mol",
-            ),
-        )
-    elif family == "Eyring":
-        raw_dg = fields.get("dG_act_J_per_mol")
-        if raw_dg is None:
-            raise ValueError(
-                "Eyring forward-rate authority requires dG_act_J_per_mol."
-            )
-        model = EyringRateModel(
-            dG_act_J_per_mol=_numeric_float(
-                raw_dg,
-                field="Eyring dG_act_J_per_mol",
-            ),
-            kappa=_numeric_float(
-                fields.get("kappa", 1.0),
-                field="Eyring kappa",
-            ),
-            standard_conc_M=_numeric_float(
-                fields.get(
-                    "standard_conc_M",
-                    default_standard_conc_M,
-                ),
-                field="Eyring standard_conc_M",
-            ),
-            molecularity=order,
-            degeneracy=_positive_integer(
-                fields.get("degeneracy", 1),
-                field="Eyring degeneracy",
-            ),
-        )
-    # Validate authored coordinates without evaluating at an arbitrary
-    # temperature (extreme, otherwise-valid barriers can be temperature-safe
-    # only over their declared execution range).
+def forward_rate_model_payload(model: ForwardRateModel) -> dict[str, object]:
+    family = forward_rate_family(model)
     if isinstance(model, ConstantRateModel):
-        admit_rate(model.k, field="Constant k", allow_zero=True)
+        fields: dict[str, object] = {"k": float(model.k)}
     elif isinstance(model, ArrheniusRateModel):
-        admit_arrhenius_prefactor(model.A, field="Arrhenius A")
-        admit_energy_j_per_mol(model.Ea_J_per_mol, field="Arrhenius Ea_J_per_mol")
+        fields = {
+            "A": float(model.A),
+            "Ea_J_per_mol": float(model.Ea_J_per_mol),
+        }
     elif isinstance(model, EyringRateModel):
-        admit_energy_j_per_mol(
-            model.dG_act_J_per_mol,
-            field="Eyring dG_act_J_per_mol",
-        )
-        if not math.isfinite(model.kappa) or model.kappa <= 0.0:
-            raise ValueError("Eyring kappa must be positive and finite.")
-    return model
-
-
-def forward_rate_model_for_reaction(
-    reaction: object,
-    *,
-    default_standard_conc_M: float = 1.0,
-) -> ForwardRateModel:
-    """Project one mechanism reaction onto the final typed rate model."""
-
-    overrides = getattr(reaction, "overrides", {}) or {}
-    if not isinstance(overrides, Mapping):
-        raise TypeError("reaction overrides must be a mapping.")
-    family = str(overrides.get("model") or "Constant")
-    fields = {
-        str(name): value
-        for name, value in overrides.items()
-        if str(name) != "model"
-    }
-    constant_rate = getattr(reaction, "rate", None)
-    bound_model = getattr(constant_rate, "model", None)
-    if isinstance(
-        bound_model,
-        (ConstantRateModel, ArrheniusRateModel, EyringRateModel),
-    ):
-        if forward_rate_family(bound_model) != family:
-            raise ValueError(
-                "Bound reaction rate family conflicts with accepted overrides."
-            )
-        return bound_model
-    if family == "Constant" and callable(constant_rate):
-        if bool(
-            getattr(
-                constant_rate,
-                "accepts_runtime_temperature",
-                False,
-            )
-        ):
-            raise ValueError(
-                "Constant symbolic rate authority cannot depend on runtime temperature."
-            )
-        constant_rate = constant_rate()
-    rate_orders = getattr(reaction, "rate_orders", None)
-    molecularity = (
-        directional_order_fraction(
-            rate_orders,
-        )
-        if rate_orders is not None
-        else getattr(reaction, "order", 1)
-    )
-    return _decode_forward_rate_model(
-        fields,
-        family=family,
-        constant_rate=constant_rate,
-        molecularity=molecularity,
-        default_standard_conc_M=default_standard_conc_M,
-    )
-
-
-def forward_rate_model_for_equilibrium(
-    equilibrium: object,
-    *,
-    temperature_K: float | None,
-    default_standard_conc_M: float = 1.0,
-) -> ForwardRateModel:
-    """Project one equilibrium's forward side onto the same typed model."""
-
-    metadata = getattr(equilibrium, "metadata", {}) or {}
-    if not isinstance(metadata, Mapping):
-        raise TypeError("equilibrium metadata must be a mapping.")
-    raw_model = metadata.get("forward_model")
-    if raw_model is not None and not isinstance(raw_model, Mapping):
-        raise TypeError("equilibrium forward_model must be a mapping.")
-    model_payload = raw_model if isinstance(raw_model, Mapping) else None
-    bound_model = getattr(getattr(equilibrium, "kf", None), "model", None)
-    if isinstance(
-        bound_model,
-        (ConstantRateModel, ArrheniusRateModel, EyringRateModel),
-    ):
-        raw_family = str(
-            dict(model_payload or {}).get("type", "Constant")
-            or "Constant"
-        )
-        if forward_rate_family(bound_model) != raw_family:
-            raise ValueError(
-                "Bound equilibrium rate family conflicts with accepted metadata."
-            )
-        return bound_model
-
-    if temperature_K is None:
-        constant_rate = getattr(equilibrium, "kf", None)
-        if callable(constant_rate):
-            if bool(
-                getattr(
-                    constant_rate,
-                    "accepts_runtime_temperature",
-                    False,
-                )
-            ):
-                constant_rate = None
-            else:
-                constant_rate = constant_rate()
+        fields = {
+            "dG_act_J_per_mol": float(model.dG_act_J_per_mol),
+            "kappa": float(model.kappa),
+            "standard_conc_M": float(model.standard_conc_M),
+            "molecularity": float(model.molecularity),
+            "degeneracy": int(model.degeneracy),
+        }
     else:
-        # Model construction must decode the typed family directly.  Rate
-        # evaluation belongs to ``forward_rate_at_temperature``; calling the
-        # equilibrium authority here would recurse through this factory and
-        # could replace an Arrhenius/Eyring family with a nominal scalar.
-        runtime_temperature = _numeric_float(
-            temperature_K,
-            field="temperature_K",
-        )
-        constant_rate = getattr(equilibrium, "kf", None)
-        if callable(constant_rate):
-            if bool(
-                getattr(
-                    constant_rate,
-                    "accepts_runtime_temperature",
-                    False,
-                )
-            ):
-                constant_rate = constant_rate(runtime_temperature)
-            else:
-                constant_rate = constant_rate()
-    molecularity = _directional_order(
-        float(
-            directional_order_fraction(
-                getattr(equilibrium, "stoich_forward", {}) or {},
-            )
-        ),
-        field="equilibrium forward directional order",
-    )
-    raw_fields = dict(model_payload or {})
-    family = str(raw_fields.pop("type", "Constant") or "Constant")
-    return _decode_forward_rate_model(
-        raw_fields,
-        family=family,
-        constant_rate=constant_rate,
-        molecularity=molecularity,
-        default_standard_conc_M=default_standard_conc_M,
-    )
+        raise TypeError("Unsupported typed forward-rate model.")
+    return {"family": family, **fields}
 
 
 def forward_rate_at_temperature(
@@ -539,72 +312,6 @@ def forward_rate_symbolic_relation(
         if standard_exponent:
             relation *= concentration_relation ** literal(standard_exponent)  # type: ignore[operator]
         return relation
-    raise TypeError("model must be one typed forward-rate model.")
-
-
-def write_reference_rate(
-    model: ForwardRateModel,
-    *,
-    reference_rate: float,
-    reference_temperature_K: float,
-) -> ForwardRateModel:
-    """Write coupled k@Tref without changing family or creating scalar k."""
-    rate = _numeric_float(reference_rate, field="reference_rate")
-    temperature = _numeric_float(
-        reference_temperature_K,
-        field="reference_temperature_K",
-    )
-    rate = admit_rate(rate, field="reference_rate")
-    temperature = validate_temperature(
-        temperature,
-        field="reference_temperature_K",
-    )
-    if isinstance(model, ConstantRateModel):
-        return ConstantRateModel(k=rate)
-    if isinstance(model, ArrheniusRateModel):
-        A = _numeric_float(model.A, field="Arrhenius A")
-        A = admit_arrhenius_prefactor(A, field="Arrhenius A")
-        Ea = -R * temperature * (math.log(rate) - math.log(A))
-        if not math.isfinite(Ea):
-            raise ValueError("The requested Arrhenius k@Tref is not finite.")
-        return ArrheniusRateModel(A=A, Ea_J_per_mol=Ea)
-    if isinstance(model, EyringRateModel):
-        kappa = _numeric_float(model.kappa, field="Eyring kappa")
-        standard = _numeric_float(
-            model.standard_conc_M,
-            field="Eyring standard_conc_M",
-        )
-        molecularity = _directional_order(
-            model.molecularity,
-            field="Eyring molecularity",
-        )
-        degeneracy = _positive_integer(
-            model.degeneracy,
-            field="Eyring degeneracy",
-        )
-        if kappa <= 0.0 or not math.isfinite(kappa):
-            raise ValueError("Eyring kappa must be positive and finite.")
-        standard = validate_c0(
-            standard,
-            field="Eyring standard_conc_M",
-        )
-        log_ratio = (
-            math.log(rate)
-            - math.log(degeneracy)
-            - (1.0 - molecularity) * math.log(standard)
-            - math.log(kappa)
-            - math.log(eyring_prefactor(temperature))
-        )
-        dG = -R * temperature * log_ratio
-        if not math.isfinite(dG):
-            raise ValueError("The requested Eyring k@Tref is not finite.")
-        return EyringRateModel(
-            dG_act_J_per_mol=dG,
-            kappa=kappa,
-            standard_conc_M=standard,
-            molecularity=molecularity,
-            degeneracy=degeneracy,
-        )
     raise TypeError("model must be one typed forward-rate model.")
 
 

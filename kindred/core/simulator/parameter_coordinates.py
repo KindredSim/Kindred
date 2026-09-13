@@ -18,27 +18,16 @@ from typing import Any, TypeAlias
 
 from kindred.core.equilibrium_rate_authority import (
     EquilibriumRateAuthorityKind,
-    effective_equilibrium_keq,
-    effective_equilibrium_reverse_rate,
     normalize_existing_equilibrium_rate_authority,
     require_step_entry_authored_role_is_editable,
     derived_equilibrium_ratio_from_directional_rates,
     effective_reverse_rate_from_keq,
 )
-from kindred.core.kinetics import (
-    ArrheniusRateModel,
-    ConstantRateModel,
-    EyringRateModel,
-    ForwardRateModel,
-    forward_rate_model_for_equilibrium,
-    forward_rate_model_for_reaction,
-    forward_rate_at_temperature,
-)
+from kindred.core.kinetics import ArrheniusRateModel, ConstantRateModel, EyringRateModel, ForwardRateModel, forward_rate_at_temperature
 from kindred.core.mechanism_metadata import (
     EquilibriumMetadataKeys,
     MechanismMetadataView,
 )
-from kindred.core.rate_binding import ForwardRateBinding, RateBinding
 from kindred.core.stoichiometry import directional_order_fraction
 from kindred.core.thermodynamics import concentration_Keq_from_deltaG_eq
 from kindred.core.simulator.dsl_build_input import source_coordinate_capabilities
@@ -126,7 +115,6 @@ def chemistry_parameter_dependencies(
 ) -> dict[str, tuple[str, ...]]:
     """Describe derived readouts using the admitted typed chemistry authority."""
     dependencies: dict[str, tuple[str, ...]] = {}
-    metadata = MechanismMetadataView.from_metadata(mechanism.metadata)
     for name, (_route, kind, index, role, entry) in targets.items():
         step = (
             mechanism.reactions[index]
@@ -136,17 +124,7 @@ def chemistry_parameter_dependencies(
         source = dict(entry.get("source_coordinates") or {})
         number = entry["step_index"]
         if role in {"k", "kf"}:
-            model = (
-                forward_rate_model_for_reaction(
-                    step, default_standard_conc_M=metadata.standard_conc_M
-                )
-                if kind == "reaction"
-                else forward_rate_model_for_equilibrium(
-                    step,
-                    temperature_K=None,
-                    default_standard_conc_M=metadata.standard_conc_M,
-                )
-            )
+            model = step.forward_model
             roles = (
                 ("A", "Ea")
                 if isinstance(model, ArrheniusRateModel)
@@ -187,17 +165,7 @@ def bind_chemistry_readout(
     source = dict(entry.get("source_coordinates") or {})
     number = entry["step_index"]
     if role in {"k", "kf"}:
-        model = (
-            forward_rate_model_for_reaction(
-                step, default_standard_conc_M=metadata.standard_conc_M
-            )
-            if kind == "reaction"
-            else forward_rate_model_for_equilibrium(
-                step,
-                temperature_K=None,
-                default_standard_conc_M=metadata.standard_conc_M,
-            )
-        )
+        model = step.forward_model
         fields = {
             "A": "A",
             "Ea": "Ea_J_per_mol",
@@ -312,13 +280,7 @@ def _admit_coordinate_value(
 
     if kind == "reaction" and role == "k":
         reactions = getattr(mechanism, "reactions", ()) or ()
-        metadata = MechanismMetadataView.from_metadata(
-            getattr(mechanism, "metadata", {}) or {}
-        )
-        model = forward_rate_model_for_reaction(
-            reactions[index],
-            default_standard_conc_M=float(metadata.standard_conc_M),
-        )
+        model = reactions[index].forward_model
         return admit_rate(
             value,
             field=name,
@@ -328,14 +290,7 @@ def _admit_coordinate_value(
     if kind == "equilibrium" and role in {"kf", "kr"}:
         equilibria = getattr(mechanism, "equilibria", ()) or ()
         equilibrium = equilibria[index]
-        metadata = MechanismMetadataView.from_metadata(
-            getattr(mechanism, "metadata", {}) or {}
-        )
-        model = forward_rate_model_for_equilibrium(
-            equilibrium,
-            temperature_K=float(metadata.temperature_K),
-            default_standard_conc_M=float(metadata.standard_conc_M),
-        )
+        model = equilibrium.forward_model
         authority = normalize_existing_equilibrium_rate_authority(equilibrium)
         allow_zero = (
             role == "kf"
@@ -345,27 +300,6 @@ def _admit_coordinate_value(
         return admit_rate(value, field=name, allow_zero=allow_zero)
 
     raise ValueError(f"Unsupported parameter target for {name!r}")
-
-
-def _written_forward_rate(
-    *,
-    name: str,
-    model: ForwardRateModel,
-    value: float | None,
-    reference_temperature_K: float,
-    require_mutable: bool,
-) -> object:
-    """Write a complete forward model while retaining mutable binding policy."""
-
-    if value is not None and isinstance(model, ConstantRateModel):
-        if not require_mutable:
-            return float(value)
-        return RateBinding(name=str(name), value=float(value))
-    return ForwardRateBinding(
-        name=str(name),
-        model=model,
-        reference_temperature_K=float(reference_temperature_K),
-    )
 
 
 def _admit_coordinate_groups(
@@ -428,13 +362,8 @@ def _compose_reaction(
     *,
     updates: Mapping[str, float],
     step_name: int,
-    metadata: MechanismMetadataView,
-    require_mutable: bool,
 ) -> object:
-    model = forward_rate_model_for_reaction(
-        reaction,
-        default_standard_conc_M=float(metadata.standard_conc_M),
-    )
+    model = reaction.forward_model
     if "k" in updates:
         if not isinstance(model, ConstantRateModel):
             raise DSLError(f"Indexed k{step_name} is not a Constant authority")
@@ -458,16 +387,7 @@ def _compose_reaction(
         model_fields["kappa"] = updates["kappa"]
     if model_fields:
         model = replace(model, **model_fields)
-    return replace(
-        reaction,
-        rate=_written_forward_rate(
-            name=f"k{step_name}",
-            model=model,
-            value=updates.get("k"),
-            reference_temperature_K=float(metadata.temperature_K),
-            require_mutable=require_mutable,
-        ),
-    )
+    return replace(reaction, forward_model=model)
 
 
 def _compose_equilibrium(
@@ -475,16 +395,10 @@ def _compose_equilibrium(
     *,
     updates: Mapping[str, float],
     step_name: int,
-    metadata: MechanismMetadataView,
-    require_mutable: bool,
 ) -> object:
     model: ForwardRateModel | None = None
     if any(role in updates for role in ("A", "Ea", "dG_act", "kappa")):
-        model = forward_rate_model_for_equilibrium(
-            equilibrium,
-            temperature_K=None,
-            default_standard_conc_M=float(metadata.standard_conc_M),
-        )
+        model = equilibrium.forward_model
         if any(role in updates for role in ("A", "Ea")) and not isinstance(
             model, ArrheniusRateModel
         ):
@@ -509,11 +423,7 @@ def _compose_equilibrium(
         }
         model = replace(model, **model_fields)
     elif "kf" in updates:
-        model = forward_rate_model_for_equilibrium(
-            equilibrium,
-            temperature_K=None,
-            default_standard_conc_M=float(metadata.standard_conc_M),
-        )
+        model = equilibrium.forward_model
 
     equilibrium_metadata = dict(getattr(equilibrium, "metadata", {}) or {})
     if "dG_eq" in updates:
@@ -521,50 +431,15 @@ def _compose_equilibrium(
             "dG_eq"
         ]
     if "Keq" in updates:
-        equilibrium_metadata[EquilibriumMetadataKeys.KEQ_INPUT] = (
-            RateBinding(name=f"Keq{step_name}", value=updates["Keq"])
-            if require_mutable
-            else updates["Keq"]
-        )
-
-    replacement_fields: dict[str, object] = {"metadata": equilibrium_metadata}
-    if model is not None:
-        replacement_fields["kf"] = ForwardRateBinding(
-            name=f"kf{step_name}",
-            model=model,
-            reference_temperature_K=float(metadata.temperature_K),
-        )
+        equilibrium_metadata[EquilibriumMetadataKeys.KEQ_INPUT] = updates["Keq"]
     if "kf" in updates:
-        if model is None:
-            raise DSLError(f"Indexed kf{step_name} has no forward authority")
         if not isinstance(model, ConstantRateModel):
-            raise DSLError(
-                f"Indexed kf{step_name} cannot replace a non-Constant model"
-            )
-        replacement_fields["kf"] = _written_forward_rate(
-            name=f"kf{step_name}",
-            model=model,
-            value=updates["kf"],
-            reference_temperature_K=float(metadata.temperature_K),
-            require_mutable=require_mutable,
-        )
-    if "kr" in updates:
-        replacement_fields["kr"] = (
-            RateBinding(name=f"kr{step_name}", value=updates["kr"])
-            if require_mutable
-            else updates["kr"]
-        )
-    else:
-        thermo_authority = (
-            equilibrium_metadata.get(EquilibriumMetadataKeys.KEQ_INPUT) is not None
-            or equilibrium_metadata.get(EquilibriumMetadataKeys.DG_EQ_J_PER_MOL)
-            is not None
-        )
-        replacement_fields["kr"] = (
-            None if thermo_authority else getattr(equilibrium, "kr", None)
-        )
-    replacement_fields["Keq"] = None
-    return replace(equilibrium, **replacement_fields)
+            raise DSLError(f"Indexed kf{step_name} cannot replace a non-Constant model")
+        model = ConstantRateModel(k=updates["kf"])
+    return replace(
+        equilibrium, forward_model=equilibrium.forward_model if model is None else model,
+        kr=updates.get("kr", equilibrium.kr), metadata=equilibrium_metadata,
+    )
 
 
 def _compose_coordinate_groups(
@@ -573,12 +448,7 @@ def _compose_coordinate_groups(
         tuple[str, int],
         tuple[Mapping[str, object], Mapping[str, float]],
     ],
-    *,
-    require_mutable: bool,
 ) -> Iterator[tuple[tuple[str, int], object]]:
-    metadata = MechanismMetadataView.from_metadata(
-        getattr(mechanism, "metadata", {}) or {}
-    )
     reactions = getattr(mechanism, "reactions", ()) or ()
     equilibria = getattr(mechanism, "equilibria", ()) or ()
     for (kind, index), (entry, updates) in grouped.items():
@@ -590,8 +460,6 @@ def _compose_coordinate_groups(
                     reactions[index],
                     updates=updates,
                     step_name=step_name,
-                    metadata=metadata,
-                    require_mutable=require_mutable,
                 ),
             )
             continue
@@ -601,8 +469,6 @@ def _compose_coordinate_groups(
                 equilibria[index],
                 updates=updates,
                 step_name=step_name,
-                metadata=metadata,
-                require_mutable=require_mutable,
             ),
         )
 
@@ -612,7 +478,6 @@ def apply_mechanism_coordinate_values(
     values: Mapping[str, object],
     *,
     parameter_target_map: Mapping[str, ParameterTarget],
-    require_mutable: bool,
 ) -> None:
     """Compose each complete changed step and publish it once."""
 
@@ -629,7 +494,6 @@ def apply_mechanism_coordinate_values(
         _compose_coordinate_groups(
             mechanism,
             grouped,
-            require_mutable=require_mutable,
         )
     )
     for (kind, index), replacement in replacements:
@@ -644,23 +508,8 @@ def read_mechanism_parameter_values(
     *,
     names: set[str] | None = None,
     parameter_target_map: Mapping[str, ParameterTarget],
-    coordinate_overrides: Mapping[str, object] | None = None,
 ) -> dict[str, float]:
-    """Read current or candidate mechanism-coordinate values without publication."""
-
-    candidates: dict[tuple[str, int], object] = {}
-    if coordinate_overrides:
-        candidates = dict(
-            _compose_coordinate_groups(
-                mechanism,
-                _admit_coordinate_groups(
-                    mechanism,
-                    coordinate_overrides,
-                    parameter_target_map=parameter_target_map,
-                ),
-                require_mutable=False,
-            )
-        )
+    """Read independent authored coordinates without deriving coefficients."""
 
     wanted = set(parameter_target_map) if names is None else names
     out: dict[str, float] = {}
@@ -684,42 +533,22 @@ def read_mechanism_parameter_values(
             continue
         route, kind, index, role, _entry = target
         if kind == "reaction":
-            step = candidates.get((kind, index), reactions[index])
+            step = reactions[index]
         else:
-            step = candidates.get((kind, index), equilibria[index])
+            step = equilibria[index]
 
         value: float | None = None
         if route == "indexed":
-            if kind == "reaction" and role == "k":
-                value = _value(getattr(step, "rate", None))
-            elif kind == "equilibrium" and role == "kf":
-                value = _value(getattr(step, "kf", None))
-            elif kind == "equilibrium" and role == "kr":
+            if role in {"k", "kf"} and isinstance(step.forward_model, ConstantRateModel):
+                value = step.forward_model.k
+            elif kind == "equilibrium":
                 authority = normalize_existing_equilibrium_rate_authority(step)
-                if authority.kind == EquilibriumRateAuthorityKind.KEQ:
-                    value = effective_equilibrium_reverse_rate(
-                        step,
-                        temperature_K=float(metadata.temperature_K),
-                    )
-                else:
-                    value = _value(getattr(step, "kr", None))
-            elif kind == "equilibrium" and role == "Keq":
-                value = effective_equilibrium_keq(
-                    step,
-                    temperature_K=float(metadata.temperature_K),
-                )
+                if role == "kr" and authority.kind == EquilibriumRateAuthorityKind.KR:
+                    value = authority.kr
+                elif role == "Keq" and authority.has_explicit_keq_param:
+                    value = authority.Keq
         elif source_coordinate_capabilities(role).algebra_target or role == "degeneracy":
-            if kind == "reaction":
-                model = forward_rate_model_for_reaction(
-                    step,
-                    default_standard_conc_M=float(metadata.standard_conc_M),
-                )
-            else:
-                model = forward_rate_model_for_equilibrium(
-                    step,
-                    temperature_K=None,
-                    default_standard_conc_M=float(metadata.standard_conc_M),
-                )
+            model = step.forward_model
             if role == "A" and isinstance(model, ArrheniusRateModel):
                 value = float(model.A)
             elif role == "Ea" and isinstance(model, ArrheniusRateModel):

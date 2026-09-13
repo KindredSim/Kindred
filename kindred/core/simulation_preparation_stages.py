@@ -139,10 +139,7 @@ def _bind_symbolic_jacobian_for_current_mechanism(
             )
     if coefficient_evaluator is None:
         coefficient_evaluator = build_effective_rate_coefficient_evaluator(mechanism)
-    jacobian_func = structure.bind(
-        coefficient_evaluator,
-        temperature_schedule=temperature_schedule,
-    )
+    jacobian_func = structure.bind(coefficient_evaluator)
     return SymbolicJacobianExecution.supported(
         jacobian_func=jacobian_func,
         jac_sparsity=structure.jac_sparsity,

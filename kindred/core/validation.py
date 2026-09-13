@@ -37,7 +37,7 @@ def try_parse_callable_finite_float(value: object) -> tuple[float, bool]:
     Best-effort float parsing that accepts either a scalar or a 0-arg callable.
 
     This is used at boundaries where values may be wrapped in lightweight bindings
-    (e.g., `RateBinding`) but callers still want a single canonical "finite float"
+    (e.g., a numerical scalar wrapper) but callers still want a single canonical "finite float"
     parsing policy.
     """
     if callable(value):

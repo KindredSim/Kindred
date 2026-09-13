@@ -1,42 +1,8 @@
-"""
-Mechanism model: species registry, reactions, and equilibria.
+"""Admitted species, immutable kinetic models, and reversible authority.
 
-Current contract
-----------------
-- Mechanism:
-  - species: OrderedDict[str, Species] (preserves declaration order)
-  - reactions: list[Reaction]
-  - equilibria: list[Equilibrium]
-  - metadata: dict
-- Species:
-  - name: str
-  - initial_conc: finite non-negative float  (standard state basis)
-- Reaction:
-  - reactants/products: immutable Mapping[str, float] positive physical side maps
-  - rate_orders: immutable Mapping[str, float] positive kinetic exponents;
-                 None defaults to reactants, {} is explicit zero-order
-  - net_stoich: immutable Mapping[str, float] products - reactants, zeros omitted
-- order: float  exact finite molecularity from rate_orders
-  - rate: StructuredRate | Callable    (opaque holder here; evaluated upstream)
-  - overrides: {"model": "Constant" | "Eyring" | "Arrhenius" | None,
-                local "kappa": float | None, "A": float | None,
-                "Ea_J_per_mol": float | None, "dG_act_J_per_mol": float | None,
-                "standard_conc_M": float | None}
-- Equilibrium:
-  - stoich_forward: immutable Mapping[str, float] positive physical forward side
-  - stoich_back: immutable Mapping[str, float] positive physical reverse side
-  - Keq: float | Expr | None
-  - kf: float | Expr | None
-  - kr: float | Expr | None
-
-Design notes
-------------
-- This file does not evaluate rates or assemble ODEs; it only holds a validated,
-  deterministic description of the mechanism. Solver and simulator layers map
-  these structures to kinetics later.
-- Molecularity/order for Reaction is the exact finite floating-point sum of
-  its positive directional rate-order coefficients. Reaction-side
-  coefficients admit every positive finite real value.
+Reaction and equilibrium forward sides retain one typed physical model.
+Thermodynamic reverse coordinates remain authored metadata; numerical rates
+are derived only by scientific consumers at their selected temperature.
 """
 
 from __future__ import annotations
@@ -45,22 +11,18 @@ import math
 from collections import OrderedDict
 from collections.abc import Mapping as MappingABC
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, Iterable, Iterator, List, Mapping, Union, Protocol, Optional
+from typing import Any, Dict, Iterable, Iterator, List, Mapping, Optional
 
+from .kinetics import ForwardRateModel
 from .species import Species
 from .stoichiometry import directional_order_fraction
 from .validation import validate_name
 from .equilibrium_rate_authority import (
     EquilibriumRateAuthority,
-    EquilibriumRateInputContext,
     normalize_equilibrium_rate_authority,
 )
 from .mechanism_metadata import EquilibriumMetadataKeys, MechanismMetadataKeys
 
-class StructuredRate(Protocol):
-    pass
-class Expr(Protocol):
-    pass
 __all__ = [
     "Reaction",
     "Equilibrium",
@@ -170,109 +132,16 @@ def _derive_net_stoich(reactants: Mapping[str, float], products: Mapping[str, fl
     return {sp: coef for sp, coef in net.items() if coef != 0.0}
 
 
-def _normalize_overrides(overrides: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
-    """
-    Validate final structured rate-override keys and normalize numeric values.
-    """
-    allowed = {
-        "model",
-        "kappa",
-        "A",
-        "Ea_J_per_mol",
-        "dG_act_J_per_mol",
-        "standard_conc_M",
-        "degeneracy",
-    }
-    out: Dict[str, Any] = {}
-    if not overrides:
-        return out
-    unknown = sorted(str(key) for key in overrides if key not in allowed)
-    if unknown:
-        raise ValueError(
-            "Unsupported reaction rate override field(s): "
-            + ", ".join(unknown)
-        )
-    for k in allowed:
-        if k in overrides:
-            out[k] = overrides[k]
-    # normalize model
-    model = out.get("model", None)
-    if model is not None:
-        if model not in ("Constant", "Eyring", "Arrhenius"):
-            raise ValueError(
-                "overrides.model must be 'Constant', 'Eyring', "
-                "'Arrhenius', or None"
-            )
-    if "degeneracy" in out:
-        degeneracy = out["degeneracy"]
-        if type(degeneracy) is not int:
-            raise TypeError(
-                "overrides.degeneracy must be a positive exact integer if provided"
-            )
-        if degeneracy <= 0:
-            raise ValueError(
-                "overrides.degeneracy must be a positive exact integer if provided"
-            )
-    # numeric sanity where applicable
-    for num_key in (
-        "kappa",
-        "A",
-        "Ea_J_per_mol",
-        "dG_act_J_per_mol",
-        "standard_conc_M",
-    ):
-        if num_key in out and out[num_key] is not None:
-            if type(out[num_key]) is bool:
-                raise TypeError(
-                    f"overrides.{num_key} must be numeric if provided"
-                )
-            try:
-                numeric = float(out[num_key])
-            except (ValueError, TypeError, OverflowError) as e:
-                raise TypeError(f"overrides.{num_key} must be numeric if provided") from e
-            if not math.isfinite(numeric):
-                raise ValueError(
-                    f"overrides.{num_key} must be finite if provided"
-                )
-            if num_key in {"kappa", "A", "standard_conc_M"} and numeric <= 0.0:
-                raise ValueError(
-                    f"overrides.{num_key} must be positive and finite"
-                )
-            out[num_key] = numeric
-    return out
-
-
 # --------------------------------- models -----------------------------------
 
 
 @dataclass(frozen=True, kw_only=True)
 class Reaction:
-    """
-    Reaction step with physical sides and explicit kinetic order.
-
-    Fields
-    ------
-    reactants : Mapping[str, float]
-        Positive reactant-side coefficients.
-    products : Mapping[str, float]
-        Positive product-side coefficients.
-    rate_orders : Mapping[str, float]
-        Positive kinetic exponents; defaults to the reactant side.
-    net_stoich : Mapping[str, float]
-        Derived products - reactants mapping, zeros omitted.
-    rate : Any
-        Either a StructuredRate object or a Callable resolved upstream.
-        Stored opaquely here.
-    overrides : Mapping[str, Any]
-        Optional per-step overrides for model parameters.
-    order : float
-        Exact finite molecularity: the sum of the directional rate orders.
-    """
+    """Immutable physical sides, kinetic orders, and one forward model."""
     reactants: Mapping[str, float]
     products: Mapping[str, float]
-    rate: Union[StructuredRate, Callable[[], float]]
+    forward_model: ForwardRateModel
     rate_orders: Mapping[str, float] | None = None
-    overrides: Mapping[str, Any] = field(default_factory=dict)
     net_stoich: Mapping[str, float] = field(init=False)
     order: float = field(init=False)
 
@@ -297,7 +166,6 @@ class Reaction:
         object.__setattr__(self, "products", FrozenDict(products))
         object.__setattr__(self, "rate_orders", FrozenDict(rate_orders))
         object.__setattr__(self, "net_stoich", FrozenDict(net_stoich))
-        object.__setattr__(self, "overrides", FrozenDict(self.overrides))
         object.__setattr__(
             self,
             "order",
@@ -316,22 +184,11 @@ class Reaction:
 
 @dataclass(frozen=True)
 class Equilibrium:
-    """
-    Reversible equilibrium description.
-
-    A forward rate kf is required. Exactly one reverse-side authority is selected:
-    explicit kr, or thermodynamic Keq/dG_eq metadata. Backend consumers may carry
-    derived values for display, but provenance must not become a second authority.
-    Equilibria stay reversible single steps; the ODE builder consumes them as
-    one column with forward/reverse power-law terms rather than duplicating
-    into two reactions.
-
-    """
+    """One reversible step with a typed forward model and authored reverse authority."""
     stoich_forward: Mapping[str, float]
     stoich_back: Mapping[str, float]
-    Keq: Union[float, Expr, None] = None
-    kf: Union[float, Expr, None] = None
-    kr: Union[float, Expr, None] = None
+    forward_model: ForwardRateModel
+    kr: float | None = None
     metadata: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -351,31 +208,10 @@ class Equilibrium:
             "stoich_back",
             FrozenDict(stoich_back),
         )
-        metadata = dict(self.metadata)
-        authority_context: EquilibriumRateInputContext | str | None = None
-        if (
-            metadata.get(EquilibriumMetadataKeys.KEQ_INPUT) is not None
-            or metadata.get(EquilibriumMetadataKeys.DG_EQ_J_PER_MOL) is not None
-        ) and not bool(metadata.get(EquilibriumMetadataKeys.USER_PROVIDED_KR)):
-            authority_context = EquilibriumRateInputContext.NORMALIZED_PUBLIC
-        authority = normalize_equilibrium_rate_authority(
-            kf=self.kf,
-            kr=self.kr,
-            Keq=self.Keq,
-            metadata=metadata,
-            context=authority_context,
+        normalize_equilibrium_rate_authority(
+            forward_model=self.forward_model, kr=self.kr, metadata=self.metadata,
         )
-        if authority.kind == "Keq_authoritative":
-            if (
-                metadata.get(EquilibriumMetadataKeys.KEQ_INPUT) is None
-                and metadata.get(EquilibriumMetadataKeys.DG_EQ_J_PER_MOL) is None
-            ):
-                metadata[EquilibriumMetadataKeys.KEQ_INPUT] = self.Keq
-            object.__setattr__(self, "Keq", None)
-            object.__setattr__(self, "kr", None)
-        else:
-            object.__setattr__(self, "Keq", None)
-        object.__setattr__(self, "metadata", FrozenDict(metadata))
+        object.__setattr__(self, "metadata", FrozenDict(self.metadata))
 
     def forward_vector(self, species_order: Iterable[str]) -> List[float]:
         return [float(self.stoich_forward.get(n, 0.0)) for n in species_order]
@@ -433,9 +269,8 @@ class Mechanism:
         *,
         reactants: Mapping[str, float],
         products: Mapping[str, float],
-        rate: Any,
+        forward_model: ForwardRateModel,
         rate_orders: Optional[Mapping[str, float]] = None,
-        overrides: Optional[Mapping[str, Any]] = None,
     ) -> Reaction:
         """
         Add a reaction step.
@@ -453,86 +288,30 @@ class Mechanism:
         if not net:
             raise ValueError("reaction net stoichiometry cannot be empty")
         _ensure_species_exist({**r, **p, **ro}, self.species)
-        ov = _normalize_overrides(overrides)
-        rxn = Reaction(reactants=r, products=p, rate=rate, rate_orders=ro, overrides=ov)
+        rxn = Reaction(reactants=r, products=p, forward_model=forward_model, rate_orders=ro)
         self.reactions.append(rxn)
         return rxn
 
-    def _add_equilibrium_with_authority_context(
+    def add_equilibrium(
         self,
         stoich_forward: Mapping[str, float],
         stoich_back: Mapping[str, float],
         *,
-        Keq: Any | None = None,
-        kf: Any | None = None,
-        kr: Any | None = None,
+        forward_model: ForwardRateModel,
+        kr: float | None = None,
         metadata: Optional[Mapping[str, Any]] = None,
-        authority_context: EquilibriumRateInputContext | str | None = None,
     ) -> tuple[Equilibrium, EquilibriumRateAuthority]:
+        """Add one admitted forward model and exactly one reverse authority."""
         sf = _validate_positive_side(stoich_forward, label="stoich_forward")
         sb = _validate_positive_side(stoich_back, label="stoich_back")
-        if not sf:
-            raise ValueError("stoich_forward cannot be empty")
-        if not sb:
-            raise ValueError("stoich_back cannot be empty")
-        _ensure_species_exist(sf, self.species)
-        _ensure_species_exist(sb, self.species)
-
-        meta = dict(metadata) if metadata else {}
-        standard_conc = meta.get(
-            EquilibriumMetadataKeys.STANDARD_CONC_M,
-            self.metadata.get(MechanismMetadataKeys.STANDARD_CONC_M, 1.0),
-        )
-        if type(standard_conc) is bool:
-            raise TypeError(
-                "equilibrium standard concentration must be a positive finite real"
-            )
-        try:
-            standard_conc_value = float(standard_conc)
-        except (TypeError, ValueError, OverflowError) as exc:
-            raise ValueError(
-                "equilibrium standard concentration must be a positive finite real"
-            ) from exc
-        if not math.isfinite(standard_conc_value) or standard_conc_value <= 0.0:
-            raise ValueError(
-                "equilibrium standard concentration must be a positive finite real"
-            )
-        # Public Keq is already concentration-form.  C0 is consumed only when
-        # lowering dG_eq; explicit Keq and explicit kf+kr are C0-inert.
-        meta.setdefault(EquilibriumMetadataKeys.USER_PROVIDED_KF, bool(kf is not None))
-        meta.setdefault(EquilibriumMetadataKeys.USER_PROVIDED_KR, bool(kr is not None))
+        _ensure_species_exist({**sf, **sb}, self.species)
+        meta = dict(metadata or {})
+        meta.setdefault(EquilibriumMetadataKeys.STANDARD_CONC_M,
+                        self.metadata.get(MechanismMetadataKeys.STANDARD_CONC_M, 1.0))
+        eq = Equilibrium(stoich_forward=sf, stoich_back=sb,
+                         forward_model=forward_model, kr=kr, metadata=meta)
         authority = normalize_equilibrium_rate_authority(
-            kf=kf,
-            kr=kr,
-            Keq=Keq,
-            metadata=meta,
-            context=authority_context,
-        )
-
-        # Keep thermodynamic authority solely in metadata.  ``kr`` and
-        # ``Keq`` are derived readouts, never stored scalar mirrors; explicit
-        # KR authority retains only its authored reverse coordinate.
-        if authority.kind == "Keq_authoritative":
-            if (
-                meta.get(EquilibriumMetadataKeys.KEQ_INPUT) is None
-                and meta.get(EquilibriumMetadataKeys.DG_EQ_J_PER_MOL) is None
-            ):
-                if Keq is None:
-                    raise ValueError("thermodynamic equilibrium authority requires Keq or dG_eq")
-                meta[EquilibriumMetadataKeys.KEQ_INPUT] = Keq
-            stored_keq = None
-            stored_kr = None
-        else:
-            stored_keq = None
-            stored_kr = kr
-
-        eq = Equilibrium(
-            stoich_forward=sf,
-            stoich_back=sb,
-            Keq=stored_keq,
-            kf=kf,
-            kr=stored_kr,
-            metadata=meta,
+            forward_model=eq.forward_model, kr=eq.kr, metadata=eq.metadata,
         )
         self.equilibria.append(eq)
         return eq, authority

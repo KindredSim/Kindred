@@ -10,21 +10,13 @@ import numpy as np
 from kindred.core.mechanism import Equilibrium, Mechanism
 from kindred.core.ode_builder import (
     EffectiveRateCoefficientEvaluator,
-    build_effective_rate_coefficient_evaluator,
 )
-from kindred.core.temperature import TemperatureScheduleProtocol
-from kindred.core.kinetics import (
-    forward_rate_model_for_reaction,
-    forward_rate_symbolic_relation,
-    forward_rate_family,
-    forward_rate_model_for_equilibrium,
-)
+from kindred.core.kinetics import forward_rate_symbolic_relation, forward_rate_family
 from kindred.core.mechanism_metadata import (
     EquilibriumMetadataKeys,
     MechanismMetadataView,
 )
 from kindred.core.equilibrium_rate_authority import (
-    EquilibriumRateAuthorityKind,
     equilibrium_rate_symbolic_relations,
     normalize_existing_equilibrium_rate_authority,
 )
@@ -50,9 +42,7 @@ class SymbolicJacobianStructure:
     def bind(
         self,
         coefficient_evaluator: EffectiveRateCoefficientEvaluator,
-        *,
-        temperature_schedule: TemperatureScheduleProtocol | None = None,
-    ) -> Callable[[float, np.ndarray], np.ndarray]:
+    ) -> Callable[..., np.ndarray]:
         if not isinstance(
             coefficient_evaluator,
             EffectiveRateCoefficientEvaluator,
@@ -61,28 +51,16 @@ class SymbolicJacobianStructure:
                 "coefficient_evaluator must be "
                 "EffectiveRateCoefficientEvaluator."
             )
-        if temperature_schedule is not None and not callable(
-            temperature_schedule
-        ):
-            raise TypeError("temperature_schedule must be callable.")
-        nominal_temperature = float(
-            coefficient_evaluator.nominal_temperature_K
-        )
         coefficient_parameter_symbols = (
             _coefficient_parameter_symbols_from_step_kinds(
                 coefficient_evaluator.step_kinds
             )
         )
-        def jacobian_func(t: float, y: np.ndarray) -> np.ndarray:
+        def jacobian_func(t: float, y: np.ndarray, *, T: float) -> np.ndarray:
             values = np.asarray(y, dtype=float).reshape(-1)
             if values.size != len(self.species_names):
                 raise ValueError(f"symbolic jacobian expected {len(self.species_names)} state values, got {values.size}")
-            temperature = (
-                nominal_temperature
-                if temperature_schedule is None
-                else float(temperature_schedule(float(t)))
-            )
-            coefficients = coefficient_evaluator(temperature)
+            coefficients = coefficient_evaluator(T)
             coefficient_values = _coefficient_values_by_parameter_name(
                 coefficient_evaluator,
                 coefficients.forward,
@@ -203,13 +181,10 @@ def _coefficient_values_by_parameter_name(
 
 
 @dataclass(frozen=True, slots=True)
-class _EquilibriumRateSource:
-    kf: object | None
-    kr: object | None
-    keq: object | None
-    kf_name: str | None
-    kr_name: str | None
-    keq_name: str | None
+class _EquilibriumParameterNames:
+    kf_name: str
+    kr_name: str
+    keq_name: str
 
 
 def _canonical_step_parameter_name(
@@ -219,7 +194,6 @@ def _canonical_step_parameter_name(
     item_index: int,
     role: str,
     expected_name: str,
-    value: object = None,
 ) -> str:
     canonical_name = canonical_name_for_mechanism_step_parameter(
         mechanism,
@@ -228,41 +202,10 @@ def _canonical_step_parameter_name(
         role=role,
         expected_name=str(expected_name),
     )
-    explicit_name = str(getattr(value, "name", None) or "").strip()
-    if explicit_name:
-        namespace = build_namespace_from_mechanism(mechanism)
-        resolution = namespace.resolve(explicit_name)
-        if resolution.canonical_name is not None:
-            resolved = str(resolution.canonical_name)
-            if resolved != canonical_name:
-                raise UnsupportedSymbolicExpressionError(
-                    f"Symbolic Jacobian binding name {explicit_name!r} resolves to {resolved!r}, "
-                    f"but this step parameter is {canonical_name!r}."
-                )
-            return resolved
-        invalid_message = namespace.invalid_protected_indexed_identifier_message(explicit_name)
-        if invalid_message is not None:
-            raise UnsupportedSymbolicExpressionError(invalid_message)
     return canonical_name
 
 
-def _runtime_scalar_binding_value(value: object, *, label: str) -> object:
-    if (
-        callable(value)
-        and callable(getattr(value, "set", None))
-        and str(getattr(value, "name", "") or "").strip()
-    ):
-        try:
-            return value()
-        except Exception as exc:
-            raise UnsupportedSymbolicExpressionError(
-                f"{label} binding could not provide a finite scalar."
-            ) from exc
-    return value
-
-
 def _finite_scalar(value: object, *, label: str) -> float:
-    value = _runtime_scalar_binding_value(value, label=label)
     if callable(value):
         raise UnsupportedSymbolicExpressionError(f"Dynamic callable {label} is not supported for symbolic Jacobian.")
     try:
@@ -290,28 +233,18 @@ def _power_product(sympy: Any, symbols: Mapping[str, Any], powers: Mapping[str, 
     return expr
 
 
-def _equilibrium_rate_source(
+def _equilibrium_parameter_names(
     mechanism: Mechanism,
     eq: Equilibrium,
     *,
     equilibrium_index: int,
-) -> _EquilibriumRateSource:
-    try:
-        authority = normalize_existing_equilibrium_rate_authority(eq)
-    except ValueError as exc:
-        raise UnsupportedSymbolicExpressionError(
-            f"Invalid equilibrium rate authority: {exc}"
-        ) from exc
-    kf = authority.kf
-    kr = authority.kr
-    keq = None if authority.kind == EquilibriumRateAuthorityKind.KR else authority.Keq
+) -> _EquilibriumParameterNames:
     kf_name = _canonical_step_parameter_name(
         mechanism,
         kind="equilibrium",
         item_index=int(equilibrium_index),
         role="kf",
         expected_name=f"kf{int(equilibrium_index) + 1}",
-        value=kf,
     )
     kr_name = _canonical_step_parameter_name(
         mechanism,
@@ -319,7 +252,6 @@ def _equilibrium_rate_source(
         item_index=int(equilibrium_index),
         role="kr",
         expected_name=f"kr{int(equilibrium_index) + 1}",
-        value=kr,
     )
     keq_name = _canonical_step_parameter_name(
         mechanism,
@@ -327,13 +259,9 @@ def _equilibrium_rate_source(
         item_index=int(equilibrium_index),
         role="Keq",
         expected_name=f"Keq{int(equilibrium_index) + 1}",
-        value=keq,
     )
 
-    return _EquilibriumRateSource(
-        kf=kf,
-        kr=kr,
-        keq=keq,
+    return _EquilibriumParameterNames(
         kf_name=kf_name,
         kr_name=kr_name,
         keq_name=keq_name,
@@ -346,31 +274,6 @@ def _unsupported_support(code: str, reason: str) -> SymbolicJacobianSupport:
         code=str(code),
         reason=str(reason),
     )
-
-
-def _authored_equilibrium_forward_rate_family(
-    mechanism: Mechanism,
-    eq: Equilibrium,
-) -> str:
-    """Validate and return one authored typed forward-rate family."""
-
-    mechanism_metadata = MechanismMetadataView.from_metadata(
-        getattr(mechanism, "metadata", {}) or {}
-    )
-    try:
-        model = forward_rate_model_for_equilibrium(
-            eq,
-            temperature_K=float(mechanism_metadata.temperature_K),
-            default_standard_conc_M=float(
-                mechanism_metadata.standard_conc_M
-            ),
-        )
-        family = forward_rate_family(model)
-    except (TypeError, ValueError) as exc:
-        raise UnsupportedSymbolicExpressionError(
-            f"Unsupported authored equilibrium forward-rate model: {exc}"
-        ) from exc
-    return family
 
 
 def classify_symbolic_jacobian_support(mechanism: Mechanism) -> SymbolicJacobianSupport:
@@ -427,52 +330,14 @@ def classify_symbolic_jacobian_support(mechanism: Mechanism) -> SymbolicJacobian
                 f"non-integral ({exponent:g}).",
             )
 
-    unsupported_code = ""
-    unsupported_reason = ""
-    for idx, rxn in enumerate(getattr(mechanism, "reactions", []) or [], start=1):
-        try:
-            rate_value = _runtime_scalar_binding_value(
-                getattr(rxn, "rate", None),
-                label=f"reaction rate k{idx}",
-            )
-            if callable(rate_value):
-                raise TypeError("dynamic reaction rate")
-            rate_value = float(rate_value)
-        except (TypeError, ValueError, OverflowError, UnsupportedSymbolicExpressionError):
-            rate_value = None
-        if not unsupported_code and (
-            rate_value is None or not math.isfinite(rate_value)
-        ):
-            unsupported_code = "dynamic-rate"
-            unsupported_reason = f"Symbolic Jacobian does not support dynamic or non-finite reaction rate k{idx}."
-    for idx, eq in enumerate(getattr(mechanism, "equilibria", []) or [], start=1):
-        try:
-            _equilibrium_rate_source(
-                mechanism,
-                eq,
-                equilibrium_index=idx - 1,
-            )
-        except UnsupportedSymbolicExpressionError as exc:
-            if not unsupported_code:
-                unsupported_code = "invalid-equilibrium-rate-authority"
-                unsupported_reason = str(exc)
-            continue
-        try:
-            _authored_equilibrium_forward_rate_family(mechanism, eq)
-        except UnsupportedSymbolicExpressionError as exc:
-            if not unsupported_code:
-                unsupported_code = "unsupported-equilibrium-rate-model"
-                unsupported_reason = str(exc)
-    if unsupported_code:
-        return _unsupported_support(unsupported_code, unsupported_reason)
     try:
-        evaluator = build_effective_rate_coefficient_evaluator(mechanism)
-        evaluator(evaluator.nominal_temperature_K)
-    except (TypeError, ValueError, OverflowError) as exc:
-        return _unsupported_support(
-            "unsupported-effective-rate-authority",
-            f"Symbolic Jacobian effective-rate authority is unsupported: {exc}",
-        )
+        for reaction in mechanism.reactions:
+            forward_rate_family(reaction.forward_model)
+        for equilibrium in mechanism.equilibria:
+            forward_rate_family(equilibrium.forward_model)
+            normalize_existing_equilibrium_rate_authority(equilibrium)
+    except (TypeError, ValueError) as exc:
+        return _unsupported_support("unsupported-rate-authority", str(exc))
     return SymbolicJacobianSupport(
         supported=True,
         code="supported",
@@ -498,12 +363,11 @@ def _coefficient_public_parameter_names(
                 item_index=reaction_index,
                 role="k",
                 expected_name=f"k{reaction_index + 1}",
-                value=getattr(reaction, "rate", None),
             )
         reaction_count = len(reactions)
         for equilibrium_index, equilibrium in enumerate(equilibria):
             step_index = reaction_count + equilibrium_index
-            source = _equilibrium_rate_source(
+            source = _equilibrium_parameter_names(
                 mechanism,
                 equilibrium,
                 equilibrium_index=equilibrium_index,
@@ -708,15 +572,9 @@ def _project_symbolic_mechanism_expression_model(
             item_index=reaction_index,
             role="k",
             expected_name=f"k{reaction_index + 1}",
-            value=getattr(reaction, "rate", None),
         )
         try:
-            rate_model = forward_rate_model_for_reaction(
-                reaction,
-                default_standard_conc_M=float(
-                    metadata.standard_conc_M
-                ),
-            )
+            rate_model = reaction.forward_model
             chemistry_relations[public_name] = (
                 forward_rate_symbolic_relation(
                     rate_model,
@@ -733,7 +591,7 @@ def _project_symbolic_mechanism_expression_model(
     for equilibrium_index, equilibrium in enumerate(
         tuple(getattr(mechanism, "equilibria", ()) or ())
     ):
-        source = _equilibrium_rate_source(
+        source = _equilibrium_parameter_names(
             mechanism,
             equilibrium,
             equilibrium_index=equilibrium_index,
@@ -747,13 +605,7 @@ def _project_symbolic_mechanism_expression_model(
                 "Equilibrium canonical public projection is incomplete."
             )
         try:
-            forward_model = forward_rate_model_for_equilibrium(
-                equilibrium,
-                temperature_K=None,
-                default_standard_conc_M=float(
-                    metadata.standard_conc_M
-                ),
-            )
+            forward_model = equilibrium.forward_model
             forward_relation = forward_rate_symbolic_relation(
                 forward_model,
                 temperature=temperature,

@@ -1459,10 +1459,6 @@ def _admitted_correction_targets(
     prepared = tab.prepared_dsl
     if prepared is None:
         raise ValueError("Correction requires admitted prepared DSL.")
-    if prepared.temperature_schedule_for_execution() is not None:
-        raise ValueError(
-            "Exact source correction is unavailable when temperature is scheduled."
-        )
     mechanism = prepared.accepted_mechanism_for_structure()
     parameter_spec = prepared.parameter_algebra_spec_for_execution()
     parameter_dependencies = parameter_spec.parameter_dependencies
@@ -1649,6 +1645,11 @@ def assess_tab_exact_correction(
             prepared.accepted_mechanism_for_structure(),
             parameter_algebra_spec=parameter_spec,
         )
+        if not any(item.status in {"unsatisfied", "unresolved"}
+                   for item in composition.constraints):
+            return ExactCorrectionAssessment(
+                composition=composition, targets=(), plan=CorrectionPlan((), (), True),
+            )
         targets = _admitted_correction_targets(detached_tab, composition)
         plan = CorrectionPlanner(composition, targets).plan()
     except (AuthoredSourceError, DSLError, TypeError, ValueError, OverflowError) as exc:
@@ -1659,15 +1660,6 @@ def assess_tab_exact_correction(
             unavailable_reason=str(exc),
         )
 
-    if not any(
-        item.status in {"unsatisfied", "unresolved"}
-        for item in composition.constraints
-    ):
-        return ExactCorrectionAssessment(
-            composition=composition,
-            targets=targets,
-            plan=plan,
-        )
     if not plan.available:
         return ExactCorrectionAssessment(
             composition=composition,

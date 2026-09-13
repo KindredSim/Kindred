@@ -7,21 +7,11 @@ from typing import Literal, Mapping
 
 from kindred.core.equilibrium_rate_authority import (
     EquilibriumRateAuthorityKind,
-    effective_equilibrium_keq,
-    effective_equilibrium_reverse_rate,
     normalize_existing_equilibrium_rate_authority,
     step_entry_authored_role_is_derived,
     step_entry_authored_role_is_editable,
 )
-from kindred.core.kinetics import (
-    ArrheniusRateModel,
-    EyringRateModel,
-    ForwardRateModel,
-    forward_rate_at_temperature,
-    forward_rate_family,
-    forward_rate_model_for_equilibrium,
-    forward_rate_model_for_reaction,
-)
+from kindred.core.kinetics import ArrheniusRateModel, EyringRateModel, ForwardRateModel, forward_rate_family
 from kindred.core.mechanism_metadata import (
     MechanismMetadataView,
 )
@@ -35,7 +25,6 @@ from kindred.core.simulator.parameter_namespace import build_namespace_from_mech
 from kindred.core.simulator.dsl_build_input import source_coordinate_capabilities
 from kindred.core.simulator.step_indexing import get_step_index_map
 from kindred.core.validation import try_parse_callable_finite_float, try_parse_int
-from kindred.core.species import validate_temperature
 from kindred.core.stoichiometry import directional_order_fraction
 from kindred.core.units import (
     UnitsModel,
@@ -57,7 +46,6 @@ class SimulationParameter:
     allow_exact_zero: bool
     unit: str = "1"
     context: str = ""
-    temperature_K: float | None = None
 
 
 def _finite(value: object) -> float | None:
@@ -70,11 +58,6 @@ def enumerate_simulation_parameters(
 ) -> tuple[SimulationParameter, ...]:
     """Enumerate writable coordinates from one accepted typed DSL authority."""
 
-    temperature = float(prepared_dsl.analysis.temperature_K)
-    temperature = validate_temperature(
-        temperature,
-        field="Prepared DSL nominal temperature",
-    )
     mechanism = prepared_dsl.mutable_mechanism_shell()
     metadata = getattr(mechanism, "metadata", {}) or {}
     metadata_view = MechanismMetadataView.from_metadata(metadata)
@@ -83,7 +66,6 @@ def enumerate_simulation_parameters(
     apply_parameter_algebra_spec_to_mechanism(
         parameter_spec,
         mechanism=mechanism,
-        require_mutable=False,
         parameter_target_map=parameter_target_map,
     )
     namespace = build_namespace_from_mechanism(mechanism)
@@ -152,12 +134,9 @@ def enumerate_simulation_parameters(
             raw_index, ok = try_parse_int(entry.get("reaction_index", -1))
             if not ok or not (0 <= raw_index < len(reactions)):
                 continue
-            model = forward_rate_model_for_reaction(
-                reactions[int(raw_index)],
-                default_standard_conc_M=metadata_view.standard_conc_M,
-            )
+            model = reactions[int(raw_index)].forward_model
             family = forward_rate_family(model)
-            value = forward_rate_at_temperature(model, temperature)
+            value = model.k
             scientific_category = "rate"
             allow_exact_zero = family == "Constant"
         elif kind == "equilibrium":
@@ -186,13 +165,9 @@ def enumerate_simulation_parameters(
                 else derived_truth
             )
             if role == "kf":
-                model = forward_rate_model_for_equilibrium(
-                    equilibrium,
-                    temperature_K=temperature,
-                    default_standard_conc_M=metadata_view.standard_conc_M,
-                )
+                model = equilibrium.forward_model
                 family = forward_rate_family(model)
-                value = forward_rate_at_temperature(model, temperature)
+                value = model.k
                 scientific_category = "rate"
                 allow_exact_zero = (
                     authority.kind == EquilibriumRateAuthorityKind.KEQ
@@ -200,18 +175,12 @@ def enumerate_simulation_parameters(
                 )
             elif role == "kr":
                 family = "reverse"
-                value = effective_equilibrium_reverse_rate(
-                    equilibrium,
-                    temperature_K=temperature,
-                )
+                value = authority.kr
                 scientific_category = "rate"
                 allow_exact_zero = False
             elif role == "Keq":
                 family = "reverse"
-                value = effective_equilibrium_keq(
-                    equilibrium,
-                    temperature_K=temperature,
-                )
+                value = authority.Keq
                 scientific_category = "equilibrium_constant"
                 allow_exact_zero = False
         else:
@@ -228,7 +197,6 @@ def enumerate_simulation_parameters(
             SimulationParameter(
                 name=name,
                 context=context,
-                temperature_K=temperature if model is not None and family in {"Arrhenius", "Eyring"} else None,
                 value=float(value),
                 family=family,
                 role=role,
@@ -263,10 +231,7 @@ def enumerate_simulation_parameters(
             if not ok or not (0 <= raw_index < len(reactions)):
                 continue
             reaction = reactions[int(raw_index)]
-            model = forward_rate_model_for_reaction(
-                reaction,
-                default_standard_conc_M=metadata_view.standard_conc_M,
-            )
+            model = reaction.forward_model
             order = float(
                 directional_order_fraction(
                     getattr(reaction, "rate_orders", {}) or {},
@@ -278,11 +243,7 @@ def enumerate_simulation_parameters(
                 continue
             equilibrium = equilibria[int(raw_index)]
             authority = normalize_existing_equilibrium_rate_authority(equilibrium)
-            model = forward_rate_model_for_equilibrium(
-                equilibrium,
-                temperature_K=temperature,
-                default_standard_conc_M=metadata_view.standard_conc_M,
-            )
+            model = equilibrium.forward_model
             order = float(
                 directional_order_fraction(
                     getattr(equilibrium, "stoich_forward", {}) or {},

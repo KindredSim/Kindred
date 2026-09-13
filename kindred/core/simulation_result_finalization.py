@@ -111,7 +111,7 @@ def finalize_simulation_result(
     result: FinalSimulationOutput,
     species_names: list[str],
     initials_for_algebra: Mapping[str, Any] | None,
-    parameter_values_at_time: Callable[[float, tuple[str, ...]], Mapping[str, float]],
+    parameter_values_at_temperature: Callable[[float, tuple[str, ...]], Mapping[str, float]],
     parameter_algebra_spec: object,
     parameters: tuple[tuple[str, float, str], ...] = (),
     solver_provenance_updates: Mapping[str, object] | None = None,
@@ -160,10 +160,10 @@ def finalize_simulation_result(
             try:
                 if name in runtime_names:
                     return np.asarray([
-                        parameter_values_at_time(float(time), (name,))[name]
-                        for time in result_time
+                        parameter_values_at_temperature(float(temperature), (name,))[name]
+                        for temperature in result.temperature_K
                     ], dtype=float)
-                return parameter_values_at_time(float(result_time[0]), (name,))[name]
+                return parameter_values_at_temperature(float(result.temperature_K[0]), (name,))[name]
             except Exception as exc:
                 symbol_failures[name] = exc
                 raise

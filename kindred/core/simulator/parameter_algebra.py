@@ -11,15 +11,13 @@ This adds an explicit, unambiguous syntax in mechanism DSL text:
 from __future__ import annotations
 
 import logging
-import math
 from collections.abc import Mapping
 from typing import Dict
 
-from kindred.core.rate_binding import RateBinding
 from kindred.core.simulator.errors import DSLError
 from kindred.core.simulator.parameter_algebra_spec import ParameterAlgebraSpec
-from kindred.core.simulator.parameter_algebra_eval import bind_parameter_evaluation
-from kindred.core.mechanism_metadata import MechanismMetadataView
+from kindred.core.algebra.evaluator import bind_scalar_expression_evaluator
+from kindred.core.algebra.errors import AlgebraError
 from kindred.core.simulator.parameter_coordinates import (
     ParameterTarget,
     apply_mechanism_coordinate_values,
@@ -57,18 +55,6 @@ __all__ = [
 ]
 
 
-def _ensure_scalar_param_storage(mechanism: object, *, require_mutable: bool) -> None:
-    meta = getattr(mechanism, "metadata", None)
-    if not isinstance(meta, dict):
-        return
-    if require_mutable:
-        meta.setdefault("scalar_param_bindings", {})
-        meta.setdefault("scalar_param_info", {})
-    else:
-        meta.setdefault("scalar_params", {})
-        meta.setdefault("scalar_param_info", {})
-
-
 def parameter_algebra_spec_from_mechanism(mechanism: object) -> ParameterAlgebraSpec | None:
     return (getattr(mechanism, "metadata", {}) or {}).get(_PARAMETER_ALGEBRA_SPEC_META_KEY)
 
@@ -77,107 +63,45 @@ def apply_parameter_algebra_spec_to_mechanism(
     spec: ParameterAlgebraSpec,
     *,
     mechanism: object,
-    require_mutable: bool,
     parameter_target_map: Mapping[str, ParameterTarget],
     mechanism_coordinate_overrides: Mapping[str, float] | None = None,
     scalar_parameter_overrides: Mapping[str, float] | None = None,
-) -> Dict[str, float]:
-    meta = getattr(mechanism, "metadata", None)
-    direct_coordinates = mechanism_coordinate_overrides or {}
-    scalar_overrides = scalar_parameter_overrides or {}
-    base_values = dict(direct_coordinates)
-    base_values.update(scalar_overrides)
-    evaluate = bind_parameter_evaluation(spec, mechanism, base_values)
-    roots = tuple(name for name in spec.parameter_dependencies
-                  if spec.parameter_assignment_kind(name) in {"independent scalar", "mechanism-bound"})
-    base_values = evaluate(float(MechanismMetadataView.from_metadata(mechanism.metadata).temperature_K), roots)
-    derived = {name: base_values[name] for name in spec.parameter_dependencies
-               if spec.parameter_assignment_kind(name) == "mechanism-bound"}
-
-    coordinate_updates: dict[str, float] = dict(direct_coordinates)
-    for name, value in tuple(derived.items()):
-        if name not in spec.mechanism_param_names or name in spec.identity_checks:
+) -> None:
+    """Seed independent inputs and publish admitted overrides, never derived values."""
+    meta = mechanism.metadata
+    scalars = dict(meta.get("scalar_params") or {})
+    scalar_info = {}
+    statements = {statement.name: statement for statement in spec.parameter_block.lines}
+    literal = bind_scalar_expression_evaluator(spec.parameter_block, {})
+    overrides = scalar_parameter_overrides or {}
+    for assignment in spec.param_statements:
+        name = assignment.name
+        if name in spec.mechanism_param_names:
             continue
-        target = parameter_target_map.get(str(name))
-        if target is None:
-            raise DSLError(
-                f"Unsupported mechanism parameter {name!r} for parameter algebra"
-            )
-        coordinate_updates[name] = float(value)
-
-    if coordinate_updates:
-        apply_mechanism_coordinate_values(
-            mechanism,
-            coordinate_updates,
-            parameter_target_map=parameter_target_map,
-            require_mutable=require_mutable,
-        )
-
-    if isinstance(meta, dict):
-        meta[_PARAMETER_ALGEBRA_SPEC_META_KEY] = spec
-    _ensure_scalar_param_storage(mechanism, require_mutable=require_mutable)
-
-    meta = getattr(mechanism, "metadata", {}) or {}
-    if require_mutable:
-        scalar_bindings = meta.get("scalar_param_bindings")
-        if not isinstance(scalar_bindings, dict):
-            scalar_bindings = {}
-            meta["scalar_param_bindings"] = scalar_bindings
-        scalar_info = meta.get("scalar_param_info")
-        if not isinstance(scalar_info, dict):
-            scalar_info = {}
-            meta["scalar_param_info"] = scalar_info
-    else:
-        scalar_vals = meta.get("scalar_params")
-        if not isinstance(scalar_vals, dict):
-            scalar_vals = {}
-            meta["scalar_params"] = scalar_vals
-        scalar_info = meta.get("scalar_param_info")
-        if not isinstance(scalar_info, dict):
-            scalar_info = {}
-            meta["scalar_param_info"] = scalar_info
-
-    for stmt in spec.param_statements:
-        # Mechanism-bound assignments are written through the grouped
-        # coordinate owner above; only scalar assignments have metadata
-        # storage here.
-        if stmt.name in spec.mechanism_param_names:
-            continue
-        is_derived = spec.parameter_assignment_kind(stmt.name) == "derived scalar"
-        scalar_info[stmt.name] = {
-            "line": stmt.line_number,
-            "expr": stmt.expr_src,
-            "derived": is_derived,
-            "editable": not is_derived,
-            "unit": "1",
+        derived = spec.parameter_assignment_kind(name) != "independent scalar"
+        scalar_info[name] = {
+            "line": assignment.line_number, "expr": assignment.expr_src,
+            "derived": derived, "editable": not derived, "unit": "1",
         }
-        if is_derived:
-            # Derived scalars belong to the bound expression graph, not a
-            # nominal numeric snapshot that can become stale or fail unused.
-            for key in ("scalar_params", "scalar_param_bindings"):
-                meta.get(key, {}).pop(stmt.name, None)
+        if derived:
+            scalars.pop(name, None)
             continue
-        cur_val = base_values[stmt.name]
-        if require_mutable:
-            b = scalar_bindings.get(stmt.name)
-            if b is None:
-                b = RateBinding(name=str(stmt.name), value=float(cur_val))
-                scalar_bindings[stmt.name] = b
-            elif stmt.name in scalar_overrides:
-                # Publish a fresh binding only after mechanism coordinates have
-                # passed admission; the old binding remains untouched on error.
-                b = RateBinding(
-                    name=str(stmt.name),
-                    value=float(scalar_overrides[stmt.name]),
-                )
-                scalar_bindings[stmt.name] = b
-        else:
-            if stmt.name not in scalar_vals and math.isfinite(cur_val):
-                scalar_vals[stmt.name] = float(cur_val)
-            if stmt.name in scalar_overrides:
-                scalar_vals[stmt.name] = float(scalar_overrides[stmt.name])
+        if name in overrides:
+            scalars[name] = float(overrides[name])
+        elif name not in scalars:
+            try:
+                scalars[name] = literal(statements[name])
+            except AlgebraError as exc:
+                raise DSLError(str(exc), line_number=assignment.line_number,
+                               line_content=assignment.line_content) from exc
 
-    return derived
+    apply_mechanism_coordinate_values(
+        mechanism, mechanism_coordinate_overrides or {},
+        parameter_target_map=parameter_target_map,
+    )
+    meta[_PARAMETER_ALGEBRA_SPEC_META_KEY] = spec
+    meta["scalar_params"] = scalars
+    meta["scalar_param_info"] = scalar_info
 
 
 def solver_parameter_units_from_mechanism(

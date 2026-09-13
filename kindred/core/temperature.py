@@ -25,7 +25,7 @@ from __future__ import annotations
 import logging
 import math
 from dataclasses import dataclass
-from typing import Callable, List, Mapping, Optional, Protocol, Tuple, runtime_checkable
+from typing import Callable, List, Literal, Mapping, Optional, Protocol, Tuple, runtime_checkable
 
 from kindred.core.species import (
     validate_temperature,
@@ -42,6 +42,7 @@ __all__ = [
     "coerce_temperature_schedule",
     "coerce_temperature_kelvin",
     "declared_temperature_step_boundaries",
+    "temperature_at_execution_time",
     "temperature_schedule_execution_identity",
 ]
 
@@ -616,6 +617,32 @@ class TemperatureSchedule:
         return f"TemperatureSchedule({self.schedule_type})"
 
 
+def temperature_at_execution_time(
+    schedule: TemperatureScheduleProtocol | None,
+    reference_temperature_K: float,
+    time: float,
+    *,
+    side: Literal["preceding", "following"] = "following",
+) -> float:
+    """Resolve an execution-selected side without changing the scientific clock.
+
+    Only declared piecewise steps have distinct sides. Continuous and arbitrary
+    callable schedules retain their ordinary evaluation at the actual time.
+    """
+    if schedule is None:
+        return reference_temperature_K
+    if side == "preceding":
+        identity = temperature_schedule_execution_identity(schedule)
+        if identity is not None and identity["type"] == "piecewise_steps":
+            temperature = float(identity["baseline_temperature"])
+            for step in identity["steps"]:
+                if float(step["time"]) >= time:
+                    break
+                temperature = float(step["temperature"])
+            return temperature
+    return float(schedule(time))
+
+
 def declared_temperature_step_boundaries(
     schedule: TemperatureScheduleProtocol | None,
     *,
@@ -642,7 +669,7 @@ def declared_temperature_step_boundaries(
         float(item["time"])
         for item in identity.get("steps", ())
         if isinstance(item, Mapping)
-        and start < float(item["time"]) < end
+        and start < float(item["time"]) <= end
     }
     return tuple(sorted(boundaries))
 

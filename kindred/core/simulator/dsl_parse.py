@@ -47,9 +47,9 @@ from ..mechanism_source import (
     normalize_source_for_analysis,
     source_matches_analysis,
 )
+from ..kinetics import ArrheniusRateModel, ConstantRateModel, EyringRateModel
 from ..units import UnitsModel
 from ..units import (
-    admit_arrhenius_prefactor,
     admit_energy_j_per_mol,
     admit_keq,
     admit_rate,
@@ -506,61 +506,27 @@ class PreparedDslRequestSet:
     def mutable_mechanism_shell(self) -> object:
         from collections.abc import Mapping
 
-        from kindred.core.equilibrium_rate_authority import (
-            EquilibriumRateAuthorityKind,
-            normalize_existing_equilibrium_rate_authority,
-        )
         from kindred.core.mechanism import Mechanism
-        from kindred.core.rate_binding import ForwardRateBinding, RateBinding
 
-        def clone_binding(value: object) -> object:
-            if isinstance(value, ForwardRateBinding):
-                return ForwardRateBinding(
-                    name=value.name,
-                    model=value.model,
-                    reference_temperature_K=value.reference_temperature_K,
-                )
-            if isinstance(value, RateBinding):
-                return RateBinding(name=value.name, value=float(value.value))
+        def clone_metadata(value: object) -> object:
             if isinstance(value, Mapping):
-                return {key: clone_binding(item) for key, item in value.items()}
+                return {key: clone_metadata(item) for key, item in value.items()}
             if isinstance(value, list):
-                return [clone_binding(item) for item in value]
+                return [clone_metadata(item) for item in value]
             if isinstance(value, tuple):
-                return tuple(clone_binding(item) for item in value)
+                return tuple(clone_metadata(item) for item in value)
             if isinstance(value, (set, frozenset)):
-                return type(value)(clone_binding(item) for item in value)
+                return type(value)(clone_metadata(item) for item in value)
             return value
 
         shell = Mechanism()
         shell.species = self.__mechanism.species
-        shell.metadata = clone_binding(
+        shell.metadata = clone_metadata(
             getattr(self.__mechanism, "metadata", {}) or {}
         )
-        shell.reactions = [
-            replace(
-                reaction,
-                rate=clone_binding(reaction.rate),
-                overrides=clone_binding(reaction.overrides),
-            )
-            for reaction in self.__mechanism.reactions
-        ]
+        shell.reactions = list(self.__mechanism.reactions)
         shell.equilibria = [
-            (
-                lambda authority: replace(
-                    equilibrium,
-                    # Thermodynamic authority has no raw scalar mirrors.
-                    # Explicit KR keeps its admitted binding unchanged.
-                    Keq=None,
-                    kf=clone_binding(equilibrium.kf),
-                    kr=(
-                        clone_binding(equilibrium.kr)
-                        if authority.kind == EquilibriumRateAuthorityKind.KR
-                        else None
-                    ),
-                    metadata=clone_binding(equilibrium.metadata),
-                )
-            )(normalize_existing_equilibrium_rate_authority(equilibrium))
+            replace(equilibrium, metadata=clone_metadata(equilibrium.metadata))
             for equilibrium in self.__mechanism.equilibria
         ]
         compiled_series = getattr(self.__mechanism, "_compiled_algebra_series", None)
@@ -863,27 +829,6 @@ def _validate_rate_or_K(
         else:
             admit_rate(value, field=name, allow_zero=str(name) in {"k", "kf"})
     except ValueError as exc:
-        raise _DSLError(str(exc), line_number=line_number, line_content=line_content) from exc
-
-
-def _derive_equilibrium_rates_with_context(
-    *,
-    line_number: Optional[int],
-    line_content: Optional[str],
-    **kwargs,
-):
-    """
-    Translate equilibrium authority errors into source-aware DSL errors.
-    """
-    try:
-        from ..equilibrium_rate_authority import (
-            derive_fast_equilibrium_rates,
-        )
-
-        if "T" in kwargs:
-            kwargs["temperature_K"] = kwargs.pop("T")
-        return derive_fast_equilibrium_rates(**kwargs)
-    except (ValueError, OverflowError, ZeroDivisionError) as exc:
         raise _DSLError(str(exc), line_number=line_number, line_content=line_content) from exc
 
 
@@ -1372,14 +1317,14 @@ def _source_coordinates_from_key_value_spans(
                 continue
             canonical_role = role
         elif role == "degeneracy":
-            if step.model != "Eyring":
+            if not isinstance(step.forward_model, EyringRateModel):
                 continue
             canonical_role = role
         elif role == "kappa":
             # kappa is a physical Eyring coordinate only when explicitly
             # authored.  Its source span remains tied to the original key
             # spelling; only the canonical authority name is normalized.
-            if step.model != "Eyring":
+            if not isinstance(step.forward_model, EyringRateModel):
                 continue
             canonical_role = "kappa"
         else:
@@ -1589,7 +1534,6 @@ def _parse_dsl_ir(text: str, *, units: UnitsModel | None = None) -> "DSLIR":
             parsed_step = _parse_reaction_step(
                 rest,
                 energy_unit=energy_unit,
-                T=temperature_K,
                 C0=standard_conc_M,
                 line_number=line_no,
                 line_content=raw,
@@ -1609,7 +1553,6 @@ def _parse_dsl_ir(text: str, *, units: UnitsModel | None = None) -> "DSLIR":
             parsed_step = _parse_equilibrium_step(
                 rest,
                 energy_unit=energy_unit,
-                T=temperature_K,
                 C0=standard_conc_M,
                 line_number=line_no,
                 line_content=raw,
@@ -1628,7 +1571,6 @@ def _parse_dsl_ir(text: str, *, units: UnitsModel | None = None) -> "DSLIR":
             parsed_step = _parse_bare_arrow_step(
                 line,
                 energy_unit=energy_unit,
-                T=temperature_K,
                 C0=standard_conc_M,
                 line_number=line_no,
                 line_content=raw,
@@ -1759,14 +1701,12 @@ def _parse_reaction_like_step(
     stoich_part: str,
     params: Dict[str, str],
     energy_unit: str,
-    T: float,
     C0: float,
     missing_eyring_message: str,
     line_number: int | None,
     line_content: str | None,
     step_label: str = "reaction",
 ) -> DslBuildStep:
-    from ..kinetics import arrhenius_rate, eyring_rate
     from .kinetics import normalize_energy_to_J_per_mol
 
     try:
@@ -1837,172 +1777,47 @@ def _parse_reaction_like_step(
                 line_number=line_number,
                 line_content=line_content,
             )
+    explicit_keq = _float_or_none(params.get("Keq"))
     if "Keq" in params:
-        _Keq_early = _float_or_none(params["Keq"])
-        if _Keq_early is None:
-            raise _DSLError(
-                "Keq must be numeric",
-                line_number=line_number,
-                line_content=line_content,
-            )
-        if _Keq_early <= 0:
-            raise _DSLError(
-                f"Keq must be positive, got {_Keq_early}",
-                line_number=line_number, line_content=line_content,
-            )
-    arrhenius_A = None
-    arrhenius_EaJ = None
-    eyring_dGJ = None
-    dG_eqJ_for_step = None
-    Keq = None
-    Keq_input = None
+        _validate_rate_or_K(explicit_keq, "Keq", line_number=line_number, line_content=line_content)
 
-    if model == "Arrhenius":
-        A = _float_or_none(params.get("A"))
-        Ea = params.get("Ea")
-        if A is None or Ea is None:
-            raise _DSLError(
-                "Arrhenius requires A and Ea",
-                examples=["A -> B ; A=1e13 ; Ea=50"],
-                line_number=line_number, line_content=line_content,
-            )
-        try:
-            A = admit_arrhenius_prefactor(A, field="Arrhenius A")
-        except ValueError as exc:
-            raise _DSLError(str(exc), line_number=line_number, line_content=line_content) from exc
-        Ea_val = _float_or_none(Ea)
-        if Ea_val is None:
-            raise _DSLError("Ea must be numeric", line_number=line_number, line_content=line_content)
-        EaJ = normalize_energy_to_J_per_mol(Ea_val, energy_unit)
-        try:
-            EaJ = admit_energy_j_per_mol(EaJ, field="Ea")
-        except ValueError as exc:
-            raise _DSLError(str(exc), line_number=line_number, line_content=line_content) from exc
-        arrhenius_A = A
-        arrhenius_EaJ = EaJ
-        try:
-            kf = arrhenius_rate(A, EaJ, T)
-        except (ValueError, OverflowError) as exc:
-            raise _DSLError(
-                "Arrhenius rate computation overflowed (A and Ea produce an unrepresentable rate)",
-                line_number=line_number, line_content=line_content,
-            ) from exc
-    elif model == "Eyring":
-        if kf is None:
-            if "dG_act" not in params:
-                raise _DSLError(
-                    missing_eyring_message,
-                    examples=["A -> B ; dG_act=75.5", "A -> B ; k=1.5"],
-                    line_number=line_number, line_content=line_content,
-                )
-            dG_act_val = _float_or_none(params["dG_act"])
-            if dG_act_val is None:
-                raise _DSLError("dG_act must be numeric", line_number=line_number, line_content=line_content)
-            dGJ = normalize_energy_to_J_per_mol(dG_act_val, energy_unit)
-            try:
-                dGJ = admit_energy_j_per_mol(dGJ, field="dG_act")
-            except ValueError as exc:
-                raise _DSLError(str(exc), line_number=line_number, line_content=line_content) from exc
-            eyring_dGJ = dGJ
-            if kappa <= 0:
-                raise _DSLError(
-                    f"Per-step kappa must be positive for Eyring rate computation, got {kappa}",
-                    line_number=line_number, line_content=line_content,
-                )
-            try:
-                kf = eyring_rate(
-                    dGJ,
-                    T,
-                    kappa=kappa,
-                    molecularity=n,
-                    standard_conc_M=C0,
-                    degeneracy=degeneracy,
-                )
-            except (ValueError, OverflowError) as exc:
-                raise _DSLError(
-                    "Eyring rate computation overflowed (dG_act too large for given T)",
-                    line_number=line_number, line_content=line_content,
-                ) from exc
-    else:
-        if kf is None:
-            raise _DSLError(
-                "Constant reaction requires explicit k or kf",
-                line_number=line_number,
-                line_content=line_content,
-            )
-
-    if reversible and kr is None:
-        explicit_keq = _float_or_none(params.get("Keq"))
-        if "dG_eq" in params:
-            dG_eq_value = _float_or_none(params["dG_eq"])
-            if dG_eq_value is None:
-                raise _DSLError(
-                    "dG_eq must be numeric",
-                    line_number=line_number,
-                    line_content=line_content,
-                )
-            dG_eqJ_for_step = normalize_energy_to_J_per_mol(
-                dG_eq_value,
-                energy_unit,
-            )
-            try:
-                dG_eqJ_for_step = admit_energy_j_per_mol(
-                    dG_eqJ_for_step,
-                    field="dG_eq",
-                )
-            except ValueError as exc:
-                raise _DSLError(
-                    str(exc),
-                    line_number=line_number,
-                    line_content=line_content,
-                ) from exc
-        rates = _derive_equilibrium_rates_with_context(
-            Keq=explicit_keq,
-            dG_eq_J_per_mol=dG_eqJ_for_step,
-            T=T,
-            standard_conc_M=C0,
-            delta_n=float(
-                directional_order_fraction(
-                    prod,
-                )
-                - directional_order_fraction(
-                    react,
-                )
-            ),
-            explicit_rates=(float(kf),),
-            line_number=line_number,
-            line_content=line_content,
+    def energy(key: str) -> float:
+        value = _float_or_none(params.get(key))
+        if value is None:
+            raise ValueError(f"{key} must be numeric")
+        return admit_energy_j_per_mol(
+            normalize_energy_to_J_per_mol(value, energy_unit), field=key
         )
-        kf = rates.kf
-        kr = rates.kr
-        Keq = rates.Keq
-        Keq_input = explicit_keq
+
+    try:
+        if model == "Arrhenius":
+            prefactor = _float_or_none(params.get("A"))
+            if prefactor is None:
+                raise ValueError("Arrhenius requires numeric A and Ea")
+            forward_model = ArrheniusRateModel(A=prefactor, Ea_J_per_mol=energy("Ea"))
+        elif model == "Eyring":
+            forward_model = EyringRateModel(
+                dG_act_J_per_mol=energy("dG_act"), kappa=kappa,
+                molecularity=n, standard_conc_M=C0, degeneracy=degeneracy,
+            )
+        else:
+            if kf is None:
+                raise ValueError(missing_eyring_message)
+            forward_model = ConstantRateModel(k=kf)
+        delta_g = energy("dG_eq") if "dG_eq" in params else None
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise _DSLError(str(exc), line_number=line_number, line_content=line_content) from exc
 
     return DslBuildStep(
-        reactants=tuple(
-            (str(name), float(value)) for name, value in react.items()
-        ),
-        products=tuple(
-            (str(name), float(value)) for name, value in prod.items()
-        ),
+        reactants=tuple((str(name), float(value)) for name, value in react.items()),
+        products=tuple((str(name), float(value)) for name, value in prod.items()),
         reversible=reversible,
-        kf=float(kf),
-        kr=float(kr) if kr is not None else None,
-        model=model,
+        forward_model=forward_model,
+        kr=kr,
         is_equilibrium=False,
-        arrhenius_A=arrhenius_A,
-        arrhenius_Ea_J_per_mol=arrhenius_EaJ,
-        eyring_dG_act_J_per_mol=eyring_dGJ,
-        kappa=kappa,
         standard_conc_M=C0,
-        dG_eq_J_per_mol=dG_eqJ_for_step,
-        Keq=float(Keq) if Keq is not None else None,
-        Keq_input=Keq_input,
-        user_kf_explicit=any(
-            key in params for key in ("kf", "k", "A", "Ea", "dG_act")
-        ),
-        user_kr_explicit=("kr" in params),
-        degeneracy=degeneracy,
+        dG_eq_J_per_mol=delta_g,
+        Keq_input=explicit_keq,
     )
 
 
@@ -2010,7 +1825,6 @@ def _parse_reaction_step(
     rest: str,
     *,
     energy_unit: str,
-    T: float,
     C0: float,
     line_number: int,
     line_content: str,
@@ -2031,7 +1845,6 @@ def _parse_reaction_step(
         stoich_part=stoich_part,
         params=params,
         energy_unit=energy_unit,
-        T=T,
         C0=C0,
         missing_eyring_message="Eyring step requires dG_act or explicit k",
         line_number=line_number,
@@ -2053,7 +1866,6 @@ def _parse_bare_arrow_step(
     line: str,
     *,
     energy_unit: str,
-    T: float,
     C0: float,
     line_number: int,
     line_content: str,
@@ -2074,7 +1886,6 @@ def _parse_bare_arrow_step(
         stoich_part=stoich_part,
         params=params,
         energy_unit=energy_unit,
-        T=T,
         C0=C0,
         missing_eyring_message="Bare arrow syntax requires k (or kf), or dG_act for Eyring",
         line_number=line_number,
@@ -2096,7 +1907,6 @@ def _parse_equilibrium_step(
     rest: str,
     *,
     energy_unit: str,
-    T: float,
     C0: float,
     line_number: int,
     line_content: str,
@@ -2130,7 +1940,6 @@ def _parse_equilibrium_step(
         stoich_part=stoich_part,
         params=params,
         energy_unit=energy_unit,
-        T=T,
         C0=C0,
         missing_eyring_message="Equilibrium requires kf or a complete forward rate family",
         step_label="equilibrium",
@@ -2261,6 +2070,12 @@ def prepare_dsl_request_set(
     )
     from .parameter_algebra_spec import admit_parameter_evaluation_graph
     parameter_algebra_spec = admit_parameter_evaluation_graph(parameter_algebra_spec, mechanism)
+    from .parameter_algebra import apply_parameter_algebra_spec_to_mechanism
+    from .parameter_coordinates import build_parameter_target_map
+    apply_parameter_algebra_spec_to_mechanism(
+        parameter_algebra_spec, mechanism=mechanism,
+        parameter_target_map=build_parameter_target_map(mechanism),
+    )
     # The retained spec is the sole admitted Algebra program.  Compile the
     # observable partition from its retained ASTs; passing raw source here (or
     # in the builder) would reparse the same Algebra text and violate the

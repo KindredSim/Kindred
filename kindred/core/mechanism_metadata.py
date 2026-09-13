@@ -27,11 +27,8 @@ class MechanismMetadataKeys:
 
 
 class EquilibriumMetadataKeys:
-    USER_PROVIDED_KF = "user_provided_kf"
-    USER_PROVIDED_KR = "user_provided_kr"
     DG_EQ_J_PER_MOL = "dG_eq_J_per_mol"
     KEQ_INPUT = "Keq_input"
-    FORWARD_MODEL = "forward_model"
     STANDARD_CONC_M = "standard_conc_M"
     KEQ_UNIT = "Keq_unit"
 
@@ -84,11 +81,8 @@ class MechanismMetadataView:
 
 @dataclass(frozen=True)
 class EquilibriumMetadataView:
-    user_provided_kf: bool
-    user_provided_kr: bool
     dG_eq_J_per_mol: Optional[float] = None
     Keq_input: Optional[object] = None
-    forward_model: Optional[dict[str, object]] = None
     standard_conc_M: Optional[float] = None
     Keq_unit: Optional[str] = None
 
@@ -105,15 +99,11 @@ class EquilibriumMetadataView:
 
     def to_metadata(self) -> dict[str, object]:
         out: dict[str, object] = {
-            EquilibriumMetadataKeys.USER_PROVIDED_KF: bool(self.user_provided_kf),
-            EquilibriumMetadataKeys.USER_PROVIDED_KR: bool(self.user_provided_kr),
         }
         if self.dG_eq_J_per_mol is not None:
             out[EquilibriumMetadataKeys.DG_EQ_J_PER_MOL] = float(self.dG_eq_J_per_mol)
         if self.Keq_input is not None:
             out[EquilibriumMetadataKeys.KEQ_INPUT] = self.Keq_input
-        if self.forward_model is not None:
-            out[EquilibriumMetadataKeys.FORWARD_MODEL] = dict(self.forward_model)
         if self.standard_conc_M is not None:
             out[EquilibriumMetadataKeys.STANDARD_CONC_M] = float(self.standard_conc_M)
         if self.Keq_unit is not None:

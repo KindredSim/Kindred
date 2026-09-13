@@ -17,11 +17,7 @@ from kindred.core.algebra.parser import (
 )
 from kindred.core.constants import N_A, R, Rkcal, h, h_bar, k_B
 from kindred.core.equilibrium_rate_authority import equilibrium_rate_symbolic_relations
-from kindred.core.kinetics import (
-    forward_rate_model_for_equilibrium,
-    forward_rate_model_for_reaction,
-    forward_rate_symbolic_relation,
-)
+from kindred.core.kinetics import forward_rate_symbolic_relation
 from kindred.core.simulator.step_indexing import (
     get_step_index_map,
     lookup_source_coordinate_target,
@@ -470,11 +466,7 @@ def _mechanism_relations(
             return ExactMonomial(Fraction(1), ((name, Fraction(1)),))
 
         try:
-            forward_model = forward_rate_model_for_reaction(reactions[index], default_standard_conc_M=1.0) if kind == "reaction" else forward_rate_model_for_equilibrium(
-                equilibria[index],
-                temperature_K=None,
-                default_standard_conc_M=1.0,
-            )
+            forward_model = reactions[index].forward_model if kind == "reaction" else equilibria[index].forward_model
             projected = forward_rate_symbolic_relation(
                 forward_model,
                 temperature=temperature,

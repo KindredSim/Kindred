@@ -8,7 +8,7 @@ immutable builder input and constructs the typed mechanism authority.
 from __future__ import annotations
 
 import logging
-from typing import Dict, List, Optional
+from typing import Dict, List
 
 from ..equilibrium_rate_authority import (
     equilibrium_constant_unit,
@@ -65,83 +65,15 @@ def build_mechanism_from_ir(
     for _source_step_no, step in enumerate(steps, start=1):
         reactants = dict(step.reactants)
         products = dict(step.products)
-        model = step.model
-
-        rxn_overrides: Dict[str, object] = {}
-        if model == "Constant":
-            rxn_overrides["model"] = "Constant"
-        elif model == "Arrhenius":
-            rxn_overrides["model"] = "Arrhenius"
-            A = step.arrhenius_A
-            EaJ = step.arrhenius_Ea_J_per_mol
-            if A is not None:
-                rxn_overrides["A"] = float(A)
-            if EaJ is not None:
-                rxn_overrides["Ea_J_per_mol"] = float(EaJ)
-        elif model == "Eyring":
-            rxn_overrides["model"] = "Eyring"
-            rxn_overrides["degeneracy"] = int(step.degeneracy)
-            dGJ = step.eyring_dG_act_J_per_mol
-            if dGJ is not None:
-                rxn_overrides["dG_act_J_per_mol"] = float(dGJ)
-            kappa = step.kappa
-            rxn_overrides["kappa"] = float(kappa)
-            sc = step.standard_conc_M
-            if sc is not None:
-                rxn_overrides["standard_conc_M"] = float(sc)
-
         namespace_policy = _namespace_policy_from_step(step)
-        kr_attr = step.kr
         is_equilibrium_step = namespace_policy.step_kind == "equilibrium"
 
         if is_equilibrium_step:
-            kf_val = step.kf
-            kr_val = float(kr_attr) if kr_attr is not None else None
-            Keq_input = step.Keq_input
-            user_kf_explicit = step.user_kf_explicit
-            user_kr_explicit = step.user_kr_explicit
-
-            Keq_model_value = step.Keq
-
-            forward_model: Optional[Dict[str, object]] = None
-            if (
-                model == "Arrhenius"
-                and step.arrhenius_A is not None
-                and step.arrhenius_Ea_J_per_mol is not None
-            ):
-                forward_model = {
-                    "type": "Arrhenius",
-                    "A": step.arrhenius_A,
-                    "Ea_J_per_mol": step.arrhenius_Ea_J_per_mol,
-                }
-            elif (
-                model == "Eyring"
-                and step.eyring_dG_act_J_per_mol is not None
-            ):
-                forward_model = {
-                    "type": "Eyring",
-                    "dG_act_J_per_mol": step.eyring_dG_act_J_per_mol,
-                    "degeneracy": int(step.degeneracy),
-                    "kappa": float(step.kappa),
-                    "standard_conc_M": (
-                        step.standard_conc_M
-                        if step.standard_conc_M is not None
-                        else C0
-                    ),
-                }
-            elif model == "Constant":
-                forward_model = {
-                    "type": "Constant",
-                }
-
             eq_metadata = EquilibriumMetadataView(
-                user_provided_kf=bool(user_kf_explicit),
-                user_provided_kr=bool(user_kr_explicit),
                 dG_eq_J_per_mol=step.dG_eq_J_per_mol
                 if step.dG_eq_J_per_mol is not None
                 else None,
-                Keq_input=Keq_input,
-                forward_model=forward_model,
+                Keq_input=step.Keq_input,
                 standard_conc_M=step.standard_conc_M
                 if step.standard_conc_M is not None
                 else None,
@@ -156,25 +88,21 @@ def build_mechanism_from_ir(
                     )
                 ),
             ).to_metadata()
-            authority_context = "normalized_public"
 
             eq_index = len(mechanism.equilibria)
-            _equilibrium, authority = mechanism._add_equilibrium_with_authority_context(
+            _equilibrium, authority = mechanism.add_equilibrium(
                 stoich_forward=reactants,
                 stoich_back=products,
-                Keq=Keq_model_value,
-                kf=kf_val,
-                kr=kr_val,
+                forward_model=step.forward_model,
+                kr=step.kr,
                 metadata=eq_metadata,
-                authority_context=authority_context,
             )
         else:
             rxn_index = len(mechanism.reactions)
             mechanism.add_reaction(
                 reactants=reactants,
                 products=products,
-                rate=step.kf,
-                overrides=rxn_overrides or None,
+                forward_model=step.forward_model,
             )
 
         # Record canonical authored step-index mapping for downstream layers (GUI/algebra/fitting).
@@ -196,8 +124,6 @@ def build_mechanism_from_ir(
         if is_equilibrium_step:
             entry["equilibrium_index"] = int(eq_index)
             entry.update(authority.step_map_fields())
-            entry["user_provided_kf"] = step.user_kf_explicit
-            entry["user_provided_kr"] = step.user_kr_explicit
         else:
             entry["reaction_index"] = int(rxn_index)
         entry["source_coordinates"] = source_coordinates

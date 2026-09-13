@@ -4,7 +4,7 @@ ODE solver wrappers for Kindred.
 
 SciPy is a hard dependency; all integration routes through `scipy.integrate.solve_ivp` with:
 - Deterministic `t_eval` output grid
-- Optional TemperatureSchedule wrapper that injects T into RHS(T=...) calls
+- Schedule execution supplies the selected temperature to RHS and Jacobian calls
 - Non-negative concentration invariant enforcement at output boundaries
 """
 
@@ -18,14 +18,12 @@ from typing import (
     Mapping,
     Sequence,
     Tuple,
-    cast,
 )
 
 import numpy as np
 from kindred.core.scipy_integrate import load_scipy_integrate
 from kindred.core.temperature import (
     TemperatureScheduleDictProtocol,
-    TemperatureScheduleProtocol,
 )
 from kindred.core.exceptions import (
     InitialConditionError,
@@ -48,8 +46,6 @@ from .intervention_schedule_execution import (
     SegmentRunResult,
 )
 from .solver_types import (
-    ODERhsNoTemp as _ODERhsNoTemp,
-    ODERhsWithTemp as _ODERhsWithTemp,
     Rhs2 as _Rhs2,
     SimulationCancellationControl as _SimulationCancellationControl,
     FinalSimulationOutput as _FinalSimulationOutput,
@@ -158,33 +154,6 @@ def normalize_solver_name(name: object) -> str:
     raise SolverError(f"Unsupported solver name {name!r}; expected one of: {allowed}.")
 
 
-class _TemperatureInjectedRhs:
-    def __init__(self, rhs: _ODERhsWithTemp, schedule: TemperatureScheduleProtocol) -> None:
-        self._rhs = rhs
-        self._schedule = schedule
-
-    def __call__(self, t: float, y: np.ndarray) -> np.ndarray:
-        T = float(self._schedule(t))
-        return self._rhs(t, y, T=T)
-
-
-class _CancellationRhs:
-    """Poll request cancellation immediately before scientific RHS work."""
-
-    def __init__(
-        self,
-        rhs: _Rhs2,
-        control: _SimulationCancellationControl,
-    ) -> None:
-        self._rhs = rhs
-        self._control = control
-
-    def __call__(self, t: float, y: np.ndarray) -> np.ndarray:
-        if self._control.cancel_requested():
-            raise SimulationCancelled()
-        return self._rhs(t, y)
-
-
 def _prepare_time_grid(req: _SimulationRequest, *, t0: float, t1: float) -> np.ndarray:
     if req.t_eval is None:
         if not isinstance(req.grid, Mapping) or not req.grid:
@@ -203,19 +172,6 @@ def _prepare_time_grid(req: _SimulationRequest, *, t0: float, t1: float) -> np.n
     if t_eval[0] < t0 or t_eval[-1] > t1:
         raise TimeGridError("t_eval must lie within t_span")
     return t_eval
-
-
-def _prepare_rhs(req: _SimulationRequest) -> _Rhs2:
-    if req.temperature_schedule is None:
-        rhs: _Rhs2 = cast(_ODERhsNoTemp, req.rhs)
-    else:
-        rhs = _TemperatureInjectedRhs(
-            cast(_ODERhsWithTemp, req.rhs), req.temperature_schedule
-        )
-
-    if req.cancellation_control is not None:
-        rhs = _CancellationRhs(rhs, req.cancellation_control)
-    return rhs
 
 
 def _build_provenance(req: _SimulationRequest, *, t_eval: np.ndarray) -> Dict[str, object]:
@@ -612,7 +568,6 @@ def solve_ode(
         raise InitialConditionError("y0 must contain non-negative concentrations")
     t0, t1 = map(float, req.t_span)
     t_eval = _prepare_time_grid(req, t0=t0, t1=t1)
-    rhs = _prepare_rhs(req)
     prov = _build_provenance(req, t_eval=t_eval)
 
     method = normalize_solver_name(req.solver)
@@ -620,7 +575,6 @@ def solve_ode(
         output = InterventionScheduleExecutionOwner(_run_scipy_segment).execute(
             ScheduleExecutionRequest(
                 request=req,
-                rhs=rhs,
                 t_eval=t_eval,
                 provenance=prov,
                 method=method,

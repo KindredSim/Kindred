@@ -20,15 +20,9 @@ from kindred.core.time_grid import normalize_time_grid_policy
 DEFAULT_SOLVER_NAME = "BDF"
 
 
-class ODERhsNoTemp(Protocol):
-    def __call__(self, t: float, y: np.ndarray) -> np.ndarray: ...
-
-
-class ODERhsWithTemp(Protocol):
+class ODERhs(Protocol):
     def __call__(self, t: float, y: np.ndarray, *, T: float) -> np.ndarray: ...
 
-
-ODERhs = ODERhsNoTemp | ODERhsWithTemp
 
 Rhs2 = Callable[[float, np.ndarray], np.ndarray]
 
@@ -166,6 +160,7 @@ class SimulationTermination:
 @dataclass(frozen=True)
 class SimulationRequest:
     rhs: ODERhs
+    reference_temperature_K: float
     t_span: Tuple[float, float]
     y0: np.ndarray
     intervention_execution: InterventionExecutionContract
@@ -183,7 +178,7 @@ class SimulationRequest:
     cancellation_control: SimulationCancellationControl | None = None
     candidate_evaluation: bool = False
     stop_observable_value: Callable[[str, float, np.ndarray, float], float] | None = None
-    parameter_values_at_time: Callable[[float, tuple[str, ...]], Mapping[str, float]] | None = None
+    parameter_values_at_temperature: Callable[[float, tuple[str, ...]], Mapping[str, float]] | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(
@@ -252,6 +247,7 @@ class FinalSimulationOutput:
     discontinuity_ids: np.ndarray
     t: np.ndarray
     Y: np.ndarray
+    temperature_K: np.ndarray
     provenance: Mapping[str, object]
     intervention_execution: InterventionExecutionContract
     presentation_boundaries: tuple[SimulationPresentationBoundary, ...] = ()
@@ -279,6 +275,12 @@ class FinalSimulationOutput:
             raise ValueError("Simulation output state rows must align with time.")
         if np.any(~np.isfinite(Y)) or np.any(Y < 0.0):
             raise ValueError("Simulation output states must be finite and nonnegative.")
+        temperature = np.asarray(self.temperature_K, dtype=float)
+        if (temperature.shape != t.shape or np.any(~np.isfinite(temperature))
+                or np.any(temperature <= 0.0)):
+            raise ValueError("Executed temperatures must be positive, finite, and aligned with output rows.")
+        temperature.setflags(write=False)
+        object.__setattr__(self, "temperature_K", temperature)
         t.setflags(write=False)
         Y.setflags(write=False)
         object.__setattr__(self, "t", t)

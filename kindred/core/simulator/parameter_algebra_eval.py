@@ -38,9 +38,6 @@ def bind_parameter_evaluation(
     for name, value in dict(metadata.get("scalar_params") or {}).items():
         if name in independent:
             values[name] = float(value)
-    for name, binding in dict(metadata.get("scalar_param_bindings") or {}).items():
-        if name in independent:
-            values[name] = float(binding())
     values.update(base_values or {})
     values["T"] = float(MechanismMetadataView.from_metadata(metadata).temperature_K)
     expression = bind_scalar_expression_evaluator(spec.parameter_block, values)

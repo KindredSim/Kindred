@@ -10,6 +10,8 @@ and are evaluated as net forward minus reverse rates (no reaction duplication).
 
 from __future__ import annotations
 
+from kindred.core.kinetics import forward_rate_model_payload
+
 import math
 import logging
 from dataclasses import dataclass
@@ -27,15 +29,6 @@ from .species import validate_temperature
 from .simulator.solver_types import (
     SimulationScientificUnavailability,
     _SimulationScientificUnavailabilitySignal,
-)
-from .kinetics import (
-    ArrheniusRateModel,
-    ConstantRateModel,
-    EyringRateModel,
-    ForwardRateModel,
-    forward_rate_family,
-    forward_rate_model_for_equilibrium,
-    forward_rate_model_for_reaction,
 )
 
 logger = logging.getLogger(__name__)
@@ -67,28 +60,6 @@ def _stoichiometric_flux_product(
         return np.sum(products, axis=1, dtype=float)
     np.sum(products, axis=1, out=out)
     return out.copy()
-
-
-def _forward_rate_model_payload(model: ForwardRateModel) -> dict[str, object]:
-    family = forward_rate_family(model)
-    if isinstance(model, ConstantRateModel):
-        fields: dict[str, object] = {"k": float(model.k)}
-    elif isinstance(model, ArrheniusRateModel):
-        fields = {
-            "A": float(model.A),
-            "Ea_J_per_mol": float(model.Ea_J_per_mol),
-        }
-    elif isinstance(model, EyringRateModel):
-        fields = {
-            "dG_act_J_per_mol": float(model.dG_act_J_per_mol),
-            "kappa": float(model.kappa),
-            "standard_conc_M": float(model.standard_conc_M),
-            "molecularity": float(model.molecularity),
-            "degeneracy": int(model.degeneracy),
-        }
-    else:
-        raise TypeError("Unsupported typed forward-rate model.")
-    return {"family": family, **fields}
 
 
 @dataclass(frozen=True, slots=True)
@@ -228,7 +199,6 @@ def build_effective_rate_coefficient_evaluator(
         getattr(mechanism, "metadata", {}) or {}
     )
     nominal_temperature = float(mech_meta.temperature_K)
-    default_standard_conc = float(mech_meta.standard_conc_M)
     from .simulator.parameter_algebra_eval import bind_parameter_evaluation
     from .simulator.parameter_algebra_spec import admit_parameter_evaluation_graph, parse_parameter_algebra_spec_from_dsl_text
     from .simulator.parameter_namespace import build_namespace_from_mechanism
@@ -249,9 +219,9 @@ def build_effective_rate_coefficient_evaluator(
             number = entries[kind, index]["step_index"]
             forward_name = f"k{number}" if kind == "reaction" else f"kf{number}"
             reverse_name = None if kind == "reaction" else f"kr{number}"
-            model = (forward_rate_model_for_reaction(step, default_standard_conc_M=default_standard_conc)
-                     if kind == "reaction" else forward_rate_model_for_equilibrium(step, temperature_K=None, default_standard_conc_M=default_standard_conc))
-            snapshot = {"kind": kind, "forward_model": _forward_rate_model_payload(model),
+            model = (step.forward_model
+                     if kind == "reaction" else step.forward_model)
+            snapshot = {"kind": kind, "forward_model": forward_rate_model_payload(model),
                         "binding_name" if kind == "reaction" else "forward_binding_name": forward_name,
                         "value_dependencies": tuple(spec.evaluation_dependencies.get(forward_name, ())),
                         "temperature_dependent": forward_name in spec.temperature_dependent_names}
@@ -392,8 +362,8 @@ def _build_bound_ode_rhs(
 
     Notes
     -----
-    - Rates come from Mechanism.rate bindings or Arrhenius/Eyring overrides in
-      kinetics.py; T defaults to mechanism.metadata["temperature_K"] if omitted.
+    - Rates come from the admitted typed forward model and reverse authority;
+      T defaults to the declared reference temperature if omitted.
     - Reactions contribute: rate = k * ∏[reactants]^stoich
     - Equilibria remain a single reversible step with rate = v_fwd - v_rev
       (stoichiometry is not duplicated into two irreversible columns).
@@ -443,20 +413,8 @@ def _build_bound_ode_rhs(
             if 0 <= idx < len(topology.step_kinds):
                 step_type = topology.step_kinds[idx]
                 step_names.append(f"{step_type}{idx}")
-                if step_type == "reaction":
-                    binding = getattr(mechanism.reactions[idx], "rate", None)
-                    binding_name = getattr(binding, "name", None)
-                    if binding_name is not None:
-                        names.append(str(binding_name))
-                else:
-                    equilibrium = mechanism.equilibria[idx - n_reactions]
-                    for binding in (
-                        getattr(equilibrium, "kf", None),
-                        getattr(equilibrium, "kr", None),
-                    ):
-                        binding_name = getattr(binding, "name", None)
-                        if binding_name is not None:
-                            names.append(str(binding_name))
+                names.extend(name for name in coefficient_evaluator._parameter_names[idx]
+                             if name is not None)
         payload = {
             "step_names": tuple(step_names),
             "step_indices": tuple(int(index) for index in selected),

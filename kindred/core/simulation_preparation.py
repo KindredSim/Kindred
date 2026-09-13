@@ -314,7 +314,7 @@ class PreparedSimulationRun:
     unresolved_intervention_schedule: InterventionSchedule | None = None
     cancellation_control: SimulationCancellationControl | None = None
     stop_observable_value: Callable[[str, float, np.ndarray, float], float] | None = None
-    parameter_values_at_time: Callable[[float, tuple[str, ...]], Mapping[str, float]] | None = None
+    parameter_values_at_temperature: Callable[[float, tuple[str, ...]], Mapping[str, float]] | None = None
 
     def __post_init__(self) -> None:
         y0 = np.asarray(self.y0, dtype=float).reshape(-1).copy()
@@ -348,6 +348,7 @@ def build_simulation_request_from_prepared_run(
     _raise_if_cancelled(cancellation_control)
     result = SimulationRequest(
         rhs=prepared_run.rhs,
+        reference_temperature_K=float(request.prepared_dsl.analysis.temperature_K),
         t_span=request.t_span,
         y0=np.asarray(y0, dtype=float).reshape(-1),
         intervention_execution=intervention_execution,
@@ -362,7 +363,7 @@ def build_simulation_request_from_prepared_run(
         t_eval=t_eval,
         candidate_evaluation=candidate_evaluation,
         stop_observable_value=prepared_run.stop_observable_value,
-        parameter_values_at_time=prepared_run.parameter_values_at_time,
+        parameter_values_at_temperature=prepared_run.parameter_values_at_temperature,
     )
     _raise_if_cancelled(cancellation_control)
     return result
@@ -855,7 +856,6 @@ def _apply_parameter_overrides_to_prepared_mechanism(
         apply_parameter_algebra_spec_to_mechanism(
             parameter_algebra_spec,
             mechanism=mechanism,
-            require_mutable=True,
             parameter_target_map=parameter_target_map,
             mechanism_coordinate_overrides=mechanism_coordinate_values,
             scalar_parameter_overrides=scalar_override_values,
@@ -954,7 +954,9 @@ def prepare_simulation_run(
                 )
                 resolved_schedule = _resolve_intervention_schedule_for_request(
                     unresolved_intervention_schedule,
-                    parameter_values=_coefficient_evaluator.parameter_values(_coefficient_evaluator.nominal_temperature_K, clock_roots),
+                    parameter_values=(_coefficient_evaluator.parameter_values(
+                        _coefficient_evaluator.nominal_temperature_K, clock_roots
+                    ) if clock_roots else {}),
                     runtime_parameters=payload_names,
                     dependency_metadata=dependency_metadata,
                 )
@@ -1007,11 +1009,10 @@ def prepare_simulation_run(
     except Exception as exc:
         raise SimulationPreparationError("initials_for_algebra", str(exc)) from exc
 
-    from kindred.core.simulation_algebra_context import prepare_simulation_algebra_symbols, runtime_algebra_symbol_names
+    from kindred.core.simulation_algebra_context import runtime_algebra_symbol_names
+    from kindred.core.temperature import temperature_at_execution_time
     runtime_names = runtime_algebra_symbol_names(parameter_algebra_spec)
-    symbols = prepare_simulation_algebra_symbols(
-        temperature_schedule=temperature_schedule, coefficient_evaluator=_coefficient_evaluator,
-    )
+    symbols = _coefficient_evaluator.parameter_values
     stop_observable_value = None
     if intervention_execution is not None:
         from kindred.core.intervention_schedule import ObservableTriggerCondition, InterventionStopAction
@@ -1032,7 +1033,10 @@ def prepare_simulation_run(
                     root for roots in target_roots.values() for root in roots
                     if root not in runtime_names
                 }))
-                static = _coefficient_evaluator.parameter_values(_coefficient_evaluator.nominal_temperature_K, static_roots)
+                static = (symbols(temperature_at_execution_time(
+                    temperature_schedule, _coefficient_evaluator.nominal_temperature_K,
+                    execution_request.t_span[0],
+                ), static_roots) if static_roots else {})
                 evaluator = prepare_algebra_stop_evaluator(
                     compiled, target_names=targets,
                     species_names=tuple(species_names), initials=initials_for_algebra,
@@ -1048,8 +1052,8 @@ def prepare_simulation_run(
                 raise SimulationPreparationError("stopping_intervention", f"Stopping {context}: {exc}",
                                                  details={"stop_declarations": declarations}) from exc
 
-            def stop_observable_value(name: str, time: float, state: np.ndarray, symbol_time: float) -> float:
-                return evaluator.evaluate(name, time, state, symbols(symbol_time, target_roots[name]))
+            def stop_observable_value(name: str, time: float, state: np.ndarray, temperature_K: float) -> float:
+                return evaluator.evaluate(name, time, state, symbols(temperature_K, target_roots[name]))
 
     request = execution_request
 
@@ -1067,7 +1071,7 @@ def prepare_simulation_run(
         unresolved_intervention_schedule=unresolved_intervention_schedule,
         cancellation_control=cancellation_control,
         stop_observable_value=stop_observable_value,
-        parameter_values_at_time=symbols,
+        parameter_values_at_temperature=symbols,
     )
 
 

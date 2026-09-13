@@ -19,7 +19,7 @@ from kindred.core.intervention_schedule_compiler import (
     validate_boundary_conflicts,
     resolve_executable_values,
 )
-from kindred.core.temperature import declared_temperature_step_boundaries, temperature_schedule_execution_identity
+from kindred.core.temperature import declared_temperature_step_boundaries, temperature_at_execution_time
 from kindred.core.species import TIME_MAX_S
 from .nonnegative_invariant import (
     NonnegativeProjection,
@@ -27,6 +27,7 @@ from .nonnegative_invariant import (
 )
 from .solver_types import (
     FinalSimulationOutput,
+    ODERhs,
     Rhs2,
     SimulationScientificUnavailability,
     _SimulationScientificUnavailabilitySignal,
@@ -165,6 +166,7 @@ class SegmentProjection:
 class _BoundaryApplicationResult:
     continuation_state: np.ndarray
     projection: NonnegativeProjection
+    temperature_K: float
     presentation_boundary: SimulationPresentationBoundary | None = None
     termination: SimulationTermination | None = None
     skipped_instants: tuple[ExecutableInstant, ...] = ()
@@ -177,7 +179,6 @@ class BaseSegmentRunner(Protocol):
 @dataclass(frozen=True)
 class ScheduleExecutionRequest:
     request: SimulationRequest
-    rhs: Rhs2
     t_eval: np.ndarray
     provenance: dict[str, object]
     method: str
@@ -189,6 +190,12 @@ class InterventionScheduleExecutionOwner:
 
     def execute(self, request: ScheduleExecutionRequest) -> FinalSimulationOutput:
         req = request.request
+
+        def temperature_at(time, *, side="following"):
+            return temperature_at_execution_time(
+                req.temperature_schedule, req.reference_temperature_K, time, side=side,
+            )
+
         t0, t1 = req.t_span
         t_eval = np.asarray(request.t_eval, dtype=float).reshape(-1)
         contract = req.intervention_execution
@@ -210,6 +217,7 @@ class InterventionScheduleExecutionOwner:
             executed_values: dict[ExecutableInstant, ExecutableInstant] = {}
             outputs_t: list[np.ndarray] = []
             outputs_y: list[np.ndarray] = []
+            outputs_temperature: list[np.ndarray] = []
             output_segment_ids: list[np.ndarray] = []
             output_segment_keys: list[tuple[str, ...]] = []
             output_discontinuity_ids: list[np.ndarray] = []
@@ -224,12 +232,6 @@ class InterventionScheduleExecutionOwner:
                 t_start=t0,
                 t_end=t1,
             )
-
-            if has_stops:
-                temperature_identity = temperature_schedule_execution_identity(req.temperature_schedule)
-                if temperature_identity is not None and temperature_identity.get("type") == "piecewise_steps":
-                    temperature_boundaries = tuple(float(item["time"]) for item in temperature_identity["steps"]
-                                                   if t0 < float(item["time"]) <= t1)
 
             boundaries = {
                 t0,
@@ -248,6 +250,7 @@ class InterventionScheduleExecutionOwner:
             ordered_boundaries = sorted(boundaries)
 
             _raise_if_cancelled(cancellation_check)
+            current_temperature = temperature_at(t0)
             initial_state_transaction = t0 in contract.discontinuities
             initial_boundary = _apply_boundary(
                 current_y,
@@ -263,8 +266,12 @@ class InterventionScheduleExecutionOwner:
                 cancellation_check=cancellation_check,
                 observable_value=req.stop_observable_value,
                 temperature_step=t0 in temperature_boundaries,
-            parameter_values=req.parameter_values_at_time, executed_values=executed_values,)
+            parameter_values=req.parameter_values_at_temperature, executed_values=executed_values,
+                                   temperature_K=current_temperature,
+                                   temperature_at=temperature_at,
+                               )
             current_y = initial_boundary.continuation_state
+            current_temperature = initial_boundary.temperature_K
             termination = initial_boundary.termination
             skipped_instants = initial_boundary.skipped_instants
             _append_presentation_boundary(
@@ -282,6 +289,8 @@ class InterventionScheduleExecutionOwner:
                 segment_id=0,
                 segment_key="integration:0",
                 discontinuity_id=discontinuity_id,
+                output_temperatures=outputs_temperature,
+                temperature_K=current_temperature,
             )
             _raise_if_cancelled(cancellation_check)
             segment_starts_after_discontinuity = initial_state_transaction
@@ -306,32 +315,33 @@ class InterventionScheduleExecutionOwner:
                     active_fluxes = _active_fluxes(contract, sub_start)
                     active_holds = _active_holds(contract, sub_start)
                     current_y = _apply_holds(
-                        current_y,
-                        active_holds,
+                        current_y, active_holds, species_index=species_index,
+                        cancellation_check=cancellation_check, time=sub_start,
+                        temperature_K=current_temperature,
+                        parameter_values=req.parameter_values_at_temperature,
+                    )
+
+                    def segment_temperature(time, end=sub_end):
+                        return temperature_at(time, side=(
+                            "preceding" if time == end and end in temperature_boundaries
+                            else "following"
+                        ))
+
+                    segment_rhs = _InterventionRhs(
+                        req.rhs, fluxes=active_fluxes, holds=active_holds,
                         species_index=species_index,
+                        parameter_values=req.parameter_values_at_temperature,
+                        temperature_at=segment_temperature,
                         cancellation_check=cancellation_check,
-                    time=sub_start, parameter_values=req.parameter_values_at_time,)
-                    def symbol_time(time, end=sub_end):
-                        return float(np.nextafter(time, -np.inf)) if time == end and end in temperature_boundaries else time
-                    segment_rhs: Rhs2 = request.rhs
-                    if active_fluxes or active_holds or sub_end in temperature_boundaries:
-                        segment_rhs = _InterventionRhs(
-                            request.rhs,
-                            fluxes=active_fluxes,
-                            holds=active_holds,
-                            species_index=species_index,
-                        parameter_values=req.parameter_values_at_time, symbol_time=symbol_time,)
+                    )
                     trigger_callables, trigger_mapping = _trigger_callables(
-                        contract.triggers,
-                        species_index=species_index,
-                        segment_start=sub_start,
-                        segment_state=current_y,
-                        trigger_counts=trigger_counts,
-                        trigger_last_times=trigger_last_times,
+                        contract.triggers, species_index=species_index,
+                        segment_start=sub_start, segment_state=current_y,
+                        trigger_counts=trigger_counts, trigger_last_times=trigger_last_times,
                         observable_value=req.stop_observable_value,
-                        segment_end=sub_end,
-                        temperature_step_at_end=sub_end in temperature_boundaries,
-                    parameter_values=req.parameter_values_at_time, holds=active_holds,)
+                        temperature_at=segment_temperature,
+                        parameter_values=req.parameter_values_at_temperature, holds=active_holds,
+                    )
                     # SciPy truncates a simultaneous active-event set at the first
                     # terminal event.  Register every trigger first as a
                     # non-terminal observer, then repeat the same callables as
@@ -361,29 +371,20 @@ class InterventionScheduleExecutionOwner:
                             + tuple(True for _ in trigger_stoppers)
                             + tuple(True for _ in purge_stoppers)
                     )
-                    if active_holds or active_fluxes or sub_end in temperature_boundaries:
-                        segment_symbolic_jacobian = segment_request.symbolic_jacobian
-                        transformed_jacobian = (
-                            None
-                            if segment_symbolic_jacobian.jacobian_func is None
-                            else _InterventionJacobian(
-                                segment_symbolic_jacobian.jacobian_func,
-                                rhs=segment_rhs,
-                                holds=active_holds,
-                                fluxes=active_fluxes,
-                                species_index=species_index,
-                            )
-                        )
+                    segment_symbolic_jacobian = segment_request.symbolic_jacobian
+                    if segment_symbolic_jacobian.jacobian_func is not None:
                         segment_request = replace(
                             segment_request,
                             symbolic_jacobian=replace(
                                 segment_symbolic_jacobian,
-                                jacobian_func=transformed_jacobian,
-                                jac_sparsity=_transform_jacobian_sparsity(
-                                    segment_symbolic_jacobian.jac_sparsity,
-                                    holds=active_holds,
+                                jacobian_func=_InterventionJacobian(
+                                    segment_symbolic_jacobian.jacobian_func,
+                                    rhs=segment_rhs, holds=active_holds, fluxes=active_fluxes,
                                     species_index=species_index,
-                                    size=current_y.size,
+                                ),
+                                jac_sparsity=_transform_jacobian_sparsity(
+                                    segment_symbolic_jacobian.jac_sparsity, holds=active_holds,
+                                    species_index=species_index, size=current_y.size,
                                 ),
                             ),
                         )
@@ -394,7 +395,7 @@ class InterventionScheduleExecutionOwner:
                         t_eval,
                         start=sub_start,
                         end=sub_end,
-                        is_final=(sub_end == t1),
+                        is_final=(sub_end == t1 and sub_end not in temperature_boundaries),
                     )
                     if has_stops:
                         requested = np.empty(0, dtype=float)
@@ -430,19 +431,6 @@ class InterventionScheduleExecutionOwner:
                     _raise_if_cancelled(cancellation_check)
                     event_times = segment_result.event_times
                     event_states = segment_result.raw_event_states
-                    if active_holds:
-                        event_states = tuple(
-                            tuple(
-                                _apply_holds(
-                                    state,
-                                    active_holds,
-                                    species_index=species_index,
-                                    cancellation_check=cancellation_check,
-                                time=symbol_time(event_time), parameter_values=req.parameter_values_at_time,)
-                                for event_time, state in zip(times, states, strict=True)
-                            )
-                            for times, states in zip(event_times, event_states, strict=True)
-                        )
                     trigger_hit = (
                         _first_trigger_hit(
                             event_times,
@@ -477,12 +465,13 @@ class InterventionScheduleExecutionOwner:
                     ):
                         trigger_hit = None
                     seg_t = segment_result.t
+                    seg_temperature = _selected_temperatures(seg_t, segment_temperature, cancellation_check)
                     seg_y = _apply_holds_to_trajectory(
                         segment_result.Y,
                         active_holds,
                         species_index=species_index,
                         cancellation_check=cancellation_check,
-                    times=[symbol_time(float(t)) for t in seg_t], parameter_values=req.parameter_values_at_time,)
+                    times=seg_t, temperatures=seg_temperature, parameter_values=req.parameter_values_at_temperature,)
                     _validate_segment_output(
                         seg_t,
                         seg_y,
@@ -543,22 +532,31 @@ class InterventionScheduleExecutionOwner:
                     }
                     integration_segments.append(segment_payload)
                     segment_count += 1
+                    current_temperature = (
+                        float(seg_temperature[-1])
+                        if seg_t.size and seg_t[-1] == actual_segment_end
+                        else segment_temperature(actual_segment_end)
+                    )
                     if trigger_hit is not None:
-                        root_time, trigger_indices, root_state = trigger_hit
-                        current_y = root_state.copy()
+                        terminal_state = trigger_hit[2]
                     elif purge_hit is not None:
-                        current_y = purge_hit[2].copy()
+                        terminal_state = purge_hit[2]
                     else:
-                        if segment_result.raw_terminal_state is None:
+                        terminal_state = segment_result.raw_terminal_state
+                        if terminal_state is None:
                             raise InterventionScheduleError(
                                 "Completed solver segment is missing its exact raw terminal state."
                             )
-                        current_y = _apply_holds(
-                            segment_result.raw_terminal_state,
-                            active_holds,
-                            species_index=species_index,
-                            cancellation_check=cancellation_check,
-                        time=symbol_time(sub_end), parameter_values=req.parameter_values_at_time,)
+                    current_y = _apply_holds(
+                        terminal_state, active_holds, species_index=species_index,
+                        cancellation_check=cancellation_check, time=actual_segment_end,
+                        temperature_K=current_temperature,
+                        parameter_values=req.parameter_values_at_temperature,
+                    )
+                    if trigger_hit is not None:
+                        trigger_hit = (trigger_hit[0], trigger_hit[1], current_y.copy())
+                    if purge_hit is not None:
+                        purge_hit = (purge_hit[0], purge_hit[1], current_y.copy())
                     scheduled_discontinuity = (
                         trigger_hit is None
                         and (
@@ -570,18 +568,22 @@ class InterventionScheduleExecutionOwner:
                     emit_count = min(requested.size, seg_t.size)
                     emit_t = seg_t[:emit_count]
                     emit_y = seg_y[:, :emit_count]
+                    emit_temperature = seg_temperature[:emit_count]
                     if trigger_hit is not None:
                         emit_mask = emit_t < float(trigger_hit[0])
                         emit_t = emit_t[emit_mask]
                         emit_y = emit_y[:, emit_mask]
+                        emit_temperature = emit_temperature[emit_mask]
                     elif purge_hit is not None:
                         emit_mask = emit_t < float(purge_hit[0])
                         emit_t = emit_t[emit_mask]
                         emit_y = emit_y[:, emit_mask]
+                        emit_temperature = emit_temperature[emit_mask]
                     elif scheduled_discontinuity:
                         emit_mask = emit_t < float(sub_end)
                         emit_t = emit_t[emit_mask]
                         emit_y = emit_y[:, emit_mask]
+                        emit_temperature = emit_temperature[emit_mask]
                     _append_identity_samples(
                         outputs_t,
                         outputs_y,
@@ -593,6 +595,8 @@ class InterventionScheduleExecutionOwner:
                         segment_id=segment_identity.ordinal,
                         segment_key=segment_identity.key,
                         discontinuity_id=discontinuity_id,
+                        output_temperatures=outputs_temperature,
+                        temperatures=emit_temperature,
                     )
                     if trigger_hit is None:
                         if purge_hit is not None and purge_hit[0] < sub_end:
@@ -607,6 +611,8 @@ class InterventionScheduleExecutionOwner:
                                 segment_id=segment_count,
                                 segment_key=f"integration:{segment_count}",
                                 discontinuity_id=discontinuity_id,
+                                output_temperatures=outputs_temperature,
+                                temperature_K=current_temperature,
                             )
                             sub_start = float(purge_hit[0])
                             segment_starts_after_discontinuity = False
@@ -624,6 +630,8 @@ class InterventionScheduleExecutionOwner:
                                     segment_id=segment_count,
                                     segment_key=f"integration:{segment_count}",
                                     discontinuity_id=discontinuity_id,
+                                    output_temperatures=outputs_temperature,
+                                    temperature_K=current_temperature,
                                 )
                             boundary_result = _apply_boundary(
                                 current_y,
@@ -639,8 +647,12 @@ class InterventionScheduleExecutionOwner:
                                 cancellation_check=cancellation_check,
                                 observable_value=req.stop_observable_value,
                                 temperature_step=sub_end in temperature_boundaries,
-                            parameter_values=req.parameter_values_at_time, executed_values=executed_values,)
+                            parameter_values=req.parameter_values_at_temperature, executed_values=executed_values,
+                                                  temperature_K=current_temperature,
+                                                  temperature_at=temperature_at,
+                                              )
                             current_y = boundary_result.continuation_state
+                            current_temperature = boundary_result.temperature_K
                             termination = boundary_result.termination
                             skipped_instants = boundary_result.skipped_instants
                             _append_presentation_boundary(
@@ -673,8 +685,12 @@ class InterventionScheduleExecutionOwner:
                                 cancellation_check=cancellation_check,
                                 observable_value=req.stop_observable_value,
                                 temperature_step=outer_end in temperature_boundaries,
-                            parameter_values=req.parameter_values_at_time, executed_values=executed_values,)
+                            parameter_values=req.parameter_values_at_temperature, executed_values=executed_values,
+                                                  temperature_K=current_temperature,
+                                                  temperature_at=temperature_at,
+                                              )
                             current_y = boundary_result.continuation_state
+                            current_temperature = boundary_result.temperature_K
                             termination = boundary_result.termination
                             skipped_instants = boundary_result.skipped_instants
                             _append_presentation_boundary(
@@ -705,6 +721,8 @@ class InterventionScheduleExecutionOwner:
                                     segment_id=post_segment_id,
                                     segment_key=f"integration:{post_segment_id}",
                                     discontinuity_id=discontinuity_id,
+                                    output_temperatures=outputs_temperature,
+                                    temperature_K=current_temperature,
                                 )
                                 segment_starts_after_discontinuity = outer_end < t1
                             elif (
@@ -727,6 +745,8 @@ class InterventionScheduleExecutionOwner:
                                     segment_id=post_segment_id,
                                     segment_key=f"integration:{post_segment_id}",
                                     discontinuity_id=discontinuity_id,
+                                    output_temperatures=outputs_temperature,
+                                    temperature_K=current_temperature,
                                 )
                                 segment_starts_after_discontinuity = False
                             elif outer_end == t1:
@@ -741,6 +761,8 @@ class InterventionScheduleExecutionOwner:
                                     segment_id=segment_output_identity.ordinal,
                                     segment_key=segment_output_identity.key,
                                     discontinuity_id=discontinuity_id,
+                                    output_temperatures=outputs_temperature,
+                                    temperature_K=current_temperature,
                                 )
                                 segment_starts_after_discontinuity = False
                             else:
@@ -761,8 +783,12 @@ class InterventionScheduleExecutionOwner:
                         cancellation_check=cancellation_check,
                         observable_value=req.stop_observable_value,
                         temperature_step=root_time in temperature_boundaries,
-                    parameter_values=req.parameter_values_at_time, executed_values=executed_values,)
+                    parameter_values=req.parameter_values_at_temperature, executed_values=executed_values,
+                                          temperature_K=current_temperature,
+                                          temperature_at=temperature_at,
+                                      )
                     current_y = boundary_result.continuation_state
+                    current_temperature = boundary_result.temperature_K
                     termination = boundary_result.termination
                     skipped_instants = boundary_result.skipped_instants
                     _append_presentation_boundary(
@@ -793,6 +819,8 @@ class InterventionScheduleExecutionOwner:
                         segment_id=post_segment_id,
                         segment_key=f"integration:{post_segment_id}",
                         discontinuity_id=discontinuity_id,
+                        output_temperatures=outputs_temperature,
+                        temperature_K=current_temperature,
                     )
                     segment_starts_after_discontinuity = root_time < t1
                     sub_start = root_time
@@ -803,9 +831,11 @@ class InterventionScheduleExecutionOwner:
             if outputs_t:
                 output_t = np.concatenate(outputs_t)
                 output_y = np.concatenate(outputs_y, axis=1)
+                output_temperature = np.concatenate(outputs_temperature)
             else:
                 output_t = np.empty(0, dtype=float)
                 output_y = np.empty((current_y.size, 0), dtype=float)
+                output_temperature = np.empty(0, dtype=float)
             if not output_t.size or float(output_t[-1]) != actual_end:
                 _append_identity_row(
                     outputs_t,
@@ -818,9 +848,12 @@ class InterventionScheduleExecutionOwner:
                     segment_id=max(0, segment_count - 1),
                     segment_key=f"integration:{max(0, segment_count - 1)}",
                     discontinuity_id=discontinuity_id,
+                    output_temperatures=outputs_temperature,
+                    temperature_K=current_temperature,
                 )
                 output_t = np.concatenate(outputs_t)
                 output_y = np.concatenate(outputs_y, axis=1)
+                output_temperature = np.concatenate(outputs_temperature)
             if has_stops:
                 from kindred.core.time_grid import build_time_grid
                 try:
@@ -833,6 +866,7 @@ class InterventionScheduleExecutionOwner:
                 )
                 final_times = np.union1d(base_times, output_t)
                 final_states = np.empty((current_y.size, final_times.size), dtype=float)
+                final_temperatures = np.empty(final_times.size, dtype=float)
                 final_ids = np.empty(final_times.size, dtype=np.int64)
                 final_keys = np.empty(final_times.size, dtype=object)
                 final_discontinuities = np.empty(final_times.size, dtype=np.int64)
@@ -840,6 +874,7 @@ class InterventionScheduleExecutionOwner:
                 # Exact executor rows own intervention and termination boundaries.
                 boundary_rows = np.searchsorted(final_times, output_t)
                 final_states[:, boundary_rows] = output_y
+                final_temperatures[boundary_rows] = output_temperature
                 final_ids[boundary_rows] = boundary_ids
                 final_keys[boundary_rows] = boundary_keys
                 final_discontinuities[boundary_rows] = boundary_discontinuities
@@ -869,17 +904,20 @@ class InterventionScheduleExecutionOwner:
                         _raise_if_cancelled(cancellation_check)
                         chunk_end = min(sample_start + 256, sample_end)
                         rows = sample_rows[sample_start:chunk_end]
-                        raw_states = dense(sample_times[sample_start:chunk_end])
+                        selected_times = sample_times[sample_start:chunk_end]
+                        selected_temperatures = _selected_temperatures(selected_times, temperature_at, cancellation_check)
+                        raw_states = dense(selected_times)
                         _raise_if_cancelled(cancellation_check)
                         raw_states = _apply_holds_to_trajectory(
                             raw_states, holds, species_index=species_index,
                             cancellation_check=cancellation_check,
-                        times=sample_times[sample_start:chunk_end], parameter_values=req.parameter_values_at_time,)
+                        times=selected_times, temperatures=selected_temperatures, parameter_values=req.parameter_values_at_temperature,)
                         projected, projection = project_nonnegative_trajectory(
                             raw_states, context="Actual-interval sampling",
                         )
                         _raise_if_cancelled(cancellation_check)
                         final_states[:, rows] = projected
+                        final_temperatures[rows] = selected_temperatures
                         final_ids[rows] = identity_record.ordinal
                         final_keys[rows] = identity_record.key
                         final_discontinuities[rows] = discontinuity
@@ -899,6 +937,7 @@ class InterventionScheduleExecutionOwner:
                     raise InterventionScheduleError("Actual-interval sample is outside its continuous segment.")
                 _raise_if_cancelled(cancellation_check)
                 output_t, output_y = final_times, final_states
+                output_temperature = final_temperatures
                 output_segment_ids, output_segment_keys, output_discontinuity_ids = [final_ids], [tuple(final_keys)], [final_discontinuities]
                 dense_segments.clear()
             if output_t.size > 1 and np.any(np.diff(output_t) <= 0.0):
@@ -915,6 +954,7 @@ class InterventionScheduleExecutionOwner:
             # the standalone result can adopt them without defensive recapture.
             output_t.setflags(write=False)
             output_y.setflags(write=False)
+            output_temperature.setflags(write=False)
             final_contract = replace(
                 contract,
                 trigger_firings=tuple(trigger_firings),
@@ -950,6 +990,7 @@ class InterventionScheduleExecutionOwner:
             return FinalSimulationOutput(
                 t=output_t,
                 Y=output_y,
+                temperature_K=output_temperature,
                 provenance=provenance,
                 intervention_execution=final_contract,
                 presentation_boundaries=tuple(presentation_boundaries),
@@ -1197,13 +1238,13 @@ def _trigger_value(
     trigger: ExecutableTrigger, time: float, state: np.ndarray,
     *, species_index: Mapping[str, int],
     observable_value: Callable[[str, float, np.ndarray, float], float] | None,
-    symbol_time: float | None = None,
+    temperature_K: float,
 ) -> float:
     try:
         if isinstance(trigger.condition, SpeciesTriggerCondition):
             value = float(state[species_index[trigger.condition.name]])
         else:
-            value = float(observable_value(trigger.condition.name, time, state, time if symbol_time is None else symbol_time))
+            value = float(observable_value(trigger.condition.name, time, state, temperature_K))
         if not math.isfinite(value):
             raise ValueError("the watched quantity is not finite")
         return value
@@ -1236,6 +1277,8 @@ def _apply_boundary(
     cancellation_check: Callable[[], bool] | None,
     observable_value: Callable[[str, float, np.ndarray, float], float] | None = None,
     temperature_step: bool = False,
+    temperature_K: float,
+    temperature_at,
     parameter_values=None, executed_values=None,
 ) -> _BoundaryApplicationResult:
     if executed_values is None:
@@ -1250,8 +1293,7 @@ def _apply_boundary(
     entering_holds = tuple(item for item in active_holds if item.start_time == boundary)
     chemical_indices = tuple(index for index in trigger_indices if index not in stops)
     trigger_instants = tuple(_trigger_action_instant(contract.triggers[index], time=boundary) for index in chemical_indices)
-    if not stops:
-        validate_boundary_conflicts(instants=_resolve_items(static + trigger_instants, boundary, parameter_values), entering_holds=_resolve_items(entering_holds, boundary, parameter_values), cancellation_check=cancellation_check)
+    root_temperature = temperature_K
     changed = False
     executed_instants: list[ExecutableInstant] = []
 
@@ -1261,7 +1303,7 @@ def _apply_boundary(
         trigger_last_times[index] = boundary
         trigger_firings.append(TriggerFiring(
             declaration_ordinal=trigger.declaration_ordinal, condition=trigger.condition,
-            threshold=_resolve_items((trigger,), float(np.nextafter(boundary, -np.inf)) if temperature_step and index in trigger_indices else boundary, parameter_values)[0].threshold, direction=trigger.direction, root_time=boundary,
+            threshold=_resolve_items((trigger,), boundary, parameter_values, temperature_K=root_temperature if index in trigger_indices else temperature_K)[0].threshold, direction=trigger.direction, root_time=boundary,
             event_state=_project_public_event_state({name: float((current if isinstance(trigger.then, InterventionStopAction) else exact_root)[position]) for name, position in species_index.items()}),
             firing_ordinal=trigger_counts[index], nested_action_payload=trigger.then.to_payload() if action is None else {"op": action.op, "species": action.species, "value" if action.op == "set" else "delta": action.value if action.op == "set" else action.delta},
         ))
@@ -1276,7 +1318,7 @@ def _apply_boundary(
             record(stop)
             termination = SimulationTermination(boundary, "stop", contract.triggers[stop].declaration_ordinal)
         return _BoundaryApplicationResult(
-            continuation.reshape(-1), projection,
+            continuation.reshape(-1), projection, temperature_K,
             _presentation_boundary_if_changed(time=boundary, pre_state=exact_root, post_state=current,
                                               species_index=species_index, changed=changed),
             termination,
@@ -1286,14 +1328,14 @@ def _apply_boundary(
             ),
         )
 
-    def crossed_stop(before: np.ndarray, *, before_symbol_time: float | None = None) -> int | None:
+    def crossed_stop(before: np.ndarray, *, before_temperature_K: float | None = None) -> int | None:
         for index in stops:
             trigger = contract.triggers[index]
             previous = _trigger_value(trigger, boundary, before, species_index=species_index,
-                                      observable_value=observable_value, symbol_time=before_symbol_time)
-            following = _trigger_value(trigger, boundary, current, species_index=species_index, observable_value=observable_value)
-            previous_threshold = _resolve_items((trigger,), boundary if before_symbol_time is None else before_symbol_time, parameter_values)[0].threshold
-            following_threshold = _resolve_items((trigger,), boundary, parameter_values)[0].threshold
+                                      observable_value=observable_value, temperature_K=temperature_K if before_temperature_K is None else before_temperature_K)
+            following = _trigger_value(trigger, boundary, current, species_index=species_index, observable_value=observable_value, temperature_K=temperature_K)
+            previous_threshold = _resolve_items((trigger,), boundary, parameter_values, temperature_K=temperature_K if before_temperature_K is None else before_temperature_K)[0].threshold
+            following_threshold = _resolve_items((trigger,), boundary, parameter_values, temperature_K=temperature_K)[0].threshold
             if _crossed(previous - previous_threshold, following - following_threshold, 0.0, trigger.direction):
                 return index
         return None
@@ -1301,11 +1343,19 @@ def _apply_boundary(
     eligible_stops = tuple(index for index in trigger_indices if index in stops)
     if eligible_stops:
         return finish(min(eligible_stops, key=lambda index: contract.triggers[index].declaration_ordinal))
+    if temperature_step:
+        temperature_K = temperature_at(boundary)
+    if not stops:
+        validate_boundary_conflicts(
+            instants=_resolve_items(static + trigger_instants, boundary, parameter_values, temperature_K=temperature_K),
+            entering_holds=_resolve_items(entering_holds, boundary, parameter_values, temperature_K=temperature_K),
+            cancellation_check=cancellation_check,
+        )
     if temperature_step and stops:
         before_temperature = current.copy()
-        current = _apply_holds(current, tuple(item for item in active_holds if item.start_time < boundary), species_index=species_index, cancellation_check=cancellation_check, time=boundary, parameter_values=parameter_values)
+        current = _apply_holds(current, tuple(item for item in active_holds if item.start_time < boundary), species_index=species_index, cancellation_check=cancellation_check, time=boundary, temperature_K=temperature_K, parameter_values=parameter_values)
         changed = not np.array_equal(before_temperature, current)
-        stop = crossed_stop(before_temperature, before_symbol_time=float(np.nextafter(boundary, -np.inf)))
+        stop = crossed_stop(before_temperature, before_temperature_K=root_temperature)
         if stop is not None:
             return finish(stop)
     executed_entering_holds: list[ExecutableHold] = []
@@ -1323,7 +1373,7 @@ def _apply_boundary(
             _raise_if_cancelled(cancellation_check)
             before = current.copy()
             original = action
-            action = _resolve_items((action,), boundary, parameter_values)[0]
+            action = _resolve_items((action,), boundary, parameter_values, temperature_K=temperature_K)[0]
             if isinstance(action, ExecutableInstant):
                 if stops:
                     validate_boundary_conflicts(instants=(*executed_instants, action), entering_holds=executed_entering_holds, cancellation_check=cancellation_check)
@@ -1337,7 +1387,7 @@ def _apply_boundary(
                     if stops:
                         validate_boundary_conflicts(instants=executed_instants, entering_holds=(*executed_entering_holds, action), cancellation_check=cancellation_check)
                     executed_entering_holds.append(action)
-                current = _apply_holds(current, (action,), species_index=species_index, cancellation_check=cancellation_check)
+                current = _apply_holds(current, (action,), species_index=species_index, cancellation_check=cancellation_check, time=boundary, temperature_K=temperature_K, parameter_values=parameter_values)
             changed = changed or not np.array_equal(before, current)
             if stops and not np.array_equal(before, current):
                 # Validate the executed prefix before admitting its terminal state.
@@ -1460,7 +1510,7 @@ def _apply_instants(
     return output
 
 
-def _resolve_items(items, time, parameter_values):
+def _resolve_items(items, time, parameter_values, *, temperature_K):
     roots = tuple(sorted({
         name
         for item in items
@@ -1470,7 +1520,7 @@ def _resolve_items(items, time, parameter_values):
     if not roots:
         return tuple(items)
     try:
-        values = parameter_values(time, roots) if parameter_values is not None else {}
+        values = parameter_values(temperature_K, roots) if parameter_values is not None else {}
         return tuple(
             resolve_executable_values(item, values, time=time) for item in items
         )
@@ -1483,11 +1533,11 @@ def _resolve_items(items, time, parameter_values):
 
 
 def _apply_holds(
-    state, holds, *, species_index, cancellation_check, time=0.0, parameter_values=None
+    state, holds, *, species_index, cancellation_check, time, temperature_K, parameter_values
 ):
     if not holds:
         return state
-    resolved = _resolve_items(holds, time, parameter_values)
+    resolved = _resolve_items(holds, time, parameter_values, temperature_K=temperature_K)
     output = np.asarray(state, dtype=float).reshape(-1).copy()
     for hold in resolved:
         _raise_if_cancelled(cancellation_check)
@@ -1506,8 +1556,9 @@ def _apply_holds_to_trajectory(
     *,
     species_index,
     cancellation_check,
-    times=None,
-    parameter_values=None,
+    times,
+    temperatures,
+    parameter_values,
 ):
     output = np.asarray(states, dtype=float).copy()
     if not holds:
@@ -1518,35 +1569,48 @@ def _apply_holds_to_trajectory(
             holds,
             species_index=species_index,
             cancellation_check=cancellation_check,
-            time=0.0 if times is None else float(times[column]),
+            time=float(times[column]),
+            temperature_K=float(temperatures[column]),
             parameter_values=parameter_values,
         )
     return output
 
 
+def _selected_temperatures(times, temperature_at, cancellation_check):
+    temperatures = np.empty(len(times), dtype=float)
+    for index, time in enumerate(times):
+        if index % 256 == 0:
+            _raise_if_cancelled(cancellation_check)
+        temperatures[index] = temperature_at(float(time))
+    _raise_if_cancelled(cancellation_check)
+    return temperatures
+
+
 class _InterventionRhs:
     def __init__(
         self,
-        rhs: Rhs2,
+        rhs: ODERhs,
         *,
         fluxes: Sequence[ExecutableFlux],
         holds: Sequence[ExecutableHold],
         species_index: Mapping[str, int],
-        parameter_values=None,
-        symbol_time=None,
+        parameter_values,
+        temperature_at,
+        cancellation_check,
     ) -> None:
         self._rhs = rhs
         self._fluxes = tuple(fluxes)
         self._holds = tuple(holds)
         self._species_index = dict(species_index)
         self._parameter_values = parameter_values
-        self._symbol_time = symbol_time or (lambda time: time)
+        self.temperature_at = temperature_at
+        self.cancellation_check = cancellation_check
 
-    def _flux_values(self, time):
+    def _flux_values(self, time, temperature_K):
         sums = {}
         negative = set()
         for flux in _resolve_items(
-            self._fluxes, self._symbol_time(time), self._parameter_values
+            self._fluxes, time, self._parameter_values, temperature_K=temperature_K
         ):
             index = self._species_index[flux.species]
             sums[index] = sums.get(index, 0.0) + float(flux.flux_rate)
@@ -1557,7 +1621,8 @@ class _InterventionRhs:
     def _base_evaluation_state(
         self,
         state: np.ndarray,
-        time: float = 0.0,
+        time: float,
+        temperature_K: float,
     ) -> tuple[np.ndarray, set[int]]:
         raw = np.asarray(state, dtype=float).reshape(-1)
         evaluation_state = raw.copy()
@@ -1567,23 +1632,26 @@ class _InterventionRhs:
             self._holds,
             species_index=self._species_index,
             cancellation_check=None,
-            time=self._symbol_time(time),
+            time=time,
+            temperature_K=temperature_K,
             parameter_values=self._parameter_values,
         )
         fixed = {self._species_index[hold.species] for hold in self._holds}
-        _sums, negative = self._flux_values(time)
+        _sums, negative = self._flux_values(time, temperature_K)
         for index in negative:
             if evaluation_state[index] < 0.0:
                 evaluation_state[index] = 0.0
         return evaluation_state, fixed
 
     def __call__(self, time: float, state: np.ndarray) -> np.ndarray:
+        _raise_if_cancelled(self.cancellation_check)
+        temperature_K = self.temperature_at(time)
         raw_state = np.asarray(state, dtype=float).reshape(-1)
-        evaluation_state, fixed = self._base_evaluation_state(raw_state, time)
+        evaluation_state, fixed = self._base_evaluation_state(raw_state, time, temperature_K)
         derivative = np.asarray(
-            self._rhs(self._symbol_time(time), evaluation_state), dtype=float
+            self._rhs(time, evaluation_state, T=temperature_K), dtype=float
         ).copy()
-        sums, negative = self._flux_values(time)
+        sums, negative = self._flux_values(time, temperature_K)
         for index, rate in sums.items():
             candidate = float(derivative[index]) + rate
             if index in negative and raw_state[index] <= 0.0:
@@ -1598,17 +1666,18 @@ class _InterventionRhs:
         self,
         time: float,
         state: np.ndarray,
+        temperature_K: float,
     ) -> tuple[set[int], set[int]]:
         """Return rows and columns masked by the active purge branch."""
 
         raw_state = np.asarray(state, dtype=float).reshape(-1)
-        evaluation_state, _fixed = self._base_evaluation_state(raw_state, time)
+        evaluation_state, _fixed = self._base_evaluation_state(raw_state, time, temperature_K)
         derivative = np.asarray(
-            self._rhs(self._symbol_time(time), evaluation_state), dtype=float
+            self._rhs(time, evaluation_state, T=temperature_K), dtype=float
         )
         zero_rows: set[int] = set()
         zero_columns: set[int] = set()
-        sums, negative = self._flux_values(time)
+        sums, negative = self._flux_values(time, temperature_K)
         for index in negative:
             if raw_state[index] < 0.0:
                 zero_columns.add(index)
@@ -1627,7 +1696,7 @@ class _InterventionJacobian:
 
     def __init__(
         self,
-        jacobian: Callable[[float, np.ndarray], np.ndarray],
+        jacobian: Callable[..., np.ndarray],
         *,
         rhs: _InterventionRhs,
         holds: Sequence[ExecutableHold],
@@ -1640,18 +1709,20 @@ class _InterventionJacobian:
         self._fluxes = tuple(fluxes)
         self._species_index = dict(species_index)
 
-    def _evaluate_state(self, state: np.ndarray, time: float) -> tuple[np.ndarray, set[int]]:
+    def _evaluate_state(self, state: np.ndarray, time: float, temperature_K: float) -> tuple[np.ndarray, set[int]]:
         values = np.asarray(state, dtype=float).reshape(-1)
         held = {
             self._species_index[hold.species]
             for hold in self._holds
         }
-        used, _fixed = self._rhs._base_evaluation_state(values, time)
+        used, _fixed = self._rhs._base_evaluation_state(values, time, temperature_K)
         return used, held
 
     def __call__(self, time: float, state: np.ndarray) -> np.ndarray:
-        used, held = self._evaluate_state(state, time)
-        matrix = np.asarray(self._jacobian(self._rhs._symbol_time(float(time)), used), dtype=float).copy()
+        _raise_if_cancelled(self._rhs.cancellation_check)
+        temperature_K = self._rhs.temperature_at(time)
+        used, held = self._evaluate_state(state, time, temperature_K)
+        matrix = np.asarray(self._jacobian(time, used, T=temperature_K), dtype=float).copy()
         size = used.size
         if matrix.shape != (size, size):
             raise ValueError(
@@ -1664,6 +1735,7 @@ class _InterventionJacobian:
         purge_rows, purge_columns = self._rhs.purge_jacobian_branches(
             float(time),
             np.asarray(state, dtype=float),
+            temperature_K,
         )
         if purge_rows:
             matrix[np.fromiter(sorted(purge_rows), dtype=np.int64), :] = 0.0
@@ -1737,8 +1809,7 @@ def _trigger_callables(
     trigger_counts: Sequence[int],
     trigger_last_times: Sequence[float | None],
     observable_value: Callable[[str, float, np.ndarray, float], float] | None = None,
-    segment_end: float | None = None,
-    temperature_step_at_end: bool = False,
+    temperature_at,
     parameter_values=None, holds=(),
 ) -> tuple[tuple[Callable[[float, np.ndarray], float], ...], tuple[int, ...]]:
     callables: list[Callable[[float, np.ndarray], float]] = []
@@ -1752,8 +1823,9 @@ def _trigger_callables(
         )
         if ready is None or segment_start < ready:
             continue
-        threshold = _resolve_items((trigger,), segment_start, parameter_values)[0].threshold
-        starts_at_threshold = _trigger_value(trigger, segment_start, _apply_holds(segment_state, holds, species_index=species_index, cancellation_check=None, time=segment_start, parameter_values=parameter_values), species_index=species_index, observable_value=observable_value) == threshold
+        initial_temperature = temperature_at(segment_start)
+        threshold = _resolve_items((trigger,), segment_start, parameter_values, temperature_K=initial_temperature)[0].threshold
+        starts_at_threshold = _trigger_value(trigger, segment_start, _apply_holds(segment_state, holds, species_index=species_index, cancellation_check=None, time=segment_start, temperature_K=initial_temperature, parameter_values=parameter_values), species_index=species_index, observable_value=observable_value, temperature_K=initial_temperature) == threshold
         directions = (
             ("rising", "falling")
             if trigger.direction == "either"
@@ -1782,10 +1854,10 @@ def _trigger_callables(
                 _starts_at_threshold: bool = starts_at_threshold,
                 _neutral_value: float = neutral_value,
             ) -> float:
-                symbol_time = float(np.nextafter(time, -np.inf)) if temperature_step_at_end and time == segment_end else time
-                state = _apply_holds(state, holds, species_index=species_index, cancellation_check=None, time=symbol_time, parameter_values=parameter_values)
-                threshold = _resolve_items((_trigger,), symbol_time, parameter_values)[0].threshold
-                value = _trigger_value(_trigger, time, state, species_index=species_index, observable_value=observable_value, symbol_time=symbol_time) - threshold
+                temperature_K = temperature_at(time)
+                state = _apply_holds(state, holds, species_index=species_index, cancellation_check=None, time=time, temperature_K=temperature_K, parameter_values=parameter_values)
+                threshold = _resolve_items((_trigger,), time, parameter_values, temperature_K=temperature_K)[0].threshold
+                value = _trigger_value(_trigger, time, state, species_index=species_index, observable_value=observable_value, temperature_K=temperature_K) - threshold
                 if _starts_at_threshold and (float(time) == _segment_start or (isinstance(_trigger.then, InterventionStopAction) and value == 0.0)):
                     return _neutral_value
                 return value
@@ -1933,15 +2005,19 @@ def _append_identity_samples(
     times: np.ndarray,
     states: np.ndarray,
     *,
+    output_temperatures: list[np.ndarray],
+    temperatures: np.ndarray,
     segment_id: int,
     segment_key: str,
     discontinuity_id: int,
 ) -> None:
     emit_times = np.asarray(times, dtype=float).reshape(-1)
     emit_states = np.asarray(states, dtype=float)
+    emit_temperatures = np.asarray(temperatures, dtype=float)
     if not emit_times.size:
         return
-    if emit_states.ndim != 2 or emit_states.shape[1] != emit_times.size:
+    if (emit_states.ndim != 2 or emit_states.shape[1] != emit_times.size
+            or emit_temperatures.shape != emit_times.shape):
         raise InterventionScheduleError(
             "Direct result rows must have one state column per emitted time."
         )
@@ -1956,6 +2032,7 @@ def _append_identity_samples(
         if emit_times[0] == last_time:
             emit_times = emit_times[1:]
             emit_states = emit_states[:, 1:]
+            emit_temperatures = emit_temperatures[1:]
         elif emit_times[0] < last_time:
             raise InterventionScheduleError(
                 "Direct result row emission must remain strictly ordered."
@@ -1964,6 +2041,7 @@ def _append_identity_samples(
         return
     output_times.append(emit_times)
     output_states.append(emit_states)
+    output_temperatures.append(emit_temperatures)
     output_segment_ids.append(
         np.full(emit_times.size, int(segment_id), dtype=np.int64)
     )
@@ -1982,6 +2060,8 @@ def _append_identity_row(
     time: float,
     state: np.ndarray,
     *,
+    output_temperatures: list[np.ndarray],
+    temperature_K: float,
     segment_id: int,
     segment_key: str,
     discontinuity_id: int,
@@ -1994,6 +2074,8 @@ def _append_identity_row(
         output_discontinuity_ids,
         np.array([float(time)], dtype=float),
         np.asarray(state, dtype=float).reshape(-1, 1),
+        output_temperatures=output_temperatures,
+        temperatures=np.array([temperature_K], dtype=float),
         segment_id=segment_id,
         segment_key=segment_key,
         discontinuity_id=discontinuity_id,

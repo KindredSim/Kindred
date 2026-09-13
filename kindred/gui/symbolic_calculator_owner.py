@@ -231,7 +231,6 @@ class SymbolicCalculatorOwner:
             apply_parameter_algebra_spec_to_mechanism(
                 prepared_dsl.parameter_algebra_spec_for_execution(),
                 mechanism=mechanism,
-                require_mutable=False,
                 parameter_target_map=parameter_target_map,
             )
             available, reason = symbolic_calculator_available(mechanism)

@@ -21,12 +21,7 @@ from kindred.core.intervention_schedule import (
     InterventionSchedule,
     intervention_schedule_parameter_names,
 )
-from kindred.core.kinetics import (
-    ArrheniusRateModel,
-    EyringRateModel,
-    forward_rate_model_for_equilibrium,
-    forward_rate_model_for_reaction,
-)
+from kindred.core.kinetics import ArrheniusRateModel, EyringRateModel
 from kindred.core.mechanism_metadata import MechanismMetadataView
 from kindred.core.ode_builder import build_effective_rate_coefficient_evaluator
 from kindred.core.simulator.dsl_parse import DslAnalysis, PreparedDslRequestSet
@@ -69,7 +64,6 @@ def build_mechanism_inspector_sections(
         apply_parameter_algebra_spec_to_mechanism(
             parameter_spec,
             mechanism=mechanism,
-            require_mutable=False,
             parameter_target_map=parameter_target_map,
         )
     else:
@@ -198,10 +192,7 @@ def _format_mechanism_step(
                 reaction.rate_orders,
             )
         )
-        forward_model = forward_rate_model_for_reaction(
-            reaction,
-            default_standard_conc_M=float(metadata.standard_conc_M),
-        )
+        forward_model = reaction.forward_model
         equilibrium = None
         reverse_order = None
     else:
@@ -218,11 +209,7 @@ def _format_mechanism_step(
                 equilibrium.stoich_back,
             )
         )
-        forward_model = forward_rate_model_for_equilibrium(
-            equilibrium,
-            temperature_K=None,
-            default_standard_conc_M=float(metadata.standard_conc_M),
-        )
+        forward_model = equilibrium.forward_model
 
     items = [
         _format_coordinate(

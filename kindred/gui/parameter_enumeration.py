@@ -215,8 +215,6 @@ def enumerate_parameter_coordinates(
         else:
             low, high = _signed_bounds(value)
         display_name = item.name
-        if item.temperature_K is not None:
-            display_name = f"{display_name} (k@{item.temperature_K:g} K)"
         if item.context:
             display_name = f"{display_name} — {item.context}"
         coordinates.append(GuiParameterCoordinate(
