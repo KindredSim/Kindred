@@ -72,6 +72,8 @@ class InteractiveDisplayCurve:
     label: str
     x: np.ndarray
     y: np.ndarray
+    # Canonical seconds stay aligned when X is another quantity or is sampled.
+    sample_time: np.ndarray
     color: str
     dashed: bool = False
     markers: bool = False
@@ -102,6 +104,7 @@ class InteractiveDisplayCurve:
         object.__setattr__(self, "label", self.label)
         object.__setattr__(self, "x", x)
         object.__setattr__(self, "y", y)
+        object.__setattr__(self, "sample_time", _readonly_display_array(self.sample_time))
         object.__setattr__(self, "color", self.color)
         object.__setattr__(self, "point_size", float(self.point_size))
         object.__setattr__(self, "opacity", float(self.opacity))
@@ -393,6 +396,8 @@ class ResultDataBlock:
     label: str
     kind: ResultLayerKind
     t: np.ndarray
+    # Unlike plotted X (t), this remains time in seconds; None means unrecorded.
+    sample_time: np.ndarray | None
     series: tuple[tuple[str, np.ndarray], ...]
     series_axes: tuple[tuple[str, AxisSeriesSelection], ...]
     x_axis: AxisSeriesSelection
@@ -661,6 +666,7 @@ def _result_block(
     )
     return ResultDataBlock(
         block_id=set_id, label=display_label, kind=kind, t=result.t,
+        sample_time=result.t,
         series=series, series_axes=series_axes,
         x_axis=SimulationSeriesAxisSelection("t"), result=result,
         segment_ids=result.segment_ids, segment_keys=result.segment_keys,
@@ -766,6 +772,7 @@ def compose_canonical_export_blocks(
                     label=label,
                     kind=ResultLayerKind.EXPERIMENTAL,
                     t=time,
+                    sample_time=time if time.size else None,
                     series=((source.raw_column, values),),
                     series_axes=((source.raw_column, source.axis),),
                     x_axis=SimulationSeriesAxisSelection("t"),
@@ -813,7 +820,7 @@ def _data_block(
     names = {name for name, _ in selected}
     return ResultDataBlock(
         block_id=block.block_id, label=block.label, kind=block.kind,
-        t=x_values, series=selected,
+        t=x_values, sample_time=block.sample_time, series=selected,
         series_axes=tuple((name, selection) for name, selection in block.series_axes if name in names),
         x_axis=x_axis, result=block.result,
         segment_ids=block.segment_ids, segment_keys=block.segment_keys,
@@ -1025,7 +1032,7 @@ def _observation_provenance(
 def _same_source_row_values(
     x_source: ExperimentalLayerInput,
     y_source: ExperimentalLayerInput,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray | None] | None:
     """Pair experimental X/Y by the admitted physical source-row facts."""
 
     if x_source.axis.dataset_id != y_source.axis.dataset_id:
@@ -1034,12 +1041,15 @@ def _same_source_row_values(
     x_values: list[float] = []
     y_values: list[float] = []
     paired_rows: list[int] = []
-    for row, value in zip(y_source.source_rows, y_source.y, strict=True):
+    paired_times: list[float] = []
+    for index, (row, value) in enumerate(zip(y_source.source_rows, y_source.y, strict=True)):
         if row not in x_by_row:
             continue
         x_values.append(float(x_by_row[row]))
         y_values.append(float(value))
         paired_rows.append(int(row))
+        if y_source.t:
+            paired_times.append(y_source.t[index])
     if not x_values:
         return None
     paired_x = np.asarray(x_values, dtype=float)
@@ -1048,7 +1058,10 @@ def _same_source_row_values(
     paired_x.setflags(write=False)
     paired_y.setflags(write=False)
     paired_source_rows.setflags(write=False)
-    return paired_x, paired_y, paired_source_rows
+    sample_time = np.asarray(paired_times, dtype=float) if y_source.t else None
+    if sample_time is not None:
+        sample_time.setflags(write=False)
+    return paired_x, paired_y, paired_source_rows, sample_time
 
 
 def _annotations_from_execution(
@@ -1185,6 +1198,7 @@ def compose_interactive_display(
             label=f"{live_label}: {series_id}",
             x=x_values,
             y=_readonly_display_array(series_values),
+            sample_time=result.t,
             color=live_colors.get(series_id) or "#3b82f6",
             segment_ids=topology[0], segment_keys=topology[1],
             discontinuity_ids=topology[2],
@@ -1228,6 +1242,7 @@ def compose_interactive_display(
                     label=f"{baseline_block.label}: {series_id}",
                     x=baseline_x,
                     y=_readonly_display_array(series_values),
+                    sample_time=baseline_result.t,
                     color=baseline_colors.get(series_id) or "#3b82f6",
                     dashed=True,
                     opacity=0.42,
@@ -1451,6 +1466,7 @@ def compose_result_input(
         x_values.setflags(write=False)
         y_values.setflags(write=False)
         source_rows.setflags(write=False)
+        sample_time = x_values if experimental.t else None
         unavailable = _is_time_selection(selected_x) and not experimental.t
         if not _is_time_selection(selected_x):
             x_source = (
@@ -1476,7 +1492,7 @@ def compose_result_input(
                 if paired is None:
                     unavailable = True
                 else:
-                    x_values, y_values, source_rows = paired
+                    x_values, y_values, source_rows, sample_time = paired
                     x_name = x_source.raw_column
                     x_axis = selected_x
                     x_provenance = _observation_provenance(x_source)
@@ -1492,6 +1508,7 @@ def compose_result_input(
                 label=label,
                 kind=ResultLayerKind.EXPERIMENTAL,
                 t=x_values,
+                sample_time=sample_time,
                 series=((experimental.raw_column, y_values),),
                 series_axes=((experimental.raw_column, y_axis),),
                 x_axis=x_axis,

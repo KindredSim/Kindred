@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import io
 import html
-import json
 import math
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from types import MappingProxyType
@@ -62,28 +61,18 @@ def _fit_y_axis_label(
 
 def _fit_copy_columns(
     dataset: FitCurveDataset,
-) -> list[tuple[str, Sequence[object], str]]:
-    """Build one dataset's model and observation columns in plot-series order."""
+) -> list[tuple[str, Sequence[float]]]:
+    """Build one dataset's timed model and observation column groups."""
 
-    dataset_label = f"{dataset.display_name} [{dataset.dataset_id}]"
-    dataset_identity = {
-        "dataset_id": dataset.dataset_id,
-        "dataset_name": dataset.display_name,
-    }
+    dataset_label = dataset.display_name
 
     def header(
         label: str,
         name: str,
-        identity: Mapping[str, str],
         unit: str | None = None,
     ) -> str:
         displayed_name = f"{name} ({unit})" if unit is not None else name
-        provenance = json.dumps(
-            {**dataset_identity, **identity}, sort_keys=True, separators=(",", ":")
-        )
-        return encode_clipboard_text(
-            f"{label}::{displayed_name} [provenance={provenance}]"
-        )
+        return encode_clipboard_text(f"{label}::{displayed_name}")
 
     model_x = dict(dataset.model_x)
     model_y = dict(dataset.model_y)
@@ -102,71 +91,38 @@ def _fit_copy_columns(
         )
         model_groups.setdefault(grid, []).append(name)
 
-    columns: list[tuple[str, Sequence[object], str]] = []
+    columns: list[tuple[str, Sequence[float]]] = []
     for index, names in enumerate(model_groups.values(), 1):
         suffix = f" {index}" if len(model_groups) > 1 else ""
         label = f"{dataset_label} — Model{suffix}"
         first = names[0]
-        x_identity = {} if x_unit is not None else {"model_target": dataset.x_name}
-        columns.append(
-            (header(label, dataset.x_name, x_identity, x_unit), model_x[first], "float")
-        )
         if x_unit is None:
             columns.append((
-                header(label, "Model integration time", {"time_kind": "model"}, "s"),
+                header(label, "Time", "s"),
                 dataset.model_time,
-                "float",
             ))
-        columns.extend(
-            (
-                encode_clipboard_text(f"{label} — {field}"), values, kind,
-            )
-            for field, values, kind in (
-                ("segment_id", segment_ids[first], "int"),
-                ("segment_key", segment_keys[first], "text"),
-                ("discontinuity_id", discontinuity_ids[first], "int"),
-            )
-        )
+        columns.append((
+            header(label, "Time" if x_unit is not None else dataset.x_name, x_unit),
+            model_x[first],
+        ))
         for name in names:
-            identity = {"model_target": name}
-            columns.append((header(label, name, identity, y_unit), model_y[name], "float"))
+            columns.append((header(label, name, y_unit), model_y[name]))
 
     observed_x = dict(dataset.observed_x)
     observed_y = dict(dataset.observed_y)
     observed_time = dict(dataset.observed_time)
-    observation_ids = dict(dataset.observed_observation_ids)
     raw_columns = dict(dataset.observed_raw_columns)
-    source_rows = dict(dataset.observed_source_rows)
     for name in sorted(observed_y):
         label = f"{dataset_label} — Observed {name}"
-        if dataset.observed_x_identity is None:
-            x_identity = {"raw_observation_id": observation_ids[name]}
-        else:
-            observation_id, raw_column = dataset.observed_x_identity
-            x_identity = {
-                "raw_observation_id": observation_id,
-                "raw_column": raw_column,
-                "model_target": dataset.x_name,
-            }
-        y_identity = {
-            "raw_observation_id": observation_ids[name],
-            "raw_column": raw_columns[name],
-            "model_target": name,
-        }
-        if x_unit is None:
+        if x_unit is None and observed_time[name]:
             columns.append((
-                header(label, "Recorded experimental time", {
-                    "raw_observation_id": observation_ids[name],
-                    "time_kind": "recorded_experimental",
-                }, "s"),
+                header(label, "Time", "s"),
                 observed_time[name],
-                "float",
             ))
         columns.extend(
             (
-                (header(label, dataset.x_name, x_identity, x_unit), observed_x[name], "float"),
-                (encode_clipboard_text(f"{label} — source_row"), source_rows[name], "int"),
-                (header(label, raw_columns[name], y_identity, y_unit), observed_y[name], "float"),
+                (header(label, "Time" if x_unit is not None else dataset.x_name, x_unit), observed_x[name]),
+                (header(label, raw_columns[name], y_unit), observed_y[name]),
             )
         )
     return columns
@@ -453,15 +409,15 @@ class GridPlotView(QtWidgets.QWidget):
     def _iter_copy_chunks(
         curves: tuple[FitCurveDataset, ...],
     ) -> Iterable[str]:
-        columns: list[tuple[str, Sequence[object], str]] = []
+        columns: list[tuple[str, Sequence[float]]] = []
         for dataset in curves:
             dataset_columns = _fit_copy_columns(dataset)
             if columns and dataset_columns:
-                columns.append(("", (), "text"))
+                columns.append(("", ()))
             columns.extend(dataset_columns)
         if not columns:
             raise ValueError("No Fit curves are available to copy.")
-        row_count = max(len(values) for _header, values, _kind in columns)
+        row_count = max(len(values) for _header, values in columns)
         cell_count = (row_count + 1) * len(columns)
         if cell_count > _MAX_FIT_COPY_CELLS:
             raise ValueError(
@@ -471,19 +427,15 @@ class GridPlotView(QtWidgets.QWidget):
 
         total_characters = 0
         output = io.StringIO()
-        output.write(encode_tsv_row([header for header, _values, _kind in columns]))
+        output.write(encode_tsv_row([header for header, _values in columns]))
         rows_in_chunk = 0
         for row_index in range(row_count):
             row: list[str] = []
-            for _header, values, kind in columns:
+            for _header, values in columns:
                 if row_index >= len(values):
                     row.append("")
-                elif kind == "float":
-                    row.append(repr(float(values[row_index])))
-                elif kind == "int":
-                    row.append(str(int(values[row_index])))
                 else:
-                    row.append(encode_clipboard_text(str(values[row_index])))
+                    row.append(repr(float(values[row_index])))
             output.write(encode_tsv_row(row))
             rows_in_chunk += 1
             if rows_in_chunk >= _FIT_COPY_ROWS_PER_CHUNK:

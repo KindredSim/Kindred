@@ -148,10 +148,7 @@ class FitCurveDataset:
     model_segment_ids: tuple[tuple[str, tuple[int, ...]], ...]
     model_segment_keys: tuple[tuple[str, tuple[str, ...]], ...]
     model_discontinuity_ids: tuple[tuple[str, tuple[int, ...]], ...]
-    observed_observation_ids: tuple[tuple[str, str], ...]
     observed_raw_columns: tuple[tuple[str, str], ...]
-    observed_source_rows: tuple[tuple[str, tuple[int, ...]], ...]
-    observed_x_identity: tuple[str, str] | None
     x_name: str = "t"
 
     def __post_init__(self) -> None:
@@ -222,23 +219,20 @@ class FitCurveDataset:
                 "Fit curves require complete model and observation axes "
                 "for every selected series."
             )
-        observation_ids = dict(self.observed_observation_ids)
         raw_columns = dict(self.observed_raw_columns)
-        source_rows = dict(self.observed_source_rows)
+        observed_time = dict(self.observed_time)
         observed_y_by_name = dict(observed_y)
         if any(
             set(mapping) != set(names)
-            for mapping in (observation_ids, raw_columns, source_rows)
+            for mapping in (raw_columns, observed_time)
         ):
-            raise ValueError("Fit observations require complete source identity.")
+            raise ValueError("Fit observations require source labels and recorded-time availability.")
         for name in names:
             if (
-                not observation_ids[name]
-                or not raw_columns[name]
-                or len(source_rows[name]) != len(observed_y_by_name[name])
-                or any(row <= 0 for row in source_rows[name])
+                not raw_columns[name]
+                or len(observed_time[name]) not in (0, len(observed_y_by_name[name]))
             ):
-                raise ValueError("Fit observations contain incomplete source identity.")
+                raise ValueError("Fit observation times must align with their plotted samples.")
         for axis, values, field in (
             (dict(model_x), dict(model_y), "model"),
             (dict(observed_x), dict(observed_y), "observed"),
@@ -249,6 +243,8 @@ class FitCurveDataset:
             ):
                 raise ValueError(f"Fit {field} curve X/Y lengths do not align.")
         model_y_by_name = dict(model_y)
+        if any(len(values) != len(self.model_time) for values in model_y_by_name.values()):
+            raise ValueError("Fit model time must align with its plotted samples.")
         segments_by_name = dict(model_segment_ids)
         segment_keys_by_name = dict(model_segment_keys)
         discontinuities_by_name = dict(model_discontinuity_ids)
@@ -262,8 +258,7 @@ class FitCurveDataset:
             for name in names
         ):
             raise ValueError(
-                "Fit curves require exact nonnegative segment identity and "
-                "positive source-row/raw-observation provenance."
+                "Fit curves require exact nonnegative segment identity."
             )
         object.__setattr__(self, "dataset_id", dataset_id)
         object.__setattr__(self, "display_name", display_name)
@@ -830,18 +825,8 @@ def _curves_from_simulations(
                 model_segment_ids=model_segment_ids,
                 model_segment_keys=model_segment_keys,
                 model_discontinuity_ids=model_discontinuity_ids,
-                observed_observation_ids=tuple(
-                    (item.model_target, item.raw_observation_id) for item in selected
-                ),
                 observed_raw_columns=tuple(
                     (item.model_target, item.raw_column) for item in selected
-                ),
-                observed_source_rows=tuple(
-                    (item.model_target, item.source_rows) for item in selected
-                ),
-                observed_x_identity=(
-                    None if x_observations is None else
-                    (x_observations.raw_observation_id, x_observations.raw_column)
                 ),
                 x_name=x_name,
             )

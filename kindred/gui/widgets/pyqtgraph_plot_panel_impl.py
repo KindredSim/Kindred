@@ -3,11 +3,9 @@
 from __future__ import annotations
 
 import io
-import json
 import time
 from dataclasses import dataclass, replace
 from collections.abc import Mapping, Sequence
-from types import MappingProxyType
 from typing import Any, Iterator
 
 import numpy as np
@@ -152,11 +150,7 @@ class _RenderedPointChunk:
 
     x: np.ndarray
     series: tuple[tuple[str, np.ndarray], ...]
-    source_row: np.ndarray | None = None
-    source_row_end: np.ndarray | None = None
-    segment_ids: np.ndarray | None = None
-    segment_keys: tuple[str, ...] | None = None
-    discontinuity_ids: np.ndarray | None = None
+    sample_time: np.ndarray | None
 
     def __post_init__(self) -> None:
         x = np.asarray(self.x)
@@ -168,20 +162,12 @@ class _RenderedPointChunk:
             values.setflags(write=False)
             if values.size != x.size:
                 raise ValueError("rendered point series must align with X.")
-        for name in ("source_row", "source_row_end", "segment_ids", "discontinuity_ids"):
-            values = getattr(self, name)
-            if values is None:
-                continue
-            values = np.asarray(values)
-            values.setflags(write=False)
-            if values.size != x.size:
-                raise ValueError(f"rendered point {name} must align with X.")
-            object.__setattr__(self, name, values)
-        if self.segment_keys is not None:
-            keys = tuple(str(value) for value in self.segment_keys)
-            if len(keys) != x.size:
-                raise ValueError("rendered point segment_keys must align with X.")
-            object.__setattr__(self, "segment_keys", keys)
+        if self.sample_time is not None:
+            sample_time = np.asarray(self.sample_time)
+            sample_time.setflags(write=False)
+            if sample_time.size != x.size:
+                raise ValueError("rendered point time must align with X.")
+            object.__setattr__(self, "sample_time", sample_time)
         object.__setattr__(self, "x", x)
         object.__setattr__(self, "series", series)
 
@@ -191,13 +177,13 @@ class _RenderedPointBlock:
     """Private sampled roster entry; it is not result or export authority."""
 
     block_id: str
+    group_id: str
     label: str
     kind: str
     x_name: str
+    x_is_time: bool
     x_unit: str | None
     y_unit: str | None
-    x_provenance: Mapping[str, object]
-    series_provenance: tuple[tuple[str, Mapping[str, object]], ...]
     chunks: tuple[_RenderedPointChunk, ...]
     derivative_wrt: str | None = None
     derivative_numerator_unit: str | None = None
@@ -216,19 +202,6 @@ class _RenderedPointBlock:
             self,
             "y_unit",
             None if self.y_unit is None else str(self.y_unit),
-        )
-        object.__setattr__(
-            self,
-            "x_provenance",
-            MappingProxyType(dict(self.x_provenance)),
-        )
-        object.__setattr__(
-            self,
-            "series_provenance",
-            tuple(
-                (str(name), MappingProxyType(dict(provenance)))
-                for name, provenance in self.series_provenance
-            ),
         )
         object.__setattr__(self, "chunks", tuple(self.chunks))
 
@@ -1226,6 +1199,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
             curve,
             x=curve.x[sample],
             y=curve.y[sample],
+            sample_time=curve.sample_time[sample],
             segment_ids=(
                 None
                 if curve.segment_ids is None
@@ -1538,7 +1512,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
                 annotations=(*static_annotations, *interactive_annotations),
             )
         # The displayed projection contains completed results, so Copy uses
-        # those same sampled curves and their scientific provenance.
+        # those same sampled curves and their corresponding time.
         if render_input is not None:
             for curve in projection.curves:
                 rendered_block = self._rendered_block_for_interactive_curve(
@@ -1891,54 +1865,32 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
             )
             for name, values in block.series
         )
-        source_row = (
-            None if block.source_row is None else block.source_row[sample]
-        )
-        segment_ids = (
-            None if block.segment_ids is None else block.segment_ids[sample]
-        )
-        discontinuity_ids = (
-            None
-            if block.discontinuity_ids is None
-            else block.discontinuity_ids[sample]
-        )
-        segment_keys = (
-            None
-            if block.segment_keys is None
-            else tuple(block.segment_keys[int(index)] for index in sample)
-        )
+        sample_time = None if block.sample_time is None else block.sample_time[sample]
         rendered_chunks = tuple(
             _RenderedPointChunk(
                 x=x[start:end],
                 series=tuple(
                     (name, values[start:end]) for name, values in sampled_series
                 ),
-                source_row=(
-                    None if source_row is None else source_row[start:end]
-                ),
-                segment_ids=(
-                    None if segment_ids is None else segment_ids[start:end]
-                ),
-                segment_keys=(
-                    None if segment_keys is None else segment_keys[start:end]
-                ),
-                discontinuity_ids=(
-                    None
-                    if discontinuity_ids is None
-                    else discontinuity_ids[start:end]
-                ),
+                sample_time=None if sample_time is None else sample_time[start:end],
             )
             for start, end in chunks
         )
         rendered_block = _RenderedPointBlock(
             block_id=block.block_id,
+            group_id=(
+                block.block_id.dataset_id
+                if block.kind is ResultLayerKind.EXPERIMENTAL else block.block_id
+            ),
             label=block.label,
             kind=block.kind.value,
             x_name=block.x_name,
+            x_is_time=(
+                isinstance(block.x_axis, SimulationSeriesAxisSelection)
+                and block.x_axis.series_name == "t"
+            ),
             x_unit=x_unit,
             y_unit=y_unit,
-            x_provenance=block.x_provenance,
-            series_provenance=block.series_provenance,
             chunks=rendered_chunks,
         )
         return rendered_block, rendered_chunks
@@ -1978,7 +1930,6 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         x_unit, y_unit, x_scale, y_scale = self._display_unit_state(
             render_input
         )
-        series_provenance = dict(source.series_provenance)
         curve_chunks = tuple(
             _RenderedPointChunk(
                 x=self._scaled_display_values(
@@ -1994,35 +1945,22 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
                         ),
                     ),
                 ),
-                segment_ids=(
-                    None
-                    if curve.segment_ids is None
-                    else curve.segment_ids[start:end]
-                ),
-                segment_keys=(
-                    None
-                    if curve.segment_keys is None
-                    else curve.segment_keys[start:end]
-                ),
-                discontinuity_ids=(
-                    None
-                    if curve.discontinuity_ids is None
-                    else curve.discontinuity_ids[start:end]
-                ),
+                sample_time=curve.sample_time[start:end],
             )
             for start, end in self._interactive_curve_chunks(curve)
         )
         return _RenderedPointBlock(
             block_id=set_id,
+            group_id=set_id,
             label=source.label,
             kind=source.kind.value,
             x_name=source.x_name,
+            x_is_time=(
+                isinstance(source.x_axis, SimulationSeriesAxisSelection)
+                and source.x_axis.series_name == "t"
+            ),
             x_unit=x_unit,
             y_unit=y_unit,
-            x_provenance=source.x_provenance,
-            series_provenance=(
-                (series_name, series_provenance.get(series_name, {})),
-            ),
             chunks=curve_chunks,
         )
 
@@ -2033,8 +1971,6 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         names = tuple(name for name, _ in block.chunks[0].series) if block.chunks else ()
         groups = tuple((name,) for name in names) if transform == "phase" else (names,)
         denominator = f"{block.x_name} ({block.x_unit})" if block.x_unit else block.x_name
-        if block.x_provenance:
-            denominator += " [provenance=" + json.dumps(dict(block.x_provenance), sort_keys=True, separators=(",", ":")) + "]"
         result = []
         for group in groups:
             chunks = []
@@ -2046,21 +1982,15 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
                 chunks.append(_RenderedPointChunk(
                     x=mapped[0][1][0],
                     series=tuple((name, coordinates[1]) for name, coordinates in mapped),
-                    source_row=None if chunk.source_row is None else chunk.source_row[:-1],
-                    source_row_end=None if chunk.source_row is None else chunk.source_row[1:],
-                    segment_ids=None if chunk.segment_ids is None else chunk.segment_ids[:-1],
-                    segment_keys=None if chunk.segment_keys is None else chunk.segment_keys[:-1],
-                    discontinuity_ids=None if chunk.discontinuity_ids is None else chunk.discontinuity_ids[:-1],
+                    sample_time=None if chunk.sample_time is None else chunk.sample_time[:-1],
                 ))
-            provenance = dict(block.series_provenance)
             result.append(replace(
                 block, chunks=tuple(chunks), derivative_wrt=denominator,
                 derivative_numerator_unit=block.y_unit,
                 x_name=f"{group[0]} [phase; left endpoint]" if transform == "phase" else f"{block.x_name} [left endpoint]",
+                x_is_time=block.x_is_time and transform != "phase",
                 x_unit=block.y_unit if transform == "phase" else block.x_unit,
                 y_unit=self._derivative_unit(block.x_unit, block.y_unit),
-                x_provenance=provenance.get(group[0], {}) if transform == "phase" else block.x_provenance,
-                series_provenance=tuple((name, provenance.get(name, {})) for name in group),
             ))
         return tuple(result)
 
@@ -2843,27 +2773,10 @@ _MAX_RENDERED_COPY_CHARACTERS = 64 * 1024 * 1024
 def _rendered_column_header(
     label: str,
     name: str,
-    provenance: Mapping[str, object],
     unit: str | None,
 ) -> str:
     displayed_name = f"{name} ({unit})" if unit is not None else name
-    header = f"{label}::{displayed_name}"
-    identity = {
-        key: str(provenance[key])
-        for key in (
-            "dataset_id",
-            "raw_observation_id",
-            "dataset_name",
-            "raw_column",
-            "model_target",
-            "set_id",
-        )
-        if provenance.get(key) not in {None, ""}
-    }
-    if identity:
-        encoded = json.dumps(identity, sort_keys=True, separators=(",", ":"))
-        header = f"{header} [provenance={encoded}]"
-    return encode_clipboard_text(header)
+    return encode_clipboard_text(f"{label}::{displayed_name}")
 
 
 def _iter_rendered_point_tsv_chunks(
@@ -2895,27 +2808,10 @@ def _iter_rendered_point_tsv_chunks(
             for chunk in chunks[1:]
         ):
             raise ValueError("rendered point chunks must preserve series order.")
-        if block.kind == ResultLayerKind.EXPERIMENTAL.value:
-            if any(chunk.source_row is None for chunk in chunks):
-                raise ValueError("experimental rendered points lack source_row.")
-            metadata_width = 2 if block.derivative_wrt is not None else 1
-        else:
-            if any(
-                chunk.segment_ids is None
-                or chunk.segment_keys is None
-                or chunk.discontinuity_ids is None
-                for chunk in chunks
-            ):
-                raise ValueError("simulation rendered points lack topology.")
-            metadata_width = 3
+        time_width = int(not block.x_is_time and chunks[0].sample_time is not None)
         rows = sum(int(chunk.x.size) for chunk in chunks)
-        width = 1 + metadata_width + len(series_names)
-        group = (
-            block.kind,
-            dict(block.series_provenance)[series_names[0]]["dataset_id"]
-            if block.kind == ResultLayerKind.EXPERIMENTAL.value
-            else block.block_id,
-        )
+        width = time_width + 1 + len(series_names)
+        group = (block.kind, block.group_id)
         separator = bool(block_specs) and group != previous_group
         previous_group = group
         block_specs.append((block, series_names, rows, width, separator))
@@ -2933,38 +2829,17 @@ def _iter_rendered_point_tsv_chunks(
         if separator:
             combined_headers.append("")
         chunks = tuple(chunk for chunk in block.chunks if chunk.x.size)
-        headers = [
+        time_name = "Time [left endpoint]" if block.derivative_wrt is not None else "Time"
+        headers = []
+        if not block.x_is_time and chunks[0].sample_time is not None:
+            headers.append(_rendered_column_header(block.label, time_name, "s"))
+        headers.append(
             _rendered_column_header(
                 block.label,
-                block.x_name,
-                block.x_provenance,
+                time_name if block.x_is_time else block.x_name,
                 block.x_unit,
             )
-        ]
-        if block.kind == ResultLayerKind.EXPERIMENTAL.value:
-            if any(chunk.source_row is None for chunk in chunks):
-                raise ValueError("experimental rendered points lack source_row.")
-            headers.append(encode_clipboard_text(f"{block.label} — source_row"))
-            if block.derivative_wrt is not None:
-                headers.append(encode_clipboard_text(f"{block.label} — source_row_end"))
-        else:
-            if any(
-                chunk.segment_ids is None
-                or chunk.segment_keys is None
-                or chunk.discontinuity_ids is None
-                for chunk in chunks
-            ):
-                raise ValueError("simulation rendered points lack topology.")
-            headers.extend(
-                (
-                    encode_clipboard_text(f"{block.label} — segment_id"),
-                    encode_clipboard_text(f"{block.label} — segment_key"),
-                    encode_clipboard_text(
-                        f"{block.label} — discontinuity_id"
-                    ),
-                )
-            )
-        provenance_by_name = dict(block.series_provenance)
+        )
         headers.extend(
             _rendered_column_header(
                 block.label,
@@ -2973,7 +2848,6 @@ def _iter_rendered_point_tsv_chunks(
                     f"/d({block.derivative_wrt}) [adjacent samples]"
                     if block.derivative_wrt is not None else name
                 ),
-                provenance_by_name.get(name, MappingProxyType({})),
                 block.y_unit,
             )
             for name in series_names
@@ -2989,19 +2863,10 @@ def _iter_rendered_point_tsv_chunks(
         for chunk in tuple(chunk for chunk in block.chunks if chunk.x.size):
             series_by_name = dict(chunk.series)
             for index in range(chunk.x.size):
-                row: list[str] = [repr(float(chunk.x[index]))]
-                if block.kind == ResultLayerKind.EXPERIMENTAL.value:
-                    row.append(str(int(chunk.source_row[index])))
-                    if block.derivative_wrt is not None:
-                        row.append(str(int(chunk.source_row_end[index])))
-                else:
-                    row.extend(
-                        (
-                            str(int(chunk.segment_ids[index])),
-                            encode_clipboard_text(chunk.segment_keys[index]),
-                            str(int(chunk.discontinuity_ids[index])),
-                        )
-                    )
+                row: list[str] = []
+                if not block.x_is_time and chunk.sample_time is not None:
+                    row.append(repr(float(chunk.sample_time[index])))
+                row.append(repr(float(chunk.x[index])))
                 row.extend(
                     repr(float(series_by_name[name][index]))
                     for name in series_names
