@@ -22,7 +22,7 @@ _LIVE_EVENTS = frozenset({
 
 
 class GlobalFitWorker(QtCore.QThread):
-    """Serialize, receive and settle off the GUI thread; controls only enqueue."""
+    """Serialize, receive and settle off the GUI thread; controls never wait."""
 
     execution_started = QtCore.Signal()
     progress = QtCore.Signal(int, str)
@@ -38,6 +38,7 @@ class GlobalFitWorker(QtCore.QThread):
         self._request = request
         self._commands = queue.SimpleQueue()
         self._cancelled = threading.Event()
+        self._shutdown = threading.Event()
         self.process_started = False
         self.terminal_projection = None
 
@@ -49,6 +50,8 @@ class GlobalFitWorker(QtCore.QThread):
 
     def request_cancel(self) -> None:
         self._cancelled.set()
+        # Arm before startup or blocked command delivery can delay cancellation.
+        self._shutdown.set()
         self._commands.put("cancel")
 
     def request_stop(self) -> None:
@@ -60,7 +63,6 @@ class GlobalFitWorker(QtCore.QThread):
         projection = None
         errors = []
         error_lock = threading.Lock()
-        shutdown = threading.Event()
         settled = threading.Event()
         threads = []
         diagnostics = bytearray()
@@ -71,7 +73,7 @@ class GlobalFitWorker(QtCore.QThread):
                     errors.append(exc)
             self._commands.put("cancel")
             self._commands.put(None)
-            shutdown.set()
+            self._shutdown.set()
 
         def write_commands(initial):
             try:
@@ -92,7 +94,7 @@ class GlobalFitWorker(QtCore.QThread):
                 fail(exc)
 
         def watchdog():
-            shutdown.wait()
+            self._shutdown.wait()
             if settled.wait(5.0):
                 return
             fail(RuntimeError("Fit process did not settle within five seconds of shutdown."))
@@ -158,7 +160,7 @@ class GlobalFitWorker(QtCore.QThread):
                                 raise RuntimeError(f"Unknown Fit event: {name!r}.")
                             if terminal is not None:
                                 self._commands.put(None)
-                                shutdown.set()
+                                self._shutdown.set()
                         except BaseException as exc:
                             fail(exc)
                     if terminal is None and not errors:
@@ -168,7 +170,7 @@ class GlobalFitWorker(QtCore.QThread):
         finally:
             if process is not None:
                 # Even malformed framing must not leave a child blocked on output.
-                shutdown.set()
+                self._shutdown.set()
                 self._commands.put(None)
                 try:
                     while process.stdout.read(65536):
