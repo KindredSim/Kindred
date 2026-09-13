@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from fractions import Fraction
 import math
 from typing import Any, Callable, Mapping
 
@@ -11,13 +10,8 @@ from kindred.core.mechanism import Equilibrium, Mechanism
 from kindred.core.ode_builder import (
     EffectiveRateCoefficientEvaluator,
 )
-from kindred.core.kinetics import forward_rate_symbolic_relation, forward_rate_family
-from kindred.core.mechanism_metadata import (
-    EquilibriumMetadataKeys,
-    MechanismMetadataView,
-)
+from kindred.core.kinetics import forward_rate_family
 from kindred.core.equilibrium_rate_authority import (
-    equilibrium_rate_symbolic_relations,
     normalize_existing_equilibrium_rate_authority,
 )
 from kindred.core.simulator.parameter_namespace import (
@@ -96,7 +90,6 @@ class SymbolicMechanismPublicProjection:
     rhs_expressions: tuple[Any, ...]
     jacobian_expressions: tuple[tuple[Any, ...], ...]
     state_symbols: tuple[Any, ...]
-    chemistry_relations: Mapping[str, Any]
 
 
 @dataclass(frozen=True, slots=True)
@@ -553,105 +546,12 @@ def _project_symbolic_mechanism_expression_model(
         for row in model.jacobian_expressions
     )
 
-    metadata = MechanismMetadataView.from_metadata(
-        getattr(mechanism, "metadata", {}) or {}
-    )
-
-    def exact_literal(value: object) -> Any:
-        if isinstance(value, Fraction):
-            return sympy.Rational(value.numerator, value.denominator)
-        return sympy.Rational(str(value))
-
-    temperature = sympy.Symbol("T")
-    chemistry_relations: dict[str, Any] = {}
-    reactions = tuple(getattr(mechanism, "reactions", ()) or ())
-    for reaction_index, reaction in enumerate(reactions):
-        public_name = _canonical_step_parameter_name(
-            mechanism,
-            kind="reaction",
-            item_index=reaction_index,
-            role="k",
-            expected_name=f"k{reaction_index + 1}",
-        )
-        try:
-            rate_model = reaction.forward_model
-            chemistry_relations[public_name] = (
-                forward_rate_symbolic_relation(
-                    rate_model,
-                    temperature=temperature,
-                    literal=exact_literal,
-                    exponential=sympy.exp,
-                )
-            )
-        except (TypeError, ValueError) as exc:
-            raise UnsupportedSymbolicExpressionError(
-                f"Unsupported symbolic reaction rate authority: {exc}"
-            ) from exc
-
-    for equilibrium_index, equilibrium in enumerate(
-        tuple(getattr(mechanism, "equilibria", ()) or ())
-    ):
-        source = _equilibrium_parameter_names(
-            mechanism,
-            equilibrium,
-            equilibrium_index=equilibrium_index,
-        )
-        if (
-            source.kf_name is None
-            or source.kr_name is None
-            or source.keq_name is None
-        ):
-            raise UnsupportedSymbolicExpressionError(
-                "Equilibrium canonical public projection is incomplete."
-            )
-        try:
-            forward_model = equilibrium.forward_model
-            forward_relation = forward_rate_symbolic_relation(
-                forward_model,
-                temperature=temperature,
-                literal=exact_literal,
-                exponential=sympy.exp,
-            )
-            equilibrium_metadata = getattr(equilibrium, "metadata", {}) or {}
-            standard_concentration = (
-                equilibrium_metadata.get(
-                    EquilibriumMetadataKeys.STANDARD_CONC_M,
-                    metadata.standard_conc_M,
-                )
-                if isinstance(equilibrium_metadata, Mapping)
-                else metadata.standard_conc_M
-            )
-            if standard_concentration is None:
-                standard_concentration = metadata.standard_conc_M
-            relations = equilibrium_rate_symbolic_relations(
-                equilibrium,
-                forward_relation=forward_relation,
-                temperature=temperature,
-                literal=exact_literal,
-                exponential=sympy.exp,
-                standard_concentration=exact_literal(
-                    float(standard_concentration)
-                ),
-            )
-        except (TypeError, ValueError) as exc:
-            raise UnsupportedSymbolicExpressionError(
-                f"Unsupported symbolic equilibrium rate authority: {exc}"
-            ) from exc
-        chemistry_relations[source.kf_name] = relations.kf
-        chemistry_relations[source.kr_name] = relations.kr
-        chemistry_relations[source.keq_name] = relations.Keq
-
-    if set(chemistry_relations) != set(public_parameter_symbols):
-        raise UnsupportedSymbolicExpressionError(
-            "Canonical chemistry relation projection is incomplete."
-        )
     return SymbolicMechanismPublicProjection(
         species_names=tuple(model.species_names),
         parameter_symbols=public_parameter_symbols,
         rhs_expressions=rhs_expressions,
         jacobian_expressions=jacobian_expressions,
         state_symbols=public_state_symbols,
-        chemistry_relations=dict(chemistry_relations),
     )
 
 

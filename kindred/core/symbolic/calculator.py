@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from decimal import Decimal, InvalidOperation
 import math
-import re
 from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Any, Mapping, Sequence
@@ -28,6 +27,7 @@ from kindred.core.simulator.parameter_namespace import (
 )
 
 from .backend import require_sympy
+from .calculator_chemistry import build_calculator_chemistry_relations
 from .errors import UnsupportedSymbolicExpressionError
 from .jacobian import (
     build_symbolic_mechanism_public_projection,
@@ -35,9 +35,6 @@ from .jacobian import (
 )
 from .namespaces import SymbolicParameterNamespaceContext
 
-_NUMERIC_LITERAL_RE = re.compile(
-    r"(?<![A-Za-z0-9_])(?:\d[\d_]*\.\d[\d_]*|\d[\d_]*\.|\.\d[\d_]*|\d[\d_]*)(?:[eE][+\-]?\d[\d_]*)?(?![A-Za-z0-9_])"
-)
 _SUPPORTED_TRANSFORMS = frozenset({"simplify", "factor", "expand", "cancel"})
 _RESERVED_ALGEBRA_IDENTIFIERS = frozenset(
     str(name)
@@ -243,6 +240,14 @@ def _build_context(mechanism: Any, *, mechanism_source: str) -> _CalculatorConte
             mechanism,
             exact_stoichiometric_coefficients=True,
         )
+        parameter_spec = parameter_algebra_spec_from_mechanism(mechanism)
+        if parameter_spec is None:
+            raise SymbolicCalculatorUnavailable(
+                "Calculator requires the retained admitted parameter specification."
+            )
+        chemistry_relations = build_calculator_chemistry_relations(
+            mechanism, parameter_spec=parameter_spec
+        )
     except (UnsupportedSymbolicExpressionError, ValueError) as exc:
         raise SymbolicCalculatorUnavailable(str(exc)) from exc
     species_names = tuple(str(name) for name in projection.species_names)
@@ -257,7 +262,7 @@ def _build_context(mechanism: Any, *, mechanism_source: str) -> _CalculatorConte
     expression_symbols.update(
         {
             name: sympy.Symbol(name)
-            for name in projection.parameter_symbols
+            for name in parameter_namespace.canonical_names
         }
     )
     expression_symbols["T"] = sympy.Symbol("T")
@@ -277,15 +282,17 @@ def _build_context(mechanism: Any, *, mechanism_source: str) -> _CalculatorConte
     return _CalculatorContext(
         mechanism=mechanism,
         species_names=species_names,
-        parameter_symbols=tuple(
-            str(name)
-            for name in projection.parameter_symbols
+        parameter_symbols=tuple(projection.parameter_symbols) + tuple(
+            sorted(
+                (parameter_namespace.canonical_names | rendered_definitions.keys())
+                - set(projection.parameter_symbols)
+            )
         ),
         rhs_by_species=rhs_by_species,
         jacobian_by_species=jacobian_by_species,
         expression_symbols=expression_symbols,
         parameter_namespace=parameter_namespace,
-        chemistry_relations=projection.chemistry_relations,
+        chemistry_relations=chemistry_relations,
         rendered_parameter_definitions=rendered_definitions,
         let_sources=let_sources,
         mechanism_source=str(mechanism_source or ""),
@@ -377,24 +384,7 @@ def _evaluate_call(context: _CalculatorContext, name: str, args: Sequence[Any]) 
         expr = args[0]
         if isinstance(expr, tuple):
             raise SymbolicCalculatorError("expand_params requires a scalar symbolic expression.")
-        parameter_definitions, _rendered = _translated_parameter_definitions(
-            context.mechanism,
-        )
-        substitutions = {
-            sympy.Symbol(name): value
-            for name, value in parameter_definitions.items()
-        }
-        chemistry_substitutions = {
-            sympy.Symbol(name): value
-            for name, value in context.chemistry_relations.items()
-        }
-        static_expansion = expr.xreplace(substitutions)
-        chemistry_expansion = static_expansion.xreplace(
-            chemistry_substitutions
-        )
-        expanded = sympy.expand(chemistry_expansion)
-        _reject_nonfinite_symbolic_result(sympy, expanded)
-        return expanded
+        return _expand_parameter_dependencies(context, expr)
     raise SymbolicCalculatorError(f"Unsupported calculator operation {name!r}.")
 
 
@@ -703,11 +693,6 @@ def _canonicalize_identifier(context: _CalculatorContext, raw_name: str) -> str:
     return name
 
 
-def _validate_numeric_literals_in_source(source: str) -> None:
-    for match in _NUMERIC_LITERAL_RE.finditer(str(source or "")):
-        _validate_numeric_literal_text(match.group(0))
-
-
 def _validate_numeric_literal_text(literal: str) -> None:
     literal_s = str(literal).replace("_", "")
     try:
@@ -728,31 +713,25 @@ def _validate_numeric_literal_text(literal: str) -> None:
         )
 
 
+def _exact_retained_number(node: NumberNode, *, sympy: Any) -> Any:
+    exact = node.exact_value
+    if exact is None:
+        raise SymbolicCalculatorError(
+            "Calculator requires a finite exact retained numeric literal."
+        )
+    return sympy.Rational(exact.numerator, exact.denominator)
+
+
 def _translate_calculator_parameter_node(
     node: object,
     *,
     namespace: SymbolicParameterNamespaceContext,
-    identifiers: list[str],
     sympy: Any,
-) -> tuple[Any, tuple[str, ...]]:
-    """Lower one retained parameter AST directly for Calculator expansion.
-
-    Algebra admission owns the retained AST; Calculator owns this lowering.
-    Numeric literals are rationalized from their admitted binary64 value and
-    identifiers are resolved through the admitted namespace before SymPy
-    symbols are created.  The returned identifier order is the only metadata
-    needed by dependency expansion; no generic policy or symbolic identity is
-    minted here.
-    """
+) -> Any:
+    """Lower the admitted arithmetic AST; admission owns dependency identity."""
 
     if isinstance(node, NumberNode):
-        value = float(node.value)
-        if not math.isfinite(value):
-            raise SymbolicCalculatorError(
-                "Only finite retained numeric literals are supported in Calculator parameter expansion."
-            )
-        numerator, denominator = value.as_integer_ratio()
-        return sympy.Rational(numerator, denominator), tuple(identifiers)
+        return _exact_retained_number(node, sympy=sympy)
 
     if isinstance(node, IdentNode):
         raw_name = str(node.name)
@@ -767,22 +746,19 @@ def _translate_calculator_parameter_node(
                 canonical_name = namespace.resolve_identifier(raw_name)
             except UnsupportedSymbolicExpressionError as exc:
                 raise SymbolicCalculatorError(str(exc)) from exc
-        if canonical_name not in identifiers:
-            identifiers.append(canonical_name)
-        return sympy.Symbol(canonical_name), tuple(identifiers)
+        return sympy.Symbol(canonical_name)
 
     if isinstance(node, UnaryNode):
         if node.op not in {"+", "-"}:
             raise SymbolicCalculatorError(
                 "Only unary plus/minus are supported in Calculator parameter expansion."
             )
-        rhs, _ = _translate_calculator_parameter_node(
+        rhs = _translate_calculator_parameter_node(
             node.rhs,
             namespace=namespace,
-            identifiers=identifiers,
             sympy=sympy,
         )
-        return (rhs if node.op == "+" else -rhs), tuple(identifiers)
+        return rhs if node.op == "+" else -rhs
 
     if isinstance(node, BinaryNode):
         operator = str(node.op)
@@ -790,16 +766,14 @@ def _translate_calculator_parameter_node(
             raise SymbolicCalculatorError(
                 f"Retained Algebra operator {operator!r} is unsupported in Calculator parameter expansion."
             )
-        lhs, _ = _translate_calculator_parameter_node(
+        lhs = _translate_calculator_parameter_node(
             node.lhs,
             namespace=namespace,
-            identifiers=identifiers,
             sympy=sympy,
         )
-        rhs, _ = _translate_calculator_parameter_node(
+        rhs = _translate_calculator_parameter_node(
             node.rhs,
             namespace=namespace,
-            identifiers=identifiers,
             sympy=sympy,
         )
         if operator == "+":
@@ -813,24 +787,11 @@ def _translate_calculator_parameter_node(
         elif operator in {"**", "^"}:
             expression = lhs ** rhs
         _reject_nonfinite_symbolic_result(sympy, expression)
-        return expression, tuple(identifiers)
+        return expression
 
     raise SymbolicCalculatorError(
         "Calculator parameter expansion requires supported nodes from the retained admitted Algebra AST; "
         f"got {type(node).__name__}."
-    )
-
-
-def _translate_calculator_parameter_expression(
-    retained_node: Any,
-    *,
-    namespace: SymbolicParameterNamespaceContext,
-) -> tuple[Any, tuple[str, ...]]:
-    return _translate_calculator_parameter_node(
-        retained_node,
-        namespace=namespace,
-        identifiers=[],
-        sympy=require_sympy(),
     )
 
 
@@ -859,53 +820,51 @@ def _parameter_definition_sources(mechanism: Any) -> dict[str, str]:
     }
 
 
-def _translated_parameter_definitions(
-    mechanism: Any,
-) -> tuple[dict[str, Any], dict[str, str]]:
-    spec = parameter_algebra_spec_from_mechanism(mechanism)
-    if spec is None:
-        return {}, {}
+def _expand_parameter_dependencies(context: _CalculatorContext, expr: Any) -> Any:
+    """Resolve only the query's closure in admission's chemistry/Algebra order."""
+
+    spec = parameter_algebra_spec_from_mechanism(context.mechanism)
+    graph = spec.evaluation_dependencies
+    expressions = _retained_parameter_expressions(spec)
+    namespace = SymbolicParameterNamespaceContext.from_spec(spec)
     sympy = require_sympy()
-    expressions_by_name = _retained_parameter_expressions(spec)
-    rendered = {
-        name: expression_to_source(expression)
-        for name, expression in expressions_by_name.items()
-    }
-    parameter_namespace = SymbolicParameterNamespaceContext.from_spec(spec)
+    required: set[str] = set()
+    pending = [str(symbol) for symbol in expr.free_symbols if str(symbol) in graph]
+    while pending:
+        name = pending.pop()
+        if name in required:
+            continue
+        required.add(name)
+        pending.extend(graph[name])
 
-    expanded_by_name: dict[str, Any] = {}
-
-    def expand_assignment(name: str, stack: tuple[str, ...] = ()) -> Any:
-        if name in expanded_by_name:
-            return expanded_by_name[name]
-        if name in stack:
-            raise SymbolicCalculatorError(f"Cyclic symbolic parameter dependency for {name!r}.")
-        try:
-            translated_expression, translated_identifiers = _translate_calculator_parameter_expression(
-                expressions_by_name[name],
-                namespace=parameter_namespace,
+    resolved: dict[Any, Any] = {}
+    for name in graph:
+        if name not in required:
+            continue
+        symbol = sympy.Symbol(name)
+        if name in expressions:
+            kind = spec.parameter_assignment_kind(name)
+            value = (
+                _translate_calculator_parameter_node(
+                    expressions[name], namespace=namespace, sympy=sympy
+                )
+                if kind in {"mechanism-bound", "derived scalar"}
+                else symbol
             )
-        except UnsupportedSymbolicExpressionError as exc:
-            raise SymbolicCalculatorError(str(exc)) from exc
-        substitutions = {
-            dep_name: expand_assignment(dep_name, stack + (name,))
-            for dep_name in translated_identifiers
-            if dep_name in expressions_by_name
-        }
-        expr = translated_expression
-        if substitutions:
-            expr = expr.xreplace(
-                {
-                    sympy.Symbol(dep_name): dependency_expr
-                    for dep_name, dependency_expr in substitutions.items()
-                }
-            )
-        _reject_nonfinite_symbolic_result(sympy, expr)
-        expanded_by_name[name] = expr
-        return expr
+        elif name in context.chemistry_relations:
+            value = context.chemistry_relations[name]
+        else:
+            value = symbol
+        # Chemistry helpers may inline indirect dependencies (e.g. dG_eq
+        # inside kr). Apply the resolved transitive closure, not only the
+        # direct graph edges, while preserving admission's identity leaves.
+        value = value.xreplace(resolved)
+        _reject_nonfinite_symbolic_result(sympy, value)
+        resolved[symbol] = value
 
-    expressions = {name: expand_assignment(name) for name in expressions_by_name}
-    return expressions, rendered
+    expanded = sympy.expand(expr.xreplace(resolved))
+    _reject_nonfinite_symbolic_result(sympy, expanded)
+    return expanded
 
 
 def _let_sources(mechanism: Any) -> dict[str, str]:
@@ -935,7 +894,6 @@ def _translate_let_by_name(context: _CalculatorContext, name: str, *, stack: Seq
     source = context.let_sources.get(name)
     if source is None:
         raise SymbolicCalculatorError(f"Unknown let observable {name!r}.")
-    _validate_numeric_literals_in_source(source)
     compiled = compiled_algebra_for_mechanism(context.mechanism)
     statement = (
         next(
@@ -963,12 +921,7 @@ def _translate_let_by_name(context: _CalculatorContext, name: str, *, stack: Seq
 def _translate_let_node(node: Any, *, context: _CalculatorContext, stack: Sequence[str]) -> Any:
     sympy = require_sympy()
     if isinstance(node, NumberNode):
-        try:
-            literal_source = expression_to_source(node)
-        except ValueError as exc:
-            raise SymbolicCalculatorError(str(exc)) from exc
-        _validate_numeric_literals_in_source(literal_source)
-        return sympy.Rational(str(float(node.value)))
+        return _exact_retained_number(node, sympy=sympy)
     if isinstance(node, IdentNode):
         name = str(node.name)
         if name in context.let_sources:

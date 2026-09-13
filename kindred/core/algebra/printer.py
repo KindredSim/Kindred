@@ -55,7 +55,7 @@ def expression_to_source(expr: ExprNode) -> str:
         value = float(expr.value)
         if not math.isfinite(value):
             raise ValueError("Cannot emit non-finite Algebra numeric literal.")
-        return str(int(value)) if math.isfinite(value) and value.is_integer() else repr(value)
+        return expr.literal if expr.literal is not None else str(value)
     if isinstance(expr, IdentNode):
         return str(expr.name)
     if isinstance(expr, SpeciesRefNode):
