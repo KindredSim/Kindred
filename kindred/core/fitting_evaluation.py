@@ -659,6 +659,7 @@ class FittingEvaluator:
                 initials_for_algebra=initials_map,
                 parameter_values_at_temperature=prepared_run.parameter_values_at_temperature,
                 parameter_algebra_spec=prepared_run.parameter_algebra_spec,
+                cancellation_control=self._cancellation_control,
                 solver_provenance_updates={
                     "fit_sampling_policy": self._context.fit_sampling_policy,
                     "fit_sampling_identity": dict(

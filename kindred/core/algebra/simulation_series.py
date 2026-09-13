@@ -211,6 +211,7 @@ def _build_simulation_context(
     symbol_values: Mapping[str, float],
     symbol_resolver: Callable[[str], float | np.ndarray | None] | None,
     runtime_symbol_names: frozenset[str],
+    cancellation_check: Callable[[], bool] | None,
 ) -> EvaluationContext:
     """Build one row-aligned context for the retained Algebra program."""
     t_arr = np.asarray(t, dtype=float).reshape(-1)
@@ -227,6 +228,7 @@ def _build_simulation_context(
         symbol_values={str(name): float(value) for name, value in symbol_values.items()},
         symbol_resolver=symbol_resolver,
         runtime_symbol_names=runtime_symbol_names,
+        cancellation_check=cancellation_check,
     )
 
 
@@ -240,6 +242,7 @@ def evaluate_compiled_algebra_series_for_simulation_partial(
     symbol_values: Mapping[str, float],
     symbol_resolver: Callable[[str], float | np.ndarray | None] | None = None,
     runtime_symbol_names: frozenset[str] = frozenset(),
+    cancellation_check: Callable[[], bool] | None = None,
 ) -> Tuple[Dict[str, np.ndarray], Dict[str, float], list[AlgebraObservableError]]:
     """Evaluate retained observables while preserving per-observable failures."""
     ctx = _build_simulation_context(
@@ -250,6 +253,7 @@ def evaluate_compiled_algebra_series_for_simulation_partial(
         symbol_values=symbol_values,
         symbol_resolver=symbol_resolver,
         runtime_symbol_names=runtime_symbol_names,
+        cancellation_check=cancellation_check,
     )
     series, scalars, errors = evaluate_block_partial(compiled.block, ctx)
     series_out = {str(name): np.asarray(values, dtype=float).reshape(-1) for name, values in (series or {}).items()}
@@ -257,6 +261,7 @@ def evaluate_compiled_algebra_series_for_simulation_partial(
     for name, value in (scalars or {}).items():
         scalars_out[str(name)] = float(value)
     for name, values in list(series_out.items()):
+        ctx.check_cancelled()
         if values.size != ctx.t.size:
             # Best-effort: broadcast scalar-like series to match time grid.
             if values.size == 1 and ctx.t.size > 1 and math.isfinite(float(values[0])):

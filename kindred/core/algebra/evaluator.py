@@ -29,6 +29,8 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Set, Tuple
 
 import numpy as np
 
+from kindred.core.exceptions import SimulationCancelled
+
 from .errors import (
     AlgebraBoolCastError,
     AlgebraDomainError,
@@ -99,6 +101,8 @@ class EvaluationContext:
         when the name is not a scientific parameter.
     runtime_symbol_names : set
         Row-dependent symbols, classified before their values are evaluated.
+    cancellation_check : callable, optional
+        Nonblocking cancellation poll supplied by the execution owner.
     """
     t: np.ndarray
     species_series: Mapping[str, np.ndarray]
@@ -109,6 +113,11 @@ class EvaluationContext:
     symbol_values: Mapping[str, float] = field(default_factory=dict)
     symbol_resolver: Callable[[str], float | np.ndarray | None] | None = None
     runtime_symbol_names: frozenset[str] = frozenset()
+    cancellation_check: Callable[[], bool] | None = None
+
+    def check_cancelled(self) -> None:
+        if self.cancellation_check is not None and self.cancellation_check():
+            raise SimulationCancelled()
 
 
 @dataclass(frozen=True)
@@ -253,6 +262,7 @@ class _Evaluator:
     def run(self) -> Tuple[Dict[str, np.ndarray], Dict[str, float]]:
         scalar_names = self._scalar_let_names()
         for stmt in self.block.statements_in_evaluation_order():
+            self.ctx.check_cancelled()
             name = stmt.name
             # shadowing guards
             self._guard_shadow(name, stmt)
@@ -270,9 +280,12 @@ class _Evaluator:
                 # Compute series across t with memo
                 arr = np.empty(self.N, dtype=float)
                 for i in range(self.N):
+                    if i % 256 == 0:
+                        self.ctx.check_cancelled()
                     arr[i] = self._eval_expr(stmt.expr, i, stmt=stmt)
                 self.series[name] = arr
 
+        self.ctx.check_cancelled()
         return self.series, self.scalars
 
     def run_partial(self) -> Tuple[Dict[str, np.ndarray], Dict[str, float], List[AlgebraObservableError]]:
@@ -287,6 +300,7 @@ class _Evaluator:
         scalar_names = self._scalar_let_names()
 
         for stmt in self.block.statements_in_evaluation_order():
+            self.ctx.check_cancelled()
             name = stmt.name
             try:
                 self._guard_shadow(name, stmt)
@@ -302,14 +316,19 @@ class _Evaluator:
 
                 arr = np.empty(self.N, dtype=float)
                 for i in range(self.N):
+                    if i % 256 == 0:
+                        self.ctx.check_cancelled()
                     arr[i] = self._eval_expr(stmt.expr, i, stmt=stmt)
                 self.series[name] = arr
+            except SimulationCancelled:
+                raise
             except Exception as exc:
                 errors.append(AlgebraObservableError.from_exception(name, exc, stmt=stmt))
                 self.series.pop(name, None)
                 self.scalars.pop(name, None)
                 continue
 
+        self.ctx.check_cancelled()
         return self.series, self.scalars, errors
 
     # Guards
@@ -697,6 +716,7 @@ def evaluate_block(
       when constructing SimulationResult.
     - Memoization is internal and keyed by (t_index, symbol) for series references.
     """
+    ctx.check_cancelled()
     # Validate basic shapes once, early
     t = np.asarray(ctx.t, dtype=float)
     if t.ndim != 1 or t.size == 0 or np.any(~np.isfinite(t)) or np.any(np.diff(t) < 0):
@@ -745,6 +765,7 @@ def evaluate_block_partial(
     when a single observable fails. It returns successful outputs plus a
     structured error list.
     """
+    ctx.check_cancelled()
     # Validate basic shapes once, early (same behavior as strict mode).
     t = np.asarray(ctx.t, dtype=float)
     if t.ndim != 1 or t.size == 0 or np.any(~np.isfinite(t)) or np.any(np.diff(t) < 0):

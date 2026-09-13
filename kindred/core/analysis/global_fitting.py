@@ -27,6 +27,7 @@ from kindred.core.analysis.fit_uncertainty import (
 )
 from kindred.core.analysis import global_fit_execution as _fit_execution
 from kindred.core.exceptions import (
+    FitCandidateDomainError,
     FitSimulationError,
     FittingCancelled,
     SimulationCancelled,
@@ -228,7 +229,6 @@ def fit_global(
                 [optimizer_result.parameters[key] for key in keys],
                 dtype=float,
             )
-            layout.validate_optimizer_vector(optimizer_endpoint_vector)
 
             def replay(
                 candidate_vector: np.ndarray,
@@ -256,7 +256,7 @@ def fit_global(
                 replay_state = replay(optimizer_endpoint_vector, converged=success)
             except FitSimulationError as exc:
                 details = dict(getattr(exc, "details", None) or {})
-                if not details.get("scientific_unavailable"):
+                if not isinstance(exc, FitCandidateDomainError) and not details.get("scientific_unavailable"):
                     raise
                 retained_best = objective.best_complete_vector
                 if retained_best is None:
@@ -267,7 +267,6 @@ def fit_global(
                         factual_cause=getattr(exc, "factual_cause", None),
                     )
                 retained_best_vector = np.asarray(retained_best, dtype=float).reshape(-1)
-                layout.validate_optimizer_vector(retained_best_vector)
                 success = False
                 optimizer_diagnostic = FactualCause(
                     domain="fit",
@@ -290,7 +289,7 @@ def fit_global(
                     fallback_details = dict(
                         getattr(fallback_exc, "details", None) or {}
                     )
-                    if not fallback_details.get("scientific_unavailable"):
+                    if not isinstance(fallback_exc, FitCandidateDomainError) and not fallback_details.get("scientific_unavailable"):
                         raise
                     return ScientificUnavailable(
                         producer=str(

@@ -215,21 +215,14 @@ class FitParameterConfiguration:
         value = _finite(self.value, "parameter value")
         minimum = _finite(self.minimum, "parameter minimum")
         maximum = _finite(self.maximum, "parameter maximum")
-        if minimum >= maximum or not minimum <= value <= maximum:
-            raise ValueError("Parameter requires minimum <= value <= maximum.")
-        if self.log10 and (minimum <= 0.0 or value <= 0.0):
-            raise ValueError("Log10 fitting requires positive values.")
+        if minimum >= maximum:
+            raise ValueError("Parameter requires minimum < maximum.")
         values = tuple(
             (_required(dataset_id, "dataset ID"), _finite(item, "dataset value"))
             for dataset_id, item in self.dataset_values
         )
         if len({dataset_id for dataset_id, _value in values}) != len(values):
             raise ValueError("Parameter dataset values repeat a dataset ID.")
-        if any(
-            not minimum <= item <= maximum or (self.log10 and item <= 0.0)
-            for _dataset_id, item in values
-        ):
-            raise ValueError("Parameter dataset values violate bounds or Log10 domain.")
         object.__setattr__(self, "value", value)
         object.__setattr__(self, "minimum", minimum)
         object.__setattr__(self, "maximum", maximum)
@@ -246,6 +239,7 @@ def _admit_fit_parameter_configuration(
     unit: str,
     scientific_category: GuiParameterScientificCategory,
     allow_exact_zero: bool,
+    dataset_scoped: bool,
 ) -> FitParameterConfiguration:
     """Admit one complete scope candidate using its retained category."""
 
@@ -262,13 +256,27 @@ def _admit_fit_parameter_configuration(
             field=f"{parameter_name} {field}",
         )
 
-    value = admit(configuration.value, "value")
     minimum = admit(configuration.minimum, "minimum")
     maximum = admit(configuration.maximum, "maximum")
-    dataset_values = tuple(
-        (dataset_id, admit(item, f"value for dataset {dataset_id}"))
-        for dataset_id, item in configuration.dataset_values
-    )
+    def admit_start(value: float, field: str) -> float:
+        value = admit(value, field)
+        if not minimum <= value <= maximum:
+            raise ValueError(f"{parameter_name} {field} must lie within its bounds.")
+        if configuration.log10 and value <= 0.0:
+            raise ValueError("Log10 fitting requires positive values.")
+        return value
+
+    if configuration.log10 and minimum <= 0.0:
+        raise ValueError("Log10 fitting requires positive bounds.")
+    value = configuration.value
+    dataset_values = configuration.dataset_values
+    if dataset_scoped and dataset_values:
+        dataset_values = tuple(
+            (dataset_id, admit_start(item, f"value for dataset {dataset_id}"))
+            for dataset_id, item in dataset_values
+        )
+    else:
+        value = admit_start(value, "value")
     return replace(
         configuration,
         value=value,
@@ -319,6 +327,7 @@ class FitParameterVariable:
             unit=self.unit,
             scientific_category=scientific_category,
             allow_exact_zero=self.allow_exact_zero,
+            dataset_scoped=False,
         )
         per_dataset_config = _admit_fit_parameter_configuration(
             self.per_dataset_config,
@@ -327,6 +336,7 @@ class FitParameterVariable:
             unit=self.unit,
             scientific_category=scientific_category,
             allow_exact_zero=self.allow_exact_zero,
+            dataset_scoped=True,
         )
         object.__setattr__(self, "scope", scope)
         object.__setattr__(self, "shared_config", shared_config)

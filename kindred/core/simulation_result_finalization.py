@@ -5,12 +5,13 @@ from typing import Any, Callable, Mapping
 
 import numpy as np
 
+from kindred.core.exceptions import SimulationCancelled
 from kindred.core.simulation_algebra_context import runtime_algebra_symbol_names
 from kindred.core.simulation_failure import FactualCause
 from kindred.core.result_repository import (
     SimulationResultValue,
 )
-from kindred.core.simulator.solver_types import FinalSimulationOutput
+from kindred.core.simulator.solver_types import FinalSimulationOutput, SimulationCancellationControl
 from kindred.core.algebra.simulation_series import (
     compiled_algebra_for_mechanism,
     evaluate_compiled_algebra_series_for_simulation_partial,
@@ -115,6 +116,7 @@ def finalize_simulation_result(
     parameter_algebra_spec: object,
     parameters: tuple[tuple[str, float, str], ...] = (),
     solver_provenance_updates: Mapping[str, object] | None = None,
+    cancellation_control: SimulationCancellationControl | None = None,
 ) -> SimulationResultValue:
     """Admit one solver output through canonical row finalization.
 
@@ -123,6 +125,11 @@ def finalize_simulation_result(
     never repairs or reconstructs row identity.
     """
 
+    def check_cancelled() -> None:
+        if cancellation_control is not None and cancellation_control.cancel_requested():
+            raise SimulationCancelled()
+
+    check_cancelled()
     result_time = result.t
     result_y = result.Y
     base_species_names = [str(name) for name in species_names]
@@ -153,17 +160,23 @@ def finalize_simulation_result(
         symbol_failures: dict[str, Exception] = {}
 
         def resolve_symbol(name: str) -> float | np.ndarray | None:
+            check_cancelled()
             if name not in parameter_algebra_spec.evaluation_dependencies:
                 return None
             if name in symbol_failures:
                 raise symbol_failures[name]
             try:
                 if name in runtime_names:
-                    return np.asarray([
-                        parameter_values_at_temperature(float(temperature), (name,))[name]
-                        for temperature in result.temperature_K
-                    ], dtype=float)
+                    values = np.empty(result.temperature_K.size, dtype=float)
+                    for index, temperature in enumerate(result.temperature_K):
+                        if index % 256 == 0:
+                            check_cancelled()
+                        values[index] = parameter_values_at_temperature(float(temperature), (name,))[name]
+                    check_cancelled()
+                    return values
                 return parameter_values_at_temperature(float(result.temperature_K[0]), (name,))[name]
+            except SimulationCancelled:
+                raise
             except Exception as exc:
                 symbol_failures[name] = exc
                 raise
@@ -182,6 +195,7 @@ def finalize_simulation_result(
                 symbol_values={},
                 symbol_resolver=resolve_symbol,
                 runtime_symbol_names=runtime_names,
+                cancellation_check=None if cancellation_control is None else cancellation_control.cancel_requested,
             )
         )
         finalized_algebra_errors = tuple(
@@ -225,6 +239,7 @@ def finalize_simulation_result(
         for name in requested_algebra_outputs
         if name not in succeeded_names and name not in failed_names
     )
+    check_cancelled()
     return SimulationResultValue(
         t=result_time,
         series=finalized_series,

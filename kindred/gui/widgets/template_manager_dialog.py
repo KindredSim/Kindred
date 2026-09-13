@@ -12,7 +12,7 @@ from kindred.gui.display_name_policy import literal_tooltip
 import logging
 from dataclasses import replace
 from datetime import datetime
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, Optional, cast
 
 from PySide6 import QtCore, QtGui, QtWidgets
 from kindred.gui.ui_helpers import clamp_initial_size, set_bounded_label_text
@@ -32,6 +32,8 @@ class TemplateEditorDialog(QtWidgets.QDialog):
     """
     Dialog for creating or editing a template.
     """
+
+    saveRequested = QtCore.Signal()
 
     def __init__(
         self,
@@ -62,6 +64,7 @@ class TemplateEditorDialog(QtWidgets.QDialog):
         if normalized_operation == "create" and self._is_edit_mode:
             raise ValueError("Template create cannot target an existing template.")
         self._operation = normalized_operation
+        self._template_id = template.id if template is not None else None
 
         self.setWindowTitle(
             "Update Template" if self._is_edit_mode else "Create Template"
@@ -151,16 +154,17 @@ class TemplateEditorDialog(QtWidgets.QDialog):
             QtWidgets.QDialogButtonBox.Save | QtWidgets.QDialogButtonBox.Cancel
         )
         save_button = button_box.button(QtWidgets.QDialogButtonBox.Save)
+        self._save_button = save_button
         if save_button is not None:
             save_button.setText(
                 "Update" if self._operation == "update" else "Create"
             )
-        button_box.accepted.connect(self._validate_and_accept)
+        button_box.accepted.connect(self._validate_and_request_save)
         button_box.rejected.connect(self.reject)
         layout.addWidget(button_box)
 
-    def _validate_and_accept(self):
-        """Validate inputs and accept dialog."""
+    def _validate_and_request_save(self):
+        """Request a synchronous save while preserving the editable draft."""
         # Check required fields
         if not self._name_edit.text().strip():
             QtWidgets.QMessageBox.warning(
@@ -193,7 +197,13 @@ class TemplateEditorDialog(QtWidgets.QDialog):
             self._mechanism_edit.setFocus()
             return
 
-        self.accept()
+        if self._save_button is not None:
+            self._save_button.setEnabled(False)
+        try:
+            self.saveRequested.emit()
+        finally:
+            if self._save_button is not None:
+                self._save_button.setEnabled(True)
 
     def get_template_data(self) -> Dict[str, Any]:
         """
@@ -595,30 +605,8 @@ class TemplateManagerDialog(QtWidgets.QDialog):
             operation="create",
         )
 
-        if dialog.exec() == QtWidgets.QDialog.Accepted:
-            data = dialog.get_template_data()
-
-            try:
-                data["source"] = self._preflight_source(data["source"])
-                template = self._template_manager.create_template(**data)
-                self._render_collection_state(
-                    selected_template_id=template.id
-                )
-
-                QtWidgets.QMessageBox.information(
-                    self,
-                    "Template Created",
-                    f"Template '{template.name}' created successfully."
-                )
-
-            except Exception as e:
-                logger.error(f"Failed to create template: {e}", exc_info=True)
-                self._render_storage_state()
-                QtWidgets.QMessageBox.critical(
-                    self,
-                    "Error",
-                    f"Failed to create template:\n\n{e}"
-                )
+        dialog.saveRequested.connect(self._save_template_editor)
+        dialog.exec()
 
     def _on_update_clicked(self):
         """Update one selected template from an admitted source candidate."""
@@ -631,33 +619,43 @@ class TemplateManagerDialog(QtWidgets.QDialog):
             operation="update",
         )
 
-        if dialog.exec() == QtWidgets.QDialog.Accepted:
+        dialog.saveRequested.connect(self._save_template_editor)
+        dialog.exec()
+
+    @QtCore.Slot()
+    def _save_template_editor(self):
+        """Finish an editor only after its admitted draft has been persisted."""
+        dialog = cast(TemplateEditorDialog, self.sender())
+        operation = dialog._operation
+        try:
             data = dialog.get_template_data()
+            data["source"] = self._preflight_source(data["source"])
+            if operation == "create":
+                template = self._template_manager.create_template(**data)
+            else:
+                template = self._template_manager.update_template(dialog._template_id, **data)
+        except Exception as exc:
+            logger.error("Failed to %s template: %s", operation, exc, exc_info=True)
+            QtWidgets.QMessageBox.critical(
+                dialog, "Error", f"Failed to {operation} template:\n\n{exc}"
+            )
+            self._render_storage_state()
+            return
 
-            try:
-                data["source"] = self._preflight_source(data["source"])
-                template = self._template_manager.update_template(
-                    self._current_template.id,
-                    **data
-                )
-                self._render_collection_state(
-                    selected_template_id=template.id
-                )
-
-                QtWidgets.QMessageBox.information(
-                    self,
-                    "Template Updated",
-                    f"Template '{data['name']}' updated successfully."
-                )
-
-            except Exception as e:
-                logger.error(f"Failed to update template: {e}", exc_info=True)
-                self._render_storage_state()
-                QtWidgets.QMessageBox.critical(
-                    self,
-                    "Error",
-                    f"Failed to update template:\n\n{e}"
-                )
+        dialog.accept()
+        try:
+            self._render_collection_state(selected_template_id=template.id)
+        except Exception as exc:
+            logger.error("Template saved but collection refresh failed", exc_info=True)
+            QtWidgets.QMessageBox.critical(
+                self, "Template Saved", f"Template '{template.name}' was saved, but refreshing the collection failed:\n\n{exc}"
+            )
+            return
+        past_operation = "Created" if operation == "create" else "Updated"
+        QtWidgets.QMessageBox.information(
+            self, f"Template {past_operation}",
+            f"Template '{template.name}' {past_operation.lower()} successfully."
+        )
 
     def _on_replace_clicked(self):
         """Explicitly replace one selected template from the source tab."""

@@ -362,6 +362,18 @@ def _estimate_rows(candidate: FitCandidate) -> tuple[list[dict[str, object]], li
             if launch_parameter is None
             else launch_parameter.selected_config
         )
+        starts = dict(launch_configuration.dataset_values)
+        if parameter.scope == "centred_fixed_effects":
+            raw_starts = {
+                dataset_id: math.log10(starts[dataset_id]) if configuration.log10 else starts[dataset_id]
+                for dataset_id in included_ids
+            }
+            starting_centre = float(np.mean(tuple(raw_starts.values())))
+            nominal = 10.0 ** starting_centre if configuration.log10 else starting_centre
+        elif parameter.scope == "shared":
+            nominal = launch_configuration.value
+        else:
+            nominal = starts[included_ids[0]]
         origin_parameter = next(
             (
                 item
@@ -371,23 +383,21 @@ def _estimate_rows(candidate: FitCandidate) -> tuple[list[dict[str, object]], li
             None,
         )
         if origin_parameter is None:
-            captured_value = launch_configuration.value
+            captured_value = nominal
             captured_source = "Fit setup value"
         elif parameter.scope in {"shared", "centred_fixed_effects"}:
             captured_value = origin_parameter.shared_config.value
             captured_source = "captured project Shared default"
         else:
-            captured_values = dict(origin_parameter.per_dataset_config.dataset_values)
-            captured_value = captured_values.get(
-                included_ids[0], origin_parameter.per_dataset_config.value
-            )
+            # Project capture can precede dataset seeding. This is labelled
+            # provenance; the dispatched starts below own nominal Fit values.
+            captured_value = origin_parameter.per_dataset_config.value
             captured_source = "captured project Per-dataset default"
         if parameter.scope == "centred_fixed_effects":
             settlement = settlements.get(parameter.name)
             if settlement is None:
                 raise ValueError(f"canonical result omitted centred settlement {parameter.name!r}")
             value = float(settlement.overall_decoded_value)
-            nominal = float(launch_configuration.value)
             absolute, percentage, unavailable = _change(value, nominal)
             append_row(shared, kind="centred_overall", name=parameter.name,
                 display_name=f"Overall · {parameter.display_name}", scope="Overall", unit=parameter.unit,
@@ -403,7 +413,6 @@ def _estimate_rows(candidate: FitCandidate) -> tuple[list[dict[str, object]], li
                 percentage_unavailable_reason=unavailable,
                 dataset_ids=list(settlement.dataset_ids),
                 captured_value_source=captured_source, nominal_value_source="Fit setup")
-            starts = dict(launch_configuration.dataset_values)
             for dataset_id in settlement.dataset_ids:
                 value = float(settlement.dataset_values[dataset_id])
                 append_row(individual, kind="centred_effective", name=parameter.name,
@@ -415,12 +424,13 @@ def _estimate_rows(candidate: FitCandidate) -> tuple[list[dict[str, object]], li
             deviation_bounds = math.log10(configuration.maximum) - math.log10(configuration.minimum) if configuration.log10 else configuration.maximum - configuration.minimum
             for deviation in settlement.deviations:
                 value = float(deviation.decoded_value)
-                absolute, percentage, unavailable = _change(value, 0.0)
                 dataset_id = str(deviation.coordinate.dataset_id)
+                nominal_deviation = raw_starts[dataset_id] - starting_centre
+                absolute, percentage, unavailable = _change(value, nominal_deviation)
                 append_row(individual, kind="centred_deviation", name=parameter.name,
                     display_name=parameter.display_name,
                     scope="Log10-coordinate deviation" if configuration.log10 else "Linear-coordinate deviation", unit="decades" if configuration.log10 else parameter.unit,
-                    captured_value=0.0, nominal_value=0.0, fitted_value=value,
+                    captured_value=0.0, nominal_value=nominal_deviation, fitted_value=value,
                     minimum=-deviation_bounds, maximum=deviation_bounds,
                     bound_state=fit_bound_state(
                         value,
@@ -430,7 +440,7 @@ def _estimate_rows(candidate: FitCandidate) -> tuple[list[dict[str, object]], li
                     absolute_change=absolute, percentage_change=percentage,
                     percentage_unavailable_reason=unavailable,
                     dataset_id=dataset_id, dataset_ids=[dataset_id], dataset_display_name=display_names.get(dataset_id),
-                    captured_value_source="centred terminal settlement", nominal_value_source="centred zero-deviation seed")
+                    captured_value_source="centred terminal settlement", nominal_value_source="Fit setup")
             continue
         if parameter.scope == "shared":
             if parameter.selected_config.fit:
@@ -480,7 +490,7 @@ def _estimate_rows(candidate: FitCandidate) -> tuple[list[dict[str, object]], li
                     f"for {parameter.name!r}."
                 )
             nominal = float(values[dataset_id])
-            captured = float(captured_values.get(dataset_id, nominal))
+            captured = float(captured_values.get(dataset_id, captured_value))
             absolute, percentage, unavailable = _change(value, nominal)
             append_row(individual, kind="per_dataset_parameter", name=parameter.name, display_name=parameter.display_name,
                 scope="Per-dataset", unit=parameter.unit,
