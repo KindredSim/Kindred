@@ -357,7 +357,10 @@ class SymbolicCalculatorResult:
         legend = [f"{kind}: {', '.join(names) or 'none'}" for kind, names in self.symbol_legend.items()]
         definitions = [f"param {name} := {expr}" for name, expr in self.parameter_definitions.items()]
         definitions += [f"let {name} := {expr}" for name, expr in self.let_definitions.items()]
-        return "\n".join((f"Query: {self.query}", f"Result: {self.result_text}", "Assumptions:",
+        result = self.copy_text
+        if self.query == "odes()":
+            result += "\nRows: " + ", ".join(f"d{name}/dt" for name in self.symbol_legend["Species"])
+        return "\n".join((f"Query: {self.query}", f"Result: {result}", "Assumptions:",
                           *self.assumptions, "Canonical symbol legend:", *legend, "Definitions:",
                           *(definitions or ["none"]), "Mechanism source:", self.mechanism_source))
 
@@ -1412,6 +1415,23 @@ def _render(expression: Any) -> str:
     return printer.doprint(expression)
 
 
+def _pretty_render(expression: Any) -> str:
+    """Lay out mathematics without changing literal coordinate names."""
+    sp = require_sympy()
+    from sympy.printing.pretty.pretty import PrettyPrinter
+    from sympy.printing.pretty.stringpict import prettyForm
+
+    class Printer(PrettyPrinter):
+        def _print_Symbol(self, expr, bold_name=False):
+            return prettyForm(expr.name)
+
+    printer = Printer({"use_unicode": True, "wrap_line": False})
+    if isinstance(expression, _Relationships):
+        return "\n\n".join(printer.doprint(sp.Eq(key, rhs, evaluate=False))
+                           for key, rhs in expression.replacements.items())
+    return printer.doprint(expression)
+
+
 def _native_components(expression):
     """Expose evaluated children and retain the native shape and binding scope."""
     sp = require_sympy()
@@ -1550,36 +1570,48 @@ def _package_result(context: CalculatorContext, query: str, result) -> SymbolicC
     expression = query
     family = isinstance(result, _Alternatives)
     entries = _entries(result)
-    lines, choices = [], []
+    lines, display_lines, choices = [], [], []
+
+    def append(text, display=None):
+        lines.append(text)
+        display_lines.append(text if display is None else display)
+
     for value in entries:
         payload = value.expression
         if isinstance(payload, _UnavailableDiagnostic):
-            lines.extend(("Unavailable expression (not selectable):", payload.explanation))
+            append("Unavailable expression (not selectable):")
+            append(payload.explanation)
         elif isinstance(payload, _UnresolvedProblem):
-            lines.extend(("Unresolved alternative (not a selectable solved answer):", _render(payload.problem), payload.explanation))
+            append("Unresolved alternative (not a selectable solved answer):")
+            append(_render(payload.problem), _pretty_render(payload.problem))
+            append(payload.explanation)
         else:
             label = _render(payload)
             index = len(choices) + 1
             if family:
-                lines.append(f"Solution {index}")
-            lines.append(("Relationships: " if isinstance(payload, _Relationships) else "Expression: " if family else "") + label)
+                append(f"Solution {index}")
+            heading = "Relationships:" if isinstance(payload, _Relationships) else "Expression:" if family else ""
+            append((heading + " " if heading else "") + label,
+                   (heading + "\n" if heading else "") + _pretty_render(payload))
             reusable = f"solution({expression}, {index})" if family else query
             choices.append((f"Solution {index}: {label}" if family else "Result", reusable))
             if family or isinstance(payload, _Relationships) or value.conditions or value.notices or value.provenance or not _printed_input_supported(context, payload, label):
-                lines.append("Reuse query: " + reusable)
+                append("Reuse query: " + reusable)
         if value.conditions:
-            lines.append("Conditions: " + "; ".join(_render(c) for c in value.conditions))
-        lines.extend((*value.notices, *value.provenance))
+            append("Conditions: " + "; ".join(_render(c) for c in value.conditions),
+                   "Conditions:\n" + "\n\n".join(_pretty_render(c) for c in value.conditions))
+        for note in (*value.notices, *value.provenance):
+            append(note)
         if family:
-            lines.append("")
+            append("")
     if not entries:
-        lines.append("No applicable real solutions (EmptySet).")
+        append("No applicable real solutions (EmptySet).")
     if family:
-        lines.append("Complete query (all answers and unresolved possibilities): " + query)
-    result_text = "\n".join(lines).rstrip()
+        append("Complete query (all answers and unresolved possibilities): " + query)
+    copy_text = "\n".join(lines).rstrip()
     if entries and all(isinstance(v.expression, _UnavailableDiagnostic) for v in entries):
-        raise SymbolicCalculatorError(result_text)
-    copy_text = result_text
+        raise SymbolicCalculatorError(copy_text)
+    result_text = "\n".join(display_lines).rstrip()
     if expression == "odes()":
         result_text += "\nRows: " + ", ".join(f"d{name}/dt" for name in context.species_names)
     assumptions = (

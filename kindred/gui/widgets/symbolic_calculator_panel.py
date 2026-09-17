@@ -60,10 +60,14 @@ class SymbolicCalculatorPanel(QtWidgets.QWidget):
         query_row.addWidget(self._query_edit, stretch=1)
         self._evaluate_button = QtWidgets.QPushButton("Evaluate", self)
         self._evaluate_button.setObjectName("symbolicCalculatorEvaluateButton")
+        self._evaluate_button.setToolTip(
+            "Calculate your expression using the reactions and definitions last applied in this tab."
+        )
         self._evaluate_button.clicked.connect(self.evaluate_current_query)
         query_row.addWidget(self._evaluate_button)
         self._cancel_button = QtWidgets.QPushButton("Cancel", self)
         self._cancel_button.setObjectName("symbolicCalculatorCancelButton")
+        self._cancel_button.setToolTip("Stop the calculation that is running.")
         self._cancel_button.clicked.connect(self.cancel_current_query)
         query_row.addWidget(self._cancel_button)
         layout.addLayout(query_row)
@@ -71,6 +75,7 @@ class SymbolicCalculatorPanel(QtWidgets.QWidget):
         self._result_view = _CalculatorResultView(self)
         self._result_view.setObjectName("symbolicCalculatorResultView")
         self._result_view.setReadOnly(True)
+        self._result_view.setLineWrapMode(QtWidgets.QPlainTextEdit.LineWrapMode.NoWrap)
         result_font = QtGui.QFont("Courier New", 10)
         self._result_view.setFont(result_font)
         layout.addWidget(self._result_view, stretch=1)
@@ -78,6 +83,7 @@ class SymbolicCalculatorPanel(QtWidgets.QWidget):
         use_row = QtWidgets.QHBoxLayout()
         self._solution_combo = QtWidgets.QComboBox(self)
         self._solution_combo.setObjectName("symbolicCalculatorSolutionCombo")
+        self._solution_combo.setToolTip("Choose the answer you want to work with next.")
         self._solution_combo.setSizeAdjustPolicy(QtWidgets.QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
         self._solution_combo.setMinimumContentsLength(20)
         use_row.addWidget(self._solution_combo, stretch=1)
@@ -91,14 +97,23 @@ class SymbolicCalculatorPanel(QtWidgets.QWidget):
         copy_row.setSpacing(6)
         self._copy_result_button = QtWidgets.QPushButton("Copy Result", self)
         self._copy_result_button.setObjectName("symbolicCalculatorCopyResultButton")
+        self._copy_result_button.setToolTip(
+            "Copy every answer, including conditions and explanations, to the clipboard. "
+            "Your selection does not limit what gets copied."
+        )
         self._copy_result_button.clicked.connect(self.copy_compact_result)
         copy_row.addWidget(self._copy_result_button)
         self._copy_context_button = QtWidgets.QPushButton("Copy Context", self)
         self._copy_context_button.setObjectName("symbolicCalculatorCopyContextButton")
+        self._copy_context_button.setToolTip(
+            "Copy the results together with your expression, reactions, definitions "
+            "and the assumptions used in the calculation."
+        )
         self._copy_context_button.clicked.connect(self.copy_full_context)
         copy_row.addWidget(self._copy_context_button)
         self._help_button = QtWidgets.QPushButton("Help", self)
         self._help_button.setObjectName("symbolicCalculatorHelpButton")
+        self._help_button.setToolTip("Find commands and worked examples for using Calculator.")
         self._help_button.clicked.connect(self.show_help)
         copy_row.addWidget(self._help_button)
         copy_row.addStretch(1)
@@ -134,12 +149,19 @@ class SymbolicCalculatorPanel(QtWidgets.QWidget):
         self._use_button.setVisible(bool(state.reuse_queries))
         self._use_button.setEnabled(available and not state.busy and bool(state.reuse_queries))
         self._use_button.setText("Use in query" if len(state.reuse_queries) > 1 else "Use result")
+        self._use_button.setToolTip(
+            "Put a calculation for the selected answer in the input box so you can build on it. "
+            "Click Evaluate when you’re ready."
+            if len(state.reuse_queries) > 1 else
+            "Put this calculation back in the input box so you can edit it. "
+            "Click Evaluate when you’re ready."
+        )
         reason = state.reason
         self._status_label.setText(state.status if available else reason)
         if self._latest_result_text:
             prefix = "Error" if self._latest_is_error else "Result"
             query = self._latest_query
-            self._result_view.setPlainText(f"{query}\n{prefix}: {self._latest_result_text}")
+            self._result_view.setPlainText(f"{query}\n{prefix}:\n{self._latest_result_text}")
         else:
             self._result_view.clear()
 

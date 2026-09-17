@@ -34,9 +34,12 @@ for later queries or change the model.</p>
 This does not evaluate the query. For example, after evaluating <code>dP/dt</code>, click
 <b>Use result</b>, change the inserted text to <code>subs(dP/dt,k3,11)</code>, then click
 <b>Evaluate</b>.</p>
-<p><b>Copy Result</b> copies the result report, including all evaluated alternatives, conditions
-and any reuse queries. <b>Copy Context</b> also includes the reaction source, definitions and
-assumptions. You can copy just a displayed expression when you want to use that expression as input.</p>
+<p>Results use mathematical formatting to make fractions, equations and matrices easier to read.
+Scroll horizontally to read wide expressions. The displayed notation is not necessarily valid input.
+Use <b>Use result</b> or <b>Use in query</b> to insert an executable query.</p>
+<p><b>Copy Result</b> copies the text report with exact values, all evaluated alternatives,
+conditions, notices and any reuse queries. Selecting an answer does not narrow this report.
+<b>Copy Context</b> adds the reaction source, definitions and assumptions to the same text report.</p>
 
 <h2>Names, definitions and exact values</h2>
 <p>Queries can use species and parameters from the current model, along with its definitions.
