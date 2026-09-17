@@ -203,6 +203,7 @@ def forward_rate_symbolic_relation(
     exponential: Callable[[object], object],
     source_coordinate: Callable[[str], object | None] | None = None,
     standard_concentration: object | None = None,
+    constant: Callable[[str], object] | None = None,
 ) -> object:
     """Project one accepted typed rate model onto a symbolic backend.
 
@@ -214,6 +215,8 @@ def forward_rate_symbolic_relation(
     optional ``standard_concentration`` is a backend-owned exact expression
     used for Eyring's concentration normalization.  If omitted, the accepted
     model's numeric standard concentration is used for ordinary projections.
+    ``constant`` optionally projects named fixed physical constants; omitting it
+    preserves the ordinary owned numeric constants without changing the formula.
     """
 
     if not callable(literal):
@@ -227,7 +230,7 @@ def forward_rate_symbolic_relation(
         number = _numeric_float(value, field=field)
         if not math.isfinite(number):
             raise ValueError(f"{field} must be finite.")
-        return literal(float(number))
+        return constant(field) if constant is not None else literal(float(number))
 
     def coordinate(role: str, value: float) -> object:
         """Use a canonical authored coordinate, or the admitted literal."""

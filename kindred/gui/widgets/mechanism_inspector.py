@@ -27,6 +27,7 @@ from kindred.core.ode_builder import build_effective_rate_coefficient_evaluator
 from kindred.core.simulator.dsl_parse import DslAnalysis, PreparedDslRequestSet
 from kindred.core.simulator.parameter_algebra import (
     apply_parameter_algebra_spec_to_mechanism,
+    parameter_algebra_spec_from_mechanism,
 )
 from kindred.core.simulator.parameter_coordinates import build_parameter_target_map
 from kindred.core.simulator.parameter_algebra_spec import ParameterAlgebraSpec
@@ -382,12 +383,19 @@ def _format_steps(
             )
             if rate_authority is not None:
                 lines.append(
-                    "  Effective-rate authority: "
+                    "  Immutable model/default inputs (before retained assignments): "
                     + json.dumps(
                         _plain_json_value(rate_authority),
                         sort_keys=True,
                     )
                 )
+            spec = parameter_algebra_spec_from_mechanism(mechanism)
+            if spec is not None:
+                coordinate_names = set((entry.get("source_coordinates") or {}).values()) | set(parameter_names)
+                for statement in spec.parameter_block.lines:
+                    if statement.name in coordinate_names:
+                        kind = spec.parameter_assignment_kind(statement.name)
+                        lines.append(f"  Retained {kind}: {statement.name} = {expression_to_source(statement.expr)}")
     else:
         lines.append("No indexed DSL reaction or equilibrium steps.")
 

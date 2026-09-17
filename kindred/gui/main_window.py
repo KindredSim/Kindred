@@ -244,6 +244,7 @@ class MainWindow(QtWidgets.QMainWindow):
         initial_document = self.config_controller.default_project_document()
         self._project_session = ProjectSession(initial_document)
         self._computation_gate = ComputationGate(parent=self)
+        self._calculator_owners: set[SymbolicCalculatorOwner] = set()
 
         self._simulation_jobs = SimulationJobOwner(
             gate=self._computation_gate,
@@ -314,6 +315,7 @@ class MainWindow(QtWidgets.QMainWindow):
             fit_session=self._fit_session_owner,
             xlsx_exports=self._xlsx_export_owner,
             scan=self._scan_owner,
+            calculator_owners=lambda: tuple(self._calculator_owners),
             set_status_text=self.set_status_text,
             capture_visible_tab_inputs=(
                 lambda token: self._capture_visible_tab_inputs(token)
@@ -454,7 +456,12 @@ class MainWindow(QtWidgets.QMainWindow):
             canonical_source=lambda captured=target: (
                 self._workspace_tab_registry.tab(captured).mechanism_source
             ),
+            gate=self._computation_gate,
+            parent=self,
         )
+        self._calculator_owners.add(calculator_owner)
+        calculator_owner.disposed.connect(self._calculator_owner_disposed)
+        calculator_owner.application_close_settlement_changed.connect(self._calculator_settlement_changed)
         calculator_panel = SymbolicCalculatorPanel(
             on_evaluate=lambda query, captured=target: self._evaluate_symbolic(
                 captured,
@@ -462,8 +469,11 @@ class MainWindow(QtWidgets.QMainWindow):
             ),
             on_copy_result=calculator_owner.copy_compact_text,
             on_copy_context=calculator_owner.copy_context_text,
+            on_use_result=calculator_owner.reuse_query,
+            on_cancel=calculator_owner.cancel,
             parent=self._calculator_stack,
         )
+        calculator_owner.stateChanged.connect(calculator_panel.render_state)
         editor_binding = MechanismEditorBinding(
             tab_id=target,
             editor=editor,
@@ -691,6 +701,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._file_menu.removeAction(self._load_data_action)
             self._load_data_action = None
         bundle.slider_binding.dispose()
+        bundle.calculator_owner.dispose()
         for stack, widget in (
             (self._mechanism_stack, bundle.editor_panel),
             (self._slider_stack, bundle.slider_panel),
@@ -2482,6 +2493,7 @@ class MainWindow(QtWidgets.QMainWindow):
             active_import=bool(self._dataset_import_staging.busy),
             active_xlsx_export=self._xlsx_export_owner.is_exporting,
             active_scan=self._scan_owner.busy,
+            active_calculator=any(owner.busy for owner in self._calculator_owners),
         )
 
     def _prepare_before_save(
@@ -4160,6 +4172,7 @@ class MainWindow(QtWidgets.QMainWindow):
             or self._dataset_import_staging.busy
             or self._xlsx_export_owner.is_exporting
             or self._scan_owner.busy
+            or any(owner.busy for owner in self._calculator_owners)
         )
         if active_work:
             self.set_status_text(
@@ -4895,6 +4908,18 @@ class MainWindow(QtWidgets.QMainWindow):
     # ------------------------------------------------------------------
     # Symbolic, inspector, and auxiliary UI
     # ------------------------------------------------------------------
+    @QtCore.Slot(object)
+    def _calculator_owner_disposed(self, owner) -> None:
+        self._calculator_owners.discard(owner)
+        owner.deleteLater()
+
+    @QtCore.Slot()
+    def _calculator_settlement_changed(self) -> None:
+        self.project_controller.notify_close_progress()
+        # A retiring owner may settle during ordinary tab-surface replacement.
+        if self._workspace_tab_registry.active_tab_id in self._tab_surfaces:
+            self._refresh_actions()
+
     def _refresh_symbolic_calculator(self, tab_id: str) -> None:
         bundle = self._tab_surfaces[str(tab_id)]
         if self._workspace_tab_registry.tab_runtime(
@@ -5367,6 +5392,7 @@ class MainWindow(QtWidgets.QMainWindow):
             or self._dataset_import_staging.busy
             or self._xlsx_export_owner.is_exporting
             or self._scan_owner.busy
+            or any(owner.busy for owner in self._calculator_owners)
         )
         if self._scan_action is not None:
             self._scan_action.setEnabled(

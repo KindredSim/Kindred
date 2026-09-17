@@ -5,6 +5,8 @@ from typing import Callable
 from PySide6 import QtCore, QtGui, QtWidgets
 
 from kindred.gui.symbolic_calculator_owner import SymbolicCalculatorViewState
+from kindred.gui.ui_helpers import clamp_initial_size
+from kindred.core.symbolic.calculator_help import calculator_help_html
 
 
 class _CalculatorResultView(QtWidgets.QPlainTextEdit):
@@ -25,6 +27,8 @@ class SymbolicCalculatorPanel(QtWidgets.QWidget):
         on_evaluate: Callable[[str], SymbolicCalculatorViewState],
         on_copy_result: Callable[[], str],
         on_copy_context: Callable[[], str],
+        on_use_result: Callable[[str, int], str],
+        on_cancel: Callable[[], SymbolicCalculatorViewState],
         parent: QtWidgets.QWidget | None = None,
     ) -> None:
         super().__init__(parent)
@@ -32,9 +36,12 @@ class SymbolicCalculatorPanel(QtWidgets.QWidget):
         self._on_evaluate = on_evaluate
         self._on_copy_result = on_copy_result
         self._on_copy_context = on_copy_context
+        self._on_use_result = on_use_result
+        self._on_cancel = on_cancel
         self._latest_query = ""
         self._latest_result_text = ""
         self._latest_is_error = False
+        self._help_dialog: QtWidgets.QDialog | None = None
 
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(8, 8, 8, 8)
@@ -55,6 +62,10 @@ class SymbolicCalculatorPanel(QtWidgets.QWidget):
         self._evaluate_button.setObjectName("symbolicCalculatorEvaluateButton")
         self._evaluate_button.clicked.connect(self.evaluate_current_query)
         query_row.addWidget(self._evaluate_button)
+        self._cancel_button = QtWidgets.QPushButton("Cancel", self)
+        self._cancel_button.setObjectName("symbolicCalculatorCancelButton")
+        self._cancel_button.clicked.connect(self.cancel_current_query)
+        query_row.addWidget(self._cancel_button)
         layout.addLayout(query_row)
 
         self._result_view = _CalculatorResultView(self)
@@ -63,6 +74,18 @@ class SymbolicCalculatorPanel(QtWidgets.QWidget):
         result_font = QtGui.QFont("Courier New", 10)
         self._result_view.setFont(result_font)
         layout.addWidget(self._result_view, stretch=1)
+
+        use_row = QtWidgets.QHBoxLayout()
+        self._solution_combo = QtWidgets.QComboBox(self)
+        self._solution_combo.setObjectName("symbolicCalculatorSolutionCombo")
+        self._solution_combo.setSizeAdjustPolicy(QtWidgets.QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        self._solution_combo.setMinimumContentsLength(20)
+        use_row.addWidget(self._solution_combo, stretch=1)
+        self._use_button = QtWidgets.QPushButton("Use result", self)
+        self._use_button.setObjectName("symbolicCalculatorUseButton")
+        self._use_button.clicked.connect(self.use_result)
+        use_row.addWidget(self._use_button)
+        layout.addLayout(use_row)
 
         copy_row = QtWidgets.QHBoxLayout()
         copy_row.setSpacing(6)
@@ -74,17 +97,12 @@ class SymbolicCalculatorPanel(QtWidgets.QWidget):
         self._copy_context_button.setObjectName("symbolicCalculatorCopyContextButton")
         self._copy_context_button.clicked.connect(self.copy_full_context)
         copy_row.addWidget(self._copy_context_button)
+        self._help_button = QtWidgets.QPushButton("Help", self)
+        self._help_button.setObjectName("symbolicCalculatorHelpButton")
+        self._help_button.clicked.connect(self.show_help)
+        copy_row.addWidget(self._help_button)
         copy_row.addStretch(1)
         layout.addLayout(copy_row)
-
-        examples = QtWidgets.QLabel(
-            "Supported: dA/dt, dA/dB, d(dA/dt)/dB, odes(), jacobian(), "
-            "simplify, factor, expand, cancel, collect, expand_params",
-            self,
-        )
-        examples.setObjectName("symbolicCalculatorExamplesLabel")
-        examples.setWordWrap(True)
-        layout.addWidget(examples)
 
         self.render_state(
             SymbolicCalculatorViewState(
@@ -97,21 +115,27 @@ class SymbolicCalculatorPanel(QtWidgets.QWidget):
         return bool(self._query_edit.isEnabled() and self._evaluate_button.isEnabled())
 
     def render_state(self, state: SymbolicCalculatorViewState) -> None:
-        if not isinstance(state, SymbolicCalculatorViewState):
-            self._render_unavailable_after_invalid_state()
-            raise TypeError("state must be SymbolicCalculatorViewState.")
         available = bool(state.available)
+        previous_index = self._solution_combo.currentIndex() if self._latest_query == state.latest_query else 0
         # An unavailable current mechanism has no result.  Do not let a
         # stale or malformed view state make a previous source look current.
         self._latest_query = state.latest_query if available else ""
         self._latest_result_text = state.latest_result_text if available else ""
         self._latest_is_error = state.latest_is_error if available else False
-        self._query_edit.setEnabled(available)
-        self._evaluate_button.setEnabled(available)
+        self._query_edit.setEnabled(available and not state.busy)
+        self._evaluate_button.setEnabled(available and not state.busy)
+        self._cancel_button.setEnabled(state.can_cancel)
         self._copy_result_button.setEnabled(available and state.can_copy_result)
         self._copy_context_button.setEnabled(available and state.can_copy_context)
+        self._solution_combo.clear()
+        self._solution_combo.addItems([label for label, _ in state.reuse_queries])
+        self._solution_combo.setCurrentIndex(max(0, min(previous_index, len(state.reuse_queries)-1)))
+        self._solution_combo.setVisible(len(state.reuse_queries) > 1)
+        self._use_button.setVisible(bool(state.reuse_queries))
+        self._use_button.setEnabled(available and not state.busy and bool(state.reuse_queries))
+        self._use_button.setText("Use in query" if len(state.reuse_queries) > 1 else "Use result")
         reason = state.reason
-        self._status_label.setText("" if available else reason)
+        self._status_label.setText(state.status if available else reason)
         if self._latest_result_text:
             prefix = "Error" if self._latest_is_error else "Result"
             query = self._latest_query
@@ -119,16 +143,34 @@ class SymbolicCalculatorPanel(QtWidgets.QWidget):
         else:
             self._result_view.clear()
 
-    def _render_unavailable_after_invalid_state(self) -> None:
-        self._latest_query = ""
-        self._latest_result_text = ""
-        self._latest_is_error = False
-        self._query_edit.setEnabled(False)
-        self._evaluate_button.setEnabled(False)
-        self._copy_result_button.setEnabled(False)
-        self._copy_context_button.setEnabled(False)
-        self._status_label.setText("Symbolic calculator unavailable.")
-        self._result_view.clear()
+    @QtCore.Slot()
+    def use_result(self) -> None:
+        query = self._on_use_result(self._latest_query, max(0, self._solution_combo.currentIndex()))
+        if query:
+            self._query_edit.setText(query)
+            self._query_edit.setFocus()
+
+    @QtCore.Slot()
+    def show_help(self) -> None:
+        if self._help_dialog is None:
+            dialog = QtWidgets.QDialog(self)
+            dialog.setWindowTitle("Symbolic Calculator Help")
+            layout = QtWidgets.QVBoxLayout(dialog)
+            browser = QtWidgets.QTextBrowser(dialog)
+            browser.setObjectName("symbolicCalculatorHelpText")
+            browser.setTextInteractionFlags(QtCore.Qt.TextInteractionFlag.TextSelectableByMouse | QtCore.Qt.TextInteractionFlag.TextSelectableByKeyboard)
+            browser.document().setDocumentMargin(16)
+            browser.document().setDefaultStyleSheet("h2 {margin-top: 24px;} p, pre {margin-top: 10px; margin-bottom: 10px;} pre {white-space: pre-wrap;}")
+            browser.setHtml(calculator_help_html())
+            layout.addWidget(browser)
+            buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.StandardButton.Close, parent=dialog)
+            buttons.rejected.connect(dialog.hide)
+            layout.addWidget(buttons)
+            clamp_initial_size(dialog, 850, 700)
+            self._help_dialog = dialog
+        self._help_dialog.show()
+        self._help_dialog.raise_()
+        self._help_dialog.activateWindow()
 
     @QtCore.Slot()
     def evaluate_current_query(self) -> None:
@@ -138,6 +180,10 @@ class SymbolicCalculatorPanel(QtWidgets.QWidget):
         if not query:
             return
         self.render_state(self._on_evaluate(query))
+
+    @QtCore.Slot()
+    def cancel_current_query(self) -> None:
+        self.render_state(self._on_cancel())
 
     @QtCore.Slot()
     def copy_compact_result(self) -> None:

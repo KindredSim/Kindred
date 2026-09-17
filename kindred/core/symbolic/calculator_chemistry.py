@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from fractions import Fraction
+from collections.abc import Mapping
 from typing import Any
 
 from kindred.core.equilibrium_rate_authority import equilibrium_rate_symbolic_relations
@@ -17,7 +18,8 @@ from .errors import UnsupportedSymbolicExpressionError
 
 
 def build_calculator_chemistry_relations(
-    mechanism: Mechanism, *, parameter_spec: ParameterAlgebraSpec
+    mechanism: Mechanism, *, parameter_spec: ParameterAlgebraSpec,
+    symbols: Mapping[str, Any],
 ) -> dict[str, Any]:
     """Lower chemistry readouts without evaluating Algebra or independent inputs."""
 
@@ -32,7 +34,7 @@ def build_calculator_chemistry_relations(
     energy_factor = exact_literal(
         normalize_energy_to_J_per_mol(1, metadata.energy_unit)
     )
-    temperature = sympy.Symbol("T")
+    temperature = symbols["T"]
     readouts_by_source: dict[int, dict[str, str]] = {}
     for item in parameter_spec.mechanism_namespace.ordered_items:
         readouts_by_source.setdefault(item.source_index, {})[
@@ -60,7 +62,7 @@ def build_calculator_chemistry_relations(
                 if role in {"kappa", "degeneracy"}:
                     return None
                 raise ValueError(f"Missing admitted source coordinate for {source_role!r}.")
-            symbol = sympy.Symbol(name)
+            symbol = symbols[name]
             if role in {"Ea", "dG_act", "dG_eq"}:
                 return energy_factor * symbol
             return symbol
@@ -72,6 +74,7 @@ def build_calculator_chemistry_relations(
                 literal=exact_literal,
                 exponential=sympy.exp,
                 source_coordinate=source_coordinate,
+                constant=symbols.__getitem__,
             )
             if forward_name in derived:
                 chemistry_relations[forward_name] = forward
@@ -84,12 +87,13 @@ def build_calculator_chemistry_relations(
                 standard_concentration = metadata.standard_conc_M
             relations = equilibrium_rate_symbolic_relations(
                 step,
-                forward_relation=sympy.Symbol(forward_name),
+                forward_relation=symbols[forward_name],
                 temperature=temperature,
                 literal=exact_literal,
                 exponential=sympy.exp,
                 source_coordinate=source_coordinate,
                 standard_concentration=exact_literal(float(standard_concentration)),
+                constant=symbols.__getitem__,
             )
             for role, expression in (("kr", relations.kr), ("Keq", relations.Keq)):
                 name = readouts[role]

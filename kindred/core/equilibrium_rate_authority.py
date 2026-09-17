@@ -171,6 +171,7 @@ def equilibrium_rate_symbolic_relations(
     exponential: Callable[[object], object],
     source_coordinate: Callable[[str], object] | None = None,
     standard_concentration: object | None = None,
+    constant: Callable[[str], object] | None = None,
 ) -> EquilibriumRateSymbolicRelations:
     """Project accepted equilibrium authority without choosing a backend.
 
@@ -178,6 +179,8 @@ def equilibrium_rate_symbolic_relations(
     projects its accepted free-energy relation from the normalized authority;
     ``standard_concentration`` is the exact backend expression used for the
     concentration-form normalization.
+    ``constant`` optionally projects the named fixed gas constant instead of its
+    owned numeric literal, without changing thermodynamic or runtime authority.
     """
 
     if not callable(literal):
@@ -242,7 +245,7 @@ def equilibrium_rate_symbolic_relations(
         )
         keq_relation = exponential(
             -(source_coordinate("dG_eq") if source_coordinate is not None else literal(delta_g))
-            / (literal(float(R)) * temperature)  # type: ignore[operator]
+            / ((constant("R") if constant is not None else literal(float(R))) * temperature)  # type: ignore[operator]
         )
         forward_order = directional_order_fraction(
             getattr(equilibrium, "stoich_forward", {}) or {},

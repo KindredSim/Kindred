@@ -1,972 +1,1606 @@
+"""Restricted, accepted-source symbolic Calculator; no execution parameter binding."""
 from __future__ import annotations
 
+from dataclasses import dataclass, replace
 from decimal import Decimal, InvalidOperation
 import math
-from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Any, Mapping, Sequence
 
-from kindred.core.algebra.parser import (
-    BinaryNode,
-    CallNode,
-    IdentNode,
-    NumberNode,
-    SpeciesRefNode,
-    UnaryNode,
-)
-from kindred.core.algebra.grammar import BUILTIN_FUNCTIONS as ALGEBRA_BUILTIN_FUNCTIONS
-from kindred.core.algebra.grammar import HELPER_FUNCTIONS as ALGEBRA_HELPER_FUNCTIONS
+from kindred.core import constants
+from kindred.core.algebra.errors import AlgebraError
+from kindred.core.algebra.parser import BinaryNode, CallNode, IdentNode, NumberNode, SpeciesRefNode, UnaryNode
 from kindred.core.algebra.printer import expression_to_source
 from kindred.core.algebra.simulation_series import compiled_algebra_for_mechanism
-from kindred.core.algebra.symbols import PROTECTED_NAMES as ALGEBRA_PROTECTED_NAMES
+from kindred.core.algebra.symbols import BUILTIN_FUNCTIONS, PROTECTED_NAMES
 from kindred.core.mechanism_metadata import MechanismMetadataView
 from kindred.core.simulator.parameter_algebra import parameter_algebra_spec_from_mechanism
-from kindred.core.simulator.parameter_namespace import (
-    MechanismParameterNamespace,
-    build_namespace_from_mechanism,
-)
+from kindred.core.simulator.parameter_namespace import build_namespace_from_mechanism
 
 from .backend import require_sympy
 from .calculator_chemistry import build_calculator_chemistry_relations
 from .errors import UnsupportedSymbolicExpressionError
-from .jacobian import (
-    build_symbolic_mechanism_public_projection,
-    classify_symbolic_jacobian_support,
-)
-from .namespaces import SymbolicParameterNamespaceContext
+from .jacobian import build_symbolic_mechanism_public_projection, classify_symbolic_jacobian_support
 
-_SUPPORTED_TRANSFORMS = frozenset({"simplify", "factor", "expand", "cancel"})
-_RESERVED_ALGEBRA_IDENTIFIERS = frozenset(
-    str(name)
-    for name in (
-        set(ALGEBRA_PROTECTED_NAMES)
-        | set(ALGEBRA_BUILTIN_FUNCTIONS)
-        | set(ALGEBRA_HELPER_FUNCTIONS)
-    )
-)
+_FIXED_CONSTANTS = tuple(name for name in constants.__all__)
+_TRANSFORMS = frozenset({"simplify", "factor", "expand", "cancel"})
+_FUNCTIONS = frozenset(BUILTIN_FUNCTIONS) - {"ifelse"} | {"log"}
+_OPERATIONS = _TRANSFORMS | _FUNCTIONS | {
+    "collect", "subs", "approx", "partial", "dt",
+    "odes", "jacobian", "matrix", "eq", "at", "transpose", "det", "initial",
+    "solve", "steady_state", "stationary_state", "solution", "integrate", "limit", "series", "remove_order",
+    "pi", "e", "infinity",
+}
 
 
 class SymbolicCalculatorError(UnsupportedSymbolicExpressionError):
-    """Raised when a calculator query is syntactically valid but unsupported."""
+    """A factual invalid, unsupported, or undefined Calculator expression."""
 
 
 class SymbolicCalculatorUnavailable(SymbolicCalculatorError):
-    """Raised when the committed mechanism cannot be represented truthfully."""
+    """The accepted mechanism is outside the supported symbolic system."""
+
+
+@dataclass(frozen=True, slots=True)
+class _Value:
+    """Finished current mathematics; construction and metadata changes are passive."""
+    expression: Any
+    conditions: tuple[Any, ...] = ()
+    notices: tuple[str, ...] = ()
+    provenance: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class _Relationships:
+    replacements: Mapping[Any, Any]
+
+
+@dataclass(frozen=True, slots=True)
+class _UnresolvedProblem:
+    problem: Any
+    explanation: str
+
+
+@dataclass(frozen=True, slots=True)
+class _UnavailableDiagnostic:
+    explanation: str
+
+
+@dataclass(frozen=True, slots=True)
+class _Alternatives:
+    values: tuple[_Value, ...]
+
+
+def _entries(result):
+    return result.values if isinstance(result, _Alternatives) else (result,)
+
+
+class _ConditionInapplicable(SymbolicCalculatorError):
+    """A current condition is false, distinct from an operation failure."""
+
+
+def _fixed_constant_values():
+    """Canonical identities and the owner's declared values as exact decimals."""
+    sp = require_sympy()
+    return {sp.Symbol(name, positive=True): sp.Rational(str(getattr(constants, name))) for name in _FIXED_CONSTANTS}
+
+
+def _boolean_result(parts, transform, *, conjunction=True):
+    """A decisive Boolean operand precedes errors in irrelevant companions."""
+    sp = require_sympy()
+    decisive = sp.false if conjunction else sp.true
+    pending, errors = [], []
+    for part in parts:
+        try:
+            part = (_boolean_result(part.args, transform, conjunction=isinstance(part, sp.And))
+                    if isinstance(part, (sp.And, sp.Or)) else transform(part))
+        except (ValueError, TypeError, ArithmeticError, NotImplementedError) as exc:
+            errors.append(exc)
+            continue
+        if part == decisive:
+            return decisive
+        pending.append(part)
+    if errors:
+        raise errors[0]
+    return (sp.And if conjunction else sp.Or)(*pending)
+
+
+def _conditions(current=(), *, replacements=None, before_substitution=(), additional=()):
+    """Evaluate changed/fresh predicates; additional conditions are already in the new coordinates."""
+    sp = require_sympy()
+    additional = tuple(dict.fromkeys(c for c in additional if c != sp.true))
+    affected = tuple(c for c in current if replacements and c.free_symbols.intersection(replacements))
+    substituted = tuple(dict.fromkeys((*affected, *before_substitution)))
+    additional = tuple(c for c in additional if c not in current or c in affected)
+    if not substituted and not additional:
+        return current
+    fixed = _fixed_constant_values()
+    def evaluate(part):
+        condition, mapping = part
+        if mapping:
+            condition = _native_substitute(condition, mapping, equations=False)
+        return _native_substitute(condition, fixed, equations=False)
+    changed = _boolean_result((*((c, replacements) for c in substituted), *((c, None) for c in additional)), evaluate)
+    return _condition_tuple(sp.And(*(c for c in current if c not in affected), changed))
+
+
+def _condition_tuple(result):
+    """Package an evaluated predicate without evaluating it again."""
+    sp = require_sympy()
+    if result == sp.false:
+        raise _ConditionInapplicable("The answer's conditions are not satisfied.")
+    return result.args if isinstance(result, sp.And) else () if result == sp.true else (result,)
+
+
+def _metadata(value, *inputs):
+    """Display inheritance never evaluates mathematics or applicability."""
+    notices = tuple(dict.fromkeys((*value.notices, *(n for v in inputs for n in v.notices))))
+    provenance = tuple(dict.fromkeys((*value.provenance, *(p for v in inputs for p in v.provenance))))
+    return value if (notices, provenance) == (value.notices, value.provenance) else replace(value, notices=notices, provenance=provenance)
+
+
+def _branches(values):
+    """Enumerate one complete family; no status, mathematics or metadata work."""
+    families = [i for i, value in enumerate(values) if isinstance(value, _Alternatives)]
+    if len(families) > 1:
+        raise SymbolicCalculatorError("Select independent answer operands explicitly with solution(result,n); branches are not paired automatically.")
+    if not families:
+        yield tuple(values)
+    else:
+        index = families[0]
+        for value in values[index].values:
+            yield (*values[:index], value, *values[index+1:])
+
+
+def _unusable(values):
+    """Unavailable operands take precedence; unresolved operands stay current."""
+    return next((v for v in values if isinstance(v.expression, _UnavailableDiagnostic)), None) or next(
+        (v for v in values if isinstance(v.expression, _UnresolvedProblem)), None)
+
+
+def _scalar(value: _Value, operation: str, *, finite=False) -> Any:
+    sp = require_sympy()
+    expression = value.expression
+    if not isinstance(expression, sp.Expr):
+        raise SymbolicCalculatorError(f"Unsupported: {operation} requires a scalar expression.")
+    if finite and expression in (sp.oo, -sp.oo):
+        raise SymbolicCalculatorError(f"Invalid input: {operation} requires a finite value.")
+    return expression
+
+
+def _map(expression: Any, operation) -> Any:
+    """Scalar operations have no meaning on set predicates or variable binders."""
+    sp = require_sympy()
+    if isinstance(expression, sp.Tuple):
+        return sp.Tuple(*(_map(item, operation) for item in expression))
+    if isinstance(expression, sp.MatrixBase):
+        return sp.ImmutableMatrix(expression.applyfunc(operation))
+    if isinstance(expression, sp.Equality):
+        return sp.Eq(_map(expression.lhs, operation), _map(expression.rhs, operation), evaluate=False)
+    if not isinstance(expression, sp.Expr):
+        raise SymbolicCalculatorError("Unsupported: this operation requires expressions, equations, tuples or matrices; apply solutions with subs first.")
+    return operation(expression)
+
+
+def _current_symbols(result) -> set[Any]:
+    """Discover current mathematics and conditions, never labels or provenance."""
+    payload = result.expression
+    if isinstance(payload, _UnavailableDiagnostic):
+        return set().union(*(c.free_symbols for c in result.conditions))
+    if isinstance(payload, _Relationships):
+        payload = require_sympy().Tuple(*payload.replacements.values())
+    elif isinstance(payload, _UnresolvedProblem):
+        payload = payload.problem
+    return set(payload.free_symbols) | set().union(*(c.free_symbols for c in result.conditions))
+
+
+def _native_substitute(expression: Any, mapping: Mapping[Any, Any], *, equations=True) -> Any:
+    """Substitute free coordinates without capturing them in native binders."""
+    sp = require_sympy()
+    from sympy.logic.boolalg import Boolean
+    from sympy.core.relational import Relational
+
+    def sub(item, replacements=mapping, *, equations=equations):
+        return _native_substitute(item, replacements, equations=equations)
+
+    def scope(body, coordinates):
+        targets = body.free_symbols | {x for derivative in body.atoms(sp.Derivative) for x in derivative.variables}
+        free = {x: y for x, y in mapping.items() if x != y and x not in coordinates and x in targets}
+        introduced = set().union(*(y.free_symbols for y in free.values()))
+        fresh = {x: sp.Dummy(x.name, **x.assumptions0) for x in coordinates if x in introduced}
+        return body.xreplace(fresh), tuple(fresh.get(x, x) for x in coordinates), free
+
+    if isinstance(expression, sp.Tuple):
+        return sp.Tuple(*(sub(item) for item in expression))
+    if isinstance(expression, sp.MatrixBase):
+        return sp.ImmutableMatrix(expression.applyfunc(sub))
+    if isinstance(expression, sp.ConditionSet):
+        bound = tuple(expression.sym) if isinstance(expression.sym, sp.Tuple) else (expression.sym,)
+        condition, bound, free = scope(expression.condition, bound)
+        renamed = sp.Tuple(*bound) if isinstance(expression.sym, sp.Tuple) else bound[0]
+        return sp.ConditionSet(renamed, sub(condition, free, equations=False), sub(expression.base_set))
+    if isinstance(expression, sp.Lambda):
+        body, bound, free = scope(expression.expr, expression.variables)
+        return sp.Lambda(bound, sub(body, free))
+    if isinstance(expression, sp.Subs):
+        body, bound, free = scope(expression.expr, expression.variables)
+        return sp.Subs(sub(body, free), bound, tuple(sub(x) for x in expression.point))
+    if isinstance(expression, sp.Limit):
+        body, coordinate, point, direction = expression.args
+        body, bound, free = scope(body, (coordinate,))
+        return sp.Limit(sub(body, free), bound[0], sub(point), dir=str(direction))
+    if isinstance(expression, sp.Integral):
+        required = {x: y for x, y in mapping.items() if x != y and x in expression.free_symbols}
+        if not required:
+            return expression
+        introduced = set().union(*(y.free_symbols for y in required.values()))
+        bound = {limit[0] for limit in expression.limits if len(limit) > 1}
+        # Native renaming distinguishes bound variables from exterior endpoints
+        # and indefinite outputs when a replacement crosses those scopes.
+        renamed = expression.as_dummy() if bound.intersection(required.keys() | introduced) else expression
+        output_coordinates = tuple(dict.fromkeys(limit[0] for limit in renamed.limits if len(limit) == 1))
+        targets = tuple(x for x in output_coordinates if x in required or x in introduced)
+        if targets:
+            fresh = {x: sp.Dummy(x.name, **x.assumptions0) for x in targets}
+            body = renamed.xreplace(fresh)
+            others = {x: y for x, y in required.items() if x not in targets}
+            return sp.Subs(sub(body, others), tuple(fresh.values()), tuple(required.get(x, x) for x in targets))
+        return sp.Integral(sub(renamed.function, required),
+                           *(tuple([limit[0], *(sub(x, required) for x in limit[1:])]) for limit in renamed.limits))
+    if isinstance(expression, sp.Equality) and equations:
+        return sp.Eq(sub(expression.lhs), sub(expression.rhs), evaluate=False)
+    if isinstance(expression, (sp.And, sp.Or)):
+        return _boolean_result(expression.args, lambda part: sub(part, equations=False),
+                               conjunction=isinstance(expression, sp.And))
+    if isinstance(expression, sp.Set) or isinstance(expression, (Boolean, Relational)) and not isinstance(expression, sp.Expr):
+        return expression.func(*(sub(x, equations=False) for x in expression.args)) if expression.args else expression
+    for order in expression.atoms(sp.Order):
+        if any(x in mapping and mapping[x] != x for x in order.variables):
+            raise SymbolicCalculatorError("Unsupported: remove_order before substituting a series coordinate.")
+    if isinstance(expression, sp.Derivative):
+        coordinates = set(expression.variables)
+        required = {x: y for x, y in mapping.items() if x != y and x in expression.free_symbols | coordinates}
+        if not required:
+            return expression
+        introduced = set().union(*(y.free_symbols for y in required.values()))
+        if coordinates.intersection(required) or coordinates.intersection(introduced):
+            # Fresh targets keep native Subs simultaneous even for coordinate swaps.
+            fresh = {x: sp.Dummy(x.name, **x.assumptions0) for x in required}
+            return sp.Subs(expression.xreplace(fresh), tuple(fresh.values()), tuple(required.values()))
+        return expression.func(*(sub(x) for x in expression.args), evaluate=False)
+    if expression.has(sp.Integral, sp.Limit, sp.Subs, sp.Lambda, sp.ConditionSet, sp.Derivative):
+        return expression.func(*(sub(x) for x in expression.args))
+    return expression.subs(mapping, simultaneous=True)
+
+
+def _substitute_value(value, replacements: Mapping[Any, Any], *, replacement_conditions=()):
+    """Transform one finished current value, preserving native binding and status."""
+    sp = require_sympy()
+    conditions = tuple(dict.fromkeys((*value.conditions, *replacement_conditions)))
+    try:
+        roots = _current_symbols(value)
+        mapping = {key: rhs for key, rhs in replacements.items() if key != rhs and key in roots}
+        payload = value.expression
+        current = value.conditions
+        domains = _relationship_domains({key: rhs for key, rhs in payload.replacements.items()
+                                        if rhs.free_symbols.intersection(mapping)}) if isinstance(payload, _Relationships) else ()
+        positive = tuple(sp.Gt(rhs, 0, evaluate=False) for key, rhs in mapping.items() if key.is_positive is True)
+        conditions = (_conditions(current, replacements=mapping, before_substitution=domains,
+                                  additional=(*positive, *replacement_conditions))
+                      if mapping or replacement_conditions else current)
+        if isinstance(payload, _Relationships):
+            expression = _Relationships({key: _native_substitute(rhs, mapping) for key, rhs in payload.replacements.items()}) if mapping else payload
+        elif isinstance(payload, _UnresolvedProblem):
+            expression = replace(payload, problem=_native_substitute(payload.problem, mapping)) if mapping else payload
+        elif isinstance(payload, _UnavailableDiagnostic):
+            expression = payload
+        else:
+            expression = _native_substitute(payload, mapping) if mapping else payload
+        if expression == value.expression:
+            return value if conditions == value.conditions else replace(value, conditions=conditions)
+        return _admit_native(expression, conditions)
+    except _ConditionInapplicable:
+        raise
+    except (SymbolicCalculatorError, ValueError, TypeError, ArithmeticError, NotImplementedError) as exc:
+        return _Value(_UnavailableDiagnostic(f"Operation is unavailable: {exc}"), conditions)
+
+
+def _calculus_domain(variable: Any) -> Any:
+    """Only the coordinate's owned real domain; conditions stay in the problem."""
+    sp = require_sympy()
+    return sp.Interval.open(0, sp.oo) if variable.is_positive else sp.S.Reals
+
+
+def _relationship_domains(replacements):
+    """Current output obligations, deferred until joint applicability evaluation."""
+    sp = require_sympy()
+    return tuple(sp.Contains(rhs, _calculus_domain(key), evaluate=False) for key, rhs in replacements.items())
+
+
+def _native_arithmetic(left: _Value, operator: str, right: _Value) -> Any:
+    sp = require_sympy()
+    lhs, rhs = left.expression, right.expression
+    matrix = isinstance(lhs, sp.MatrixBase) or isinstance(rhs, sp.MatrixBase)
+    if not matrix:
+        lhs, rhs = _scalar(left, "arithmetic"), _scalar(right, "arithmetic")
+    elif operator not in {"+", "-", "*"}:
+        raise SymbolicCalculatorError("Unsupported: matrix arithmetic supports +, - and *.")
+    try:
+        if operator == "+":
+            result = lhs + rhs
+        elif operator == "-":
+            result = lhs - rhs
+        elif operator == "*":
+            result = lhs * rhs
+        elif operator == "/":
+            result = lhs / rhs
+        else:
+            result = lhs ** rhs
+    except (TypeError, ValueError, sp.ShapeError) as exc:
+        raise SymbolicCalculatorError(f"Invalid input: incompatible arithmetic operands ({exc}).") from exc
+    return result
 
 
 @dataclass(frozen=True, slots=True)
 class SymbolicCalculatorResult:
     query: str
     result_text: str
+    copy_text: str
     assumptions: tuple[str, ...]
     symbol_legend: Mapping[str, Sequence[str]]
-    mechanism_source: str = ""
-    parameter_definitions: Mapping[str, str] = field(default_factory=dict)
-    let_definitions: Mapping[str, str] = field(default_factory=dict)
-
-    def __post_init__(self) -> None:
-        object.__setattr__(self, "assumptions", tuple(str(item) for item in self.assumptions))
-        object.__setattr__(
-            self,
-            "symbol_legend",
-            MappingProxyType(
-                {
-                    str(kind): tuple(str(name) for name in names)
-                    for kind, names in dict(self.symbol_legend).items()
-                }
-            ),
-        )
-        object.__setattr__(
-            self,
-            "parameter_definitions",
-            MappingProxyType({str(name): str(expr) for name, expr in dict(self.parameter_definitions).items()}),
-        )
-        object.__setattr__(
-            self,
-            "let_definitions",
-            MappingProxyType({str(name): str(expr) for name, expr in dict(self.let_definitions).items()}),
-        )
+    mechanism_source: str
+    parameter_definitions: Mapping[str, str]
+    let_definitions: Mapping[str, str]
+    reuse_queries: tuple[tuple[str, str], ...] = ()
 
     def full_context_copy_text(self) -> str:
-        parameters = ", ".join(str(name) for name in self.symbol_legend.get("parameters", ())) or "none"
-        species = ", ".join(str(name) for name in self.symbol_legend.get("species", ())) or "none"
-        assumptions = "\n".join(f"- {item}" for item in self.assumptions) or "- none"
-        definitions_by_kind = [
-            (f"param {name}", expr)
-            for name, expr in sorted(dict(self.parameter_definitions).items())
-        ]
-        definitions_by_kind.extend(
-            (f"let {name}", expr)
-            for name, expr in sorted(dict(self.let_definitions).items())
-        )
-        definitions = "\n".join(f"- {name} := {expr}" for name, expr in definitions_by_kind) or "- none"
-        # The source is an immutable historical snapshot.  Preserve it
-        # byte-for-byte so Copy Context remains truthful even when the
-        # project is later edited or reconstructed.
-        mechanism_source = str(self.mechanism_source or "") or "(not provided)"
-        return "\n".join(
-            [
-                f"Query: {self.query}",
-                f"Result: {self.result_text}",
-                "Assumptions:",
-                assumptions,
-                "Canonical symbol legend:",
-                f"Species: {species}",
-                f"Parameters: {parameters}",
-                "Definitions:",
-                definitions,
-                "Mechanism source:",
-                mechanism_source,
-            ]
-        )
+        legend = [f"{kind}: {', '.join(names) or 'none'}" for kind, names in self.symbol_legend.items()]
+        definitions = [f"param {name} := {expr}" for name, expr in self.parameter_definitions.items()]
+        definitions += [f"let {name} := {expr}" for name, expr in self.let_definitions.items()]
+        return "\n".join((f"Query: {self.query}", f"Result: {self.result_text}", "Assumptions:",
+                          *self.assumptions, "Canonical symbol legend:", *legend, "Definitions:",
+                          *(definitions or ["none"]), "Mechanism source:", self.mechanism_source))
 
 
 @dataclass(frozen=True, slots=True)
-class _CalculatorContext:
+class CalculatorContext:
+    """Exact symbolic mathematics for one accepted mechanism."""
     mechanism: Any
-    species_names: tuple[str, ...]
-    parameter_symbols: tuple[str, ...]
-    rhs_by_species: Mapping[str, Any]
-    jacobian_by_species: Mapping[tuple[str, str], Any]
-    expression_symbols: Mapping[str, Any]
-    parameter_namespace: MechanismParameterNamespace
-    chemistry_relations: Mapping[str, Any]
-    rendered_parameter_definitions: Mapping[str, str]
-    let_sources: Mapping[str, str]
     mechanism_source: str
-
-    def __post_init__(self) -> None:
-        object.__setattr__(self, "species_names", tuple(str(name) for name in self.species_names))
-        object.__setattr__(self, "parameter_symbols", tuple(str(name) for name in self.parameter_symbols))
-        object.__setattr__(
-            self,
-            "rhs_by_species",
-            MappingProxyType({str(name): expr for name, expr in dict(self.rhs_by_species).items()}),
-        )
-        object.__setattr__(
-            self,
-            "jacobian_by_species",
-            MappingProxyType(
-                {
-                    (str(row), str(col)): expr
-                    for (row, col), expr in dict(self.jacobian_by_species).items()
-                }
-            ),
-        )
-        object.__setattr__(self, "expression_symbols", MappingProxyType(dict(self.expression_symbols)))
-        object.__setattr__(
-            self,
-            "chemistry_relations",
-            MappingProxyType(
-                {
-                    str(name): expression
-                    for name, expression in dict(
-                        self.chemistry_relations
-                    ).items()
-                }
-            ),
-        )
-        object.__setattr__(
-            self,
-            "rendered_parameter_definitions",
-            MappingProxyType({str(name): str(expr) for name, expr in dict(self.rendered_parameter_definitions).items()}),
-        )
-        object.__setattr__(
-            self,
-            "let_sources",
-            MappingProxyType({str(name): str(expr) for name, expr in dict(self.let_sources).items()}),
-        )
-        object.__setattr__(self, "mechanism_source", str(self.mechanism_source or ""))
-
-
-def evaluate_symbolic_query(
-    mechanism: Any,
-    query: str,
-    *,
-    mechanism_source: str = "",
-) -> SymbolicCalculatorResult:
-    context = _build_context(mechanism, mechanism_source=mechanism_source)
-    query_s = str(query or "").strip()
-    if not query_s:
-        raise SymbolicCalculatorError("Symbolic calculator query is empty.")
-    expr_or_lines = _parse_calculator_expression(context, query_s)
-    if isinstance(expr_or_lines, tuple):
-        result_text = "\n".join(str(line) for line in expr_or_lines)
-    else:
-        result_text = str(expr_or_lines)
-    return SymbolicCalculatorResult(
-        query=query_s,
-        result_text=result_text,
-        assumptions=(
-            "Symbolic calculator uses the committed mechanism's elementary steps and supported Algebra definitions.",
-            "Scheduled interventions, scheduled temperature, runtime overrides, and hybrid execution behavior are not included in symbolic calculations.",
-        ),
-        symbol_legend={
-            "species": list(context.species_names),
-            "parameters": list(context.parameter_symbols),
-        },
-        mechanism_source=str(mechanism_source or ""),
-        parameter_definitions=context.rendered_parameter_definitions,
-        let_definitions=_supported_let_sources(context),
-    )
+    parameter_namespace: Any
+    species_names: tuple[str, ...]
+    symbols: Mapping[str, Any]
+    values: Mapping[str, _Value | _Alternatives]
+    coordinates: frozenset[Any]
+    rhs: tuple[_Value | _Alternatives, ...]
+    jacobian: _Value | _Alternatives
+    parameter_definitions: Mapping[str, str]
+    let_definitions: Mapping[str, str]
 
 
 def symbolic_calculator_available(mechanism: Any) -> tuple[bool, str]:
-    try:
-        _build_context(mechanism, mechanism_source="")
-        support = classify_symbolic_jacobian_support(mechanism)
-    except SymbolicCalculatorUnavailable as exc:
-        return False, str(exc)
-    if not bool(support.supported):
-        return False, str(support.reason or "Symbolic calculator unavailable.")
+    """Cheap structural availability; expression construction is first-query work."""
+    metadata = MechanismMetadataView.from_metadata(mechanism.metadata)
+    if metadata.temperature_schedule is not None:
+        return False, "Symbolic calculator is unavailable for scheduled temperature."
+    support = classify_symbolic_jacobian_support(mechanism)
+    if not support.supported:
+        return False, str(support.reason)
+    namespace = build_namespace_from_mechanism(mechanism)
+    spec = parameter_algebra_spec_from_mechanism(mechanism)
+    if spec is None:
+        return False, "Calculator requires the retained admitted parameter specification."
+    reserved = set(namespace.canonical_names) | set(spec.param_assignment_names()) | set(spec.observable_names)
+    reserved |= set(PROTECTED_NAMES) | set(BUILTIN_FUNCTIONS)
+    collisions = [name for name in mechanism.species_names() if name in reserved
+                  or namespace.resolve(name).canonical_name is not None
+                  or namespace.invalid_protected_indexed_identifier(name) is not None]
+    if collisions:
+        return False, f"Species collide with parameter or Algebra names: {', '.join(collisions)}."
     return True, ""
 
 
-def _check_available(mechanism: Any) -> None:
-    raw_metadata = getattr(mechanism, "metadata", {}) or {}
-    metadata = MechanismMetadataView.from_metadata(raw_metadata)
-    if metadata.temperature_schedule is not None:
-        raise SymbolicCalculatorUnavailable(
-            "Symbolic calculator is unavailable for mechanisms with scheduled temperature."
-        )
+def build_calculator_context(mechanism: Any, *, mechanism_source: str) -> CalculatorContext:
+    available, reason = symbolic_calculator_available(mechanism)
+    if not available:
+        raise SymbolicCalculatorUnavailable(reason)
+    sp = require_sympy()
+    namespace = build_namespace_from_mechanism(mechanism)
+    spec = parameter_algebra_spec_from_mechanism(mechanism)
+    graph = spec.evaluation_dependencies
+    statements = {stmt.name: stmt for stmt in spec.parameter_block.lines}
+    names = tuple(mechanism.species_names())
+    symbols = {name: sp.Symbol(name, real=True) for name in
+               (*names, *namespace.canonical_names, *spec.param_assignment_names(), "t")}
+    symbols.update({symbol.name: symbol for symbol in _fixed_constant_values()})
+    symbols["T"] = sp.Symbol("T", positive=True)
+    symbols.update({f"initial({name})": sp.Symbol(f"initial({name})", real=True) for name in names})
+    kinds = {name: spec.parameter_assignment_kind(name) for name in statements}
+    independent = {name for name, deps in graph.items() if not deps and kinds.get(name) != "mechanism-bound"}
+    coordinates = {symbol for name, symbol in symbols.items() if name not in graph and name not in _FIXED_CONSTANTS}
+    coordinates.update(symbols[name] for name in independent)
+    compiled = compiled_algebra_for_mechanism(mechanism)
+    values = {name: _Value(symbol) for name, symbol in symbols.items() if name not in graph}
+    context = CalculatorContext(
+        mechanism, mechanism_source, namespace, names, MappingProxyType(symbols), MappingProxyType(values),
+        frozenset(coordinates), (), _Value(sp.ImmutableMatrix([])),
+        MappingProxyType({name: expression_to_source(stmt.expr) for name, stmt in statements.items()}),
+        MappingProxyType({stmt.name: expression_to_source(stmt.expr) for stmt in compiled.block.lines} if compiled else {}),
+    )
+    chemistry = build_calculator_chemistry_relations(mechanism, parameter_spec=spec, symbols=symbols)
+    closures = {}
 
-def _build_context(mechanism: Any, *, mechanism_source: str) -> _CalculatorContext:
-    _check_available(mechanism)
-    parameter_namespace = build_namespace_from_mechanism(mechanism)
-    _check_symbol_name_collisions(mechanism, parameter_namespace=parameter_namespace)
-    sympy = require_sympy()
+    def project(expression, dependencies):
+        """Install completed dependencies before admitting a native projection."""
+        selected = tuple(name for name in graph if name in dependencies)
+        operands = tuple(values[name] for name in selected)
+        answers = []
+        family = any(isinstance(v, _Alternatives) for v in operands)
+        for args in _branches(operands):
+            try:
+                conditions = _conditions(additional=(c for item in args for c in item.conditions))
+                unavailable = _unusable(args)
+                mapping = {symbols[name]: item.expression for name, item in zip(selected, args, strict=True)}
+                result = (replace(unavailable, conditions=conditions) if unavailable is not None
+                          else _admit_native(_native_substitute(expression, mapping), conditions))
+            except _ConditionInapplicable:
+                continue
+            except (SymbolicCalculatorError, ValueError, TypeError, ArithmeticError, NotImplementedError) as exc:
+                result = _Value(_UnavailableDiagnostic(str(exc)))
+            family |= isinstance(result, _Alternatives)
+            answers.extend(_metadata(item, *args) for item in _entries(result))
+        return _Alternatives(tuple(answers)) if family or not answers else answers[0]
+
+    for name, dependencies in graph.items():
+        closures[name] = set(dependencies).union(*(closures[dep] for dep in dependencies))
+        def definition():
+            if kinds.get(name) in {"mechanism-bound", "derived scalar"}:
+                return _translate_node(context, statements[name].expr)
+            if name in chemistry:
+                return project(chemistry[name], closures[name])
+            return _Value(symbols[name])
+        try:
+            values[name] = definition()
+        except (SymbolicCalculatorError, AlgebraError, ValueError, TypeError, ArithmeticError, NotImplementedError) as exc:
+            values[name] = _Value(_UnavailableDiagnostic(str(exc)))
+    if compiled:
+        for statement in compiled.block.statements_in_evaluation_order():
+            try:
+                values[statement.name] = _translate_node(context, statement.expr)
+            except (SymbolicCalculatorError, AlgebraError, ValueError, TypeError, ArithmeticError, NotImplementedError) as exc:
+                values[statement.name] = _Value(_UnavailableDiagnostic(str(exc)))
+    projection = build_symbolic_mechanism_public_projection(mechanism, exact_stoichiometric_coefficients=True)
+    canonical = {symbol: symbols[str(symbol)] for expression in projection.rhs_expressions for symbol in expression.free_symbols}
+    def field(expression):
+        expression = expression.xreplace(canonical)
+        roots = {name for name in graph if symbols[name] in expression.free_symbols}
+        return project(expression, roots.union(*(closures[name] for name in roots)))
+    return replace(context, rhs=tuple(field(x) for x in projection.rhs_expressions),
+                   jacobian=field(sp.ImmutableMatrix(projection.jacobian_expressions)))
+
+
+def _canonical_symbol(context: CalculatorContext, name: str) -> Any:
+    if name in context.symbols:
+        return context.symbols[name]
+    resolved = context.parameter_namespace.resolve(name)
+    if resolved.canonical_name in context.symbols:
+        return context.symbols[resolved.canonical_name]
+    message = context.parameter_namespace.invalid_protected_indexed_identifier_message(name)
+    raise SymbolicCalculatorError(message or f"Invalid input: unknown symbolic identifier {name!r}.")
+
+
+def _exact_number(node: NumberNode) -> Any:
+    exact = node.exact_value
+    if exact is None:
+        raise SymbolicCalculatorError("Undefined: a retained coefficient is not finite and exact.")
+    return require_sympy().Rational(exact.numerator, exact.denominator)
+
+
+def _translate_node(context: CalculatorContext, node: Any) -> _Value:
+    sp = require_sympy()
+    def lower(child):
+        return _translate_node(context, child)
+    if isinstance(node, NumberNode):
+        return _Value(_exact_number(node))
+    if isinstance(node, IdentNode):
+        name = node.name if node.name in context.values else str(_canonical_symbol(context, node.name))
+        return context.values[name]
+    if isinstance(node, SpeciesRefNode):
+        return _Value(context.symbols[node.name if node.kind == "now" else f"initial({node.name})"])
+    if isinstance(node, UnaryNode) and node.op in {"+", "-"}:
+        value = lower(node.rhs)
+        return value if node.op == "+" else _evaluate_call(context, "*", (_Value(sp.Integer(-1)), value))
+    if isinstance(node, BinaryNode) and node.op in {"+", "-", "*", "/", "^", "**"}:
+        return _evaluate_call(context, node.op, (lower(node.lhs), lower(node.rhs)))
+    if isinstance(node, CallNode):
+        if node.name in _FUNCTIONS:
+            return _evaluate_call(context, node.name, [lower(child) for child in node.args])
+    raise SymbolicCalculatorError(
+        f"Unsupported: admitted {type(node).__name__}; dynamic conditions and logical expressions are not Calculator mathematics."
+    )
+
+
+def _math_call(name: str, arguments: Sequence[_Value]) -> Any:
+    sp = require_sympy()
+    args = [_scalar(arg, name) for arg in arguments]
+    unary = {"sqrt": sp.sqrt, "ln": sp.log, "log": sp.log,
+             "log10": lambda x: sp.log(x, 10), "log1p": lambda x: sp.log(1+x),
+             "exp": sp.exp, "expm1": lambda x: sp.exp(x)-1,
+             "sin": sp.sin, "cos": sp.cos, "tan": sp.tan, "abs": sp.Abs, "erf": sp.erf,
+             "heaviside": lambda x: sp.Heaviside(x, 0)}
+    if name in unary and len(args) == 1:
+        x = args[0]
+        expression = unary[name](x)
+    elif name in {"min", "max"} and args:
+        expression = (sp.Min if name == "min" else sp.Max)(*args)
+    elif name == "pow" and len(args) == 2:
+        return args[0] ** args[1]
+    elif name == "clip" and len(args) == 3:
+        x, lo, hi = args
+        expression = sp.Min(sp.Max(x, sp.Min(lo, hi)), sp.Max(lo, hi))
+    else:
+        raise SymbolicCalculatorError(f"Invalid input: wrong argument count for {name}.")
+    return expression
+
+
+def _coordinate(context: CalculatorContext, symbol: Any, operation: str) -> Any:
+    sp = require_sympy()
+    if not isinstance(symbol, sp.Symbol) or symbol not in context.symbols.values() or str(symbol) in _FIXED_CONSTANTS:
+        raise SymbolicCalculatorError(f"Invalid input: {operation} requires a model coordinate, not a constant or expression.")
+    if symbol not in context.coordinates:
+        definition = context.parameter_definitions.get(str(symbol))
+        detail = f" Defined as {definition}." if definition is not None else " It is a derived quantity."
+        raise SymbolicCalculatorError(
+            f"Invalid input: {operation} requires an independent coordinate; {symbol} is not one.{detail} "
+            "Use independent coordinates from the definition."
+        )
+    return symbol
+
+
+def _integer(value: _Value, operation: str, *, minimum=0) -> int:
+    expression = _scalar(value, operation)
+    if expression.is_Integer is not True or expression < minimum:
+        raise SymbolicCalculatorError(f"Invalid input: {operation} requires an integer >= {minimum}.")
+    return int(expression)
+
+
+def _differentiate(context: CalculatorContext, value: _Value, variable: Any | None, order: int):
+    """Admit each derivative step, without reentering command orchestration."""
+    sp = require_sympy()
+    for step in range(order):
+        answers = []
+        family = isinstance(value, _Alternatives)
+        for item in _entries(value):
+            if step and isinstance(item.expression, (_UnavailableDiagnostic, _UnresolvedProblem)):
+                answers.append(item)
+                continue
+            try:
+                if variable is not None:
+                    expression = _map(item.expression, lambda x: sp.diff(x, variable))
+                    result = item if expression == item.expression else _admit_native(expression, item.conditions)
+                else:
+                    result = _kinetic_derivative(context, item)
+                family |= isinstance(result, _Alternatives)
+                answers.extend(_entries(result))
+            except _ConditionInapplicable:
+                if not isinstance(value, _Alternatives):
+                    raise
+            except (SymbolicCalculatorError, ValueError, TypeError, ArithmeticError, NotImplementedError) as exc:
+                answers.append(_Value(_UnavailableDiagnostic(str(exc)), item.conditions))
+        value = _Alternatives(tuple(answers)) if family else answers[0]
+    return value
+
+
+def _kinetic_derivative(context, value):
+    sp = require_sympy()
+    partials = {}
+    def differentiate_leaf(expression):
+        partials[expression] = sp.Tuple(sp.diff(expression, context.symbols["t"]),
+                                       *(sp.diff(expression, context.symbols[name]) for name in context.species_names))
+        return expression
+    _map(value.expression, differentiate_leaf)
+    differentiated = _admit_native(sp.Tuple(*partials.values()), value.conditions)
+    answers = []
+    family = isinstance(differentiated, _Alternatives)
+    for derivatives in _entries(differentiated):
+        if isinstance(derivatives.expression, (_UnavailableDiagnostic, _UnresolvedProblem)):
+            answers.append(derivatives)
+            continue
+        parts = dict(zip(partials, derivatives.expression, strict=True))
+        required = [i for i in range(len(context.species_names)) if any(row[i+1] != 0 for row in parts.values())]
+        fields = tuple(context.rhs[i] for i in required)
+        family |= any(isinstance(field, _Alternatives) for field in fields)
+        for rates in _branches(fields):
+            conditions = tuple(dict.fromkeys((*derivatives.conditions, *(c for rate in rates for c in rate.conditions))))
+            try:
+                conditions = _conditions(derivatives.conditions, additional=(c for rate in rates for c in rate.conditions))
+                unavailable = _unusable(rates)
+                if unavailable is not None:
+                    result = replace(unavailable, conditions=conditions)
+                else:
+                    expression = _map(value.expression, lambda x: parts[x][0] + sum(
+                        parts[x][i+1] * rate.expression for i, rate in zip(required, rates, strict=True)))
+                    result = (value if conditions == value.conditions else replace(value, conditions=conditions)) if expression == value.expression else _admit_native(expression, conditions)
+                family |= isinstance(result, _Alternatives)
+                answers.extend(_entries(result))
+            except _ConditionInapplicable:
+                if not family:
+                    raise
+            except (SymbolicCalculatorError, ValueError, TypeError, ArithmeticError, NotImplementedError) as exc:
+                answers.append(_Value(_UnavailableDiagnostic(str(exc)), conditions))
+    return _Alternatives(tuple(answers)) if family else answers[0]
+
+
+def _equations(left: Any, right: Any) -> Any:
+    sp = require_sympy()
+    if isinstance(left, sp.MatrixBase):
+        if right == 0:
+            right = sp.zeros(*left.shape)
+        if not isinstance(right, sp.MatrixBase) or right.shape != left.shape:
+            raise SymbolicCalculatorError("Invalid input: equation matrix shapes must agree.")
+        return sp.Tuple(*(sp.Eq(a, b, evaluate=False) for a, b in zip(left, right, strict=True)))
+    if not isinstance(left, sp.Expr) or not isinstance(right, sp.Expr):
+        raise SymbolicCalculatorError("Invalid input: eq requires scalar expressions or matching matrices.")
+    return sp.Eq(left, right, evaluate=False)
+
+
+def _solution_set(equations, conditions, variables):
+    sp = require_sympy()
+    return sp.ConditionSet(sp.Tuple(*variables), sp.And(*equations, *conditions),
+                           sp.ProductSet(*(_calculus_domain(x) for x in variables)))
+
+
+def _solve(context: CalculatorContext, problem: _Value, coordinates: _Value, conditions):
+    """Own this invocation's native solving, candidate admission and current remainder."""
+    applicable = conditions
     try:
-        projection = build_symbolic_mechanism_public_projection(
-            mechanism,
-            exact_stoichiometric_coefficients=True,
-        )
-        parameter_spec = parameter_algebra_spec_from_mechanism(mechanism)
-        if parameter_spec is None:
-            raise SymbolicCalculatorUnavailable(
-                "Calculator requires the retained admitted parameter specification."
-            )
-        chemistry_relations = build_calculator_chemistry_relations(
-            mechanism, parameter_spec=parameter_spec
-        )
-    except (UnsupportedSymbolicExpressionError, ValueError) as exc:
-        raise SymbolicCalculatorUnavailable(str(exc)) from exc
-    species_names = tuple(str(name) for name in projection.species_names)
-    expression_symbols: dict[str, Any] = {
-        name: symbol
-        for name, symbol in zip(
-            species_names,
-            projection.state_symbols,
-            strict=True,
-        )
-    }
-    expression_symbols.update(
-        {
-            name: sympy.Symbol(name)
-            for name in parameter_namespace.canonical_names
-        }
-    )
-    expression_symbols["T"] = sympy.Symbol("T")
-    rhs_by_species = {
-        name: projection.rhs_expressions[idx]
-        for idx, name in enumerate(species_names)
-    }
-    jacobian_by_species = {
-        (row_name, col_name): projection.jacobian_expressions[row_idx][col_idx]
-        for row_idx, row_name in enumerate(species_names)
-        for col_idx, col_name in enumerate(species_names)
-    }
-    rendered_definitions = _parameter_definition_sources(mechanism)
-    expression_symbols.update({name: sympy.Symbol(name) for name in rendered_definitions})
-    let_sources = _let_sources(mechanism)
-    expression_symbols.update({name: sympy.Symbol(name) for name in let_sources})
-    return _CalculatorContext(
-        mechanism=mechanism,
-        species_names=species_names,
-        parameter_symbols=tuple(projection.parameter_symbols) + tuple(
-            sorted(
-                (parameter_namespace.canonical_names | rendered_definitions.keys())
-                - set(projection.parameter_symbols)
-            )
-        ),
-        rhs_by_species=rhs_by_species,
-        jacobian_by_species=jacobian_by_species,
-        expression_symbols=expression_symbols,
-        parameter_namespace=parameter_namespace,
-        chemistry_relations=chemistry_relations,
-        rendered_parameter_definitions=rendered_definitions,
-        let_sources=let_sources,
-        mechanism_source=str(mechanism_source or ""),
-    )
+        sp = require_sympy()
+        from sympy.solvers.solveset import NonlinearError
+        labels = coordinates.expression if isinstance(coordinates.expression, sp.Tuple) else (coordinates.expression,)
+        if not labels or len(set(labels)) != len(labels):
+            raise SymbolicCalculatorError("Invalid input: solve requires distinct coordinates.")
+        for symbol in labels:
+            _coordinate(context, symbol, "solve")
+        equations = problem.expression if isinstance(problem.expression, sp.Tuple) else (problem.expression,)
+        if not equations or any(not isinstance(item, sp.Equality) for item in equations):
+            raise SymbolicCalculatorError("Invalid input: solve requires equations made with eq.")
+        variables = tuple(sp.Dummy(x.name, **x.assumptions0) for x in labels)
+        mapping = {**_fixed_constant_values(), **dict(zip(labels, variables, strict=True))}
+        conditions = _conditions(conditions, replacements=mapping)
+        bound = _admit_native(_native_substitute(sp.Tuple(*equations), mapping), conditions)
+        def solve(equations, residual):
+            if isinstance(residual.expression, (_UnavailableDiagnostic, _UnresolvedProblem)):
+                return _Alternatives((residual,))
+            expressions, conditions = residual.expression, residual.conditions
+            parameters = equations.free_symbols - set(variables)
+            candidates = []
+            complete = False
+            explanation = "The native solver has not resolved these remaining possibilities."
+            try:
+                try:
+                    matrix, vector = sp.linear_eq_to_matrix(expressions, variables)
+                except NonlinearError:
+                    if len(variables) == len(expressions) == 1:
+                        native = sp.solveset(expressions[0], variables[0], domain=_calculus_domain(variables[0]))
+                        def finite_roots(result):
+                            if isinstance(result, sp.FiniteSet):
+                                return list(result)
+                            if isinstance(result, sp.Union):
+                                return [x for part in result.args for x in finite_roots(part)]
+                            if isinstance(result, sp.Intersection):
+                                finite = next((part for part in result.args if isinstance(part, sp.FiniteSet)), None)
+                                return list(finite) if finite is not None else []
+                            return []
+                        candidates = [sp.Tuple(x) for x in finite_roots(native)]
+                    else:
+                        native = sp.nonlinsolve(expressions, variables)
+                        candidates = list(native) if isinstance(native, sp.FiniteSet) else []
+                else:
+                    native = sp.linsolve((matrix, vector), variables)
+                    candidates = list(native) if isinstance(native, sp.FiniteSet) else []
+                    constant_matrix = not matrix.free_symbols and all(x.is_finite is True for x in matrix)
+                    unique = (matrix.rows == matrix.cols and all(x.is_finite is True for x in matrix)
+                              and matrix.det().is_zero is False)
+                    complete = isinstance(native, sp.FiniteSet) and (constant_matrix or unique)
+                complete |= not parameters and (isinstance(native, sp.FiniteSet) or native == sp.S.EmptySet)
+            except (NotImplementedError, ValueError, TypeError, ArithmeticError, KeyError) as exc:
+                explanation = f"Native solver could not resolve this system: {exc}."
+
+            answers = []
+            for candidate in candidates:
+                if not isinstance(candidate, sp.Tuple) or len(candidate) != len(variables) or any(not isinstance(x, sp.Expr) for x in candidate):
+                    complete = False
+                    continue
+                replacements = dict(zip(variables, candidate, strict=True))
+                try:
+                    restrictions = _conditions(conditions, replacements=replacements, additional=(
+                        *(sp.Ne(sp.denom(x), 0, evaluate=False) for x in candidate), *_relationship_domains(replacements)))
+                    residuals = tuple(sp.simplify(eq.subs(replacements, simultaneous=True)) for eq in equations)
+                    restrictions = _conditions(restrictions, additional=residuals)
+                    admitted = _admit_native(candidate, restrictions)
+                except _ConditionInapplicable:
+                    continue
+                except (SymbolicCalculatorError, ValueError, TypeError, ArithmeticError):
+                    complete = False
+                    continue
+                for item in _entries(admitted):
+                    if isinstance(item.expression, _UnavailableDiagnostic):
+                        complete = False
+                    else:
+                        answers.append(item)
+            answers = tuple(sorted(dict.fromkeys(answers), key=lambda v: sp.default_sort_key(v.expression)))
+            if not complete:
+                original = _solution_set(equations, conditions, variables)
+                represented = sp.Union(*(_solution_set(
+                    tuple(sp.Eq(x, y) for x, y in zip(variables, v.expression, strict=True)), v.conditions, variables) for v in answers))
+                remainder = sp.Complement(original, represented)
+                if remainder != sp.S.EmptySet:
+                    answers += _entries(_admit_native(_UnresolvedProblem(remainder, explanation)))
+            return _Alternatives(tuple(answers))
+        answers = []
+        for branch in _entries(bound):
+            if isinstance(branch.expression, (_UnavailableDiagnostic, _UnresolvedProblem)):
+                answers.append(branch)
+                continue
+            residuals = _admit_native(sp.Tuple(*(eq.lhs - eq.rhs for eq in branch.expression)), branch.conditions)
+            answers.extend(answer for residual in _entries(residuals) for answer in solve(branch.expression, residual).values)
+        aliases = dict(zip(variables, labels, strict=True))
+        def canonical(expression, *, equations=True):
+            mapping = {symbol: aliases[symbol] for symbol in expression.free_symbols.intersection(aliases)}
+            return _native_substitute(expression, mapping, equations=equations) if mapping else expression
+        published = []
+        for item in answers:
+            payload = item.expression
+            if isinstance(payload, _UnresolvedProblem):
+                problem = canonical(payload.problem)
+                payload = payload if problem == payload.problem else replace(payload, problem=problem)
+            elif not isinstance(payload, _UnavailableDiagnostic):
+                payload = _Relationships({key: canonical(rhs)
+                                          for key, rhs in zip(labels, payload, strict=True)})
+            published.append(replace(item, expression=payload,
+                                     conditions=tuple(canonical(c, equations=False) for c in item.conditions)))
+        return _Alternatives(tuple(published))
+    except _ConditionInapplicable:
+        raise
+    except (SymbolicCalculatorError, ValueError, TypeError, ArithmeticError, NotImplementedError) as exc:
+        return _Value(_UnavailableDiagnostic(f"Operation is unavailable: {exc}"), applicable)
 
 
-def _check_symbol_name_collisions(
-    mechanism: Any,
-    *,
-    parameter_namespace: MechanismParameterNamespace | None = None,
-) -> None:
-    species_names = tuple(str(name) for name in _mechanism_species_names(mechanism))
-    namespace = parameter_namespace or build_namespace_from_mechanism(mechanism)
-    parameter_names = set(namespace.canonical_names)
-    parameter_names.update(_parameter_definition_sources(mechanism))
-    let_names = set(_let_sources(mechanism))
-    reserved_names = parameter_names | let_names
-    collisions: list[str] = []
-    for name in species_names:
-        if name in reserved_names or name in _RESERVED_ALGEBRA_IDENTIFIERS:
-            collisions.append(name)
-            continue
-        resolved = namespace.resolve(name)
-        if resolved.canonical_name is not None:
-            collisions.append(name)
-            continue
-        if namespace.invalid_protected_indexed_identifier(name) is not None:
-            collisions.append(name)
-            continue
-    collisions = sorted(set(collisions))
-    if collisions:
-        raise SymbolicCalculatorUnavailable(
-            "Symbolic calculator is unavailable because species names collide with symbolic "
-            f"parameter or Algebra names: {', '.join(collisions)}."
-        )
+def _evaluate_call(context: CalculatorContext, name: str, args: Sequence[_Value | _Alternatives], *, direction=None):
+    """Own complete operand admission, family lifting and command metadata."""
+    args = tuple(args)
+    selection = name == "solution" and len(args) == 2
+    if name == "subs" and len(args) == 2:
+        entries = _entries(args[1])
+        usable = tuple(v for v in entries if not isinstance(v.expression, (_UnresolvedProblem, _UnavailableDiagnostic)))
+        if any(not isinstance(v.expression, _Relationships) for v in usable):
+            raise SymbolicCalculatorError("Invalid input: subs(F, solutions) requires resolved solution relationships, not reduced expression results.")
+        if all(isinstance(v, _Alternatives) for v in args):
+            if len(entries) != 1 or len(usable) != 1:
+                raise SymbolicCalculatorError("Select the replacement explicitly with solution(result,n) when alternatives or unresolved possibilities remain.")
+            args = (args[0], usable[0])
+    if selection and all(isinstance(v, _Alternatives) for v in args):
+        raise SymbolicCalculatorError("Select independent answer operands explicitly with solution(result,n); branches are not paired automatically.")
+    operands = args[1:] if selection else args
+    family = any(isinstance(v, _Alternatives) for v in operands)
+    answers = []
+    for values in _branches(operands):
+        try:
+            if selection:
+                result = _select(args[0], values[0])
+            else:
+                result = _dispatch_call(context, name, values, direction=direction)
+            family |= isinstance(result, _Alternatives)
+        except _ConditionInapplicable as exc:
+            if any(isinstance(v, _Alternatives) for v in operands):
+                continue
+            result = _Value(_UnavailableDiagnostic(str(exc)))
+        answers.extend(_metadata(item, *values) for item in _entries(result))
+    return _Alternatives(tuple(answers)) if family else answers[0]
 
 
-def _mechanism_species_names(mechanism: Any) -> tuple[str, ...]:
-    species_names = getattr(mechanism, "species_names", None)
-    if not callable(species_names):
-        raise SymbolicCalculatorUnavailable(
-            "Symbolic calculator requires a Kindred mechanism with species_names()."
-        )
-    return tuple(str(name) for name in species_names())
+def _select(result, index):
+    """Inspect the complete primary collection; selection performs no mathematics."""
+    if isinstance(index.expression, (_UnavailableDiagnostic, _UnresolvedProblem)):
+        values = []
+        for item in _entries(result):
+            conditions = tuple(dict.fromkeys((*item.conditions, *index.conditions)))
+            try:
+                conditions = _conditions(item.conditions, additional=index.conditions)
+                value = replace(index, conditions=conditions)
+            except _ConditionInapplicable as exc:
+                if isinstance(result, _Alternatives):
+                    continue
+                value = _Value(_UnavailableDiagnostic(str(exc)))
+            except (SymbolicCalculatorError, ValueError, TypeError, ArithmeticError, NotImplementedError) as exc:
+                value = _Value(_UnavailableDiagnostic(str(exc)), conditions)
+            values.append(_metadata(value, item))
+        return _Alternatives(tuple(values)) if isinstance(result, _Alternatives) else values[0]
+    selected, conditions = index, index.conditions
+    try:
+        if isinstance(result, _Value) and isinstance(result.expression, _UnavailableDiagnostic):
+            selected = result
+        else:
+            usable = tuple(v for v in _entries(result) if not isinstance(v.expression, (_UnresolvedProblem, _UnavailableDiagnostic)))
+            offset = _integer(index, "solution", minimum=1) - 1
+            if offset >= len(usable):
+                raise SymbolicCalculatorError("Invalid input: no resolved solution with this number; unresolved and unavailable alternatives cannot be selected.")
+            selected = usable[offset]
+        conditions = tuple(dict.fromkeys((*selected.conditions, *index.conditions)))
+        conditions = _conditions(selected.conditions, additional=index.conditions)
+        return selected if conditions == selected.conditions else replace(selected, conditions=conditions)
+    except _ConditionInapplicable as exc:
+        return replace(selected, expression=_UnavailableDiagnostic(str(exc)), conditions=())
+    except (SymbolicCalculatorError, ValueError, TypeError, ArithmeticError, NotImplementedError) as exc:
+        return replace(selected, expression=_UnavailableDiagnostic(f"Operation is unavailable: {exc}"), conditions=conditions)
 
 
-def _evaluate_zero_arg_query(context: _CalculatorContext, name: str) -> tuple[str, ...]:
-    if name == "odes":
-        return tuple(
-            f"d{name}/dt = {str(context.rhs_by_species[name])}"
-            for name in context.species_names
-        )
-    if name == "jacobian":
-        rows: list[str] = []
-        for row_name in context.species_names:
-            rendered = [
-                str(context.jacobian_by_species[(row_name, col_name)])
-                for col_name in context.species_names
-            ]
-            rows.append("[" + ", ".join(rendered) + "]")
-        return tuple(rows)
-    raise SymbolicCalculatorError(f"Unsupported calculator operation {name!r}.")
+def _shape(value):
+    return value.expression.problem if isinstance(value.expression, _UnresolvedProblem) else value.expression
 
 
-def _reject_nonfinite_symbolic_result(sympy: Any, expr: Any) -> None:
-    if expr.has(sympy.zoo, sympy.oo, -sympy.oo, sympy.nan):
-        raise SymbolicCalculatorError("Calculator expression produced a non-finite symbolic result.")
+def _dispatch_call(context: CalculatorContext, name: str, args: Sequence[_Value], *, direction=None):
+    """Execute one branch; each operation owns its applicability and failures."""
+    conditions = tuple(dict.fromkeys(c for value in args for c in value.conditions))
+    try:
+        sp = require_sympy()
+        def count(*counts):
+            if len(args) not in counts:
+                raise SymbolicCalculatorError(f"Invalid input: {name} requires {' or '.join(map(str, counts))} arguments.")
+        structural = name in {"tuple", "matrix", "eq"}
+        if name == "subs":
+            count(2, 3)
+            if _unusable(args[1:]) is None:
+                if len(args) == 2:
+                    source, relationships = args
+                    provenance = ("Original relationships used: " + _render(relationships.expression),)
+                    if relationships.conditions:
+                        provenance += ("Original applicability (provenance, not current conditions): "
+                                       + "; ".join(_render(c) for c in relationships.conditions),)
+                    result = _substitute_value(source, relationships.expression.replacements, replacement_conditions=relationships.conditions)
+                    entries = tuple(replace(v, provenance=(*v.provenance, *provenance)) for v in _entries(result))
+                    return _Alternatives(entries) if isinstance(result, _Alternatives) else entries[0]
+                targets = args[1].expression if isinstance(args[1].expression, sp.Tuple) else (args[1].expression,)
+                values = args[2].expression if isinstance(args[2].expression, sp.Tuple) else (args[2].expression,)
+                if len(targets) != len(values) or len(set(targets)) != len(targets):
+                    raise SymbolicCalculatorError("Invalid input: substitution rosters must match and targets must be unique.")
+                replacements = {_coordinate(context, target, name): replacement for target, replacement in zip(targets, values, strict=True)}
+                return _substitute_value(args[0], replacements, replacement_conditions=(*args[1].conditions, *args[2].conditions))
+        conditions = _conditions(args[0].conditions, additional=(c for v in args[1:] for c in v.conditions)) if args else ()
+        unresolved = _unusable(args)
+        if unresolved is not None and (isinstance(unresolved.expression, _UnavailableDiagnostic)
+                                       or not (structural or name in {"steady_state", "stationary_state"})):
+            return replace(unresolved, conditions=conditions)
+        if name == "solve":
+            count(2)
+            return _solve(context, *args, conditions)
+        if name in {"integrate", "limit", "series"}:
+            count(*({"integrate": (2, 4), "limit": (3,), "series": (4,)}[name]))
+            return _calculus_call(context, name, args, conditions, direction=direction)
+        if name in {"dt", "partial"}:
+            count(*((1, 2) if name == "dt" else (2, 3)))
+            variable = None if name == "dt" else _coordinate(context, args[1].expression, name)
+            order = _integer(args[-1], name) if len(args) == (2 if name == "dt" else 3) else 1
+            return _differentiate(context, args[0] if conditions == args[0].conditions else replace(args[0], conditions=conditions), variable, order)
+        if name == "approx":
+            count(1, 2)
+            digits = _integer(args[1], name, minimum=1) if len(args) == 2 else 15
+            expression = _map(args[0].expression, lambda x: _native_substitute(x, _fixed_constant_values()).evalf(digits))
+            return _admit_native(expression, conditions, notices=(f"Approximation: {digits} significant decimal digits.",))
+        if name in {"steady_state", "stationary_state"}:
+            if name == "steady_state":
+                if not args:
+                    raise SymbolicCalculatorError("Supply species: steady_state(Int) or steady_state([X,Y]). Use stationary_state() for the whole mechanism.")
+                count(1, 2)
+                selected = _shape(args[0]) if isinstance(_shape(args[0]), sp.Tuple) else (_shape(args[0]),)
+                if not selected or len(set(selected)) != len(selected) or any(x not in [context.symbols[n] for n in context.species_names] for x in selected):
+                    raise SymbolicCalculatorError("Invalid input: steady_state requires distinct accepted species, not equations or parameter names.")
+                extra_args = args[1:]
+            else:
+                count(0, 1)
+                selected = tuple(context.symbols[n] for n in context.species_names)
+                extra_args = args
+            def solve_rates(rates):
+                applicable = _conditions(conditions, additional=(c for rate in rates for c in rate.conditions))
+                failure = _unusable(rates) or unresolved
+                if failure is not None and isinstance(failure.expression, _UnavailableDiagnostic):
+                    return replace(failure, conditions=applicable)
+                equations = tuple(sp.Eq(_shape(rate), 0, evaluate=False) for rate in rates)
+                if extra_args:
+                    extra = _shape(extra_args[0])
+                    equations += tuple(extra) if isinstance(extra, sp.Tuple) else (extra,)
+                if failure is not None:
+                    return _Value(_UnresolvedProblem(sp.Tuple(*equations), failure.expression.explanation), applicable)
+                return _solve(context, _Value(sp.Tuple(*equations), applicable), _Value(sp.Tuple(*selected)), applicable)
+            rates = tuple(context.rhs[context.species_names.index(str(x))] for x in selected)
+            answers = []
+            for branch in _branches(rates):
+                try:
+                    answers.extend(_entries(solve_rates(branch)))
+                except _ConditionInapplicable:
+                    continue
+            return _Alternatives(tuple(answers))
+        if name in {"odes", "jacobian"}:
+            count(0)
+            if name == "jacobian":
+                return context.jacobian
+            answers = []
+            for rates in _branches(context.rhs):
+                applicable = _conditions(additional=(c for rate in rates for c in rate.conditions))
+                unavailable = _unusable(rates)
+                expression = sp.ImmutableMatrix([_shape(rate) for rate in rates]) if unavailable is None or isinstance(unavailable.expression, _UnresolvedProblem) else None
+                answers.append(replace(unavailable, conditions=applicable) if expression is None else
+                               _Value(_UnresolvedProblem(expression, unavailable.expression.explanation) if unavailable else expression, applicable))
+            return _Alternatives(tuple(answers)) if any(isinstance(rate, _Alternatives) for rate in context.rhs) else answers[0]
+        def native():
+            if name in {"+", "-", "*", "/", "^", "**"}:
+                return _native_arithmetic(args[0], name, args[1])
+            if name in {"pi", "e", "infinity"}:
+                count(0)
+                return {"pi": sp.pi, "e": sp.E, "infinity": sp.oo}[name]
+            if name in _FUNCTIONS:
+                return _math_call(name, args)
+            if name in _TRANSFORMS:
+                count(1)
+                return _map(args[0].expression, getattr(sp, name))
+            if name == "collect":
+                count(2)
+                variable = _coordinate(context, args[1].expression, name)
+                return _map(args[0].expression, lambda x: sp.collect(x, variable))
+            if name == "initial":
+                count(1)
+                species = str(args[0].expression)
+                if species not in context.species_names:
+                    raise SymbolicCalculatorError("Invalid input: initial requires a species name.")
+                return context.symbols[f"initial({species})"]
+            if name == "tuple":
+                return sp.Tuple(*(_shape(item) for item in args))
+            if name == "matrix":
+                count(1)
+                rows = _shape(args[0])
+                if isinstance(rows, sp.Tuple):
+                    rows = sp.Tuple(*(row if isinstance(row, sp.Tuple) else sp.Tuple(row) for row in rows))
+                if not isinstance(rows, sp.Tuple) or not rows or any(not row for row in rows):
+                    raise SymbolicCalculatorError("Invalid input: matrix requires nonempty rows, e.g. matrix([[1,2],[3,4]]).")
+                if len({len(row) for row in rows}) != 1 or any(not isinstance(x, sp.Expr) for row in rows for x in row):
+                    raise SymbolicCalculatorError("Invalid input: matrix rows require equally many scalar entries.")
+                return sp.ImmutableMatrix(rows)
+            if name == "eq":
+                count(2)
+                return _equations(_shape(args[0]), _shape(args[1]))
+            if name == "at":
+                count(2, 3)
+                expression = args[0].expression
+                indices = tuple(_integer(arg, name) for arg in args[1:])
+                try:
+                    if len(indices) == 2 and isinstance(expression, sp.MatrixBase):
+                        return expression[indices]
+                    if len(indices) == 1 and isinstance(expression, (sp.Tuple, sp.MatrixBase)):
+                        return expression[indices[0]]
+                    raise TypeError("unsupported indexed object")
+                except (IndexError, TypeError) as exc:
+                    raise SymbolicCalculatorError(f"Invalid input: {name}: {exc}.") from exc
+            if name in {"transpose", "det"}:
+                count(1)
+                matrix = args[0].expression
+                if not isinstance(matrix, sp.MatrixBase):
+                    raise SymbolicCalculatorError(f"Invalid input: {name} requires a matrix.")
+                if name == "det" and matrix.rows != matrix.cols:
+                    raise SymbolicCalculatorError("Invalid input: det requires a square matrix.")
+                return matrix.T if name == "transpose" else matrix.det()
+            if name == "remove_order":
+                count(1)
+                def remove(x):
+                    result = x.removeO()
+                    if result.has(sp.Order):
+                        raise SymbolicCalculatorError("Unsupported: native remove_order does not remove this nested remainder; apply it to the series before nesting.")
+                    return result
+                return _map(args[0].expression, remove)
+            raise SymbolicCalculatorError(f"Unsupported calculator operation {name!r}.")
+        try:
+            expression = native()
+        except (SymbolicCalculatorError, ValueError, TypeError, ArithmeticError, NotImplementedError):
+            if unresolved is not None:
+                return replace(unresolved, conditions=conditions)
+            raise
+        notices = ("Series order term explicitly removed; the result is truncated.",) if name == "remove_order" and args[0].expression.has(sp.Order) else ()
+        if unresolved is not None:
+            return _Value(_UnresolvedProblem(expression, unresolved.expression.explanation), conditions)
+        if args and expression == args[0].expression:
+            return args[0] if conditions == args[0].conditions and not notices else replace(args[0], conditions=conditions, notices=(*args[0].notices, *notices))
+        if structural or name in {"at", "transpose", "initial"}:
+            return _Value(expression, conditions, notices)
+        return _admit_native(expression, conditions, notices=notices)
+    except _ConditionInapplicable:
+        raise
+    except (SymbolicCalculatorError, AlgebraError, ValueError, TypeError, ArithmeticError, NotImplementedError) as exc:
+        if name == "subs":
+            conditions = _conditions(args[0].conditions, additional=(c for value in args[1:] for c in value.conditions)) if args else ()
+        return _Value(_UnavailableDiagnostic(f"Operation is unavailable: {exc}"), conditions)
 
 
-def _evaluate_call(context: _CalculatorContext, name: str, args: Sequence[Any]) -> Any:
-    sympy = require_sympy()
-    if name in _SUPPORTED_TRANSFORMS:
-        if len(args) != 1:
-            raise SymbolicCalculatorError(f"{name} requires exactly one argument.")
-        expr = args[0]
-        if isinstance(expr, tuple):
-            raise SymbolicCalculatorError(f"{name} requires a scalar symbolic expression.")
-        return getattr(sympy, name)(expr)
-    if name == "collect":
-        if len(args) != 2:
-            raise SymbolicCalculatorError("collect requires an expression and a symbol.")
-        expr = args[0]
-        if isinstance(expr, tuple):
-            raise SymbolicCalculatorError("collect requires a scalar symbolic expression.")
-        return sympy.collect(expr, args[1])
-    if name == "expand_params":
-        if len(args) != 1:
-            raise SymbolicCalculatorError("expand_params requires exactly one expression.")
-        expr = args[0]
-        if isinstance(expr, tuple):
-            raise SymbolicCalculatorError("expand_params requires a scalar symbolic expression.")
-        return _expand_parameter_dependencies(context, expr)
-    raise SymbolicCalculatorError(f"Unsupported calculator operation {name!r}.")
+def _conditions_cover_interval(conditions, variable, lower, upper):
+    """Establish active applicability on the open interval using native truth."""
+    sp = require_sympy()
+    try:
+        copied = sp.Tuple(*conditions, lower, upper)
+        copied = copied.xreplace({x: sp.Rational(x) for x in copied.atoms(sp.Float)})
+        lower, upper = (_native_substitute(x, _fixed_constant_values()) for x in copied[-2:])
+        if sp.simplify(lower > upper, doit=False) is sp.true:
+            lower, upper = upper, lower
+        if lower == upper and lower.is_finite is True:
+            return True
+        interior = sp.Dummy("interior", positive=True)
+        if lower == -sp.oo and upper == sp.oo:
+            point = sp.Dummy("interior", real=True)
+        elif upper == sp.oo and lower.is_real is True and lower.is_finite is True:
+            point = lower + interior
+        elif lower == -sp.oo and upper.is_real is True and upper.is_finite is True:
+            point = upper - interior
+        elif (all(x.is_real is True and x.is_finite is True for x in (lower, upper))
+              and sp.simplify(lower < upper, doit=False) is sp.true):
+            point = sp.cancel((lower + upper*interior)/(1 + interior))
+        else:
+            return False
+        remaining = _conditions(before_substitution=copied[:-2], replacements={variable: point})
+        return sp.simplify(sp.And(*remaining), doit=False) is sp.true
+    except (SymbolicCalculatorError, ValueError, TypeError, ArithmeticError, NotImplementedError):
+        # Unestablished interval coverage is not false applicability of the input.
+        return False
 
 
-def _require_scalar_expression(expr: Any, *, operation: str) -> Any:
-    if isinstance(expr, tuple):
-        raise SymbolicCalculatorError(f"{operation} requires a scalar symbolic expression.")
-    return expr
+def _calculus_call(context: CalculatorContext, name: str, args: Sequence[_Value], conditions, *, direction=None) -> _Value | _Alternatives:
+    """Use native calculus, with bounded adaptation of actual answer conditions."""
+    applicable, notices = conditions, ()
+    try:
+        sp = require_sympy()
+        expression = _scalar(args[0], name)
+        variable = _coordinate(context, args[1].expression, name)
+        companion = tuple(c for arg in args[1:] for c in arg.conditions)
+        dependent = tuple(c for c in conditions if c in args[0].conditions and variable in c.free_symbols)
+        independent = tuple(c for c in conditions if c not in dependent or c in companion)
+        restricted = False
+        operators = (sp.Integral, sp.Limit, sp.Subs, sp.Derivative, sp.ConditionSet)
+        inherited = {item for item in expression.atoms(*operators) if variable not in item.free_symbols}
+        if name == "integrate" and len(args) == 2:
+            result = sp.integrate(expression, variable)
+            independent = conditions
+        else:
+            if name == "limit" and dependent:
+                raise SymbolicCalculatorError("Unsupported: Calculator cannot adapt a limit with answer conditions on its active coordinate. Specialize or select an applicable answer first.")
+            if name == "integrate":
+                lower, upper = (_scalar(arg, name) for arg in args[2:])
+                fixed = _fixed_constant_values().keys()
+                if dependent and ((lower.free_symbols | upper.free_symbols) - fixed
+                                  or any(c.free_symbols - {variable} - fixed for c in dependent)):
+                    raise SymbolicCalculatorError("Unsupported: definite integration with active answer conditions requires coordinate-free bounds and conditions involving only the integration coordinate. Substitute other coordinates first.")
+                if dependent and _conditions_cover_interval(dependent, variable, lower, upper):
+                    dependent = ()
+                restricted = bool(dependent)
+            # This wrapper exists only for this backend call. It represents a legitimate
+            # answer condition, never a domain inferred from ordinary operands.
+            bound = sp.Dummy(variable.name, real=True) if dependent else variable
+            prepared = _native_substitute(expression, {variable: bound}) if restricted else expression
+            operand = (sp.Piecewise(
+                (prepared if restricted else expression.xreplace({variable: bound}),
+                 _native_substitute(sp.And(*dependent), {variable: bound}, equations=False)),
+                (sp.nan, True), evaluate=False,
+            ) if dependent else expression)
+            if name == "integrate":
+                applicable = independent
+                result = sp.integrate(operand, (bound, lower, upper), conds="piecewise")
+            elif name == "limit":
+                point = _scalar(args[2], name)
+                direction = ("-" if direction == "left" else "+") if direction else "+-"
+                applicable = independent
+                result = sp.Limit(operand, bound, point, dir=direction).doit()
+            else:
+                point = _scalar(args[2], name, finite=True)
+                order = _integer(args[3], name, minimum=1)
+                direction = direction or "right"
+                result = sp.series(operand, bound, point, order, dir="-" if direction == "left" else "+")
+                result = result.xreplace({bound: variable})
+                independent = conditions
+                notices = (f"Local series about {_render(variable)}={_render(point)}, direction {direction}.",)
+            if name == "series" and dependent:
+                if any(item.has(sp.nan) for item in result.atoms(*operators)):
+                    raise SymbolicCalculatorError("Unsupported: stock SymPy retained the condition-restricted operator; Calculator cannot publish that temporary restriction as an ordinary expression.")
 
+        def classify(body, restrictions, conditional):
+            if restricted:
+                current = sp.Tuple(body, *restrictions)
+                if current.atoms(*operators) - inherited or bound in current.free_symbols:
+                    raise SymbolicCalculatorError("Unsupported: stock SymPy retained the condition-restricted operator; Calculator cannot publish that temporary restriction as an ordinary expression.")
+            if conditional and body.atoms(*operators) - inherited:
+                return _UnresolvedProblem(body, "The native conditional fallback remains unresolved.")
+            return body
 
-def _parse_calculator_expression(context: _CalculatorContext, source: str) -> Any:
-    parser = _CalculatorExpressionParser(context, source)
-    expr = parser.parse()
-    if not isinstance(expr, tuple):
-        _reject_nonfinite_symbolic_result(require_sympy(), expr)
-    return expr
+        return _admit_native(result, independent, notices=notices, classify=classify)
+    except _ConditionInapplicable:
+        raise
+    except (SymbolicCalculatorError, ValueError, TypeError, ArithmeticError, NotImplementedError) as exc:
+        return _Value(_UnavailableDiagnostic(f"Operation is unavailable: {exc}"), applicable, notices)
 
 
 @dataclass(frozen=True, slots=True)
 class _Token:
     kind: str
     text: str
-    pos: int
+
+
+def _validate_numeric_literal(literal: str) -> None:
+    literal = literal.replace("_", "")
+    try:
+        exact = Decimal(literal)
+        value = float(literal)
+    except (InvalidOperation, ValueError, OverflowError) as exc:
+        raise SymbolicCalculatorError("Invalid input: numeric literal.") from exc
+    if not math.isfinite(value):
+        raise SymbolicCalculatorError("Invalid input: numeric literal exceeds finite query ingress.")
+    if exact != 0 and value == 0:
+        raise SymbolicCalculatorError("Invalid input: numeric literal is below query ingress range.")
 
 
 class _CalculatorExpressionParser:
-    def __init__(self, context: _CalculatorContext, source: str) -> None:
-        self._context = context
-        self._source = str(source or "")
-        self._tokens = self._tokenize(self._source)
-        self._idx = 0
-
-    def parse(self) -> Any:
-        expr = self._parse_additive()
-        if not self._at("EOF"):
-            token = self._peek()
-            raise SymbolicCalculatorError(f"Unexpected calculator token {token.text!r}.")
-        return expr
+    """No eval, Python AST execution, attribute access, imports, or arbitrary calls."""
+    def __init__(self, context: CalculatorContext, source: str):
+        self.context = context
+        self.tokens = self._tokenize(source)
+        self.index = 0
 
     @staticmethod
     def _tokenize(source: str) -> list[_Token]:
-        tokens: list[_Token] = []
-        idx = 0
-        while idx < len(source):
-            char = source[idx]
+        tokens = []
+        i = 0
+        while i < len(source):
+            char = source[i]
             if char.isspace():
-                idx += 1
+                i += 1
                 continue
+            start = i
             if char.isalpha() or char == "_":
-                start = idx
-                idx += 1
-                while idx < len(source) and (source[idx].isalnum() or source[idx] == "_"):
-                    idx += 1
-                tokens.append(_Token("IDENT", source[start:idx], start))
+                i += 1
+                while i < len(source) and (source[i].isalnum() or source[i] == "_"):
+                    i += 1
+                tokens.append(_Token("IDENT", source[start:i]))
                 continue
             if char.isdigit() or char == ".":
-                start = idx
-                if char == "." and (idx + 1 >= len(source) or not source[idx + 1].isdigit()):
-                    raise SymbolicCalculatorError(f"Unexpected calculator token {char!r}.")
-                idx += 1
-                while idx < len(source) and (source[idx].isdigit() or source[idx] in "_."):
-                    idx += 1
-                if idx < len(source) and source[idx] in "eE":
-                    idx += 1
-                    if idx < len(source) and source[idx] in "+-":
-                        idx += 1
-                    if idx >= len(source) or not source[idx].isdigit():
-                        raise SymbolicCalculatorError("Invalid numeric literal in calculator expression.")
-                    while idx < len(source) and (source[idx].isdigit() or source[idx] == "_"):
-                        idx += 1
-                literal = source[start:idx]
-                _validate_numeric_literal_text(literal)
-                tokens.append(_Token("NUMBER", literal, start))
+                i += 1
+                while i < len(source) and (source[i].isdigit() or source[i] in "_."):
+                    i += 1
+                if i < len(source) and source[i] in "eE":
+                    i += 1
+                    if i < len(source) and source[i] in "+-":
+                        i += 1
+                    while i < len(source) and (source[i].isdigit() or source[i] == "_"):
+                        i += 1
+                literal = source[start:i]
+                _validate_numeric_literal(literal)
+                tokens.append(_Token("NUMBER", literal))
                 continue
-            if char in "+-/^(),":
-                tokens.append(_Token(char, char, idx))
-                idx += 1
-                continue
-            if char == "*":
-                if idx + 1 < len(source) and source[idx + 1] == "*":
-                    tokens.append(_Token("**", "**", idx))
-                    idx += 2
-                else:
-                    tokens.append(_Token("*", "*", idx))
-                    idx += 1
-                continue
-            raise SymbolicCalculatorError(f"Unexpected calculator token {char!r}.")
-        tokens.append(_Token("EOF", "", len(source)))
-        return tokens
-
-    def _parse_additive(self) -> Any:
-        expr = self._parse_multiplicative()
-        while self._at("+") or self._at("-"):
-            op = self._advance().kind
-            rhs = self._parse_multiplicative()
-            expr = _require_scalar_expression(expr, operation="Arithmetic composition")
-            rhs = _require_scalar_expression(rhs, operation="Arithmetic composition")
-            if op == "+":
-                expr = expr + rhs
+            if source[i:i+2] == "**":
+                tokens.append(_Token("^", "**"))
+                i += 2
+            elif char in "+-*/^(),[]":
+                tokens.append(_Token(char, char))
+                i += 1
             else:
-                expr = expr - rhs
-        return expr
+                raise SymbolicCalculatorError(f"Invalid input: unexpected token {char!r}.")
+        return [*tokens, _Token("EOF", "")]
 
-    def _parse_multiplicative(self) -> Any:
-        expr = self._parse_unary()
-        while self._at("*") or self._at("/"):
-            op = self._advance().kind
-            rhs = self._parse_unary()
-            expr = _require_scalar_expression(expr, operation="Arithmetic composition")
-            rhs = _require_scalar_expression(rhs, operation="Arithmetic composition")
-            if op == "*":
-                expr = expr * rhs
-            else:
-                expr = expr / rhs
-                _reject_nonfinite_symbolic_result(require_sympy(), expr)
-        return expr
+    def at(self, kind):
+        return self.tokens[self.index].kind == kind
 
-    def _parse_power(self) -> Any:
-        expr = self._parse_primary()
-        if self._at("^") or self._at("**"):
-            self._advance()
-            rhs = self._parse_unary()
-            expr = _require_scalar_expression(expr, operation="Exponentiation")
-            rhs = _require_scalar_expression(rhs, operation="Exponentiation")
-            expr = expr ** rhs
-            _reject_nonfinite_symbolic_result(require_sympy(), expr)
-        return expr
+    def take(self, kind=None):
+        token = self.tokens[self.index]
+        if kind is not None and token.kind != kind:
+            raise SymbolicCalculatorError(f"Invalid input: expected {kind}, got {token.text or 'end of query'!r}.")
+        self.index += 1
+        return token.text
 
-    def _parse_unary(self) -> Any:
-        if self._at("+"):
-            self._advance()
-            return _require_scalar_expression(self._parse_unary(), operation="Unary plus")
-        if self._at("-"):
-            self._advance()
-            return -_require_scalar_expression(self._parse_unary(), operation="Unary minus")
-        return self._parse_power()
+    def parse(self) -> _Value | _Alternatives:
+        value = self.additive()
+        self.take("EOF")
+        return value
 
-    def _parse_primary(self) -> Any:
-        if self._at("NUMBER"):
-            literal = self._advance().text.replace("_", "")
-            try:
-                return require_sympy().Rational(literal)
-            except Exception as exc:
-                raise SymbolicCalculatorError("Invalid numeric literal in calculator expression.") from exc
-        if self._at("("):
-            self._advance()
-            expr = self._parse_additive()
-            self._expect(")")
-            return expr
-        if self._at("IDENT"):
-            return self._parse_identifier_primary()
-        token = self._peek()
-        raise SymbolicCalculatorError(f"Unexpected calculator token {token.text!r}.")
+    def additive(self):
+        value = self.multiplicative()
+        while self.at("+") or self.at("-"):
+            operator = self.take()
+            value = _evaluate_call(self.context, operator, (value, self.multiplicative()))
+        return value
 
-    def _parse_identifier_primary(self) -> Any:
-        token = self._advance()
-        name = token.text
-        if name == "d" and self._at("("):
-            return self._parse_field_derivative_after_d()
-        if self._should_parse_compact_derivative(name):
-            return self._parse_derivative_after_numerator(name)
-        if self._at("("):
-            return self._parse_call_after_name(name)
-        return self._symbol_for_identifier(name)
+    def multiplicative(self):
+        value = self.unary()
+        while self.at("*") or self.at("/"):
+            operator = self.take()
+            value = _evaluate_call(self.context, operator, (value, self.unary()))
+        return value
 
-    def _should_parse_compact_derivative(self, numerator: str) -> bool:
-        if not numerator.startswith("d") or not self._at("/"):
-            return False
-        if numerator in self._context.expression_symbols or numerator in self._context.let_sources:
-            return False
-        denominator_index = self._idx + 1
-        if denominator_index >= len(self._tokens):
-            return False
-        denominator_token = self._tokens[denominator_index]
-        if denominator_token.kind != "IDENT":
-            return False
-        denominator = denominator_token.text
-        numerator_species = numerator[1:]
-        if denominator == "dt":
-            return numerator_species in self._context.rhs_by_species
-        if denominator.startswith("d"):
-            if denominator in self._context.expression_symbols or denominator in self._context.let_sources:
-                return False
-            denominator_species = denominator[1:]
-            return (
-                numerator_species in self._context.rhs_by_species
-                and denominator_species in self._context.rhs_by_species
-            )
-        return False
+    def unary(self):
+        if self.at("+") or self.at("-"):
+            operator = self.take()
+            value = self.unary()
+            return value if operator == "+" else _evaluate_call(self.context, "*", (_Value(require_sympy().Integer(-1)), value))
+        value = self.primary()
+        if self.at("^"):
+            self.take()
+            value = _evaluate_call(self.context, "^", (value, self.unary()))
+        return value
 
-    def _parse_field_derivative_after_d(self) -> Any:
-        self._expect("(")
-        if not self._at("IDENT"):
-            raise SymbolicCalculatorError("Field derivative requires a rate expression.")
-        numerator = self._advance().text
-        if not self._is_unambiguous_derivative_symbol(numerator):
-            raise SymbolicCalculatorError("Field derivative requires a rate expression.")
-        self._expect("/")
-        denominator_time = self._expect("IDENT").text
-        if denominator_time != "dt":
-            raise SymbolicCalculatorError("Field derivative requires a rate expression.")
-        self._expect(")")
-        self._expect("/")
-        denominator = self._expect("IDENT").text
-        if not self._is_unambiguous_derivative_symbol(denominator):
-            raise SymbolicCalculatorError("Field derivative requires a species denominator.")
-        num = _require_species(self._context, numerator[1:])
-        den = _require_species(self._context, denominator[1:])
-        return require_sympy().diff(
-            self._context.rhs_by_species[num],
-            self._context.expression_symbols[den],
-        )
-
-    def _is_unambiguous_derivative_symbol(self, name: str) -> bool:
-        return (
-            name.startswith("d")
-            and name not in self._context.expression_symbols
-            and name not in self._context.let_sources
-            and name[1:] in self._context.rhs_by_species
-        )
-
-    def _parse_derivative_after_numerator(self, numerator: str) -> Any:
-        self._expect("/")
-        denominator = self._expect("IDENT").text
-        if denominator == "dt":
-            return self._context.rhs_by_species[_require_species(self._context, numerator[1:])]
-        if denominator.startswith("d"):
-            num = _require_species(self._context, numerator[1:])
-            den = _require_species(self._context, denominator[1:])
-            denominator_expr = self._context.rhs_by_species[den]
-            if denominator_expr == 0:
-                raise SymbolicCalculatorError(f"d{den}/dt is zero, so d{num}/d{den} is undefined.")
-            return require_sympy().simplify(self._context.rhs_by_species[num] / denominator_expr)
-        raise SymbolicCalculatorError(f"Unknown symbolic identifier {denominator!r}.")
-
-    def _parse_call_after_name(self, name: str) -> Any:
-        if name not in _SUPPORTED_TRANSFORMS and name not in {"collect", "expand_params", "odes", "jacobian"}:
-            raise SymbolicCalculatorError(f"Unsupported calculator operation {name!r}.")
-        self._expect("(")
-        if name == "odes" or name == "jacobian":
-            if not self._at(")"):
-                raise SymbolicCalculatorError(f"{name} takes no arguments.")
-            self._expect(")")
-            return _evaluate_zero_arg_query(self._context, name)
-        args: list[Any] = []
-        if not self._at(")"):
-            if name == "collect":
-                args.append(self._parse_additive())
-                if not self._at(","):
-                    raise SymbolicCalculatorError("collect requires an expression and a symbol.")
-                self._advance()
-                args.append(self._parse_collect_symbol())
-            else:
-                args.append(self._parse_additive())
-                while self._at(","):
-                    self._advance()
-                    args.append(self._parse_additive())
-        self._expect(")")
-        return _evaluate_call(self._context, name, args)
-
-    def _parse_collect_symbol(self) -> Any:
-        if not self._at("IDENT"):
-            raise SymbolicCalculatorError("collect requires a symbol as its second argument.")
-        name = _canonicalize_identifier(self._context, self._advance().text)
-        if name not in self._context.expression_symbols:
-            raise SymbolicCalculatorError(f"Unknown collect symbol {name!r}.")
-        return self._context.expression_symbols[name]
-
-    def _symbol_for_identifier(self, name: str) -> Any:
-        if name in self._context.let_sources:
-            return _translate_let_by_name(self._context, name, stack=())
-        canonical = _canonicalize_identifier(self._context, name)
-        if canonical not in self._context.expression_symbols:
-            raise SymbolicCalculatorError(f"Unknown symbolic identifier {canonical!r}.")
-        return self._context.expression_symbols[canonical]
-
-    def _at(self, kind: str) -> bool:
-        return self._peek().kind == kind
-
-    def _peek(self) -> _Token:
-        return self._tokens[self._idx]
-
-    def _advance(self) -> _Token:
-        token = self._peek()
-        self._idx += 1
-        return token
-
-    def _expect(self, kind: str) -> _Token:
-        if not self._at(kind):
-            token = self._peek()
-            expected = kind if kind != "IDENT" else "identifier"
-            actual = token.text or "end of query"
-            raise SymbolicCalculatorError(f"Expected {expected}, got {actual!r}.")
-        return self._advance()
-
-
-def _canonicalize_identifier(context: _CalculatorContext, raw_name: str) -> str:
-    name = str(raw_name)
-    if name in context.expression_symbols:
-        return name
-    resolved = context.parameter_namespace.resolve(name)
-    if resolved.canonical_name is not None and resolved.canonical_name in context.expression_symbols:
-        return resolved.canonical_name
-    invalid_message = context.parameter_namespace.invalid_protected_indexed_identifier_message(name)
-    if invalid_message is not None:
-        raise SymbolicCalculatorError(invalid_message)
-    return name
-
-
-def _validate_numeric_literal_text(literal: str) -> None:
-    literal_s = str(literal).replace("_", "")
-    try:
-        decimal_value = Decimal(literal_s)
-    except InvalidOperation:
-        return
-    try:
-        float_value = float(literal_s)
-    except (OverflowError, ValueError):
-        raise SymbolicCalculatorError(
-            "Numeric literal is too large to preserve safely in calculator expressions."
-        )
-    if not math.isfinite(float_value):
-        raise SymbolicCalculatorError("Only finite numeric literals are supported in calculator expressions.")
-    if decimal_value.is_finite() and decimal_value != 0 and float_value == 0.0:
-        raise SymbolicCalculatorError(
-            "Numeric literal is too small to preserve safely in calculator expressions."
-        )
-
-
-def _exact_retained_number(node: NumberNode, *, sympy: Any) -> Any:
-    exact = node.exact_value
-    if exact is None:
-        raise SymbolicCalculatorError(
-            "Calculator requires a finite exact retained numeric literal."
-        )
-    return sympy.Rational(exact.numerator, exact.denominator)
-
-
-def _translate_calculator_parameter_node(
-    node: object,
-    *,
-    namespace: SymbolicParameterNamespaceContext,
-    sympy: Any,
-) -> Any:
-    """Lower the admitted arithmetic AST; admission owns dependency identity."""
-
-    if isinstance(node, NumberNode):
-        return _exact_retained_number(node, sympy=sympy)
-
-    if isinstance(node, IdentNode):
-        raw_name = str(node.name)
-        if raw_name in ALGEBRA_PROTECTED_NAMES:
-            if raw_name == "T":
-                raise SymbolicCalculatorError(
-                    "Protected runtime symbol 'T' is not supported in Calculator parameter expansion."
-                )
-            canonical_name = raw_name
+    def direct_targets(self, tokens):
+        """Find authored names in an already parsed direct target or roster."""
+        while tokens and tokens[0].kind == "+":
+            tokens = tokens[1:]
+        if len(tokens) == 1 and tokens[0].kind == "IDENT":
+            yield tokens[0].text
+            return
+        if not tokens or tokens[0].kind not in {"(", "["}:
+            return
+        depth = 0
+        for index, token in enumerate(tokens):
+            depth += token.kind in {"(", "["}
+            depth -= token.kind in {")", "]"}
+            if depth == 0:
+                if index != len(tokens)-1:
+                    return
+                break
+        inner = tokens[1:-1]
+        if tokens[0].kind == "(":
+            yield from self.direct_targets(inner)
         else:
-            try:
-                canonical_name = namespace.resolve_identifier(raw_name)
-            except UnsupportedSymbolicExpressionError as exc:
-                raise SymbolicCalculatorError(str(exc)) from exc
-        return sympy.Symbol(canonical_name)
+            start = depth = 0
+            for index, token in enumerate(inner):
+                depth += token.kind in {"(", "["}
+                depth -= token.kind in {")", "]"}
+                if token.kind == "," and depth == 0:
+                    yield from self.direct_targets(inner[start:index])
+                    start = index+1
+            yield from self.direct_targets(inner[start:])
 
-    if isinstance(node, UnaryNode):
-        if node.op not in {"+", "-"}:
+    def check_targets(self, name, args, spans):
+        target = (
+            1 if name in {"solve", "partial", "integrate", "limit", "series", "collect"}
+            or name == "subs" and len(args) == 3
+            else 0 if name in {"initial", "steady_state"}
+            else None
+        )
+        if target is None or len(spans) <= target:
+            return
+        for authored in self.direct_targets(spans[target]):
+            definition = self.context.let_definitions.get(authored)
+            if definition is None:
+                symbol = _canonical_symbol(self.context, authored)
+                if symbol in self.context.coordinates or str(symbol) in _FIXED_CONSTANTS:
+                    continue
+                definition = self.context.parameter_definitions.get(str(symbol), "derived model quantity")
             raise SymbolicCalculatorError(
-                "Only unary plus/minus are supported in Calculator parameter expansion."
+                f"{name}: {authored} is defined as {definition}; use independent coordinates from its definition."
             )
-        rhs = _translate_calculator_parameter_node(
-            node.rhs,
-            namespace=namespace,
-            sympy=sympy,
-        )
-        return rhs if node.op == "+" else -rhs
 
-    if isinstance(node, BinaryNode):
-        operator = str(node.op)
-        if operator not in {"+", "-", "*", "/", "**", "^"}:
-            raise SymbolicCalculatorError(
-                f"Retained Algebra operator {operator!r} is unsupported in Calculator parameter expansion."
-            )
-        lhs = _translate_calculator_parameter_node(
-            node.lhs,
-            namespace=namespace,
-            sympy=sympy,
-        )
-        rhs = _translate_calculator_parameter_node(
-            node.rhs,
-            namespace=namespace,
-            sympy=sympy,
-        )
-        if operator == "+":
-            expression = lhs + rhs
-        elif operator == "-":
-            expression = lhs - rhs
-        elif operator == "*":
-            expression = lhs * rhs
-        elif operator == "/":
-            expression = lhs / rhs
-        elif operator in {"**", "^"}:
-            expression = lhs ** rhs
-        _reject_nonfinite_symbolic_result(sympy, expression)
-        return expression
+    def primary(self):
+        sp = require_sympy()
+        if self.at("NUMBER"):
+            return _Value(sp.Rational(self.take().replace("_", "")))
+        if self.at("("):
+            self.take()
+            value = self.additive()
+            self.take(")")
+            return value
+        if self.at("["):
+            self.take()
+            # Existing Algebra bracket spelling is unambiguous for one species.
+            if self.at("IDENT") and self.tokens[self.index+1].kind == "]" and self.tokens[self.index].text in self.context.species_names:
+                name = self.take()
+                self.take("]")
+                if self.at("IDENT") and self.tokens[self.index].text == "_0":
+                    self.take()
+                    name = f"initial({name})"
+                return _Value(self.context.symbols[name])
+            values = []
+            if not self.at("]"):
+                values.append(self.additive())
+                while self.at(","):
+                    self.take()
+                    values.append(self.additive())
+            self.take("]")
+            return _evaluate_call(self.context, "tuple", values)
+        name = self.take("IDENT")
+        if name == "d" and self.at("("):
+            self.take()
+            inner_start = self.index
+            inner = self.additive()
+            inner_tokens = self.tokens[inner_start:self.index]
+            self.take(")")
+            self.take("/")
+            denominator = self.take("IDENT")
+            if denominator == "dt":
+                return _evaluate_call(self.context, "dt", (inner,))
+            legacy_rate = (len(inner_tokens) == 3 and inner_tokens[0].text.startswith("d")
+                           and inner_tokens[0].text[1:] in self.context.species_names
+                           and inner_tokens[1].kind == "/" and inner_tokens[2].text == "dt")
+            if legacy_rate and denominator.startswith("d") and denominator[1:] in self.context.species_names and denominator not in self.context.symbols and denominator not in self.context.let_definitions:
+                return _evaluate_call(self.context, "partial", (inner, _Value(self.context.symbols[denominator[1:]])))
+            raise SymbolicCalculatorError("Invalid input: use dt(F) or partial(F, coordinate).")
+        if name not in self.context.symbols and name not in self.context.let_definitions and name.startswith("d") and name[1:] in self.context.species_names and self.at("/"):
+            denominator = self.tokens[self.index+1]
+            if denominator.kind == "IDENT" and (denominator.text == "dt" or denominator.text.startswith("d") and denominator.text[1:] in self.context.species_names and denominator.text not in self.context.symbols and denominator.text not in self.context.let_definitions):
+                self.take()
+                denominator = self.take()
+                rhs = self.context.rhs[self.context.species_names.index(name[1:])]
+                if denominator == "dt":
+                    return rhs
+                other = self.context.rhs[self.context.species_names.index(denominator[1:])]
+                result = _evaluate_call(self.context, "/", (rhs, other))
+                return _evaluate_call(self.context, "simplify", (result,))
+        if self.at("("):
+            if name not in _OPERATIONS:
+                raise SymbolicCalculatorError(f"Unsupported calculator operation {name!r}.")
+            self.take()
+            args, spans = [], []
+            direction = None
+            if not self.at(")"):
+                while True:
+                    if name == "limit" and len(args) == 3 or name == "series" and len(args) == 4:
+                        direction = self.take("IDENT")
+                        if direction not in {"left", "right"}:
+                            raise SymbolicCalculatorError("Invalid input: direction is left or right.")
+                        break
+                    start = self.index
+                    args.append(self.additive())
+                    spans.append(self.tokens[start:self.index])
+                    if not self.at(","):
+                        break
+                    self.take()
+            self.take(")")
+            self.check_targets(name, args, spans)
+            return _evaluate_call(self.context, name, args, direction=direction)
+        if name in self.context.let_definitions:
+            return self.context.values[name]
+        symbol = _canonical_symbol(self.context, name)
+        return self.context.values[str(symbol)]
 
-    raise SymbolicCalculatorError(
-        "Calculator parameter expansion requires supported nodes from the retained admitted Algebra AST; "
-        f"got {type(node).__name__}."
-    )
+
+def _render(expression: Any) -> str:
+    sp = require_sympy()
+    from sympy.printing.str import StrPrinter
+    if isinstance(expression, _Relationships):
+        return ", ".join(f"{_render(key)} = {_render(rhs)}" for key, rhs in expression.replacements.items())
+
+    class Printer(StrPrinter):
+        def _print_ImaginaryUnit(self, expr):
+            return "sqrt(-1)"
+
+        def _print_Infinity(self, expr):
+            return "infinity()"
+
+        def _print_NegativeInfinity(self, expr):
+            return "-infinity()"
+
+        def _print_Pi(self, expr):
+            return "pi()"
+
+        def _print_Exp1(self, expr):
+            return "e()"
+
+        def _print_Abs(self, expr):
+            return "abs(" + self._print(expr.args[0]) + ")"
+
+        def _print_Min(self, expr):
+            return "min(" + ", ".join(self._print(arg) for arg in expr.args) + ")"
+
+        def _print_Max(self, expr):
+            return "max(" + ", ".join(self._print(arg) for arg in expr.args) + ")"
+
+        def _print_Heaviside(self, expr):
+            if expr.args[1] == 0:
+                return "heaviside(" + self._print(expr.args[0]) + ")"
+            return "Heaviside(" + ", ".join(self._print(arg) for arg in expr.args) + ")"
+
+        def _print_Float(self, expr):
+            from sympy.core.evalf import prec_to_dps
+            return f"approx({super()._print_Float(expr)}, {prec_to_dps(expr._prec)})"
+
+    printer = Printer()
+    if isinstance(expression, sp.Tuple):
+        items = [_render(item) for item in expression]
+        return "[" + (f"({items[0]})" if len(items) == 1 else ", ".join(items)) + "]"
+    if isinstance(expression, sp.MatrixBase):
+        return "matrix([" + ", ".join("[" + ", ".join(_render(x) for x in expression.row(i)) + "]" for i in range(expression.rows)) + "])"
+    if isinstance(expression, sp.Equality):
+        return f"eq({_render(expression.lhs)}, {_render(expression.rhs)})"
+    return printer.doprint(expression)
 
 
-# Algebra admission retains the validated program on the mechanism.  The
-# calculator consumes that retained AST without reconstructing or reparsing
-# accepted source text or metadata.
-def _retained_parameter_expressions(spec: Any) -> dict[str, Any]:
-    block = spec.parameter_block
-    if block is None:
-        raise SymbolicCalculatorError(
-            "Calculator parameter expansion requires the retained admitted Algebra AST."
-        )
-    return {
-        str(statement.name): statement.expr
-        for statement in block.lines
-    }
+def _native_components(expression):
+    """Expose evaluated children and retain the native shape and binding scope."""
+    sp = require_sympy()
+    if isinstance(expression, _Relationships):
+        return tuple(expression.replacements.values()), lambda values: _Relationships(dict(zip(expression.replacements, values, strict=True)))
+    if isinstance(expression, sp.MatrixBase):
+        return tuple(expression), lambda values: sp.ImmutableMatrix(expression.rows, expression.cols, values)
+    if isinstance(expression, (sp.Lambda, sp.Derivative)):
+        return (), lambda _: expression
+    if isinstance(expression, sp.ConditionSet):
+        return (expression.base_set,), lambda values: sp.ConditionSet(expression.sym, expression.condition, values[0])
+    if isinstance(expression, sp.Integral):
+        exposed, positions, outer = [], [], set()
+        for i in reversed(range(len(expression.limits))):
+            limit = expression.limits[i]
+            for j, bound in enumerate(limit[1:], 1):
+                if not bound.free_symbols & outer:
+                    positions.append((i, j))
+                    exposed.append(bound)
+            outer.add(limit[0])
+        def integral(values):
+            limits = [list(limit) for limit in expression.limits]
+            for (i, j), value in zip(positions, values, strict=True):
+                limits[i][j] = value
+            return sp.Integral(expression.function, *limits)
+        return tuple(exposed), integral
+    if isinstance(expression, sp.Subs):
+        return tuple(expression.point), lambda values: sp.Subs(expression.expr, expression.variables, values)
+    if isinstance(expression, sp.Limit):
+        body, coordinate, point, direction = expression.args
+        return (point,), lambda values: sp.Limit(body, coordinate, values[0], dir=str(direction))
+    return expression.args, lambda values: (expression if values == expression.args else
+        expression.func(*values, evaluate=False) if isinstance(expression, sp.Equality) else expression.func(*values))
 
 
-def _parameter_definition_sources(mechanism: Any) -> dict[str, str]:
-    spec = parameter_algebra_spec_from_mechanism(mechanism)
-    if spec is None:
-        return {}
-    return {
-        name: expression_to_source(expression)
-        for name, expression in _retained_parameter_expressions(spec).items()
-    }
+def _admit_native(expression, conditions=(), *, notices=(), classify=None):
+    """Admit new native branches directly, under established current applicability."""
+    sp = require_sympy()
+    fixed = _fixed_constant_values()
+    unresolved = expression if isinstance(expression, _UnresolvedProblem) else None
+    template = unresolved.problem if unresolved else expression
+    if unresolved and isinstance(template, sp.Set):
+        problem = _native_substitute(template, fixed, equations=False)
+        return _Alternatives(()) if problem == sp.S.EmptySet else _Value(replace(unresolved, problem=problem), conditions, notices)
 
+    def conditional(node, choices):
+        if isinstance(node, sp.Piecewise):
+            return conditional(choices[node], choices) if node in choices else node
+        children, _ = _native_components(node)
+        return next((found for child in children if (found := conditional(child, choices)) is not None), None)
 
-def _expand_parameter_dependencies(context: _CalculatorContext, expr: Any) -> Any:
-    """Resolve only the query's closure in admission's chemistry/Algebra order."""
+    def materialize(node, choices, *, check=False):
+        if isinstance(node, sp.Piecewise):
+            return materialize(choices[node], choices, check=check)
+        if check and isinstance(node, sp.Symbol):
+            node = fixed.get(node, node)
+        children, rebuild = _native_components(node)
+        values = tuple(materialize(child, choices, check=check) for child in children)
+        result = rebuild(values)
+        if check and (result is sp.nan or result is sp.zoo):
+            raise SymbolicCalculatorError("Undefined: native mathematics produced an undefined value.")
+        return result
 
-    spec = parameter_algebra_spec_from_mechanism(context.mechanism)
-    graph = spec.evaluation_dependencies
-    expressions = _retained_parameter_expressions(spec)
-    namespace = SymbolicParameterNamespaceContext.from_spec(spec)
-    sympy = require_sympy()
-    required: set[str] = set()
-    pending = [str(symbol) for symbol in expr.free_symbols if str(symbol) in graph]
+    unchanged = tuple(c for c in conditions if conditional(c, {}) is None)
+    pending = [((), {})]
+    answers, branched = [], False
     while pending:
-        name = pending.pop()
-        if name in required:
+        guards, choices = pending.pop()
+        node = next((found for root in (*guards, *conditions, template)
+                     if (found := conditional(root, choices)) is not None), None)
+        if node is not None:
+            branched = True
+            prior, branches = sp.false, []
+            for body, predicate in node.args:
+                branches.append(((*guards, sp.And(predicate, sp.Not(prior))), {**choices, node: body}))
+                prior = sp.Or(prior, predicate)
+            if prior != sp.true:
+                branches.append(((*guards, sp.Not(prior)), {**choices, node: sp.nan}))
+            pending.extend(reversed(branches))
             continue
-        required.add(name)
-        pending.extend(graph[name])
-
-    resolved: dict[Any, Any] = {}
-    for name in graph:
-        if name not in required:
-            continue
-        symbol = sympy.Symbol(name)
-        if name in expressions:
-            kind = spec.parameter_assignment_kind(name)
-            value = (
-                _translate_calculator_parameter_node(
-                    expressions[name], namespace=namespace, sympy=sympy
-                )
-                if kind in {"mechanism-bound", "derived scalar"}
-                else symbol
-            )
-        elif name in context.chemistry_relations:
-            value = context.chemistry_relations[name]
-        else:
-            value = symbol
-        # Chemistry helpers may inline indirect dependencies (e.g. dG_eq
-        # inside kr). Apply the resolved transitive closure, not only the
-        # direct graph edges, while preserving admission's identity leaves.
-        value = value.xreplace(resolved)
-        _reject_nonfinite_symbolic_result(sympy, value)
-        resolved[symbol] = value
-
-    expanded = sympy.expand(expr.xreplace(resolved))
-    _reject_nonfinite_symbolic_result(sympy, expanded)
-    return expanded
-
-
-def _let_sources(mechanism: Any) -> dict[str, str]:
-    compiled = compiled_algebra_for_mechanism(mechanism)
-    if compiled is None:
-        return {}
-    return {
-        str(statement.name): expression_to_source(statement.expr)
-        for statement in compiled.block.lines
-    }
-
-
-def _supported_let_sources(context: _CalculatorContext) -> dict[str, str]:
-    supported: dict[str, str] = {}
-    for name, source in context.let_sources.items():
+        restrictions = conditions
         try:
-            _translate_let_by_name(context, name, stack=())
-        except SymbolicCalculatorError:
+            if branched:
+                # Predicates are transformed lazily: a false guard wins over an
+                # invalid comparison belonging only to that inapplicable branch.
+                changed = _boolean_result((*guards, *(c for c in conditions if c not in unchanged)),
+                    lambda c: _native_substitute(materialize(c, choices), fixed, equations=False))
+                restrictions = _condition_tuple(sp.And(*unchanged, changed))
+            materialize(template, choices, check=True)
+            body = materialize(template, choices) if choices else template
+            body = replace(unresolved, problem=body) if unresolved else body
+            if classify is not None:
+                body = classify(body, restrictions, branched)
+        except _ConditionInapplicable:
             continue
-        supported[str(name)] = str(source)
-    return supported
+        except (SymbolicCalculatorError, ValueError, TypeError, ArithmeticError, NotImplementedError) as exc:
+            body = _UnavailableDiagnostic(str(exc))
+        answers.append(_Value(body, restrictions, notices))
+    return _Alternatives(tuple(answers)) if branched else answers[0]
 
 
-def _translate_let_by_name(context: _CalculatorContext, name: str, *, stack: Sequence[str]) -> Any:
-    if name in stack:
-        raise SymbolicCalculatorError(f"Unsupported let expression cycle at {name!r}.")
-    source = context.let_sources.get(name)
-    if source is None:
-        raise SymbolicCalculatorError(f"Unknown let observable {name!r}.")
-    compiled = compiled_algebra_for_mechanism(context.mechanism)
-    statement = (
-        next(
-            (
-                candidate
-                for candidate in reversed(compiled.block.lines)
-                if str(candidate.name) == name
-            ),
-            None,
-        )
-        if compiled is not None
-        else None
+def _printed_input_supported(context: CalculatorContext, expression, text: str) -> bool:
+    """Check emitted vocabulary/number ingress without executing another query."""
+    sp = require_sympy()
+    if expression.atoms(sp.NumberSymbol) - {sp.pi, sp.E}:
+        return False
+    try:
+        tokens = _CalculatorExpressionParser._tokenize(text)
+    except SymbolicCalculatorError:
+        return False
+    for index, token in enumerate(tokens):
+        if token.kind != "IDENT":
+            continue
+        if tokens[index + 1].kind == "(":
+            if token.text not in _OPERATIONS:
+                return False
+        elif token.text not in context.symbols and token.text not in context.let_definitions:
+            return False
+    return True
+
+
+def evaluate_symbolic_query(context: CalculatorContext, query: str) -> SymbolicCalculatorResult:
+    query = query.strip()
+    if not query:
+        raise SymbolicCalculatorError("Invalid input: empty Calculator query.")
+    try:
+        value = _CalculatorExpressionParser(context, query).parse()
+        return _package_result(context, query, value)
+    except SymbolicCalculatorError:
+        raise
+    except (ValueError, TypeError, ArithmeticError, NotImplementedError, AttributeError, RecursionError) as exc:
+        raise SymbolicCalculatorError(f"Unsupported or undefined mathematics: {exc}") from exc
+
+
+def _package_result(context: CalculatorContext, query: str, result) -> SymbolicCalculatorResult:
+    expression = query
+    family = isinstance(result, _Alternatives)
+    entries = _entries(result)
+    lines, choices = [], []
+    for value in entries:
+        payload = value.expression
+        if isinstance(payload, _UnavailableDiagnostic):
+            lines.extend(("Unavailable expression (not selectable):", payload.explanation))
+        elif isinstance(payload, _UnresolvedProblem):
+            lines.extend(("Unresolved alternative (not a selectable solved answer):", _render(payload.problem), payload.explanation))
+        else:
+            label = _render(payload)
+            index = len(choices) + 1
+            if family:
+                lines.append(f"Solution {index}")
+            lines.append(("Relationships: " if isinstance(payload, _Relationships) else "Expression: " if family else "") + label)
+            reusable = f"solution({expression}, {index})" if family else query
+            choices.append((f"Solution {index}: {label}" if family else "Result", reusable))
+            if family or isinstance(payload, _Relationships) or value.conditions or value.notices or value.provenance or not _printed_input_supported(context, payload, label):
+                lines.append("Reuse query: " + reusable)
+        if value.conditions:
+            lines.append("Conditions: " + "; ".join(_render(c) for c in value.conditions))
+        lines.extend((*value.notices, *value.provenance))
+        if family:
+            lines.append("")
+    if not entries:
+        lines.append("No applicable real solutions (EmptySet).")
+    if family:
+        lines.append("Complete query (all answers and unresolved possibilities): " + query)
+    result_text = "\n".join(lines).rstrip()
+    if entries and all(isinstance(v.expression, _UnavailableDiagnostic) for v in entries):
+        raise SymbolicCalculatorError(result_text)
+    copy_text = result_text
+    if expression == "odes()":
+        result_text += "\nRows: " + ", ".join(f"d{name}/dt" for name in context.species_names)
+    assumptions = (
+        "Accepted-source symbolic system; no schedules, execution overrides, Fit candidates or Slider drafts.",
+        "Coordinates are real; T is positive and fixed in time unless explicit expression dependence is supplied.",
+        "Definitions are prepared before calculation. Independent parameters and initial concentrations are fixed in time; partial differentiates prepared mathematics.",
+        "Independent inputs remain symbolic; supply concrete values explicitly with subs. Accepted defaults are not Calculator inputs.",
+        "Physical constants retain their names and owned values; approximation does not increase source precision.",
+        "Special functions, conditional/unresolved sets and some root/order forms may not round-trip as direct input; nested operation composition remains supported.",
+        "Stock SymPy 1.14.0 supplies mathematical algorithms. Its known parameter-dependent rational integration bug (sympy/sympy#28596) is not corrected or independently verified by Kindred.",
+        "Ordinary algebra and formal calculus use native CAS semantics, without historical operand domains. A simplified result does not certify the original expression's domain or a parameterized integral's regularity.",
+        "Actual answer conditions, unavailable cases and unresolved alternatives are retained. Active-condition definite integrals require coordinate-free bounds and no other condition parameters; active-condition limits remain unsupported. Series retain direction and order, not inferred neighborhood conditions.",
     )
-    if statement is None:
-        raise SymbolicCalculatorError(f"Unsupported let expression {name!r}.")
-    result = _translate_let_node(
-        statement.expr,
-        context=context,
-        stack=tuple(stack) + (name,),
+    metadata = MechanismMetadataView.from_metadata(context.mechanism.metadata)
+    return SymbolicCalculatorResult(
+        query, result_text, copy_text, assumptions,
+        {"Species": context.species_names, "Parameters": tuple(sorted(context.parameter_namespace.canonical_names | context.parameter_definitions.keys())),
+         "Fixed constants": _FIXED_CONSTANTS, "Time and temperature": ("t [s]", "T [K]"),
+         "Energy coordinates": (f"Ea, dG_act, dG_eq in authored {metadata.energy_unit}; chemistry lowers to J/mol once",),
+         "Initial coordinates": tuple(f"initial({name})" for name in context.species_names)},
+        context.mechanism_source,
+        context.parameter_definitions, context.let_definitions,
+        tuple(choices),
     )
-    _reject_nonfinite_symbolic_result(require_sympy(), result)
-    return result
-
-
-def _translate_let_node(node: Any, *, context: _CalculatorContext, stack: Sequence[str]) -> Any:
-    sympy = require_sympy()
-    if isinstance(node, NumberNode):
-        return _exact_retained_number(node, sympy=sympy)
-    if isinstance(node, IdentNode):
-        name = str(node.name)
-        if name in context.let_sources:
-            return _translate_let_by_name(context, name, stack=stack)
-        name = _canonicalize_identifier(context, name)
-        if name not in context.expression_symbols:
-            raise SymbolicCalculatorError(f"Unsupported let expression identifier {name!r}.")
-        return context.expression_symbols[name]
-    if isinstance(node, SpeciesRefNode):
-        if node.kind != "now":
-            raise SymbolicCalculatorError("Unsupported let expression species reference.")
-        name = str(node.name)
-        if name not in context.expression_symbols:
-            raise SymbolicCalculatorError(f"Unsupported let expression species {name!r}.")
-        return context.expression_symbols[name]
-    if isinstance(node, UnaryNode):
-        rhs = _translate_let_node(node.rhs, context=context, stack=stack)
-        if node.op == "+":
-            return rhs
-        if node.op == "-":
-            return -rhs
-        raise SymbolicCalculatorError("Unsupported let expression unary operator.")
-    if isinstance(node, BinaryNode):
-        lhs = _translate_let_node(node.lhs, context=context, stack=stack)
-        rhs = _translate_let_node(node.rhs, context=context, stack=stack)
-        if node.op == "+":
-            return lhs + rhs
-        if node.op == "-":
-            return lhs - rhs
-        if node.op == "*":
-            return lhs * rhs
-        if node.op == "/":
-            result = lhs / rhs
-            _reject_nonfinite_symbolic_result(sympy, result)
-            return result
-        if node.op in {"^", "**"}:
-            return lhs ** rhs
-        raise SymbolicCalculatorError("Unsupported let expression binary operator.")
-    if isinstance(node, CallNode):
-        raise SymbolicCalculatorError("Unsupported let expression function call.")
-    raise SymbolicCalculatorError(f"Unsupported let expression node {type(node).__name__}.")
-
-
-def _require_species(context: _CalculatorContext, name: str) -> str:
-    name_s = str(name)
-    if name_s not in context.species_names:
-        raise SymbolicCalculatorError(f"Unknown species {name_s!r}.")
-    return name_s

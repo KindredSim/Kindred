@@ -51,6 +51,7 @@ class ProjectTransientState:
     active_import: bool = False
     active_xlsx_export: bool = False
     active_scan: bool = False
+    active_calculator: bool = False
 
     def __post_init__(self) -> None:
         for field_name in (
@@ -65,6 +66,7 @@ class ProjectTransientState:
             "active_import",
             "active_xlsx_export",
             "active_scan",
+            "active_calculator",
         ):
             if type(getattr(self, field_name)) is not bool:
                 raise TypeError(f"{field_name} must be bool.")
@@ -91,6 +93,7 @@ class ProjectTransientState:
             or self.active_import
             or self.active_xlsx_export
             or self.active_scan
+            or self.active_calculator
         )
 
     @property
@@ -152,6 +155,7 @@ class ProjectController(QtCore.QObject):
         fit_session: FitSessionOwner,
         xlsx_exports: object,
         scan: object,
+        calculator_owners: Callable[[], tuple[object, ...]],
         set_status_text: Callable[[str], None],
         admit_incoming_document: Callable[
             [ProjectDocument],
@@ -192,6 +196,7 @@ class ProjectController(QtCore.QObject):
         self._fit_session = fit_session
         self._xlsx_exports = xlsx_exports
         self._scan = scan
+        self._calculator_owners = calculator_owners
         self._set_status_text = set_status_text
         self._admit_incoming_document = admit_incoming_document
         self._capture_visible_tab_inputs = capture_visible_tab_inputs
@@ -346,6 +351,8 @@ class ProjectController(QtCore.QObject):
             details.append("An XLSX export is still active.")
         if transient.active_scan:
             details.append("A Chemical Space Scan is still active.")
+        if transient.active_calculator:
+            details.append("A Calculator query is still active.")
         details.append(f"Choose once how to proceed before {request.action}.")
 
         dialog = QtWidgets.QMessageBox(self._parent_widget)
@@ -940,6 +947,8 @@ class ProjectController(QtCore.QObject):
             self._scan.cancel_for_application_close()
         except Exception:
             logger.exception("Chemical Space Scan cancellation failed during Close")
+        for calculator in self._calculator_owners():
+            calculator.cancel_for_application_close()
         self.notify_close_progress()
         return self._native_close_authorized
 
@@ -960,6 +969,7 @@ class ProjectController(QtCore.QObject):
             ("Fit", self._fit_session),
             ("XLSX export", self._xlsx_exports),
             ("Chemical Space Scan", self._scan),
+            *(("Calculator", owner) for owner in self._calculator_owners()),
         ):
             try:
                 owner_settled = owner.application_close_settled
