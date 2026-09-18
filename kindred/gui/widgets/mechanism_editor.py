@@ -38,6 +38,39 @@ class _MechanismEditorRenderProjection:
     accepted_reactions: bool
 
 
+def _make_sliders_icon(color: QtGui.QColor) -> QtGui.QIcon:
+    """Paint the compact three-track glyph used by the Sliders button."""
+
+    size = 18
+    pixmap = QtGui.QPixmap(size, size)
+    pixmap.fill(QtCore.Qt.GlobalColor.transparent)
+    painter = QtGui.QPainter(pixmap)
+    painter.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
+    painter.setPen(
+        QtGui.QPen(
+            color,
+            1.5,
+            QtCore.Qt.PenStyle.SolidLine,
+            QtCore.Qt.PenCapStyle.RoundCap,
+            QtCore.Qt.PenJoinStyle.RoundJoin,
+        )
+    )
+    track_start = QtCore.QPointF(2.0, 0.0)
+    track_end = QtCore.QPointF(16.0, 0.0)
+    for y in (4.0, 9.0, 14.0):
+        painter.drawLine(
+            QtCore.QPointF(track_start.x(), y),
+            QtCore.QPointF(track_end.x(), y),
+        )
+
+    painter.setPen(QtCore.Qt.PenStyle.NoPen)
+    painter.setBrush(color)
+    for y, x in zip((4.0, 9.0, 14.0), (6.0, 12.0, 8.5)):
+        painter.drawEllipse(QtCore.QRectF(x - 2.0, y - 2.0, 4.0, 4.0))
+    painter.end()
+    return QtGui.QIcon(pixmap)
+
+
 class _PersistentToggleMenu(QtWidgets.QMenu):
     """Keep checkable actions open so users can toggle multiple sliders in one pass."""
 
@@ -77,7 +110,6 @@ class _PersistentToggleMenu(QtWidgets.QMenu):
 
 
 class MechanismEditorTabbed(QtWidgets.QWidget):
-    mechanismInspectRequested = Signal()
     sourceDraftEdited = Signal(object)
     reactionsRevertRequested = Signal()
     notesEdited = Signal(str)
@@ -133,18 +165,22 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
         self.symbolic_calculator_btn = QtWidgets.QPushButton("Σ", self)
         self.symbolic_calculator_btn.setAccessibleName("Open Symbolic Calculator")
         self.symbolic_calculator_btn.setObjectName("symbolicCalculatorOpenButton")
-        self.symbolic_calculator_btn.setToolTip("Open the Symbolic Calculator panel")
+        self.symbolic_calculator_btn.setToolTip(
+            "Show or hide the Symbolic Calculator panel."
+        )
         self.symbolic_calculator_btn.setStyleSheet("QPushButton { padding: 6px 12px; }")
         self.symbolic_calculator_btn.setEnabled(False)
         reactions_header_row.addWidget(self.symbolic_calculator_btn)
-        self.inspect_mechanism_btn = QtWidgets.QPushButton("Inspect...", self)
-        self.inspect_mechanism_btn.setObjectName("mechanismInspectorOpenButton")
-        self.inspect_mechanism_btn.setToolTip("Open a read-only Mechanism Inspector")
-        self.inspect_mechanism_btn.setStyleSheet("QPushButton { padding: 2px 8px; }")
-        self.inspect_mechanism_btn.clicked.connect(
-            lambda _checked=False: self.mechanismInspectRequested.emit()
+        self.sliders_btn = QtWidgets.QPushButton(self)
+        self.sliders_btn.setAccessibleName("Open Interactive Sliders panel")
+        self.sliders_btn.setObjectName("slidersOpenButton")
+        self.sliders_btn.setToolTip(
+            "Show or hide the Interactive Sliders panel."
         )
-        reactions_header_row.addWidget(self.inspect_mechanism_btn)
+        self.sliders_btn.setStyleSheet("QPushButton { padding: 6px 12px; }")
+        self.sliders_btn.setIconSize(QtCore.QSize(18, 18))
+        self._refresh_sliders_icon()
+        reactions_header_row.addWidget(self.sliders_btn)
         self._run_btn = QtWidgets.QPushButton("Run")
         run_font = self._run_btn.font()
         run_font.setPointSize(run_font.pointSize() + 2)
@@ -454,9 +490,9 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
             "<pre>param pulse_time = 2.0\nintervention: op=set; species=A; time_param=pulse_time; value=1.0</pre>"
             "<p>The complete *_param set is time_param, start_time_param, end_time_param, value_param, delta_param, flux_rate_param, and threshold_param. every, count, duration, max_count, and min_interval remain literal fields. Exact indexed names such as k1, kf1, kr1, and Keq1 resolve through the mechanism parameter namespace; use a longer name such as K1_test for an independent scalar or schedule parameter.</p>"
             "<h2>Inspecting Interventions</h2>"
-            "<p>Inspect... shows what an admitted schedule will do without editing it.</p>"
+            "<p>Simulation → Inspect Mechanism... shows what an admitted schedule will do without editing it.</p>"
             "<pre>intervention: op=hold; species=B; start_time=0.0; end_time=5.0; value=1.0</pre>"
-            "<p>Open Inspect... to read step numbers, symbolic right-hand-side equations, the authored schedule, typed operations, discontinuities, and repeat/trigger lineage. Plot annotations for executed schedule operations and exact trigger firings come from the run provenance and can be toggled in the plot context menu.</p>"
+            "<p>Open Simulation → Inspect Mechanism... to read step numbers, symbolic right-hand-side equations, the authored schedule, typed operations, discontinuities, and repeat/trigger lineage. Plot annotations for executed schedule operations and exact trigger firings come from the run provenance and can be toggled in the plot context menu.</p>"
             "<h2>Parameters and Observables</h2>"
             "<p>param defines scalar inputs or relationships between parameters. let defines calculated quantities that can be plotted or matched to observations.</p>"
             "<pre>reaction: A -&gt; B ; k=0.5\n[A] = 1.0, [B] = 0.0\nparam scale = 2.0\nlet conversion = 1.0 - ([A] / max([A]_0, 1e-18))</pre>"
@@ -707,11 +743,16 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
     def changeEvent(self, event: QtCore.QEvent) -> None:
         super().changeEvent(event)
         if event.type() in (QtCore.QEvent.PaletteChange, QtCore.QEvent.ApplicationPaletteChange):
+            self._refresh_sliders_icon()
             if hasattr(self, "_reactions_highlighter"):
                 with QtCore.QSignalBlocker(self._reactions_text):
                     self._reactions_highlighter.set_theme(
                         dark_mode=self.palette().color(QtGui.QPalette.Text).lightness() > 128
                     )
+
+    def _refresh_sliders_icon(self) -> None:
+        color = self.palette().color(QtGui.QPalette.ColorRole.ButtonText)
+        self.sliders_btn.setIcon(_make_sliders_icon(color))
 
     def _on_text_changed(self):
         """Capture literal source edits without running scientific preparation."""

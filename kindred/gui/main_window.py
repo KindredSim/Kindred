@@ -608,12 +608,14 @@ class MainWindow(QtWidgets.QMainWindow):
             self._on_slider_draft_state_changed
         )
         editor.symbolic_calculator_btn.clicked.connect(
-            lambda _checked=False, captured=tab_id: self._open_symbolic_calculator(
+            lambda _checked=False, captured=tab_id: self._toggle_symbolic_calculator(
                 captured
             )
         )
-        editor.mechanismInspectRequested.connect(
-            lambda captured=tab_id: self._open_mechanism_inspector(captured)
+        editor.sliders_btn.clicked.connect(
+            lambda _checked=False, captured=tab_id: self._toggle_interactive_sliders(
+                captured
+            )
         )
         bundle.editor_binding.draftStateChanged.connect(
             self._on_draft_state_changed
@@ -4381,6 +4383,15 @@ class MainWindow(QtWidgets.QMainWindow):
             None,
             "openSymbolicCalculatorAction",
         )
+        self._add_action(
+            simulation,
+            "Inspect Mechanism...",
+            lambda: self._open_mechanism_inspector(
+                self._workspace_tab_registry.active_tab_id
+            ),
+            None,
+            "inspectMechanismAction",
+        )
         simulation.addSeparator()
         self._add_action(
             simulation,
@@ -4931,6 +4942,16 @@ class MainWindow(QtWidgets.QMainWindow):
         bundle.calculator_panel.render_state(state)
         bundle.editor.symbolic_calculator_btn.setEnabled(state.available)
 
+    def _toggle_symbolic_calculator(self, tab_id: str) -> None:
+        if not self._mutation_input_admitted("Toggle Symbolic Calculator"):
+            return
+        identity = SYMBOLIC_CALCULATOR_DOCK_SPEC.identity_key
+        dock = self._workspace.dock_for_identity(identity)
+        if self._workspace.is_dock_frontmost(identity):
+            dock.hide()
+            return
+        self._open_symbolic_calculator(tab_id)
+
     def _open_symbolic_calculator(self, tab_id: str) -> None:
         if not self._mutation_input_admitted("Open Symbolic Calculator"):
             return
@@ -4939,6 +4960,19 @@ class MainWindow(QtWidgets.QMainWindow):
         if str(tab_id) == self._workspace_tab_registry.active_tab_id:
             self._calculator_stack.setCurrentWidget(bundle.calculator_panel)
         self._workspace.reveal_dock(SYMBOLIC_CALCULATOR_DOCK_SPEC.identity_key)
+
+    def _toggle_interactive_sliders(self, tab_id: str) -> None:
+        if not self._mutation_input_admitted("Toggle Interactive Sliders"):
+            return
+        identity = SLIDERS_DOCK_SPEC.identity_key
+        dock = self._workspace.dock_for_identity(identity)
+        if self._workspace.is_dock_frontmost(identity):
+            dock.hide()
+            return
+        bundle = self._tab_surfaces[str(tab_id)]
+        if str(tab_id) == self._workspace_tab_registry.active_tab_id:
+            self._slider_stack.setCurrentWidget(bundle.slider_panel)
+        self._workspace.reveal_dock(identity)
 
     def _evaluate_symbolic(self, tab_id: str, query: str):
         bundle = self._tab_surfaces[str(tab_id)]

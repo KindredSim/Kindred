@@ -214,6 +214,16 @@ class ProjectWorkspaceWidget(QtWidgets.QMainWindow):
             dock.activateWindow()
         return dock
 
+    def is_dock_frontmost(self, identity: str) -> bool:
+        """Return whether a dock is shown and not behind another dock tab."""
+
+        dock = self.dock_for_identity(identity)
+        if not dock.isVisible():
+            return False
+        if dock.isFloating():
+            return True
+        return not dock.visibleRegion().isEmpty()
+
     def _new_plot_panel(self) -> PyQtGraphPlotPanel:
         plot = PyQtGraphPlotPanel()
         plot.set_theme(dark_mode=self._dark_mode)
