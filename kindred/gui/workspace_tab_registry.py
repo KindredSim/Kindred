@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
-from typing import TYPE_CHECKING, Callable, Iterable
+from typing import TYPE_CHECKING, Callable, Iterable, Mapping
 
 from kindred.core.mechanism_source import MechanismAuthoringSource
 from kindred.core.project_document import (
@@ -12,6 +12,7 @@ from kindred.core.project_document import (
     ProjectDocument,
     SimulationExecutionSettings,
     TabScientificSettings,
+    canonical_initial_values,
     new_set_id,
     new_tab_id,
     prepare_tab_scientific_settings,
@@ -448,10 +449,24 @@ class WorkspaceTabRegistry:
     ) -> MechanismTabDocument | None:
         """Copy accepted setup and retained results without touching source drafts."""
 
+        document, copied, set_ids = self.prepare_tab_copy(tab_id, name_suffix="Copy")
+        return self.publish_tab_copy(
+            tab_id, copied, set_ids, document,
+            expected_token=expected_token, activate=True,
+        )
+
+    def prepare_tab_copy(
+        self,
+        tab_id: str,
+        *,
+        name_suffix: str,
+    ) -> tuple[ProjectDocument, MechanismTabDocument, dict[str, str]]:
+        """Prepare an accepted-state copy with fresh identities, without publication."""
+
         document = self.document
         source = document.tab(tab_id)
         names = {tab.name.casefold() for tab in document.tabs}
-        base_name = f"{source.name} — Copy"
+        base_name = f"{source.name} — {name_suffix}"
         name, suffix = base_name, 2
         while name.casefold() in names:
             name = f"{base_name} {suffix}"
@@ -479,6 +494,29 @@ class WorkspaceTabRegistry:
                 for did, link in source.dataset_links
             ),
         )
+        index = next(
+            i for i, tab in enumerate(document.tabs) if tab.tab_id == tab_id
+        ) + 1
+        candidate = replace(
+            document, tabs=(*document.tabs[:index], copied, *document.tabs[index:])
+        )
+        return candidate, copied, set_ids
+
+    def publish_tab_copy(
+        self,
+        tab_id: str,
+        copied: MechanismTabDocument,
+        set_ids: Mapping[str, str],
+        document: ProjectDocument,
+        *,
+        expected_token: ProjectContentToken,
+        activate: bool,
+    ) -> MechanismTabDocument | None:
+        """Publish a prepared copy, retaining only Runs matching its final inputs."""
+
+        if not self._session.is_content_token_current(expected_token):
+            return None
+        final_copy = document.tab(copied.tab_id)
         state = self.presentation(tab_id)
         presentation = replace(
             state,
@@ -488,25 +526,36 @@ class WorkspaceTabRegistry:
             plot_set_ids=tuple(set_ids[sid] for sid in state.plot_set_ids),
             pinned_slider_set_ids=(),
         )
+        presentation = validate_project_presentation_state(
+            document, final_copy, presentation.reconciled(document, final_copy),
+        )
+        delta = self.scientific_document_delta(document.replace_tab(copied), document)
+        changed_ids = {
+            sid for target, ids in (
+                *delta.affected_targets_by_tab, *delta.removed_targets_by_tab,
+            ) if target == copied.tab_id for sid in ids
+        }
+        matching_set_ids = {
+            source_id: destination_id for source_id, destination_id in set_ids.items()
+            if destination_id not in changed_ids
+        }
         source_runtime = self.tab_runtime(tab_id)
         repository = source_runtime.result_repository
-        index = next(
-            i for i, tab in enumerate(document.tabs) if tab.tab_id == tab_id
-        ) + 1
-        candidate = replace(
-            document, tabs=(*document.tabs[:index], copied, *document.tabs[index:])
-        )
-        if self.replace_document(candidate, expected_token=expected_token) is None:
+        if self.replace_document(document, expected_token=expected_token) is None:
             return None
-        self.set_presentation(copied.tab_id, presentation)
+        self._presentation_by_tab_id = tuple(
+            (current_id, presentation if current_id == copied.tab_id else current)
+            for current_id, current in self._presentation_by_tab_id
+        )
         runtime = self.tab_runtime(copied.tab_id)
         runtime.selected_run_set_ids = tuple(
             set_ids[sid] for sid in source_runtime.selected_run_set_ids
         )
         if repository is not None and runtime.result_repository is not None:
-            runtime.result_repository.copy_accepted_runs_from(repository, set_ids)
-        self.select_tab(copied.tab_id)
-        return copied
+            runtime.result_repository.copy_accepted_runs_from(repository, matching_set_ids)
+        if activate:
+            self.select_tab(copied.tab_id)
+        return final_copy
 
     def reorder_tabs(
         self,
@@ -731,7 +780,10 @@ class WorkspaceTabRegistry:
                 old_set = old_sets.get(initial_set.set_id)
                 if old_set is None:
                     continue
-                if old_set.values_dict() != initial_set.values_dict():
+                # Sparse omissions and explicit zeros are the same accepted science.
+                if canonical_initial_values(
+                    old_tab, initial_set.set_id,
+                ) != canonical_initial_values(tab, initial_set.set_id):
                     changed.append(initial_set.set_id)
                     continue
                 if (

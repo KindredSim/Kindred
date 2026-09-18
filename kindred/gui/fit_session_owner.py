@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import replace
 
 from PySide6 import QtCore, QtWidgets
@@ -10,7 +10,9 @@ from PySide6 import QtCore, QtWidgets
 from kindred.core.project_document import (
     FitDefaults,
     MechanismSourceCollision,
+    ProjectDocument,
     reconcile_tab_mechanism_source,
+    retained_tab_mechanism_source,
 )
 from kindred.core.mechanism_source import MechanismAuthoringSource
 from kindred.core.project_session import ProjectSession
@@ -87,6 +89,8 @@ class FitSessionOwner(QtCore.QObject):
         self._window: FittingWindow | None = None
         self._worker: GlobalFitWorker | None = None
         self._candidate: FitCandidate | None = None
+        self._candidate_copy_name: str | None = None
+        self._candidate_applied_to_project = False
         self._candidate_projection = None
         self._setup_state: FitSetupSnapshot | None = None
         self._initial_setup_snapshot: FitSetupSnapshot | None = None
@@ -187,8 +191,7 @@ class FitSessionOwner(QtCore.QObject):
         self._install_setup(setup)
         self._initial_setup_snapshot = setup
         self._last_fit_setup_snapshot = None
-        self._candidate = None
-        self._candidate_projection = None
+        self._invalidate_candidate_custody()
         try:
             window.project_setup_snapshot(setup)
             window.set_initial_reset_available(setup)
@@ -210,6 +213,7 @@ class FitSessionOwner(QtCore.QObject):
         window.resultsSummaryRequested.connect(self.results_summary)
         window.sharedSeedRequested.connect(self.seed_shared_fit)
         window.applyRequested.connect(self.apply_fit_to_project)
+        window.applyToCopyRequested.connect(self.apply_fit_to_tab_copy)
         window.setupSnapshotRequested.connect(self._on_setup_snapshot)
         window.resetRequested.connect(self.reset_setup)
         window.destroyed.connect(self._on_window_destroyed)
@@ -513,6 +517,8 @@ class FitSessionOwner(QtCore.QObject):
 
         self._candidate = None
         self._candidate_projection = None
+        self._candidate_copy_name = None
+        self._candidate_applied_to_project = False
 
     def set_project_defaults(self, defaults: FitDefaults) -> bool:
         self._require_thread()
@@ -687,6 +693,7 @@ class FitSessionOwner(QtCore.QObject):
             or self._worker is not worker
         ):
             return
+        self._invalidate_candidate_custody()
         self._candidate = candidate
         self._candidate_projection = worker.terminal_projection
         # Keep terminal actions disabled until the worker's finished callback
@@ -718,8 +725,7 @@ class FitSessionOwner(QtCore.QObject):
                 curves=curves,
                 curve_failure=curve_failure,
             )
-            apply_reason = self._candidate_apply_reason(candidate)
-            window.set_apply_available(not apply_reason, apply_reason)
+            self._refresh_apply_availability()
         except Exception as exc:
             self._set_status(f"Fit result presentation failed: {exc}")
 
@@ -856,6 +862,34 @@ class FitSessionOwner(QtCore.QObject):
     def apply_fit_to_project(self) -> bool:
         """Apply one complete, current terminal Fit candidate atomically."""
 
+        return self._apply_fit(to_copy=False)
+
+    @QtCore.Slot()
+    def apply_fit_to_tab_copy(self) -> bool:
+        """Publish one fitted copy while retaining the original Fit origin."""
+
+        return self._apply_fit(to_copy=True)
+
+    def _refresh_apply_availability(self) -> None:
+        window = self._window
+        if window is None:
+            return
+        if self._candidate_applied_to_project:
+            reason = "These Fit values have already been applied to the project. Run a new fit to apply again."
+        elif self._candidate is None:
+            reason = "Run a fit to obtain current values to apply."
+        elif not self._origin_science_is_current(self._candidate.origin):
+            reason = "Origin science is no longer current."
+        else:
+            reason = self._candidate_apply_reason(self._candidate)
+        copy_reason = reason
+        if self._candidate_copy_name is not None:
+            copy_reason = f'Fit already applied to “{self._candidate_copy_name}”. Run a new fit to create another fitted copy.'
+        window.set_apply_available(
+            not reason, reason, copy_available=not copy_reason, copy_reason=copy_reason,
+        )
+
+    def _apply_fit(self, *, to_copy: bool) -> bool:
         self._require_thread()
         candidate = self._candidate
         origin = self._current_origin()
@@ -869,68 +903,50 @@ class FitSessionOwner(QtCore.QObject):
             or setup is None
             or window is None
             or self._worker is not None
+            or self._candidate_applied_to_project
+            or (to_copy and self._candidate_copy_name is not None)
         ):
             return False
         if not self._origin_science_is_current(candidate.origin):
             self._set_status("Fit Apply rejected: origin science is no longer current.")
             return False
-        if any(
-            parameter.scope == "per_dataset"
-            and parameter.selected_config.fit
-            for parameter in candidate.setup_snapshot.parameters
-        ):
-            self._set_status(
-                "Fit Apply rejected: configure an ordinary Shared Fit before applying."
-            )
+        reason = self._candidate_apply_reason(candidate)
+        if reason:
+            self._set_status(f"Fit Apply rejected: {reason}")
             return False
+        token = self._session.capture_content_token()
         try:
-            parameter_values = self._candidate_publishable_parameter_values(candidate)
             centred_provenance = self._candidate_centred_fixed_effects_provenance(candidate)
-            initial_values = {
-                (set_id, species): value
-                for set_id, values in candidate.initial_values_by_set
-                for species, value in values
-            }
-            source_text = origin.mechanism_source.reactions_text
-            updates = tuple(
-                DslParameterCoordinateUpdate(name=name, value=value)
-                for name, value in sorted(parameter_values.items())
-            )
-            if updates:
-                source_text = derive_source_with_parameter_updates(
-                    source_text,
-                    origin.prepared_dsl,
-                    updates,
+            if to_copy:
+                document, copied, set_ids = self._registry.prepare_tab_copy(
+                    origin.tab_id, name_suffix="Fit",
                 )
-            source_text = self._append_centred_fixed_effects_provenance(source_text, centred_provenance)
-            reconciliation = reconcile_tab_mechanism_source(
-                self._registry.document,
-                origin.tab_id,
-                MechanismAuthoringSource.from_parts(reactions_text=source_text),
-            )
-            if isinstance(reconciliation, MechanismSourceCollision):
-                reconciliation = reconciliation.replacement
-            proposed_document = reconciliation.proposed_document
-            proposed_tab = proposed_document.tab(origin.tab_id)
-            if initial_values:
-                found_keys: set[tuple[str, str]] = set()
-                proposed_sets = []
-                for initial_set in proposed_tab.initial_condition_sets:
-                    values = initial_set.values_dict()
-                    for key, value in initial_values.items():
-                        if key[0] != initial_set.set_id:
-                            continue
-                        # Fit captures the complete canonical species roster;
-                        # assigning here materializes an authored omission
-                        # whose accepted initial concentration was exact zero.
-                        values[key[1]] = value
-                        found_keys.add(key)
-                    proposed_sets.append(initial_set.with_values(values))
-                if found_keys != set(initial_values):
-                    raise ValueError("Fit Apply initial-condition identity is stale.")
-                proposed_document = proposed_document.replace_tab(
-                    proposed_tab.with_initial_condition_sets(tuple(proposed_sets))
+                proposed_document = self._prepare_fit_application(
+                    candidate, document, copied.tab_id, set_ids=set_ids,
                 )
+                capture_fit_origin(proposed_document, copied.tab_id)
+                published = self._registry.publish_tab_copy(
+                    origin.tab_id, copied, set_ids, proposed_document,
+                    expected_token=token, activate=False,
+                )
+                if published is None:
+                    self._set_status("Fit Apply rejected: the captured project is stale.")
+                    return False
+                self._candidate_copy_name = published.name
+                self._refresh_apply_availability()
+                self.project_document_changed.emit(published.tab_id)
+                origin_name = self._registry.tab(origin.tab_id).name
+                message = (
+                    f'Fit applied to “{published.name}”. '
+                    f'This fitting session remains attached to “{origin_name}”.'
+                )
+                if centred_provenance:
+                    message += " Overall values published; dataset estimates not applied (recorded as mechanism-source provenance)."
+                self._set_status(message)
+                return True
+            proposed_document = self._prepare_fit_application(
+                candidate, self._registry.document, origin.tab_id,
+            )
             successor_origin = capture_fit_origin(proposed_document, origin.tab_id)
             rebased_setup = replace(setup, origin=successor_origin)
             rebased_initial_setup = (
@@ -948,19 +964,76 @@ class FitSessionOwner(QtCore.QObject):
         except (TypeError, ValueError, KeyError, LookupError) as exc:
             self._set_status(f"Fit Apply rejected: {exc}")
             return False
-        token = self._session.capture_content_token()
         if self._registry.replace_document(proposed_document, expected_token=token) is None:
             self._set_status("Fit Apply rejected: the captured project is stale.")
             return False
+        self._candidate_applied_to_project = True
         self._install_setup(rebased_setup)
         self._initial_setup_snapshot = rebased_initial_setup
         self._last_fit_setup_snapshot = rebased_last_fit_setup
         window.project_setup_snapshot(rebased_setup)
         window.set_last_fit_reset_available(rebased_last_fit_setup)
         self.project_document_changed.emit(origin.tab_id)
-        window.set_apply_available(False, "These Fit values have already been applied to the project.")
+        self._refresh_apply_availability()
         self._set_status("Centred Fit applied: overall values published; dataset estimates not applied (recorded as mechanism-source provenance)." if centred_provenance else "Fit candidate applied to the project.")
         return True
+
+    def _prepare_fit_application(
+        self,
+        candidate: FitCandidate,
+        document: ProjectDocument,
+        tab_id: str,
+        *,
+        set_ids: Mapping[str, str] | None = None,
+    ) -> ProjectDocument:
+        """Admit the same complete Fit values for either destination, detached."""
+
+        parameter_values = self._candidate_publishable_parameter_values(candidate)
+        initial_values = {
+            (set_ids[set_id] if set_ids is not None else set_id, species): value
+            for set_id, values in candidate.initial_values_by_set
+            for species, value in values
+        }
+        origin = candidate.origin
+        source_text = origin.mechanism_source.reactions_text
+        updates = tuple(
+            DslParameterCoordinateUpdate(name=name, value=value)
+            for name, value in sorted(parameter_values.items())
+        )
+        if updates:
+            source_text = derive_source_with_parameter_updates(source_text, origin.prepared_dsl, updates)
+        source_text = self._append_centred_fixed_effects_provenance(
+            source_text, self._candidate_centred_fixed_effects_provenance(candidate),
+        )
+        source = MechanismAuthoringSource.from_parts(reactions_text=source_text)
+        if source == document.tab(tab_id).mechanism_source:
+            # IC-only and unchanged-value Apply retain the accepted owner so
+            # unaffected Run requests remain reusable by ordinary Preview.
+            reconciliation = retained_tab_mechanism_source(document, tab_id)
+        else:
+            reconciliation = reconcile_tab_mechanism_source(document, tab_id, source)
+        if isinstance(reconciliation, MechanismSourceCollision):
+            reconciliation = reconciliation.replacement
+        proposed_document = reconciliation.proposed_document
+        proposed_tab = proposed_document.tab(tab_id)
+        if initial_values:
+            found_keys: set[tuple[str, str]] = set()
+            proposed_sets = []
+            for initial_set in proposed_tab.initial_condition_sets:
+                values = initial_set.values_dict()
+                for key, value in initial_values.items():
+                    if key[0] != initial_set.set_id:
+                        continue
+                    # Materialize an authored omission whose admitted value was zero.
+                    values[key[1]] = value
+                    found_keys.add(key)
+                proposed_sets.append(initial_set.with_values(values))
+            if found_keys != set(initial_values):
+                raise ValueError("Fit Apply initial-condition identity is stale.")
+            proposed_document = proposed_document.replace_tab(
+                proposed_tab.with_initial_condition_sets(tuple(proposed_sets))
+            )
+        return proposed_document
 
     @staticmethod
     def _candidate_centred_fixed_effects_provenance(candidate: FitCandidate) -> tuple[str, ...]:

@@ -5300,7 +5300,12 @@ class MainWindow(QtWidgets.QMainWindow):
         if tab_id is None:
             self._refresh_project_state()
             return
-        self._refresh_tab_controls(str(tab_id))
+        target = str(tab_id)
+        if target not in self._tab_surfaces:
+            self._create_tab_surface(target)
+            self._refresh_workspace_tab_structure()
+            self._apply_persisted_plot_state(target)
+        self._refresh_tab_controls(target)
 
     @QtCore.Slot()
     def _on_simulation_state_changed(self) -> None:

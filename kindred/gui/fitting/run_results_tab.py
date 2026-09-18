@@ -410,6 +410,7 @@ class RunResultsTab(QtWidgets.QWidget):
         self._color_resolver = color_resolver
         self._summary_dialog: ResultsSummaryDialog | None = None
         self._apply_reason = ""
+        self._apply_copy_reason = ""
         self._summary_body = ""
         self._summary_provenance = ""
         self._progress = 0
@@ -486,8 +487,9 @@ class RunResultsTab(QtWidgets.QWidget):
             self._render_diagnostic_label.show()
         return self.copy_eligible()
 
-    def set_apply_reason(self, reason: str) -> None:
+    def set_apply_reasons(self, reason: str, copy_reason: str) -> None:
         self._apply_reason = reason
+        self._apply_copy_reason = copy_reason
         self._refresh_summary()
 
     def set_progress(self, value: int) -> None:
@@ -500,6 +502,8 @@ class RunResultsTab(QtWidgets.QWidget):
             body += f"<p>Progress: {self._progress}%</p>"
         body += ("<h3>Apply Fit to Project availability</h3><p>"
                  + html.escape(self._apply_reason or "Apply is available for compatible shared estimates and fitted initial values.").replace("\n", "<br>") + "</p>")
+        body += ("<h3>Apply Fit to Tab Copy availability</h3><p>"
+                 + html.escape(self._apply_copy_reason or "Apply to a new tab copy is available; the fitting session remains attached to the original tab.").replace("\n", "<br>") + "</p>")
         view = self._subtab_stack.currentWidget()
         if view is not None and self._curves:
             legend, _plain = view.legend_text()

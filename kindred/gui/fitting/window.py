@@ -40,6 +40,7 @@ class FittingWindow(QtWidgets.QDialog):
 
     executeRequested = QtCore.Signal()
     applyRequested = QtCore.Signal()
+    applyToCopyRequested = QtCore.Signal()
     sharedSeedRequested = QtCore.Signal(str)
     stopRequested = QtCore.Signal()
     pauseRequested = QtCore.Signal()
@@ -197,6 +198,10 @@ class FittingWindow(QtWidgets.QDialog):
         self._apply_button.setEnabled(False)
         self._apply_button.clicked.connect(self.applyRequested)
         self._footer_widgets.append(self._apply_button)
+        self._apply_copy_button = QtWidgets.QPushButton("Apply Fit to Tab Cop&y", footer)
+        self._apply_copy_button.setEnabled(False)
+        self._apply_copy_button.clicked.connect(self.applyToCopyRequested)
+        self._footer_widgets.append(self._apply_copy_button)
         self._shared_seed_combo = QtWidgets.QComboBox(footer)
         self._shared_seed_combo.addItem("Arithmetic mean", "arithmetic")
         self._shared_seed_combo.addItem("Geometric mean", "geometric")
@@ -208,6 +213,8 @@ class FittingWindow(QtWidgets.QDialog):
         self.set_shared_seed_available(False)
         reason_row = QtWidgets.QHBoxLayout()
         self._apply_reason_label = QtWidgets.QLabel(footer)
+        self._apply_reason_label.setTextFormat(QtCore.Qt.TextFormat.PlainText)
+        self._apply_reason_label.setWordWrap(True)
         reason_row.addWidget(self._apply_reason_label, 1)
         column.addLayout(reason_row)
         self.set_apply_available(False, "Run a fit to obtain values to apply.")
@@ -217,8 +224,6 @@ class FittingWindow(QtWidgets.QDialog):
     def _layout_footer(self) -> None:
         self._status_widget.setVisible(bool(self._status.text() or self._run_block_reason_label.text()))
         self._progress.setFixedWidth(self._progress.fontMetrics().horizontalAdvance("100%") + 48)
-        if hasattr(self, "_apply_reason_label"):
-            self._apply_reason_label.setFixedHeight(self._apply_reason_label.fontMetrics().lineSpacing())
         available = max(1, self.width() - 32)
         key = (available, tuple((widget.isHidden(), widget.sizeHint().width()) for widget in self._footer_widgets))
         if key == getattr(self, "_footer_layout_key", None):
@@ -786,7 +791,7 @@ class FittingWindow(QtWidgets.QDialog):
             if not was_executing:
                 self._start_results_presentation()
             self._tabs.setCurrentIndex(2)
-            self._apply_button.setEnabled(False)
+            self.set_apply_available(False, "Fit is running.")
             self.set_shared_seed_available(False)
         else:
             self._paused = False
@@ -882,10 +887,27 @@ class FittingWindow(QtWidgets.QDialog):
         self._tabs.setCurrentIndex(2)
         return bool(rendered)
 
-    def set_apply_available(self, available: bool, reason: str) -> None:
-        self._apply_button.setEnabled(available and not self._executing)
-        set_bounded_label_text(self._apply_reason_label, reason, max_width=16777215)
-        self._run_results_tab.set_apply_reason(reason)
+    def set_apply_available(
+        self, available: bool, reason: str, *,
+        copy_available: bool | None = None, copy_reason: str | None = None,
+    ) -> None:
+        if copy_available is None:
+            copy_available = available
+        if copy_reason is None:
+            copy_reason = reason
+        idle = not self._executing and not self._closing
+        self._apply_button.setEnabled(available and idle)
+        self._apply_copy_button.setEnabled(copy_available and idle)
+        self._apply_button.setToolTip(reason)
+        self._apply_copy_button.setToolTip(copy_reason)
+        feedback = reason if reason == copy_reason else "\n".join(
+            text for text in (
+                f"Apply Fit to Project: {reason}" if reason else "",
+                f"Apply Fit to Tab Copy: {copy_reason}" if copy_reason else "",
+            ) if text
+        )
+        set_bounded_label_text(self._apply_reason_label, feedback, max_width=16777215)
+        self._run_results_tab.set_apply_reasons(reason, copy_reason)
         self._layout_footer()
 
     def set_shared_seed_available(self, available: bool) -> None:
@@ -902,7 +924,7 @@ class FittingWindow(QtWidgets.QDialog):
         )
 
     def clear_candidate(self) -> None:
-        self._apply_button.setEnabled(False)
+        self.set_apply_available(False, "Run a fit to obtain current values to apply.")
         self._results_summary_button.setEnabled(True)
         if self._executing:
             self._start_results_presentation()
@@ -995,7 +1017,7 @@ class FittingWindow(QtWidgets.QDialog):
         self._pause_button.setText("Pause")
         self._pause_button.setEnabled(False)
         self._results_summary_button.setEnabled(False)
-        self._apply_button.setEnabled(False)
+        self.set_apply_available(False, "Fit is closing.")
         self.set_shared_seed_available(False)
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:  # noqa: N802
