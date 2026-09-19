@@ -81,10 +81,25 @@ class _FitValueLabel(QtWidgets.QLabel):
     def contextMenuEvent(self, event: QtGui.QContextMenuEvent) -> None:
         if not self.copy_break_positions:
             super().contextMenuEvent(event)
+            for menu in self.findChildren(
+                QtWidgets.QMenu,
+                options=QtCore.Qt.FindChildOption.FindDirectChildrenOnly,
+            ):
+                if menu.isVisible():
+                    menu.setToolTipsVisible(True)
+                    copy, select_all = (
+                        action for action in menu.actions() if not action.isSeparator()
+                    )
+                    copy.setToolTip("Copy the selected result text.")
+                    select_all.setToolTip("Select all text in this result entry.")
             return
         menu = QtWidgets.QMenu()
-        menu.addAction("Copy", self._copy_selection).setEnabled(self.hasSelectedText())
-        menu.addAction("Select All", self._select_all)
+        menu.setToolTipsVisible(True)
+        copy = menu.addAction("Copy", self._copy_selection)
+        copy.setEnabled(self.hasSelectedText())
+        copy.setToolTip("Copy the selected result text.")
+        select_all = menu.addAction("Select All", self._select_all)
+        select_all.setToolTip("Select all text in this result entry.")
         menu.exec(event.globalPos())
 
     def _select_all(self) -> None:

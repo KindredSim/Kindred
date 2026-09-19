@@ -3357,6 +3357,8 @@ class MainWindow(QtWidgets.QMainWindow):
             action.setEnabled(False)
             if reason:
                 action.setToolTip(literal_tooltip(reason))
+            else:
+                action.setToolTip("Create a reusable mechanism in Template Manager.")
         for template in templates:
             label = compact_text(template.name, max_chars=60)
             action = menu.addAction(label.display.replace("&", "&&"))
@@ -4162,6 +4164,9 @@ class MainWindow(QtWidgets.QMainWindow):
         if recent:
             menu.addSeparator()
         clear_action = menu.addAction("Clear Recent Projects")
+        clear_action.setToolTip(
+            "Clear the recent-project list without deleting any project files."
+        )
         clear_action.setEnabled(bool(recent))
         clear_action.triggered.connect(self.config_controller.clear_recent_files)
 
@@ -4221,6 +4226,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _create_menus(self) -> None:
         bar = self.menuBar()
         file_menu = bar.addMenu("&File")
+        file_menu.setToolTipsVisible(True)
         self._file_menu = file_menu
         self._new_project_action = self._add_action(
             file_menu,
@@ -4228,6 +4234,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._new_project,
             QtGui.QKeySequence.StandardKey.New,
             "newProjectAction",
+            tooltip="Start a new project.",
         )
         self._open_project_action = self._add_action(
             file_menu,
@@ -4235,8 +4242,13 @@ class MainWindow(QtWidgets.QMainWindow):
             self._open_project,
             QtGui.QKeySequence.StandardKey.Open,
             "openProjectAction",
+            tooltip="Open a saved Kindred project.",
         )
         self._recent_menu = file_menu.addMenu("Open Recent")
+        self._recent_menu.setToolTipsVisible(True)
+        self._recent_menu.menuAction().setToolTip(
+            "Reopen a recent project or clear the list."
+        )
         self._recent_menu.setObjectName("recentProjectsMenu")
         self._populate_recent_menu()
         file_menu.addSeparator()
@@ -4246,6 +4258,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.project_controller.save_project,
             QtGui.QKeySequence.StandardKey.Save,
             "saveProjectAction",
+            tooltip="Save the current project.",
         )
         self._add_action(
             file_menu,
@@ -4253,6 +4266,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.project_controller.save_project_as,
             QtGui.QKeySequence.StandardKey.SaveAs,
             "saveProjectAsAction",
+            tooltip="Save the current project under a different name or location.",
         )
         self._load_data_action = self._selected_bundle().data_panel.import_action
         file_menu.addAction(self._load_data_action)
@@ -4262,6 +4276,10 @@ class MainWindow(QtWidgets.QMainWindow):
             self._export_xlsx,
             "Ctrl+E",
             "exportResultsXlsxAction",
+            tooltip=(
+                "Export the simulation results for this tab and the linked "
+                "experimental data to an Excel workbook."
+            ),
         )
         file_menu.addSeparator()
         self._add_action(
@@ -4270,9 +4288,11 @@ class MainWindow(QtWidgets.QMainWindow):
             self.close,
             QtGui.QKeySequence.StandardKey.Quit,
             "exitAction",
+            tooltip="Close Kindred.",
         )
 
         edit_menu = bar.addMenu("&Edit")
+        edit_menu.setToolTipsVisible(True)
         self._edit_menu = edit_menu
         self._undo_action = self._add_action(
             edit_menu,
@@ -4280,6 +4300,7 @@ class MainWindow(QtWidgets.QMainWindow):
             lambda: self._selected_bundle().editor.undo_focused_text(),
             QtGui.QKeySequence.StandardKey.Undo,
             "undoAction",
+            tooltip="Undo the last text change in the focused Reactions or Notes editor.",
         )
         self._redo_action = self._add_action(
             edit_menu,
@@ -4287,15 +4308,28 @@ class MainWindow(QtWidgets.QMainWindow):
             lambda: self._selected_bundle().editor.redo_focused_text(),
             QtGui.QKeySequence.StandardKey.Redo,
             "redoAction",
+            tooltip="Restore the last undone text change in the focused Reactions or Notes editor.",
         )
         view_menu = bar.addMenu("&View")
+        view_menu.setToolTipsVisible(True)
         self._view_menu = view_menu
         panels = view_menu.addMenu("Panels")
+        panels.setToolTipsVisible(True)
+        panels.menuAction().setToolTip("Choose which panels are visible.")
+        panel_tooltips = {
+            "mechanism": "Show or hide the mechanism editor.",
+            "interactive_sliders": "Show or hide the parameter and concentration sliders.",
+            "batch_initial_conditions": "Show or hide the initial-condition sets.",
+            "data": "Show or hide imported datasets and their mappings.",
+            "analysis": "Show or hide model parameters and simulation statistics.",
+            "symbolic_calculator": "Show or hide the symbolic calculation panel.",
+        }
         for spec in DOCK_SPECS:
             dock = self._workspace.dock_for_identity(spec.identity_key)
             action = dock.toggleViewAction()
             action.setText(spec.title)
             action.setObjectName(f"{spec.identity_key}PanelAction")
+            action.setToolTip(panel_tooltips[spec.identity_key])
             panels.addAction(action)
         view_menu.addSeparator()
         reset_layout_action = self._add_action(
@@ -4317,7 +4351,7 @@ class MainWindow(QtWidgets.QMainWindow):
             "restoreDefaultPanelLayoutAction",
         )
         restore_default_action.setToolTip(
-            "Restore Kindred’s factory panel arrangement and default panel visibility."
+            "Restore the factory panel arrangement and default panel visibility."
         )
         self._dark_mode_action = self._add_action(
             view_menu,
@@ -4326,11 +4360,17 @@ class MainWindow(QtWidgets.QMainWindow):
             "Ctrl+Shift+D",
             "darkModeAction",
             checkable=True,
+            tooltip="Use a dark theme. Turn this off to return to the light theme.",
         )
 
         examples = bar.addMenu("&Examples")
+        examples.setToolTipsVisible(True)
         self._examples_menu = examples
         presets = examples.addMenu("Preset Mechanisms")
+        presets.setToolTipsVisible(True)
+        presets.menuAction().setToolTip(
+            "Replace the current mechanism with a built-in example."
+        )
         for index in range(1, 10):
             preset_id = f"M{index}"
             action = presets.addAction(preset_id)
@@ -4342,12 +4382,20 @@ class MainWindow(QtWidgets.QMainWindow):
                 )
             )
         interventions = examples.addMenu("Intervention Examples")
+        interventions.setToolTipsVisible(True)
+        interventions.menuAction().setToolTip(
+            "Replace the current mechanism with an example of scheduled or "
+            "condition-triggered changes."
+        )
         try:
             intervention_specs = get_all_intervention_example_specs()
         except InterventionExampleCatalogError as exc:
             unavailable = interventions.addAction(str(exc))
             unavailable.setObjectName("interventionExampleCatalogUnavailableAction")
             unavailable.setEnabled(False)
+            unavailable.setToolTip(literal_tooltip(
+                f"The bundled intervention examples could not be loaded.\n{exc}"
+            ))
         else:
             for spec in intervention_specs:
                 example_id = spec.id
@@ -4368,12 +4416,17 @@ class MainWindow(QtWidgets.QMainWindow):
             self._open_template_manager,
             "Ctrl+T",
             "templateManagerAction",
+            tooltip="Create, edit, organize, and reuse saved mechanism templates.",
         )
         self._user_templates_menu = examples.addMenu("User-Created Templates")
         self._user_templates_menu.setToolTipsVisible(True)
+        self._user_templates_menu.menuAction().setToolTip(
+            "Replace the current mechanism with one of your saved templates."
+        )
         self._user_templates_menu.aboutToShow.connect(self._populate_user_templates_menu)
 
         simulation = bar.addMenu("&Simulation")
+        simulation.setToolTipsVisible(True)
         self._simulation_menu = simulation
         self._run_action = self._add_action(
             simulation,
@@ -4381,11 +4434,13 @@ class MainWindow(QtWidgets.QMainWindow):
             lambda: self._start_selected_run(),
             "Ctrl+R",
             "runSimulationAction",
+            tooltip="Run the current mechanism for the selected initial-condition sets.",
         )
         self._run_action.setShortcuts(["Ctrl+R", "F5"])
         self._scan_action = self._add_action(
             simulation, "Chemical Space Scan…", self._open_chemical_space_scan,
             None, "chemicalSpaceScanAction",
+            tooltip="Open the scan window to configure simulations across combinations of model inputs.",
         )
         self._stop_action = self._add_action(
             simulation,
@@ -4393,6 +4448,10 @@ class MainWindow(QtWidgets.QMainWindow):
             lambda _checked=False: self._stop_simulation(),
             "Esc",
             "stopSimulationAction",
+            tooltip=(
+                "Stop simulation and preview work across all tabs and cancel "
+                "an active Chemical Space Scan."
+            ),
         )
         self._add_action(
             simulation,
@@ -4402,6 +4461,7 @@ class MainWindow(QtWidgets.QMainWindow):
             ),
             None,
             "openSymbolicCalculatorAction",
+            tooltip="Open the calculator to work with expressions and equations for this mechanism.",
         )
         self._add_action(
             simulation,
@@ -4411,6 +4471,7 @@ class MainWindow(QtWidgets.QMainWindow):
             ),
             None,
             "inspectMechanismAction",
+            tooltip="Examine the reactions, parameters, equations, and interventions of the current mechanism.",
         )
         simulation.addSeparator()
         self._add_action(
@@ -4419,9 +4480,14 @@ class MainWindow(QtWidgets.QMainWindow):
             self._open_simulation_settings,
             None,
             "simulationSettingsAction",
+            tooltip=(
+                "Configure mechanism settings, solver tolerances, stopping "
+                "behavior, previews, parallel execution, and result caching."
+            ),
         )
 
         fitting = bar.addMenu("&Fitting")
+        fitting.setToolTipsVisible(True)
         self._fitting_menu = fitting
         self._add_action(
             fitting,
@@ -4429,6 +4495,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._configure_fitting,
             None,
             "fittingDefaultsAction",
+            tooltip="Choose default fitting settings for the current project or new projects.",
         )
         self._global_fit_action = self._add_action(
             fitting,
@@ -4436,12 +4503,15 @@ class MainWindow(QtWidgets.QMainWindow):
             self._run_global_fit,
             "Ctrl+Shift+F",
             "globalFitAction",
+            tooltip="Configure a fit of the current mechanism to experimental datasets.",
         )
 
         help_menu = bar.addMenu("&Help")
+        help_menu.setToolTipsVisible(True)
         self._add_action(
             help_menu, "Interactive Tutorials…", lambda: self._tutorials.open(),
             None, "tutorialsAction",
+            tooltip="Choose a guided lesson or return to your current tutorial.",
         )
         self._add_action(
             help_menu,
@@ -4449,6 +4519,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._open_docs,
             QtGui.QKeySequence.StandardKey.HelpContents,
             "documentationAction",
+            tooltip="Online documentation is not available yet.",
         )
         self._add_action(
             help_menu,
@@ -4456,6 +4527,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._show_panel_layout_tips,
             None,
             "panelLayoutTipsAction",
+            tooltip="Learn how to move, restore, and arrange panels.",
         )
         self._add_action(
             help_menu,
@@ -4463,6 +4535,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._show_diagnostic_log,
             None,
             "diagnosticLogAction",
+            tooltip="View the current diagnostic log for troubleshooting.",
         )
         help_menu.addSeparator()
         self._add_action(
@@ -4471,6 +4544,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._show_about,
             None,
             "aboutAction",
+            tooltip="View version, credits, and license information for Kindred.",
         )
 
     def _add_action(
@@ -4482,10 +4556,12 @@ class MainWindow(QtWidgets.QMainWindow):
         object_name: str,
         *,
         checkable: bool = False,
+        tooltip: str = "",
     ) -> QtGui.QAction:
         action = menu.addAction(text)
         action.setObjectName(object_name)
         action.setCheckable(checkable)
+        action.setToolTip(tooltip)
         if shortcut is not None:
             action.setShortcut(shortcut)
         action.triggered.connect(callback)

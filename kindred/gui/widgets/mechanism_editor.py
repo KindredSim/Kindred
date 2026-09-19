@@ -660,12 +660,14 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
         mechanism_entries = list(self._variable_sliders.slider_picker_entries())
         species_entries = list(self._species_sliders.slider_picker_entries())
         invert_action = menu.addAction("Invert selection")
+        invert_action.setToolTip("Show the hidden sliders and hide the visible ones.")
         invert_action.setEnabled(bool(mechanism_entries or species_entries))
         invert_action.triggered.connect(
             lambda _checked=False: self._invert_slider_visibility()
         )
         if not mechanism_entries and not species_entries:
             action = menu.addAction("No sliders available")
+            action.setToolTip("No adjustable parameter or concentration sliders are available.")
             action.setEnabled(False)
             return
 
@@ -673,6 +675,7 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
             self._add_slider_visibility_entries(
                 menu,
                 title="Mechanism",
+                tooltip="Adjustable inputs in the mechanism.",
                 entry_kind="mechanism",
                 entries=mechanism_entries,
             )
@@ -682,6 +685,7 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
             self._add_slider_visibility_entries(
                 menu,
                 title="Initial concentrations",
+                tooltip="Starting concentrations for species in the mechanism.",
                 entry_kind="species",
                 entries=species_entries,
             )
@@ -713,10 +717,12 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
         menu: QtWidgets.QMenu,
         *,
         title: str,
+        tooltip: str,
         entry_kind: str,
         entries: list[tuple[str, str, bool]],
     ) -> None:
         header = menu.addAction(str(title))
+        header.setToolTip(tooltip)
         header.setEnabled(False)
         for key, label, visible in entries:
             action = menu.addAction(compact_text(label, max_chars=48).display)

@@ -660,9 +660,19 @@ class ProjectWorkspaceWidget(QtWidgets.QMainWindow):
             return
         self.tabMenuOpening.emit()
         menu = QtWidgets.QMenu(self)
+        menu.setToolTipsVisible(True)
         rename = menu.addAction("Rename…")
+        rename.setToolTip("Change the name of this mechanism tab.")
         copy = menu.addAction("Create copy")
+        copy.setToolTip(
+            "Copy this mechanism and its settings into a new tab, including "
+            "simulation results that still match them. Unapplied edits and "
+            "slider previews are not copied."
+        )
         delete = menu.addAction("Delete")
+        delete.setToolTip(
+            "Remove this mechanism tab from the project. The final tab cannot be deleted."
+        )
         delete.setEnabled(self._mechanism_tab_count() > 1)
         chosen = menu.exec(self._tab_bar.mapToGlobal(position))
         if chosen is rename:

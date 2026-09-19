@@ -191,6 +191,26 @@ class GridPlotView(QtWidgets.QWidget):
         self._context_actions["range"].setToolTip(
             "Fit both axes to the data once. Automatic ranging remains off afterward."
         )
+        self._context_actions["copy"].setToolTip(
+            "Copy the model predictions and observations for this dataset at full resolution."
+        )
+        self._context_actions["pan"].setToolTip("Drag the plot to move the visible area.")
+        self._context_actions["rect"].setToolTip(
+            "Drag a rectangle to zoom into part of the plot."
+        )
+        self._context_actions["legend"].setToolTip("Show curve names and colors.")
+        self._context_actions["log_x"].setToolTip(
+            "Use a logarithmic horizontal scale. Only positive X values can appear."
+        )
+        self._context_actions["log_y"].setToolTip(
+            "Use a logarithmic vertical scale. Only positive Y values can appear."
+        )
+        self._context_actions["invert_x"].setToolTip(
+            "Reverse the direction of the horizontal axis."
+        )
+        self._context_actions["invert_y"].setToolTip(
+            "Reverse the direction of the vertical axis."
+        )
         for action in tuple(self._context_actions.values())[2:]:
             action.setCheckable(True)
         self._mouse_mode_group = QtGui.QActionGroup(self)

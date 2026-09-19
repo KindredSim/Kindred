@@ -553,9 +553,24 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         self._plot_actions: dict[str, QtGui.QAction] = {}
         self._plot_percentages: dict[str, QtWidgets.QDoubleSpinBox] = {}
         appearance = self._plot_menu.addMenu("Appearance")
+        appearance.menuAction().setToolTip(
+            "Control grid lines, curve visibility, legends, and intervention annotations."
+        )
         transforms = self._plot_menu.addMenu("Transform")
+        transforms.menuAction().setToolTip(
+            "Show original values, derivatives, or derivatives plotted against Y."
+        )
         axes = self._plot_menu.addMenu("Axes")
+        axes.menuAction().setToolTip(
+            "Adjust axis scaling, navigation, and automatic range settings."
+        )
         axis_menus = {axis: axes.addMenu(f"{axis.upper()} Axis") for axis in ("x", "y")}
+        axis_menus["x"].menuAction().setToolTip(
+            "Control horizontal scaling, direction, and mouse navigation."
+        )
+        axis_menus["y"].menuAction().setToolTip(
+            "Control vertical scaling, direction, and mouse navigation."
+        )
         # PySide transfers menu ownership to wrappers returned by menuAction;
         # retain both so inspecting actions cannot destroy a nested menu.
         self._plot_submenus = {

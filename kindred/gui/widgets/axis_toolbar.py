@@ -85,7 +85,9 @@ class AxisToolbar(QtWidgets.QWidget):
         self._y_unit_combo.setMaximumWidth(84)
 
         self._y_list = QtWidgets.QListWidget(self)
-        self._y_list.setToolTip('Select Y-axis Variables (species or observables defined with "let … = …").')
+        self._y_list.setToolTip(
+            "Choose which model quantities and experimental data appear on the Y axis."
+        )
         self._y_list.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.NoSelection)
         self._y_list.setAlternatingRowColors(True)
         self._y_list.setUniformItemSizes(True)
@@ -112,9 +114,13 @@ class AxisToolbar(QtWidgets.QWidget):
         y_popup_layout.setSpacing(4)
 
         self._y_popup_label = QtWidgets.QLabel("Visible series", self._y_popup_container)
+        self._y_popup_label.setToolTip(self._y_list.toolTip())
         self._invert_y_selection_btn = QtWidgets.QPushButton("Invert selection", self._y_popup_container)
         self._invert_y_selection_btn.setObjectName("axisToolbarInvertYSelectionButton")
-        self._invert_y_selection_btn.setToolTip("Select the unselected Y series and deselect the selected ones.")
+        self._invert_y_selection_btn.setToolTip(
+            "Select the unselected Y series and deselect the selected ones. "
+            "Series required by active overlays stay selected."
+        )
         y_popup_layout.addWidget(self._y_popup_label)
         y_popup_layout.addWidget(self._invert_y_selection_btn)
         y_popup_layout.addWidget(self._y_list)
