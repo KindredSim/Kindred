@@ -1,11 +1,13 @@
-# Preset M2 — Reversible isomerization (baseline coverage)
-# Mechanism
-A <-> B ; kf = 2.0 ; kr = 0.5
+# Both <-> and <=> are accepted for reversible reactions.
+# kf specifies the forward rate constant and kr the reverse.
+# Alternatively, specify Keq instead of kr.
+# Use only one reverse-rate specification: kr, Keq, or dG_eq.
+A <-> B ; kf=2.0 ; kr=0.5
 
 preset_set1 = {
   [A] = 1.0
   [B] = 0.0
 }
 
-# Algebra
+# max keeps the denominator above zero.
 let ratio = [B] / max([A], 1e-30)

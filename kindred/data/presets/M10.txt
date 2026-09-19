@@ -1,0 +1,47 @@
+T=298.15
+energy=kJ/mol
+C0=1.0
+
+# Different steps can use different rate models.
+A + B <-> C ; A=1e7 ; Ea=40.0 ; dG_eq=-5.0
+C -> D ; dG_act=75.0
+D -> E ; k=0.2
+
+preset_set1 = {
+  [A] = 1.0
+  [B] = 1.0
+  [C] = 0.0
+  [D] = 0.0
+  [E] = 0.0
+}
+
+param k_rel = 0.5
+
+# This relationship determines k3.
+# As the Eyring rate k2 changes with temperature, k3 follows it.
+param k3 = k_rel * k2
+
+# Times are in seconds and temperatures are in K.
+# Each temperature applies between consecutive time boundaries.
+# Run from time 0 to 15 s to include the full schedule.
+temp_step: t=[0,5,10,15], T=[298.15,308.15,318.15]
+
+# For a gradual response, replace the temp_step line with this:
+# temp_response: t=[0,5,10,15], T=[298.15,308.15,318.15], tau=1.0
+#
+# tau is the response time constant in seconds:
+# dT/dt = (T_target - T) / tau
+#
+# Within each interval:
+# T(t) = T_target + (T_start - T_target)*exp(-(t - t_start)/tau)
+# T_target is the temperature specified for that interval.
+# T_start is the actual temperature at the interval start, t_start.
+# Use only one temperature schedule.
+
+# T is the temperature at each point in the result.
+let temperature = T
+let rate_constant_ratio = k3 / k2
+let rate_CD = k2 * [C]
+let rate_DE = k3 * [D]
+let total_products = [D] + [E]
+let fraction_E = [E] / max(total_products, 1e-30)

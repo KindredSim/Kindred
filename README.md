@@ -16,8 +16,8 @@ fitting kinetic parameters.
   projects as `.kin` files.
 - Start from bundled mechanism presets and intervention examples.
 
-Mechanism steps may use bare reaction lines or the `reaction:` and
-`equilibrium:` prefixes. Irreversible arrows may be written as `->` or `=>`,
+Mechanism steps use unprefixed reaction lines. Irreversible arrows may be
+written as `->` or `=>`,
 and reversible arrows as `<->` or `<=>`. The bundled presets use the same
 accepted DSL. Open the Reactions Help tab in Kindred for the syntax reference
 and examples.

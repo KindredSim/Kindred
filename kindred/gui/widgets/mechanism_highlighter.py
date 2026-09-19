@@ -20,7 +20,7 @@ class MechanismHighlighter(QtGui.QSyntaxHighlighter):
     Syntax highlighter for Kindred mechanism DSL.
 
     Highlights:
-    - Keywords (reaction, equilibrium, time, etc.) - bold purple
+    - Keywords (init, param, intervention, etc.) - bold purple
     - Species names (A, B, ATP, etc.) - blue
     - Operators (->, =>, <->, <=>, +) - muted in light mode, red in dark mode
     - Rate constants (k=, kf=, kr=, Keq=, local kappa=) - green
@@ -82,9 +82,8 @@ class MechanismHighlighter(QtGui.QSyntaxHighlighter):
         for term in energy_terms:
             self.rules.append((re.compile(term, re.IGNORECASE), 'energy', True))
 
-        # 5. Keywords (reaction, equilibrium, init, etc.)
+        # 5. Declaration and intervention keywords
         keywords = [
-            'reaction', 'equilibrium',
             'init', 'initial', 'time',
             'temp_step', 'temp_response', 'state', 'edge', 'intervention',
             'trigger', 'watch_species', 'watch_observable', 'threshold',

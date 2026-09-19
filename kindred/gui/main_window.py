@@ -161,6 +161,7 @@ from kindred.io.kin_archive_store import KinArchiveStore
 from kindred.io.logging import diagnostic_log_path
 from kindred.io.paths import resolve_export_start_dir
 from kindred.io.resources import (
+    PRESET_MECHANISM_TITLES,
     InterventionExampleCatalogError,
     get_all_intervention_example_specs,
 )
@@ -4371,9 +4372,8 @@ class MainWindow(QtWidgets.QMainWindow):
         presets.menuAction().setToolTip(
             "Replace the current mechanism with a built-in example."
         )
-        for index in range(1, 10):
-            preset_id = f"M{index}"
-            action = presets.addAction(preset_id)
+        for preset_id, title in PRESET_MECHANISM_TITLES.items():
+            action = presets.addAction(f"{preset_id}: {title}")
             action.setData(preset_id)
             action.setObjectName(f"loadPreset{preset_id}Action")
             action.triggered.connect(

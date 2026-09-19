@@ -10,8 +10,8 @@ intervention_set1 = {
   [UnlabeledProduct] = 0.0
 }
 
-reaction: LabeledSubstrate + Catalyst -> LabeledAdduct; k=1.0
-reaction: LabeledAdduct -> LabeledProduct + Catalyst; k=0.35
-reaction: UnlabeledSubstrate + Catalyst -> UnlabeledAdduct; k=1.0
-reaction: UnlabeledAdduct -> UnlabeledProduct + Catalyst; k=0.35
+LabeledSubstrate + Catalyst -> LabeledAdduct; k=1.0
+LabeledAdduct -> LabeledProduct + Catalyst; k=0.35
+UnlabeledSubstrate + Catalyst -> UnlabeledAdduct; k=1.0
+UnlabeledAdduct -> UnlabeledProduct + Catalyst; k=0.35
 intervention: op=trigger; watch_species=LabeledAdduct; threshold=0.05; direction=rising; max_count=1; min_interval=0.0; then={op=jump,species=UnlabeledSubstrate,delta=1.0}

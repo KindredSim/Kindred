@@ -10,10 +10,10 @@ intervention_set1 = {
   [Product] = 0.0
 }
 
-reaction: Substrate + Catalyst -> Product + Catalyst; k=0.15
-reaction: Substrate + LigatedCatalyst -> Product + LigatedCatalyst; k=0.9
-reaction: Catalyst + Ligand -> LigatedCatalyst; k=1.0
-reaction: Catalyst + Inhibitor -> InhibitedCatalyst; k=1.2
+Substrate + Catalyst -> Product + Catalyst; k=0.15
+Substrate + LigatedCatalyst -> Product + LigatedCatalyst; k=0.9
+Catalyst + Ligand -> LigatedCatalyst; k=1.0
+Catalyst + Inhibitor -> InhibitedCatalyst; k=1.2
 intervention: op=jump; species=Ligand; time=1.0; delta=0.4
 intervention: op=jump; species=Inhibitor; time=3.0; delta=0.25
 intervention: op=jump; species=Ligand; time=4.5; delta=-0.2

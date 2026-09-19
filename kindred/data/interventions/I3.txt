@@ -8,7 +8,7 @@ intervention_set1 = {
   [OxidizedProduct] = 0.0
 }
 
-reaction: Substrate + Reagent -> DesiredProduct; k=0.7
-reaction: Substrate + Oxygen -> OxidizedProduct; k=0.45
+Substrate + Reagent -> DesiredProduct; k=0.7
+Substrate + Oxygen -> OxidizedProduct; k=0.45
 intervention: op=flux; species=Reagent; start_time=0.0; end_time=4.0; flux_rate=0.15
 intervention: op=flux; species=Oxygen; start_time=1.5; end_time=5.0; flux_rate=-0.25

@@ -1,7 +1,5 @@
-# Preset M6 — Parallel and competition
-# Mechanism
-A -> B ; kf = 0.8
-A -> C ; kf = 0.2
+A -> B ; k=0.8
+A -> C ; k=0.2
 
 preset_set1 = {
   [A] = 1.0
@@ -9,5 +7,12 @@ preset_set1 = {
   [C] = 0.0
 }
 
-# Algebra
-let Sel_B = [B] / max([B] + [C], 1e-30)
+# param defines an input or a relationship between parameters.
+param k_rel = 0.25
+
+# This relationship determines the second rate constant.
+# Changing k_rel or k1 also changes k2.
+param k2 = k_rel * k1
+
+# Use param to constrain a parameter and let to calculate an output.
+let fraction_B = [B] / max([B] + [C], 1e-30)

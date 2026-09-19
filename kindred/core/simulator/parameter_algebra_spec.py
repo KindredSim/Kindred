@@ -37,10 +37,8 @@ _MECH_PARAM_RE = source_coordinate_name_pattern()
 _PROTECTED_STEP_KEY_IDENTIFIERS = frozenset({"k", "kf", "kr", "keq"})
 _NON_ALGEBRA_ASSIGNMENT_PREFIXES = {
     "energy",
-    "equilibrium",
     "init",
     "initial",
-    "reaction",
     "t",
     "temp_response",
     "temp_step",
@@ -1163,7 +1161,7 @@ def extract_parameter_assignments_from_algebra_lines(
                 raise DSLError(
                     f"Unknown mechanism parameter {raw_name!r} in Algebra param statement",
                     suggestion="Use an existing mechanism parameter (e.g., k1, k2, kf1, kr1, Keq1) or define the parameter on a reaction line.",
-                    examples=["reaction: A -> B; k=1.0", "param k1 = 4*k2"],
+                    examples=["A -> B; k=1.0", "param k1 = 4*k2"],
                     line_number=line_no,
                     line_content=original,
                 )

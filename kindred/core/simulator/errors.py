@@ -99,10 +99,10 @@ def missing_arrow_error(line: str) -> DSLError:
         "Reaction/equilibrium must contain '->', '<->', or '<=>'",
         suggestion="Use '->' for irreversible or '<->' / '<=>' for reversible reactions",
         examples=[
-            "reaction: A -> B; k=1.0",
-            "reaction: A + B -> C; dG_act=75.5",
-            "equilibrium: A <-> B; kf=1.0; Keq=2.0",
-            "equilibrium: A <=> B; kf=1.0; Keq=2.0",
+            "A -> B; k=1.0",
+            "A + B -> C; dG_act=75.5",
+            "A <-> B; kf=1.0; Keq=2.0",
+            "A <=> B; kf=1.0; Keq=2.0",
         ],
         line_content=line
     )

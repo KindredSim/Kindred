@@ -1,14 +1,18 @@
-# Preset M3 — Bimolecular association
-# Mechanism
-A + B -> C ; kf = 0.2
+# Use + to separate species on either side of a reaction.
+A + B -> C ; kf=0.2
 
+# Add another named block to supply a second initial-condition set.
 preset_set1 = {
   [A] = 1.0
   [B] = 1.0
   [C] = 0.0
 }
 
-# Algebra
-let extent = [C]
-let mass_A = [A] + [C]     # if stoich is A + B -> C, each C consumes one A
+preset_set2 = {
+  [A] = 1.0
+  [B] = 2.0
+  [C] = 0.0
+}
+
+let mass_A = [A] + [C]
 let mass_B = [B] + [C]

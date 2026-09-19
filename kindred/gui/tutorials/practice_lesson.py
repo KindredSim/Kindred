@@ -388,7 +388,7 @@ class PracticeLesson(Lesson):
                 "load_preset",
                 "Load a Preset",
                 "<p>A preset provides a mechanism and starting values that you can use and modify.</p>"
-                "<p>Open <b>Examples → Preset Mechanisms → M1</b>.</p>"
+                "<p>Open <b>Examples → Preset Mechanisms → M1: A -&gt; B</b>.</p>"
                 "<p>Follow the highlighted menu entries. There is no need to press Next between menus.</p>"
                 "<p>M1 adds <b>preset_set1</b> with starting concentrations "
                 "<b>A = 1</b> and <b>B = 0</b>. A set is a named group of starting values for one simulation.</p>"

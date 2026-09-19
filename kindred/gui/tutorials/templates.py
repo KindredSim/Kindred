@@ -43,10 +43,19 @@ class CreateAndReuseTemplates(PracticeLesson):
     def _template_loaded(self) -> bool:
         if self.tab.prepared_dsl is None:
             return False
-        imported = next((item for item in self.tab.initial_condition_sets if item.name == "preset_set1"), None)
-        if imported is None:
-            return False
-        self.reuse_set = imported.set_id
+        sets = {item.name: item for item in self.tab.initial_condition_sets}
+        for name, values in (
+            ("preset_set1", {"A": 1.0, "B": 1.0, "C": 0.0}),
+            ("preset_set2", {"A": 1.0, "B": 2.0, "C": 0.0}),
+        ):
+            item = sets.get(name)
+            if (
+                item is None
+                or dict(item.values) != values
+                or self.registry.tab_runtime(self.tab_id).initial_text_by_set_id.get(item.set_id)
+            ):
+                return False
+        self.reuse_set = sets["preset_set1"].set_id
         return True
 
     def _creation_target(self):
@@ -98,9 +107,10 @@ class CreateAndReuseTemplates(PracticeLesson):
             replace(
                 load_preset,
                 title="Load M3",
-                instruction="<p>Open <b>Examples → Preset Mechanisms → M3</b>.</p>"
+                instruction="<p>Open <b>Examples → Preset Mechanisms → M3: A + B -&gt; C</b>.</p>"
                 "<p>We will use this example to explore what Kindred includes in a template. "
-                "It supplies <b>preset_set1</b> with <b>A = 1, B = 1, and C = 0</b>.</p>",
+                "It supplies <b>preset_set1</b> with <b>A = 1, B = 1, and C = 0</b>, "
+                "and <b>preset_set2</b> with <b>A = 1, B = 2, and C = 0</b>.</p>",
                 success="M3 and the starting values are ready.",
             ),
             Step(
@@ -113,16 +123,18 @@ class CreateAndReuseTemplates(PracticeLesson):
             ),
             Step(
                 "template_values", "Find the Starting Values",
-                "<p>In <b>Mechanism DSL</b>, find the <b>preset_set1</b> declaration. It contains the starting concentrations from M3.</p>"
-                "<p>After loading M3, Kindred recorded that declaration as comments in Reactions. "
-                "Here, it has been restored as a declaration so the template can supply those starting values when loaded.</p>"
-                "<p>Check <b>A = 1, B = 1, and C = 0</b>. These are the recorded values. "
+                "<p>In <b>Mechanism DSL</b>, find the <b>preset_set1</b> and <b>preset_set2</b> declarations. "
+                "They contain the starting concentrations from M3.</p>"
+                "<p>After loading M3, Kindred recorded those declarations as comments in Reactions. "
+                "Here, they have been restored as declarations so the template can supply both sets when loaded.</p>"
+                "<p>Check <b>A = 1, B = 1, and C = 0</b> in preset_set1, "
+                "and <b>A = 1, B = 2, and C = 0</b> in preset_set2. These are the recorded values. "
                 "Changes made only in the Initial Conditions table are not copied into the template.</p>",
                 self._source_editor_target,
             ),
             Step(
                 "template_comments", "Comments Are Included Too",
-                "<p>Find the comments beginning with <b>#</b>, including the headings and the comment after <b>let mass_A</b>.</p>"
+                "<p>Find the comments beginning with <b>#</b> above the reaction and the initial-condition blocks.</p>"
                 "<p>Ordinary comments are copied into the template and remain comments. You can use them to explain the mechanism "
                 "or leave instructions for someone reusing it.</p>"
                 "<p>The reaction and observable definitions are included too.</p>",
@@ -138,7 +150,7 @@ class CreateAndReuseTemplates(PracticeLesson):
             Step(
                 "template_description", "Add a Description",
                 "<p>In <b>Description</b>, enter:</p>"
-                "<p>Association of A and B to form C, with starting values for one simulation.</p>"
+                "<p>Association of A and B to form C, with two sets of starting concentrations.</p>"
                 "<p>Use this field to explain what the template contains and when someone might use it. "
                 "Descriptions are also included when searching in Template Manager.</p>",
                 lambda: self._metadata_targets(4),
@@ -168,10 +180,12 @@ class CreateAndReuseTemplates(PracticeLesson):
             Step(
                 "apply_template", "Load Your Template",
                 "<p>Open <b>Examples → User-Created Templates</b> and choose <b>Association model</b>, or the name you entered.</p>"
-                "<p>The mechanism text, comments, and starting-value declarations load into the selected tab.</p>",
+                "<p>The mechanism text, comments, and both starting-value declarations load into the selected tab.</p>"
+                "<p>Check <b>preset_set1</b> with <b>A = 1, B = 1, C = 0</b> and "
+                "<b>preset_set2</b> with <b>A = 1, B = 2, C = 0</b> in Initial Conditions.</p>",
                 self._user_template_target,
                 self._template_loaded,
-                "The template and its starting values are available in this tab.",
+                "The template and both sets of starting values are available in this tab.",
             ),
             Step(
                 "finish", "Lesson Complete",

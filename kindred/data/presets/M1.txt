@@ -1,11 +1,15 @@
-# Preset M1 — Simple first-order isomerization
-# Mechanism
-A -> B ; kf = 1.0
+# Write one reaction per line.
+# Both -> and => are accepted.
+# Separate the reaction from its rate parameter with a semicolon.
+# For an irreversible reaction, k can be used instead of kf.
+A -> B ; kf=1.0
 
+# A named block supplies a set of starting concentrations.
 preset_set1 = {
   [A] = 1.0
   [B] = 0.0
 }
 
-# Algebra
+# let defines a calculated quantity that can be plotted.
+# Square brackets refer to species concentrations.
 let total = [A] + [B]

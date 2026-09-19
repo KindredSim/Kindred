@@ -3,7 +3,7 @@ Computational Simulator DSL tools.
 
 Current contract
 ----------------
-- Steps may be bare or prefixed with `reaction:` or `equilibrium:`.
+- Steps use unprefixed reaction lines.
 - Irreversible arrows: `->` and `=>`; reversible arrows: `<->` and `<=>`.
 - Accepted keys with normalization:
   degeneracy, kappa, C0, dG_act, Ea, dG_eq, k|kf|kr, A,
@@ -853,9 +853,9 @@ def _validate_equilibrium_rate_authority_for_dsl(
             str(exc),
             suggestion="Provide kf=... with either kr=... or Keq=/dG_eq=..., but not both.",
             examples=[
-                "equilibrium: A <-> B; kf=4.0; kr=2.0",
-                "equilibrium: A <-> B; kf=10.0; Keq=5.0",
-                "equilibrium: A <-> B; kf=10.0; dG_eq=-4.0",
+                "A <-> B; kf=4.0; kr=2.0",
+                "A <-> B; kf=10.0; Keq=5.0",
+                "A <-> B; kf=10.0; dG_eq=-4.0",
             ],
             line_number=line_number,
             line_content=line_content,
@@ -1297,9 +1297,7 @@ def _source_coordinates_from_key_value_spans(
 ) -> tuple[DslSourceCoordinate, ...]:
     """Project parser-captured value spans into canonical source identities."""
 
-    equilibrium = bool(
-        step.is_equilibrium or step.reversible
-    )
+    equilibrium = step.reversible
     coordinates: list[DslSourceCoordinate] = []
     seen_names: set[str] = set()
     for role, value_start, value_end in key_value_spans:
@@ -1525,45 +1523,6 @@ def _parse_dsl_ir(text: str, *, units: UnitsModel | None = None) -> "DSLIR":
                 line_content=raw,
             )
 
-        # reaction: line
-        if lower.startswith("reaction:"):
-            _, rest = line.split(":", 1)
-            leading_offset = len(line_contents[line_no - 1]) - len(
-                line_contents[line_no - 1].lstrip()
-            )
-            parsed_step = _parse_reaction_step(
-                rest,
-                energy_unit=energy_unit,
-                C0=standard_conc_M,
-                line_number=line_no,
-                line_content=raw,
-                physical_line_index=line_no - 1,
-                step_index=len(steps) + 1,
-                source_offset=leading_offset + len("reaction:"),
-            )
-            steps.append(parsed_step)
-            continue
-
-        # equilibrium: line
-        if lower.startswith("equilibrium:"):
-            _, rest = line.split(":", 1)
-            leading_offset = len(line_contents[line_no - 1]) - len(
-                line_contents[line_no - 1].lstrip()
-            )
-            parsed_step = _parse_equilibrium_step(
-                rest,
-                energy_unit=energy_unit,
-                C0=standard_conc_M,
-                line_number=line_no,
-                line_content=raw,
-                physical_line_index=line_no - 1,
-                step_index=len(steps) + 1,
-                source_offset=leading_offset + len("equilibrium:"),
-            )
-            steps.append(parsed_step)
-            continue
-
-        # Fallback: Try to parse as bare arrow syntax (no "reaction:" or "equilibrium:" prefix)
         if _ARROW_RE.search(line):
             leading_offset = len(line_contents[line_no - 1]) - len(
                 line_contents[line_no - 1].lstrip()
@@ -1682,7 +1641,6 @@ def _reject_per_step_globals(
 def _reject_unknown_params(
     params: Dict[str, str],
     known_keys: frozenset,
-    step_label: str,
     *,
     line_number: Optional[int],
     line_content: Optional[str],
@@ -1691,7 +1649,7 @@ def _reject_unknown_params(
     unknown = set(params) - known_keys
     if unknown:
         raise _DSLError(
-            f"Unknown {step_label} parameter(s): {', '.join(sorted(unknown))}",
+            f"Unknown reaction parameter(s): {', '.join(sorted(unknown))}",
             line_number=line_number, line_content=line_content,
         )
 
@@ -1702,10 +1660,8 @@ def _parse_reaction_like_step(
     params: Dict[str, str],
     energy_unit: str,
     C0: float,
-    missing_eyring_message: str,
     line_number: int | None,
     line_content: str | None,
-    step_label: str = "reaction",
 ) -> DslBuildStep:
     from .kinetics import normalize_energy_to_J_per_mol
 
@@ -1719,7 +1675,7 @@ def _parse_reaction_like_step(
     reversible = arrow in ("<->", "<=>")
 
     _reject_per_step_globals(params, line_number=line_number, line_content=line_content)
-    _reject_unknown_params(params, _REACTION_KNOWN_KEYS, step_label,
+    _reject_unknown_params(params, _REACTION_KNOWN_KEYS,
                            line_number=line_number, line_content=line_content)
 
     model = _forward_rate_family_from_params(
@@ -1802,7 +1758,7 @@ def _parse_reaction_like_step(
             )
         else:
             if kf is None:
-                raise ValueError(missing_eyring_message)
+                raise ValueError("Constant rate requires k or kf")
             forward_model = ConstantRateModel(k=kf)
         delta_g = energy("dG_eq") if "dG_eq" in params else None
     except (TypeError, ValueError, OverflowError) as exc:
@@ -1814,51 +1770,9 @@ def _parse_reaction_like_step(
         reversible=reversible,
         forward_model=forward_model,
         kr=kr,
-        is_equilibrium=False,
         standard_conc_M=C0,
         dG_eq_J_per_mol=delta_g,
         Keq_input=explicit_keq,
-    )
-
-
-def _parse_reaction_step(
-    rest: str,
-    *,
-    energy_unit: str,
-    C0: float,
-    line_number: int,
-    line_content: str,
-    physical_line_index: int = 0,
-    step_index: int = 1,
-    source_offset: int = 0,
-) -> DslBuildStep:
-    coordinate_spans: list[tuple[str, int, int]] = []
-    stoich_part, params = _split_stoich_and_params(
-        rest,
-        reject_duplicate_canonical_keys=True,
-        line_number=line_number,
-        line_content=line_content,
-        coordinate_spans=coordinate_spans,
-        source_offset=source_offset,
-    )
-    parsed_step = _parse_reaction_like_step(
-        stoich_part=stoich_part,
-        params=params,
-        energy_unit=energy_unit,
-        C0=C0,
-        missing_eyring_message="Eyring step requires dG_act or explicit k",
-        line_number=line_number,
-        line_content=line_content,
-    )
-    return replace(
-        parsed_step,
-        source_coordinates=_source_coordinates_from_key_value_spans(
-            tuple(coordinate_spans),
-            physical_line_index=physical_line_index,
-            step_index=step_index,
-            step=parsed_step,
-            line_content=line_content,
-        ),
     )
 
 
@@ -1887,66 +1801,9 @@ def _parse_bare_arrow_step(
         params=params,
         energy_unit=energy_unit,
         C0=C0,
-        missing_eyring_message="Bare arrow syntax requires k (or kf), or dG_act for Eyring",
         line_number=line_number,
         line_content=line_content,
     )
-    return replace(
-        parsed_step,
-        source_coordinates=_source_coordinates_from_key_value_spans(
-            tuple(coordinate_spans),
-            physical_line_index=physical_line_index,
-            step_index=step_index,
-            step=parsed_step,
-            line_content=line_content,
-        ),
-    )
-
-
-def _parse_equilibrium_step(
-    rest: str,
-    *,
-    energy_unit: str,
-    C0: float,
-    line_number: int,
-    line_content: str,
-    physical_line_index: int = 0,
-    step_index: int = 1,
-    source_offset: int = 0,
-) -> DslBuildStep:
-    coordinate_spans: list[tuple[str, int, int]] = []
-    stoich_part, params = _split_stoich_and_params(
-        rest,
-        reject_duplicate_canonical_keys=True,
-        line_number=line_number,
-        line_content=line_content,
-        coordinate_spans=coordinate_spans,
-        source_offset=source_offset,
-    )
-    try:
-        _, _, arrow = _parse_stoich(stoich_part)
-    except _DSLError as exc:
-        if exc.line_number is None:
-            raise _DSLError(str(exc.message), suggestion=exc.suggestion, examples=exc.examples,
-                           line_number=line_number, line_content=line_content) from exc
-        raise
-    if arrow not in ("<->", "<=>"):
-        raise _DSLError(
-            "equilibrium must use '<->' or '<=>'",
-            examples=["equilibrium: A <-> B ; Keq=2.0 ; kf=10"],
-            line_number=line_number, line_content=line_content,
-        )
-    parsed_step = _parse_reaction_like_step(
-        stoich_part=stoich_part,
-        params=params,
-        energy_unit=energy_unit,
-        C0=C0,
-        missing_eyring_message="Equilibrium requires kf or a complete forward rate family",
-        step_label="equilibrium",
-        line_number=line_number,
-        line_content=line_content,
-    )
-    parsed_step = replace(parsed_step, is_equilibrium=True)
     return replace(
         parsed_step,
         source_coordinates=_source_coordinates_from_key_value_spans(

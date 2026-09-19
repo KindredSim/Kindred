@@ -194,7 +194,6 @@ class DslBuildStep:
     reversible: bool
     forward_model: ForwardRateModel
     kr: float | None
-    is_equilibrium: bool
     standard_conc_M: float
     dG_eq_J_per_mol: float | None = None
     Keq_input: float | None = None

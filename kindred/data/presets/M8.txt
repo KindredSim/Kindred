@@ -1,15 +1,29 @@
-# Preset M8 — Michaelis–Menten elementary mechanism
-# Mechanism
-E + S <-> ES ; kf = 10.0 ; kr = 2.0
-ES -> E + P  ; kf = 1.0
+# Temperature in K, energy units, and standard concentration in M.
+T=298.15
+energy=kJ/mol
+C0=1.0
+
+# A and Ea select an Arrhenius rate for each forward step.
+# The field A= is the prefactor, distinct from the species named A.
+# dG_eq specifies the equilibrium free energy for the reversible step.
+A + B <-> C ; A=1e7 ; Ea=40.0 ; dG_eq=-5.0
+C -> D ; A=1e8 ; Ea=45.0
+C -> E ; A=1e8 ; Ea=50.0
 
 preset_set1 = {
-  [E]  = 1.0
-  [S]  = 10.0
-  [ES] = 0.0
-  [P]  = 0.0
+  [A] = 1.0
+  [B] = 1.0
+  [C] = 0.0
+  [D] = 0.0
+  [E] = 0.0
 }
 
-# Algebra
-let v    = k2 * [ES]
-let Et   = [E] + [ES]
+# The offset uses the energy unit declared above.
+param energy_offset = 5.0
+
+# Constrain the third activation energy using the second.
+param Ea3 = Ea2 + energy_offset
+
+# k2 and k3 are the rate constants calculated from A and Ea.
+let rate_ratio = k3 / k2
+let fraction_D = [D] / max([D] + [E], 1e-30)

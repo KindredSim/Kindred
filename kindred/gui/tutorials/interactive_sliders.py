@@ -31,7 +31,7 @@ class InteractiveSliders(PracticeLesson):
         name = self.step.name
         if name in {"preview_first", "preview_second", "drag_slider", "fine_slider", "preview_both"}:
             sliders = self.bundle.editor.variable_sliders_widget()
-            if not all(sliders.variable_visible(key) for key in ("k1", "k2")):
+            if not all(sliders.variable_visible(key) for key in ("kf1", "k2")):
                 return self._missing("Show both rate sliders before adjusting them.", "show_slider")
         if name in {"preview_first", "preview_reference", "preview_second", "drag_slider", "fine_slider"}:
             if self.bundle.slider_binding.resolve_target_set_ids() != (self.preset_set,):
@@ -43,9 +43,9 @@ class InteractiveSliders(PracticeLesson):
         if name in {"preview_both", "understand_apply", "apply_preview"}:
             if set(self.bundle.slider_binding.resolve_target_set_ids()) != {self.preset_set, self.extra_set}:
                 return self._missing("Choose both practice sets as slider targets.", "slider_targets")
-        if name == "preview_reference" and not self._preview_ready(0.5, 0.5, (self.preset_set,)):
+        if name == "preview_reference" and not self._preview_ready(0.75, 0.1, (self.preset_set,)):
             return self._missing("Finish the first rate trial before comparing it with Reference.", "preview_first")
-        if name == "understand_apply" and not self._preview_ready(0.75, 0.25, (self.preset_set, self.extra_set)):
+        if name == "understand_apply" and not self._preview_ready(1.125, 0.05, (self.preset_set, self.extra_set)):
             return self._missing("Finish both rate changes before reviewing Apply.", "preview_both")
         return None
 
@@ -60,7 +60,7 @@ class InteractiveSliders(PracticeLesson):
             parameters = {name: value for name, value, _unit in result.parameters}
             if any(
                 key not in parameters or not isclose(parameters[key], value, rel_tol=1e-8)
-                for key, value in (("k1", first), ("k2", second))
+                for key, value in (("kf1", first), ("kr1", 0.25), ("k2", second))
             ):
                 return False
         return True
@@ -75,9 +75,10 @@ class InteractiveSliders(PracticeLesson):
             create_tab,
             replace(
                 load_preset,
-                instruction="<p>Open <b>Examples → Preset Mechanisms → M5</b>.</p>"
-                "<p>M5 contains two reactions: <b>A → B</b> with a rate constant of <b>1.0</b>, "
-                "and <b>B → C</b> with a rate constant of <b>0.5</b>. We will try changing both with sliders.</p>"
+                instruction="<p>Open <b>Examples → Preset Mechanisms → M5: A &lt;-&gt; B, B -&gt; C</b>.</p>"
+                "<p>M5 contains <b>A ⇌ B</b> with <b>kf1 = 1.5</b> and <b>kr1 = 0.25</b>, "
+                "and <b>B → C</b> with <b>k2 = 0.1</b>. We will change kf1 and k2 with sliders "
+                "and keep kr1 at 0.25 throughout this lesson.</p>"
                 "<p>The preset adds <b>preset_set1</b> with <b>A = 1</b>, <b>B = 0</b>, and <b>C = 0</b>. "
                 "Use that set for the first run. The original set1 row can stay.</p>",
                 success="M5 and the starting values are ready.",
@@ -91,24 +92,24 @@ class InteractiveSliders(PracticeLesson):
             ),
             Step(
                 "run_first", "Run M5",
-                "<p>Keep the supplied rates: <b>1.0</b> for A → B and <b>0.5</b> for B → C.</p>"
+                "<p>Keep the supplied rates: <b>kf1 = 1.5</b>, <b>kr1 = 0.25</b>, and <b>k2 = 0.1</b>.</p>"
                 "<p>Select only <b>preset_set1</b>, then click <b>Run</b> in either <b>Initial Conditions</b> "
                 "or the <b>Mechanism</b> panel. Wait for the curves.</p>",
                 self._run_targets,
                 lambda: self._values(self.preset_set, 1.0)
-                and self._run_ok({"k1": 1.0, "k2": 0.5}, (self.preset_set,)),
-                "Both supplied rates have been used in the completed run.",
+                and self._run_ok({"kf1": 1.5, "kr1": 0.25, "k2": 0.1}, (self.preset_set,)),
+                "The supplied rates have been used in the completed run.",
             ),
             Step(
                 "show_slider", "Show Both Rate Sliders",
                 "<p>If the <b>Interactive Sliders panel</b> is hidden, open "
                 "<b>View → Panels → Interactive Sliders</b>. You can also click <b>Show this control</b> below.</p>"
                 "<p>In the Interactive Sliders panel, open <b>Visible sliders</b>. "
-                "Check <b>k1 — A → B</b> and <b>k2 — B → C</b>, then close the menu.</p>"
-                "<p><b>k1</b> controls the first reaction rate and <b>k2</b> controls the second. "
-                "You can drag either slider or type a value.</p>",
+                "Check <b>kf1 — A → B</b> and <b>k2 — B → C</b>, then close the menu.</p>"
+                "<p><b>kf1</b> controls the forward rate of A ⇌ B and <b>k2</b> controls B → C. "
+                "You can drag either slider or type a value. Leave <b>kr1 = 0.25</b>.</p>",
                 self._slider_target,
-                lambda: all(self.bundle.editor.variable_sliders_widget().variable_visible(key) for key in ("k1", "k2")),
+                lambda: all(self.bundle.editor.variable_sliders_widget().variable_visible(key) for key in ("kf1", "k2")),
             ),
             Step(
                 "preview_target", "Choose the Set to Preview",
@@ -127,43 +128,43 @@ class InteractiveSliders(PracticeLesson):
             ),
             Step(
                 "preview_first", "Try a Different First Rate",
-                "<p>Enter <b>0.5</b> in the <b>k1</b> value field. Keep <b>k2</b> at <b>0.5</b>. "
+                "<p>Enter <b>0.75</b> in the <b>kf1</b> value field. Keep <b>k2</b> at <b>0.1</b>. "
                 "Press <b>Enter</b> after an edit and wait for the Preview to finish.</p>"
                 "<p>The <b>accepted model</b> is the version currently kept in this mechanism tab. "
                 "Slider changes create a trial Preview. They become part of the accepted model when you click <b>Apply</b>.</p>"
-                "<p>The proposed first rate is now 0.5. The accepted first rate is still 1.0.</p>",
+                "<p>The proposed forward rate is now 0.75. The accepted forward rate is still 1.5.</p>",
                 self._slider_target,
-                lambda: self._preview_ready(0.5, 0.5, (self.preset_set,)),
-                "The Preview uses k1 = 0.5 and k2 = 0.5.",
+                lambda: self._preview_ready(0.75, 0.1, (self.preset_set,)),
+                "The Preview uses kf1 = 0.75, kr1 = 0.25, and k2 = 0.1.",
             ),
             Step(
                 "preview_reference", "Compare Preview with Reference",
                 "<p><b>Preview</b> shows the proposed change. <b>Reference</b> shows the accepted model, "
-                "with <b>k1 = 1.0</b> and <b>k2 = 0.5</b>.</p>"
+                "with <b>kf1 = 1.5</b> and <b>k2 = 0.1</b>.</p>"
                 "<p>Compare the curves. If Reference is hidden, right-click the plot and enable "
                 "<b>Appearance → Show Reference</b>. Use the legend to tell them apart.</p>",
                 self._plot_target, manual=True,
             ),
             Step(
                 "preview_second", "Change the Second Rate Too",
-                "<p>Keep <b>k1 = 0.5</b> and enter <b>1.0</b> in the <b>k2</b> value field. "
+                "<p>Keep <b>kf1 = 0.75</b> and enter <b>0.2</b> in the <b>k2</b> value field. "
                 "Press <b>Enter</b> and wait for the Preview.</p>"
                 "<p>The Preview now includes both proposed changes. Changing the second slider keeps the trial value of the first. "
-                "Reference still uses the original pair, k1 = 1.0 and k2 = 0.5.</p>",
+                "Reference still uses the original pair, kf1 = 1.5 and k2 = 0.1.</p>",
                 self._slider_target,
-                lambda: self._preview_ready(0.5, 1.0, (self.preset_set,)),
+                lambda: self._preview_ready(0.75, 0.2, (self.preset_set,)),
                 "The Preview includes both changed rates.",
             ),
             Step(
                 "reset_trial", "Discard Both Changes",
                 "<p>Click <b>Reset</b> in the <b>Interactive Sliders panel</b>. Both sliders return to the accepted values: "
-                "<b>k1 = 1.0</b> and <b>k2 = 0.5</b>.</p>"
+                "<b>kf1 = 1.5</b> and <b>k2 = 0.1</b>.</p>"
                 "<p>Reset discards the trial without changing the accepted model.</p>",
                 self._slider_target, manual=True,
             ),
             Step(
                 "drag_slider", "Drag to Explore",
-                "<p>Drag the <b>k1</b> handle a short distance with the left mouse button, then try <b>k2</b>. "
+                "<p>Drag the <b>kf1</b> handle a short distance with the left mouse button, then try <b>k2</b>. "
                 "Watch the Preview change.</p>"
                 "<p>Release each handle and wait for the completed Preview. There is no exact value to reach yet.</p>",
                 lambda: (self._slider_target(), self._plot_target()), manual=True,
@@ -173,7 +174,7 @@ class InteractiveSliders(PracticeLesson):
                 "<p>Enable <b>Fine</b> and drag either handle again. Mouse dragging is ten times slower. "
                 "With a slider focused, try the Left and Right arrow keys for smaller keyboard adjustments.</p>"
                 "<p>Turn Fine off and click <b>Reset</b> before continuing. "
-                "Restore <b>k1 = 1.0</b> and <b>k2 = 0.5</b> for the next run.</p>",
+                "Restore <b>kf1 = 1.5</b> and <b>k2 = 0.1</b> for the next run.</p>",
                 self._slider_target, manual=True,
             ),
             self._add_set_step(),
@@ -187,11 +188,11 @@ class InteractiveSliders(PracticeLesson):
             Step(
                 "run_new_set", "Run Higher A",
                 "<p>Select only <b>Higher A</b> and click <b>Run</b> in either panel. "
-                "Keep the supplied rates, <b>k1 = 1.0</b> and <b>k2 = 0.5</b>.</p>"
+                "Keep the supplied rates, <b>kf1 = 1.5</b> and <b>k2 = 0.1</b>.</p>"
                 "<p>This gives the second set results to compare with its Preview.</p>",
                 lambda: (self._table_target(self.extra_set), *self._run_targets()),
                 lambda: self._values(self.extra_set, 2.0)
-                and self._run_ok({"k1": 1.0, "k2": 0.5}, (self.extra_set,)),
+                and self._run_ok({"kf1": 1.5, "kr1": 0.25, "k2": 0.1}, (self.extra_set,)),
             ),
             Step(
                 "slider_targets", "Preview Both Sets",
@@ -208,17 +209,17 @@ class InteractiveSliders(PracticeLesson):
             ),
             Step(
                 "preview_both", "Choose Both Rates to Keep",
-                "<p>Enter <b>0.75</b> for <b>k1</b> and <b>0.25</b> for <b>k2</b>. Press <b>Enter</b> after each edit.</p>"
+                "<p>Enter <b>1.125</b> for <b>kf1</b> and <b>0.05</b> for <b>k2</b>. Press <b>Enter</b> after each edit.</p>"
                 "<p>Wait for both previews to finish. Both sets use the same proposed rates, "
                 "with different starting concentrations.</p>",
                 self._slider_target,
-                lambda: self._preview_ready(0.75, 0.25, (self.preset_set, self.extra_set)),
+                lambda: self._preview_ready(1.125, 0.05, (self.preset_set, self.extra_set)),
                 "Both sets have completed previews using the chosen rates.",
             ),
             Step(
                 "understand_apply", "What Does Apply Do?",
-                "<p>The accepted rates are <b>k1 = 1.0</b> and <b>k2 = 0.5</b>. "
-                "The proposed rates are <b>k1 = 0.75</b> and <b>k2 = 0.25</b>.</p>"
+                "<p>The accepted rates are <b>kf1 = 1.5</b> and <b>k2 = 0.1</b>. "
+                "The proposed rates are <b>kf1 = 1.125</b> and <b>k2 = 0.05</b>. The reverse rate remains <b>kr1 = 0.25</b>.</p>"
                 "<p><b>Apply</b> makes both proposed rates part of the accepted model. It updates Reactions "
                 "and keeps the completed Preview results for the targeted sets. You do not need to run those simulations again.</p>"
                 "<p>The rates are shared by all sets in the tab. Results for other sets become out of date "
@@ -229,7 +230,7 @@ class InteractiveSliders(PracticeLesson):
             Step(
                 "apply_preview", "Keep Both Changes",
                 "<p>Click <b>Apply</b> in the <b>Interactive Sliders panel</b>. If Preview is still computing, wait and click Apply again.</p>"
-                "<p>Check Reactions for <b>kf = 0.75</b> on A → B and <b>kf = 0.25</b> on B → C. "
+                "<p>Check Reactions for <b>kf = 1.125</b> and <b>kr = 0.25</b> on A ⇌ B, and <b>k = 0.05</b> on B → C. "
                 "The completed curves now belong to the accepted model. Later trials start from these rates, "
                 "and Reset returns to them.</p>"
                 "<p>Apply uses the accepted source behind the Preview. It replaces pending edits in Reactions. "

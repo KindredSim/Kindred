@@ -7,6 +7,6 @@ intervention_set1 = {
   [Product] = 0.0
 }
 
-reaction: Precursor -> Intermediate; k=0.8
-reaction: Intermediate + Scavenger -> Product; k=1.0
+Precursor -> Intermediate; k=0.8
+Intermediate + Scavenger -> Product; k=1.0
 intervention: op=trigger; watch_species=Intermediate; threshold=0.25; direction=rising; max_count=1; min_interval=0.0; then={op=jump,species=Scavenger,delta=0.5}

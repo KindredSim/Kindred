@@ -32,6 +32,7 @@ __all__ = [
     "get_resource_text",
     "get_resource_path",
     "get_preset_mechanism_source",
+    "PRESET_MECHANISM_TITLES",
     "get_intervention_example_source",
     "get_all_intervention_example_specs",
     "InterventionExampleCatalogError",
@@ -56,7 +57,19 @@ class InterventionExampleSpec:
 _MANDATORY_INTERVENTION_EXAMPLE_IDS = frozenset(
     {"I1", "I2", "I3", "I4", "I5", "I6", "I7", "I8"}
 )
-_FIXED_PRESET_IDS = frozenset(f"M{index}" for index in range(1, 10))
+PRESET_MECHANISM_TITLES = {
+    "M1": "A -> B",
+    "M2": "A <-> B",
+    "M3": "A + B -> C",
+    "M4": "2*A <-> A2",
+    "M5": "A <-> B, B -> C",
+    "M6": "A -> B, A -> C",
+    "M7": "E + S <-> ES, ES -> E + P",
+    "M8": "A + B <-> C, C -> D, C -> E (Arrhenius)",
+    "M9": "A + B <-> C, C -> D, C -> E (Eyring)",
+    "M10": "A + B <-> C, C -> D, D -> E (Temperature Change)",
+    "M11": "PB cascade",
+}
 
 
 def get_resource_text(relative_path: str, encoding: str = "utf-8") -> str:
@@ -257,8 +270,8 @@ def get_preset_mechanism_source(preset_id: str) -> MechanismAuthoringSource:
         Complete mechanism source.
     """
     normalized = str(preset_id).strip()
-    if normalized not in _FIXED_PRESET_IDS:
-        raise ValueError("Preset mechanism must be one of M1 through M9.")
+    if normalized not in PRESET_MECHANISM_TITLES:
+        raise ValueError(f"Unknown packaged preset mechanism {normalized!r}.")
     return MechanismAuthoringSource.from_parts(
         reactions_text=get_resource_text(f"presets/{normalized}.txt")
     )

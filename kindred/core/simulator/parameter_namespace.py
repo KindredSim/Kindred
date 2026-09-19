@@ -299,17 +299,14 @@ def _build_namespace(descriptors: Sequence[_NamespaceStepDescriptor]) -> Mechani
 def _namespace_policy_from_step(step: object) -> _StepNamespacePolicy:
     missing_attrs = [
         attr
-        for attr in ("is_equilibrium", "reversible", "Keq_input")
+        for attr in ("reversible", "Keq_input")
         if not hasattr(step, attr)
     ]
     if missing_attrs:
         raise ValueError(
             "Step is missing required namespace metadata: " + ", ".join(sorted(missing_attrs))
         )
-    is_equilibrium_step = bool(
-        getattr(step, "is_equilibrium")
-        or getattr(step, "reversible")
-    )
+    is_equilibrium_step = bool(getattr(step, "reversible"))
     return _StepNamespacePolicy(
         step_kind="equilibrium" if is_equilibrium_step else "reaction",
         has_explicit_keq=bool(getattr(step, "Keq_input", None) is not None),
