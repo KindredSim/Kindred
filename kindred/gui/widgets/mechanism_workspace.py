@@ -124,16 +124,29 @@ class ProjectWorkspaceWidget(QtWidgets.QMainWindow):
         except KeyError as exc:
             raise KeyError(f"Unknown project dock identity: {identity!r}.") from exc
 
-    def apply_default_dock_arrangement(self) -> None:
-        """Restore the root-owned default six-dock arrangement."""
+    def _docks_are_stacked(
+        self,
+        upper: QtWidgets.QDockWidget,
+        lower: QtWidgets.QDockWidget,
+    ) -> bool:
+        peers = self.tabifiedDockWidgets(lower)
+        if upper in peers:
+            return False
+        # Inactive tabs have offscreen geometry; use the displayed member.
+        displayed = next(
+            (dock for dock in (lower, *peers) if not dock.visibleRegion().isEmpty()),
+            lower,
+        )
+        upper_rect, lower_rect = upper.geometry(), displayed.geometry()
+        return (
+            upper_rect.bottom() < lower_rect.top()
+            and upper_rect.left() == lower_rect.left()
+            and upper_rect.right() == lower_rect.right()
+        )
 
-        docks = tuple(self._dock_by_identity.values())
-        for dock in docks:
-            dock.setFloating(False)
-            area = dock.property("kindred/defaultDockArea")
-            if area is not None:
-                self.addDockWidget(QtCore.Qt.DockWidgetArea(int(area)), dock)
-            dock.show()
+    def reset_visible_dock_layout(self) -> None:
+        """Restore open panels' positions while retaining hidden Qt dock slots."""
+
         from kindred.gui.app_wiring import (
             ANALYSIS_DOCK_SPEC,
             BATCH_DOCK_SPEC,
@@ -144,22 +157,71 @@ class ProjectWorkspaceWidget(QtWidgets.QMainWindow):
             SYMBOLIC_CALCULATOR_DOCK_SPEC,
         )
 
-        if len(docks) != len(DOCK_SPECS):
-            return
+        docks = {
+            identity: dock
+            for identity, dock in self._dock_by_identity.items()
+            if not dock.isHidden()
+        }
+        for spec in DOCK_SPECS:
+            dock = docks.get(spec.identity_key)
+            if dock is None:
+                continue
+            if dock.isFloating():
+                dock.setFloating(False)
+            if self.dockWidgetArea(dock) != spec.default_area:
+                self.addDockWidget(spec.default_area, dock)
+        self.layout().activate()
 
-        mechanism = self.dock_for_identity(MECHANISM_DOCK_SPEC.identity_key)
-        sliders = self.dock_for_identity(SLIDERS_DOCK_SPEC.identity_key)
-        batch = self.dock_for_identity(BATCH_DOCK_SPEC.identity_key)
-        data = self.dock_for_identity(RIGHT_DOCK_SPEC.identity_key)
-        analysis = self.dock_for_identity(ANALYSIS_DOCK_SPEC.identity_key)
-        calculator = self.dock_for_identity(
-            SYMBOLIC_CALCULATOR_DOCK_SPEC.identity_key
+        mechanism = docks.get(MECHANISM_DOCK_SPEC.identity_key)
+        sliders = docks.get(SLIDERS_DOCK_SPEC.identity_key)
+        if mechanism is not None and sliders is not None:
+            if not self._docks_are_stacked(mechanism, sliders):
+                self.addDockWidget(MECHANISM_DOCK_SPEC.default_area, mechanism)
+                self.addDockWidget(SLIDERS_DOCK_SPEC.default_area, sliders)
+                self.splitDockWidget(mechanism, sliders, QtCore.Qt.Orientation.Vertical)
+        self.layout().activate()
+
+        lower = [
+            docks[spec.identity_key]
+            for spec in (
+                RIGHT_DOCK_SPEC,
+                ANALYSIS_DOCK_SPEC,
+                SYMBOLIC_CALCULATOR_DOCK_SPEC,
+            )
+            if spec.identity_key in docks
+        ]
+        if not lower:
+            return
+        anchor = lower[0]
+        batch = docks.get(BATCH_DOCK_SPEC.identity_key)
+        if batch is not None and not self._docks_are_stacked(batch, anchor):
+            self.addDockWidget(BATCH_DOCK_SPEC.default_area, batch)
+            self.addDockWidget(RIGHT_DOCK_SPEC.default_area, anchor)
+            self.splitDockWidget(batch, anchor, QtCore.Qt.Orientation.Vertical)
+        for dock in lower[1:]:
+            if dock not in self.tabifiedDockWidgets(anchor):
+                self.tabifyDockWidget(anchor, dock)
+        anchor.raise_()
+
+    def restore_default_panel_layout(self) -> None:
+        """Restore the factory arrangement and panel visibility."""
+
+        from kindred.gui.app_wiring import (
+            BATCH_DOCK_SPEC,
+            MECHANISM_DOCK_SPEC,
+            RIGHT_DOCK_SPEC,
         )
-        self.splitDockWidget(mechanism, sliders, QtCore.Qt.Orientation.Vertical)
-        self.splitDockWidget(batch, data, QtCore.Qt.Orientation.Vertical)
-        self.tabifyDockWidget(data, analysis)
-        self.tabifyDockWidget(data, calculator)
-        data.raise_()
+
+        for dock in self._dock_by_identity.values():
+            dock.show()
+        self.reset_visible_dock_layout()
+        visible = {
+            MECHANISM_DOCK_SPEC.identity_key,
+            BATCH_DOCK_SPEC.identity_key,
+            RIGHT_DOCK_SPEC.identity_key,
+        }
+        for identity, dock in self._dock_by_identity.items():
+            dock.setVisible(identity in visible)
 
     def redock_dock(self, dock: QtWidgets.QDockWidget) -> None:
         if dock not in self._dock_by_identity.values():
@@ -187,17 +249,17 @@ class ProjectWorkspaceWidget(QtWidgets.QMainWindow):
         elif isinstance(state, (bytes, bytearray)):
             payload = QtCore.QByteArray(bytes(state))
         else:
-            self.apply_default_dock_arrangement()
+            self.restore_default_panel_layout()
             return False
         if payload.isEmpty():
-            self.apply_default_dock_arrangement()
+            self.restore_default_panel_layout()
             return False
         try:
             restored = bool(self.restoreState(payload))
         except (RuntimeError, TypeError, ValueError):
             restored = False
         if not restored:
-            self.apply_default_dock_arrangement()
+            self.restore_default_panel_layout()
         return restored
 
     def reveal_dock(self, identity: str) -> QtWidgets.QDockWidget:

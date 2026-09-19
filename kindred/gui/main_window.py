@@ -4206,8 +4206,14 @@ class MainWindow(QtWidgets.QMainWindow):
     def _reset_layout(self) -> None:
         if not self._mutation_input_admitted("Reset Layout"):
             return
-        self._workspace.apply_default_dock_arrangement()
+        self._workspace.reset_visible_dock_layout()
         self.set_status_text("Panel layout reset.")
+
+    def _restore_default_panel_layout(self) -> None:
+        if not self._mutation_input_admitted("Restore Default Panel Layout"):
+            return
+        self._workspace.restore_default_panel_layout()
+        self.set_status_text("Default panel layout restored.")
 
     # ------------------------------------------------------------------
     # Menus and preserved shell actions
@@ -4292,12 +4298,26 @@ class MainWindow(QtWidgets.QMainWindow):
             action.setObjectName(f"{spec.identity_key}PanelAction")
             panels.addAction(action)
         view_menu.addSeparator()
-        self._add_action(
+        reset_layout_action = self._add_action(
             view_menu,
             "Reset Layout",
             self._reset_layout,
             "Ctrl+Shift+R",
             "resetLayoutAction",
+        )
+        reset_layout_action.setToolTip(
+            "Restore the standard positions of currently visible panels "
+            "without changing panel visibility."
+        )
+        restore_default_action = self._add_action(
+            view_menu,
+            "Restore Default Panel Layout",
+            self._restore_default_panel_layout,
+            None,
+            "restoreDefaultPanelLayoutAction",
+        )
+        restore_default_action.setToolTip(
+            "Restore Kindred’s factory panel arrangement and default panel visibility."
         )
         self._dark_mode_action = self._add_action(
             view_menu,
@@ -5015,8 +5035,9 @@ class MainWindow(QtWidgets.QMainWindow):
             self,
             "Panel Layout Tips",
             "Drag dock title bars to float, redock, or arrange panels on either "
-            "side. Use View → Panels to restore hidden panels and Reset Layout "
-            "to restore the default arrangement.",
+            "side. Use View → Panels to restore hidden panels, Reset Layout to "
+            "reposition visible panels, or Restore Default Panel Layout to restore "
+            "the factory arrangement and visibility.",
         )
 
     def _build_diagnostic_log_dialog(self) -> QtWidgets.QDialog:

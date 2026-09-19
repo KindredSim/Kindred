@@ -133,7 +133,7 @@ def build_module_dock(
         content=panel,
         dock=dock,
         on_dock_back=lambda: workspace_root.redock_dock(dock),
-        on_reset_layout=workspace_root.apply_default_dock_arrangement,
+        on_restore_default_layout=workspace_root.restore_default_panel_layout,
         parent=workspace_root,
     )
     dock.setWidget(container)
