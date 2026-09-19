@@ -743,7 +743,9 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
         if str(entry_kind) == "mechanism":
             self._variable_sliders.set_variable_visible(str(item_name), bool(visible))
         elif str(entry_kind) == "species":
-            self._species_sliders.set_species_visible(str(item_name), bool(visible))
+            self._species_sliders.apply_visibility_projection(
+                {str(item_name): bool(visible)}
+            )
         self._sync_slider_workspace_state()
 
     def changeEvent(self, event: QtCore.QEvent) -> None:

@@ -29,22 +29,17 @@ def sanitize_nonneg_finite(value: object) -> float:
     return float(v) if ok else 0.0
 
 
-def compute_slider_max_option_c(*, v: object, row_max: object) -> float:
+def compute_slider_max_option_c(*, v: object) -> float:
     """
-    Option C slider max:
-    - `row_max` is the row-wide max (after sanitization)
-    - `v` is the current species value (after sanitization)
-    - slider_max = max(1.0, 2*row_max, 5*v)
+    Return max(1.0, 5*v) for the current species value after sanitization.
 
-    Both growth terms saturate at the largest finite float so a valid finite
+    The growth term saturates at the largest finite float so a valid finite
     species value never turns the GUI range into infinity.
     """
     v_f = sanitize_nonneg_finite(v)
-    row_max_f = sanitize_nonneg_finite(row_max)
     return float(
         max(
             1.0,
-            _scale_finite_gui_range(row_max_f, 2.0),
             _scale_finite_gui_range(v_f, 5.0),
         )
     )

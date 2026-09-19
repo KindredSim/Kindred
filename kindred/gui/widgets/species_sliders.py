@@ -192,16 +192,6 @@ class BatchSpeciesSliders(QtWidgets.QWidget):
             for name in self._values
         ]
 
-    def set_species_visible(self, species: str, visible: bool) -> None:
-        name = str(species)
-        if name not in self._values:
-            return
-        if visible:
-            self._hidden_species.discard(name)
-        else:
-            self._hidden_species.add(name)
-        self._sync_visibility()
-
     def get_current_values(self) -> dict[str, float]:
         return dict(self._values)
 
@@ -282,9 +272,7 @@ class BatchSpeciesSliders(QtWidgets.QWidget):
         slider.setSingleStep(1 if self._fine_mode else 50)
         slider.setPageStep(50 if self._fine_mode else 1000)
         slider.set_fine_mode(self._fine_mode)
-        maximum = compute_slider_max_option_c(
-            v=value, row_max=max(self._values.values(), default=value)
-        )
+        maximum = compute_slider_max_option_c(v=value)
         maximum = max(float(maximum), 1e-12)
         slider.setValue(self._value_to_position(value, maximum))
         slider.setEnabled(bool(self._target_set_ids))
@@ -371,11 +359,20 @@ class BatchSpeciesSliders(QtWidgets.QWidget):
     def apply_visibility_projection(
         self, visibility: dict[str, bool] | list[tuple[str, bool]]
     ) -> None:
-        """Apply one complete visibility projection without workspace callbacks."""
+        """Set supplied picker choices, recalculating ranges on hidden-to-shown changes."""
         projected = dict(visibility)
         for species in tuple(self._rows):
             if species in projected:
                 if bool(projected[species]):
+                    if species in self._hidden_species:
+                        row = self._rows[species]
+                        value = self._values[species]
+                        row.maximum = compute_slider_max_option_c(v=value)
+                        row.maximum_label.setText(format_slider_value(row.maximum))
+                        with QtCore.QSignalBlocker(row.slider):
+                            row.slider.setValue(
+                                self._value_to_position(value, row.maximum)
+                            )
                     self._hidden_species.discard(species)
                 else:
                     self._hidden_species.add(species)
