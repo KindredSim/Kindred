@@ -1,7 +1,9 @@
 """Constructive affine scan constraints over retained authored Algebra."""
 from __future__ import annotations
 
-from dataclasses import dataclass
+from kindred.core._bounded_rational import literal_fraction
+
+from dataclasses import dataclass, replace
 from fractions import Fraction as F
 from itertools import product
 from typing import Callable
@@ -12,6 +14,7 @@ from kindred.core.algebra.parser import (
 from kindred.core.algebra.symbols import SymbolTable, BUILTIN_FUNCTIONS
 from kindred.core.algebra.evaluator import EvaluationContext, evaluate_block
 from kindred.core.simulation_parameters import enumerate_simulation_parameters
+from kindred.core.quantity_units import conversion_scale, convert_value, presentation_unit
 import numpy as np
 from kindred.scan.config import START, END, ScanConfig, initial_key, parameter_key
 from kindred.scan.intervals import Interval, normalize, representable, sample
@@ -57,6 +60,19 @@ class Inequality:
     strict: bool = False
 
 
+def scientific_constraints(spec, constraints):
+    statements = {s.name: s for s in spec.observable_block.lines}
+    result = []
+    for condition in constraints:
+        statement = statements[condition.observable]
+        unit = statement.expr.quantity_unit
+        shown = presentation_unit(unit, statement.declared_unit)
+        result.append(condition if unit is None else replace(condition,
+            lower=convert_value(condition.lower, shown, unit),
+            upper=convert_value(condition.upper, shown, unit)))
+    return tuple(result)
+
+
 def compile_constraints(prepared, config: ScanConfig, fixed: dict[str, float]):
     spec = prepared.parameter_algebra_spec_for_execution()
     statements = {}
@@ -65,6 +81,7 @@ def compile_constraints(prepared, config: ScanConfig, fixed: dict[str, float]):
             statements.update({s.name: s.expr for s in block.lines})
     available = {parameter_key(p.name) for p in enumerate_simulation_parameters(prepared)}
     available.update(initial_key(s) for s in prepared.analysis.species_names)
+    inputs, quantities = dict(spec.input_units), dict(spec.quantity_units)
     symbols = SymbolTable()
     memo: dict[str, Affine] = {}
 
@@ -74,8 +91,13 @@ def compile_constraints(prepared, config: ScanConfig, fixed: dict[str, float]):
         return Affine({key: F(1)})
 
     def lower(node) -> Affine:
+        value = unscaled(node)
+        factor = node.unit_scale.rational()
+        return value.scale(factor if factor is not None else F(node.unit_factor))
+
+    def unscaled(node) -> Affine:
         if isinstance(node, NumberNode):
-            return Affine({}, node.exact_value if node.exact_value is not None else F(node.value))
+            return Affine({}, literal_fraction(node.literal if node.literal is not None else str(node.value)))
         if isinstance(node, SpeciesRefNode):
             if node.kind != "init":
                 raise ValueError(f"[{node.name}] depends on simulated concentrations; use an input-only quantity.")
@@ -85,7 +107,9 @@ def compile_constraints(prepared, config: ScanConfig, fixed: dict[str, float]):
                 raise ValueError(f"{node.name} is an execution-dependent symbol.")
             key = parameter_key(node.name)
             if key in available:
-                return coordinate(key)
+                scale = conversion_scale(inputs[node.name], quantities[node.name])
+                factor = scale.rational()
+                return coordinate(key).scale(factor if factor is not None else F(scale.number()))
             if node.name in memo:
                 return memo[node.name]
             if node.name in statements:
@@ -119,7 +143,7 @@ def compile_constraints(prepared, config: ScanConfig, fixed: dict[str, float]):
         raise ValueError("Unsupported authored expression in scan constraint.")
 
     equations, dependents, inequalities, conditional = [], [], [], []
-    for condition in config.constraints:
+    for condition in scientific_constraints(spec, config.constraints):
         if condition.observable not in spec.observable_names:
             raise ValueError(f"Unknown authored quantity: {condition.observable}")
         if condition.dependent not in config.ranges:
@@ -183,6 +207,8 @@ class IntervalChecks:
         if not conditions:
             return
         spec = prepared.parameter_algebra_spec_for_execution()
+        conditions = scientific_constraints(spec, conditions)
+        self.input_units, self.quantity_units = dict(spec.input_units), dict(spec.quantity_units)
         statements = {s.name: s for block in (spec.parameter_block, spec.observable_block) if block for s in block.lines}
         independent = {p.name for p in enumerate_simulation_parameters(prepared)}
         dependencies = {}
@@ -233,7 +259,7 @@ class IntervalChecks:
         context = EvaluationContext(t=np.array([0.0]), species_series={}, species_names=self.species,
                                     initials={k.removeprefix("initial:"): v for k, v in values.items() if k.startswith("initial:")},
                                     symtab=SymbolTable(),
-                                    symbol_values={k.removeprefix("parameter:"): v for k, v in values.items() if k.startswith("parameter:")})
+                                    symbol_values={k.removeprefix("parameter:"): convert_value(v, self.input_units[k.removeprefix("parameter:")], self.quantity_units[k.removeprefix("parameter:")]) for k, v in values.items() if k.startswith("parameter:")})
         _, scalars = evaluate_block(block, context)
         for condition in conditions:
             value = scalars[condition.observable]

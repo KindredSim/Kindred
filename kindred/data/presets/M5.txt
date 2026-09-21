@@ -9,8 +9,9 @@ preset_set1 = {
 
 # Parameter numbers follow the order of the reaction lines.
 # The first step has kf1 and kr1. The second has k2.
+param concentration_floor = 1e-30; unit = M
 let net_rate_AB = kf1*[A] - kr1*[B]
 let rate_C = k2*[B]
 
 # [A]_0 refers to the initial concentration of A.
-let yield_C = [C] / max([A]_0, 1e-30)
+let yield_C = [C] / max([A]_0, concentration_floor)

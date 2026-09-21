@@ -4,6 +4,9 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from decimal import Decimal, InvalidOperation
 import math
+from fractions import Fraction
+from kindred.core.quantity_units import Unit, ONE_SCALE, DIMENSIONLESS, MOLAR, SECOND, conversion_scale, scientific_unit
+from kindred.core.algebra.unit_preparation import UnitOperation, operation_units
 from types import MappingProxyType
 from typing import Any, Mapping, Sequence
 
@@ -41,6 +44,9 @@ class SymbolicCalculatorUnavailable(SymbolicCalculatorError):
     """The accepted mechanism is outside the supported symbolic system."""
 
 
+Quantity = Unit | tuple["Quantity", ...] | None
+
+
 @dataclass(frozen=True, slots=True)
 class _Value:
     """Finished current mathematics; construction and metadata changes are passive."""
@@ -48,6 +54,7 @@ class _Value:
     conditions: tuple[Any, ...] = ()
     notices: tuple[str, ...] = ()
     provenance: tuple[str, ...] = ()
+    quantity: Quantity = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -69,6 +76,32 @@ class _UnavailableDiagnostic:
 @dataclass(frozen=True, slots=True)
 class _Alternatives:
     values: tuple[_Value, ...]
+
+
+def _with_quantity(result, quantity):
+    if isinstance(result, _Alternatives):
+        return _Alternatives(tuple(replace(value, quantity=quantity) for value in result.values))
+    return replace(result, quantity=quantity)
+
+
+def _quantity_map(expression, quantity, operation):
+    """Transform scalar quantities without treating equations as scalar values."""
+    sp = require_sympy()
+    if isinstance(expression, sp.Equality):
+        return DIMENSIONLESS if _known_quantity(quantity) else None
+    if isinstance(expression, sp.Tuple):
+        return tuple(_quantity_map(part, quantity[i] if isinstance(quantity, tuple) else None, operation)
+                     for i, part in enumerate(expression))
+    if isinstance(expression, sp.MatrixBase):
+        return tuple(tuple(_quantity_map(expression[i,j], quantity[i][j] if isinstance(quantity, tuple) else None, operation)
+                           for j in range(expression.cols)) for i in range(expression.rows))
+    return operation(quantity)
+
+
+def _quantity_text(quantity):
+    if isinstance(quantity, tuple):
+        return "[" + ", ".join(_quantity_text(item) for item in quantity) + "]"
+    return quantity.symbol if isinstance(quantity, Unit) else "unspecified"
 
 
 def _entries(result):
@@ -298,7 +331,7 @@ def _substitute_value(value, replacements: Mapping[Any, Any], *, replacement_con
             expression = _native_substitute(payload, mapping) if mapping else payload
         if expression == value.expression:
             return value if conditions == value.conditions else replace(value, conditions=conditions)
-        return _admit_native(expression, conditions)
+        return _with_quantity(_admit_native(expression, conditions), value.quantity)
     except _ConditionInapplicable:
         raise
     except (SymbolicCalculatorError, ValueError, TypeError, ArithmeticError, NotImplementedError) as exc:
@@ -379,6 +412,7 @@ class CalculatorContext:
     jacobian: _Value | _Alternatives
     parameter_definitions: Mapping[str, str]
     let_definitions: Mapping[str, str]
+    coordinate_units: Mapping[str, Unit | None]
 
 
 def symbolic_calculator_available(mechanism: Any) -> tuple[bool, str]:
@@ -423,12 +457,15 @@ def build_calculator_context(mechanism: Any, *, mechanism_source: str) -> Calcul
     coordinates = {symbol for name, symbol in symbols.items() if name not in graph and name not in _FIXED_CONSTANTS}
     coordinates.update(symbols[name] for name in independent)
     compiled = compiled_algebra_for_mechanism(mechanism)
-    values = {name: _Value(symbol) for name, symbol in symbols.items() if name not in graph}
+    quantities = dict(spec.quantity_units)
+    quantities.update({name: MOLAR for name in (*names, *(f"initial({n})" for n in names))})
+    values = {name: _Value(symbol, quantity=quantities.get(name)) for name, symbol in symbols.items() if name not in graph}
     context = CalculatorContext(
         mechanism, mechanism_source, namespace, names, MappingProxyType(symbols), MappingProxyType(values),
         frozenset(coordinates), (), _Value(sp.ImmutableMatrix([])),
         MappingProxyType({name: expression_to_source(stmt.expr) for name, stmt in statements.items()}),
         MappingProxyType({stmt.name: expression_to_source(stmt.expr) for stmt in compiled.block.lines} if compiled else {}),
+        MappingProxyType(quantities),
     )
     chemistry = build_calculator_chemistry_relations(mechanism, parameter_spec=spec, symbols=symbols)
     closures = {}
@@ -458,10 +495,11 @@ def build_calculator_context(mechanism: Any, *, mechanism_source: str) -> Calcul
         closures[name] = set(dependencies).union(*(closures[dep] for dep in dependencies))
         def definition():
             if kinds.get(name) in {"mechanism-bound", "derived scalar"}:
-                return _translate_node(context, statements[name].expr)
+                value = _translate_node(context, statements[name].expr)
+                return _with_quantity(value, quantities.get(name)) if name in spec.mechanism_param_names else value
             if name in chemistry:
-                return project(chemistry[name], closures[name])
-            return _Value(symbols[name])
+                return _with_quantity(project(chemistry[name], closures[name]), quantities.get(name))
+            return _Value(symbols[name], quantity=quantities.get(name))
         try:
             values[name] = definition()
         except (SymbolicCalculatorError, AlgebraError, ValueError, TypeError, ArithmeticError, NotImplementedError) as exc:
@@ -478,8 +516,9 @@ def build_calculator_context(mechanism: Any, *, mechanism_source: str) -> Calcul
         expression = expression.xreplace(canonical)
         roots = {name for name in graph if symbols[name] in expression.free_symbols}
         return project(expression, roots.union(*(closures[name] for name in roots)))
-    return replace(context, rhs=tuple(field(x) for x in projection.rhs_expressions),
-                   jacobian=field(sp.ImmutableMatrix(projection.jacobian_expressions)))
+    return replace(context, rhs=tuple(_with_quantity(field(x), MOLAR.divide(SECOND)) for x in projection.rhs_expressions),
+                   jacobian=_with_quantity(field(sp.ImmutableMatrix(projection.jacobian_expressions)),
+                                           tuple(tuple(DIMENSIONLESS.divide(SECOND) for _ in names) for _ in names)))
 
 
 def _canonical_symbol(context: CalculatorContext, name: str) -> Any:
@@ -503,21 +542,31 @@ def _translate_node(context: CalculatorContext, node: Any) -> _Value:
     sp = require_sympy()
     def lower(child):
         return _translate_node(context, child)
+    def operation(name, args):
+        # Source admission already decided every conversion. CAS simplification
+        # must not establish a second interpretation of retained source.
+        return _evaluate_call(context, name, args,
+                              conversion=UnitOperation(node.quantity_unit, (ONE_SCALE,) * len(args), node.unit_scale))
+    def leaf(value):
+        if node.unit_scale == ONE_SCALE:
+            return _with_quantity(value, node.quantity_unit)
+        # Parent argument conversions may be retained on a leaf as well as on
+        # an operator. Keep dependency conditions and normal native admission.
+        return operation("*", (value, _Value(sp.Integer(1), quantity=DIMENSIONLESS)))
     if isinstance(node, NumberNode):
-        return _Value(_exact_number(node))
+        return leaf(_Value(_exact_number(node), quantity=DIMENSIONLESS))
     if isinstance(node, IdentNode):
         name = node.name if node.name in context.values else str(_canonical_symbol(context, node.name))
-        return context.values[name]
+        return leaf(context.values[name])
     if isinstance(node, SpeciesRefNode):
-        return _Value(context.symbols[node.name if node.kind == "now" else f"initial({node.name})"])
+        return leaf(_Value(context.symbols[node.name if node.kind == "now" else f"initial({node.name})"], quantity=MOLAR))
     if isinstance(node, UnaryNode) and node.op in {"+", "-"}:
-        value = lower(node.rhs)
-        return value if node.op == "+" else _evaluate_call(context, "*", (_Value(sp.Integer(-1)), value))
+        return operation("*", (_Value(sp.Integer(1 if node.op == "+" else -1), quantity=DIMENSIONLESS), lower(node.rhs)))
     if isinstance(node, BinaryNode) and node.op in {"+", "-", "*", "/", "^", "**"}:
-        return _evaluate_call(context, node.op, (lower(node.lhs), lower(node.rhs)))
+        return operation(node.op, (lower(node.lhs), lower(node.rhs)))
     if isinstance(node, CallNode):
         if node.name in _FUNCTIONS:
-            return _evaluate_call(context, node.name, [lower(child) for child in node.args])
+            return operation(node.name, tuple(lower(child) for child in node.args))
     raise SymbolicCalculatorError(
         f"Unsupported: admitted {type(node).__name__}; dynamic conditions and logical expressions are not Calculator mathematics."
     )
@@ -562,6 +611,8 @@ def _coordinate(context: CalculatorContext, symbol: Any, operation: str) -> Any:
 
 def _integer(value: _Value, operation: str, *, minimum=0) -> int:
     expression = _scalar(value, operation)
+    if isinstance(value.quantity, Unit) and value.quantity.compatible(DIMENSIONLESS):
+        expression *= conversion_scale(value.quantity, DIMENSIONLESS).symbolic()
     if expression.is_Integer is not True or expression < minimum:
         raise SymbolicCalculatorError(f"Invalid input: {operation} requires an integer >= {minimum}.")
     return int(expression)
@@ -634,17 +685,164 @@ def _kinetic_derivative(context, value):
     return _Alternatives(tuple(answers)) if family else answers[0]
 
 
-def _equations(left: Any, right: Any) -> Any:
+def _scalar_operation(name, args, *, conversion=None):
+    """Consume source preparation, or prepare a new query's scalar operation."""
+    if conversion is None:
+        exponent = None
+        if name in {"^", "**", "pow"} and len(args) == 2 and args[1].expression.is_Rational:
+            exponent = Fraction(int(args[1].expression.p), int(args[1].expression.q))
+        conversion = operation_units("ln" if name == "log" else name,
+            tuple(arg.quantity if isinstance(arg.quantity, Unit) else None for arg in args),
+            zeros=tuple(arg.expression == 0 and isinstance(arg.quantity, Unit) for arg in args), exponent=exponent)
+    working = tuple(replace(arg, expression=arg.expression * factor.symbolic())
+                    for arg, factor in zip(args, conversion.arguments))
+    expression = (_native_arithmetic(working[0], name, working[1])
+                  if name in {"+", "-", "*", "/", "^", "**"} else _math_call(name, working))
+    return expression * conversion.result.symbolic(), conversion.unit
+
+
+def _matrix_cell(value, i, j):
+    unit = value.quantity[i][j] if isinstance(value.quantity, tuple) else None
+    return replace(value, expression=value.expression[i, j], quantity=unit)
+
+
+def _matrix_arithmetic(name, left, right):
+    """Compose matrix entries from scalar operations, before native admission."""
     sp = require_sympy()
-    if isinstance(left, sp.MatrixBase):
-        if right == 0:
-            right = sp.zeros(*left.shape)
-        if not isinstance(right, sp.MatrixBase) or right.shape != left.shape:
+    lm, rm = isinstance(left.expression, sp.MatrixBase), isinstance(right.expression, sp.MatrixBase)
+    if name not in {"+", "-", "*"}:
+        raise SymbolicCalculatorError("Unsupported: matrix arithmetic supports +, - and *.")
+    if name in {"+", "-"}:
+        if not lm or not rm or left.expression.shape != right.expression.shape:
+            raise SymbolicCalculatorError("Invalid input: incompatible arithmetic operands.")
+        rows, cols = left.expression.shape
+    elif lm and rm:
+        if left.expression.cols != right.expression.rows:
+            raise SymbolicCalculatorError("Invalid input: incompatible arithmetic operands.")
+        rows, cols = left.expression.rows, right.expression.cols
+    else:
+        rows, cols = (left if lm else right).expression.shape
+    cells = []
+    for i in range(rows):
+        row = []
+        for j in range(cols):
+            if name == "*" and lm and rm:
+                terms = []
+                for k in range(left.expression.cols):
+                    expression, unit = _scalar_operation("*", (_matrix_cell(left, i, k), _matrix_cell(right, k, j)))
+                    terms.append(_Value(expression, quantity=unit))
+                value = terms[0] if terms else _Value(sp.Integer(0), quantity=DIMENSIONLESS)
+                for term in terms[1:]:
+                    expression, unit = _scalar_operation("+", (value, term))
+                    value = _Value(expression, quantity=unit)
+            else:
+                expression, unit = _scalar_operation(name, (_matrix_cell(left, i, j) if lm else left,
+                                                           _matrix_cell(right, i, j) if rm else right))
+                value = _Value(expression, quantity=unit)
+            row.append(value)
+        cells.append(row)
+    return sp.ImmutableMatrix(rows, cols, [v.expression for row in cells for v in row]), tuple(tuple(v.quantity for v in row) for row in cells)
+
+
+def _determinant(value):
+    """Factor row/column dimensions; use native determinant on aligned entries."""
+    matrix = value.expression
+    n = matrix.rows
+    if not n:
+        return matrix.det(), DIMENSIONLESS
+    rows, columns = [None]*n, [None]*n
+    cells = {(i, j): _matrix_cell(value, i, j) for i in range(n) for j in range(n)
+             if matrix[i, j] != 0 or _matrix_cell(value, i, j).quantity is None}
+    if any(not isinstance(cell.quantity, Unit) for cell in cells.values()):
+        return matrix.det(), None
+    for start in range(n):
+        if rows[start] is not None:
+            continue
+        rows[start] = DIMENSIONLESS
+        pending = True
+        while pending:
+            pending = False
+            for (i, j), cell in cells.items():
+                if rows[i] is not None and columns[j] is None:
+                    columns[j] = cell.quantity.divide(rows[i])
+                    pending = True
+                elif columns[j] is not None and rows[i] is None:
+                    rows[i] = cell.quantity.divide(columns[j])
+                    pending = True
+                elif rows[i] is not None and columns[j] is not None and not cell.quantity.compatible(rows[i].multiply(columns[j])):
+                    return matrix.det(), None
+    if any(unit is None for unit in columns):
+        return matrix.det(), None
+    aligned = matrix.as_mutable()
+    for (i, j), cell in cells.items():
+        aligned[i, j] *= conversion_scale(cell.quantity, rows[i].multiply(columns[j])).symbolic()
+    raw = DIMENSIONLESS
+    for unit in (*rows, *columns):
+        raw = raw.multiply(unit)
+    normalized = scientific_unit(raw.dimensions)
+    return aligned.det() * conversion_scale(raw, normalized).symbolic(), normalized
+
+
+def _equations(left: _Value, right: _Value):
+    sp = require_sympy()
+    if isinstance(left.expression, sp.MatrixBase):
+        matrix = left.expression
+        if right.expression == 0:
+            right = replace(right, expression=sp.zeros(*matrix.shape),
+                            quantity=tuple(tuple(right.quantity for _ in range(matrix.cols)) for _ in range(matrix.rows)))
+        if not isinstance(right.expression, sp.MatrixBase) or right.expression.shape != matrix.shape:
             raise SymbolicCalculatorError("Invalid input: equation matrix shapes must agree.")
-        return sp.Tuple(*(sp.Eq(a, b, evaluate=False) for a, b in zip(left, right, strict=True)))
-    if not isinstance(left, sp.Expr) or not isinstance(right, sp.Expr):
+        entries = [_equations(_matrix_cell(left, i, j), _matrix_cell(right, i, j))
+                   for i in range(matrix.rows) for j in range(matrix.cols)]
+        return sp.Tuple(*(expr for expr, _unit in entries)), tuple(unit for _expr, unit in entries)
+    if not isinstance(left.expression, sp.Expr) or not isinstance(right.expression, sp.Expr):
         raise SymbolicCalculatorError("Invalid input: eq requires scalar expressions or matching matrices.")
-    return sp.Eq(left, right, evaluate=False)
+    conversion = operation_units("==", (left.quantity, right.quantity),
+        zeros=tuple(v.expression == 0 and isinstance(v.quantity, Unit) for v in (left, right)))
+    lhs, rhs = (v.expression * factor.symbolic() for v, factor in zip((left, right), conversion.arguments))
+    return sp.Eq(lhs, rhs, evaluate=False), conversion.unit
+
+
+def _known_quantity(quantity):
+    return all(_known_quantity(part) for part in quantity) if isinstance(quantity, tuple) else isinstance(quantity, Unit)
+
+
+def _coordinate_argument(context, coordinate, value):
+    """Interpret a number or convert a finished quantity at a coordinate boundary."""
+    target = context.coordinate_units.get(str(coordinate))
+    source = value.quantity
+    if target is not None and isinstance(source, Unit):
+        if source.compatible(DIMENSIONLESS) and value.expression.is_number:
+            return value.expression * conversion_scale(source, DIMENSIONLESS).symbolic(), True
+        if source.compatible(target):
+            return value.expression * conversion_scale(source, target).symbolic(), True
+    return value.expression, False
+
+
+def _substitution_quantity(expression, quantity, unknown):
+    """Only affected result entries lose meaning; finished CAS is never re-inferred."""
+    sp = require_sympy()
+    if isinstance(expression, _Relationships):
+        parts = tuple(expression.replacements.values())
+    elif isinstance(expression, sp.MatrixBase):
+        return tuple(tuple(_substitution_quantity(expression[i,j], quantity[i][j] if isinstance(quantity, tuple) else None, unknown)
+                           for j in range(expression.cols)) for i in range(expression.rows))
+    elif isinstance(expression, sp.Tuple):
+        parts = tuple(expression)
+    else:
+        return None if isinstance(expression, sp.Basic) and expression.free_symbols.intersection(unknown) else quantity
+    return tuple(_substitution_quantity(part, quantity[i] if isinstance(quantity, tuple) else None, unknown) for i, part in enumerate(parts))
+
+
+def _substitute_coordinates(context, source, targets, replacements, units, *, conditions):
+    converted, unknown = {}, set()
+    for target, expression, unit in zip(targets, replacements, units, strict=True):
+        expression, known = _coordinate_argument(context, target, _Value(expression, quantity=unit))
+        converted[target] = expression
+        if not known:
+            unknown.add(target)
+    source = replace(source, quantity=_substitution_quantity(source.expression, source.quantity, unknown))
+    return _substitute_value(source, converted, replacement_conditions=conditions)
 
 
 def _solution_set(equations, conditions, variables):
@@ -656,6 +854,7 @@ def _solution_set(equations, conditions, variables):
 def _solve(context: CalculatorContext, problem: _Value, coordinates: _Value, conditions):
     """Own this invocation's native solving, candidate admission and current remainder."""
     applicable = conditions
+    coherent = _known_quantity(problem.quantity)
     try:
         sp = require_sympy()
         from sympy.solvers.solveset import NonlinearError
@@ -760,7 +959,8 @@ def _solve(context: CalculatorContext, problem: _Value, coordinates: _Value, con
             elif not isinstance(payload, _UnavailableDiagnostic):
                 payload = _Relationships({key: canonical(rhs)
                                           for key, rhs in zip(labels, payload, strict=True)})
-            published.append(replace(item, expression=payload,
+            quantity = tuple(context.coordinate_units.get(str(label)) if coherent else None for label in labels) if isinstance(payload, _Relationships) else None
+            published.append(replace(item, expression=payload, quantity=quantity,
                                      conditions=tuple(canonical(c, equations=False) for c in item.conditions)))
         return _Alternatives(tuple(published))
     except _ConditionInapplicable:
@@ -769,7 +969,7 @@ def _solve(context: CalculatorContext, problem: _Value, coordinates: _Value, con
         return _Value(_UnavailableDiagnostic(f"Operation is unavailable: {exc}"), applicable)
 
 
-def _evaluate_call(context: CalculatorContext, name: str, args: Sequence[_Value | _Alternatives], *, direction=None):
+def _evaluate_call(context: CalculatorContext, name: str, args: Sequence[_Value | _Alternatives], *, direction=None, conversion=None):
     """Own complete operand admission, family lifting and command metadata."""
     args = tuple(args)
     selection = name == "solution" and len(args) == 2
@@ -792,7 +992,7 @@ def _evaluate_call(context: CalculatorContext, name: str, args: Sequence[_Value 
             if selection:
                 result = _select(args[0], values[0])
             else:
-                result = _dispatch_call(context, name, values, direction=direction)
+                result = _dispatch_call(context, name, values, direction=direction, conversion=conversion)
             family |= isinstance(result, _Alternatives)
         except _ConditionInapplicable as exc:
             if any(isinstance(v, _Alternatives) for v in operands):
@@ -842,7 +1042,7 @@ def _shape(value):
     return value.expression.problem if isinstance(value.expression, _UnresolvedProblem) else value.expression
 
 
-def _dispatch_call(context: CalculatorContext, name: str, args: Sequence[_Value], *, direction=None):
+def _dispatch_call(context: CalculatorContext, name: str, args: Sequence[_Value], *, direction=None, conversion=None):
     """Execute one branch; each operation owns its applicability and failures."""
     conditions = tuple(dict.fromkeys(c for value in args for c in value.conditions))
     try:
@@ -860,15 +1060,18 @@ def _dispatch_call(context: CalculatorContext, name: str, args: Sequence[_Value]
                     if relationships.conditions:
                         provenance += ("Original applicability (provenance, not current conditions): "
                                        + "; ".join(_render(c) for c in relationships.conditions),)
-                    result = _substitute_value(source, relationships.expression.replacements, replacement_conditions=relationships.conditions)
+                    mapping = relationships.expression.replacements
+                    units = relationships.quantity if isinstance(relationships.quantity, tuple) else (None,) * len(mapping)
+                    result = _substitute_coordinates(context, source, tuple(mapping), tuple(mapping.values()), units, conditions=relationships.conditions)
                     entries = tuple(replace(v, provenance=(*v.provenance, *provenance)) for v in _entries(result))
                     return _Alternatives(entries) if isinstance(result, _Alternatives) else entries[0]
                 targets = args[1].expression if isinstance(args[1].expression, sp.Tuple) else (args[1].expression,)
                 values = args[2].expression if isinstance(args[2].expression, sp.Tuple) else (args[2].expression,)
                 if len(targets) != len(values) or len(set(targets)) != len(targets):
                     raise SymbolicCalculatorError("Invalid input: substitution rosters must match and targets must be unique.")
-                replacements = {_coordinate(context, target, name): replacement for target, replacement in zip(targets, values, strict=True)}
-                return _substitute_value(args[0], replacements, replacement_conditions=(*args[1].conditions, *args[2].conditions))
+                targets = tuple(_coordinate(context, target, name) for target in targets)
+                units = args[2].quantity if isinstance(args[2].expression, sp.Tuple) and isinstance(args[2].quantity, tuple) else (args[2].quantity,) * len(values)
+                return _substitute_coordinates(context, args[0], targets, values, units, conditions=(*args[1].conditions, *args[2].conditions))
         conditions = _conditions(args[0].conditions, additional=(c for v in args[1:] for c in v.conditions)) if args else ()
         unresolved = _unusable(args)
         if unresolved is not None and (isinstance(unresolved.expression, _UnavailableDiagnostic)
@@ -884,12 +1087,15 @@ def _dispatch_call(context: CalculatorContext, name: str, args: Sequence[_Value]
             count(*((1, 2) if name == "dt" else (2, 3)))
             variable = None if name == "dt" else _coordinate(context, args[1].expression, name)
             order = _integer(args[-1], name) if len(args) == (2 if name == "dt" else 3) else 1
-            return _differentiate(context, args[0] if conditions == args[0].conditions else replace(args[0], conditions=conditions), variable, order)
+            coordinate = SECOND if variable is None else context.coordinate_units.get(str(variable))
+            quantity = _quantity_map(args[0].expression, args[0].quantity, lambda unit: unit.divide(coordinate.power(Fraction(order)))
+                                     if isinstance(unit, Unit) and coordinate is not None else None)
+            return _with_quantity(_differentiate(context, args[0] if conditions == args[0].conditions else replace(args[0], conditions=conditions), variable, order), quantity)
         if name == "approx":
             count(1, 2)
             digits = _integer(args[1], name, minimum=1) if len(args) == 2 else 15
             expression = _map(args[0].expression, lambda x: _native_substitute(x, _fixed_constant_values()).evalf(digits))
-            return _admit_native(expression, conditions, notices=(f"Approximation: {digits} significant decimal digits.",))
+            return _with_quantity(_admit_native(expression, conditions, notices=(f"Approximation: {digits} significant decimal digits.",)), args[0].quantity)
         if name in {"steady_state", "stationary_state"}:
             if name == "steady_state":
                 if not args:
@@ -914,7 +1120,11 @@ def _dispatch_call(context: CalculatorContext, name: str, args: Sequence[_Value]
                     equations += tuple(extra) if isinstance(extra, sp.Tuple) else (extra,)
                 if failure is not None:
                     return _Value(_UnresolvedProblem(sp.Tuple(*equations), failure.expression.explanation), applicable)
-                return _solve(context, _Value(sp.Tuple(*equations), applicable), _Value(sp.Tuple(*selected)), applicable)
+                meanings = tuple(DIMENSIONLESS if _known_quantity(rate.quantity) else None for rate in rates)
+                if extra_args:
+                    extra_units = extra_args[0].quantity
+                    meanings += extra_units if isinstance(extra_units, tuple) else (extra_units,)
+                return _solve(context, _Value(sp.Tuple(*equations), applicable, quantity=meanings), _Value(sp.Tuple(*selected)), applicable)
             rates = tuple(context.rhs[context.species_names.index(str(x))] for x in selected)
             answers = []
             for branch in _branches(rates):
@@ -933,21 +1143,32 @@ def _dispatch_call(context: CalculatorContext, name: str, args: Sequence[_Value]
                 unavailable = _unusable(rates)
                 expression = sp.ImmutableMatrix([_shape(rate) for rate in rates]) if unavailable is None or isinstance(unavailable.expression, _UnresolvedProblem) else None
                 answers.append(replace(unavailable, conditions=applicable) if expression is None else
-                               _Value(_UnresolvedProblem(expression, unavailable.expression.explanation) if unavailable else expression, applicable))
+                               _Value(_UnresolvedProblem(expression, unavailable.expression.explanation) if unavailable else expression, applicable,
+                                      quantity=tuple((rate.quantity,) for rate in rates)))
             return _Alternatives(tuple(answers)) if any(isinstance(rate, _Alternatives) for rate in context.rhs) else answers[0]
+        quantity = None
         def native():
+            nonlocal quantity
             if name in {"+", "-", "*", "/", "^", "**"}:
-                return _native_arithmetic(args[0], name, args[1])
+                if any(isinstance(arg.expression, sp.MatrixBase) for arg in args):
+                    expression, quantity = _matrix_arithmetic(name, *args)
+                else:
+                    expression, quantity = _scalar_operation(name, args, conversion=conversion)
+                return expression
             if name in {"pi", "e", "infinity"}:
                 count(0)
+                quantity = DIMENSIONLESS
                 return {"pi": sp.pi, "e": sp.E, "infinity": sp.oo}[name]
             if name in _FUNCTIONS:
-                return _math_call(name, args)
+                expression, quantity = _scalar_operation(name, args, conversion=conversion)
+                return expression
             if name in _TRANSFORMS:
                 count(1)
+                quantity = args[0].quantity
                 return _map(args[0].expression, getattr(sp, name))
             if name == "collect":
                 count(2)
+                quantity = args[0].quantity
                 variable = _coordinate(context, args[1].expression, name)
                 return _map(args[0].expression, lambda x: sp.collect(x, variable))
             if name == "initial":
@@ -955,8 +1176,10 @@ def _dispatch_call(context: CalculatorContext, name: str, args: Sequence[_Value]
                 species = str(args[0].expression)
                 if species not in context.species_names:
                     raise SymbolicCalculatorError("Invalid input: initial requires a species name.")
+                quantity = MOLAR
                 return context.symbols[f"initial({species})"]
             if name == "tuple":
+                quantity = tuple(arg.quantity for arg in args)
                 return sp.Tuple(*(_shape(item) for item in args))
             if name == "matrix":
                 count(1)
@@ -967,18 +1190,25 @@ def _dispatch_call(context: CalculatorContext, name: str, args: Sequence[_Value]
                     raise SymbolicCalculatorError("Invalid input: matrix requires nonempty rows, e.g. matrix([[1,2],[3,4]]).")
                 if len({len(row) for row in rows}) != 1 or any(not isinstance(x, sp.Expr) for row in rows for x in row):
                     raise SymbolicCalculatorError("Invalid input: matrix rows require equally many scalar entries.")
+                quantity = tuple(row if isinstance(row, tuple) else (row,) for row in args[0].quantity) if isinstance(args[0].quantity, tuple) else None
                 return sp.ImmutableMatrix(rows)
             if name == "eq":
                 count(2)
-                return _equations(_shape(args[0]), _shape(args[1]))
+                expression, quantity = _equations(*args)
+                return expression
             if name == "at":
                 count(2, 3)
                 expression = args[0].expression
                 indices = tuple(_integer(arg, name) for arg in args[1:])
                 try:
                     if len(indices) == 2 and isinstance(expression, sp.MatrixBase):
+                        quantity = _matrix_cell(args[0], *indices).quantity
                         return expression[indices]
                     if len(indices) == 1 and isinstance(expression, (sp.Tuple, sp.MatrixBase)):
+                        units = args[0].quantity
+                        if isinstance(units, tuple):
+                            units = tuple(cell for row in units for cell in row) if isinstance(expression, sp.MatrixBase) else units
+                            quantity = units[indices[0]]
                         return expression[indices[0]]
                     raise TypeError("unsupported indexed object")
                 except (IndexError, TypeError) as exc:
@@ -990,9 +1220,14 @@ def _dispatch_call(context: CalculatorContext, name: str, args: Sequence[_Value]
                     raise SymbolicCalculatorError(f"Invalid input: {name} requires a matrix.")
                 if name == "det" and matrix.rows != matrix.cols:
                     raise SymbolicCalculatorError("Invalid input: det requires a square matrix.")
-                return matrix.T if name == "transpose" else matrix.det()
+                if name == "transpose":
+                    quantity = tuple(zip(*args[0].quantity)) if isinstance(args[0].quantity, tuple) else None
+                    return matrix.T
+                expression, quantity = _determinant(args[0])
+                return expression
             if name == "remove_order":
                 count(1)
+                quantity = args[0].quantity
                 def remove(x):
                     result = x.removeO()
                     if result.has(sp.Order):
@@ -1010,10 +1245,10 @@ def _dispatch_call(context: CalculatorContext, name: str, args: Sequence[_Value]
         if unresolved is not None:
             return _Value(_UnresolvedProblem(expression, unresolved.expression.explanation), conditions)
         if args and expression == args[0].expression:
-            return args[0] if conditions == args[0].conditions and not notices else replace(args[0], conditions=conditions, notices=(*args[0].notices, *notices))
+            return replace(args[0], quantity=quantity, conditions=conditions, notices=(*args[0].notices, *notices))
         if structural or name in {"at", "transpose", "initial"}:
-            return _Value(expression, conditions, notices)
-        return _admit_native(expression, conditions, notices=notices)
+            return _Value(expression, conditions, notices, quantity=quantity)
+        return _with_quantity(_admit_native(expression, conditions, notices=notices), quantity)
     except _ConditionInapplicable:
         raise
     except (SymbolicCalculatorError, AlgebraError, ValueError, TypeError, ArithmeticError, NotImplementedError) as exc:
@@ -1059,6 +1294,17 @@ def _calculus_call(context: CalculatorContext, name: str, args: Sequence[_Value]
         sp = require_sympy()
         expression = _scalar(args[0], name)
         variable = _coordinate(context, args[1].expression, name)
+        coordinate_unit = context.coordinate_units.get(str(variable))
+        quantity = args[0].quantity
+        if name == "integrate":
+            quantity = quantity.multiply(coordinate_unit) if isinstance(quantity, Unit) and coordinate_unit is not None else None
+        args = list(args)
+        positions = range(2, 4) if name == "integrate" and len(args) == 4 else (2,) if name in {"limit", "series"} else ()
+        for index in positions:
+            point, known = _coordinate_argument(context, variable, args[index])
+            args[index] = replace(args[index], expression=point)
+            if not known:
+                quantity = None
         companion = tuple(c for arg in args[1:] for c in arg.conditions)
         dependent = tuple(c for c in conditions if c in args[0].conditions and variable in c.free_symbols)
         independent = tuple(c for c in conditions if c not in dependent or c in companion)
@@ -1118,7 +1364,7 @@ def _calculus_call(context: CalculatorContext, name: str, args: Sequence[_Value]
                 return _UnresolvedProblem(body, "The native conditional fallback remains unresolved.")
             return body
 
-        return _admit_native(result, independent, notices=notices, classify=classify)
+        return _with_quantity(_admit_native(result, independent, notices=notices, classify=classify), quantity)
     except _ConditionInapplicable:
         raise
     except (SymbolicCalculatorError, ValueError, TypeError, ArithmeticError, NotImplementedError) as exc:
@@ -1224,7 +1470,7 @@ class _CalculatorExpressionParser:
         if self.at("+") or self.at("-"):
             operator = self.take()
             value = self.unary()
-            return value if operator == "+" else _evaluate_call(self.context, "*", (_Value(require_sympy().Integer(-1)), value))
+            return value if operator == "+" else _evaluate_call(self.context, "*", (_Value(require_sympy().Integer(-1), quantity=DIMENSIONLESS), value))
         value = self.primary()
         if self.at("^"):
             self.take()
@@ -1284,7 +1530,7 @@ class _CalculatorExpressionParser:
     def primary(self):
         sp = require_sympy()
         if self.at("NUMBER"):
-            return _Value(sp.Rational(self.take().replace("_", "")))
+            return _Value(sp.Rational(self.take().replace("_", "")), quantity=DIMENSIONLESS)
         if self.at("("):
             self.take()
             value = self.additive()
@@ -1299,7 +1545,7 @@ class _CalculatorExpressionParser:
                 if self.at("IDENT") and self.tokens[self.index].text == "_0":
                     self.take()
                     name = f"initial({name})"
-                return _Value(self.context.symbols[name])
+                return _Value(self.context.symbols[name], quantity=MOLAR)
             values = []
             if not self.at("]"):
                 values.append(self.additive())
@@ -1595,7 +1841,9 @@ def _package_result(context: CalculatorContext, query: str, result) -> SymbolicC
                    (heading + "\n" if heading else "") + _pretty_render(payload))
             reusable = f"solution({expression}, {index})" if family else query
             choices.append((f"Solution {index}: {label}" if family else "Result", reusable))
-            if family or isinstance(payload, _Relationships) or value.conditions or value.notices or value.provenance or not _printed_input_supported(context, payload, label):
+            if value.quantity is not None:
+                append("Units: " + _quantity_text(value.quantity))
+            if value.quantity is not None or family or isinstance(payload, _Relationships) or value.conditions or value.notices or value.provenance or not _printed_input_supported(context, payload, label):
                 append("Reuse query: " + reusable)
         if value.conditions:
             append("Conditions: " + "; ".join(_render(c) for c in value.conditions),
@@ -1625,12 +1873,12 @@ def _package_result(context: CalculatorContext, query: str, result) -> SymbolicC
         "Ordinary algebra and formal calculus use native CAS semantics, without historical operand domains. A simplified result does not certify the original expression's domain or a parameterized integral's regularity.",
         "Actual answer conditions, unavailable cases and unresolved alternatives are retained. Active-condition definite integrals require coordinate-free bounds and no other condition parameters; active-condition limits remain unsupported. Series retain direction and order, not inferred neighborhood conditions.",
     )
-    metadata = MechanismMetadataView.from_metadata(context.mechanism.metadata)
     return SymbolicCalculatorResult(
         query, result_text, copy_text, assumptions,
         {"Species": context.species_names, "Parameters": tuple(sorted(context.parameter_namespace.canonical_names | context.parameter_definitions.keys())),
          "Fixed constants": _FIXED_CONSTANTS, "Time and temperature": ("t [s]", "T [K]"),
-         "Energy coordinates": (f"Ea, dG_act, dG_eq in authored {metadata.energy_unit}; chemistry lowers to J/mol once",),
+         "Energy coordinates": ("Ea, dG_act, dG_eq in J/mol",),
+         "Coordinate units": tuple(f"{name} [{unit.symbol}]" for name, unit in dict(parameter_algebra_spec_from_mechanism(context.mechanism).quantity_units).items() if unit is not None and name in context.symbols),
          "Initial coordinates": tuple(f"initial({name})" for name in context.species_names)},
         context.mechanism_source,
         context.parameter_definitions, context.let_definitions,

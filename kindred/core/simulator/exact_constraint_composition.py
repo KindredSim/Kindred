@@ -15,7 +15,9 @@ from kindred.core.algebra.parser import (
     UnaryNode,
     _iter_identifiers,
 )
-from kindred.core.constants import N_A, R, Rkcal, h, h_bar, k_B
+from kindred.core.quantity_units import Unit
+from kindred.core._bounded_rational import ExactWorkLimit, literal_fraction, rational_binary
+from kindred.core.constants import N_A, R, h, h_bar, k_B
 from kindred.core.equilibrium_rate_authority import equilibrium_rate_symbolic_relations
 from kindred.core.kinetics import forward_rate_symbolic_relation
 from kindred.core.simulator.step_indexing import (
@@ -37,7 +39,6 @@ _EXACT_CONSTANTS = {
     "h_bar": Fraction(str(h_bar)),
     "N_A": Fraction(str(N_A)),
     "R": Fraction(str(R)),
-    "Rkcal": Fraction(str(Rkcal)),
 }
 
 
@@ -238,7 +239,7 @@ class ExactMonomial:
         if root is None:
             return None
         try:
-            coefficient = root ** numerator
+            coefficient = rational_binary("^", root, Fraction(numerator))
         except (OverflowError, ZeroDivisionError, ValueError):
             return None
         return ExactMonomial(
@@ -253,6 +254,8 @@ def _exact_integer_root(value: int, degree: int) -> int | None:
         return None
     if value in {0, 1} or degree == 1:
         return value
+    if degree > value.bit_length():
+        return None
     low, high = 0, 1 << ((value.bit_length() + degree - 1) // degree + 1)
     while low + 1 < high:
         middle = (low + high) // 2
@@ -283,7 +286,21 @@ def _exact_rational_root(value: Fraction, degree: int) -> Fraction | None:
     return Fraction(numerator, denominator)
 
 
-def _exact_monomial_from_ast(
+def _exact_monomial_from_ast(expr, *, canonical_names):
+    try:
+        value = _unscaled_monomial_from_ast(expr, canonical_names=canonical_names)
+        if value is None:
+            return None
+        scale = expr.unit_scale.rational()
+        if scale is None:
+            return None
+        rational_binary("*", value.coefficient, scale)
+        return value.scale(scale)
+    except ExactWorkLimit:
+        return None
+
+
+def _unscaled_monomial_from_ast(
     expr: object,
     *,
     canonical_names: set[str] | frozenset[str],
@@ -296,8 +313,10 @@ def _exact_monomial_from_ast(
     """
 
     if isinstance(expr, NumberNode):
-        exact = expr.exact_value
-        return None if exact is None else ExactMonomial(exact)
+        try:
+            return ExactMonomial(literal_fraction(expr.literal if expr.literal is not None else str(expr.value)))
+        except ValueError:
+            return None
     if isinstance(expr, IdentNode):
         name = str(expr.name)
         if name in _EXACT_CONSTANTS:
@@ -326,6 +345,8 @@ def _exact_monomial_from_ast(
     right = _exact_monomial_from_ast(expr.rhs, canonical_names=canonical_names)
     if left is None or right is None:
         return None
+    if expr.op in {"+", "-", "*", "/"} and (expr.op != "/" or right.coefficient):
+        rational_binary(expr.op, left.coefficient, right.coefficient)
     if expr.op == "*":
         return left.multiply(right)
     if expr.op == "/":
@@ -368,6 +389,7 @@ class ExactConstraint:
 @dataclass(frozen=True, slots=True)
 class ExactConstraintComposition:
     constraints: tuple[ExactConstraint, ...]
+    coordinate_units: tuple[tuple[str, Unit | None], ...] = ()
 
 
 def _render_monomial(value: ExactMonomial) -> str:
@@ -822,4 +844,4 @@ def compose_exact_constraints(
                 reason=reason,
             )
         )
-    return ExactConstraintComposition(tuple(result))
+    return ExactConstraintComposition(tuple(result), tuple(mechanism.metadata["parameter_algebra_spec"].quantity_units))

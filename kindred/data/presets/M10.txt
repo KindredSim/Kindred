@@ -39,9 +39,10 @@ temp_step: t=[0,5,10,15], T=[298.15,308.15,318.15]
 # Use only one temperature schedule.
 
 # T is the temperature at each point in the result.
+param concentration_floor = 1e-30; unit = M
 let temperature = T
 let rate_constant_ratio = k3 / k2
 let rate_CD = k2 * [C]
 let rate_DE = k3 * [D]
 let total_products = [D] + [E]
-let fraction_E = [E] / max(total_products, 1e-30)
+let fraction_E = [E] / max(total_products, concentration_floor)

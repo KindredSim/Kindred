@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from kindred.core.quantity_units import parse_unit
+
 from dataclasses import dataclass, replace
 import math
 from typing import Iterable
@@ -386,6 +388,12 @@ class TabSliderBinding(QtCore.QObject):
             if tab.prepared_dsl is None
             else build_parameter_slider_projection(tab.prepared_dsl)
         )
+        if self._active_drag and self._active_drag[0] == "parameter":
+            name = self._active_drag[1]
+            old = None if self._projection is None else self._projection.metadata_dict().get(name)
+            new = projection.metadata_dict().get(name)
+            if old is None or new is None or parse_unit(str(old["unit"])) != parse_unit(str(new["unit"])):
+                self._active_drag = None
         parameters = projection.values_dict()
         parameters.update(runtime.slider_parameter_draft)
         if self._active_drag and self._active_drag[0] == "parameter":

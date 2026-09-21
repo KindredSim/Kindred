@@ -40,10 +40,12 @@ from __future__ import annotations
 import logging
 import math
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from collections.abc import Iterable, Mapping
 from fractions import Fraction
 from typing import Dict, List, Literal, Optional, Tuple
+
+from kindred.core.quantity_units import Unit, UnitScale, ONE_SCALE
 
 from .errors import (
     AlgebraSyntaxError,
@@ -120,8 +122,12 @@ def _line_of(src: str, line_no: int) -> str:
 # ------------------------------ AST nodes ------------------------------------
 
 
+@dataclass(frozen=True, kw_only=True)
 class ExprNode:
-    """Base class for AST nodes; used for typing only."""
+    """Authored syntax with immutable preparation facts; printers use syntax only."""
+    quantity_unit: Unit | None = field(default=None, compare=False, repr=False)
+    unit_scale: UnitScale = field(default=ONE_SCALE, compare=False, repr=False)
+    unit_factor: float = field(default=1.0, compare=False, repr=False)
     def is_static(self) -> bool:  # free of species/time refs and user idents
         return False
 
@@ -214,6 +220,7 @@ class LetStatement:
     line: int
     col: int
     line_text: str
+    declared_unit: Unit | None = None
 
 
 def _iter_identifiers(node: ExprNode):

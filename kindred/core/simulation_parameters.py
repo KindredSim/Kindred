@@ -18,17 +18,15 @@ from kindred.core.mechanism_metadata import (
 from kindred.core.simulator.dsl_parse import PreparedDslRequestSet
 from kindred.core.simulator.parameter_algebra import (
     apply_parameter_algebra_spec_to_mechanism,
-    solver_parameter_units_from_mechanism,
 )
 from kindred.core.simulator.parameter_coordinates import build_parameter_target_map
 from kindred.core.simulator.parameter_namespace import build_namespace_from_mechanism
 from kindred.core.simulator.dsl_build_input import source_coordinate_capabilities
 from kindred.core.simulator.step_indexing import get_step_index_map
 from kindred.core.validation import try_parse_callable_finite_float, try_parse_int
-from kindred.core.stoichiometry import directional_order_fraction
+from kindred.core.quantity_units import convert_value
 from kindred.core.units import (
     UnitsModel,
-    rate_constant_unit,
 )
 
 SimulationParameterScientificCategory = Literal["rate", "equilibrium_constant", "finite_scalar"]
@@ -75,10 +73,7 @@ def enumerate_simulation_parameters(
         parsed, ok = try_parse_int(entry.get("step_index"))
         if ok:
             step_by_index[int(parsed)] = entry
-    units = solver_parameter_units_from_mechanism(
-        mechanism,
-        parameter_target_map=parameter_target_map,
-    )
+    units = {name: unit.symbol for name, unit in parameter_spec.input_units}
     parameter_assignment_names = parameter_spec.param_assignment_names()
 
     def assignment_kind(name: str) -> str | None:
@@ -204,7 +199,7 @@ def enumerate_simulation_parameters(
                 derived=False,
                 scientific_category=scientific_category,
                 allow_exact_zero=allow_exact_zero,
-                unit=str(units.get(name, "1")),
+                unit=units[name],
             )
         )
 
@@ -224,7 +219,6 @@ def enumerate_simulation_parameters(
         if not source_coordinates:
             continue
         model: ForwardRateModel | None = None
-        order = 1.0
         authority = None
         if kind == "reaction":
             raw_index, ok = try_parse_int(entry.get("reaction_index", -1))
@@ -232,11 +226,6 @@ def enumerate_simulation_parameters(
                 continue
             reaction = reactions[int(raw_index)]
             model = reaction.forward_model
-            order = float(
-                directional_order_fraction(
-                    getattr(reaction, "rate_orders", {}) or {},
-                )
-            )
         elif kind == "equilibrium":
             raw_index, ok = try_parse_int(entry.get("equilibrium_index", -1))
             if not ok or not (0 <= raw_index < len(equilibria)):
@@ -244,11 +233,6 @@ def enumerate_simulation_parameters(
             equilibrium = equilibria[int(raw_index)]
             authority = normalize_existing_equilibrium_rate_authority(equilibrium)
             model = equilibrium.forward_model
-            order = float(
-                directional_order_fraction(
-                    getattr(equilibrium, "stoich_forward", {}) or {},
-                )
-            )
         if model is None:
             continue
         editable = not bool(entry.get("locked", False))
@@ -262,7 +246,7 @@ def enumerate_simulation_parameters(
                         role,
                         float(model.A),
                         editable,
-                        rate_constant_unit(order),
+                        units[name],
                     )
                 )
             elif role == "Ea" and isinstance(model, ArrheniusRateModel):
@@ -343,6 +327,8 @@ def enumerate_simulation_parameters(
         item[0] for item in physical_candidates
     }
     scalar_params = dict(metadata.get("scalar_params") or {})
+    input_units = dict(parameter_spec.input_units)
+    scientific_units = dict(parameter_spec.quantity_units)
     for raw_name, raw_value in scalar_params.items():
         name = str(raw_name)
         value = _finite(raw_value)
@@ -356,14 +342,14 @@ def enumerate_simulation_parameters(
         coordinates.append(
             SimulationParameter(
                 name=name,
-                value=value,
+                value=convert_value(value, scientific_units[name], input_units[name]),
                 family="scalar",
                 role="scalar",
                 writable=True,
                 derived=False,
                 scientific_category="finite_scalar",
                 allow_exact_zero=True,
-                unit=str(units.get(name, "1")),
+                unit=units[name],
             )
         )
     return tuple(coordinates)

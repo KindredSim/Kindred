@@ -19,7 +19,6 @@ __all__ = [
     "h_bar",
     "N_A",
     "R",
-    "Rkcal",
 ]
 
 # Boltzmann constant [J/K]
@@ -37,5 +36,3 @@ N_A: float = 6.022_140_76e23
 # Gas constant [J/(mol·K)]
 R: float = 8.314_462_618_153_24
 
-# Gas constant [kcal/(mol·K)]
-Rkcal: float = 1.987_204_258_640_83e-3

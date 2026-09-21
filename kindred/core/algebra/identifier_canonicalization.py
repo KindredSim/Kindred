@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Dict, Mapping
 
 from kindred.core.algebra.parser import (
@@ -50,7 +50,7 @@ def canonicalize_mechanism_identifiers(
         resolution = mechanism_namespace.resolve(expr.name)
         if resolution.canonical_name is not None:
             return CanonicalizedExpression(
-                expr=IdentNode(str(resolution.canonical_name)),
+                expr=replace(expr, name=str(resolution.canonical_name)),
                 raw_to_canonical_identifiers={str(expr.name): str(resolution.canonical_name)},
             )
         invalid_message = mechanism_namespace.invalid_protected_indexed_identifier_message(expr.name)
@@ -60,14 +60,14 @@ def canonicalize_mechanism_identifiers(
     if isinstance(expr, UnaryNode):
         rhs = canonicalize_mechanism_identifiers(expr.rhs, mechanism_namespace=mechanism_namespace)
         return CanonicalizedExpression(
-            expr=UnaryNode(op=expr.op, rhs=rhs.expr),
+            expr=replace(expr, rhs=rhs.expr),
             raw_to_canonical_identifiers=dict(rhs.raw_to_canonical_identifiers),
         )
     if isinstance(expr, BinaryNode):
         lhs = canonicalize_mechanism_identifiers(expr.lhs, mechanism_namespace=mechanism_namespace)
         rhs = canonicalize_mechanism_identifiers(expr.rhs, mechanism_namespace=mechanism_namespace)
         return CanonicalizedExpression(
-            expr=BinaryNode(op=expr.op, lhs=lhs.expr, rhs=rhs.expr),
+            expr=replace(expr, lhs=lhs.expr, rhs=rhs.expr),
             raw_to_canonical_identifiers=_merge_identifier_maps(
                 lhs.raw_to_canonical_identifiers,
                 rhs.raw_to_canonical_identifiers,
@@ -81,7 +81,7 @@ def canonicalize_mechanism_identifiers(
             args.append(canonical_arg.expr)
             raw_map = _merge_identifier_maps(raw_map, canonical_arg.raw_to_canonical_identifiers)
         return CanonicalizedExpression(
-            expr=CallNode(name=expr.name, args=tuple(args)),
+            expr=replace(expr, args=tuple(args)),
             raw_to_canonical_identifiers=raw_map,
         )
     return CanonicalizedExpression(expr=expr, raw_to_canonical_identifiers={})
@@ -102,6 +102,7 @@ def canonicalize_algebra_block(
                 line=stmt.line,
                 col=stmt.col,
                 line_text=stmt.line_text,
+                declared_unit=stmt.declared_unit,
             )
         )
     return AlgebraBlock(

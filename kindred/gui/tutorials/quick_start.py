@@ -110,16 +110,11 @@ class QuickStart(PracticeLesson):
             Step(
                 "solver_points",
                 "Solver and Output Points",
-                "<p><b>Solver</b> selects the numerical method used to calculate the simulation. "
-                "The default in Kindred is <b>BDF</b>. <b>Radau</b> is particularly suited to strongly stiff systems "
-                "and can offer better robustness, potentially at higher computational cost. Consider switching to Radau "
-                "for mechanisms with fast and slow processes occurring together, such as rapid equilibration alongside "
-                "much slower reactions. Very different rate constants can indicate this, but their units, reaction orders, "
-                "and the species concentrations also matter. There is no universal rate-constant cutoff for stiffness. "
-                "For more details on stiff problems and numerical solvers, see <b>(Reference to be added soon)</b>.</p>"
+                "<p>Choose <b>BDF</b> or <b>Radau</b> from <b>Solver</b>. Either works for this exercise.</p>"
+                "<p>For more details on stiff problems and numerical solvers, see <b>(Reference to be added soon)</b>.</p>"
                 "<p><b>Points</b> sets the number of evenly spaced output times, including "
                 "<i>t</i><sub>start</sub> and <i>t</i><sub>end</sub>. It does not set the internal integration steps.</p>"
-                "<p>Use either solver for this exercise. Set <b>Points</b> to <b>100</b> and press <b>Enter</b>.</p>",
+                "<p>Set <b>Points</b> to <b>100</b> and press <b>Enter</b>.</p>",
                 lambda: tuple(
                     self._panel(widget, "batch_initial_conditions")
                     for widget in (self.bundle.simulation_panel.solver_method_combo, self.bundle.simulation_panel.num_points_spinbox)

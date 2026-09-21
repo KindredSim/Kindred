@@ -13,5 +13,6 @@ preset_set1 = {
   [BOH] = 0.0
 }
 
+param concentration_floor = 1e-18; unit = M
 let total_PB = [PB] + [PH]
-let selectivity = [PH] / max([PH] + [BOH], 1e-18)
+let selectivity = [PH] / max([PH] + [BOH], concentration_floor)

@@ -5,6 +5,25 @@ Small core validation helpers shared across multiple core modules.
 from __future__ import annotations
 
 import math
+from decimal import Decimal, InvalidOperation
+
+
+def parse_finite_numeric_text(text: str, *, field: str = "Value") -> float:
+    """Admit numeric text without silently replacing a nonzero input by zero."""
+    try:
+        value = float(text)
+    except (ValueError, OverflowError) as exc:
+        raise ValueError(f"{field} must be a number.") from exc
+    if not math.isfinite(value):
+        raise ValueError(f"{field} must be finite.")
+    if value == 0.0:
+        try:
+            nonzero = not Decimal(text).is_zero()
+        except InvalidOperation as exc:
+            raise ValueError(f"{field} cannot be represented as a number.") from exc
+        if nonzero:
+            raise ValueError(f"{field} is nonzero but too small to represent.")
+    return value
 
 
 def validate_name(name: str) -> str:

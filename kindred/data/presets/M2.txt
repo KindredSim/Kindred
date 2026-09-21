@@ -10,4 +10,5 @@ preset_set1 = {
 }
 
 # max keeps the denominator above zero.
-let ratio = [B] / max([A], 1e-30)
+param concentration_floor = 1e-30; unit = M
+let ratio = [B] / max([A], concentration_floor)

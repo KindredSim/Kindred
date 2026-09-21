@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from kindred.core.quantity_units import Unit, MOLAR, SECOND, compatible_units
+
 import io
 import csv
 import json
@@ -410,7 +412,8 @@ class ResultDataBlock:
     source_row: np.ndarray | None
     x_name: str = "t"
     copy_definitions: tuple[tuple[str, str], ...] = ()
-    concentration_names: tuple[str, ...] = ()
+    quantity_units: tuple[tuple[str, Unit | None], ...] = ()
+    presentation_units: tuple[tuple[str, Unit | None], ...] = ()
     series_provenance: tuple[tuple[str, Mapping[str, object]], ...] = ()
     x_provenance: Mapping[str, object] = MappingProxyType({})
     color_by_series: tuple[tuple[str, str], ...] = ()
@@ -421,6 +424,15 @@ class ResultDataBlock:
     point_size: float = 6.0
     point_shape: str = "o"
     presentation_boundaries: tuple[SimulationPresentationBoundary, ...] = ()
+
+    def unit_for(self, name: str, *, x: bool = False) -> Unit | None:
+        if self.kind is ResultLayerKind.EXPERIMENTAL:
+            return SECOND if x and isinstance(self.x_axis, SimulationSeriesAxisSelection) and self.x_axis.series_name == "t" else MOLAR
+        return dict(self.quantity_units).get(name)
+
+    def unit_label(self, name: str, *, x: bool = False) -> str:
+        unit = self.unit_for(name, x=x)
+        return f"{name} [{unit.symbol}]" if unit is not None else name
 
     def __post_init__(self) -> None:
         if not isinstance(self.kind, ResultLayerKind):
@@ -583,8 +595,10 @@ class ResultRenderInput:
     selected_y_uses_default_all: bool = True
     x_label: str = "Time (s)"
     y_label: str = "Value"
-    x_is_concentration: bool = False
-    y_is_concentration: bool = False
+    x_unit: Unit | None = None
+    y_unit: Unit | None = None
+    x_unit_options: tuple[Unit, ...] = ()
+    y_unit_options: tuple[Unit, ...] = ()
     axis_candidates: tuple[AxisSelectionCandidate, ...] = ()
     reference_lines_visible: bool = True
     intervention_annotations: tuple[_DisplayAnnotation, ...] = ()
@@ -673,7 +687,8 @@ def _result_block(
         block_id=set_id, label=display_label, kind=kind, t=result.t,
         sample_time=result.t,
         copy_definitions=observable_copy_definitions(prepared_dsl),
-        concentration_names=tuple(prepared_dsl.analysis.species_names),
+        quantity_units=result.quantity_units,
+        presentation_units=result.presentation_units,
         series=series, series_axes=series_axes,
         x_axis=SimulationSeriesAxisSelection("t"), result=result,
         segment_ids=result.segment_ids, segment_keys=result.segment_keys,
@@ -836,7 +851,8 @@ def _data_block(
         discontinuity_ids=block.discontinuity_ids, source_row=block.source_row,
         x_name=x_name,
         copy_definitions=block.copy_definitions,
-        concentration_names=block.concentration_names,
+        quantity_units=block.quantity_units,
+        presentation_units=block.presentation_units,
         series_provenance=tuple((name, payload) for name, payload in block.series_provenance if name in names),
         x_provenance=x_provenance,
         color_by_series=block.color_by_series,
@@ -896,8 +912,9 @@ def _export_column_header(
     block: ResultDataBlock,
     name: str,
     provenance: Mapping[str, object],
+    *, x: bool = False,
 ) -> str:
-    header = f"{block.label}::{name}"
+    header = f"{block.label}::{block.unit_label(name, x=x)}"
     identity = {
         key: str(provenance[key])
         for key in (
@@ -1301,7 +1318,6 @@ def compose_result_input(
     reference_lines_visible: bool,
     intervention_annotations_visible: bool,
     intervention_labels_visible: bool,
-    mechanism_species: Sequence[str],
     active_overlay_layers: Sequence[ExperimentalLayerInput] = (),
     color_by_axis_selection: Mapping[AxisSeriesSelection, str] = MappingProxyType({}),
     experimental_point_shape: str = "o",
@@ -1314,9 +1330,6 @@ def compose_result_input(
     tab_id = _required_id(tab_id, "tab_id")
     if repository.tab_id != tab_id:
         raise ValueError("repository does not belong to requested tab.")
-    mechanism_species_set = {
-        _required_id(name, "mechanism species") for name in mechanism_species
-    }
     current_id = str(current_set_id or "")
     preview_ids = set(repository.preview_set_ids())
     colors = {
@@ -1551,27 +1564,21 @@ def compose_result_input(
             else f"{selected_x.dataset_id}: {selected_x.raw_observation_id}",
         )
     selected_candidate = next(item for item in candidates if item.selection == selected_x)
-    y_axes = tuple(
-        selection
-        for block in blocks
-        if block.visible
-        for _name, selection in block.series_axes
-    )
+    def axis_units(axis):
+        selected = [(block, block.x_name) for block in blocks if block.visible] if axis == "x" else [
+            (block, name) for block in blocks if block.visible for name, _values in block.series]
+        quantities = [block.unit_for(name, x=axis == "x") for block, name in selected]
+        if not quantities or any(unit is None for unit in quantities):
+            return None, ()
+        unit = quantities[0]
+        if any(other != unit for other in quantities):
+            return None, ()
+        preferred = tuple(dict(block.presentation_units).get(name, unit) for block, name in selected)
+        preferred = tuple(item for item in preferred if item is not None and item.compatible(unit))
+        return unit, compatible_units(unit, preferred)
 
-    def is_concentration(selection: AxisSeriesSelection) -> bool:
-        if isinstance(selection, ExperimentalAxisSelection):
-            # Every imported observation crosses an explicit concentration-unit
-            # ingress and is retained canonically in molar units.
-            return selection in experimental_by_axis
-        return isinstance(selection, SimulationSeriesAxisSelection) and selection.series_name in mechanism_species_set
-
-    x_is_concentration = (
-        not _is_time_selection(selected_x)
-        and is_concentration(selected_x)
-    )
-    y_is_concentration = bool(y_axes) and all(
-        is_concentration(item) for item in y_axes
-    )
+    x_unit, x_options = axis_units("x")
+    y_unit, y_options = axis_units("y")
 
     return ResultRenderInput(
         tab_id=tab_id, current_set_id=current_id, blocks=tuple(blocks),
@@ -1580,9 +1587,9 @@ def compose_result_input(
         mapped_overlay_locks=mapped_overlay_locks,
         selected_y_uses_default_all=bool(selected_y_uses_default_all),
         x_label="Time (s)" if _is_time_selection(selected_x) else selected_candidate.label,
-        y_label="Concentration (M)" if y_is_concentration else "Value",
-        x_is_concentration=x_is_concentration,
-        y_is_concentration=y_is_concentration,
+        y_label="Concentration" if y_unit is not None and y_unit.compatible(MOLAR) else "Value",
+        x_unit=x_unit, y_unit=y_unit,
+        x_unit_options=x_options, y_unit_options=y_options,
         axis_candidates=tuple(candidates),
         reference_lines_visible=bool(reference_lines_visible),
         intervention_annotations=owned_annotations,
@@ -1615,7 +1622,7 @@ def iter_blocks_tsv_chunks(
                 _export_column_header(
                     block,
                     block.x_name,
-                    block.x_provenance,
+                    block.x_provenance, x=True,
                 ),
                 block.t,
                 "float",
@@ -1794,9 +1801,9 @@ def write_xlsx(
             _append_xlsx_row(
                 sheet,
                 (
-                    block.x_name,
+                    block.unit_label(block.x_name, x=True),
                     *identity_headers,
-                    *(name for name, _values in block.series),
+                    *(block.unit_label(name) for name, _values in block.series),
                 ),
             )
             for index in range(block.series[0][1].size):

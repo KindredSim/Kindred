@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import re
+from kindred.core.algebra.parser import NumberNode, IdentNode, BinaryNode
+from kindred.core.algebra.printer import expression_to_source
+from kindred.core.algebra.unit_preparation import authored_projection
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from fractions import Fraction
@@ -540,36 +543,10 @@ def _linear_rows_are_consistent(
     return True
 
 
-def _render_linear_term(name: str, coefficient: Fraction) -> str:
-    coefficient = Fraction(coefficient)
-    if coefficient == 1:
-        return str(name)
-    if coefficient == -1:
-        return f"-{name}"
-    return f"{_render_fraction(coefficient)} * {name}"
-
-
-def _render_linear_expression(terms: Mapping[str, Fraction]) -> str:
-    nonzero = [
-        (str(name), Fraction(coefficient))
-        for name, coefficient in terms.items()
-        if Fraction(coefficient)
-    ]
-    if not nonzero:
-        return "0"
-    rendered = _render_linear_term(*nonzero[0])
-    for name, coefficient in nonzero[1:]:
-        coefficient = Fraction(coefficient)
-        if coefficient < 0:
-            rendered += " - " + _render_linear_term(name, -coefficient)
-        else:
-            rendered += " + " + _render_linear_term(name, coefficient)
-    return rendered
-
-
 def _build_energy_correction_expressions(
     constraints: Sequence[object],
     basis: Sequence[str],
+    units,
 ) -> dict[str, str] | None:
     rows = _energy_rows(constraints)
     if rows is None:
@@ -593,7 +570,12 @@ def _build_energy_correction_expressions(
                 if name in selected:
                     continue
                 terms[name] = terms.get(name, Fraction(0)) + multiplier * coefficient
-        output[str(target_name)] = _render_linear_expression(terms)
+        expression = NumberNode(0.0, "0")
+        for name, coefficient in terms.items():
+            if coefficient:
+                term = BinaryNode("*", _fraction_node(coefficient), IdentNode(name))
+                expression = BinaryNode("+", expression, term)
+        output[str(target_name)] = expression_to_source(authored_projection(expression, units.get))
     return output
 
 
@@ -919,17 +901,10 @@ class CorrectionPlanner:
         )
 
 
-def _render_fraction(value: Fraction) -> str:
-    value = Fraction(value)
-    return (
-        str(value.numerator)
-        if value.denominator == 1
-        else f"({value.numerator}/{value.denominator})"
-    )
-
-
-def _render_factor(name: str, power: Fraction) -> str:
-    return name if power == 1 else f"{name}**({_render_fraction(power)})"
+def _fraction_node(value: Fraction):
+    numerator = NumberNode(float(value.numerator), str(value.numerator))
+    return numerator if value.denominator == 1 else BinaryNode(
+        "/", numerator, NumberNode(float(value.denominator), str(value.denominator)))
 
 
 def build_correction_expressions(
@@ -956,7 +931,7 @@ def build_correction_expressions(
         raise ValueError("Correction plan constraint and parameter bases differ in size.")
 
     if any(_has_unsupported_source_factor(item) for item in constraints):
-        expressions = _build_energy_correction_expressions(constraints, basis)
+        expressions = _build_energy_correction_expressions(constraints, basis, dict(composition.coordinate_units))
         if expressions is None:
             raise ValueError(
                 "Exact source correction requires a bounded linear energy projection."
@@ -976,14 +951,13 @@ def build_correction_expressions(
             "does not depend on symbolic-only degeneracy or C0."
         )
     output: dict[str, str] = {}
+    units = dict(composition.coordinate_units)
     for target_index, target_name in enumerate(basis):
-        factors: list[str] = []
+        expression = NumberNode(1.0, "1")
         for (kind, value), power in generated_factors[target_index].items():
-            rendered_name = (
-                _render_fraction(value)
-                if kind == "coefficient"
-                else str(value)
-            )
-            factors.append(_render_factor(rendered_name, power))
-        output[target_name] = " * ".join(factors) if factors else "1"
+            factor = _fraction_node(value) if kind == "coefficient" else IdentNode(str(value))
+            if power != 1:
+                factor = BinaryNode("^", factor, _fraction_node(power))
+            expression = BinaryNode("*", expression, factor)
+        output[target_name] = expression_to_source(authored_projection(expression, units.get))
     return output

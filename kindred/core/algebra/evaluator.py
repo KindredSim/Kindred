@@ -174,13 +174,16 @@ def _as_float(x: Any, *, stmt: LetStatement) -> float:
 # ----------------------------- evaluator core --------------------------------
 
 
-def bind_scalar_expression_evaluator(block: AlgebraBlock, values: dict[str, float]):
+def bind_scalar_expression_evaluator(
+    block: AlgebraBlock, values: dict[str, float], *,
+    literal_reader: Callable[[NumberNode], float] | None = None,
+):
     """Bind admitted scalar AST arithmetic to one current numerical map."""
     context = EvaluationContext(
         t=np.array([0.0]), species_series={}, initials={},
         species_names=set(), symtab=SymbolTable(),
     )
-    evaluator = _Evaluator(block, context)
+    evaluator = _Evaluator(block, context, literal_reader=literal_reader)
     evaluator.symbol_values = values
 
     def evaluate(statement: LetStatement) -> float:
@@ -190,9 +193,11 @@ def bind_scalar_expression_evaluator(block: AlgebraBlock, values: dict[str, floa
 
 
 class _Evaluator:
-    def __init__(self, block: AlgebraBlock, ctx: EvaluationContext) -> None:
+    def __init__(self, block: AlgebraBlock, ctx: EvaluationContext, *,
+                 literal_reader: Callable[[NumberNode], float] | None = None) -> None:
         self.block = block
         self.ctx = ctx
+        self.literal_reader = literal_reader
         self.N = int(ctx.t.size)
         self.symbol_series: Dict[str, np.ndarray] = {}
         for name, values in (ctx.symbol_series or {}).items():
@@ -343,9 +348,15 @@ class _Evaluator:
 
     # Eval
     def _eval_expr(self, node: ExprNode, i: int, *, stmt: LetStatement) -> float | bool:
+        value = self._eval_unscaled_expr(node, i, stmt=stmt)
+        if node.unit_factor == 1.0:
+            return value
+        return _as_float(_as_float(value, stmt=stmt) * node.unit_factor, stmt=stmt)
+
+    def _eval_unscaled_expr(self, node: ExprNode, i: int, *, stmt: LetStatement) -> float | bool:
         # Number
         if isinstance(node, NumberNode):
-            return float(node.value)
+            return float(node.value) if self.literal_reader is None else self.literal_reader(node)
 
         # Identifier: may be scalar from symtab or user-defined scalar/series
         if isinstance(node, IdentNode):

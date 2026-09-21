@@ -15,4 +15,5 @@ param k_rel = 0.25
 param k2 = k_rel * k1
 
 # Use param to constrain a parameter and let to calculate an output.
-let fraction_B = [B] / max([B] + [C], 1e-30)
+param concentration_floor = 1e-30; unit = M
+let fraction_B = [B] / max([B] + [C], concentration_floor)

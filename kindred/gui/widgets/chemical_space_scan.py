@@ -1,6 +1,8 @@
 """Chemical Space Scan window. All generated trajectories stay outside Qt."""
 from __future__ import annotations
 
+from kindred.core.quantity_units import presentation_unit
+
 from dataclasses import replace
 import os
 import secrets
@@ -289,10 +291,14 @@ class ChemicalSpaceScanDialog(QtWidgets.QDialog):
     def _render_constraints(self):
         self.constraint_list.clear()
         calculated = {c.dependent for c in self.constraints if c.condition == "equals"}
+        statements = {stmt.name: stmt for stmt in self.tab.prepared_dsl.parameter_algebra_spec_for_execution().observable_block.lines}
         for condition in self.constraints:
+            statement = statements[condition.observable]
+            unit = presentation_unit(statement.expr.quantity_unit, statement.declared_unit)
+            unit_label = "units unspecified" if unit is None else unit.symbol
             label = (f"= {condition.lower:g}" if condition.condition == "equals" else
                      f"{'[' if condition.include_lower else '('}{condition.lower:g}, {condition.upper:g}{']' if condition.include_upper else ')'}")
-            self.constraint_list.addItem(f"{condition.observable} {label} — {condition.dependent}")
+            self.constraint_list.addItem(f"{condition.observable} {label} [{unit_label}] — {condition.dependent}")
         for key, (mode, _, _, _) in self.rows.items():
             if key in calculated:
                 mode.setCurrentIndex(2)

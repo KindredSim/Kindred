@@ -78,7 +78,7 @@ class ReactionsAndInitialConditions(PracticeLesson):
                 "<p>Find <b>let total = [A] + [B]</b> below the reaction.</p>"
                 "<p>A <b>user-defined observable</b> is a calculated quantity that you can plot or use as a fitting target.</p>"
                 "<ul><li><b>let</b> introduces the definition.</li><li><b>total</b> is the name chosen for this observable.</li>"
-                "<li><b>[A]</b> and <b>[B]</b> refer to the current species concentrations. "
+                "<li><code>[A]</code> and <code>[B]</code> refer to the concentrations of A and B at simulation time <i>t</i>. "
                 "Brackets distinguish these references from parameter names.</li></ul>"
                 "<p>The <b>Help</b> tab beside Reactions lists supported expressions "
                 "under <b>Parameters and Observables</b>.</p>",
@@ -87,10 +87,8 @@ class ReactionsAndInitialConditions(PracticeLesson):
             Step(
                 "initial_rows",
                 "What Is a Set?",
-                "<p><b>Initial conditions</b> are the concentrations at the start of a simulation. "
-                "A <b>set</b> is one named starting scenario, shown as a row in Initial Conditions.</p>"
-                "<p>For example, one set can start with A = 1 and B = 0. Another can start with A = 2 and B = 0. "
-                "Both use the same reactions but produce separate results.</p>"
+                "<p>Each row in <b>Initial Conditions</b> stores a named set of starting concentrations. "
+                "Run different sets with the same reactions to obtain separate results.</p>"
                 "<p>The fresh tab supplied <b>set1</b> with zero concentrations. Loading M1 added <b>preset_set1</b> "
                 "with A = 1 and B = 0. Keep preset_set1 for this lesson.</p>"
                 "<p>You can reorder rows with <b>Move Up</b> and <b>Move Down</b>. "
@@ -190,7 +188,7 @@ class ReactionsAndInitialConditions(PracticeLesson):
             Step(
                 "run_new_set",
                 "Run the Second Starting Scenario",
-                "<p>Select only <b>Higher A</b> and click <b>Run</b>. Use the same reaction rate of <b>0.5</b>.</p>"
+                "<p>Select only <b>Higher A</b> and click <b>Run</b>. Keep <code>kf = 0.5</code>.</p>"
                 "<p>Selecting rows chooses what to run. <b>Plot</b> and <b>Slider</b> checkboxes have different jobs. "
                 "To run several sets together, select their rows with Ctrl-click, or Cmd-click on macOS.</p>",
                 lambda: (self._table_target(self.extra_set), *self._run_targets()),

@@ -1,7 +1,9 @@
 """GUI interval selection and authored-quantity constraint controls."""
 from __future__ import annotations
 
-import math
+from kindred.core.quantity_units import presentation_unit
+from kindred.core.validation import parse_finite_numeric_text
+
 
 from PySide6 import QtCore, QtWidgets
 
@@ -10,10 +12,7 @@ from kindred.scan.intervals import Interval, normalize
 
 
 def number(edit):
-    value = float(edit.text().strip())
-    if not math.isfinite(value):
-        raise ValueError("Enter a finite number.")
-    return value
+    return parse_finite_numeric_text(edit.text().strip())
 
 
 def entry(value, parent=None):
@@ -97,7 +96,9 @@ class ScanConstraintDialog(QtWidgets.QDialog):
         layout = QtWidgets.QFormLayout(self)
         self.quantity = QtWidgets.QComboBox()
         for statement in statements:
-            self.quantity.addItem(statement.name, statement)
+            unit = presentation_unit(statement.expr.quantity_unit, statement.declared_unit)
+            label = statement.name + (f" [{unit.symbol}]" if unit is not None else " [units unspecified]")
+            self.quantity.addItem(label, statement)
         self.definition = QtWidgets.QLabel()
         self.definition.setWordWrap(True)
         self.definition.setTextInteractionFlags(QtCore.Qt.TextInteractionFlag.TextSelectableByMouse)
@@ -149,7 +150,7 @@ class ScanConstraintDialog(QtWidgets.QDialog):
             high = low if equality else number(self.upper)
             lc, uc = (True, True) if equality else (self.include_lower.isChecked(), self.include_upper.isChecked())
             normalize((Interval(low, high, lc, uc),))
-            self.constraint = ObservableConstraint(self.quantity.currentText(), self.condition.currentData(), low, high,
+            self.constraint = ObservableConstraint(self.quantity.currentData().name, self.condition.currentData(), low, high,
                                                   self.dependent.currentData(), lc, uc)
         except ValueError as exc:
             self.error.setText(str(exc))

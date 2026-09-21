@@ -41,13 +41,24 @@ Use <b>Use result</b> or <b>Use in query</b> to insert an executable query.</p>
 conditions, notices and any reuse queries. Selecting an answer does not narrow this report.
 <b>Copy Context</b> adds the reaction source, definitions and assumptions to the same text report.</p>
 
+<h2>Units in Calculator Queries</h2>
+<p>When substituting numerical values, use M for concentrations, s for time, K for temperature,
+J/mol for energy parameters, and m³ for volume.</p>
+<p>For example, to substitute a concentration of 1 mM for Y in the example model, enter:</p>
+<pre>subs(dP/dt,Y,1/1000)</pre>
+<p>For a model with an independent <code>Ea1</code> parameter, enter 5000 to substitute 5 kJ/mol:</p>
+<pre>subs(Ea1,Ea1,5000)</pre>
+<p>These query units apply even when the corresponding slider or fitting field uses another input unit.</p>
+<p>Results and <b>Copy Context</b> include known units. If Kindred cannot determine consistent units,
+it leaves them unspecified and continues the calculation.</p>
+<p>Use <b>Use result</b> or <b>Use in query</b> to reuse an answer with its unit conversions preserved.</p>
 <h2>Names, definitions and exact values</h2>
-<p>Queries can use species and parameters from the current model, along with its definitions.
-For species A, <code>A</code> and <code>[A]</code> both mean its concentration.
-<code>initial(A)</code> and <code>[A]_0</code> mean its symbolic initial concentration, not a
-numerical value taken from an initial-condition set. <code>t</code> is time in seconds.
-<code>T</code> is absolute temperature in kelvin and is positive. Other variables are real,
-without an assumption that they are positive.</p>
+<p>Queries can use species, parameters, and definitions from the model in the current tab.</p>
+<p>For species A, <code>A</code> and <code>[A]</code> both represent its concentration at simulation
+time <i>t</i>. <code>initial(A)</code> and <code>[A]_0</code> represent its symbolic initial concentration.
+Calculator does not automatically insert the numerical value from an initial-condition set.</p>
+<p><code>t</code> represents time in seconds. <code>T</code> represents temperature in kelvin and is
+assumed positive. Other variables are real, with no automatic assumption that they are positive.</p>
 <p>Use <code>+ - * / ^ **</code> for arithmetic and parentheses to group expressions.
 Literal numbers remain exact. For example, <code>1/10+2/10</code> gives <code>3/10</code>.
 Use <code>approx(F)</code> for a decimal approximation with 15 significant digits, or
@@ -60,10 +71,8 @@ solve. The placeholders lhs and rhs are expressions, and equation1 and equation2
 made with eq. These are not predefined names for previous results. Calculator queries do
 not create assignments. In particular, <code>eq</code> constructs an equation rather than assigning
 a value. Worked queries use the actual names from the example model.</p>
-<p>Fixed constants are <code>k_B</code>, <code>h</code>, <code>h_bar</code>, <code>N_A</code>,
-<code>R</code> and <code>Rkcal</code>. Their values cannot be substituted or solved for.
-Energy parameters use the energy units specified in the model. Calculator accounts for those
-units in expressions for reaction rates.</p>
+<p>Fixed constants are <code>k_B</code>, <code>h</code>, <code>h_bar</code>, <code>N_A</code>, and
+<code>R</code>. The gas constant <i>R</i> uses J/(mol·K). Their values cannot be substituted or solved for.</p>
 
 <h3>Use a parameter definition in a signal calculation</h3>
 <p>Extend the three-reaction example with these definitions for a signal proportional to P:</p>
@@ -190,7 +199,7 @@ In solve answers, substitution changes the expressions on the right of =, not th
 names on the left. The same variable name still means the same variable on both sides.</p>
 
 <h2>Multiple answers after adding a reaction</h2>
-<p>Add a competing reaction that consumes two X molecules to form D. The complete example is now:</p>
+<p>Add <code>2 X -&gt; D; k=1</code> to <b>Reactions</b>. The complete example is now:</p>
 <pre>A &lt;-&gt; X; kf=2; kr=3
 X &lt;-&gt; Y; kf=5; kr=7
 Y -&gt; P; k=11
@@ -198,9 +207,7 @@ Y -&gt; P; k=11
 param gain=2
 param response=2*gain
 let signal=response*[P]</pre>
-<p>The new rate constant is k4. The rate for D is <code>k4*X^2</code>, and the additional term in
-dX/dt is <code>-2*k4*X^2</code>. The coupled-intermediate answers from the previous section apply
-to the three-reaction model, before this addition.</p>
+<p>The added reaction uses the name <code>k4</code>. Use this four-reaction model for the following queries.</p>
 <p>Find values of X where dX/dt is zero while holding A=1 and Y=0. Substitute the relevant rate
 constants explicitly:</p>
 <pre>solve(subs(eq(dX/dt,0),[A,Y,kf1,kr1,kf2,kr2,k4],[1,0,2,3,5,7,1]),X)</pre>

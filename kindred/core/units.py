@@ -14,6 +14,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
+from fractions import Fraction
+
+from .quantity_units import parse_unit, convert_value, scientific_unit, conversion_scale
 
 # Category-specific admission limits.  These are deliberately explicit rather
 # than one universal scalar envelope: concentrations, rates, energies, and
@@ -24,25 +27,49 @@ ARRHENIUS_A_MAX = 1.0e40
 ENERGY_ABS_MAX_J_PER_MOL = 1.0e20
 KEQ_MIN = 1.0e-20
 KEQ_MAX = 1.0e20
+ORDINARY_PARAMETER_MIN_ABS = 1.0e-30
+ORDINARY_PARAMETER_MAX_ABS = 1.0e30
 
-# ---------- scalar converters ----------
 
-def kcalmol_to_jmol(x: float) -> float:
-    """Convert kcal/mol -> J/mol."""
-    return float(x) * 4184.0
+class OrdinaryParameterDomainError(ValueError):
+    """A finite independent scalar lies outside its scientific input domain."""
 
-def jmol_to_kcalmol(x: float) -> float:
-    """Convert J/mol -> kcal/mol."""
-    return float(x) / 4184.0
+    def __init__(self, field: str):
+        self.field = field
+        super().__init__(
+            f"{field} must be exact zero or have an absolute value between "
+            f"{ORDINARY_PARAMETER_MIN_ABS:g} and {ORDINARY_PARAMETER_MAX_ABS:g} "
+            "in scientific units."
+        )
 
-def kjmol_to_jmol(x: float) -> float:
-    """Convert kJ/mol -> J/mol."""
-    return float(x) * 1000.0
 
-def jmol_to_kjmol(x: float) -> float:
-    """Convert J/mol -> kJ/mol."""
-    return float(x) / 1000.0
+def admit_ordinary_parameter(value: object, *, field: str = "parameter") -> float:
+    """Admit an independent ordinary parameter already in scientific units."""
+    if type(value) is bool:
+        raise ValueError(f"{field} must be finite and numeric")
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"{field} must be finite and numeric") from exc
+    if not math.isfinite(number):
+        raise ValueError(f"{field} must be finite")
+    if number != 0.0 and not ORDINARY_PARAMETER_MIN_ABS <= abs(number) <= ORDINARY_PARAMETER_MAX_ABS:
+        raise OrdinaryParameterDomainError(field)
+    return number
 
+
+def ordinary_parameter_input_bounds(unit: str) -> tuple[float, float]:
+    """Positive closed input component, projected inward into editable units."""
+    editable = parse_unit(unit)
+    scientific = scientific_unit(editable.dimensions)
+    conversion_scale(editable, scientific).check_exact_work()
+    low = convert_value(ORDINARY_PARAMETER_MIN_ABS, scientific, editable)
+    high = convert_value(ORDINARY_PARAMETER_MAX_ABS, scientific, editable)
+    while convert_value(low, editable, scientific) < ORDINARY_PARAMETER_MIN_ABS:
+        low = math.nextafter(low, math.inf)
+    while convert_value(high, editable, scientific) > ORDINARY_PARAMETER_MAX_ABS:
+        high = math.nextafter(high, 0.0)
+    return low, high
 
 def _admit_finite_range(
     value: object,
@@ -118,21 +145,8 @@ def admit_keq(value: object, *, field: str = "Keq") -> float:
 
 def equilibrium_constant_unit(delta_n: object, *, conc_unit: str = "M") -> str:
     """Return the concentration-form unit ``M^delta_n`` for public Keq."""
-    try:
-        exponent = float(delta_n)
-    except (TypeError, ValueError, OverflowError) as exc:
-        raise ValueError("equilibrium delta_n must be numeric") from exc
-    if not math.isfinite(exponent):
-        raise ValueError("equilibrium delta_n must be finite")
-    if exponent == 0.0:
-        return "1"
-    if exponent == 1.0:
-        return str(conc_unit)
-    if exponent == -1.0:
-        return f"1/{conc_unit}"
-    if exponent > 0.0:
-        return f"{conc_unit}^{format(exponent, '.15g')}"
-    return f"1/({conc_unit}^{format(-exponent, '.15g')})"
+    exponent = Fraction(str(delta_n))
+    return parse_unit(conc_unit).power(exponent).symbol
 
 
 def rate_constant_unit(
@@ -142,22 +156,10 @@ def rate_constant_unit(
     time_unit: str = "s",
 ) -> str:
     """Return ``M^(1-order)/s`` for one directional kinetic order."""
-    try:
-        exponent = float(order)
-    except (TypeError, ValueError, OverflowError) as exc:
-        raise ValueError("reaction order must be numeric") from exc
-    if not math.isfinite(exponent) or exponent < 0.0:
-        raise ValueError("reaction order must be finite and nonnegative")
-    power = 1.0 - exponent
-    if power == 0.0:
-        return f"1/{time_unit}"
-    if power == 1.0:
-        return f"{conc_unit}/{time_unit}"
-    if power == -1.0:
-        return f"1/({conc_unit} {time_unit})"
-    if power > 0.0:
-        return f"{conc_unit}^{format(power, '.15g')}/{time_unit}"
-    return f"1/({conc_unit}^{format(-power, '.15g')} {time_unit})"
+    exponent = Fraction(str(order))
+    if exponent < 0:
+        raise ValueError("reaction order must be nonnegative")
+    return parse_unit(conc_unit).power(1 - exponent).divide(parse_unit(time_unit)).symbol
 
 
 # ---------- Units model ----------
@@ -187,10 +189,4 @@ class UnitsModel:
 
     def from_jmol(self, value: float) -> float:
         """Convert from canonical J/mol to current energy_unit."""
-        if self.energy_unit == "kJ/mol":
-            return jmol_to_kjmol(value)
-        if self.energy_unit == "kcal/mol":
-            return jmol_to_kcalmol(value)
-        if self.energy_unit == "J/mol":
-            return float(value)
-        raise ValueError(f"Unsupported energy_unit: {self.energy_unit!r}")
+        return convert_value(value, parse_unit("J/mol"), parse_unit(self.energy_unit))

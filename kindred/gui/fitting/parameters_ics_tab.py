@@ -11,7 +11,6 @@ from __future__ import annotations
 import html
 
 
-import math
 import sys
 from dataclasses import dataclass, replace
 from collections.abc import Mapping, Sequence
@@ -31,6 +30,7 @@ from kindred.core.analysis.fit_uncertainty import (
     ResidualBootstrapConfig,
 )
 from kindred.core.analysis.global_fit_execution import FitCoordinate
+from kindred.core.validation import parse_finite_numeric_text
 
 from kindred.core.fitting_method_policy import SUPPORTED_FIT_METHODS
 from kindred.gui.fitting.constants import FIT_METHOD_LABELS
@@ -1588,13 +1588,7 @@ class ParametersIcsTab(QtWidgets.QWidget):
 
     @staticmethod
     def _parse_number(raw_text: str, field: str) -> float:
-        try:
-            value = float(raw_text)
-        except (TypeError, ValueError, OverflowError) as exc:
-            raise ValueError(f"{field} must be a number.") from exc
-        if not math.isfinite(value):
-            raise ValueError(f"{field} must be finite.")
-        return value
+        return parse_finite_numeric_text(raw_text, field=field)
 
     def _project_defaults(self, defaults: FitDefaults) -> None:
         blocker = [

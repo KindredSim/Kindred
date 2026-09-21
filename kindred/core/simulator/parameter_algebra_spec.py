@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from kindred.core.quantity_units import Unit, parse_declared_unit
+
 from dataclasses import dataclass, field, replace
 import re
 from types import MappingProxyType
@@ -163,6 +165,7 @@ class ParameterAssignment:
     line_number: int
     line_content: str
     source_coordinate: DslSourceCoordinate | None = None
+    declared_unit: Unit | None = None
 
 
 @dataclass(frozen=True)
@@ -324,6 +327,8 @@ class ParameterAlgebraSpec:
     chemistry_dependencies: Mapping[str, Tuple[str, ...]] = field(default_factory=dict)
     temperature_dependent_names: frozenset[str] = frozenset()
     identity_checks: tuple[str, ...] = ()
+    quantity_units: tuple[tuple[str, Unit | None], ...] = ()
+    input_units: tuple[tuple[str, Unit], ...] = ()
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "param_statements", tuple(self.param_statements))
@@ -359,6 +364,7 @@ class ParameterAlgebraSpec:
             },
             dict(self.evaluation_dependencies), dict(self.chemistry_dependencies),
             self.temperature_dependent_names, self.identity_checks,
+            self.quantity_units, self.input_units,
         )
         memo[id(self)] = clone
         return clone
@@ -379,6 +385,7 @@ class ParameterAlgebraSpec:
                 },
                 dict(self.evaluation_dependencies), dict(self.chemistry_dependencies),
                 self.temperature_dependent_names, self.identity_checks,
+                self.quantity_units, self.input_units,
             ),
         )
 
@@ -460,6 +467,9 @@ def admit_parameter_evaluation_graph(
                 dep for dep in _iter_expr_identifiers(statement.expr) if dep in names
             )
         )
+    from .parameter_units import prepare_spec_units
+    spec = prepare_spec_units(spec, mechanism, graph)
+    statements = {statement.name: statement for statement in spec.parameter_block.lines}
     identities: list[str] = []
     while True:
         try:
@@ -631,6 +641,7 @@ def _compile_retained_parameter_block(
                 line=int(assignment.line_number or statement.line),
                 col=int(statement.col),
                 line_text=assignment.line_content,
+                declared_unit=assignment.declared_unit,
             )
         )
     block = AlgebraBlock(
@@ -859,7 +870,7 @@ def _validate_retained_observable_program(
                     "parameters (for example, `a` from `param a = 5`), available reaction parameters "
                     "(such as `k1`, `kf1`, `kr1`, `Keq1`, `A1`, `Ea1`, `dG_act1`, `dG_eq1`, or "
                     "`kappa1`), values defined by other `let` statements, time `t`, temperature `T`, "
-                    "or the constants `k_B`, `h`, `h_bar`, `N_A`, `R`, and `Rkcal`."
+                    "or the constants `k_B`, `h`, `h_bar`, `N_A`, `R`."
                 ),
                 line_number=statement.line,
                 line_content=statement.line_text,
@@ -1000,7 +1011,7 @@ def _compile_retained_algebra_program(
                 line_number=line_number,
                 line_content=raw,
             )
-        expr_src = str(match.group(2) or "").strip()
+        expr_src, _unit = _split_unit_clause(str(match.group(2) or ""), line_number, raw)
         source_lines.append(f"let {name} = {expr_src}")
         descriptors.append((classification.kind, int(line_number), str(raw)))
     try:
@@ -1023,11 +1034,27 @@ def _compile_retained_algebra_program(
                 line=line_number,
                 col=len(raw) - len(raw.lstrip()) + 1,
                 line_text=raw,
+                declared_unit=_split_unit_clause(strip_inline_comment(raw).split("=", 1)[1], line_number, raw)[1],
             )
             for statement, (_kind, line_number, raw) in zip(block.lines, descriptors)
         ),
     )
     return block, tuple(descriptors)
+
+
+def _split_unit_clause(rhs: str, line_number: int, line_content: str) -> tuple[str, Unit | None]:
+    parts = rhs.split(";")
+    if len(parts) == 1:
+        return rhs.strip(), None
+    try:
+        if len(parts) != 2 or "=" not in parts[1]:
+            raise ValueError("Expected one trailing '; unit = ...' declaration.")
+        key, value = parts[1].split("=", 1)
+        if key.strip() != "unit":
+            raise ValueError(f"Unknown parameter/observable annotation {key.strip()!r}; expected 'unit'.")
+        return parts[0].strip(), parse_declared_unit(value)
+    except ValueError as exc:
+        raise DSLError(str(exc), line_number=line_number, line_content=line_content) from exc
 
 
 def strip_inline_comment(line: str) -> str:
@@ -1087,7 +1114,7 @@ def _scalar_source_coordinate(
         )
     rhs = code[equals_index + 1 :]
     value_start = equals_index + 1 + (len(rhs) - len(rhs.lstrip()))
-    value_end = len(code.rstrip())
+    value_end = len(code.split(";", 1)[0].rstrip())
     if value_end <= value_start:
         raise DSLError(
             "Param declaration requires a nonempty right-hand side.",
@@ -1148,7 +1175,7 @@ def extract_parameter_assignments_from_algebra_lines(
                     line_number=line_no,
                     line_content=original,
                 )
-            expr = _PARAM_STMT_RE.match(code).group(2).strip()  # type: ignore[union-attr]
+            expr, declared_unit = _split_unit_clause(_PARAM_STMT_RE.match(code).group(2), line_no, original)
             if name in SymbolTable().protected_names() or name in SymbolTable().functions().keys():
                 raise DSLError(
                     f"Invalid solver parameter name {name!r}",
@@ -1177,6 +1204,7 @@ def extract_parameter_assignments_from_algebra_lines(
                 ParameterAssignment(
                     name=name,
                     expr_src=expr,
+                    declared_unit=declared_unit,
                     line_number=line_no,
                     line_content=original,
                     source_coordinate=(

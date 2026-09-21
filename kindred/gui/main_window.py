@@ -1392,7 +1392,6 @@ class MainWindow(QtWidgets.QMainWindow):
                 presentation.intervention_annotations_visible
             ),
             intervention_labels_visible=presentation.intervention_labels_visible,
-            mechanism_species=canonical_species_names(tab),
             active_overlay_layers=experimental_layers,
             color_by_axis_selection=color_by_axis_selection,
             experimental_point_shape=self.config_controller.experimental_point_shape(),

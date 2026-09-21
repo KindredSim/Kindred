@@ -8,7 +8,7 @@ Current contract
 - Helpers:
     heaviside(x) with heaviside(0)=0.0, clip(x, lo, hi), ifelse(cond, a, b)
 - Protected read-only symbols:
-    k_B, h, h_bar, N_A, R, Rkcal, T
+    k_B, h, h_bar, N_A, R, T
 - No shadowing of species or builtins; parser/evaluator must emit E120.
 
 Notes
@@ -24,7 +24,7 @@ import math
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Mapping, Optional, Set
 
-from ..constants import k_B, h, h_bar, N_A, R, Rkcal
+from ..constants import k_B, h, h_bar, N_A, R
 
 logger = logging.getLogger(__name__)
 
@@ -79,30 +79,37 @@ def ifelse(cond: Any, a: float, b: float) -> float:
 
 # ----------------------------- builtins catalog ------------------------------
 
-BUILTIN_FUNCTIONS: Dict[str, Callable[..., float]] = {
-    # Math core
-    "sqrt": lambda x: math.sqrt(float(x)),
-    "ln": lambda x: math.log(float(x)),
-    "log10": lambda x: math.log10(float(x)),
-    "log1p": lambda x: math.log1p(float(x)),
-    "exp": lambda x: math.exp(float(x)),
-    "expm1": lambda x: math.expm1(float(x)),
-    "sin": lambda x: math.sin(float(x)),
-    "cos": lambda x: math.cos(float(x)),
-    "tan": lambda x: math.tan(float(x)),
-    "abs": lambda x: abs(float(x)),
-    "min": lambda *xs: float(min(float(v) for v in xs)),
-    "max": lambda *xs: float(max(float(v) for v in xs)),
-    "pow": lambda x, y: float(math.pow(float(x), float(y))),
-    "erf": lambda x: math.erf(float(x)),
-    # Helpers
-    "heaviside": heaviside,
-    "clip": clip,
-    "ifelse": ifelse,
+@dataclass(frozen=True)
+class BuiltinFunction:
+    evaluate: Callable[..., float]
+    unit_rule: str
+
+    def __call__(self, *args):
+        return self.evaluate(*args)
+
+
+BUILTIN_FUNCTIONS: Dict[str, BuiltinFunction] = {
+    "sqrt": BuiltinFunction(lambda x: math.sqrt(float(x)), "sqrt"),
+    "ln": BuiltinFunction(lambda x: math.log(float(x)), "dimensionless"),
+    "log10": BuiltinFunction(lambda x: math.log10(float(x)), "dimensionless"),
+    "log1p": BuiltinFunction(lambda x: math.log1p(float(x)), "dimensionless"),
+    "exp": BuiltinFunction(lambda x: math.exp(float(x)), "dimensionless"),
+    "expm1": BuiltinFunction(lambda x: math.expm1(float(x)), "dimensionless"),
+    "sin": BuiltinFunction(lambda x: math.sin(float(x)), "dimensionless"),
+    "cos": BuiltinFunction(lambda x: math.cos(float(x)), "dimensionless"),
+    "tan": BuiltinFunction(lambda x: math.tan(float(x)), "dimensionless"),
+    "abs": BuiltinFunction(lambda x: abs(float(x)), "preserve"),
+    "min": BuiltinFunction(lambda *xs: float(min(float(v) for v in xs)), "compatible"),
+    "max": BuiltinFunction(lambda *xs: float(max(float(v) for v in xs)), "compatible"),
+    "pow": BuiltinFunction(lambda x, y: float(math.pow(float(x), float(y))), "power"),
+    "erf": BuiltinFunction(lambda x: math.erf(float(x)), "dimensionless"),
+    "heaviside": BuiltinFunction(heaviside, "predicate"),
+    "clip": BuiltinFunction(clip, "compatible"),
+    "ifelse": BuiltinFunction(ifelse, "branches"),
 }
 
 # Protected names are read-only within Algebra
-PROTECTED_NAMES: Set[str] = {"k_B", "h", "h_bar", "N_A", "R", "Rkcal", "T"}
+PROTECTED_NAMES: Set[str] = {"k_B", "h", "h_bar", "N_A", "R", "T"}
 
 # Names that cannot be defined by users either (functions)
 PROTECTED_FUNCTION_NAMES: Set[str] = set(BUILTIN_FUNCTIONS.keys())
@@ -139,7 +146,6 @@ class SymbolTable:
             "h_bar": float(h_bar),
             "N_A": float(N_A),
             "R": float(R),
-            "Rkcal": float(Rkcal),
             "T": float(self.temperature_K),
         }
         # User namespace starts empty

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from typing import Sequence
+from kindred.core.quantity_units import parse_unit as scientific_parse_unit, conversion_scale, MOLAR, SECOND
 
 __all__ = [
     "CONCENTRATION_UNIT_DISPLAY",
@@ -11,32 +12,12 @@ __all__ = [
     "parse_unit",
 ]
 
-_TIME_SYMBOL_FACTORS = {
-    "fs": 1e-15,
-    "ps": 1e-12,
-    "ns": 1e-9,
-    "µs": 1e-6,
-    "ms": 1e-3,
-    "s": 1.0,
-    "h": 3600.0,
-}
-_TIME_WORD_FACTORS = {
-    "min": 60.0,
-}
 _TIME_ALIASES = {
     "us": "µs",
 }
 _TIME_DISPLAY_UNITS = ("fs", "ps", "ns", "µs", "us", "μs", "ms", "s", "min", "h")
 TIME_UNIT_DISPLAY = ("fs", "ps", "ns", "us", "ms", "s", "min", "h")
 
-_CONCENTRATION_FACTORS = {
-    "fM": 1e-15,
-    "pM": 1e-12,
-    "nM": 1e-9,
-    "µM": 1e-6,
-    "mM": 1e-3,
-    "M": 1.0,
-}
 _CONCENTRATION_ALIASES = {
     "uM": "µM",
 }
@@ -52,12 +33,10 @@ def parse_time_unit(unit: str) -> float:
             f"Unsupported time unit {unit!r}. Supported time units: {', '.join(_TIME_DISPLAY_UNITS)}"
         )
     canonical = _normalize_micro_prefix(_TIME_ALIASES.get(normalized, normalized))
-    if canonical in _TIME_SYMBOL_FACTORS:
-        return _TIME_SYMBOL_FACTORS[canonical]
-
-    word_form = canonical.lower()
-    if word_form in _TIME_WORD_FACTORS:
-        return _TIME_WORD_FACTORS[word_form]
+    if canonical.lower() == "min":
+        canonical = "min"
+    if canonical in _TIME_DISPLAY_UNITS:
+        return conversion_scale(scientific_parse_unit(canonical), SECOND).number()
 
     raise ValueError(
         f"Unsupported time unit {unit!r}. Supported time units: {', '.join(_TIME_DISPLAY_UNITS)}"
@@ -73,8 +52,8 @@ def parse_concentration_unit(unit: str) -> float:
             f"{unit!r}. Supported concentration units: {', '.join(_CONCENTRATION_DISPLAY_UNITS)}"
         )
     canonical = _normalize_micro_prefix(_CONCENTRATION_ALIASES.get(normalized, normalized))
-    if canonical in _CONCENTRATION_FACTORS:
-        return _CONCENTRATION_FACTORS[canonical]
+    if canonical in _CONCENTRATION_DISPLAY_UNITS:
+        return conversion_scale(scientific_parse_unit(canonical), MOLAR).number()
 
     raise ValueError(
         "Unsupported concentration unit "

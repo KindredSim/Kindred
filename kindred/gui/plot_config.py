@@ -6,6 +6,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Any
+from kindred.core.quantity_units import parse_unit, conversion_scale, SECOND
 
 from kindred.core.project_presentation_state import (
     AxisSeriesSelection,
@@ -15,40 +16,15 @@ from kindred.core.project_presentation_state import (
 
 __all__ = [
     "AxisSelectionCandidate",
-    "CONCENTRATION_DISPLAY_UNIT_FACTORS",
     "TIME_DISPLAY_UNIT_FACTORS",
     "require_pyqtgraph",
 ]
 
 
-TIME_DISPLAY_UNIT_FACTORS = MappingProxyType(
-    {
-        "fs": 1e-15,
-        "ps": 1e-12,
-        "ns": 1e-9,
-        "µs": 1e-6,
-        "ms": 1e-3,
-        "s": 1.0,
-        "ks": 1e3,
-        "min": 60.0,
-        "h": 3600.0,
-        "d": 86_400.0,
-        "yr": 31_557_600.0,
-    }
-)
-
-CONCENTRATION_DISPLAY_UNIT_FACTORS = MappingProxyType(
-    {
-        "fM": 1e-15,
-        "pM": 1e-12,
-        "nM": 1e-9,
-        "µM": 1e-6,
-        "mM": 1e-3,
-        "M": 1.0,
-    }
-)
-
-
+TIME_DISPLAY_UNIT_FACTORS = MappingProxyType({
+    symbol: conversion_scale(parse_unit(symbol), SECOND).number()
+    for symbol in ("fs", "ps", "ns", "µs", "ms", "s", "ks", "min", "h", "d", "yr")
+})
 @dataclass(frozen=True, slots=True)
 class AxisSelectionCandidate:
     """One typed axis identity paired with display-only text."""

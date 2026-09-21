@@ -8,8 +8,9 @@ preset_set1 = {
   [P] = 0.0
 }
 
+param concentration_floor = 1e-30; unit = M
 let product_rate = k2 * [ES]
 let total_enzyme = [E] + [ES]
 
 # An observable can reference another observable by name.
-let bound_fraction = [ES] / max(total_enzyme, 1e-30)
+let bound_fraction = [ES] / max(total_enzyme, concentration_floor)

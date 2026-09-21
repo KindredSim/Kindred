@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from kindred.core.exceptions import SimulationCancelled
+from kindred.core.quantity_units import convert_value
 from kindred.core.result_repository import SimulationResultValue
 from kindred.core.simulation_parameters import enumerate_simulation_parameters
 from kindred.core.simulation_preparation import (
@@ -33,7 +34,9 @@ def execute_simulation(
             raise ValueError(f"Preview parameter {name!r} is not a direct GUI coordinate.")
         if not coordinate.writable or coordinate.derived:
             raise ValueError(f"Preview parameter {name!r} is owned by retained Algebra.")
-    parameters = tuple((item.name, overrides.get(item.name, item.value), item.unit) for item in coordinates)
+    spec = execution_request.prepared_dsl.parameter_algebra_spec_for_execution()
+    inputs, quantities = dict(spec.input_units), dict(spec.quantity_units)
+    parameters = tuple((item.name, convert_value(overrides.get(item.name, item.value), inputs[item.name], quantities[item.name]), quantities[item.name].symbol) for item in coordinates)
     prepared = prepare_simulation_run(execution_request=execution_request, cancellation_control=cancellation_control)
     if prepared.intervention_execution is None:
         raise SimulationPreparationError("intervention_schedule", "Prepared Run retained an unresolved intervention schedule.")

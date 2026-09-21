@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from kindred.core.quantity_units import Unit
+
 from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Any, Iterable, Mapping
@@ -48,6 +50,8 @@ class SimulationResultValue:
     scalars: Mapping[str, float] = MappingProxyType({})
     parameters: tuple[tuple[str, float, str], ...] = ()
     presentation_boundaries: tuple[SimulationPresentationBoundary, ...] = ()
+    quantity_units: tuple[tuple[str, Unit | None], ...] = ()
+    presentation_units: tuple[tuple[str, Unit | None], ...] = ()
 
     def __post_init__(self) -> None:
         # Canonical finalization is the sole producer; solver-owned arrays and

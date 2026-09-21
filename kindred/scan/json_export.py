@@ -14,6 +14,7 @@ import scipy
 
 from kindred._version import __version__ as KINDRED_VERSION
 from kindred.scan.config import START, END
+from kindred.core.quantity_units import presentation_unit
 
 
 def plain(value):
@@ -59,6 +60,7 @@ def result_record(run, result, outputs):
         "segment_ids": result.segment_ids.tolist(), "segment_keys": list(result.segment_keys),
         "discontinuity_ids": result.discontinuity_ids.tolist(),
         "parameters": plain(result.parameters),
+        "output_units": {name: unit.symbol if unit is not None else None for name, unit in result.quantity_units if name == "t" or name in outputs},
         "algebra_errors": [error.to_payload() for error in result.algebra_errors],
         "boundaries": [{"time": b.time,
                         "pre": {k: v for k, v in b.pre_state if k in outputs},
@@ -87,7 +89,11 @@ class JsonScanWriter:
             raise
         versions = {"kindred": KINDRED_VERSION, "numpy": np.__version__,
                     "scipy": scipy.__version__}
-        header = {"schema_version": 1, "created_utc": datetime.now(timezone.utc).isoformat(),
+        spec = design.prepared.parameter_algebra_spec_for_execution()
+        constraint_units = {s.name: presentation_unit(s.expr.quantity_unit, s.declared_unit) for s in spec.observable_block.lines}
+        header = {"schema_version": 2,
+                  "input_units": {item.key: item.unit for item in design.catalog},
+                  "constraint_units": {c.observable: constraint_units[c.observable].symbol if constraint_units[c.observable] is not None else None for c in config.constraints}, "created_utc": datetime.now(timezone.utc).isoformat(),
                   "versions": versions, "configuration": asdict(config),
                   "effective_ranges": plain(design.effective_ranges),
                   "sampling_note": "Conditional interval sampling; constrained physical coordinates are not guaranteed uniform or Latin-hypercube stratified."}

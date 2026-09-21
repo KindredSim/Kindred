@@ -9,7 +9,6 @@ from kindred.core.equilibrium_rate_authority import equilibrium_rate_symbolic_re
 from kindred.core.kinetics import forward_rate_symbolic_relation
 from kindred.core.mechanism import Mechanism
 from kindred.core.mechanism_metadata import EquilibriumMetadataKeys, MechanismMetadataView
-from kindred.core.simulator.kinetics import normalize_energy_to_J_per_mol
 from kindred.core.simulator.parameter_algebra_spec import ParameterAlgebraSpec
 from kindred.core.simulator.step_indexing import get_step_index_map
 
@@ -31,9 +30,6 @@ def build_calculator_chemistry_relations(
             return sympy.Rational(value.numerator, value.denominator)
         return sympy.Rational(str(value))
 
-    energy_factor = exact_literal(
-        normalize_energy_to_J_per_mol(1, metadata.energy_unit)
-    )
     temperature = symbols["T"]
     readouts_by_source: dict[int, dict[str, str]] = {}
     for item in parameter_spec.mechanism_namespace.ordered_items:
@@ -63,8 +59,6 @@ def build_calculator_chemistry_relations(
                     return None
                 raise ValueError(f"Missing admitted source coordinate for {source_role!r}.")
             symbol = symbols[name]
-            if role in {"Ea", "dG_act", "dG_eq"}:
-                return energy_factor * symbol
             return symbol
 
         try:

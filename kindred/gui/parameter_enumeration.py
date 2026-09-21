@@ -13,6 +13,7 @@ from typing import Literal
 
 from kindred.core.simulator.dsl_parse import PreparedDslRequestSet
 from kindred.core.simulator.parameter_coordinates import admit_physical_coordinate_value
+from kindred.core.quantity_units import parse_unit, scientific_unit, convert_value
 from kindred.core.simulation_parameters import enumerate_simulation_parameters
 from kindred.core.units import (
     ARRHENIUS_A_MAX,
@@ -23,6 +24,8 @@ from kindred.core.units import (
     RATE_MAX,
     admit_keq,
     admit_rate,
+    admit_ordinary_parameter,
+    ordinary_parameter_input_bounds,
     UnitsModel,
 )
 
@@ -73,15 +76,18 @@ def admit_gui_parameter_value(
             raise TypeError(f"{field} must be numeric.") from exc
         if not math.isfinite(parsed):
             raise ValueError(f"{field} must be finite.")
+        input_unit = parse_unit(unit)
+        scientific = convert_value(parsed, input_unit, scientific_unit(input_unit.dimensions))
         if role != "scalar":
             admit_physical_coordinate_value(
-                parsed, role=role, energy_unit=unit, field=field,
+                scientific, role=role, field=field,
             )
             # GUI values retain authored units; only scientific execution
             # consumes the admission function's J/mol energy result.
             return parsed
         if parsed == 0.0 and not allow_exact_zero:
             raise ValueError(f"{field} must be nonzero.")
+        admit_ordinary_parameter(scientific, field=field)
         return float(parsed)
     raise ValueError(f"Unknown GUI parameter scientific category: {scientific_category!r}.")
 
@@ -214,6 +220,14 @@ def enumerate_parameter_coordinates(
             low, high = max(low, -limit), min(high, limit)
         else:
             low, high = _signed_bounds(value)
+            floor, limit = ordinary_parameter_input_bounds(item.unit)
+            low, high = max(low, -limit), min(high, limit)
+            if 0.0 < abs(low) < floor:
+                low = 0.0
+            if 0.0 < abs(high) < floor:
+                high = 0.0
+            if low == high:
+                low, high = -floor, floor
         display_name = item.name
         if item.context:
             display_name = f"{display_name} — {item.context}"

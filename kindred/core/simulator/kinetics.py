@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import math
 
-from ..units import kcalmol_to_jmol, kjmol_to_jmol
+from ..quantity_units import convert_value, parse_unit
 
 
 __all__ = [
@@ -37,14 +37,7 @@ def normalize_energy_to_J_per_mol(value: float, unit: str | None) -> float:
 
     unit ∈ {"J/mol","kJ/mol","kcal/mol"}; if None, assume J/mol.
     """
-    if unit is None or unit == "J/mol":
-        ej = float(value)
-    elif unit == "kJ/mol":
-        ej = kjmol_to_jmol(float(value))
-    elif unit == "kcal/mol":
-        ej = kcalmol_to_jmol(float(value))
-    else:
-        raise ValueError(f"unsupported energy unit {unit!r}")
+    ej = convert_value(value, parse_unit(unit or "J/mol"), parse_unit("J/mol"))
     if not math.isfinite(ej):
         raise ValueError("energy must be finite")
     return ej

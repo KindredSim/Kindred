@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from kindred.core.quantity_units import Unit, conversion_scale, presentation_unit, scientific_unit
+
 import io
 import time
 from dataclasses import dataclass, replace
@@ -22,7 +24,6 @@ from kindred.gui.theme_manager import plot_background_color, plot_foreground_col
 from kindred.gui.ui_helpers import clamp_initial_size
 from kindred.gui.interactive_preview import InteractivePreviewRequest
 from kindred.gui.plot_config import (
-    CONCENTRATION_DISPLAY_UNIT_FACTORS,
     TIME_DISPLAY_UNIT_FACTORS,
     require_pyqtgraph,
 )
@@ -228,9 +229,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         self._presentation = ProjectPresentationState()
         self._axis_range = _AxisRangeSession()
         self._refit_axes = (False, False)
-        self._x_time_unit = "s"
-        self._x_concentration_unit = "M"
-        self._y_concentration_unit = "M"
+        self._axis_display_units: dict[tuple[str, tuple], Unit] = {}
         self._render_input: ResultRenderInput | None = None
         self._copy_all_available = False
         self._rendered_point_roster: tuple[_RenderedPointBlock, ...] = ()
@@ -952,9 +951,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         self._axis_range = _AxisRangeSession()
         self._refit_axes = (False, False)
         self._apply_axis_range_state(self._axis_range, self._presentation)
-        self._x_time_unit = "s"
-        self._x_concentration_unit = "M"
-        self._y_concentration_unit = "M"
+        self._axis_display_units: dict[tuple[str, tuple], Unit] = {}
 
     def reset_plot_session_state(self) -> None:
         """Project replacement/reopen resets non-archived Plot session truth."""
@@ -967,9 +964,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         self._axis_range = _AxisRangeSession()
         self._refit_axes = (False, False)
         self._apply_axis_range_state(self._axis_range, self._presentation)
-        self._x_time_unit = "s"
-        self._x_concentration_unit = "M"
-        self._y_concentration_unit = "M"
+        self._axis_display_units: dict[tuple[str, tuple], Unit] = {}
         self._axis_toolbar.set_axis_unit_choices(
             x_units=tuple(TIME_DISPLAY_UNIT_FACTORS),
             selected_x="s",
@@ -1722,49 +1717,42 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
             and selection.series_name == "t"
         )
 
+    def _selected_display_unit(self, axis: str, source: Unit | None) -> Unit | None:
+        if source is None:
+            return None
+        return self._axis_display_units.get(
+            (axis, source.dimensions), presentation_unit(scientific_unit(source.dimensions)),
+        )
+
+    def _display_unit_choices(self, render_input: ResultRenderInput, axis: str) -> tuple[Unit, ...]:
+        source = render_input.x_unit if axis == "x" else render_input.y_unit
+        selected = self._selected_display_unit(axis, source)
+        if selected is None:
+            return ()
+        options = render_input.x_unit_options if axis == "x" else render_input.y_unit_options
+        if any(option.symbol == selected.symbol for option in options):
+            return options
+        return (*options, selected)
+
     def _display_unit_state(
         self,
         render_input: ResultRenderInput,
     ) -> tuple[str | None, str | None, float, float]:
-        if self._has_time_x(render_input):
-            x_unit = self._x_time_unit
-            x_scale = 1.0 / TIME_DISPLAY_UNIT_FACTORS[x_unit]
-        elif render_input.x_is_concentration:
-            x_unit = self._x_concentration_unit
-            x_scale = 1.0 / CONCENTRATION_DISPLAY_UNIT_FACTORS[x_unit]
-        else:
-            x_unit = None
-            x_scale = 1.0
-        if render_input.y_is_concentration:
-            y_unit = self._y_concentration_unit
-            y_scale = 1.0 / CONCENTRATION_DISPLAY_UNIT_FACTORS[y_unit]
-        else:
-            y_unit = None
-            y_scale = 1.0
+        def selected(axis, unit):
+            shown = self._selected_display_unit(axis, unit)
+            if shown is None:
+                return None, 1.0
+            return shown.symbol, conversion_scale(unit, shown).number()
+        x_unit, x_scale = selected("x", render_input.x_unit)
+        y_unit, y_scale = selected("y", render_input.y_unit)
         return x_unit, y_unit, x_scale, y_scale
 
-    def _configure_axis_unit_controls(
-        self,
-        render_input: ResultRenderInput,
-    ) -> None:
-        x_unit, y_unit, _x_scale, _y_scale = self._display_unit_state(
-            render_input
-        )
-        if self._has_time_x(render_input):
-            x_units = tuple(TIME_DISPLAY_UNIT_FACTORS)
-        elif render_input.x_is_concentration:
-            x_units = tuple(CONCENTRATION_DISPLAY_UNIT_FACTORS)
-        else:
-            x_units = ()
-        y_units = (
-            tuple(CONCENTRATION_DISPLAY_UNIT_FACTORS)
-            if render_input.y_is_concentration
-            else ()
-        )
+    def _configure_axis_unit_controls(self, render_input: ResultRenderInput) -> None:
+        x_unit, y_unit, _x_scale, _y_scale = self._display_unit_state(render_input)
         self._axis_toolbar.set_axis_unit_choices(
-            x_units=x_units,
+            x_units=tuple(unit.symbol for unit in self._display_unit_choices(render_input, "x")),
             selected_x=x_unit,
-            y_units=y_units,
+            y_units=tuple(unit.symbol for unit in self._display_unit_choices(render_input, "y")),
             selected_y=y_unit,
             transformed=self._presentation.plot_transform != "original",
         )
@@ -1783,7 +1771,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         else:
             x_label = render_input.x_label
         y_label = (
-            f"Concentration ({y_unit})"
+            f"{render_input.y_label} ({y_unit})"
             if y_unit is not None
             else render_input.y_label
         )
@@ -1955,7 +1943,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
                 for name, _ in sampled_series
             ),
             y_units=tuple(
-                (name, self._copy_concentration_unit(block, name, y_unit))
+                (name, self._copy_quantity_unit(block, name, y_unit))
                 for name, _ in sampled_series
             ),
             chunks=rendered_chunks,
@@ -1963,18 +1951,18 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         return rendered_block, rendered_chunks
 
     @staticmethod
-    def _copy_concentration_unit(
+    def _copy_quantity_unit(
         block: ResultDataBlock, name: str, display_unit: str | None,
     ) -> str | None:
         # Mixed axes retain canonical concentrations even without an axis unit.
-        if block.kind is ResultLayerKind.EXPERIMENTAL or name in block.concentration_names:
-            return display_unit or "M"
-        return None
+        source_unit = block.unit_for(name)
+        return (display_unit or source_unit.symbol) if source_unit is not None else None
 
     def _copy_x_unit(self, block: ResultDataBlock, display_unit: str | None) -> str | None:
         if isinstance(block.x_axis, SimulationSeriesAxisSelection) and block.x_axis.series_name == "t":
-            return display_unit
-        return self._copy_concentration_unit(block, block.x_name, display_unit)
+            return display_unit or "s"
+        unit = block.unit_for(block.x_name, x=True)
+        return (display_unit or unit.symbol) if unit is not None else None
 
     def _rendered_block_for_interactive_curve(
         self,
@@ -2046,7 +2034,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
             y_names=((series_name, copy_series_label(
                 series_name, definition=definitions.get(series_name),
             )),),
-            y_units=((series_name, self._copy_concentration_unit(source, series_name, y_unit)),),
+            y_units=((series_name, self._copy_quantity_unit(source, series_name, y_unit)),),
             chunks=curve_chunks,
         )
 
@@ -2661,22 +2649,16 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         render_input = self._render_input
         if render_input is None:
             return
+        options = self._display_unit_choices(render_input, axis)
+        chosen = next((item for item in options if item.symbol == unit), None)
+        if chosen is None:
+            return
+        source = render_input.x_unit if axis == "x" else render_input.y_unit
+        if self._selected_display_unit(axis, source).symbol == chosen.symbol:
+            return
         self._axis_range = self._capture_view_range()
         old_x_scale, old_y_scale = self._coordinate_scales(render_input)
-        if axis == "x" and self._has_time_x(render_input):
-            if unit not in TIME_DISPLAY_UNIT_FACTORS:
-                return
-            self._x_time_unit = unit
-        elif axis == "x" and render_input.x_is_concentration:
-            if unit not in CONCENTRATION_DISPLAY_UNIT_FACTORS:
-                return
-            self._x_concentration_unit = unit
-        elif axis == "y" and render_input.y_is_concentration:
-            if unit not in CONCENTRATION_DISPLAY_UNIT_FACTORS:
-                return
-            self._y_concentration_unit = unit
-        else:
-            return
+        self._axis_display_units[axis, chosen.dimensions] = chosen
         new_x_scale, new_y_scale = self._coordinate_scales(render_input)
         x_ratio = new_x_scale / old_x_scale
         y_ratio = new_y_scale / old_y_scale

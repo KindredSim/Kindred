@@ -546,6 +546,17 @@ class FittingEvaluator:
                 cancellation_control=self._cancellation_control,
             )
         except SimulationPreparationError as exc:
+            if exc.stage == "ordinary_parameter_domain" and exc.parameter_names and all(
+                _parameter_origin_for(name, origin_map) in {
+                    FITTING_PARAM_ORIGIN_OPTIMIZER_SHARED,
+                    FITTING_PARAM_ORIGIN_OPTIMIZER_DATASET,
+                }
+                for name in exc.parameter_names
+            ):
+                raise FitCandidateDomainError(
+                    str(exc), stage=exc.stage, failed_params=failed_params,
+                    details=dict(exc.details),
+                ) from exc
             raise fit_simulation_error_from_preparation_error(
                 exc,
                 failed_params=failed_params,

@@ -9,7 +9,6 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
-from enum import Enum
 
 import numpy as np
 
@@ -47,6 +46,7 @@ from kindred.core.fitting_completion import (
     FitExtensionProgress,
 )
 from kindred.core.result_repository import SimulationResultValue
+from kindred.core.quantity_units import Unit, MOLAR, SECOND, conversion_scale, presentation_unit
 from kindred.core.simulator.solver_types import SimulationCancellationControl
 from kindred.core.simulation_failure import (
     FactualCause,
@@ -71,20 +71,12 @@ from kindred.core.species import validate_concentration
 __all__ = [
     "FitCandidate",
     "FitCurveDataset",
-    "FitCurveYSemantic",
     "FitLiveUpdate",
     "project_fit_candidate_curves",
 ]
 
 _BEST_INTERVAL_SECONDS = 0.25
 _CURVE_INTERVAL_SECONDS = 2.0
-
-
-class FitCurveYSemantic(str, Enum):
-    """Typed physical meaning of one projected Fit Y series."""
-
-    CONCENTRATION = "concentration"
-    VALUE = "value"
 
 
 def _finite_items(
@@ -139,7 +131,7 @@ def _curve_items(
 class FitCurveDataset:
     dataset_id: str
     display_name: str
-    y_semantics: tuple[tuple[str, FitCurveYSemantic], ...]
+    quantity_units: tuple[tuple[str, Unit | None], ...]
     model_x: tuple[tuple[str, tuple[float, ...]], ...]
     model_y: tuple[tuple[str, tuple[float, ...]], ...]
     model_time: tuple[float, ...]
@@ -151,8 +143,10 @@ class FitCurveDataset:
     model_discontinuity_ids: tuple[tuple[str, tuple[int, ...]], ...]
     observed_raw_columns: tuple[tuple[str, str], ...]
     model_definitions: tuple[tuple[str, str], ...]
-    x_semantic: FitCurveYSemantic
     observed_x_name: str | None
+    x_unit: Unit | None
+    observed_x_unit: Unit
+    observed_y_unit: Unit
     x_name: str = "t"
 
     def __post_init__(self) -> None:
@@ -181,28 +175,6 @@ class FitCurveDataset:
             for name, values in self.model_discontinuity_ids
         )
         names = tuple(name for name, _values in model_y)
-        if type(self.y_semantics) is not tuple or any(
-            type(item) is not tuple or len(item) != 2
-            for item in self.y_semantics
-        ):
-            raise ValueError(
-                "Fit curves require immutable typed Y semantic entries."
-            )
-        y_semantics = self.y_semantics
-        if (
-            any(
-                not isinstance(name, str)
-                or not name.strip()
-                or not isinstance(semantic, FitCurveYSemantic)
-                for name, semantic in y_semantics
-            )
-            or len(y_semantics) != len(names)
-            or tuple(name for name, _semantic in y_semantics) != names
-        ):
-            raise ValueError(
-                "Fit curves require one ordered typed Y semantic for every "
-                "projected series."
-            )
         segment_names = tuple(name for name, _values in model_segment_ids)
         segment_key_names = tuple(
             name for name, _values in model_segment_keys
@@ -266,7 +238,6 @@ class FitCurveDataset:
             )
         object.__setattr__(self, "dataset_id", dataset_id)
         object.__setattr__(self, "display_name", display_name)
-        object.__setattr__(self, "y_semantics", y_semantics)
         object.__setattr__(self, "x_name", x_name)
         object.__setattr__(self, "model_x", model_x)
         object.__setattr__(self, "model_y", model_y)
@@ -734,25 +705,30 @@ def _terminal_setup_snapshot(
     )
 
 
-def _fit_curve_y_semantics(
-    prepared_dsl: PreparedDslRequestSet,
-    names: Sequence[str],
-) -> tuple[tuple[str, FitCurveYSemantic], ...]:
-    """Project Y meaning only from the prepared DSL typed species roster."""
+def fit_curve_units(prepared_dsl: PreparedDslRequestSet) -> tuple[tuple[str, Unit | None], ...]:
+    """Capture scientific units from the admitted model, independently of species roles."""
+    spec = prepared_dsl.parameter_algebra_spec_for_execution()
+    units = dict(spec.quantity_units)
+    units.update((name, MOLAR) for name in prepared_dsl.analysis.species_names)
+    units["t"] = SECOND
+    return tuple(units.items())
 
-    concentration_names = {
-        str(name) for name in prepared_dsl.analysis.species_names
-    }
-    return tuple(
-        (
-            str(name),
-            FitCurveYSemantic.CONCENTRATION
-            if str(name) in concentration_names
-            else FitCurveYSemantic.VALUE,
-        )
-        for name in names
-    )
 
+def fit_display_units(quantity_units, presentation_units, names, x_name):
+    """Choose common display units without changing admitted observations."""
+    units, preferences = dict(quantity_units), dict(presentation_units)
+    def concentration_unit(selected):
+        if not selected or any(units.get(name) is None or not units[name].compatible(MOLAR) for name in selected):
+            return MOLAR
+        preferred = tuple(preferences.get(name) or MOLAR for name in selected)
+        return preferred[0] if all(unit == preferred[0] for unit in preferred) else MOLAR
+    return SECOND if x_name == "t" else concentration_unit((x_name,)), concentration_unit(names)
+
+
+def fit_source_presentation_units(prepared_dsl):
+    spec = prepared_dsl.parameter_algebra_spec_for_execution()
+    return tuple((stmt.name, presentation_unit(stmt.expr.quantity_unit, stmt.declared_unit))
+                 for stmt in spec.observable_block.lines)
 
 
 def _curves_from_simulations(
@@ -806,6 +782,26 @@ def _curves_from_simulations(
             )
             for name in model_names
         )
+        x_display, y_display = fit_display_units(simulation.quantity_units, simulation.presentation_units, model_names, x_name)
+        quantities = dict(simulation.quantity_units)
+        def scaled(items, target):
+            result = []
+            for name, values in items:
+                source = quantities.get(name)
+                factor = conversion_scale(source, target).number() if source is not None and source.compatible(target) else 1.0
+                result.append((name, tuple(value * factor for value in values)))
+            return tuple(result)
+        model_y = scaled(model_y, y_display)
+        x_source = quantities.get(x_name)
+        x_factor = conversion_scale(x_source, x_display).number() if x_source is not None and x_source.compatible(x_display) else 1.0
+        model_x = tuple((name, tuple(value * x_factor for value in values)) for name, values in model_x)
+        ox_factor = conversion_scale(SECOND if x_name == "t" else MOLAR, x_display).number()
+        oy_factor = conversion_scale(MOLAR, y_display).number()
+        observed_x = tuple((name, tuple(value * ox_factor for value in values)) for name, values in observed_x)
+        observed_y = tuple((name, tuple(value * oy_factor for value in values)) for name, values in observed_y)
+        for name, target in ((x_name, x_display), *((name, y_display) for name in model_names)):
+            if quantities.get(name) is not None and quantities[name].compatible(target):
+                quantities[name] = target
         model_segment_ids = tuple(
             (name, tuple(int(value) for value in simulation.segment_ids))
             for name in model_names
@@ -822,9 +818,10 @@ def _curves_from_simulations(
             FitCurveDataset(
                 dataset_id=dataset_id,
                 display_name=mapped.display_name,
-                y_semantics=_fit_curve_y_semantics(request.setup.origin.prepared_dsl, model_names),
+                quantity_units=tuple(quantities.items()),
+                x_unit=x_display if x_source is not None and x_source.compatible(x_display) else x_source,
+                observed_x_unit=x_display, observed_y_unit=y_display,
                 model_definitions=model_definitions,
-                x_semantic=_fit_curve_y_semantics(request.setup.origin.prepared_dsl, (x_name,))[0][1],
                 observed_x_name=(
                     None if prepared.parametric_x_observation is None
                     else prepared.parametric_x_observation.raw_column

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from kindred.core.quantity_units import MOLAR, SECOND, presentation_unit
+
 from types import MappingProxyType
 from typing import Any, Callable, Mapping
 
@@ -240,7 +242,14 @@ def finalize_simulation_result(
         if name not in succeeded_names and name not in failed_names
     )
     check_cancelled()
+    units = dict(parameter_algebra_spec.quantity_units)
+    units.update({name: MOLAR for name in species_names})
+    units["t"] = SECOND
+    names = ("t", *finalized_series, *finalized_algebra_scalars)
+    declarations = {s.name: s.declared_unit for s in parameter_algebra_spec.observable_block.lines}
     return SimulationResultValue(
+        quantity_units=tuple((name, units.get(name)) for name in names),
+        presentation_units=tuple((name, presentation_unit(units.get(name), declarations.get(name))) for name in names),
         t=result_time,
         series=finalized_series,
         segment_ids=result.segment_ids,

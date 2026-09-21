@@ -347,17 +347,26 @@ class AxisToolbar(QtWidgets.QWidget):
         self._x_unit_label.setText("Source X unit:" if transformed else "Unit:")
         self._y_unit_label.setText("Source Y unit:" if transformed else "Unit:")
         x_tooltip = (
-            "Choose the units for the original X quantity. This changes the \"per X\" part of dy/dx. "
-            "For example, changing seconds to minutes changes a rate per second to a rate per minute."
+            "Choose the units for the original horizontal quantity. "
+            "This changes the denominator units of the displayed derivative. "
+            "For example, choosing minutes instead of seconds changes a rate per second to a rate per minute. "
+            "Manual limits and copied plot values update with the display."
             if transformed else
-            "Choose the units for the horizontal axis and Copy Plotted Data. Available for time or concentration."
+            "Choose the units for the horizontal axis. Plotted values, manual axis limits, "
+            "Copy Plotted Data, and Copy Visible Data use these units. "
+            "Switching between compatible quantities keeps your selection."
         )
         y_tooltip = (
-            "Choose the units for the original Y quantities. This changes the Y part of dy/dx. "
-            "In Derivative versus Y, it also changes the horizontal axis units."
+            "Choose the units for the original vertical quantities. "
+            "This changes the numerator units of the displayed derivative. "
+            "For example, choosing mM instead of M changes M/s to mM/s when the horizontal quantity is time in seconds. "
+            "In Derivative versus Y, it also changes the horizontal-axis units. "
+            "Manual limits and copied plot values update with the display."
             if transformed else
-            "Choose the concentration units for the vertical axis and Copy Plotted Data. "
-            "Available when all selected Y quantities are concentrations."
+            "Choose the units for the vertical axis. Plotted values, manual axis limits, "
+            "Copy Plotted Data, and Copy Visible Data use these units. "
+            "Switching between compatible curves keeps your selection. "
+            "Available when the selected curves have compatible known units."
         )
         for widget in (self._x_unit_combo, self._x_unit_label):
             widget.setToolTip(x_tooltip)

@@ -7,6 +7,9 @@ equilibrium constants, and scalar values) with automatic simulation updates.
 
 from __future__ import annotations
 
+from kindred.core.quantity_units import parse_unit
+from kindred.core.validation import parse_finite_numeric_text
+
 from functools import partial
 from dataclasses import dataclass
 import logging
@@ -466,7 +469,7 @@ class VariableSliders(QtWidgets.QWidget):
         if meta and bool(meta.get("derived")):
             derived_suffix = " (derived)"
         unit_suffix = ""
-        if meta and meta.get("scale") == "linear" and meta.get("unit"):
+        if meta and meta.get("unit"):
             unit_suffix = f" [{meta.get('unit')}]"
         if meta and isinstance(meta.get("label"), str):
             display_name = str(meta["label"]).strip()
@@ -632,11 +635,25 @@ class VariableSliders(QtWidgets.QWidget):
                     self.update_variable(name, value)
             self._sync_visibility_state()
         else:
+            retained_editors = {}
+            if preserve_editor_drafts:
+                for name, editor in self._value_labels.items():
+                    old, new = self._metadata.get(name), normalized_metadata.get(name)
+                    dirty = (bool(editor.property("invalidNumeric")) or editor.text() != self._last_committed_editor_text.get(name, self._format_value(self._variables[name])))
+                    if dirty and old is not None and new is not None and parse_unit(str(old["unit"])) == parse_unit(str(new["unit"])):
+                        retained_editors[name] = (editor.text(), self._editor_pre_edit_state.get(name), self._last_committed_editor_text.get(name), bool(editor.property("invalidNumeric")))
             self.set_variables(
                 normalized_variables,
                 metadata=normalized_metadata,
                 preserve_visibility=preserve_visibility,
             )
+            for name, (text, baseline, committed, rejected) in retained_editors.items():
+                self._set_value_projection(name, normalized_variables[name], editor_text=text, emit=False)
+                self._decorate_editor(name, rejected=rejected)
+                if baseline is not None:
+                    self._editor_pre_edit_state[name] = baseline
+                if committed is not None:
+                    self._last_committed_editor_text[name] = committed
         if not preserve_editor_drafts:
             for name in normalized_variables:
                 self.remember_editor_state(name)
@@ -978,7 +995,7 @@ class VariableSliders(QtWidgets.QWidget):
         if not isinstance(editor, _NumericValueEdit):
             return
         try:
-            value = float(editor.text().strip())
+            value = parse_finite_numeric_text(editor.text().strip())
             valid = bool(math.isfinite(value)) and not rejected
         except (TypeError, ValueError, OverflowError):
             valid = False
@@ -1001,7 +1018,7 @@ class VariableSliders(QtWidgets.QWidget):
         if raw == self._last_committed_editor_text.get(name_s):
             return
         try:
-            value = float(raw.strip())
+            value = parse_finite_numeric_text(raw.strip())
         except (TypeError, ValueError, OverflowError):
             self._decorate_editor(name_s)
             return
@@ -1032,6 +1049,7 @@ class VariableSliders(QtWidgets.QWidget):
         value_f = float(value)
         if not math.isfinite(value_f):
             return
+        previous_range = self._slider_ranges[name_s]
         if self._slider_scales.get(name_s, "log") == "log":
             self._slider_signs[name_s] = 1.0 if value_f >= 0 else -1.0
         self._ensure_range_covers(name_s, value_f)
@@ -1059,6 +1077,17 @@ class VariableSliders(QtWidgets.QWidget):
             if not isinstance(interaction, SliderInteractionKind):
                 raise TypeError("emitted Slider values require an interaction kind.")
             self.interactionRequested.emit(name_s, value_f, interaction)
+            if (
+                interaction is SliderInteractionKind.EXACT_TYPED_COMMIT
+                and self._value_labels.get(name_s) is value_label
+                and bool(value_label.property("invalidNumeric"))
+            ):
+                # The synchronous owner restored the accepted value. A rejected
+                # typed number must not expand its slider's display range.
+                self._slider_ranges[name_s] = previous_range
+                self._update_range_labels(name_s)
+                with QtCore.QSignalBlocker(slider):
+                    slider.setValue(self._value_to_slider_pos(name_s, self._variables[name_s]))
 
     @staticmethod
     def _set_editor_text(editor: QtWidgets.QLineEdit, text: str) -> None:

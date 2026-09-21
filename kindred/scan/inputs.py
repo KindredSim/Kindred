@@ -11,7 +11,7 @@ from kindred.core.species import (
 )
 from kindred.core.units import (
     RATE_MIN, RATE_MAX, KEQ_MIN, KEQ_MAX, ARRHENIUS_A_MAX,
-    ENERGY_ABS_MAX_J_PER_MOL, UnitsModel,
+    ENERGY_ABS_MAX_J_PER_MOL, UnitsModel, ordinary_parameter_input_bounds,
 )
 from kindred.scan.config import START, END, ScanConfig, initial_key, parameter_key
 from kindred.scan.intervals import Interval, intersect, normalize
@@ -43,6 +43,9 @@ def input_catalog(prepared, config: ScanConfig) -> tuple[ScanInput, ...]:
         elif item.role in {"Ea", "dG_act", "dG_eq"}:
             limit = UnitsModel(energy_unit=item.unit).from_jmol(ENERGY_ABS_MAX_J_PER_MOL)
             bounds = (Interval(-limit, limit),)
+        elif item.role == "scalar":
+            floor, limit = ordinary_parameter_input_bounds(item.unit)
+            bounds = (Interval(-limit, -floor), Interval(0.0, 0.0), Interval(floor, limit))
         else:
             bounds = (Interval(-sys.float_info.max, sys.float_info.max),)
         if item.allow_exact_zero and bounds[0].lower > 0:

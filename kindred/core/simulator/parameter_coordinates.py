@@ -39,9 +39,6 @@ from kindred.core.units import (
     admit_energy_j_per_mol,
     admit_keq,
     admit_rate,
-    kcalmol_to_jmol,
-    kjmol_to_jmol,
-    UnitsModel,
 )
 
 ParameterTarget: TypeAlias = tuple[
@@ -185,7 +182,6 @@ def bind_chemistry_readout(
                         else admit_physical_coordinate_value(
                             value,
                             role=coordinate,
-                            energy_unit=metadata.energy_unit,
                             field=source[coordinate],
                         )
                     )
@@ -216,7 +212,6 @@ def bind_chemistry_readout(
         admit_physical_coordinate_value(
             values[source["dG_eq"]],
             role="dG_eq",
-            energy_unit=metadata.energy_unit,
             field=source["dG_eq"],
         ),
         values["T"],
@@ -229,10 +224,9 @@ def admit_physical_coordinate_value(
     value: object,
     *,
     role: str,
-    energy_unit: str,
     field: str,
 ) -> float:
-    """Admit a physical coordinate, lowering authored energies to J/mol."""
+    """Admit a physical coordinate already expressed in scientific units."""
     if role == "A":
         return admit_arrhenius_prefactor(value, field=field)
     if role == "kappa":
@@ -245,14 +239,7 @@ def admit_physical_coordinate_value(
         return numeric
     if role not in {"Ea", "dG_act", "dG_eq"}:
         raise ValueError(f"Unsupported source coordinate role {role!r}")
-    conversion = {
-        "J/mol": lambda raw: float(raw),
-        "kJ/mol": kjmol_to_jmol,
-        "kcal/mol": kcalmol_to_jmol,
-    }.get(energy_unit)
-    if conversion is None:
-        raise ValueError(f"Unsupported energy_unit: {energy_unit!r}")
-    return admit_energy_j_per_mol(conversion(value), field=field)
+    return admit_energy_j_per_mol(value, field=field)
 
 
 def _admit_coordinate_value(
@@ -270,9 +257,6 @@ def _admit_coordinate_value(
     if route == "physical":
         return admit_physical_coordinate_value(
             value, role=role, field=name,
-            energy_unit=MechanismMetadataView.from_metadata(
-                getattr(mechanism, "metadata", {}) or {}
-            ).energy_unit,
         )
 
     if role == "Keq":
@@ -515,10 +499,6 @@ def read_mechanism_parameter_values(
     out: dict[str, float] = {}
     reactions = getattr(mechanism, "reactions", ()) or ()
     equilibria = getattr(mechanism, "equilibria", ()) or ()
-    metadata = MechanismMetadataView.from_metadata(
-        getattr(mechanism, "metadata", {}) or {}
-    )
-    energy_units = UnitsModel(energy_unit=metadata.energy_unit)
 
     def _value(raw: object) -> float | None:
         if raw is None:
@@ -552,9 +532,9 @@ def read_mechanism_parameter_values(
             if role == "A" and isinstance(model, ArrheniusRateModel):
                 value = float(model.A)
             elif role == "Ea" and isinstance(model, ArrheniusRateModel):
-                value = float(energy_units.from_jmol(model.Ea_J_per_mol))
+                value = float(model.Ea_J_per_mol)
             elif role == "dG_act" and isinstance(model, EyringRateModel):
-                value = float(energy_units.from_jmol(model.dG_act_J_per_mol))
+                value = float(model.dG_act_J_per_mol)
             elif role == "kappa" and isinstance(model, EyringRateModel):
                 value = float(model.kappa)
             elif role == "degeneracy" and isinstance(model, EyringRateModel):
@@ -566,7 +546,7 @@ def read_mechanism_parameter_values(
                     )
                 )
                 if value is not None:
-                    value = float(energy_units.from_jmol(value))
+                    value = float(value)
         if value is not None and math.isfinite(value):
             out[name] = float(value)
     return out

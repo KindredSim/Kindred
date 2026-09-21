@@ -21,6 +21,7 @@ from kindred.core.exceptions import (
     SimulationCancelled,
 )
 from kindred.core.species import validate_concentration, validate_time_seconds
+from kindred.core.units import OrdinaryParameterDomainError
 from kindred.core.temperature import (
     TemperatureScheduleProtocol,
 )
@@ -860,6 +861,10 @@ def _apply_parameter_overrides_to_prepared_mechanism(
             mechanism_coordinate_overrides=mechanism_coordinate_values,
             scalar_parameter_overrides=scalar_override_values,
         )
+    except OrdinaryParameterDomainError as exc:
+        raise SimulationPreparationError(
+            "ordinary_parameter_domain", str(exc), parameter_names=(exc.field,),
+        ) from exc
     except Exception as exc:
         raise SimulationPreparationError(
             "parameter_overrides",

@@ -27,7 +27,7 @@ Helpers:
     heaviside(x), clip(x, lo, hi), ifelse(cond, a, b)
 
 Protected symbols (read-only; listed here for reference only):
-    k_B, h, h_bar, N_A, R, Rkcal, T
+    k_B, h, h_bar, N_A, R, T
 """
 
 from __future__ import annotations

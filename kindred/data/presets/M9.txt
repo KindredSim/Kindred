@@ -19,11 +19,12 @@ preset_set1 = {
   [E] = 0.0
 }
 
-param barrier_offset = 3.0
+param barrier_offset = 3.0; unit = kJ/mol
 param dG_act3 = dG_act2 + barrier_offset
 
 # Calculated rate constants already include kappa and degeneracy.
 # Do not multiply by those factors again in these expressions.
+param concentration_floor = 1e-30; unit = M
 let rate_D = k2 * [C]
 let rate_E = k3 * [C]
-let fraction_D = [D] / max([D] + [E], 1e-30)
+let fraction_D = [D] / max([D] + [E], concentration_floor)
