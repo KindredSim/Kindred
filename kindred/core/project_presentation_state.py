@@ -17,6 +17,7 @@ __all__ = [
     "ExperimentalAxisSelection",
     "ProjectPresentationState",
     "SimulationSeriesAxisSelection",
+    "VesselVolumeAxisSelection",
     "WorkspacePresentationState",
     "default_project_presentation_state",
     "default_workspace_presentation_state",
@@ -45,6 +46,11 @@ class SimulationSeriesAxisSelection:
 
 
 @dataclass(frozen=True, slots=True)
+class VesselVolumeAxisSelection:
+    """Execution-owned vessel volume, distinct from authored names."""
+
+
+@dataclass(frozen=True, slots=True)
 class ExperimentalAxisSelection:
     """One dataset-local raw observation selected for an axis."""
 
@@ -68,7 +74,7 @@ class ExperimentalAxisSelection:
 
 
 AxisSeriesSelection: TypeAlias = (
-    SimulationSeriesAxisSelection | ExperimentalAxisSelection
+    SimulationSeriesAxisSelection | ExperimentalAxisSelection | VesselVolumeAxisSelection
 )
 
 
@@ -142,7 +148,7 @@ class ProjectPresentationState:
         selected_x = self.selected_x_series
         if not isinstance(
             selected_x,
-            (SimulationSeriesAxisSelection, ExperimentalAxisSelection),
+            (SimulationSeriesAxisSelection, ExperimentalAxisSelection, VesselVolumeAxisSelection),
         ):
             raise TypeError(
                 "selected_x_series must be a typed simulation or "
@@ -151,7 +157,7 @@ class ProjectPresentationState:
         if not isinstance(self.selected_y_series, tuple) or any(
             not isinstance(
                 selection,
-                (SimulationSeriesAxisSelection, ExperimentalAxisSelection),
+                (SimulationSeriesAxisSelection, ExperimentalAxisSelection, VesselVolumeAxisSelection),
             )
             for selection in self.selected_y_series
         ):
@@ -286,6 +292,8 @@ def _axis_selection_is_current(
     simulation_series: frozenset[SimulationSeriesAxisSelection],
     experimental_series: frozenset[ExperimentalAxisSelection],
 ) -> bool:
+    if isinstance(value, VesselVolumeAxisSelection):
+        return True
     if isinstance(value, SimulationSeriesAxisSelection):
         return value in simulation_series
     return bool(
@@ -304,7 +312,7 @@ def _validate_axis_selection(
 ) -> None:
     if not isinstance(
         value,
-        (SimulationSeriesAxisSelection, ExperimentalAxisSelection),
+        (SimulationSeriesAxisSelection, ExperimentalAxisSelection, VesselVolumeAxisSelection),
     ):
         raise TypeError(
             f"{label} must be a typed simulation or experimental axis "

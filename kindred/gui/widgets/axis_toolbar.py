@@ -46,6 +46,7 @@ from PySide6.QtCore import Qt
 from kindred.core.project_presentation_state import (
     AxisSeriesSelection,
     ExperimentalAxisSelection,
+    VesselVolumeAxisSelection,
     SimulationSeriesAxisSelection,
 )
 from kindred.gui.plot_config import AxisSelectionCandidate
@@ -72,7 +73,11 @@ class AxisToolbar(QtWidgets.QWidget):
         self._x_combo.setMinimumContentsLength(4)
         self._x_combo.setSizeAdjustPolicy(QtWidgets.QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
         self._x_combo.setMaximumWidth(220)
-        self._x_combo.setToolTip('Select X-axis Variable (time, species, or observables defined with "let … = …").')
+        self._x_combo.setToolTip(
+            'Choose time, a species, or a quantity defined with "let ... = ...". '
+            "After running a model with an initial-volume declaration, you can also select Vessel volume. "
+            "Use the adjacent Unit control to choose its display unit."
+        )
 
         self._x_unit_combo = QtWidgets.QComboBox(self)
         self._x_unit_combo.setObjectName("axisToolbarXUnit")
@@ -86,7 +91,9 @@ class AxisToolbar(QtWidgets.QWidget):
 
         self._y_list = QtWidgets.QListWidget(self)
         self._y_list.setToolTip(
-            "Choose which model quantities and experimental data appear on the Y axis."
+            "Choose which model quantities and experimental data appear on the Y axis. "
+            "After running a model with an initial-volume declaration, you can also select Vessel volume. "
+            "Use the adjacent Unit control to choose its display unit."
         )
         self._y_list.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.NoSelection)
         self._y_list.setAlternatingRowColors(True)
@@ -219,7 +226,7 @@ class AxisToolbar(QtWidgets.QWidget):
             raise ValueError("X candidate identities must be unique.")
         if not isinstance(
             selected,
-            (SimulationSeriesAxisSelection, ExperimentalAxisSelection),
+            (SimulationSeriesAxisSelection, ExperimentalAxisSelection, VesselVolumeAxisSelection),
         ):
             raise TypeError("Selected X must be a typed axis identity.")
         if selected not in identities:
@@ -428,7 +435,7 @@ class AxisToolbar(QtWidgets.QWidget):
                 selection = it.data(Qt.ItemDataRole.UserRole)
                 if not isinstance(
                     selection,
-                    (SimulationSeriesAxisSelection, ExperimentalAxisSelection),
+                    (SimulationSeriesAxisSelection, ExperimentalAxisSelection, VesselVolumeAxisSelection),
                 ):
                     raise TypeError(
                         "Y selector item lacks a typed axis identity."
@@ -442,7 +449,7 @@ class AxisToolbar(QtWidgets.QWidget):
         selection = self._x_combo.currentData()
         if not isinstance(
             selection,
-            (SimulationSeriesAxisSelection, ExperimentalAxisSelection),
+            (SimulationSeriesAxisSelection, ExperimentalAxisSelection, VesselVolumeAxisSelection),
         ):
             raise TypeError("X selector lacks a typed axis identity.")
         return selection

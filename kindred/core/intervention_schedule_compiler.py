@@ -9,6 +9,9 @@ from kindred.core.exceptions import SimulationCancelled
 from kindred.core.species import validate_time_seconds
 from kindred.core.intervention_schedule import (
     InterventionFlux,
+    InterventionPhysical,
+    PhysicalAction,
+    PhysicalQuantity,
     InterventionHold,
     InterventionJump,
     InterventionProtocol,
@@ -192,6 +195,7 @@ class ExecutableInstant:
     phase: str = "ordinary"
     window_ordinal: int | None = None
     authored_ordinal: int | None = None
+    physical: PhysicalAction | None = None
 
     def to_payload(self) -> dict[str, Any]:
         payload: dict[str, Any] = {
@@ -213,6 +217,10 @@ class ExecutableInstant:
             if parameter is not None:
                 payload.pop(field, None)
                 payload[f"{field}_param"] = parameter
+        if self.physical is not None:
+            for field in ("species", "value", "delta", "flux_rate"):
+                payload.pop(field, None)
+            payload.update(self.physical.to_payload())
         return payload
 
 
@@ -227,6 +235,7 @@ class ExecutableFlux:
     phase: str = "ordinary"
     window_ordinal: int | None = None
     authored_ordinal: int | None = None
+    physical: PhysicalAction | None = None
 
     @property
     def op(self) -> str:
@@ -251,6 +260,10 @@ class ExecutableFlux:
             if parameter is not None:
                 payload.pop(field, None)
                 payload[f"{field}_param"] = parameter
+        if self.physical is not None:
+            for field in ("species", "value", "delta", "flux_rate"):
+                payload.pop(field, None)
+            payload.update(self.physical.to_payload())
         return payload
 
 
@@ -372,6 +385,7 @@ class TriggerFiring:
 @dataclass(frozen=True, slots=True)
 class InterventionExecutionContract:
     declarative_payload: Mapping[str, Any]
+    initial_volume: tuple[PhysicalQuantity, InterventionScheduleFieldIdentity] | None = None
     instants: tuple[ExecutableInstant, ...] = ()
     fluxes: tuple[ExecutableFlux, ...] = ()
     holds: tuple[ExecutableHold, ...] = ()
@@ -505,6 +519,7 @@ class InterventionExecutionContract:
                             else "instant"
                         ),
                         "label": f"{instant.op} {instant.species}",
+                        "physical_action": {"op": instant.op, **instant.physical.to_payload()} if instant.physical is not None else None,
                         "declaration_ordinal": instant.declaration_ordinal,
                         "window_ordinal": instant.window_ordinal,
                         "authored_ordinal": instant.authored_ordinal,
@@ -528,6 +543,7 @@ class InterventionExecutionContract:
                         "declared_end": interval.end_time,
                         "kind": interval.op,
                         "label": f"{interval.op} {interval.species}",
+                        "physical_action": {"op": interval.op, **interval.physical.to_payload()} if isinstance(interval, ExecutableFlux) and interval.physical is not None else None,
                         "declaration_ordinal": interval.declaration_ordinal,
                         "window_ordinal": interval.window_ordinal,
                         "authored_ordinal": interval.authored_ordinal,
@@ -547,9 +563,13 @@ class InterventionExecutionContract:
                         "kind": "trigger",
                         "label": (
                             f"trigger {firing.condition.name}: "
-                            f"{nested_action_payload.get('op', '')} "
-                            f"{nested_action_payload.get('species', '')}"
+                            + (
+                                f"{nested_action_payload.get('op', '')} "
+                                f"{nested_action_payload.get('species', '')}"
+                            )
                         ).strip(),
+                        "physical_action": nested_action_payload if "solution" in nested_action_payload or nested_action_payload["op"] in {"scale", "withdraw"} else None,
+                        "label_prefix": f"trigger {firing.condition.name}: ",
                         "declaration_ordinal": firing.declaration_ordinal,
                         "firing_ordinal": firing.firing_ordinal,
                         "threshold": firing.threshold,
@@ -565,8 +585,11 @@ class InterventionExecutionContract:
 
 
 def _instant_from_direct(
-    operation: InterventionSet | InterventionJump,
+    operation: InterventionSet | InterventionJump | InterventionPhysical,
 ) -> ExecutableInstant:
+    if isinstance(operation, InterventionPhysical):
+        return ExecutableInstant(op=operation.op, species="", time=float(operation.time),
+                                 declaration_ordinal=operation.declaration_ordinal, physical=operation.physical)
     if isinstance(operation, InterventionSet):
         return ExecutableInstant(
             op="set",
@@ -593,6 +616,7 @@ def _protocol_instant(
 ) -> ExecutableInstant:
     return ExecutableInstant(
         op=operation.op,
+        physical=operation.physical,
         species=operation.species,
         time=time,
         value=operation.value, value_param=operation.value_param,
@@ -622,7 +646,7 @@ def _protocol_interval(
         "authored_ordinal": operation.authored_ordinal,
     }
     if operation.op == "flux":
-        return ExecutableFlux(flux_rate=operation.flux_rate, flux_rate_param=operation.flux_rate_param, **common)
+        return ExecutableFlux(flux_rate=operation.flux_rate, flux_rate_param=operation.flux_rate_param, physical=operation.physical, **common)
     return ExecutableHold(value=operation.value, value_param=operation.value_param, **common)
 
 
@@ -919,7 +943,14 @@ def compile_intervention_schedule(
     lineage: list[dict[str, Any]] = []
     for operation in schedule_obj.operations:
         _raise_if_cancelled(cancellation_check)
-        if isinstance(operation, (InterventionSet, InterventionJump)):
+        if isinstance(operation, InterventionPhysical):
+            if operation.op == "flux":
+                fluxes.append(ExecutableFlux(species="", start_time=float(operation.start_time),
+                                             end_time=float(operation.end_time), flux_rate=None,
+                                             declaration_ordinal=operation.declaration_ordinal, physical=operation.physical))
+            else:
+                instants.append(_instant_from_direct(operation))
+        elif isinstance(operation, (InterventionSet, InterventionJump)):
             instants.append(_instant_from_direct(operation))
         elif isinstance(operation, InterventionFlux):
             fluxes.append(
@@ -1181,6 +1212,7 @@ def compile_intervention_schedule(
     declarative_payload = schedule_obj.to_payload() if authored_payload is None else authored_payload
     return InterventionExecutionContract(
         declarative_payload=declarative_payload,
+        initial_volume=schedule_obj.initial_volume,
         instants=tuple(instants),
         fluxes=tuple(fluxes),
         holds=tuple(holds),
@@ -1200,9 +1232,21 @@ def validate_boundary_conflicts(
 ) -> None:
     dependency_metadata = dependency_metadata or {}
     by_key: dict[tuple[float, str], list[ExecutableInstant | ExecutableHold]] = {}
+    first_set_by_time: dict[float, ExecutableInstant] = {}
     for instant in instants:
         _raise_if_cancelled(cancellation_check)
-        by_key.setdefault((instant.time, instant.species), []).append(instant)
+        if instant.op == "set":
+            first_set_by_time.setdefault(instant.time, instant)
+    for physical in instants:
+        _raise_if_cancelled(cancellation_check)
+        if physical.physical is not None and physical.op != "withdraw":
+            absolute = first_set_by_time.get(physical.time)
+            if absolute is not None:
+                raise InterventionScheduleError(f"set and {physical.op} conflict for {absolute.species} at t={physical.time:g}.")
+    for instant in instants:
+        _raise_if_cancelled(cancellation_check)
+        if instant.physical is None:
+            by_key.setdefault((instant.time, instant.species), []).append(instant)
     for hold in entering_holds:
         _raise_if_cancelled(cancellation_check)
         by_key.setdefault((hold.start_time, hold.species), []).append(hold)
@@ -1267,24 +1311,31 @@ def _validate_hold_overlaps(
     dependency_metadata: InterventionScheduleDependencyMetadata | None = None,
 ) -> None:
     dependency_metadata = dependency_metadata or {}
-    for index, left in enumerate(holds):
+    next_by_species: dict[str, ExecutableHold] = {}
+    conflict: tuple[ExecutableHold, ExecutableHold] | None = None
+    # Compilation orders positive intervals by start time. The next hold of
+    # the same species is the first possible conflict for each left interval.
+    # Walking backwards preserves the earliest conflicting pair from the
+    # nested scan, including when several species' intervals are interleaved.
+    for left in reversed(holds):
         _raise_if_cancelled(cancellation_check)
-        for right in holds[index + 1 :]:
-            _raise_if_cancelled(cancellation_check)
-            if left.species != right.species:
-                continue
-            if left.start_time < right.end_time and right.start_time < left.end_time:
-                raise _annotated_schedule_error(
-                    InterventionScheduleError(
-                        f"Overlapping holds for {left.species}: "
-                        f"declaration {left.declaration_ordinal + 1} "
-                        f"[{left.start_time!r}, {left.end_time!r}) and "
-                        f"declaration {right.declaration_ordinal + 1} "
-                        f"[{right.start_time!r}, {right.end_time!r}). "
-                        "Only one hold per species may be active at a time."
-                    ),
-                    operation=None,
-                    dependency_metadata=dependency_metadata,
-                    fields=("start_time", "end_time"),
-                    operations=(left, right),
-                )
+        right = next_by_species.get(left.species)
+        if right is not None and right.start_time < left.end_time:
+            conflict = (left, right)
+        next_by_species[left.species] = left
+    if conflict is not None:
+        left, right = conflict
+        raise _annotated_schedule_error(
+            InterventionScheduleError(
+                f"Overlapping holds for {left.species}: "
+                f"declaration {left.declaration_ordinal + 1} "
+                f"[{left.start_time!r}, {left.end_time!r}) and "
+                f"declaration {right.declaration_ordinal + 1} "
+                f"[{right.start_time!r}, {right.end_time!r}). "
+                "Only one hold per species may be active at a time."
+            ),
+            operation=None,
+            dependency_metadata=dependency_metadata,
+            fields=("start_time", "end_time"),
+            operations=(left, right),
+        )

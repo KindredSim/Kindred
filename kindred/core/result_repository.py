@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from kindred.core.quantity_units import Unit
+from kindred.core.volume import VolumeTrajectory
 
 from dataclasses import dataclass
 from types import MappingProxyType
@@ -35,6 +36,7 @@ class SimulationResultValue:
     """Immutable numerical output and its complete execution truth."""
 
     t: np.ndarray
+    temperature_K: np.ndarray
     series: Mapping[str, np.ndarray]
     segment_ids: np.ndarray
     segment_keys: tuple[str, ...]
@@ -52,6 +54,7 @@ class SimulationResultValue:
     presentation_boundaries: tuple[SimulationPresentationBoundary, ...] = ()
     quantity_units: tuple[tuple[str, Unit | None], ...] = ()
     presentation_units: tuple[tuple[str, Unit | None], ...] = ()
+    volume: VolumeTrajectory | None = None
 
     def __post_init__(self) -> None:
         # Canonical finalization is the sole producer; solver-owned arrays and

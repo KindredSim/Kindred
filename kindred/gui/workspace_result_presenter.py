@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from kindred.core.quantity_units import Unit, MOLAR, SECOND, compatible_units
+from kindred.core.quantity_units import Unit, MOLAR, SECOND, CUBIC_METRE, compatible_units, convert_value
 
 import io
 import csv
@@ -22,6 +22,7 @@ from openpyxl.writer.excel import ExcelWriter
 from kindred.core.project_presentation_state import (
     AxisSeriesSelection,
     ExperimentalAxisSelection,
+    VesselVolumeAxisSelection,
     SimulationSeriesAxisSelection,
 )
 from kindred.core.project_document import ProjectDocument
@@ -34,6 +35,7 @@ from kindred.core.simulator.dsl_parse import PreparedDslRequestSet
 from kindred.gui.curve_copy_headers import observable_copy_definitions
 from kindred.gui.dataset_payload_snapshot import ExperimentalLayerInput
 from kindred.gui.plot_config import AxisSelectionCandidate
+from kindred.gui.result_curve_projection import ProjectedCurveChunk, physical_curve_chunks
 
 __all__ = [
     "InteractiveDisplayCurve",
@@ -72,16 +74,15 @@ def _readonly_display_array(value: object) -> np.ndarray:
 class InteractiveDisplayCurve:
     """One immutable, transient physical curve; never Copy/export authority."""
 
-    key: tuple[str, ...]
+    key: tuple[object, ...]
     label: str
     x: np.ndarray
     y: np.ndarray
     # Canonical seconds stay aligned when X is another quantity or is sampled.
     sample_time: np.ndarray
     color: str
+    source: ResultDataBlock
     dashed: bool = False
-    markers: bool = False
-    point_size: float = 6.0
     opacity: float = 1.0
     # These arrays are display topology, not result authority.  Keeping them
     # with the transient curve prevents the preview renderer from connecting
@@ -89,7 +90,7 @@ class InteractiveDisplayCurve:
     segment_ids: np.ndarray | None = None
     segment_keys: tuple[str, ...] | None = None
     discontinuity_ids: np.ndarray | None = None
-    intervention_connectors: tuple[tuple[int, float, float, float], ...] = ()
+    physical_chunks: tuple[ProjectedCurveChunk, ...] = ()
 
     def __post_init__(self) -> None:
         x = _readonly_display_array(self.x)
@@ -110,12 +111,10 @@ class InteractiveDisplayCurve:
         object.__setattr__(self, "y", y)
         object.__setattr__(self, "sample_time", _readonly_display_array(self.sample_time))
         object.__setattr__(self, "color", self.color)
-        object.__setattr__(self, "point_size", float(self.point_size))
         object.__setattr__(self, "opacity", float(self.opacity))
         object.__setattr__(self, "segment_ids", segment_ids)
         object.__setattr__(self, "segment_keys", self.segment_keys)
         object.__setattr__(self, "discontinuity_ids", discontinuity_ids)
-        object.__setattr__(self, "intervention_connectors", tuple(self.intervention_connectors))
 
 
 _DisplayAnnotation = tuple[str, str, Mapping[str, object], float]
@@ -222,7 +221,7 @@ def _required_id(value: object, field: str) -> str:
 def _axis_selection(value: object, *, field: str) -> AxisSeriesSelection:
     if not isinstance(
         value,
-        (SimulationSeriesAxisSelection, ExperimentalAxisSelection),
+        (SimulationSeriesAxisSelection, ExperimentalAxisSelection, VesselVolumeAxisSelection),
     ):
         raise TypeError(
             f"{field} must be a typed simulation or experimental axis selection."
@@ -357,6 +356,8 @@ def _result_provenance_payload(result: SimulationResultValue) -> Mapping[str, ob
                 {
                     "solver": result.solver_provenance,
                     "termination": result.termination,
+                    "volume": result.volume,
+                    "boundaries": result.presentation_boundaries,
                     "algebra": MappingProxyType(
                         {
                             "requested": result.requested_algebra_outputs,
@@ -424,10 +425,15 @@ class ResultDataBlock:
     point_size: float = 6.0
     point_shape: str = "o"
     presentation_boundaries: tuple[SimulationPresentationBoundary, ...] = ()
+    first_index: int = 0
 
     def unit_for(self, name: str, *, x: bool = False) -> Unit | None:
         if self.kind is ResultLayerKind.EXPERIMENTAL:
             return SECOND if x and isinstance(self.x_axis, SimulationSeriesAxisSelection) and self.x_axis.series_name == "t" else MOLAR
+        if x and isinstance(self.x_axis, VesselVolumeAxisSelection):
+            return CUBIC_METRE
+        if not x and isinstance(dict(self.series_axes).get(name), VesselVolumeAxisSelection):
+            return CUBIC_METRE
         return dict(self.quantity_units).get(name)
 
     def unit_label(self, name: str, *, x: bool = False) -> str:
@@ -480,7 +486,7 @@ class ResultDataBlock:
             segment_ids = segment_keys = discontinuity_ids = None
             boundaries = ()
         else:
-            if not isinstance(x_axis, SimulationSeriesAxisSelection):
+            if not isinstance(x_axis, (SimulationSeriesAxisSelection, VesselVolumeAxisSelection)):
                 raise TypeError("simulation data blocks require a simulation X axis.")
             if not isinstance(result, SimulationResultValue):
                 raise TypeError("simulation data blocks require a canonical result.")
@@ -514,7 +520,7 @@ class ResultDataBlock:
             if self.kind is ResultLayerKind.EXPERIMENTAL:
                 if not isinstance(selection, ExperimentalAxisSelection):
                     raise TypeError("experimental data series require experimental axis identity.")
-            elif not isinstance(selection, SimulationSeriesAxisSelection):
+            elif not isinstance(selection, (SimulationSeriesAxisSelection, VesselVolumeAxisSelection)):
                 raise TypeError("simulation data series require simulation axis identity.")
         colors = tuple(
             (_required_id(name, "color series name"), _required_id(color, "data series color"))
@@ -609,7 +615,7 @@ class ResultRenderInput:
 
     def __post_init__(self) -> None:
         blocks = tuple(self.blocks)
-        identities = tuple((block.kind, block.block_id) for block in blocks)
+        identities = tuple((block.kind, block.block_id, tuple(axis for _, axis in block.series_axes)) for block in blocks)
         if len(identities) != len(set(identities)):
             raise ValueError("render blocks must have unique semantic identities.")
         object.__setattr__(self, "blocks", blocks)
@@ -646,6 +652,20 @@ class ResultRenderInput:
     def statistics_result(self) -> SimulationResultValue | None:
         block = _select_analysis_block(self.blocks, self.current_set_id)
         return block.result if block is not None else None
+
+    @property
+    def authored_volume_unit(self) -> Unit | None:
+        result = self.statistics_result
+        if result is None or result.volume is None:
+            result = next((block.result for block in self.blocks
+                           if block.result is not None and block.result.volume is not None), None)
+        return None if result is None else dict(result.presentation_units)["Vessel volume"]
+
+    @property
+    def volume_unit_options(self) -> tuple[Unit, ...]:
+        preferred = tuple(dict(block.result.presentation_units)["Vessel volume"]
+                          for block in self.blocks if block.result is not None and block.result.volume is not None)
+        return compatible_units(CUBIC_METRE, preferred) if preferred else ()
 
     @property
     def parameters(self) -> tuple[tuple[str, float, str], ...]:
@@ -703,6 +723,23 @@ def _result_block(
         presentation_boundaries=result.presentation_boundaries,
     )
 
+
+
+def _volume_block(block: ResultDataBlock) -> ResultDataBlock | None:
+    result = block.result
+    if result.volume is None:
+        return None
+    first = result.volume.first_index
+    name = "Vessel volume"
+    return replace(
+        block, t=result.t[first:], sample_time=result.t[first:],
+        series=((name, result.volume.values),),
+        series_axes=((name, VesselVolumeAxisSelection()),),
+        segment_ids=result.segment_ids[first:], segment_keys=result.segment_keys[first:], discontinuity_ids=result.discontinuity_ids[first:],
+        first_index=first, color_by_series=((name, "#8b5cf6"),),
+        quantity_units=(("t", SECOND), (name, CUBIC_METRE)),
+        presentation_units=((name, dict(result.presentation_units)[name]),),
+    )
 
 def compose_canonical_export_blocks(
     *,
@@ -820,45 +857,34 @@ def _data_block(
     x_axis: AxisSeriesSelection,
     y_axes: set[AxisSeriesSelection] | None = None,
 ) -> ResultDataBlock | None:
+    from kindred.gui.result_curve_projection import axis_values
+
     series_axis_map = dict(block.series_axes)
-    if _is_time_selection(x_axis):
-        if block.t.size == 0:
-            return None
-        x_values, x_name = block.t, "t"
-        x_provenance: Mapping[str, object] = MappingProxyType({})
-    elif isinstance(x_axis, SimulationSeriesAxisSelection) and block.kind is not ResultLayerKind.EXPERIMENTAL:
-        x_name = next((name for name, selection in block.series_axes if selection == x_axis), "")
-        if not x_name:
-            return None
-        x_values = dict(block.series)[x_name]
-        x_provenance = dict(block.series_provenance).get(x_name, MappingProxyType({}))
-    else:
+    if block.kind is ResultLayerKind.EXPERIMENTAL:
+        return block if _is_time_selection(x_axis) else None
+    coordinates = axis_values(block.result, x_axis)
+    if coordinates is None:
         return None
+    x_first, x_values, x_name = coordinates
+    first = max(block.first_index, x_first)
+    offset = first - block.first_index
     selected = tuple(
-        (name, values)
-        for name, values in block.series
-        if (y_axes is None or series_axis_map[name] in y_axes)
+        (name, values[offset:]) for name, values in block.series
+        if (series_axis_map[name] in y_axes if y_axes is not None
+            else not isinstance(series_axis_map[name], VesselVolumeAxisSelection))
     )
     if not selected:
         return None
     names = {name for name, _ in selected}
-    return ResultDataBlock(
-        block_id=block.block_id, label=block.label, kind=block.kind,
-        t=x_values, sample_time=block.sample_time, series=selected,
+    return replace(
+        block, t=x_values[first-x_first:], sample_time=block.result.t[first:],
+        series=selected,
         series_axes=tuple((name, selection) for name, selection in block.series_axes if name in names),
-        x_axis=x_axis, result=block.result,
-        segment_ids=block.segment_ids, segment_keys=block.segment_keys,
-        discontinuity_ids=block.discontinuity_ids, source_row=block.source_row,
-        x_name=x_name,
-        copy_definitions=block.copy_definitions,
-        quantity_units=block.quantity_units,
-        presentation_units=block.presentation_units,
-        series_provenance=tuple((name, payload) for name, payload in block.series_provenance if name in names),
-        x_provenance=x_provenance,
-        color_by_series=block.color_by_series,
-        visible=block.visible, dashed=block.dashed, opacity=block.opacity,
-        markers=block.markers, point_size=block.point_size, point_shape=block.point_shape,
-        presentation_boundaries=block.presentation_boundaries,
+        x_axis=x_axis, x_name=x_name, first_index=first,
+        segment_ids=block.result.segment_ids[first:], segment_keys=block.result.segment_keys[first:],
+        discontinuity_ids=block.result.discontinuity_ids[first:],
+        quantity_units=block.result.quantity_units,
+        color_by_series=tuple((name, color) for name, color in block.color_by_series if name in names),
     )
 
 
@@ -899,6 +925,7 @@ def _selected_x_unavailable_diagnostic(
     selected_identity = (
         f"series {selected_x.series_name!r}"
         if isinstance(selected_x, SimulationSeriesAxisSelection)
+        else "vessel volume" if isinstance(selected_x, VesselVolumeAxisSelection)
         else f"raw observation {selected_x.raw_observation_id!r} in dataset {selected_x.dataset_id!r}"
     )
     return (
@@ -996,6 +1023,32 @@ def _validate_xlsx_worksheet_dimensions(
             )
 
 
+
+def _boundary_export_columns(result):
+    if result is None:
+        return ()
+    columns = []
+    if result.volume is not None:
+        first = result.volume.first_index
+        columns.extend((
+            ("Volume canonical row", np.arange(first, len(result.t)), "int"),
+            ("Volume time [s]", result.t[first:], "float"),
+            ("Vessel volume [m³]", result.volume.values, "float"),
+        ))
+    states = [(b.time, i, j, state) for i, b in enumerate(result.presentation_boundaries)
+              for j, state in enumerate(b.states)]
+    if states:
+        columns.extend((
+            ("Boundary time [s]", tuple(item[0] for item in states), "float"),
+            ("Boundary index", tuple(item[1] for item in states), "int"),
+            ("Boundary state ordinal", tuple(item[2] for item in states), "int"),
+            ("Boundary vessel volume [m³]", tuple(item[3].volume for item in states), "float"),
+            ("Boundary executed temperature [K]", tuple(item[3].temperature_K for item in states), "float"),
+        ))
+        columns.extend((f"Boundary {name} [M]", tuple(dict(item[3].concentrations)[name] for item in states), "float")
+                       for name, _ in states[0][3].concentrations)
+    return tuple(columns)
+
 def _planned_xlsx_worksheet_dimensions(
     blocks: Sequence[ResultDataBlock],
     *,
@@ -1012,8 +1065,8 @@ def _planned_xlsx_worksheet_dimensions(
         dimensions.append(
             (
                 title,
-                int(block.series[0][1].size) + 1,
-                identity_column_count + len(block.series),
+                max((block.series[0][1].size, *(len(values) for _, values, _ in _boundary_export_columns(block.result)))) + 1,
+                identity_column_count + len(block.series) + len(_boundary_export_columns(block.result)),
             )
         )
     if lineage_row_count:
@@ -1100,6 +1153,41 @@ def _annotations_from_execution(
     )
 
 
+def intervention_label(
+    annotation: Mapping[str, object], *, volume_unit: Unit, time_unit: Unit,
+) -> str:
+    """Format retained action amounts without evaluating their declarations."""
+    action = annotation["physical_action"]
+    if action is None:
+        return str(annotation["label"])
+
+    def quantity(fields, name, source, display, symbol=None):
+        parameter = fields.get(name + "_param")
+        value = str(parameter) if parameter is not None else f"{convert_value(fields[name], source, display):g}"
+        unit = display.symbol if symbol is None else symbol
+        return f"{value} {unit}".strip()
+
+    op = action["op"]
+    if op == "scale":
+        factor = action["factor"]
+        text = f"Scale all concentrations ×{factor:g} (volume ÷{factor:g})"
+    elif op == "withdraw":
+        text = f"Withdraw aliquot {quantity(action, 'volume', CUBIC_METRE, volume_unit)}"
+    else:
+        solution = action["solution"]
+        if op == "flux":
+            amount = quantity(solution, "volume_rate", CUBIC_METRE.divide(SECOND),
+                              volume_unit.divide(time_unit), f"{volume_unit.symbol}/{time_unit.symbol}")
+        else:
+            amount = quantity(solution, "volume", CUBIC_METRE, volume_unit)
+        stock = ", ".join(f"{item['species']}: {quantity(item, 'value', MOLAR, MOLAR)}"
+                          for item in solution["stock"]) or "pure solvent"
+        text = f"{'Solution inflow' if op == 'flux' else 'Add solution'} {amount} ({stock})"
+    if "initial_volume" in action or "initial_volume_param" in action:
+        text += f" (volume at simulation start {quantity(action, 'initial_volume', CUBIC_METRE, volume_unit)})"
+    return str(annotation.get("label_prefix", "")) + text
+
+
 def _owned_annotations(
     result: SimulationResultValue, role: str, set_id: str,
 ) -> tuple[_DisplayAnnotation, ...]:
@@ -1109,56 +1197,6 @@ def _owned_annotations(
     )
 
 
-def _result_topology(
-    result: SimulationResultValue,
-) -> tuple[np.ndarray, tuple[str, ...], np.ndarray]:
-    """Read executor-issued topology from the admitted canonical result."""
-
-    segments = _readonly_display_array(result.segment_ids).reshape(-1)
-    discontinuities = _readonly_display_array(result.discontinuity_ids).reshape(-1)
-    segments.setflags(write=False)
-    discontinuities.setflags(write=False)
-    return segments, tuple(result.segment_keys), discontinuities
-
-
-def _result_connectors(
-    result: SimulationResultValue,
-    *,
-    selected_x: AxisSeriesSelection,
-    series_names: set[str],
-) -> tuple[tuple[int, float, float, float, str], ...]:
-    """Project optional worker-issued intervention endpoint facts."""
-
-    if not (
-        isinstance(selected_x, SimulationSeriesAxisSelection)
-        and selected_x.series_name == "t"
-    ):
-        return ()
-    boundaries = result.presentation_boundaries
-    entries: list[tuple[int, float, float, float, str]] = []
-    for boundary_index, boundary in enumerate(tuple(boundaries or ())):
-        pre_by_name = dict(boundary.pre_state)
-        post_by_name = dict(boundary.post_state)
-        for name, pre_value in pre_by_name.items():
-            if name not in series_names:
-                continue
-            post_value = float(post_by_name[name])
-            pre_value = float(pre_value)
-            if pre_value == post_value:
-                continue
-            entries.append(
-                (
-                    boundary_index,
-                    float(boundary.time),
-                    pre_value,
-                    post_value,
-                    str(name),
-                )
-            )
-    return tuple(entries)
-
-
-
 def compose_interactive_display(
     result: SimulationResultValue,
     *,
@@ -1166,146 +1204,57 @@ def compose_interactive_display(
     set_id: str,
     render_input: ResultRenderInput,
 ) -> InteractiveDisplayProjection | None:
-    result_series = dict(_series_tuple(result))
     selected_x = render_input.selected_x_series
-
     if isinstance(selected_x, ExperimentalAxisSelection):
         return None
-    if selected_x.series_name == "t":
-        x_values = _readonly_display_array(result.t)
-    else:
-        selected_series = result_series.get(selected_x.series_name)
-        if selected_series is None:
-            return None
-        x_values = _readonly_display_array(selected_series)
-    wanted_y = (
-        tuple(result_series)
-        if render_input.selected_y_uses_default_all
-        else tuple(
-            selection.series_name
-            for selection in render_input.selected_y_series
-            if isinstance(selection, SimulationSeriesAxisSelection)
-        )
-    )
-    live_block = next(
-        (
-            block
-            for block in render_input.blocks
-            if block.block_id == set_id
-            and block.kind in {ResultLayerKind.EXPLICIT, ResultLayerKind.PREVIEW}
-        ),
-        None,
-    )
-    reference_block = next(
-        (
-            block
-            for block in render_input.blocks
-            if block.block_id == set_id
-            and block.kind is ResultLayerKind.REFERENCE
-            and render_input.reference_lines_visible
-        ),
-        None,
-    )
-    baseline_block = reference_block
-    if live_block is None:
+    wanted = None if render_input.selected_y_uses_default_all else set(render_input.selected_y_series)
+    live = next((block for block in render_input.blocks if block.block_id == set_id
+                 and block.kind in {ResultLayerKind.EXPLICIT, ResultLayerKind.PREVIEW}), None)
+    reference = next((block for block in render_input.blocks if block.block_id == set_id
+                      and block.kind is ResultLayerKind.REFERENCE), None)
+    if live is None:
         return None
-    topology = _result_topology(result)
-    connectors = _result_connectors(
-        result, selected_x=selected_x, series_names=set(result_series)
-    )
-    live_colors = dict(live_block.color_by_series)
-    baseline_colors = (
-        dict(baseline_block.color_by_series)
-        if baseline_block is not None
-        else live_colors
-    )
-    live_label = live_block.label
-    curves = tuple(
-        InteractiveDisplayCurve(
-            key=("simulation", "foreground", set_id, series_id),
-            label=f"{live_label}: {series_id}",
-            x=x_values,
-            y=_readonly_display_array(series_values),
-            sample_time=result.t,
-            color=live_colors.get(series_id) or "#3b82f6",
-            segment_ids=topology[0], segment_keys=topology[1],
-            discontinuity_ids=topology[2],
-            intervention_connectors=tuple(
-                (item[0], item[1], item[2], item[3])
-                for item in connectors if item[4] == series_id
-            ),
+    curves = []
+    annotations = []
+    sources = [(result, live, "foreground")]
+    if reference is not None and render_input.reference_lines_visible:
+        sources.append((reference.result, reference, "ghost"))
+    for value, style, role in sources:
+        series = _series_tuple(value)
+        colors = dict(style.color_by_series)
+        semantic = replace(
+            style, result=value, t=value.t, sample_time=value.t, first_index=0,
+            series=series, series_axes=tuple((name, SimulationSeriesAxisSelection(name)) for name, _ in series),
+            x_axis=SimulationSeriesAxisSelection("t"), x_name="t",
+            quantity_units=value.quantity_units, presentation_units=value.presentation_units,
+            segment_ids=value.segment_ids, segment_keys=value.segment_keys,
+            discontinuity_ids=value.discontinuity_ids, presentation_boundaries=value.presentation_boundaries,
+            color_by_series=tuple((name, colors.get(name, "#3b82f6")) for name, _ in series),
         )
-        for series_id in wanted_y
-        if x_values.size
-        and (series_values := result_series.get(series_id)) is not None
-        and series_values.size
-    )
-    baseline_result = baseline_block.result if baseline_block is not None else None
-    if baseline_result is not None:
-        baseline_series_map = dict(_series_tuple(baseline_result))
-        baseline_wanted_y = (
-            tuple(baseline_series_map)
-            if render_input.selected_y_uses_default_all
-            else wanted_y
-        )
-        if selected_x.series_name == "t":
-            baseline_x = _readonly_display_array(baseline_result.t)
-        else:
-            baseline_series = baseline_series_map.get(selected_x.series_name)
-            baseline_x = (
-                None
-                if baseline_series is None
-                else _readonly_display_array(baseline_series)
-            )
-        if baseline_x is not None:
-            baseline_topology = _result_topology(baseline_result)
-            baseline_connectors = _result_connectors(
-                baseline_result,
-                selected_x=selected_x,
-                series_names=set(baseline_series_map),
-            )
-            curves += tuple(
-                InteractiveDisplayCurve(
-                    key=("simulation", "ghost", set_id, series_id),
-                    label=f"{baseline_block.label}: {series_id}",
-                    x=baseline_x,
-                    y=_readonly_display_array(series_values),
-                    sample_time=baseline_result.t,
-                    color=baseline_colors.get(series_id) or "#3b82f6",
-                    dashed=True,
-                    opacity=0.42,
-                    segment_ids=baseline_topology[0],
-                    segment_keys=baseline_topology[1],
-                    discontinuity_ids=baseline_topology[2],
-                    intervention_connectors=tuple(
-                        (item[0], item[1], item[2], item[3])
-                        for item in baseline_connectors
-                        if item[4] == series_id
-                    ),
-                )
-                for series_id in baseline_wanted_y
-                if baseline_x.size
-                if (series_values := baseline_series_map.get(series_id)) is not None
-                and series_values.size
-            )
-    if not any(
-        len(curve.key) >= 2
-        and curve.key[0:2] == ("simulation", "foreground")
-        for curve in curves
-    ):
+        vessel = _volume_block(semantic)
+        for source in (semantic,) if vessel is None else (semantic, vessel):
+            block = _data_block(source, x_axis=selected_x, y_axes=wanted)
+            if block is None:
+                continue
+            axes = dict(block.series_axes)
+            for name, values in block.series:
+                chunks = physical_curve_chunks(value, selected_x, ((name, axes[name]),), range(block.first_index, len(value.t)))
+                curves.append(InteractiveDisplayCurve(
+                    key=("simulation", role, set_id, axes[name]), label=f"{style.label}: {name}",
+                    x=block.t, y=values, sample_time=block.sample_time,
+                    color=dict(block.color_by_series)[name], source=block, dashed=role == "ghost",
+                    opacity=.42 if role == "ghost" else 1.,
+                    segment_ids=block.segment_ids, segment_keys=block.segment_keys,
+                    discontinuity_ids=block.discontinuity_ids,
+                    physical_chunks=chunks,
+                ))
+        if _is_time_selection(selected_x):
+            annotations.extend(_owned_annotations(value, role, set_id))
+    if not any(curve.key[1] == "foreground" for curve in curves):
         return None
-    annotations: tuple[_DisplayAnnotation, ...] = ()
-    if _is_time_selection(selected_x):
-        annotations = _owned_annotations(result, "foreground", set_id)
-        if baseline_result is not None:
-            annotations += _owned_annotations(baseline_result, "ghost", set_id)
     return InteractiveDisplayProjection(
-        tab_id=tab_id,
-        set_id=set_id,
-        x_label=render_input.x_label,
-        y_label=render_input.y_label,
-        curves=curves,
-        intervention_annotations=annotations,
+        tab_id=tab_id, set_id=set_id, x_label=render_input.x_label,
+        y_label=render_input.y_label, curves=tuple(curves), intervention_annotations=tuple(annotations),
     )
 
 
@@ -1441,6 +1390,12 @@ def compose_result_input(
                 ):
                     unavailable_labels.append(semantic.label)
                 blocks.append(replace(semantic, visible=False))
+            vessel = _volume_block(semantic)
+            if vessel is not None:
+                add_candidate(VesselVolumeAxisSelection(), "Vessel volume")
+                vessel = _data_block(vessel, x_axis=simulation_x, y_axes=wanted_y)
+                if vessel is not None:
+                    blocks.append(vessel)
             add_warning(semantic.label, foreground, True)
             annotations.extend(_owned_annotations(foreground, "foreground", visible.set_id))
         reference = repository.reference_result(visible.set_id)
@@ -1454,6 +1409,12 @@ def compose_result_input(
             )
             for name, selection in reference_semantic.series_axes:
                 add_candidate(selection, name)
+            vessel = _volume_block(reference_semantic)
+            if vessel is not None:
+                add_candidate(VesselVolumeAxisSelection(), "Vessel volume")
+                vessel = _data_block(vessel, x_axis=simulation_x, y_axes=wanted_y)
+                if vessel is not None:
+                    blocks.append(vessel)
             if reference_lines_visible:
                 reference_physical = _data_block(
                     reference_semantic, x_axis=simulation_x, y_axes=wanted_y,
@@ -1561,6 +1522,7 @@ def compose_result_input(
         add_candidate(
             selected_x,
             selected_x.series_name if isinstance(selected_x, SimulationSeriesAxisSelection)
+            else "Vessel volume" if isinstance(selected_x, VesselVolumeAxisSelection)
             else f"{selected_x.dataset_id}: {selected_x.raw_observation_id}",
         )
     selected_candidate = next(item for item in candidates if item.selection == selected_x)
@@ -1677,6 +1639,8 @@ def iter_blocks_tsv_chunks(
             )
             for name, values in block.series
         )
+        columns.extend((encode_clipboard_text(f"{block.label} — {name}"), values, kind)
+                       for name, values, kind in _boundary_export_columns(block.result))
     if not columns:
         raise ValueError("No retained result or qualifying mapped dataset data.")
     row_count = max(len(values) for _header, values, _kind in columns)
@@ -1713,7 +1677,7 @@ def iter_blocks_tsv_chunks(
                                 else encode_clipboard_text(str(values[index]))
                             )
                         )
-                        if index < len(values)
+                        if index < len(values) and values[index] is not None
                         else ""
                         for _header, values, kind in columns
                     )
@@ -1798,18 +1762,23 @@ def write_xlsx(
                     "segment_key",
                     "discontinuity_id",
                 ]
+            volume_columns = _boundary_export_columns(block.result)
             _append_xlsx_row(
                 sheet,
                 (
                     block.unit_label(block.x_name, x=True),
                     *identity_headers,
                     *(block.unit_label(name) for name, _values in block.series),
+                    *(name for name, _, _ in volume_columns),
                 ),
             )
-            for index in range(block.series[0][1].size):
+            row_count = max((block.series[0][1].size, *(len(values) for _, values, _ in volume_columns)))
+            for index in range(row_count):
                 if cancellation_check is not None and index % 256 == 0:
                     cancellation_check()
-                if block.kind is ResultLayerKind.EXPERIMENTAL:
+                if index >= block.series[0][1].size:
+                    identity_values = [None] * len(identity_headers)
+                elif block.kind is ResultLayerKind.EXPERIMENTAL:
                     identity_values: list[object] = [int(block.source_row[index])]
                 else:
                     identity_values = [
@@ -1820,9 +1789,10 @@ def write_xlsx(
                 _append_xlsx_row(
                     sheet,
                     (
-                        float(block.t[index]) if block.t.size else None,
+                        float(block.t[index]) if index < block.t.size else None,
                         *identity_values,
-                        *(float(values[index]) for _name, values in block.series),
+                        *(float(values[index]) if index < len(values) else None for _name, values in block.series),
+                        *((int(values[index]) if kind == "int" else float(values[index])) if index < len(values) and values[index] is not None else None for _, values, kind in volume_columns),
                     ),
                 )
                 data_rows += 1

@@ -44,6 +44,7 @@ from kindred.core.datasets.units import parse_concentration_unit, parse_time_uni
 from kindred.core.project_presentation_state import (
     AxisSeriesSelection,
     ExperimentalAxisSelection,
+    VesselVolumeAxisSelection,
     ProjectPresentationState,
     SimulationSeriesAxisSelection,
     WorkspacePresentationState,
@@ -1064,6 +1065,8 @@ def _encode_presentation(
 def _encode_axis_selection(
     selection: AxisSeriesSelection,
 ) -> dict[str, object]:
+    if isinstance(selection, VesselVolumeAxisSelection):
+        return {"kind": "vessel_volume"}
     if isinstance(selection, SimulationSeriesAxisSelection):
         return {
             "kind": "simulation",
@@ -1084,6 +1087,9 @@ def _decode_axis_selection(
 ) -> AxisSeriesSelection:
     data = _object(value, label)
     kind = _string(data.get("kind"), f"{label}.kind", nonblank=True)
+    if kind == "vessel_volume":
+        _exact_fields(data, label, {"kind"})
+        return VesselVolumeAxisSelection()
     if kind == "simulation":
         fields = _exact_fields(
             data,
@@ -1116,7 +1122,7 @@ def _decode_axis_selection(
             ),
         )
     raise ValueError(
-        f"{label}.kind must be exactly 'simulation' or 'experimental'."
+        f"{label}.kind must be 'simulation', 'experimental', or 'vessel_volume'."
     )
 
 

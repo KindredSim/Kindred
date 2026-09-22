@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from kindred.core.quantity_units import Unit, conversion_scale, presentation_unit, scientific_unit
+from kindred.core.quantity_units import CUBIC_METRE, SECOND, Unit, conversion_scale, presentation_unit, scientific_unit
 
 import io
 import time
@@ -16,6 +16,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from kindred.core.project_presentation_state import (
     ProjectPresentationState,
     SimulationSeriesAxisSelection,
+    VesselVolumeAxisSelection,
 )
 from kindred.core.result_repository import SimulationResultValue
 from kindred.gui.curve_copy_headers import copy_column_header, copy_series_label
@@ -39,6 +40,7 @@ from kindred.gui.workspace_result_presenter import (
     encode_clipboard_text,
     encode_tsv_row,
     compose_interactive_display,
+    intervention_label,
 )
 
 pg = require_pyqtgraph(context="Kindred GUI")
@@ -153,6 +155,7 @@ class _RenderedPointChunk:
     x: np.ndarray
     series: tuple[tuple[str, np.ndarray], ...]
     sample_time: np.ndarray | None
+    instantaneous: bool = False
 
     def __post_init__(self) -> None:
         x = np.asarray(self.x)
@@ -230,6 +233,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         self._axis_range = _AxisRangeSession()
         self._refit_axes = (False, False)
         self._axis_display_units: dict[tuple[str, tuple], Unit] = {}
+        self._volume_display_unit: Unit | None = None
         self._render_input: ResultRenderInput | None = None
         self._copy_all_available = False
         self._rendered_point_roster: tuple[_RenderedPointBlock, ...] = ()
@@ -468,7 +472,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
                 key = tuple(curve.key)
                 if len(key) < 4 or key[0] != "simulation":
                     continue
-                names_by_target.setdefault(str(key[2]), set()).add(str(key[3]))
+                names_by_target.setdefault(str(key[2]), set()).add(key[3])
             for available in names_by_target.values():
                 if wanted is not None and not wanted.issubset(available):
                     return False
@@ -481,9 +485,9 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         if render_input.selected_y_uses_default_all:
             return None
         return {
-            selection.series_name
+            selection
             for selection in render_input.selected_y_series
-            if isinstance(selection, SimulationSeriesAxisSelection)
+            if isinstance(selection, (SimulationSeriesAxisSelection, VesselVolumeAxisSelection))
         }
 
     def _filter_cached_interactive_projection(
@@ -498,7 +502,9 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
             if len(key) < 4 or key[0] != "simulation":
                 curves.append(curve)
                 continue
-            if wanted is not None and str(key[3]) not in wanted:
+            if wanted is not None and key[3] not in wanted:
+                continue
+            if render_input.selected_y_uses_default_all and isinstance(key[3], VesselVolumeAxisSelection):
                 continue
             if key[1] == "ghost" and not render_input.reference_lines_visible:
                 continue
@@ -596,6 +602,21 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
                 action = menu.addAction(text)
                 action.setCheckable(key not in {"copy_all", "copy_plotted", "copy_visible", "fit_once", "warnings"})
                 self._plot_actions[key] = action
+        volume_host = QtWidgets.QWidget(appearance)
+        volume_layout = QtWidgets.QHBoxLayout(volume_host)
+        volume_layout.addWidget(QtWidgets.QLabel("Volume Unit", volume_host))
+        self._volume_unit_combo = QtWidgets.QComboBox(volume_host)
+        self._volume_unit_combo.setAccessibleName("Volume Unit")
+        self._volume_unit_combo.setToolTip(
+            "Use one volume unit for plot axes and intervention labels. Authored uses the initial-volume "
+            "declaration's unit, or L when no compatible unit is declared. "
+            "Inflow labels use this volume unit divided by the selected time unit."
+        )
+        volume_layout.addWidget(self._volume_unit_combo)
+        self._volume_unit_action = QtWidgets.QWidgetAction(appearance)
+        self._volume_unit_action.setDefaultWidget(volume_host)
+        appearance.addAction(self._volume_unit_action)
+        self._volume_unit_combo.currentTextChanged.connect(self._apply_volume_unit_change)
         for axis, menu in axis_menus.items():
             for key, label in ((f"auto_{axis}", "Auto Range"), (f"mouse_{axis}", "Mouse Navigation"),
                                (f"pan_{axis}", "Auto Pan"), (f"log_{axis}", "Log Scale"),
@@ -777,6 +798,15 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
             auto_x=state.auto_x, auto_y=state.auto_y,
             enabled=not self._interactive_gesture_active,
         )
+        units = self._volume_unit_choices()
+        with QtCore.QSignalBlocker(self._volume_unit_combo):
+            self._volume_unit_combo.clear()
+            self._volume_unit_combo.addItems(("Authored", *(unit.symbol for unit in units)))
+            self._volume_unit_combo.setCurrentText(
+                self._volume_display_unit.symbol if self._volume_display_unit is not None else "Authored"
+            )
+        available = self._render_input is not None and self._render_input.authored_volume_unit is not None
+        self._volume_unit_action.setEnabled(available)
 
     def _on_plot_click(self, event: object) -> None:
         if event.button() == QtCore.Qt.MouseButton.RightButton:
@@ -952,6 +982,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         self._refit_axes = (False, False)
         self._apply_axis_range_state(self._axis_range, self._presentation)
         self._axis_display_units: dict[tuple[str, tuple], Unit] = {}
+        self._volume_display_unit = None
 
     def reset_plot_session_state(self) -> None:
         """Project replacement/reopen resets non-archived Plot session truth."""
@@ -965,6 +996,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         self._refit_axes = (False, False)
         self._apply_axis_range_state(self._axis_range, self._presentation)
         self._axis_display_units: dict[tuple[str, tuple], Unit] = {}
+        self._volume_display_unit = None
         self._axis_toolbar.set_axis_unit_choices(
             x_units=tuple(TIME_DISPLAY_UNIT_FACTORS),
             selected_x="s",
@@ -1243,8 +1275,19 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
                 dtype=int,
             )
             sample = np.unique(np.concatenate((sample, endpoints)))
+        physical_chunks = []
+        for chunk in curve.physical_chunks:
+            if chunk.instantaneous:
+                physical_chunks.append(chunk)
+                continue
+            keep = np.isin(chunk.time, curve.sample_time[sample])
+            if len(keep):
+                keep[0] = keep[-1] = True
+            physical_chunks.append(replace(chunk, time=chunk.time[keep], x=chunk.x[keep],
+                series=tuple((name, values[keep]) for name, values in chunk.series)))
         return replace(
             curve,
+            physical_chunks=tuple(physical_chunks),
             x=curve.x[sample],
             y=curve.y[sample],
             sample_time=curve.sample_time[sample],
@@ -1381,11 +1424,6 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
             for role, set_id, _payload, _opacity
             in projection.intervention_annotations}
         )
-        _x_unit, _y_unit, x_scale, y_scale = (
-            self._display_unit_state(render_input)
-            if render_input is not None
-            else (None, None, 1.0, 1.0)
-        )
         if render_input is not None:
             for block in render_input.blocks:
                 if not block.visible:
@@ -1403,137 +1441,26 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
                 if any(chunk.x.size for chunk in rendered_block.chunks):
                     rendered_points.extend(self._transformed_blocks(rendered_block))
         for curve in projection.curves:
-            style = "marker" if curve.markers else "line"
-            color = QtGui.QColor(curve.color)
-            opacity = curve.opacity
-            visual_break_indices = tuple(
-                chunk_index
-                for chunk_index, (start, _end) in enumerate(
-                    self._interactive_curve_chunks(curve)[1:], 1
-                )
-                if any(
-                    float(curve.x[start]) == float(connector[1])
-                    for connector in curve.intervention_connectors
-                )
-                or (
-                    render_input is not None
-                    and not self._has_time_x(render_input)
-                    and (
-                        curve.x[start] != curve.x[start - 1]
-                        or curve.y[start] != curve.y[start - 1]
-                    )
-                )
-            )
-            for chunk_index, (start, end) in enumerate(
-                self._interactive_curve_chunks(
-                    curve,
-                    visual_break_indices=visual_break_indices if self._presentation.plot_transform == "original" else None,
-                )
-            ):
-                displayed_x = self._scaled_display_values(
-                    curve.x[start:end],
-                    x_scale,
-                )
-                displayed_y = self._scaled_display_values(
-                    curve.y[start:end],
-                    y_scale,
-                )
-                displayed_x, displayed_y = _transform_samples(displayed_x, displayed_y, self._presentation.plot_transform)
-                if not np.any(np.isfinite(displayed_x) & np.isfinite(displayed_y)):
-                    continue
-                # Retained static items own the stable legend rows.  The
-                # transient projection supplies pixels only.
-                curve_name = None
-                item_key = (
-                    *curve.key,
-                    "segment",
-                    chunk_index,
-                    style,
-                )
-                item = existing.get(item_key)
-                if item is None:
-                    if curve.markers:
-                        item = self._add_plot_data(
-                            displayed_x,
-                            displayed_y,
-                            pen=None,
-                            symbol="o",
-                            symbolSize=curve.point_size,
-                            symbolBrush=pg.mkBrush(color),
-                            symbolPen=pg.mkPen(color),
-                            name=curve_name, connect="finite",
-                        )
+            if render_input is None:
+                continue
+            point_block = self._rendered_block_for_interactive_curve(curve)
+            if point_block is None:
+                continue
+            for transformed in self._transformed_blocks(point_block):
+                for index, chunk in enumerate(transformed.chunks):
+                    y = chunk.series[0][1]
+                    if not np.any(np.isfinite(chunk.x) & np.isfinite(y)):
+                        continue
+                    item_key = (*curve.key, "physical", index)
+                    pen = pg.mkPen(color=curve.color, width=2, style=(QtCore.Qt.PenStyle.DashLine if curve.dashed else QtCore.Qt.PenStyle.SolidLine))
+                    item = existing.get(item_key)
+                    if item is None:
+                        item = self._add_plot_data(chunk.x, y, pen=pen, name=None, connect="finite")
                     else:
-                        item = self._add_plot_data(
-                            displayed_x,
-                            displayed_y,
-                            pen=pg.mkPen(
-                                color=color,
-                                width=2,
-                                style=(
-                                    QtCore.Qt.PenStyle.DashLine
-                                    if curve.dashed
-                                    else QtCore.Qt.PenStyle.SolidLine
-                                ),
-                            ),
-                            name=curve_name, connect="finite",
-                        )
-                else:
-                    item.setData(displayed_x, displayed_y, connect="finite")
-                    if curve.markers:
-                        item.setSymbolSize(curve.point_size)
-                        item.setSymbolBrush(pg.mkBrush(color))
-                        item.setSymbolPen(pg.mkPen(color))
-                    else:
-                        item.setPen(
-                            pg.mkPen(
-                                color=color,
-                                width=2,
-                                style=(
-                                    QtCore.Qt.PenStyle.DashLine
-                                    if curve.dashed
-                                    else QtCore.Qt.PenStyle.SolidLine
-                                ),
-                            )
-                        )
-                self._update_plot_item_legend(item, curve_name)
-                self._style_simulation_item(item, True, color, opacity, singleton=displayed_x.size == 1)
-                rendered[item_key] = item
-            for connector in (curve.intervention_connectors if self._presentation.plot_transform == "original" else ()):
-                boundary_index, boundary_time, pre_value, post_value = connector
-                displayed_time = boundary_time * x_scale
-                displayed_pre = pre_value * y_scale
-                displayed_post = post_value * y_scale
-                item_key = (
-                    *curve.key,
-                    "intervention-boundary",
-                    boundary_index,
-                )
-                item = existing.get(item_key)
-                pen = pg.mkPen(
-                    color=color,
-                    width=2,
-                    style=(
-                        QtCore.Qt.PenStyle.DashLine
-                        if curve.dashed
-                        else QtCore.Qt.PenStyle.SolidLine
-                    ),
-                )
-                if item is None:
-                    item = self._add_plot_data(
-                        [displayed_time, displayed_time],
-                        [displayed_pre, displayed_post],
-                        pen=pen,
-                        name=None,
-                    )
-                else:
-                    item.setData(
-                        [displayed_time, displayed_time],
-                        [displayed_pre, displayed_post],
-                    )
-                    item.setPen(pen)
-                item.setOpacity(opacity * self._presentation.simulation_opacity)
-                rendered[item_key] = item
+                        item.setData(chunk.x, y, connect="finite")
+                        item.setPen(pen)
+                    self._style_simulation_item(item, True, curve.color, curve.opacity, singleton=chunk.x.size == 1)
+                    rendered[item_key] = item
         for item_key, item in existing.items():
             if item_key not in rendered:
                 self._remove_interactive_plot_item(item)
@@ -1562,16 +1489,9 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         # The displayed projection contains completed results, so Copy uses
         # those same sampled curves and their corresponding time.
         if render_input is not None:
-            definitions_by_source = {
-                (block.kind, block.block_id): dict(block.copy_definitions)
-                for block in render_input.blocks
-                if block.kind is not ResultLayerKind.EXPERIMENTAL
-            }
             for curve in projection.curves:
                 rendered_block = self._rendered_block_for_interactive_curve(
                     curve,
-                    render_input,
-                    definitions_by_source,
                 )
                 if rendered_block is not None and any(
                     chunk.x.size for chunk in rendered_block.chunks
@@ -1595,8 +1515,6 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
     @staticmethod
     def _interactive_curve_chunks(
         curve: object,
-        *,
-        visual_break_indices: Sequence[int] | None = None,
     ) -> tuple[tuple[int, int], ...]:
         """Split a transient curve at every executor-issued topology change."""
 
@@ -1617,10 +1535,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
                 or int(discontinuities[index]) != int(discontinuities[index - 1])
             )
         )
-        starts = [0, *changes] if visual_break_indices is None else [
-            0,
-            *(changes[index - 1] for index in visual_break_indices),
-        ]
+        starts = [0, *changes]
         return tuple(
             (
                 start,
@@ -1720,15 +1635,30 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
     def _selected_display_unit(self, axis: str, source: Unit | None) -> Unit | None:
         if source is None:
             return None
+        if source.compatible(CUBIC_METRE) and self._render_input is not None and self._render_input.authored_volume_unit is not None:
+            return self._selected_volume_unit()
         return self._axis_display_units.get(
             (axis, source.dimensions), presentation_unit(scientific_unit(source.dimensions)),
         )
+
+    def _selected_volume_unit(self) -> Unit:
+        authored = self._render_input.authored_volume_unit if self._render_input is not None else None
+        return self._volume_display_unit or authored or presentation_unit(CUBIC_METRE)
+
+    def _volume_unit_choices(self) -> tuple[Unit, ...]:
+        units = self._render_input.volume_unit_options if self._render_input is not None else ()
+        selected = self._volume_display_unit
+        if selected is not None and all(unit.symbol != selected.symbol for unit in units):
+            units = (*units, selected)
+        return units
 
     def _display_unit_choices(self, render_input: ResultRenderInput, axis: str) -> tuple[Unit, ...]:
         source = render_input.x_unit if axis == "x" else render_input.y_unit
         selected = self._selected_display_unit(axis, source)
         if selected is None:
             return ()
+        if source.compatible(CUBIC_METRE) and render_input.authored_volume_unit is not None:
+            return self._volume_unit_choices() or (selected,)
         options = render_input.x_unit_options if axis == "x" else render_input.y_unit_options
         if any(option.symbol == selected.symbol for option in options):
             return options
@@ -1747,12 +1677,33 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         y_unit, y_scale = selected("y", render_input.y_unit)
         return x_unit, y_unit, x_scale, y_scale
 
+    def _curve_unit_state(self, axis: str, source: Unit | None) -> tuple[str | None, float]:
+        """Keep mixed quantities scientific except for the shared volume choice."""
+        if source is None:
+            return None, 1.0
+        render_input = self._render_input
+        common = None if render_input is None else render_input.x_unit if axis == "x" else render_input.y_unit
+        if common is not None:
+            shown = self._selected_display_unit(axis, common)
+        elif source.compatible(CUBIC_METRE) and render_input is not None and render_input.authored_volume_unit is not None:
+            shown = self._selected_volume_unit()
+        else:
+            shown = source
+        return shown.symbol, conversion_scale(source, shown).number()
+
     def _configure_axis_unit_controls(self, render_input: ResultRenderInput) -> None:
         x_unit, y_unit, _x_scale, _y_scale = self._display_unit_state(render_input)
+        def options(axis, source, selected):
+            units = tuple(unit.symbol for unit in self._display_unit_choices(render_input, axis))
+            if source is not None and source.compatible(CUBIC_METRE) and render_input.authored_volume_unit is not None:
+                return ("Authored", *units), selected if self._volume_display_unit is not None else "Authored"
+            return units, selected
+        x_units, x_unit = options("x", render_input.x_unit, x_unit)
+        y_units, y_unit = options("y", render_input.y_unit, y_unit)
         self._axis_toolbar.set_axis_unit_choices(
-            x_units=tuple(unit.symbol for unit in self._display_unit_choices(render_input, "x")),
+            x_units=x_units,
             selected_x=x_unit,
-            y_units=tuple(unit.symbol for unit in self._display_unit_choices(render_input, "y")),
+            y_units=y_units,
             selected_y=y_unit,
             transformed=self._presentation.plot_transform != "original",
         )
@@ -1843,7 +1794,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
             [
                 (
                     candidate,
-                    render_input.selected_y_uses_default_all
+                    (render_input.selected_y_uses_default_all and not isinstance(candidate.selection, VesselVolumeAxisSelection))
                     or candidate.selection in render_input.selected_y_series
                     or candidate.selection in locked_checked,
                 )
@@ -1897,33 +1848,24 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         block: ResultDataBlock,
         sampling_limit: int | None,
     ) -> tuple[_RenderedPointBlock, tuple[_RenderedPointChunk, ...]]:
-        sample, chunks = self._sample_and_chunks(block, sampling_limit)
+        sample = self._sample_static_block(block, sampling_limit)
         definitions = dict(block.copy_definitions)
-        render_input = self._render_input
-        x_unit, y_unit, x_scale, y_scale = (
-            self._display_unit_state(render_input)
-            if render_input is not None
-            else (None, None, 1.0, 1.0)
-        )
-        x = self._scaled_display_values(block.t[sample], x_scale)
-        sampled_series = tuple(
-            (
-                name,
-                self._scaled_display_values(values[sample], y_scale),
-            )
-            for name, values in block.series
-        )
-        sample_time = None if block.sample_time is None else block.sample_time[sample]
-        rendered_chunks = tuple(
-            _RenderedPointChunk(
-                x=x[start:end],
-                series=tuple(
-                    (name, values[start:end]) for name, values in sampled_series
-                ),
-                sample_time=None if sample_time is None else sample_time[start:end],
-            )
-            for start, end in chunks
-        )
+        x_unit, x_scale = self._curve_unit_state("x", block.unit_for(block.x_name, x=True))
+        y_units = {name: self._curve_unit_state("y", block.unit_for(name)) for name, _ in block.series}
+        if block.result is not None:
+            from kindred.gui.result_curve_projection import physical_curve_chunks
+            projected = physical_curve_chunks(block.result, block.x_axis, block.series_axes, sample + block.first_index)
+            rendered_chunks = tuple(_RenderedPointChunk(
+                x=self._scaled_display_values(chunk.x, x_scale),
+                series=tuple((name, self._scaled_display_values(values, y_units[name][1])) for name, values in chunk.series),
+                sample_time=chunk.time, instantaneous=chunk.instantaneous,
+            ) for chunk in projected)
+        else:
+            rendered_chunks = (_RenderedPointChunk(
+                x=self._scaled_display_values(block.t[sample], x_scale),
+                series=tuple((name, self._scaled_display_values(values[sample], y_units[name][1])) for name, values in block.series),
+                sample_time=None if block.sample_time is None else block.sample_time[sample],
+            ),)
         rendered_block = _RenderedPointBlock(
             block_id=block.block_id,
             group_id=(
@@ -1937,89 +1879,37 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
                 isinstance(block.x_axis, SimulationSeriesAxisSelection)
                 and block.x_axis.series_name == "t"
             ),
-            x_unit=self._copy_x_unit(block, x_unit),
+            x_unit=x_unit,
             y_names=tuple(
                 (name, copy_series_label(name, definition=definitions.get(name)))
-                for name, _ in sampled_series
+                for name, _ in block.series
             ),
             y_units=tuple(
-                (name, self._copy_quantity_unit(block, name, y_unit))
-                for name, _ in sampled_series
+                (name, y_units[name][0])
+                for name, _ in block.series
             ),
             chunks=rendered_chunks,
         )
         return rendered_block, rendered_chunks
 
-    @staticmethod
-    def _copy_quantity_unit(
-        block: ResultDataBlock, name: str, display_unit: str | None,
-    ) -> str | None:
-        # Mixed axes retain canonical concentrations even without an axis unit.
-        source_unit = block.unit_for(name)
-        return (display_unit or source_unit.symbol) if source_unit is not None else None
-
-    def _copy_x_unit(self, block: ResultDataBlock, display_unit: str | None) -> str | None:
-        if isinstance(block.x_axis, SimulationSeriesAxisSelection) and block.x_axis.series_name == "t":
-            return display_unit or "s"
-        unit = block.unit_for(block.x_name, x=True)
-        return (display_unit or unit.symbol) if unit is not None else None
-
     def _rendered_block_for_interactive_curve(
         self,
         curve: object,
-        render_input: ResultRenderInput,
-        definitions_by_source: Mapping[tuple[ResultLayerKind, str], Mapping[str, str]],
     ) -> _RenderedPointBlock | None:
         key = tuple(curve.key)
         if len(key) < 4 or key[0] != "simulation":
             return None
-        role, set_id, series_name = key[1], str(key[2]), str(key[3])
-        if role == "ghost":
-            source = next(
-                (
-                    block
-                    for block in render_input.blocks
-                    if block.block_id == set_id
-                    and block.kind is ResultLayerKind.REFERENCE
-                ),
-                None,
-            )
-        else:
-            source = next(
-                (
-                    block
-                    for block in render_input.blocks
-                    if block.block_id == set_id
-                    and block.kind
-                    in {ResultLayerKind.EXPLICIT, ResultLayerKind.PREVIEW}
-                ),
-                None,
-            )
-        if source is None:
-            return None
-        definitions = definitions_by_source[(source.kind, source.block_id)]
-        x_unit, y_unit, x_scale, y_scale = self._display_unit_state(
-            render_input
-        )
-        curve_chunks = tuple(
-            _RenderedPointChunk(
-                x=self._scaled_display_values(
-                    curve.x[start:end],
-                    x_scale,
-                ),
-                series=(
-                    (
-                        series_name,
-                        self._scaled_display_values(
-                            curve.y[start:end],
-                            y_scale,
-                        ),
-                    ),
-                ),
-                sample_time=curve.sample_time[start:end],
-            )
-            for start, end in self._interactive_curve_chunks(curve)
-        )
+        set_id, selection = str(key[2]), key[3]
+        source = curve.source
+        series_name = next(name for name, axis in source.series_axes if axis == selection)
+        definitions = dict(source.copy_definitions)
+        x_unit, x_scale = self._curve_unit_state("x", source.unit_for(source.x_name, x=True))
+        y_unit, y_scale = self._curve_unit_state("y", source.unit_for(series_name))
+        curve_chunks = tuple(_RenderedPointChunk(
+            x=self._scaled_display_values(chunk.x, x_scale),
+            series=tuple((name, self._scaled_display_values(values, y_scale)) for name, values in chunk.series),
+            sample_time=chunk.time, instantaneous=chunk.instantaneous,
+        ) for chunk in curve.physical_chunks)
         return _RenderedPointBlock(
             block_id=set_id,
             group_id=set_id,
@@ -2030,11 +1920,11 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
                 isinstance(source.x_axis, SimulationSeriesAxisSelection)
                 and source.x_axis.series_name == "t"
             ),
-            x_unit=self._copy_x_unit(source, x_unit),
+            x_unit=x_unit,
             y_names=((series_name, copy_series_label(
                 series_name, definition=definitions.get(series_name),
             )),),
-            y_units=((series_name, self._copy_quantity_unit(source, series_name, y_unit)),),
+            y_units=((series_name, y_unit),),
             chunks=curve_chunks,
         )
 
@@ -2050,6 +1940,8 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         for group in groups:
             chunks = []
             for chunk in block.chunks:
+                if chunk.instantaneous:
+                    continue
                 series = dict(chunk.series)
                 mapped = tuple((name, _transform_samples(chunk.x, series[name], transform)) for name in group)
                 if not mapped:
@@ -2091,52 +1983,15 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         item_store = rendered_items if rendered_items is not None else {}
         existing_store = existing_items if existing_items is not None else {}
         role = (block.kind.value, block.block_id)
-        visual_breaks: dict[str, set[int]] = {
-            name: set() for name, _values in block.series
-        }
-        if block.result is not None:
-            result = block.result
-            result_chunks = self._execution_region_chunks(
-                np.asarray(result.segment_ids).reshape(-1),
-                tuple(result.segment_keys),
-                np.asarray(result.discontinuity_ids).reshape(-1),
-            )
-            transition_times = tuple(
-                float(result.t[start]) for start, _end in result_chunks[1:]
-            )
-            requested = set(result.requested_algebra_outputs)
-            x_name = None if block.x_axis.series_name == "t" else block.x_axis.series_name
-            boundary_by_time = {
-                float(item.time): (dict(item.pre_state), dict(item.post_state))
-                for item in block.presentation_boundaries
-            }
-            states = tuple(boundary_by_time.get(time) for time in transition_times)
-            visual_breaks = {
-                name: {
-                    chunk_index
-                    for chunk_index, state in enumerate(states, 1)
-                    if (
-                        ((x_name is not None and x_name in requested) or name in requested)
-                        if state is None
-                        else any(
-                            axis_name not in state[0]
-                            or axis_name not in state[1]
-                            or state[0][axis_name] != state[1][axis_name]
-                            for axis_name in (x_name, name)
-                            if axis_name is not None
-                        )
-                    )
-                }
-                for name, _values in block.series
-            }
         for series_name, _values in block.series:
             color = colors[series_name]
-            rendered_chunks = next((item.chunks for item in transformed_blocks if item.chunks and series_name in dict(item.chunks[0].series)), ())
+            transformed = next((item for item in transformed_blocks if item.chunks and series_name in dict(item.chunks[0].series)), None)
+            rendered_chunks = () if transformed is None else transformed.chunks
             physical_chunks: list[tuple[np.ndarray, np.ndarray]] = []
             for chunk_index, chunk in enumerate(rendered_chunks):
                 x = chunk.x
                 y = dict(chunk.series)[series_name]
-                if transform == "original" and chunk_index and chunk_index not in visual_breaks[series_name]:
+                if transform == "original" and chunk_index and block.result is None:
                     prior_x, prior_y = physical_chunks[-1]
                     physical_chunks[-1] = (
                         np.concatenate((prior_x, x)),
@@ -2150,9 +2005,12 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
                     continue
                 singleton = x.size == 1
                 marker = bool(block.markers or singleton)
-                item_key = (role, series_name, chunk_index, "marker" if marker else "line")
+                item_key = (role, dict(block.series_axes)[series_name], chunk_index, "marker" if marker else "line")
                 item = existing_store.get(item_key)
                 name = f"{block.label}: {series_name}"
+                unit = block.unit_for(series_name)
+                if self._render_input.y_unit is None and unit is not None and unit.compatible(CUBIC_METRE):
+                    name += f" [{dict(transformed.y_units)[series_name]}]"
                 legend_name = name if legend_pending else None
                 legend_pending = False
                 if item is None:
@@ -2186,31 +2044,6 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
             chunk.x.size for chunk in rendered_block.chunks
         ):
             rendered_points.extend(transformed_blocks)
-        if transform != "original":
-            return
-        render_input = self._render_input
-        _x_unit, _y_unit, x_scale, y_scale = (
-            self._display_unit_state(render_input)
-            if render_input is not None
-            else (None, None, 1.0, 1.0)
-        )
-        for boundary_index, species_name, boundary_time, pre_value, post_value in self._intervention_connector_entries(block):
-            color = colors[species_name]
-            item_key = (role, "intervention-boundary", boundary_index, species_name)
-            pen = pg.mkPen(color=color, width=2, style=(QtCore.Qt.PenStyle.DashLine if block.dashed else QtCore.Qt.PenStyle.SolidLine))
-            displayed_time = boundary_time * x_scale
-            displayed_pre = pre_value * y_scale
-            displayed_post = post_value * y_scale
-            item = existing_store.get(item_key)
-            if item is None:
-                item = self._add_plot_data([displayed_time, displayed_time], [displayed_pre, displayed_post], pen=pen, name=None)
-            else:
-                item.setData([displayed_time, displayed_time], [displayed_pre, displayed_post])
-                item.setPen(pen)
-            item.setVisible(True)
-            item.setOpacity(block.opacity * self._presentation.simulation_opacity)
-            item_store[item_key] = item
-
     def _style_simulation_item(self, item: object, simulation: bool, color: object, opacity: float, *, singleton: bool) -> None:
         if simulation:
             item.setSymbol("o" if self._presentation.simulation_markers or singleton else None)
@@ -2221,67 +2054,16 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
             opacity *= self._presentation.simulation_opacity
         item.setOpacity(opacity)
 
-    @staticmethod
-    def _intervention_connector_entries(
-        block: ResultDataBlock,
-    ) -> tuple[tuple[int, str, float, float, float], ...]:
-        """Return exact vertical connectors for a time-X simulation block."""
-
-        if block.kind is ResultLayerKind.EXPERIMENTAL:
-            return ()
-        if not (
-            isinstance(block.x_axis, SimulationSeriesAxisSelection)
-            and block.x_axis.series_name == "t"
-        ):
-            return ()
-        series_names = {name for name, _values in block.series}
-        entries: list[tuple[int, str, float, float, float]] = []
-        for boundary_index, boundary in enumerate(block.presentation_boundaries):
-            pre_by_name = dict(boundary.pre_state)
-            post_by_name = dict(boundary.post_state)
-            for species_name in pre_by_name:
-                if species_name not in series_names:
-                    continue
-                pre_value = pre_by_name[species_name]
-                post_value = post_by_name[species_name]
-                if pre_value == post_value:
-                    continue
-                entries.append(
-                    (
-                        boundary_index,
-                        species_name,
-                        float(boundary.time),
-                        float(pre_value),
-                        float(post_value),
-                    )
-                )
-        return tuple(entries)
-
-    def _sample_and_chunks(
+    def _sample_static_block(
         self,
         block: ResultDataBlock,
         sampling_limit: int | None,
-    ) -> tuple[np.ndarray, tuple[tuple[int, int], ...]]:
+    ) -> np.ndarray:
         sample = self._sample_indices(block.t.size, sampling_limit)
         if block.kind is not ResultLayerKind.EXPERIMENTAL:
             region_endpoints = self._execution_region_endpoints(block)
             sample = np.unique(np.concatenate((sample, region_endpoints)))
-            if (
-                block.segment_ids is None
-                or block.segment_keys is None
-                or block.discontinuity_ids is None
-            ):
-                raise ValueError("simulation plot block lacks executor identity.")
-            segment_ids = block.segment_ids[sample]
-            segment_keys = tuple(block.segment_keys[int(index)] for index in sample)
-            chunks = self._execution_region_chunks(
-                segment_ids,
-                segment_keys,
-                block.discontinuity_ids[sample],
-            )
-        else:
-            chunks = ((0, sample.size),)
-        return sample, chunks
+        return sample
 
     def _render_analysis(self, render_input: ResultRenderInput) -> None:
         self._parameter_table.update_parameters(
@@ -2501,11 +2283,13 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         rendered_labels: dict[tuple[object, ...], _AnnotationLabel] = {}
         for lane, (occurrence, candidate) in enumerate(label_candidates.items()):
             annotation, weighted_start, weight = candidate
+            text = intervention_label(annotation, volume_unit=self._selected_volume_unit(),
+                                      time_unit=self._selected_display_unit("x", SECOND))
             prior = existing_labels.get(occurrence)
             accent = self._annotation_accent(annotation)
             if prior is None:
                 label = pg.TextItem(
-                    str(annotation.get("label") or "intervention"),
+                    text,
                     color=(238, 238, 238), anchor=(0.0, 0.5),
                     border=pg.mkPen(accent), fill=pg.mkBrush(30, 30, 30, 210),
                 )
@@ -2519,7 +2303,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
                 prior = _AnnotationLabel(label, QtCore.QPointF(label.pos()), weighted_start / weight, lane)
             else:
                 label = prior.item
-                label.setText(str(annotation.get("label") or "intervention"))
+                label.setText(text)
                 label.border = pg.mkPen(accent)
                 label.update()
             prior.event_x = weighted_start / weight
@@ -2589,30 +2373,6 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         ends = np.concatenate((changes - 1, np.asarray((count - 1,), dtype=int)))
         return np.unique(np.concatenate((starts, ends)))
 
-    @staticmethod
-    def _execution_region_chunks(
-        segment_ids: np.ndarray,
-        segment_keys: tuple[str, ...],
-        discontinuity_ids: np.ndarray,
-    ) -> tuple[tuple[int, int], ...]:
-        count = int(segment_ids.size)
-        if count == 0:
-            return ()
-        starts = [0]
-        starts.extend(
-            index
-            for index in range(1, count)
-            if (
-                int(segment_ids[index]) != int(segment_ids[index - 1])
-                or segment_keys[index] != segment_keys[index - 1]
-                or int(discontinuity_ids[index]) != int(discontinuity_ids[index - 1])
-            )
-        )
-        return tuple(
-            (start, starts[index + 1] if index + 1 < len(starts) else count)
-            for index, start in enumerate(starts)
-        )
-
     def _clear_plot_items(self) -> None:
         self._annotation_labels.clear()
         self._plot_widget.clear()
@@ -2649,16 +2409,35 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         render_input = self._render_input
         if render_input is None:
             return
+        source = render_input.x_unit if axis == "x" else render_input.y_unit
+        if source is not None and source.compatible(CUBIC_METRE) and render_input.authored_volume_unit is not None:
+            self._apply_volume_unit_change(unit)
+            return
         options = self._display_unit_choices(render_input, axis)
         chosen = next((item for item in options if item.symbol == unit), None)
         if chosen is None:
             return
-        source = render_input.x_unit if axis == "x" else render_input.y_unit
         if self._selected_display_unit(axis, source).symbol == chosen.symbol:
             return
         self._axis_range = self._capture_view_range()
         old_x_scale, old_y_scale = self._coordinate_scales(render_input)
         self._axis_display_units[axis, chosen.dimensions] = chosen
+        self._refresh_display_units(old_x_scale, old_y_scale)
+
+    def _apply_volume_unit_change(self, symbol: str) -> None:
+        render_input = self._render_input
+        if render_input is None or render_input.authored_volume_unit is None:
+            return
+        chosen = None if symbol == "Authored" else next(unit for unit in self._volume_unit_choices() if unit.symbol == symbol)
+        if chosen == self._volume_display_unit:
+            return
+        self._axis_range = self._capture_view_range()
+        old_x_scale, old_y_scale = self._coordinate_scales(render_input)
+        self._volume_display_unit = chosen
+        self._refresh_display_units(old_x_scale, old_y_scale)
+
+    def _refresh_display_units(self, old_x_scale: float, old_y_scale: float) -> None:
+        render_input = self._render_input
         new_x_scale, new_y_scale = self._coordinate_scales(render_input)
         x_ratio = new_x_scale / old_x_scale
         y_ratio = new_y_scale / old_y_scale
@@ -2675,7 +2454,6 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
             self._axis_range.y_min,
             self._axis_range.y_max,
         )
-        self._clear_annotation_items()
         self.apply_result_input(render_input)
 
     @QtCore.Slot(bool)

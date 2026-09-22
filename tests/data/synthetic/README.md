@@ -1,6 +1,6 @@
 # Synthetic kinetics datasets
 
-This directory hosts curated CSV files that exercise various kinetic motifs for fitting demos and regression tests. All files use comma-separated values, seconds for time (`time`), and molar concentration units for species columns named directly after each species (e.g., `A`, `PBMP`). Gaussian noise (sigma noted below) keeps the data realistic but still well behaved.
+This directory hosts curated CSV files that exercise various kinetic motifs for fitting demos and regression tests. All files use comma-separated values, seconds for time (`time`), and molar concentration units for species columns named directly after each species (e.g., `A`, `PB`). Gaussian noise (sigma noted below) keeps the data realistic but still well behaved.
 
 ## Files
 
@@ -33,17 +33,18 @@ Contains three CSVs (`dataset_01`–`dataset_03`) for global fitting of the same
 Global-fitting bundle (datasets `01`–`06`) that exercises a multi-step reversible/irreversible mechanism:
 
 1. A + B ⇌ Int + Water (k_f = 1, k_r = 0.01)
-2. Int + C → PBMPBPIN (k = 0.01)
-3. PBMPBPIN + Water → PBMP + pinBOH (k = 100)
+2. Int + C → PB (k = 0.01)
+3. PB + Water → PH + BOH (k = 100)
 
 Each CSV shares the same time grid (0–120 s, 0.5 s spacing) and columns:
-`time`, `A`, `B`, `C`, `Int`, `Water`, `PBMPBPIN`, `PBMP`, `pinBOH`.
+`time`, `A`, `B`, `C`, `Int`, `Water`, `PB`, `PH`, `BOH`.
 
 - Dataset 01: A₀ = B₀ = C₀ = 0.2 M (benchmark condition requested by the user).
 - Datasets 02–06: Additional A/B/C combinations ranging from 0.05–0.35 M to stress-test shared-parameter fits.
 - Initial Water is fixed at 0.05 M for all files; other species start at 0.
 - Noise: σ = 0.002 for reactants (A/B/C) and σ = 0.0015 for intermediates/products.
 - Use case: demanding regression/global-fitting workflows that require simultaneous handling of reversible steps, intermediates, and fast consumption reactions.
+- `complex_mechanism_global.xlsx` contains the same six datasets, one per worksheet, with a recognized units row (`s` for time and `M` for each species) for Excel import.
 
 All datasets maintain strictly increasing time axes and non-negative
 concentrations, and can be loaded through the `DataManagerPanel` CSV import

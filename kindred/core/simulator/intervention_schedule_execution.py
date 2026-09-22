@@ -2,13 +2,15 @@
 from __future__ import annotations
 
 import math
+from bisect import bisect_left, bisect_right
 from dataclasses import dataclass, replace
+from operator import attrgetter
 from typing import Callable, Mapping, Protocol, Sequence
 
 import numpy as np
 
 from kindred.core.exceptions import SimulationCancelled, create_solver_error
-from kindred.core.intervention_schedule import (InterventionScheduleError, InterventionStopAction, SpeciesTriggerCondition, ObservableTriggerCondition)
+from kindred.core.intervention_schedule import (InterventionScheduleError, InterventionStopAction, SpeciesTriggerCondition, ObservableTriggerCondition, intervention_species)
 from kindred.core.intervention_schedule_compiler import (
     ExecutableFlux,
     ExecutableHold,
@@ -20,6 +22,8 @@ from kindred.core.intervention_schedule_compiler import (
     resolve_executable_values,
 )
 from kindred.core.temperature import declared_temperature_step_boundaries, temperature_at_execution_time
+from .volume_execution import VolumeExecution
+from kindred.core.volume import SimulationBoundaryState
 from kindred.core.species import TIME_MAX_S
 from .nonnegative_invariant import (
     NonnegativeProjection,
@@ -89,6 +93,7 @@ class SegmentExecutionRequest:
     method: str
     boundary_events: tuple[Callable[[float, np.ndarray], float], ...] = ()
     boundary_terminal_flags: tuple[bool, ...] = ()
+    volume: VolumeExecution | None = None
 
 
 @dataclass(frozen=True)
@@ -205,6 +210,8 @@ class InterventionScheduleExecutionOwner:
         dense = None
         try:
             species_index = _species_index(req, contract)
+            volume = VolumeExecution(species_names=species_index, parameter_values=req.parameter_values_at_temperature,
+                                     end_time=t1)
             current_y = np.asarray(req.y0, dtype=float).reshape(-1).copy()
             cancellation_check = (
                 req.cancellation_control.cancel_requested
@@ -251,6 +258,8 @@ class InterventionScheduleExecutionOwner:
 
             _raise_if_cancelled(cancellation_check)
             current_temperature = temperature_at(t0)
+            if contract.initial_volume is not None:
+                volume.initialize(contract.initial_volume, t0, current_temperature)
             initial_state_transaction = t0 in contract.discontinuities
             initial_boundary = _apply_boundary(
                 current_y,
@@ -266,7 +275,7 @@ class InterventionScheduleExecutionOwner:
                 cancellation_check=cancellation_check,
                 observable_value=req.stop_observable_value,
                 temperature_step=t0 in temperature_boundaries,
-            parameter_values=req.parameter_values_at_temperature, executed_values=executed_values,
+            parameter_values=req.parameter_values_at_temperature, executed_values=executed_values, volume=volume,
                                    temperature_K=current_temperature,
                                    temperature_at=temperature_at,
                                )
@@ -328,7 +337,7 @@ class InterventionScheduleExecutionOwner:
                         ))
 
                     segment_rhs = _InterventionRhs(
-                        req.rhs, fluxes=active_fluxes, holds=active_holds,
+                        req.rhs, fluxes=active_fluxes, holds=active_holds, volume=volume,
                         species_index=species_index,
                         parameter_values=req.parameter_values_at_temperature,
                         temperature_at=segment_temperature,
@@ -384,10 +393,18 @@ class InterventionScheduleExecutionOwner:
                                 ),
                                 jac_sparsity=_transform_jacobian_sparsity(
                                     segment_symbolic_jacobian.jac_sparsity, holds=active_holds,
-                                    species_index=species_index, size=current_y.size,
+                                    species_index=species_index, size=current_y.size, volume=volume.value is not None,
                                 ),
                             ),
                         )
+                    elif volume.value is not None and segment_symbolic_jacobian.jac_sparsity is not None:
+                        segment_request = replace(segment_request, symbolic_jacobian=replace(
+                            segment_symbolic_jacobian,
+                            jac_sparsity=_transform_jacobian_sparsity(
+                                segment_symbolic_jacobian.jac_sparsity, holds=active_holds,
+                                species_index=species_index, size=current_y.size, volume=True,
+                            ),
+                        ))
                     segment_request = _request_for_internal_segment(
                         segment_request, t0=sub_start, t1=sub_end
                     )
@@ -426,6 +443,7 @@ class InterventionScheduleExecutionOwner:
                             method=request.method,
                             boundary_events=segment_events,
                             boundary_terminal_flags=segment_terminal_flags,
+                            volume=volume if volume.value is not None else None,
                         )
                     )
                     _raise_if_cancelled(cancellation_check)
@@ -647,7 +665,7 @@ class InterventionScheduleExecutionOwner:
                                 cancellation_check=cancellation_check,
                                 observable_value=req.stop_observable_value,
                                 temperature_step=sub_end in temperature_boundaries,
-                            parameter_values=req.parameter_values_at_temperature, executed_values=executed_values,
+                            parameter_values=req.parameter_values_at_temperature, executed_values=executed_values, volume=volume,
                                                   temperature_K=current_temperature,
                                                   temperature_at=temperature_at,
                                               )
@@ -685,7 +703,7 @@ class InterventionScheduleExecutionOwner:
                                 cancellation_check=cancellation_check,
                                 observable_value=req.stop_observable_value,
                                 temperature_step=outer_end in temperature_boundaries,
-                            parameter_values=req.parameter_values_at_temperature, executed_values=executed_values,
+                            parameter_values=req.parameter_values_at_temperature, executed_values=executed_values, volume=volume,
                                                   temperature_K=current_temperature,
                                                   temperature_at=temperature_at,
                                               )
@@ -783,7 +801,7 @@ class InterventionScheduleExecutionOwner:
                         cancellation_check=cancellation_check,
                         observable_value=req.stop_observable_value,
                         temperature_step=root_time in temperature_boundaries,
-                    parameter_values=req.parameter_values_at_temperature, executed_values=executed_values,
+                    parameter_values=req.parameter_values_at_temperature, executed_values=executed_values, volume=volume,
                                           temperature_K=current_temperature,
                                           temperature_at=temperature_at,
                                       )
@@ -990,6 +1008,7 @@ class InterventionScheduleExecutionOwner:
             return FinalSimulationOutput(
                 t=output_t,
                 Y=output_y,
+                volume=volume.trajectory(output_t),
                 temperature_K=output_temperature,
                 provenance=provenance,
                 intervention_execution=final_contract,
@@ -1129,11 +1148,11 @@ def _species_index(
     req: SimulationRequest, contract: InterventionExecutionContract
 ) -> dict[str, int]:
     referenced = {
-        *(item.species for item in contract.instants),
-        *(item.species for item in contract.fluxes),
+        *(name for item in contract.instants for name in intervention_species(item)),
+        *(name for item in contract.fluxes for name in intervention_species(item)),
         *(item.species for item in contract.holds),
         *(item.condition.name for item in contract.triggers if isinstance(item.condition, SpeciesTriggerCondition)),
-        *(item.then.species for item in contract.triggers if not isinstance(item.then, InterventionStopAction)),
+        *(name for item in contract.triggers if not isinstance(item.then, InterventionStopAction) for name in intervention_species(item.then)),
     }
     names = tuple(str(name) for name in (req.species_names or ()))
     if not names and referenced:
@@ -1152,7 +1171,11 @@ def _species_index(
 def _static_instants_at(
     contract: InterventionExecutionContract, time: float
 ) -> tuple[ExecutableInstant, ...]:
-    return tuple(item for item in contract.instants if item.time == time)
+    # The compiler owns chronological order, including ties within each time.
+    by_time = attrgetter("time")
+    first = bisect_left(contract.instants, time, key=by_time)
+    last = bisect_right(contract.instants, time, lo=first, key=by_time)
+    return contract.instants[first:last]
 
 
 def _active_fluxes(
@@ -1190,6 +1213,8 @@ def _purge_zero_crossing_events(
 
     purge_indices: set[int] = set()
     for flux in fluxes:
+        if flux.physical is not None:
+            continue
         index = species_index[flux.species]
         if flux.flux_rate_param is not None or flux.flux_rate < 0.0:
             purge_indices.add(index)
@@ -1225,6 +1250,7 @@ def _trigger_action_instant(
     action = trigger.then
     return ExecutableInstant(
         op=action.op,
+        physical=action.physical,
         species=action.species,
         time=time,
         value=action.value, value_param=action.value_param,
@@ -1279,7 +1305,7 @@ def _apply_boundary(
     temperature_step: bool = False,
     temperature_K: float,
     temperature_at,
-    parameter_values=None, executed_values=None,
+    parameter_values=None, executed_values=None, volume,
 ) -> _BoundaryApplicationResult:
     if executed_values is None:
         executed_values = {}
@@ -1294,22 +1320,36 @@ def _apply_boundary(
     chemical_indices = tuple(index for index in trigger_indices if index not in stops)
     trigger_instants = tuple(_trigger_action_instant(contract.triggers[index], time=boundary) for index in chemical_indices)
     root_temperature = temperature_K
-    changed = False
     executed_instants: list[ExecutableInstant] = []
+    states: list[SimulationBoundaryState] = []
+
+    def snapshot() -> None:
+        public = _project_public_event_state({name: float(current[index]) for name, index in species_index.items()})
+        state = SimulationBoundaryState(tuple(public.items()), volume.value, temperature_K)
+        if not states or state != states[-1]:
+            states.append(state)
+
+    snapshot()
 
     def record(index: int, action=None) -> None:
         trigger = contract.triggers[index]
         trigger_counts[index] += 1
         trigger_last_times[index] = boundary
+        action_payload = trigger.then.to_payload() if action is None else action.to_payload()
         trigger_firings.append(TriggerFiring(
             declaration_ordinal=trigger.declaration_ordinal, condition=trigger.condition,
             threshold=_resolve_items((trigger,), boundary, parameter_values, temperature_K=root_temperature if index in trigger_indices else temperature_K)[0].threshold, direction=trigger.direction, root_time=boundary,
             event_state=_project_public_event_state({name: float((current if isinstance(trigger.then, InterventionStopAction) else exact_root)[position]) for name, position in species_index.items()}),
-            firing_ordinal=trigger_counts[index], nested_action_payload=trigger.then.to_payload() if action is None else {"op": action.op, "species": action.species, "value" if action.op == "set" else "delta": action.value if action.op == "set" else action.delta},
+            firing_ordinal=trigger_counts[index], nested_action_payload=action_payload,
         ))
 
     def finish(stop: int | None = None) -> _BoundaryApplicationResult:
-        invalid_negative = (current < 0.0) & (~projectable_solver_negatives | (current < exact_root))
+        if stop is None and boundary < volume.end_time:
+            for flux in _active_fluxes(contract, boundary):
+                if flux.physical is not None:
+                    volume.require_volume(flux, boundary)
+        snapshot()
+        invalid_negative = (current < 0.0) & ~projectable_solver_negatives
         if np.any(invalid_negative):
             raise InterventionScheduleError("Intervention boundary produced a scientifically invalid negative continuation state.")
         continuation, projection = project_nonnegative_trajectory(current.reshape(-1, 1), context=f"Intervention continuation state at t={boundary:g}")
@@ -1319,8 +1359,7 @@ def _apply_boundary(
             termination = SimulationTermination(boundary, "stop", contract.triggers[stop].declaration_ordinal)
         return _BoundaryApplicationResult(
             continuation.reshape(-1), projection, temperature_K,
-            _presentation_boundary_if_changed(time=boundary, pre_state=exact_root, post_state=current,
-                                              species_index=species_index, changed=changed),
+            SimulationPresentationBoundary(boundary, tuple(states)) if len(states) > 1 else None,
             termination,
             skipped_instants=(
                 tuple(item for item in static if item not in executed_values)
@@ -1345,6 +1384,7 @@ def _apply_boundary(
         return finish(min(eligible_stops, key=lambda index: contract.triggers[index].declaration_ordinal))
     if temperature_step:
         temperature_K = temperature_at(boundary)
+        snapshot()
     if not stops:
         validate_boundary_conflicts(
             instants=_resolve_items(static + trigger_instants, boundary, parameter_values, temperature_K=temperature_K),
@@ -1354,11 +1394,12 @@ def _apply_boundary(
     if temperature_step and stops:
         before_temperature = current.copy()
         current = _apply_holds(current, tuple(item for item in active_holds if item.start_time < boundary), species_index=species_index, cancellation_check=cancellation_check, time=boundary, temperature_K=temperature_K, parameter_values=parameter_values)
-        changed = not np.array_equal(before_temperature, current)
+        snapshot()
         stop = crossed_stop(before_temperature, before_temperature_K=root_temperature)
         if stop is not None:
             return finish(stop)
     executed_entering_holds: list[ExecutableHold] = []
+    held_indices: set[int] = set()
     stages = (
         tuple(item for item in active_holds if item.start_time < boundary),
         tuple(sorted((item for item in static if item.phase in {"ordinary", "before"}), key=_instant_canonical_order)),
@@ -1377,7 +1418,13 @@ def _apply_boundary(
             if isinstance(action, ExecutableInstant):
                 if stops:
                     validate_boundary_conflicts(instants=(*executed_instants, action), entering_holds=executed_entering_holds, cancellation_check=cancellation_check)
-                current = _apply_instants(current, (action,), species_index=species_index, cancellation_check=cancellation_check)
+                if action.physical is not None:
+                    if action.physical.op != "scale":
+                        volume.require_volume(action, boundary)
+                    current, action = volume.apply(action, current, time=boundary, temperature=temperature_K,
+                        held_indices=held_indices)
+                else:
+                    current = _apply_instants(current, (action,), species_index=species_index, cancellation_check=cancellation_check, held_indices=held_indices)
                 executed_instants.append(action)
                 executed_values[original] = action
                 if action.declaration_ordinal in trigger_by_declaration:
@@ -1388,10 +1435,11 @@ def _apply_boundary(
                         validate_boundary_conflicts(instants=executed_instants, entering_holds=(*executed_entering_holds, action), cancellation_check=cancellation_check)
                     executed_entering_holds.append(action)
                 current = _apply_holds(current, (action,), species_index=species_index, cancellation_check=cancellation_check, time=boundary, temperature_K=temperature_K, parameter_values=parameter_values)
-            changed = changed or not np.array_equal(before, current)
+                held_indices.add(species_index[action.species])
+            snapshot()
             if stops and not np.array_equal(before, current):
                 # Validate the executed prefix before admitting its terminal state.
-                invalid = (current < 0.0) & (~projectable_solver_negatives | (current < exact_root))
+                invalid = (current < 0.0) & ~projectable_solver_negatives
                 if np.any(invalid):
                     raise InterventionScheduleError("Intervention boundary produced a scientifically invalid negative continuation state.")
                 stop = crossed_stop(before)
@@ -1436,50 +1484,13 @@ def _project_public_event_state(
     }
 
 
-def _presentation_boundary_if_changed(
-    *,
-    time: float,
-    pre_state: np.ndarray,
-    post_state: np.ndarray,
-    species_index: Mapping[str, int],
-    changed: bool,
-) -> SimulationPresentationBoundary | None:
-    """Capture one detached public boundary state after atomic actions."""
-
-    if not changed:
-        return None
-    names = tuple(species_index)
-    raw_pre = {
-        name: float(np.asarray(pre_state, dtype=float).reshape(-1)[index])
-        for name, index in species_index.items()
-    }
-    raw_post = {
-        name: float(np.asarray(post_state, dtype=float).reshape(-1)[index])
-        for name, index in species_index.items()
-    }
-    public_pre = _project_public_event_state(raw_pre)
-    public_post = _project_public_event_state(raw_post)
-    pre_pairs = tuple((name, public_pre[name]) for name in names)
-    post_pairs = tuple((name, public_post[name]) for name in names)
-    if all(pre_value == post_value for (_, pre_value), (_, post_value) in zip(
-        pre_pairs,
-        post_pairs,
-        strict=True,
-    )):
-        return None
-    return SimulationPresentationBoundary(
-        time=float(time),
-        pre_state=pre_pairs,
-        post_state=post_pairs,
-    )
-
-
 def _apply_instants(
     state: np.ndarray,
     instants: Sequence[ExecutableInstant],
     *,
     species_index: Mapping[str, int],
     cancellation_check: Callable[[], bool] | None,
+    held_indices: set[int],
 ) -> np.ndarray:
     if not instants:
         return state
@@ -1493,11 +1504,13 @@ def _apply_instants(
                 raise InterventionScheduleError(
                     "Intervention set produced an invalid state."
                 )
-            output[index] = value
+            if index not in held_indices:
+                output[index] = value
         elif instant.op == "jump":
-            output[index] = max(
-                0.0, float(output[index]) + float(instant.delta)
-            )
+            if index not in held_indices:
+                output[index] = max(
+                    0.0, float(output[index]) + float(instant.delta)
+                )
         else:
             raise InterventionScheduleError(
                 f"Unsupported executable instant op: {instant.op!r}."
@@ -1590,6 +1603,7 @@ class _InterventionRhs:
     def __init__(
         self,
         rhs: ODERhs,
+        volume: VolumeExecution,
         *,
         fluxes: Sequence[ExecutableFlux],
         holds: Sequence[ExecutableHold],
@@ -1599,6 +1613,7 @@ class _InterventionRhs:
         cancellation_check,
     ) -> None:
         self._rhs = rhs
+        self.volume = volume
         self._fluxes = tuple(fluxes)
         self._holds = tuple(holds)
         self._species_index = dict(species_index)
@@ -1612,6 +1627,8 @@ class _InterventionRhs:
         for flux in _resolve_items(
             self._fluxes, time, self._parameter_values, temperature_K=temperature_K
         ):
+            if flux.physical is not None:
+                continue
             index = self._species_index[flux.species]
             sums[index] = sums.get(index, 0.0) + float(flux.flux_rate)
             if flux.flux_rate < 0.0:
@@ -1625,7 +1642,7 @@ class _InterventionRhs:
         temperature_K: float,
     ) -> tuple[np.ndarray, set[int]]:
         raw = np.asarray(state, dtype=float).reshape(-1)
-        evaluation_state = raw.copy()
+        evaluation_state = raw[:len(self._species_index)].copy()
         fixed: set[int] = set()
         evaluation_state = _apply_holds(
             evaluation_state,
@@ -1651,6 +1668,11 @@ class _InterventionRhs:
         derivative = np.asarray(
             self._rhs(time, evaluation_state, T=temperature_K), dtype=float
         ).copy()
+        volume_rate = 0.0
+        if self.volume.value is not None:
+            vessel = raw_state[-1]
+            volume_rate, mixing = self.volume.flow(self._fluxes, time, temperature_K, vessel, evaluation_state, fixed)
+            derivative += mixing
         sums, negative = self._flux_values(time, temperature_K)
         for index, rate in sums.items():
             candidate = float(derivative[index]) + rate
@@ -1660,7 +1682,7 @@ class _InterventionRhs:
                 derivative[index] = candidate
         for index in fixed:
             derivative[index] = 0.0
-        return derivative
+        return np.append(derivative, volume_rate) if self.volume.value is not None else derivative
 
     def purge_jacobian_branches(
         self,
@@ -1675,6 +1697,9 @@ class _InterventionRhs:
         derivative = np.asarray(
             self._rhs(time, evaluation_state, T=temperature_K), dtype=float
         )
+        if self.volume.value is not None:
+            _rate, mixing = self.volume.flow(self._fluxes, time, temperature_K, raw_state[-1], evaluation_state, _fixed)
+            derivative = derivative + mixing
         zero_rows: set[int] = set()
         zero_columns: set[int] = set()
         sums, negative = self._flux_values(time, temperature_K)
@@ -1728,6 +1753,14 @@ class _InterventionJacobian:
             raise ValueError(
                 f"intervention Jacobian expected {(size, size)}, got {matrix.shape}"
             )
+        if self._rhs.volume.value is not None:
+            vessel = float(state[-1])
+            rate, mixing = self._rhs.volume.flow(self._fluxes, time, temperature_K, vessel, used, held)
+            matrix -= np.eye(size) * (rate / vessel)
+            coupled = np.zeros((size + 1, size + 1))
+            coupled[:size, :size] = matrix
+            coupled[:size, -1] = -mixing / vessel
+            matrix = coupled
         if held:
             indices = np.fromiter(sorted(held), dtype=np.int64)
             matrix[indices, :] = 0.0
@@ -1749,6 +1782,7 @@ def _transform_jacobian_sparsity(
     holds: Sequence[ExecutableHold],
     species_index: Mapping[str, int],
     size: int,
+    volume: bool = False,
 ) -> object:
     """Apply the same row/column mask as the exact hold Jacobian."""
 
@@ -1763,6 +1797,11 @@ def _transform_jacobian_sparsity(
         raise ValueError(
             f"Jacobian sparsity expected {(int(size), int(size))}, got {matrix.shape}"
         )
+    if volume:
+        coupled = np.zeros((size + 1, size + 1), dtype=bool)
+        coupled[:size, :size] = matrix | np.eye(size, dtype=bool)
+        coupled[:size, -1] = True
+        matrix = coupled
     held = {
         species_index[hold.species]
         for hold in holds

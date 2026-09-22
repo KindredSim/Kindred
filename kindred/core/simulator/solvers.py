@@ -263,10 +263,15 @@ def _execute_scipy(
     method: str,
     boundary_events: Sequence[Callable[[float, np.ndarray], float]],
     boundary_terminal_flags: Sequence[bool],
+    volume=None,
 ) -> SegmentRunResult:
+    species_count = len(y0)
     base_kwargs: Dict[str, Any] = dict(t_eval=t_eval, rtol=float(req.rtol), atol=float(req.atol))
+    if volume is not None:
+        y0 = np.append(y0, volume.value)
+        base_kwargs["atol"] = np.append(np.full(species_count, req.atol), req.atol * volume.initial_value)
     from kindred.core.intervention_schedule import InterventionStopAction
-    retain_dense = any(isinstance(item.then, InterventionStopAction) for item in req.intervention_execution.triggers)
+    retain_dense = volume is not None or any(isinstance(item.then, InterventionStopAction) for item in req.intervention_execution.triggers)
     if retain_dense:
         base_kwargs["dense_output"] = True
     if req.max_step is not None:
@@ -288,7 +293,7 @@ def _execute_scipy(
             *,
             _event=event,
         ) -> float:
-            return float(_event(t, y))
+            return float(_event(t, y[:species_count]))
 
         _wrapped_event.terminal = terminal  # type: ignore[attr-defined]
         if hasattr(event, "direction"):
@@ -448,6 +453,9 @@ def _execute_scipy(
             y0=y0,
             t_out=t_out,
         )
+        if volume is not None:
+            volume.record_segment(t0, float(sol.sol.t_max), sol.sol)
+            raw_trajectory = raw_trajectory[:species_count]
         raw_terminal_state = None
         if (
             t_out.size
@@ -469,9 +477,10 @@ def _execute_scipy(
         )
         raw_event_states, event_state_projection = (
             _normal_event_states_with_projection(
-                getattr(sol, "y_events", None),
+                (tuple(np.asarray(states).reshape(-1, len(y0))[:, :species_count] for states in (sol.y_events or ()))
+                 if volume is not None else getattr(sol, "y_events", None)),
                 count=event_count,
-                species_count=int(np.asarray(y0, dtype=float).reshape(-1).size),
+                species_count=species_count,
             )
         )
         if event_state_projection.projected:
@@ -492,7 +501,8 @@ def _execute_scipy(
             trajectory_projection=nonnegative_projection,
             event_state_projection=event_state_projection,
             solver_used=str(prov.get("solver_used") or method),
-            dense_output=sol.sol if retain_dense else None,
+            dense_output=((lambda times, dense=sol.sol: dense(times)[:species_count]) if volume is not None
+                          else sol.sol if retain_dense else None),
             symbolic_jacobian_used=bool(
                 prov.get("symbolic_jacobian")
             ),
@@ -518,6 +528,7 @@ def _run_scipy_segment(request: SegmentExecutionRequest) -> SegmentRunResult:
         method=request.method,
         boundary_events=request.boundary_events,
         boundary_terminal_flags=request.boundary_terminal_flags,
+        volume=request.volume,
     )
 
 

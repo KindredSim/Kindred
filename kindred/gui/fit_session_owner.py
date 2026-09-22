@@ -1099,7 +1099,7 @@ class FitSessionOwner(QtCore.QObject):
             self._window.set_terminal_unavailable(unavailable)
         cause = unavailable.factual_cause
         self._set_status(
-            "Fit result scientifically unavailable: "
+            "No valid candidate found: "
             + (cause.message if cause is not None else unavailable.stage), present=False
         )
 

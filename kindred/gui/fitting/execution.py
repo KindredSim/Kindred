@@ -26,7 +26,6 @@ from kindred.core.analysis.global_fit_execution import (
     ObjectiveDatasetInput,
     evaluate_dataset_simulation,
     normalize_weights,
-    fit_result_target_values,
 )
 from kindred.core.analysis.fit_evaluation_outcome import (
     ScientificUnavailable,
@@ -46,13 +45,12 @@ from kindred.core.fitting_completion import (
     FitExtensionProgress,
 )
 from kindred.core.result_repository import SimulationResultValue
-from kindred.core.quantity_units import Unit, MOLAR, SECOND, conversion_scale, presentation_unit
+from kindred.core.quantity_units import Unit, MOLAR, SECOND
 from kindred.core.simulator.solver_types import SimulationCancellationControl
 from kindred.core.simulation_failure import (
     FactualCause,
     factual_cause_from_exception,
 )
-from kindred.core.simulator.dsl_parse import PreparedDslRequestSet
 from kindred.gui.curve_copy_headers import observable_copy_definitions
 from kindred.gui.fitting.constants import INITIAL_PREFIX
 from kindred.gui.fitting.launch import (
@@ -107,149 +105,28 @@ def _fit_coordinate_display_label(value: FitCoordinate) -> str:
     return value.display_name
 
 
-def _curve_items(
-    items: tuple[tuple[str, tuple[float, ...]], ...],
-    *,
-    field: str,
-) -> tuple[tuple[str, tuple[float, ...]], ...]:
-    normalized: list[tuple[str, tuple[float, ...]]] = []
-    for raw_name, raw_values in items:
-        name = str(raw_name or "").strip()
-        values = tuple(float(value) for value in raw_values)
-        if not name or not values or any(
-            not math.isfinite(value) for value in values
-        ):
-            raise ValueError(f"{field} contains an invalid curve.")
-        normalized.append((name, values))
-    names = [name for name, _values in normalized]
-    if len(names) != len(set(names)):
-        raise ValueError(f"{field} repeats a curve series.")
-    return tuple(normalized)
-
-
 @dataclass(frozen=True, slots=True)
 class FitCurveDataset:
     dataset_id: str
     display_name: str
-    quantity_units: tuple[tuple[str, Unit | None], ...]
-    model_x: tuple[tuple[str, tuple[float, ...]], ...]
-    model_y: tuple[tuple[str, tuple[float, ...]], ...]
-    model_time: tuple[float, ...]
+    simulation: SimulationResultValue
     observed_x: tuple[tuple[str, tuple[float, ...]], ...]
     observed_y: tuple[tuple[str, tuple[float, ...]], ...]
     observed_time: tuple[tuple[str, tuple[float, ...]], ...]
-    model_segment_ids: tuple[tuple[str, tuple[int, ...]], ...]
-    model_segment_keys: tuple[tuple[str, tuple[str, ...]], ...]
-    model_discontinuity_ids: tuple[tuple[str, tuple[int, ...]], ...]
     observed_raw_columns: tuple[tuple[str, str], ...]
     model_definitions: tuple[tuple[str, str], ...]
     observed_x_name: str | None
-    x_unit: Unit | None
     observed_x_unit: Unit
     observed_y_unit: Unit
     x_name: str = "t"
 
     def __post_init__(self) -> None:
-        dataset_id = str(self.dataset_id or "").strip()
-        display_name = str(self.display_name or "").strip()
-        x_name = str(self.x_name or "").strip()
-        if not dataset_id or not display_name or not x_name:
-            raise ValueError("Fit curve dataset identity must be complete.")
-        model_x = _curve_items(self.model_x, field="model X")
-        model_y = _curve_items(self.model_y, field="model Y")
-        observed_x = _curve_items(self.observed_x, field="observed X")
-        observed_y = _curve_items(self.observed_y, field="observed Y")
-        model_segment_ids = tuple(
-            (str(name), tuple(int(value) for value in values))
-            for name, values in self.model_segment_ids
-        )
-        model_segment_keys = tuple(
-            (
-                str(name),
-                tuple(str(value or "").strip() for value in values),
-            )
-            for name, values in self.model_segment_keys
-        )
-        model_discontinuity_ids = tuple(
-            (str(name), tuple(int(value) for value in values))
-            for name, values in self.model_discontinuity_ids
-        )
-        names = tuple(name for name, _values in model_y)
-        segment_names = tuple(name for name, _values in model_segment_ids)
-        segment_key_names = tuple(
-            name for name, _values in model_segment_keys
-        )
-        discontinuity_names = tuple(name for name, _values in model_discontinuity_ids)
-        if (
-            not names
-            or set(names) != {name for name, _values in model_x}
-            or set(names) != {name for name, _values in observed_x}
-            or set(names) != {name for name, _values in observed_y}
-            or set(names) != set(segment_names)
-            or set(names) != set(segment_key_names)
-            or set(names) != set(discontinuity_names)
-            or len(segment_names) != len(set(segment_names))
-            or len(segment_key_names) != len(set(segment_key_names))
-        ):
-            raise ValueError(
-                "Fit curves require complete model and observation axes "
-                "for every selected series."
-            )
-        raw_columns = dict(self.observed_raw_columns)
-        observed_time = dict(self.observed_time)
-        observed_y_by_name = dict(observed_y)
-        if any(
-            set(mapping) != set(names)
-            for mapping in (raw_columns, observed_time)
-        ):
-            raise ValueError("Fit observations require source labels and recorded-time availability.")
-        for name in names:
-            if (
-                not raw_columns[name]
-                or len(observed_time[name]) not in (0, len(observed_y_by_name[name]))
-            ):
-                raise ValueError("Fit observation times must align with their plotted samples.")
-        for axis, values, field in (
-            (dict(model_x), dict(model_y), "model"),
-            (dict(observed_x), dict(observed_y), "observed"),
-        ):
-            if any(
-                len(axis[name]) != len(values[name])
-                for name in names
-            ):
-                raise ValueError(f"Fit {field} curve X/Y lengths do not align.")
-        model_y_by_name = dict(model_y)
-        if any(len(values) != len(self.model_time) for values in model_y_by_name.values()):
-            raise ValueError("Fit model time must align with its plotted samples.")
-        segments_by_name = dict(model_segment_ids)
-        segment_keys_by_name = dict(model_segment_keys)
-        discontinuities_by_name = dict(model_discontinuity_ids)
-        if any(
-            len(segments_by_name[name]) != len(model_y_by_name[name])
-            or any(value < 0 for value in segments_by_name[name])
-            or len(segment_keys_by_name[name]) != len(model_y_by_name[name])
-            or any(not value for value in segment_keys_by_name[name])
-            or len(discontinuities_by_name[name]) != len(model_y_by_name[name])
-            or any(value < 0 for value in discontinuities_by_name[name])
-            for name in names
-        ):
-            raise ValueError(
-                "Fit curves require exact nonnegative segment identity."
-            )
-        object.__setattr__(self, "dataset_id", dataset_id)
-        object.__setattr__(self, "display_name", display_name)
-        object.__setattr__(self, "x_name", x_name)
-        object.__setattr__(self, "model_x", model_x)
-        object.__setattr__(self, "model_y", model_y)
-        object.__setattr__(self, "observed_x", observed_x)
-        object.__setattr__(self, "observed_y", observed_y)
-        object.__setattr__(self, "model_segment_ids", model_segment_ids)
-        object.__setattr__(
-            self,
-            "model_segment_keys",
-            model_segment_keys,
-        )
-        object.__setattr__(self, "model_discontinuity_ids", model_discontinuity_ids)
+        x, y = dict(self.observed_x), dict(self.observed_y)
+        if x.keys() != y.keys() or any(len(x[name]) != len(values) for name, values in y.items()):
+            raise ValueError("Fit observation axes must align.")
+        times = dict(self.observed_time)
+        if times.keys() != y.keys() or any(len(times[name]) not in (0, len(values)) for name, values in y.items()):
+            raise ValueError("Fit observation times must align with their samples.")
 
 
 @dataclass(frozen=True, slots=True)
@@ -705,32 +582,6 @@ def _terminal_setup_snapshot(
     )
 
 
-def fit_curve_units(prepared_dsl: PreparedDslRequestSet) -> tuple[tuple[str, Unit | None], ...]:
-    """Capture scientific units from the admitted model, independently of species roles."""
-    spec = prepared_dsl.parameter_algebra_spec_for_execution()
-    units = dict(spec.quantity_units)
-    units.update((name, MOLAR) for name in prepared_dsl.analysis.species_names)
-    units["t"] = SECOND
-    return tuple(units.items())
-
-
-def fit_display_units(quantity_units, presentation_units, names, x_name):
-    """Choose common display units without changing admitted observations."""
-    units, preferences = dict(quantity_units), dict(presentation_units)
-    def concentration_unit(selected):
-        if not selected or any(units.get(name) is None or not units[name].compatible(MOLAR) for name in selected):
-            return MOLAR
-        preferred = tuple(preferences.get(name) or MOLAR for name in selected)
-        return preferred[0] if all(unit == preferred[0] for unit in preferred) else MOLAR
-    return SECOND if x_name == "t" else concentration_unit((x_name,)), concentration_unit(names)
-
-
-def fit_source_presentation_units(prepared_dsl):
-    spec = prepared_dsl.parameter_algebra_spec_for_execution()
-    return tuple((stmt.name, presentation_unit(stmt.expr.quantity_unit, stmt.declared_unit))
-                 for stmt in spec.observable_block.lines)
-
-
 def _curves_from_simulations(
     *,
     request: FitExecutionRequest,
@@ -769,72 +620,20 @@ def _curves_from_simulations(
             x_observations=x_observations,
         )
         x_name = local.parametric.x_name if local.parametric is not None else "t"
-        model_names = tuple(item.model_target for item in selected)
-        model_x_values = simulation.t if x_name == "t" else fit_result_target_values(simulation, x_name)
-        model_x = tuple(
-            (name, tuple(float(value) for value in model_x_values))
-            for name in model_names
-        )
-        model_y = tuple(
-            (
-                name,
-                tuple(float(value) for value in fit_result_target_values(simulation, name)),
-            )
-            for name in model_names
-        )
-        x_display, y_display = fit_display_units(simulation.quantity_units, simulation.presentation_units, model_names, x_name)
-        quantities = dict(simulation.quantity_units)
-        def scaled(items, target):
-            result = []
-            for name, values in items:
-                source = quantities.get(name)
-                factor = conversion_scale(source, target).number() if source is not None and source.compatible(target) else 1.0
-                result.append((name, tuple(value * factor for value in values)))
-            return tuple(result)
-        model_y = scaled(model_y, y_display)
-        x_source = quantities.get(x_name)
-        x_factor = conversion_scale(x_source, x_display).number() if x_source is not None and x_source.compatible(x_display) else 1.0
-        model_x = tuple((name, tuple(value * x_factor for value in values)) for name, values in model_x)
-        ox_factor = conversion_scale(SECOND if x_name == "t" else MOLAR, x_display).number()
-        oy_factor = conversion_scale(MOLAR, y_display).number()
-        observed_x = tuple((name, tuple(value * ox_factor for value in values)) for name, values in observed_x)
-        observed_y = tuple((name, tuple(value * oy_factor for value in values)) for name, values in observed_y)
-        for name, target in ((x_name, x_display), *((name, y_display) for name in model_names)):
-            if quantities.get(name) is not None and quantities[name].compatible(target):
-                quantities[name] = target
-        model_segment_ids = tuple(
-            (name, tuple(int(value) for value in simulation.segment_ids))
-            for name in model_names
-        )
-        model_segment_keys = tuple(
-            (name, tuple(str(value) for value in simulation.segment_keys))
-            for name in model_names
-        )
-        model_discontinuity_ids = tuple(
-            (name, tuple(int(value) for value in simulation.discontinuity_ids))
-            for name in model_names
-        )
         curves.append(
             FitCurveDataset(
                 dataset_id=dataset_id,
                 display_name=mapped.display_name,
-                quantity_units=tuple(quantities.items()),
-                x_unit=x_display if x_source is not None and x_source.compatible(x_display) else x_source,
-                observed_x_unit=x_display, observed_y_unit=y_display,
+                simulation=simulation,
+                observed_x_unit=SECOND if x_name == "t" else MOLAR, observed_y_unit=MOLAR,
                 model_definitions=model_definitions,
                 observed_x_name=(
                     None if prepared.parametric_x_observation is None
                     else prepared.parametric_x_observation.raw_column
                 ),
-                model_x=model_x,
-                model_y=model_y,
-                model_time=tuple(float(value) for value in simulation.t),
                 observed_x=observed_x,
                 observed_y=observed_y,
                 observed_time=tuple((item.model_target, item.t) for item in selected),
-                model_segment_ids=model_segment_ids,
-                model_segment_keys=model_segment_keys,
-                model_discontinuity_ids=model_discontinuity_ids,
                 observed_raw_columns=tuple(
                     (item.model_target, item.raw_column) for item in selected
                 ),

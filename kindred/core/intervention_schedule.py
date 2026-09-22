@@ -1,18 +1,26 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, replace
+import re
+from dataclasses import dataclass, field as dataclass_field, replace
 from numbers import Real
 from types import MappingProxyType
 from typing import Any, Mapping, Sequence, TypeAlias
 
 from kindred.core.authored_source_errors import AuthoredSourceError
+from kindred.core.quantity_units import CUBIC_METRE, MOLAR, SECOND, Unit, convert_value, parse_declared_unit
+from kindred.core.validation import parse_finite_numeric_text
+from kindred.core.volume import volume_input_in_range
 from kindred.core.species import (
     validate_concentration,
     validate_time_seconds,
 )
 
 __all__ = [
+    "InterventionPhysical",
+    "PhysicalAction",
+    "PhysicalQuantity",
+    "intervention_species",
     "InterventionFlux",
     "InterventionHold",
     "InterventionJump",
@@ -153,6 +161,7 @@ _PARAM_FIELDS = frozenset(
         "delta_param",
         "flux_rate_param",
         "threshold_param",
+        "volume_param", "volume_rate_param", "initial_volume_param", "factor_param",
     }
 )
 _DIRECTIONS = frozenset({"rising", "falling", "either"})
@@ -333,6 +342,151 @@ def _reject_keys(
         raise InterventionScheduleError(
             f"Unsupported {context} field: {unknown[0]!r}."
         )
+
+
+@dataclass(frozen=True, slots=True)
+class PhysicalQuantity:
+    """One scientific literal or live parameter reference in a physical action."""
+
+    value: float | None = None
+    parameter: str | None = None
+    authored: str | None = None
+    declared_unit: Unit | None = None
+
+    def __post_init__(self) -> None:
+        value, parameter = _pair(self.value, self.parameter, field="physical quantity", domain="signed")
+        object.__setattr__(self, "value", value)
+        object.__setattr__(self, "parameter", parameter)
+
+    def put(self, payload: dict[str, Any], field: str) -> None:
+        if self.parameter is not None:
+            payload[field + "_param"] = self.parameter
+        else:
+            payload[field] = self.value
+            if self.authored is not None:
+                payload[field + "_authored"] = self.authored
+
+
+@dataclass(frozen=True, slots=True)
+class PhysicalAction:
+    """Incoming solution, uniform scale, or well-mixed aliquot instructions."""
+
+    op: str
+    amount: PhysicalQuantity
+    stock: tuple[tuple[str, PhysicalQuantity], ...] = ()
+    initial_volume: PhysicalQuantity | None = None
+
+    def __post_init__(self) -> None:
+        if self.op not in {"jump", "flux", "scale", "withdraw"}:
+            raise InterventionScheduleError(f"Unsupported physical action: {self.op!r}.")
+        if self.op in {"scale", "withdraw"} and self.stock:
+            raise InterventionScheduleError(f"{self.op} does not permit stock composition.")
+        if self.op == "scale" and self.initial_volume is not None:
+            raise InterventionScheduleError("scale does not initialize volume.")
+        names = tuple(_name(name, field="stock species") for name, _ in self.stock)
+        if len(set(names)) != len(names):
+            raise InterventionScheduleError("Stock species must be unique.")
+        for path, quantity in self.quantities():
+            if quantity.value is not None and path in {
+                "initial_volume", "volume", "solution.volume", "solution.volume_rate",
+            } and not volume_input_in_range(quantity.value, allow_zero=path != "initial_volume"):
+                unit = "m³/s" if path == "solution.volume_rate" else "m³"
+                zero = "zero or " if path != "initial_volume" else ""
+                raise InterventionScheduleError(f"{path} must be {zero}from 1e-30 through 1e30 {unit}.")
+            if quantity.value is not None and (
+                quantity.value < 0.0 or
+                (path in {"factor", "initial_volume"} and quantity.value == 0.0)
+            ):
+                raise InterventionScheduleError(f"{path} must be {'positive' if path in {'factor', 'initial_volume'} else 'nonnegative'}.")
+
+    @property
+    def amount_field(self) -> str:
+        return {"jump": "volume", "flux": "volume_rate", "withdraw": "volume", "scale": "factor"}[self.op]
+
+    def quantities(self, *, include_initializer: bool = True) -> tuple[tuple[str, PhysicalQuantity], ...]:
+        prefix = "solution." if self.op in {"jump", "flux"} else ""
+        items = [(prefix + self.amount_field, self.amount)]
+        items.extend((f"solution.stock.{name}.value", value) for name, value in self.stock)
+        if include_initializer and self.initial_volume is not None:
+            items.append(("initial_volume", self.initial_volume))
+        return tuple(items)
+
+    @property
+    def is_parameterized(self) -> bool:
+        return any(value.parameter is not None for _, value in self.quantities())
+
+    def to_payload(self) -> dict[str, Any]:
+        payload: dict[str, Any] = {}
+        if self.op in {"jump", "flux"}:
+            solution: dict[str, Any] = {}
+            self.amount.put(solution, self.amount_field)
+            stock = []
+            for name, quantity in self.stock:
+                component = {"species": name}
+                quantity.put(component, "value")
+                stock.append(component)
+            solution["stock"] = stock
+            payload["solution"] = solution
+        else:
+            self.amount.put(payload, self.amount_field)
+        if self.initial_volume is not None:
+            self.initial_volume.put(payload, "initial_volume")
+        return payload
+
+
+@dataclass(frozen=True, slots=True)
+class InterventionPhysical:
+    physical: PhysicalAction
+    time: float | None = None
+    time_param: str | None = None
+    start_time: float | None = None
+    start_time_param: str | None = None
+    end_time: float | None = None
+    end_time_param: str | None = None
+    declaration_ordinal: int = 0
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "declaration_ordinal", _ordinal(self.declaration_ordinal, field="declaration_ordinal"))
+        for field in self.clock_fields:
+            value, parameter = _pair(getattr(self, field), getattr(self, field + "_param"), field=field, domain="nonnegative")
+            object.__setattr__(self, field, value)
+            object.__setattr__(self, field + "_param", parameter)
+        if self.op == "flux" and self.start_time is not None and self.end_time is not None and self.end_time <= self.start_time:
+            raise InterventionScheduleError("end_time must be greater than start_time.")
+
+    @property
+    def op(self) -> str:
+        return self.physical.op
+
+    @property
+    def clock_fields(self) -> tuple[str, ...]:
+        return ("start_time", "end_time") if self.op == "flux" else ("time",)
+
+    @property
+    def is_parameterized(self) -> bool:
+        return self.physical.is_parameterized or any(getattr(self, field + "_param") is not None for field in self.clock_fields)
+
+    def resolve_parameters(self, values: Mapping[str, Any], *, runtime_parameters: frozenset[str] = frozenset()) -> InterventionPhysical:
+        updates = {}
+        for field in self.clock_fields:
+            updates[field] = _resolved(getattr(self, field), getattr(self, field + "_param"), values, field=field, domain="nonnegative")
+            updates[field + "_param"] = None
+        # Physical payloads are consumed by execution, never by compilation.
+        return replace(self, **updates)
+
+    def to_payload(self) -> dict[str, Any]:
+        payload = {"op": self.op, "declaration_ordinal": self.declaration_ordinal, **self.physical.to_payload()}
+        for field in self.clock_fields:
+            _put_pair(payload, field=field, value=getattr(self, field), parameter=getattr(self, field + "_param"))
+        return payload
+
+
+def intervention_species(operation: object) -> tuple[str, ...]:
+    """Species referenced by one primitive; a physical footprint may be global."""
+    physical = getattr(operation, "physical", None)
+    if physical is not None:
+        return tuple(name for name, _ in physical.stock)
+    return (operation.species,)
 
 
 @dataclass(frozen=True, slots=True)
@@ -681,7 +835,8 @@ class InterventionHold:
 class InterventionProtocolOperation:
     phase: str
     op: str
-    species: str
+    species: str = ""
+    physical: PhysicalAction | None = None
     value: float | None = None
     delta: float | None = None
     flux_rate: float | None = None
@@ -695,19 +850,19 @@ class InterventionProtocolOperation:
         op = _enum(self.op, field="op")
         if phase not in _PHASES:
             raise InterventionScheduleError(f"Unsupported protocol phase: {phase!r}.")
-        permitted = {"before": {"set", "jump"}, "during": {"flux", "hold"}, "after": {"set", "jump"}}
+        permitted = {"before": {"set", "jump", "scale", "withdraw"}, "during": {"flux", "hold"}, "after": {"set", "jump", "scale", "withdraw"}}
         if op not in permitted[phase]:
             raise InterventionScheduleError(
                 f"Protocol phase {phase!r} does not permit op={op!r}."
             )
         object.__setattr__(self, "phase", phase)
         object.__setattr__(self, "op", op)
+        object.__setattr__(self, "authored_ordinal", _ordinal(self.authored_ordinal, field="authored_ordinal"))
+        if self.physical is not None:
+            if self.physical.op != op or self.species or any(getattr(self, name, None) is not None for name in ("value", "delta", "flux_rate", "value_param", "delta_param", "flux_rate_param")):
+                raise InterventionScheduleError("Physical and concentration instructions are mutually exclusive.")
+            return
         object.__setattr__(self, "species", _name(self.species, field="species"))
-        object.__setattr__(
-            self,
-            "authored_ordinal",
-            _ordinal(self.authored_ordinal, field="authored_ordinal"),
-        )
         selected = {"set": "value", "hold": "value", "jump": "delta", "flux": "flux_rate"}[op]
         for field in ("value", "delta", "flux_rate"):
             raw_value = getattr(self, field)
@@ -730,6 +885,8 @@ class InterventionProtocolOperation:
 
     @property
     def is_parameterized(self) -> bool:
+        if self.physical is not None:
+            return self.physical.is_parameterized
         return any(
             item is not None
             for item in (self.value_param, self.delta_param, self.flux_rate_param)
@@ -738,6 +895,8 @@ class InterventionProtocolOperation:
     def resolve_parameters(
         self, values: Mapping[str, Any], *, runtime_parameters: frozenset[str] = frozenset()
     ) -> "InterventionProtocolOperation":
+        if self.physical is not None:
+            return self
         selected = {"set": "value", "hold": "value", "jump": "delta", "flux": "flux_rate"}[self.op]
         kwargs: dict[str, Any] = {
             "phase": self.phase,
@@ -750,6 +909,8 @@ class InterventionProtocolOperation:
         return InterventionProtocolOperation(**kwargs)
 
     def to_payload(self) -> dict[str, Any]:
+        if self.physical is not None:
+            return {"op": self.op, "authored_ordinal": self.authored_ordinal, **self.physical.to_payload()}
         selected = {"set": "value", "hold": "value", "jump": "delta", "flux": "flux_rate"}[self.op]
         payload: dict[str, Any] = {
             "op": self.op,
@@ -906,7 +1067,8 @@ class InterventionProtocol:
 @dataclass(frozen=True, slots=True)
 class InterventionTriggerAction:
     op: str
-    species: str
+    species: str = ""
+    physical: PhysicalAction | None = None
     value: float | None = None
     delta: float | None = None
     value_param: str | None = None
@@ -914,11 +1076,15 @@ class InterventionTriggerAction:
 
     def __post_init__(self) -> None:
         op = _enum(self.op, field="op")
-        if op not in {"set", "jump"}:
+        if op not in {"set", "jump", "scale", "withdraw"}:
             raise InterventionScheduleError(
                 "Trigger then permits exactly op=set or op=jump."
             )
         object.__setattr__(self, "op", op)
+        if self.physical is not None:
+            if self.physical.op != op or self.species or any(getattr(self, name, None) is not None for name in ("value", "delta", "flux_rate", "value_param", "delta_param", "flux_rate_param")):
+                raise InterventionScheduleError("Physical and concentration instructions are mutually exclusive.")
+            return
         object.__setattr__(self, "species", _name(self.species, field="species"))
         selected = "value" if op == "set" else "delta"
         rejected = "delta" if op == "set" else "value"
@@ -937,11 +1103,15 @@ class InterventionTriggerAction:
 
     @property
     def is_parameterized(self) -> bool:
+        if self.physical is not None:
+            return self.physical.is_parameterized
         return self.value_param is not None or self.delta_param is not None
 
     def resolve_parameters(
         self, values: Mapping[str, Any], *, runtime_parameters: frozenset[str] = frozenset()
     ) -> "InterventionTriggerAction":
+        if self.physical is not None:
+            return self
         selected = "value" if self.op == "set" else "delta"
         return InterventionTriggerAction(
             op=self.op,
@@ -951,6 +1121,8 @@ class InterventionTriggerAction:
         )
 
     def to_payload(self) -> dict[str, Any]:
+        if self.physical is not None:
+            return {"op": self.op, **self.physical.to_payload()}
         selected = "value" if self.op == "set" else "delta"
         payload: dict[str, Any] = {"op": self.op, "species": self.species}
         _put_pair(
@@ -1078,17 +1250,20 @@ InterventionOperation: TypeAlias = (
     | InterventionHold
     | InterventionProtocol
     | InterventionTrigger
+    | InterventionPhysical
 )
 
 
 @dataclass(frozen=True, slots=True)
 class InterventionSchedule:
     operations: tuple[InterventionOperation, ...] = ()
+    initial_volume: tuple[PhysicalQuantity, InterventionScheduleFieldIdentity] | None = dataclass_field(init=False, default=None)
 
     def __post_init__(self) -> None:
         operations = tuple(self.operations)
         allowed = (
             InterventionSet,
+            InterventionPhysical,
             InterventionJump,
             InterventionFlux,
             InterventionHold,
@@ -1109,6 +1284,28 @@ class InterventionSchedule:
                 "Intervention operations must remain in authored ordinal order."
             )
         object.__setattr__(self, "operations", operations)
+        initializers = []
+        for operation in operations:
+            if isinstance(operation, InterventionProtocol):
+                sources = tuple(
+                    (item, item.authored_ordinal, item.phase + ".")
+                    for item in operation.before + operation.during + operation.after
+                )
+            elif isinstance(operation, InterventionTrigger):
+                sources = ((operation.then, None, "then."),)
+            else:
+                sources = ((operation, None, ""),)
+            for source, nested, prefix in sources:
+                physical = getattr(source, "physical", None)
+                if physical is not None and physical.initial_volume is not None:
+                    identity = (operation.declaration_ordinal, nested, prefix + "initial_volume")
+                    initializers.append((physical.initial_volume, identity))
+        if len(initializers) > 1:
+            raise InterventionScheduleError(
+                "Declare initial_volume or initial_volume_param only once; it defines the vessel volume at simulation start.",
+                field="initial_volume", field_identities=tuple(identity for _, identity in initializers),
+            )
+        object.__setattr__(self, "initial_volume", initializers[0] if initializers else None)
 
     def without_stops(self) -> InterventionSchedule:
         return InterventionSchedule(tuple(
@@ -1180,15 +1377,16 @@ class InterventionSchedule:
             names: tuple[str, ...]
             if isinstance(operation, InterventionProtocol):
                 names = tuple(
-                    item.species
+                    name
                     for item in operation.before + operation.during + operation.after
+                    for name in intervention_species(item)
                 )
             elif isinstance(operation, InterventionTrigger):
                 names = (() if isinstance(operation.condition, ObservableTriggerCondition) else (operation.condition.name,))
                 if isinstance(operation.then, InterventionTriggerAction):
-                    names += (operation.then.species,)
+                    names += intervention_species(operation.then)
             else:
-                names = (operation.species,)
+                names = intervention_species(operation)
             for name in names:
                 if name not in available:
                     raise InterventionScheduleError(
@@ -1313,6 +1511,11 @@ def _operation_from_fields(
     _literal_fields(data, context="intervention")
     op = _enum(data.get("op"), field="op")
     ordinal = _ordinal(declaration_ordinal, field="declaration_ordinal")
+    if "solution" in data or op in {"scale", "withdraw"}:
+        clocks = ("start_time", "end_time") if op == "flux" else ("time",)
+        physical = _physical_from_fields(data, extra_keys={key for field in clocks for key in (field, field + "_param")})
+        return InterventionPhysical(physical=physical, declaration_ordinal=ordinal,
+                                    **{key: data.get(key) for field in clocks for key in (field, field + "_param")})
     if op == "set":
         allowed = frozenset(
             {"op", "species", "time", "time_param", "value", "value_param"}
@@ -1493,6 +1696,9 @@ def _protocol_operation_from_fields(
     data = dict(fields)
     _literal_fields(data, context=f"protocol {phase}")
     op = _enum(data.get("op"), field="op")
+    if "solution" in data or op in {"scale", "withdraw"}:
+        return InterventionProtocolOperation(phase=phase, op=op, physical=_physical_from_fields(data),
+                                             authored_ordinal=_ordinal(authored_ordinal, field="authored_ordinal"))
     selected = {
         "set": "value",
         "hold": "value",
@@ -1521,6 +1727,10 @@ def _trigger_action_from_payload(raw: Mapping[str, Any]) -> InterventionTriggerA
     data = dict(raw)
     _literal_fields(data, context="trigger then")
     op = _enum(data.get("op"), field="op")
+    if "solution" in data or op in {"scale", "withdraw"}:
+        if op == "flux":
+            raise InterventionScheduleError("Trigger actions do not start intervals.")
+        return InterventionTriggerAction(op=op, physical=_physical_from_fields(data))
     if op == "stop":
         _reject_keys(data, frozenset({"op"}), context="stop action")
         return InterventionStopAction()
@@ -1542,6 +1752,96 @@ def _trigger_action_from_payload(raw: Mapping[str, Any]) -> InterventionTriggerA
             f"{selected}_param": data.get(f"{selected}_param"),
         },
     )
+
+
+def _split_nested(text: str, delimiter: str, *, context: str) -> list[str]:
+    parts = []
+    start = depth = 0
+    for index, character in enumerate(text):
+        if character == "{":
+            depth += 1
+        elif character == "}":
+            depth -= 1
+        if depth < 0 or depth > 3:
+            raise InterventionScheduleError(f"Invalid braces in {context}.")
+        if character == delimiter and depth == 0:
+            parts.append(text[start:index].strip())
+            start = index + 1
+    if depth:
+        raise InterventionScheduleError(f"Unclosed braces in {context}.")
+    parts.append(text[start:].strip())
+    return parts
+
+
+def _physical_quantity(data: Mapping[str, Any], field: str, *, optional: bool = False) -> PhysicalQuantity | None:
+    value, parameter = data.get(field), data.get(field + "_param")
+    if optional and value is None and parameter is None:
+        return None
+    authored = data.get(field + "_authored")
+    declared_unit = None
+    convert_literal = isinstance(value, str)
+    if convert_literal:
+        authored = value
+    if authored is not None:
+        match = re.fullmatch(r"\s*([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)\s*(.*?)\s*", authored)
+        if match is None:
+            raise InterventionScheduleError(f"{field} requires a finite numeric quantity.")
+        number, unit_text = match.groups()
+        try:
+            if convert_literal:
+                value = parse_finite_numeric_text(number, field=field)
+            if field == "factor":
+                if unit_text:
+                    raise ValueError("factor is a dimensionless number without a unit suffix.")
+            else:
+                if not unit_text and field != "value":
+                    raise ValueError(f"{field} requires an explicit volume unit.")
+                target = MOLAR if field == "value" else CUBIC_METRE.divide(SECOND) if field == "volume_rate" else CUBIC_METRE
+                declared_unit = parse_declared_unit(unit_text or "M")
+                if convert_literal:
+                    value = convert_value(value, declared_unit, target)
+        except ValueError as exc:
+            raise InterventionScheduleError(f"{field}: {exc}") from exc
+    return PhysicalQuantity(value, parameter, authored, declared_unit)
+
+
+def _physical_from_fields(data: Mapping[str, Any], *, extra_keys: set[str] = frozenset()) -> PhysicalAction:
+    op = _enum(data.get("op"), field="op")
+    if op not in {"jump", "flux", "scale", "withdraw"}:
+        raise InterventionScheduleError(f"op={op} does not permit a solution.")
+    allowed = {"op", *extra_keys}
+    if op != "scale":
+        allowed.update({"initial_volume", "initial_volume_param", "initial_volume_authored"})
+    field = {"jump": "volume", "flux": "volume_rate", "scale": "factor", "withdraw": "volume"}[op]
+    stock = []
+    if op in {"jump", "flux"}:
+        allowed.add("solution")
+        solution = data.get("solution")
+        if isinstance(solution, str):
+            solution = _parse_record_fields(_unwrap_envelope(solution, context="solution"), delimiter=",", context="solution", lower=False)
+        if not isinstance(solution, Mapping):
+            raise InterventionScheduleError("Physical addition requires a solution record.")
+        _reject_keys(solution, frozenset({field, field + "_param", field + "_authored", "stock"}), context="solution")
+        composition = solution.get("stock")
+        if isinstance(composition, str):
+            inner = _unwrap_envelope(composition, context="stock")
+            composition = [] if not inner.strip() else [
+                _parse_record_fields(record, delimiter=",", context="stock component", lower=False)
+                for record in _split_nested(inner, ";", context="stock")
+            ]
+        if not isinstance(composition, (list, tuple)):
+            raise InterventionScheduleError("solution requires stock composition; stock={} denotes solvent.")
+        for component in composition:
+            if not isinstance(component, Mapping):
+                raise InterventionScheduleError("Stock components must be records.")
+            _reject_keys(component, frozenset({"species", "value", "value_param", "value_authored"}), context="stock component")
+            stock.append((_name(component.get("species"), field="stock species"), _physical_quantity(component, "value")))
+        amount = _physical_quantity(solution, field)
+    else:
+        allowed.update({field, field + "_param", field + "_authored"})
+        amount = _physical_quantity(data, field)
+    _reject_keys(data, frozenset(allowed), context=f"physical {op}")
+    return PhysicalAction(op, amount, tuple(stock), _physical_quantity(data, "initial_volume", optional=True))
 
 
 def _lower_authored_fields(
@@ -1568,10 +1868,10 @@ def _lower_authored_fields(
     return lowered
 
 
-def _parse_record_fields(text: str, *, delimiter: str, context: str) -> dict[str, Any]:
+def _parse_record_fields(text: str, *, delimiter: str, context: str, lower: bool = True) -> dict[str, Any]:
     if not text:
         raise InterventionScheduleError(f"{context} must not be empty.")
-    parts = text.split(delimiter)
+    parts = _split_nested(text, delimiter, context=context)
     if any(not part.strip() for part in parts):
         raise InterventionScheduleError(f"{context} contains an empty field.")
     fields: dict[str, str] = {}
@@ -1590,7 +1890,7 @@ def _parse_record_fields(text: str, *, delimiter: str, context: str) -> dict[str
                 f"Duplicate {context} field: {key!r}."
             )
         fields[key] = value
-    return _lower_authored_fields(fields, context=context)
+    return _lower_authored_fields(fields, context=context) if lower else fields
 
 
 def _unwrap_envelope(value: str, *, context: str) -> str:
@@ -1599,19 +1899,14 @@ def _unwrap_envelope(value: str, *, context: str) -> str:
         raise InterventionScheduleError(
             f"{context} must be enclosed by one pair of braces."
         )
-    inner = text[1:-1]
-    if any(char in inner for char in "{};"):
-        raise InterventionScheduleError(
-            f"{context} forbids nesting and semicolons."
-        )
-    return inner
+    return text[1:-1]
 
 
 def _parse_phase_envelope(
     value: str, *, phase: str
 ) -> tuple[InterventionProtocolOperation, ...]:
     inner = _unwrap_envelope(value, context=f"Protocol {phase}")
-    records = inner.split("|")
+    records = _split_nested(inner, ";", context=f"protocol {phase}")
     if any(not record.strip() for record in records):
         raise InterventionScheduleError(
             f"Protocol {phase} contains an empty operation record."
@@ -1630,7 +1925,7 @@ def _parse_phase_envelope(
 
 def _parse_trigger_envelope(value: str) -> InterventionTriggerAction | InterventionStopAction:
     inner = _unwrap_envelope(value, context="Trigger then")
-    if "|" in inner:
+    if len(_split_nested(inner, ";", context="trigger then")) != 1:
         raise InterventionScheduleError(
             "Trigger then requires exactly one action record."
         )
@@ -1652,9 +1947,9 @@ def _parse_directive(rest: str, *, line_no: int) -> dict[str, Any]:
     for character in text:
         if character == "{":
             depth += 1
-            if depth > 1:
+            if depth > 3:
                 raise InterventionScheduleError(
-                    f"Line {line_no}: nested braces are forbidden."
+                    f"Line {line_no}: intervention nesting is too deep."
                 )
         elif character == "}":
             depth -= 1
@@ -1754,12 +2049,26 @@ def intervention_schedule_parameter_dependencies(
         identity = (int(declaration), nested_ordinal, str(field_path))
         dependencies[identity] = (parameter.strip(),)
 
+    def add_physical(item, declaration, nested=None, prefix=""):
+        physical = getattr(item, "physical", None)
+        if physical is not None:
+            for path, quantity in physical.quantities():
+                add(declaration, nested, prefix + path, quantity.parameter)
+        return physical is not None
+
     for operation in schedule.operations:
         declaration = int(getattr(operation, "declaration_ordinal", 0))
+        add_physical(operation, declaration)
+        if isinstance(operation, InterventionPhysical):
+            for field in operation.clock_fields:
+                add(declaration, None, field, getattr(operation, field + "_param"))
+            continue
         if isinstance(operation, InterventionProtocol):
             add(declaration, None, "start_time", operation.start_time_param)
             for phase in ("before", "during", "after"):
                 for nested in getattr(operation, phase):
+                    if add_physical(nested, declaration, nested.authored_ordinal, phase + "."):
+                        continue
                     selected = {
                         "set": "value",
                         "hold": "value",
@@ -1776,6 +2085,8 @@ def intervention_schedule_parameter_dependencies(
         if isinstance(operation, InterventionTrigger):
             add(declaration, None, "threshold", operation.threshold_param)
             if isinstance(operation.then, InterventionStopAction):
+                continue
+            if add_physical(operation.then, declaration, prefix="then."):
                 continue
             selected = "value" if operation.then.op == "set" else "delta"
             add(

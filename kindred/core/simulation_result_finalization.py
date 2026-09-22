@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from kindred.core.quantity_units import MOLAR, SECOND, presentation_unit
+from kindred.core.quantity_units import CUBIC_METRE, MOLAR, SECOND, presentation_unit
 
 from types import MappingProxyType
 from typing import Any, Callable, Mapping
@@ -247,9 +247,19 @@ def finalize_simulation_result(
     units["t"] = SECOND
     names = ("t", *finalized_series, *finalized_algebra_scalars)
     declarations = {s.name: s.declared_unit for s in parameter_algebra_spec.observable_block.lines}
+    presentation_units = tuple((name, presentation_unit(units.get(name), declarations.get(name))) for name in names)
+    if result.volume is not None:
+        initializer, _identity = result.intervention_execution.initial_volume
+        declared = initializer.declared_unit
+        if initializer.parameter is not None:
+            parameter_units = {s.name: s.declared_unit for s in parameter_algebra_spec.parameter_block.lines}
+            parameter_unit = units.get(initializer.parameter)
+            declared = parameter_units.get(initializer.parameter) if parameter_unit is not None and parameter_unit.compatible(CUBIC_METRE) else None
+        presentation_units += (("Vessel volume", presentation_unit(CUBIC_METRE, declared)),)
     return SimulationResultValue(
+        temperature_K=result.temperature_K,
         quantity_units=tuple((name, units.get(name)) for name in names),
-        presentation_units=tuple((name, presentation_unit(units.get(name), declarations.get(name))) for name in names),
+        presentation_units=presentation_units,
         t=result_time,
         series=finalized_series,
         segment_ids=result.segment_ids,
@@ -265,5 +275,6 @@ def finalize_simulation_result(
         algebra_errors=finalized_algebra_errors,
         intervention_execution=getattr(result, "intervention_execution"),
         presentation_boundaries=result.presentation_boundaries,
+        volume=result.volume,
         termination=result.termination,
     )

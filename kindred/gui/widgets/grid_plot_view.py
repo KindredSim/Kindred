@@ -12,14 +12,17 @@ from typing import TypeAlias
 from PySide6 import QtCore, QtGui, QtWidgets
 
 from kindred.gui.curve_copy_headers import copy_column_header
-from kindred.core.quantity_units import Unit, MOLAR, SECOND, conversion_scale
+from kindred.core.quantity_units import Unit, MOLAR, SECOND
+from kindred.gui.fitting.curve_projection import (
+    focused_units, prepared_fit_units, scale_values, focused_model_chunks, focused_model_rows,
+)
 from kindred.gui.display_name_policy import (
     PLOT_TITLE_LABEL_MAX_CHARS,
     compact_plot_title_label,
 )
 from kindred.gui.fitting.launch import FitExecutionRequest
 from kindred.gui.fitting.execution import (
-    FitCurveDataset, fit_curve_units, fit_display_units, fit_source_presentation_units, _observed_curve_parts,
+    FitCurveDataset, _observed_curve_parts,
 )
 from kindred.gui.theme_manager import plot_background_color, plot_foreground_color
 from kindred.gui.plot_config import require_pyqtgraph
@@ -55,81 +58,45 @@ def _fit_y_axis_label(
     # Observations retain their admitted concentration meaning.
     units = dict(quantity_units)
     visible = tuple(dict.fromkeys(visible_y_names))
-    if visible and all(units.get(name) == observed_unit for name in visible):
+    if observed_unit is not None and observed_unit.compatible(MOLAR) and visible and all(units.get(name) == observed_unit for name in visible):
         return "Concentration", observed_unit.symbol
     return "Value", None
 
 
-def _fit_copy_columns(
-    dataset: FitCurveDataset,
-) -> list[tuple[str, Sequence[float]]]:
-    """Build one dataset's timed model and observation column groups."""
-
-    dataset_label = dataset.display_name
-
-    def header(
-        label: str,
-        name: str,
-        unit: str | None = None,
-        definition: str | None = None,
-    ) -> str:
-        return encode_clipboard_text(copy_column_header(label, name, unit, definition))
-
-    model_x = dict(dataset.model_x)
-    model_y = dict(dataset.model_y)
-    segment_ids = dict(dataset.model_segment_ids)
-    segment_keys = dict(dataset.model_segment_keys)
-    discontinuity_ids = dict(dataset.model_discontinuity_ids)
-    series_names = sorted(model_y)
-    x_is_time = dataset.x_name == "t"
-    units = dict(dataset.quantity_units)
-    x_quantity = dataset.x_unit
-    x_unit = None if x_quantity is None else x_quantity.symbol
+def _fit_copy_columns(dataset):
+    """Project complete retained data independently of widget display history."""
+    targets = tuple(name for name, _ in dataset.observed_y)
+    units = dict(dataset.simulation.quantity_units)
+    display = dict(focused_units(units, dataset.simulation.presentation_units, dataset.x_name, targets))
     definitions = dict(dataset.model_definitions)
-    model_groups: dict[tuple[object, ...], list[str]] = {}
-    for name in series_names:
-        # Repeated X values on different execution segments are separate grids.
-        grid = (
-            model_x[name], segment_ids[name], segment_keys[name],
-            discontinuity_ids[name],
-        )
-        model_groups.setdefault(grid, []).append(name)
+    rows = focused_model_rows(dataset)
+    columns = []
 
-    columns: list[tuple[str, Sequence[float]]] = []
-    for index, names in enumerate(model_groups.values(), 1):
-        suffix = f" {index}" if len(model_groups) > 1 else ""
-        label = f"{dataset_label} — Model{suffix}"
-        first = names[0]
-        if not x_is_time:
-            columns.append((
-                header(label, "Time", "s"),
-                dataset.model_time,
-            ))
-        columns.append((
-            header(label, "Time" if x_is_time else dataset.x_name, x_unit, definitions.get(dataset.x_name)),
-            model_x[first],
-        ))
-        for name in names:
-            unit = None if units.get(name) is None else units[name].symbol
-            columns.append((header(label, name, unit, definitions.get(name)), model_y[name]))
+    def add(group, name, values, unit, definition=None):
+        header = copy_column_header(f"{dataset.display_name} — {group}", name,
+                                    None if unit is None else unit.symbol, definition)
+        columns.append((encode_clipboard_text(header), values))
 
-    observed_x = dict(dataset.observed_x)
-    observed_y = dict(dataset.observed_y)
-    observed_time = dict(dataset.observed_time)
-    raw_columns = dict(dataset.observed_raw_columns)
-    for name in sorted(observed_y):
-        label = f"{dataset_label} — Observed {name}"
-        if not x_is_time and observed_time[name]:
-            columns.append((
-                header(label, "Time", "s"),
-                observed_time[name],
-            ))
-        columns.extend(
-            (
-                (header(label, "Time" if x_is_time else dataset.observed_x_name, dataset.observed_x_unit.symbol), observed_x[name]),
-                (header(label, raw_columns[name], dataset.observed_y_unit.symbol), observed_y[name]),
-            )
-        )
+    add("Model", "t", rows[:, 0], SECOND)
+    if dataset.x_name != "t":
+        name = dataset.x_name
+        add("Model", name, scale_values(rows[:, 1], units.get(name), display[name]), display[name], definitions.get(name))
+    for index, name in enumerate(targets):
+        add("Model", name, scale_values(rows[:, index+2], units.get(name), display[name]), display[name], definitions.get(name))
+    observed_x, times, raw = dict(dataset.observed_x), dict(dataset.observed_time), dict(dataset.observed_raw_columns)
+    for name, values in dataset.observed_y:
+        group = f"Observed {raw[name]}"
+        if dataset.x_name != "t" and times[name]:
+            add(group, "Recorded time", times[name], SECOND)
+        x_name = dataset.observed_x_name or "t"
+        x_unit = display[dataset.x_name]
+        if x_unit is None or not dataset.observed_x_unit.compatible(x_unit):
+            x_unit = dataset.observed_x_unit
+        y_unit = display[name]
+        if y_unit is None or not dataset.observed_y_unit.compatible(y_unit):
+            y_unit = dataset.observed_y_unit
+        add(group, x_name, scale_values(observed_x[name], dataset.observed_x_unit, x_unit), x_unit)
+        add(group, raw[name], scale_values(values, dataset.observed_y_unit, y_unit), y_unit)
     return columns
 
 
@@ -231,7 +198,6 @@ class GridPlotView(QtWidgets.QWidget):
                                          QtWidgets.QSizePolicy.Policy.Fixed)
         legend_row.addWidget(self._legend_label, 1)
         layout.addLayout(legend_row)
-
         self._canvas = pg.GraphicsLayoutWidget(self)
         self._canvas.scene().installEventFilter(self)
         self._canvas.scene().sigMouseClicked.connect(self._on_plot_click)
@@ -265,9 +231,6 @@ class GridPlotView(QtWidgets.QWidget):
         self._reconcile_structure(structure)
         self._refresh_appearance()
         for identity in dataset_ids:
-            for (kind, species), item in self._plot_series_items[identity].items():
-                if kind == "model":
-                    self._update_series(identity, kind, species, ((), (), (), (), ()))
             if changed:
                 self._plot_items[identity].getViewBox().autoRange()
         self._update_grid()
@@ -300,19 +263,34 @@ class GridPlotView(QtWidgets.QWidget):
         """Retain full Copy data and update only existing model-series data."""
         self.cancel_copy()
         self._curves = tuple(curves)
-        if not self._curves:
-            for identity, series in self._plot_series_items.items():
-                for kind, species in series:
-                    if kind == "model":
-                        self._update_series(identity, kind, species, ((), (), (), (), ()))
         for curve in self._curves:
-            for species, y in curve.model_y:
-                self._update_series(curve.dataset_id, "model", species,
-                    (dict(curve.model_x)[species], y, dict(curve.model_segment_ids)[species],
-                     dict(curve.model_segment_keys)[species], dict(curve.model_discontinuity_ids)[species]))
             if curve.dataset_id in presentation:
                 self._plot_items[curve.dataset_id].setToolTip(presentation[curve.dataset_id][1])
+        self._update_models()
         self._context_actions["copy"].setEnabled(self.copy_eligible())
+
+    def _update_models(self):
+        curves = {curve.dataset_id: curve for curve in self._curves}
+        for identity, series in self._plot_series_items.items():
+            curve = curves.get(identity)
+            if curve is None:
+                for kind, name in series:
+                    if kind == "model":
+                        self._update_series(identity, kind, name, ((), ()))
+                continue
+            units = dict(curve.simulation.quantity_units)
+            display = dict(focused_units(units, curve.simulation.presentation_units,
+                                        curve.x_name, tuple(name for name, _ in curve.observed_y)))
+            chunks = focused_model_chunks(curve)
+            for name, _ in curve.observed_y:
+                xs, ys = [], []
+                for chunk in chunks:
+                    if xs:
+                        xs.append(math.nan)
+                        ys.append(math.nan)
+                    xs.extend(scale_values(chunk.x, units.get(curve.x_name), display[curve.x_name]))
+                    ys.extend(scale_values(dict(chunk.series)[name], units.get(name), display[name]))
+                self._update_series(identity, "model", name, (tuple(xs), tuple(ys)))
 
     def _prepare_context_menu(self, dataset_id: str) -> None:
         plot = self._plot_items[dataset_id]
@@ -437,9 +415,8 @@ class GridPlotView(QtWidgets.QWidget):
         self._copy_chunks = None
         self._copy_output = None
 
-    @staticmethod
     def _iter_copy_chunks(
-        curves: tuple[FitCurveDataset, ...],
+        self, curves: tuple[FitCurveDataset, ...],
     ) -> Iterable[str]:
         columns: list[tuple[str, Sequence[float]]] = []
         for dataset in curves:
@@ -467,7 +444,8 @@ class GridPlotView(QtWidgets.QWidget):
                 if row_index >= len(values):
                     row.append("")
                 else:
-                    row.append(repr(float(values[row_index])))
+                    value = float(values[row_index])
+                    row.append(repr(value) if math.isfinite(value) else "")
             output.write(encode_tsv_row(row))
             rows_in_chunk += 1
             if rows_in_chunk >= _FIT_COPY_ROWS_PER_CHUNK:
@@ -635,36 +613,6 @@ class GridPlotView(QtWidgets.QWidget):
             self._observation_style = (shape, size, opacity)
             self._refresh_appearance()
 
-    @staticmethod
-    def _with_segment_gaps(
-        x_values: tuple[float, ...],
-        y_values: tuple[float, ...],
-        segment_ids: tuple[int, ...],
-        segment_keys: tuple[str, ...],
-        discontinuity_ids: tuple[int, ...],
-    ) -> tuple[list[float], list[float]]:
-        if not (
-            len(x_values)
-            == len(y_values)
-            == len(segment_ids)
-            == len(segment_keys)
-            == len(discontinuity_ids)
-        ):
-            raise ValueError("Fit model curve identity lengths do not align.")
-        x_render: list[float] = []
-        y_render: list[float] = []
-        for index, (x_value, y_value) in enumerate(zip(x_values, y_values)):
-            if index and (
-                segment_ids[index] != segment_ids[index - 1]
-                or segment_keys[index] != segment_keys[index - 1]
-                or discontinuity_ids[index] != discontinuity_ids[index - 1]
-            ):
-                x_render.append(math.nan)
-                y_render.append(math.nan)
-            x_render.append(x_value)
-            y_render.append(y_value)
-        return x_render, y_render
-
     def _reconcile_structure(self, structure: tuple) -> None:
         ids = set(self._dataset_ids)
         for identity in tuple(self._plot_items):
@@ -685,7 +633,7 @@ class GridPlotView(QtWidgets.QWidget):
                 self._plot_items[identity] = plot
                 self._plot_series_items[identity] = {}
             series = self._plot_series_items[identity]
-            active = {(kind, name) for kind in ("observed", "model") for name in names}
+            active = {(kind, name) for name in names for kind in ("observed", "model")}
             for key in tuple(series):
                 if key not in active:
                     item = series.pop(key)
@@ -710,8 +658,11 @@ class GridPlotView(QtWidgets.QWidget):
             plot.setToolTip(tooltip)
             plot.setLabel("left", label, units=units)
             model_x = dict(quantity_units).get(x_name)
+            observed_x = SECOND if x_name == "t" else MOLAR
+            common_x = (x_display is not None and model_x is not None
+                        and model_x.compatible(x_display) and observed_x.compatible(x_display))
             plot.setLabel("bottom", "Time" if x_name == "t" else html.escape(x_name),
-                          units=x_display.symbol if model_x == x_display else None)
+                          units=x_display.symbol if common_x else None)
             plot._kindred_appearance = state
 
     def _update_series(self, identity: str, kind: str, species: str, data: tuple) -> None:
@@ -721,6 +672,7 @@ class GridPlotView(QtWidgets.QWidget):
         if item is None:
             item = self._plot_items[identity].plot([], [], pen=None)
             series[key] = item
+        item.setVisible(True)
         color = self._pg.mkColor(self._color_by_species[species])
         style = (color.rgba(), self._observation_style if kind == "observed" else None)
         if getattr(item, "_kindred_style", None) != style:
@@ -735,8 +687,8 @@ class GridPlotView(QtWidgets.QWidget):
                 item.setPen(self._pg.mkPen(color=color, width=2))
             item._kindred_style = style
         if getattr(item, "_kindred_data", None) != data:
-            x, y = self._with_segment_gaps(*data) if kind == "model" else data
-            item.setData(x, y)
+            x, y = data
+            item.setData(x, y, connect="finite")
             item._kindred_data = data
 
     def _toggle_legend(self, visible: bool) -> None:
@@ -795,21 +747,19 @@ class GridPlotView(QtWidgets.QWidget):
             names = tuple(item.model_target for item in config.selected_observations)
             x = config.parametric_x_observation
             x_name = "t" if x is None else x.model_target
-            quantities = dict(fit_curve_units(request.setup.origin.prepared_dsl))
-            x_display, y_display = fit_display_units(tuple(quantities.items()),
-                fit_source_presentation_units(request.setup.origin.prepared_dsl), names, x_name)
-            for name, target in ((x_name, x_display), *((name, y_display) for name in names)):
-                if quantities.get(name) is not None and quantities[name].compatible(target):
-                    quantities[name] = target
+            quantities, display_pairs = prepared_fit_units(request.setup.origin.prepared_dsl, x_name, names)
+            display = dict(display_pairs)
+            x_display = display[x_name]
+            y_units = tuple(display[name] for name in names)
+            y_display = y_units[0] if y_units and all(unit == y_units[0] for unit in y_units) else None
             self._update_panel(identity, mapped[identity].display_name, x_name,
-                               tuple(quantities.items()), names, x_display, y_display)
+                               display_pairs, names, x_display, y_display)
             observed_x, observed_y = _observed_curve_parts(config.selected_observations, x_observations=x)
-            x_factor = conversion_scale(SECOND if x is None else MOLAR, x_display).number()
-            y_factor = conversion_scale(MOLAR, y_display).number()
             for species, y in observed_y:
-                self._update_series(identity, "observed", species,
-                    (tuple(value*x_factor for value in dict(observed_x)[species]), tuple(value*y_factor for value in y)))
-                item = self._plot_series_items[identity].get(("model", species))
-                data = getattr(item, "_kindred_data", ((), (), (), (), ()))
-                self._update_series(identity, "model", species, data)
+                self._update_series(identity, "observed", species, (
+                    scale_values(dict(observed_x)[species], SECOND if x is None else MOLAR, x_display),
+                    scale_values(y, MOLAR, display[species])))
+                if ("model", species) not in self._plot_series_items[identity]:
+                    self._update_series(identity, "model", species, ((), ()))
         self._update_legend()
+        self._update_models()

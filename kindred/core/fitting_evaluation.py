@@ -54,6 +54,8 @@ from kindred.core.simulator.solver_types import (
 from kindred.core.simulator.solvers import solve_ode
 from kindred.core.simulator.dsl_parse import PreparedDslRequestSet
 from kindred.core.time_grid import build_time_grid
+from kindred.core.volume import PhysicalDomainError
+from kindred.core.simulation_failure import factual_cause_from_exception
 
 logger = logging.getLogger(__name__)
 
@@ -160,12 +162,18 @@ def _known_candidate_unavailability(
 ) -> ScientificUnavailable | None:
     """Translate producer-owned typed candidate failures at this boundary.
 
-    Only the explicit candidate-domain exception owns candidate rejection here.
+    Explicit candidate-domain and physical-predicate failures reject candidates.
     Preparation, Algebra, kinetic, and wrapped failures remain fatal; the
     solver's typed ``SimulationScientificUnavailability`` is settled separately
     below.
     """
 
+    if isinstance(exc, PhysicalDomainError):
+        return ScientificUnavailable(
+            producer="physical_intervention", stage="execution",
+            details={**exc.details, "failed_params": dict(failed_params or {})},
+            factual_cause=factual_cause_from_exception(exc),
+        )
     if isinstance(exc, FitCandidateDomainError):
         details = getattr(exc, "details", {})
         stage = (
@@ -634,6 +642,8 @@ class FittingEvaluator:
         )
         try:
             result = solve_ode(request)
+        except PhysicalDomainError:
+            raise
         except FitSimulationError:
             raise
         except SimulationCancelled as exc:

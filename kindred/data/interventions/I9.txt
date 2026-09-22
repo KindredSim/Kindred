@@ -1,0 +1,16 @@
+# title: Solution additions, dilution and aliquots
+# Initial volume is present at simulation start. Additions accumulate across repetitions.
+intervention_set1 = {
+  [A] = 1.0
+  [B] = 0.0
+}
+
+param dose = 2; unit = mL
+param feed = 1; unit = mL/min
+A -> B; k=0.1
+intervention: op=protocol; kind=repeat; start_time=1; every=2; count=3; before={op=jump,initial_volume=10 mL,solution={volume_param=dose,stock={species=A,value=0.5 M}}}
+intervention: op=flux; start_time=1; end_time=6; solution={volume_rate_param=feed,stock={}}
+# Halve every concentration not maintained by a hold. Double the vessel volume.
+intervention: op=scale; time=6; factor=0.5
+# A well-mixed aliquot changes volume without changing concentrations.
+intervention: op=withdraw; time=7; volume=2 mL

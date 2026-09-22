@@ -16,6 +16,7 @@ from kindred.core.species import (
     validate_time_seconds,
 )
 from kindred.core.time_grid import normalize_time_grid_policy
+from kindred.core.volume import SimulationBoundaryState, VolumeTrajectory
 
 DEFAULT_SOLVER_NAME = "BDF"
 
@@ -91,41 +92,33 @@ def _freeze_solver_value(value: Any) -> Any:
 
 @dataclass(frozen=True, slots=True)
 class SimulationPresentationBoundary:
-    """Exact public pre/post state for one intervention boundary.
-
-    This is a presentation-only carrier.  The executor retains raw trigger
-    roots locally for action ordering and continuation; only detached public
-    endpoint values cross the solver/output boundary.
-    """
+    """Ordered executed public states at one exact canonical boundary row."""
 
     time: float
-    pre_state: tuple[tuple[str, float], ...]
-    post_state: tuple[tuple[str, float], ...]
+    states: tuple[SimulationBoundaryState, ...]
 
     def __post_init__(self) -> None:
         time = validate_time_seconds(self.time, field="presentation boundary time")
-        pre = _finite_state_pairs(self.pre_state, field="pre_state")
-        post = _finite_state_pairs(self.post_state, field="post_state")
-        if tuple(name for name, _value in pre) != tuple(
-            name for name, _value in post
-        ):
-            raise ValueError(
-                "Presentation boundary pre/post states must align exactly."
-            )
-        if not any(
-            pre_value != post_value
-            for (_pre_name, pre_value), (_post_name, post_value) in zip(
-                pre,
-                post,
-                strict=True,
-            )
-        ):
-            raise ValueError(
-                "Presentation boundary must contain an exact changed state."
-            )
+        states = tuple(self.states)
+        if len(states) < 2:
+            raise ValueError("Presentation boundary requires an executed transition.")
+        names = None
+        for state in states:
+            pairs = _finite_state_pairs(state.concentrations, field="boundary state")
+            current_names = tuple(name for name, _ in pairs)
+            if names is not None and current_names != names:
+                raise ValueError("Presentation boundary species must align exactly.")
+            names = current_names
         object.__setattr__(self, "time", time)
-        object.__setattr__(self, "pre_state", pre)
-        object.__setattr__(self, "post_state", post)
+        object.__setattr__(self, "states", states)
+
+    @property
+    def pre_state(self) -> tuple[tuple[str, float], ...]:
+        return self.states[0].concentrations
+
+    @property
+    def post_state(self) -> tuple[tuple[str, float], ...]:
+        return self.states[-1].concentrations
 
 
 def _finite_state_pairs(
@@ -252,6 +245,7 @@ class FinalSimulationOutput:
     intervention_execution: InterventionExecutionContract
     presentation_boundaries: tuple[SimulationPresentationBoundary, ...] = ()
     termination: SimulationTermination
+    volume: VolumeTrajectory | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.intervention_execution, InterventionExecutionContract):
@@ -273,6 +267,8 @@ class FinalSimulationOutput:
             raise ValueError("Simulation output times must be bounded and increasing.")
         if Y.ndim != 2 or Y.shape[1] != t.size:
             raise ValueError("Simulation output state rows must align with time.")
+        if self.volume is not None and self.volume.first_index + self.volume.values.size != t.size:
+            raise ValueError("Vessel volume must cover a suffix of simulation rows.")
         if np.any(~np.isfinite(Y)) or np.any(Y < 0.0):
             raise ValueError("Simulation output states must be finite and nonnegative.")
         temperature = np.asarray(self.temperature_K, dtype=float)

@@ -11,6 +11,7 @@ from kindred.core.quantity_units import parse_unit, conversion_scale, SECOND
 from kindred.core.project_presentation_state import (
     AxisSeriesSelection,
     ExperimentalAxisSelection,
+    VesselVolumeAxisSelection,
     SimulationSeriesAxisSelection,
 )
 
@@ -35,7 +36,7 @@ class AxisSelectionCandidate:
     def __post_init__(self) -> None:
         if not isinstance(
             self.selection,
-            (SimulationSeriesAxisSelection, ExperimentalAxisSelection),
+            (SimulationSeriesAxisSelection, ExperimentalAxisSelection, VesselVolumeAxisSelection),
         ):
             raise TypeError(
                 "Axis candidate selection must be a typed simulation or "

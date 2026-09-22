@@ -589,9 +589,9 @@ class RunResultsTab(QtWidgets.QWidget):
                 f"{getattr(current, 'message', current)}"
             )
             current = getattr(current, "cause", None)
-        self.set_execution_status("Scientifically unavailable",
+        self.set_execution_status("No valid candidate found",
                                   cause.factual_cause.message if cause.factual_cause is not None else cause.stage)
-        self._summary_body = "<h2>Fit result scientifically unavailable</h2><p>" + html.escape(" Caused by: ".join(chain)).replace("\n", "<br>") + "</p>"
+        self._summary_body = "<h2>No valid candidate found</h2><p>" + html.escape(" Caused by: ".join(chain)).replace("\n", "<br>") + "</p>"
         self._summary_provenance = ""
         self._refresh_summary()
 

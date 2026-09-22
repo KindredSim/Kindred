@@ -62,12 +62,15 @@ def result_record(run, result, outputs):
         "parameters": plain(result.parameters),
         "output_units": {name: unit.symbol if unit is not None else None for name, unit in result.quantity_units if name == "t" or name in outputs},
         "algebra_errors": [error.to_payload() for error in result.algebra_errors],
-        "boundaries": [{"time": b.time,
-                        "pre": {k: v for k, v in b.pre_state if k in outputs},
-                        "post": {k: v for k, v in b.post_state if k in outputs}}
+        "boundaries": [{"time": b.time, "states": plain(b.states)}
                        for b in result.presentation_boundaries],
         "interventions": result.intervention_execution.provenance_projection(),
     })
+    if result.volume is not None:
+        record["volume"] = {
+            "unit": "m^3", "first_index": result.volume.first_index,
+            "values": result.volume.values.tolist(),
+        }
     return record
 
 
@@ -91,7 +94,7 @@ class JsonScanWriter:
                     "scipy": scipy.__version__}
         spec = design.prepared.parameter_algebra_spec_for_execution()
         constraint_units = {s.name: presentation_unit(s.expr.quantity_unit, s.declared_unit) for s in spec.observable_block.lines}
-        header = {"schema_version": 2,
+        header = {"schema_version": 3,
                   "input_units": {item.key: item.unit for item in design.catalog},
                   "constraint_units": {c.observable: constraint_units[c.observable].symbol if constraint_units[c.observable] is not None else None for c in config.constraints}, "created_utc": datetime.now(timezone.utc).isoformat(),
                   "versions": versions, "configuration": asdict(config),
