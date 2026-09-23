@@ -17,12 +17,12 @@ Example DSL:
 from __future__ import annotations
 
 import logging
-import math
 import re
 from typing import List
 
 from .authored_source_errors import AuthoredSourceError
 from .temperature import TemperatureSchedule, TemperatureScheduleError
+from .validation import parse_finite_numeric_text
 
 logger = logging.getLogger(__name__)
 
@@ -56,14 +56,9 @@ def _parse_finite_number(text: str, *, field: str) -> float:
     if not token:
         raise TemperatureDSLError(f"{field} must not be empty.")
     try:
-        value = float(token)
-    except (TypeError, ValueError, OverflowError) as exc:
-        raise TemperatureDSLError(
-            f"{field} must be one finite numeric value."
-        ) from exc
-    if not math.isfinite(value):
-        raise TemperatureDSLError(f"{field} must be finite.")
-    return float(value)
+        return parse_finite_numeric_text(token, field=field)
+    except ValueError as exc:
+        raise TemperatureDSLError(str(exc)) from exc
 
 
 def _parse_number_list(text: str, *, field: str) -> List[float]:

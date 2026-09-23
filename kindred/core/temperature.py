@@ -28,6 +28,7 @@ from dataclasses import dataclass
 from typing import Callable, List, Literal, Mapping, Optional, Protocol, Tuple, runtime_checkable
 
 from kindred.core.species import (
+    validate_input_time_seconds,
     validate_temperature,
     validate_time_seconds,
 )
@@ -157,8 +158,11 @@ class TimeInterval:
 
     def __post_init__(self):
         """Validate interval."""
-        self.t_start = _coerce_nonnegative_time(self.t_start, field="interval start time")
-        self.t_end = _coerce_nonnegative_time(self.t_end, field="interval end time")
+        try:
+            self.t_start = validate_input_time_seconds(self.t_start, field="interval start time")
+            self.t_end = validate_input_time_seconds(self.t_end, field="interval end time")
+        except (TypeError, ValueError) as exc:
+            raise TemperatureScheduleError(str(exc)) from exc
         self.temperature = coerce_temperature_kelvin(self.temperature)
         if self.t_end <= self.t_start:
             raise TemperatureScheduleError(
@@ -406,7 +410,7 @@ class TemperatureSchedule:
         setpoint; it never extrapolates an authored setpoint backward in time.
         """
         try:
-            tau_f = validate_time_seconds(tau, field="tau", allow_zero=False)
+            tau_f = validate_input_time_seconds(tau, field="tau", allow_zero=False)
         except (TypeError, ValueError) as exc:
             raise TemperatureScheduleError(str(exc)) from exc
 

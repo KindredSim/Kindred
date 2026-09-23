@@ -20,7 +20,7 @@ from kindred.core.exceptions import (
     FitSimulationError,
     SimulationCancelled,
 )
-from kindred.core.species import validate_concentration, validate_time_seconds
+from kindred.core.species import validate_concentration, validate_input_time_seconds
 from kindred.core.units import OrdinaryParameterDomainError
 from kindred.core.temperature import (
     TemperatureScheduleProtocol,
@@ -428,12 +428,12 @@ class SimulationExecutionRequest:
             raise TypeError("execution request t_span must be an exact pair.")
         try:
             t_span = (
-                validate_time_seconds(self.t_span[0], field="execution t_start"),
-                validate_time_seconds(self.t_span[1], field="execution t_end"),
+                validate_input_time_seconds(self.t_span[0], field="execution t_start"),
+                validate_input_time_seconds(self.t_span[1], field="execution t_end"),
             )
         except (TypeError, ValueError) as exc:
             raise ValueError(
-                "execution request requires admitted 0 <= t_start < t_end."
+                f"Invalid execution time span: {exc}"
             ) from exc
         if t_span[1] <= t_span[0]:
             raise ValueError("execution request requires t_end > t_start.")
@@ -661,16 +661,16 @@ def build_simulation_execution_request(
                 )
             normalized_parameters[name] = value
     try:
-        t_start = validate_time_seconds(
+        t_start = validate_input_time_seconds(
             t_span[0],
             field="execution t_start",
         )
-        t_end = validate_time_seconds(
+        t_end = validate_input_time_seconds(
             t_span[1],
             field="execution t_end",
         )
     except (TypeError, ValueError) as exc:
-        raise ValueError("execution time span must use admitted seconds.") from exc
+        raise ValueError(f"Invalid execution time span: {exc}") from exc
     if t_end <= t_start:
         raise ValueError("execution t_end must be greater than t_start.")
     try:

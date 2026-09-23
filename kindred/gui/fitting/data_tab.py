@@ -7,6 +7,7 @@ from collections.abc import Callable, Iterable, Mapping
 
 from PySide6 import QtCore, QtWidgets
 
+from kindred.core.validation import parse_finite_numeric_text
 from kindred.gui.fitting.launch import fit_execution_span
 from kindred.gui.ui_helpers import set_bounded_label_text
 from kindred.gui.ui_helpers import setup_scientific_validator
@@ -346,7 +347,10 @@ class DataTab(QtWidgets.QWidget):
                 self._invalid_raw.pop((dataset_id, field), None)
                 continue
             try:
-                value = float(raw)
+                value = (
+                    parse_finite_numeric_text(raw, field=field)
+                    if field in {"t_start", "simulation_end"} else float(raw)
+                )
                 if not math.isfinite(value):
                     raise ValueError
             except (TypeError, ValueError, OverflowError):

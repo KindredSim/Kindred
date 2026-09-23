@@ -24,6 +24,14 @@ from kindred.core.simulator.solver_types import SimulationPresentationBoundary
 
 __all__ = ["SpeciesStatisticsTable"]
 
+
+def _display_statistic(value: float, source: Unit, target: Unit) -> str:
+    try:
+        return f"{convert_value(value, source, target):.6g}"
+    except ValueError:
+        return "Unavailable"
+
+
 class SpeciesStatisticsTable(QtWidgets.QTableWidget):
     """
     Bottom panel showing simulation-owned species statistics.
@@ -147,15 +155,9 @@ class SpeciesStatisticsTable(QtWidgets.QTableWidget):
                     if boundary_value is not None and boundary_value > max_conc:
                         max_conc = boundary_value
                         max_time = boundary.time
-            try:
-                display_final = convert_value(final_conc, MOLAR, concentration_display_unit)
-                display_max = convert_value(max_conc, MOLAR, concentration_display_unit)
-                display_time = convert_value(max_time, SECOND, time_display_unit)
-                final_text, maximum_text, time_text = (
-                    f"{display_final:.6g}", f"{display_max:.6g}", f"{display_time:.6g}"
-                )
-            except ValueError:
-                final_text = maximum_text = time_text = "Unavailable"
+            final_text = _display_statistic(final_conc, MOLAR, concentration_display_unit)
+            maximum_text = _display_statistic(max_conc, MOLAR, concentration_display_unit)
+            time_text = _display_statistic(max_time, SECOND, time_display_unit)
             ctc_text = "—"
             if ctc_applicable:
                 integrand = (
@@ -167,11 +169,7 @@ class SpeciesStatisticsTable(QtWidgets.QTableWidget):
                 ctc_text = "Unavailable"
                 if ctc.available:
                     source_unit = MOLAR.multiply(SECOND)
-                    try:
-                        display_ctc = convert_value(ctc.value, source_unit, ctc_unit)
-                        ctc_text = f"{display_ctc:.6g}"
-                    except ValueError:
-                        ctc_text = "Unavailable"
+                    ctc_text = _display_statistic(ctc.value, source_unit, ctc_unit)
             calculated.append(
                 (
                     species_name,

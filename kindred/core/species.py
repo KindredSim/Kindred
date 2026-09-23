@@ -28,6 +28,7 @@ __all__ = [
     "TEMPERATURE_MIN_K",
     "TEMPERATURE_MAX_K",
     "TIME_MIN_S",
+    "TIME_INPUT_MIN_S",
     "TIME_MAX_S",
     "IMPORTED_TIME_MIN_S",
     "IMPORTED_TIME_MAX_S",
@@ -39,6 +40,7 @@ __all__ = [
     "validate_c0",
     "validate_temperature",
     "validate_time_seconds",
+    "validate_input_time_seconds",
     "validate_imported_time_seconds",
     "validate_observation",
     "validate_runtime_concentration",
@@ -57,6 +59,7 @@ C0_MAX_M = CONCENTRATION_MAX_M
 TEMPERATURE_MIN_K = 0.1
 TEMPERATURE_MAX_K = 10_000.0
 TIME_MIN_S = 0.0
+TIME_INPUT_MIN_S = 1e-30
 TIME_MAX_S = 1e10
 IMPORTED_TIME_MIN_S = -1e10
 IMPORTED_TIME_MAX_S = 1e10
@@ -130,11 +133,28 @@ def validate_time_seconds(
     field: str = "time",
     allow_zero: bool = True,
 ) -> float:
+    """Check execution times, including generated samples below the input floor."""
     parsed = _numeric(value, field=field)
     if parsed < TIME_MIN_S or (not allow_zero and parsed == TIME_MIN_S):
-        raise ValueError(f"{field} must be nonnegative.")
+        qualifier = "nonnegative" if allow_zero else "strictly positive"
+        raise ValueError(f"{field} must be {qualifier}.")
     if parsed > TIME_MAX_S:
         raise ValueError(f"{field} must be at most {TIME_MAX_S:g} seconds.")
+    return parsed
+
+
+def validate_input_time_seconds(
+    value: object,
+    *,
+    field: str = "time",
+    allow_zero: bool = True,
+) -> float:
+    """Admit model timing inputs without restricting generated execution times."""
+    parsed = validate_time_seconds(value, field=field, allow_zero=allow_zero)
+    if 0.0 < parsed < TIME_INPUT_MIN_S:
+        raise ValueError(
+            f"{field} must be at least {TIME_INPUT_MIN_S:g} seconds when nonzero."
+        )
     return parsed
 
 

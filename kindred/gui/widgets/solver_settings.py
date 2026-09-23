@@ -4,8 +4,6 @@ from __future__ import annotations
 
 from kindred.gui.display_name_policy import scientific_symbol_html, scientific_symbol_spoken
 
-import math
-
 from PySide6 import QtCore, QtWidgets
 
 from kindred.core.project_document import (
@@ -18,6 +16,7 @@ from kindred.core.project_document import (
     validate_tab_scientific_settings,
 )
 from kindred.core.runtime_defaults import MAX_PARALLEL_WORKERS_CEILING
+from kindred.core.validation import parse_finite_numeric_text
 from kindred.gui.ui_helpers import setup_scientific_validator
 
 __all__ = [
@@ -106,25 +105,11 @@ class SolverSettingsDialog(QtWidgets.QDialog):
             del blockers
         self.integration_points_spin.setValue(settings.integration_points)
 
-    @staticmethod
-    def _parse_time_edit(edit: QtWidgets.QLineEdit, field: str) -> float:
-        try:
-            value = float(edit.text().strip())
-        except (TypeError, ValueError, OverflowError) as exc:
-            raise ValueError(
-                f"{field} must be a finite, nonnegative number."
-            ) from exc
-        if not math.isfinite(value) or value < 0.0:
-            raise ValueError(
-                f"{field} must be a finite, nonnegative number."
-            )
-        return value
-
     def execution_settings(self) -> SimulationExecutionSettings:
         candidate = SimulationExecutionSettings(
             solver=str(self.solver_combo.currentText()),
-            t_start=self._parse_time_edit(self.t_start_edit, "t_start"),
-            t_end=self._parse_time_edit(self.t_end_edit, "t_end"),
+            t_start=parse_finite_numeric_text(self.t_start_edit.text(), field="t_start"),
+            t_end=parse_finite_numeric_text(self.t_end_edit.text(), field="t_end"),
             integration_points=int(self.integration_points_spin.value()),
         )
         validate_simulation_execution_settings(candidate)

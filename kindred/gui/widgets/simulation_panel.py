@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from kindred.gui.display_name_policy import scientific_symbol_html, scientific_symbol_spoken
 
-import math
 from collections.abc import Callable
 
 from PySide6 import QtCore, QtGui, QtWidgets
@@ -15,6 +14,7 @@ from kindred.core.project_document import (
     SUPPORTED_SOLVERS,
     validate_simulation_execution_settings,
 )
+from kindred.core.validation import parse_finite_numeric_text
 from kindred.gui.ui_helpers import (
     ControlRowsLayout, configure_compact_numeric_edit, setup_scientific_validator,
 )
@@ -471,13 +471,7 @@ class SimulationPanel(QtWidgets.QWidget):
         ):
             if field not in changed:
                 continue
-            try:
-                parsed = float(edit.text())
-                if not math.isfinite(parsed):
-                    raise ValueError
-            except (TypeError, ValueError, OverflowError) as exc:
-                raise ValueError(f"{field}: {edit.text()!r} must be a finite number.") from exc
-            values[field] = parsed
+            values[field] = parse_finite_numeric_text(edit.text(), field=field)
         points_edit = self.num_points_spinbox.lineEdit()
         projected_points = str(int(values["integration_points"]))
         if points_edit.text() != projected_points:

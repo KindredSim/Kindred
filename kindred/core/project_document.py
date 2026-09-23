@@ -52,14 +52,12 @@ from kindred.core.species import (
     CONCENTRATION_MIN_M,
     MAX_FIT_EVALUATIONS,
     MAX_GENERATED_TIME_ROWS,
-    TIME_MAX_S,
-    TIME_MIN_S,
     TEMPERATURE_MAX_K,
     TEMPERATURE_MIN_K,
     validate_concentration,
     validate_c0,
     validate_temperature,
-    validate_time_seconds,
+    validate_input_time_seconds,
 )
 
 __all__ = [
@@ -82,7 +80,6 @@ __all__ = [
     "SIMULATION_POINT_RANGE",
     "TEMPERATURE_RANGE_K",
     "CONCENTRATION_RANGE_M",
-    "TIME_RANGE_S",
     "SUPPORTED_SOLVERS",
     "validate_fit_solver",
     "fresh_mechanism_tab",
@@ -122,7 +119,6 @@ FIT_SEED_RANGE = _FITTING_SEED_RANGE
 SIMULATION_POINT_RANGE = _SIMULATION_POINT_RANGE
 TEMPERATURE_RANGE_K = _TEMPERATURE_RANGE_K
 CONCENTRATION_RANGE_M = (CONCENTRATION_MIN_M, CONCENTRATION_MAX_M)
-TIME_RANGE_S = (TIME_MIN_S, TIME_MAX_S)
 
 
 def _new_id(prefix: str) -> str:
@@ -941,8 +937,8 @@ def validate_simulation_execution_settings(
         raise ValueError(
             f"{label}.solver must use canonical supported spelling."
         )
-    start = validate_time_seconds(settings.t_start, field=f"{label}.t_start")
-    end = validate_time_seconds(settings.t_end, field=f"{label}.t_end")
+    start = validate_input_time_seconds(settings.t_start, field=f"{label}.t_start")
+    end = validate_input_time_seconds(settings.t_end, field=f"{label}.t_end")
     if end <= start:
         raise ValueError(f"{label}.t_end must be greater than t_start.")
     _require_int(

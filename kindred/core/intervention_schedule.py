@@ -13,7 +13,7 @@ from kindred.core.validation import parse_finite_numeric_text
 from kindred.core.volume import volume_input_in_range
 from kindred.core.species import (
     validate_concentration,
-    validate_time_seconds,
+    validate_input_time_seconds,
 )
 
 __all__ = [
@@ -166,20 +166,17 @@ _PARAM_FIELDS = frozenset(
 )
 _DIRECTIONS = frozenset({"rising", "falling", "either"})
 _PHASES = frozenset({"before", "during", "after"})
-_AUTHORED_FLOAT_FIELDS = frozenset(
+_AUTHORED_TIME_FIELDS = frozenset(
     {
         "time",
         "start_time",
         "end_time",
-        "value",
-        "delta",
-        "flux_rate",
-        "threshold",
         "every",
         "duration",
         "min_interval",
     }
 )
+_AUTHORED_FLOAT_FIELDS = _AUTHORED_TIME_FIELDS | {"value", "delta", "flux_rate", "threshold"}
 _AUTHORED_INTEGER_FIELDS = frozenset({"count", "max_count"})
 
 
@@ -194,7 +191,7 @@ def _finite(value: object, *, field: str) -> float:
 
 def _nonnegative(value: object, *, field: str) -> float:
     try:
-        return validate_time_seconds(value, field=field)
+        return validate_input_time_seconds(value, field=field)
     except (TypeError, ValueError) as exc:
         raise InterventionScheduleError(str(exc)) from exc
 
@@ -1851,10 +1848,13 @@ def _lower_authored_fields(
     for key, value in fields.items():
         if key in _AUTHORED_FLOAT_FIELDS:
             try:
-                lowered[key] = float(value)
+                lowered[key] = (
+                    parse_finite_numeric_text(value, field=f"{context} field {key!r}")
+                    if key in _AUTHORED_TIME_FIELDS else float(value)
+                )
             except (TypeError, ValueError, OverflowError) as exc:
                 raise InterventionScheduleError(
-                    f"{context} field {key!r} must be a numeric literal."
+                    f"{context} field {key!r} must be a numeric literal: {exc}"
                 ) from exc
         elif key in _AUTHORED_INTEGER_FIELDS:
             try:

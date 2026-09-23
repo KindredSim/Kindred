@@ -7,7 +7,7 @@ import sys
 from kindred.core.simulation_parameters import enumerate_simulation_parameters
 from kindred.core.simulator.parameter_coordinates import build_parameter_target_map, _admit_coordinate_value
 from kindred.core.species import (
-    CONCENTRATION_MIN_M, CONCENTRATION_MAX_M, TIME_MIN_S, TIME_MAX_S,
+    CONCENTRATION_MIN_M, CONCENTRATION_MAX_M, TIME_INPUT_MIN_S, TIME_MAX_S,
 )
 from kindred.core.units import (
     RATE_MIN, RATE_MAX, KEQ_MIN, KEQ_MAX, ARRHENIUS_A_MAX,
@@ -75,8 +75,9 @@ def input_catalog(prepared, config: ScanConfig) -> tuple[ScanInput, ...]:
         entries.append(ScanInput(parameter_key(item.name), item.name,
                                  config.parameters.get(item.name, item.value), item.unit, bounds,
                                  item.family, item.role))
-    entries.extend((ScanInput(START, "Start time", config.t_start, "s", (Interval(TIME_MIN_S, TIME_MAX_S),)),
-                    ScanInput(END, "End time", config.t_end, "s", (Interval(TIME_MIN_S, TIME_MAX_S),))))
+    time_bounds = (Interval(0.0, 0.0), Interval(TIME_INPUT_MIN_S, TIME_MAX_S))
+    entries.extend((ScanInput(START, "Start time", config.t_start, "s", time_bounds),
+                    ScanInput(END, "End time", config.t_end, "s", time_bounds)))
     return tuple(entries)
 
 

@@ -686,6 +686,10 @@ class RunResultsTab(QtWidgets.QWidget):
                 self._subtab_stack.addWidget(view)
             view.prepare(request, ids if aggregate else (identity[1],))
         self._empty_label.hide()
+        for index in range(self._subtabs.count()):
+            if self._subtabs.tabData(index)["view_identity"] == ("aggregate", "all"):
+                self._subtabs.setCurrentIndex(index)
+                break
         self._refresh_active_plot_view()
 
     def finish_preparation(self) -> None:

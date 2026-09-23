@@ -42,7 +42,7 @@ from kindred.core.project_document import (
     canonical_initial_values,
     validate_fit_solver,
 )
-from kindred.core.species import TIME_MAX_S, validate_concentration
+from kindred.core.species import validate_concentration, validate_input_time_seconds
 from kindred.core.time_grid import build_time_grid
 from kindred.core.simulator.dsl_parse import PreparedDslRequestSet
 from kindred.core.simulation_preparation_stages import (
@@ -104,10 +104,8 @@ def fit_execution_span(t_start: object, t_end: object) -> tuple[float, float]:
     """Validate and return a strictly positive Fit solver span."""
     if t_start is None or t_end is None:
         raise ValueError("Enter both Simulation start and Simulation end.")
-    start = _finite(t_start, "Fit execution start")
-    end = _finite(t_end, "Fit execution end")
-    if start < 0.0 or end < 0.0 or end > TIME_MAX_S or start > TIME_MAX_S:
-        raise ValueError("Fit execution span must use admitted nonnegative seconds.")
+    start = validate_input_time_seconds(t_start, field="Fit execution start")
+    end = validate_input_time_seconds(t_end, field="Fit execution end")
     if end <= start:
         raise ValueError("Fit execution end must be greater than its start.")
     return start, end
