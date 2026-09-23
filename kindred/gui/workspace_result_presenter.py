@@ -441,7 +441,7 @@ class ResultDataBlock:
 
     def unit_for(self, name: str, *, x: bool = False) -> Unit | None:
         if self.kind is ResultLayerKind.EXPERIMENTAL:
-            return SECOND if x and isinstance(self.x_axis, SimulationSeriesAxisSelection) and self.x_axis.series_name == "t" else MOLAR
+            return SECOND if x and isinstance(self.x_axis, SimulationSeriesAxisSelection) and self.x_axis.series_name == "t" else dict(self.quantity_units)[name]
         if x and isinstance(self.x_axis, VesselVolumeAxisSelection):
             return CUBIC_METRE
         if not x and isinstance(dict(self.series_axes).get(name), VesselVolumeAxisSelection):
@@ -842,6 +842,7 @@ def compose_canonical_export_blocks(
                 ),
                 dataset_name=record.display_name,
                 raw_column=series.column_name,
+                unit=series.unit,
                 model_target=mapping.get(series.raw_observation_id),
                 set_id=link.set_id,
                 t=series.t,
@@ -865,6 +866,7 @@ def compose_canonical_export_blocks(
                     t=time,
                     sample_time=time if time.size else None,
                     series=((source.raw_column, values),),
+                    quantity_units=((source.raw_column, source.unit),),
                     series_axes=((source.raw_column, source.axis),),
                     x_axis=SimulationSeriesAxisSelection("t"),
                     result=None,
@@ -1477,6 +1479,7 @@ def compose_result_input(
         x_values = np.array(experimental.t, dtype=float, copy=True)
         y_values = np.array(experimental.y, dtype=float, copy=True)
         x_name = "t"
+        x_unit = SECOND
         x_axis: AxisSeriesSelection = SimulationSeriesAxisSelection("t")
         x_provenance: Mapping[str, object] = MappingProxyType({})
         source_rows = np.array(experimental.source_rows, dtype=np.int64, copy=True)
@@ -1511,6 +1514,7 @@ def compose_result_input(
                 else:
                     x_values, y_values, source_rows, sample_time = paired
                     x_name = x_source.raw_column
+                    x_unit = x_source.unit
                     x_axis = selected_x
                     x_provenance = _observation_provenance(x_source)
         if unavailable:
@@ -1535,6 +1539,7 @@ def compose_result_input(
                 discontinuity_ids=None,
                 source_row=source_rows,
                 x_name=x_name,
+                quantity_units=((x_name, x_unit), (experimental.raw_column, experimental.unit)),
                 series_provenance=(
                     (experimental.raw_column, _observation_provenance(experimental)),
                 ),

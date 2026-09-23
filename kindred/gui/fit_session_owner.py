@@ -1175,6 +1175,7 @@ class FitSessionOwner(QtCore.QObject):
                     (
                         observation.raw_observation_id,
                         observation.model_target,
+                        observation.unit,
                         observation.t,
                         observation.y,
                         observation.source_rows,

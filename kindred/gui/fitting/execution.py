@@ -45,7 +45,7 @@ from kindred.core.fitting_completion import (
     FitExtensionProgress,
 )
 from kindred.core.result_repository import SimulationResultValue
-from kindred.core.quantity_units import Unit, MOLAR, SECOND
+from kindred.core.quantity_units import Unit, SECOND
 from kindred.core.simulator.solver_types import SimulationCancellationControl
 from kindred.core.simulation_failure import (
     FactualCause,
@@ -117,13 +117,15 @@ class FitCurveDataset:
     model_definitions: tuple[tuple[str, str], ...]
     observed_x_name: str | None
     observed_x_unit: Unit
-    observed_y_unit: Unit
+    observed_y_units: tuple[tuple[str, Unit], ...]
     x_name: str = "t"
 
     def __post_init__(self) -> None:
         x, y = dict(self.observed_x), dict(self.observed_y)
         if x.keys() != y.keys() or any(len(x[name]) != len(values) for name, values in y.items()):
             raise ValueError("Fit observation axes must align.")
+        if tuple(name for name, _ in self.observed_y_units) != tuple(name for name, _ in self.observed_y):
+            raise ValueError("Fit observation units must align with their Y targets.")
         times = dict(self.observed_time)
         if times.keys() != y.keys() or any(len(times[name]) not in (0, len(values)) for name, values in y.items()):
             raise ValueError("Fit observation times must align with their samples.")
@@ -625,7 +627,8 @@ def _curves_from_simulations(
                 dataset_id=dataset_id,
                 display_name=mapped.display_name,
                 simulation=simulation,
-                observed_x_unit=SECOND if x_name == "t" else MOLAR, observed_y_unit=MOLAR,
+                observed_x_unit=SECOND if prepared.parametric_x_observation is None else prepared.parametric_x_observation.unit,
+                observed_y_units=tuple((item.model_target, item.unit) for item in selected),
                 model_definitions=model_definitions,
                 observed_x_name=(
                     None if prepared.parametric_x_observation is None

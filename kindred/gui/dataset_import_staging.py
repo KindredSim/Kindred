@@ -158,11 +158,9 @@ class _DatasetImportBatchWorker(QtCore.QThread):
             source_label=source.original_filename,
             sheet_name=sheet_name,
             source_row_start=3 if plan.skip_unit_row else 2,
-            time_factor=plan.time_factor,
-            observation_factors=plan.conc_factors,
+            time_unit=plan.time_unit,
+            observation_units=plan.observation_units,
             metadata_extras={
-                "original_time_unit": plan.original_time_unit,
-                "original_concentration_units": dict(plan.original_conc_units),
                 "skip_unit_row": plan.skip_unit_row,
             },
         )

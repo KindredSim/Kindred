@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import itertools
-import math
 import io
 import csv
 from typing import Callable, Iterable, Mapping, Sequence
@@ -19,6 +18,7 @@ from kindred.core.datasets.source_rules import (
     identify_physical_columns,
 )
 from kindred.core.species import validate_imported_time_seconds, validate_observation
+from kindred.core.quantity_units import Unit, SECOND, conversion_scale, scientific_unit
 
 __all__ = [
     "CsvImportInterrupted",
@@ -125,12 +125,12 @@ def parse_physical_rows(
     columns: Sequence[PhysicalColumn],
     time_column: PhysicalColumn | None,
     species_columns: Sequence[PhysicalColumn],
+    time_unit: Unit,
+    observation_units: Mapping[str, Unit],
     interruption_checker: Callable[[], bool] | None = None,
     source_label: str | None = None,
     sheet_name: str | None = None,
     source_row_start: int = 2,
-    time_factor: float = 1.0,
-    observation_factors: Mapping[str, float] | None = None,
     metadata_extras: Mapping[str, object] | None = None,
 ) -> DatasetObservationPayload:
     """Convert physical source rows without ever keying by authored headers."""
@@ -183,35 +183,16 @@ def parse_physical_rows(
     if resolved_time in resolved_species:
         raise ValueError("The admitted time column cannot also be an observation column.")
 
-    resolved_time_factor = float(time_factor)
-    if (
-        isinstance(time_factor, bool)
-        or not math.isfinite(resolved_time_factor)
-        or resolved_time_factor <= 0.0
-    ):
-        raise ValueError("time_factor must be finite and positive.")
-    raw_observation_factors = dict(observation_factors or {})
-    expected_factor_names = {
-        column.assigned_name for column in resolved_species
+    time_scale = conversion_scale(time_unit, SECOND)
+    if set(observation_units) != {column.assigned_name for column in resolved_species}:
+        raise ValueError("Observation units must exactly match the selected columns.")
+    scientific_units = {
+        name: scientific_unit(unit.dimensions) for name, unit in observation_units.items()
     }
-    if raw_observation_factors and set(raw_observation_factors) != expected_factor_names:
-        raise ValueError(
-            "Observation factors must exactly match the selected observation "
-            "columns."
-        )
-    resolved_observation_factors: dict[str, float] = {}
-    for name in expected_factor_names:
-        raw_factor = raw_observation_factors.get(name, 1.0)
-        factor = float(raw_factor)
-        if (
-            isinstance(raw_factor, bool)
-            or not math.isfinite(factor)
-            or factor <= 0.0
-        ):
-            raise ValueError(
-                f"Observation factor for {name!r} must be finite and positive."
-            )
-        resolved_observation_factors[name] = factor
+    observation_scales = {
+        name: conversion_scale(unit, scientific_units[name])
+        for name, unit in observation_units.items()
+    }
 
     observations_by_column = {
         column: {"t": [], "y": [], "source_rows": []}
@@ -259,12 +240,12 @@ def parse_physical_rows(
                     f"{resolved_time.assigned_name!r}: missing value."
                 )
             try:
-                parsed_time = float(raw_time) * resolved_time_factor
+                parsed_time = time_scale.apply(float(raw_time))
             except (TypeError, ValueError) as exc:
                 raise ValueError(
                     f"{_source_prefix()}row {row_index}, time column "
                     f"{resolved_time.assigned_name!r}: invalid numeric value "
-                    f"{raw_time!r}."
+                    f"{raw_time!r}: {exc}"
                 ) from exc
             try:
                 parsed_time = validate_imported_time_seconds(
@@ -283,15 +264,12 @@ def parse_physical_rows(
             if not raw_value:
                 continue
             try:
-                parsed_value = (
-                    float(raw_value)
-                    * resolved_observation_factors[column.assigned_name]
-                )
+                parsed_value = observation_scales[column.assigned_name].apply(float(raw_value))
             except (TypeError, ValueError) as exc:
                 raise ValueError(
                     f"{_source_prefix()}row {row_index}, column "
                     f"{column.assigned_name!r}: invalid numeric observation "
-                    f"{raw_value!r}."
+                    f"{raw_value!r}: {exc}"
                 ) from exc
             try:
                 parsed_value = validate_observation(
@@ -322,6 +300,7 @@ def parse_physical_rows(
         retained_columns.append(column)
         observations[column.assigned_name] = {
             "raw_observation_id": new_raw_observation_id(),
+            "unit": scientific_units[column.assigned_name],
             "t": spec["t"],
             "y": spec["y"],
             "source_rows": spec["source_rows"],
@@ -330,6 +309,11 @@ def parse_physical_rows(
         raise ValueError("No numeric observation columns were found.")
 
     metadata: dict[str, object] = {
+        "original_time_unit": time_unit.symbol,
+        "original_concentration_units": {
+            name: unit.symbol
+            for name, unit in observation_units.items()
+        },
         "time_column": resolved_time.assigned_name if resolved_time is not None else None,
         "observation_columns": [
             column.assigned_name for column in retained_columns

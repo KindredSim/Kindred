@@ -83,6 +83,7 @@ PRESET_MECHANISM_TITLES = {
     "M9": "A + B <-> C, C -> D, C -> E (Eyring)",
     "M10": "A + B <-> C, C -> D, D -> E (Temperature Change)",
     "M11": "PB cascade",
+    "M12": "Intermolecular Competition",
 }
 
 

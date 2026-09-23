@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from kindred.core.quantity_units import Unit
 
 from kindred.core.project_document import (
     MechanismTabDocument,
@@ -42,6 +43,7 @@ class ExperimentalLayerInput:
     axis: ExperimentalAxisSelection
     dataset_name: str
     raw_column: str
+    unit: Unit
     model_target: str | None
     t: tuple[float, ...]
     y: tuple[float, ...]
@@ -175,6 +177,7 @@ def build_experimental_layer_inputs(
                     ),
                     dataset_name=record.display_name,
                     raw_column=raw_column,
+                    unit=series.unit,
                     model_target=mapping.get(raw_observation_id),
                     set_id=(link.set_id if link is not None else None),
                     t=series.t,

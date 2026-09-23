@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
+from enum import Enum
 import os
 from pathlib import Path
 from types import MappingProxyType
@@ -13,10 +14,10 @@ from kindred.core.datasets.foundation import ImportedSource, validate_imported_s
 from kindred.core.datasets.source_rules import PhysicalColumn
 from kindred.core.datasets.units import (
     looks_like_unit_row,
-    parse_concentration_unit,
+    parse_measurement_unit,
     parse_time_unit,
-    parse_unit,
 )
+from kindred.core.quantity_units import Unit, SECOND
 
 
 def capture_import_source(
@@ -52,83 +53,65 @@ def capture_import_source(
     return validate_imported_source(source)
 
 
+class UnitSource(Enum):
+    FILE = "file"
+    DEFAULT = "default"
+
+
 @dataclass
 class ImportSettings:
     """One sheet's editable choices; hidden time-column species choice survives."""
 
     time_column: PhysicalColumn | None
     species_columns: set[PhysicalColumn]
-    time_choice: str | None = None
-    time_fallback: str = "s"
-    concentration_default: str = "M"
-    concentration_fallbacks: dict[PhysicalColumn, str] = field(default_factory=dict)
-    override_no_unit_row: bool = False
+    time_choice: str | UnitSource = UnitSource.FILE
+    default_unit: str = "M"
+    # Missing choices follow the file when present, otherwise the sheet default.
+    column_units: dict[PhysicalColumn, str | UnitSource] = field(default_factory=dict)
+    # None retains detection per sheet; a boolean is an explicit row decision.
+    first_row_contains_units: bool | None = None
 
 
 def classify_unit_row(
-    row: Mapping[PhysicalColumn, object],
+    row: Mapping[PhysicalColumn, object] | None,
+    *,
+    contains_units: bool | None = None,
 ) -> Mapping[PhysicalColumn, object] | None:
-    """Retain the candidate row itself when the whole-row heuristic accepts it."""
-    return row if looks_like_unit_row(list(row.values())) else None
+    """Resolve an explicit row choice or detect textual units for this sheet."""
+    if row is None:
+        return None
+    selected = looks_like_unit_row(list(row.values())) if contains_units is None else contains_units
+    return row if selected else None
 
 
 def resolve_column_unit(
     column: PhysicalColumn,
-    category: str,
     unit_row: Mapping[PhysicalColumn, object] | None,
     settings: ImportSettings,
-) -> tuple[str, float]:
+    *,
+    time: bool = False,
+) -> Unit:
     """Admit selected declarations and resolve incoming units in one place."""
-    if settings.override_no_unit_row:
-        return ("s" if category == "time" else "M"), 1.0
-    declared = str(unit_row.get(column, "")).strip() if unit_row is not None else ""
-    if declared:
-        try:
-            actual_category, _ = parse_unit(declared)
-        except ValueError as exc:
-            raise ValueError(
-                f"Classified unit row cell for selected column {column.assigned_name!r} "
-                f"contains unsupported unit {declared!r}."
-            ) from exc
-        if actual_category != category:
-            raise ValueError(
-                f"Classified unit row cell for selected column {column.assigned_name!r} "
-                f"must contain a supported {category} unit, not {declared!r}."
-            )
-    if category == "time":
-        unit = (
-            settings.time_choice
-            if settings.time_choice is not None
-            else declared or settings.time_fallback
-        )
-        return unit, parse_time_unit(unit)
-    unit = (
-        declared
-        or settings.concentration_fallbacks.get(column)
-        or settings.concentration_default
-    )
-    return unit, parse_concentration_unit(unit)
+    raw = unit_row.get(column) if unit_row is not None else None
+    declared = "" if raw is None else str(raw).strip()
+    choice = settings.time_choice if time else settings.column_units.get(column, UnitSource.FILE)
+    default = "s" if time else settings.default_unit
+    text = (declared or default) if choice is UnitSource.FILE else default if choice is UnitSource.DEFAULT else choice
+    try:
+        return parse_time_unit(text) if time else parse_measurement_unit(text)
+    except ValueError as exc:
+        raise ValueError(f"Column {column.assigned_name!r}: {exc}") from exc
 
 
 def sharing_settings(
     settings: ImportSettings,
-    unit_row: Mapping[PhysicalColumn, object] | None,
 ) -> ImportSettings:
-    """Detach choices and retain source-effective fallbacks without editing drafts."""
-    time_unit = (
-        resolve_column_unit(settings.time_column, "time", unit_row, settings)[0]
-        if settings.time_column is not None else "s"
-    )
-    fallbacks = {
-        column: resolve_column_unit(column, "concentration", unit_row, settings)[0]
-        for column in settings.species_columns
-        if column != settings.time_column
-    }
+    """Share deliberate choices; destination file units precede shared defaults."""
     return replace(
         settings,
         species_columns=set(settings.species_columns),
-        time_fallback=time_unit,
-        concentration_fallbacks=fallbacks,
+        time_choice=UnitSource.FILE if settings.time_choice is UnitSource.DEFAULT else settings.time_choice,
+        column_units={column: unit for column, unit in settings.column_units.items() if unit is not UnitSource.DEFAULT},
     )
 
 
@@ -140,22 +123,17 @@ class ResolvedSheetPlan:
     time_column: PhysicalColumn | None
     species_columns: Tuple[PhysicalColumn, ...]
     skip_unit_row: bool
-    time_factor: float
-    conc_factors: Mapping[str, float]
-    original_time_unit: str
-    original_conc_units: Mapping[str, str]
+    time_unit: Unit
+    observation_units: Mapping[str, Unit]
 
     def __post_init__(self) -> None:
         # The worker retains this plan after GUI admission.  Copy caller
         # mappings once, then expose read-only views so later caller edits
         # cannot change worker normalization.
         object.__setattr__(
-            self, "conc_factors", MappingProxyType(dict(self.conc_factors))
-        )
-        object.__setattr__(
             self,
-            "original_conc_units",
-            MappingProxyType(dict(self.original_conc_units)),
+            "observation_units",
+            MappingProxyType(dict(self.observation_units)),
         )
 
 
@@ -169,10 +147,11 @@ class ImportConfig:
 def resolve_sheet_plan(
     sheet_name: str | None,
     columns: Sequence[PhysicalColumn],
-    unit_row: Mapping[PhysicalColumn, object] | None,
+    first_row: Mapping[PhysicalColumn, object] | None,
     settings: ImportSettings,
 ) -> ResolvedSheetPlan:
     time_column = settings.time_column
+    unit_row = classify_unit_row(first_row, contains_units=settings.first_row_contains_units)
     species = settings.species_columns - {time_column}
     if not species:
         raise ValueError("Select at least one species column.")
@@ -182,13 +161,13 @@ def resolve_sheet_plan(
                 f"Column {column.assigned_name!r} not found in sheet {sheet_name!r}."
             )
     ordered_species = tuple(column for column in columns if column in species)
-    time_unit, time_factor = (
-        resolve_column_unit(time_column, "time", unit_row, settings)
-        if time_column is not None else ("s", 1.0)
+    time_unit = (
+        resolve_column_unit(time_column, unit_row, settings, time=True)
+        if time_column is not None else SECOND
     )
-    concentrations = {
+    observations = {
         column.assigned_name: resolve_column_unit(
-            column, "concentration", unit_row, settings
+            column, unit_row, settings
         )
         for column in ordered_species
     }
@@ -196,9 +175,7 @@ def resolve_sheet_plan(
         sheet_name=sheet_name,
         time_column=time_column,
         species_columns=ordered_species,
-        skip_unit_row=unit_row is not None and not settings.override_no_unit_row,
-        time_factor=time_factor,
-        conc_factors={name: value[1] for name, value in concentrations.items()},
-        original_time_unit=time_unit,
-        original_conc_units={name: value[0] for name, value in concentrations.items()},
+        skip_unit_row=unit_row is not None,
+        time_unit=time_unit,
+        observation_units=observations,
     )

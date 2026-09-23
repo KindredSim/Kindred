@@ -18,7 +18,6 @@ from kindred.gui.import_workflow import (
     ImportConfig,
     ImportSettings,
     capture_import_source,
-    classify_unit_row,
     resolve_sheet_plan,
 )
 from kindred.gui.widgets.import_config_dialog import ImportConfigDialog, ImportDialogResult
@@ -606,8 +605,7 @@ class DataManagerPanel(QtWidgets.QWidget):
                 first_row = next(iter(rows), None)
             finally:
                 rows.close()
-            unit_row = classify_unit_row(first_row.values) if first_row else None
-            plans.append(resolve_sheet_plan(None, columns, unit_row, source_settings))
+            plans.append(resolve_sheet_plan(None, columns, first_row.values if first_row else None, source_settings))
         else:
             with ExcelWorkbookPair(
                 source.exact_source_bytes,
@@ -627,9 +625,8 @@ class DataManagerPanel(QtWidgets.QWidget):
                     finally:
                         rows.close()
                     columns = tuple(first_row) if first_row is not None else ()
-                    unit_row = classify_unit_row(first_row) if first_row else None
                     plans.append(resolve_sheet_plan(
-                        sheet_name, columns, unit_row, source_settings,
+                        sheet_name, columns, first_row, source_settings,
                     ))
         return ImportConfig(source=source, plans=tuple(plans))
 

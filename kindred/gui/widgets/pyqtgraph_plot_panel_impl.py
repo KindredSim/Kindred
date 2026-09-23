@@ -2043,7 +2043,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
                 item = existing_store.get(item_key)
                 name = f"{block.label}: {series_name}"
                 unit = block.unit_for(series_name)
-                if self._render_input.y_unit is None and unit is not None and unit.compatible(CUBIC_METRE):
+                if self._render_input.y_unit is None and unit is not None:
                     name += f" [{format_unit_for_display(dict(transformed.y_units)[series_name])}]"
                 legend_name = name if legend_pending else None
                 legend_pending = False

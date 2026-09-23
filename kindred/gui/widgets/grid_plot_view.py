@@ -15,6 +15,7 @@ from kindred.gui.curve_copy_headers import copy_column_header
 from kindred.core.quantity_units import Unit, MOLAR, SECOND, format_unit_for_display
 from kindred.gui.fitting.curve_projection import (
     focused_units, prepared_fit_units, scale_values, focused_model_chunks, focused_model_rows,
+    observed_fit_units, shared_axis_unit,
 )
 from kindred.gui.display_name_policy import (
     PLOT_TITLE_LABEL_MAX_CHARS,
@@ -51,16 +52,10 @@ def _color_value(value: object) -> object:
 
 
 def _fit_y_axis_label(
-    quantity_units: tuple[tuple[str, Unit | None], ...],
-    visible_y_names: Iterable[str],
-    observed_unit: Unit = MOLAR,
+    unit: Unit | None,
 ) -> tuple[str, str | None]:
-    # Observations retain their admitted concentration meaning.
-    units = dict(quantity_units)
-    visible = tuple(dict.fromkeys(visible_y_names))
-    if observed_unit is not None and observed_unit.compatible(MOLAR) and visible and all(units.get(name) == observed_unit for name in visible):
-        return "Concentration", format_unit_for_display(observed_unit)
-    return "Value", None
+    label = "Concentration" if unit is not None and unit.compatible(MOLAR) else "Value"
+    return label, format_unit_for_display(unit)
 
 
 def _fit_copy_columns(dataset):
@@ -68,6 +63,8 @@ def _fit_copy_columns(dataset):
     targets = tuple(name for name, _ in dataset.observed_y)
     units = dict(dataset.simulation.quantity_units)
     display = dict(focused_units(units, dataset.simulation.presentation_units, dataset.x_name, targets))
+    measured_display = dict(observed_fit_units(display, dataset.x_name, dataset.observed_x_unit, dataset.observed_y_units))
+    measured_y_units = dict(dataset.observed_y_units)
     definitions = dict(dataset.model_definitions)
     rows = focused_model_rows(dataset)
     columns = []
@@ -89,14 +86,10 @@ def _fit_copy_columns(dataset):
         if dataset.x_name != "t" and times[name]:
             add(group, "Recorded time", times[name], SECOND)
         x_name = dataset.observed_x_name or "t"
-        x_unit = display[dataset.x_name]
-        if x_unit is None or not dataset.observed_x_unit.compatible(x_unit):
-            x_unit = dataset.observed_x_unit
-        y_unit = display[name]
-        if y_unit is None or not dataset.observed_y_unit.compatible(y_unit):
-            y_unit = dataset.observed_y_unit
+        x_unit = measured_display[dataset.x_name]
+        y_unit = measured_display[name]
         add(group, x_name, scale_values(observed_x[name], dataset.observed_x_unit, x_unit), x_unit)
-        add(group, raw[name], scale_values(values, dataset.observed_y_unit, y_unit), y_unit)
+        add(group, raw[name], scale_values(values, measured_y_units[name], y_unit), y_unit)
     return columns
 
 
@@ -644,11 +637,20 @@ class GridPlotView(QtWidgets.QWidget):
             self._grid_key = None
         self._structure_key = structure
 
-    def _update_panel(self, identity, display_name, x_name, quantity_units, names, x_display, y_display) -> None:
+    def _update_panel(self, identity, display_name, x_name, model_display, measured_display, names) -> None:
         plot = self._plot_items[identity]
         name = compact_plot_title_label(display_name, max_chars=PLOT_TITLE_LABEL_MAX_CHARS)
         title, tooltip = name.display, f"{name.full}\nDataset ID: {identity}"
-        label, units = _fit_y_axis_label(quantity_units, names, y_display)
+        x_display = shared_axis_unit((model_display[x_name], measured_display[x_name]))
+        y_display = shared_axis_unit(unit for name in names for unit in (model_display[name], measured_display[name]))
+        label, units = _fit_y_axis_label(y_display)
+        if x_display is None or y_display is None:
+            details = [html.escape(tooltip).replace("\n", "<br>")]
+            for quantity in (x_name, *names):
+                model = format_unit_for_display(model_display[quantity]) or "Unspecified"
+                measured = format_unit_for_display(measured_display[quantity])
+                details.append(f"{html.escape(quantity)}: model {model}; measured {measured}")
+            tooltip = "<qt>" + "<br>".join(details) + "</qt>"
         state = (x_name, title, tooltip, label, units, x_display, len(self._dataset_ids) > 1,
                  self._dark_mode, self.font().toString())
         if getattr(plot, "_kindred_appearance", None) != state:
@@ -658,12 +660,8 @@ class GridPlotView(QtWidgets.QWidget):
                           size=f"{self.font().pointSizeF()}pt")
             plot.setToolTip(tooltip)
             plot.setLabel("left", label, units=units)
-            model_x = dict(quantity_units).get(x_name)
-            observed_x = SECOND if x_name == "t" else MOLAR
-            common_x = (x_display is not None and model_x is not None
-                        and model_x.compatible(x_display) and observed_x.compatible(x_display))
             plot.setLabel("bottom", "Time" if x_name == "t" else html.escape(x_name),
-                          units=format_unit_for_display(x_display) if common_x else None)
+                          units=format_unit_for_display(x_display))
             plot._kindred_appearance = state
 
     def _update_series(self, identity: str, kind: str, species: str, data: tuple) -> None:
@@ -748,18 +746,18 @@ class GridPlotView(QtWidgets.QWidget):
             names = tuple(item.model_target for item in config.selected_observations)
             x = config.parametric_x_observation
             x_name = "t" if x is None else x.model_target
-            quantities, display_pairs = prepared_fit_units(request.setup.origin.prepared_dsl, x_name, names)
+            _quantities, display_pairs = prepared_fit_units(request.setup.origin.prepared_dsl, x_name, names)
             display = dict(display_pairs)
-            x_display = display[x_name]
-            y_units = tuple(display[name] for name in names)
-            y_display = y_units[0] if y_units and all(unit == y_units[0] for unit in y_units) else None
+            x_unit = SECOND if x is None else x.unit
+            y_units = {item.model_target: item.unit for item in config.selected_observations}
+            measured_display = dict(observed_fit_units(display, x_name, x_unit, tuple(y_units.items())))
             self._update_panel(identity, mapped[identity].display_name, x_name,
-                               display_pairs, names, x_display, y_display)
+                               display, measured_display, names)
             observed_x, observed_y = _observed_curve_parts(config.selected_observations, x_observations=x)
             for species, y in observed_y:
                 self._update_series(identity, "observed", species, (
-                    scale_values(dict(observed_x)[species], SECOND if x is None else MOLAR, x_display),
-                    scale_values(y, MOLAR, display[species])))
+                    scale_values(dict(observed_x)[species], x_unit, measured_display[x_name]),
+                    scale_values(y, y_units[species], measured_display[species])))
                 if ("model", species) not in self._plot_series_items[identity]:
                     self._update_series(identity, "model", species, ((), ()))
         self._update_legend()

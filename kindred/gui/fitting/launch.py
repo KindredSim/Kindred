@@ -7,6 +7,7 @@ from dataclasses import dataclass, replace
 from typing import Iterable, Literal, Sequence
 
 import numpy as np
+from kindred.core.quantity_units import Unit
 
 from kindred.core.analysis.fit_uncertainty import (
     ProfileLikelihoodConfig,
@@ -126,6 +127,7 @@ class FitObservationSnapshot:
     raw_observation_id: str
     raw_column: str
     model_target: str
+    unit: Unit
     t: tuple[float, ...]
     y: tuple[float, ...]
     source_rows: tuple[int, ...]
@@ -1040,6 +1042,7 @@ class FitSelectedObservation:
     raw_observation_id: str
     raw_column: str
     model_target: str
+    unit: Unit
     t: tuple[float, ...]
     y: tuple[float, ...]
     source_rows: tuple[int, ...]
@@ -1231,6 +1234,7 @@ def capture_fit_origin(
                     raw_observation_id=observation.raw_observation_id,
                     raw_column=observation.column_name,
                     model_target=model_target,
+                    unit=observation.unit,
                     t=observation.t,
                     y=observation.y,
                     source_rows=observation.source_rows,
@@ -1367,6 +1371,7 @@ def selected_observations(
                 raw_observation_id=observation.raw_observation_id,
                 raw_column=observation.raw_column,
                 model_target=target,
+                unit=observation.unit,
                 t=tuple(float(observation.t[index]) for index in indices) if observation.t else (),
                 y=tuple(float(observation.y[index]) for index in indices),
                 source_rows=tuple(
@@ -1502,6 +1507,7 @@ def _selected_parametric_x_observation(
         raw_observation_id=x_source.raw_observation_id,
         raw_column=x_source.raw_column,
         model_target=parametric.x_name,
+        unit=x_source.unit,
         t=tuple(float(x_source.t[index]) for index in indices) if x_source.t else (),
         y=tuple(float(x_source.y[index]) for index in indices),
         source_rows=tuple(int(x_source.source_rows[index]) for index in indices),

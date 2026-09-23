@@ -12,6 +12,7 @@ from numbers import Real
 from pathlib import Path
 from pathlib import PurePosixPath, PureWindowsPath
 from typing import Mapping, TypeAlias
+from kindred.core.quantity_units import Unit, scientific_unit
 
 from kindred.core.datasets.source_rules import (
     identify_physical_columns,
@@ -111,6 +112,7 @@ def validate_raw_observation_id(
 class ObservationSeries:
     raw_observation_id: str
     column_name: str
+    unit: Unit
     # Empty means no recorded experimental time; rows remain the observation identity.
     t: tuple[float, ...]
     y: tuple[float, ...]
@@ -118,6 +120,8 @@ class ObservationSeries:
 
     def __post_init__(self) -> None:
         validate_raw_observation_id(self.raw_observation_id)
+        if self.unit != scientific_unit(self.unit.dimensions):
+            raise ValueError("Observation values require scientific-coordinate units.")
         if type(self.t) is not tuple or type(self.y) is not tuple:
             raise TypeError("ObservationSeries t/y must be immutable tuples.")
         if not self.y or (self.t and len(self.t) != len(self.y)):

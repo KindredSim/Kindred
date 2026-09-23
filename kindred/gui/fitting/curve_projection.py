@@ -29,10 +29,27 @@ def prepared_fit_units(prepared, x_name, targets):
     return tuple(units.items()), focused_units(units, preferred, x_name, targets)
 
 
+def observed_fit_units(model_display, x_name, x_unit, y_units):
+    """Convert compatible measurements to the model display, retaining other meanings."""
+    display = dict(model_display)
+    return tuple(
+        (name, display[name] if display.get(name) is not None and unit.compatible(display[name]) else unit)
+        for name, unit in ((x_name, x_unit), *y_units)
+    )
+
+
+def shared_axis_unit(units):
+    """A shared label describes every model and measured quantity on the axis."""
+    units = tuple(units)
+    return units[0] if units and units[0] is not None and all(unit == units[0] for unit in units) else None
+
+
 def scale_values(values, source, destination):
-    factor = (conversion_scale(source, destination).number()
-              if source is not None and destination is not None and source.compatible(destination) else 1.0)
-    return tuple(float(value) * factor for value in values)
+    if source is None or destination is None:
+        return tuple(float(value) for value in values)
+    scale = conversion_scale(source, destination)
+    # Model gaps retain their presentation meaning; observations are admitted finite.
+    return tuple(scale.apply(float(value)) if np.isfinite(value) else float(value) for value in values)
 
 
 def focused_model_chunks(dataset):

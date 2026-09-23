@@ -1,4 +1,4 @@
-"""Strict codec for the sole current ``kindred-kin-5`` archive."""
+"""Shared strict decoder for format 5/6 archives and format 6 writer."""
 
 from __future__ import annotations
 
@@ -40,7 +40,8 @@ from kindred.core.datasets.csv_import import (
 )
 from kindred.core.datasets.excel_import import ExcelWorkbookPair
 from kindred.core.datasets.source_rules import PhysicalColumn
-from kindred.core.datasets.units import parse_concentration_unit, parse_time_unit
+from kindred.core.datasets.units import parse_measurement_unit, parse_time_unit
+from kindred.core.quantity_units import Unit, scientific_unit
 from kindred.core.project_presentation_state import (
     AxisSeriesSelection,
     ExperimentalAxisSelection,
@@ -57,7 +58,7 @@ __all__ = [
     "KinArchiveStore",
 ]
 
-CURRENT_PROJECT_FORMAT = "kindred-kin-5"
+CURRENT_PROJECT_FORMAT = "kindred-kin-6"
 _PROJECT_MEMBER = "project.json"
 _SOURCE_MEMBER_PREFIX = "sources/"
 _CANONICAL_ZIP_TIMESTAMP = (1980, 1, 1, 0, 0, 0)
@@ -450,10 +451,12 @@ def _replay_imported_dataset(
     source: ImportedSource,
     *,
     label: str,
+    time_unit: Unit,
+    observation_units: Mapping[str, Unit],
     workbooks: ExcelWorkbookPair | None = None,
 ) -> None:
     """Reparse retained source bytes and require exact observation replay."""
-    metadata = _require_replay_metadata(dataset, source, label=label)
+    metadata = thaw_json_value(dataset.source_metadata)
     raw_columns = metadata["physical_columns"]
     if not isinstance(raw_columns, list):
         raise ValueError(f"{label}.source_metadata.physical_columns must be an array.")
@@ -483,45 +486,17 @@ def _replay_imported_dataset(
         species_columns = tuple(by_name[str(name)] for name in observation_names)
     except KeyError as exc:
         raise ValueError(f"{label}.source_metadata references an unknown physical column.") from exc
-    original_time_unit = _string(
-        metadata["original_time_unit"],
-        f"{label}.source_metadata.original_time_unit",
-        nonblank=True,
-    )
-    raw_concentration_units = metadata["original_concentration_units"]
-    if not isinstance(raw_concentration_units, Mapping):
-        raise ValueError(
-            f"{label}.source_metadata.original_concentration_units must be an object."
-        )
-    if any(name not in raw_concentration_units for name in observation_names):
-        raise ValueError(
-            f"{label}.source_metadata.original_concentration_units must include every observation."
-        )
-    concentration_units = {
-        name: _string(
-            raw_concentration_units.get(name),
-            f"{label}.source_metadata.original_concentration_units.{name}",
-            nonblank=True,
-        )
-        for name in observation_names
-    }
     skip_unit_row = _boolean(
-        metadata["skip_unit_row"],
-        f"{label}.source_metadata.skip_unit_row",
+        metadata["skip_unit_row"], f"{label}.source_metadata.skip_unit_row",
     )
-    time_factor = parse_time_unit(original_time_unit)
-    observation_factors = {
-        name: parse_concentration_unit(unit)
-        for name, unit in concentration_units.items()
-    }
 
     def _compare(payload) -> None:  # noqa: ANN001
         expected = tuple(
-            (series.column_name, series.t, series.y, series.source_rows)
+            (series.column_name, series.unit, series.t, series.y, series.source_rows)
             for series in dataset.observations
         )
         actual = tuple(
-            (series.column_name, series.t, series.y, series.source_rows)
+            (series.column_name, series.unit, series.t, series.y, series.source_rows)
             for series in payload.observations
         )
         if actual != expected:
@@ -553,11 +528,9 @@ def _replay_imported_dataset(
                 species_columns=species_columns,
                 source_label=source.original_filename,
                 source_row_start=3 if skip_unit_row else 2,
-                time_factor=time_factor,
-                observation_factors=observation_factors,
+                time_unit=time_unit,
+                observation_units=observation_units,
                 metadata_extras={
-                    "original_time_unit": original_time_unit,
-                    "original_concentration_units": concentration_units,
                     "skip_unit_row": skip_unit_row,
                 },
             )
@@ -602,11 +575,9 @@ def _replay_imported_dataset(
                 source_label=source.original_filename,
                 sheet_name=sheet_name,
                 source_row_start=3 if skip_unit_row else 2,
-                time_factor=time_factor,
-                observation_factors=observation_factors,
+                time_unit=time_unit,
+                observation_units=observation_units,
                 metadata_extras={
-                    "original_time_unit": original_time_unit,
-                    "original_concentration_units": concentration_units,
                     "skip_unit_row": skip_unit_row,
                 },
             )
@@ -616,12 +587,11 @@ def _replay_imported_dataset(
 
 
 def _require_replay_metadata(
-    dataset: RawDatasetRecord,
+    metadata: object,
     source: ImportedSource,
     *,
     label: str,
 ) -> Mapping[str, object]:
-    metadata = thaw_json_value(dataset.source_metadata)
     if not isinstance(metadata, Mapping):
         raise ValueError(f"{label}.source_metadata must be a JSON object.")
     missing = sorted(_REPLAY_METADATA_FIELDS - set(metadata))
@@ -694,7 +664,7 @@ def _decode_document(
         validate_imported_source(sources[-1])
         sources_by_id[source_id] = sources[-1]
     datasets: list[RawDatasetRecord] = []
-    datasets_by_source: dict[str, list[tuple[RawDatasetRecord, str]]] = {}
+    datasets_by_source: dict[str, list[tuple[RawDatasetRecord, str, Unit, dict[str, Unit]]]] = {}
     referenced_source_ids: set[str] = set()
     for index, raw_dataset in enumerate(
         _array(data["datasets"], "document.datasets")
@@ -715,6 +685,14 @@ def _decode_document(
         if source_id not in source_ids:
             raise ValueError(f"{label}.source_id references an unknown imported source.")
         referenced_source_ids.add(source_id)
+        metadata = _require_replay_metadata(item["source_metadata"], sources_by_id[source_id], label=label)
+        time_unit = parse_time_unit(_string(
+            metadata["original_time_unit"], f"{label}.source_metadata.original_time_unit", nonblank=True,
+        ))
+        declared_units = metadata["original_concentration_units"]
+        if not isinstance(declared_units, Mapping):
+            raise ValueError(f"{label}.source_metadata.original_concentration_units must be an object.")
+        observation_units: dict[str, Unit] = {}
         observations: list[ObservationSeries] = []
         for series_index, raw_series in enumerate(
             _array(item["observations"], f"{label}.observations")
@@ -731,6 +709,14 @@ def _decode_document(
                     "source_rows",
                 },
             )
+            column_name = _string(series["column_name"], f"{series_label}.column_name", nonblank=True)
+            if column_name not in declared_units:
+                raise ValueError(f"{series_label} requires an input unit declaration.")
+            observation_units[column_name] = parse_measurement_unit(_string(
+                declared_units[column_name],
+                f"{label}.source_metadata.original_concentration_units.{column_name}",
+                nonblank=True,
+            ))
             observations.append(
                 ObservationSeries(
                     raw_observation_id=_string(
@@ -738,11 +724,8 @@ def _decode_document(
                         f"{series_label}.raw_observation_id",
                         nonblank=True,
                     ),
-                    column_name=_string(
-                        series["column_name"],
-                        f"{series_label}.column_name",
-                        nonblank=True,
-                    ),
+                    column_name=column_name,
+                    unit=scientific_unit(observation_units[column_name].dimensions),
                     t=tuple(
                         _finite(
                             item_value,
@@ -787,12 +770,12 @@ def _decode_document(
                 nonblank=True,
             ),
             source_id=source_id,
-            source_metadata=freeze_json_value(item["source_metadata"]),
+            source_metadata=freeze_json_value(metadata),
             observations=tuple(observations),
         )
         validate_raw_dataset_record(dataset)
         datasets.append(dataset)
-        datasets_by_source.setdefault(source_id, []).append((dataset, label))
+        datasets_by_source.setdefault(source_id, []).append((dataset, label, time_unit, observation_units))
     for source_id, source_datasets in datasets_by_source.items():
         source = sources_by_id[source_id]
         if source.original_format == "xlsx":
@@ -800,16 +783,20 @@ def _decode_document(
                 source.exact_source_bytes,
                 source_label=source.original_filename,
             ) as workbooks:
-                for dataset, label in source_datasets:
+                for dataset, label, time_unit, observation_units in source_datasets:
                     _replay_imported_dataset(
                         dataset,
                         source,
                         label=label,
+                        time_unit=time_unit,
+                        observation_units=observation_units,
                         workbooks=workbooks,
                     )
         else:
-            for dataset, label in source_datasets:
-                _replay_imported_dataset(dataset, source, label=label)
+            for dataset, label, time_unit, observation_units in source_datasets:
+                _replay_imported_dataset(
+                    dataset, source, label=label, time_unit=time_unit, observation_units=observation_units,
+                )
     if referenced_source_ids != source_ids:
         raise ValueError("Archive contains an unreferenced imported source.")
     if source_members != set(source_bytes_by_member):
@@ -1336,10 +1323,10 @@ def _decode_project(
         "project.format",
         nonblank=True,
     )
-    if project_format != CURRENT_PROJECT_FORMAT:
+    if project_format not in ("kindred-kin-5", CURRENT_PROJECT_FORMAT):
         raise ValueError(
             f"Unsupported project format {project_format!r}; "
-            f"expected {CURRENT_PROJECT_FORMAT!r}."
+            f"expected 'kindred-kin-5' or {CURRENT_PROJECT_FORMAT!r}."
         )
     document = _decode_document(
         root["document"],
@@ -1393,7 +1380,7 @@ def _decode_project(
 
 
 class KinArchiveStore:
-    """Read and write the sole current Kindred project archive schema."""
+    """Decode formats 5 and 6 through one schema; save as format 6."""
 
     def load(self, path: str | os.PathLike[str]) -> ArchiveProject:
         """Decode one archive; final document admission belongs to its caller."""

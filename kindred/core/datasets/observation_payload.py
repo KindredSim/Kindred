@@ -135,6 +135,7 @@ def immutable_dataset_payload(
             ObservationSeries(
                 raw_observation_id=raw_observation_id,
                 column_name=name,
+                unit=raw_spec["unit"],
                 t=times,
                 y=values,
                 source_rows=rows,
