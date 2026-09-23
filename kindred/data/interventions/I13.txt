@@ -1,0 +1,30 @@
+A + B <-> C ; kf=0.02 ; kr=0.004
+C + B <-> D ; kf=0.01 ; kr=0.002
+
+param addition_time = 120.0; unit = s
+param dose_volume = 2.0; unit = mL
+param stock_concentration = 5.0; unit = M
+
+# Volume tracking is optional.
+# initial_volume specifies the volume present at simulation start.
+# Declare it once, even if the action containing it occurs later.
+#
+# solution specifies the added volume and stock composition.
+# Use it instead of the species and delta fields of a concentration jump.
+# The addition increases volume and mixes the stock with the vessel contents.
+intervention: op=jump; time_param=addition_time; initial_volume=10 mL; solution={volume_param=dose_volume,stock={species=B,value_param=stock_concentration}}
+
+# A stock can contain several species.
+# Separate stock entries with semicolons.
+intervention: op=jump; time=240.0; solution={volume=2 mL,stock={species=B,value=2 M; species=D,value=1 M}}
+
+# stock={} specifies pure solvent.
+# Species omitted from a stock have zero concentration in that stock.
+intervention: op=jump; time=300.0; solution={volume=5 mL,stock={}}
+
+intervention_set1 = {
+  [A] = 1.0
+  [B] = 0.0
+  [C] = 0.0
+  [D] = 0.0
+}

@@ -426,6 +426,7 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
             "<h3>Before and after the listed times</h3>"
             "<p>Before the first listed time, Kindred uses the nominal temperature. After the last listed time, a step schedule keeps its final temperature. A response schedule continues toward its final setpoint.</p>"
             "<h2>Interventions</h2>"
+            "<p>The bundled intervention examples are designed for simulations from 0 to 600 seconds.</p>"
             "<p>Use <code>intervention:</code> to change or maintain a species concentration. Choose an <code>op=</code> option:</p>"
             "<table border=\"1\" cellpadding=\"5\" cellspacing=\"0\">"
             "<tr><th>Option</th><th>Effect</th></tr>"

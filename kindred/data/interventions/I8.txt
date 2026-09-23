@@ -1,19 +1,16 @@
-# title: Ligand and inhibitor perturbation sequence
-# Interleaves ligand activation, inhibitor challenge, and ligand removal in one catalytic run.
-intervention_set1 = {
-  [Substrate] = 1.0
-  [Catalyst] = 0.2
-  [Ligand] = 0.0
-  [LigatedCatalyst] = 0.0
-  [Inhibitor] = 0.0
-  [InhibitedCatalyst] = 0.0
-  [Product] = 0.0
-}
+A <-> B ; kf=0.02 ; kr=0.004
+B -> C ; k=0.006
+B -> D ; k=0.002
 
-Substrate + Catalyst -> Product + Catalyst; k=0.15
-Substrate + LigatedCatalyst -> Product + LigatedCatalyst; k=0.9
-Catalyst + Ligand -> LigatedCatalyst; k=1.0
-Catalyst + Inhibitor -> InhibitedCatalyst; k=1.2
-intervention: op=jump; species=Ligand; time=1.0; delta=0.4
-intervention: op=jump; species=Inhibitor; time=3.0; delta=0.25
-intervention: op=jump; species=Ligand; time=4.5; delta=-0.2
+# [A]_0 refers to the initial concentration of A.
+let conversion = 1 - [A] / [A]_0
+
+# watch_observable references a let definition by name.
+intervention: op=trigger; watch_observable=conversion; threshold=0.8; direction=rising; then={op=stop}
+
+intervention_set1 = {
+  [A] = 1.0
+  [B] = 0.0
+  [C] = 0.0
+  [D] = 0.0
+}

@@ -1,10 +1,12 @@
-# title: Pseudo-first-order reagent reservoir
-# Holds an excess reagent constant so substrate decay reports pseudo-first-order kinetics.
-intervention_set1 = {
-  [Substrate] = 1.0
-  [Reagent] = 0.0
-  [Product] = 0.0
-}
+A + C -> B ; k=0.01
 
-Substrate + Reagent -> Product; k=0.8
-intervention: op=hold; species=Reagent; start_time=0.0; end_time=4.0; value=10.0
+# hold keeps a species concentration constant between start_time and end_time.
+# The species still participates in reactions, but its concentration stays fixed.
+# After end_time, its concentration can change again.
+intervention: op=hold; species=C; start_time=0.0; end_time=240.0; value=1.0
+
+intervention_set1 = {
+  [A] = 1.0
+  [B] = 0.0
+  [C] = 1.0
+}

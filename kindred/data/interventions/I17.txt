@@ -1,0 +1,25 @@
+A + B -> C ; k=0.02
+C + D -> E ; k=0.02
+
+param starting_volume = 10.0; unit = mL
+param dose_volume = 2.0; unit = mL
+param stock_concentration = 2.0; unit = M
+param sample_volume = 500.0; unit = uL
+
+# B and D arrive in the same dose.
+#
+# initial_volume_param is declared once inside the repeated action.
+# It sets the volume at simulation start, not at each repetition.
+# Each addition and withdrawal uses the current vessel volume.
+#
+# before adds the stock solution.
+# after removes a sample 120 s later.
+intervention: op=protocol; kind=repeat; start_time=60.0; every=180.0; count=3; duration=120.0; before={op=jump,initial_volume_param=starting_volume,solution={volume_param=dose_volume,stock={species=B,value_param=stock_concentration; species=D,value_param=stock_concentration}}}; after={op=withdraw,volume_param=sample_volume}
+
+intervention_set1 = {
+  [A] = 1.0
+  [B] = 0.0
+  [C] = 0.0
+  [D] = 0.0
+  [E] = 0.0
+}

@@ -1,17 +1,16 @@
-# title: Isotope entrainment chase
-# Adds an unlabeled substrate chase after a labeled catalyst-bound adduct has accumulated.
-intervention_set1 = {
-  [LabeledSubstrate] = 1.0
-  [UnlabeledSubstrate] = 0.0
-  [Catalyst] = 0.2
-  [LabeledAdduct] = 0.0
-  [UnlabeledAdduct] = 0.0
-  [LabeledProduct] = 0.0
-  [UnlabeledProduct] = 0.0
-}
+A + B <-> C ; kf=0.02 ; kr=0.002
+C + D -> E ; k=0.02
 
-LabeledSubstrate + Catalyst -> LabeledAdduct; k=1.0
-LabeledAdduct -> LabeledProduct + Catalyst; k=0.35
-UnlabeledSubstrate + Catalyst -> UnlabeledAdduct; k=1.0
-UnlabeledAdduct -> UnlabeledProduct + Catalyst; k=0.35
-intervention: op=trigger; watch_species=LabeledAdduct; threshold=0.05; direction=rising; max_count=1; min_interval=0.0; then={op=jump,species=UnlabeledSubstrate,delta=1.0}
+# stop finishes the simulation at the threshold crossing.
+# It has no species or value fields.
+# Stopping triggers do not use max_count or min_interval.
+# Enable Use authored stopping interventions in Simulation Settings.
+intervention: op=trigger; watch_species=A; threshold=0.1; direction=falling; then={op=stop}
+
+intervention_set1 = {
+  [A] = 1.0
+  [B] = 2.0
+  [C] = 0.0
+  [D] = 2.0
+  [E] = 0.0
+}

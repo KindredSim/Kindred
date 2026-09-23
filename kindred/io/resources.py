@@ -46,17 +46,31 @@ class InterventionExampleCatalogError(RuntimeError):
 
 @dataclass(frozen=True, slots=True)
 class InterventionExampleSpec:
-    """One dynamically discovered packaged intervention example."""
+    """One named packaged intervention example."""
 
     id: str
     title: str
-    path: str
-    type: str = "intervention"
 
 
-_MANDATORY_INTERVENTION_EXAMPLE_IDS = frozenset(
-    {"I1", "I2", "I3", "I4", "I5", "I6", "I7", "I8"}
-)
+_INTERVENTION_EXAMPLE_TITLES = {
+    "I1": "Set a concentration",
+    "I2": "Increase and decrease a concentration",
+    "I3": "Continuous addition and removal",
+    "I4": "Maintain constant reagent",
+    "I5": "Trap an intermediate",
+    "I6": "Replenish a reagent",
+    "I7": "Stop at a concentration",
+    "I8": "Stop at a conversion",
+    "I9": "Repeated additions",
+    "I10": "Intermittent feeding",
+    "I11": "Light–dark photoswitching",
+    "I12": "Mix, react, and quench",
+    "I13": "Add stock solution and solvent",
+    "I14": "Pump a stock solution",
+    "I15": "Withdraw an aliquot",
+    "I16": "Scale concentrations",
+    "I17": "Repeated dosing and sampling",
+}
 PRESET_MECHANISM_TITLES = {
     "M1": "A -> B",
     "M2": "A <-> B",
@@ -237,24 +251,6 @@ def get_resource_path(relative_path: str) -> Path:
 # Convenience functions for common resources
 
 
-def _natural_key(name: str) -> list[object]:
-    """Split into numeric and text chunks for deterministic ordering."""
-    return [int(part) if part.isdigit() else part.lower() for part in re.split(r"(\d+)", name)]
-
-
-def _title_from_resource_text(text: str, *, fallback: str) -> str:
-    for line in str(text or "").splitlines():
-        stripped = line.strip()
-        if not stripped:
-            continue
-        prefix = "# title:"
-        if stripped.lower().startswith(prefix):
-            title = stripped[len(prefix):].strip()
-            return title or fallback
-        return fallback
-    return fallback
-
-
 def get_preset_mechanism_source(preset_id: str) -> MechanismAuthoringSource:
     """
     Load a preset mechanism by ID as a complete authoring source.
@@ -304,69 +300,30 @@ def get_intervention_example_source(example_id: str) -> MechanismAuthoringSource
 
 def get_all_intervention_example_specs() -> tuple[InterventionExampleSpec, ...]:
     """
-    Discover and validate all bundled intervention examples.
-
-    Discovery is dynamic and naturally ordered, so later non-contiguous IDs
-    are included. The mandatory I1-I8 package contract fails closed when a
-    required file is absent or any discovered resource cannot be read.
+    Return the ordered catalog after verifying every listed resource is readable.
 
     Returns
     -------
     tuple of InterventionExampleSpec
-        Typed metadata for every discovered intervention resource.
+        Names and IDs for every cataloged intervention resource.
 
     Raises
     ------
     InterventionExampleCatalogError
-        If discovery fails, I1-I8 are incomplete, or a discovered resource is
-        unreadable.
+        If any cataloged resource is missing or unreadable.
     """
-    from importlib.resources import files
-
-    try:
-        base = files("kindred").joinpath("data", "interventions")
-        names = sorted(
-            (
-                item.name
-                for item in base.iterdir()
-                if item.is_file() and item.suffix == ".txt"
-            ),
-            key=_natural_key,
-        )
-    except Exception as exc:
-        raise InterventionExampleCatalogError(
-            "Unable to discover packaged intervention examples."
-        ) from exc
-
-    discovered_ids = {
-        name[:-4] if name.endswith(".txt") else name
-        for name in names
-    }
-    missing = sorted(
-        _MANDATORY_INTERVENTION_EXAMPLE_IDS - discovered_ids,
-        key=_natural_key,
-    )
-    if missing:
-        raise InterventionExampleCatalogError(
-            "Mandatory packaged intervention examples are missing: "
-            + ", ".join(missing)
-        )
-
     examples: list[InterventionExampleSpec] = []
-    for name in names:
-        base = name[:-4] if name.endswith(".txt") else name
-        path = f"interventions/{name}"
+    for example_id, title in _INTERVENTION_EXAMPLE_TITLES.items():
         try:
-            text = get_resource_text(path)
+            get_resource_text(f"interventions/{example_id}.txt")
         except Exception as exc:
             raise InterventionExampleCatalogError(
-                f"Packaged intervention example {base!r} is unreadable."
+                f"Packaged intervention example {example_id!r} is missing or unreadable."
             ) from exc
         examples.append(
             InterventionExampleSpec(
-                id=base,
-                path=path,
-                title=_title_from_resource_text(text, fallback=base),
+                id=example_id,
+                title=title,
             )
         )
 
