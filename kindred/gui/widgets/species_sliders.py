@@ -8,6 +8,7 @@ from typing import Mapping, Sequence
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
+from kindred.gui.display_name_policy import CompactText, compact_text
 from kindred.gui.ui_helpers import (
     configure_compact_numeric_edit, make_bounded_label, set_bounded_label_text,
 )
@@ -93,7 +94,7 @@ class BatchSpeciesSliders(QtWidgets.QWidget):
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(5)
-        title = QtWidgets.QLabel("Initial concentrations", self)
+        title = QtWidgets.QLabel("Initial concentrations (M)", self)
         title.setStyleSheet("font-weight: bold;")
         layout.addWidget(title)
         self._content = QtWidgets.QWidget(self)
@@ -182,11 +183,12 @@ class BatchSpeciesSliders(QtWidgets.QWidget):
                 self._last_committed_editor_text[species] = text
         self._sync_visibility()
 
-    def slider_picker_entries(self) -> list[tuple[str, str, bool]]:
+    def slider_picker_entries(self) -> list[tuple[str, CompactText, str, bool]]:
         return [
             (
                 name,
-                self._display_names[name],
+                compact_text(self._display_names[name], max_chars=48),
+                "",
                 name not in self._hidden_species,
             )
             for name in self._values

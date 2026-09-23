@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 class SymbolicCalculatorLatestResult:
     prepared_dsl: PreparedDslRequestSet
     query: str
-    result_text: str
+    result_html: str
     context_text: str
     copy_text: str
     is_error: bool = False
@@ -39,7 +39,7 @@ class SymbolicCalculatorViewState:
     available: bool
     reason: str = ""
     latest_query: str = ""
-    latest_result_text: str = ""
+    latest_result_html: str = ""
     latest_is_error: bool = False
     can_copy_result: bool = False
     can_copy_context: bool = False
@@ -151,14 +151,17 @@ class SymbolicCalculatorOwner(QtCore.QObject):
         return self._publish()
 
     @QtCore.Slot(str, str, str, bool, str, object)
-    def _receive_result(self, query, result, context, error, copy_text, reuse_queries):
+    def _receive_result(self, query, result_html, context, error, copy_text, reuse_queries):
         worker = self.sender()
         if self._request is None or self._request[0] is not worker or self._worker is not worker:
             return
         _, snapshot, requested = self._request
         if self._closed or snapshot is not self._snapshot or requested != query:
             return
-        self._latest_result = SymbolicCalculatorLatestResult(snapshot.prepared_dsl, query, result, context, copy_text, error, reuse_queries)
+        self._latest_result = SymbolicCalculatorLatestResult(
+            snapshot.prepared_dsl, query, result_html, context,
+            copy_text, error, reuse_queries,
+        )
         self._request = None
         self._status = ""
         self._gate.release(self)
@@ -220,7 +223,7 @@ class SymbolicCalculatorOwner(QtCore.QObject):
             available=self._available and not self._closed,
             reason=self._reason if not self._available else "",
             latest_query=latest.query if latest else "",
-            latest_result_text=latest.result_text if latest else "",
+            latest_result_html=latest.result_html if latest else "",
             latest_is_error=latest.is_error if latest else False,
             can_copy_result=copyable, can_copy_context=copyable,
             busy=self.busy or bool(self._retiring), can_cancel=self.busy and self._worker is not None,

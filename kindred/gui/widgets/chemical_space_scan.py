@@ -1,7 +1,9 @@
 """Chemical Space Scan window. All generated trajectories stay outside Qt."""
 from __future__ import annotations
 
-from kindred.core.quantity_units import presentation_unit
+import html
+
+from kindred.core.quantity_units import format_unit_for_display, presentation_unit
 
 from dataclasses import replace
 import os
@@ -12,6 +14,8 @@ from PySide6 import QtCore, QtWidgets
 from kindred.core.project_document import canonical_initial_values, SUPPORTED_SOLVERS, SIMULATION_POINT_RANGE
 from kindred.gui.controllers.simulation_job_owner import resolve_run_parallel_capacity
 from kindred.gui.widgets.scan_range_dialog import ScanRangeDialog, ScanConstraintDialog, entry, number
+from kindred.gui.display_name_policy import scientific_symbol_html, scientific_symbol_spoken
+from kindred.gui.ui_helpers import SCIENTIFIC_NAME_HTML_ROLE, ScientificNameDelegate
 from kindred.scan.config import ScanConfig, InputRange, START, END
 from kindred.scan.inputs import input_catalog
 from kindred.scan.intervals import Interval
@@ -39,6 +43,8 @@ class ChemicalSpaceScanDialog(QtWidgets.QDialog):
         layout.addWidget(self.tabs, 1)
         self.inputs = QtWidgets.QTableWidget(0, 4)
         self.inputs.setHorizontalHeaderLabels(["Input", "Mode", "Value / allowed ranges", "Units"])
+        self.inputs.setItemDelegateForColumn(0, ScientificNameDelegate(self.inputs))
+        self.inputs.setItemDelegateForColumn(3, ScientificNameDelegate(self.inputs))
         self.inputs.setToolTip("Only independently editable inputs appear here. Derived parameters remain controlled by their authored Algebra expressions.")
         self.inputs.horizontalHeader().setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
         self.inputs.horizontalHeader().setSectionResizeMode(2, QtWidgets.QHeaderView.ResizeMode.Stretch)
@@ -135,6 +141,7 @@ class ChemicalSpaceScanDialog(QtWidgets.QDialog):
         note.setWordWrap(True)
         layout.addWidget(note)
         self.constraint_list = QtWidgets.QListWidget()
+        self.constraint_list.setItemDelegate(ScientificNameDelegate(self.constraint_list))
         layout.addWidget(self.constraint_list)
         row = QtWidgets.QHBoxLayout()
         add, remove = QtWidgets.QPushButton("Add constraint…"), QtWidgets.QPushButton("Remove selected")
@@ -222,13 +229,29 @@ class ChemicalSpaceScanDialog(QtWidgets.QDialog):
             mode.currentIndexChanged.connect(lambda index, key=item.key: self._mode_changed(key, index))
             if item.key in (START, END):
                 row.insertWidget(0, mode)
-                self.time_form.insertRow(0 if item.key == START else 1, f"{item.label} ({item.unit})", holder)
+                caption = QtWidgets.QLabel(
+                    f"{item.label} ({format_unit_for_display(item.unit)})"
+                )
+                caption.setTextFormat(QtCore.Qt.TextFormat.RichText)
+                caption.setAccessibleName(f"{item.label} ({item.unit})")
+                self.time_form.insertRow(0 if item.key == START else 1, caption, holder)
             else:
                 index = self.inputs.rowCount()
                 self.inputs.insertRow(index)
                 for column, text in ((0, item.label), (3, item.unit)):
                     cell = QtWidgets.QTableWidgetItem(text)
                     cell.setFlags(cell.flags() & ~QtCore.Qt.ItemFlag.ItemIsEditable)
+                    if column == 0:
+                        cell.setData(
+                            SCIENTIFIC_NAME_HTML_ROLE,
+                            scientific_symbol_html(item.label, family=item.family, role=item.role),
+                        )
+                        cell.setData(
+                            QtCore.Qt.ItemDataRole.AccessibleTextRole,
+                            scientific_symbol_spoken(item.label, family=item.family, role=item.role),
+                        )
+                    else:
+                        cell.setData(SCIENTIFIC_NAME_HTML_ROLE, format_unit_for_display(item.unit))
                     self.inputs.setItem(index, column, cell)
                 self.inputs.setCellWidget(index, 1, mode)
                 self.inputs.setCellWidget(index, 2, holder)
@@ -298,7 +321,13 @@ class ChemicalSpaceScanDialog(QtWidgets.QDialog):
             unit_label = "units unspecified" if unit is None else unit.symbol
             label = (f"= {condition.lower:g}" if condition.condition == "equals" else
                      f"{'[' if condition.include_lower else '('}{condition.lower:g}, {condition.upper:g}{']' if condition.include_upper else ')'}")
-            self.constraint_list.addItem(f"{condition.observable} {label} [{unit_label}] — {condition.dependent}")
+            text = f"{condition.observable} {label} [{unit_label}] — {condition.dependent}"
+            row = QtWidgets.QListWidgetItem(text)
+            row.setData(
+                SCIENTIFIC_NAME_HTML_ROLE,
+                f"{html.escape(condition.observable)} {label} [{format_unit_for_display(unit) if unit is not None else 'units unspecified'}] — {html.escape(condition.dependent)}",
+            )
+            self.constraint_list.addItem(row)
         for key, (mode, _, _, _) in self.rows.items():
             if key in calculated:
                 mode.setCurrentIndex(2)

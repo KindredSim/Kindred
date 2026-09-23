@@ -30,6 +30,7 @@ from kindred.core.analysis.fit_uncertainty import (
     ResidualBootstrapConfig,
 )
 from kindred.core.analysis.global_fit_execution import FitCoordinate
+from kindred.core.quantity_units import format_unit_for_display
 from kindred.core.validation import parse_finite_numeric_text
 
 from kindred.core.fitting_method_policy import SUPPORTED_FIT_METHODS
@@ -375,9 +376,10 @@ class _ParameterRosterTable(QtWidgets.QTableWidget):
         em = self.fontMetrics().horizontalAdvance("M")
         self.setColumnWidth(2, 12 * em)
         self.setColumnWidth(3, 18 * em)
+        self.setColumnWidth(4, 9 * em)
         self.setColumnWidth(1, max(
             18 * em,
-            self.viewport().width() - sum(self.columnWidth(i) for i in (0, 2, 3)),
+            self.viewport().width() - sum(self.columnWidth(i) for i in (0, 2, 3, 4)),
         ))
 
     def sizeHint(self) -> QtCore.QSize:
@@ -537,12 +539,12 @@ class ParametersIcsTab(QtWidgets.QWidget):
         roster_layout = QtWidgets.QVBoxLayout(roster_pane)
         roster_layout.setContentsMargins(0, 0, 0, 6)
         roster_layout.addWidget(QtWidgets.QLabel("Parameter list", roster_pane))
-        self._param_table = _ParameterRosterTable(0, 4, roster_pane)
+        self._param_table = _ParameterRosterTable(0, 5, roster_pane)
         self._param_table.setObjectName("fit_parameter_roster")
         self._param_table.setWordWrap(False)
         self._param_table.verticalHeader().setSectionResizeMode(QtWidgets.QHeaderView.ResizeToContents)
         self._param_table.setHorizontalHeaderLabels(
-            ("Vary", "Parameter", "Mechanism value", "Last result")
+            ("Vary", "Parameter", "Mechanism value", "Last result", "Unit")
         )
         self._param_table.setSelectionBehavior(
             QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows
@@ -566,9 +568,13 @@ class ParametersIcsTab(QtWidgets.QWidget):
         self._param_table.horizontalHeader().setSectionResizeMode(
             3, QtWidgets.QHeaderView.ResizeMode.Interactive
         )
+        self._param_table.horizontalHeader().setSectionResizeMode(
+            4, QtWidgets.QHeaderView.ResizeMode.ResizeToContents
+        )
         self._param_table.itemChanged.connect(self._on_roster_item_changed)
         self._param_table.itemSelectionChanged.connect(self._on_parameter_selection_changed)
         self._param_table.setItemDelegateForColumn(1, ScientificNameDelegate(self._param_table))
+        self._param_table.setItemDelegateForColumn(4, ScientificNameDelegate(self._param_table))
         self._param_table.installEventFilter(self)
         roster_layout.addWidget(self._param_table, 1)
         split.addWidget(left)
@@ -601,9 +607,14 @@ class ParametersIcsTab(QtWidgets.QWidget):
         for combo in (self._scale_combo, self._scope_combo):
             combo.setSizeAdjustPolicy(QtWidgets.QComboBox.AdjustToContents)
             combo.setSizePolicy(QtWidgets.QSizePolicy.Fixed, QtWidgets.QSizePolicy.Fixed)
-        form.addRow("Starting value:", self._starting_edit)
-        form.addRow("Finite minimum:", self._minimum_edit)
-        form.addRow("Finite maximum:", self._maximum_edit)
+        self._starting_caption = QtWidgets.QLabel(self._selected_editor)
+        self._minimum_caption = QtWidgets.QLabel(self._selected_editor)
+        self._maximum_caption = QtWidgets.QLabel(self._selected_editor)
+        for caption in (self._starting_caption, self._minimum_caption, self._maximum_caption):
+            caption.setTextFormat(QtCore.Qt.TextFormat.RichText)
+        form.addRow(self._starting_caption, self._starting_edit)
+        form.addRow(self._minimum_caption, self._minimum_edit)
+        form.addRow(self._maximum_caption, self._maximum_edit)
         form.addRow("Scale:", self._scale_combo)
         form.addRow("Across datasets:", self._scope_combo)
         editor_layout.addLayout(form)
@@ -622,12 +633,13 @@ class ParametersIcsTab(QtWidgets.QWidget):
         self._dataset_values_group = QtWidgets.QGroupBox("Values by dataset", self._selected_editor)
         self._dataset_values_group.setObjectName("fit_parameter_values_by_dataset")
         dataset_layout = QtWidgets.QVBoxLayout(self._dataset_values_group)
-        self._dataset_values_table = QtWidgets.QTableWidget(0, 3, self._dataset_values_group)
+        self._dataset_values_table = QtWidgets.QTableWidget(0, 4, self._dataset_values_group)
         self._dataset_values_table.setObjectName("fit_parameter_dataset_values")
         self._dataset_values_table.setWordWrap(False)
         self._dataset_values_table.setItemDelegate(_DatasetValueDelegate(self))
+        self._dataset_values_table.setItemDelegateForColumn(3, ScientificNameDelegate(self._dataset_values_table))
         self._dataset_values_table.setHorizontalHeaderLabels(
-            ("Dataset", "Starting value", "Last result")
+            ("Dataset", "Starting value", "Last result", "Unit")
         )
         self._dataset_values_table.horizontalHeader().setStretchLastSection(True)
         self._dataset_values_table.horizontalHeader().setSectionResizeMode(
@@ -1005,6 +1017,12 @@ class ParametersIcsTab(QtWidgets.QWidget):
         last.setFlags(QtCore.Qt.ItemFlag.ItemIsEnabled | QtCore.Qt.ItemFlag.ItemIsSelectable)
         last.setTextAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
         self._param_table.setItem(row, 3, last)
+        unit_item = QtWidgets.QTableWidgetItem(parameter.unit)
+        unit_item.setData(SCIENTIFIC_NAME_HTML_ROLE, format_unit_for_display(parameter.unit))
+        unit_item.setData(QtCore.Qt.AccessibleTextRole, parameter.unit)
+        unit_item.setToolTip(parameter.unit)
+        unit_item.setFlags(QtCore.Qt.ItemFlag.ItemIsEnabled | QtCore.Qt.ItemFlag.ItemIsSelectable)
+        self._param_table.setItem(row, 4, unit_item)
 
     def _last_fit_summary(self, name: str, *, full_precision: bool = False) -> str:
         last = self._last_fit_parameters.get(name)
@@ -1075,6 +1093,17 @@ class ParametersIcsTab(QtWidgets.QWidget):
             self._clear_selected_editor()
             return
         self._selected_editor.setEnabled(True)
+        display_unit = format_unit_for_display(parameter.unit)
+        unit_caption = f" ({display_unit})" if parameter.unit != "1" else ""
+        self._starting_caption.setText("Starting value" + unit_caption + ":")
+        self._minimum_caption.setText("Finite minimum" + unit_caption + ":")
+        self._maximum_caption.setText("Finite maximum" + unit_caption + ":")
+        for caption, label in (
+            (self._starting_caption, "Starting value"),
+            (self._minimum_caption, "Finite minimum"),
+            (self._maximum_caption, "Finite maximum"),
+        ):
+            caption.setAccessibleName(f"{label} {parameter.unit}")
         config = parameter.selected_config
         validator_minimum = (
             -sys.float_info.max
@@ -1199,6 +1228,12 @@ class ParametersIcsTab(QtWidgets.QWidget):
             last_item.setTextAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
             last_item.setToolTip(f"Dataset ID: {dataset_id}")
             self._dataset_values_table.setItem(row, 2, last_item)
+            unit_item = QtWidgets.QTableWidgetItem(parameter.unit)
+            unit_item.setData(SCIENTIFIC_NAME_HTML_ROLE, format_unit_for_display(parameter.unit))
+            unit_item.setData(QtCore.Qt.AccessibleTextRole, parameter.unit)
+            unit_item.setToolTip(parameter.unit)
+            unit_item.setFlags(QtCore.Qt.ItemFlag.ItemIsEnabled | QtCore.Qt.ItemFlag.ItemIsSelectable)
+            self._dataset_values_table.setItem(row, 3, unit_item)
         del blocker
         self._size_dataset_values_table(self._dataset_values_table)
 

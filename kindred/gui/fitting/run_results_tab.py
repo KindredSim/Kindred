@@ -17,6 +17,7 @@ from PySide6.QtCore import Qt, Signal
 
 from kindred.core.analysis.fit_evaluation_outcome import ScientificUnavailable
 from kindred.core.analysis.fit_statistics import FitMetric
+from kindred.core.quantity_units import format_unit_for_display
 from kindred.gui.display_name_policy import (
     TAB_LABEL_MAX_CHARS,
     compact_dataset_label,
@@ -33,6 +34,7 @@ from kindred.gui.widgets.grid_plot_view import DatasetPlotPresentation, GridPlot
 __all__ = ["FitTrackerPanel", "ResultsSummaryDialog", "RunResultsTab"]
 
 ColorResolver = Callable[[str], object]
+
 
 def _format_metric(value: object) -> str:
     if isinstance(value, FitMetric):
@@ -309,17 +311,21 @@ class FitTrackerPanel(QtWidgets.QWidget):
             label.copy_break_positions.clear()
             metrics = label.fontMetrics()
             number = f"{value:.6g}"
-            suffix = "" if unit == "1" else " " + unit
-            numeric_width = metrics.horizontalAdvance("−8.88888e+308")
+            suffix = "" if unit == "1" else " " + format_unit_for_display(unit)
             document = QtGui.QTextDocument()
             document.setDefaultFont(label.font())
             document.setDocumentMargin(0)
+            document.setHtml(suffix)
+            numeric_width = (
+                metrics.horizontalAdvance("−8.88888e+308")
+                + math.ceil(document.idealWidth())
+            )
             document.setHtml(symbol + " = ")
             symbol_width = math.ceil(document.idealWidth()) + 4
             context_budget = max(0, min(metrics.horizontalAdvance("M" * 28), width - symbol_width - numeric_width - 24))
-            compact = metrics.elidedText(" ".join((context + suffix).splitlines()), Qt.TextElideMode.ElideRight, context_budget)
-            prefix = html.escape(compact) + " · " if compact else ""
-            numeric_html = ' = <span style="white-space: nowrap">' + html.escape(number) + '</span>'
+            compact = metrics.elidedText(" ".join(context.splitlines()), Qt.TextElideMode.ElideRight, context_budget)
+            prefix = html.escape(compact) + " " if compact else ""
+            numeric_html = ' = <span style="white-space: nowrap">' + html.escape(number) + suffix + '</span>'
             if symbol_width + numeric_width > width:
                 # Rich text retains scientific formatting; explicit opportunities
                 # let an authored unbroken name wrap without splitting its number.
@@ -332,9 +338,10 @@ class FitTrackerPanel(QtWidgets.QWidget):
                 label.setText(document.toHtml())
             else:
                 label.setText(prefix + symbol + numeric_html)
-            label.setAccessibleName(f"{context} · {plain_symbol} = {number}{suffix}")
+            accessible_unit = f" {unit}" if unit != "1" else ""
+            label.setAccessibleName(f"{context} {plain_symbol} = {number}{accessible_unit}")
             label.setToolTip(label.accessibleName())
-            entry_width = min(width, metrics.horizontalAdvance(compact + (" · " if compact else "")) + symbol_width + numeric_width)
+            entry_width = min(width, metrics.horizontalAdvance(compact + (" " if compact else "")) + symbol_width + numeric_width)
             label.setFixedWidth(entry_width)
             label.setMinimumHeight(0)
             label.setMaximumHeight(16777215)

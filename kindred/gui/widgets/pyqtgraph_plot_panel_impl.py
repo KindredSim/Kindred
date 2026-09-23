@@ -2,7 +2,19 @@
 
 from __future__ import annotations
 
-from kindred.core.quantity_units import CUBIC_METRE, SECOND, Unit, conversion_scale, presentation_unit, scientific_unit
+import html
+
+from kindred.core.quantity_units import (
+    CUBIC_METRE,
+    MOLAR,
+    SECOND,
+    Unit,
+    conversion_scale,
+    format_unit_for_display,
+    presentation_unit,
+    reconcile_unit_choices,
+    scientific_unit,
+)
 
 import io
 import time
@@ -22,7 +34,11 @@ from kindred.core.result_repository import SimulationResultValue
 from kindred.gui.curve_copy_headers import copy_column_header, copy_series_label
 from kindred.gui.display_name_policy import literal_tooltip
 from kindred.gui.theme_manager import plot_background_color, plot_foreground_color
-from kindred.gui.ui_helpers import clamp_initial_size
+from kindred.gui.ui_helpers import (
+    SCIENTIFIC_NAME_HTML_ROLE,
+    ScientificNameComboBox,
+    clamp_initial_size,
+)
 from kindred.gui.interactive_preview import InteractivePreviewRequest
 from kindred.gui.plot_config import (
     TIME_DISPLAY_UNIT_FACTORS,
@@ -605,7 +621,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         volume_host = QtWidgets.QWidget(appearance)
         volume_layout = QtWidgets.QHBoxLayout(volume_host)
         volume_layout.addWidget(QtWidgets.QLabel("Volume Unit", volume_host))
-        self._volume_unit_combo = QtWidgets.QComboBox(volume_host)
+        self._volume_unit_combo = ScientificNameComboBox(volume_host)
         self._volume_unit_combo.setAccessibleName("Volume Unit")
         self._volume_unit_combo.setToolTip(
             "Use one volume unit for plot axes and intervention labels. Authored uses the initial-volume "
@@ -616,7 +632,11 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         self._volume_unit_action = QtWidgets.QWidgetAction(appearance)
         self._volume_unit_action.setDefaultWidget(volume_host)
         appearance.addAction(self._volume_unit_action)
-        self._volume_unit_combo.currentTextChanged.connect(self._apply_volume_unit_change)
+        self._volume_unit_combo.currentIndexChanged.connect(
+            lambda _index: self._apply_volume_unit_change(
+                self._volume_unit_combo.currentData()
+            )
+        )
         for axis, menu in axis_menus.items():
             for key, label in ((f"auto_{axis}", "Auto Range"), (f"mouse_{axis}", "Mouse Navigation"),
                                (f"pan_{axis}", "Auto Pan"), (f"log_{axis}", "Log Scale"),
@@ -801,9 +821,18 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         units = self._volume_unit_choices()
         with QtCore.QSignalBlocker(self._volume_unit_combo):
             self._volume_unit_combo.clear()
-            self._volume_unit_combo.addItems(("Authored", *(unit.symbol for unit in units)))
-            self._volume_unit_combo.setCurrentText(
-                self._volume_display_unit.symbol if self._volume_display_unit is not None else "Authored"
+            self._volume_unit_combo.addItem("Authored", "Authored")
+            for unit in units:
+                self._volume_unit_combo.addItem(unit.symbol, unit.symbol)
+                self._volume_unit_combo.setItemData(
+                    self._volume_unit_combo.count() - 1,
+                    format_unit_for_display(unit),
+                    SCIENTIFIC_NAME_HTML_ROLE,
+                )
+            self._volume_unit_combo.setCurrentIndex(
+                self._volume_unit_combo.findData(
+                    self._volume_display_unit.symbol if self._volume_display_unit is not None else "Authored"
+                )
             )
         available = self._render_input is not None and self._render_input.authored_volume_unit is not None
         self._volume_unit_action.setEnabled(available)
@@ -998,7 +1027,10 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         self._axis_display_units: dict[tuple[str, tuple], Unit] = {}
         self._volume_display_unit = None
         self._axis_toolbar.set_axis_unit_choices(
-            x_units=tuple(TIME_DISPLAY_UNIT_FACTORS),
+            x_units=tuple(
+                (unit, format_unit_for_display(unit))
+                for unit in TIME_DISPLAY_UNIT_FACTORS
+            ),
             selected_x="s",
             y_units=(),
             selected_y=None,
@@ -1647,10 +1679,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
 
     def _volume_unit_choices(self) -> tuple[Unit, ...]:
         units = self._render_input.volume_unit_options if self._render_input is not None else ()
-        selected = self._volume_display_unit
-        if selected is not None and all(unit.symbol != selected.symbol for unit in units):
-            units = (*units, selected)
-        return units
+        return reconcile_unit_choices(units, self._volume_display_unit)
 
     def _display_unit_choices(self, render_input: ResultRenderInput, axis: str) -> tuple[Unit, ...]:
         source = render_input.x_unit if axis == "x" else render_input.y_unit
@@ -1660,9 +1689,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         if source.compatible(CUBIC_METRE) and render_input.authored_volume_unit is not None:
             return self._volume_unit_choices() or (selected,)
         options = render_input.x_unit_options if axis == "x" else render_input.y_unit_options
-        if any(option.symbol == selected.symbol for option in options):
-            return options
-        return (*options, selected)
+        return reconcile_unit_choices(options, selected)
 
     def _display_unit_state(
         self,
@@ -1694,9 +1721,12 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
     def _configure_axis_unit_controls(self, render_input: ResultRenderInput) -> None:
         x_unit, y_unit, _x_scale, _y_scale = self._display_unit_state(render_input)
         def options(axis, source, selected):
-            units = tuple(unit.symbol for unit in self._display_unit_choices(render_input, axis))
+            units = tuple(
+                (unit.symbol, format_unit_for_display(unit))
+                for unit in self._display_unit_choices(render_input, axis)
+            )
             if source is not None and source.compatible(CUBIC_METRE) and render_input.authored_volume_unit is not None:
-                return ("Authored", *units), selected if self._volume_display_unit is not None else "Authored"
+                return (("Authored", ""), *units), selected if self._volume_display_unit is not None else "Authored"
             return units, selected
         x_units, x_unit = options("x", render_input.x_unit, x_unit)
         y_units, y_unit = options("y", render_input.y_unit, y_unit)
@@ -1716,15 +1746,15 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
             render_input
         )
         if self._has_time_x(render_input):
-            x_label = f"Time ({x_unit})"
+            x_label = f"Time ({format_unit_for_display(x_unit)})"
         elif x_unit is not None:
-            x_label = f"{render_input.x_label} ({x_unit})"
+            x_label = f"{html.escape(render_input.x_label)} ({format_unit_for_display(x_unit)})"
         else:
-            x_label = render_input.x_label
+            x_label = html.escape(render_input.x_label)
         y_label = (
-            f"{render_input.y_label} ({y_unit})"
+            f"{html.escape(render_input.y_label)} ({format_unit_for_display(y_unit)})"
             if y_unit is not None
-            else render_input.y_label
+            else html.escape(render_input.y_label)
         )
         if self._presentation.plot_transform != "original":
             derivative_label = f"d({y_label}) / d({x_label})"
@@ -1735,7 +1765,11 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
 
     @staticmethod
     def _derivative_unit(x_unit: str | None, y_unit: str | None) -> str | None:
-        return f"{y_unit}/{x_unit}" if x_unit is not None and y_unit is not None else None
+        if x_unit is None or y_unit is None:
+            return None
+        numerator = f"({y_unit})" if "*" in y_unit or "/" in y_unit else y_unit
+        denominator = f"({x_unit})" if "*" in x_unit or "/" in x_unit else x_unit
+        return f"{numerator}/{denominator}"
 
     def _coordinate_scales(self, render_input: ResultRenderInput) -> tuple[float, float]:
         _x_unit, _y_unit, x_scale, y_scale = self._display_unit_state(render_input)
@@ -2010,7 +2044,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
                 name = f"{block.label}: {series_name}"
                 unit = block.unit_for(series_name)
                 if self._render_input.y_unit is None and unit is not None and unit.compatible(CUBIC_METRE):
-                    name += f" [{dict(transformed.y_units)[series_name]}]"
+                    name += f" [{format_unit_for_display(dict(transformed.y_units)[series_name])}]"
                 legend_name = name if legend_pending else None
                 legend_pending = False
                 if item is None:
@@ -2066,8 +2100,25 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         return sample
 
     def _render_analysis(self, render_input: ResultRenderInput) -> None:
+        concentration_unit = (
+            self._selected_display_unit("y", render_input.y_unit)
+            if render_input.y_unit is not None and render_input.y_unit.compatible(MOLAR)
+            else MOLAR
+        )
+        time_unit = (
+            self._selected_display_unit("x", SECOND)
+            if self._has_time_x(render_input)
+            else SECOND
+        )
+        volume_unit = (
+            self._selected_volume_unit()
+            if render_input.authored_volume_unit is not None
+            else CUBIC_METRE
+        )
         self._parameter_table.update_parameters(
-            {name: (value, unit) for name, value, unit in render_input.parameters}
+            render_input.parameters_for_display(
+                concentration_unit=concentration_unit, time_unit=time_unit, volume_unit=volume_unit,
+            )
         )
         result = render_input.statistics_result
         if result is None or not render_input.statistics_series_names:
@@ -2078,6 +2129,8 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
             species_data={name: result.series[name] for name in render_input.statistics_series_names},
             intervention_execution=result.intervention_execution,
             presentation_boundaries=result.presentation_boundaries,
+            concentration_display_unit=concentration_unit,
+            time_display_unit=time_unit,
         )
     def _project_completion_warning(
         self,
@@ -2289,10 +2342,11 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
             accent = self._annotation_accent(annotation)
             if prior is None:
                 label = pg.TextItem(
-                    text,
+                    "",
                     color=(238, 238, 238), anchor=(0.0, 0.5),
                     border=pg.mkPen(accent), fill=pg.mkBrush(30, 30, 30, 210),
                 )
+                label.setHtml(text)
                 label.setFlag(
                     QtWidgets.QGraphicsItem.GraphicsItemFlag.ItemIsMovable, True
                 )
@@ -2303,7 +2357,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
                 prior = _AnnotationLabel(label, QtCore.QPointF(label.pos()), weighted_start / weight, lane)
             else:
                 label = prior.item
-                label.setText(text)
+                label.setHtml(text)
                 label.border = pg.mkPen(accent)
                 label.update()
             prior.event_x = weighted_start / weight
@@ -2429,7 +2483,8 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         if render_input is None or render_input.authored_volume_unit is None:
             return
         chosen = None if symbol == "Authored" else next(unit for unit in self._volume_unit_choices() if unit.symbol == symbol)
-        if chosen == self._volume_display_unit:
+        current = self._volume_display_unit.symbol if self._volume_display_unit is not None else "Authored"
+        if symbol == current:
             return
         self._axis_range = self._capture_view_range()
         old_x_scale, old_y_scale = self._coordinate_scales(render_input)

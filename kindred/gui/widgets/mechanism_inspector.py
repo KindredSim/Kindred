@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import html
 import json
 from fractions import Fraction
 from collections.abc import Callable, Mapping
@@ -24,10 +25,10 @@ from kindred.core.intervention_schedule import (
 from kindred.core.kinetics import ArrheniusRateModel, EyringRateModel
 from kindred.core.mechanism_metadata import MechanismMetadataView
 from kindred.core.ode_builder import build_effective_rate_coefficient_evaluator
+from kindred.core.quantity_units import format_unit_for_display
 from kindred.core.simulator.dsl_parse import DslAnalysis, PreparedDslRequestSet
 from kindred.core.simulator.parameter_algebra import (
     apply_parameter_algebra_spec_to_mechanism,
-    parameter_algebra_spec_from_mechanism,
 )
 from kindred.core.simulator.parameter_coordinates import build_parameter_target_map
 from kindred.core.simulator.parameter_algebra_spec import ParameterAlgebraSpec
@@ -84,7 +85,7 @@ def build_mechanism_inspector_sections(
         ),
         steps_text=_safe_format_section(
             "steps",
-            lambda: _format_steps_from_authority(mechanism),
+            lambda: _format_steps_from_authority(mechanism, parameter_spec=parameter_spec),
         ),
         equations_text=_safe_format_section(
             "equations",
@@ -128,8 +129,8 @@ def _format_mechanism_reference(
         getattr(mechanism, "metadata", {}) or {}
     )
     parameter_provenance = {
-        str(statement.name): str(statement.expr_src)
-        for statement in parameter_spec.param_statements
+        str(statement.name): expression_to_source(statement.expr)
+        for statement in parameter_spec.parameter_block.lines
     }
     step_lines: list[str] = []
     uses_standard_concentration = False
@@ -156,17 +157,23 @@ def _format_mechanism_reference(
     lines.extend(("", *(step_lines or ("No reaction steps.",))))
 
     algebra_lines = [
-        f"param {statement.name} = {statement.expr_src}"
-        for statement in parameter_spec.param_statements
+        html.escape(
+            f"param {statement.name} = {expression_to_source(statement.expr)}"
+            + (f"; unit={statement.declared_unit.symbol}" if statement.declared_unit is not None else "")
+        )
+        for statement in parameter_spec.parameter_block.lines
     ]
     if parameter_spec.observable_block is not None:
         algebra_lines.extend(
-            f"let {statement.name} = {expression_to_source(statement.expr)}"
+            html.escape(
+                f"let {statement.name} = {expression_to_source(statement.expr)}"
+                + (f"; unit={statement.declared_unit.symbol}" if statement.declared_unit is not None else "")
+            )
             for statement in parameter_spec.observable_block.lines
         )
     if algebra_lines:
         lines.extend(("", "Algebra", *algebra_lines))
-    return "\n".join(lines)
+    return "<pre>" + "\n".join(lines) + "</pre>"
 
 
 def _format_mechanism_step(
@@ -178,7 +185,7 @@ def _format_mechanism_step(
 ) -> tuple[str, bool]:
     step_index = int(entry["step_index"])
     kind = str(entry["kind"])
-    context = str(entry["context"]).replace(" <-> ", " ⇌ ").replace(" -> ", " → ")
+    context = html.escape(str(entry["context"]).replace(" <-> ", " ⇌ ").replace(" -> ", " → "))
     source_coordinates = {
         str(role): str(name)
         for role, name in dict(entry.get("source_coordinates") or {}).items()
@@ -318,9 +325,9 @@ def _format_coordinate(
     unit: str,
     provenance: str | None,
 ) -> str:
-    unit_text = "" if unit == "1" else f" [{unit}]"
-    provenance_text = "" if provenance is None else f" (derived from {provenance})"
-    return f"{name}{unit_text}{provenance_text}"
+    unit_text = "" if unit == "1" else f" [{format_unit_for_display(unit)}]"
+    provenance_text = "" if provenance is None else f" (derived from {html.escape(provenance)})"
+    return f"{html.escape(name)}{unit_text}{provenance_text}"
 
 
 def _family_provenance(
@@ -341,11 +348,12 @@ def _format_number(value: object) -> str:
     return format(float(value), ".15g")
 
 
-def _format_steps_from_authority(mechanism: object) -> str:
+def _format_steps_from_authority(mechanism: object, *, parameter_spec: ParameterAlgebraSpec) -> str:
     coefficient_authority = build_effective_rate_coefficient_evaluator(mechanism)
     return _format_steps(
         mechanism,
         authority_snapshot=coefficient_authority.authority_snapshot,
+        parameter_spec=parameter_spec,
     )
 
 
@@ -353,6 +361,7 @@ def _format_steps(
     mechanism: object,
     *,
     authority_snapshot: tuple[Mapping[str, object], ...],
+    parameter_spec: ParameterAlgebraSpec,
 ) -> str:
     entries = get_step_index_map(mechanism)
     parameter_names_by_step_index: dict[int, list[str]] = {}
@@ -389,13 +398,14 @@ def _format_steps(
                         sort_keys=True,
                     )
                 )
-            spec = parameter_algebra_spec_from_mechanism(mechanism)
-            if spec is not None:
-                coordinate_names = set((entry.get("source_coordinates") or {}).values()) | set(parameter_names)
-                for statement in spec.parameter_block.lines:
-                    if statement.name in coordinate_names:
-                        kind = spec.parameter_assignment_kind(statement.name)
-                        lines.append(f"  Retained {kind}: {statement.name} = {expression_to_source(statement.expr)}")
+            coordinate_names = set((entry.get("source_coordinates") or {}).values()) | set(parameter_names)
+            for statement in parameter_spec.parameter_block.lines:
+                if statement.name in coordinate_names:
+                    kind = parameter_spec.parameter_assignment_kind(statement.name)
+                    declaration = f"{statement.name} = {expression_to_source(statement.expr)}"
+                    if statement.declared_unit is not None:
+                        declaration += f"; unit={statement.declared_unit.symbol}"
+                    lines.append(f"  Retained {kind}: {declaration}")
     else:
         lines.append("No indexed DSL reaction or equilibrium steps.")
 
@@ -584,12 +594,22 @@ class MechanismInspectorDialog(QtWidgets.QDialog):
                 "",
             ),
         ):
-            editor = QtWidgets.QPlainTextEdit(self)
+            editor = (
+                QtWidgets.QTextBrowser(self)
+                if title == "Mechanism"
+                else QtWidgets.QPlainTextEdit(self)
+            )
             editor.setObjectName(object_name)
             editor.setReadOnly(True)
-            if no_wrap:
+            if no_wrap and isinstance(editor, QtWidgets.QPlainTextEdit):
                 editor.setLineWrapMode(QtWidgets.QPlainTextEdit.LineWrapMode.NoWrap)
-            editor.setPlainText(text)
+            if isinstance(editor, QtWidgets.QTextBrowser):
+                editor.setOpenLinks(False)
+                editor.setOpenExternalLinks(False)
+                editor.setLineWrapMode(QtWidgets.QTextEdit.LineWrapMode.NoWrap)
+                editor.setHtml(text)
+            else:
+                editor.setPlainText(text)
             tab_index = tabs.addTab(editor, title)
             if tooltip:
                 tabs.setTabToolTip(tab_index, tooltip)

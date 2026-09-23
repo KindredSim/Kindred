@@ -117,6 +117,7 @@ def finalize_simulation_result(
     parameter_values_at_temperature: Callable[[float, tuple[str, ...]], Mapping[str, float]],
     parameter_algebra_spec: object,
     parameters: tuple[tuple[str, float, str], ...] = (),
+    parameter_classifications: tuple[tuple[str, str, str], ...] = (),
     solver_provenance_updates: Mapping[str, object] | None = None,
     cancellation_control: SimulationCancellationControl | None = None,
 ) -> SimulationResultValue:
@@ -267,6 +268,7 @@ def finalize_simulation_result(
         discontinuity_ids=result.discontinuity_ids,
         scalars=finalized_algebra_scalars,
         parameters=parameters,
+        parameter_classifications=parameter_classifications,
         solver_provenance=frozen_solver_provenance,
         requested_algebra_outputs=requested_algebra_outputs,
         succeeded_algebra_outputs=succeeded_algebra_outputs,

@@ -4,8 +4,11 @@
 from __future__ import annotations
 
 from kindred.gui.display_name_policy import literal_tooltip
+from kindred.gui.display_name_policy import scientific_symbol_html, scientific_symbol_spoken
+from kindred.core.quantity_units import format_unit_for_display
+from kindred.gui.ui_helpers import SCIENTIFIC_NAME_HTML_ROLE, ScientificNameDelegate
 
-from typing import Dict, Optional, Tuple
+from typing import Mapping, Optional
 
 from PySide6 import QtCore, QtWidgets
 
@@ -27,6 +30,8 @@ class ParameterStatisticsTable(QtWidgets.QTableWidget):
         self.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
         self.setColumnCount(3)
         self.setHorizontalHeaderLabels(["Name", "Value", "Unit"])
+        self.setItemDelegateForColumn(0, ScientificNameDelegate(self))
+        self.setItemDelegateForColumn(2, ScientificNameDelegate(self))
         header = self.horizontalHeader()
         header.setStretchLastSection(False)
         header.setSectionResizeMode(0, QtWidgets.QHeaderView.Stretch)
@@ -38,14 +43,18 @@ class ParameterStatisticsTable(QtWidgets.QTableWidget):
             QtWidgets.QSizePolicy.Policy.Expanding,
         )
 
-    def update_parameters(self, parameters: Dict[str, Tuple[float, str]]) -> None:
+    def update_parameters(
+        self,
+        parameters: Mapping[str, tuple[float | None, str, str, str]],
+    ) -> None:
         """
         Update table with parameter values.
 
         Parameters
         ----------
         parameters : dict
-            Mapping name -> (value, unit)
+            Mapping name -> (display value, unit, family, role).
+            A missing value means the display conversion is unavailable.
         """
         names = tuple(sorted(parameters.keys(), key=_param_sort_key))
         current_names = tuple(
@@ -58,7 +67,7 @@ class ParameterStatisticsTable(QtWidgets.QTableWidget):
             self.setRowCount(len(names))
             for row, name in enumerate(names):
                 name_item = QtWidgets.QTableWidgetItem()
-                name_item.setData(QtCore.Qt.ItemDataRole.UserRole, str(name))
+                name_item.setData(QtCore.Qt.ItemDataRole.UserRole, name)
                 name_item.setTextAlignment(QtCore.Qt.AlignCenter)
                 self.setItem(row, 0, name_item)
                 for column in (1, 2):
@@ -66,12 +75,20 @@ class ParameterStatisticsTable(QtWidgets.QTableWidget):
                     item.setTextAlignment(QtCore.Qt.AlignCenter)
                     self.setItem(row, column, item)
         for row, name in enumerate(names):
-            value, unit = parameters[name]
-            self.item(row, 0).setText(str(name))
-            self.item(row, 0).setToolTip(literal_tooltip(str(name)))
-            self.item(row, 1).setText(f"{float(value):.6g}")
-            self.item(row, 2).setText(str(unit))
-            self.item(row, 2).setToolTip(literal_tooltip(str(unit)))
+            value, unit, family, role = parameters[name]
+            name_item = self.item(row, 0)
+            name_item.setText(name)
+            name_item.setData(SCIENTIFIC_NAME_HTML_ROLE,
+                              scientific_symbol_html(name, family=family, role=role))
+            name_item.setData(QtCore.Qt.AccessibleTextRole,
+                              scientific_symbol_spoken(name, family=family, role=role))
+            name_item.setToolTip(literal_tooltip(name))
+            self.item(row, 1).setText("Unavailable" if value is None else f"{value:.6g}")
+            unit_item = self.item(row, 2)
+            unit_item.setText(unit)
+            unit_item.setData(SCIENTIFIC_NAME_HTML_ROLE, format_unit_for_display(unit))
+            unit_item.setData(QtCore.Qt.AccessibleTextRole, unit)
+            unit_item.setToolTip(literal_tooltip(unit))
 
 
 def _param_sort_key(name: str):

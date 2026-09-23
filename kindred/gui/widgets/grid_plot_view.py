@@ -12,7 +12,7 @@ from typing import TypeAlias
 from PySide6 import QtCore, QtGui, QtWidgets
 
 from kindred.gui.curve_copy_headers import copy_column_header
-from kindred.core.quantity_units import Unit, MOLAR, SECOND
+from kindred.core.quantity_units import Unit, MOLAR, SECOND, format_unit_for_display
 from kindred.gui.fitting.curve_projection import (
     focused_units, prepared_fit_units, scale_values, focused_model_chunks, focused_model_rows,
 )
@@ -59,7 +59,7 @@ def _fit_y_axis_label(
     units = dict(quantity_units)
     visible = tuple(dict.fromkeys(visible_y_names))
     if observed_unit is not None and observed_unit.compatible(MOLAR) and visible and all(units.get(name) == observed_unit for name in visible):
-        return "Concentration", observed_unit.symbol
+        return "Concentration", format_unit_for_display(observed_unit)
     return "Value", None
 
 
@@ -555,13 +555,14 @@ class GridPlotView(QtWidgets.QWidget):
         plot.setMenuEnabled(False)
         x_label = "Time" if x_name == "t" else x_name
         if x_name == "t":
-            plot.setLabel("bottom", x_label, units="s")
+            plot.setLabel("bottom", x_label, units=format_unit_for_display(SECOND))
         else:
             plot.setLabel("bottom", html.escape(x_label))
         plot.showGrid(x=True, y=True, alpha=0.3)
         font = self.font()
         for axis_name in ("left", "bottom"):
             axis = plot.getAxis(axis_name)
+            axis.enableAutoSIPrefix(False)
             if axis.style["tickFont"] != font:
                 axis.setWidth(None) if axis_name == "left" else axis.setHeight(None)
             axis.setTickFont(font)
@@ -662,7 +663,7 @@ class GridPlotView(QtWidgets.QWidget):
             common_x = (x_display is not None and model_x is not None
                         and model_x.compatible(x_display) and observed_x.compatible(x_display))
             plot.setLabel("bottom", "Time" if x_name == "t" else html.escape(x_name),
-                          units=x_display.symbol if common_x else None)
+                          units=format_unit_for_display(x_display) if common_x else None)
             plot._kindred_appearance = state
 
     def _update_series(self, identity: str, kind: str, species: str, data: tuple) -> None:

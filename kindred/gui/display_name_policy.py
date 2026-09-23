@@ -58,6 +58,9 @@ def _scientific_parts(symbol: str, family: str, role: str) -> tuple[str, str] | 
         "Constant", "Arrhenius", "Eyring", "reverse", "equilibrium"
     } and re.fullmatch(re.escape(role) + r"[0-9]+", symbol):
         return ("K", "eq" + symbol[3:]) if role == "Keq" else ("k", symbol[1:])
+    if family == "Arrhenius" and role in {"A", "Ea"} and re.fullmatch(re.escape(role) + r"[0-9]+", symbol):
+        index = symbol[len(role):]
+        return ("E", "a" + index) if role == "Ea" else ("A", index)
     if (family, role) in {
         ("Eyring", "dG_act"), ("Eyring", "kappa"),
         ("equilibrium", "dG_eq"),

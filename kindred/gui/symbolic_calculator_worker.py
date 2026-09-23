@@ -60,9 +60,9 @@ class CalculatorWorker(QtCore.QThread):
                     parent_pipe.send(query)
                 ready = wait((parent_pipe, process.sentinel), timeout=0.05)
                 if parent_pipe in ready:
-                    query, result, context, error, copy_text, reuse_queries = parent_pipe.recv()
+                    query, result_html, context, error, copy_text, reuse_queries = parent_pipe.recv()
                     if not self._shutdown.is_set():
-                        self.result.emit(query, result, context, error, copy_text, reuse_queries)
+                        self.result.emit(query, result_html, context, error, copy_text, reuse_queries)
                 if process.sentinel in ready:
                     if not self._shutdown.is_set():
                         self.failed.emit("Calculator child exited unexpectedly; the next explicit query can start a new context.")

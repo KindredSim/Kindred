@@ -3,9 +3,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from decimal import Decimal, InvalidOperation
+from html import escape
 import math
 from fractions import Fraction
-from kindred.core.quantity_units import Unit, ONE_SCALE, DIMENSIONLESS, MOLAR, SECOND, conversion_scale, scientific_unit
+from kindred.core.quantity_units import (
+    Unit, ONE_SCALE, DIMENSIONLESS, MOLAR, SECOND, conversion_scale,
+    format_unit_for_display, scientific_unit,
+)
 from kindred.core.algebra.unit_preparation import UnitOperation, operation_units
 from types import MappingProxyType
 from typing import Any, Mapping, Sequence
@@ -102,6 +106,12 @@ def _quantity_text(quantity):
     if isinstance(quantity, tuple):
         return "[" + ", ".join(_quantity_text(item) for item in quantity) + "]"
     return quantity.symbol if isinstance(quantity, Unit) else "unspecified"
+
+
+def _quantity_html(quantity):
+    if isinstance(quantity, tuple):
+        return "[" + ", ".join(_quantity_html(item) for item in quantity) + "]"
+    return format_unit_for_display(quantity) if isinstance(quantity, Unit) else "unspecified"
 
 
 def _entries(result):
@@ -377,25 +387,22 @@ def _native_arithmetic(left: _Value, operator: str, right: _Value) -> Any:
 @dataclass(frozen=True, slots=True)
 class SymbolicCalculatorResult:
     query: str
-    result_text: str
+    result_html: str
     copy_text: str
     assumptions: tuple[str, ...]
     symbol_legend: Mapping[str, Sequence[str]]
     mechanism_source: str
-    parameter_definitions: Mapping[str, str]
-    let_definitions: Mapping[str, str]
     reuse_queries: tuple[tuple[str, str], ...] = ()
 
-    def full_context_copy_text(self) -> str:
+    def full_context_copy_text(self, authored_definitions: tuple[str, ...]) -> str:
         legend = [f"{kind}: {', '.join(names) or 'none'}" for kind, names in self.symbol_legend.items()]
-        definitions = [f"param {name} := {expr}" for name, expr in self.parameter_definitions.items()]
-        definitions += [f"let {name} := {expr}" for name, expr in self.let_definitions.items()]
         result = self.copy_text
         if self.query == "odes()":
             result += "\nRows: " + ", ".join(f"d{name}/dt" for name in self.symbol_legend["Species"])
         return "\n".join((f"Query: {self.query}", f"Result: {result}", "Assumptions:",
-                          *self.assumptions, "Canonical symbol legend:", *legend, "Definitions:",
-                          *(definitions or ["none"]), "Mechanism source:", self.mechanism_source))
+                          *self.assumptions, "Scientific-coordinate legend (calculation units):", *legend,
+                          "Authored definitions (source units):", *(authored_definitions or ("none",)),
+                          "Mechanism source:", self.mechanism_source))
 
 
 @dataclass(frozen=True, slots=True)
@@ -413,6 +420,7 @@ class CalculatorContext:
     parameter_definitions: Mapping[str, str]
     let_definitions: Mapping[str, str]
     coordinate_units: Mapping[str, Unit | None]
+    authored_definitions: tuple[str, ...]
 
 
 def symbolic_calculator_available(mechanism: Any) -> tuple[bool, str]:
@@ -460,12 +468,23 @@ def build_calculator_context(mechanism: Any, *, mechanism_source: str) -> Calcul
     quantities = dict(spec.quantity_units)
     quantities.update({name: MOLAR for name in (*names, *(f"initial({n})" for n in names))})
     values = {name: _Value(symbol, quantity=quantities.get(name)) for name, symbol in symbols.items() if name not in graph}
+    authored_definitions = tuple(
+        f"{kind} {statement.name} = {expression_to_source(statement.expr)}"
+        + (f"; unit={statement.declared_unit.symbol}" if statement.declared_unit is not None else "")
+        for kind, block in (
+            ("param", spec.parameter_block),
+            ("let", spec.observable_block),
+        )
+        if block is not None
+        for statement in block.lines
+    )
     context = CalculatorContext(
         mechanism, mechanism_source, namespace, names, MappingProxyType(symbols), MappingProxyType(values),
         frozenset(coordinates), (), _Value(sp.ImmutableMatrix([])),
         MappingProxyType({name: expression_to_source(stmt.expr) for name, stmt in statements.items()}),
         MappingProxyType({stmt.name: expression_to_source(stmt.expr) for stmt in compiled.block.lines} if compiled else {}),
         MappingProxyType(quantities),
+        authored_definitions,
     )
     chemistry = build_calculator_chemistry_relations(mechanism, parameter_spec=spec, symbols=symbols)
     closures = {}
@@ -1816,11 +1835,12 @@ def _package_result(context: CalculatorContext, query: str, result) -> SymbolicC
     expression = query
     family = isinstance(result, _Alternatives)
     entries = _entries(result)
-    lines, display_lines, choices = [], [], []
+    lines, display_html_lines, choices = [], [], []
 
-    def append(text, display=None):
+    def append(text, display=None, display_html=None):
         lines.append(text)
-        display_lines.append(text if display is None else display)
+        visible = text if display is None else display
+        display_html_lines.append(escape(visible) if display_html is None else display_html)
 
     for value in entries:
         payload = value.expression
@@ -1842,7 +1862,12 @@ def _package_result(context: CalculatorContext, query: str, result) -> SymbolicC
             reusable = f"solution({expression}, {index})" if family else query
             choices.append((f"Solution {index}: {label}" if family else "Result", reusable))
             if value.quantity is not None:
-                append("Units: " + _quantity_text(value.quantity))
+                unit_text = _quantity_text(value.quantity)
+                append(
+                    "Units: " + unit_text,
+                    display_html='Units: <span style="white-space: nowrap">'
+                    + _quantity_html(value.quantity) + "</span>",
+                )
             if value.quantity is not None or family or isinstance(payload, _Relationships) or value.conditions or value.notices or value.provenance or not _printed_input_supported(context, payload, label):
                 append("Reuse query: " + reusable)
         if value.conditions:
@@ -1859,9 +1884,9 @@ def _package_result(context: CalculatorContext, query: str, result) -> SymbolicC
     copy_text = "\n".join(lines).rstrip()
     if entries and all(isinstance(v.expression, _UnavailableDiagnostic) for v in entries):
         raise SymbolicCalculatorError(copy_text)
-    result_text = "\n".join(display_lines).rstrip()
     if expression == "odes()":
-        result_text += "\nRows: " + ", ".join(f"d{name}/dt" for name in context.species_names)
+        rows_text = "Rows: " + ", ".join(f"d{name}/dt" for name in context.species_names)
+        display_html_lines.append(escape(rows_text))
     assumptions = (
         "Accepted-source symbolic system; no schedules, execution overrides, Fit candidates or Slider drafts.",
         "Coordinates are real; T is positive and fixed in time unless explicit expression dependence is supplied.",
@@ -1874,13 +1899,15 @@ def _package_result(context: CalculatorContext, query: str, result) -> SymbolicC
         "Actual answer conditions, unavailable cases and unresolved alternatives are retained. Active-condition definite integrals require coordinate-free bounds and no other condition parameters; active-condition limits remain unsupported. Series retain direction and order, not inferred neighborhood conditions.",
     )
     return SymbolicCalculatorResult(
-        query, result_text, copy_text, assumptions,
-        {"Species": context.species_names, "Parameters": tuple(sorted(context.parameter_namespace.canonical_names | context.parameter_definitions.keys())),
+        query=query,
+        result_html="<pre>" + "\n".join(display_html_lines).rstrip() + "</pre>",
+        copy_text=copy_text,
+        assumptions=assumptions,
+        symbol_legend={"Species": context.species_names, "Parameters": tuple(sorted(context.parameter_namespace.canonical_names | context.parameter_definitions.keys())),
          "Fixed constants": _FIXED_CONSTANTS, "Time and temperature": ("t [s]", "T [K]"),
          "Energy coordinates": ("Ea, dG_act, dG_eq in J/mol",),
          "Coordinate units": tuple(f"{name} [{unit.symbol}]" for name, unit in dict(parameter_algebra_spec_from_mechanism(context.mechanism).quantity_units).items() if unit is not None and name in context.symbols),
          "Initial coordinates": tuple(f"initial({name})" for name in context.species_names)},
-        context.mechanism_source,
-        context.parameter_definitions, context.let_definitions,
-        tuple(choices),
+        mechanism_source=context.mechanism_source,
+        reuse_queries=tuple(choices),
     )

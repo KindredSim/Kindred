@@ -24,6 +24,8 @@ class ScanInput:
     value: float
     unit: str
     bounds: tuple[Interval, ...]
+    family: str = ""
+    role: str = ""
 
 
 def input_catalog(prepared, config: ScanConfig) -> tuple[ScanInput, ...]:
@@ -71,7 +73,8 @@ def input_catalog(prepared, config: ScanConfig) -> tuple[ScanInput, ...]:
                 admitted.append(component)
             bounds = tuple(admitted)
         entries.append(ScanInput(parameter_key(item.name), item.name,
-                                 config.parameters.get(item.name, item.value), item.unit, bounds))
+                                 config.parameters.get(item.name, item.value), item.unit, bounds,
+                                 item.family, item.role))
     entries.extend((ScanInput(START, "Start time", config.t_start, "s", (Interval(TIME_MIN_S, TIME_MAX_S),)),
                     ScanInput(END, "End time", config.t_end, "s", (Interval(TIME_MIN_S, TIME_MAX_S),))))
     return tuple(entries)

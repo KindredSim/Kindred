@@ -8,6 +8,14 @@ from typing import Mapping, Optional
 import numpy as np
 from PySide6 import QtCore, QtWidgets
 
+from kindred.core.quantity_units import (
+    MOLAR,
+    SECOND,
+    Unit,
+    convert_value,
+    format_unit_for_display,
+)
+from kindred.gui.ui_helpers import SCIENTIFIC_NAME_HTML_ROLE, ScientificNameHeaderView
 from kindred.core.intervention_schedule_compiler import (
     InterventionExecutionContract,
 )
@@ -45,6 +53,9 @@ class SpeciesStatisticsTable(QtWidgets.QTableWidget):
 
         # Configure table
         self.setColumnCount(5)
+        self.setHorizontalHeader(
+            ScientificNameHeaderView(QtCore.Qt.Orientation.Horizontal, self)
+        )
         self.setHorizontalHeaderLabels([
             "Species", "Final", "Max", "t@Max", "CTC"
         ])
@@ -63,16 +74,19 @@ class SpeciesStatisticsTable(QtWidgets.QTableWidget):
             "nonfinite result."
         )
 
-        header.setStretchLastSection(False)
+        header.setStretchLastSection(True)
         for col in range(self.columnCount()):
             header.setSectionResizeMode(col, QtWidgets.QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(0, QtWidgets.QHeaderView.Interactive)  # Species
-        self.setColumnWidth(0, 140)
         self.setAlternatingRowColors(True)
         self.setSizePolicy(
             QtWidgets.QSizePolicy.Policy.Expanding,
             QtWidgets.QSizePolicy.Policy.Expanding,
         )
+
+    def sizeHintForColumn(self, column: int) -> int:
+        width = super().sizeHintForColumn(column)
+        # Qt also accounts for the header, so "Species" always fits.
+        return min(width, 140) if column == 0 else width
 
     def update_results(
         self,
@@ -80,7 +94,9 @@ class SpeciesStatisticsTable(QtWidgets.QTableWidget):
         species_data: Mapping[str, np.ndarray],
         *,
         intervention_execution: InterventionExecutionContract,
-        presentation_boundaries: tuple[SimulationPresentationBoundary, ...] = (),
+        presentation_boundaries: tuple[SimulationPresentationBoundary, ...],
+        concentration_display_unit: Unit,
+        time_display_unit: Unit,
     ) -> None:
         """
         Update table with simulation results.
@@ -99,69 +115,47 @@ class SpeciesStatisticsTable(QtWidgets.QTableWidget):
             Exact intervention pre/post values retained by the primary result;
             these contribute to Max and t@Max without becoming table rows.
         """
-        if not isinstance(
-            intervention_execution,
-            InterventionExecutionContract,
+        ctc_unit = concentration_display_unit.multiply(time_display_unit)
+        for column, label, unit in (
+            (1, "Final", concentration_display_unit),
+            (2, "Max", concentration_display_unit),
+            (3, "t@Max", time_display_unit),
+            (4, "CTC", ctc_unit),
         ):
-            raise TypeError(
-                "intervention_execution must be an "
-                "InterventionExecutionContract."
+            header_item = self.horizontalHeaderItem(column)
+            unit_text = unit.symbol
+            header_item.setText(f"{label} ({unit_text})")
+            header_item.setData(
+                SCIENTIFIC_NAME_HTML_ROLE,
+                f"{label} ({format_unit_for_display(unit)})",
             )
-        boundaries = tuple(presentation_boundaries)
-        if any(
-            not isinstance(boundary, SimulationPresentationBoundary)
-            for boundary in boundaries
-        ):
-            raise TypeError(
-                "presentation_boundaries must contain only "
-                "SimulationPresentationBoundary values."
+            header_item.setToolTip(
+                f"{label} in {format_unit_for_display(unit)}."
             )
         ctc_applicable = intervention_execution.is_empty
-        time = np.asarray(canonical_time, dtype=float)
-        if (
-            time.ndim != 1
-            or time.size == 0
-            or np.any(~np.isfinite(time))
-            or (time.size > 1 and np.any(np.diff(time) <= 0.0))
-        ):
-            raise ValueError(
-                "Scientific statistics require finite, strictly increasing "
-                "canonical simulation time."
-            )
-        normalized: dict[str, np.ndarray] = {}
-        for raw_name, raw_values in species_data.items():
-            name = str(raw_name or "").strip()
-            values = np.asarray(raw_values, dtype=float)
-            if (
-                not name
-                or values.ndim != 1
-                or values.size != time.size
-                or np.any(~np.isfinite(values))
-            ):
-                raise ValueError(
-                    "Scientific statistics series must be named, finite, and "
-                    "aligned with canonical simulation time."
-                )
-            if name in normalized:
-                raise ValueError(
-                    "Scientific statistics series names must be unique after "
-                    "normalization."
-                )
-            normalized[name] = values
-        projected_roster = tuple(sorted(normalized))
+        projected_roster = tuple(sorted(species_data))
         calculated: list[tuple[str, ...]] = []
         for species_name in projected_roster:
-            concentrations = normalized[species_name]
+            concentrations = species_data[species_name]
             final_conc = concentrations[-1]
             max_conc = np.max(concentrations)
             idx_max = np.argmax(concentrations)
-            max_time = time[idx_max]
-            for boundary in boundaries:
+            max_time = canonical_time[idx_max]
+            for boundary in presentation_boundaries:
                 for boundary_values in (boundary.pre_state, boundary.post_state):
                     boundary_value = dict(boundary_values).get(species_name)
                     if boundary_value is not None and boundary_value > max_conc:
                         max_conc = boundary_value
                         max_time = boundary.time
+            try:
+                display_final = convert_value(final_conc, MOLAR, concentration_display_unit)
+                display_max = convert_value(max_conc, MOLAR, concentration_display_unit)
+                display_time = convert_value(max_time, SECOND, time_display_unit)
+                final_text, maximum_text, time_text = (
+                    f"{display_final:.6g}", f"{display_max:.6g}", f"{display_time:.6g}"
+                )
+            except ValueError:
+                final_text = maximum_text = time_text = "Unavailable"
             ctc_text = "—"
             if ctc_applicable:
                 integrand = (
@@ -169,18 +163,21 @@ class SpeciesStatisticsTable(QtWidgets.QTableWidget):
                     if final_conc == 0.0
                     else np.abs(concentrations - final_conc)
                 )
-                ctc = integrate_ctc(time, integrand)
-                ctc_text = (
-                    f"{ctc.value:.6g}"
-                    if ctc.available
-                    else "Unavailable"
-                )
+                ctc = integrate_ctc(canonical_time, integrand)
+                ctc_text = "Unavailable"
+                if ctc.available:
+                    source_unit = MOLAR.multiply(SECOND)
+                    try:
+                        display_ctc = convert_value(ctc.value, source_unit, ctc_unit)
+                        ctc_text = f"{display_ctc:.6g}"
+                    except ValueError:
+                        ctc_text = "Unavailable"
             calculated.append(
                 (
                     species_name,
-                    f"{final_conc:.6g}",
-                    f"{max_conc:.6g}",
-                    f"{max_time:.6g}",
+                    final_text,
+                    maximum_text,
+                    time_text,
                     ctc_text,
                 )
             )

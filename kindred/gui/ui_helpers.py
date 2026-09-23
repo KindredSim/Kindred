@@ -18,7 +18,9 @@ __all__ = [
     "SCIENTIFIC_NAME_HTML_ROLE",
     "ControlRowsLayout",
     "configure_compact_numeric_edit",
+    "ScientificNameComboBox",
     "ScientificNameDelegate",
+    "ScientificNameHeaderView",
     "clamp_initial_size",
     "make_bounded_label",
     "make_placeholder_label",
@@ -300,6 +302,10 @@ class ScientificNameDelegate(QtWidgets.QStyledItemDelegate):
         doc = QtGui.QTextDocument()
         doc.setDocumentMargin(0)
         doc.setDefaultFont(opt.font)
+        text_option = QtGui.QTextOption(opt.displayAlignment)
+        text_option.setWrapMode(QtGui.QTextOption.WrapMode.NoWrap)
+        doc.setDefaultTextOption(text_option)
+        doc.setTextWidth(max(0, rect.width()))
         doc.setHtml(markup)
         painter.save()
         painter.setClipRect(rect)
@@ -308,8 +314,98 @@ class ScientificNameDelegate(QtWidgets.QStyledItemDelegate):
         context.palette = opt.palette
         if opt.state & QtWidgets.QStyle.State_Selected:
             context.palette.setColor(QtGui.QPalette.Text, opt.palette.color(QtGui.QPalette.HighlightedText))
-        doc.documentLayout().draw(painter, context)
-        painter.restore()
+        try:
+            doc.documentLayout().draw(painter, context)
+        finally:
+            painter.restore()
+
+
+class ScientificNameComboBox(QtWidgets.QComboBox):
+    """Show a scientific markup role in both popup rows and the closed label."""
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self.setItemDelegate(ScientificNameDelegate(self))
+
+    def paintEvent(self, event) -> None:
+        if self.currentIndex() < 0:
+            super().paintEvent(event)
+            return
+        index = self.model().index(
+            self.currentIndex(), self.modelColumn(), self.rootModelIndex(),
+        )
+        if not index.isValid() or not index.data(SCIENTIFIC_NAME_HTML_ROLE):
+            super().paintEvent(event)
+            return
+
+        painter = QtWidgets.QStylePainter(self)
+        try:
+            option = QtWidgets.QStyleOptionComboBox()
+            self.initStyleOption(option)
+            option.currentText = ""
+            painter.drawComplexControl(QtWidgets.QStyle.ComplexControl.CC_ComboBox, option)
+            rect = self.style().subControlRect(
+                QtWidgets.QStyle.ComplexControl.CC_ComboBox,
+                option,
+                QtWidgets.QStyle.SubControl.SC_ComboBoxEditField,
+                self,
+            )
+            item_option = QtWidgets.QStyleOptionViewItem()
+            item_option.initFrom(self)
+            item_option.rect = rect
+            item_option.widget = self
+            item_option.font = self.font()
+            item_option.palette = option.palette
+            item_option.displayAlignment = (
+                QtCore.Qt.AlignmentFlag.AlignLeft
+                | QtCore.Qt.AlignmentFlag.AlignVCenter
+            )
+            self.itemDelegate().paint(painter, item_option, index)
+        finally:
+            painter.end()
+
+
+class ScientificNameHeaderView(QtWidgets.QHeaderView):
+    """Paint explicitly marked header text as rich text without changing its data."""
+
+    def paintSection(self, painter, rect, logical_index) -> None:
+        markup = self.model().headerData(
+            logical_index, self.orientation(), SCIENTIFIC_NAME_HTML_ROLE,
+        )
+        if not markup:
+            super().paintSection(painter, rect, logical_index)
+            return
+
+        option = QtWidgets.QStyleOptionHeader()
+        self.initStyleOption(option)
+        self.initStyleOptionForIndex(option, logical_index)
+        option.rect = rect
+        option.text = ""
+        style = self.style()
+        style.drawControl(QtWidgets.QStyle.ControlElement.CE_Header, option, painter, self)
+        text_rect = style.subElementRect(
+            QtWidgets.QStyle.SubElement.SE_HeaderLabel, option, self,
+        )
+        document = QtGui.QTextDocument()
+        document.setDocumentMargin(0)
+        document.setDefaultFont(self.font())
+        text_option = QtGui.QTextOption(option.textAlignment)
+        text_option.setWrapMode(QtGui.QTextOption.WrapMode.NoWrap)
+        document.setDefaultTextOption(text_option)
+        document.setTextWidth(max(0, text_rect.width()))
+        document.setHtml(markup)
+        painter.save()
+        painter.setClipRect(text_rect)
+        painter.translate(
+            text_rect.left(),
+            text_rect.top() + max(0, (text_rect.height() - document.size().height()) / 2),
+        )
+        context = QtGui.QAbstractTextDocumentLayout.PaintContext()
+        context.palette = option.palette
+        try:
+            document.documentLayout().draw(painter, context)
+        finally:
+            painter.restore()
 
 
 def make_bounded_label(

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import html
 from typing import Callable
 
 from PySide6 import QtCore, QtGui, QtWidgets
@@ -9,7 +10,7 @@ from kindred.gui.ui_helpers import clamp_initial_size
 from kindred.core.symbolic.calculator_help import calculator_help_html
 
 
-class _CalculatorResultView(QtWidgets.QPlainTextEdit):
+class _CalculatorResultView(QtWidgets.QTextBrowser):
     def minimumSizeHint(self) -> QtCore.QSize:
         size = super().minimumSizeHint()
         size.setHeight(
@@ -39,7 +40,6 @@ class SymbolicCalculatorPanel(QtWidgets.QWidget):
         self._on_use_result = on_use_result
         self._on_cancel = on_cancel
         self._latest_query = ""
-        self._latest_result_text = ""
         self._latest_is_error = False
         self._help_dialog: QtWidgets.QDialog | None = None
 
@@ -75,7 +75,7 @@ class SymbolicCalculatorPanel(QtWidgets.QWidget):
         self._result_view = _CalculatorResultView(self)
         self._result_view.setObjectName("symbolicCalculatorResultView")
         self._result_view.setReadOnly(True)
-        self._result_view.setLineWrapMode(QtWidgets.QPlainTextEdit.LineWrapMode.NoWrap)
+        self._result_view.setLineWrapMode(QtWidgets.QTextEdit.LineWrapMode.NoWrap)
         result_font = QtGui.QFont("Courier New", 10)
         self._result_view.setFont(result_font)
         layout.addWidget(self._result_view, stretch=1)
@@ -135,7 +135,6 @@ class SymbolicCalculatorPanel(QtWidgets.QWidget):
         # An unavailable current mechanism has no result.  Do not let a
         # stale or malformed view state make a previous source look current.
         self._latest_query = state.latest_query if available else ""
-        self._latest_result_text = state.latest_result_text if available else ""
         self._latest_is_error = state.latest_is_error if available else False
         self._query_edit.setEnabled(available and not state.busy)
         self._evaluate_button.setEnabled(available and not state.busy)
@@ -158,10 +157,13 @@ class SymbolicCalculatorPanel(QtWidgets.QWidget):
         )
         reason = state.reason
         self._status_label.setText(state.status if available else reason)
-        if self._latest_result_text:
+        if state.latest_result_html:
             prefix = "Error" if self._latest_is_error else "Result"
             query = self._latest_query
-            self._result_view.setPlainText(f"{query}\n{prefix}:\n{self._latest_result_text}")
+            self._result_view.setHtml(
+                "<pre>" + html.escape(f"{query}\n{prefix}:") + "</pre>"
+                + state.latest_result_html
+            )
         else:
             self._result_view.clear()
 

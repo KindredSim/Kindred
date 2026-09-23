@@ -43,7 +43,7 @@ conditions, notices and any reuse queries. Selecting an answer does not narrow t
 
 <h2>Units in Calculator Queries</h2>
 <p>When substituting numerical values, use M for concentrations, s for time, K for temperature,
-J/mol for energy parameters, and m³ for volume.</p>
+J/mol for energy parameters, and m<sup>3</sup> for volume.</p>
 <p>For example, to substitute a concentration of 1 mM for Y in the example model, enter:</p>
 <pre>subs(dP/dt,Y,1/1000)</pre>
 <p>For a model with an independent <code>Ea1</code> parameter, enter 5000 to substitute 5 kJ/mol:</p>

@@ -18,6 +18,7 @@ import numpy as np
 
 from kindred.core.analysis.fit_statistics import FitMetric
 from kindred.core.analysis.global_fit_execution import FitCoordinate
+from kindred.core.quantity_units import format_unit_for_display
 from kindred.core.simulation_failure import FactualCause
 from kindred.gui.display_name_policy import scientific_symbol_html
 from kindred.gui.fitting.constants import INITIAL_PREFIX
@@ -545,7 +546,7 @@ def _initial_rows(candidate: FitCandidate) -> list[dict[str, object]]:
             absolute, percentage, unavailable = _change(value, launch_item.initial)
             captured = dict(mapped.initial_values).get(item.species, launch_item.initial)
             rows.append({"kind": "initial", "name": item.species, "display_name": item.species,
-                "scope": "Per-dataset IC", "unit": "model concentration", "captured_value": captured,
+                "scope": "Per-dataset IC", "unit": "M", "captured_value": captured,
                 "nominal_value": launch_item.initial, "fitted_value": value, "minimum": launch_item.minimum, "maximum": launch_item.maximum,
                 "bound_state": fit_bound_state(
                     value,
@@ -584,7 +585,7 @@ def _initial_rows(candidate: FitCandidate) -> list[dict[str, object]]:
             absolute, percentage, unavailable = _change(value, launch_item.initial)
             captured = dict(mapped.initial_values).get(item.species, launch_item.initial)
             rows.append({"kind": "initial", "name": item.species, "display_name": item.species,
-                "scope": "Shared Fit IC group", "unit": "model concentration",
+                "scope": "Shared Fit IC group", "unit": "M",
                 "captured_value": captured, "nominal_value": launch_item.initial, "fitted_value": value,
                 "minimum": launch_item.minimum, "maximum": launch_item.maximum,
                 "bound_state": fit_bound_state(
@@ -656,6 +657,11 @@ def _text(value: object) -> str:
     return html.escape(_display(value)).replace("\n", "<br>")
 
 
+def _unit_html(unit: object) -> str:
+    text = str(unit or "")
+    return format_unit_for_display(text)
+
+
 def _table(headers: tuple[str, ...], rows: object, *, rich_columns: tuple[int, ...] = ()) -> str:
     return ('<table cellspacing="0" cellpadding="5"><tr>'
             + "".join(f'<th align="left">{_text(header)}</th>' for header in headers)
@@ -687,7 +693,7 @@ def _diagnostic(value: object, labels: Mapping[str, str]) -> str:
 
 
 def _analysis_section(title: str, data: Mapping[str, object], labels: Mapping[str, str],
-                      symbols: Mapping[str, str]) -> str:
+                      symbols: Mapping[str, str], coordinate_units: Mapping[tuple[str, str, str | None], str]) -> str:
     if not data["requested"]:
         return ""
     section = f"<h3>{_text(title)} — {_text(str(data['status']).replace('_', ' '))}</h3>"
@@ -712,8 +718,14 @@ def _analysis_section(title: str, data: Mapping[str, object], labels: Mapping[st
                 name = "Overall · " + name
             elif coordinate["scope"] == "centred_deviation":
                 name = "Deviation · " + name
+            unit = coordinate_units.get((
+                str(coordinate.get("scope", "")),
+                str(coordinate.get("name", "")),
+                None if dataset is None else str(dataset),
+            ), "")
         else:
             name = _text(coordinate)
+            unit = ""
         outcomes = [str(interval[key]) for key in ("reason", "lower_outcome", "upper_outcome") if interval.get(key)]
         for side in ("lower", "upper"):
             endpoint = interval.get(side + "_resolution")
@@ -724,9 +736,9 @@ def _analysis_section(title: str, data: Mapping[str, object], labels: Mapping[st
                     outcomes.append(f"{side}: {_diagnostic(endpoint['failure'], labels)}")
         if interval.get("endpoint_messages"):
             outcomes.append(_diagnostic(interval["endpoint_messages"], labels))
-        rows.append((name, interval["lower"], interval["upper"], interval["status"], "; ".join(outcomes)))
+        rows.append((name, interval["lower"], interval["upper"], _unit_html(unit), interval["status"], "; ".join(outcomes)))
     if rows:
-        section += _table(("Parameter", "Lower", "Upper", "Outcome", "Details"), rows, rich_columns=(0,))
+        section += _table(("Parameter", "Lower", "Upper", "Unit", "Outcome", "Details"), rows, rich_columns=(0, 3))
     return section
 
 
@@ -801,10 +813,10 @@ def fit_live_presentation(
     for set_id, label in initial_labels.items():
         for name, value in initials.get(set_id, {}).items():
             entries.append((("initial", set_id, name), html.escape(name), name,
-                            label + " · Initial", value, "model concentration"))
+                            label + " · Initial", value, "M"))
     body = '<h3>Best complete candidate</h3>' + _table(
         ("Dataset / scope", "Parameter", "Value", "Unit"),
-        ((context, symbol, value, unit) for _identity, symbol, _plain_symbol, context, value, unit in entries), rich_columns=(1,))
+        ((context, symbol, value, _unit_html(unit)) for _identity, symbol, _plain_symbol, context, value, unit in entries), rich_columns=(1, 3))
     return tuple(entries), body
 
 
@@ -844,9 +856,9 @@ def fit_candidate_presentation(candidate: FitCandidate) -> tuple[tuple[str, ...]
             return ""
         return f"<h3>{_text(title)}</h3>" + _table(
             ("Parameter", "Scope", "Estimate", "Unit", "Starting value", "Bounds", "Bound position"),
-            ((parameter_name(row), row["scope"], row["fitted_value"], row["unit"], row["nominal_value"],
+            ((parameter_name(row), row["scope"], row["fitted_value"], _unit_html(row["unit"]), row["nominal_value"],
               f"{_display(row['minimum'])} to {_display(row['maximum'])}", row["bound_state"])
-             for row in rows), rich_columns=(0,))
+             for row in rows), rich_columns=(0, 3))
     body += estimates("Overall and shared estimates", shared)
     effective = [row for row in individual if row["kind"] != "centred_deviation"] + initial
     for mapped in candidate.origin.mapped_datasets:
@@ -857,13 +869,13 @@ def fit_candidate_presentation(candidate: FitCandidate) -> tuple[tuple[str, ...]
     if deviations:
         body += "<h3>Centred coordinate deviations (Fit only)</h3><p>Linear deviations use physical units; logarithmic deviations are in log10 coordinates (decades). Effective physical values above come directly from the retained settlement.</p>"
         body += _table(("Dataset", "Parameter", "Coordinate", "Deviation", "Unit", "Starting deviation", "Bounds"),
-                       ((row["dataset_display_name"], parameter_name(row), row["scope"], row["fitted_value"], row["unit"],
-                         row["nominal_value"], f"{_display(row['minimum'])} to {_display(row['maximum'])}") for row in deviations), rich_columns=(1,))
+                       ((row["dataset_display_name"], parameter_name(row), row["scope"], row["fitted_value"], _unit_html(row["unit"]),
+                         row["nominal_value"], f"{_display(row['minimum'])} to {_display(row['maximum'])}") for row in deviations), rich_columns=(1, 4))
     aggregates = _aggregate_rows(individual)
     if aggregates:
         body += "<h3>Per-dataset estimate statistics</h3>" + _table(
-            ("Parameter", "Datasets", "Mean", "Median", "Sample SD", "IQR"),
-            ((parameter_name(row), row["n"], row["arithmetic_mean"], row["median"], row["sample_sd"], row["iqr"]) for row in aggregates), rich_columns=(0,))
+            ("Parameter", "Datasets", "Mean", "Median", "Sample SD", "IQR", "Unit"),
+            ((parameter_name(row), row["n"], row["arithmetic_mean"], row["median"], row["sample_sd"], row["iqr"], _unit_html(row["unit"])) for row in aggregates), rich_columns=(0, 6))
     metrics = _dataset_metrics(candidate)
     body += "<h3>Dataset metrics</h3>" + _table(
         ("Dataset", "Weighted SSE", "Weighted MSE", "Weighted RMSE", "Weighted MAE", "Effective weight"),
@@ -872,8 +884,20 @@ def fit_candidate_presentation(candidate: FitCandidate) -> tuple[tuple[str, ...]
     if r_squared:
         body += _table(("Dataset", "Series", "R²"), r_squared)
     profile, bootstrap = _profile_data(candidate), _bootstrap_data(candidate)
-    body += _analysis_section("Profile likelihood", profile, labels, symbols)
-    body += _analysis_section("Residual bootstrap", bootstrap, labels, symbols)
+    coordinate_units: dict[tuple[str, str, str | None], str] = {}
+    for parameter in candidate.setup_snapshot.parameters:
+        if parameter.scope == "shared":
+            coordinate_units[("shared", parameter.name, None)] = parameter.unit
+        elif parameter.scope == "centred_fixed_effects":
+            coordinate_units[("centred_overall", parameter.name, None)] = parameter.unit
+            deviation_unit = "decades" if parameter.selected_config.log10 else parameter.unit
+            for dataset_id, _value in parameter.selected_config.dataset_values:
+                coordinate_units[("centred_deviation", parameter.name, dataset_id)] = deviation_unit
+        else:
+            for dataset_id, _value in parameter.selected_config.dataset_values:
+                coordinate_units[("dataset", parameter.name, dataset_id)] = parameter.unit
+    body += _analysis_section("Profile likelihood", profile, labels, symbols, coordinate_units)
+    body += _analysis_section("Residual bootstrap", bootstrap, labels, symbols, coordinate_units)
     body += "<h3>Apply effect</h3><p>Apply publishes compatible shared estimates and fitted initial values to the project."
     if result.centred_fixed_effects_settlements:
         body += " For centred parameters, only the overall value is published; dataset-specific effective values and deviations remain Fit results."

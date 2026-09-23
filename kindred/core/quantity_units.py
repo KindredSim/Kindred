@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 from fractions import Fraction
 from decimal import Decimal, localcontext, DecimalException
 from functools import lru_cache
+from html import escape
 import math
 import re
 
@@ -315,13 +316,85 @@ def presentation_unit(unit: Unit | None, declared: Unit | None = None) -> Unit |
     return NAMED_UNITS["L"] if unit.dimensions == CUBIC_METRE.dimensions else unit
 
 
-def compatible_units(unit: Unit, preferred: tuple[Unit, ...] = ()) -> tuple[Unit, ...]:
-    candidates = (unit, *preferred, *NAMED_UNITS.values())
+def analysis_display_unit(
+    unit: Unit, *, concentration: Unit, time: Unit, volume: Unit,
+) -> Unit:
+    """Express concentration/time quantities and vessel volume in display units.
+
+    Other dimensions keep their retained unit. These choices affect readouts,
+    never the scientific or editable coordinates of a parameter.
+    """
+    energy, amount, length, time_power, temperature = unit.dimensions
+    if energy == 0 and length == -3 * amount:
+        factors = ((concentration, amount), (time, time_power), (KELVIN, temperature))
+    elif energy == amount == temperature == 0 and length == 3:
+        factors = ((volume, Fraction(1)), (time, time_power))
+    else:
+        return unit
+    result = DIMENSIONLESS
+    for base, exponent in factors:
+        if exponent:
+            result = result.multiply(base.power(exponent))
+    return result
+
+
+_UNIT_POWER = re.compile(
+    r"(?:\^|\*\*)\s*(\(\s*[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:\s*/\s*[+-]?(?:\d+(?:\.\d*)?|\.\d+))?\s*\)"
+    r"|[+-]?(?:\d+(?:\.\d*)?|\.\d+))"
+)
+_UNIT_WORD = re.compile(r"[A-Za-zµ]+")
+
+
+def _display_unit_spelling(text: str) -> str:
+    text = text.replace("μ", "µ")
+    return _UNIT_WORD.sub(
+        lambda match: "µ" + match.group(0)[1:]
+        if match.group(0).startswith("u")
+        and "µ" + match.group(0)[1:] in NAMED_UNITS
+        else match.group(0),
+        text,
+    )
+
+
+def format_unit_for_display(unit: Unit | str | None) -> str | None:
+    """Format an admitted unit spelling for human-facing text.
+
+    The result is a Qt-independent HTML fragment for rich-text consumers.
+    This is a presentation-only lexical projection.  It does not admit or
+    interpret units, alter their identity, or participate in conversion.
+    """
+    if unit is None:
+        return None
+    text = unit.symbol if isinstance(unit, Unit) else unit
+    if text == "1":
+        return text
+    text = _display_unit_spelling(text)
+    escaped = escape(text)
+    escaped = _UNIT_POWER.sub(
+        lambda match: f"<sup>{match.group(1)}</sup>", escaped,
+    )
+    return escaped.replace("*", "·")
+
+
+def reconcile_unit_choices(
+    candidates: tuple[Unit, ...], selected: Unit | None = None,
+) -> tuple[Unit, ...]:
+    """Collapse spelling aliases in order, retaining the selected identity."""
     unique = {}
+    if selected is not None:
+        candidates = (*candidates, selected)
     for item in candidates:
-        if unit.compatible(item):
-            unique.setdefault(item.symbol, item)
+        key = (item.dimensions, item.scale, _display_unit_spelling(item.symbol))
+        if key not in unique or item is selected:
+            unique[key] = item
     return tuple(unique.values())
+
+
+def compatible_units(unit: Unit, preferred: tuple[Unit, ...] = ()) -> tuple[Unit, ...]:
+    return reconcile_unit_choices(tuple(
+        item for item in (unit, *preferred, *NAMED_UNITS.values())
+        if unit.compatible(item)
+    ))
 
 
 CONSTANT_UNITS = {

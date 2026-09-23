@@ -1,7 +1,9 @@
 """GUI interval selection and authored-quantity constraint controls."""
 from __future__ import annotations
 
-from kindred.core.quantity_units import presentation_unit
+import html
+
+from kindred.core.quantity_units import format_unit_for_display, presentation_unit
 from kindred.core.validation import parse_finite_numeric_text
 
 
@@ -9,6 +11,11 @@ from PySide6 import QtCore, QtWidgets
 
 from kindred.scan.config import InputRange, ObservableConstraint
 from kindred.scan.intervals import Interval, normalize
+from kindred.gui.ui_helpers import (
+    SCIENTIFIC_NAME_HTML_ROLE,
+    ScientificNameComboBox,
+)
+from kindred.gui.display_name_policy import scientific_symbol_html
 
 
 def number(edit):
@@ -94,11 +101,17 @@ class ScanConstraintDialog(QtWidgets.QDialog):
         self.setWindowTitle("Constrain an authored quantity")
         self.resize(580, 350)
         layout = QtWidgets.QFormLayout(self)
-        self.quantity = QtWidgets.QComboBox()
+        self.quantity = ScientificNameComboBox()
         for statement in statements:
             unit = presentation_unit(statement.expr.quantity_unit, statement.declared_unit)
             label = statement.name + (f" [{unit.symbol}]" if unit is not None else " [units unspecified]")
             self.quantity.addItem(label, statement)
+            if unit is not None:
+                self.quantity.setItemData(
+                    self.quantity.count() - 1,
+                    f"{html.escape(statement.name)} [{format_unit_for_display(unit)}]",
+                    SCIENTIFIC_NAME_HTML_ROLE,
+                )
         self.definition = QtWidgets.QLabel()
         self.definition.setWordWrap(True)
         self.definition.setTextInteractionFlags(QtCore.Qt.TextInteractionFlag.TextSelectableByMouse)
@@ -111,9 +124,16 @@ class ScanConstraintDialog(QtWidgets.QDialog):
         self.include_lower, self.include_upper = QtWidgets.QCheckBox("Include lower"), QtWidgets.QCheckBox("Include upper")
         self.include_lower.setChecked(True)
         self.include_upper.setChecked(True)
-        self.dependent = QtWidgets.QComboBox()
+        self.dependent = ScientificNameComboBox()
         for item in inputs:
-            self.dependent.addItem(item.label, item.key)
+            unit_html = format_unit_for_display(item.unit)
+            label_html = scientific_symbol_html(item.label, family=item.family, role=item.role)
+            self.dependent.addItem(f"{item.label} [{item.unit}]", item.key)
+            self.dependent.setItemData(
+                self.dependent.count() - 1,
+                f"{label_html} [{unit_html}]",
+                SCIENTIFIC_NAME_HTML_ROLE,
+            )
         layout.addRow("Authored quantity", self.quantity)
         layout.addRow(self.definition)
         layout.addRow("Condition", self.condition)

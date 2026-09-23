@@ -1,6 +1,8 @@
 """Same-runtime Calculator child; its input is admitted science, never source to admit."""
 from __future__ import annotations
 
+from html import escape
+
 from .calculator import SymbolicCalculatorError, build_calculator_context, evaluate_symbolic_query
 
 
@@ -14,9 +16,23 @@ def run_calculator_child(connection, mechanism, source) -> None:
                 result = evaluate_symbolic_query(context, query)
             except SymbolicCalculatorError as exc:
                 message = str(exc)
-                connection.send((query, message, f"Query: {query}\nError: {message}\nMechanism source:\n{source}", True, message, ()))
+                connection.send((
+                    query,
+                    "<pre>" + escape(message) + "</pre>",
+                    f"Query: {query}\nError: {message}\nMechanism source:\n{source}",
+                    True,
+                    message,
+                    (),
+                ))
             else:
-                connection.send((query, result.result_text, result.full_context_copy_text(), False, result.copy_text, result.reuse_queries))
+                connection.send((
+                    query,
+                    result.result_html,
+                    result.full_context_copy_text(context.authored_definitions),
+                    False,
+                    result.copy_text,
+                    result.reuse_queries,
+                ))
     except (EOFError, BrokenPipeError):
         pass
     finally:

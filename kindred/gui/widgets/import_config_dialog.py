@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import html
 import itertools
 from collections import Counter
 from dataclasses import dataclass
@@ -9,6 +10,7 @@ from typing import Mapping
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
+from kindred.core.quantity_units import format_unit_for_display
 from kindred.core.datasets.csv_import import read_csv_rows_from_bytes
 from kindred.core.datasets.excel_import import ExcelWorkbookPair
 from kindred.core.datasets.foundation import ImportedSource
@@ -27,7 +29,10 @@ from kindred.gui.import_workflow import (
     sharing_settings,
 )
 from kindred.gui.theme_manager import semantic_color
-from kindred.gui.ui_helpers import clamp_initial_size, set_bounded_label_text
+from kindred.gui.ui_helpers import (
+    SCIENTIFIC_NAME_HTML_ROLE, ScientificNameComboBox,
+    clamp_initial_size, set_bounded_label_text,
+)
 
 __all__ = ["ImportConfigDialog", "ImportDialogResult"]
 
@@ -50,10 +55,6 @@ class _Sheet:
     settings: ImportSettings
     included: bool
     load_error: str = ""
-
-
-def _display_unit(unit: str) -> str:
-    return unit.replace("u", "µ").replace("μ", "µ")
 
 
 def _concentration_default(unit_row: Mapping[PhysicalColumn, object] | None) -> str:
@@ -155,11 +156,16 @@ class ImportConfigDialog(QtWidgets.QDialog):
         )
         self._time_combo.setMinimumContentsLength(12)
         form.addRow("Time column", self._time_combo)
-        self._time_unit_combo = QtWidgets.QComboBox(settings)
+        self._time_unit_combo = ScientificNameComboBox(settings)
         form.addRow("Time unit", self._time_unit_combo)
-        self._conc_unit_combo = QtWidgets.QComboBox(settings)
+        self._conc_unit_combo = ScientificNameComboBox(settings)
         for unit in CONCENTRATION_UNIT_DISPLAY:
-            self._conc_unit_combo.addItem(_display_unit(unit), unit)
+            self._conc_unit_combo.addItem(unit, unit)
+            self._conc_unit_combo.setItemData(
+                self._conc_unit_combo.count() - 1,
+                format_unit_for_display(unit),
+                SCIENTIFIC_NAME_HTML_ROLE,
+            )
         self._conc_unit_combo.setToolTip(
             "Default for columns without a detected concentration unit."
         )
@@ -415,11 +421,22 @@ class ImportConfigDialog(QtWidgets.QDialog):
                 declared = str(
                     (sheet.unit_row or {}).get(settings.time_column, "")
                 ).strip()
-                evidence = _display_unit(declared or settings.time_fallback)
+                evidence_raw = declared or settings.time_fallback
+                evidence = format_unit_for_display(evidence_raw)
                 suffix = "" if declared else "; fallback"
-                self._time_unit_combo.addItem(f"From file ({evidence}{suffix})", None)
+                self._time_unit_combo.addItem(f"From file ({evidence_raw}{suffix})", None)
+                self._time_unit_combo.setItemData(
+                    self._time_unit_combo.count() - 1,
+                    f"From file ({evidence}{html.escape(suffix)})",
+                    SCIENTIFIC_NAME_HTML_ROLE,
+                )
                 for unit in TIME_UNIT_DISPLAY:
-                    self._time_unit_combo.addItem(_display_unit(unit), unit)
+                    self._time_unit_combo.addItem(unit, unit)
+                    self._time_unit_combo.setItemData(
+                        self._time_unit_combo.count() - 1,
+                        format_unit_for_display(unit),
+                        SCIENTIFIC_NAME_HTML_ROLE,
+                    )
                 self._time_unit_combo.setCurrentIndex(
                     self._time_unit_combo.findData(settings.time_choice)
                 )
@@ -441,7 +458,7 @@ class ImportConfigDialog(QtWidgets.QDialog):
                 unit, _ = resolve_column_unit(
                     settings.time_column, "time", sheet.unit_row, settings
                 )
-                info = f"Time: {_display_unit(unit)} → s. Concentrations convert to M."
+                info = f"Time: {format_unit_for_display(unit)} → s. Concentrations convert to M."
             except ValueError as exc:
                 info = str(exc)
         else:
@@ -486,7 +503,7 @@ class ImportConfigDialog(QtWidgets.QDialog):
                     unit, _ = resolve_column_unit(
                         column, "concentration", sheet.unit_row, sheet.settings
                     )
-                    text = f"{_display_unit(unit)} → M"
+                    text = f"{format_unit_for_display(unit)} → M"
                     if (
                         not sheet.settings.override_no_unit_row
                         and not str((sheet.unit_row or {}).get(column, "")).strip()

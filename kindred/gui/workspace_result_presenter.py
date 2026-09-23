@@ -2,7 +2,19 @@
 
 from __future__ import annotations
 
-from kindred.core.quantity_units import Unit, MOLAR, SECOND, CUBIC_METRE, compatible_units, convert_value
+import html
+
+from kindred.core.quantity_units import (
+    CUBIC_METRE,
+    MOLAR,
+    SECOND,
+    Unit,
+    analysis_display_unit,
+    compatible_units,
+    convert_value,
+    format_unit_for_display,
+    parse_unit,
+)
 
 import io
 import csv
@@ -667,11 +679,29 @@ class ResultRenderInput:
                           for block in self.blocks if block.result is not None and block.result.volume is not None)
         return compatible_units(CUBIC_METRE, preferred) if preferred else ()
 
-    @property
-    def parameters(self) -> tuple[tuple[str, float, str], ...]:
-        block = _select_analysis_block(self.blocks, self.current_set_id)
-        result = block.result if block is not None else None
-        return tuple(result.parameters) if isinstance(result, SimulationResultValue) else ()
+    def parameters_for_display(
+        self, *, concentration_unit: Unit, time_unit: Unit, volume_unit: Unit,
+    ) -> dict[str, tuple[float | None, str, str, str]]:
+        """Project canonical parameters using the plot's Analysis unit choices."""
+        result = self.statistics_result
+        if result is None:
+            return {}
+        classifications = {
+            name: (family, role)
+            for name, family, role in result.parameter_classifications
+        }
+        rows = {}
+        for name, value, unit_text in result.parameters:
+            source = parse_unit(unit_text)
+            display = analysis_display_unit(
+                source, concentration=concentration_unit, time=time_unit, volume=volume_unit,
+            )
+            try:
+                display_value = convert_value(value, source, display)
+            except ValueError:
+                display_value = None
+            rows[name] = (display_value, display.symbol, *classifications[name])
+        return rows
 
     @property
     def completion_warning_tooltip(self) -> str:
@@ -1159,13 +1189,13 @@ def intervention_label(
     """Format retained action amounts without evaluating their declarations."""
     action = annotation["physical_action"]
     if action is None:
-        return str(annotation["label"])
+        return html.escape(str(annotation["label"]))
 
-    def quantity(fields, name, source, display, symbol=None):
+    def quantity(fields, name, source, display):
         parameter = fields.get(name + "_param")
-        value = str(parameter) if parameter is not None else f"{convert_value(fields[name], source, display):g}"
-        unit = display.symbol if symbol is None else symbol
-        return f"{value} {unit}".strip()
+        value = html.escape(str(parameter)) if parameter is not None else f"{convert_value(fields[name], source, display):g}"
+        unit_html = format_unit_for_display(display)
+        return f"{value} {unit_html}".strip()
 
     op = action["op"]
     if op == "scale":
@@ -1177,15 +1207,15 @@ def intervention_label(
         solution = action["solution"]
         if op == "flux":
             amount = quantity(solution, "volume_rate", CUBIC_METRE.divide(SECOND),
-                              volume_unit.divide(time_unit), f"{volume_unit.symbol}/{time_unit.symbol}")
+                              volume_unit.divide(time_unit))
         else:
             amount = quantity(solution, "volume", CUBIC_METRE, volume_unit)
-        stock = ", ".join(f"{item['species']}: {quantity(item, 'value', MOLAR, MOLAR)}"
+        stock = ", ".join(f"{html.escape(item['species'])}: {quantity(item, 'value', MOLAR, MOLAR)}"
                           for item in solution["stock"]) or "pure solvent"
         text = f"{'Solution inflow' if op == 'flux' else 'Add solution'} {amount} ({stock})"
     if "initial_volume" in action or "initial_volume_param" in action:
         text += f" (volume at simulation start {quantity(action, 'initial_volume', CUBIC_METRE, volume_unit)})"
-    return str(annotation.get("label_prefix", "")) + text
+    return html.escape(str(annotation.get("label_prefix", ""))) + text
 
 
 def _owned_annotations(

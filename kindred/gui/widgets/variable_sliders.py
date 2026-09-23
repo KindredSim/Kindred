@@ -7,7 +7,7 @@ equilibrium constants, and scalar values) with automatic simulation updates.
 
 from __future__ import annotations
 
-from kindred.core.quantity_units import parse_unit
+from kindred.core.quantity_units import format_unit_for_display, parse_unit
 from kindred.core.validation import parse_finite_numeric_text
 
 from functools import partial
@@ -23,13 +23,19 @@ from PySide6.QtCore import Signal
 from kindred.gui.interactive_preview import SliderInteractionKind
 from kindred.gui.widgets.fine_drag_slider import FineDragSlider
 from html import escape
-from kindred.gui.display_name_policy import scientific_symbol_html, scientific_symbol_spoken, literal_tooltip
+from kindred.gui.display_name_policy import (
+    CompactText,
+    compact_text,
+    literal_tooltip,
+    scientific_symbol_html,
+    scientific_symbol_spoken,
+)
 
 from ..ui_helpers import (
     configure_compact_numeric_edit,
-    set_bounded_label_text,
     make_placeholder_label,
     make_scroll_area,
+    set_bounded_label_text,
 )
 
 logger = logging.getLogger(__name__)
@@ -291,11 +297,12 @@ class VariableSliders(QtWidgets.QWidget):
         top_row = QtWidgets.QHBoxLayout()
         top_row.setSpacing(8)
 
-        full_label = self._format_label_text(name)
+        title, unit, qualifier = self._label_parts(name)
+        full_label = title + (f" [{unit}]" if unit else "") + qualifier
         symbol_html = scientific_symbol_html(name, family=meta["family"], role=meta["role"])
         spoken = scientific_symbol_spoken(name, family=meta["family"], role=meta["role"])
-        context = full_label
-        if symbol_html != escape(name) and full_label.startswith(name):
+        context = title
+        if symbol_html != escape(name) and title.startswith(name):
             symbol_label = QtWidgets.QLabel(self)
             symbol_label.setTextFormat(QtCore.Qt.RichText)
             symbol_label.setText(symbol_html)
@@ -305,12 +312,34 @@ class VariableSliders(QtWidgets.QWidget):
                 QtWidgets.QSizePolicy.Fixed, QtWidgets.QSizePolicy.Preferred
             )
             top_row.addWidget(symbol_label)
-            context = full_label[len(name):].removeprefix(" — ").lstrip()
+            context = title[len(name):].removeprefix(" — ").lstrip()
         name_label = QtWidgets.QLabel()
+        unit_label = None
+        if unit:
+            unit_label = QtWidgets.QLabel()
+            unit_label.setTextFormat(QtCore.Qt.TextFormat.RichText)
+            unit_label.setText(
+                '<span style="white-space:nowrap">[' + format_unit_for_display(unit)
+                + ']' + escape(qualifier) + "</span>"
+            )
+            unit_label.setAccessibleName(unit)
+            unit_label.setToolTip(literal_tooltip(unit))
+            unit_label.setSizePolicy(
+                QtWidgets.QSizePolicy.Policy.Fixed,
+                QtWidgets.QSizePolicy.Policy.Preferred,
+            )
+        else:
+            context += qualifier
         set_bounded_label_text(
-            name_label, context, max_width=16777215, tooltip_text=full_label
+            name_label,
+            context,
+            max_width=16777215,
+            tooltip_text=full_label,
         )
+        name_label.setAccessibleName(context or full_label)
         top_row.addWidget(name_label, 1)
+        if unit_label is not None:
+            top_row.addWidget(unit_label)
 
         if meta.get("editable") is False:
             value_label: QtWidgets.QWidget = QtWidgets.QLabel(
@@ -463,25 +492,14 @@ class VariableSliders(QtWidgets.QWidget):
                 SliderInteractionKind.EXACT_DRAG_RELEASE,
             )
 
-    def _format_label_text(self, name: str) -> str:
-        meta = self._metadata.get(name)
-        derived_suffix = ""
-        if meta and bool(meta.get("derived")):
-            derived_suffix = " (derived)"
-        unit_suffix = ""
-        if meta and meta.get("unit"):
-            unit_suffix = f" [{meta.get('unit')}]"
-        if meta and isinstance(meta.get("label"), str):
-            display_name = str(meta["label"]).strip()
-            if not display_name:
-                raise ValueError("Slider display names must be nonblank.")
-            if meta["family"] in {"Constant", "Arrhenius", "Eyring", "reverse"} and meta["role"] in {"k", "kf", "kr", "Keq"}:
-                # Only admitted reaction context gets display arrows. Authored
-                # scalar labels and canonical metadata remain literal.
-                identity, separator, context = display_name.partition(" — ")
-                display_name = identity + separator + context.replace(" <-> ", " ⇌ ").replace(" -> ", " → ")
-            return f"{display_name}{unit_suffix}{derived_suffix}"
-        return f"{name}{unit_suffix}{derived_suffix}"
+    def _label_parts(self, name: str) -> tuple[str, str, str]:
+        meta = self._metadata[name]
+        title = meta["label"]
+        if meta["family"] in {"Constant", "Arrhenius", "Eyring", "reverse"} and meta["role"] in {"k", "kf", "kr", "Keq"}:
+            # Only admitted reaction context gets display arrows.
+            identity, separator, context = title.partition(" — ")
+            title = identity + separator + context.replace(" <-> ", " ⇌ ").replace(" -> ", " → ")
+        return title, meta["unit"], " (derived)" if meta["derived"] else ""
 
     def _on_slider_changed(self, name: str, slider_pos: int) -> None:
         """
@@ -736,17 +754,22 @@ class VariableSliders(QtWidgets.QWidget):
     def visible_slider_count(self) -> int:
         return sum(1 for name in self._containers if self.variable_visible(name))
 
-    def slider_picker_entries(self) -> list[tuple[str, str, bool]]:
-        entries: list[tuple[str, str, bool]] = []
+    def slider_picker_entries(self) -> list[tuple[str, CompactText, str, bool]]:
+        entries = []
         for name in self._variables:
-            name_s = str(name)
-            entries.append(
-                (
-                    name_s,
-                    self._format_label_text(name_s),
-                    self.variable_visible(name_s),
-                )
+            title, unit, qualifier = self._label_parts(name)
+            suffix = (f" [{unit}]" if unit else "") + qualifier
+            compact = compact_text(title, max_chars=max(1, 48 - len(suffix)))
+            label = CompactText(compact.display + suffix, title + suffix, compact.was_elided)
+            meta = self._metadata[name]
+            symbol = scientific_symbol_html(name, family=meta["family"], role=meta["role"])
+            markup = (
+                symbol + escape(compact.display[len(name):])
+                if symbol != escape(name) and compact.display.startswith(name)
+                else escape(compact.display)
             )
+            markup += (f" [{format_unit_for_display(unit)}]" if unit else "") + escape(qualifier)
+            entries.append((name, label, markup, self.variable_visible(name)))
         return entries
 
     def variable_visible(self, name: str) -> bool:

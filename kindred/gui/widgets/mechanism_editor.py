@@ -13,12 +13,14 @@ if TYPE_CHECKING:
     from kindred.core.mechanism_source import MechanismAuthoringSource
 
 from kindred.gui.ui_helpers import (
+    SCIENTIFIC_NAME_HTML_ROLE,
+    ScientificNameDelegate,
     make_bounded_label,
     make_scroll_area,
     set_bounded_label_text,
 )
 
-from kindred.gui.display_name_policy import compact_text, literal_tooltip
+from kindred.gui.display_name_policy import CompactText, literal_tooltip
 from kindred.gui.widgets.mechanism_highlighter import MechanismHighlighter
 from kindred.gui.widgets.variable_sliders import VariableSliders
 from kindred.gui.widgets.species_sliders import BatchSpeciesSliders
@@ -71,42 +73,21 @@ def _make_sliders_icon(color: QtGui.QColor) -> QtGui.QIcon:
     return QtGui.QIcon(pixmap)
 
 
-class _PersistentToggleMenu(QtWidgets.QMenu):
-    """Keep checkable actions open so users can toggle multiple sliders in one pass."""
-
-    def __init__(self, parent: Optional[QtWidgets.QWidget] = None) -> None:
-        super().__init__(parent)
-        self._pressed_checkable_action: Optional[QtGui.QAction] = None
-
-    def mousePressEvent(self, event: QtGui.QMouseEvent) -> None:
-        action = self.actionAt(event.position().toPoint())
+class _SliderVisibilityDelegate(ScientificNameDelegate):
+    def editorEvent(self, event, model, option, index):
+        if super().editorEvent(event, model, option, index):
+            return True
         if (
-            event.button() == QtCore.Qt.MouseButton.LeftButton
-            and action is not None
-            and action.isEnabled()
-            and action.isCheckable()
+            event.type() == QtCore.QEvent.Type.MouseButtonRelease
+            and event.button() == QtCore.Qt.MouseButton.LeftButton
+            and index.flags() & QtCore.Qt.ItemFlag.ItemIsEnabled
+            and index.flags() & QtCore.Qt.ItemFlag.ItemIsUserCheckable
         ):
-            self._pressed_checkable_action = action
-            event.accept()
-            return
-        self._pressed_checkable_action = None
-        super().mousePressEvent(event)
-
-    def mouseReleaseEvent(self, event: QtGui.QMouseEvent) -> None:
-        action = self.actionAt(event.position().toPoint())
-        pressed_action = self._pressed_checkable_action
-        self._pressed_checkable_action = None
-        if (
-            event.button() == QtCore.Qt.MouseButton.LeftButton
-            and pressed_action is not None
-            and action is pressed_action
-            and action.isEnabled()
-            and action.isCheckable()
-        ):
-            action.trigger()
-            event.accept()
-            return
-        super().mouseReleaseEvent(event)
+            role = QtCore.Qt.ItemDataRole.CheckStateRole
+            checked = QtCore.Qt.CheckState(index.data(role)) == QtCore.Qt.CheckState.Checked
+            state = QtCore.Qt.CheckState.Unchecked if checked else QtCore.Qt.CheckState.Checked
+            return model.setData(index, state.value, role)
+        return False
 
 
 class MechanismEditorTabbed(QtWidgets.QWidget):
@@ -305,7 +286,7 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
         self._slider_visibility_picker_btn.setPopupMode(
             QtWidgets.QToolButton.ToolButtonPopupMode.InstantPopup
         )
-        self._slider_visibility_menu = _PersistentToggleMenu(self)
+        self._slider_visibility_menu = QtWidgets.QMenu(self)
         self._slider_visibility_menu.aboutToShow.connect(
             self._rebuild_slider_visibility_menu
         )
@@ -425,8 +406,8 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
             "<p>With <code>Keq=</code> or <code>dG_eq=</code>, Kindred calculates the reverse rate constant using:</p>"
             "<p><i>k</i><sub>r</sub> = <i>k</i><sub>f</sub> / <i>K</i><sub>eq</sub></p>"
             "<p>For <code>dG_eq=</code>:</p>"
-            "<p><i>K</i><sub>eq</sub> = exp[−Δ<i>G</i><sub>eq</sub> / (<i>R</i><i>T</i>)] <i>C</i><sub>0</sub>^(<i>n</i><sub>r</sub> − <i>n</i><sub>f</sub>)</p>"
-            "<p><i>n</i><sub>f</sub> and <i>n</i><sub>r</sub> are the forward and reverse reaction orders. <i>K</i><sub>eq</sub> has units M^(<i>n</i><sub>r</sub> − <i>n</i><sub>f</sub>). <i>C</i><sub>0</sub> is the standard concentration. <i>R</i> is the gas constant and <i>T</i> is the temperature at simulation time <i>t</i>.</p>"
+            "<p><i>K</i><sub>eq</sub> = exp[−Δ<i>G</i><sub>eq</sub> / (<i>R</i><i>T</i>)] <i>C</i><sub>0</sub><sup>(<i>n</i><sub>r</sub> − <i>n</i><sub>f</sub>)</sup></p>"
+            "<p><i>n</i><sub>f</sub> and <i>n</i><sub>r</sub> are the forward and reverse reaction orders. <i>K</i><sub>eq</sub> has units M<sup>(<i>n</i><sub>r</sub> − <i>n</i><sub>f</sub>)</sup>. <i>C</i><sub>0</sub> is the standard concentration. <i>R</i> is the gas constant and <i>T</i> is the temperature at simulation time <i>t</i>.</p>"
             "<p>With <code>Keq=</code> or <code>dG_eq=</code>, <code>kf=0</code> disables both directions. With an explicit <code>kr=</code>, both directional rate constants must be positive.</p>"
             "<h2>Temperature Schedules</h2>"
             "<p>Use one <code>temp_step</code> or <code>temp_response</code> declaration. Enter times and <code>tau</code> in seconds, and temperatures in kelvin.</p>"
@@ -605,9 +586,9 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
             "<tr><td>Times and <code>min_interval</code></td><td>Finite and nonnegative. <code>end_time</code> must be greater than <code>start_time</code>.</td></tr>"
             "<tr><td>Species thresholds, <code>set</code> values, and <code>hold</code> values</td><td>Finite and nonnegative, within the species concentration limits</td></tr>"
             "<tr><td>Calculated-quantity thresholds, concentration changes (<code>delta</code>), and concentration rates (<code>flux_rate</code>)</td><td>Finite positive, negative, or zero values</td></tr>"
-            "<tr><td><code>initial_volume</code></td><td>10⁻³⁰ through 10³⁰ m³, inclusive</td></tr>"
-            "<tr><td>Added or withdrawn volume</td><td>Zero or 10⁻³⁰ through 10³⁰ m³, inclusive</td></tr>"
-            "<tr><td>Solution inflow rate</td><td>Zero or 10⁻³⁰ through 10³⁰ m³/s, inclusive</td></tr>"
+            "<tr><td><code>initial_volume</code></td><td>10<sup>-30</sup> through 10<sup>30</sup> m<sup>3</sup>, inclusive</td></tr>"
+            "<tr><td>Added or withdrawn volume</td><td>Zero or 10<sup>-30</sup> through 10<sup>30</sup> m<sup>3</sup>, inclusive</td></tr>"
+            "<tr><td>Solution inflow rate</td><td>Zero or 10<sup>-30</sup> through 10<sup>30</sup> m<sup>3</sup>/s, inclusive</td></tr>"
             "<tr><td><code>factor</code></td><td>Finite and greater than zero</td></tr>"
             "<tr><td>Stock concentration</td><td>Finite and nonnegative</td></tr>"
             "<tr><td><code>every</code> and <code>duration</code></td><td>Greater than zero</td></tr>"
@@ -670,13 +651,13 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
             "<p>The symbols <code>min</code>, <code>h</code>, <code>d</code>, and <code>yr</code> mean minutes, hours, days, and years. Kindred treats one year as 365.25 days.</p>"
             '<table border="1" cellpadding="5" cellspacing="0">'
             "<tr><th>Prefix</th><th>Meaning</th><th>Factor</th></tr>"
-            "<tr><td><code>f</code></td><td>femto</td><td>10⁻¹⁵</td></tr>"
-            "<tr><td><code>p</code></td><td>pico</td><td>10⁻¹²</td></tr>"
-            "<tr><td><code>n</code></td><td>nano</td><td>10⁻⁹</td></tr>"
-            "<tr><td><code>u</code></td><td>micro</td><td>10⁻⁶</td></tr>"
-            "<tr><td><code>m</code></td><td>milli</td><td>10⁻³</td></tr>"
-            "<tr><td><code>c</code></td><td>centi, available in <code>cm</code></td><td>10⁻²</td></tr>"
-            "<tr><td><code>k</code></td><td>kilo</td><td>10³</td></tr>"
+            "<tr><td><code>f</code></td><td>femto</td><td>10<sup>-15</sup></td></tr>"
+            "<tr><td><code>p</code></td><td>pico</td><td>10<sup>-12</sup></td></tr>"
+            "<tr><td><code>n</code></td><td>nano</td><td>10<sup>-9</sup></td></tr>"
+            "<tr><td><code>u</code></td><td>micro</td><td>10<sup>-6</sup></td></tr>"
+            "<tr><td><code>m</code></td><td>milli</td><td>10<sup>-3</sup></td></tr>"
+            "<tr><td><code>c</code></td><td>centi, available in <code>cm</code></td><td>10<sup>-2</sup></td></tr>"
+            "<tr><td><code>k</code></td><td>kilo</td><td>10<sup>3</sup></td></tr>"
             "</table>"
             "<h3>Writing compound units</h3>"
             "<p>Combine unit symbols using products, quotients, and powers:</p>"
@@ -712,10 +693,10 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
             "<p>A <code>let</code> expression can use species concentrations, parameters, other <code>let</code> definitions, simulation time <code>t</code>, and temperature <code>T</code>.</p>"
             "<p>Begin each definition with <code>param</code> or <code>let</code>. A line containing only <code>name = expression</code> is not accepted. <code>observable</code> is not a keyword.</p>"
             "<h3>Supported input ranges</h3>"
-            "<p>Kindred uses M for concentration, s for time, K for temperature, J/mol for energy parameters, and m³ for volume in calculations.</p>"
-            "<p>An ordinary adjustable parameter can be zero, or a positive or negative value with magnitude between 10⁻³⁰ and 10³⁰, inclusive, after conversion to these units.</p>"
+            "<p>Kindred uses M for concentration, s for time, K for temperature, J/mol for energy parameters, and m<sup>3</sup> for volume in calculations.</p>"
+            "<p>An ordinary adjustable parameter can be zero, or a positive or negative value with magnitude between 10<sup>-30</sup> and 10<sup>30</sup>, inclusive, after conversion to these units.</p>"
             "<p>These limits apply to ordinary independent parameter values. Calculated expressions and simulation results are not restricted to this range. Species concentrations and physical-model parameters have their own input limits.</p>"
-            "<p>The factor used to convert a declared unit to Kindred’s calculation units must be between 10⁻³⁰ and 10³⁰, inclusive. For example, mM has a factor of 0.001 relative to M. Kindred checks unit declarations even when the starting value is zero and reports unsupported declarations in <b>Reactions</b>.</p>"
+            "<p>The factor used to convert a declared unit to Kindred’s calculation units must be between 10<sup>-30</sup> and 10<sup>30</sup>, inclusive. For example, mM has a factor of 0.001 relative to M. Kindred checks unit declarations even when the starting value is zero and reports unsupported declarations in <b>Reactions</b>.</p>"
             "<p>Kindred reports an error if an entered nonzero number is so small that it would be read as zero.</p>"
             "<h2>Functions</h2>"
             "<p>Use these functions in <code>param</code> and <code>let</code> expressions:</p>"
@@ -756,7 +737,7 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
             "<tr><td><code>k_B</code></td><td>Boltzmann constant, in J/K</td></tr>"
             "<tr><td><code>h</code></td><td>Planck constant, in J·s</td></tr>"
             "<tr><td><code>h_bar</code></td><td>Reduced Planck constant, in J·s</td></tr>"
-            "<tr><td><code>N_A</code></td><td>Avogadro constant, in mol⁻¹</td></tr>"
+            "<tr><td><code>N_A</code></td><td>Avogadro constant, in mol<sup>-1</sup></td></tr>"
             "<tr><td><code>R</code></td><td>Gas constant, in J/(mol·K)</td></tr>"
             "</table>"
             "<p>Enter <code>t</code> and <code>T</code> directly in <code>let</code> expressions. For temperature-dependent <code>param</code> expressions, use the reaction parameters described under <b>Parameters and Observables</b>.</p>"
@@ -910,24 +891,42 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
             action.setEnabled(False)
             return
 
+        roster = QtWidgets.QListWidget(menu)
+        roster.setObjectName("sliderVisibilityRoster")
+        roster.setAccessibleName("Slider visibility")
+        roster.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.SingleSelection)
+        roster.setItemDelegate(_SliderVisibilityDelegate(roster))
+        roster.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
         if mechanism_entries:
             self._add_slider_visibility_entries(
-                menu,
+                roster,
                 title="Mechanism",
                 tooltip="Adjustable inputs in the mechanism.",
                 entry_kind="mechanism",
                 entries=mechanism_entries,
             )
-        if mechanism_entries and species_entries:
-            menu.addSeparator()
         if species_entries:
             self._add_slider_visibility_entries(
-                menu,
-                title="Initial concentrations",
+                roster,
+                title="Initial concentrations (M)",
                 tooltip="Starting concentrations for species in the mechanism.",
                 entry_kind="species",
                 entries=species_entries,
             )
+        screen = self.screen()
+        available = screen.availableGeometry()
+        available_height = available.height()
+        roster.setMaximumHeight(
+            max(1, min(roster.sizeHint().height(), int(available_height * 0.65)))
+        )
+        roster_width = min(420, available.width())
+        roster.setMaximumWidth(roster_width)
+        roster.setMinimumWidth(min(roster_width, max(280, roster.sizeHint().width())))
+        roster.itemChanged.connect(self._on_slider_visibility_item_changed)
+        menu.aboutToShow.connect(roster.setFocus)
+        action = QtWidgets.QWidgetAction(menu)
+        action.setDefaultWidget(roster)
+        menu.addAction(action)
 
     def _invert_slider_visibility(self) -> None:
         """Invert both complete child rosters in one workspace transaction."""
@@ -939,11 +938,11 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
         )
         mechanism_projection = {
             name: not bool(visible)
-            for name, _label, visible in mechanism_entries
+            for name, _label, _markup, visible in mechanism_entries
         }
         species_projection = {
             name: not bool(visible)
-            for name, _label, visible in species_entries
+            for name, _label, _markup, visible in species_entries
         }
         self._variable_sliders.apply_visibility_projection(
             mechanism_projection
@@ -953,37 +952,60 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
 
     def _add_slider_visibility_entries(
         self,
-        menu: QtWidgets.QMenu,
+        roster: QtWidgets.QListWidget,
         *,
         title: str,
         tooltip: str,
         entry_kind: str,
-        entries: list[tuple[str, str, bool]],
+        entries: list[tuple[str, CompactText, str, bool]],
     ) -> None:
-        header = menu.addAction(str(title))
+        header = QtWidgets.QListWidgetItem(title)
+        header.setFlags(QtCore.Qt.ItemFlag.ItemIsEnabled)
         header.setToolTip(tooltip)
-        header.setEnabled(False)
-        for key, label, visible in entries:
-            action = menu.addAction(compact_text(label, max_chars=48).display)
-            action.setToolTip(literal_tooltip(str(label)))
-            action.setStatusTip(str(label))
-            action.setCheckable(True)
-            action.setChecked(bool(visible))
-            action.setData((str(entry_kind), str(key)))
-            action.toggled.connect(
-                lambda checked,
-                kind=str(entry_kind),
-                item=str(key): self._set_slider_entry_visible(kind, item, checked)
+        header_font = roster.font()
+        header_font.setBold(True)
+        header.setData(QtCore.Qt.ItemDataRole.FontRole, header_font)
+        roster.addItem(header)
+        for key, label, markup, visible in entries:
+            item = QtWidgets.QListWidgetItem(label.display)
+            item.setFlags(
+                QtCore.Qt.ItemFlag.ItemIsEnabled
+                | QtCore.Qt.ItemFlag.ItemIsSelectable
+                | QtCore.Qt.ItemFlag.ItemIsUserCheckable
             )
+            item.setCheckState(
+                QtCore.Qt.CheckState.Checked if visible else QtCore.Qt.CheckState.Unchecked
+            )
+            item.setData(QtCore.Qt.ItemDataRole.UserRole, (entry_kind, key))
+            item.setData(QtCore.Qt.ItemDataRole.AccessibleTextRole, label.full)
+            item.setData(QtCore.Qt.ItemDataRole.StatusTipRole, label.full)
+            item.setToolTip(literal_tooltip(label.full))
+            if markup:
+                item.setData(SCIENTIFIC_NAME_HTML_ROLE, markup)
+            roster.addItem(item)
+
+    def _on_slider_visibility_item_changed(
+        self,
+        item: QtWidgets.QListWidgetItem,
+    ) -> None:
+        identity = item.data(QtCore.Qt.ItemDataRole.UserRole)
+        if not identity:
+            return
+        entry_kind, item_name = identity
+        self._set_slider_entry_visible(
+            entry_kind,
+            item_name,
+            item.checkState() == QtCore.Qt.CheckState.Checked,
+        )
 
     def _set_slider_entry_visible(
         self, entry_kind: str, item_name: str, visible: bool
     ) -> None:
-        if str(entry_kind) == "mechanism":
-            self._variable_sliders.set_variable_visible(str(item_name), bool(visible))
-        elif str(entry_kind) == "species":
+        if entry_kind == "mechanism":
+            self._variable_sliders.set_variable_visible(item_name, visible)
+        elif entry_kind == "species":
             self._species_sliders.apply_visibility_projection(
-                {str(item_name): bool(visible)}
+                {item_name: visible}
             )
         self._sync_slider_workspace_state()
 

@@ -49,6 +49,9 @@ def execute_simulation(
         mechanism=prepared.mechanism, result=solved, species_names=list(prepared.species_names),
         initials_for_algebra=prepared.initials_for_algebra, parameter_values_at_temperature=prepared.parameter_values_at_temperature,
         parameter_algebra_spec=prepared.parameter_algebra_spec, parameters=parameters,
+        parameter_classifications=tuple(
+            (item.name, item.family, item.role) for item in coordinates
+        ),
         cancellation_control=cancellation_control,
     )
     check_cancelled()

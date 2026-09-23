@@ -51,6 +51,7 @@ class SimulationResultValue:
     algebra_errors: tuple[FactualCause, ...] = ()
     scalars: Mapping[str, float] = MappingProxyType({})
     parameters: tuple[tuple[str, float, str], ...] = ()
+    parameter_classifications: tuple[tuple[str, str, str], ...] = ()
     presentation_boundaries: tuple[SimulationPresentationBoundary, ...] = ()
     quantity_units: tuple[tuple[str, Unit | None], ...] = ()
     presentation_units: tuple[tuple[str, Unit | None], ...] = ()
@@ -107,6 +108,14 @@ class SimulationResultValue:
         object.__setattr__(self, "series", MappingProxyType(series))
         object.__setattr__(self, "scalars", MappingProxyType(scalars))
         object.__setattr__(self, "parameters", tuple(parameters))
+        parameter_classifications = tuple(self.parameter_classifications)
+        if tuple(name for name, _family, _role in parameter_classifications) != tuple(
+            name for name, _value, _unit in parameters
+        ):
+            raise ValueError(
+                "parameter classifications must match result parameters exactly."
+            )
+        object.__setattr__(self, "parameter_classifications", parameter_classifications)
         object.__setattr__(self, "requested_algebra_outputs", requested)
         object.__setattr__(self, "succeeded_algebra_outputs", succeeded)
         object.__setattr__(self, "failed_algebra_outputs", failed)

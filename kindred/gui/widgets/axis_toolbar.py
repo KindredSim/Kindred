@@ -50,7 +50,12 @@ from kindred.core.project_presentation_state import (
     SimulationSeriesAxisSelection,
 )
 from kindred.gui.plot_config import AxisSelectionCandidate
-from kindred.gui.ui_helpers import ControlRowsLayout, configure_compact_numeric_edit
+from kindred.gui.ui_helpers import (
+    SCIENTIFIC_NAME_HTML_ROLE,
+    ControlRowsLayout,
+    ScientificNameComboBox,
+    configure_compact_numeric_edit,
+)
 from kindred.gui.display_name_policy import compact_text, literal_tooltip
 
 __all__ = ["AxisToolbar"]
@@ -79,12 +84,12 @@ class AxisToolbar(QtWidgets.QWidget):
             "Use the adjacent Unit control to choose its display unit."
         )
 
-        self._x_unit_combo = QtWidgets.QComboBox(self)
+        self._x_unit_combo = ScientificNameComboBox(self)
         self._x_unit_combo.setObjectName("axisToolbarXUnit")
         self._x_unit_combo.setMinimumWidth(64)
         self._x_unit_combo.setMaximumWidth(84)
 
-        self._y_unit_combo = QtWidgets.QComboBox(self)
+        self._y_unit_combo = ScientificNameComboBox(self)
         self._y_unit_combo.setObjectName("axisToolbarYUnit")
         self._y_unit_combo.setMinimumWidth(64)
         self._y_unit_combo.setMaximumWidth(84)
@@ -174,11 +179,11 @@ class AxisToolbar(QtWidgets.QWidget):
 
         # Wiring
         self._x_combo.currentIndexChanged.connect(self._on_x_changed)
-        self._x_unit_combo.currentTextChanged.connect(
-            lambda unit: self.unitChanged.emit("x", unit)
+        self._x_unit_combo.currentIndexChanged.connect(
+            lambda _index: self.unitChanged.emit("x", self._x_unit_combo.currentData())
         )
-        self._y_unit_combo.currentTextChanged.connect(
-            lambda unit: self.unitChanged.emit("y", unit)
+        self._y_unit_combo.currentIndexChanged.connect(
+            lambda _index: self.unitChanged.emit("y", self._y_unit_combo.currentData())
         )
         self._y_list.itemChanged.connect(self._on_y_item_changed)
         self._invert_y_selection_btn.clicked.connect(self.invert_y_selection)
@@ -199,7 +204,7 @@ class AxisToolbar(QtWidgets.QWidget):
             selected=time_selection,
         )
         self.set_axis_unit_choices(
-            x_units=("s",),
+            x_units=(("s", "s"),),
             selected_x="s",
             y_units=(),
             selected_y=None,
@@ -341,9 +346,9 @@ class AxisToolbar(QtWidgets.QWidget):
     def set_axis_unit_choices(
         self,
         *,
-        x_units: Sequence[str],
+        x_units: Sequence[tuple[str, str]],
         selected_x: str | None,
-        y_units: Sequence[str],
+        y_units: Sequence[tuple[str, str]],
         selected_y: str | None,
         transformed: bool = False,
     ) -> None:
@@ -383,21 +388,24 @@ class AxisToolbar(QtWidgets.QWidget):
     @staticmethod
     def _set_unit_combo(
         combo: QtWidgets.QComboBox,
-        units: Sequence[str],
+        units: Sequence[tuple[str, str]],
         selected: str | None,
     ) -> None:
-        choices = tuple(str(unit) for unit in units)
         blocker = QtCore.QSignalBlocker(combo)
         try:
             combo.clear()
-            if not choices:
+            if not units:
                 combo.addItem("—")
                 combo.setEnabled(False)
                 return
-            combo.addItems(choices)
-            combo.setCurrentText(
-                selected if selected in choices else choices[0]
-            )
+            for identity, markup in units:
+                combo.addItem(identity, identity)
+                if markup:
+                    combo.setItemData(
+                        combo.count() - 1, markup, SCIENTIFIC_NAME_HTML_ROLE,
+                    )
+            index = combo.findData(selected)
+            combo.setCurrentIndex(index if index >= 0 else 0)
             combo.setEnabled(True)
         finally:
             del blocker
