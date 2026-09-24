@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-import itertools
 from dataclasses import dataclass
+from itertools import islice
 from typing import Mapping
 
 from PySide6 import QtCore, QtGui, QtWidgets
@@ -34,7 +34,7 @@ from kindred.gui.ui_helpers import (
 __all__ = ["ImportConfigDialog", "ImportDialogResult"]
 
 _TIME_CANDIDATES = ("time", "time_s", "t", "Time", "T", "x")
-_MAX_PREVIEW_ROWS = 20
+_PREVIEW_DATA_ROW_LIMIT = 1000
 
 
 @dataclass
@@ -171,10 +171,7 @@ class ImportConfigDialog(QtWidgets.QDialog):
         self._species_table.setHorizontalHeaderLabels(["Use", "Column", "Unit", "Conversion"])
         self._species_table.setMinimumHeight(80)
         self._species_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
-        self._species_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
-        self._species_table.setSelectionMode(
-            QtWidgets.QAbstractItemView.SingleSelection
-        )
+        self._species_table.setSelectionMode(QtWidgets.QAbstractItemView.NoSelection)
         self._species_table.verticalHeader().hide()
         self._species_table.verticalHeader().setSectionResizeMode(
             QtWidgets.QHeaderView.Fixed
@@ -199,6 +196,14 @@ class ImportConfigDialog(QtWidgets.QDialog):
         self._preview_label = QtWidgets.QLabel(preview)
         self._preview_label.setFont(font)
         preview_layout.addWidget(self._preview_label)
+        self._preview_limit_label = QtWidgets.QLabel(
+            f"Showing the first {_PREVIEW_DATA_ROW_LIMIT:,} data rows. "
+            "Import will read all data rows.",
+            preview,
+        )
+        self._preview_limit_label.setWordWrap(True)
+        self._preview_limit_label.hide()
+        preview_layout.addWidget(self._preview_limit_label)
         self._preview_table = QtWidgets.QTableWidget(preview)
         self._preview_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
         self._preview_table.setSelectionMode(QtWidgets.QAbstractItemView.NoSelection)
@@ -273,15 +278,15 @@ class ImportConfigDialog(QtWidgets.QDialog):
         )
 
     def _load_preview(self) -> None:
+        # Allow an optional units row and one row to detect truncation.
+        row_limit = _PREVIEW_DATA_ROW_LIMIT + 2
         if self._source.original_format == "csv":
             columns, rows = read_csv_rows_from_bytes(
                 self._source.exact_source_bytes,
                 source_label=self._source.original_filename,
             )
             try:
-                preview = [
-                    row.values for row in itertools.islice(rows, _MAX_PREVIEW_ROWS)
-                ]
+                preview = [row.values for row in islice(rows, row_limit)]
             finally:
                 rows.close()
             self._sheets.append(self._make_sheet(None, columns, preview))
@@ -294,15 +299,8 @@ class ImportConfigDialog(QtWidgets.QDialog):
             for name in workbooks.sheet_names:
                 rows = workbooks.read_sheet_rows(name)
                 try:
-                    # Preserve the established Excel preview's one-row lookahead.
-                    preview = []
-                    columns = ()
-                    for index, row in enumerate(rows):
-                        if index == 0:
-                            columns = tuple(row)
-                        if index >= _MAX_PREVIEW_ROWS:
-                            break
-                        preview.append(row)
+                    preview = list(islice(rows, row_limit))
+                    columns = tuple(preview[0]) if preview else ()
                     sheet = self._make_sheet(name, columns, preview)
                 except Exception as exc:
                     sheet = self._make_sheet(name, (), [], str(exc))
@@ -365,29 +363,36 @@ class ImportConfigDialog(QtWidgets.QDialog):
         self._update_import_enabled()
 
     @staticmethod
-    def _populate_unit_choices(combo, choices, choice, *, default=None, declared="") -> None:
+    def _populate_unit_choices(combo, choices, choice, *, default=None, declared="", custom=False) -> None:
         with QtCore.QSignalBlocker(combo):
+            combo.setEditable(False)
             combo.clear()
             if default is not None:
                 combo.addItem("Use default", UnitSource.DEFAULT)
                 if declared:
-                    combo.addItem(f"From file ({declared})", UnitSource.FILE)
+                    label = "Dimensionless" if declared == "1" else declared
+                    combo.addItem(f"From file ({label})", UnitSource.FILE)
             for unit in choices:
                 combo.addItem("Dimensionless" if unit == "1" else unit, unit)
+            if custom:
+                combo.addItem("Custom…", None)
             index = combo.findData(choice)
             if choice is UnitSource.FILE and not declared:
                 index = combo.findData(UnitSource.DEFAULT)
             if index >= 0:
                 combo.setCurrentIndex(index)
-            else:
-                combo.setCurrentIndex(-1)
+            elif custom:
+                combo.setCurrentIndex(combo.count() - 1)
+                combo.setEditable(True)
+                combo.setCompleter(None)
                 combo.setEditText(choice)
+            else:
+                combo.addItem(choice, choice)
+                combo.setCurrentIndex(combo.count() - 1)
 
     @staticmethod
     def _unit_choice(combo) -> str | UnitSource:
-        text = combo.currentText()
-        index = combo.findText(text)
-        return combo.itemData(index) if index >= 0 else text
+        return combo.currentText() if combo.isEditable() else combo.currentData()
 
     @staticmethod
     def _declared_unit(sheet, column) -> str:
@@ -422,16 +427,23 @@ class ImportConfigDialog(QtWidgets.QDialog):
 
     def _render_preview(self) -> None:
         sheet = self._current_sheet
+        excluded = sheet.unit_row is not None
+        rows = sheet.preview_rows[:_PREVIEW_DATA_ROW_LIMIT + int(excluded)]
+        self._preview_limit_label.setVisible(len(sheet.preview_rows) > len(rows))
         self._preview_table.clear()
         self._preview_table.setColumnCount(len(sheet.columns))
-        self._preview_table.setRowCount(len(sheet.preview_rows))
+        self._preview_table.setRowCount(len(rows))
         self._preview_table.setHorizontalHeaderLabels([col.assigned_name for col in sheet.columns])
-        excluded = sheet.unit_row is not None
         self._preview_table.setVerticalHeaderLabels([
-            "Units (excluded)" if index == 0 and excluded else f"Data {index + 1 - int(excluded)}"
-            for index in range(len(sheet.preview_rows))
+            "Units" if index == 0 and excluded else f"Data {index + 1 - int(excluded)}"
+            for index in range(len(rows))
         ])
-        for row_index, row in enumerate(sheet.preview_rows):
+        if excluded:
+            header = self._preview_table.verticalHeaderItem(0)
+            font = header.font()
+            font.setItalic(True)
+            header.setFont(font)
+        for row_index, row in enumerate(rows):
             for column_index, column in enumerate(sheet.columns):
                 value = row.get(column)
                 text = "" if value is None else str(value)
@@ -462,15 +474,17 @@ class ImportConfigDialog(QtWidgets.QDialog):
                 label.setToolTip(column.assigned_name)
                 self._species_table.setItem(row, 1, label)
                 combo = QtWidgets.QComboBox(self._species_table)
-                combo.setEditable(True)
                 combo.setInsertPolicy(QtWidgets.QComboBox.NoInsert)
                 combo.setAccessibleName(f"Unit for {column.assigned_name}")
                 self._populate_unit_choices(
                     combo, MEASUREMENT_UNIT_DISPLAY, sheet.settings.column_units.get(column, UnitSource.FILE),
-                    default=sheet.settings.default_unit, declared=self._declared_unit(sheet, column),
+                    default=sheet.settings.default_unit, declared=self._declared_unit(sheet, column), custom=True,
                 )
-                combo.currentTextChanged.connect(
-                    lambda _text, col=column, control=combo: self._on_column_unit_changed(col, control)
+                combo.currentIndexChanged.connect(
+                    lambda index, col=column, control=combo: self._on_column_unit_selected(col, control, index)
+                )
+                combo.editTextChanged.connect(
+                    lambda _text, col=column, control=combo: self._on_column_unit_edited(col, control)
                 )
                 self._species_table.setCellWidget(row, 2, combo)
         self._refresh_conversions()
@@ -516,6 +530,33 @@ class ImportConfigDialog(QtWidgets.QDialog):
         self._current_sheet.settings.column_units[column] = self._unit_choice(combo)
         self._refresh_conversions()
         self._update_import_enabled()
+
+    def _on_column_unit_selected(self, column, combo, index: int) -> None:
+        if index < 0:
+            return
+        if combo.itemData(index) is None:
+            sheet = self._current_sheet
+            try:
+                expression = resolve_column_unit(column, sheet.unit_row, sheet.settings).symbol
+            except ValueError:
+                choice = sheet.settings.column_units.get(column, UnitSource.FILE)
+                expression = choice if isinstance(choice, str) else self._declared_unit(sheet, column)
+            with QtCore.QSignalBlocker(combo):
+                combo.setEditable(True)
+                combo.setCompleter(None)
+                combo.setEditText(expression)
+            combo.setFocus()
+            combo.lineEdit().selectAll()
+        else:
+            with QtCore.QSignalBlocker(combo):
+                combo.setEditable(False)
+        self._on_column_unit_changed(column, combo)
+
+    def _on_column_unit_edited(self, column, combo) -> None:
+        # A popup selection can also emit editTextChanged before indexChanged.
+        # Only an active custom expression owns edits to the setting.
+        if combo.isEditable() and combo.currentData() is None and combo.currentText() != "Custom…":
+            self._on_column_unit_changed(column, combo)
 
     def _on_unit_row_toggled(self, checked: bool) -> None:
         self._current_sheet.settings.first_row_contains_units = checked
@@ -572,11 +613,11 @@ class ImportConfigDialog(QtWidgets.QDialog):
 
     def _resolved_plans(self):
         current = self._current_sheet
-        shared = sharing_settings(current.settings) if current is not None and self._apply_remaining_cb.isChecked() else None
+        shared = current.settings if current is not None and self._apply_remaining_cb.isChecked() else None
         return tuple(
             resolve_sheet_plan(
                 sheet.name, sheet.columns, sheet.first_row,
-                sheet.settings if sheet is current or shared is None else shared,
+                sheet.settings if sheet is current or shared is None else sharing_settings(shared, destination=sheet.settings),
             )
             for sheet in self._sheets if sheet.included
         )

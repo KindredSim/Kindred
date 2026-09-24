@@ -570,6 +570,11 @@ class RunResultsTab(QtWidgets.QWidget):
     def set_terminal_failure(self, failure: object) -> None:
         self._empty_label.hide()
         self._tracker_panel.clear()
+        dataset_id = getattr(failure, "details", {}).get("dataset")
+        dataset_label = self._dataset_labels.get(dataset_id, dataset_id)
+        if dataset_label is not None and tuple(self._dataset_labels.values()).count(dataset_label) > 1:
+            dataset_label = f"{dataset_label} ({dataset_id})"
+        caption = f"Dataset: {dataset_label}" if dataset_label is not None else ""
         chain: list[str] = []
         current = failure
         while current is not None:
@@ -578,8 +583,12 @@ class RunResultsTab(QtWidgets.QWidget):
             message = getattr(current, "message", str(current))
             chain.append(f"{type(current).__name__}{code_text}: {message}")
             current = getattr(current, "cause", None)
-        self.set_execution_status("Failed", getattr(failure, "message", str(failure)))
-        self._summary_body = "<h2>Fit failed</h2><p>" + html.escape(" Caused by: ".join(chain)).replace("\n", "<br>") + "</p>"
+        message = getattr(failure, "message", str(failure))
+        self.set_execution_status("Failed", f"{caption}: {message}" if caption else message)
+        self._summary_body = (
+            "<h2>Fit failed</h2>" + (f"<p>{html.escape(caption)}</p>" if caption else "")
+            + "<p>" + html.escape(" Caused by: ".join(chain)).replace("\n", "<br>") + "</p>"
+        )
         self._summary_provenance = ""
         self._refresh_summary()
 

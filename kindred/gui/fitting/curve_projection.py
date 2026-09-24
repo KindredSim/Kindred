@@ -57,7 +57,7 @@ def focused_model_chunks(dataset):
     targets = tuple(name for name, _ in dataset.observed_y)
     for name in dict.fromkeys((dataset.x_name, *targets)):
         if name != "t":
-            fit_result_target_values(result, name)
+            fit_result_target_values(result, name, dataset_id=dataset.dataset_id)
     return physical_curve_chunks(
         result, SimulationSeriesAxisSelection(dataset.x_name),
         tuple((name, SimulationSeriesAxisSelection(name)) for name in targets),

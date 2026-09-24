@@ -105,13 +105,27 @@ def resolve_column_unit(
 
 def sharing_settings(
     settings: ImportSettings,
+    *,
+    destination: ImportSettings | None = None,
 ) -> ImportSettings:
-    """Share deliberate choices; destination file units precede shared defaults."""
+    """Share explicit choices without using defaults to replace specific units."""
+    units = {column: unit for column, unit in settings.column_units.items() if unit is not UnitSource.DEFAULT}
+    time_choice = UnitSource.FILE if settings.time_choice is UnitSource.DEFAULT else settings.time_choice
+    if destination is not None:
+        for column, unit in destination.column_units.items():
+            if isinstance(unit, str) and not isinstance(units.get(column), str):
+                units[column] = unit
+        if (
+            destination.time_column == settings.time_column
+            and isinstance(destination.time_choice, str)
+            and not isinstance(time_choice, str)
+        ):
+            time_choice = destination.time_choice
     return replace(
         settings,
         species_columns=set(settings.species_columns),
-        time_choice=UnitSource.FILE if settings.time_choice is UnitSource.DEFAULT else settings.time_choice,
-        column_units={column: unit for column, unit in settings.column_units.items() if unit is not UnitSource.DEFAULT},
+        time_choice=time_choice,
+        column_units=units,
     )
 
 

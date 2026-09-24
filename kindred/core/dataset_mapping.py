@@ -12,8 +12,9 @@ from typing import Iterable, Mapping, Sequence
 import uuid
 
 from kindred.core.datasets.observation_mapping import (
+    InitialConcentrationSource,
+    extract_initial_concentrations,
     normalize_observation_mapping,
-    seed_species_values_at_exact_zero,
 )
 from kindred.core.datasets import foundation as dataset_foundation
 from kindred.core.project_document import (
@@ -30,7 +31,7 @@ class DatasetMappingError(ValueError):
 
 
 class DatasetMappingChoice(str, Enum):
-    CREATE_SET = "create_set_from_t0"
+    CREATE_SET = "create_set"
     MAP_EXISTING = "map_existing"
     LEAVE_UNMAPPED = "leave_unmapped"
 
@@ -51,6 +52,7 @@ class DatasetMappingProposal:
     occupied_choice: OccupiedSetChoice | str | None = None
     observation_mapping: tuple[tuple[str, str], ...] = ()
     proposed_set_name: str | None = None
+    initial_concentration_source: InitialConcentrationSource | None = None
 
     def __post_init__(self) -> None:
         dataset_id = str(self.dataset_id).strip()
@@ -82,6 +84,11 @@ class DatasetMappingProposal:
             raise DatasetMappingError("Map Existing requires a target set.")
         if action is DatasetMappingChoice.CREATE_SET and target is not None:
             raise DatasetMappingError("Create Set cannot target an existing set.")
+        if action is DatasetMappingChoice.CREATE_SET:
+            if self.initial_concentration_source is None:
+                raise DatasetMappingError("Choose a source for the initial concentrations.")
+        elif self.initial_concentration_source is not None:
+            raise DatasetMappingError("Only Create Set selects an initial-concentration source.")
         object.__setattr__(self, "dataset_id", dataset_id)
         object.__setattr__(self, "action", action)
         object.__setattr__(self, "target_set_id", target)
@@ -209,7 +216,7 @@ def export_original_source(
     return target
 
 
-def create_set_from_exact_zero(
+def create_set_from_data(
     *,
     tab: MechanismTabDocument,
     dataset: dataset_foundation.RawDatasetRecord,
@@ -217,8 +224,9 @@ def create_set_from_exact_zero(
     set_name: str,
     model_targets: Sequence[str],
     confirmed_mapping: Iterable[tuple[str, str]],
+    source: InitialConcentrationSource,
 ) -> MechanismTabDocument:
-    """Create and map one complete IC set from confirmed exact-zero values.
+    """Create and map one complete IC set from an explicitly selected source.
 
     model_targets is the accepted observation-target roster.  The mechanism
     species roster remains canonical state owned by tab and is the only roster
@@ -232,15 +240,6 @@ def create_set_from_exact_zero(
         raise DatasetMappingError(f"Initial-condition set ID '{clean_set_id}' already exists.")
     if any(existing.name.casefold() == clean_name.casefold() for existing in tab.initial_condition_sets):
         raise DatasetMappingError(f"An initial-condition set named '{clean_name}' already exists.")
-    observations = {
-        series.raw_observation_id: {
-            "raw_column": series.column_name,
-            "t": series.t,
-            "y": series.y,
-            "source_rows": series.source_rows,
-        }
-        for series in dataset.observations
-    }
     normalized_mapping = normalize_observation_mapping(
         confirmed_mapping,
         raw_observations=tuple(
@@ -249,16 +248,16 @@ def create_set_from_exact_zero(
         ),
         model_targets=model_targets,
     )
-    values = seed_species_values_at_exact_zero(
-        observations=observations,
+    values = extract_initial_concentrations(
+        observations=dataset.observations,
         mechanism_species=canonical_species_names(tab),
-        model_targets=model_targets,
         confirmed_mapping=normalized_mapping,
+        source=source,
     )
     created_set = InitialConditionSet(
         set_id=clean_set_id,
         name=clean_name,
-        values=values,
+        values=tuple((name, 0.0 if value is None else value) for name, value in values),
     )
     with_set = tab.with_initial_condition_sets((*tab.initial_condition_sets, created_set))
     return with_set.with_dataset_link(
@@ -365,25 +364,16 @@ def apply_dataset_mapping_batch(
                 raise DatasetMappingError(
                     "Create Set name is not the canonical display-derived name."
                 )
-            observations = {
-                series.raw_observation_id: {
-                    "raw_column": series.column_name,
-                    "t": series.t,
-                    "y": series.y,
-                    "source_rows": series.source_rows,
-                }
-                for series in dataset.observations
-            }
-            values = seed_species_values_at_exact_zero(
-                observations=observations,
+            values = extract_initial_concentrations(
+                observations=dataset.observations,
                 mechanism_species=species,
-                model_targets=observation_targets,
                 confirmed_mapping=normalized_mapping,
+                source=item.initial_concentration_source,
             )
             new_set = InitialConditionSet(
                 set_id=new_set_id(),
                 name=expected_name,
-                values=values,
+                values=tuple((name, 0.0 if value is None else value) for name, value in values),
             )
             sets.append(new_set)
             used_names.add(expected_name.casefold())

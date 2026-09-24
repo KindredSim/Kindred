@@ -881,6 +881,8 @@ def _payload_x_observations(payload: FitDatasetSpec) -> Dict[str, object]:
 def fit_result_target_values(
     result: SimulationResultValue,
     name: str,
+    *,
+    dataset_id: str,
 ) -> np.ndarray:
     """Resolve a Fit target from the canonical scalar/series result split.
 
@@ -892,6 +894,7 @@ def fit_result_target_values(
     if not isinstance(result, SimulationResultValue):
         raise TypeError("Fit target lookup requires a SimulationResultValue.")
     target_name = str(name)
+    details = {"fatal": True, "stage": "fit_target_lookup", "dataset": dataset_id, "target": target_name}
     time_size = np.asarray(result.t, dtype=float).reshape(-1).size
     if target_name in result.series:
         values = np.asarray(result.series[target_name], dtype=float).reshape(-1)
@@ -900,19 +903,28 @@ def fit_result_target_values(
         if not np.isfinite(value):
             raise FitSimulationError(
                 f"Fit scalar target {target_name!r} is non-finite.",
-                details={"fatal": True, "stage": "fit_target_lookup"},
+                details=details,
             )
         values = np.full(time_size, value, dtype=float)
     else:
-        raise FitSimulationError(
-            f"Fit target {target_name!r} is absent from the canonical "
-            "simulation scalar/series outputs.",
-            details={"fatal": True, "stage": "fit_target_lookup"},
+        algebra_cause = next(
+            (cause for cause in result.algebra_errors if cause.details.get("name") == target_name), None,
         )
+        error = FitSimulationError(
+            f"Fit target {target_name!r} could not be calculated." if algebra_cause is not None else
+            f"Fit target {target_name!r} is absent from the canonical simulation scalar/series outputs.",
+            details=details,
+        )
+        if algebra_cause is not None:
+            error.factual_cause = replace(
+                factual_cause_from_exception(error, domain="fit", origin="fit_target_lookup"),
+                cause=algebra_cause,
+            )
+        raise error
     if values.size != time_size or not np.all(np.isfinite(values)):
         raise FitSimulationError(
             f"Fit target {target_name!r} is not a finite row-aligned output.",
-            details={"fatal": True, "stage": "fit_target_lookup"},
+            details=details,
         )
     return values
 
@@ -1610,12 +1622,12 @@ def _build_dataset_fit_info(
                 observed_x=x_observations["x"],
                 source_rows=x_observations["source_rows"],
                 model_time=sim_time,
-                model_x=fit_result_target_values(simulation, x_name),
+                model_x=fit_result_target_values(simulation, x_name, dataset_id=dataset_id),
                 segment_ids=segment_ids,
                 segment_keys=segment_keys,
                 discontinuity_ids=discontinuity_ids,
                 observations=payload.observations,
-                model_y={name: fit_result_target_values(simulation, name) for name in payload.species_list},
+                model_y={name: fit_result_target_values(simulation, name, dataset_id=dataset_id) for name in payload.species_list},
                 multipliers=target_multipliers,
                 dataset_label=dataset_id,
                 x_name=x_name,
@@ -1650,7 +1662,7 @@ def _build_dataset_fit_info(
         species_obs = observations[species_name]
         obs_t = np.asarray(species_obs["t"], dtype=float).reshape(-1)
         y_exp = np.asarray(species_obs["y"], dtype=float).reshape(-1)
-        model_values = fit_result_target_values(simulation, species_name)
+        model_values = fit_result_target_values(simulation, species_name, dataset_id=dataset_id)
         if x_name == "t":
             selected = _select_fit_rows(
                 model_y=np.asarray(model_values, dtype=float),

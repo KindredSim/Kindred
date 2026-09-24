@@ -14,10 +14,10 @@ from kindred.core.dataset_mapping import (
     OccupiedSetChoice,
     allocate_initial_condition_set_name,
 )
-from kindred.core.datasets.observation_mapping import suggest_observation_mapping, normalize_observation_mapping
 from kindred.gui.ui_helpers import clamp_initial_size
 from kindred.core.datasets.foundation import RawDatasetRecord
-from kindred.core.project_document import MechanismTabDocument
+from kindred.core.project_document import MechanismTabDocument, canonical_species_names
+from kindred.gui.widgets.observation_mapping_widget import ObservationMappingWidget
 
 __all__ = ["DatasetMappingBatchDialog"]
 
@@ -29,7 +29,7 @@ class _DatasetMappingRow:
     target: QtWidgets.QComboBox
     occupancy: QtWidgets.QComboBox
     proposed_name: QtWidgets.QLabel
-    observation_combos: dict[str, QtWidgets.QComboBox]
+    editor: ObservationMappingWidget
 
 
 class DatasetMappingBatchDialog(QtWidgets.QDialog):
@@ -129,30 +129,12 @@ class DatasetMappingBatchDialog(QtWidgets.QDialog):
         controls.setColumnStretch(1, 1)
         group_layout.addLayout(controls)
 
-        observations = QtWidgets.QFormLayout()
-        observation_combos: dict[str, QtWidgets.QComboBox] = {}
-        suggestions = {
-            item.raw_observation_id: item.model_target
-            for item in suggest_observation_mapping(
-                raw_observations=tuple(
-                    (series.raw_observation_id, series.column_name)
-                    for series in record.observations
-                ),
-                model_targets=self._model_targets,
-            )
-        }
-        for series in record.observations:
-            combo = QtWidgets.QComboBox(group)
-            combo.addItem("Unmapped", None)
-            for target_name in self._model_targets:
-                combo.addItem(target_name, target_name)
-            suggested = suggestions.get(series.raw_observation_id)
-            if suggested is not None:
-                combo.setCurrentIndex(combo.findData(suggested))
-            observations.addRow(series.column_name, combo)
-            observation_combos[series.raw_observation_id] = combo
         group_layout.addWidget(QtWidgets.QLabel("Observation target mappings (suggestions require OK confirmation):", group))
-        group_layout.addLayout(observations)
+        editor = ObservationMappingWidget(
+            record, self._model_targets,
+            mechanism_species=canonical_species_names(self._tab), create_set=True, parent=group,
+        )
+        group_layout.addWidget(editor)
 
         row = _DatasetMappingRow(
             record=record,
@@ -160,7 +142,7 @@ class DatasetMappingBatchDialog(QtWidgets.QDialog):
             target=target,
             occupancy=occupancy,
             proposed_name=proposed_name,
-            observation_combos=observation_combos,
+            editor=editor,
         )
         self._rows.append(row)
         action.currentIndexChanged.connect(lambda _index: self._refresh_rows())
@@ -187,6 +169,7 @@ class DatasetMappingBatchDialog(QtWidgets.QDialog):
             action = DatasetMappingChoice(row.action.currentData())
             is_create = action is DatasetMappingChoice.CREATE_SET
             is_existing = action is DatasetMappingChoice.MAP_EXISTING
+            row.editor.set_create_set(is_create)
             row.target.setEnabled(is_existing)
             row.occupancy.setEnabled(False)
             if is_create:
@@ -330,17 +313,7 @@ class DatasetMappingBatchDialog(QtWidgets.QDialog):
                     pass
                 elif occupied != OccupiedSetChoice.CANCEL.value:
                     projected_occupants[target.set_id] = row.record.dataset_id
-            mapping = tuple(
-                (raw_id, str(combo.currentData()))
-                for raw_id, combo in row.observation_combos.items()
-                if combo.currentData() is not None
-            )
-            mapping = normalize_observation_mapping(
-                mapping,
-                raw_observations=tuple((series.raw_observation_id, series.column_name)
-                                       for series in row.record.observations),
-                model_targets=self._model_targets,
-            )
+            mapping = row.editor.confirmed_mapping()
             proposals.append(
                 DatasetMappingProposal(
                     dataset_id=row.record.dataset_id,
@@ -349,6 +322,9 @@ class DatasetMappingBatchDialog(QtWidgets.QDialog):
                     occupied_choice=occupied,
                     observation_mapping=mapping,
                     proposed_set_name=proposed_name,
+                    initial_concentration_source=(
+                        row.editor.creation_source() if action is DatasetMappingChoice.CREATE_SET else None
+                    ),
                 )
             )
         return DatasetMappingBatchProposal(tab_id=self._tab.tab_id, proposals=tuple(proposals))

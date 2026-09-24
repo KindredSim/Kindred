@@ -173,25 +173,34 @@ class _SourceDialog(QtWidgets.QDialog):
         if "sheet_name" in metadata:
             fields.append(("Worksheet", metadata["sheet_name"]))
         source_names = {column["assigned_name"]: column["authored_name"] for column in metadata["physical_columns"]}
-        fields.extend([
-            ("Time column", source_names.get(metadata["time_column"], "Not recorded")),
-            ("Time unit", metadata.get("original_time_unit", "Not recorded") if metadata["time_column"] is not None else "Not recorded"),
-            ("Time points", str(len({t for series in record.observations for t in series.t}))),
-        ])
+        if metadata["time_column"] is None:
+            fields.append(("Time", "Not recorded"))
+        else:
+            fields.extend([
+                ("Time column", source_names[metadata["time_column"]]),
+                ("Time unit", metadata["original_time_unit"]),
+                ("Distinct recorded timestamps", str(len({t for series in record.observations for t in series.t}))),
+            ])
         for title, value in fields:
             form.addRow(title, _source_label(value))
         layout.addWidget(original)
         layout.addWidget(QtWidgets.QLabel("Measured columns"))
-        table = QtWidgets.QTableWidget(len(record.observations), 2)
-        table.setAccessibleName("Measured columns and original units")
-        table.setHorizontalHeaderLabels(["Column in file", "Original unit"])
+        table = QtWidgets.QTableWidget(len(record.observations), 4)
+        table.setAccessibleName("Measured columns, measurement counts and units")
+        table.setHorizontalHeaderLabels(["Column in file", "Measurements", "Imported unit", "Converted to"])
         table.verticalHeader().hide()
         table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
         table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
         table.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.Stretch)
         units = metadata.get("original_concentration_units", {})
         for row, series in enumerate(record.observations):
-            for column, value in enumerate((source_names[series.column_name], units.get(series.column_name, "Not recorded"))):
+            imported = units[series.column_name]
+            converted = series.unit.symbol
+            for column, value in enumerate((
+                source_names[series.column_name], str(len(series.y)),
+                "Dimensionless" if imported == "1" else imported,
+                "Dimensionless" if converted == "1" else converted,
+            )):
                 item = QtWidgets.QTableWidgetItem(value)
                 item.setToolTip(literal_tooltip(value))
                 table.setItem(row, column, item)
@@ -221,7 +230,7 @@ class _ICSetDialog(QtWidgets.QDialog):
             self.sets.setEnabled(False)
         form.addRow("Existing IC set", self.sets)
         layout.addLayout(form)
-        create = QtWidgets.QPushButton("Create IC set from data at t=0…")
+        create = QtWidgets.QPushButton("Create IC set from data…")
         create.setAutoDefault(False)
         create.clicked.connect(lambda: self.done(self.CREATE_FROM_DATA))
         layout.addWidget(create, 0, Qt.AlignLeft)
@@ -733,7 +742,7 @@ class DataManagerPanel(QtWidgets.QWidget):
         finally:
             dialog.deleteLater()
         if result == _ICSetDialog.CREATE_FROM_DATA:
-            self._emit_mapping_action("create_set_from_t0")
+            self._emit_mapping_action("create_set")
             return
         if result != QtWidgets.QDialog.Accepted:
             return

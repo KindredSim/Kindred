@@ -6,7 +6,7 @@ import logging
 import io
 import os
 from dataclasses import dataclass, replace
-from typing import Callable, Iterable, Sequence
+from typing import Callable, Iterable
 
 from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtCore import Qt
@@ -22,18 +22,14 @@ from kindred.core.dataset_mapping import (
     allocate_initial_condition_set_name,
     apply_dataset_mapping_batch,
     apply_dataset_set_mapping_plan,
-    create_set_from_exact_zero,
+    create_set_from_data,
     export_original_source,
     plan_dataset_to_set_mapping,
     plan_global_dataset_delete,
     validate_unique_dataset_name,
     with_confirmed_observation_mapping,
 )
-from kindred.core.datasets.observation_mapping import (
-    ObservationMappingError,
-    normalize_observation_mapping,
-    suggest_observation_mapping,
-)
+from kindred.gui.widgets.observation_mapping_widget import ObservationMappingDialog
 from kindred.core.mechanism_source import MechanismAuthoringSource
 from kindred.core.fitting_method_policy import SUPPORTED_FIT_METHODS
 from kindred.core.project_document import (
@@ -3823,29 +3819,39 @@ class MainWindow(QtWidgets.QMainWindow):
                     raise ValueError(
                         "Apply a valid mechanism with observation targets before creating a set from observations."
                     )
-                mapping = self._prompt_observation_mapping(
+                dialog = ObservationMappingDialog(
                     dataset,
-                    tab.dataset_link(dataset.dataset_id).observation_mapping
-                    if tab.dataset_link(dataset.dataset_id) is not None
-                    else (),
                     model_targets,
+                    current_mapping=(
+                        tab.dataset_link(dataset.dataset_id).observation_mapping
+                        if tab.dataset_link(dataset.dataset_id) is not None else ()
+                    ),
+                    mechanism_species=canonical_species_names(tab),
+                    create_set=True,
                     title="Confirm Observation Mapping",
+                    parent=self,
                 )
-                if mapping is None:
-                    return
+                try:
+                    if dialog.exec() != QtWidgets.QDialog.DialogCode.Accepted:
+                        return
+                    mapping = dialog.editor.confirmed_mapping()
+                    source = dialog.editor.creation_source()
+                finally:
+                    dialog.deleteLater()
                 suggested_name = allocate_initial_condition_set_name(
                     dataset.display_name,
                     existing_names=(
                         item.name for item in tab.initial_condition_sets
                     ),
                 )
-                candidate_tab = create_set_from_exact_zero(
+                candidate_tab = create_set_from_data(
                     tab=tab,
                     dataset=dataset,
                     set_id=new_set_id(),
                     set_name=suggested_name,
                     model_targets=model_targets,
                     confirmed_mapping=mapping,
+                    source=source,
                 )
             elif choice is DatasetMappingChoice.MAP_EXISTING:
                 if not set_id:
@@ -3916,14 +3922,19 @@ class MainWindow(QtWidgets.QMainWindow):
             dataset = self._project_session.document.dataset(dataset_id)
             model_targets = canonical_observation_target_names(tab)
             current = tab.dataset_link(dataset.dataset_id)
-            mapping = self._prompt_observation_mapping(
+            dialog = ObservationMappingDialog(
                 dataset,
-                current.observation_mapping if current is not None else (),
                 model_targets,
+                current_mapping=current.observation_mapping if current is not None else (),
                 title="Observation Mapping",
+                parent=self,
             )
-            if mapping is None:
-                return
+            try:
+                if dialog.exec() != QtWidgets.QDialog.DialogCode.Accepted:
+                    return
+                mapping = dialog.editor.confirmed_mapping()
+            finally:
+                dialog.deleteLater()
             candidate = with_confirmed_observation_mapping(
                 tab=tab,
                 dataset=dataset,
@@ -3941,93 +3952,6 @@ class MainWindow(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.warning(self, "Observation Mapping", str(exc))
         if changed:
             self._refresh_dataset_views((tab_id,))
-
-    def _prompt_observation_mapping(
-        self,
-        dataset,
-        current_mapping: Iterable[tuple[str, str]],
-        model_targets: Sequence[str],
-        *,
-        title: str,
-    ) -> tuple[tuple[str, str], ...] | None:
-        targets = tuple(dict.fromkeys(str(name) for name in model_targets))
-        observations = tuple(
-            (series.raw_observation_id, series.column_name)
-            for series in dataset.observations
-        )
-        current = dict(current_mapping)
-        suggestions = {
-            item.raw_observation_id: item.model_target
-            for item in suggest_observation_mapping(
-                raw_observations=observations,
-                model_targets=targets,
-            )
-        }
-        dialog = QtWidgets.QDialog(self)
-        dialog.setWindowTitle(title)
-        layout = QtWidgets.QVBoxLayout(dialog)
-        explanation = QtWidgets.QLabel(
-            "Review every suggested mapping. Selecting OK explicitly confirms "
-            "the choices; no equal-name column is adopted silently.",
-            dialog,
-        )
-        explanation.setWordWrap(True)
-        layout.addWidget(explanation)
-        body = QtWidgets.QWidget(dialog)
-        form = QtWidgets.QFormLayout(body)
-        editors: dict[str, QtWidgets.QComboBox] = {}
-        for raw_observation_id, column in observations:
-            combo = QtWidgets.QComboBox(dialog)
-            combo.addItem("(unmapped)", None)
-            for target_name in targets:
-                combo.addItem(target_name, target_name)
-            selected = current.get(
-                raw_observation_id,
-                suggestions.get(raw_observation_id),
-            )
-            if selected in targets:
-                combo.setCurrentIndex(combo.findData(selected))
-            form.addRow(column, combo)
-            editors[raw_observation_id] = combo
-        scroll = QtWidgets.QScrollArea(dialog)
-        scroll.setWidgetResizable(True)
-        scroll.setWidget(body)
-        layout.addWidget(scroll, 1)
-        feedback = QtWidgets.QLabel(dialog)
-        feedback.setTextFormat(QtCore.Qt.TextFormat.PlainText)
-        feedback.setWordWrap(True)
-        layout.addWidget(feedback)
-        mapping: tuple[tuple[str, str], ...] = ()
-
-        def accept_mapping() -> None:
-            nonlocal mapping
-            try:
-                mapping = normalize_observation_mapping(
-                    (
-                        (raw_id, combo.currentData())
-                        for raw_id, combo in editors.items()
-                        if combo.currentData() is not None
-                    ),
-                    raw_observations=observations,
-                    model_targets=targets,
-                )
-            except ObservationMappingError as exc:
-                feedback.setText(str(exc))
-                return
-            dialog.accept()
-
-        buttons = QtWidgets.QDialogButtonBox(
-            QtWidgets.QDialogButtonBox.StandardButton.Ok
-            | QtWidgets.QDialogButtonBox.StandardButton.Cancel,
-            parent=dialog,
-        )
-        buttons.accepted.connect(accept_mapping)
-        buttons.rejected.connect(dialog.reject)
-        layout.addWidget(buttons)
-        clamp_initial_size(dialog, 620, 520)
-        if dialog.exec() != QtWidgets.QDialog.DialogCode.Accepted:
-            return None
-        return mapping
 
     def _set_overlay_selection(
         self,

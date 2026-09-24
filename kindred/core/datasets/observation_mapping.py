@@ -1,15 +1,23 @@
-"""Pure raw-observation mapping and exact-zero seeding helpers."""
+"""Pure observation mapping and explicit initial-concentration extraction."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Iterable, Mapping, Sequence
+from enum import Enum
+from typing import Iterable, Sequence
 
+from kindred.core.datasets.foundation import ObservationSeries
+from kindred.core.quantity_units import MOLAR
 from kindred.core.species import validate_concentration
 
 
 class ObservationMappingError(ValueError):
     """Raised when an explicit observation mapping cannot be honored."""
+
+
+class InitialConcentrationSource(Enum):
+    RECORDED_ZERO = "recorded_zero"
+    FIRST_DATA_ROW = "first_data_row"
 
 
 @dataclass(frozen=True)
@@ -155,90 +163,51 @@ def suggest_observation_mapping(
     return tuple(suggestions)
 
 
-def seed_species_values_at_exact_zero(
+def extract_initial_concentrations(
     *,
-    observations: Mapping[str, object],
+    observations: Sequence[ObservationSeries],
     mechanism_species: Sequence[str],
-    model_targets: Sequence[str],
     confirmed_mapping: Iterable[tuple[str, str]],
-) -> tuple[tuple[str, float], ...]:
-    """Seed mechanism species from confirmed samples at exact t == 0.0.
+    source: InitialConcentrationSource,
+) -> tuple[tuple[str, float | None], ...]:
+    """Read admitted observations through a confirmed mapping for IC creation.
 
-    The model-target roster validates every confirmed mapping, including
-    authored observables, while only mechanism species receive IC values.
+    None means no concentration was supplied; a measured zero remains zero.
+    Values already use scientific units and undergo only IC-domain admission.
     """
-    raw_observations: list[tuple[str, str]] = []
-    for raw_id_value, raw_spec in observations.items():
-        raw_id = _canonical_text(raw_id_value, "Raw observation ID")
-        if not isinstance(raw_spec, Mapping):
-            raise ObservationMappingError(
-                f"Raw observation {raw_id!r} has an invalid series payload."
-            )
-        raw_observations.append(
-            (
-                raw_id,
-                _canonical_text(
-                    raw_spec.get("raw_column"),
-                    "Raw observation label",
-                ),
-            )
-        )
-    mapping = normalize_observation_mapping(
-        confirmed_mapping,
-        raw_observations=tuple(raw_observations),
-        model_targets=model_targets,
-    )
-    raw_id_by_target = {target: raw_id for raw_id, target in mapping}
-    normalized_mechanism_species = tuple(
-        _canonical_text(value, "Mechanism species name")
-        for value in mechanism_species
-    )
-    if len(set(normalized_mechanism_species)) != len(
-        normalized_mechanism_species
+    if source is InitialConcentrationSource.RECORDED_ZERO and not any(
+        0.0 in series.t for series in observations
     ):
-        raise ObservationMappingError(
-            "Mechanism species names must be unique."
-        )
-    seeded: list[tuple[str, float]] = []
-    for species in normalized_mechanism_species:
-        value = 0.0
+        raise ObservationMappingError("The dataset has no recorded observation at t = 0.")
+    first_row = (
+        min(row for series in observations for row in series.source_rows)
+        if source is InitialConcentrationSource.FIRST_DATA_ROW else None
+    )
+    by_id = {series.raw_observation_id: series for series in observations}
+    raw_id_by_target = {target: raw_id for raw_id, target in confirmed_mapping}
+    concentrations: list[tuple[str, float | None]] = []
+    for species in mechanism_species:
+        value = None
         raw_id = raw_id_by_target.get(species)
         if raw_id is not None:
-            spec = observations[raw_id]
-            raw_column = _canonical_text(
-                spec.get("raw_column"),
-                "Raw observation label",
-            )
-            t_values = spec["t"]
-            y_values = spec["y"]
-            source_rows = spec["source_rows"]
-            if len(set(source_rows)) != len(source_rows):
-                raise ObservationMappingError(
-                    f"Observation {raw_column!r} (raw ID {raw_id!r}) contains "
-                    "duplicate physical source-row identities."
-                )
-            zero_indexes = tuple(
-                index
-                for index, t_value in enumerate(t_values)
-                if t_value == 0.0
-            )
-            if len(zero_indexes) > 1:
-                identities = tuple(
-                    source_rows[index] for index in zero_indexes
-                )
-                joined = ", ".join(str(identity) for identity in identities)
-                raise ObservationMappingError(
-                    f"Observation {raw_column!r} (raw ID {raw_id!r}) mapped "
-                    f"to species {species!r} has multiple exact t=0.0 values "
-                    f"at source rows {joined}."
-                )
-            if zero_indexes:
-                try:
-                    value = validate_concentration(
-                        y_values[zero_indexes[0]],
-                        field=f"initial concentration for {species}",
+            series = by_id[raw_id]
+            if series.unit.compatible(MOLAR):
+                coordinates = series.t if first_row is None else series.source_rows
+                selected = 0.0 if first_row is None else first_row
+                indexes = tuple(index for index, item in enumerate(coordinates) if item == selected)
+                if len(indexes) > 1:
+                    rows = ", ".join(str(series.source_rows[index]) for index in indexes)
+                    raise ObservationMappingError(
+                        f"Observation {series.column_name!r} (raw ID {raw_id!r}) mapped "
+                        f"to species {species!r} has multiple exact t=0.0 values "
+                        f"at source rows {rows}."
                     )
-                except (TypeError, ValueError) as exc:
-                    raise ObservationMappingError(str(exc)) from exc
-        seeded.append((species, value))
-    return tuple(seeded)
+                if indexes:
+                    try:
+                        value = validate_concentration(
+                            series.y[indexes[0]], field=f"initial concentration for {species}",
+                        )
+                    except (TypeError, ValueError) as exc:
+                        raise ObservationMappingError(str(exc)) from exc
+        concentrations.append((species, value))
+    return tuple(concentrations)
