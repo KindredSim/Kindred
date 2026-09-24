@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import closing
 import datetime as dt
 from io import BytesIO
 from typing import Iterator, List, Mapping
@@ -98,20 +99,6 @@ class ExcelWorkbookPair:
             sheet_name=sheet_name,
         )
 
-def _exact_worksheet_width(worksheet) -> int:  # noqa: ANN001
-    """Return the declared width or exhaustively discover it from real rows."""
-    declared = worksheet.max_column
-    if declared is not None:
-        width = int(declared)
-        if width <= 0:
-            raise ValueError("Worksheet column extent must be positive.")
-        return width
-    return max(
-        (len(row) for row in worksheet.iter_rows(values_only=False)),
-        default=0,
-    )
-
-
 def _read_worksheet_rows(
     worksheet,
     *,
@@ -119,22 +106,15 @@ def _read_worksheet_rows(
     filepath: str,
     sheet_name: str,
 ) -> Iterator[Mapping[PhysicalColumn, object]]:  # noqa: ANN001
-    physical_width = max(
-        _exact_worksheet_width(worksheet),
-        _exact_worksheet_width(authored_worksheet),
-    )
-    if physical_width <= 0:
-        raise ValueError(f"Sheet {sheet_name!r} in workbook {filepath!r} has no rows.")
-    cell_rows = worksheet.iter_rows(
-        max_col=physical_width,
-        values_only=False,
-    )
-    authored_rows = authored_worksheet.iter_rows(
-        max_col=physical_width,
-        values_only=False,
-    )
-    header_cells = next(cell_rows, None)
-    authored_header_cells = next(authored_rows, None)
+    # Imported columns are defined by the header, including sparse positions.
+    with closing(
+        worksheet.iter_rows(max_row=1, values_only=False)
+    ) as cell_rows:
+        header_cells = next(cell_rows, None)
+    with closing(
+        authored_worksheet.iter_rows(max_row=1, values_only=False)
+    ) as authored_rows:
+        authored_header_cells = next(authored_rows, None)
     if header_cells is None or authored_header_cells is None:
         raise ValueError(f"Sheet {sheet_name!r} in workbook {filepath!r} has no rows.")
     header_values = tuple(
