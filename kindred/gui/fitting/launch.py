@@ -1348,7 +1348,7 @@ def selected_observations(
             ))
         )
         if not usable:
-            selection = "Parametric-X physical-row pairing" if x_rows is not None else "Data Range"
+            selection = "Parametric-X row pairing" if x_rows is not None else "Data Range"
             raise ValueError(
                 f"Dataset {mapped.display_name!r} target {target!r} has "
                 f"zero usable observations after {selection}."
@@ -1501,7 +1501,7 @@ def _selected_parametric_x_observation(
     if not indices:
         raise ValueError(
             f"Dataset {mapped.display_name!r} Parametric-X series "
-            f"{parametric.x_name!r} has no physically paired observations."
+            f"{parametric.x_name!r} has no observations paired by dataset row."
         )
     return FitSelectedObservation(
         raw_observation_id=x_source.raw_observation_id,

@@ -153,54 +153,60 @@ def _source_label(text: str) -> QtWidgets.QLabel:
 
 
 class _SourceDialog(QtWidgets.QDialog):
-    """Present the original file and measured units without internal metadata."""
+    """Present the dataset's origin and retained measurement units."""
 
-    def __init__(self, record: RawDatasetRecord, source: ImportedSource, parent):
+    def __init__(self, record: RawDatasetRecord, source: ImportedSource | None, parent):
         super().__init__(parent)
-        self.setWindowTitle("File Details")
+        self.setWindowTitle("File Details" if source is not None else "Dataset Details")
         layout = QtWidgets.QVBoxLayout(self)
         layout.setSpacing(8)
         metadata = thaw_json_value(record.source_metadata)
-        original = QtWidgets.QGroupBox("Original file")
+        original = QtWidgets.QGroupBox("Original file" if source is not None else "Created in Kindred")
         form = QtWidgets.QFormLayout(original)
         form.setRowWrapPolicy(QtWidgets.QFormLayout.WrapLongRows)
         form.setVerticalSpacing(6)
-        fields = [
-            ("Filename", source.original_filename),
-            ("Original filepath", source.original_filepath),
-            ("File type", "Excel (XLSX)" if source.original_format == "xlsx" else "CSV"),
-        ]
-        if "sheet_name" in metadata:
-            fields.append(("Worksheet", metadata["sheet_name"]))
-        source_names = {column["assigned_name"]: column["authored_name"] for column in metadata["physical_columns"]}
-        if metadata["time_column"] is None:
-            fields.append(("Time", "Not recorded"))
+        source_names = {}
+        if source is not None:
+            fields = [
+                ("Filename", source.original_filename),
+                ("Original filepath", source.original_filepath),
+                ("File type", "Excel (XLSX)" if source.original_format == "xlsx" else "CSV"),
+            ]
+            if "sheet_name" in metadata:
+                fields.append(("Worksheet", metadata["sheet_name"]))
+            source_names = {column["assigned_name"]: column["authored_name"] for column in metadata["physical_columns"]}
+            if metadata["time_column"] is not None:
+                fields.extend([
+                    ("Time column", source_names[metadata["time_column"]]),
+                    ("Time unit", metadata["original_time_unit"]),
+                ])
         else:
-            fields.extend([
-                ("Time column", source_names[metadata["time_column"]]),
-                ("Time unit", metadata["original_time_unit"]),
-                ("Distinct recorded timestamps", str(len({t for series in record.observations for t in series.t}))),
-            ])
+            fields = [("Dataset", record.display_name), ("Origin", "Created with the spreadsheet editor")]
+        times = {time for series in record.observations for time in series.t}
+        if times:
+            fields.append(("Distinct recorded timestamps", str(len(times))))
+        else:
+            fields.append(("Time", "Not recorded"))
         for title, value in fields:
             form.addRow(title, _source_label(value))
         layout.addWidget(original)
         layout.addWidget(QtWidgets.QLabel("Measured columns"))
-        table = QtWidgets.QTableWidget(len(record.observations), 4)
+        table = QtWidgets.QTableWidget(len(record.observations), 4 if source is not None else 3)
         table.setAccessibleName("Measured columns, measurement counts and units")
-        table.setHorizontalHeaderLabels(["Column in file", "Measurements", "Imported unit", "Converted to"])
+        table.setHorizontalHeaderLabels(["Column in file", "Measurements", "Imported unit", "Converted to"] if source is not None else ["Column", "Measurements", "Scientific unit"])
         table.verticalHeader().hide()
         table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
         table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
         table.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.Stretch)
-        units = metadata.get("original_concentration_units", {})
+        units = metadata.get("original_concentration_units", {}) if metadata is not None else {}
         for row, series in enumerate(record.observations):
-            imported = units[series.column_name]
-            converted = series.unit.symbol
-            for column, value in enumerate((
-                source_names[series.column_name], str(len(series.y)),
-                "Dimensionless" if imported == "1" else imported,
-                "Dimensionless" if converted == "1" else converted,
-            )):
+            converted = "Dimensionless" if series.unit.symbol == "1" else series.unit.symbol
+            values = (series.column_name, str(len(series.y)), converted)
+            if source is not None:
+                imported = units[series.column_name]
+                values = (source_names[series.column_name], str(len(series.y)),
+                          "Dimensionless" if imported == "1" else imported, converted)
+            for column, value in enumerate(values):
                 item = QtWidgets.QTableWidgetItem(value)
                 item.setToolTip(literal_tooltip(value))
                 table.setItem(row, column, item)
@@ -259,6 +265,7 @@ class DataManagerPanel(QtWidgets.QWidget):
     datasetMappingRequested = QtCore.Signal(str, str, object, object)
     datasetObservationMappingRequested = QtCore.Signal(str)
     datasetImportRequested = QtCore.Signal(str, object)
+    datasetCreationRequested = QtCore.Signal(str, str)
 
     def __init__(
         self,
@@ -302,8 +309,16 @@ class DataManagerPanel(QtWidgets.QWidget):
             button.setToolTip(self.import_action.toolTip())
             button.clicked.connect(self.import_action.trigger)
         self.import_action.changed.connect(self._sync_import_buttons)
+        self.create_action = QtGui.QAction("Create from Data…", self)
+        self.create_action.setToolTip("Open selected datasets in a temporary spreadsheet to create new experimental datasets.")
+        self.create_action.triggered.connect(lambda: self.datasetCreationRequested.emit(self._origin_tab_id, self._selected_dataset_id()))
+        self._create_btn = QtWidgets.QPushButton(self.create_action.text())
+        self._create_btn.setToolTip(self.create_action.toolTip())
+        self._create_btn.clicked.connect(self.create_action.trigger)
+        self.create_action.changed.connect(lambda: self._create_btn.setEnabled(self.create_action.isEnabled()))
+        self._creation_busy = False
         self._rename_btn = QtWidgets.QPushButton("Rename…")
-        self._rename_btn.setToolTip("Change this dataset’s name in Kindred. The original file is unchanged.")
+        self._rename_btn.setToolTip("Change this dataset’s name in Kindred.")
         self._rename_btn.clicked.connect(self._rename_dataset)
         self._export_original_btn = QtWidgets.QPushButton("Export Original…")
         self._export_original_btn.setToolTip("Save a copy of the original imported file, with its original contents and units.")
@@ -326,6 +341,7 @@ class DataManagerPanel(QtWidgets.QWidget):
         self._dataset_selector.setMinimumWidth(self.fontMetrics().horizontalAdvance("dataset"))
         selector_row.addRow("Dataset", _MappingField(self._dataset_selector, self._import_btn))
         browser_layout.addLayout(selector_row)
+        browser_layout.addWidget(self._create_btn)
         self._actions = _DatasetActions([
             self._rename_btn, self._export_original_btn, self._source_btn, self._remove_btn,
         ])
@@ -409,6 +425,10 @@ class DataManagerPanel(QtWidgets.QWidget):
         self._import_busy = False
         self._update_mapping_area()
 
+    def set_creation_busy(self, busy: bool) -> None:
+        self._creation_busy = busy
+        self._update_mapping_area()
+
     def _sync_import_buttons(self) -> None:
         for button in (self._import_btn, self._empty_import_btn):
             button.setEnabled(self.import_action.isEnabled())
@@ -474,7 +494,7 @@ class DataManagerPanel(QtWidgets.QWidget):
             self._dataset_selector.addItem(record.display_name, record.dataset_id)
             self._dataset_selector.setItemData(row, literal_tooltip(record.display_name), Qt.ToolTipRole)
             self._dataset_selector.setItemData(row, record.display_name, Qt.AccessibleTextRole)
-            source = document.imported_source(record.source_id)
+            source = document.imported_source(record.source_id) if record.source_id is not None else None
             self._dataset_selector.setItemData(row, source, Qt.UserRole + 2)
             if record.dataset_id == selected_id:
                 selected_row = row
@@ -698,6 +718,10 @@ class DataManagerPanel(QtWidgets.QWidget):
         enabled = record is not None and self._mapping_available
         for action in (self._rename_btn, self._remove_btn, self._export_original_btn, self._source_btn):
             action.setEnabled(record is not None)
+        self.create_action.setEnabled(bool(self._visible_records_by_id) and self._mapping_available and not self._creation_busy)
+        self._export_original_btn.setEnabled(record is not None and record.source_id is not None)
+        self._source_btn.setText("File Details…" if record is None or record.source_id is not None else "Dataset Details…")
+        self._source_btn.setToolTip("View dataset measurements, units, and origin.")
         self._change_set_btn.setEnabled(enabled)
         self._observation_mapping_btn.setEnabled(enabled)
         link = self._active_link(dataset_id)
@@ -709,7 +733,7 @@ class DataManagerPanel(QtWidgets.QWidget):
         self._tab_name.set_name(self._mechanism_name or "No active mechanism")
         self._mapping_status.setVisible(not self._mapping_available)
         if not self._mechanism_name:
-            self._mapping_status.setText("No active mechanism. Source files remain available; select a mechanism to assign data.")
+            self._mapping_status.setText("No active mechanism. Datasets remain available; select a mechanism to assign data.")
         elif not self._mapping_available:
             self._mapping_status.setText("Apply a valid mechanism with observation targets to assign data.")
         else:

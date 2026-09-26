@@ -242,6 +242,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._project_session = ProjectSession(initial_document)
         self._computation_gate = ComputationGate(parent=self)
         self._calculator_owners: set[SymbolicCalculatorOwner] = set()
+        self._spreadsheet_editor = None
 
         self._simulation_jobs = SimulationJobOwner(
             gate=self._computation_gate,
@@ -313,6 +314,7 @@ class MainWindow(QtWidgets.QMainWindow):
             xlsx_exports=self._xlsx_export_owner,
             scan=self._scan_owner,
             calculator_owners=lambda: tuple(self._calculator_owners),
+            spreadsheet_editor=lambda: self._spreadsheet_editor,
             set_status_text=self.set_status_text,
             capture_visible_tab_inputs=(
                 lambda token: self._capture_visible_tab_inputs(token)
@@ -431,6 +433,7 @@ class MainWindow(QtWidgets.QMainWindow):
             parent=self._data_stack,
         )
         data_panel.set_import_busy(self._dataset_import_staging.busy)
+        data_panel.set_creation_busy(self._spreadsheet_editor is not None)
         overlay_panel = DatasetOverlayPanel(
             self._workspace,
             import_action=data_panel.import_action,
@@ -649,6 +652,7 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         data = bundle.data_panel
         data.datasetImportRequested.connect(self._start_dataset_import)
+        data.datasetCreationRequested.connect(self._open_spreadsheet)
         data.datasetRenameRequested.connect(self._rename_dataset)
         data.datasetDeleteRequested.connect(self._delete_dataset)
         data.datasetExportOriginalRequested.connect(self._export_original_dataset)
@@ -2492,6 +2496,7 @@ class MainWindow(QtWidgets.QMainWindow):
             active_xlsx_export=self._xlsx_export_owner.is_exporting,
             active_scan=self._scan_owner.busy,
             active_calculator=any(owner.busy for owner in self._calculator_owners),
+            active_spreadsheet=self._spreadsheet_editor is not None,
         )
 
     def _prepare_before_save(
@@ -3730,6 +3735,92 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         self._refresh_dataset_views()
 
+    @QtCore.Slot(str, str)
+    def _open_spreadsheet(self, origin_tab_id: str, selected_id: str) -> None:
+        if not self._mutation_input_admitted("Create from Data") or self._spreadsheet_editor is not None:
+            return
+        from kindred.gui.widgets.spreadsheet_editor import SpreadsheetEditorDialog, SpreadsheetSelectionDialog
+
+        document = self._project_session.document
+        tab = document.tab(origin_tab_id)
+        if not canonical_observation_target_names(tab):
+            self.set_status_text("Create from Data requires an accepted mechanism with observation targets.")
+            return
+        token = self._project_session.capture_content_token()
+        selection = SpreadsheetSelectionDialog(document.datasets, selected_id, parent=self)
+        try:
+            if selection.exec() != QtWidgets.QDialog.Accepted:
+                return
+            selected = tuple(document.dataset(identity) for identity in selection.selected_ids())
+        finally:
+            selection.deleteLater()
+        if not selected:
+            return
+        names, occupied = [], {record.display_name.casefold() for record in document.datasets}
+        for record in selected:
+            base = f"{record.display_name} — processed"
+            name, number = base, 2
+            while name.casefold() in occupied:
+                name = f"{base} ({number})"
+                number += 1
+            occupied.add(name.casefold())
+            names.append(name)
+        editor = SpreadsheetEditorDialog(selected, tuple(names), parent=self)
+        self._spreadsheet_editor = editor
+        editor.outputsReady.connect(lambda records: self._create_spreadsheet_datasets(
+            editor, document, origin_tab_id, token, records,
+        ))
+        editor.failed.connect(self.set_status_text)
+        editor.settled.connect(self._spreadsheet_settled)
+        editor.show()
+        self._refresh_actions()
+
+    def _create_spreadsheet_datasets(self, editor, document, origin_tab_id, token, records) -> None:
+        if not self._mutation_input_admitted("Create from Data"):
+            return
+        tab = document.tab(origin_tab_id)
+        try:
+            existing = [(record.dataset_id, record.display_name) for record in document.datasets]
+            for record in records:
+                validate_unique_dataset_name(record.display_name, existing=existing)
+                existing.append((record.dataset_id, record.display_name))
+            targets = canonical_observation_target_names(tab)
+            review = DatasetMappingBatchDialog(records=records, tab=tab, model_targets=targets,
+                                               create_only=True, parent=editor)
+            try:
+                if review.exec() != QtWidgets.QDialog.Accepted:
+                    return
+                batch = review.proposal()
+            finally:
+                review.deleteLater()
+            candidate = document.add_datasets(records, sources=())
+            mapped = apply_dataset_mapping_batch(document=candidate, tab=tab, batch=batch, model_targets=targets)
+            candidate = validate_project_document(candidate.replace_tab(mapped))
+            if not self._mutation_input_admitted("Create from Data"):
+                return
+            published = self._workspace_tab_registry.replace_document(candidate, expected_token=token)
+            if published is None:
+                QtWidgets.QMessageBox.warning(editor, "Create from Data", "The project changed while editing. Open a new editor session to create datasets from the current project.")
+                return
+        except (ValueError, TypeError, KeyError) as exc:
+            QtWidgets.QMessageBox.warning(editor, "Create from Data", str(exc))
+            return
+        editor.finish_creation()
+        bundle = self._tab_surfaces[origin_tab_id]
+        bundle.initial_actions.render()
+        bundle.slider_binding.render()
+        self._refresh_dataset_views()
+        self.set_status_text(f"Created {len(records)} experimental datasets, each with a new mapped initial-condition set.")
+
+    @QtCore.Slot()
+    def _spreadsheet_settled(self) -> None:
+        editor = self._spreadsheet_editor
+        self._spreadsheet_editor = None
+        if editor is not None:
+            editor.deleteLater()
+        self._refresh_actions()
+        self.project_controller.notify_close_progress()
+
     @QtCore.Slot(str)
     def _export_original_dataset(self, dataset_id: str) -> None:
         if not self._mutation_input_admitted("Export Original Dataset"):
@@ -3737,6 +3828,9 @@ class MainWindow(QtWidgets.QMainWindow):
         document = self._project_session.document
         try:
             record = document.dataset(dataset_id)
+            if record.source_id is None:
+                self.set_status_text("This dataset was created in Kindred and has no original imported file.")
+                return
             source = document.imported_source(record.source_id)
         except KeyError:
             return
@@ -4104,6 +4198,7 @@ class MainWindow(QtWidgets.QMainWindow):
             or self._xlsx_export_owner.is_exporting
             or self._scan_owner.busy
             or any(owner.busy for owner in self._calculator_owners)
+            or self._spreadsheet_editor is not None
         )
         if active_work:
             self.set_status_text(
@@ -5415,6 +5510,8 @@ class MainWindow(QtWidgets.QMainWindow):
         if bundle is None:
             return
         mutation_admitted = self._mutation_input_admitted()
+        for surface in self._tab_surfaces.values():
+            surface.data_panel.set_creation_busy(self._spreadsheet_editor is not None or not mutation_admitted)
         if self._xlsx_export_action is not None:
             import_action = bundle.data_panel.import_action
             if self._load_data_action is not import_action:
@@ -5452,6 +5549,7 @@ class MainWindow(QtWidgets.QMainWindow):
             or self._xlsx_export_owner.is_exporting
             or self._scan_owner.busy
             or any(owner.busy for owner in self._calculator_owners)
+            or self._spreadsheet_editor is not None
         )
         if self._scan_action is not None:
             self._scan_action.setEnabled(

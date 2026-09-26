@@ -116,6 +116,7 @@ class ObservationSeries:
     # Empty means no recorded experimental time; rows remain the observation identity.
     t: tuple[float, ...]
     y: tuple[float, ...]
+    # Physical rows for imports; logical worksheet rows for created datasets.
     source_rows: tuple[int, ...]
 
     def __post_init__(self) -> None:
@@ -186,7 +187,7 @@ def validate_original_basename(value: object, *, label: str = "original filename
 class RawDatasetRecord:
     dataset_id: str
     display_name: str
-    source_id: str
+    source_id: str | None
     source_metadata: FrozenJsonValue
     observations: tuple[ObservationSeries, ...]
 
@@ -212,17 +213,66 @@ def validate_raw_dataset_record(record: RawDatasetRecord) -> RawDatasetRecord:
         fail(
             f"Raw dataset {record.dataset_id!r} display name must be a nonblank edge-normalized string."
         )
+    if type(record.observations) is not tuple:
+        fail(f"Raw dataset {record.dataset_id!r} observations must be an immutable tuple.")
+    if not record.observations:
+        fail(f"Raw dataset {record.dataset_id!r} requires at least one observation series.")
+
+    observation_names: list[str] = []
+    raw_observation_ids: set[str] = set()
+    for series in record.observations:
+        if not isinstance(series, ObservationSeries):
+            fail(f"Raw dataset {record.dataset_id!r} observations must contain only ObservationSeries values.")
+        name = series.column_name
+        if not isinstance(name, str) or not name or name != name.strip():
+            fail(f"Raw dataset {record.dataset_id!r} observation names must be nonblank edge-normalized strings.")
+        if name in observation_names:
+            fail(f"Raw dataset {record.dataset_id!r} contains duplicate assigned observation name {name!r}.")
+        try:
+            raw_observation_id = validate_raw_observation_id(
+                series.raw_observation_id,
+                f"Raw dataset {record.dataset_id!r} observation {name!r} raw observation ID",
+            )
+        except (TypeError, ValueError) as exc:
+            fail(str(exc))
+        if raw_observation_id in raw_observation_ids:
+            fail(f"Raw dataset {record.dataset_id!r} contains duplicate raw observation ID {raw_observation_id!r}.")
+        raw_observation_ids.add(raw_observation_id)
+        if type(series.t) is not tuple or type(series.y) is not tuple or type(series.source_rows) is not tuple:
+            fail(f"Raw dataset {record.dataset_id!r} observation {name!r} must own immutable t/y/source_rows tuples.")
+        if (
+            not series.y
+            or (series.t and len(series.t) != len(series.y))
+            or len(series.y) != len(series.source_rows)
+        ):
+            fail(f"Raw dataset {record.dataset_id!r} observation {name!r} must retain equal nonempty time/value tuples aligned with source rows.")
+        if any(type(row) is not int or row <= 0 for row in series.source_rows):
+            fail(f"Raw dataset {record.dataset_id!r} observation {name!r} source rows must be positive integers.")
+        if len(set(series.source_rows)) != len(series.source_rows):
+            fail(f"Raw dataset {record.dataset_id!r} observation {name!r} contains duplicate observation row identities.")
+        observation_names.append(name)
+    if record.source_id is None:
+        if record.source_metadata is not None:
+            fail("Created datasets cannot retain imported source metadata.")
+        timed = bool(record.observations[0].t)
+        times_by_row: dict[int, float] = {}
+        for series in record.observations:
+            if bool(series.t) != timed:
+                fail("Created dataset columns must agree on whether time was recorded.")
+            if any(left >= right for left, right in zip(series.source_rows, series.source_rows[1:])):
+                fail("Created observation row identities must increase in worksheet order.")
+            for row, time in zip(series.source_rows, series.t):
+                if row in times_by_row and times_by_row[row] != time:
+                    fail("Created observations sharing a row must have the same recorded time.")
+                times_by_row[row] = time
+        return record
+
     if (
         not isinstance(record.source_id, str)
         or not record.source_id
         or record.source_id != record.source_id.strip()
     ):
         fail(f"Raw dataset {record.dataset_id!r} source ID must be nonblank and edge-normalized.")
-    if type(record.observations) is not tuple:
-        fail(f"Raw dataset {record.dataset_id!r} observations must be an immutable tuple.")
-    if not record.observations:
-        fail(f"Raw dataset {record.dataset_id!r} requires at least one observation series.")
-
     thawed_metadata = thaw_json_value(record.source_metadata)
     if not isinstance(thawed_metadata, dict):
         fail(f"Raw dataset {record.dataset_id!r} source metadata must be an immutable JSON object.")
@@ -261,39 +311,6 @@ def validate_raw_dataset_record(record: RawDatasetRecord) -> RawDatasetRecord:
     if tuple(physical_rows) != expected_rows:
         fail(f"Raw dataset {record.dataset_id!r} physical column names do not match the canonical case-sensitive duplicate allocation.")
 
-    observation_names: list[str] = []
-    raw_observation_ids: set[str] = set()
-    for series in record.observations:
-        if not isinstance(series, ObservationSeries):
-            fail(f"Raw dataset {record.dataset_id!r} observations must contain only ObservationSeries values.")
-        name = series.column_name
-        if not isinstance(name, str) or not name or name != name.strip():
-            fail(f"Raw dataset {record.dataset_id!r} observation names must be nonblank edge-normalized strings.")
-        if name in observation_names:
-            fail(f"Raw dataset {record.dataset_id!r} contains duplicate assigned observation name {name!r}.")
-        try:
-            raw_observation_id = validate_raw_observation_id(
-                series.raw_observation_id,
-                f"Raw dataset {record.dataset_id!r} observation {name!r} raw observation ID",
-            )
-        except (TypeError, ValueError) as exc:
-            fail(str(exc))
-        if raw_observation_id in raw_observation_ids:
-            fail(f"Raw dataset {record.dataset_id!r} contains duplicate raw observation ID {raw_observation_id!r}.")
-        raw_observation_ids.add(raw_observation_id)
-        if type(series.t) is not tuple or type(series.y) is not tuple or type(series.source_rows) is not tuple:
-            fail(f"Raw dataset {record.dataset_id!r} observation {name!r} must own immutable t/y/source_rows tuples.")
-        if (
-            not series.y
-            or (series.t and len(series.t) != len(series.y))
-            or len(series.y) != len(series.source_rows)
-        ):
-            fail(f"Raw dataset {record.dataset_id!r} observation {name!r} must retain equal nonempty time/value tuples aligned with source rows.")
-        if any(type(row) is not int or row <= 0 for row in series.source_rows):
-            fail(f"Raw dataset {record.dataset_id!r} observation {name!r} source rows must be positive integers.")
-        if len(set(series.source_rows)) != len(series.source_rows):
-            fail(f"Raw dataset {record.dataset_id!r} observation {name!r} contains duplicate physical source-row identities.")
-        observation_names.append(name)
     if thawed_metadata.get("observation_columns") != observation_names:
         fail(f"Raw dataset {record.dataset_id!r} observation-column metadata must exactly match its immutable ordered series labels.")
     physical_assigned = {assigned_name for _source_index, _authored_name, assigned_name in physical_rows}

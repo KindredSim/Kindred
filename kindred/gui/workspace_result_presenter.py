@@ -1146,7 +1146,7 @@ def _same_source_row_values(
     x_source: ExperimentalLayerInput,
     y_source: ExperimentalLayerInput,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray | None] | None:
-    """Pair experimental X/Y by the admitted physical source-row facts."""
+    """Pair experimental X/Y by the admitted dataset row identities."""
 
     if x_source.axis.dataset_id != y_source.axis.dataset_id:
         return None
@@ -1630,7 +1630,7 @@ def iter_blocks_tsv_chunks(
                 raise ValueError("experimental Copy block lacks source_row.")
             columns.append(
                 (
-                    encode_clipboard_text(f"{block.label} — source_row"),
+                    encode_clipboard_text(f"{block.label} — row_id"),
                     block.source_row,
                     "int",
                 )
@@ -1782,7 +1782,7 @@ def write_xlsx(
             if block.kind is ResultLayerKind.EXPERIMENTAL:
                 if block.source_row is None:
                     raise ValueError("experimental XLSX block lacks source_row.")
-                identity_headers = ["source_row"]
+                identity_headers = ["row_id"]
             else:
                 if (
                     block.segment_ids is None

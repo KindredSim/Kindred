@@ -29,7 +29,7 @@ def _readonly_float_vector(values: object, field: str) -> np.ndarray:
 
 @dataclass(frozen=True, slots=True)
 class FitObservationSeries:
-    """One visible Y series with its physical source-row identity."""
+    """One visible Y series with its dataset row identity."""
 
     raw_observation_id: str
     raw_column: str
@@ -112,7 +112,7 @@ class FitDatasetSpec:
     target_weights: Mapping[str, float] = field(default_factory=dict)
     x_name: str = "t"
     # One immutable X capture. Its `y` member stores captured X values; using
-    # the same row-aligned DTO keeps raw identity and physical source-row
+    # the same row-aligned DTO keeps raw identity and dataset row
     # custody identical for Y and X.
     x_observations: FitObservationSeries | None = None
 
@@ -217,7 +217,7 @@ class FitDatasetSpec:
 
     @property
     def x_source_rows(self) -> tuple[int, ...]:
-        """Ordered union of physical X rows referenced by retained Y rows."""
+        """Ordered union of dataset X rows referenced by retained Y rows."""
 
         if self.x_name == "t" or self.x_observations is None:
             return ()

@@ -56,7 +56,7 @@ class CandidateParametricAlignmentError(FitCandidateDomainError):
 
 @dataclass(frozen=True, slots=True)
 class ParametricProjection:
-    """One shared curve location per physical row within the owning dataset."""
+    """One shared curve location per dataset row within the owning dataset."""
 
     source_rows: tuple[int, ...]
     selected_model_x: np.ndarray

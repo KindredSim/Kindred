@@ -753,7 +753,7 @@ class ProjectDocument:
             for item in self.datasets
             if item.dataset_id != target
         )
-        referenced_source_ids = {item.source_id for item in datasets}
+        referenced_source_ids = {item.source_id for item in datasets if item.source_id is not None}
         imported_sources = tuple(
             source
             for source in self.imported_sources
@@ -1739,12 +1739,13 @@ def validate_project_document(document: ProjectDocument) -> ProjectDocument:
     referenced_source_ids: set[str] = set()
     for dataset in document.datasets:
         dataset_foundation.validate_raw_dataset_record(dataset)
-        referenced_source_ids.add(dataset.source_id)
-        if not any(source.source_id == dataset.source_id for source in document.imported_sources):
-            raise ValueError(
-                f"Dataset {dataset.dataset_id!r} references unknown imported source "
-                f"{dataset.source_id!r}."
-            )
+        if dataset.source_id is not None:
+            referenced_source_ids.add(dataset.source_id)
+            if not any(source.source_id == dataset.source_id for source in document.imported_sources):
+                raise ValueError(
+                    f"Dataset {dataset.dataset_id!r} references unknown imported source "
+                    f"{dataset.source_id!r}."
+                )
         raw_observation_ids = tuple(
             dataset_foundation.validate_raw_observation_id(
                 series.raw_observation_id,

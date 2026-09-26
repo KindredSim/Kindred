@@ -1,4 +1,4 @@
-"""One reviewed, scrollable mapping surface for a committed import batch."""
+"""One reviewed, scrollable mapping surface for experimental datasets."""
 
 from __future__ import annotations
 
@@ -41,21 +41,23 @@ class DatasetMappingBatchDialog(QtWidgets.QDialog):
         records: tuple[RawDatasetRecord, ...],
         tab: MechanismTabDocument,
         model_targets: tuple[str, ...],
+        create_only: bool = False,
         parent: QtWidgets.QWidget | None = None,
     ) -> None:
         super().__init__(parent)
         if type(records) is not tuple or not records:
-            raise ValueError("Batch mapping review requires committed datasets.")
+            raise ValueError("Batch mapping review requires datasets.")
         if not isinstance(tab, MechanismTabDocument):
             raise TypeError("Batch mapping review requires one mechanism tab.")
         targets = tuple(str(item).strip() for item in model_targets)
         if not targets or any(not item for item in targets):
             raise ValueError("Batch mapping review requires model targets.")
+        self._create_only = create_only
         self._records = records
         self._tab = tab
         self._model_targets = targets
         self._rows: list[_DatasetMappingRow] = []
-        self.setWindowTitle("Review Imported Dataset Mapping")
+        self.setWindowTitle("Review New Datasets" if create_only else "Review Imported Dataset Mapping")
         self.setModal(True)
         clamp_initial_size(self, 900, 720)
         self._build_ui()
@@ -63,7 +65,8 @@ class DatasetMappingBatchDialog(QtWidgets.QDialog):
     def _build_ui(self) -> None:
         layout = QtWidgets.QVBoxLayout(self)
         intro = QtWidgets.QLabel(
-            "Review every committed dataset below. Suggestions are never "
+            "Review mappings and starting concentrations for each new dataset. Each receives a new initial-condition set."
+            if self._create_only else "Review every committed dataset below. Suggestions are never "
             "applied until you press OK; each observation may be explicitly "
             "mapped or left Unmapped.",
             self,
@@ -88,6 +91,9 @@ class DatasetMappingBatchDialog(QtWidgets.QDialog):
             | QtWidgets.QDialogButtonBox.StandardButton.Cancel,
             parent=self,
         )
+        if self._create_only:
+            buttons.button(QtWidgets.QDialogButtonBox.Ok).setText(f"Create {len(self._records)} datasets")
+            buttons.button(QtWidgets.QDialogButtonBox.Cancel).setText("Back to editor")
         buttons.accepted.connect(self._accept_review)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
@@ -103,8 +109,9 @@ class DatasetMappingBatchDialog(QtWidgets.QDialog):
         controls.addWidget(QtWidgets.QLabel("Action:", group), 0, 0)
         action = QtWidgets.QComboBox(group)
         action.addItem("Create Set", DatasetMappingChoice.CREATE_SET.value)
-        action.addItem("Map Existing", DatasetMappingChoice.MAP_EXISTING.value)
-        action.addItem("Leave Unmapped", DatasetMappingChoice.LEAVE_UNMAPPED.value)
+        if not self._create_only:
+            action.addItem("Map Existing", DatasetMappingChoice.MAP_EXISTING.value)
+            action.addItem("Leave Unmapped", DatasetMappingChoice.LEAVE_UNMAPPED.value)
         controls.addWidget(action, 0, 1)
 
         controls.addWidget(QtWidgets.QLabel("Target set:", group), 1, 0)
@@ -126,10 +133,14 @@ class DatasetMappingBatchDialog(QtWidgets.QDialog):
         proposed_name = QtWidgets.QLabel("(not applicable)", group)
         proposed_name.setTextInteractionFlags(QtCore.Qt.TextInteractionFlag.TextSelectableByMouse)
         controls.addWidget(proposed_name, 3, 1)
+        if self._create_only:
+            for row in range(3):
+                for column in range(2):
+                    controls.itemAtPosition(row, column).widget().hide()
         controls.setColumnStretch(1, 1)
         group_layout.addLayout(controls)
 
-        group_layout.addWidget(QtWidgets.QLabel("Observation target mappings (suggestions require OK confirmation):", group))
+        group_layout.addWidget(QtWidgets.QLabel("Observation target mappings (confirm to apply suggestions):", group))
         editor = ObservationMappingWidget(
             record, self._model_targets,
             mechanism_species=canonical_species_names(self._tab), create_set=True, parent=group,
@@ -251,7 +262,7 @@ class DatasetMappingBatchDialog(QtWidgets.QDialog):
         try:
             self.proposal()
         except (DatasetMappingError, ValueError, TypeError) as exc:
-            QtWidgets.QMessageBox.warning(self, "Review Imported Dataset Mapping", str(exc))
+            QtWidgets.QMessageBox.warning(self, self.windowTitle(), str(exc))
             return
         self.accept()
 

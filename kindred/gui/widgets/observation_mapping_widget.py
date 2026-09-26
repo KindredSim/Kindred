@@ -140,7 +140,7 @@ class ObservationMappingWidget(QtWidgets.QWidget):
             return
         if source is InitialConcentrationSource.FIRST_DATA_ROW:
             row = min(row for item in self._record.observations for row in item.source_rows)
-            self._source_label.setText(f"First data row — source row {row}")
+            self._source_label.setText(f"First data row — row {row}")
         else:
             self._source_label.setText("Recorded data at t = 0")
         try:

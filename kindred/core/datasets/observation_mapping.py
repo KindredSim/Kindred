@@ -200,7 +200,7 @@ def extract_initial_concentrations(
                     raise ObservationMappingError(
                         f"Observation {series.column_name!r} (raw ID {raw_id!r}) mapped "
                         f"to species {species!r} has multiple exact t=0.0 values "
-                        f"at source rows {rows}."
+                        f"at dataset rows {rows}."
                     )
                 if indexes:
                     try:

@@ -860,7 +860,7 @@ def _payload_observations(
 
 
 def _payload_x_observations(payload: FitDatasetSpec) -> Dict[str, object]:
-    """Return one canonical X block plus its physical-row lookup."""
+    """Return one canonical X block plus its dataset row lookup."""
 
     if payload.x_name == "t" or payload.x_observations is None:
         return {}
