@@ -1,7 +1,7 @@
 """Spreadsheet process and pipe lifetime, supervised off the GUI thread."""
 from __future__ import annotations
 
-from multiprocessing import get_context
+from multiprocessing import Pipe, get_context
 from multiprocessing.connection import wait
 import queue
 import threading
@@ -20,12 +20,16 @@ class SpreadsheetWorker(QtCore.QThread):
         self._inputs = records, names
         self._requests = queue.SimpleQueue()
         self._shutdown = threading.Event()
+        # Wakes the supervisor as soon as a request or shutdown arrives.
+        self._wake, self._waker = Pipe(duplex=False)
 
     def submit(self, operation, sheet, args=()):
         self._requests.put((operation, sheet, args))
+        self._waker.send_bytes(b"")
 
     def request_shutdown(self):
         self._shutdown.set()
+        self._waker.send_bytes(b"")
 
     def run(self):
         process = parent_pipe = child_pipe = watchdog = None
@@ -50,21 +54,22 @@ class SpreadsheetWorker(QtCore.QThread):
             watchdog = threading.Thread(target=stop_calculation, name="Spreadsheet cancellation")
             watchdog.start()
             while not self._shutdown.is_set():
-                try:
-                    request = self._requests.get_nowait()
-                except queue.Empty:
-                    pass
-                else:
-                    parent_pipe.send(request)
-                ready = wait((parent_pipe, process.sentinel), timeout=0.05)
+                ready = wait((parent_pipe, self._wake))
+                if self._wake in ready:
+                    while self._wake.poll():
+                        self._wake.recv_bytes()
+                    while not self._requests.empty():
+                        parent_pipe.send(self._requests.get())
                 if parent_pipe in ready:
-                    operation, value, error = parent_pipe.recv()
+                    try:
+                        operation, value, error = parent_pipe.recv()
+                    except EOFError:
+                        # The child closed its end: it has exited.
+                        if not self._shutdown.is_set():
+                            self.failed.emit("Spreadsheet calculation stopped.")
+                        break
                     if not self._shutdown.is_set():
                         self.result.emit(operation, value, error)
-                if process.sentinel in ready:
-                    if not self._shutdown.is_set():
-                        self.failed.emit("Spreadsheet calculation stopped.")
-                    break
         except Exception as exc:
             if not self._shutdown.is_set():
                 self.failed.emit(f"Spreadsheet calculation failed: {exc}")

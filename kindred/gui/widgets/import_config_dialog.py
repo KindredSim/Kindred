@@ -8,7 +8,7 @@ from typing import Mapping
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
-from kindred.core.quantity_units import format_unit_for_display, scientific_unit
+from kindred.core.quantity_units import format_unit_for_display, parse_unit, scientific_unit
 from kindred.core.datasets.csv_import import read_csv_rows_from_bytes
 from kindred.core.datasets.excel_import import ExcelWorkbookPair
 from kindred.core.datasets.foundation import ImportedSource
@@ -28,7 +28,7 @@ from kindred.gui.import_workflow import (
 )
 from kindred.gui.theme_manager import semantic_color
 from kindred.gui.ui_helpers import (
-    clamp_initial_size, set_bounded_label_text,
+    SCIENTIFIC_NAME_HTML_ROLE, ScientificNameComboBox, clamp_initial_size, data_unit_labels, set_bounded_label_text,
 )
 
 __all__ = ["ImportConfigDialog", "ImportDialogResult"]
@@ -146,9 +146,9 @@ class ImportConfigDialog(QtWidgets.QDialog):
         )
         self._time_combo.setMinimumContentsLength(12)
         form.addRow("Time column", self._time_combo)
-        self._time_unit_combo = QtWidgets.QComboBox(settings)
+        self._time_unit_combo = ScientificNameComboBox(settings)
         form.addRow("Time unit", self._time_unit_combo)
-        self._default_unit_combo = QtWidgets.QComboBox(settings)
+        self._default_unit_combo = ScientificNameComboBox(settings)
         self._populate_unit_choices(self._default_unit_combo, MEASUREMENT_UNIT_DISPLAY, "M")
         self._default_unit_combo.setToolTip(
             "Used by columns set to Use default. Choose Dimensionless for ratios and fractions. "
@@ -373,7 +373,9 @@ class ImportConfigDialog(QtWidgets.QDialog):
                     label = "Dimensionless" if declared == "1" else declared
                     combo.addItem(f"From file ({label})", UnitSource.FILE)
             for unit in choices:
-                combo.addItem("Dimensionless" if unit == "1" else unit, unit)
+                label, markup = data_unit_labels(parse_unit(unit))
+                combo.addItem(label, unit)
+                combo.setItemData(combo.count() - 1, markup, SCIENTIFIC_NAME_HTML_ROLE)
             if custom:
                 combo.addItem("Custom…", None)
             index = combo.findData(choice)
@@ -420,7 +422,7 @@ class ImportConfigDialog(QtWidgets.QDialog):
         else:
             try:
                 unit = resolve_column_unit(sheet.settings.time_column, sheet.unit_row, sheet.settings, time=True)
-                info = f"Time: {format_unit_for_display(unit)} → s. Each measured column uses its selected unit."
+                info = f"Time: {unit.symbol} → s. Each measured column uses its selected unit."
             except ValueError as exc:
                 info = str(exc)
         set_bounded_label_text(self._unit_info_label, info, max_width=640)
@@ -473,7 +475,7 @@ class ImportConfigDialog(QtWidgets.QDialog):
                 label = QtWidgets.QTableWidgetItem(column.assigned_name)
                 label.setToolTip(column.assigned_name)
                 self._species_table.setItem(row, 1, label)
-                combo = QtWidgets.QComboBox(self._species_table)
+                combo = ScientificNameComboBox(self._species_table)
                 combo.setInsertPolicy(QtWidgets.QComboBox.NoInsert)
                 combo.setAccessibleName(f"Unit for {column.assigned_name}")
                 self._populate_unit_choices(

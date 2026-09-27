@@ -5,10 +5,16 @@ import ironcalc
 from PySide6 import QtCore, QtGui, QtWidgets
 
 from kindred.core.datasets.units import MEASUREMENT_UNIT_DISPLAY, TIME_UNIT_DISPLAY, parse_measurement_unit, parse_time_unit
+from kindred.core.quantity_units import parse_unit
+from kindred.gui.display_name_policy import literal_tooltip
+from kindred.gui.spreadsheet_formulas import formula_at_row
 from kindred.gui.spreadsheet_worker import SpreadsheetWorker
+from kindred.gui.ui_helpers import (
+    SCIENTIFIC_NAME_HTML_ROLE, ScientificNameComboBox, data_unit_labels, paint_markup, set_bounded_label_text,
+)
 
-
-_SPREADSHEET_MIME = "application/x-kindred-spreadsheet-copy"
+# Requests that change nothing the user could lose.
+_READS = frozenset({"initializing", "view", "copy", "outputs", "select"})
 
 
 class SpreadsheetSelectionDialog(QtWidgets.QDialog):
@@ -59,75 +65,73 @@ class _SheetModel(QtCore.QAbstractTableModel):
         display, content, error = self.cells.get((index.row() + 1, index.column() + 1), ("", "", False))
         if role == QtCore.Qt.DisplayRole:
             return display
-        if role in (QtCore.Qt.EditRole, QtCore.Qt.ToolTipRole):
+        if role == QtCore.Qt.EditRole:
+            return self.entry(index.row() + 1, index.column() + 1)
+        if role == QtCore.Qt.ToolTipRole:
             return content
         if role == QtCore.Qt.ForegroundRole and error:
             return QtGui.QBrush(QtGui.QColor("#c53b32"))
         if role == QtCore.Qt.TextAlignmentRole:
-            return int(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
+            return int(QtCore.Qt.AlignCenter)
         return None
 
     def headerData(self, section, orientation, role=QtCore.Qt.DisplayRole):
-        if role != QtCore.Qt.DisplayRole:
-            return None
         if orientation == QtCore.Qt.Vertical:
-            return str(section + 1)
-        name, unit = self.info["columns"][section]
-        label = "Choose unit" if unit is None else "Dimensionless" if unit == "1" else unit
-        return f"{ironcalc.column_name_from_number(section + 1)}\n{name}\n{label}"
+            return str(section + 1) if role == QtCore.Qt.DisplayRole else None
+        if role == QtCore.Qt.DisplayRole:
+            return ironcalc.column_name_from_number(section + 1)
+        if role == QtCore.Qt.ToolTipRole:
+            column = self.info["columns"][section]
+            tip = f"{column["name"]}\n{_unit_labels(column)[0]}\nDouble-click the name to edit."
+            if column["formula"] is not None and column["unit"] is None:
+                tip += ("\n\nThe formula's unit could not be inferred. Its numbers are calculated from the "
+                        "scientific values (M, s, K, J/mol, m³) of the columns it uses and are used as they are. "
+                        "To give it a unit, take plain numbers from a column that has a unit, or delete the "
+                        "formula including = and use Correct unit declaration.")
+            return literal_tooltip(tip)
+        return None
+
+    def entry(self, row, column):
+        """The text a cell edit starts from: the row's formula or the loaded number."""
+        formula = self.info["columns"][column - 1]["formula"]
+        if formula is not None:
+            return formula_at_row(formula, row)
+        cell = self.cells.get((row, column))
+        return None if cell is None else cell[1]
 
     def flags(self, index):
         flags = super().flags(index)
         loaded = (index.row() + 1, index.column() + 1) in self.cells
-        return flags | QtCore.Qt.ItemIsEditable if loaded and self.editor._editing_available and self.editor._draft_cell is None else flags
+        editable = loaded and self.editor._editing_available
+        return flags | QtCore.Qt.ItemIsEditable if editable else flags
 
     def setData(self, index, value, role=QtCore.Qt.EditRole):
         if role != QtCore.Qt.EditRole or not index.isValid():
             return False
-        if self.editor._draft_cell is not None:
-            return True
         cell = index.row() + 1, index.column() + 1
         if cell not in self.cells:
             return False
-        return self.editor._submit_edit("set", (*cell, str(value)))
+        return self.editor._commit_entry(*cell, str(value))
 
 
 class _CellDelegate(QtWidgets.QStyledItemDelegate):
     def __init__(self, dialog):
         super().__init__(dialog._table)
-        self.dialog = dialog
         self.active_editor = None
         self._initialized = False
 
     def createEditor(self, parent, option, index):
         editor = super().createEditor(parent, option, index)
+        editor.setAlignment(QtCore.Qt.AlignCenter)
         self.active_editor = editor
         self._initialized = False
-        cell = self.dialog._sheet, index.row() + 1, index.column() + 1
-        editor.textEdited.connect(lambda *_args: self.dialog._edit_draft(editor, cell))
-        for signal in (editor.cursorPositionChanged, editor.selectionChanged):
-            signal.connect(lambda *_args: self.dialog._observe_draft_cursor(editor))
         return editor
 
     def setEditorData(self, editor, index):
-        # A viewport reply updates the display cache, not an open editor's text.
+        # Replies update the display cache, not unfinished input.
         if not self._initialized:
             super().setEditorData(editor, index)
             self._initialized = True
-
-    def eventFilter(self, editor, event):
-        if editor is self.active_editor and event.type() == QtCore.QEvent.FocusIn:
-            index = self.dialog._table.currentIndex()
-            self.dialog._focus_draft(editor, (self.dialog._sheet, index.row() + 1, index.column() + 1))
-        if editor is self.active_editor and self.dialog._draft_cell is not None:
-            if event.type() == QtCore.QEvent.FocusOut:
-                self.dialog._remember_draft_cursor(editor)
-                return False
-            if event.type() == QtCore.QEvent.KeyPress:
-                if event.key() in (QtCore.Qt.Key_Return, QtCore.Qt.Key_Enter, QtCore.Qt.Key_Escape):
-                    self.dialog._finish_formula(event.key() != QtCore.Qt.Key_Escape)
-                    return True
-        return super().eventFilter(editor, event)
 
     def destroyEditor(self, editor, index):
         if self.active_editor is editor:
@@ -135,9 +139,6 @@ class _CellDelegate(QtWidgets.QStyledItemDelegate):
         super().destroyEditor(editor, index)
 
     def finish_edit(self):
-        if self.dialog._draft_cell is not None:
-            self.dialog._finish_formula(True)
-            return
         editor = self.active_editor
         if editor is not None:
             self.commitData.emit(editor)
@@ -146,6 +147,311 @@ class _CellDelegate(QtWidgets.QStyledItemDelegate):
     def discard_edit(self):
         if self.active_editor is not None:
             self.closeEditor.emit(self.active_editor, QtWidgets.QAbstractItemDelegate.RevertModelCache)
+
+
+def _unit_labels(column):
+    """Plain text and scientific markup for a column's unit."""
+    if column["unit"] is None:
+        text = "Unspecified" if column["declared"] else "Choose unit"
+        return text, text
+    return data_unit_labels(parse_unit(column["unit"]))
+
+
+class _SheetHeader(QtWidgets.QHeaderView):
+    """Worksheet addresses and, horizontally, editable measurement metadata."""
+
+    def __init__(self, orientation, dialog):
+        super().__init__(orientation, dialog._table)
+        self.dialog = dialog
+        self._press = None
+        self._edit = None
+        self._input = None
+        self.setMouseTracking(True)
+        self.viewport().setMouseTracking(True)
+        self.setSectionsClickable(True)
+        self.setHighlightSections(True)
+        self.setSectionsMovable(False)
+        self.sectionResized.connect(self._position_editor)
+        self.geometriesChanged.connect(self._position_editor)
+
+    def _letter_height(self):
+        return self.fontMetrics().height() + 8
+
+    def _metadata_height(self):
+        return self.fontMetrics().height() + 14
+
+    def sizeHint(self):
+        size = super().sizeHint()
+        if self.orientation() == QtCore.Qt.Horizontal:
+            size.setHeight(self._letter_height() + 2 * self._metadata_height())
+        return size
+
+    def sectionSizeFromContents(self, section):
+        size = super().sectionSizeFromContents(section)
+        if self.orientation() == QtCore.Qt.Horizontal:
+            column = self.dialog._model.info["columns"][section]
+            metrics = self.fontMetrics()
+            size.setWidth(max(metrics.horizontalAdvance(column["name"]) + 34,
+                              metrics.horizontalAdvance(_unit_labels(column)[0]) + 36,
+                              metrics.horizontalAdvance("−9.99999e−308") + 22))
+            size.setHeight(self._letter_height() + 2 * self._metadata_height())
+        return size
+
+    def _metadata_rects(self, section):
+        left, width = self.sectionViewportPosition(section), self.sectionSize(section)
+        height = self._metadata_height()
+        return (QtCore.QRect(left + 5, self._letter_height(), width - 10, height),
+                QtCore.QRect(left + 4, self._letter_height() + height + 2, width - 8, height - 4))
+
+    def paintSection(self, painter, rect, section):
+        if self.orientation() == QtCore.Qt.Vertical:
+            super().paintSection(painter, rect, section)
+            return
+        painter.save()
+        painter.setClipRect(rect)
+        column = self.dialog._model.info["columns"][section]
+        option = QtWidgets.QStyleOptionHeader()
+        self.initStyleOption(option)
+        option.rect, option.section, option.text = rect, section, ""
+        self.style().drawControl(QtWidgets.QStyle.CE_Header, option, painter, self)
+        option.rect = QtCore.QRect(rect.left(), rect.top(), rect.width(), self._letter_height())
+        role = " · Time" if self.dialog._model.info["timed"] and section == 0 else " · fx" if column["formula"] is not None else ""
+        option.text = ironcalc.column_name_from_number(section + 1) + role
+        option.textAlignment = QtCore.Qt.AlignCenter
+        if self.dialog._table.selectionModel().isColumnSelected(section):
+            option.state |= QtWidgets.QStyle.State_On
+        self.style().drawControl(QtWidgets.QStyle.CE_Header, option, painter, self)
+        painter.setFont(self.font())
+        name_rect, unit_rect = self._metadata_rects(section)
+        if name_rect.contains(self.viewport().mapFromGlobal(QtGui.QCursor.pos())):
+            painter.fillRect(name_rect, self.palette().brush(QtGui.QPalette.AlternateBase))
+        painter.setPen(self.palette().color(QtGui.QPalette.Link))
+        painter.drawText(name_rect.adjusted(1, 0, -22, 0), QtCore.Qt.AlignVCenter | QtCore.Qt.AlignLeft,
+                         self.fontMetrics().elidedText(column["name"], QtCore.Qt.ElideRight, name_rect.width() - 23))
+        painter.drawText(name_rect, QtCore.Qt.AlignVCenter | QtCore.Qt.AlignRight, "✎")
+        painter.setPen(self.palette().color(QtGui.QPalette.Text))
+        markup = _unit_labels(column)[1]
+        if column["formula"] is not None:
+            paint_markup(painter, unit_rect, markup, font=self.font(), alignment=QtCore.Qt.AlignCenter,
+                         palette=self.palette())
+        else:
+            combo = QtWidgets.QStyleOptionComboBox()
+            combo.initFrom(self)
+            combo.rect = unit_rect
+            self.style().drawComplexControl(QtWidgets.QStyle.CC_ComboBox, combo, painter, self)
+            field = self.style().subControlRect(QtWidgets.QStyle.CC_ComboBox, combo,
+                                                QtWidgets.QStyle.SC_ComboBoxEditField, self)
+            paint_markup(painter, field, markup, font=self.font(),
+                         alignment=QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter, palette=self.palette())
+        painter.restore()
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        coordinate = self.dialog._insertion_coordinate(self.orientation())
+        if coordinate is not None:
+            painter = QtGui.QPainter(self.viewport())
+            painter.setPen(QtGui.QPen(self.palette().color(QtGui.QPalette.Highlight), 3))
+            if self.orientation() == QtCore.Qt.Horizontal:
+                painter.drawLine(coordinate, 0, coordinate, self.height())
+            else:
+                painter.drawLine(0, coordinate, self.width(), coordinate)
+
+    def begin_edit(self, sheet, column, field, correction=False):
+        spec = self.dialog._sheets[sheet]["columns"][column]
+        if field == "unit" and spec["formula"] is not None:
+            self.dialog._feedback.setText("This unit follows from the column formula.")
+            return
+        self._edit = sheet, column, field, correction
+        timed = self.dialog._sheets[sheet]["timed"] and column == 0
+        if field == "name":
+            control = QtWidgets.QLineEdit(spec["name"], self.viewport())
+            control.setAccessibleName("Column name")
+            control.setToolTip(literal_tooltip(spec["name"]))
+            control.selectAll()
+        else:
+            control = ScientificNameComboBox(self.viewport())
+            control.setInsertPolicy(QtWidgets.QComboBox.NoInsert)
+            control.setAccessibleName("Column unit")
+            control.setToolTip("Correct declaration: numbers stay unchanged." if correction else
+                               "Changing an established unit converts its values. The first unit declares their meaning.")
+            control.addItem(_unit_labels(spec)[0] if spec["unit"] is None else "Choose unit...", None)
+            choices = list(TIME_UNIT_DISPLAY if timed else MEASUREMENT_UNIT_DISPLAY)
+            if spec["unit"] is not None:
+                # The column's unit takes the place of a preset displayed the same way (uM as µM).
+                own = data_unit_labels(parse_unit(spec["unit"]))[1]
+                choices = [spec["unit"] if data_unit_labels(parse_unit(choice))[1] == own else choice for choice in choices]
+                if spec["unit"] not in choices:
+                    choices.append(spec["unit"])
+            for choice in choices:
+                label, markup = data_unit_labels(parse_unit(choice))
+                control.addItem(label, choice)
+                control.setItemData(control.count() - 1, markup, SCIENTIFIC_NAME_HTML_ROLE)
+            control.addItem("Custom expression...", "custom")
+            control.setCurrentIndex(max(0, control.findData(spec["unit"])))
+            control.activated.connect(lambda: self._unit_selected(control))
+        self._input = control
+        control.installEventFilter(self)
+        self._position_editor()
+        control.show()
+        control.setFocus()
+        if field == "unit":
+            control.showPopup()
+
+    def _unit_selected(self, control):
+        if control.currentData() == "custom":
+            control.setEditable(True)
+            control.setCompleter(None)
+            control.setEditText("")
+            control.lineEdit().installEventFilter(self)
+            control.setFocus()
+        else:
+            self.finish_edit()
+
+    def _position_editor(self, *_args):
+        if self._edit is not None:
+            _sheet, column, field, _correction = self._edit
+            name, unit = self._metadata_rects(column)
+            self._input.setGeometry(name if field == "name" else unit)
+
+    def finish_edit(self, commit=True):
+        if self._edit is None:
+            return True
+        sheet, column, field, correction = self._edit
+        control = self._input
+        if commit:
+            spec = self.dialog._sheets[sheet]["columns"][column]
+            if field == "name":
+                value = control.text()
+            else:
+                # A listed unit submits its unit, not its label, even after Custom
+                # expression made the box editable.
+                listed = control.itemData(control.findText(control.currentText()))
+                value = listed if listed not in (None, "custom") else (
+                    control.currentText().strip() if control.isEditable() else control.currentData())
+            if value is not None and value != spec[field]:
+                if field == "unit":
+                    try:
+                        (parse_time_unit if self.dialog._sheets[sheet]["timed"] and column == 0 else parse_measurement_unit)(value)
+                    except ValueError as exc:
+                        self.dialog._feedback.setText(str(exc))
+                        control.setFocus()
+                        return False
+                if not self.dialog._submit_edit("column", (column, field, value, correction), sheet=sheet):
+                    return False
+        control.blockSignals(True)
+        self._input = self._edit = None
+        control.hide()
+        control.deleteLater()
+        return True
+
+    def eventFilter(self, watched, event):
+        if event.type() == QtCore.QEvent.KeyPress:
+            if event.key() in (QtCore.Qt.Key_Return, QtCore.Qt.Key_Enter, QtCore.Qt.Key_Escape):
+                if self.finish_edit(event.key() != QtCore.Qt.Key_Escape):
+                    self.dialog._table.setFocus()
+                return True
+        return super().eventFilter(watched, event)
+
+    def mouseDoubleClickEvent(self, event):
+        section = self.logicalIndexAt(event.position().toPoint())
+        if self.orientation() == QtCore.Qt.Horizontal and section >= 0:
+            name, _unit = self._metadata_rects(section)
+            if name.contains(event.position().toPoint()):
+                self.dialog._begin_header_edit(section, "name")
+                return
+        super().mouseDoubleClickEvent(event)
+
+    def _handle_at(self, point):
+        """The section whose resize handle is at point, as QHeaderView decides, or -1."""
+        position = point.x() if self.orientation() == QtCore.Qt.Horizontal else point.y()
+        section = self.logicalIndexAt(position)
+        if section < 0:
+            return -1
+        grip = self.style().pixelMetric(QtWidgets.QStyle.PM_HeaderGripMargin, None, self)
+        start = self.sectionViewportPosition(section)
+        if position < start + grip:
+            section -= 1
+        elif position <= start + self.sectionSize(section) - grip:
+            return -1
+        return section if section >= 0 and self.sectionResizeMode(section) == QtWidgets.QHeaderView.Interactive else -1
+
+    def mousePressEvent(self, event):
+        # One press means, in order: resize, unit choice, moving a selection, else Qt's selection.
+        point = event.position().toPoint()
+        section = self.logicalIndexAt(point)
+        if event.button() != QtCore.Qt.LeftButton or section < 0 or self._handle_at(point) >= 0:
+            return super().mousePressEvent(event)
+        horizontal = self.orientation() == QtCore.Qt.Horizontal
+        if horizontal and self._metadata_rects(section)[1].contains(point):
+            self.dialog._begin_header_edit(section, "unit")
+            return
+        if not self.dialog._finish_edits():
+            return
+        selection = self.dialog._table.selectionModel()
+        selected = selection.isColumnSelected(section) if horizontal else selection.isRowSelected(section)
+        source = self.dialog._area()
+        if selected and not event.modifiers() and self.dialog._can_move(self.orientation(), source):
+            self._press = point, source, section
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        self.viewport().update()
+        if self._press is not None:
+            point, source, _section = self._press
+            if self.dialog._gesture is None and (event.position().toPoint() - point).manhattanLength() >= QtWidgets.QApplication.startDragDistance():
+                self.dialog._begin_move(self.orientation(), source)
+            if self.dialog._gesture is not None:
+                self.dialog._update_gesture(self.viewport().mapToGlobal(event.position().toPoint()))
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if self._press is not None:
+            _point, _source, section = self._press
+            self._press = None
+            if self.dialog._gesture is None:
+                # A click without a drag selects just that column or row.
+                table = self.dialog._table
+                (table.selectColumn if self.orientation() == QtCore.Qt.Horizontal else table.selectRow)(section)
+                return
+            self.dialog._update_gesture(self.viewport().mapToGlobal(event.position().toPoint()))
+            self.dialog._finish_gesture(True)
+            return
+        super().mouseReleaseEvent(event)
+
+    def scrollContentsBy(self, dx, dy):
+        super().scrollContentsBy(dx, dy)
+        self._position_editor()
+
+
+class _SheetTable(QtWidgets.QTableView):
+    def __init__(self, dialog):
+        super().__init__(dialog)
+        self.dialog = dialog
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        painter = QtGui.QPainter(self.viewport())
+        color = self.palette().color(QtGui.QPalette.Highlight)
+        handle = self.dialog._fill_handle()
+        if not handle.isNull():
+            painter.fillRect(handle, color)
+        gesture = self.dialog._gesture
+        if gesture is not None and gesture["kind"] == "fill":
+            top, left, _bottom, right = gesture["source"]
+            first = self.visualRect(self.model().index(top - 1, left - 1))
+            last = self.visualRect(self.model().index(gesture["destination"] - 1, right - 1))
+            painter.setPen(QtGui.QPen(color, 2, QtCore.Qt.DashLine))
+            painter.drawRect(first.united(last).adjusted(1, 1, -1, -1))
+        painter.setPen(QtGui.QPen(color, 3))
+        for orientation in (QtCore.Qt.Horizontal, QtCore.Qt.Vertical):
+            coordinate = self.dialog._insertion_coordinate(orientation)
+            if coordinate is not None:
+                if orientation == QtCore.Qt.Horizontal:
+                    painter.drawLine(coordinate, 0, coordinate, self.viewport().height())
+                else:
+                    painter.drawLine(0, coordinate, self.viewport().width(), coordinate)
 
 
 class SpreadsheetEditorDialog(QtWidgets.QDialog):
@@ -163,16 +469,12 @@ class SpreadsheetEditorDialog(QtWidgets.QDialog):
         self._command = "initializing"
         self._closing = False
         self._settled = False
-        self._created = False
-        self._pending_action = None
-        self._pending_sheet = None
-        self._pending_edit = None
-        self._control_cell = None
-        self._clipboard_id = None
-        self._draft_cell = None
-        self._draft_cursor = (0, -1, 0)
-        self._draft_commit_pending = False
-        self._picking_reference = False
+        # Requests made while a reply is outstanding, run in order.
+        self._queue = []
+        self._result_area = None
+        self._formula_edit = None
+        self._gesture = None
+        self._gesture_point = None
         self._projecting = False
         self._can_undo = self._can_redo = False
         self._view_area = None
@@ -198,6 +500,7 @@ class SpreadsheetEditorDialog(QtWidgets.QDialog):
         self._columns_menu = QtWidgets.QMenu(self)
         self._columns_menu.addAction("Insert column", lambda: self._columns("insert"))
         self._columns_menu.addAction("Add column", lambda: self._columns("append"))
+        self._columns_menu.addAction("Correct unit declaration…", self._correct_declaration)
         self._columns_menu.addAction("Delete columns", lambda: self._columns("delete"))
         for text, menu in (("Rows", self._rows_menu), ("Columns", self._columns_menu)):
             button = QtWidgets.QToolButton(self)
@@ -206,45 +509,39 @@ class SpreadsheetEditorDialog(QtWidgets.QDialog):
             button.setPopupMode(QtWidgets.QToolButton.InstantPopup)
             self._toolbar.addWidget(button)
         formula_row = QtWidgets.QHBoxLayout()
-        self._address = QtWidgets.QLabel("A1", self)
+        self._address = QtWidgets.QLabel("", self)
         self._address.setMinimumWidth(65)
         formula_row.addWidget(self._address)
         formula_row.addWidget(QtWidgets.QLabel("fx", self))
         self._formula = QtWidgets.QLineEdit(self)
-        self._formula.setAccessibleName("Cell value or formula")
-        self._formula.setToolTip("Spreadsheet formulas: LOG(x) is base 10; LN(x) is the natural logarithm.\nCross-sheet example: ='Data 2'!B1")
+        self._formula.setAccessibleName("Cell contents")
+        self._formula.setToolTip("A number, or a formula such as =B5*D5 that computes its whole column from cells of the same row.\n"
+                                 "Plain numbers in formulas are scientific values (M, s, K, J/mol, m³).\n"
+                                 "Use ln(x) for natural logarithms and log10(x) for base 10.")
         formula_row.addWidget(self._formula)
         layout.addLayout(formula_row)
-        column_row = QtWidgets.QHBoxLayout()
-        column_row.addWidget(QtWidgets.QLabel("Column name", self))
-        self._column_name = QtWidgets.QLineEdit(self)
-        self._column_name.setAccessibleName("Measurement column name")
-        column_row.addWidget(self._column_name)
-        column_row.addWidget(QtWidgets.QLabel("Unit", self))
-        self._unit = QtWidgets.QComboBox(self)
-        self._unit.setInsertPolicy(QtWidgets.QComboBox.NoInsert)
-        self._unit.setAccessibleName("Column unit")
-        self._unit.setMinimumWidth(180)
-        self._unit.setToolTip("Changing the unit leaves the numbers unchanged and changes their interpretation.")
-        column_row.addWidget(self._unit)
-        layout.addLayout(column_row)
-        self._table = QtWidgets.QTableView(self)
+        self._table = _SheetTable(self)
         self._table.setAccessibleName("Temporary experimental worksheet")
         self._model = _SheetModel(self)
         self._table.setModel(self._model)
+        self._header = _SheetHeader(QtCore.Qt.Horizontal, self)
+        self._table.setHorizontalHeader(self._header)
+        self._table.setVerticalHeader(_SheetHeader(QtCore.Qt.Vertical, self))
+        self._header.setMinimumSectionSize(80)
         self._delegate = _CellDelegate(self)
         self._table.setItemDelegate(self._delegate)
         self._table.setSelectionMode(QtWidgets.QAbstractItemView.ContiguousSelection)
-        self._table.horizontalHeader().setDefaultSectionSize(150)
         self._table.verticalHeader().setDefaultSectionSize(25)
+        self._table.setHorizontalScrollMode(QtWidgets.QAbstractItemView.ScrollPerPixel)
+        self._table.setVerticalScrollMode(QtWidgets.QAbstractItemView.ScrollPerPixel)
         self._table.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
         self._table.customContextMenuRequested.connect(self._context_menu)
         layout.addWidget(self._table, 1)
         self._tabs = QtWidgets.QTabBar(self)
         layout.addWidget(self._tabs)
-        self._feedback = QtWidgets.QLabel("Opening worksheets...", self)
-        self._feedback.setWordWrap(True)
-        self._feedback.setTextFormat(QtCore.Qt.PlainText)
+        # One fixed line: longer messages elide and show in full on hover.
+        self._feedback = QtWidgets.QLabel(self)
+        set_bounded_label_text(self._feedback, "Opening worksheets...", max_width=16777215)
         layout.addWidget(self._feedback)
         footer = QtWidgets.QHBoxLayout()
         footer.addStretch(1)
@@ -258,22 +555,25 @@ class SpreadsheetEditorDialog(QtWidgets.QDialog):
         self._view_timer = QtCore.QTimer(self)
         self._view_timer.setSingleShot(True)
         self._view_timer.timeout.connect(self._read_view)
+        self._drag_timer = QtCore.QTimer(self)
+        self._drag_timer.setInterval(50)
+        self._drag_timer.timeout.connect(self._scroll_gesture)
+        self._cancel_drag = self._action("Cancel drag", lambda: self._finish_gesture(False), "Escape", toolbar=False)
+        self._cancel_drag.setShortcutContext(QtCore.Qt.WindowShortcut)
         self._table.verticalScrollBar().valueChanged.connect(self._schedule_view)
         self._table.horizontalScrollBar().valueChanged.connect(self._schedule_view)
         self._table.verticalHeader().sectionResized.connect(self._schedule_view)
         self._table.horizontalHeader().sectionResized.connect(self._schedule_view)
         self._table.selectionModel().currentChanged.connect(self._selection_changed)
+        self._table.selectionModel().selectionChanged.connect(lambda *_args: self._table.viewport().update())
         self._table.installEventFilter(self)
         self._table.viewport().installEventFilter(self)
         self._formula.installEventFilter(self)
+        self._name.installEventFilter(self)
         self._tabs.currentChanged.connect(self._select_sheet)
-        self._formula.textEdited.connect(lambda *_args: self._edit_draft(self._formula))
-        for signal in (self._formula.cursorPositionChanged, self._formula.selectionChanged):
-            signal.connect(lambda *_args: self._observe_draft_cursor(self._formula))
-        self._formula.editingFinished.connect(self._commit_formula)
+        self._formula.textEdited.connect(self._start_formula_edit)
+        self._formula.editingFinished.connect(lambda: self._finish_formula(True))
         self._name.editingFinished.connect(self._commit_name)
-        self._column_name.editingFinished.connect(self._commit_column)
-        self._unit.activated.connect(self._unit_selected)
         self._cancel.clicked.connect(self.reject)
         self._review.clicked.connect(lambda: self._request("outputs"))
         self._worker = SpreadsheetWorker(records, names, parent=self)
@@ -289,14 +589,29 @@ class SpreadsheetEditorDialog(QtWidgets.QDialog):
 
     @property
     def _editing_available(self):
-        return self._command in (None, "view") and self._pending_edit is None and not self._closing
+        return self._command in (None, "view") and not self._queue and not self._closing
+
+    @property
+    def _pending(self):
+        return tuple(operation for operation in (self._command, *(entry[0] for entry in self._queue)) if operation)
+
+    @property
+    def has_changes(self):
+        """Whether closing now would discard something the user did."""
+        draft = self._formula_edit is not None and self._formula.text() != self._formula_edit[3]
+        cell = self._delegate.active_editor is not None and self._delegate.active_editor.isModified()
+        header = self._header._input
+        header = header is not None and (header.isModified() if isinstance(header, QtWidgets.QLineEdit)
+                                         else header.isEditable() and header.lineEdit().isModified())
+        return (self._can_undo or any(operation not in _READS for operation in self._pending)
+                or draft or cell or header or self._name.isModified())
 
     @property
     def application_close_settled(self):
         return self._settled
 
     def cancel_for_application_close(self):
-        self.reject()
+        self._close_session()
 
     def _action(self, text, callback, shortcut, *, toolbar=True):
         action = QtGui.QAction(text, self)
@@ -309,21 +624,25 @@ class SpreadsheetEditorDialog(QtWidgets.QDialog):
         return action
 
     def _availability(self):
-        ready = not self.busy
-        drafting = self._draft_cell is not None
-        self._toolbar.setEnabled(ready and not drafting)
+        # Viewport reads never block commands; commands that capture worksheet
+        # coordinates wait for pending changes, while Undo and Redo queue in order.
+        ready = self._editing_available and self._gesture is None
         for action in (*self._toolbar.actions(), *self._rows_menu.actions(), *self._columns_menu.actions()):
-            action.setEnabled(ready and not drafting)
-        for widget in (self._name, self._column_name, self._unit):
-            widget.setEnabled(self._editing_available and not drafting)
-        self._tabs.setEnabled(ready)
-        self._formula.setEnabled(self._editing_available and not self._draft_commit_pending)
+            action.setEnabled(ready)
+        self._name.setEnabled(ready)
+        self._tabs.setEnabled(bool(self._sheets) and not self._closing and self._command != "outputs" and self._gesture is None)
+        self._formula.setEnabled(ready)
+        # Read after disabling fields: a focused field's focus loss can queue an edit.
+        pending = self._pending
         # Focus loss can submit an edit before a mouse click reaches Review.
         # Keep the button available to record that click while the edit finishes.
-        self._review.setEnabled(bool(self._sheets) and not self._closing and self._command != "outputs" and self._pending_action is None)
-        self._undo.setEnabled(ready and not drafting and self._can_undo)
-        self._redo.setEnabled(ready and not drafting and self._can_redo)
-        self._clear.setEnabled(ready and not drafting)
+        self._review.setEnabled(bool(self._sheets) and not self._closing and "outputs" not in pending)
+        history = not self._closing and self._gesture is None
+        self._undo.setEnabled(history and (self._can_undo or any(operation not in _READS for operation in pending)))
+        self._redo.setEnabled(history and (self._can_redo or "undo" in pending))
+        self._clear.setEnabled(ready)
+        self._cancel_drag.setEnabled(self._gesture is not None)
+        self._table.viewport().update()
 
     def _area(self):
         selection = self._table.selectionModel().selection()
@@ -334,34 +653,39 @@ class SpreadsheetEditorDialog(QtWidgets.QDialog):
         row, column = max(0, index.row()) + 1, max(0, index.column()) + 1
         return row, column, row, column
 
-    def _request(self, operation, args=()):
+    def _request(self, operation, args=(), *, sheet=None):
+        """Run a worksheet command after active edits, behind any outstanding work."""
+        if self._closing or not self._finish_edits():
+            return False
+        sheet = self._sheet if sheet is None else sheet
+        if self.busy:
+            self._queue.append((operation, args, sheet))
+            self._availability()
+        else:
+            self._send(operation, args, sheet)
+        return True
+
+    def _submit_edit(self, operation, args, *, sheet=None):
+        """Submit a captured edit; only a viewport read may be outstanding."""
         if self._closing:
             return False
-        if operation not in ("view", "set", "column", "name"):
-            if self._pending_action is not None or not self._finish_edits():
-                return False
-            if self.busy:
-                self._pending_action = operation, args
-                self._availability()
-                return True
+        # Capture the destination now: selection may move before the reply.
+        sheet = self._sheet if sheet is None else sheet
+        if self._command == "view":
+            self._queue.append((operation, args, sheet))
+            self._availability()
+            return True
         if self.busy:
             return False
+        self._send(operation, args, sheet)
+        return True
+
+    def _send(self, operation, args, sheet):
         self._command = operation
         self._availability()
         if operation != "view":
             self._feedback.setText("Calculating..." if operation != "outputs" else "Preparing numeric measurements...")
-        self._worker.submit(operation, self._sheet, args)
-        return True
-
-    def _submit_edit(self, operation, args):
-        if self._closing or self._pending_edit is not None:
-            return False
-        if self._command == "view":
-            # Capture the destination now: selection may move before the reply.
-            self._pending_edit = operation, args
-            self._availability()
-            return True
-        return self._request(operation, args)
+        self._worker.submit(operation, sheet, args)
 
     def _receive(self, operation, data, error):
         if self._closing:
@@ -378,11 +702,7 @@ class SpreadsheetEditorDialog(QtWidgets.QDialog):
             self._model.dataChanged.emit(self._model.index(top - 1, left - 1), self._model.index(bottom - 1, right - 1))
             self._selection_changed()
         elif operation == "copy":
-            self._clipboard_id = QtCore.QUuid.createUuid().toByteArray()
-            mime = QtCore.QMimeData()
-            mime.setText(data)
-            mime.setData(_SPREADSHEET_MIME, self._clipboard_id)
-            QtWidgets.QApplication.clipboard().setMimeData(mime)
+            QtWidgets.QApplication.clipboard().setText(data)
         elif operation == "outputs":
             self._availability()
             if not error:
@@ -390,40 +710,63 @@ class SpreadsheetEditorDialog(QtWidgets.QDialog):
             if self._closing:
                 return
         else:
-            self._sheets, self._can_undo, self._can_redo = data
+            # Unchanged columns keep their widths wherever structural changes move them.
+            previous = {spec["name"]: (spec, self._table.columnWidth(column))
+                        for column, spec in enumerate(self._model.info["columns"])}
+            self._sheets, self._can_undo, self._can_redo, shown = data
             if operation == "ready":
                 blocker = QtCore.QSignalBlocker(self._tabs)
                 for info in self._sheets:
                     tab = self._tabs.addTab(info["sheet"])
-                    self._tabs.setTabToolTip(tab, info["source"])
+                    self._tabs.setTabToolTip(tab, literal_tooltip(f"Worksheet: {info['sheet']}\nSource dataset: {info['source']}"))
                 del blocker
-            self._project_sheet()
+            if shown is not None and shown != self._sheet:
+                # Undo and Redo show the worksheet they change.
+                self._sheet = shown
+                with QtCore.QSignalBlocker(self._tabs):
+                    self._tabs.setCurrentIndex(shown)
+                previous = None
+            if operation == "formula" and not error:
+                sheet, _row, column, _entry = self._formula_edit
+                self._formula_edit = None
+                spec = self._sheets[sheet]["columns"][column - 1]
+                if spec["formula"] is not None and spec["unit"] is None:
+                    self._feedback.setText(f"Column {ironcalc.column_name_from_number(column)} has no unit; it is "
+                                           "calculated from scientific values (M, s, …). Hover its unit for how to set one.")
+            area = None
+            if self._result_area is not None and operation == self._result_area[0]:
+                if not error:
+                    area = self._result_area[1]
+                self._result_area = None
+            self._project_sheet(area)
+            self._fit_columns(previous)
+        if error:
+            self._queue.clear()
+            with QtCore.QSignalBlocker(self._tabs):
+                self._tabs.setCurrentIndex(self._sheet)
         self._availability()
-        if self._pending_edit is not None:
-            pending, self._pending_edit = self._pending_edit, None
-            self._request(*pending)
-        elif self._draft_commit_pending:
-            self._finish_formula(True)
-        elif self._pending_sheet is not None:
-            sheet, self._pending_sheet = self._pending_sheet, None
-            self._select_sheet(sheet)
-        elif self._pending_action is not None:
-            pending, self._pending_action = self._pending_action, None
-            self._request(*pending)
-        else:
+        if error and operation == "formula":
+            self._feedback.setText(f"{error}{'' if error.endswith('.') else '.'} Press Escape to discard the entry.")
+            self._formula.setReadOnly(False)
+            self._formula.setFocus()
+        while self._queue and not self.busy:
+            operation, args, sheet = self._queue.pop(0)
+            if operation == "select":
+                self._select_sheet(sheet)
+            else:
+                self._send(operation, args, sheet)
+        if not self.busy:
+            self._availability()
             self._schedule_view()
 
-    def _project_sheet(self):
-        area = self._area()
-        previous = self._control_cell
-        previous_column = self._model.info["columns"][previous[2] - 1] if previous is not None else None
+    def _project_sheet(self, area=None):
+        area = self._area() if area is None else area
         self._projecting = True
         self._model.beginResetModel()
         self._model.info = self._sheets[self._sheet]
         self._model.cells = {}
         self._model.endResetModel()
         self._view_area = None
-        self._control_cell = None
         self._name.setText(self._model.info["name"])
         if self._model.columnCount():
             top, left, bottom, right = area
@@ -432,74 +775,62 @@ class SpreadsheetEditorDialog(QtWidgets.QDialog):
             self._table.setCurrentIndex(self._model.index(top, left))
             self._table.selectionModel().select(QtCore.QItemSelection(self._model.index(top, left), self._model.index(bottom, right)), QtCore.QItemSelectionModel.ClearAndSelect)
         self._projecting = False
-        column = self._table.currentIndex().column()
-        preserve_column = (
-            previous is not None and (previous[0], previous[2]) == (self._sheet, column + 1)
-            and previous_column == self._model.info["columns"][column]
-        )
-        self._selection_changed(preserve_column=preserve_column)
+        self._selection_changed()
 
     def _select_sheet(self, sheet):
-        if sheet < 0 or self.busy or not self._sheets:
+        if sheet < 0 or self._closing or not self._sheets:
             return
         # Tab clicks can keep a line edit focused. Commit against the old
-        # worksheet before projecting the requested worksheet's controls.
+        # worksheet before projecting or queueing the requested worksheet.
         with QtCore.QSignalBlocker(self._tabs):
             self._tabs.setCurrentIndex(self._sheet)
-        if self._draft_cell is not None:
-            self._delegate.discard_edit()
-        else:
-            if not self._finish_edits():
-                return
-        if self.busy:
-            self._pending_sheet = sheet
+        if not self._finish_edits():
             return
-        self._sheet = sheet
         with QtCore.QSignalBlocker(self._tabs):
             self._tabs.setCurrentIndex(sheet)
+        if self.busy:
+            # Only the latest tab choice waits; the tab bar shows it meanwhile.
+            self._queue = [entry for entry in self._queue if entry[0] != "select"]
+            self._queue.append(("select", None, sheet))
+            self._availability()
+            return
+        self._sheet = sheet
         self._project_sheet()
+        self._fit_columns()
         self._schedule_view()
 
-    def _selection_changed(self, *_args, preserve_column=False):
-        if self._projecting or not self._sheets:
+    def _selection_changed(self, *_args):
+        if self._projecting or not self._sheets or self._formula_edit is not None:
             return
         index = self._table.currentIndex()
         if not index.isValid():
+            self._address.clear()
+            self._formula.clear()
+            self._formula.setReadOnly(True)
             return
         row, column = index.row() + 1, index.column() + 1
-        cell = self._sheet, row, column
-        previous = self._control_cell
-        column_changed = previous is None or (previous[0], previous[2]) != (self._sheet, column)
-        if previous is not None and previous != cell:
-            self._commit_formula()
-            if column_changed and not self._commit_column():
-                with QtCore.QSignalBlocker(self._table.selectionModel()):
-                    self._table.setCurrentIndex(self._model.index(previous[1] - 1, previous[2] - 1))
-                return
-        self._control_cell = cell
-        self._projecting = True
-        if self._draft_cell is None:
-            self._address.setText(f"{ironcalc.column_name_from_number(column)}{row}")
-            loaded = (row, column) in self._model.cells
-            was_loading = self._formula.isReadOnly()
-            self._formula.setReadOnly(not loaded)
-            if previous != cell or was_loading or not (self._formula.hasFocus() or self._formula.isModified()):
-                self._formula.setText(self._model.cells.get((row, column), ("", "", False))[1])
-        if column_changed and not preserve_column:
-            name, unit = self._model.info["columns"][column - 1]
-            timed = self._model.info["timed"] and column == 1
-            self._column_name.setText(name)
-            self._column_name.setReadOnly(timed)
-            self._unit.setEditable(False)
-            self._unit.clear()
-            self._unit.addItem("Choose unit...", None)
-            for choice in TIME_UNIT_DISPLAY if timed else MEASUREMENT_UNIT_DISPLAY:
-                self._unit.addItem("Dimensionless" if choice == "1" else choice, choice)
-            if unit is not None and self._unit.findData(unit) < 0:
-                self._unit.addItem(unit, unit)
-            self._unit.addItem("Custom expression...", "custom")
-            self._unit.setCurrentIndex(max(0, self._unit.findData(unit)))
-        self._projecting = False
+        entry = self._model.entry(row, column)
+        self._address.setText(f"{ironcalc.column_name_from_number(column)}{row}")
+        # A number is editable here only once its current value has loaded.
+        self._formula.setReadOnly(entry is None)
+        self._formula.setText(entry or "")
+
+    def _fit_columns(self, previous=None):
+        """Fit columns to their headers; given earlier definitions and widths by name, only those that changed."""
+        for column, spec in enumerate(self._model.info["columns"]):
+            kept = None if previous is None else previous.get(spec["name"])
+            if kept is not None and kept[0] == spec:
+                self._table.setColumnWidth(column, kept[1])
+            else:
+                self._table.setColumnWidth(column, min(260, self._header.sectionSizeFromContents(column).width()))
+        self._header._position_editor()
+
+    def _begin_header_edit(self, column, field, correction=False):
+        if not self._editing_available or self._gesture is not None:
+            return
+        if not self._finish_edits() or not self._editing_available:
+            return
+        self._header.begin_edit(self._sheet, column, field, correction)
 
     def _schedule_view(self, *_args):
         self._view_timer.start(0)
@@ -522,188 +853,96 @@ class SpreadsheetEditorDialog(QtWidgets.QDialog):
         area = top + 1, left + 1, bottom + 1, right + 1
         if area != self._view_area:
             self._view_area = area
-            self._request("view", area)
+            self._send("view", area, self._sheet)
 
-    def _commit_formula(self):
-        if self._projecting or self._closing or self._draft_cell is not None or self._control_cell is None:
-            return
-        _sheet, row, column = self._control_cell
-        if (row, column) not in self._model.cells:
-            return
-        text = self._formula.text()
-        if text != self._model.cells[row, column][1]:
-            if self._submit_edit("set", (row, column, text)):
-                self._formula.setModified(False)
+    def _commit_entry(self, row, column, text):
+        """Commit a cell entry through the formula bar, which keeps it if refused."""
+        self._formula_edit = self._sheet, row, column, self._model.entry(row, column)
+        self._address.setText(f"{ironcalc.column_name_from_number(column)}{row}")
+        self._formula.setText(text)
+        return self._finish_formula(True)
 
-    def _edit_draft(self, source, cell=None):
-        if self._projecting or self._closing:
-            return
-        if self._draft_cell is None:
-            if not source.text().startswith("="):
-                return
-            if cell is None:
-                index = self._table.currentIndex()
-                if not index.isValid():
-                    return
-                cell = self._sheet, index.row() + 1, index.column() + 1
-            self._draft_cell = cell
-            self._availability()
-        if source.hasFocus():
-            self._remember_draft_cursor(source)
-        if source is not self._formula:
-            # The formula bar retains the draft when a sheet switch destroys
-            # the inline editor. Preserve its cursor and selected text too.
-            with QtCore.QSignalBlocker(self._formula):
-                self._formula.setText(source.text())
-                start, length = source.selectionStart(), len(source.selectedText())
-                if start < 0:
-                    self._formula.setCursorPosition(source.cursorPosition())
-                elif source.cursorPosition() == start:
-                    self._formula.setSelection(start + length, -length)
-                else:
-                    self._formula.setSelection(start, length)
+    def _start_formula_edit(self, *_args):
+        if self._formula_edit is None:
+            index = self._table.currentIndex()
+            row, column = index.row() + 1, index.column() + 1
+            self._formula_edit = self._sheet, row, column, self._model.entry(row, column)
 
-    def _remember_draft_cursor(self, source):
-        self._draft_cursor = source.cursorPosition(), source.selectionStart(), len(source.selectedText())
-
-    def _observe_draft_cursor(self, source):
-        if self._draft_cell is not None and not self._projecting and not self._closing and source.hasFocus():
-            self._remember_draft_cursor(source)
-
-    def _focus_draft(self, source, cell=None):
-        if self._projecting or self._closing or self._draft_commit_pending:
-            return
-        if self._draft_cell is None:
-            self._edit_draft(source, cell)
-        if self._draft_cell is None:
-            return
-        # Both editing locations resume the one retained formula and cursor.
-        cursor, start, length = self._draft_cursor
-        with QtCore.QSignalBlocker(source):
-            if source is not self._formula:
-                source.setText(self._formula.text())
-            if start < 0:
-                source.setCursorPosition(cursor)
-            elif cursor == start:
-                source.setSelection(start + length, -length)
-            else:
-                source.setSelection(start, length)
+    def _correct_declaration(self):
+        index = self._table.currentIndex()
+        if index.isValid():
+            self._begin_header_edit(index.column(), "unit", correction=True)
 
     def _finish_formula(self, commit):
-        if self._draft_cell is None:
-            return
-        if commit and self.busy:
-            self._draft_commit_pending = True
-            self._delegate.discard_edit()
-            self._availability()
-            return
-        sheet, row, column = self._draft_cell
-        text = self._formula.text()
-        self._projecting = True
-        self._draft_cell = None
-        self._draft_commit_pending = False
-        self._picking_reference = False
-        self._control_cell = None
-        self._delegate.discard_edit()
-        self._projecting = False
+        if self._formula_edit is None or "formula" in self._pending:
+            return True
         if commit:
-            if sheet != self._sheet:
-                self._sheet = sheet
-                with QtCore.QSignalBlocker(self._tabs):
-                    self._tabs.setCurrentIndex(sheet)
-                self._project_sheet()
-            self._table.setCurrentIndex(self._model.index(row - 1, column - 1))
-            self._request("set", (row, column, text))
+            sheet, row, column, entry = self._formula_edit
+            text = self._formula.text()
+            if text == entry:
+                self._formula_edit = None
+                return True
+            if not self._submit_edit("formula", (row, column, text), sheet=sheet):
+                return False
         else:
+            self._formula_edit = None
             self._selection_changed()
-            self._availability()
-        self._table.setFocus()
-
-    def _insert_reference(self):
-        if self._draft_cell is None or self._draft_commit_pending or self._closing:
-            return
-        top, left, bottom, right = self._area()
-        reference = f"{ironcalc.column_name_from_number(left)}{top}"
-        if (top, left) != (bottom, right):
-            reference += f":{ironcalc.column_name_from_number(right)}{bottom}"
-        if self._sheet != self._draft_cell[0]:
-            reference = f"{ironcalc.quote_name(self._sheets[self._sheet]['sheet'])}!{reference}"
-        cursor, start, length = self._draft_cursor
-        self._formula.setFocus()
-        with QtCore.QSignalBlocker(self._formula):
-            if start < 0:
-                self._formula.setCursorPosition(cursor)
-            elif cursor == start:
-                self._formula.setSelection(start + length, -length)
-            else:
-                self._formula.setSelection(start, length)
-        self._formula.insert(reference)
-        self._remember_draft_cursor(self._formula)
+            self._table.setFocus()
+        return True
 
     def eventFilter(self, watched, event):
-        if watched is self._formula and event.type() == QtCore.QEvent.FocusIn:
-            self._focus_draft(watched)
+        if watched in (self._formula, self._name) and event.type() == QtCore.QEvent.FocusIn:
+            if not self._header.finish_edit():
+                return True
+            if watched is self._formula and not self._formula.isReadOnly():
+                self._start_formula_edit()
+        if watched is self._formula and event.type() == QtCore.QEvent.KeyPress:
+            if event.key() in (QtCore.Qt.Key_Return, QtCore.Qt.Key_Enter, QtCore.Qt.Key_Escape):
+                self._finish_formula(event.key() != QtCore.Qt.Key_Escape)
+                return True
         if watched is self._table.viewport() and event.type() == QtCore.QEvent.Resize:
             self._schedule_view()
-        if self._draft_cell is not None:
-            if watched is self._formula and event.type() == QtCore.QEvent.FocusOut:
-                # QLineEdit deselects text before the table's mouse press.
-                self._remember_draft_cursor(self._formula)
-            elif watched is self._table.viewport() and event.type() == QtCore.QEvent.MouseButtonPress and event.button() == QtCore.Qt.LeftButton:
-                self._delegate.discard_edit()
-                self._picking_reference = True
-            elif watched is self._table.viewport() and event.type() == QtCore.QEvent.MouseButtonRelease and event.button() == QtCore.Qt.LeftButton and self._picking_reference:
-                self._picking_reference = False
-                QtCore.QTimer.singleShot(0, self._insert_reference)
-            elif event.type() == QtCore.QEvent.KeyPress:
-                if event.key() in (QtCore.Qt.Key_Return, QtCore.Qt.Key_Enter, QtCore.Qt.Key_Escape):
-                    self._finish_formula(event.key() != QtCore.Qt.Key_Escape)
+        if watched is self._table.viewport():
+            if event.type() == QtCore.QEvent.MouseButtonPress and event.button() == QtCore.Qt.LeftButton:
+                if not self._finish_edits():
                     return True
-                if watched is self._table:
-                    self._formula.setFocus()
-                    QtWidgets.QApplication.sendEvent(self._formula, event)
+                if self._fill_handle().contains(event.position().toPoint()):
+                    self._gesture = {"kind": "fill", "sheet": self._sheet, "source": self._area(), "destination": self._area()[2]}
+                    self._table.viewport().grabMouse()
+                    self._update_gesture(self._table.viewport().mapToGlobal(event.position().toPoint()))
+                    self._drag_timer.start()
+                    self._availability()
+                    return True
+            elif self._gesture is not None and self._gesture["kind"] == "fill":
+                if event.type() == QtCore.QEvent.MouseMove:
+                    self._update_gesture(self._table.viewport().mapToGlobal(event.position().toPoint()))
+                    return True
+                if event.type() == QtCore.QEvent.MouseButtonRelease:
+                    self._update_gesture(self._table.viewport().mapToGlobal(event.position().toPoint()))
+                    self._finish_gesture(True)
                     return True
         return super().eventFilter(watched, event)
 
+    def event(self, event):
+        if event.type() == QtCore.QEvent.WindowDeactivate and self._gesture is not None:
+            self._finish_gesture(False)
+        if event.type() == QtCore.QEvent.FontChange:
+            self._fit_columns()
+        return super().event(event)
+
     def _commit_name(self):
-        if not self._projecting and self._name.text() != self._model.info.get("name"):
-            self._submit_edit("name", (self._name.text(),))
-
-    def _unit_selected(self):
-        if self._unit.currentData() == "custom":
-            self._unit.setEditable(True)
-            self._unit.setEditText("")
-            self._unit.lineEdit().editingFinished.connect(self._commit_column)
-            self._unit.setFocus()
-            return
-        self._unit.setEditable(False)
-        self._commit_column()
-
-    def _commit_column(self):
-        if self._projecting or self._closing or self._control_cell is None:
-            return True
-        index = self._control_cell[2] - 1
-        unit = self._unit.currentText().strip() if self._unit.isEditable() else self._unit.currentData()
-        if unit is not None:
-            try:
-                parser = parse_time_unit if self._model.info["timed"] and index == 0 else parse_measurement_unit
-                parser(unit)
-            except ValueError as exc:
-                self._feedback.setText(str(exc))
-                return False
-        value = self._column_name.text(), unit
-        if value != self._model.info["columns"][index]:
-            self._submit_edit("column", (index, *value))
-        return True
+        # Clear first: submitting disables the field, and its focus loss commits again.
+        if self._name.isModified():
+            self._name.setModified(False)
+            if not self._submit_edit("name", (self._name.text(),)):
+                self._name.setModified(True)
 
     def _finish_edits(self):
-        if not self._commit_column():
+        if not self._header.finish_edit():
             return False
         self._delegate.finish_edit()
-        focused = self.focusWidget()
-        if focused is not None:
-            focused.clearFocus()
-        self._commit_formula()
+        if not self._finish_formula(True):
+            return False
         self._commit_name()
         return True
 
@@ -711,13 +950,126 @@ class SpreadsheetEditorDialog(QtWidgets.QDialog):
         self._request("copy", self._area())
 
     def _paste(self):
-        clipboard = QtWidgets.QApplication.clipboard()
-        mime = clipboard.mimeData()
-        native = self._clipboard_id is not None and mime is not None and mime.data(_SPREADSHEET_MIME) == self._clipboard_id
-        self._request("paste", (self._area(), clipboard.text(), native))
+        self._request("paste", (self._area(), QtWidgets.QApplication.clipboard().text()))
 
     def _fill(self):
-        self._request("fill", self._area())
+        top, left, bottom, right = self._area()
+        # A whole-column selection includes the entry row below the data.
+        self._request("fill", ((top, left, top, right), min(bottom, self._model.info["rows"])))
+
+    def _fill_handle(self):
+        if not self._sheets or self._formula_edit is not None or not self._editing_available:
+            return QtCore.QRect()
+        _top, _left, bottom, right = self._area()
+        if bottom > self._model.info["rows"]:
+            return QtCore.QRect()
+        corner = self._table.visualRect(self._model.index(bottom - 1, right - 1)).bottomRight()
+        return QtCore.QRect(corner.x() - 4, corner.y() - 4, 8, 8)
+
+    def _can_move(self, orientation, source):
+        """Whether a selected row or column range can be dragged to a new position."""
+        if not self._editing_available or self._formula_edit is not None:
+            return False
+        _top, left, bottom, _right = source
+        if orientation == QtCore.Qt.Horizontal:
+            return not (self._model.info["timed"] and left == 1)
+        return bottom <= self._model.info["rows"]
+
+    def _begin_move(self, orientation, source):
+        if not self._can_move(orientation, source):
+            return
+        top, left, bottom, right = source
+        horizontal = orientation == QtCore.Qt.Horizontal
+        start, end = (left, right) if horizontal else (top, bottom)
+        self._gesture = {"kind": "columns" if horizontal else "rows", "sheet": self._sheet,
+                         "source": source, "start": start, "count": end - start + 1, "destination": start}
+        header = self._header if horizontal else self._table.verticalHeader()
+        header.viewport().grabMouse()
+        self._drag_timer.start()
+        self._availability()
+
+    def _update_gesture(self, point):
+        gesture = self._gesture
+        if gesture is None:
+            return
+        self._gesture_point = point
+        local = self._table.viewport().mapFromGlobal(point)
+        if gesture["kind"] == "fill":
+            y = max(0, min(local.y(), self._table.viewport().height() - 1))
+            row = self._table.rowAt(y)
+            row = self._model.info["rows"] if row < 0 else row + 1
+            gesture["destination"] = max(gesture["source"][2], min(row, self._model.info["rows"]))
+        else:
+            horizontal = gesture["kind"] == "columns"
+            header = self._header if horizontal else self._table.verticalHeader()
+            coordinate = local.x() if horizontal else local.y()
+            section = header.logicalIndexAt(max(0, coordinate))
+            extent = self._model.columnCount() if horizontal else self._model.info["rows"]
+            if section < 0:
+                destination = extent + 1
+            else:
+                destination = section + 1 + (coordinate >= header.sectionViewportPosition(section) + header.sectionSize(section) / 2)
+            first = 2 if horizontal and self._model.info["timed"] else 1
+            gesture["destination"] = max(first, min(destination, extent + 1))
+        self._paint_gesture()
+
+    def _paint_gesture(self):
+        self._table.viewport().update()
+        self._header.viewport().update()
+        self._table.verticalHeader().viewport().update()
+
+    def _insertion_coordinate(self, orientation):
+        if self._gesture is None or self._gesture["kind"] != ("columns" if orientation == QtCore.Qt.Horizontal else "rows"):
+            return None
+        header = self._header if orientation == QtCore.Qt.Horizontal else self._table.verticalHeader()
+        section = self._gesture["destination"] - 1
+        if section == header.count():
+            return header.sectionViewportPosition(section - 1) + header.sectionSize(section - 1)
+        return header.sectionViewportPosition(section)
+
+    def _scroll_gesture(self):
+        if self._gesture is None or self._gesture_point is None:
+            return
+        viewport = self._table.viewport()
+        point = viewport.mapFromGlobal(self._gesture_point)
+        horizontal = self._gesture["kind"] == "columns"
+        coordinate, extent = (point.x(), viewport.width()) if horizontal else (point.y(), viewport.height())
+        direction = 1 if coordinate >= extent - 24 else -1 if coordinate < 24 and self._gesture["kind"] != "fill" else 0
+        if direction:
+            bar = self._table.horizontalScrollBar() if horizontal else self._table.verticalScrollBar()
+            bar.setValue(bar.value() + direction * (30 if horizontal else self._table.verticalHeader().defaultSectionSize()))
+            self._update_gesture(self._gesture_point)
+
+    def _finish_gesture(self, commit):
+        gesture, self._gesture = self._gesture, None
+        self._gesture_point = None
+        self._header._press = None
+        self._table.verticalHeader()._press = None
+        self._drag_timer.stop()
+        grabber = QtWidgets.QWidget.mouseGrabber()
+        if grabber in (self._table.viewport(), self._header.viewport(), self._table.verticalHeader().viewport()):
+            grabber.releaseMouse()
+        self._paint_gesture()
+        self._availability()
+        if not commit or gesture is None:
+            return
+        top, left, bottom, right = gesture["source"]
+        destination = gesture["destination"]
+        if gesture["kind"] == "fill":
+            if destination <= bottom:
+                return
+            operation, args = "fill", (gesture["source"], destination)
+            area = top, left, destination, right
+        else:
+            start, count = gesture["start"], gesture["count"]
+            if start <= destination <= start + count:
+                return
+            delta = destination - start - (count if destination > start else 0)
+            operation, args = "move_" + gesture["kind"], (start, count, delta)
+            area = (top, left + delta, bottom, right + delta) if gesture["kind"] == "columns" else (top + delta, left, bottom + delta, right)
+        self._result_area = operation, area
+        if not self._request(operation, args, sheet=gesture["sheet"]):
+            self._result_area = None
 
     def _clear_cells(self):
         self._request("clear", self._area())
@@ -735,8 +1087,9 @@ class SpreadsheetEditorDialog(QtWidgets.QDialog):
         timed = self._model.info["timed"]
         if operation == "append":
             left = self._model.columnCount() + 1
-        elif timed:
+        elif timed and operation == "insert":
             left = max(2, left)
+        # The session admits deletions, refusing ones that include Recorded Time.
         count = max(0, right - left + 1) if operation == "delete" else 1
         if count:
             self._request("delete_columns" if operation == "delete" else "insert_columns", (left, count))
@@ -750,19 +1103,36 @@ class SpreadsheetEditorDialog(QtWidgets.QDialog):
         menu.addMenu(self._rows_menu).setText("Rows")
         menu.addMenu(self._columns_menu).setText("Columns")
         menu.exec(self._table.viewport().mapToGlobal(point))
+        menu.deleteLater()
 
     def finish_creation(self):
-        self._created = True
-        self.reject()
+        self._close_session()
 
     def reject(self):
+        """Cancel, Escape and the window close ask before discarding edits."""
         if self._closing:
             return
+        if QtWidgets.QApplication.mouseButtons() != QtCore.Qt.NoButton:
+            # Escape during a native resize or drag leaves the editor open.
+            return
+        if self.has_changes:
+            dialog = QtWidgets.QMessageBox(self)
+            dialog.setWindowTitle("Create from Data")
+            dialog.setIcon(QtWidgets.QMessageBox.Icon.Warning)
+            dialog.setText("Discard the temporary worksheets and close the editor?")
+            discard = dialog.addButton("Discard Worksheets", QtWidgets.QMessageBox.ButtonRole.DestructiveRole)
+            dialog.setDefaultButton(dialog.addButton(QtWidgets.QMessageBox.StandardButton.Cancel))
+            dialog.exec()
+            if dialog.clickedButton() is not discard or self._closing:
+                return
+        self._close_session()
+
+    def _close_session(self):
+        if self._closing:
+            return
+        self._finish_gesture(False)
+        self._header.finish_edit(False)
         self._closing = True
-        self._draft_cell = None
-        self._draft_commit_pending = False
-        self._pending_edit = None
-        self._pending_action = None
         self._delegate.discard_edit()
         self._view_timer.stop()
         self.setEnabled(False)
@@ -781,14 +1151,11 @@ class SpreadsheetEditorDialog(QtWidgets.QDialog):
     def _failure(self, message):
         if not self._closing:
             self.failed.emit(message)
-            self.reject()
+            self._close_session()
 
     def _worker_finished(self):
         if self._settled:
             return
-        if not self._closing:
-            self._failure("Spreadsheet calculation stopped.")
-            return
-        self.done(QtWidgets.QDialog.Accepted if self._created else QtWidgets.QDialog.Rejected)
+        self.done(QtWidgets.QDialog.Rejected)
         self._settled = True
         self.settled.emit()

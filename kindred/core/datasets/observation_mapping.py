@@ -191,7 +191,7 @@ def extract_initial_concentrations(
         raw_id = raw_id_by_target.get(species)
         if raw_id is not None:
             series = by_id[raw_id]
-            if series.unit.compatible(MOLAR):
+            if series.unit is not None and series.unit.compatible(MOLAR):
                 coordinates = series.t if first_row is None else series.source_rows
                 selected = 0.0 if first_row is None else first_row
                 indexes = tuple(index for index, item in enumerate(coordinates) if item == selected)

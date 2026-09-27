@@ -29,17 +29,29 @@ def operation_units(
     exponent: Fraction | None = None,
 ) -> UnitOperation:
     """Decide conversions without reading numerical values or defaults."""
+    # An unspecified result is a number in its known operands' scientific
+    # coordinates, like every established result.
+    scientific = tuple(ONE_SCALE if unit is None else conversion_scale(unit, scientific_unit(unit.dimensions))
+                       for unit in units)
     try:
         result = _operation_units(operation, units, zeros=zeros, exponent=exponent)
+        if result.unit is None:
+            result = UnitOperation(None, scientific)
         for factor in (*result.arguments, result.result):
             factor.check_exact_work()
             factor.number()
+        return result
     except ValueError:
-        # Unit inference cannot make an otherwise retained numerical operation
-        # a source-admission error. An inferred factor that cannot be represented
-        # by numerical execution leaves the operation's units unspecified.
-        return UnitOperation(None, (ONE_SCALE,) * len(units))
-    return result
+        # Declined exact work or an unrepresentable inferred factor leaves the
+        # units unspecified. Known operands still enter in their scientific
+        # coordinates through numerical factors, unless even those cannot be
+        # represented; unit inference never makes retained arithmetic an error.
+        try:
+            for factor in scientific:
+                factor.number()
+        except ValueError:
+            return UnitOperation(None, (ONE_SCALE,) * len(units))
+        return UnitOperation(None, scientific)
 
 
 def _operation_units(operation, units, *, zeros, exponent):
@@ -70,13 +82,13 @@ def _operation_units(operation, units, *, zeros, exponent):
             factors = (ONE_SCALE, units[1].scale)
             exponent_scale = units[1].scale.rational()
             exponent = exponent * exponent_scale if exponent is not None and exponent_scale is not None else None
-        # The exponent's numerical meaning is independent of whether the base
-        # has established units. Preserve its conversion on the fallback path.
         if units[0] is None:
-            return UnitOperation(None, factors)
+            return unknown
         if exponent is None:
-            return UnitOperation(DIMENSIONLESS, (units[0].scale, *factors[1:])) if units[0].compatible(DIMENSIONLESS) else UnitOperation(None, factors)
+            return UnitOperation(DIMENSIONLESS, (units[0].scale, *factors[1:])) if units[0].compatible(DIMENSIONLESS) else unknown
         raw = units[0].power(exponent)
+    elif rule == "predicate":
+        return UnitOperation(DIMENSIONLESS, factors)
     elif any(unit is None for unit in units):
         return unknown
     elif rule in {"*", "/"}:
@@ -85,8 +97,6 @@ def _operation_units(operation, units, *, zeros, exponent):
         raw = units[0]
     elif rule in {"dimensionless", "!", "&&", "||"}:
         return UnitOperation(DIMENSIONLESS, tuple(unit.scale for unit in units)) if all(unit.compatible(DIMENSIONLESS) for unit in units) else unknown
-    elif rule == "predicate":
-        return UnitOperation(DIMENSIONLESS, factors)
     else:
         return unknown
     result = scientific_unit(raw.dimensions)
@@ -94,7 +104,8 @@ def _operation_units(operation, units, *, zeros, exponent):
 
 
 _RATIONAL_OPERATIONS = {"+", "-", "*", "/", "^", "**"}
-_ZERO_RULES = {"+", "-", "compatible", "branches", "==", "!=", "<", "<=", ">", ">="}
+_COMPARISON_RULES = {"==", "!=", "<", "<=", ">", ">="}
+_ZERO_RULES = {"+", "-", "compatible", "branches", *_COMPARISON_RULES}
 
 
 def _children(node):
@@ -137,15 +148,13 @@ def _finish(node, children, constants):
         zeros=tuple(value == 0 for value in constants) if rule in _ZERO_RULES else (),
         exponent=constants[1] if operation in {"^", "**", "pow"} and len(children) == 2 else None,
     )
-    try:
-        scales = tuple(child.unit_scale * factor for child, factor in zip(children, result.arguments))
-        for scale in scales:
-            scale.check_exact_work()
-        scaled = tuple(replace(child, unit_scale=scale, unit_factor=scale.number())
-                       for child, scale in zip(children, scales))
-    except ValueError:
-        result = UnitOperation(None, (ONE_SCALE,) * len(children))
-        scaled = children
+    if result.unit is None and rule in _COMPARISON_RULES:
+        # A truth value is dimensionless; unrelated operands still compare in
+        # their scientific coordinates.
+        result = replace(result, unit=DIMENSIONLESS)
+    scales = tuple(child.unit_scale * factor for child, factor in zip(children, result.arguments))
+    scaled = tuple(replace(child, unit_scale=scale, unit_factor=scale.number())
+                   for child, scale in zip(children, scales))
     return replace(_with_children(node, scaled), quantity_unit=result.unit,
                    unit_scale=result.result, unit_factor=result.result.number())
 

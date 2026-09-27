@@ -33,7 +33,9 @@ from kindred.core.project_document import (
     ProjectDocument,
     canonical_observation_target_names,
 )
-from kindred.gui.ui_helpers import ControlRowsLayout
+from kindred.gui.ui_helpers import (
+    SCIENTIFIC_NAME_HTML_ROLE, ControlRowsLayout, ScientificNameDelegate, data_unit_labels,
+)
 from kindred.gui.display_name_policy import (
     literal_tooltip,
 )
@@ -177,13 +179,14 @@ class _SourceDialog(QtWidgets.QDialog):
             source_names = {column["assigned_name"]: column["authored_name"] for column in metadata["physical_columns"]}
             if metadata["time_column"] is not None:
                 fields.extend([
-                    ("Time column", source_names[metadata["time_column"]]),
+                    ("Original time column", source_names[metadata["time_column"]]),
                     ("Time unit", metadata["original_time_unit"]),
                 ])
         else:
             fields = [("Dataset", record.display_name), ("Origin", "Created with the spreadsheet editor")]
         times = {time for series in record.observations for time in series.t}
         if times:
+            fields.append(("Recorded time column", record.time_column_name))
             fields.append(("Distinct recorded timestamps", str(len(times))))
         else:
             fields.append(("Time", "Not recorded"))
@@ -199,17 +202,20 @@ class _SourceDialog(QtWidgets.QDialog):
         table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
         table.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.Stretch)
         units = metadata.get("original_concentration_units", {}) if metadata is not None else {}
+        table.setItemDelegateForColumn(table.columnCount() - 1, ScientificNameDelegate(table))
         for row, series in enumerate(record.observations):
-            converted = "Dimensionless" if series.unit.symbol == "1" else series.unit.symbol
+            converted, markup = data_unit_labels(series.unit)
             values = (series.column_name, str(len(series.y)), converted)
             if source is not None:
                 imported = units[series.column_name]
+                # The imported unit is shown as the file declared it.
                 values = (source_names[series.column_name], str(len(series.y)),
                           "Dimensionless" if imported == "1" else imported, converted)
             for column, value in enumerate(values):
                 item = QtWidgets.QTableWidgetItem(value)
                 item.setToolTip(literal_tooltip(value))
                 table.setItem(row, column, item)
+            table.item(row, len(values) - 1).setData(SCIENTIFIC_NAME_HTML_ROLE, markup)
         layout.addWidget(table, 1)
         buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Close)
         buttons.rejected.connect(self.reject)

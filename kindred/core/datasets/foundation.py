@@ -112,7 +112,7 @@ def validate_raw_observation_id(
 class ObservationSeries:
     raw_observation_id: str
     column_name: str
-    unit: Unit
+    unit: Unit | None
     # Empty means no recorded experimental time; rows remain the observation identity.
     t: tuple[float, ...]
     y: tuple[float, ...]
@@ -121,7 +121,7 @@ class ObservationSeries:
 
     def __post_init__(self) -> None:
         validate_raw_observation_id(self.raw_observation_id)
-        if self.unit != scientific_unit(self.unit.dimensions):
+        if self.unit is not None and self.unit != scientific_unit(self.unit.dimensions):
             raise ValueError("Observation values require scientific-coordinate units.")
         if type(self.t) is not tuple or type(self.y) is not tuple:
             raise TypeError("ObservationSeries t/y must be immutable tuples.")
@@ -187,6 +187,7 @@ def validate_original_basename(value: object, *, label: str = "original filename
 class RawDatasetRecord:
     dataset_id: str
     display_name: str
+    time_column_name: str | None
     source_id: str | None
     source_metadata: FrozenJsonValue
     observations: tuple[ObservationSeries, ...]
@@ -251,6 +252,15 @@ def validate_raw_dataset_record(record: RawDatasetRecord) -> RawDatasetRecord:
         if len(set(series.source_rows)) != len(series.source_rows):
             fail(f"Raw dataset {record.dataset_id!r} observation {name!r} contains duplicate observation row identities.")
         observation_names.append(name)
+    if any(series.t for series in record.observations):
+        if (
+            not isinstance(record.time_column_name, str)
+            or not record.time_column_name
+            or record.time_column_name != record.time_column_name.strip()
+        ):
+            fail("Timed datasets require a nonblank edge-normalized time column name.")
+    elif record.time_column_name is not None:
+        fail("Untimed datasets cannot have a time column name.")
     if record.source_id is None:
         if record.source_metadata is not None:
             fail("Created datasets cannot retain imported source metadata.")
@@ -273,6 +283,8 @@ def validate_raw_dataset_record(record: RawDatasetRecord) -> RawDatasetRecord:
         or record.source_id != record.source_id.strip()
     ):
         fail(f"Raw dataset {record.dataset_id!r} source ID must be nonblank and edge-normalized.")
+    if any(series.unit is None for series in record.observations):
+        fail("Imported observations require known scientific units.")
     thawed_metadata = thaw_json_value(record.source_metadata)
     if not isinstance(thawed_metadata, dict):
         fail(f"Raw dataset {record.dataset_id!r} source metadata must be an immutable JSON object.")

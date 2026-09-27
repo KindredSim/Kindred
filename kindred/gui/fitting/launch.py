@@ -127,7 +127,7 @@ class FitObservationSnapshot:
     raw_observation_id: str
     raw_column: str
     model_target: str
-    unit: Unit
+    unit: Unit | None
     t: tuple[float, ...]
     y: tuple[float, ...]
     source_rows: tuple[int, ...]
@@ -150,6 +150,7 @@ class FitObservationSnapshot:
 class FitMappedDatasetSnapshot:
     dataset_id: str
     display_name: str
+    time_column_name: str | None
     set_id: str
     set_name: str
     initial_values: tuple[tuple[str, float], ...]
@@ -1042,7 +1043,7 @@ class FitSelectedObservation:
     raw_observation_id: str
     raw_column: str
     model_target: str
-    unit: Unit
+    unit: Unit | None
     t: tuple[float, ...]
     y: tuple[float, ...]
     source_rows: tuple[int, ...]
@@ -1244,6 +1245,7 @@ def capture_fit_origin(
             FitMappedDatasetSnapshot(
                 dataset_id=dataset.dataset_id,
                 display_name=dataset.display_name,
+                time_column_name=dataset.time_column_name,
                 set_id=initial_set.set_id,
                 set_name=initial_set.name,
                 initial_values=canonical_initial_values(tab, initial_set.set_id),

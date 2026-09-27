@@ -424,6 +424,7 @@ class ResultDataBlock:
     discontinuity_ids: np.ndarray | None
     source_row: np.ndarray | None
     x_name: str = "t"
+    time_column_name: str | None = None
     copy_definitions: tuple[tuple[str, str], ...] = ()
     quantity_units: tuple[tuple[str, Unit | None], ...] = ()
     presentation_units: tuple[tuple[str, Unit | None], ...] = ()
@@ -450,6 +451,11 @@ class ResultDataBlock:
 
     def unit_label(self, name: str, *, x: bool = False) -> str:
         unit = self.unit_for(name, x=x)
+        if (
+            x and self.kind is ResultLayerKind.EXPERIMENTAL
+            and _is_time_selection(self.x_axis) and self.time_column_name is not None
+        ):
+            name = self.time_column_name
         return f"{name} [{unit.symbol}]" if unit is not None else name
 
     def __post_init__(self) -> None:
@@ -843,6 +849,7 @@ def compose_canonical_export_blocks(
                 dataset_name=record.display_name,
                 raw_column=series.column_name,
                 unit=series.unit,
+                time_column_name=record.time_column_name,
                 model_target=mapping.get(series.raw_observation_id),
                 set_id=link.set_id,
                 t=series.t,
@@ -865,6 +872,7 @@ def compose_canonical_export_blocks(
                     kind=ResultLayerKind.EXPERIMENTAL,
                     t=time,
                     sample_time=time if time.size else None,
+                    time_column_name=source.time_column_name,
                     series=((source.raw_column, values),),
                     quantity_units=((source.raw_column, source.unit),),
                     series_axes=((source.raw_column, source.axis),),
@@ -1530,6 +1538,7 @@ def compose_result_input(
                 kind=ResultLayerKind.EXPERIMENTAL,
                 t=x_values,
                 sample_time=sample_time,
+                time_column_name=experimental.time_column_name,
                 series=((experimental.raw_column, y_values),),
                 series_axes=((experimental.raw_column, y_axis),),
                 x_axis=x_axis,

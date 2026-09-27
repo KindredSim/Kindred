@@ -6,6 +6,7 @@ from typing import Optional
 from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtGui import QDoubleValidator
 
+from kindred.core.quantity_units import format_unit_for_display
 from kindred.gui.display_name_policy import (
     DATASET_LIST_LABEL_MAX_CHARS,
     CompactText,
@@ -283,6 +284,36 @@ def clamp_initial_size(widget: QtWidgets.QWidget, width: int, height: int) -> No
 SCIENTIFIC_NAME_HTML_ROLE = int(QtCore.Qt.UserRole) + 173
 
 
+def paint_markup(painter, rect, markup, *, font, alignment, palette) -> None:
+    """Paint one unwrapped line of scientific markup, vertically centred in rect."""
+    document = QtGui.QTextDocument()
+    document.setDocumentMargin(0)
+    document.setDefaultFont(font)
+    text_option = QtGui.QTextOption(alignment)
+    text_option.setWrapMode(QtGui.QTextOption.WrapMode.NoWrap)
+    document.setDefaultTextOption(text_option)
+    document.setTextWidth(max(0, rect.width()))
+    document.setHtml(markup)
+    painter.save()
+    painter.setClipRect(rect)
+    painter.translate(rect.left(), rect.top() + max(0, (rect.height() - document.size().height()) / 2))
+    context = QtGui.QAbstractTextDocumentLayout.PaintContext()
+    context.palette = palette
+    try:
+        document.documentLayout().draw(painter, context)
+    finally:
+        painter.restore()
+
+
+def data_unit_labels(unit) -> tuple[str, str]:
+    """Plain text and scientific markup for a measurement unit on data surfaces."""
+    if unit is None:
+        return "Unspecified", "Unspecified"
+    if unit.symbol == "1":
+        return "Dimensionless", "Dimensionless"
+    return unit.symbol, format_unit_for_display(unit)
+
+
 class ScientificNameDelegate(QtWidgets.QStyledItemDelegate):
     """Paint explicit scientific markup while retaining the model's plain text."""
 
@@ -299,25 +330,10 @@ class ScientificNameDelegate(QtWidgets.QStyledItemDelegate):
         rect = style.subElementRect(QtWidgets.QStyle.SE_ItemViewItemText, opt, opt.widget)
         inset = max(opt.fontMetrics.horizontalAdvance(" "), style.pixelMetric(QtWidgets.QStyle.PM_FocusFrameHMargin))
         rect.adjust(inset, 0, -inset, 0)
-        doc = QtGui.QTextDocument()
-        doc.setDocumentMargin(0)
-        doc.setDefaultFont(opt.font)
-        text_option = QtGui.QTextOption(opt.displayAlignment)
-        text_option.setWrapMode(QtGui.QTextOption.WrapMode.NoWrap)
-        doc.setDefaultTextOption(text_option)
-        doc.setTextWidth(max(0, rect.width()))
-        doc.setHtml(markup)
-        painter.save()
-        painter.setClipRect(rect)
-        painter.translate(rect.left(), rect.top() + max(0, (rect.height() - doc.size().height()) / 2))
-        context = QtGui.QAbstractTextDocumentLayout.PaintContext()
-        context.palette = opt.palette
+        palette = QtGui.QPalette(opt.palette)
         if opt.state & QtWidgets.QStyle.State_Selected:
-            context.palette.setColor(QtGui.QPalette.Text, opt.palette.color(QtGui.QPalette.HighlightedText))
-        try:
-            doc.documentLayout().draw(painter, context)
-        finally:
-            painter.restore()
+            palette.setColor(QtGui.QPalette.Text, opt.palette.color(QtGui.QPalette.HighlightedText))
+        paint_markup(painter, rect, markup, font=opt.font, alignment=opt.displayAlignment, palette=palette)
 
 
 class ScientificNameComboBox(QtWidgets.QComboBox):
@@ -386,26 +402,8 @@ class ScientificNameHeaderView(QtWidgets.QHeaderView):
         text_rect = style.subElementRect(
             QtWidgets.QStyle.SubElement.SE_HeaderLabel, option, self,
         )
-        document = QtGui.QTextDocument()
-        document.setDocumentMargin(0)
-        document.setDefaultFont(self.font())
-        text_option = QtGui.QTextOption(option.textAlignment)
-        text_option.setWrapMode(QtGui.QTextOption.WrapMode.NoWrap)
-        document.setDefaultTextOption(text_option)
-        document.setTextWidth(max(0, text_rect.width()))
-        document.setHtml(markup)
-        painter.save()
-        painter.setClipRect(text_rect)
-        painter.translate(
-            text_rect.left(),
-            text_rect.top() + max(0, (text_rect.height() - document.size().height()) / 2),
-        )
-        context = QtGui.QAbstractTextDocumentLayout.PaintContext()
-        context.palette = option.palette
-        try:
-            document.documentLayout().draw(painter, context)
-        finally:
-            painter.restore()
+        paint_markup(painter, text_rect, markup, font=self.font(),
+                     alignment=option.textAlignment, palette=option.palette)
 
 
 def make_bounded_label(

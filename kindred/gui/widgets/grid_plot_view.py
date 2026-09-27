@@ -14,8 +14,8 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from kindred.gui.curve_copy_headers import copy_column_header
 from kindred.core.quantity_units import Unit, MOLAR, SECOND, format_unit_for_display
 from kindred.gui.fitting.curve_projection import (
-    focused_units, prepared_fit_units, scale_values, focused_model_chunks, focused_model_rows,
-    observed_fit_units, shared_axis_unit,
+    fit_display_units, prepared_fit_units, scale_values, focused_model_chunks, focused_model_rows,
+    shared_axis_unit,
 )
 from kindred.gui.display_name_policy import (
     PLOT_TITLE_LABEL_MAX_CHARS,
@@ -62,8 +62,8 @@ def _fit_copy_columns(dataset):
     """Project complete retained data independently of widget display history."""
     targets = tuple(name for name, _ in dataset.observed_y)
     units = dict(dataset.simulation.quantity_units)
-    display = dict(focused_units(units, dataset.simulation.presentation_units, dataset.x_name, targets))
-    measured_display = dict(observed_fit_units(display, dataset.x_name, dataset.observed_x_unit, dataset.observed_y_units))
+    display, measured_display = fit_display_units(units, dataset.simulation.presentation_units, dataset.x_name, targets,
+                                                  dataset.observed_x_unit, dataset.observed_y_units)
     measured_y_units = dict(dataset.observed_y_units)
     definitions = dict(dataset.model_definitions)
     rows = focused_model_rows(dataset)
@@ -84,8 +84,8 @@ def _fit_copy_columns(dataset):
     for name, values in dataset.observed_y:
         group = f"Observed {raw[name]}"
         if dataset.x_name != "t" and times[name]:
-            add(group, "Recorded time", times[name], SECOND)
-        x_name = dataset.observed_x_name or "t"
+            add(group, dataset.time_column_name, times[name], SECOND)
+        x_name = dataset.observed_x_name or dataset.time_column_name
         x_unit = measured_display[dataset.x_name]
         y_unit = measured_display[name]
         add(group, x_name, scale_values(observed_x[name], dataset.observed_x_unit, x_unit), x_unit)
@@ -272,8 +272,9 @@ class GridPlotView(QtWidgets.QWidget):
                         self._update_series(identity, kind, name, ((), ()))
                 continue
             units = dict(curve.simulation.quantity_units)
-            display = dict(focused_units(units, curve.simulation.presentation_units,
-                                        curve.x_name, tuple(name for name, _ in curve.observed_y)))
+            display, _measured = fit_display_units(units, curve.simulation.presentation_units, curve.x_name,
+                                                   tuple(name for name, _ in curve.observed_y),
+                                                   curve.observed_x_unit, curve.observed_y_units)
             chunks = focused_model_chunks(curve)
             for name, _ in curve.observed_y:
                 xs, ys = [], []
@@ -648,7 +649,7 @@ class GridPlotView(QtWidgets.QWidget):
             details = [html.escape(tooltip).replace("\n", "<br>")]
             for quantity in (x_name, *names):
                 model = format_unit_for_display(model_display[quantity]) or "Unspecified"
-                measured = format_unit_for_display(measured_display[quantity])
+                measured = format_unit_for_display(measured_display[quantity]) or "Unspecified"
                 details.append(f"{html.escape(quantity)}: model {model}; measured {measured}")
             tooltip = "<qt>" + "<br>".join(details) + "</qt>"
         state = (x_name, title, tooltip, label, units, x_display, len(self._dataset_ids) > 1,
@@ -746,11 +747,10 @@ class GridPlotView(QtWidgets.QWidget):
             names = tuple(item.model_target for item in config.selected_observations)
             x = config.parametric_x_observation
             x_name = "t" if x is None else x.model_target
-            _quantities, display_pairs = prepared_fit_units(request.setup.origin.prepared_dsl, x_name, names)
-            display = dict(display_pairs)
             x_unit = SECOND if x is None else x.unit
             y_units = {item.model_target: item.unit for item in config.selected_observations}
-            measured_display = dict(observed_fit_units(display, x_name, x_unit, tuple(y_units.items())))
+            display, measured_display = prepared_fit_units(request.setup.origin.prepared_dsl, x_name, names,
+                                                           x_unit, tuple(y_units.items()))
             self._update_panel(identity, mapped[identity].display_name, x_name,
                                display, measured_display, names)
             observed_x, observed_y = _observed_curve_parts(config.selected_observations, x_observations=x)

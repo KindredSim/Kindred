@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from html import escape
+
 from PySide6 import QtCore, QtWidgets
 
 from kindred.core.datasets.foundation import RawDatasetRecord
@@ -13,7 +15,7 @@ from kindred.core.datasets.observation_mapping import (
     suggest_observation_mapping,
 )
 from kindred.core.quantity_units import MOLAR
-from kindred.gui.ui_helpers import clamp_initial_size
+from kindred.gui.ui_helpers import clamp_initial_size, data_unit_labels
 
 
 class ObservationMappingWidget(QtWidgets.QWidget):
@@ -56,7 +58,9 @@ class ObservationMappingWidget(QtWidgets.QWidget):
             if selected in model_targets:
                 combo.setCurrentIndex(combo.findData(selected))
             self._observation_combos[series.raw_observation_id] = combo
-            form.addRow(series.column_name, combo)
+            label = QtWidgets.QLabel(f"{escape(series.column_name)} · {data_unit_labels(series.unit)[1]}", self)
+            label.setTextFormat(QtCore.Qt.RichText)
+            form.addRow(label, combo)
         layout.addLayout(form)
 
         self._concentrations_group = QtWidgets.QGroupBox("Initial concentrations", self)
@@ -70,7 +74,7 @@ class ObservationMappingWidget(QtWidgets.QWidget):
         self._source_combo.model().item(1).setEnabled(any(0.0 in item.t for item in record.observations))
         if any(
             self._observation_combos[item.raw_observation_id].currentData() in mechanism_species
-            and item.unit.compatible(MOLAR) and 0.0 in item.t
+            and item.unit is not None and item.unit.compatible(MOLAR) and 0.0 in item.t
             for item in record.observations
         ):
             self._source_combo.setCurrentIndex(1)

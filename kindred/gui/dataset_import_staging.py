@@ -19,6 +19,7 @@ from kindred.core.datasets.observation_payload import DatasetObservationPayload
 from kindred.core.datasets.foundation import (
     ImportedSource,
     RawDatasetRecord,
+    thaw_json_value,
     validate_raw_dataset_record,
 )
 from kindred.gui.controllers.dataset_errors import (
@@ -312,9 +313,11 @@ def build_raw_record_batch_proposal(
                 f"Import captured multiple distinct sources with source ID {source.source_id!r}."
             )
         sources_by_id[source.source_id] = source
+        metadata = thaw_json_value(unit.payload.source_metadata)
         candidate = RawDatasetRecord(
             dataset_id=new_dataset_id(),
             display_name=display_name,
+            time_column_name=metadata["time_column"],
             source_id=source.source_id,
             source_metadata=unit.payload.source_metadata,
             observations=unit.payload.observations,

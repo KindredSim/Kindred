@@ -19,21 +19,32 @@ def focused_units(quantity_units, preferred_units, x_name, targets):
     return tuple((name, SECOND if name == "t" else common if name in concentrations else units.get(name)) for name in names)
 
 
-def prepared_fit_units(prepared, x_name, targets):
+def fit_display_units(units, preferred_units, x_name, targets, x_unit, y_units):
+    """Model and measured display units; an axis without one shared unit stays scientific."""
+    units = dict(units)
+    display = dict(focused_units(units, preferred_units, x_name, targets))
+    for axis in ((x_name,), tuple(targets)):
+        measured = dict(observed_fit_units(display, x_name, x_unit, y_units))
+        if shared_axis_unit(unit for name in axis for unit in (display[name], measured[name])) is None:
+            display.update((name, SECOND if name == "t" else units.get(name)) for name in axis)
+    return display, dict(observed_fit_units(display, x_name, x_unit, y_units))
+
+
+def prepared_fit_units(prepared, x_name, targets, x_unit, y_units):
     spec = prepared.parameter_algebra_spec_for_execution()
     units = dict(spec.quantity_units)
     units.update({name: MOLAR for name in prepared.analysis.species_names})
     units["t"] = SECOND
     declarations = {line.name: line.declared_unit for line in spec.observable_block.lines}
     preferred = {name: presentation_unit(unit, declarations.get(name)) for name, unit in units.items()}
-    return tuple(units.items()), focused_units(units, preferred, x_name, targets)
+    return fit_display_units(units, preferred, x_name, targets, x_unit, y_units)
 
 
 def observed_fit_units(model_display, x_name, x_unit, y_units):
     """Convert compatible measurements to the model display, retaining other meanings."""
     display = dict(model_display)
     return tuple(
-        (name, display[name] if display.get(name) is not None and unit.compatible(display[name]) else unit)
+        (name, display[name] if unit is not None and display.get(name) is not None and unit.compatible(display[name]) else unit)
         for name, unit in ((x_name, x_unit), *y_units)
     )
 

@@ -109,6 +109,7 @@ def _fit_coordinate_display_label(value: FitCoordinate) -> str:
 class FitCurveDataset:
     dataset_id: str
     display_name: str
+    time_column_name: str | None
     simulation: SimulationResultValue
     observed_x: tuple[tuple[str, tuple[float, ...]], ...]
     observed_y: tuple[tuple[str, tuple[float, ...]], ...]
@@ -116,8 +117,8 @@ class FitCurveDataset:
     observed_raw_columns: tuple[tuple[str, str], ...]
     model_definitions: tuple[tuple[str, str], ...]
     observed_x_name: str | None
-    observed_x_unit: Unit
-    observed_y_units: tuple[tuple[str, Unit], ...]
+    observed_x_unit: Unit | None
+    observed_y_units: tuple[tuple[str, Unit | None], ...]
     x_name: str = "t"
 
     def __post_init__(self) -> None:
@@ -626,6 +627,7 @@ def _curves_from_simulations(
             FitCurveDataset(
                 dataset_id=dataset_id,
                 display_name=mapped.display_name,
+                time_column_name=mapped.time_column_name,
                 simulation=simulation,
                 observed_x_unit=SECOND if prepared.parametric_x_observation is None else prepared.parametric_x_observation.unit,
                 observed_y_units=tuple((item.model_target, item.unit) for item in selected),

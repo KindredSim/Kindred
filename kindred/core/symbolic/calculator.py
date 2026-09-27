@@ -763,17 +763,35 @@ def _matrix_arithmetic(name, left, right):
     return sp.ImmutableMatrix(rows, cols, [v.expression for row in cells for v in row]), tuple(tuple(v.quantity for v in row) for row in cells)
 
 
+def _scientific(expression, unit):
+    """Express a finished known quantity, or each matrix entry, in its scientific coordinates."""
+    sp = require_sympy()
+    if isinstance(expression, sp.MatrixBase):
+        return sp.ImmutableMatrix(expression.rows, expression.cols, [
+            _scientific(expression[i, j], unit[i][j] if isinstance(unit, tuple) else None)
+            for i in range(expression.rows) for j in range(expression.cols)])
+    # Equations have dimensionless meaning; _equations already made their sides scientific.
+    if not isinstance(unit, Unit) or not isinstance(expression, sp.Expr):
+        return expression
+    return expression * conversion_scale(unit, scientific_unit(unit.dimensions)).symbolic()
+
+
 def _determinant(value):
     """Factor row/column dimensions; use native determinant on aligned entries."""
     matrix = value.expression
     n = matrix.rows
     if not n:
         return matrix.det(), DIMENSIONLESS
+
+    def unestablished():
+        # Without a dimension contract, entries enter in their scientific coordinates.
+        return _scientific(matrix, value.quantity).det(), None
+
     rows, columns = [None]*n, [None]*n
     cells = {(i, j): _matrix_cell(value, i, j) for i in range(n) for j in range(n)
              if matrix[i, j] != 0 or _matrix_cell(value, i, j).quantity is None}
     if any(not isinstance(cell.quantity, Unit) for cell in cells.values()):
-        return matrix.det(), None
+        return unestablished()
     for start in range(n):
         if rows[start] is not None:
             continue
@@ -789,9 +807,9 @@ def _determinant(value):
                     rows[i] = cell.quantity.divide(columns[j])
                     pending = True
                 elif rows[i] is not None and columns[j] is not None and not cell.quantity.compatible(rows[i].multiply(columns[j])):
-                    return matrix.det(), None
+                    return unestablished()
     if any(unit is None for unit in columns):
-        return matrix.det(), None
+        return unestablished()
     aligned = matrix.as_mutable()
     for (i, j), cell in cells.items():
         aligned[i, j] *= conversion_scale(cell.quantity, rows[i].multiply(columns[j])).symbolic()
@@ -835,22 +853,30 @@ def _coordinate_argument(context, coordinate, value):
             return value.expression * conversion_scale(source, DIMENSIONLESS).symbolic(), True
         if source.compatible(target):
             return value.expression * conversion_scale(source, target).symbolic(), True
-    return value.expression, False
+    return _scientific(value.expression, source), False
 
 
-def _substitution_quantity(expression, quantity, unknown):
-    """Only affected result entries lose meaning; finished CAS is never re-inferred."""
+def _lose_units(expression, quantity, unknown):
+    """Only affected entries lose meaning and continue in their scientific
+    coordinates; finished CAS is never re-inferred."""
     sp = require_sympy()
     if isinstance(expression, _Relationships):
-        parts = tuple(expression.replacements.values())
-    elif isinstance(expression, sp.MatrixBase):
-        return tuple(tuple(_substitution_quantity(expression[i,j], quantity[i][j] if isinstance(quantity, tuple) else None, unknown)
-                           for j in range(expression.cols)) for i in range(expression.rows))
-    elif isinstance(expression, sp.Tuple):
-        parts = tuple(expression)
-    else:
-        return None if isinstance(expression, sp.Basic) and expression.free_symbols.intersection(unknown) else quantity
-    return tuple(_substitution_quantity(part, quantity[i] if isinstance(quantity, tuple) else None, unknown) for i, part in enumerate(parts))
+        parts = [_lose_units(rhs, quantity[i] if isinstance(quantity, tuple) else None, unknown)
+                 for i, rhs in enumerate(expression.replacements.values())]
+        return (_Relationships(dict(zip(expression.replacements, (e for e, _ in parts)))),
+                tuple(q for _, q in parts))
+    if isinstance(expression, sp.MatrixBase):
+        rows = [[_lose_units(expression[i, j], quantity[i][j] if isinstance(quantity, tuple) else None, unknown)
+                 for j in range(expression.cols)] for i in range(expression.rows)]
+        return (sp.ImmutableMatrix(expression.rows, expression.cols, [e for row in rows for e, _ in row]),
+                tuple(tuple(q for _, q in row) for row in rows))
+    if isinstance(expression, sp.Tuple):
+        parts = [_lose_units(part, quantity[i] if isinstance(quantity, tuple) else None, unknown)
+                 for i, part in enumerate(expression)]
+        return sp.Tuple(*(e for e, _ in parts)), tuple(q for _, q in parts)
+    if isinstance(expression, sp.Basic) and expression.free_symbols.intersection(unknown):
+        return _scientific(expression, quantity), None
+    return expression, quantity
 
 
 def _substitute_coordinates(context, source, targets, replacements, units, *, conditions):
@@ -860,7 +886,8 @@ def _substitute_coordinates(context, source, targets, replacements, units, *, co
         converted[target] = expression
         if not known:
             unknown.add(target)
-    source = replace(source, quantity=_substitution_quantity(source.expression, source.quantity, unknown))
+    expression, quantity = _lose_units(source.expression, source.quantity, unknown)
+    source = replace(source, expression=expression, quantity=quantity)
     return _substitute_value(source, converted, replacement_conditions=conditions)
 
 
@@ -1316,14 +1343,17 @@ def _calculus_call(context: CalculatorContext, name: str, args: Sequence[_Value]
         coordinate_unit = context.coordinate_units.get(str(variable))
         quantity = args[0].quantity
         if name == "integrate":
-            quantity = quantity.multiply(coordinate_unit) if isinstance(quantity, Unit) and coordinate_unit is not None else None
+            quantity = _quantity_map(expression, quantity, lambda unit: unit.multiply(coordinate_unit)
+                                     if isinstance(unit, Unit) and coordinate_unit is not None else None)
         args = list(args)
         positions = range(2, 4) if name == "integrate" and len(args) == 4 else (2,) if name in {"limit", "series"} else ()
         for index in positions:
             point, known = _coordinate_argument(context, variable, args[index])
             args[index] = replace(args[index], expression=point)
             if not known:
-                quantity = None
+                # An unknown point or bound leaves the result in the scientific
+                # coordinates of its known finished quantity.
+                expression, quantity = _scientific(expression, quantity), None
         companion = tuple(c for arg in args[1:] for c in arg.conditions)
         dependent = tuple(c for c in conditions if c in args[0].conditions and variable in c.free_symbols)
         independent = tuple(c for c in conditions if c not in dependent or c in companion)

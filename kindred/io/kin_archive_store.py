@@ -1,4 +1,4 @@
-"""Shared strict decoder for format 5/6 archives and format 6 writer."""
+"""Strict decoder and writer for current format 7 archives."""
 
 from __future__ import annotations
 
@@ -346,6 +346,7 @@ def _encode_document(
             {
                 "dataset_id": dataset.dataset_id,
                 "display_name": dataset.display_name,
+                "time_column_name": dataset.time_column_name,
                 "source_id": dataset.source_id,
                 "source_metadata": thaw_json_value(
                     dataset.source_metadata
@@ -357,7 +358,10 @@ def _encode_document(
                         "t": list(series.t),
                         "y": list(series.y),
                         **({"source_rows": list(series.source_rows)} if dataset.source_id is not None else {
-                            "scientific_unit": scientific_unit(series.unit.dimensions).symbol,
+                            "scientific_unit": (
+                                None if series.unit is None
+                                else scientific_unit(series.unit.dimensions).symbol
+                            ),
                             "row_ids": list(series.source_rows),
                         }),
                     }
@@ -615,7 +619,6 @@ def _require_replay_metadata(
 def _decode_document(
     value: object,
     source_bytes_by_member: Mapping[str, bytes],
-    project_format: str,
 ) -> ProjectDocument:
     data = _exact_fields(
         value,
@@ -680,6 +683,7 @@ def _decode_document(
             {
                 "dataset_id",
                 "display_name",
+                "time_column_name",
                 "source_id",
                 "source_metadata",
                 "observations",
@@ -687,8 +691,8 @@ def _decode_document(
         )
         created = item["source_id"] is None
         if created:
-            if project_format != "kindred-kin-7" or item["source_metadata"] is not None:
-                raise ValueError(f"{label}: created datasets require format 7 and null capture fields.")
+            if item["source_metadata"] is not None:
+                raise ValueError(f"{label}: created datasets require null capture fields.")
             source_id, metadata = None, None
         else:
             source_id = _string(item["source_id"], f"{label}.source_id", nonblank=True)
@@ -720,10 +724,10 @@ def _decode_document(
             )
             column_name = _string(series["column_name"], f"{series_label}.column_name", nonblank=True)
             if created:
-                unit = parse_measurement_unit(_string(
+                unit = None if series["scientific_unit"] is None else parse_measurement_unit(_string(
                     series["scientific_unit"], f"{series_label}.scientific_unit", nonblank=True,
                 ))
-                if unit != scientific_unit(unit.dimensions):
+                if unit is not None and unit != scientific_unit(unit.dimensions):
                     raise ValueError(f"{series_label}: stored units must use scientific coordinates.")
             else:
                 if column_name not in declared_units:
@@ -786,6 +790,10 @@ def _decode_document(
                 item["display_name"],
                 f"{label}.display_name",
                 nonblank=True,
+            ),
+            time_column_name=(
+                None if item["time_column_name"] is None
+                else _string(item["time_column_name"], f"{label}.time_column_name", nonblank=True)
             ),
             source_id=source_id,
             source_metadata=freeze_json_value(metadata),
@@ -1342,13 +1350,13 @@ def _decode_project(
         "project.format",
         nonblank=True,
     )
-    if project_format not in ("kindred-kin-5", "kindred-kin-6", CURRENT_PROJECT_FORMAT):
+    if project_format != CURRENT_PROJECT_FORMAT:
         raise ValueError(
             f"Unsupported project format {project_format!r}; "
-            f"expected 'kindred-kin-5', 'kindred-kin-6', or {CURRENT_PROJECT_FORMAT!r}."
+            f"expected {CURRENT_PROJECT_FORMAT!r}."
         )
     document = _decode_document(
-        root["document"], source_bytes_by_member, project_format,
+        root["document"], source_bytes_by_member,
     )
     workspace = _exact_fields(
         root["workspace"],
@@ -1398,7 +1406,7 @@ def _decode_project(
 
 
 class KinArchiveStore:
-    """Decode formats 5, 6, and 7 strictly; save as format 7."""
+    """Decode and save current format 7 archives strictly."""
 
     def load(self, path: str | os.PathLike[str]) -> ArchiveProject:
         """Decode one archive; final document admission belongs to its caller."""

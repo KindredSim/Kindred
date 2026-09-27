@@ -272,7 +272,10 @@ def parse_unit(source: str) -> Unit:
             result = result.multiply(rhs) if op == "*" else result.divide(rhs)
         return result
 
-    result = product()
+    try:
+        result = product()
+    except RecursionError:
+        raise ValueError(f"Unit declaration is nested too deeply: {source!r}.") from None
     if index != len(tokens):
         raise ValueError(f"Malformed unit declaration: {source!r}.")
     return Unit(result.dimensions, result.scale, source.replace("μ", "µ"))

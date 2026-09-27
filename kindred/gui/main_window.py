@@ -2496,7 +2496,7 @@ class MainWindow(QtWidgets.QMainWindow):
             active_xlsx_export=self._xlsx_export_owner.is_exporting,
             active_scan=self._scan_owner.busy,
             active_calculator=any(owner.busy for owner in self._calculator_owners),
-            active_spreadsheet=self._spreadsheet_editor is not None,
+            active_spreadsheet=self._spreadsheet_editor is not None and self._spreadsheet_editor.has_changes,
         )
 
     def _prepare_before_save(
@@ -3746,7 +3746,6 @@ class MainWindow(QtWidgets.QMainWindow):
         if not canonical_observation_target_names(tab):
             self.set_status_text("Create from Data requires an accepted mechanism with observation targets.")
             return
-        token = self._project_session.capture_content_token()
         selection = SpreadsheetSelectionDialog(document.datasets, selected_id, parent=self)
         try:
             if selection.exec() != QtWidgets.QDialog.Accepted:
@@ -3767,24 +3766,32 @@ class MainWindow(QtWidgets.QMainWindow):
             names.append(name)
         editor = SpreadsheetEditorDialog(selected, tuple(names), parent=self)
         self._spreadsheet_editor = editor
-        editor.outputsReady.connect(lambda records: self._create_spreadsheet_datasets(
-            editor, document, origin_tab_id, token, records,
-        ))
+        editor.outputsReady.connect(lambda records: self._create_spreadsheet_datasets(editor, origin_tab_id, records))
         editor.failed.connect(self.set_status_text)
         editor.settled.connect(self._spreadsheet_settled)
         editor.show()
         self._refresh_actions()
 
-    def _create_spreadsheet_datasets(self, editor, document, origin_tab_id, token, records) -> None:
+    def _create_spreadsheet_datasets(self, editor, origin_tab_id, records) -> None:
         if not self._mutation_input_admitted("Create from Data"):
             return
+        # The worksheets are detached from the project, so outputs are reviewed
+        # and published against the project as it is now.
+        document = self._project_session.document
+        token = self._project_session.capture_content_token()
+        if all(item.tab_id != origin_tab_id for item in document.tabs):
+            QtWidgets.QMessageBox.warning(editor, "Create from Data", "The workspace tab that opened this editor was closed, so the new datasets have no tab to join.")
+            return
         tab = document.tab(origin_tab_id)
+        targets = canonical_observation_target_names(tab)
+        if not targets:
+            QtWidgets.QMessageBox.warning(editor, "Create from Data", "Create from Data requires an accepted mechanism with observation targets.")
+            return
         try:
             existing = [(record.dataset_id, record.display_name) for record in document.datasets]
             for record in records:
                 validate_unique_dataset_name(record.display_name, existing=existing)
                 existing.append((record.dataset_id, record.display_name))
-            targets = canonical_observation_target_names(tab)
             review = DatasetMappingBatchDialog(records=records, tab=tab, model_targets=targets,
                                                create_only=True, parent=editor)
             try:
@@ -3800,7 +3807,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 return
             published = self._workspace_tab_registry.replace_document(candidate, expected_token=token)
             if published is None:
-                QtWidgets.QMessageBox.warning(editor, "Create from Data", "The project changed while editing. Open a new editor session to create datasets from the current project.")
+                QtWidgets.QMessageBox.warning(editor, "Create from Data", "The project changed during review. Review and create again.")
                 return
         except (ValueError, TypeError, KeyError) as exc:
             QtWidgets.QMessageBox.warning(editor, "Create from Data", str(exc))

@@ -8,8 +8,7 @@ import uuid
 
 import numpy as np
 
-from kindred.core.datasets.units import parse_measurement_unit, parse_time_unit
-from kindred.core.quantity_units import SECOND, conversion_scale, scientific_unit
+from kindred.core.quantity_units import SECOND, Unit, conversion_scale, scientific_unit
 from kindred.core.species import validate_observation
 
 from kindred.core.datasets.foundation import (
@@ -61,13 +60,13 @@ def new_raw_observation_id() -> str:
 
 
 def created_dataset_payload(
-    columns: Sequence[tuple[str, str, Sequence[float | None]]],
+    columns: Sequence[tuple[str, Unit | None, Sequence[float | None]]],
     *,
-    time: tuple[str, Sequence[float | None]] | None = None,
+    time: tuple[Unit, Sequence[float | None]] | None = None,
 ) -> DatasetObservationPayload:
-    """Admit a calculated numeric worksheet using its declared column units."""
+    """Admit numeric columns using retained known or accepted unknown units."""
     names = [name.strip() for name, _unit, _values in columns]
-    if not names or any(not name for name in names) or len(set(names)) != len(names):
+    if any(not name for name in names) or len(set(names)) != len(names):
         raise ValueError("Measurement column names must be nonempty and unique.")
     retained_rows = sorted({
         row for _name, _unit, values in columns
@@ -75,22 +74,22 @@ def created_dataset_payload(
     })
     recorded: dict[int, float] = {}
     if time is not None:
-        declaration, values = time
-        scale = conversion_scale(parse_time_unit(declaration), SECOND)
+        time_unit, values = time
+        scale = conversion_scale(time_unit, SECOND)
         for row in retained_rows:
             if values[row - 1] is None:
                 raise ValueError(f"Row {row}: a measurement requires recorded time.")
             recorded[row] = scale.apply(validate_observation(values[row - 1], field=f"Row {row} time"))
     observations = []
-    for name, (_old_name, declaration, values) in zip(names, columns, strict=True):
-        unit = parse_measurement_unit(declaration)
-        scientific = scientific_unit(unit.dimensions)
-        scale = conversion_scale(unit, scientific)
+    for name, (_old_name, unit, values) in zip(names, columns, strict=True):
+        scientific = None if unit is None else scientific_unit(unit.dimensions)
+        scale = None if unit is None else conversion_scale(unit, scientific)
         rows, measurements = [], []
         for row, value in enumerate(values, 1):
             if value is not None:
                 label = f"{name}, row {row}"
-                measurements.append(scale.apply(validate_observation(value, field=label)))
+                admitted = validate_observation(value, field=label)
+                measurements.append(admitted if scale is None else scale.apply(admitted))
                 rows.append(row)
         if measurements:
             observations.append(ObservationSeries(
@@ -98,6 +97,8 @@ def created_dataset_payload(
                 unit=scientific, t=tuple(recorded[row] for row in rows) if time is not None else (),
                 y=tuple(measurements), source_rows=tuple(rows),
             ))
+    if not observations:
+        raise ValueError("There are no measurements to create a dataset from.")
     return DatasetObservationPayload(observations=tuple(observations), source_metadata=None)
 
 

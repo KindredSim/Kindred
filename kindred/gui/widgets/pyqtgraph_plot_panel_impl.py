@@ -204,6 +204,7 @@ class _RenderedPointBlock:
     x_name: str
     x_is_time: bool
     x_unit: str | None
+    time_column_name: str | None
     y_names: tuple[tuple[str, str], ...]
     y_units: tuple[tuple[str, str | None], ...]
     chunks: tuple[_RenderedPointChunk, ...]
@@ -1884,6 +1885,15 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
     ) -> tuple[_RenderedPointBlock, tuple[_RenderedPointChunk, ...]]:
         sample = self._sample_static_block(block, sampling_limit)
         definitions = dict(block.copy_definitions)
+        x_is_time = (
+            isinstance(block.x_axis, SimulationSeriesAxisSelection)
+            and block.x_axis.series_name == "t"
+        )
+        x_name = (
+            block.time_column_name
+            if block.kind is ResultLayerKind.EXPERIMENTAL and x_is_time
+            else block.x_name
+        )
         x_unit, x_scale = self._curve_unit_state("x", block.unit_for(block.x_name, x=True))
         y_units = {name: self._curve_unit_state("y", block.unit_for(name)) for name, _ in block.series}
         if block.result is not None:
@@ -1908,12 +1918,13 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
             ),
             label=block.label,
             kind=block.kind.value,
-            x_name=copy_series_label(block.x_name, definition=definitions.get(block.x_name)),
-            x_is_time=(
-                isinstance(block.x_axis, SimulationSeriesAxisSelection)
-                and block.x_axis.series_name == "t"
+            x_name=copy_series_label(
+                x_name,
+                definition=definitions.get(block.x_name),
             ),
+            x_is_time=x_is_time,
             x_unit=x_unit,
+            time_column_name=block.time_column_name,
             y_names=tuple(
                 (name, copy_series_label(name, definition=definitions.get(name)))
                 for name, _ in block.series
@@ -1955,6 +1966,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
                 and source.x_axis.series_name == "t"
             ),
             x_unit=x_unit,
+            time_column_name=source.time_column_name,
             y_names=((series_name, copy_series_label(
                 series_name, definition=definitions.get(series_name),
             )),),
@@ -2789,7 +2801,9 @@ def _iter_rendered_point_tsv_chunks(
         if separator:
             combined_headers.append("")
         chunks = tuple(chunk for chunk in block.chunks if chunk.x.size)
-        time_name = "Time [left endpoint]" if block.left_endpoint else "Time"
+        time_name = block.time_column_name if block.kind == ResultLayerKind.EXPERIMENTAL.value else "Time"
+        if block.left_endpoint:
+            time_name = f"{time_name} [left endpoint]"
         headers = []
         if not block.x_is_time and chunks[0].sample_time is not None:
             headers.append(encode_clipboard_text(copy_column_header(block.label, time_name, "s")))
