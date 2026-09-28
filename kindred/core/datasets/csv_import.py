@@ -3,14 +3,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import datetime as dt
 import itertools
 import io
 import csv
 from typing import Callable, Iterable, Mapping, Sequence
 
+from kindred.core.datasets.foundation import ObservationSeries, freeze_json_value
 from kindred.core.datasets.observation_payload import (
     DatasetObservationPayload,
-    immutable_dataset_payload,
     new_raw_observation_id,
 )
 from kindred.core.datasets.source_rules import (
@@ -23,6 +24,7 @@ from kindred.core.quantity_units import Unit, SECOND, conversion_scale, scientif
 __all__ = [
     "CsvImportInterrupted",
     "PhysicalRow",
+    "TemporalCell",
     "UncachedFormulaCell",
     "read_csv_rows_from_bytes",
     "parse_physical_rows",
@@ -48,6 +50,34 @@ class UncachedFormulaCell:
 
     def __str__(self) -> str:
         return self.formula
+
+
+@dataclass(frozen=True, slots=True)
+class TemporalCell:
+    """XLSX date, time or duration cell retained with its typed meaning."""
+
+    value: dt.datetime | dt.date | dt.time | dt.timedelta
+
+    @property
+    def elapsed_seconds(self) -> float | None:
+        """Durations and clock times are elapsed seconds; calendar cells are not."""
+        value = self.value
+        if isinstance(value, dt.timedelta):
+            return value.total_seconds()
+        if isinstance(value, dt.time):
+            return (value.hour * 3600 + value.minute * 60 + value.second
+                    + value.microsecond / 1_000_000)
+        return None
+
+    def __str__(self) -> str:
+        value = self.value
+        if isinstance(value, dt.timedelta):
+            sign, seconds = ("-", -value) if value < dt.timedelta(0) else ("", value)
+            hours, rest = divmod(seconds, dt.timedelta(hours=1))
+            return f"{sign}{hours}:{str(rest)[2:]}"
+        if isinstance(value, dt.datetime):
+            return value.isoformat(sep=" ")
+        return value.isoformat()
 
 
 @dataclass(frozen=True, slots=True)
@@ -198,6 +228,10 @@ def parse_physical_rows(
         column: {"t": [], "y": [], "source_rows": []}
         for column in resolved_species
     }
+    selected_columns = tuple(
+        column for column in physical_columns
+        if column == resolved_time or column in resolved_species
+    )
     saw_nonempty_row = False
     def _cell(row: Mapping[PhysicalColumn, object], column: PhysicalColumn) -> str:
         value = row.get(column, "")
@@ -205,6 +239,12 @@ def parse_physical_rows(
             raise ValueError(
                 f"{_source_prefix()}column {column.assigned_name!r}: selected "
                 f"XLSX formula {value.formula!r} has no cached value."
+            )
+        if isinstance(value, TemporalCell):
+            raise ValueError(
+                f"{_source_prefix()}row {row_index}, column "
+                f"{column.assigned_name!r}: date or time cell {str(value)!r} "
+                "is not a numeric observation; format measurements as plain numbers."
             )
         return "" if value is None else str(value).strip()
 
@@ -225,28 +265,38 @@ def parse_physical_rows(
         if row_index <= 0:
             raise ValueError("Physical source rows must be positive.")
         _raise_if_interrupted()
-        raw_values = tuple(row.get(column, "") for column in physical_columns)
         if not any(
             value is not None and str(value).strip()
-            for value in raw_values
+            for value in (row.get(column, "") for column in selected_columns)
         ):
             continue
         saw_nonempty_row = True
         if resolved_time is not None:
-            raw_time = _cell(row, resolved_time)
-            if not raw_time:
-                raise ValueError(
-                    f"{_source_prefix()}row {row_index}, time column "
-                    f"{resolved_time.assigned_name!r}: missing value."
-                )
-            try:
-                parsed_time = time_scale.apply(float(raw_time))
-            except (TypeError, ValueError) as exc:
-                raise ValueError(
-                    f"{_source_prefix()}row {row_index}, time column "
-                    f"{resolved_time.assigned_name!r}: invalid numeric value "
-                    f"{raw_time!r}: {exc}"
-                ) from exc
+            temporal = row.get(resolved_time)
+            if isinstance(temporal, TemporalCell):
+                parsed_time = temporal.elapsed_seconds
+                if parsed_time is None:
+                    raise ValueError(
+                        f"{_source_prefix()}row {row_index}, time column "
+                        f"{resolved_time.assigned_name!r}: calendar date cell "
+                        f"{str(temporal)!r} is not an elapsed time; format "
+                        "times as [h]:mm:ss durations or plain numbers."
+                    )
+            else:
+                raw_time = _cell(row, resolved_time)
+                if not raw_time:
+                    raise ValueError(
+                        f"{_source_prefix()}row {row_index}, time column "
+                        f"{resolved_time.assigned_name!r}: missing value."
+                    )
+                try:
+                    parsed_time = time_scale.apply(float(raw_time))
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(
+                        f"{_source_prefix()}row {row_index}, time column "
+                        f"{resolved_time.assigned_name!r}: invalid numeric value "
+                        f"{raw_time!r}: {exc}"
+                    ) from exc
             try:
                 parsed_time = validate_imported_time_seconds(
                     parsed_time,
@@ -288,9 +338,9 @@ def parse_physical_rows(
             spec["source_rows"].append(row_index)
 
     if not saw_nonempty_row:
-        raise ValueError("The source contains only blank data rows.")
+        raise ValueError("The selected columns contain only blank data rows.")
 
-    observations: dict[str, dict[str, object]] = {}
+    observations: list[ObservationSeries] = []
     retained_columns: list[PhysicalColumn] = []
     for column in resolved_species:
         _raise_if_interrupted()
@@ -298,13 +348,14 @@ def parse_physical_rows(
         if not spec["y"]:
             continue
         retained_columns.append(column)
-        observations[column.assigned_name] = {
-            "raw_observation_id": new_raw_observation_id(),
-            "unit": scientific_units[column.assigned_name],
-            "t": spec["t"],
-            "y": spec["y"],
-            "source_rows": spec["source_rows"],
-        }
+        observations.append(ObservationSeries(
+            raw_observation_id=new_raw_observation_id(),
+            column_name=column.assigned_name,
+            unit=scientific_units[column.assigned_name],
+            t=tuple(spec["t"]),
+            y=tuple(spec["y"]),
+            source_rows=tuple(spec["source_rows"]),
+        ))
     if not observations:
         raise ValueError("No numeric observation columns were found.")
 
@@ -338,4 +389,7 @@ def parse_physical_rows(
             + ", ".join(sorted(collisions))
         )
     metadata.update(extras)
-    return immutable_dataset_payload(observations, metadata=metadata)
+    return DatasetObservationPayload(
+        observations=tuple(observations),
+        source_metadata=freeze_json_value(metadata),
+    )

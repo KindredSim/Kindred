@@ -9,6 +9,7 @@ from zipfile import BadZipFile, ZipFile
 from openpyxl import load_workbook
 
 from kindred.core.datasets.csv_import import (
+    TemporalCell,
     UncachedFormulaCell,
 )
 from kindred.core.datasets.source_rules import (
@@ -148,6 +149,8 @@ def _read_worksheet_rows(
                 if not formula.startswith("="):
                     formula = f"={formula}"
                 values.append(UncachedFormulaCell(formula))
+            elif isinstance(cell.value, (dt.date, dt.time, dt.timedelta)):
+                values.append(TemporalCell(cell.value))
             else:
                 values.append(_stringify_cell_value(cell.value))
         yield {

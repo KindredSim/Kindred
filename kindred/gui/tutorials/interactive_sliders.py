@@ -13,6 +13,7 @@ class InteractiveSliders(PracticeLesson):
     description = "Try two reaction rates, compare Preview with Reference, and decide which changes to keep."
     _preset_name = "M5"
     _practice_species = ("A", "B", "C")
+    _preset_rates = {"kf1": 1.5, "kr1": 0.25, "k2": 0.1}
     _extra_steps = frozenset(
         {"rename_extra", "configure_extra", "run_new_set", "slider_targets", "preview_both", "understand_apply", "apply_preview"}
     )

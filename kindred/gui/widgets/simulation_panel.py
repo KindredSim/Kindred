@@ -4,8 +4,6 @@ from __future__ import annotations
 
 from kindred.gui.display_name_policy import scientific_symbol_html, scientific_symbol_spoken
 
-from collections.abc import Callable
-
 from PySide6 import QtCore, QtGui, QtWidgets
 
 from kindred.core.project_document import (
@@ -39,6 +37,8 @@ class _ControlsScrollArea(QtWidgets.QScrollArea):
             "QScrollArea#initial_conditions_controls_scroll { border: none; padding: 0; margin: 0; }"
         )
         self.setFrameShape(QtWidgets.QFrame.NoFrame)
+        # Clicks on its buttons must not move focus here (see the Run button).
+        self.setFocusPolicy(QtCore.Qt.NoFocus)
         self.setWidgetResizable(True)
         self.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
         self.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
@@ -215,6 +215,9 @@ class SimulationPanel(QtWidgets.QWidget):
             "Delete Set(s)\N{HORIZONTAL ELLIPSIS}", "deleteBatchSetButton"
         )
         self.run_btn = self._button("Run", "runSelectedButton")
+        # A pointer Run must not take focus: focus loss would commit the open
+        # cell or Run-setting editor before Run admits Reactions.
+        self.run_btn.setFocusPolicy(QtCore.Qt.TabFocus)
         self.stop_btn = self._button("Stop", "stopButton")
         action_buttons = (
             self.add_batch_set_btn, self.move_batch_up_btn,
@@ -421,14 +424,8 @@ class SimulationPanel(QtWidgets.QWidget):
         if had_draft:
             self.runDefaultsDraftStateChanged.emit(False)
 
-    def settle_run_defaults(
-        self,
-        publish_candidate: (
-            Callable[[SimulationExecutionSettings], bool] | None
-        ) = None,
-    ) -> bool:
+    def settle_run_defaults(self) -> bool:
         """Commit one complete candidate or reproject canonical and abort once."""
-        self.batch_table.settle_active_editor()
         if not self._candidate_dirty:
             return True
         try:
@@ -444,11 +441,7 @@ class SimulationPanel(QtWidgets.QWidget):
             return False
         self._candidate_dirty = False
         if candidate != self._canonical_settings:
-            if publish_candidate is None:
-                self.workspaceRunDefaultsRequested.emit(candidate)
-            elif not publish_candidate(candidate):
-                self._reproject_canonical()
-                return False
+            self.workspaceRunDefaultsRequested.emit(candidate)
         self.runDefaultsDraftStateChanged.emit(False)
         return True
 
@@ -596,8 +589,9 @@ class SimulationPanel(QtWidgets.QWidget):
 
     @QtCore.Slot()
     def _request_run(self) -> None:
-        if self.settle_run_defaults():
-            self.runSelectedRequested.emit()
+        # The Run owner captures focused editors and Run-setting drafts after
+        # it admits Reactions; nothing is published before that admission.
+        self.runSelectedRequested.emit()
 
     def _sync_controls(self) -> None:
         show_stop = self._simulation_job_kind in {"run", "preview"}

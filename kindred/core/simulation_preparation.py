@@ -39,6 +39,7 @@ from kindred.core.intervention_schedule_compiler import (
 from kindred.core.simulator.solver_types import (
     SimulationRequest,
     SimulationCancellationControl,
+    freeze_retained_value,
 )
 from kindred.core.symbolic.jacobian_execution import SymbolicJacobianExecution
 from kindred.core.simulator.parameter_namespace import (
@@ -56,24 +57,6 @@ from kindred.core.simulation_preparation_stages import (
 from kindred.core.time_grid import build_time_grid
 
 logger = logging.getLogger(__name__)
-
-
-def _freeze_prepared_value(value: Any) -> Any:
-    """Freeze one retained preparation value without owning its policy."""
-
-    if isinstance(value, Mapping):
-        return MappingProxyType(
-            {str(key): _freeze_prepared_value(item) for key, item in value.items()}
-        )
-    if isinstance(value, (list, tuple)):
-        return tuple(_freeze_prepared_value(item) for item in value)
-    if isinstance(value, (set, frozenset)):
-        return frozenset(_freeze_prepared_value(item) for item in value)
-    if isinstance(value, np.ndarray):
-        array = np.asarray(value).copy()
-        array.setflags(write=False)
-        return array
-    return value
 
 
 __all__ = [
@@ -280,7 +263,7 @@ class SimulationPreparationError(RuntimeError):
         )
         self.details = MappingProxyType(
             {
-                str(key): _freeze_prepared_value(value)
+                str(key): freeze_retained_value(value)
                 for key, value in normalized_details.items()
             }
         )
@@ -328,7 +311,7 @@ class PreparedSimulationRun:
             object.__setattr__(
                 self,
                 "initials_for_algebra",
-                _freeze_prepared_value(self.initials_for_algebra),
+                freeze_retained_value(self.initials_for_algebra),
             )
 def build_simulation_request_from_prepared_run(
     prepared_run: PreparedSimulationRun,

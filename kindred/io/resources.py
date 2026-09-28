@@ -16,11 +16,9 @@ Usage:
 
 from __future__ import annotations
 
-import hashlib
 import logging
 import os
 import re
-import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -129,13 +127,7 @@ def get_resource_path(relative_path: str) -> Path:
     """
     Get filesystem path to kindred/data resource.
 
-    For resources that already exist on disk (typical wheel installs), returns
-    the on-disk path under the installed package.
-
-    For resources loaded from non-filesystem importers (e.g., zipimport),
-    materializes the resource into a per-user cache directory and returns the
-    cached on-disk path. The returned path remains valid after this function
-    returns.
+    Returns the on-disk path under the installed or editable package.
 
     Parameters
     ----------
@@ -174,73 +166,17 @@ def get_resource_path(relative_path: str) -> Path:
         if not (resource_file.is_file() or resource_file.is_dir()):
             raise FileNotFoundError(f"Resource not found: kindred/data/{relative_path}")
 
+        # Kindred ships as a filesystem package (wheel or editable install);
+        # a resource without a filesystem path is treated as missing.
         try:
             fs_path = Path(os.fspath(resource_file)).resolve()
-            if fs_path.exists():
-                return fs_path
-        except TypeError:
-            pass
-
-        cache_root = os.environ.get("KINDRED_RESOURCE_CACHE_DIR", "").strip()
-        if cache_root:
-            cache_base = Path(cache_root).expanduser().resolve()
-        else:
-            cache_base = Path(tempfile.gettempdir()).resolve() / "kindred_resource_cache"
-
-        def _sha256_file(path: Path) -> str:
-            h = hashlib.sha256()
-            with path.open("rb") as handle:
-                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-                    h.update(chunk)
-            return h.hexdigest()
-
-        def _materialize_file(*, src, dest: Path) -> None:
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            data = src.read_bytes()
-            data_hash = hashlib.sha256(data).hexdigest()
-
-            if dest.exists() and dest.is_file():
-                try:
-                    if dest.stat().st_size == len(data) and _sha256_file(dest) == data_hash:
-                        return
-                except OSError:
-                    pass
-
-            tmp_path: Path | None = None
-            try:
-                with tempfile.NamedTemporaryFile(
-                    mode="wb",
-                    delete=False,
-                    dir=str(dest.parent),
-                    prefix=dest.name + ".",
-                    suffix=".tmp",
-                ) as handle:
-                    handle.write(data)
-                    tmp_path = Path(handle.name)
-                os.replace(str(tmp_path), str(dest))
-            finally:
-                if tmp_path is not None and tmp_path.exists():
-                    try:
-                        tmp_path.unlink()
-                    except OSError:
-                        pass
-
-        def _materialize_dir(*, src, dest_dir: Path) -> None:
-            dest_dir.mkdir(parents=True, exist_ok=True)
-            for child in src.iterdir():
-                out = dest_dir / child.name
-                if child.is_dir():
-                    _materialize_dir(src=child, dest_dir=out)
-                elif child.is_file():
-                    _materialize_file(src=child, dest=out)
-
-        target = (cache_base / "kindred" / "data" / Path(*parts)).resolve()
-        if resource_file.is_dir():
-            _materialize_dir(src=resource_file, dest_dir=target)
-            return target
-
-        _materialize_file(src=resource_file, dest=target)
-        return target
+        except TypeError as exc:
+            raise FileNotFoundError(
+                f"Resource has no filesystem path: kindred/data/{relative_path}"
+            ) from exc
+        if not fs_path.exists():
+            raise FileNotFoundError(f"Resource not found: kindred/data/{relative_path}")
+        return fs_path
 
     except (FileNotFoundError, AttributeError) as e:
         logger.error(f"Resource not found: kindred/data/{relative_path}")

@@ -13,11 +13,9 @@ indexed readouts.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
 from typing import Dict, Iterator, List, Optional, Tuple
 
 from kindred.core.simulator.parameter_namespace import build_namespace_from_mechanism
-from kindred.core.validation import try_parse_int
 
 __all__ = [
     "get_step_index_map",
@@ -26,18 +24,8 @@ __all__ = [
 ]
 
 def get_step_index_map(mechanism: object) -> List[Dict[str, object]]:
-    meta = getattr(mechanism, "metadata", {}) or {}
-    mapping = meta.get("step_index_map")
-    if not isinstance(mapping, list):
-        return []
-    out: List[Dict[str, object]] = []
-    for entry in mapping:
-        if not isinstance(entry, dict):
-            continue
-        if "step_index" not in entry or "kind" not in entry:
-            continue
-        out.append(entry)
-    return out
+    """Return the builder-owned step map; a missing map is a producer error."""
+    return list(mechanism.metadata["step_index_map"])
 
 
 def iter_canonical_parameters(mechanism: object) -> Iterator[Tuple[str, Dict[str, object], str]]:
@@ -50,8 +38,6 @@ def iter_canonical_parameters(mechanism: object) -> Iterator[Tuple[str, Dict[str
     namespace = build_namespace_from_mechanism(mechanism)
     for item in namespace.ordered_items:
         if item.source_index is None:
-            continue
-        if not (0 <= int(item.source_index) < len(step_map)):
             continue
         entry = step_map[int(item.source_index)]
         role = item.info.role
@@ -76,16 +62,10 @@ def lookup_source_coordinate_target(
     if requested not in namespace.source_coordinate_names:
         return None
     for entry in get_step_index_map(mechanism):
-        raw_coordinates = entry.get("source_coordinates") or {}
-        if not isinstance(raw_coordinates, Mapping):
-            continue
-        for raw_role, raw_name in raw_coordinates.items():
+        for raw_role, raw_name in (entry.get("source_coordinates") or {}).items():
             if str(raw_name) != requested:
                 continue
-            kind = str(entry.get("kind") or "")
+            kind = str(entry["kind"])
             index_key = "reaction_index" if kind == "reaction" else "equilibrium_index"
-            index, ok = try_parse_int(entry.get(index_key))
-            if not ok or kind not in {"reaction", "equilibrium"}:
-                return None
-            return (kind, int(index), str(raw_role), entry)
+            return (kind, int(entry[index_key]), str(raw_role), entry)
     return None

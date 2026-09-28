@@ -13,15 +13,11 @@ from kindred.core.units import (
     admit_energy_j_per_mol,
     admit_keq,
     admit_rate,
-    equilibrium_constant_unit,
-    rate_constant_unit,
 )
 
 AUTHORITY_ERROR = "equilibrium requires kf and exactly one of kr or Keq/dG_eq"
 
 __all__ = [
-    "equilibrium_constant_unit",
-    "rate_constant_unit",
     "admit_explicit_directional_rate_pair",
     "derived_equilibrium_ratio_from_directional_rates",
     "EquilibriumRateAuthorityKind",

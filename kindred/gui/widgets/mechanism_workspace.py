@@ -7,7 +7,6 @@ from collections.abc import Mapping
 from PySide6 import QtCore, QtWidgets
 
 from kindred.core.project_document import ProjectDocument
-from kindred.core.project_presentation_state import WorkspacePresentationState
 from kindred.gui.widgets.pyqtgraph_plot_panel_impl import PyQtGraphPlotPanel
 
 __all__ = ["ProjectWorkspaceWidget"]
@@ -313,15 +312,6 @@ class ProjectWorkspaceWidget(QtWidgets.QMainWindow):
         self.plotCreated.emit(target, plot)
         return plot
 
-    def active_plot(self) -> PyQtGraphPlotPanel:
-        if self._active_tab_id is not None:
-            plot = self._plot_by_tab_id.get(self._active_tab_id)
-            if plot is not None:
-                return plot
-        if self._initial_plot is not None:
-            return self._initial_plot
-        raise RuntimeError("Mechanism workspace has no active plot panel.")
-
     def plot_for_tab(self, tab_id: str) -> PyQtGraphPlotPanel:
         target = str(tab_id)
         try:
@@ -338,105 +328,84 @@ class ProjectWorkspaceWidget(QtWidgets.QMainWindow):
         self,
         document: ProjectDocument,
         *,
-        active_tab_id: str | None = None,
-        presentation: WorkspacePresentationState | None = None,
+        active_tab_id: str,
     ) -> None:
         """Render one document directly into this workspace root.
 
         Rendering is intentionally limited to tab/plot custody.  It reads the
-        document and optional presentation snapshot, and never looks up a
-        registry or connects a live callback.
+        document and never looks up a registry or connects a live callback.
+        A failure propagates; the permanent root stays usable.
         """
 
+        target_active = str(active_tab_id)
+        document.tab(target_active)
+        current_tab_ids = {tab.tab_id for tab in document.tabs}
+        for tab in document.tabs:
+            self._ensure_plot(tab.tab_id)
+        for tab_id in tuple(self._plot_by_tab_id):
+            if tab_id not in current_tab_ids:
+                self.drop_tab_session_state(tab_id)
+
+        previous = self._tab_bar.blockSignals(True)
         try:
-            if not isinstance(document, ProjectDocument):
-                raise TypeError("document must be a ProjectDocument.")
-            if presentation is not None:
-                if not isinstance(presentation, WorkspacePresentationState):
-                    raise TypeError(
-                        "presentation must be WorkspacePresentationState."
-                    )
-                incoming_active = presentation.active_tab_id
+            for index in range(self._tab_bar.count() - 1, -1, -1):
+                rendered_tab_id = self._tab_bar.tabData(index)
                 if (
-                    active_tab_id is not None
-                    and str(active_tab_id) != incoming_active
+                    rendered_tab_id is not None
+                    and rendered_tab_id not in current_tab_ids
                 ):
-                    raise ValueError("active_tab_id disagrees with presentation.")
-                active_tab_id = incoming_active
-            if active_tab_id is None:
-                raise ValueError("active_tab_id or presentation is required.")
-            target_active = str(active_tab_id)
-            document.tab(target_active)
-            current_tab_ids = {tab.tab_id for tab in document.tabs}
-            for tab in document.tabs:
-                self._ensure_plot(tab.tab_id)
-            for tab_id in tuple(self._plot_by_tab_id):
-                if tab_id not in current_tab_ids:
-                    self.drop_tab_session_state(tab_id)
+                    self._tab_bar.removeTab(index)
 
-            previous = self._tab_bar.blockSignals(True)
-            try:
-                for index in range(self._tab_bar.count() - 1, -1, -1):
-                    rendered_tab_id = self._tab_bar.tabData(index)
-                    if (
-                        rendered_tab_id is not None
-                        and rendered_tab_id not in current_tab_ids
-                    ):
-                        self._tab_bar.removeTab(index)
+            plus_indexes = [
+                index
+                for index in range(self._tab_bar.count())
+                if self._tab_bar.tabData(index) is None
+            ]
+            if plus_indexes:
+                plus_index = plus_indexes[0]
+                for index in reversed(plus_indexes[1:]):
+                    self._tab_bar.removeTab(index)
+            else:
+                plus_index = self._tab_bar.addTab("+")
 
-                plus_indexes = [
-                    index
-                    for index in range(self._tab_bar.count())
-                    if self._tab_bar.tabData(index) is None
-                ]
-                if plus_indexes:
-                    plus_index = plus_indexes[0]
-                    for index in reversed(plus_indexes[1:]):
-                        self._tab_bar.removeTab(index)
-                else:
-                    plus_index = self._tab_bar.addTab("+")
-
-                for desired_index, tab in enumerate(document.tabs):
-                    try:
-                        current_index = self._index_for_tab_id(tab.tab_id)
-                    except KeyError:
-                        current_index = self._tab_bar.insertTab(
-                            desired_index, tab.name
-                        )
-                        self._tab_bar.setTabData(current_index, tab.tab_id)
-                    if current_index != desired_index:
-                        self._tab_bar.moveTab(current_index, desired_index)
-                        current_index = desired_index
-                    dirty = self._tab_bar.tabText(current_index).endswith(" *")
-                    self._tab_bar.setTabText(
-                        current_index,
-                        f"{tab.name} *" if dirty else tab.name,
+            for desired_index, tab in enumerate(document.tabs):
+                try:
+                    current_index = self._index_for_tab_id(tab.tab_id)
+                except KeyError:
+                    current_index = self._tab_bar.insertTab(
+                        desired_index, tab.name
                     )
-                    self._tab_bar.setTabToolTip(current_index, tab.name)
-
-                plus_index = next(
-                    index
-                    for index in range(self._tab_bar.count())
-                    if self._tab_bar.tabData(index) is None
+                    self._tab_bar.setTabData(current_index, tab.tab_id)
+                if current_index != desired_index:
+                    self._tab_bar.moveTab(current_index, desired_index)
+                    current_index = desired_index
+                dirty = self._tab_bar.tabText(current_index).endswith(" *")
+                self._tab_bar.setTabText(
+                    current_index,
+                    f"{tab.name} *" if dirty else tab.name,
                 )
-                if plus_index != self._tab_bar.count() - 1:
-                    self._tab_bar.moveTab(plus_index, self._tab_bar.count() - 1)
-                plus_index = self._tab_bar.count() - 1
-                self._tab_bar.setTabText(plus_index, "+")
-                self._tab_bar.setTabData(plus_index, None)
-                self._tab_bar.setTabToolTip(plus_index, _CREATE_TAB_TOOLTIP)
-                active_index = self._index_for_tab_id(target_active)
-                self._tab_bar.setCurrentIndex(active_index)
-            finally:
-                self._tab_bar.blockSignals(previous)
+                self._tab_bar.setTabToolTip(current_index, tab.name)
 
-            active_plot = self._ensure_plot(target_active)
-            self._active_tab_id = target_active
-            self._plot_stack.setCurrentWidget(active_plot)
-            self._analysis_stack.setCurrentWidget(active_plot.analysis_tabs())
-        except Exception:
-            self.dispose()
-            raise
+            plus_index = next(
+                index
+                for index in range(self._tab_bar.count())
+                if self._tab_bar.tabData(index) is None
+            )
+            if plus_index != self._tab_bar.count() - 1:
+                self._tab_bar.moveTab(plus_index, self._tab_bar.count() - 1)
+            plus_index = self._tab_bar.count() - 1
+            self._tab_bar.setTabText(plus_index, "+")
+            self._tab_bar.setTabData(plus_index, None)
+            self._tab_bar.setTabToolTip(plus_index, _CREATE_TAB_TOOLTIP)
+            active_index = self._index_for_tab_id(target_active)
+            self._tab_bar.setCurrentIndex(active_index)
+        finally:
+            self._tab_bar.blockSignals(previous)
+
+        active_plot = self._ensure_plot(target_active)
+        self._active_tab_id = target_active
+        self._plot_stack.setCurrentWidget(active_plot)
+        self._analysis_stack.setCurrentWidget(active_plot.analysis_tabs())
 
     def select_tab_surface(self, tab_id: str) -> None:
         target = str(tab_id or "").strip()
@@ -460,7 +429,8 @@ class ProjectWorkspaceWidget(QtWidgets.QMainWindow):
         plot = self._plot_by_tab_id.pop(target, None)
         if plot is None:
             return
-        plot.drop_tab_session_state()
+        # The panel is deleted below; only its project content needs releasing.
+        plot.dispose_project_content()
         analysis = plot.analysis_tabs()
         self._plot_stack.removeWidget(plot)
         self._analysis_stack.removeWidget(analysis)

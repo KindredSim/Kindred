@@ -965,8 +965,6 @@ class FittingWindow(QtWidgets.QDialog):
 
     def _current_results_dark_mode(self) -> bool:
         for candidate in (self.parentWidget(), self.parent()):
-            if candidate is not None and hasattr(candidate, "_dark_mode"):
-                return bool(getattr(candidate, "_dark_mode"))
             if candidate is not None:
                 window_color = candidate.palette().color(
                     QtGui.QPalette.ColorRole.Window

@@ -23,7 +23,7 @@ from kindred.core.simulator.parameter_coordinates import build_parameter_target_
 from kindred.core.simulator.parameter_namespace import build_namespace_from_mechanism
 from kindred.core.simulator.dsl_build_input import source_coordinate_capabilities
 from kindred.core.simulator.step_indexing import get_step_index_map
-from kindred.core.validation import try_parse_callable_finite_float, try_parse_int
+from kindred.core.validation import try_parse_callable_finite_float
 from kindred.core.quantity_units import convert_value
 from kindred.core.units import (
     UnitsModel,
@@ -70,9 +70,7 @@ def enumerate_simulation_parameters(
     source_coordinate_names = namespace.source_coordinate_names
     step_by_index: dict[int, Mapping[str, object]] = {}
     for entry in get_step_index_map(mechanism):
-        parsed, ok = try_parse_int(entry.get("step_index"))
-        if ok:
-            step_by_index[int(parsed)] = entry
+        step_by_index[int(entry["step_index"])] = entry
     units = {name: unit.symbol for name, unit in parameter_spec.input_units}
     parameter_assignment_names = parameter_spec.param_assignment_names()
 
@@ -126,9 +124,7 @@ def enumerate_simulation_parameters(
             # projected below.
             if role != "k" or source_coordinates.get("k") != name:
                 continue
-            raw_index, ok = try_parse_int(entry.get("reaction_index", -1))
-            if not ok or not (0 <= raw_index < len(reactions)):
-                continue
+            raw_index = int(entry["reaction_index"])
             model = reactions[int(raw_index)].forward_model
             family = forward_rate_family(model)
             value = model.k
@@ -141,9 +137,7 @@ def enumerate_simulation_parameters(
             # readout semantics in the rest of the namespace.
             if source_coordinates.get(role) != name:
                 continue
-            raw_index, ok = try_parse_int(entry.get("equilibrium_index", -1))
-            if not ok or not (0 <= raw_index < len(equilibria)):
-                continue
+            raw_index = int(entry["equilibrium_index"])
             equilibrium = equilibria[int(raw_index)]
             authority = normalize_existing_equilibrium_rate_authority(equilibrium)
             editable = step_entry_authored_role_is_editable(entry, role)
@@ -221,15 +215,11 @@ def enumerate_simulation_parameters(
         model: ForwardRateModel | None = None
         authority = None
         if kind == "reaction":
-            raw_index, ok = try_parse_int(entry.get("reaction_index", -1))
-            if not ok or not (0 <= raw_index < len(reactions)):
-                continue
+            raw_index = int(entry["reaction_index"])
             reaction = reactions[int(raw_index)]
             model = reaction.forward_model
         elif kind == "equilibrium":
-            raw_index, ok = try_parse_int(entry.get("equilibrium_index", -1))
-            if not ok or not (0 <= raw_index < len(equilibria)):
-                continue
+            raw_index = int(entry["equilibrium_index"])
             equilibrium = equilibria[int(raw_index)]
             authority = normalize_existing_equilibrium_rate_authority(equilibrium)
             model = equilibrium.forward_model

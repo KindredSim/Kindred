@@ -127,21 +127,15 @@ def _finite(
     value: object,
     label: str,
     *,
-    positive: bool = False,
     nonnegative: bool = False,
-    maximum: float | None = None,
 ) -> float:
     if type(value) is bool or not isinstance(value, Real):
         raise TypeError(f"{label} must be numeric.")
     parsed = float(value)
     if not math.isfinite(parsed):
         raise ValueError(f"{label} must be finite.")
-    if positive and parsed <= 0.0:
-        raise ValueError(f"{label} must be positive.")
     if nonnegative and parsed < 0.0:
         raise ValueError(f"{label} must be nonnegative.")
-    if maximum is not None and parsed > maximum:
-        raise ValueError(f"{label} must be at most {maximum}.")
     return parsed
 
 

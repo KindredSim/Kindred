@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from enum import Enum
-import math
 import os
 from pathlib import Path
 import stat
@@ -51,7 +50,6 @@ class DatasetMappingProposal:
     target_set_id: str | None = None
     occupied_choice: OccupiedSetChoice | str | None = None
     observation_mapping: tuple[tuple[str, str], ...] = ()
-    proposed_set_name: str | None = None
     initial_concentration_source: InitialConcentrationSource | None = None
 
     def __post_init__(self) -> None:
@@ -77,9 +75,6 @@ class DatasetMappingProposal:
         )
         if any(not raw_id or not species for raw_id, species in mapping):
             raise DatasetMappingError("Observation mappings cannot contain blank identities.")
-        proposed_name = None if self.proposed_set_name is None else str(self.proposed_set_name).strip()
-        if proposed_name == "":
-            proposed_name = None
         if action is DatasetMappingChoice.MAP_EXISTING and not target:
             raise DatasetMappingError("Map Existing requires a target set.")
         if action is DatasetMappingChoice.CREATE_SET and target is not None:
@@ -94,7 +89,6 @@ class DatasetMappingProposal:
         object.__setattr__(self, "target_set_id", target)
         object.__setattr__(self, "occupied_choice", occupied)
         object.__setattr__(self, "observation_mapping", mapping)
-        object.__setattr__(self, "proposed_set_name", proposed_name)
 
 
 @dataclass(frozen=True, slots=True)
@@ -119,53 +113,8 @@ class DatasetMappingBatchProposal:
 
 
 @dataclass(frozen=True)
-class SetCopyPlan:
-    source_set_id: str
-    new_set_id: str
-    new_name: str
-    values: tuple[tuple[str, float], ...]
-
-
-@dataclass(frozen=True)
-class DatasetSetMappingPlan:
-    links: tuple[tuple[str, DatasetLink], ...]
-    copied_set: SetCopyPlan | None = None
-    canceled: bool = False
-
-
-@dataclass(frozen=True)
 class GlobalDatasetDeletePlan:
     referenced: bool
-
-
-def resolve_fit_t_start(
-    tab: MechanismTabDocument,
-    set_id: str,
-    *,
-    label: str = "Fit dataset",
-) -> float:
-    """Resolve and validate only the start-time scalar owned by Fit."""
-
-    if not isinstance(tab, MechanismTabDocument):
-        raise TypeError("tab must be a MechanismTabDocument.")
-    target = tab.initial_condition_set(set_id).set_id
-    settings = dict(tab.run_overrides_by_set_id).get(target, tab.run_defaults)
-    raw_t_start = settings.t_start
-    if type(raw_t_start) is bool:
-        raise DatasetMappingError(
-            f"{label} requires a numeric resolved start time."
-        )
-    try:
-        resolved_t_start = float(raw_t_start)
-    except (TypeError, ValueError, OverflowError) as exc:
-        raise DatasetMappingError(
-            f"{label} requires a numeric resolved start time."
-        ) from exc
-    if not math.isfinite(resolved_t_start) or resolved_t_start < 0.0:
-        raise DatasetMappingError(
-            f"{label} requires a finite nonnegative resolved start time."
-        )
-    return resolved_t_start
 
 
 def export_original_source(
@@ -214,59 +163,6 @@ def export_original_source(
             pass
         raise
     return target
-
-
-def create_set_from_data(
-    *,
-    tab: MechanismTabDocument,
-    dataset: dataset_foundation.RawDatasetRecord,
-    set_id: str,
-    set_name: str,
-    model_targets: Sequence[str],
-    confirmed_mapping: Iterable[tuple[str, str]],
-    source: InitialConcentrationSource,
-) -> MechanismTabDocument:
-    """Create and map one complete IC set from an explicitly selected source.
-
-    model_targets is the accepted observation-target roster.  The mechanism
-    species roster remains canonical state owned by tab and is the only roster
-    materialized into the new initial-condition set.
-    """
-    clean_set_id = str(set_id).strip()
-    clean_name = str(set_name).strip()
-    if not clean_set_id or not clean_name:
-        raise DatasetMappingError("The new initial-condition set requires a stable ID and name.")
-    if any(existing.set_id == clean_set_id for existing in tab.initial_condition_sets):
-        raise DatasetMappingError(f"Initial-condition set ID '{clean_set_id}' already exists.")
-    if any(existing.name.casefold() == clean_name.casefold() for existing in tab.initial_condition_sets):
-        raise DatasetMappingError(f"An initial-condition set named '{clean_name}' already exists.")
-    normalized_mapping = normalize_observation_mapping(
-        confirmed_mapping,
-        raw_observations=tuple(
-            (series.raw_observation_id, series.column_name)
-            for series in dataset.observations
-        ),
-        model_targets=model_targets,
-    )
-    values = extract_initial_concentrations(
-        observations=dataset.observations,
-        mechanism_species=canonical_species_names(tab),
-        confirmed_mapping=normalized_mapping,
-        source=source,
-    )
-    created_set = InitialConditionSet(
-        set_id=clean_set_id,
-        name=clean_name,
-        values=tuple((name, 0.0 if value is None else value) for name, value in values),
-    )
-    with_set = tab.with_initial_condition_sets((*tab.initial_condition_sets, created_set))
-    return with_set.with_dataset_link(
-        dataset.dataset_id,
-        DatasetLink(
-            set_id=clean_set_id,
-            observation_mapping=normalized_mapping,
-        ),
-    )
 
 
 def allocate_initial_condition_set_name(
@@ -360,10 +256,6 @@ def apply_dataset_mapping_batch(
                 dataset.display_name,
                 existing_names=used_names,
             )
-            if item.proposed_set_name != expected_name:
-                raise DatasetMappingError(
-                    "Create Set name is not the canonical display-derived name."
-                )
             values = extract_initial_concentrations(
                 observations=dataset.observations,
                 mechanism_species=species,
@@ -413,10 +305,6 @@ def apply_dataset_mapping_batch(
                     target_set.name,
                     existing_names=used_names,
                 )
-                if item.proposed_set_name != expected_name:
-                    raise DatasetMappingError(
-                        "Copied set name is not the canonical collision-safe name."
-                    )
                 destination = new_set_id()
                 sets.append(
                     InitialConditionSet(
@@ -442,37 +330,6 @@ def apply_dataset_mapping_batch(
             known_dataset_ids=records,
             known_set_ids=(item.set_id for item in sets),
         ),
-    )
-    return candidate
-
-
-def apply_dataset_set_mapping_plan(
-    *,
-    tab: MechanismTabDocument,
-    plan: DatasetSetMappingPlan,
-) -> MechanismTabDocument:
-    """Materialize the admitted mapping plan and its optional copied set."""
-    if plan.canceled:
-        return tab
-    sets = tab.initial_condition_sets
-    if plan.copied_set is not None:
-        copy = plan.copied_set
-        if any(item.set_id == copy.new_set_id for item in sets):
-            raise DatasetMappingError(f"Initial-condition set ID '{copy.new_set_id}' already exists.")
-        if any(item.name.casefold() == copy.new_name.casefold() for item in sets):
-            raise DatasetMappingError(f"An initial-condition set named '{copy.new_name}' already exists.")
-        sets = (
-            *sets,
-            InitialConditionSet(
-                set_id=copy.new_set_id,
-                name=copy.new_name,
-                values=copy.values,
-            ),
-        )
-    candidate = replace(
-        tab,
-        initial_condition_sets=tuple(sets),
-        dataset_links=plan.links,
     )
     return candidate
 
@@ -563,59 +420,6 @@ def validate_partial_bijection(
         )
         by_dataset[dataset_id] = link
     return tuple((key, by_dataset[key]) for key in sorted(by_dataset))
-
-
-def plan_dataset_to_set_mapping(
-    *,
-    links: Iterable[tuple[str, DatasetLink]],
-    dataset_id: str,
-    target_set_id: str,
-    occupied_choice: OccupiedSetChoice | None,
-    copy_plan: SetCopyPlan | None = None,
-) -> DatasetSetMappingPlan:
-    """Plan Map Existing after the occupied-set choice has been presented."""
-    target_dataset = str(dataset_id).strip()
-    target_set = str(target_set_id).strip()
-    if not target_dataset or not target_set:
-        raise DatasetMappingError("Mapping requires a dataset ID and set ID.")
-    current = dict(validate_partial_bijection(links))
-    selected = current.get(target_dataset, DatasetLink())
-    occupant = next(
-        ((current_dataset_id, link) for current_dataset_id, link in current.items()
-         if link.set_id == target_set and current_dataset_id != target_dataset),
-        None,
-    )
-    if occupant is not None and occupied_choice == OccupiedSetChoice.CANCEL:
-        return DatasetSetMappingPlan(
-            links=tuple((key, current[key]) for key in sorted(current)),
-            canceled=True,
-        )
-    destination_set = target_set
-    copied_set: SetCopyPlan | None = None
-    if occupant is not None:
-        occupant_dataset_id, occupant_link = occupant
-        if occupied_choice == OccupiedSetChoice.OVERRIDE:
-            current[occupant_dataset_id] = DatasetLink(
-                set_id=None,
-                observation_mapping=occupant_link.observation_mapping,
-            )
-        elif occupied_choice == OccupiedSetChoice.CREATE_COPY:
-            if copy_plan is None or copy_plan.source_set_id != target_set:
-                raise DatasetMappingError("Create Copy requires a complete copy plan for the occupied set.")
-            destination_set = str(copy_plan.new_set_id).strip()
-            if not destination_set or destination_set == target_set:
-                raise DatasetMappingError("The copied set requires a new stable set ID.")
-            copied_set = copy_plan
-        else:
-            raise DatasetMappingError("An occupied set requires Override, Create Copy, or Cancel.")
-    current[target_dataset] = DatasetLink(
-        set_id=destination_set,
-        observation_mapping=selected.observation_mapping,
-    )
-    return DatasetSetMappingPlan(
-        links=validate_partial_bijection(current.items()),
-        copied_set=copied_set,
-    )
 
 
 def plan_global_dataset_delete(

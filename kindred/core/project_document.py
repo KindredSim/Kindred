@@ -48,8 +48,6 @@ from kindred.core.simulator.solvers import normalize_solver_name
 from kindred.core.scipy_integrate import validate_scipy_rtol
 from kindred.core.units import UnitsModel
 from kindred.core.species import (
-    CONCENTRATION_MAX_M,
-    CONCENTRATION_MIN_M,
     MAX_FIT_EVALUATIONS,
     MAX_GENERATED_TIME_ROWS,
     TEMPERATURE_MAX_K,
@@ -79,7 +77,6 @@ __all__ = [
     "FIT_SEED_RANGE",
     "SIMULATION_POINT_RANGE",
     "TEMPERATURE_RANGE_K",
-    "CONCENTRATION_RANGE_M",
     "SUPPORTED_SOLVERS",
     "validate_fit_solver",
     "fresh_mechanism_tab",
@@ -118,7 +115,6 @@ FIT_MAX_NFEV_RANGE = _FITTING_MAX_NFEV_RANGE
 FIT_SEED_RANGE = _FITTING_SEED_RANGE
 SIMULATION_POINT_RANGE = _SIMULATION_POINT_RANGE
 TEMPERATURE_RANGE_K = _TEMPERATURE_RANGE_K
-CONCENTRATION_RANGE_M = (CONCENTRATION_MIN_M, CONCENTRATION_MAX_M)
 
 
 def _new_id(prefix: str) -> str:
@@ -543,8 +539,6 @@ class MechanismTabDocument:
         self,
         dataset_id: str,
         link: DatasetLink,
-        *,
-        override_set_occupant: bool = False,
     ) -> "MechanismTabDocument":
         target_dataset_id = _require_id(dataset_id, "dataset ID")
         if not isinstance(link, DatasetLink):
@@ -560,16 +554,10 @@ class MechanismTabDocument:
                 ),
                 None,
             )
-            if occupant is not None and not override_set_occupant:
+            if occupant is not None:
                 raise ValueError(
                     f"Initial-condition set {link.set_id!r} is already mapped "
                     f"to dataset {occupant!r}."
-                )
-            if occupant is not None:
-                old = links[occupant]
-                links[occupant] = replace(
-                    old,
-                    set_id=None,
                 )
         links[target_dataset_id] = link
         return replace(self, dataset_links=tuple(links.items()))
@@ -1746,20 +1734,6 @@ def validate_project_document(document: ProjectDocument) -> ProjectDocument:
                     f"Dataset {dataset.dataset_id!r} references unknown imported source "
                     f"{dataset.source_id!r}."
                 )
-        raw_observation_ids = tuple(
-            dataset_foundation.validate_raw_observation_id(
-                series.raw_observation_id,
-                (
-                    f"Raw dataset {dataset.dataset_id!r} observation "
-                    f"{series.column_name!r} raw observation ID"
-                ),
-            )
-            for series in dataset.observations
-        )
-        _validate_unique(
-            raw_observation_ids,
-            f"raw observation IDs in dataset {dataset.dataset_id!r}",
-        )
         normalized_metadata = dataset_foundation.freeze_json_value(
             dataset_foundation.thaw_json_value(dataset.source_metadata)
         )

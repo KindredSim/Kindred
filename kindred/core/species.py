@@ -18,7 +18,7 @@ from dataclasses import dataclass
 import math
 from numbers import Real
 
-from .validation import validate_name
+from .validation import parse_finite_numeric_text, validate_name
 
 __all__ = [
     "CONCENTRATION_MIN_M",
@@ -36,6 +36,7 @@ __all__ = [
     "MAX_FIT_EVALUATIONS",
     "Species",
     "coerce_float",
+    "concentration_from_text",
     "validate_concentration",
     "validate_c0",
     "validate_temperature",
@@ -105,6 +106,15 @@ def validate_concentration(
             f"{field} must be at most {CONCENTRATION_MAX_M:g} M."
         )
     return parsed
+
+
+def concentration_from_text(text: str, *, field: str = "concentration") -> float:
+    """Admit authored concentration text; nonzero text never becomes zero."""
+
+    return validate_concentration(
+        parse_finite_numeric_text(text, field=field),
+        field=field,
+    )
 
 
 def validate_c0(value: object, *, field: str = "C0") -> float:

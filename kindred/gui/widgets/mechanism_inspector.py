@@ -25,7 +25,7 @@ from kindred.core.intervention_schedule import (
 from kindred.core.kinetics import ArrheniusRateModel, EyringRateModel
 from kindred.core.mechanism_metadata import MechanismMetadataView
 from kindred.core.ode_builder import build_effective_rate_coefficient_evaluator
-from kindred.core.quantity_units import format_unit_for_display
+from kindred.core.quantity_units import Unit, format_unit_for_display
 from kindred.core.simulator.dsl_parse import DslAnalysis, PreparedDslRequestSet
 from kindred.core.simulator.parameter_algebra import (
     apply_parameter_algebra_spec_to_mechanism,
@@ -36,7 +36,6 @@ from kindred.core.simulator.step_indexing import (
     get_step_index_map,
     iter_canonical_parameters,
 )
-from kindred.core.units import equilibrium_constant_unit, rate_constant_unit
 from kindred.core.stoichiometry import directional_order_fraction
 
 __all__ = [
@@ -138,8 +137,8 @@ def _format_mechanism_reference(
         line, step_uses_standard_concentration = _format_mechanism_step(
             mechanism,
             entry,
-            metadata=metadata,
             parameter_provenance=parameter_provenance,
+            units=dict(parameter_spec.input_units),
         )
         step_lines.append(line)
         uses_standard_concentration |= step_uses_standard_concentration
@@ -180,9 +179,10 @@ def _format_mechanism_step(
     mechanism: object,
     entry: Mapping[str, object],
     *,
-    metadata: MechanismMetadataView,
     parameter_provenance: Mapping[str, str],
+    units: Mapping[str, Unit],
 ) -> tuple[str, bool]:
+    """Project one step; units come from the admitted parameter spec."""
     step_index = int(entry["step_index"])
     kind = str(entry["kind"])
     context = html.escape(str(entry["context"]).replace(" <-> ", " ⇌ ").replace(" -> ", " → "))
@@ -195,38 +195,18 @@ def _format_mechanism_step(
         reaction = (getattr(mechanism, "reactions", ()) or ())[
             int(entry["reaction_index"])
         ]
-        forward_order = float(
-            directional_order_fraction(
-                reaction.rate_orders,
-            )
-        )
         forward_model = reaction.forward_model
         equilibrium = None
-        reverse_order = None
     else:
         equilibrium = (getattr(mechanism, "equilibria", ()) or ())[
             int(entry["equilibrium_index"])
         ]
-        forward_order = float(
-            directional_order_fraction(
-                equilibrium.stoich_forward,
-            )
-        )
-        reverse_order = float(
-            directional_order_fraction(
-                equilibrium.stoich_back,
-            )
-        )
         forward_model = equilibrium.forward_model
 
     items = [
         _format_coordinate(
             name,
-            unit=_source_coordinate_unit(
-                role,
-                forward_order=forward_order,
-                energy_unit=metadata.energy_unit,
-            ),
+            unit=units.get(name),
             provenance=parameter_provenance.get(name),
         )
         for role, name in source_coordinates.items()
@@ -254,12 +234,12 @@ def _format_mechanism_step(
     items.append(
         _format_coordinate(
             forward_name,
-            unit=rate_constant_unit(forward_order),
+            unit=units.get(forward_name),
             provenance=forward_provenance,
         )
     )
 
-    if equilibrium is not None and reverse_order is not None:
+    if equilibrium is not None:
         keq_name = f"Keq{step_index}"
         reverse_name = f"kr{step_index}"
         authority = authority_fields_from_step_entry(entry)
@@ -281,7 +261,7 @@ def _format_mechanism_step(
         items.append(
             _format_coordinate(
                 keq_name,
-                unit=equilibrium_constant_unit(reverse_order - forward_order),
+                unit=units.get(keq_name),
                 provenance=keq_provenance,
             )
         )
@@ -295,7 +275,7 @@ def _format_mechanism_step(
         items.append(
             _format_coordinate(
                 reverse_name,
-                unit=rate_constant_unit(reverse_order),
+                unit=units.get(reverse_name),
                 provenance=reverse_provenance,
             )
         )
@@ -306,26 +286,16 @@ def _format_mechanism_step(
     )
 
 
-def _source_coordinate_unit(
-    role: str,
-    *,
-    forward_order: float,
-    energy_unit: str,
-) -> str:
-    if role == "A":
-        return rate_constant_unit(forward_order)
-    if role in {"Ea", "dG_act", "dG_eq"}:
-        return energy_unit
-    return "1"
-
-
 def _format_coordinate(
     name: str,
     *,
-    unit: str,
+    unit: Unit | None,
     provenance: str | None,
 ) -> str:
-    unit_text = "" if unit == "1" else f" [{format_unit_for_display(unit)}]"
+    unit_text = (
+        "" if unit is None or unit.symbol == "1"
+        else f" [{format_unit_for_display(unit)}]"
+    )
     provenance_text = "" if provenance is None else f" (derived from {html.escape(provenance)})"
     return f"{html.escape(name)}{unit_text}{provenance_text}"
 

@@ -92,14 +92,9 @@ class _PendingGesture:
 
 
 @dataclass(frozen=True, slots=True)
-class _GestureCapture:
-    tab: MechanismTabDocument
-    projection: ParameterSliderProjection
-    targets: tuple[str, ...]
-
-
-@dataclass(frozen=True, slots=True)
 class _PreviewPreflight:
+    """Admitted Slider Preview inputs, captured at a gesture or checked live."""
+
     tab: MechanismTabDocument
     projection: ParameterSliderProjection
     targets: tuple[str, ...]
@@ -121,7 +116,6 @@ def build_parameter_slider_projection(
             item.name,
             tuple(
                 {
-                    "type": item.family,
                     "family": item.family,
                     "role": item.role,
                     "label": item.display_name,
@@ -142,7 +136,7 @@ def build_parameter_slider_projection(
 class TabSliderBinding(QtCore.QObject):
     """Own one tab's Slider drafts; the job owner owns computation custody."""
 
-    draftStateChanged = QtCore.Signal(str, bool)
+    draftStateChanged = QtCore.Signal(str)
     sliderDraftStateChanged = QtCore.Signal(str, bool, bool)
     targetSetIdsChanged = QtCore.Signal(object)
     errorRaised = QtCore.Signal(str)
@@ -297,7 +291,7 @@ class TabSliderBinding(QtCore.QObject):
             prepared = self._preflight_preview_action(self.resolve_target_set_ids())
             if prepared is None:
                 return
-            self._gesture_capture = _GestureCapture(
+            self._gesture_capture = _PreviewPreflight(
                 prepared.tab,
                 prepared.projection,
                 prepared.targets,
@@ -322,7 +316,7 @@ class TabSliderBinding(QtCore.QObject):
         *,
         interaction: SliderInteractionKind,
         defer_rejected_restore: bool,
-        gesture_capture: _GestureCapture | None,
+        gesture_capture: _PreviewPreflight | None,
     ) -> bool:
         self._cancel_deferred_restore()
         self._defer_rejected_slider_restore = defer_rejected_restore
@@ -554,7 +548,7 @@ class TabSliderBinding(QtCore.QObject):
         return _PreviewPreflight(tab, projection, tuple(targets))
 
     def _captured_gesture_transaction(
-        self, capture: _GestureCapture, targets: tuple[str, ...]
+        self, capture: _PreviewPreflight, targets: tuple[str, ...]
     ) -> _PreviewPreflight | None:
         if (
             capture.tab.tab_id != self._tab_id
@@ -562,7 +556,7 @@ class TabSliderBinding(QtCore.QObject):
             or self._registry.tab(self._tab_id) is not capture.tab
         ):
             return None
-        return _PreviewPreflight(capture.tab, capture.projection, capture.targets)
+        return capture
 
     def stage_parameter(
         self,
@@ -570,7 +564,7 @@ class TabSliderBinding(QtCore.QObject):
         value: float,
         *,
         _interaction: SliderInteractionKind = SliderInteractionKind.EXACT_TYPED_COMMIT,
-        _gesture_capture: _GestureCapture | None = None,
+        _gesture_capture: _PreviewPreflight | None = None,
     ) -> bool:
         if self._rendering:
             return False
@@ -642,7 +636,7 @@ class TabSliderBinding(QtCore.QObject):
         value: float,
         *,
         _interaction: SliderInteractionKind = SliderInteractionKind.EXACT_TYPED_COMMIT,
-        _gesture_capture: _GestureCapture | None = None,
+        _gesture_capture: _PreviewPreflight | None = None,
     ) -> bool:
         if self._rendering:
             return False
@@ -903,15 +897,11 @@ class TabSliderBinding(QtCore.QObject):
     def cancel_pending_preview_intent(
         self,
         set_ids: tuple[str, ...] | None = None,
-        *,
-        preserve_reference: bool = False,
     ) -> None:
         self._cancel_deferred_restore()
         self._interactive_stop_fenced = True
         self._clear_gesture_state()
-        self._simulation_jobs.retire_preview(
-            self._tab_id, set_ids, preserve_reference=preserve_reference
-        )
+        self._simulation_jobs.retire_preview(self._tab_id, set_ids)
         self._exact_preview_capture = None
 
     def reset_project_session(self) -> None:
@@ -1100,8 +1090,7 @@ class TabSliderBinding(QtCore.QObject):
         self._exact_preview_capture = None
 
     def _emit_draft_state(self) -> None:
-        runtime = self._registry.tab_runtime(self._tab_id)
-        self.draftStateChanged.emit(self._tab_id, runtime.has_dirty_drafts)
+        self.draftStateChanged.emit(self._tab_id)
         self.publish_slider_draft_state()
 
     def _restore_rejected_slider_action(self) -> bool:

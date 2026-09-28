@@ -13,6 +13,7 @@ from kindred.gui.workspace_result_presenter import (
     ResultDataBlock,
     write_xlsx,
 )
+from kindred.io.paths import same_local_path
 
 logger = logging.getLogger(__name__)
 
@@ -145,18 +146,11 @@ class XlsxExportOwner(QtCore.QObject):
 
         return self._active_worker is None
 
-    @staticmethod
-    def _canonical_local_path(path: str | os.PathLike[str]) -> str:
-        return os.path.normcase(
-            os.path.realpath(os.path.abspath(os.fsdecode(os.fspath(path))))
-        )
-
     def owns_destination(self, path: str | os.PathLike[str]) -> bool:
         worker = self._active_worker
         return bool(
             worker is not None
-            and self._canonical_local_path(path)
-            == self._canonical_local_path(worker.path)
+            and same_local_path(path, worker.path)
         )
 
     def start(

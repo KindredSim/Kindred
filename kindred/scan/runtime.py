@@ -83,6 +83,18 @@ class _Worker:
     stopping: bool = False
 
 
+def _pending(connection, timeout=0.0):
+    """Whether input is buffered; a peer-closed pipe counts as drained.
+
+    On Windows, PipeConnection.poll raises BrokenPipeError once the child has
+    exited instead of reporting readable EOF as Linux does.
+    """
+    try:
+        return connection.poll(timeout)
+    except OSError:
+        return False
+
+
 def run_scan(config, prepared, cancel, progress_callback):
     """Run off the GUI thread. Own processes, generator and the sole file writer."""
     progress = ScanProgress(config.requested)
@@ -198,7 +210,7 @@ def run_scan(config, prepared, cancel, progress_callback):
                             fail(f"Worker preparation failed: {payload}")
                             child.run = None
                 # Drain the pipe before declaring a started attempt lost.
-                if connection_closed or (child.process.sentinel in ready and not child.connection.poll()):
+                if connection_closed or (child.process.sentinel in ready and not _pending(child.connection)):
                     if child.run is not None:
                         if child.started:
                             record = input_record(child.run)
@@ -234,8 +246,8 @@ def run_scan(config, prepared, cancel, progress_callback):
                         child.connection.send(None)
                     except (BrokenPipeError, OSError):
                         pass
-                while child.process.is_alive() or child.connection.poll():
-                    if child.connection.poll(0.1):
+                while child.process.is_alive() or _pending(child.connection):
+                    if _pending(child.connection, 0.1):
                         try:
                             kind, payload = child.connection.recv()
                             if kind == "started":
@@ -246,7 +258,7 @@ def run_scan(config, prepared, cancel, progress_callback):
                                 consume(payload)
                                 child.run = None
                                 child.started = False
-                        except EOFError:
+                        except (EOFError, OSError):
                             break
                     emit()
                 child.process.join()

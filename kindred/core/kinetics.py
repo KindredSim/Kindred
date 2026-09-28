@@ -1,9 +1,9 @@
 """
 Core kinetics formulas shared across Kindred.
 
-This module intentionally contains the fundamental Arrhenius/Eyring and
-equilibrium-constant mappings so both the simulator layer and the ODE builder
-can depend on a single source of truth without creating cross-layer imports.
+This module contains the fundamental Arrhenius/Eyring rate mappings so both
+the simulator layer and the ODE builder can depend on a single source of truth
+without creating cross-layer imports.
 """
 
 from __future__ import annotations

@@ -58,16 +58,10 @@ class ErrorContext:
         Column number (1-based) where error occurred
     line_text : str, optional
         Source line text for context
-    file_path : str, optional
-        File path where error occurred
-    stack_trace : str, optional
-        Relevant stack trace information
     """
     line: Optional[int] = None
     col: Optional[int] = None
     line_text: Optional[str] = None
-    file_path: Optional[str] = None
-    stack_trace: Optional[str] = None
 
 
 class KindredError(Exception):
@@ -125,8 +119,6 @@ class KindredError(Exception):
         # Add context (file, line, column)
         if self.context:
             ctx_parts = []
-            if self.context.file_path:
-                ctx_parts.append(f"File: {self.context.file_path}")
             if self.context.line is not None:
                 loc = f"L{self.context.line}"
                 if self.context.col is not None:

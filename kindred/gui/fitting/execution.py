@@ -20,7 +20,6 @@ from kindred.core.analysis.global_fitting import fit_global
 from kindred.core.analysis.global_fit_execution import (
     FitCoordinate,
     DatasetFitInfo,
-    FitParameterLayout,
     FitProgress,
     GlobalFitResult,
     ObjectiveDatasetInput,
@@ -679,8 +678,6 @@ def _assemble_fit_terminal(
     """Validate terminal provenance and build the sole retained candidate."""
 
     admitted_layout = request.dispatch.ordinary_optimizer_layout
-    if not isinstance(admitted_layout, FitParameterLayout):
-        raise ValueError("Fit terminal omitted its admitted optimizer layout.")
     if not isinstance(result.optimizer_vector, np.ndarray):
         raise TypeError("Fit terminal optimizer vector must be a NumPy array.")
     admitted_layout.validate_optimizer_vector(result.optimizer_vector)
@@ -795,56 +792,6 @@ def _assemble_fit_terminal(
         setup_snapshot=terminal_setup,
     )
     return candidate
-
-
-def _execute_global_fit_model(
-    *,
-    request: FitExecutionRequest,
-    evaluators: Mapping[str, object],
-    datasets: Sequence[FitDatasetSpec],
-    weights: Mapping[str, float] | None,
-    progress_callback: Callable[[FitProgress], None],
-    extension_progress_callback: Callable[[FitExtensionProgress], None],
-    cancellation_check: Callable[[], bool],
-    cancellation_control: SimulationCancellationControl,
-    stop_check: Callable[[], bool],
-    starting_facts: tuple[DatasetFitInfo, ...],
-    executor: ThreadPoolExecutor,
-) -> GlobalFitResult | ScientificUnavailable:
-    """Dispatch one exact ordinary or advanced Fit execution."""
-
-    common = {
-        "fit_evaluators": evaluators,
-        "datasets": datasets,
-        "weights": weights,
-        "method": request.setup.defaults.method,
-        "max_nfev": int(request.setup.defaults.max_nfev),
-        "ftol": float(request.setup.defaults.ftol),
-        "xtol": float(request.setup.defaults.xtol),
-        "seed": (
-            int(request.setup.defaults.seed)
-            if request.setup.defaults.use_seed
-            else None
-        ),
-        "progress_callback": progress_callback,
-        "extension_progress_callback": extension_progress_callback,
-        "cancellation_check": cancellation_check,
-        "cancellation_control": cancellation_control,
-        "stop_check": stop_check,
-        "starting_facts": starting_facts,
-        "profile_likelihood": request.setup.profile_likelihood,
-        "residual_bootstrap": request.setup.residual_bootstrap,
-    }
-    dispatch = request.dispatch
-    layout = dispatch.ordinary_optimizer_layout
-    if not isinstance(layout, FitParameterLayout):
-        raise RuntimeError("Ordinary Fit omitted its admitted optimizer layout.")
-    return fit_global(
-        dataset_overrides=dispatch.ordinary_dataset_overrides,
-        optimizer_layout=layout,
-        executor=executor,
-        **common,
-    )
 
 
 class _FitControl:
@@ -1246,17 +1193,26 @@ class _FitExecution(_FitControl):
         )
         for evaluator in evaluators.values():
             evaluator.set_cancellation_control(self._cancellation_control)
-        result_or_unavailable = _execute_global_fit_model(
-            request=request,
-            evaluators=evaluators,
+        defaults = request.setup.defaults
+        result_or_unavailable = fit_global(
+            fit_evaluators=evaluators,
             datasets=datasets,
             weights=weights,
+            method=defaults.method,
+            max_nfev=int(defaults.max_nfev),
+            ftol=float(defaults.ftol),
+            xtol=float(defaults.xtol),
+            seed=int(defaults.seed) if defaults.use_seed else None,
             progress_callback=progress,
             extension_progress_callback=extension_progress,
             cancellation_check=execution_cancellation_check,
             cancellation_control=execution_cancellation_control,
             stop_check=self._stopped.is_set,
             starting_facts=tuple(sorted(starting_facts, key=lambda info: info.dataset_id)),
+            profile_likelihood=request.setup.profile_likelihood,
+            residual_bootstrap=request.setup.residual_bootstrap,
+            dataset_overrides=request.dispatch.ordinary_dataset_overrides,
+            optimizer_layout=request.dispatch.ordinary_optimizer_layout,
             executor=self._executor,
         )
         if isinstance(result_or_unavailable, ScientificUnavailable):
@@ -1280,8 +1236,6 @@ class _FitExecution(_FitControl):
         """Build one transient presentation directly from callback-local progress."""
         dispatch = self._request.dispatch
         layout = dispatch.ordinary_optimizer_layout
-        if not isinstance(layout, FitParameterLayout):
-            raise RuntimeError("Live Fit update omitted its admitted optimizer layout.")
         setup = self._request.setup
         vector = np.asarray(best_progress.optimizer_vector, dtype=float).reshape(-1)
         layout.validate_optimizer_vector(vector)

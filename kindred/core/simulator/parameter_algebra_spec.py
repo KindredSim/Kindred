@@ -1282,6 +1282,19 @@ def extract_observable_names_from_algebra_lines(algebra_lines: Sequence[Tuple[in
                     line_number=_line_no,
                     line_content=raw.rstrip("\n"),
                 )
+            symbols = SymbolTable()
+            if (
+                classification.raw_name in symbols.protected_names()
+                or classification.raw_name in symbols.functions()
+            ):
+                # Evaluation would drop the LET and later references would
+                # silently read the built-in constant or function instead.
+                raise DSLError(
+                    f"Invalid observable name {classification.raw_name!r}",
+                    suggestion="Choose a name that does not shadow protected constants/functions (e.g., 'ratio', 'rate_A').",
+                    line_number=_line_no,
+                    line_content=raw.rstrip("\n"),
+                )
             out.add(classification.raw_name)
             continue
         if classification.kind == "invalid_step_key_identifier":

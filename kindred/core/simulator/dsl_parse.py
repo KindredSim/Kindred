@@ -32,7 +32,7 @@ from __future__ import annotations
 
 import logging
 import math
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, replace
 from threading import Lock
 from typing import Dict, List, Mapping, Optional, Tuple, TYPE_CHECKING
 
@@ -149,24 +149,6 @@ class DSLIR:
     intervention_schedule: Optional["InterventionSchedule"]
     steps: List[DslBuildStep]
     inline_initial_conditions: "DslInitialConditionAdmission"
-    notes: List[str] = field(default_factory=list)
-
-
-def _dsl_admission_payload(
-    text: str,
-    units: UnitsModel | None,
-) -> dict[str, object]:
-    if type(text) is not str:
-        raise TypeError("DSL source must be an exact string.")
-    if units is not None and type(units) is not UnitsModel:
-        raise TypeError("DSL units must be UnitsModel or None.")
-    effective = UnitsModel() if units is None else units
-    return {
-        "dsl": normalize_source_for_analysis(text),
-        "energy_unit": effective.energy_unit,
-        "temperature_K": effective.temperature_K,
-        "standard_conc_M": effective.standard_conc_M,
-    }
 
 
 @dataclass(frozen=True, slots=True)
@@ -1368,7 +1350,6 @@ def _parse_dsl_ir(text: str, *, units: UnitsModel | None = None) -> "DSLIR":
     inline_initial_conditions, inline_initial_line_indexes = (
         _admit_inline_initial_conditions(text)
     )
-    notes: List[str] = []
 
     # Build the temperature schedule after resolving the nominal temperature.
     from ..temperature_dsl import parse_temperature_schedule
@@ -1439,7 +1420,6 @@ def _parse_dsl_ir(text: str, *, units: UnitsModel | None = None) -> "DSLIR":
                     line_content=raw,
                 ) from exc
             raise
-        notes.append(f"energy unit set to {energy_unit}")
     if "C0" in global_directives:
         line_no, raw = global_directives["C0"]
         try:
@@ -1454,7 +1434,6 @@ def _parse_dsl_ir(text: str, *, units: UnitsModel | None = None) -> "DSLIR":
                     line_content=raw,
                 ) from exc
             raise
-        notes.append(f"C0 set to {standard_conc_M:g} M")
 
     if "T" in global_directives:
         line_no, raw = global_directives["T"]
@@ -1465,7 +1444,6 @@ def _parse_dsl_ir(text: str, *, units: UnitsModel | None = None) -> "DSLIR":
             raise _DSLError(
                 str(exc), line_number=line_no, line_content=raw,
             ) from exc
-        notes.append(f"T set to {temperature_K:g} K")
 
     temperature_schedule = (
         parse_temperature_schedule(
@@ -1542,10 +1520,6 @@ def _parse_dsl_ir(text: str, *, units: UnitsModel | None = None) -> "DSLIR":
 
         raise _DSLError(f"unrecognized line: {line!r}", line_number=line_no, line_content=raw)
 
-    if temperature_schedule is not None:
-        notes.append(f"Temperature schedule detected: {temperature_schedule}")
-    if intervention_schedule is not None:
-        notes.append("Intervention schedule detected")
 
     return DSLIR(
         energy_unit=str(energy_unit),
@@ -1555,7 +1529,6 @@ def _parse_dsl_ir(text: str, *, units: UnitsModel | None = None) -> "DSLIR":
         intervention_schedule=intervention_schedule,
         steps=steps,
         inline_initial_conditions=inline_initial_conditions,
-        notes=notes,
     )
 
 
@@ -1677,6 +1650,14 @@ def _parse_reaction_like_step(
     _reject_per_step_globals(params, line_number=line_number, line_content=line_content)
     _reject_unknown_params(params, _REACTION_KNOWN_KEYS,
                            line_number=line_number, line_content=line_content)
+    reverse_only = [key for key in ("kr", "Keq", "dG_eq") if key in params]
+    if not reversible and reverse_only:
+        raise _DSLError(
+            f"Irreversible step cannot declare reverse/equilibrium field(s): {', '.join(reverse_only)}",
+            suggestion="Use <-> for a reversible step, or remove the field.",
+            line_number=line_number,
+            line_content=line_content,
+        )
 
     model = _forward_rate_family_from_params(
         params,
@@ -1908,8 +1889,7 @@ def prepare_dsl_request_set(
     )
 
     units = units or UnitsModel()
-    payload = _dsl_admission_payload(text, units)
-    normalized_text = str(payload["dsl"])
+    normalized_text = normalize_source_for_analysis(text)
     ir = _parse_dsl_ir(text, units=units)
     intervention_schedule = coerce_intervention_schedule(
         ir.intervention_schedule
@@ -1987,9 +1967,6 @@ def prepare_dsl_request_set(
         temperature_K=float(ir.temperature_K),
         energy_unit=str(ir.energy_unit),
     )
-    metadata = getattr(mechanism, "metadata", None)
-    if isinstance(metadata, dict):
-        metadata["parameter_algebra_spec"] = parameter_algebra_spec
     return PreparedDslRequestSet(
         analysis=analysis,
         default_units=units,

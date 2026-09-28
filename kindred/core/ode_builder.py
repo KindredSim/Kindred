@@ -200,14 +200,10 @@ def build_effective_rate_coefficient_evaluator(
     )
     nominal_temperature = float(mech_meta.temperature_K)
     from .simulator.parameter_algebra_eval import bind_parameter_evaluation
-    from .simulator.parameter_algebra_spec import admit_parameter_evaluation_graph, parse_parameter_algebra_spec_from_dsl_text
-    from .simulator.parameter_namespace import build_namespace_from_mechanism
     from .simulator.step_indexing import get_step_index_map
 
-    spec = mechanism.metadata.get("parameter_algebra_spec")
-    if spec is None:
-        spec = admit_parameter_evaluation_graph(parse_parameter_algebra_spec_from_dsl_text(
-            "", mechanism_namespace=build_namespace_from_mechanism(mechanism)), mechanism)
+    # Admission always retains the spec; its absence is a producer error.
+    spec = mechanism.metadata["parameter_algebra_spec"]
     evaluate = bind_parameter_evaluation(spec, mechanism, base_values=base_values)
     entries = {(entry["kind"], int(entry["reaction_index" if entry["kind"] == "reaction" else "equilibrium_index"])): entry
                for entry in get_step_index_map(mechanism)}
@@ -219,8 +215,7 @@ def build_effective_rate_coefficient_evaluator(
             number = entries[kind, index]["step_index"]
             forward_name = f"k{number}" if kind == "reaction" else f"kf{number}"
             reverse_name = None if kind == "reaction" else f"kr{number}"
-            model = (step.forward_model
-                     if kind == "reaction" else step.forward_model)
+            model = step.forward_model
             snapshot = {"kind": kind, "forward_model": forward_rate_model_payload(model),
                         "binding_name" if kind == "reaction" else "forward_binding_name": forward_name,
                         "value_dependencies": tuple(spec.evaluation_dependencies.get(forward_name, ())),

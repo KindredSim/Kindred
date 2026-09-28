@@ -3,10 +3,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from types import MappingProxyType
 from typing import Mapping
 
-from kindred.core.simulation_failure import FactualCause
+from kindred.core.simulation_failure import FactualCause, freeze_factual_value
 
 @dataclass(frozen=True, slots=True)
 class ScientificUnavailable:
@@ -29,27 +28,12 @@ class ScientificUnavailable:
             raise ValueError("Scientific-unavailability producer and stage are required.")
         object.__setattr__(self, "producer", producer)
         object.__setattr__(self, "stage", stage)
-        object.__setattr__(self, "details", _freeze_value(dict(self.details or {})))
+        object.__setattr__(self, "details", freeze_factual_value(dict(self.details or {})))
         if self.factual_cause is not None and not isinstance(
             self.factual_cause,
             FactualCause,
         ):
             raise TypeError("Scientific-unavailability factual cause must be typed.")
-
-def _freeze_value(value: object) -> object:
-    """Deep-freeze request provenance while retaining mapping semantics."""
-
-    if isinstance(value, Mapping):
-        return MappingProxyType(
-            {str(key): _freeze_value(item) for key, item in value.items()}
-        )
-    if isinstance(value, (list, tuple)):
-        return tuple(_freeze_value(item) for item in value)
-    if isinstance(value, (set, frozenset)):
-        return tuple(_freeze_value(item) for item in sorted(value, key=repr))
-    if value is None or isinstance(value, (bool, int, float, str, bytes)):
-        return value
-    return str(value)
 
 
 

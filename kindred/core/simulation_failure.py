@@ -20,7 +20,7 @@ __all__ = [
 ]
 
 
-def _freeze_value(value: object) -> object:
+def freeze_factual_value(value: object) -> object:
     """Recursively freeze factual metadata without inventing a schema."""
 
     if value is None or isinstance(value, (bool, int, float, str, bytes)):
@@ -28,15 +28,15 @@ def _freeze_value(value: object) -> object:
     if isinstance(value, Mapping):
         return MappingProxyType(
             {
-                str(key): _freeze_value(item)
+                str(key): freeze_factual_value(item)
                 for key, item in value.items()
             }
         )
     if isinstance(value, (list, tuple)):
-        return tuple(_freeze_value(item) for item in value)
+        return tuple(freeze_factual_value(item) for item in value)
     if isinstance(value, (set, frozenset)):
         return tuple(
-            _freeze_value(item)
+            freeze_factual_value(item)
             for item in sorted(value, key=repr)
         )
     return str(value)
@@ -65,8 +65,6 @@ def _context_values(context: ErrorContext | Mapping[str, Any] | None) -> Mapping
             "line": getattr(context, "line", None),
             "col": getattr(context, "col", None),
             "line_text": getattr(context, "line_text", None),
-            "file_path": getattr(context, "file_path", None),
-            "stack_trace": getattr(context, "stack_trace", None),
         }
     def value_for(key: str) -> object:
         return source[key] if key in source else None
@@ -85,16 +83,6 @@ def _context_values(context: ErrorContext | Mapping[str, Any] | None) -> Mapping
         "line_text": (
             str(value_for("line_text"))
             if value_for("line_text") is not None
-            else None
-        ),
-        "file_path": (
-            str(value_for("file_path"))
-            if value_for("file_path") is not None
-            else None
-        ),
-        "stack_trace": (
-            str(value_for("stack_trace"))
-            if value_for("stack_trace") is not None
             else None
         ),
     }
@@ -178,12 +166,12 @@ class FactualCause:
         object.__setattr__(
             self,
             "context",
-            _freeze_value(context),
+            freeze_factual_value(context),
         )
         object.__setattr__(
             self,
             "details",
-            _freeze_value(details),
+            freeze_factual_value(details),
         )
         object.__setattr__(self, "suggestion", normalized_suggestion)
         object.__setattr__(self, "examples", normalized_examples)

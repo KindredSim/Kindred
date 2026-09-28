@@ -51,43 +51,6 @@ class ExperimentalLayerInput:
     source_rows: tuple[int, ...]
     set_id: str | None = None
 
-    def __post_init__(self) -> None:
-        if not isinstance(self.axis, ExperimentalAxisSelection):
-            raise TypeError(
-                "Experimental axis must be an ExperimentalAxisSelection."
-            )
-        for value, label in (
-            (self.dataset_name, "dataset name"),
-            (self.raw_column, "raw column"),
-        ):
-            if (
-                not isinstance(value, str)
-                or not value
-                or value != value.strip()
-            ):
-                raise ValueError(
-                    f"Experimental {label} identity must be a nonblank "
-                    "edge-normalized string."
-                )
-        if self.model_target is not None and (
-            not isinstance(self.model_target, str)
-            or not self.model_target
-            or self.model_target != self.model_target.strip()
-        ):
-            raise ValueError(
-                "Experimental mapped-target identity must be None or a "
-                "nonblank edge-normalized string."
-            )
-        if self.set_id is not None and (
-            not isinstance(self.set_id, str)
-            or not self.set_id
-            or self.set_id != self.set_id.strip()
-        ):
-            raise ValueError(
-                "Experimental mapped set identity must be None or a "
-                "nonblank edge-normalized string."
-            )
-
 
 def build_data_manager_snapshot(
     *,

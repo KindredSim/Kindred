@@ -11,6 +11,7 @@ from PySide6 import QtCore, QtWidgets
 from kindred.core.exceptions import SimulationCancelled
 from kindred.scan.runtime import run_scan
 from kindred.scan.sampling import PreparedScanDesign
+from kindred.io.paths import same_local_path
 
 
 logger = logging.getLogger(__name__)
@@ -138,7 +139,7 @@ class ChemicalSpaceScanOwner(QtCore.QObject):
     def owns_destination(self, path):
         worker = self.worker
         return bool(worker is not None and not worker.check_only
-                    and self.parent_widget.project_controller._same_canonical_path(path, worker.config.destination))
+                    and same_local_path(path, worker.config.destination))
 
     def start(self, config, *, check_only=False):
         if self.close_fenced or self.session_closing or self.busy or self.exports.is_exporting or not self.gate.is_idle:

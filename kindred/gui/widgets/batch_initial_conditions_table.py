@@ -17,13 +17,14 @@ from kindred.core.project_document import (
 )
 from kindred.core.project_presentation_state import ProjectPresentationState
 from kindred.core.project_session import ProjectContentToken
-from kindred.core.species import validate_concentration
+from kindred.core.species import concentration_from_text
 from kindred.gui.widgets.solver_settings import SolverSettingsDialog
 
 __all__ = [
     "BatchInitialConditionsTableModel",
     "BatchInitialConditionsTableView",
     "InitialConditionsTableActions",
+    "is_valid_initial_text",
     "resolve_live_slider_target_set_ids",
 ]
 
@@ -40,6 +41,16 @@ _INVALID_EDITOR_STYLE = (
     "QLineEdit { background-color: rgb(255, 210, 210); "
     "color: rgb(80, 0, 0); }"
 )
+
+
+def is_valid_initial_text(raw: object) -> bool:
+    """Whether visible Initial Conditions text is an admissible concentration."""
+
+    try:
+        concentration_from_text(str(raw))
+    except ValueError:
+        return False
+    return True
 
 
 @dataclass(frozen=True, slots=True)
@@ -128,7 +139,7 @@ class BatchInitialConditionsTableModel(QtCore.QAbstractTableModel):
                     (str(species_name), str(raw))
                     for species_name, raw
                     in invalid.get(initial_set.set_id, {}).items()
-                    if not self._is_valid_concentration(raw, str(species_name))
+                    if not is_valid_initial_text(raw)
                 ),
                 custom_run_settings=initial_set.set_id in override_ids,
                 plot_requested=initial_set.set_id in plot_ids,
@@ -202,17 +213,6 @@ class BatchInitialConditionsTableModel(QtCore.QAbstractTableModel):
         if 0 <= row_i < len(self._rows):
             return self._rows[row_i].set_id
         return None
-
-    @staticmethod
-    def _is_valid_concentration(raw: object, species: str) -> bool:
-        try:
-            validate_concentration(
-                float(raw),
-                field=f"initial concentration for {species}",
-            )
-        except (TypeError, ValueError, OverflowError):
-            return False
-        return True
 
     def set_id_for_live_index(self, index: QtCore.QModelIndex) -> str | None:
         if (
@@ -440,24 +440,13 @@ class _InitialConditionsItemDelegate(QtWidgets.QStyledItemDelegate):
                 index.isValid()
                 and isinstance(model, BatchInitialConditionsTableModel)
                 and model.is_numeric_column(index.column())
-                and not self._is_valid_concentration(editor.text())
+                and not is_valid_initial_text(editor.text())
             ):
                 self.commitData.emit(editor)
                 self._update_editor_style(editor)
                 event.accept()
                 return True
         return super().eventFilter(editor, event)
-
-    @staticmethod
-    def _is_valid_concentration(text: str) -> bool:
-        try:
-            validate_concentration(
-                float(text),
-                field="initial concentration",
-            )
-        except (TypeError, ValueError, OverflowError):
-            return False
-        return True
 
     def _index_for_editor(
         self,
@@ -474,7 +463,7 @@ class _InitialConditionsItemDelegate(QtWidgets.QStyledItemDelegate):
         editor.setStyleSheet(
             _INVALID_EDITOR_STYLE
             if index.isValid() and index.column() != 0
-            and not self._is_valid_concentration(editor.text())
+            and not is_valid_initial_text(editor.text())
             else ""
         )
 
@@ -672,7 +661,7 @@ class InitialConditionsTableActions(QtCore.QObject):
     """Own IC intents for one immutable mechanism-tab identity."""
 
     errorRaised = QtCore.Signal(str)
-    draftStateChanged = QtCore.Signal(str, bool)
+    draftStateChanged = QtCore.Signal(str)
     initialValuesChanged = QtCore.Signal(str)
     setNameChanged = QtCore.Signal(str)
     selectedRunSetIdsChanged = QtCore.Signal(object)
@@ -833,7 +822,7 @@ class InitialConditionsTableActions(QtCore.QObject):
         finally:
             del blockers
         self.render()
-        self.draftStateChanged.emit(self._tab_id, runtime.has_dirty_drafts)
+        self.draftStateChanged.emit(self._tab_id)
         return expected_token
 
     def settle_active_editor(self) -> None:
@@ -857,7 +846,7 @@ class InitialConditionsTableActions(QtCore.QObject):
             for set_id, values in runtime.initial_text_by_set_id.items()
             if allowed is None or set_id in allowed
             for species, raw in values.items()
-            if not self._valid_raw(raw, species)
+            if not is_valid_initial_text(raw)
         )
 
     def has_invalid_cells(self, set_ids: Iterable[str] | None = None) -> bool:
@@ -868,11 +857,11 @@ class InitialConditionsTableActions(QtCore.QObject):
         tab = self._registry.tab(self._tab_id)
         initial_set = tab.initial_condition_set(set_id)
         try:
-            value = validate_concentration(
-                float(raw_text),
+            value = concentration_from_text(
+                str(raw_text),
                 field=f"initial concentration for {species}",
             )
-        except (TypeError, ValueError, OverflowError):
+        except ValueError:
             value = None
         invalid = self._registry.tab_runtime(
             self._tab_id
@@ -882,10 +871,7 @@ class InitialConditionsTableActions(QtCore.QObject):
                 return False
             invalid.setdefault(set_id, {})[species] = str(raw_text)
             self.render()
-            self.draftStateChanged.emit(
-                self._tab_id,
-                self._registry.tab_runtime(self._tab_id).has_dirty_drafts,
-            )
+            self.draftStateChanged.emit(self._tab_id)
             return False
 
         values = dict(initial_set.values)
@@ -907,10 +893,7 @@ class InitialConditionsTableActions(QtCore.QObject):
         if changed:
             self.initialValuesChanged.emit(self._tab_id)
         if invalid_cleared:
-            self.draftStateChanged.emit(
-                self._tab_id,
-                self._registry.tab_runtime(self._tab_id).has_dirty_drafts,
-            )
+            self.draftStateChanged.emit(self._tab_id)
         return changed
 
     @QtCore.Slot(int, int, str)
@@ -935,14 +918,14 @@ class InitialConditionsTableActions(QtCore.QObject):
         try:
             for row in cells:
                 values = [
-                    validate_concentration(
-                        float(raw.strip()),
+                    concentration_from_text(
+                        raw.strip(),
                         field="pasted initial concentration",
                     )
                     for raw in row
                 ]
                 parsed.append(values)
-        except (TypeError, ValueError, OverflowError):
+        except ValueError:
             return self._reject(
                 "Every pasted concentration must be within the supported "
                 "concentration domain."
@@ -987,10 +970,7 @@ class InitialConditionsTableActions(QtCore.QObject):
         if result is not None:
             self.initialValuesChanged.emit(self._tab_id)
         if invalid_cleared:
-            self.draftStateChanged.emit(
-                self._tab_id,
-                self._registry.tab_runtime(self._tab_id).has_dirty_drafts,
-            )
+            self.draftStateChanged.emit(self._tab_id)
         return bool(result is not None or invalid_cleared)
 
     @QtCore.Slot(str, str)
@@ -1253,17 +1233,6 @@ class InitialConditionsTableActions(QtCore.QObject):
         set_values.pop(species, None)
         if not set_values:
             invalid.pop(set_id, None)
-        return True
-
-    @staticmethod
-    def _valid_raw(raw: object, species: str) -> bool:
-        try:
-            validate_concentration(
-                float(raw),
-                field=f"initial concentration for {species}",
-            )
-        except (TypeError, ValueError, OverflowError):
-            return False
         return True
 
     def _reject(self, message: str) -> bool:

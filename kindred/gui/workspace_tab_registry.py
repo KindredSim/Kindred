@@ -24,7 +24,6 @@ from kindred.core.project_presentation_state import (
     default_project_presentation_state,
     reconcile_workspace_presentation_state,
     validate_project_presentation_state,
-    validate_workspace_presentation_state,
 )
 
 if TYPE_CHECKING:
@@ -91,23 +90,13 @@ class WorkspaceTabRegistry:
             [ScientificDocumentDelta], None
         ],
         post_document_publication: Callable[[ScientificDocumentDelta], None],
-        runtime_factory: Callable[[str], TabRuntimeState] | None = None,
+        runtime_factory: Callable[[str], TabRuntimeState],
     ) -> None:
-        if not isinstance(session, ProjectSession):
-            raise TypeError("session must be a ProjectSession.")
-        if not callable(computation_fence):
-            raise TypeError("computation_fence must be callable.")
-        if not callable(retire_interactive_plot_targets):
-            raise TypeError(
-                "retire_interactive_plot_targets must be callable."
-            )
-        if not callable(post_document_publication):
-            raise TypeError("post_document_publication must be callable.")
         self._session = session
         self._computation_fence = computation_fence
         self._retire_interactive_plot_targets = retire_interactive_plot_targets
         self._post_document_publication = post_document_publication
-        self._runtime_factory = runtime_factory or (lambda _tab_id: TabRuntimeState())
+        self._runtime_factory = runtime_factory
         self._active_tab_id = ""
         self._presentation_by_tab_id: tuple[
             tuple[str, ProjectPresentationState], ...
@@ -248,23 +237,15 @@ class WorkspaceTabRegistry:
             presentation_by_tab_id=tuple(
                 (
                     tab.tab_id,
-                    (
-                        existing_presentation[tab.tab_id].reconciled(
-                            document,
-                            tab,
-                        )
-                        if tab.tab_id in existing_presentation
-                        else default_project_presentation_state(tab)
-                    ),
+                    existing_presentation[tab.tab_id]
+                    if tab.tab_id in existing_presentation
+                    else default_project_presentation_state(tab),
                 )
                 for tab in document.tabs
             ),
         )
+        # One reconcile pass also validates the complete workspace state.
         next_workspace = reconcile_workspace_presentation_state(
-            document,
-            next_workspace,
-        )
-        next_workspace = validate_workspace_presentation_state(
             document,
             next_workspace,
         )

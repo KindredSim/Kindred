@@ -25,35 +25,18 @@ __all__ = [
 ]
 
 
-class SolverSettingsDialog(QtWidgets.QDialog):
-    """Edit one complete override; partial values never leave the dialog."""
+class _RunSettingsFields:
+    """The four Run-setting editors shared by both settings dialogs."""
 
-    def __init__(
-        self,
-        parent: QtWidgets.QWidget | None = None,
-        *,
-        title: str = "Custom Run Settings",
-    ) -> None:
-        super().__init__(parent)
-        self.setWindowTitle(str(title))
-        self.setModal(True)
-
-        layout = QtWidgets.QVBoxLayout(self)
-        form = QtWidgets.QFormLayout()
-        self.solver_combo = QtWidgets.QComboBox(self)
+    def __init__(self, form: QtWidgets.QFormLayout, parent: QtWidgets.QWidget) -> None:
+        self.solver_combo = QtWidgets.QComboBox(parent)
         self.solver_combo.addItems(list(SUPPORTED_SOLVERS))
         self.solver_combo.setToolTip(
             "Choose the numerical method used to calculate the simulation."
         )
-        self.t_start_edit = self._time_edit(
-            "0",
-            "Absolute Run start time",
-        )
-        self.t_end_edit = self._time_edit(
-            "10",
-            "Absolute Run end time",
-        )
-        self.integration_points_spin = QtWidgets.QSpinBox(self)
+        self.t_start_edit = self._time_edit(parent, "0", "Absolute Run start time")
+        self.t_end_edit = self._time_edit(parent, "10", "Absolute Run end time")
+        self.integration_points_spin = QtWidgets.QSpinBox(parent)
         self.integration_points_spin.setRange(*SIMULATION_POINT_RANGE)
         self.integration_points_spin.setSingleStep(10)
         self.integration_points_spin.setToolTip(
@@ -73,25 +56,18 @@ class SolverSettingsDialog(QtWidgets.QDialog):
                 name_label.setTextFormat(QtCore.Qt.RichText)
                 name_label.setText(scientific_symbol_html(label, family="time", role=label))
             widget.setAccessibleName(scientific_symbol_spoken(label, family="time", role=label))
-        layout.addLayout(form)
 
-        self._buttons = QtWidgets.QDialogButtonBox(
-            QtWidgets.QDialogButtonBox.StandardButton.Ok
-            | QtWidgets.QDialogButtonBox.StandardButton.Cancel,
-            parent=self,
-        )
-        self._buttons.accepted.connect(self._accept_candidate)
-        self._buttons.rejected.connect(self.reject)
-        layout.addWidget(self._buttons)
-
-    def _time_edit(self, value: str, tooltip: str) -> QtWidgets.QLineEdit:
-        edit = QtWidgets.QLineEdit(str(value), self)
+    @staticmethod
+    def _time_edit(
+        parent: QtWidgets.QWidget, value: str, tooltip: str,
+    ) -> QtWidgets.QLineEdit:
+        edit = QtWidgets.QLineEdit(str(value), parent)
         edit.setToolTip(str(tooltip))
         edit.setMaximumWidth(190)
         setup_scientific_validator(edit)
         return edit
 
-    def set_execution_settings(self, settings: SimulationExecutionSettings) -> None:
+    def set_settings(self, settings: SimulationExecutionSettings) -> None:
         validate_simulation_execution_settings(settings)
         self.solver_combo.setCurrentText(settings.solver)
         blockers = (
@@ -105,7 +81,7 @@ class SolverSettingsDialog(QtWidgets.QDialog):
             del blockers
         self.integration_points_spin.setValue(settings.integration_points)
 
-    def execution_settings(self) -> SimulationExecutionSettings:
+    def settings(self) -> SimulationExecutionSettings:
         candidate = SimulationExecutionSettings(
             solver=str(self.solver_combo.currentText()),
             t_start=parse_finite_numeric_text(self.t_start_edit.text(), field="t_start"),
@@ -114,6 +90,40 @@ class SolverSettingsDialog(QtWidgets.QDialog):
         )
         validate_simulation_execution_settings(candidate)
         return candidate
+
+
+class SolverSettingsDialog(QtWidgets.QDialog):
+    """Edit one complete override; partial values never leave the dialog."""
+
+    def __init__(
+        self,
+        parent: QtWidgets.QWidget | None = None,
+        *,
+        title: str = "Custom Run Settings",
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle(str(title))
+        self.setModal(True)
+
+        layout = QtWidgets.QVBoxLayout(self)
+        form = QtWidgets.QFormLayout()
+        self._fields = _RunSettingsFields(form, self)
+        layout.addLayout(form)
+
+        self._buttons = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.StandardButton.Ok
+            | QtWidgets.QDialogButtonBox.StandardButton.Cancel,
+            parent=self,
+        )
+        self._buttons.accepted.connect(self._accept_candidate)
+        self._buttons.rejected.connect(self.reject)
+        layout.addWidget(self._buttons)
+
+    def set_execution_settings(self, settings: SimulationExecutionSettings) -> None:
+        self._fields.set_settings(settings)
+
+    def execution_settings(self) -> SimulationExecutionSettings:
+        return self._fields.settings()
 
     @QtCore.Slot()
     def _accept_candidate(self) -> None:
@@ -241,6 +251,15 @@ class SimulationSettingsDialog(QtWidgets.QDialog):
         self.set_stopping_declarations(())
         layout.addWidget(science_box)
 
+        run_box = QtWidgets.QGroupBox("Run defaults for new projects and tabs", self)
+        run_box.setToolTip(
+            "Run settings that new projects and tabs start with. Existing tabs "
+            "keep their settings; edit those in each tab's Run panel."
+        )
+        run_form = QtWidgets.QFormLayout(run_box)
+        self._run_default_fields = _RunSettingsFields(run_form, run_box)
+        layout.addWidget(run_box)
+
         preview_box = QtWidgets.QGroupBox("Preview", self)
         preview_form = QtWidgets.QFormLayout(preview_box)
         self.preview_points_spin = self._integer_spin(
@@ -308,7 +327,7 @@ class SimulationSettingsDialog(QtWidgets.QDialog):
         )
         layout.addWidget(cache_box)
 
-        for form in (science_form, preview_form, parallel_form, cache_form):
+        for form in (science_form, run_form, preview_form, parallel_form, cache_form):
             for row in range(form.rowCount()):
                 field = form.itemAt(row, QtWidgets.QFormLayout.ItemRole.FieldRole).widget()
                 label = form.labelForField(field)
@@ -402,6 +421,12 @@ class SimulationSettingsDialog(QtWidgets.QDialog):
 
         return bool(self.scientific_defaults_check.isChecked())
 
+    def set_new_tab_run_defaults(self, settings: SimulationExecutionSettings) -> None:
+        self._run_default_fields.set_settings(settings)
+
+    def new_tab_run_defaults(self) -> SimulationExecutionSettings:
+        return self._run_default_fields.settings()
+
     def preview_settings(self) -> tuple[int, int]:
         return self.preview_points_spin.value(), self.preview_delay_spin.value()
 
@@ -434,6 +459,7 @@ class SimulationSettingsDialog(QtWidgets.QDialog):
     def _accept_candidate(self) -> None:
         try:
             self.scientific_settings()
+            self.new_tab_run_defaults()
             self.preview_settings()
             self.run_user_maximum()
             self.result_cache_capacity()

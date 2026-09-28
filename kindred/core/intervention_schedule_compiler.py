@@ -435,11 +435,6 @@ class InterventionExecutionContract:
         return replace(self, triggers=retained, declarative_payload=payload,
                        trigger_firings=tuple(item for item in self.trigger_firings if item.declaration_ordinal in ordinals))
 
-    def with_trigger_firings(
-        self, firings: Sequence[TriggerFiring]
-    ) -> "InterventionExecutionContract":
-        return replace(self, trigger_firings=tuple(firings))
-
     def provenance_projection(self) -> dict[str, Any]:
         executable_operations = [
             *(item.to_payload() for item in self.instants),

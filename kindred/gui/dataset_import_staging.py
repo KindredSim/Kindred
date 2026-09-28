@@ -405,9 +405,6 @@ class DatasetImportStaging(QtCore.QObject):
         if worker is not None:
             worker.cancel()
 
-    def fence_application_close_admission(self) -> None:
-        self._application_close_fenced = True
-
     def cancel_for_application_close(self) -> None:
         self._application_close_fenced = True
         self.cancel_active()

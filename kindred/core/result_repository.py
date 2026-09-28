@@ -336,17 +336,10 @@ class ResultRepository:
     def deauthorize_sets(
         self,
         set_ids: Iterable[str],
-        *,
-        preserve_reference: bool = False,
     ) -> None:
-        """Clear foreground values while retaining exact reusable Run cache.
+        """Clear foreground values and the Reference; keep the exact Run cache.
 
-        Slider Preview reaches this canonical deauthorization boundary only
-        after constructing its exact request candidates. Its established
-        Run-to-Reference behavior moves the prior explicit entry separately,
-        before this boundary. Deauthorization never manufactures a Reference
-        value. An existing Reference may be retained for Preview admission but
-        remains absent for ordinary invalidation.
+        Deauthorization never manufactures a Reference value.
         """
 
         targets = set(set_ids)
@@ -355,8 +348,7 @@ class ResultRepository:
         for set_id in targets:
             self._current_by_set_id.pop(set_id, None)
             self._current_run_set_ids.discard(set_id)
-            if not preserve_reference:
-                self._reference_by_set_id.pop(set_id, None)
+            self._reference_by_set_id.pop(set_id, None)
 
     def purge_set(self, set_id: str) -> None:
         """Delete/history removal purges visible entries and cached storage."""

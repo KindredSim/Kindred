@@ -167,6 +167,9 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
         run_font.setPointSize(run_font.pointSize() + 2)
         self._run_btn.setFont(run_font)
         self._run_btn.setStyleSheet("QPushButton { padding: 6px 18px; }")
+        # Like Apply below, a pointer Run leaves focus with the open editor so
+        # Run captures it instead of a focus-out commit publishing it first.
+        self._run_btn.setFocusPolicy(QtCore.Qt.TabFocus)
         self._run_btn.setEnabled(False)
         reactions_header_row.addStretch(1)
         reactions_header_row.addWidget(self._run_btn)
@@ -191,6 +194,9 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
         source_font.setPointSize(10)
         self._reactions_text.setFont(source_font)
         self._reactions_text.setUndoRedoEnabled(True)  # Enable undo/redo
+        # The first authoring render installs the tab's text without history;
+        # later canonical replacements are one undoable native edit.
+        self._authoring_rendered = False
         self._reactions_text.undoAvailable.connect(
             self._emit_native_history_availability
         )
@@ -360,7 +366,7 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
             "<tr><th>Setting</th><th>Meaning</th></tr>"
             "<tr><td><code>T=</code></td><td>Nominal temperature, in K. Used throughout the simulation unless a temperature schedule is specified.</td></tr>"
             "<tr><td><code>energy=</code></td><td>Unit for <code>Ea</code>, <code>dG_act</code>, and <code>dG_eq</code>. Options: <code>J/mol</code>, <code>kJ/mol</code>, <code>kcal/mol</code>.</td></tr>"
-            "<tr><td><code>C0=</code></td><td>Standard concentration, in M. Must be greater than zero.</td></tr>"
+            "<tr><td><code>C0=</code></td><td>Standard concentration, from 10<sup>-50</sup> through 10<sup>30</sup> M, inclusive.</td></tr>"
             "</table>"
             "<pre>T=298.15\nenergy=kJ/mol\nC0=1.0</pre>"
             "<p>Enter each setting at most once. Omitted settings use the values in <b>Simulation Settings</b>. Enter <code>T=</code> and <code>energy=</code> on separate lines from reactions.</p>"
@@ -375,10 +381,20 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
             "<tr><td>Irreversible</td><td><code>-&gt;</code> or <code>=&gt;</code></td></tr>"
             "<tr><td>Reversible</td><td><code>&lt;-&gt;</code> or <code>&lt;=&gt;</code></td></tr>"
             "</table>"
-            "<p><code>&lt;-</code> alone is not accepted. Write stoichiometric coefficients as <code>2B</code> or <code>2*B</code>.</p>"
+            "<p><code>&lt;-</code> alone is not accepted. Write stoichiometric coefficients as <code>2B</code> or <code>2*B</code>. "
+            "Coefficients can be any positive number, including decimals and scientific notation, such as <code>0.5 C</code> or <code>1e-3*D</code>. "
+            "An omitted coefficient means 1.</p>"
             "<pre>A + 2B -&gt; C ; k=0.5</pre>"
+            "<p>Leave one side empty for a zero-order source or a product-free sink:</p>"
+            "<pre>-&gt; B ; k=0.1\nA -&gt; ; k=0.2</pre>"
             "<h2>Reaction Parameters</h2>"
-            "<p>Add reaction parameters after the semicolon. Choose one forward rate model per reaction:</p>"
+            "<p>Add reaction parameters after the semicolon. Separate multiple parameters with semicolons or commas.</p>"
+            "<p>Kindred uses mass-action kinetics. Each reactant concentration is raised to its coefficient. "
+            "The reverse rate of a reversible reaction uses the products in the same way. "
+            "A species on both sides, such as a catalyst, remains in the rate even though its concentration does not change:</p>"
+            "<pre>A + Cat -&gt; B + Cat ; k=0.5</pre>"
+            "<p>This reaction has the rate <i>k</i>[A][Cat].</p>"
+            "<p>Choose one forward rate model per reaction:</p>"
             "<table border=\"1\" cellpadding=\"5\" cellspacing=\"0\">"
             "<tr><th>Forward rate model</th><th>Required fields</th></tr>"
             "<tr><td>Constant</td><td><code>k=</code> or <code>kf=</code></td></tr>"
@@ -409,6 +425,18 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
             "<p><i>K</i><sub>eq</sub> = exp[−Δ<i>G</i><sub>eq</sub> / (<i>R</i><i>T</i>)] <i>C</i><sub>0</sub><sup>(<i>n</i><sub>r</sub> − <i>n</i><sub>f</sub>)</sup></p>"
             "<p><i>n</i><sub>f</sub> and <i>n</i><sub>r</sub> are the forward and reverse reaction orders. <i>K</i><sub>eq</sub> has units M<sup>(<i>n</i><sub>r</sub> − <i>n</i><sub>f</sub>)</sup>. <i>C</i><sub>0</sub> is the standard concentration. <i>R</i> is the gas constant and <i>T</i> is the temperature at simulation time <i>t</i>.</p>"
             "<p>With <code>Keq=</code> or <code>dG_eq=</code>, <code>kf=0</code> disables both directions. With an explicit <code>kr=</code>, both directional rate constants must be positive.</p>"
+            "<h2>Reaction Input Limits</h2>"
+            "<table border=\"1\" cellpadding=\"5\" cellspacing=\"0\">"
+            "<tr><th>Input</th><th>Allowed values</th></tr>"
+            "<tr><td><code>k</code>, <code>kf</code></td><td>Zero, or 10<sup>-20</sup> through 10<sup>20</sup> M<sup>(1 − <i>n</i><sub>f</sub>)</sup> s<sup>-1</sup>, inclusive</td></tr>"
+            "<tr><td><code>kr</code></td><td>10<sup>-20</sup> through 10<sup>20</sup> M<sup>(1 − <i>n</i><sub>r</sub>)</sup> s<sup>-1</sup>, inclusive</td></tr>"
+            "<tr><td><code>Keq</code></td><td>10<sup>-20</sup> through 10<sup>20</sup> M<sup>(<i>n</i><sub>r</sub> − <i>n</i><sub>f</sub>)</sup>, inclusive</td></tr>"
+            "<tr><td><code>A</code></td><td>10<sup>-20</sup> through 10<sup>40</sup> M<sup>(1 − <i>n</i><sub>f</sub>)</sup> s<sup>-1</sup>, inclusive</td></tr>"
+            "<tr><td><code>Ea</code>, <code>dG_act</code>, <code>dG_eq</code></td><td>Positive, negative, or zero, with magnitude at most 10<sup>20</sup> J/mol after conversion from the <code>energy=</code> unit</td></tr>"
+            "<tr><td><code>kappa</code></td><td>Finite and greater than zero</td></tr>"
+            "<tr><td><code>degeneracy</code></td><td>Positive integers, entered without a decimal point</td></tr>"
+            "</table>"
+            "<p><i>n</i><sub>f</sub> and <i>n</i><sub>r</sub> are the forward and reverse reaction orders.</p>"
             "<h2>Temperature Schedules</h2>"
             "<p>Use one <code>temp_step</code> or <code>temp_response</code> declaration. Enter times and <code>tau</code> in seconds, and temperatures in kelvin.</p>"
             "<p>List at least two times in increasing order, without repeats. Use zero or a value from 10<sup>-30</sup> through 10<sup>10</sup> seconds, inclusive. Supply one temperature for each interval between consecutive times.</p>"
@@ -693,10 +721,11 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
             "<p>A <code>param</code> expression cannot directly use species concentrations, <code>t</code>, or <code>T</code>. It can depend on temperature indirectly through a temperature-dependent rate constant. Referring to an energy parameter alone does not make an expression temperature-dependent.</p>"
             "<p>A <code>let</code> expression can use species concentrations, parameters, other <code>let</code> definitions, simulation time <code>t</code>, and temperature <code>T</code>.</p>"
             "<p>Begin each definition with <code>param</code> or <code>let</code>. A line containing only <code>name = expression</code> is not accepted. <code>observable</code> is not a keyword.</p>"
+            "<p><code>param</code> and <code>let</code> definitions can appear anywhere in <b>Reactions</b> and can use definitions written later. Circular definitions are rejected.</p>"
             "<h3>Supported input ranges</h3>"
             "<p>Kindred uses M for concentration, s for time, K for temperature, J/mol for energy parameters, and m<sup>3</sup> for volume in calculations.</p>"
             "<p>An ordinary adjustable parameter can be zero, or a positive or negative value with magnitude between 10<sup>-30</sup> and 10<sup>30</sup>, inclusive, after conversion to these units.</p>"
-            "<p>These limits apply to ordinary independent parameter values. Calculated expressions and simulation results are not restricted to this range. Species concentrations and physical-model parameters have their own input limits.</p>"
+            "<p>These limits apply to ordinary independent parameter values. Calculated expressions and simulation results are not restricted to this range. Species concentrations have their own input limits. Reaction parameter limits are listed under <b>Reaction Input Limits</b>.</p>"
             "<p>The factor used to convert a declared unit to Kindred’s calculation units must be between 10<sup>-30</sup> and 10<sup>30</sup>, inclusive. For example, mM has a factor of 0.001 relative to M. Kindred checks unit declarations even when the starting value is zero and reports unsupported declarations in <b>Reactions</b>.</p>"
             "<p>Kindred reports an error if an entered nonzero number is so small that it would be read as zero.</p>"
             "<h2>Functions</h2>"
@@ -723,7 +752,8 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
             "<tr><th>Write</th><th>Meaning</th></tr>"
             "<tr><td><code>+</code>, <code>-</code>, <code>*</code>, <code>/</code></td><td>Addition, subtraction, multiplication, division</td></tr>"
             "<tr><td><code>-a</code></td><td>Changes the sign of <i>a</i>. A leading <code>+</code> is also accepted and leaves the value unchanged.</td></tr>"
-            "<tr><td><code>a^b</code> or <code>a**b</code></td><td><i>a</i> raised to the power <i>b</i></td></tr>"
+            "<tr><td><code>a^b</code> or <code>a**b</code></td><td><i>a</i> raised to the power <i>b</i>. Powers are applied before a leading minus and from right to left: "
+            "<code>-2^2</code> is −4, <code>2^3^2</code> is 2<sup>9</sup>, and <code>2^-2</code> is 0.25.</td></tr>"
             "<tr><td><code>==</code>, <code>!=</code></td><td>Equal to, not equal to</td></tr>"
             "<tr><td><code>&lt;</code>, <code>&lt;=</code></td><td>Less than, less than or equal to</td></tr>"
             "<tr><td><code>&gt;</code>, <code>&gt;=</code></td><td>Greater than, greater than or equal to</td></tr>"
@@ -1168,14 +1198,21 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
         replacement = str(accepted_text)
         if replacement == self.reactions_text():
             return False
-        cursor = self._reactions_text.textCursor()
+        self._replace_text_undoably(self._reactions_text, replacement)
+        return True
+
+    @staticmethod
+    def _replace_text_undoably(
+        editor: QtWidgets.QPlainTextEdit,
+        replacement: str,
+    ) -> None:
+        cursor = editor.textCursor()
         cursor.beginEditBlock()
         try:
             cursor.select(QtGui.QTextCursor.SelectionType.Document)
             cursor.insertText(replacement)
         finally:
             cursor.endEditBlock()
-        return True
 
     def render_authoring_snapshot(
         self,
@@ -1192,14 +1229,24 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
         reactions_blocker = QtCore.QSignalBlocker(self._reactions_text)
         notes_blocker = QtCore.QSignalBlocker(self._notes_text)
         try:
-            self.set_reactions_text(source.reactions_text)
             notes_text = str(notes)
-            if self._notes_text.toPlainText() != notes_text:
-                self._notes_text.setPlainText(notes_text)
+            if not self._authoring_rendered:
+                self.set_reactions_text(source.reactions_text)
+                if self._notes_text.toPlainText() != notes_text:
+                    self._notes_text.setPlainText(notes_text)
+                self._authoring_rendered = True
+            else:
+                for editor, text in (
+                    (self._reactions_text, source.reactions_text),
+                    (self._notes_text, notes_text),
+                ):
+                    if editor.toPlainText() != text:
+                        self._replace_text_undoably(editor, text)
         finally:
             del notes_blocker
             del reactions_blocker
             del editor_blocker
+        self._emit_native_history_availability()
 
     def variable_sliders_widget(self) -> VariableSliders:
         return self._variable_sliders
@@ -1262,7 +1309,7 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
 class MechanismEditorBinding(QtCore.QObject):
     """Live binding for one published mechanism-tab editor."""
 
-    draftStateChanged = QtCore.Signal(str, bool)
+    draftStateChanged = QtCore.Signal(str)
 
     def __init__(
         self,
@@ -1346,7 +1393,7 @@ class MechanismEditorBinding(QtCore.QObject):
             has_draft=runtime.reactions_draft is not None,
             has_accepted_reactions=tab.prepared_dsl is not None,
         )
-        self.draftStateChanged.emit(tab.tab_id, runtime.has_dirty_drafts)
+        self.draftStateChanged.emit(tab.tab_id)
 
     @QtCore.Slot(str)
     def _on_notes_edited(self, notes: str) -> None:
@@ -1358,7 +1405,7 @@ class MechanismEditorBinding(QtCore.QObject):
         runtime.notes_draft = (
             None if visible_notes == tab.notes else visible_notes
         )
-        self.draftStateChanged.emit(tab.tab_id, runtime.has_dirty_drafts)
+        self.draftStateChanged.emit(tab.tab_id)
 
     def apply_accepted_source_rewrite(
         self,

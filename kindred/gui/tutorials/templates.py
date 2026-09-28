@@ -17,6 +17,7 @@ class CreateAndReuseTemplates(PracticeLesson):
     title = "Create and Reuse Templates"
     description = "Create a template with comments and starting values, describe it, and reuse it from the Examples menu."
     _preset_name = "M3"
+    _preset_rates = {"k1": 0.2}
     _reuse_steps = frozenset({"create_reuse_tab", "apply_template"})
     _editor_steps = frozenset(
         {"template_values", "template_comments", "template_name", "template_description", "template_tags"}

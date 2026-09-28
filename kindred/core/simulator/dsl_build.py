@@ -10,12 +10,8 @@ from __future__ import annotations
 import logging
 from typing import Dict, List
 
-from ..equilibrium_rate_authority import (
-    equilibrium_constant_unit,
-)
 from ..mechanism import Mechanism
 from ..mechanism_metadata import MechanismMetadataKeys, MechanismMetadataView, EquilibriumMetadataView
-from ..stoichiometry import directional_order_fraction
 from .dsl_format import format_stoichiometry_side as _fmt_side
 from .dsl_build_input import DslMechanismBuildInput
 from .parameter_namespace import (
@@ -77,16 +73,6 @@ def build_mechanism_from_ir(
                 standard_conc_M=step.standard_conc_M
                 if step.standard_conc_M is not None
                 else None,
-                Keq_unit=equilibrium_constant_unit(
-                    float(
-                        directional_order_fraction(
-                            products,
-                        )
-                        - directional_order_fraction(
-                            reactants,
-                        )
-                    )
-                ),
             ).to_metadata()
 
             eq_index = len(mechanism.equilibria)

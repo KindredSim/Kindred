@@ -921,48 +921,11 @@ class VariableSliders(QtWidgets.QWidget):
         variables: Dict[str, float],
         metadata: Optional[Dict[str, Dict[str, object]]],
     ) -> tuple[Dict[str, float], Dict[str, Dict[str, object]]]:
-        """Normalize one render call without changing widget state."""
-        try:
-            variable_items = variables.items()
-        except AttributeError as exc:
-            raise ValueError("Slider variables must be a mapping.") from exc
-
-        normalized_variables: Dict[str, float] = {}
-        for raw_name, value in variable_items:
-            name = str(raw_name)
-            if name in normalized_variables:
-                raise ValueError(
-                    "Slider variables must have unique canonical names."
-                )
-            try:
-                normalized_variables[name] = float(value)
-            except (ArithmeticError, TypeError, ValueError) as exc:
-                raise ValueError(
-                    "Slider variable values must be numeric."
-                ) from exc
-
-        if metadata is None:
-            metadata_items = ()
-        else:
-            try:
-                metadata_items = metadata.items()
-            except AttributeError as exc:
-                raise ValueError("Slider metadata must be a mapping.") from exc
-
-        normalized_metadata: Dict[str, Dict[str, object]] = {}
-        for raw_name, raw_meta in metadata_items:
-            name = str(raw_name)
-            if name in normalized_metadata:
-                raise ValueError(
-                    "Slider metadata must have unique canonical names."
-                )
-            try:
-                normalized_metadata[name] = dict(raw_meta)
-            except (TypeError, ValueError) as exc:
-                raise ValueError(
-                    "Slider metadata entries must be mappings."
-                ) from exc
-
+        """Copy one render call's trusted projection without changing widget state."""
+        normalized_variables = {str(name): float(value) for name, value in variables.items()}
+        normalized_metadata = {
+            str(name): dict(meta) for name, meta in (metadata or {}).items()
+        }
         return normalized_variables, normalized_metadata
 
     def _editor_has_focus(self, name: str) -> bool:

@@ -28,9 +28,6 @@ from kindred.core.analysis.dataset_parameter_overrides import (
 )
 from kindred.gui.fitting.constants import INITIAL_PREFIX
 from kindred.core.analysis.dataset_sampling import compute_sampled_indices
-from kindred.core.dataset_mapping import (
-    resolve_fit_t_start,
-)
 from kindred.core.mechanism_source import (
     MechanismAuthoringSource,
     source_matches_analysis,
@@ -131,19 +128,6 @@ class FitObservationSnapshot:
     t: tuple[float, ...]
     y: tuple[float, ...]
     source_rows: tuple[int, ...]
-
-    def __post_init__(self) -> None:
-        object.__setattr__(
-            self,
-            "raw_observation_id",
-            _required(self.raw_observation_id, "raw observation ID"),
-        )
-        object.__setattr__(self, "raw_column", _required(self.raw_column, "raw column"))
-        object.__setattr__(
-            self,
-            "model_target",
-            _required(self.model_target, "mapped model target"),
-        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -688,12 +672,6 @@ class FitOriginSnapshot:
     mapped_datasets: tuple[FitMappedDatasetSnapshot, ...]
     parameter_defaults: tuple[FitParameterVariable, ...]
     def __post_init__(self) -> None:
-        object.__setattr__(self, "tab_id", _required(self.tab_id, "tab ID"))
-        object.__setattr__(self, "tab_name", _required(self.tab_name, "tab name"))
-        if not isinstance(self.mechanism_source, MechanismAuthoringSource):
-            raise TypeError("mechanism_source must be MechanismAuthoringSource.")
-        if not isinstance(self.prepared_dsl, PreparedDslRequestSet):
-            raise TypeError("prepared_dsl must be a PreparedDslRequestSet.")
         if not source_matches_analysis(
             self.mechanism_source,
             self.prepared_dsl.analysis,
@@ -702,26 +680,8 @@ class FitOriginSnapshot:
                 "Fit origin prepared DSL must be the retained analysis for "
                 "the captured source."
             )
-        if not isinstance(self.scientific_settings, TabScientificSettings):
-            raise TypeError("scientific_settings must be TabScientificSettings.")
-        if not isinstance(self.fit_defaults, FitDefaults):
-            raise TypeError("fit_defaults must be FitDefaults.")
         mapped_datasets = tuple(self.mapped_datasets)
         parameter_defaults = tuple(self.parameter_defaults)
-        if any(
-            not isinstance(item, FitMappedDatasetSnapshot)
-            for item in mapped_datasets
-        ):
-            raise TypeError(
-                "Fit origin datasets must be FitMappedDatasetSnapshot values."
-            )
-        if any(
-            not isinstance(item, FitParameterVariable)
-            for item in parameter_defaults
-        ):
-            raise TypeError(
-                "Fit origin parameters must be FitParameterVariable values."
-            )
         dataset_ids = [item.dataset_id for item in mapped_datasets]
         set_ids = [item.set_id for item in mapped_datasets]
         parameter_names = [item.name for item in parameter_defaults]
@@ -744,16 +704,6 @@ def _validate_advanced_analysis_setup(
     profile_likelihood: ProfileLikelihoodConfig | None,
     residual_bootstrap: ResidualBootstrapConfig | None,
 ) -> None:
-    if profile_likelihood is not None and not isinstance(
-        profile_likelihood,
-        ProfileLikelihoodConfig,
-    ):
-        raise TypeError("Profile likelihood configuration must be typed.")
-    if residual_bootstrap is not None and not isinstance(
-        residual_bootstrap,
-        ResidualBootstrapConfig,
-    ):
-        raise TypeError("Residual bootstrap configuration must be typed.")
     allowed_coordinates = fit_uncertainty_coordinates(parameters, datasets)
     allowed_set = set(allowed_coordinates)
     allowed_display = {item.display_name for item in allowed_coordinates}
@@ -905,7 +855,7 @@ class _FitDispatchCompilation:
     fixed_by_dataset: tuple[tuple[str, tuple[tuple[str, float], ...]], ...]
     ordinary_dataset_overrides: tuple[FitDatasetParameterOverrides, ...]
     candidate_names: tuple[str, ...]
-    ordinary_optimizer_layout: FitParameterLayout | None
+    ordinary_optimizer_layout: FitParameterLayout
     ordinary_centred_variables: tuple[FitCentredFixedEffectsParamSpec, ...]
 
 
@@ -936,10 +886,6 @@ class FitSetupSnapshot:
     profile_likelihood: ProfileLikelihoodConfig | None = None
     residual_bootstrap: ResidualBootstrapConfig | None = None
     def __post_init__(self) -> None:
-        if not isinstance(self.origin, FitOriginSnapshot):
-            raise TypeError("snapshot origin must be FitOriginSnapshot.")
-        if not isinstance(self.defaults, FitDefaults):
-            raise TypeError("snapshot defaults must be FitDefaults.")
         object.__setattr__(self, "solver", validate_fit_solver(self.solver))
         object.__setattr__(
             self,
@@ -950,29 +896,6 @@ class FitSetupSnapshot:
         parameters = tuple(self.parameters)
         initials = tuple(self.initials)
         shared_initial_groups = tuple(self.shared_initial_groups)
-        if any(
-            not isinstance(item, FitDatasetLocalSettings)
-            for item in datasets
-        ):
-            raise TypeError(
-                "Fit snapshot datasets must be FitDatasetLocalSettings values."
-            )
-        if any(
-            not isinstance(item, FitParameterVariable)
-            for item in parameters
-        ):
-            raise TypeError(
-                "Fit snapshot parameters must be FitParameterVariable values."
-            )
-        if any(
-            not isinstance(item, FitInitialVariable)
-            for item in initials
-        ):
-            raise TypeError(
-                "Fit snapshot initials must be FitInitialVariable values."
-            )
-        if any(not isinstance(item, FitSharedInitialGroup) for item in shared_initial_groups):
-            raise TypeError("Fit snapshot shared initial groups must be typed.")
         dataset_ids = [item.dataset_id for item in datasets]
         parameter_names = [item.name for item in parameters]
         initial_keys = [(item.set_id, item.species) for item in initials]
@@ -1189,8 +1112,6 @@ def create_initial_fit_setup(origin: FitOriginSnapshot) -> FitSetupSnapshot:
 def capture_fit_origin(
     document: ProjectDocument,
     tab_id: str,
-    *,
-    dataset_ids: Iterable[str] | None = None,
 ) -> FitOriginSnapshot:
     """Copy mapped dataset science from one exact tab."""
     if not isinstance(document, ProjectDocument):
@@ -1198,23 +1119,9 @@ def capture_fit_origin(
     tab = document.tab(tab_id)
     if not isinstance(tab.prepared_dsl, PreparedDslRequestSet):
         raise ValueError("Fit requires an accepted visible mechanism.")
-    selected_dataset_ids = (
-        None
-        if dataset_ids is None
-        else frozenset(
-            str(dataset_id)
-            for dataset_id in dataset_ids
-            if str(dataset_id).strip()
-        )
-    )
     mapped: list[FitMappedDatasetSnapshot] = []
     for dataset_id, link in tab.dataset_links:
         if link.set_id is None:
-            continue
-        if (
-            selected_dataset_ids is not None
-            and dataset_id not in selected_dataset_ids
-        ):
             continue
         dataset = document.dataset(dataset_id)
         initial_set = tab.initial_condition_set(link.set_id)
@@ -1250,11 +1157,9 @@ def capture_fit_origin(
                 set_name=initial_set.name,
                 initial_values=canonical_initial_values(tab, initial_set.set_id),
                 observations=tuple(observations),
-                resolved_t_start=resolve_fit_t_start(
-                    tab,
-                    initial_set.set_id,
-                    label=f"Fit snapshot for dataset {dataset.dataset_id!r}",
-                ),
+                resolved_t_start=tab.resolved_execution_settings(
+                    initial_set.set_id
+                ).t_start,
             )
         )
     return FitOriginSnapshot(

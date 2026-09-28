@@ -61,6 +61,8 @@ from kindred.core.fitting_evaluation import (
     FITTING_PARAM_ORIGIN_OPTIMIZER_DATASET,
     FITTING_PARAM_ORIGIN_OPTIMIZER_SHARED,
 )
+from kindred.core.project_presentation_state import SimulationSeriesAxisSelection
+from kindred.core.result_curve_projection import alignment_rows
 from kindred.core.result_repository import SimulationResultValue
 from kindred.core.simulator.solver_types import SimulationCancellationControl
 from kindred.core.simulation_failure import (
@@ -262,6 +264,29 @@ def _decode_log10_physical(raw_value: object, *, coordinate: str) -> float:
     return float(decoded)
 
 
+def _decode_admitted_physical(
+    raw_value: float,
+    *,
+    encoded: tuple[float, float, float],
+    physical: tuple[float, float, float],
+    coordinate: str,
+) -> float:
+    """Decode one Log10 value; admitted starts and bounds decode exactly.
+
+    ``encoded``/``physical`` hold (start, lower, upper).  Inside the optimizer
+    box the decoded value is clamped to the admitted bounds, which only ever
+    corrects floating-point rounding; values outside stay for rejection.
+    """
+
+    for encoded_value, physical_value in zip(encoded, physical):
+        if raw_value == encoded_value:
+            return float(physical_value)
+    decoded = _decode_log10_physical(raw_value, coordinate=coordinate)
+    if encoded[1] <= raw_value <= encoded[2]:
+        return min(max(decoded, float(physical[1])), float(physical[2]))
+    return decoded
+
+
 def _raise_if_fitting_cancelled(cancellation_check: Optional[Callable[[], bool]]) -> None:
     if cancellation_check is not None and cancellation_check():
         raise FittingCancelled()
@@ -348,14 +373,6 @@ class DatasetFitInfo:
     residuals: np.ndarray
     weighted_residuals: np.ndarray
     model_series: Mapping[str, np.ndarray]
-    model_x_by_species: Mapping[str, np.ndarray]
-    model_segment_ids: Mapping[str, np.ndarray]
-    model_segment_keys: Mapping[str, tuple[str, ...]]
-    model_discontinuity_ids: Mapping[str, np.ndarray]
-    model_selection_provenance: Mapping[str, tuple[str, ...]]
-    model_observation_ids: Mapping[str, tuple[str, ...]]
-    model_raw_columns: Mapping[str, tuple[str, ...]]
-    model_source_rows: Mapping[str, tuple[int, ...]]
     x_projection: ParametricProjection | None
 
     def __post_init__(self) -> None:
@@ -369,19 +386,9 @@ class DatasetFitInfo:
             "r_squared_by_series",
             MappingProxyType(dict(self.r_squared_by_series)),
         )
-        for name in (
-            "model_series",
-            "model_x_by_species",
-            "model_segment_ids",
-            "model_segment_keys",
-            "model_discontinuity_ids",
-            "model_selection_provenance",
-            "model_observation_ids",
-            "model_raw_columns",
-            "model_source_rows",
-        ):
-            values = getattr(self, name)
-            object.__setattr__(self, name, MappingProxyType(dict(values)))
+        object.__setattr__(
+            self, "model_series", MappingProxyType(dict(self.model_series)),
+        )
 
         if self.residuals.size != self.weighted_residuals.size:
             raise ValueError("Dataset fit residual blocks must have equal counts.")
@@ -783,18 +790,8 @@ def _select_fit_rows(
     segment_ids: np.ndarray,
     segment_keys: Sequence[str],
     discontinuity_ids: np.ndarray,
-) -> tuple[
-    np.ndarray,
-    np.ndarray,
-    np.ndarray,
-    tuple[str, ...],
-    np.ndarray,
-    tuple[str, ...],
-    tuple[str, ...],
-    tuple[str, ...],
-    tuple[int, ...],
-]:
-    """Align one time-based Y series and preserve its row identity."""
+) -> np.ndarray:
+    """Align one time-based Y series to its admitted observation rows."""
 
     obs_t = np.asarray(observation_time, dtype=float).reshape(-1)
     rows = tuple(int(value) for value in source_rows)
@@ -820,18 +817,7 @@ def _select_fit_rows(
         segment_keys,
         np.asarray(discontinuity_ids, dtype=np.int64),
     )
-    selected_x = obs_t.copy()
-    return (
-        selected_x,
-        np.asarray(selected[0], dtype=float),
-        np.asarray(selected[1], dtype=np.int64),
-        tuple(selected[2]),
-        np.asarray(selected[3], dtype=np.int64),
-        tuple(selected[4]),
-        tuple(raw_id for _row in rows),
-        tuple(raw_name for _row in rows),
-        rows,
-    )
+    return np.asarray(selected[0], dtype=float)
 
 
 def _objective_dataset_weight_multiplier(weight: float) -> float:
@@ -941,6 +927,11 @@ class FitParameterLayout:
     x0: np.ndarray
     lower: np.ndarray
     upper: np.ndarray
+    # Admitted physical start and bounds per optimizer index, so admitted
+    # values decode exactly rather than through 10**log10(value).
+    physical_x0: np.ndarray
+    physical_lower: np.ndarray
+    physical_upper: np.ndarray
     centred_var_order: tuple[FitCentredFixedEffectsParamSpec, ...] = ()
     centred_overall_index: Mapping[str, int] = field(default_factory=dict)
     centred_deviation_index: Mapping[tuple[str, str], int] = field(default_factory=dict)
@@ -1024,7 +1015,7 @@ class FitParameterLayout:
                 }
             ),
         )
-        for name in ("x0", "lower", "upper"):
+        for name in ("x0", "lower", "upper", "physical_x0", "physical_lower", "physical_upper"):
             values = np.asarray(getattr(self, name), dtype=float).reshape(-1).copy()
             values.setflags(write=False)
             object.__setattr__(self, name, values)
@@ -1110,10 +1101,40 @@ class FitParameterLayout:
                     stage="centred_fixed_effects_domain",
                 )
             return value
-        return (
-            _decode_log10_physical(value, coordinate=identity.display_name)
-            if self.coordinate_log10(identity)
-            else value
+        return self._decode_index(
+            self.coordinate_index(identity),
+            value,
+            log10=self.coordinate_log10(identity),
+            coordinate=identity.display_name,
+        )
+
+    def _decode_index(
+        self, index: int, raw_value: float, *, log10: bool, coordinate: str,
+    ) -> float:
+        if not log10:
+            return float(raw_value)
+        return _decode_admitted_physical(
+            float(raw_value),
+            encoded=(float(self.x0[index]), float(self.lower[index]), float(self.upper[index])),
+            physical=(
+                float(self.physical_x0[index]),
+                float(self.physical_lower[index]),
+                float(self.physical_upper[index]),
+            ),
+            coordinate=coordinate,
+        )
+
+    def _centred_physical_value(
+        self, spec: FitCentredFixedEffectsParamSpec, dataset_id: str, raw_value: float,
+    ) -> float:
+        if not spec.log10:
+            return float(raw_value)
+        start = float(dict(spec.initial_values)[dataset_id])
+        return _decode_admitted_physical(
+            float(raw_value),
+            encoded=(math.log10(start), math.log10(spec.minimum), math.log10(spec.maximum)),
+            physical=(start, float(spec.minimum), float(spec.maximum)),
+            coordinate=spec.parameter_name,
         )
 
     def _centred_raw_values_for_spec(
@@ -1122,17 +1143,35 @@ class FitParameterLayout:
         vector: np.ndarray,
     ) -> tuple[float, dict[str, float]]:
         overall_index = self.centred_overall_index[spec.parameter_name]
-        overall_raw = float(vector[overall_index])
-        deltas: dict[str, float] = {}
-        for dataset_id in spec.dataset_ids[1:]:
-            index = self.centred_deviation_index[(spec.parameter_name, dataset_id)]
-            deltas[dataset_id] = float(vector[index])
-        reference = spec.dataset_ids[0]
-        deltas[reference] = -float(sum(deltas.values()))
-        raw_values = {
-            dataset_id: overall_raw + deltas[dataset_id]
-            for dataset_id in spec.dataset_ids
-        }
+        indices = (
+            overall_index,
+            *(
+                self.centred_deviation_index[(spec.parameter_name, dataset_id)]
+                for dataset_id in spec.dataset_ids[1:]
+            ),
+        )
+        block = tuple(float(vector[index]) for index in indices)
+        overall_raw = block[0]
+        if block == tuple(float(self.x0[index]) for index in indices):
+            # The admitted start vector reconstructs the admitted starts exactly.
+            return overall_raw, {
+                str(dataset_id): (math.log10(value) if spec.log10 else float(value))
+                for dataset_id, value in spec.initial_values
+            }
+        deltas = dict(zip(spec.dataset_ids[1:], block[1:], strict=True))
+        deltas[spec.dataset_ids[0]] = -math.fsum(block[1:])
+        low = float(self.lower[overall_index])
+        high = float(self.upper[overall_index])
+        # Values within the reconstruction's rounding of a bound settle on it.
+        rounding = 4.0 * np.finfo(float).eps * math.fsum(abs(value) for value in block)
+        raw_values: dict[str, float] = {}
+        for dataset_id in spec.dataset_ids:
+            raw = overall_raw + deltas[dataset_id]
+            if abs(raw - low) <= rounding:
+                raw = low
+            elif abs(raw - high) <= rounding:
+                raw = high
+            raw_values[dataset_id] = raw
         return overall_raw, raw_values
 
     def validate_optimizer_vector(self, vector: np.ndarray) -> None:
@@ -1180,11 +1219,8 @@ class FitParameterLayout:
             if dataset_id not in spec.dataset_ids:
                 continue
             _overall_raw, raw_values = self._centred_raw_values_for_spec(spec, vector)
-            raw_value = raw_values[dataset_id]
-            values[spec.parameter_name] = (
-                _decode_log10_physical(raw_value, coordinate=spec.parameter_name)
-                if spec.log10
-                else float(raw_value)
+            values[spec.parameter_name] = self._centred_physical_value(
+                spec, dataset_id, raw_values[dataset_id],
             )
         return values
 
@@ -1197,10 +1233,11 @@ class FitParameterLayout:
         settlements: list[CentredFixedEffectsSettlement] = []
         for spec in self.centred_var_order:
             overall_raw, raw_values = self._centred_raw_values_for_spec(spec, values)
-            overall_decoded = (
-                _decode_log10_physical(overall_raw, coordinate=spec.parameter_name)
-                if spec.log10
-                else float(overall_raw)
+            overall_decoded = self._decode_index(
+                self.centred_overall_index[spec.parameter_name],
+                overall_raw,
+                log10=spec.log10,
+                coordinate=spec.parameter_name,
             )
             deviations = tuple(
                 CentredFixedEffectsDeviation(
@@ -1212,11 +1249,7 @@ class FitParameterLayout:
                 for dataset_id in spec.dataset_ids
             )
             decoded_dataset_values = {
-                dataset_id: (
-                    _decode_log10_physical(raw_value, coordinate=spec.parameter_name)
-                    if spec.log10
-                    else float(raw_value)
-                )
+                dataset_id: self._centred_physical_value(spec, dataset_id, raw_value)
                 for dataset_id, raw_value in raw_values.items()
             }
             settlements.append(
@@ -1233,14 +1266,10 @@ class FitParameterLayout:
     def shared_param_dict_from_vector(self, vector: np.ndarray) -> Dict[str, float]:
         out: Dict[str, float] = {}
         for idx, name in enumerate(self.param_names):
-            raw_val = float(vector[idx])
-            if self.shared_log10.get(name):
-                out[name] = _decode_log10_physical(
-                    raw_val,
-                    coordinate=name,
-                )
-            else:
-                out[name] = raw_val
+            out[name] = self._decode_index(
+                idx, float(vector[idx]),
+                log10=bool(self.shared_log10.get(name)), coordinate=name,
+            )
         return out
 
     def dataset_var_params_for_dataset(self, ds_id: str, vector: np.ndarray) -> Dict[str, float]:
@@ -1249,14 +1278,11 @@ class FitParameterLayout:
         if not var_map:
             return out
         for var_name, idx in var_map.items():
-            raw_val = float(vector[idx])
-            if self.dataset_var_log10.get((ds_id, var_name)):
-                out[var_name] = _decode_log10_physical(
-                    raw_val,
-                    coordinate=f"{ds_id}::{var_name}",
-                )
-            else:
-                out[var_name] = raw_val
+            out[var_name] = self._decode_index(
+                idx, float(vector[idx]),
+                log10=bool(self.dataset_var_log10.get((ds_id, var_name))),
+                coordinate=f"{ds_id}::{var_name}",
+            )
         return out
 
     def coupled_params_for_dataset(
@@ -1269,14 +1295,9 @@ class FitParameterLayout:
             if ds_id not in spec.dataset_ids:
                 continue
             index = self.coupled_var_index[spec.variable_id]
-            raw_value = float(vector[index])
-            out[spec.parameter_name] = (
-                _decode_log10_physical(
-                    raw_value,
-                    coordinate=spec.variable_id,
-                )
-                if spec.log10
-                else raw_value
+            out[spec.parameter_name] = self._decode_index(
+                index, float(vector[index]),
+                log10=spec.log10, coordinate=spec.variable_id,
             )
         return out
 
@@ -1305,6 +1326,8 @@ def build_parameter_layout_for_dataset_ids(
 
     shared_initials: List[float] = []
     shared_log10: Dict[str, bool] = {}
+    # (start, lower, upper) admitted physical values per optimizer index.
+    shared_physical: List[tuple[float, float, float]] = []
     for name in param_names:
         flag = bool(log10_params_norm.get(name, False))
         shared_log10[name] = flag
@@ -1345,6 +1368,7 @@ def build_parameter_layout_for_dataset_ids(
 
     centred_initials: list[float] = []
     centred_bounds: list[tuple[float, float]] = []
+    centred_physical: list[tuple[float, float, float]] = []
     centred_overall_index: dict[str, int] = {}
     centred_deviation_index: dict[tuple[str, str], int] = {}
     for spec in centred_order:
@@ -1359,17 +1383,25 @@ def build_parameter_layout_for_dataset_ids(
             ],
             dtype=float,
         )
-        overall_raw = float(np.mean(raw_starts))
-        centred_initials.append(overall_raw)
         low = math.log10(spec.minimum) if spec.log10 else float(spec.minimum)
         high = math.log10(spec.maximum) if spec.log10 else float(spec.maximum)
+        # The mean of in-bound starts can round one ulp past a bound.
+        overall_raw = min(max(float(np.mean(raw_starts)), low), high)
+        centred_initials.append(overall_raw)
         centred_bounds.append((low, high))
+        overall_physical = (
+            min(max(_decode_log10_physical(overall_raw, coordinate=spec.parameter_name),
+                    float(spec.minimum)), float(spec.maximum))
+            if spec.log10 else overall_raw
+        )
+        centred_physical.append((overall_physical, float(spec.minimum), float(spec.maximum)))
         overall_index = len(param_names) + len(centred_initials) - 1
         centred_overall_index[spec.parameter_name] = overall_index
         for dataset_id, raw_start in zip(spec.dataset_ids[1:], raw_starts[1:], strict=True):
             delta = float(raw_start - overall_raw)
             centred_initials.append(delta)
             centred_bounds.append((low - high, high - low))
+            centred_physical.append((delta, low - high, high - low))
             centred_deviation_index[(spec.parameter_name, dataset_id)] = (
                 len(param_names) + len(centred_initials) - 1
             )
@@ -1379,6 +1411,7 @@ def build_parameter_layout_for_dataset_ids(
     dataset_var_inits: List[float] = []
     dataset_var_bounds: List[Tuple[float, float]] = []
     dataset_var_log10: Dict[Tuple[str, str], bool] = {}
+    dataset_var_physical: List[tuple[float, float, float]] = []
 
     overrides_by_id = {item.dataset_id: item for item in dataset_overrides}
     for ds_id in normalized_dataset_ids:
@@ -1411,6 +1444,7 @@ def build_parameter_layout_for_dataset_ids(
             else:
                 dataset_var_inits.append(init_val)
                 dataset_var_bounds.append((min_val, max_val))
+            dataset_var_physical.append((init_val, min_val, max_val))
             dataset_var_log10[(ds_id, param_name)] = log10_flag
 
     coupled_order = sorted(coupled_variables, key=lambda item: item.variable_id)
@@ -1458,6 +1492,7 @@ def build_parameter_layout_for_dataset_ids(
         else:
             shared_lower.append(low)
             shared_upper.append(high)
+        shared_physical.append((float(shared_params[name]), low, high))
 
     coupled_bounds = [
         (
@@ -1480,6 +1515,13 @@ def build_parameter_layout_for_dataset_ids(
         + [b[1] for b in coupled_bounds],
         dtype=float,
     )
+    physical = np.array(
+        shared_physical
+        + centred_physical
+        + dataset_var_physical
+        + [(float(item.initial), float(item.minimum), float(item.maximum)) for item in coupled_order],
+        dtype=float,
+    ).reshape(-1, 3)
     coupled_start = len(param_names) + len(centred_initials) + len(dataset_var_inits)
     coupled_index = {
         item.variable_id: coupled_start + index
@@ -1497,6 +1539,9 @@ def build_parameter_layout_for_dataset_ids(
         x0=x0,
         lower=lower,
         upper=upper,
+        physical_x0=physical[:, 0],
+        physical_lower=physical[:, 1],
+        physical_upper=physical[:, 2],
         centred_var_order=centred_order,
         centred_overall_index=centred_overall_index,
         centred_deviation_index=centred_deviation_index,
@@ -1615,19 +1660,30 @@ def _build_dataset_fit_info(
         species_list=payload.target_roster,
         target_weights=dict(payload.target_weights),
     )
+    alignment_y: dict[str, np.ndarray] = {}
     if x_name != "t":
         x_observations = _payload_x_observations(payload)
+        # Fail closed on unavailable targets before matching.
+        for name in (x_name, *payload.species_list):
+            fit_result_target_values(simulation, name, dataset_id=dataset_id)
+        # Match along the same curve the Fit plot draws: known pre-boundary
+        # endpoints included, instantaneous jumps never crossed.
+        alignment_time, alignment_x, alignment_y, alignment_regions = alignment_rows(
+            simulation,
+            SimulationSeriesAxisSelection(x_name),
+            tuple((name, SimulationSeriesAxisSelection(name)) for name in payload.species_list),
+        )
         try:
             x_projection = align_parametric(
                 observed_x=x_observations["x"],
                 source_rows=x_observations["source_rows"],
-                model_time=sim_time,
-                model_x=fit_result_target_values(simulation, x_name, dataset_id=dataset_id),
-                segment_ids=segment_ids,
-                segment_keys=segment_keys,
-                discontinuity_ids=discontinuity_ids,
+                model_time=alignment_time,
+                model_x=alignment_x,
+                segment_ids=alignment_regions,
+                segment_keys=tuple(str(region) for region in alignment_regions),
+                discontinuity_ids=np.zeros_like(alignment_regions),
                 observations=payload.observations,
-                model_y={name: fit_result_target_values(simulation, name, dataset_id=dataset_id) for name in payload.species_list},
+                model_y=alignment_y,
                 multipliers=target_multipliers,
                 dataset_label=dataset_id,
                 x_name=x_name,
@@ -1648,14 +1704,6 @@ def _build_dataset_fit_info(
     raw_blocks: list[np.ndarray] = []
     weighted_blocks: list[np.ndarray] = []
     model_series: dict[str, np.ndarray] = {}
-    model_x: dict[str, np.ndarray] = {}
-    model_segment: dict[str, np.ndarray] = {}
-    model_keys: dict[str, tuple[str, ...]] = {}
-    model_discontinuity: dict[str, np.ndarray] = {}
-    model_selection: dict[str, tuple[str, ...]] = {}
-    model_observation: dict[str, tuple[str, ...]] = {}
-    model_raw_columns: dict[str, tuple[str, ...]] = {}
-    model_source_rows: dict[str, tuple[int, ...]] = {}
     r_squared: dict[str, FitMetric] = {}
     for species_name in sorted(payload.species_list):
         _raise_if_fitting_cancel_requested(cancellation_control)
@@ -1664,7 +1712,7 @@ def _build_dataset_fit_info(
         y_exp = np.asarray(species_obs["y"], dtype=float).reshape(-1)
         model_values = fit_result_target_values(simulation, species_name, dataset_id=dataset_id)
         if x_name == "t":
-            selected = _select_fit_rows(
+            y_sim = _select_fit_rows(
                 model_y=np.asarray(model_values, dtype=float),
                 sim_time=sim_time,
                 observation_time=obs_t,
@@ -1680,20 +1728,9 @@ def _build_dataset_fit_info(
             y_projection = x_projection.subset(species_obs["source_rows"])
             y_sim = project_parametric_y(
                 projection=y_projection,
-                model_y=np.asarray(model_values, dtype=float),
+                model_y=alignment_y[species_name],
             )
-            selected = (
-                y_projection.selected_model_x,
-                y_sim,
-                y_projection.segment_ids,
-                y_projection.segment_keys,
-                y_projection.discontinuity_ids,
-                y_projection.sample_kinds,
-                tuple(species_obs["raw_observation_id"] for _ in species_obs["source_rows"]),
-                tuple(species_obs["raw_column"] for _ in species_obs["source_rows"]),
-                tuple(int(row) for row in species_obs["source_rows"]),
-            )
-        y_sim = np.asarray(selected[1], dtype=float).reshape(-1)
+        y_sim = np.asarray(y_sim, dtype=float).reshape(-1)
         if y_sim.size != y_exp.size or not np.all(np.isfinite(y_sim)):
             raise _DatasetFitUnavailable(ScientificUnavailable(
                 producer="global_fit_objective",
@@ -1712,14 +1749,6 @@ def _build_dataset_fit_info(
         raw_blocks.append(raw_residual)
         weighted_blocks.append(weighted)
         model_series[species_name] = y_sim
-        model_x[species_name] = np.asarray(selected[0], dtype=float)
-        model_segment[species_name] = np.asarray(selected[2], dtype=np.int64)
-        model_keys[species_name] = tuple(selected[3])
-        model_discontinuity[species_name] = np.asarray(selected[4], dtype=np.int64)
-        model_selection[species_name] = tuple(selected[5])
-        model_observation[species_name] = tuple(selected[6])
-        model_raw_columns[species_name] = tuple(selected[7])
-        model_source_rows[species_name] = tuple(selected[8])
         r_squared[str(species_name)] = r_squared_metric(y_exp, raw_residual)
 
     if x_projection is not None:
@@ -1739,14 +1768,8 @@ def _build_dataset_fit_info(
     weighted_residuals = np.concatenate(weighted_blocks)
     residuals.setflags(write=False)
     weighted_residuals.setflags(write=False)
-    for values in (
-        model_series,
-        model_x,
-        model_segment,
-        model_discontinuity,
-    ):
-        for array in values.values():
-            array.setflags(write=False)
+    for array in model_series.values():
+        array.setflags(write=False)
     dataset_metrics = fit_error_metrics(weighted_residuals)
     return DatasetFitInfo(
         dataset_id=dataset_id,
@@ -1760,14 +1783,6 @@ def _build_dataset_fit_info(
         residuals=residuals,
         weighted_residuals=weighted_residuals,
         model_series=model_series,
-        model_x_by_species=model_x,
-        model_segment_ids=model_segment,
-        model_segment_keys=model_keys,
-        model_discontinuity_ids=model_discontinuity,
-        model_selection_provenance=model_selection,
-        model_observation_ids=model_observation,
-        model_raw_columns=model_raw_columns,
-        model_source_rows=model_source_rows,
         x_projection=x_projection,
     )
 

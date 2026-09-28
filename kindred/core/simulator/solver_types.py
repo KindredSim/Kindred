@@ -61,7 +61,7 @@ class SimulationScientificUnavailability:
             raise TypeError("Simulation unavailability details must be a mapping.")
         object.__setattr__(self, "producer", producer)
         object.__setattr__(self, "stage", stage)
-        object.__setattr__(self, "details", _freeze_solver_value(dict(self.details)))
+        object.__setattr__(self, "details", freeze_retained_value(dict(self.details)))
 
 
 class _SimulationScientificUnavailabilitySignal(RuntimeError):
@@ -74,15 +74,15 @@ class _SimulationScientificUnavailabilitySignal(RuntimeError):
         super().__init__("scientific simulation unavailable")
 
 
-def _freeze_solver_value(value: Any) -> Any:
+def freeze_retained_value(value: Any) -> Any:
     if isinstance(value, Mapping):
         return MappingProxyType(
-            {str(key): _freeze_solver_value(item) for key, item in value.items()}
+            {str(key): freeze_retained_value(item) for key, item in value.items()}
         )
     if isinstance(value, (list, tuple)):
-        return tuple(_freeze_solver_value(item) for item in value)
+        return tuple(freeze_retained_value(item) for item in value)
     if isinstance(value, (set, frozenset)):
-        return frozenset(_freeze_solver_value(item) for item in value)
+        return frozenset(freeze_retained_value(item) for item in value)
     if isinstance(value, np.ndarray):
         array = np.asarray(value).copy()
         array.setflags(write=False)
@@ -111,14 +111,6 @@ class SimulationPresentationBoundary:
             names = current_names
         object.__setattr__(self, "time", time)
         object.__setattr__(self, "states", states)
-
-    @property
-    def pre_state(self) -> tuple[tuple[str, float], ...]:
-        return self.states[0].concentrations
-
-    @property
-    def post_state(self) -> tuple[tuple[str, float], ...]:
-        return self.states[-1].concentrations
 
 
 def _finite_state_pairs(
@@ -221,7 +213,7 @@ class SimulationRequest:
             object.__setattr__(
                 self,
                 "grid",
-                _freeze_solver_value(normalized_grid),
+                freeze_retained_value(normalized_grid),
             )
         if self.species_names is not None:
             object.__setattr__(

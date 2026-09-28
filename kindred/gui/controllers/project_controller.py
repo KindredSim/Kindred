@@ -26,11 +26,11 @@ from kindred.gui.dataset_import_staging import DatasetImportStaging
 from kindred.gui.fit_session_owner import FitSessionOwner
 from kindred.gui.workspace_tab_registry import WorkspaceTabRegistry
 from kindred.io.kin_archive_store import KinArchiveStore
+from kindred.io.paths import same_local_path
 
 logger = logging.getLogger(__name__)
 
 __all__ = [
-    "AuthoringDiscardMode",
     "ProjectController",
     "ProjectTransientState",
 ]
@@ -53,25 +53,6 @@ class ProjectTransientState:
     active_scan: bool = False
     active_calculator: bool = False
     active_spreadsheet: bool = False
-
-    def __post_init__(self) -> None:
-        for field_name in (
-            "reactions_draft",
-            "notes_draft",
-            "initial_condition_drafts",
-            "invalid_initial_conditions",
-            "run_defaults_drafts",
-            "slider_drafts",
-            "active_run_or_preview",
-            "active_fit",
-            "active_import",
-            "active_xlsx_export",
-            "active_scan",
-            "active_calculator",
-            "active_spreadsheet",
-        ):
-            if type(getattr(self, field_name)) is not bool:
-                raise TypeError(f"{field_name} must be bool.")
 
     @property
     def has_authoring_edits(self) -> bool:
@@ -124,12 +105,6 @@ class _DispositionChoice(Enum):
     CANCEL = "cancel"
 
 
-class AuthoringDiscardMode(Enum):
-    """Exact scope for one direct Integration authoring-discard action."""
-
-    ALL_UNACCEPTED = "all_unaccepted"
-
-
 @dataclass(frozen=True, slots=True)
 class _DispositionResult:
     content_token: ProjectContentToken
@@ -142,7 +117,7 @@ class ProjectController(QtCore.QObject):
     """The sole Save/Save As/Close disposition owner."""
 
     projectStateChanged = QtCore.Signal(bool)
-    closePendingChanged = QtCore.Signal(bool)
+    closeStarted = QtCore.Signal()
     nativeCloseAuthorized = QtCore.Signal()
 
     def __init__(
@@ -186,7 +161,7 @@ class ProjectController(QtCore.QObject):
             ProjectContentToken | None,
         ],
         inspect_transient_state: Callable[[], ProjectTransientState],
-        discard_authoring: Callable[[AuthoringDiscardMode], None],
+        discard_authoring: Callable[[], None],
         discard_slider_drafts: Callable[[], None],
     ) -> None:
         super().__init__(parent_widget)
@@ -459,29 +434,14 @@ class ProjectController(QtCore.QObject):
 
     def _apply_discard(self, result: _DispositionResult) -> None:
         if result.discard_all_authoring:
-            self._discard_authoring(AuthoringDiscardMode.ALL_UNACCEPTED)
+            self._discard_authoring()
         if result.discard_slider_drafts:
             self._discard_slider_drafts()
-
-    @staticmethod
-    def _same_canonical_path(
-        first: str | os.PathLike[str],
-        second: str | os.PathLike[str] | None,
-    ) -> bool:
-        if second is None:
-            return False
-        first_path = os.path.normcase(
-            os.path.realpath(os.path.abspath(os.fsdecode(os.fspath(first))))
-        )
-        second_path = os.path.normcase(
-            os.path.realpath(os.path.abspath(os.fsdecode(os.fspath(second))))
-        )
-        return first_path == second_path
 
     def is_current_project_path(self, path: str | os.PathLike[str]) -> bool:
         """Return whether ``path`` resolves to the active project archive."""
 
-        return self._same_canonical_path(path, self._session.current_path)
+        return same_local_path(path, self._session.current_path)
 
     def _replace_project(
         self,
@@ -853,7 +813,6 @@ class ProjectController(QtCore.QObject):
                 "changed before save publication."
             )
             return None
-        self._discard_authoring(AuthoringDiscardMode.ALL_UNACCEPTED)
         status = f"Saved project: {absolute_path}"
         try:
             self._config.record_recent_project(absolute_path)
@@ -925,7 +884,7 @@ class ProjectController(QtCore.QObject):
             )
         self._close_started = True
         self._close_pending = True
-        self.closePendingChanged.emit(True)
+        self.closeStarted.emit()
         try:
             self._simulation_jobs.cancel_for_application_close()
         except Exception:
@@ -1001,7 +960,6 @@ class ProjectController(QtCore.QObject):
         if not self._close_pending or self._native_close_authorized:
             return
         self._close_pending = False
-        self.closePendingChanged.emit(False)
         self._native_close_authorized = True
         self.nativeCloseAuthorized.emit()
 

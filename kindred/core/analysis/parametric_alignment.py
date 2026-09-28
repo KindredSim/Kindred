@@ -61,9 +61,6 @@ class ParametricProjection:
     source_rows: tuple[int, ...]
     selected_model_x: np.ndarray
     delta_x: np.ndarray
-    segment_ids: np.ndarray
-    segment_keys: tuple[str, ...]
-    discontinuity_ids: np.ndarray
     left_rows: np.ndarray
     right_rows: np.ndarray
     fractions: np.ndarray
@@ -78,17 +75,12 @@ class ParametricProjection:
     def size(self) -> int:
         return len(self.source_rows)
 
-    @property
-    def sample_kinds(self) -> tuple[str, ...]:
-        return tuple("direct" if f == 0.0 or f == 1.0 else "interpolated"
-                     for f in self.fractions)
-
     def subset(self, source_rows: Sequence[int]) -> "ParametricProjection":
         positions = {row: index for index, row in enumerate(self.source_rows)}
         indexes = [positions[row] for row in source_rows]
         return ParametricProjection(**{
             field.name: (tuple(getattr(self, field.name)[i] for i in indexes)
-                         if field.name in {"source_rows", "segment_keys"}
+                         if field.name == "source_rows"
                          else getattr(self, field.name)[indexes])
             for field in fields(self)
         })
@@ -177,9 +169,6 @@ def align_parametric(
     return ParametricProjection(
         source_rows=tuple(source_rows), selected_model_x=selected_x,
         delta_x=selected_x - observed_x,
-        segment_ids=segments[selected_left],
-        segment_keys=tuple(keys[i] for i in selected_left),
-        discontinuity_ids=discontinuities[selected_left],
         left_rows=selected_left, right_rows=selected_right, fractions=fractions,
     )
 

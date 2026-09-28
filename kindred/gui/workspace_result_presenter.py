@@ -47,7 +47,7 @@ from kindred.core.simulator.dsl_parse import PreparedDslRequestSet
 from kindred.gui.curve_copy_headers import observable_copy_definitions
 from kindred.gui.dataset_payload_snapshot import ExperimentalLayerInput
 from kindred.gui.plot_config import AxisSelectionCandidate
-from kindred.gui.result_curve_projection import ProjectedCurveChunk, physical_curve_chunks
+from kindred.core.result_curve_projection import ProjectedCurveChunk, physical_curve_chunks
 
 __all__ = [
     "InteractiveDisplayCurve",
@@ -117,15 +117,10 @@ class InteractiveDisplayCurve:
             if self.discontinuity_ids is None
             else _readonly_display_array(self.discontinuity_ids)
         )
-        object.__setattr__(self, "key", tuple(self.key))
-        object.__setattr__(self, "label", self.label)
         object.__setattr__(self, "x", x)
         object.__setattr__(self, "y", y)
         object.__setattr__(self, "sample_time", _readonly_display_array(self.sample_time))
-        object.__setattr__(self, "color", self.color)
-        object.__setattr__(self, "opacity", float(self.opacity))
         object.__setattr__(self, "segment_ids", segment_ids)
-        object.__setattr__(self, "segment_keys", self.segment_keys)
         object.__setattr__(self, "discontinuity_ids", discontinuity_ids)
 
 
@@ -459,126 +454,66 @@ class ResultDataBlock:
         return f"{name} [{unit.symbol}]" if unit is not None else name
 
     def __post_init__(self) -> None:
-        if not isinstance(self.kind, ResultLayerKind):
-            raise TypeError("kind must be a ResultLayerKind.")
-        block_id = self.block_id
-        if self.kind is ResultLayerKind.EXPERIMENTAL:
-            if not isinstance(block_id, ExperimentalAxisSelection):
-                raise TypeError("experimental data blocks require an experimental axis.")
-        elif (
-            type(block_id) is not str or not block_id.strip()
-        ):
-            raise TypeError("simulation data blocks require a nonblank set ID.")
+        # Blocks are built only by this module's composers; keep the genuine
+        # cross-field invariants and immutability, not generic type checks.
         time = self.t
-        normalized: list[tuple[str, np.ndarray]] = []
         names: set[str] = set()
-        for raw_name, raw_values in self.series:
-            name = _required_id(raw_name, "data series name")
+        for name, values in self.series:
             if name in names:
                 raise ValueError(f"data block contains duplicate series {name!r}.")
-            values = raw_values
             if values.size != time.size and not (
                 self.kind is ResultLayerKind.EXPERIMENTAL and time.size == 0
             ):
                 raise ValueError(f"data series {name!r} length does not match time.")
             names.add(name)
-            normalized.append((name, values))
-        if not normalized:
+        if not names:
             raise ValueError("data block requires at least one series.")
-        series_axes = tuple(
-            (_required_id(name, "data axis series name"), _axis_selection(selection, field="data series axis"))
-            for name, selection in self.series_axes
-        )
-        if tuple(name for name, _ in series_axes) != tuple(name for name, _ in normalized):
+        series_axes = tuple(self.series_axes)
+        if tuple(name for name, _ in series_axes) != tuple(name for name, _ in self.series):
             raise ValueError("data series axes must align exactly with data series.")
         if len({selection for _, selection in series_axes}) != len(series_axes):
             raise ValueError("data series axis identities must be unique.")
-        x_axis = _axis_selection(self.x_axis, field="data X axis")
-        result = self.result
         if self.kind is ResultLayerKind.EXPERIMENTAL:
-            if result is not None:
+            if self.result is not None:
                 raise ValueError("experimental data blocks prohibit repository entries.")
             if any(value is not None for value in (self.segment_ids, self.segment_keys, self.discontinuity_ids)):
                 raise ValueError("experimental data blocks prohibit solver identity.")
-            source_row = self.source_row
-            segment_ids = segment_keys = discontinuity_ids = None
             boundaries = ()
         else:
-            if not isinstance(x_axis, (SimulationSeriesAxisSelection, VesselVolumeAxisSelection)):
-                raise TypeError("simulation data blocks require a simulation X axis.")
-            if not isinstance(result, SimulationResultValue):
-                raise TypeError("simulation data blocks require a canonical result.")
             if self.source_row is not None:
                 raise ValueError("simulation data blocks prohibit observation source_row.")
             if self.segment_ids is None or self.segment_keys is None or self.discontinuity_ids is None:
                 raise ValueError("simulation data blocks require complete executor identity.")
-            segment_ids = self.segment_ids
-            segment_keys = self.segment_keys
-            discontinuity_ids = self.discontinuity_ids
-            source_row = None
             boundaries = tuple(self.presentation_boundaries)
-            if boundaries is not result.presentation_boundaries:
+            if boundaries is not self.result.presentation_boundaries:
                 raise ValueError("simulation data blocks must retain canonical presentation boundaries.")
-        provenance: list[tuple[str, Mapping[str, object]]] = []
-        provenance_names: set[str] = set()
-        for raw_name, raw_payload in self.series_provenance:
-            name = _required_id(raw_name, "data series provenance name")
-            if name not in names or name in provenance_names:
-                raise ValueError("data series provenance must uniquely reference data.")
-            if not isinstance(raw_payload, Mapping):
-                raise TypeError("data series provenance must be a mapping.")
-            provenance_names.add(name)
-            provenance.append((name, MappingProxyType({
-                str(key): tuple(value) if isinstance(value, (list, tuple)) else value
-                for key, value in raw_payload.items()
-            })))
-        if not isinstance(self.x_provenance, Mapping):
-            raise TypeError("x_provenance must be a mapping.")
-        for name, selection in series_axes:
-            if self.kind is ResultLayerKind.EXPERIMENTAL:
-                if not isinstance(selection, ExperimentalAxisSelection):
-                    raise TypeError("experimental data series require experimental axis identity.")
-            elif not isinstance(selection, (SimulationSeriesAxisSelection, VesselVolumeAxisSelection)):
-                raise TypeError("simulation data series require simulation axis identity.")
-        colors = tuple(
-            (_required_id(name, "color series name"), _required_id(color, "data series color"))
-            for name, color in self.color_by_series
-        )
+        provenance_names = [name for name, _payload in self.series_provenance]
+        if len(provenance_names) != len(set(provenance_names)) or not names.issuperset(provenance_names):
+            raise ValueError("data series provenance must uniquely reference data.")
+        colors = tuple(self.color_by_series)
         if not names.issubset({name for name, _color in colors}):
             raise ValueError("data series colors must cover every data series.")
         if len(colors) != len({name for name, _color in colors}):
             raise ValueError("data series colors must be unique by series.")
-        opacity = float(self.opacity)
-        point_size = float(self.point_size)
-        if not np.isfinite(opacity) or not 0.0 <= opacity <= 1.0:
+        if not np.isfinite(self.opacity) or not 0.0 <= self.opacity <= 1.0:
             raise ValueError("opacity must be between zero and one.")
-        if not np.isfinite(point_size) or point_size <= 0.0:
+        if not np.isfinite(self.point_size) or self.point_size <= 0.0:
             raise ValueError("point_size must be positive.")
-        object.__setattr__(self, "block_id", block_id)
-        object.__setattr__(self, "label", _required_id(self.label, "label"))
-        object.__setattr__(self, "x_name", _required_id(self.x_name, "x_name"))
-        object.__setattr__(self, "t", time)
-        object.__setattr__(self, "series", tuple(normalized))
+        object.__setattr__(self, "series", tuple(self.series))
         object.__setattr__(self, "series_axes", series_axes)
-        object.__setattr__(self, "x_axis", x_axis)
-        object.__setattr__(self, "result", result)
-        object.__setattr__(self, "segment_ids", segment_ids)
-        object.__setattr__(self, "segment_keys", segment_keys)
-        object.__setattr__(self, "discontinuity_ids", discontinuity_ids)
-        object.__setattr__(self, "source_row", source_row)
-        object.__setattr__(self, "series_provenance", tuple(provenance))
+        object.__setattr__(self, "series_provenance", tuple(
+            (name, MappingProxyType({
+                str(key): tuple(value) if isinstance(value, (list, tuple)) else value
+                for key, value in payload.items()
+            }))
+            for name, payload in self.series_provenance
+        ))
         object.__setattr__(self, "x_provenance", MappingProxyType({
             str(key): tuple(value) if isinstance(value, (list, tuple)) else value
             for key, value in self.x_provenance.items()
         }))
         object.__setattr__(self, "color_by_series", colors)
-        object.__setattr__(self, "visible", bool(self.visible))
-        object.__setattr__(self, "dashed", bool(self.dashed))
-        object.__setattr__(self, "opacity", opacity)
-        object.__setattr__(self, "markers", bool(self.markers))
-        object.__setattr__(self, "point_size", point_size)
         object.__setattr__(self, "presentation_boundaries", boundaries)
-
 
 def _select_analysis_block(
     blocks: Sequence[ResultDataBlock],
@@ -630,6 +565,11 @@ class ResultRenderInput:
     intervention_labels_visible: bool = True
     unavailable_x_diagnostic: str | None = None
     completion_warning_details: tuple[tuple[str, tuple[str, ...]], ...] = ()
+    # Composer-resolved facts that interactive Preview composition reuses, so
+    # it never re-derives membership, colours, or the simulation X axis.
+    plot_set_labels: tuple[tuple[str, str], ...] = ()
+    color_by_axis_selection: tuple[tuple[AxisSeriesSelection, str], ...] = ()
+    simulation_x_series: AxisSeriesSelection = SimulationSeriesAxisSelection("t")
 
     def __post_init__(self) -> None:
         blocks = tuple(self.blocks)
@@ -897,7 +837,7 @@ def _data_block(
     x_axis: AxisSeriesSelection,
     y_axes: set[AxisSeriesSelection] | None = None,
 ) -> ResultDataBlock | None:
-    from kindred.gui.result_curve_projection import axis_values
+    from kindred.core.result_curve_projection import axis_values
 
     series_axis_map = dict(block.series_axes)
     if block.kind is ResultLayerKind.EXPERIMENTAL:
@@ -1243,17 +1183,29 @@ def compose_interactive_display(
     tab_id: str,
     set_id: str,
     render_input: ResultRenderInput,
+    prepared_dsl: PreparedDslRequestSet,
 ) -> InteractiveDisplayProjection | None:
-    selected_x = render_input.selected_x_series
+    # Reuse the static composer's resolved X, plot membership and colours so
+    # interactive Preview never re-derives them from whichever block exists.
+    selected_x = render_input.simulation_x_series
     if isinstance(selected_x, ExperimentalAxisSelection):
         return None
+    label = dict(render_input.plot_set_labels).get(set_id)
+    if label is None:
+        return None
     wanted = None if render_input.selected_y_uses_default_all else set(render_input.selected_y_series)
-    live = next((block for block in render_input.blocks if block.block_id == set_id
-                 and block.kind in {ResultLayerKind.EXPLICIT, ResultLayerKind.PREVIEW}), None)
+    name_colors = {
+        selection.series_name: color
+        for selection, color in render_input.color_by_axis_selection
+        if isinstance(selection, SimulationSeriesAxisSelection)
+    }
+    live = _result_block(
+        set_id=set_id, label=label, result=result, prepared_dsl=prepared_dsl,
+        kind=ResultLayerKind.PREVIEW,
+        color_by_axis_selection=dict(render_input.color_by_axis_selection),
+    )
     reference = next((block for block in render_input.blocks if block.block_id == set_id
                       and block.kind is ResultLayerKind.REFERENCE), None)
-    if live is None:
-        return None
     curves = []
     annotations = []
     sources = [(result, live, "foreground")]
@@ -1261,7 +1213,7 @@ def compose_interactive_display(
         sources.append((reference.result, reference, "ghost"))
     for value, style, role in sources:
         series = _series_tuple(value)
-        colors = dict(style.color_by_series)
+        colors = name_colors
         semantic = replace(
             style, result=value, t=value.t, sample_time=value.t, first_index=0,
             series=series, series_axes=tuple((name, SimulationSeriesAxisSelection(name)) for name, _ in series),
@@ -1603,6 +1555,9 @@ def compose_result_input(
         intervention_labels_visible=intervention_labels_visible,
         unavailable_x_diagnostic=_selected_x_unavailable_diagnostic(selected_x, unavailable_labels),
         completion_warning_details=tuple(warning_facts),
+        plot_set_labels=tuple((item.set_id, item.label) for item in visible_sets),
+        color_by_axis_selection=tuple(colors.items()),
+        simulation_x_series=simulation_x,
     )
 
 def iter_blocks_tsv_chunks(

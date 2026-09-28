@@ -13,10 +13,15 @@ from kindred.core.dataset_mapping import (
     DatasetMappingProposal,
     OccupiedSetChoice,
     allocate_initial_condition_set_name,
+    apply_dataset_mapping_batch,
 )
 from kindred.gui.ui_helpers import clamp_initial_size
 from kindred.core.datasets.foundation import RawDatasetRecord
-from kindred.core.project_document import MechanismTabDocument, canonical_species_names
+from kindred.core.project_document import (
+    MechanismTabDocument,
+    ProjectDocument,
+    canonical_species_names,
+)
 from kindred.gui.widgets.observation_mapping_widget import ObservationMappingWidget
 
 __all__ = ["DatasetMappingBatchDialog"]
@@ -38,6 +43,7 @@ class DatasetMappingBatchDialog(QtWidgets.QDialog):
     def __init__(
         self,
         *,
+        document: ProjectDocument,
         records: tuple[RawDatasetRecord, ...],
         tab: MechanismTabDocument,
         model_targets: tuple[str, ...],
@@ -45,17 +51,11 @@ class DatasetMappingBatchDialog(QtWidgets.QDialog):
         parent: QtWidgets.QWidget | None = None,
     ) -> None:
         super().__init__(parent)
-        if type(records) is not tuple or not records:
-            raise ValueError("Batch mapping review requires datasets.")
-        if not isinstance(tab, MechanismTabDocument):
-            raise TypeError("Batch mapping review requires one mechanism tab.")
-        targets = tuple(str(item).strip() for item in model_targets)
-        if not targets or any(not item for item in targets):
-            raise ValueError("Batch mapping review requires model targets.")
         self._create_only = create_only
+        self._document = document
         self._records = records
         self._tab = tab
-        self._model_targets = targets
+        self._model_targets = model_targets
         self._rows: list[_DatasetMappingRow] = []
         self.setWindowTitle("Review New Datasets" if create_only else "Review Imported Dataset Mapping")
         self.setModal(True)
@@ -259,80 +259,33 @@ class DatasetMappingBatchDialog(QtWidgets.QDialog):
             del blocker
 
     def _accept_review(self) -> None:
+        # The core fold is the single owner of occupancy and naming rules.
         try:
-            self.proposal()
+            apply_dataset_mapping_batch(
+                document=self._document,
+                tab=self._tab,
+                batch=self.proposal(),
+                model_targets=self._model_targets,
+            )
         except (DatasetMappingError, ValueError, TypeError) as exc:
             QtWidgets.QMessageBox.warning(self, self.windowTitle(), str(exc))
             return
         self.accept()
 
     def proposal(self) -> DatasetMappingBatchProposal:
-        # Ensure choices are folded against all earlier rows even when a
-        # caller changes controls programmatically without emitting Qt events.
-        self._refresh_rows()
+        """Project the current controls into one mapping batch proposal."""
+
         proposals: list[DatasetMappingProposal] = []
-        names = [item.name for item in self._tab.initial_condition_sets]
-        projected_occupants = {
-            link.set_id: dataset_id
-            for dataset_id, link in self._tab.dataset_links
-            if link.set_id is not None
-        }
         for row in self._rows:
             action = DatasetMappingChoice(row.action.currentData())
-            target_id = row.target.currentData() if action is DatasetMappingChoice.MAP_EXISTING else None
-            occupied = row.occupancy.currentData() if action is DatasetMappingChoice.MAP_EXISTING else None
-            proposed_name: str | None = None
-            if action is DatasetMappingChoice.CREATE_SET:
-                proposed_name = allocate_initial_condition_set_name(
-                    row.record.display_name,
-                    existing_names=names,
-                )
-                names.append(proposed_name)
-            elif action is DatasetMappingChoice.MAP_EXISTING and occupied == OccupiedSetChoice.CREATE_COPY.value:
-                target = next((item for item in self._tab.initial_condition_sets if item.set_id == target_id), None)
-                if target is None:
-                    raise DatasetMappingError("Map Existing requires a target set.")
-                proposed_name = allocate_initial_condition_set_name(
-                    target.name,
-                    existing_names=names,
-                )
-                names.append(proposed_name)
-            if action is DatasetMappingChoice.MAP_EXISTING:
-                target = next(
-                    (item for item in self._tab.initial_condition_sets if item.set_id == target_id),
-                    None,
-                )
-                if target is None:
-                    raise DatasetMappingError("Map Existing requires a target set.")
-                occupant = projected_occupants.get(target.set_id)
-                if occupant is None and occupied is not None:
-                    raise DatasetMappingError(
-                        "An unoccupied target cannot include an occupancy choice."
-                    )
-                if occupant is not None and occupied is None:
-                    raise DatasetMappingError(
-                        "An occupied target requires Override, Create Copy, or Cancel."
-                    )
-                if occupied == OccupiedSetChoice.OVERRIDE.value:
-                    for set_id, current_occupant in tuple(projected_occupants.items()):
-                        if current_occupant == occupant:
-                            del projected_occupants[set_id]
-                    projected_occupants[target.set_id] = row.record.dataset_id
-                elif occupied == OccupiedSetChoice.CREATE_COPY.value:
-                    # The original target remains occupied; the copied set is
-                    # not selectable by later rows in this review.
-                    pass
-                elif occupied != OccupiedSetChoice.CANCEL.value:
-                    projected_occupants[target.set_id] = row.record.dataset_id
-            mapping = row.editor.confirmed_mapping()
+            is_existing = action is DatasetMappingChoice.MAP_EXISTING
             proposals.append(
                 DatasetMappingProposal(
                     dataset_id=row.record.dataset_id,
                     action=action,
-                    target_set_id=target_id,
-                    occupied_choice=occupied,
-                    observation_mapping=mapping,
-                    proposed_set_name=proposed_name,
+                    target_set_id=row.target.currentData() if is_existing else None,
+                    occupied_choice=row.occupancy.currentData() if is_existing else None,
+                    observation_mapping=row.editor.confirmed_mapping(),
                     initial_concentration_source=(
                         row.editor.creation_source() if action is DatasetMappingChoice.CREATE_SET else None
                     ),

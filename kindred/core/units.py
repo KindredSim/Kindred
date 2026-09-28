@@ -14,7 +14,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
-from fractions import Fraction
 
 from .quantity_units import parse_unit, convert_value, scientific_unit, conversion_scale
 
@@ -141,25 +140,6 @@ def admit_keq(value: object, *, field: str = "Keq") -> float:
         minimum=KEQ_MIN,
         maximum=KEQ_MAX,
     )
-
-
-def equilibrium_constant_unit(delta_n: object, *, conc_unit: str = "M") -> str:
-    """Return the concentration-form unit ``M^delta_n`` for public Keq."""
-    exponent = Fraction(str(delta_n))
-    return parse_unit(conc_unit).power(exponent).symbol
-
-
-def rate_constant_unit(
-    order: object,
-    *,
-    conc_unit: str = "M",
-    time_unit: str = "s",
-) -> str:
-    """Return ``M^(1-order)/s`` for one directional kinetic order."""
-    exponent = Fraction(str(order))
-    if exponent < 0:
-        raise ValueError("reaction order must be nonnegative")
-    return parse_unit(conc_unit).power(1 - exponent).divide(parse_unit(time_unit)).symbol
 
 
 # ---------- Units model ----------

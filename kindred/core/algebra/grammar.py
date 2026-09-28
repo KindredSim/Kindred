@@ -36,27 +36,6 @@ from enum import Enum
 from typing import Dict, List, Tuple
 
 
-# ----------------------------- EBNF (reference) ------------------------------
-
-EBNF: str = (
-    "algebra_block  := { let_stmt }\n"
-    "let_stmt       := \"let\" IDENT \"=\" expr newline\n"
-    "expr           := logic_or\n"
-    "logic_or       := logic_and { \"||\" logic_and }\n"
-    "logic_and      := equality { \"&&\" equality }\n"
-    "equality       := comparison { (\"==\" | \"!=\") comparison }\n"
-    "comparison     := term { (\"<\"|\"<=\"|\">\"|\">=\") term }\n"
-    "term           := factor { (\"+\"|\"-\") factor }\n"
-    "factor         := unary { (\"*\"|\"/\") unary }\n"
-    "power          := primary [ (\"**\"|\"^\") unary ]  # right associative\n"
-    "unary          := (\"+\"|\"-\"|\"!\") unary | power\n"
-    "primary        := NUMBER | IDENT | func_call | species_ref | \"(\" expr \")\"\n"
-    "func_call      := IDENT \"(\" [ arg_list ] \")\"\n"
-    "arg_list       := expr { \",\" expr }\n"
-    "species_ref    := \"[\" IDENT \"]\" | \"[\" IDENT \"]_0\"\n"
-)
-
-
 # ----------------------------- token kinds -----------------------------------
 
 class TokenKind(str, Enum):
@@ -140,15 +119,6 @@ KEYWORDS: Dict[str, TokenKind] = {
     "let": TokenKind.LET,
 }
 
-# Built-in function names (reference for parser validation; not enforced here).
-BUILTIN_FUNCTIONS: List[str] = [
-    "sqrt", "ln", "log10", "log1p", "exp", "expm1",
-    "sin", "cos", "tan", "abs", "min", "max", "pow", "erf",
-]
-
-HELPER_FUNCTIONS: List[str] = ["heaviside", "clip", "ifelse"]
-
-
 # ----------------------------- precedence ------------------------------------
 
 # Higher number means higher precedence.
@@ -190,12 +160,9 @@ ASSOCIATIVITY: Dict[str, str] = {
 
 
 __all__ = [
-    "EBNF",
     "TokenKind",
     "TOKEN_SPEC",
     "KEYWORDS",
-    "BUILTIN_FUNCTIONS",
-    "HELPER_FUNCTIONS",
     "PRECEDENCE",
     "ASSOCIATIVITY",
 ]

@@ -6,7 +6,7 @@ import numpy as np
 from kindred.core.analysis.global_fit_execution import fit_result_target_values
 from kindred.core.project_presentation_state import SimulationSeriesAxisSelection
 from kindred.core.quantity_units import MOLAR, SECOND, conversion_scale, presentation_unit
-from kindred.gui.result_curve_projection import physical_curve_chunks
+from kindred.core.result_curve_projection import physical_curve_chunks
 
 
 def focused_units(quantity_units, preferred_units, x_name, targets):

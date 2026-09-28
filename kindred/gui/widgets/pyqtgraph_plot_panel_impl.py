@@ -353,11 +353,10 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         self._rendered_point_roster = ()
         self._settling_static_input = True
         try:
+            # Plot membership, not a retained block, keeps an interactive target:
+            # a never-run set still shows its first drag Preview.
             plotted_set_ids = {
-                str(block.block_id)
-                for block in render_input.blocks
-                if block.kind
-                in {ResultLayerKind.EXPLICIT, ResultLayerKind.PREVIEW}
+                set_id for set_id, _label in render_input.plot_set_labels
             }
             removed = tuple(
                 set_id
@@ -1003,17 +1002,6 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         self._presentation = state
         self._apply_plot_presentation(state)
 
-    def drop_tab_session_state(self) -> None:
-        self.dispose_project_content()
-        self._zoom_enabled = False
-        self._presentation = ProjectPresentationState()
-        self._sampling_limit = None
-        self._axis_range = _AxisRangeSession()
-        self._refit_axes = (False, False)
-        self._apply_axis_range_state(self._axis_range, self._presentation)
-        self._axis_display_units: dict[tuple[str, tuple], Unit] = {}
-        self._volume_display_unit = None
-
     def reset_plot_session_state(self) -> None:
         """Project replacement/reopen resets non-archived Plot session truth."""
 
@@ -1274,13 +1262,21 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         *,
         set_id: str,
     ) -> InteractiveDisplayProjection | None:
-        if self._render_input is None:
+        request = self._interactive_request
+        if self._render_input is None or request is None:
+            return None
+        target = next(
+            (item for item in request.targets if item.set_id == set_id),
+            None,
+        )
+        if target is None:
             return None
         return compose_interactive_display(
             result,
             tab_id=self._render_input.tab_id,
             set_id=set_id,
             render_input=self._render_input,
+            prepared_dsl=target.execution_request.prepared_dsl,
         )
 
     def _sample_interactive_projection(
@@ -1897,7 +1893,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         x_unit, x_scale = self._curve_unit_state("x", block.unit_for(block.x_name, x=True))
         y_units = {name: self._curve_unit_state("y", block.unit_for(name)) for name, _ in block.series}
         if block.result is not None:
-            from kindred.gui.result_curve_projection import physical_curve_chunks
+            from kindred.core.result_curve_projection import physical_curve_chunks
             projected = physical_curve_chunks(block.result, block.x_axis, block.series_axes, sample + block.first_index)
             rendered_chunks = tuple(_RenderedPointChunk(
                 x=self._scaled_display_values(chunk.x, x_scale),

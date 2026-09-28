@@ -30,7 +30,6 @@ class EquilibriumMetadataKeys:
     DG_EQ_J_PER_MOL = "dG_eq_J_per_mol"
     KEQ_INPUT = "Keq_input"
     STANDARD_CONC_M = "standard_conc_M"
-    KEQ_UNIT = "Keq_unit"
 
 
 @dataclass(frozen=True)
@@ -84,7 +83,6 @@ class EquilibriumMetadataView:
     dG_eq_J_per_mol: Optional[float] = None
     Keq_input: Optional[object] = None
     standard_conc_M: Optional[float] = None
-    Keq_unit: Optional[str] = None
 
     def __post_init__(self) -> None:
         if self.standard_conc_M is not None:
@@ -106,6 +104,4 @@ class EquilibriumMetadataView:
             out[EquilibriumMetadataKeys.KEQ_INPUT] = self.Keq_input
         if self.standard_conc_M is not None:
             out[EquilibriumMetadataKeys.STANDARD_CONC_M] = float(self.standard_conc_M)
-        if self.Keq_unit is not None:
-            out[EquilibriumMetadataKeys.KEQ_UNIT] = str(self.Keq_unit)
         return out

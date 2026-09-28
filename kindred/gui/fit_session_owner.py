@@ -43,7 +43,6 @@ __all__ = [
     "FitSessionOwner",
 ]
 
-WindowFactory = Callable[..., FittingWindow]
 ColorResolver = Callable[[str, Sequence[str]], object]
 
 
@@ -63,29 +62,17 @@ class FitSessionOwner(QtCore.QObject):
         registry: WorkspaceTabRegistry,
         gate: ComputationGate,
         observation_style_getter: Callable[[], tuple[str, float, float]],
-        color_resolver: ColorResolver | None = None,
+        color_resolver: ColorResolver,
         parent_widget: QtWidgets.QWidget | None = None,
-        window_factory: WindowFactory = FittingWindow,
         parent: QtCore.QObject | None = None,
     ) -> None:
         super().__init__(parent)
-        if not isinstance(session, ProjectSession):
-            raise TypeError("session must be ProjectSession.")
-        if not isinstance(registry, WorkspaceTabRegistry):
-            raise TypeError("registry must be WorkspaceTabRegistry.")
-        if not isinstance(gate, ComputationGate):
-            raise TypeError("gate must be ComputationGate.")
-        if color_resolver is not None and not callable(color_resolver):
-            raise TypeError("color_resolver must be callable.")
-        if not callable(window_factory):
-            raise TypeError("window_factory must be callable.")
         self._session = session
         self._registry = registry
         self._gate = gate
         self._color_resolver = color_resolver
         self._observation_style_getter = observation_style_getter
         self._parent_widget = parent_widget
-        self._window_factory = window_factory
         self._window: FittingWindow | None = None
         self._worker: GlobalFitWorker | None = None
         self._candidate: FitCandidate | None = None
@@ -166,15 +153,10 @@ class FitSessionOwner(QtCore.QObject):
                     (*analysis.species_names, *analysis.observable_names)
                 )
             )
-            fit_color_resolver = (
-                None
-                if self._color_resolver is None
-                else lambda species: self._color_resolver(
-                    str(species),
-                    modeled_species,
-                )
-            )
-            window = self._window_factory(
+            def fit_color_resolver(species):
+                return self._color_resolver(str(species), modeled_species)
+
+            window = FittingWindow(
                 origin,
                 close_handler=self._request_window_close,
                 color_resolver=fit_color_resolver,
@@ -184,9 +166,6 @@ class FitSessionOwner(QtCore.QObject):
         except (TypeError, ValueError, KeyError, LookupError) as exc:
             self._set_status(f"Fit Open failed: {exc}")
             return None
-        if not isinstance(window, FittingWindow):
-            raise TypeError("window_factory must return FittingWindow.")
-
         self._window = window
         self._install_setup(setup)
         self._initial_setup_snapshot = setup
@@ -1170,7 +1149,8 @@ class FitSessionOwner(QtCore.QObject):
                 item.dataset_id,
                 item.set_id,
                 item.initial_values,
-                item.resolved_t_start,
+                # resolved_t_start only seeds the Fit-owned interval; a later
+                # Run-start change must not make an explicit interval stale.
                 tuple(
                     (
                         observation.raw_observation_id,

@@ -381,6 +381,7 @@ class ChemicalSpaceScanDialog(QtWidgets.QDialog):
                        rtol=number(self.rtol), atol=number(self.atol), analytic_jacobian=self.jacobian.isChecked(),
                        use_authored_stops=self.stops.isChecked(), requested=int(self.requested.text()),
                        destination=destination, seed=int(self.seed.text()), sampler=self.sampler.currentData(),
+                       grouped=bool(grouped),
                        parameter_sets=int(self.parameter_count.text()) if grouped else 0,
                        initial_sets=int(self.initial_count.text()) if grouped else 0,
                        boundary_attempts=int(self.boundary_count.text()) if boundary and not grouped else 0,

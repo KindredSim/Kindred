@@ -6,6 +6,7 @@ from math import isclose
 
 from PySide6 import QtCore, QtWidgets
 
+from kindred.gui.parameter_enumeration import enumerate_parameter_coordinates
 from kindred.gui.tutorials.controller import Lesson, Step
 from kindred.gui.tutorials.overlay import Highlight, menu_target, scroll_into_view
 
@@ -15,6 +16,9 @@ class PracticeLesson(Lesson):
 
     _preset_name = "M1"
     _practice_species = ("A", "B")
+    # Demonstrated rates distinguish the preset from neighbours that share its
+    # starting concentrations (e.g. M2 for M1, M6 for M5).
+    _preset_rates: dict[str, float] = {"k1": 1.0}
 
     _reuse_steps: frozenset[str] = frozenset()
     _result_steps: frozenset[str] = frozenset()
@@ -191,7 +195,21 @@ class PracticeLesson(Lesson):
                 ),
                 None,
             )
-        return self.preset_set is not None and self._values(self.preset_set, 1.0)
+        return (
+            self.preset_set is not None
+            and self._values(self.preset_set, 1.0)
+            and self._preset_rates_loaded()
+        )
+
+    def _preset_rates_loaded(self) -> bool:
+        values = {
+            item.name: float(item.value)
+            for item in enumerate_parameter_coordinates(self.tab.prepared_dsl)
+        }
+        return all(
+            name in values and isclose(values[name], rate, rel_tol=1e-8)
+            for name, rate in self._preset_rates.items()
+        )
 
     def _project_changed(self, replaced: bool) -> None:
         if replaced:

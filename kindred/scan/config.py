@@ -44,6 +44,9 @@ class ScanConfig:
     destination: str
     seed: int = 1729
     sampler: Literal["sobol", "lhs"] = "sobol"
+    # The user-selected exploration mode; never inferred from the counts, so
+    # zero counts in grouped mode reach the grouped-count admission error.
+    grouped: bool = False
     parameter_sets: int = 0
     initial_sets: int = 0
     boundary_attempts: int = 0
@@ -54,10 +57,6 @@ class ScanConfig:
     energy_unit: str = "kJ/mol"
     temperature_K: float = 298.15
     standard_conc_M: float = 1.0
-
-    @property
-    def grouped(self) -> bool:
-        return bool(self.parameter_sets or self.initial_sets)
 
 
 @dataclass

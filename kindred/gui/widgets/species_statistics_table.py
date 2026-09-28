@@ -120,7 +120,7 @@ class SpeciesStatisticsTable(QtWidgets.QTableWidget):
             Accepted Run intervention truth. Any intervention makes CTC
             inapplicable for the complete result.
         presentation_boundaries : tuple, optional
-            Exact intervention pre/post values retained by the primary result;
+            Every retained intervention boundary state of the primary result;
             these contribute to Max and t@Max without becoming table rows.
         """
         ctc_unit = concentration_display_unit.multiply(time_display_unit)
@@ -150,8 +150,8 @@ class SpeciesStatisticsTable(QtWidgets.QTableWidget):
             idx_max = np.argmax(concentrations)
             max_time = canonical_time[idx_max]
             for boundary in presentation_boundaries:
-                for boundary_values in (boundary.pre_state, boundary.post_state):
-                    boundary_value = dict(boundary_values).get(species_name)
+                for state in boundary.states:
+                    boundary_value = dict(state.concentrations).get(species_name)
                     if boundary_value is not None and boundary_value > max_conc:
                         max_conc = boundary_value
                         max_time = boundary.time

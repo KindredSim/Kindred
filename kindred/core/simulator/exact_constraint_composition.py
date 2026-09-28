@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 from fractions import Fraction
 
 from kindred.core.algebra.parser import (
@@ -25,6 +26,9 @@ from kindred.core.simulator.step_indexing import (
     lookup_source_coordinate_target,
 )
 from kindred.core.simulator.wegscheider_symbolic import analyze_wegscheider_topology
+
+if TYPE_CHECKING:
+    from kindred.core.simulator.parameter_algebra_spec import ParameterAlgebraSpec
 
 __all__ = [
     "ExactMonomial",
@@ -642,24 +646,13 @@ def _render_constraint(monomial: ExactMonomial) -> str:
 
 
 def _algebra_relations(
-    spec: object | None,
+    spec: ParameterAlgebraSpec,
 ) -> tuple[dict[str, ExactMonomial], set[str]]:
     """Lower retained parameter assignments in their admitted order."""
 
-    if spec is None:
-        return {}, set()
-    block = getattr(spec, "parameter_block", None)
-    dependencies = getattr(spec, "parameter_dependencies", None)
-    assignment_kind = getattr(spec, "parameter_assignment_kind", None)
-    if (
-        block is None
-        or not isinstance(dependencies, Mapping)
-        or not callable(assignment_kind)
-    ):
-        return {}, set()
-    statements_in_order = getattr(block, "statements_in_evaluation_order", None)
-    if not callable(statements_in_order):
-        return {}, set()
+    dependencies = spec.parameter_dependencies
+    assignment_kind = spec.parameter_assignment_kind
+    statements_in_order = spec.parameter_block.statements_in_evaluation_order
 
     # Build one direct name -> retained statement view.  The spec's dependency
     # mapping supplies the already-admitted topological order; no identifier
@@ -788,7 +781,7 @@ def proves_redundant_parameter(
 def compose_exact_constraints(
     mechanism: object,
     *,
-    parameter_algebra_spec: object | None = None,
+    parameter_algebra_spec: ParameterAlgebraSpec,
 ) -> ExactConstraintComposition:
     """Compose exact cycle products using one symbolic relation graph."""
 
@@ -796,7 +789,7 @@ def compose_exact_constraints(
     relations = _mechanism_relations(mechanism)
     algebra, unresolved = _algebra_relations(parameter_algebra_spec)
     relations.update({name: value for name, value in algebra.items()
-                      if name not in getattr(parameter_algebra_spec, "identity_checks", ())})
+                      if name not in parameter_algebra_spec.identity_checks})
     result: list[ExactConstraint] = []
     for cycle in topology.cycles:
         initial = ExactMonomial(
@@ -844,4 +837,4 @@ def compose_exact_constraints(
                 reason=reason,
             )
         )
-    return ExactConstraintComposition(tuple(result), tuple(mechanism.metadata["parameter_algebra_spec"].quantity_units))
+    return ExactConstraintComposition(tuple(result), tuple(parameter_algebra_spec.quantity_units))
