@@ -423,7 +423,7 @@ def main() -> int:
             loc = f"{occ.src_relpath}:{occ.lineno}" if occ.lineno else occ.src_relpath
             evidence = occ.line_text or "-"
             print(
-                f"A2 ObsoleteFastEqFacadeImport | FAIL | {loc} | Production import of deleted compatibility facade {FORBIDDEN_FAST_EQ_MODULE!r} (evidence: {evidence}) | Import shared simulator helpers from kindred.core.simulator.common"
+                f"A2 ObsoleteFastEqFacadeImport | FAIL | {loc} | Production import of deleted compatibility facade {FORBIDDEN_FAST_EQ_MODULE!r} (evidence: {evidence}) | Import the owning simulator modules directly"
             )
     else:
         print(

@@ -17,7 +17,7 @@ from kindred.core.project_document import (
 )
 from kindred.core.runtime_defaults import MAX_PARALLEL_WORKERS_CEILING
 from kindred.core.validation import parse_finite_numeric_text
-from kindred.gui.ui_helpers import setup_scientific_validator
+from kindred.gui.ui_helpers import clamp_initial_size, make_scroll_area, setup_scientific_validator
 
 __all__ = [
     "SimulationSettingsDialog",
@@ -160,7 +160,12 @@ class SimulationSettingsDialog(QtWidgets.QDialog):
         self.setModal(True)
 
         layout = QtWidgets.QVBoxLayout(self)
-        science_box = QtWidgets.QGroupBox("Mechanism settings", self)
+        scroll = make_scroll_area(self)
+        scroll.setFocusPolicy(QtCore.Qt.FocusPolicy.NoFocus)
+        body = QtWidgets.QWidget(scroll)
+        body_layout = QtWidgets.QVBoxLayout(body)
+        body_layout.setContentsMargins(0, 0, 0, 0)
+        science_box = QtWidgets.QGroupBox("Mechanism settings", body)
         science_form = QtWidgets.QFormLayout(science_box)
         factory = TabScientificSettings()
         self.temperature_spin = self._positive_spin(
@@ -249,18 +254,18 @@ class SimulationSettingsDialog(QtWidgets.QDialog):
         science_form.addRow("", stopping_row)
         science_form.addRow("", self.scientific_defaults_check)
         self.set_stopping_declarations(())
-        layout.addWidget(science_box)
+        body_layout.addWidget(science_box)
 
-        run_box = QtWidgets.QGroupBox("Run defaults for new projects and tabs", self)
+        run_box = QtWidgets.QGroupBox("Run defaults for new projects and tabs", body)
         run_box.setToolTip(
             "Run settings that new projects and tabs start with. Existing tabs "
             "keep their settings; edit those in each tab's Run panel."
         )
         run_form = QtWidgets.QFormLayout(run_box)
         self._run_default_fields = _RunSettingsFields(run_form, run_box)
-        layout.addWidget(run_box)
+        body_layout.addWidget(run_box)
 
-        preview_box = QtWidgets.QGroupBox("Preview", self)
+        preview_box = QtWidgets.QGroupBox("Preview", body)
         preview_form = QtWidgets.QFormLayout(preview_box)
         self.preview_points_spin = self._integer_spin(
             *SIMULATION_POINT_RANGE, preview_points, preview_box,
@@ -277,9 +282,9 @@ class SimulationSettingsDialog(QtWidgets.QDialog):
         )
         preview_form.addRow("Preview points", self.preview_points_spin)
         preview_form.addRow("Preview delay (ms)", self.preview_delay_spin)
-        layout.addWidget(preview_box)
+        body_layout.addWidget(preview_box)
 
-        parallel_box = QtWidgets.QGroupBox("Parallel execution", self)
+        parallel_box = QtWidgets.QGroupBox("Parallel execution", body)
         parallel_form = QtWidgets.QFormLayout(parallel_box)
         self.run_maximum_automatic_check = QtWidgets.QCheckBox(
             "Automatic (CPU fallback)",
@@ -305,9 +310,9 @@ class SimulationSettingsDialog(QtWidgets.QDialog):
         )
         parallel_form.addRow("Run user maximum", self.run_maximum_automatic_check)
         parallel_form.addRow("Explicit maximum", self.run_maximum_spin)
-        layout.addWidget(parallel_box)
+        body_layout.addWidget(parallel_box)
 
-        cache_box = QtWidgets.QGroupBox("Result cache", self)
+        cache_box = QtWidgets.QGroupBox("Result cache", body)
         cache_form = QtWidgets.QFormLayout(cache_box)
         self.cache_capacity_spin = self._integer_spin(
             1,
@@ -325,7 +330,9 @@ class SimulationSettingsDialog(QtWidgets.QDialog):
             "Explicit-result cache capacity",
             self.cache_capacity_spin,
         )
-        layout.addWidget(cache_box)
+        body_layout.addWidget(cache_box)
+        scroll.setWidget(body)
+        layout.addWidget(scroll, 1)
 
         for form in (science_form, run_form, preview_form, parallel_form, cache_form):
             for row in range(form.rowCount()):
@@ -348,6 +355,21 @@ class SimulationSettingsDialog(QtWidgets.QDialog):
         buttons.accepted.connect(self._accept_candidate)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
+        # Scroll only vertically, and open at the groups' natural height when
+        # the screen allows; QScrollArea caps its own size hint.
+        self.ensurePolished()  # the theme style sheet sets the scroll frame
+        chrome = 2 * scroll.frameWidth()
+        scroll.setMinimumWidth(
+            body.minimumSizeHint().width()
+            + scroll.verticalScrollBar().sizeHint().width()
+            + chrome
+        )
+        clamp_initial_size(
+            self,
+            self.sizeHint().width(),
+            self.sizeHint().height() - scroll.sizeHint().height()
+            + body.sizeHint().height() + chrome,
+        )
 
     @staticmethod
     def _integer_spin(

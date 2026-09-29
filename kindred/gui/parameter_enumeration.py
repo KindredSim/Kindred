@@ -150,8 +150,6 @@ class GuiParameterCoordinate:
     log10_allowed: bool
     family: str
     role: str
-    writable: bool
-    derived: bool
     scientific_category: GuiParameterScientificCategory
     allow_exact_zero: bool
     unit: str = "1"
@@ -235,8 +233,8 @@ def enumerate_parameter_coordinates(
             name=item.name, display_name=display_name, value=value,
             minimum=low, maximum=high,
             log10_allowed=bool(value > 0.0 and low > 0.0),
-            family=item.family, role=item.role, writable=item.writable,
-            derived=item.derived, scientific_category=item.scientific_category,
+            family=item.family, role=item.role,
+            scientific_category=item.scientific_category,
             allow_exact_zero=item.allow_exact_zero, unit=item.unit,
         ))
     return tuple(coordinates)

@@ -110,6 +110,19 @@ def build_data_manager_snapshot(
     )
 
 
+def experimental_axis_label(
+    document: ProjectDocument,
+    selection: ExperimentalAxisSelection,
+) -> str:
+    """Name a retained experimental axis whose overlay may be hidden."""
+    for record in document.datasets:
+        if record.dataset_id == selection.dataset_id:
+            for series in record.observations:
+                if series.raw_observation_id == selection.raw_observation_id:
+                    return f"{record.display_name}: {series.column_name}"
+    return "Removed data column"
+
+
 def build_experimental_layer_inputs(
     *,
     document: ProjectDocument,

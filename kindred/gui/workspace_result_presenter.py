@@ -896,20 +896,14 @@ def _statistics_series_names(
 
 
 def _selected_x_unavailable_diagnostic(
-    selected_x: AxisSeriesSelection,
+    selected: AxisSelectionCandidate,
     unavailable_labels: Sequence[str],
 ) -> str | None:
-    if _is_time_selection(selected_x) or not unavailable_labels:
+    if _is_time_selection(selected.selection) or not unavailable_labels:
         return None
     labels = ", ".join(repr(str(label)) for label in unavailable_labels)
-    selected_identity = (
-        f"series {selected_x.series_name!r}"
-        if isinstance(selected_x, SimulationSeriesAxisSelection)
-        else "vessel volume" if isinstance(selected_x, VesselVolumeAxisSelection)
-        else f"raw observation {selected_x.raw_observation_id!r} in dataset {selected_x.dataset_id!r}"
-    )
     return (
-        f"Selected X {selected_identity} is unavailable for result layer(s) {labels}. "
+        f"Selected X {selected.label!r} is unavailable for result layer(s) {labels}. "
         "Those layer(s) are omitted from the current plot only; "
         "full-resolution Copy All/XLSX exports remain unaffected."
     )
@@ -1041,7 +1035,7 @@ def _planned_xlsx_worksheet_dimensions(
     dimensions: list[tuple[str, int, int]] = []
     for block in blocks:
         title = _worksheet_title(block.label, used)
-        identity_column_count = 2 if block.kind is ResultLayerKind.EXPERIMENTAL else 4
+        identity_column_count = int(block.t.size > 0) + (1 if block.kind is ResultLayerKind.EXPERIMENTAL else 3)
         dimensions.append(
             (
                 title,
@@ -1133,6 +1127,38 @@ def _annotations_from_execution(
     )
 
 
+def _authored_action(result: SimulationResultValue, annotation: Mapping[str, object]) -> Mapping[str, object]:
+    """Find the authored declaration of one executed instant or trigger action."""
+    operation = next(item for item in result.intervention_execution.declarative_payload["operations"]
+                     if item["declaration_ordinal"] == annotation["declaration_ordinal"])
+    kind = str(annotation["kind"])
+    if kind == "trigger":
+        return operation["then"]
+    if kind.startswith("protocol-"):
+        return next(item for item in operation[kind.removeprefix("protocol-")]
+                    if item["authored_ordinal"] == annotation["authored_ordinal"])
+    return operation
+
+
+def _named_amounts(executed: object, authored: object, retained: Mapping[str, float]) -> object:
+    """Pair executed amounts with authored parameter names and the start-volume
+    declaration that executed records omit; live references take the result's
+    retained parameter value when one exists."""
+    if isinstance(executed, (list, tuple)):
+        authored = authored if isinstance(authored, (list, tuple)) else ()
+        return [_named_amounts(item, authored[index] if index < len(authored) else None, retained)
+                for index, item in enumerate(executed)]
+    if not isinstance(executed, Mapping):
+        return executed
+    authored = authored if isinstance(authored, Mapping) else {}
+    named = {key: _named_amounts(value, authored.get(key), retained) for key, value in executed.items()}
+    named.update((key, value) for key, value in authored.items()
+                 if (key.endswith("_param") and key[:-6] in named) or key in {"initial_volume", "initial_volume_param"})
+    named.update((key[:-6], retained[name]) for key, name in tuple(named.items())
+                 if key.endswith("_param") and key[:-6] not in named and name in retained)
+    return named
+
+
 def intervention_label(
     annotation: Mapping[str, object], *, volume_unit: Unit, time_unit: Unit,
 ) -> str:
@@ -1143,14 +1169,18 @@ def intervention_label(
 
     def quantity(fields, name, source, display):
         parameter = fields.get(name + "_param")
-        value = html.escape(str(parameter)) if parameter is not None else f"{convert_value(fields[name], source, display):g}"
-        unit_html = format_unit_for_display(display)
-        return f"{value} {unit_html}".strip()
+        amount = (f"{convert_value(fields[name], source, display):g} {format_unit_for_display(display)}"
+                  if name in fields else "")
+        if parameter is None:
+            return amount
+        return html.escape(str(parameter)) + (f" = {amount}" if amount else "")
 
     op = action["op"]
     if op == "scale":
         factor = action["factor"]
-        text = f"Scale all concentrations ×{factor:g} (volume ÷{factor:g})"
+        parameter = action.get("factor_param")
+        named = f"{factor:g}" if parameter is None else f"{html.escape(str(parameter))} = {factor:g}"
+        text = f"Scale all concentrations ×{named} (volume ÷{factor:g})"
     elif op == "withdraw":
         text = f"Withdraw aliquot {quantity(action, 'volume', CUBIC_METRE, volume_unit)}"
     else:
@@ -1171,8 +1201,18 @@ def intervention_label(
 def _owned_annotations(
     result: SimulationResultValue, role: str, set_id: str,
 ) -> tuple[_DisplayAnnotation, ...]:
+    retained = {name: value for name, value, _unit in result.parameters}
     return tuple(
-        (role, set_id, annotation, 0.42 if role == "ghost" else 1.0)
+        (role, set_id, annotation if annotation["physical_action"] is None else MappingProxyType({
+            **annotation,
+            # Interval actions keep live references; executed instants and
+            # trigger actions record amounts beside their authored declaration.
+            "physical_action": _named_amounts(
+                annotation["physical_action"],
+                None if annotation["kind"] == "flux" else _authored_action(result, annotation),
+                retained,
+            ),
+        }), 0.42 if role == "ghost" else 1.0)
         for annotation in _annotations_from_execution(result)
     )
 
@@ -1204,8 +1244,15 @@ def compose_interactive_display(
         kind=ResultLayerKind.PREVIEW,
         color_by_axis_selection=dict(render_input.color_by_axis_selection),
     )
-    reference = next((block for block in render_input.blocks if block.block_id == set_id
-                      and block.kind is ResultLayerKind.REFERENCE), None)
+    # Before exact Preview settles, the set's Run is the Reference it will
+    # retain; a Preview block is never a Reference.
+    owned = {block.kind: block for block in reversed(render_input.blocks) if block.block_id == set_id}
+    reference = owned.get(ResultLayerKind.REFERENCE)
+    if reference is None and ResultLayerKind.EXPLICIT in owned:
+        reference = replace(
+            owned[ResultLayerKind.EXPLICIT], kind=ResultLayerKind.REFERENCE,
+            label=f"{label} [Reference]", dashed=True, opacity=0.42,
+        )
     curves = []
     annotations = []
     sources = [(result, live, "foreground")]
@@ -1265,6 +1312,7 @@ def compose_result_input(
     experimental_point_size: float = 6.0,
     experimental_point_opacity: float = 0.85,
     selected_x_series: AxisSeriesSelection = SimulationSeriesAxisSelection("t"),
+    selected_x_label: str = "",
     selected_y_series: Sequence[AxisSeriesSelection] = (),
     selected_y_uses_default_all: bool = True,
 ) -> ResultRenderInput:
@@ -1519,7 +1567,7 @@ def compose_result_input(
             selected_x,
             selected_x.series_name if isinstance(selected_x, SimulationSeriesAxisSelection)
             else "Vessel volume" if isinstance(selected_x, VesselVolumeAxisSelection)
-            else f"{selected_x.dataset_id}: {selected_x.raw_observation_id}",
+            else selected_x_label,
         )
     selected_candidate = next(item for item in candidates if item.selection == selected_x)
     def axis_units(axis):
@@ -1553,7 +1601,7 @@ def compose_result_input(
         intervention_annotations=owned_annotations,
         intervention_annotations_visible=intervention_annotations_visible,
         intervention_labels_visible=intervention_labels_visible,
-        unavailable_x_diagnostic=_selected_x_unavailable_diagnostic(selected_x, unavailable_labels),
+        unavailable_x_diagnostic=_selected_x_unavailable_diagnostic(selected_candidate, unavailable_labels),
         completion_warning_details=tuple(warning_facts),
         plot_set_labels=tuple((item.set_id, item.label) for item in visible_sets),
         color_by_axis_selection=tuple(colors.items()),
@@ -1578,17 +1626,18 @@ def iter_blocks_tsv_chunks(
         if columns and group != previous_group:
             columns.append(("", (), "text"))
         previous_group = group
-        columns.append(
-            (
-                _export_column_header(
-                    block,
-                    block.x_name,
-                    block.x_provenance, x=True,
-                ),
-                block.t,
-                "float",
+        if block.t.size:
+            columns.append(
+                (
+                    _export_column_header(
+                        block,
+                        block.x_name,
+                        block.x_provenance, x=True,
+                    ),
+                    block.t,
+                    "float",
+                )
             )
-        )
         if block.kind is ResultLayerKind.EXPERIMENTAL:
             if block.source_row is None:
                 raise ValueError("experimental Copy block lacks source_row.")
@@ -1762,10 +1811,11 @@ def write_xlsx(
                     "discontinuity_id",
                 ]
             volume_columns = _boundary_export_columns(block.result)
+            x_headers = (block.unit_label(block.x_name, x=True),) if block.t.size else ()
             _append_xlsx_row(
                 sheet,
                 (
-                    block.unit_label(block.x_name, x=True),
+                    *x_headers,
                     *identity_headers,
                     *(block.unit_label(name) for name, _values in block.series),
                     *(name for name, _, _ in volume_columns),
@@ -1788,7 +1838,7 @@ def write_xlsx(
                 _append_xlsx_row(
                     sheet,
                     (
-                        float(block.t[index]) if index < block.t.size else None,
+                        *((float(block.t[index]) if index < block.t.size else None,) if x_headers else ()),
                         *identity_values,
                         *(float(values[index]) if index < len(values) else None for _name, values in block.series),
                         *((int(values[index]) if kind == "int" else float(values[index])) if index < len(values) and values[index] is not None else None for _, values, kind in volume_columns),

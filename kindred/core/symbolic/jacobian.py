@@ -11,9 +11,6 @@ from kindred.core.ode_builder import (
     EffectiveRateCoefficientEvaluator,
 )
 from kindred.core.kinetics import forward_rate_family
-from kindred.core.equilibrium_rate_authority import (
-    normalize_existing_equilibrium_rate_authority,
-)
 from kindred.core.simulator.parameter_namespace import (
     build_namespace_from_mechanism,
     canonical_name_for_mechanism_step_parameter,
@@ -21,7 +18,7 @@ from kindred.core.simulator.parameter_namespace import (
 
 from .backend import require_sympy
 from .errors import UnsupportedSymbolicExpressionError
-from .namespaces import symbolic_status_payload
+from .jacobian_execution import symbolic_status_payload
 
 
 @dataclass(frozen=True, slots=True)
@@ -121,12 +118,12 @@ def _symbolic_coefficient_parameter_symbols(
 ) -> tuple[str, ...]:
     names: list[str] = []
     step_index = 0
-    for _reaction in getattr(mechanism, "reactions", ()) or ():
+    for _reaction in mechanism.reactions:
         names.append(
             _coefficient_parameter_name(step_index, "forward")
         )
         step_index += 1
-    for _equilibrium in getattr(mechanism, "equilibria", ()) or ():
+    for _equilibrium in mechanism.equilibria:
         names.extend(
             (
                 _coefficient_parameter_name(step_index, "forward"),
@@ -270,13 +267,7 @@ def _unsupported_support(code: str, reason: str) -> SymbolicJacobianSupport:
 
 
 def classify_symbolic_jacobian_support(mechanism: Mechanism) -> SymbolicJacobianSupport:
-    species_names_func = getattr(mechanism, "species_names", None)
-    if not callable(species_names_func):
-        return _unsupported_support(
-            "missing-species",
-            "Symbolic Jacobian requires a Kindred mechanism with species_names().",
-        )
-    species_names = tuple(str(name) for name in species_names_func())
+    species_names = tuple(str(name) for name in mechanism.species_names())
     if not species_names:
         return _unsupported_support(
             "missing-species",
@@ -285,7 +276,7 @@ def classify_symbolic_jacobian_support(mechanism: Mechanism) -> SymbolicJacobian
 
     concentration_exponents: list[tuple[str, str, float]] = []
     for idx, reaction in enumerate(
-        getattr(mechanism, "reactions", ()) or (),
+        mechanism.reactions,
         start=1,
     ):
         concentration_exponents.extend(
@@ -295,16 +286,16 @@ def classify_symbolic_jacobian_support(mechanism: Mechanism) -> SymbolicJacobian
                 float(exponent),
             )
             for species_name, exponent in (
-                getattr(reaction, "rate_orders", {}) or {}
+                reaction.rate_orders
             ).items()
         )
     for idx, equilibrium in enumerate(
-        getattr(mechanism, "equilibria", ()) or (),
+        mechanism.equilibria,
         start=1,
     ):
         for direction, side in (
-            ("forward", getattr(equilibrium, "stoich_forward", {}) or {}),
-            ("reverse", getattr(equilibrium, "stoich_back", {}) or {}),
+            ("forward", equilibrium.stoich_forward),
+            ("reverse", equilibrium.stoich_back),
         ):
             concentration_exponents.extend(
                 (
@@ -328,7 +319,6 @@ def classify_symbolic_jacobian_support(mechanism: Mechanism) -> SymbolicJacobian
             forward_rate_family(reaction.forward_model)
         for equilibrium in mechanism.equilibria:
             forward_rate_family(equilibrium.forward_model)
-            normalize_existing_equilibrium_rate_authority(equilibrium)
     except (TypeError, ValueError) as exc:
         return _unsupported_support("unsupported-rate-authority", str(exc))
     return SymbolicJacobianSupport(
@@ -342,8 +332,8 @@ def _coefficient_public_parameter_names(
     mechanism: Mechanism,
 ) -> tuple[str, ...]:
     public_by_internal: dict[str, str] = {}
-    reactions = tuple(getattr(mechanism, "reactions", ()) or ())
-    equilibria = tuple(getattr(mechanism, "equilibria", ()) or ())
+    reactions = tuple(mechanism.reactions)
+    equilibria = tuple(mechanism.equilibria)
     try:
         for reaction_index, reaction in enumerate(reactions):
             internal_name = _coefficient_parameter_name(
@@ -407,22 +397,21 @@ def _build_symbolic_mechanism_expression_model(
     support = classify_symbolic_jacobian_support(mechanism)
     support.raise_if_unsupported()
     sympy = require_sympy()
-    species_names_func = getattr(mechanism, "species_names", None)
-    if not callable(species_names_func):
-        raise UnsupportedSymbolicExpressionError(
-            "Symbolic Jacobian requires a Kindred mechanism with species_names()."
-        )
-    species_names = tuple(str(name) for name in species_names_func())
+    species_names = tuple(str(name) for name in mechanism.species_names())
     if not species_names:
         raise UnsupportedSymbolicExpressionError("Symbolic Jacobian requires at least one species.")
+    # Plain private state symbols keep lambdify from dummifying every
+    # argument.  Their prefix is disjoint from the private coefficient
+    # symbols, and species names never enter this private graph.
     state_symbols = tuple(
-        sympy.Dummy(f"y_{idx}") for idx, _name in enumerate(species_names)
+        sympy.Symbol(f"__kindred_state_{idx}")
+        for idx, _name in enumerate(species_names)
     )
     symbol_by_species = dict(zip(species_names, state_symbols))
     rhs = [sympy.Integer(0) for _name in species_names]
     species_index = {name: idx for idx, name in enumerate(species_names)}
 
-    for reaction_index, rxn in enumerate(getattr(mechanism, "reactions", []) or []):
+    for reaction_index, rxn in enumerate(mechanism.reactions):
         coefficient = sympy.Symbol(
             _coefficient_parameter_name(
                 reaction_index,
@@ -432,17 +421,17 @@ def _build_symbolic_mechanism_expression_model(
         rate_expr = coefficient * _power_product(
             sympy,
             symbol_by_species,
-            getattr(rxn, "rate_orders", {}) or {},
+            rxn.rate_orders,
         )
-        for species_name, coeff in getattr(rxn, "net_stoich", {}).items():
+        for species_name, coeff in rxn.net_stoich.items():
             rhs[species_index[str(species_name)]] += _stoichiometric_coefficient_expr(
                 sympy,
                 float(coeff),
                 exact=bool(exact_stoichiometric_coefficients),
             ) * rate_expr
 
-    reaction_count = len(tuple(getattr(mechanism, "reactions", []) or ()))
-    for equilibrium_index, eq in enumerate(getattr(mechanism, "equilibria", []) or []):
+    reaction_count = len(tuple(mechanism.reactions))
+    for equilibrium_index, eq in enumerate(mechanism.equilibria):
         step_index = reaction_count + equilibrium_index
         forward_coefficient = sympy.Symbol(
             _coefficient_parameter_name(step_index, "forward")
@@ -453,17 +442,17 @@ def _build_symbolic_mechanism_expression_model(
         forward_expr = forward_coefficient * _power_product(
             sympy,
             symbol_by_species,
-            getattr(eq, "stoich_forward", {}) or {},
+            eq.stoich_forward,
         )
         reverse_expr = reverse_coefficient * _power_product(
             sympy,
             symbol_by_species,
-            getattr(eq, "stoich_back", {}) or {},
+            eq.stoich_back,
         )
         rate_expr = forward_expr - reverse_expr
         for species_name in species_names:
-            coeff = float(getattr(eq, "stoich_back", {}).get(species_name, 0.0)) - float(
-                getattr(eq, "stoich_forward", {}).get(species_name, 0.0)
+            coeff = float(eq.stoich_back.get(species_name, 0.0)) - float(
+                eq.stoich_forward.get(species_name, 0.0)
             )
             if coeff:
                 rhs[species_index[species_name]] += _stoichiometric_coefficient_expr(

@@ -190,6 +190,7 @@ class Equilibrium:
     forward_model: ForwardRateModel
     kr: float | None = None
     metadata: Mapping[str, Any] = field(default_factory=dict)
+    authority: EquilibriumRateAuthority = field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         stoich_forward = _validate_positive_side(self.stoich_forward, label="stoich_forward")
@@ -208,10 +209,14 @@ class Equilibrium:
             "stoich_back",
             FrozenDict(stoich_back),
         )
-        normalize_equilibrium_rate_authority(
-            forward_model=self.forward_model, kr=self.kr, metadata=self.metadata,
-        )
         object.__setattr__(self, "metadata", FrozenDict(self.metadata))
+        object.__setattr__(
+            self,
+            "authority",
+            normalize_equilibrium_rate_authority(
+                forward_model=self.forward_model, kr=self.kr, metadata=self.metadata,
+            ),
+        )
 
     def forward_vector(self, species_order: Iterable[str]) -> List[float]:
         return [float(self.stoich_forward.get(n, 0.0)) for n in species_order]
@@ -251,11 +256,11 @@ class Mechanism:
 
     # ---------- species management ----------
 
-    def add_species(self, name: str, initial_conc: float = 0.0) -> Species:
+    def add_species(self, name: str) -> Species:
         n = validate_name(name)
         if n in self.species:
             raise ValueError(f"species {n!r} already exists")
-        sp = Species(n, initial_conc)
+        sp = Species(n)
         self.species[n] = sp
         return sp
 
@@ -300,7 +305,7 @@ class Mechanism:
         forward_model: ForwardRateModel,
         kr: float | None = None,
         metadata: Optional[Mapping[str, Any]] = None,
-    ) -> tuple[Equilibrium, EquilibriumRateAuthority]:
+    ) -> Equilibrium:
         """Add one admitted forward model and exactly one reverse authority."""
         sf = _validate_positive_side(stoich_forward, label="stoich_forward")
         sb = _validate_positive_side(stoich_back, label="stoich_back")
@@ -310,8 +315,5 @@ class Mechanism:
                         self.metadata.get(MechanismMetadataKeys.STANDARD_CONC_M, 1.0))
         eq = Equilibrium(stoich_forward=sf, stoich_back=sb,
                          forward_model=forward_model, kr=kr, metadata=meta)
-        authority = normalize_equilibrium_rate_authority(
-            forward_model=eq.forward_model, kr=eq.kr, metadata=eq.metadata,
-        )
         self.equilibria.append(eq)
-        return eq, authority
+        return eq

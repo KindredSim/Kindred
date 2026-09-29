@@ -92,19 +92,8 @@ def _canonical_reversible_steps(
     admitted source reaction.
     """
 
-    reactions = tuple(getattr(mechanism, "reactions", ()) or ())
-    metadata = getattr(mechanism, "metadata", None)
-    if not isinstance(metadata, Mapping):
-        raise DSLError(
-            "Canonical mechanism metadata is missing; Wegscheider analysis "
-            "requires the admitted step_index_map."
-        )
-    raw_mapping = metadata.get("step_index_map")
-    if not isinstance(raw_mapping, list):
-        raise DSLError(
-            "Canonical mechanism step_index_map is missing or invalid; "
-            "Wegscheider analysis cannot infer reaction identities."
-        )
+    reactions = tuple(mechanism.reactions)
+    raw_mapping = mechanism.metadata["step_index_map"]
     expected_count = len(reactions) + len(equilibria)
     if len(raw_mapping) != expected_count:
         raise DSLError(
@@ -189,7 +178,7 @@ def _canonical_reversible_steps(
 
 
 def _reversible_steps(mechanism: object) -> tuple[_ReversibleStep, ...]:
-    eqs = list(getattr(mechanism, "equilibria", []) or [])
+    eqs = list(mechanism.equilibria)
     if not eqs:
         return ()
     authored_steps = _canonical_reversible_steps(mechanism, eqs)
@@ -198,11 +187,11 @@ def _reversible_steps(mechanism: object) -> tuple[_ReversibleStep, ...]:
     for equilibrium_index, step_index in authored_steps:
         eq = eqs[equilibrium_index]
         forward = _as_fraction_stoich_map(
-            getattr(eq, "stoich_forward", None),
+            eq.stoich_forward,
             label="forward",
         )
         back = _as_fraction_stoich_map(
-            getattr(eq, "stoich_back", None),
+            eq.stoich_back,
             label="backward",
         )
         species = sorted(set(forward) | set(back))

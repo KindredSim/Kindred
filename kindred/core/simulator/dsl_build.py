@@ -14,9 +14,6 @@ from ..mechanism import Mechanism
 from ..mechanism_metadata import MechanismMetadataKeys, MechanismMetadataView, EquilibriumMetadataView
 from .dsl_format import format_stoichiometry_side as _fmt_side
 from .dsl_build_input import DslMechanismBuildInput
-from .parameter_namespace import (
-    _namespace_policy_from_step,
-)
 
 logger = logging.getLogger(__name__)
 
@@ -28,7 +25,6 @@ def build_mechanism_from_ir(
 ) -> Mechanism:
     """Build a mechanism from the admitted immutable builder input."""
 
-    initials_merged = dict(build_input.initials)
     energy_unit = build_input.energy_unit
     T = build_input.temperature_K
     C0 = build_input.standard_conc_M
@@ -54,15 +50,13 @@ def build_mechanism_from_ir(
 
     # Add species to mechanism
     for sp_name in sorted(all_species):
-        init_conc = float(initials_merged.get(sp_name, 0.0))
-        mechanism.add_species(sp_name, init_conc)
+        mechanism.add_species(sp_name)
 
     authored_step_no = 0
     for _source_step_no, step in enumerate(steps, start=1):
         reactants = dict(step.reactants)
         products = dict(step.products)
-        namespace_policy = _namespace_policy_from_step(step)
-        is_equilibrium_step = namespace_policy.step_kind == "equilibrium"
+        is_equilibrium_step = step.reversible
 
         if is_equilibrium_step:
             eq_metadata = EquilibriumMetadataView(
@@ -76,7 +70,7 @@ def build_mechanism_from_ir(
             ).to_metadata()
 
             eq_index = len(mechanism.equilibria)
-            _equilibrium, authority = mechanism.add_equilibrium(
+            mechanism.add_equilibrium(
                 stoich_forward=reactants,
                 stoich_back=products,
                 forward_model=step.forward_model,
@@ -97,7 +91,7 @@ def build_mechanism_from_ir(
         context = f"{_fmt_side(reactants)} {arrow} {_fmt_side(products)}"
         entry: Dict[str, object] = {
             "step_index": int(authored_step_no),
-            "kind": namespace_policy.step_kind,
+            "kind": "equilibrium" if is_equilibrium_step else "reaction",
             "context": context,
         }
         # Project only the parser-admitted physical source roles into the
@@ -109,7 +103,6 @@ def build_mechanism_from_ir(
         }
         if is_equilibrium_step:
             entry["equilibrium_index"] = int(eq_index)
-            entry.update(authority.step_map_fields())
         else:
             entry["reaction_index"] = int(rxn_index)
         entry["source_coordinates"] = source_coordinates

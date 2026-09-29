@@ -54,13 +54,10 @@ class ErrorContext:
     ----------
     line : int, optional
         Line number (1-based) where error occurred
-    col : int, optional
-        Column number (1-based) where error occurred
     line_text : str, optional
         Source line text for context
     """
     line: Optional[int] = None
-    col: Optional[int] = None
     line_text: Optional[str] = None
 
 
@@ -116,26 +113,20 @@ class KindredError(Exception):
         """Build user-friendly error message."""
         parts = [f"{self.code} {self.__class__.__name__}: {self.message}"]
 
-        # Add context (file, line, column)
+        # Add context (line)
         if self.context:
             ctx_parts = []
             if self.context.line is not None:
-                loc = f"L{self.context.line}"
-                if self.context.col is not None:
-                    loc += f":C{self.context.col}"
-                ctx_parts.append(f"Location: {loc}")
+                ctx_parts.append(f"Location: L{self.context.line}")
 
             if ctx_parts:
                 parts.append("")
                 parts.extend(ctx_parts)
 
-            # Add source line with caret
+            # Add source line
             if self.context.line_text:
                 parts.append("")
                 parts.append(f"  {self.context.line_text}")
-                if self.context.col:
-                    caret_pos = self.context.col - 1
-                    parts.append("  " + " " * caret_pos + "^")
 
         # Add suggestion
         if self.suggestion:

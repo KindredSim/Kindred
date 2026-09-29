@@ -43,8 +43,10 @@ class ProjectTransientState:
     reactions_draft: bool = False
     notes_draft: bool = False
     initial_condition_drafts: bool = False
-    invalid_initial_conditions: bool = False
     run_defaults_drafts: bool = False
+    # Mechanism tab names holding an invalid Initial Conditions cell or an
+    # invalid Run-settings draft; Save discards both with one choice.
+    invalid_authoring_tabs: tuple[str, ...] = ()
     slider_drafts: bool = False
     active_run_or_preview: bool = False
     active_fit: bool = False
@@ -61,12 +63,12 @@ class ProjectTransientState:
             or self.notes_draft
             or self.initial_condition_drafts
             or self.run_defaults_drafts
-            or self.invalid_initial_conditions
+            or self.has_invalid_authoring
         )
 
     @property
     def has_invalid_authoring(self) -> bool:
-        return self.invalid_initial_conditions
+        return bool(self.invalid_authoring_tabs)
 
     @property
     def has_active_work(self) -> bool:
@@ -140,10 +142,7 @@ class ProjectController(QtCore.QObject):
             [ProjectDocument],
             ProjectDocument | None,
         ],
-        capture_visible_tab_inputs: Callable[
-            [ProjectContentToken],
-            ProjectContentToken | None,
-        ],
+        capture_visible_tab_inputs: Callable[[], None],
         prepare_before_save: Callable[
             [bool],
             tuple[
@@ -237,31 +236,20 @@ class ProjectController(QtCore.QObject):
         )
         return False
 
-    def _transient_state(self) -> ProjectTransientState:
-        return self._inspect_transient_state()
-
     def _resolve_disposition(
         self,
         action: str,
         *,
-        expected_token: ProjectContentToken,
         application_close: bool = False,
     ) -> _DispositionResult | None:
-        if not self._content_token_is_current(
-            expected_token,
-            action=action,
-        ):
-            return None
-        captured_token = self._capture_visible_tab_inputs(expected_token)
-        if captured_token is None:
-            return None
-        expected_token = captured_token
+        self._capture_visible_tab_inputs()
+        expected_token = self._session.capture_content_token()
         request = _ProjectDispositionRequest(
             action=str(action),
             archive_dirty=self._session.is_dirty(
                 self._tabs.workspace_presentation()
             ),
-            transient=self._transient_state(),
+            transient=self._inspect_transient_state(),
             application_close=bool(application_close),
         )
         if not request.archive_dirty and not request.transient.has_any:
@@ -280,9 +268,7 @@ class ProjectController(QtCore.QObject):
         if choice is _DispositionChoice.SAVE:
             saved_token = self._save_project_from_token(
                 expected_token,
-                discard_invalid_initial_conditions=(
-                    request.transient.invalid_initial_conditions
-                ),
+                discard_invalid_authoring=request.transient.has_invalid_authoring,
             )
             if saved_token is None:
                 return None
@@ -310,15 +296,18 @@ class ProjectController(QtCore.QObject):
                 "unsaved changes."
             )
         if transient.reactions_draft:
-            details.append("Visible Reactions text has not yet been accepted.")
+            details.append("Reactions text has not yet been accepted.")
         if transient.notes_draft:
-            details.append("Visible Notes text has not yet been saved.")
+            details.append("Notes text has not yet been saved.")
         if transient.initial_condition_drafts:
-            details.append("Visible Initial Conditions edits have not yet been saved.")
-        if transient.invalid_initial_conditions:
-            details.append("One or more visible initial-condition cells are invalid.")
+            details.append("Initial Conditions edits have not yet been saved.")
+        if transient.has_invalid_authoring:
+            tabs = ", ".join(repr(name) for name in transient.invalid_authoring_tabs)
+            details.append(
+                f"Initial Conditions or Run settings on mechanism tab(s) {tabs} are invalid."
+            )
         if transient.run_defaults_drafts:
-            details.append("Visible Run-default edits have not yet been saved.")
+            details.append("Run-default edits have not yet been saved.")
         if transient.slider_drafts:
             details.append("Slider Preview drafts are not project content.")
         if transient.active_run_or_preview:
@@ -386,8 +375,8 @@ class ProjectController(QtCore.QObject):
             discard_parts.append("Initial Conditions Edit")
         if transient.run_defaults_drafts:
             discard_parts.append("Run Defaults Edit")
-        if transient.invalid_initial_conditions:
-            discard_parts.append("Invalid Cell Edit(s)")
+        if transient.has_invalid_authoring:
+            discard_parts.append("Invalid Edit(s)")
         if transient.slider_drafts:
             discard_parts.append("Slider Preview")
         if not discard_parts and not transient.has_active_work:
@@ -455,18 +444,13 @@ class ProjectController(QtCore.QObject):
     ) -> bool:
         if not self._content_token_is_current(expected_token, action=action):
             return False
-        token = self._tabs.replace_project(
+        self._tabs.replace_project(
             document,
             presentation,
             path=path,
             baseline_document=baseline_document,
             expected_token=expected_token,
         )
-        if token is None:
-            self._set_status(
-                f"{action} was not completed because the current project changed."
-            )
-            return False
         status = (
             "Created new project." if path is None else f"Loaded project: {path}"
         )
@@ -485,11 +469,7 @@ class ProjectController(QtCore.QObject):
 
         if self._reject_mutation_during_close("New Project"):
             return False
-        expected_token = self._session.capture_content_token()
-        disposition = self._resolve_disposition(
-            "New Project",
-            expected_token=expected_token,
-        )
+        disposition = self._resolve_disposition("New Project")
         if disposition is None:
             return False
         self._apply_discard(disposition)
@@ -512,9 +492,7 @@ class ProjectController(QtCore.QObject):
         # Capture the visible editor before opening the native picker.  The
         # picker may take focus away; canceling it must leave this exact draft
         # owned by the current project with no publication or disposition.
-        expected_token = self._session.capture_content_token()
-        if self._capture_visible_tab_inputs(expected_token) is None:
-            return False
+        self._capture_visible_tab_inputs()
         path, _selected_filter = QtWidgets.QFileDialog.getOpenFileName(
             self._parent_widget,
             "Open Project",
@@ -533,11 +511,7 @@ class ProjectController(QtCore.QObject):
 
         if self._reject_mutation_during_close("Open Project"):
             return False
-        expected_token = self._session.capture_content_token()
-        disposition = self._resolve_disposition(
-            "Open Project",
-            expected_token=expected_token,
-        )
+        disposition = self._resolve_disposition("Open Project")
         if disposition is None:
             return False
         try:
@@ -589,13 +563,9 @@ class ProjectController(QtCore.QObject):
     def save_project(self) -> bool:
         if self._reject_mutation_during_close("Save Project"):
             return False
-        entry_token = self._session.capture_content_token()
-        operative_token = self._capture_visible_tab_inputs(entry_token)
-        if operative_token is None:
-            return False
-        prepared = self._prepared_save_document(
-            discard_invalid_initial_conditions=False,
-        )
+        self._capture_visible_tab_inputs()
+        expected_token = self._session.capture_content_token()
+        prepared = self._prepare_before_save(False)
         if prepared is None:
             return False
         candidate, materialized_by_tab = prepared
@@ -603,7 +573,7 @@ class ProjectController(QtCore.QObject):
             self._save_prepared_document(
                 candidate,
                 materialized_by_tab,
-                expected_token=operative_token,
+                expected_token=expected_token,
                 choose_destination=self._session.current_path is None,
             )
             is not None
@@ -612,13 +582,9 @@ class ProjectController(QtCore.QObject):
     def save_project_as(self) -> bool:
         if self._reject_mutation_during_close("Save Project As"):
             return False
-        entry_token = self._session.capture_content_token()
-        operative_token = self._capture_visible_tab_inputs(entry_token)
-        if operative_token is None:
-            return False
-        prepared = self._prepared_save_document(
-            discard_invalid_initial_conditions=False,
-        )
+        self._capture_visible_tab_inputs()
+        expected_token = self._session.capture_content_token()
+        prepared = self._prepare_before_save(False)
         if prepared is None:
             return False
         candidate, materialized_by_tab = prepared
@@ -626,7 +592,7 @@ class ProjectController(QtCore.QObject):
             self._save_prepared_document(
                 candidate,
                 materialized_by_tab,
-                expected_token=operative_token,
+                expected_token=expected_token,
                 choose_destination=True,
             )
             is not None
@@ -636,20 +602,11 @@ class ProjectController(QtCore.QObject):
         self,
         expected_token: ProjectContentToken,
         *,
-        discard_invalid_initial_conditions: bool,
+        discard_invalid_authoring: bool,
     ) -> ProjectContentToken | None:
         """Save during one already-admitted project disposition."""
 
-        if not self._content_token_is_current(
-            expected_token,
-            action="Save Project",
-        ):
-            return None
-        prepared = self._prepared_save_document(
-            discard_invalid_initial_conditions=(
-                discard_invalid_initial_conditions
-            ),
-        )
+        prepared = self._prepare_before_save(discard_invalid_authoring)
         if prepared is None:
             return None
         candidate, materialized_by_tab = prepared
@@ -659,19 +616,6 @@ class ProjectController(QtCore.QObject):
             expected_token=expected_token,
             choose_destination=self._session.current_path is None,
         )
-
-    def _prepared_save_document(
-        self,
-        *,
-        discard_invalid_initial_conditions: bool,
-    ) -> tuple[
-        ProjectDocument,
-        tuple[tuple[str, tuple[str, ...]], ...],
-    ] | None:
-        prepared = self._prepare_before_save(
-            discard_invalid_initial_conditions
-        )
-        return prepared
 
     def _save_prepared_document(
         self,
@@ -776,14 +720,6 @@ class ProjectController(QtCore.QObject):
                 "The selected save candidate was superseded before publication."
             )
             return None
-        if (
-            not self._session.is_content_token_current(committed_token)
-            or self._session.document != candidate
-        ):
-            self._set_status(
-                "The selected save candidate changed before archive publication."
-            )
-            return None
         try:
             presentation = self._tabs.workspace_presentation()
             self._archive_store.save(
@@ -794,25 +730,11 @@ class ProjectController(QtCore.QObject):
         except Exception as exc:
             self._show_error("Save Error", f"Failed to save project:\n\n{exc}")
             return None
-        if not self._content_token_is_current(
-            committed_token,
-            action="Save Project",
-        ):
-            self._set_status(
-                "The selected snapshot was written, but the current project "
-                "changed and remains unsaved."
-            )
-            return None
-        if not self._session.mark_saved(
+        self._session.mark_saved(
             absolute_path,
             presentation,
             expected_token=committed_token,
-        ):
-            self._set_status(
-                "The selected snapshot was written, but the current project "
-                "changed before save publication."
-            )
-            return None
+        )
         status = f"Saved project: {absolute_path}"
         try:
             self._config.record_recent_project(absolute_path)
@@ -831,24 +753,13 @@ class ProjectController(QtCore.QObject):
         if self._close_started:
             self.notify_close_progress()
             return self._native_close_authorized
-        entry_token = self._session.capture_content_token()
         disposition = self._resolve_disposition(
             "closing Kindred",
-            expected_token=entry_token,
             application_close=True,
         )
         if disposition is None:
             return False
-        if not self._content_token_is_current(
-            disposition.content_token,
-            action="Close",
-        ):
-            return False
         self._apply_discard(disposition)
-        if not self._session.is_content_token_current(
-            disposition.content_token
-        ):
-            return False
         if disposition.clean_idle and self._async_owners_are_settled():
             try:
                 fit_idle_closed = bool(
@@ -865,13 +776,6 @@ class ProjectController(QtCore.QObject):
                 logger.exception("Idle Scan cleanup failed during application Close")
                 scan_idle_closed = False
             if fit_idle_closed and scan_idle_closed:
-                if not self._session.is_content_token_current(
-                    disposition.content_token
-                ):
-                    self._set_status(
-                        "Close was not completed because the current project changed."
-                    )
-                    return False
                 self._close_started = True
                 self._native_close_authorized = True
                 self.nativeCloseAuthorized.emit()

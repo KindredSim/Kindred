@@ -15,6 +15,7 @@ from PySide6 import QtCore, QtWidgets
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QBrush, QColor, QFontMetrics, QPalette
 
+from kindred.gui.fitting.constants import FIT_DATASET_WEIGHT_MODE_LABELS
 from kindred.gui.fitting.contracts import FitTargetSelection, copy_target_selection
 from kindred.gui.fitting.launch import (
     FitDatasetLocalSettings,
@@ -249,11 +250,8 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
         weighting_form.setRowWrapPolicy(QtWidgets.QFormLayout.RowWrapPolicy.WrapLongRows)
         self._weight_mode_combo = QtWidgets.QComboBox(self)
         self._weight_mode_combo.setObjectName("global_fit_weight_mode_combo")
-        self._weight_mode_combo.addItem(
-            "Implicit weights (1/N per dataset)",
-            "implicit",
-        )
-        self._weight_mode_combo.addItem("User weights only", "user")
+        for mode, label in FIT_DATASET_WEIGHT_MODE_LABELS.items():
+            self._weight_mode_combo.addItem(label, mode)
         weighting_form.addRow("Weight mode:", self._weight_mode_combo)
 
         self._dataset_weight_edit = QtWidgets.QLineEdit(self)

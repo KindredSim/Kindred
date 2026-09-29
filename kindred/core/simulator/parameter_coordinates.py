@@ -18,8 +18,6 @@ from typing import Any, TypeAlias
 
 from kindred.core.equilibrium_rate_authority import (
     EquilibriumRateAuthorityKind,
-    normalize_existing_equilibrium_rate_authority,
-    require_step_entry_authored_role_is_editable,
     derived_equilibrium_ratio_from_directional_rates,
     effective_reverse_rate_from_keq,
 )
@@ -134,7 +132,7 @@ def chemistry_parameter_dependencies(
                     "T",
                 )
         elif kind == "equilibrium":
-            authority = normalize_existing_equilibrium_rate_authority(step)
+            authority = step.authority
             if role == "kr" and authority.kind == EquilibriumRateAuthorityKind.KEQ:
                 dependencies[name] = (f"kf{number}", f"Keq{number}")
             elif role == "Keq":
@@ -194,8 +192,7 @@ def bind_chemistry_readout(
                 values[f"kf{number}"], values[f"Keq{number}"]
             )
         )
-    authority = normalize_existing_equilibrium_rate_authority(step)
-    if authority.kind == EquilibriumRateAuthorityKind.KR:
+    if step.authority.kind == EquilibriumRateAuthorityKind.KR:
         return lambda: derived_equilibrium_ratio_from_directional_rates(
             values[f"kf{number}"], values[f"kr{number}"]
         )
@@ -263,7 +260,7 @@ def _admit_coordinate_value(
         return admit_keq(value, field=name)
 
     if kind == "reaction" and role == "k":
-        reactions = getattr(mechanism, "reactions", ()) or ()
+        reactions = mechanism.reactions
         model = reactions[index].forward_model
         return admit_rate(
             value,
@@ -272,14 +269,13 @@ def _admit_coordinate_value(
         )
 
     if kind == "equilibrium" and role in {"kf", "kr"}:
-        equilibria = getattr(mechanism, "equilibria", ()) or ()
+        equilibria = mechanism.equilibria
         equilibrium = equilibria[index]
         model = equilibrium.forward_model
-        authority = normalize_existing_equilibrium_rate_authority(equilibrium)
         allow_zero = (
             role == "kf"
             and isinstance(model, ConstantRateModel)
-            and authority.kind == EquilibriumRateAuthorityKind.KEQ
+            and equilibrium.authority.kind == EquilibriumRateAuthorityKind.KEQ
         )
         return admit_rate(value, field=name, allow_zero=allow_zero)
 
@@ -307,21 +303,14 @@ def _admit_coordinate_groups(
             role
         ).grouped_model_target:
             raise DSLError(f"Source coordinate {name!r} is not a model coordinate")
-        if bool(entry.get("locked", False)):
-            raise DSLError(f"Mechanism coordinate {name!r} is locked and not writable")
-        if kind == "equilibrium":
-            try:
-                require_step_entry_authored_role_is_editable(
-                    entry,
-                    role,
-                    parameter_name=name,
-                )
-            except ValueError as exc:
-                # Indexed equilibrium roles and dG_eq all carry one normalized
-                # editability decision.  The same rule is not needed for
-                # reaction coordinates, whose source map is the authority.
-                if route == "indexed" or role == "dG_eq":
-                    raise DSLError(str(exc)) from exc
+        if (
+            kind == "equilibrium"
+            and route == "indexed"
+            and not mechanism.equilibria[index].authority.authored_role_is_editable(role)
+        ):
+            raise DSLError(
+                f"{name} is not editable under normalized equilibrium authority."
+            )
         try:
             admitted = _admit_coordinate_value(
                 mechanism,
@@ -409,7 +398,7 @@ def _compose_equilibrium(
     elif "kf" in updates:
         model = equilibrium.forward_model
 
-    equilibrium_metadata = dict(getattr(equilibrium, "metadata", {}) or {})
+    equilibrium_metadata = dict(equilibrium.metadata)
     if "dG_eq" in updates:
         equilibrium_metadata[EquilibriumMetadataKeys.DG_EQ_J_PER_MOL] = updates[
             "dG_eq"
@@ -433,8 +422,8 @@ def _compose_coordinate_groups(
         tuple[Mapping[str, object], Mapping[str, float]],
     ],
 ) -> Iterator[tuple[tuple[str, int], object]]:
-    reactions = getattr(mechanism, "reactions", ()) or ()
-    equilibria = getattr(mechanism, "equilibria", ()) or ()
+    reactions = mechanism.reactions
+    equilibria = mechanism.equilibria
     for (kind, index), (entry, updates) in grouped.items():
         step_name = int(entry["step_index"])
         if kind == "reaction":
@@ -472,8 +461,8 @@ def apply_mechanism_coordinate_values(
     )
     if not grouped:
         return
-    reactions = getattr(mechanism, "reactions", ()) or ()
-    equilibria = getattr(mechanism, "equilibria", ()) or ()
+    reactions = mechanism.reactions
+    equilibria = mechanism.equilibria
     replacements = tuple(
         _compose_coordinate_groups(
             mechanism,
@@ -497,16 +486,8 @@ def read_mechanism_parameter_values(
 
     wanted = set(parameter_target_map) if names is None else names
     out: dict[str, float] = {}
-    reactions = getattr(mechanism, "reactions", ()) or ()
-    equilibria = getattr(mechanism, "equilibria", ()) or ()
-
-    def _value(raw: object) -> float | None:
-        if raw is None:
-            return None
-        try:
-            return float(raw()) if callable(raw) else float(raw)
-        except (TypeError, ValueError, OverflowError):
-            return None
+    reactions = mechanism.reactions
+    equilibria = mechanism.equilibria
 
     for name, target in parameter_target_map.items():
         if name not in wanted:
@@ -522,7 +503,7 @@ def read_mechanism_parameter_values(
             if role in {"k", "kf"} and isinstance(step.forward_model, ConstantRateModel):
                 value = step.forward_model.k
             elif kind == "equilibrium":
-                authority = normalize_existing_equilibrium_rate_authority(step)
+                authority = step.authority
                 if role == "kr" and authority.kind == EquilibriumRateAuthorityKind.KR:
                     value = authority.kr
                 elif role == "Keq" and authority.has_explicit_keq_param:
@@ -539,14 +520,8 @@ def read_mechanism_parameter_values(
                 value = float(model.kappa)
             elif role == "degeneracy" and isinstance(model, EyringRateModel):
                 value = float(model.degeneracy)
-            elif role == "dG_eq" and kind == "equilibrium":
-                value = _value(
-                    getattr(step, "metadata", {}).get(
-                        EquilibriumMetadataKeys.DG_EQ_J_PER_MOL
-                    )
-                )
-                if value is not None:
-                    value = float(value)
+            elif role == "dG_eq":
+                value = step.authority.dG_eq_J_per_mol
         if value is not None and math.isfinite(value):
             out[name] = float(value)
     return out

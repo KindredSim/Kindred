@@ -139,12 +139,7 @@ class _DatasetImportBatchWorker(QtCore.QThread):
         if first_row is None:
             first_row = next(row_iter, None)
         if first_row is None:
-            label = (
-                f"Sheet {sheet_name!r} in workbook {source.original_filename!r}"
-                if sheet_name is not None
-                else f"CSV file {source.original_filename!r}"
-            )
-            raise ValueError(f"{label} is empty.")
+            raise ValueError(f"CSV file {source.original_filename!r} is empty.")
         rows_to_parse = (
             row_iter
             if plan.skip_unit_row
@@ -169,25 +164,18 @@ class _DatasetImportBatchWorker(QtCore.QThread):
     def _load_csv(self, config: ImportConfig) -> DatasetImportUnit:
         source = config.source
         plan = config.plans[0]
-        try:
-            columns, rows = read_csv_rows_from_bytes(
-                source.exact_source_bytes,
-                source_label=source.original_filename,
+        columns, rows = read_csv_rows_from_bytes(
+            source.exact_source_bytes,
+            source_label=source.original_filename,
+        )
+        with closing(rows):
+            payload = self._parse_rows(
+                rows,
+                columns=columns,
+                plan=plan,
+                source=source,
+                interruption_checker=lambda: self.isInterruptionRequested(),
             )
-            with closing(rows):
-                payload = self._parse_rows(
-                    rows,
-                    columns=columns,
-                    plan=plan,
-                    source=source,
-                    interruption_checker=lambda: self.isInterruptionRequested(),
-                )
-        except (_DatasetImportCancelled, CsvImportInterrupted):
-            raise
-        except Exception as exc:
-            raise ValueError(
-                f"CSV file {source.original_filename!r}: {exc}"
-            ) from exc
         return DatasetImportUnit(
             source=source,
             display_name=source.original_filename,
@@ -198,57 +186,43 @@ class _DatasetImportBatchWorker(QtCore.QThread):
         source = config.source
         units: list[DatasetImportUnit] = []
         # Keep one workbook pair open for all selected sheets in this source.
-        try:
-            with ExcelWorkbookPair(
-                source.exact_source_bytes,
-                source_label=source.original_filename,
-            ) as workbooks:
-                for plan in config.plans:
-                    self._check_interrupted()
-                    sheet_name = plan.sheet_name
-                    if sheet_name is None:
-                        raise ValueError("XLSX import plans require a sheet name.")
-                    try:
-                        rows = workbooks.read_sheet_rows(sheet_name)
-                        with closing(rows):
-                            row_iter = iter(rows)
-                            first_row = next(row_iter, None)
-                            if first_row is None:
-                                raise ValueError("sheet is empty")
-                            payload = self._parse_rows(
-                                row_iter,
-                                columns=tuple(first_row),
-                                plan=plan,
-                                source=source,
-                                sheet_name=sheet_name,
-                                first_row=first_row,
-                                interruption_checker=lambda: self.isInterruptionRequested(),
-                            )
-                    except (_DatasetImportCancelled, CsvImportInterrupted):
-                        raise
-                    except Exception as exc:
+        with ExcelWorkbookPair(
+            source.exact_source_bytes,
+            source_label=source.original_filename,
+        ) as workbooks:
+            for plan in config.plans:
+                self._check_interrupted()
+                sheet_name = plan.sheet_name
+                if sheet_name is None:
+                    raise ValueError("XLSX import plans require a sheet name.")
+                rows = workbooks.read_sheet_rows(sheet_name)
+                with closing(rows):
+                    row_iter = iter(rows)
+                    first_row = next(row_iter, None)
+                    if first_row is None:
                         raise ValueError(
-                            f"Workbook {source.original_filename!r}, sheet "
-                            f"{sheet_name!r}: {exc}"
-                        ) from exc
-                    units.append(
-                        DatasetImportUnit(
-                            source=source,
-                            display_name=f"{source.original_filename}::{sheet_name}",
-                            payload=payload,
+                            f"Sheet {sheet_name!r} in workbook "
+                            f"{source.original_filename!r} is empty."
                         )
+                    payload = self._parse_rows(
+                        row_iter,
+                        columns=tuple(first_row),
+                        plan=plan,
+                        source=source,
+                        sheet_name=sheet_name,
+                        first_row=first_row,
+                        interruption_checker=lambda: self.isInterruptionRequested(),
                     )
-                    self._completed_units += 1
-                    self._publish_plan_progress()
-                    self._check_interrupted()
-        except (_DatasetImportCancelled, CsvImportInterrupted):
-            raise
-        except Exception as exc:
-            if str(source.original_filename) in str(exc):
-                raise
-            raise ValueError(
-                f"Workbook {source.original_filename!r}: {exc}"
-            ) from exc
+                units.append(
+                    DatasetImportUnit(
+                        source=source,
+                        display_name=f"{source.original_filename}::{sheet_name}",
+                        payload=payload,
+                    )
+                )
+                self._completed_units += 1
+                self._publish_plan_progress()
+                self._check_interrupted()
         return tuple(units)
 
     def _publish_plan_progress(self) -> None:
@@ -283,7 +257,7 @@ class _DatasetImportBatchWorker(QtCore.QThread):
             self.cancelled.emit()
         except Exception as exc:
             logger.exception("Dataset import failed")
-            self.failed.emit(f"{type(exc).__name__}: {exc}")
+            self.failed.emit(str(exc) or type(exc).__name__)
 
 
 def build_raw_record_batch_proposal(

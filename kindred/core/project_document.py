@@ -9,9 +9,6 @@ from numbers import Real
 from typing import Callable, Iterable, Mapping, Sequence
 
 from kindred.core.authored_source_errors import AuthoredSourceError
-from kindred.core.equilibrium_rate_authority import (
-    normalize_existing_equilibrium_rate_authority,
-)
 from kindred.core.datasets import foundation as dataset_foundation
 from kindred.core.mechanism_source import (
     MechanismAuthoringSource,
@@ -1028,7 +1025,6 @@ def prepare_authored_source_admission(
             if not source.reactions_text.strip()
             else prepare_dsl_request_set(
                 source.reactions_text,
-                initials={},
                 units=scientific_settings.default_units,
             )
         )
@@ -1460,7 +1456,6 @@ def _admitted_correction_targets(
         powers.update(str(name) for name in item.monomial.coordinate_power_map())
     admitted: list[CorrectionTarget] = []
     admitted_names: set[str] = set()
-    equilibria = tuple(getattr(mechanism, "equilibria", ()) or ())
     for coordinate in coordinates:
         name = str(coordinate.canonical_name)
         role = str(coordinate.role)
@@ -1482,42 +1477,26 @@ def _admitted_correction_targets(
                     name=name,
                     family=role,
                     source_backed=False,
-                    editable=False,
                     derived=assignment_kind in {"derived scalar", "mechanism-bound"},
                 )
             )
             continue
-        kind, item_index, target_role, entry = source_target
+        _kind, _item_index, target_role, _entry = source_target
         if str(target_role) != role:
             admitted.append(
                 CorrectionTarget(
                     name=name,
                     family=role,
                     source_backed=False,
-                    editable=False,
                     derived=assignment_kind in {"derived scalar", "mechanism-bound"},
                 )
             )
             continue
-        editable = not bool(entry.get("locked", False))
-        derived = assignment_kind in {
-            "derived scalar",
-            "mechanism-bound",
-        }
-        if str(kind) == "equilibrium":
-            authority = normalize_existing_equilibrium_rate_authority(
-                equilibria[int(item_index)]
-            )
-            if capabilities.equilibrium_authority:
-                editable = editable and authority.authored_role_is_editable(role)
-                derived = derived or authority.authored_role_is_derived(role)
         admitted.append(
             CorrectionTarget(
                 name=name,
                 family=role,
-                editable=editable,
-                locked=bool(entry.get("locked", False)),
-                derived=derived,
+                derived=assignment_kind in {"derived scalar", "mechanism-bound"},
             )
         )
     cycle_steps = {
@@ -1536,7 +1515,6 @@ def _admitted_correction_targets(
                 name=name,
                 family=role,
                 source_backed=False,
-                editable=False,
                 derived=True,
             )
         )
@@ -1616,7 +1594,6 @@ def assess_tab_exact_correction(
         # owned by ordinary source admission after a user accepts a proposal.
         prepared = prepare_dsl_request_set(
             source.reactions_text,
-            initials={},
             units=tab.scientific_settings.default_units,
         )
         detached_tab = replace(

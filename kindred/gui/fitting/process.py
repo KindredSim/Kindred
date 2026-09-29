@@ -53,7 +53,7 @@ def main() -> int:
             return 0
         source, settings, payload = codec._decode_fit(initial, {})
         prepared = prepare_dsl_request_set(
-            source.reactions_text, initials={}, units=settings.default_units
+            source.reactions_text, units=settings.default_units
         )
         request = codec._decode_fit(payload, {"prepared": prepared})
         references = {"request": request, "origin": request.setup.origin}

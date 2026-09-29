@@ -16,19 +16,13 @@ from kindred.core.simulator.solver_types import SimulationPresentationBoundary, 
 from kindred.core.simulation_failure import FactualCause
 from kindred.core.simulation_preparation import (
     SimulationExecutionRequest,
+    simulation_execution_requests_equal,
 )
 
 __all__ = [
     "ResultRepository",
     "SimulationResultValue",
 ]
-
-
-def _required_id(value: object, field: str) -> str:
-    normalized = str(value or "").strip()
-    if not normalized:
-        raise ValueError(f"{field} must be nonblank.")
-    return normalized
 
 
 @dataclass(frozen=True, slots=True, eq=False)
@@ -58,74 +52,27 @@ class SimulationResultValue:
     volume: VolumeTrajectory | None = None
 
     def __post_init__(self) -> None:
-        # Canonical finalization is the sole producer; solver-owned arrays and
-        # boundaries already crossed their typed admission boundary.
-        presentation_boundaries = tuple(self.presentation_boundaries)
-        series = dict(self.series)
-
-        scalars: dict[str, float] = {}
-        for raw_name, raw_value in dict(self.scalars or {}).items():
-            name = _required_id(raw_name, "scalar name")
-            value = float(raw_value)
-            if not np.isfinite(value):
-                raise ValueError(f"scalar {name!r} must be finite.")
-            scalars[name] = value
-
-        parameters: list[tuple[str, float, str]] = []
-        parameter_names: set[str] = set()
-        for raw_name, raw_value, raw_unit in self.parameters:
-            name = _required_id(raw_name, "parameter name")
-            if name in parameter_names:
-                raise ValueError(f"parameters contain duplicate name {name!r}.")
-            value = float(raw_value)
-            if not np.isfinite(value):
-                raise ValueError(f"parameter {name!r} must be finite.")
-            parameter_names.add(name)
-            parameters.append((name, value, str(raw_unit or "")))
-
-        def normalized_names(values: Iterable[str], field: str) -> tuple[str, ...]:
-            result = tuple(_required_id(value, field) for value in values)
-            if len(result) != len(set(result)):
-                raise ValueError(f"{field} contains duplicate output names.")
-            return result
-
-        requested = normalized_names(self.requested_algebra_outputs, "requested_algebra_outputs")
-        succeeded = normalized_names(self.succeeded_algebra_outputs, "succeeded_algebra_outputs")
-        failed = normalized_names(self.failed_algebra_outputs, "failed_algebra_outputs")
-        omitted = normalized_names(self.omitted_algebra_outputs, "omitted_algebra_outputs")
-        requested_set = set(requested)
-        partitions = (set(succeeded), set(failed), set(omitted))
-        if any(not values <= requested_set for values in partitions):
+        # Canonical finalization is the sole producer and publishes frozen,
+        # typed values; the carrier checks only its cross-field invariants.
+        requested = set(self.requested_algebra_outputs)
+        partitions = (
+            set(self.succeeded_algebra_outputs),
+            set(self.failed_algebra_outputs),
+            set(self.omitted_algebra_outputs),
+        )
+        if any(not values <= requested for values in partitions):
             raise ValueError("algebra outcome contains an unrequested output.")
         if set.intersection(*partitions):
             raise ValueError("algebra output outcome partitions overlap.")
-        if requested_set.difference(set.union(*partitions)):
+        if requested.difference(set.union(*partitions)):
             raise ValueError("requested algebra outputs lack a terminal outcome.")
-        errors = tuple(self.algebra_errors)
-        if any(not isinstance(value, FactualCause) for value in errors):
-            raise TypeError("algebra_errors must contain only FactualCause values.")
-
-        object.__setattr__(self, "series", MappingProxyType(series))
-        object.__setattr__(self, "scalars", MappingProxyType(scalars))
-        object.__setattr__(self, "parameters", tuple(parameters))
-        parameter_classifications = tuple(self.parameter_classifications)
-        if tuple(name for name, _family, _role in parameter_classifications) != tuple(
-            name for name, _value, _unit in parameters
+        if tuple(name for name, _family, _role in self.parameter_classifications) != tuple(
+            name for name, _value, _unit in self.parameters
         ):
             raise ValueError(
                 "parameter classifications must match result parameters exactly."
             )
-        object.__setattr__(self, "parameter_classifications", parameter_classifications)
-        object.__setattr__(self, "requested_algebra_outputs", requested)
-        object.__setattr__(self, "succeeded_algebra_outputs", succeeded)
-        object.__setattr__(self, "failed_algebra_outputs", failed)
-        object.__setattr__(self, "omitted_algebra_outputs", omitted)
-        object.__setattr__(self, "algebra_errors", errors)
-        object.__setattr__(
-            self,
-            "presentation_boundaries",
-            presentation_boundaries,
-        )
+
 
 class ResultRepository:
     """Store completed result values and a bounded exact-request Run cache."""
@@ -273,7 +220,6 @@ class ResultRepository:
         self._current_by_set_id[sid] = entry
         self._current_run_set_ids.add(sid)
         self._reference_by_set_id.pop(sid, None)
-        from kindred.core.simulation_preparation import simulation_execution_requests_equal
         self._explicit_cache[:] = [
             cached
             for cached in self._explicit_cache
@@ -306,7 +252,6 @@ class ResultRepository:
 
     def hydrate_cached(self, set_id: str, execution_request: SimulationExecutionRequest) -> SimulationResultValue | None:
         """Hydrate a structurally equal full request; a miss changes nothing."""
-        from kindred.core.simulation_preparation import simulation_execution_requests_equal
         sid = set_id
         entry = next(
             (
@@ -326,42 +271,25 @@ class ResultRepository:
         self._reference_by_set_id.pop(sid, None)
         return entry[2]
 
-    def clear_semantic_set(self, set_id: str) -> None:
-        """Clear visible semantic entries while retaining exact cache storage."""
-        sid = set_id
-        self._current_by_set_id.pop(sid, None)
-        self._current_run_set_ids.discard(sid)
-        self._reference_by_set_id.pop(sid, None)
-
-    def deauthorize_sets(
-        self,
-        set_ids: Iterable[str],
-    ) -> None:
+    def deauthorize_sets(self, set_ids: Iterable[str]) -> None:
         """Clear foreground values and the Reference; keep the exact Run cache.
 
         Deauthorization never manufactures a Reference value.
         """
 
-        targets = set(set_ids)
-        if not targets:
-            return
-        for set_id in targets:
+        for set_id in set_ids:
             self._current_by_set_id.pop(set_id, None)
             self._current_run_set_ids.discard(set_id)
             self._reference_by_set_id.pop(set_id, None)
 
-    def purge_set(self, set_id: str) -> None:
+    def purge_sets(self, set_ids: Iterable[str]) -> None:
         """Delete/history removal purges visible entries and cached storage."""
 
-        sid = set_id
-        self.clear_semantic_set(sid)
+        removed = set(set_ids)
+        self.deauthorize_sets(removed)
         self._explicit_cache[:] = [
-            entry for entry in self._explicit_cache if entry[0] != sid
+            entry for entry in self._explicit_cache if entry[0] not in removed
         ]
-
-    def purge_sets(self, set_ids: Iterable[str]) -> None:
-        for set_id in tuple(set_ids):
-            self.purge_set(set_id)
 
     def _trim_explicit_cache(self) -> None:
         del self._explicit_cache[:-self._cache_capacity]

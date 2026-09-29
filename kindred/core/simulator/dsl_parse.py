@@ -53,6 +53,8 @@ from ..units import (
     admit_energy_j_per_mol,
     admit_keq,
     admit_rate,
+    energy_to_j_per_mol,
+    normalize_energy_unit,
 )
 from ..species import validate_c0, validate_concentration, validate_temperature
 from ..stoichiometry import directional_order_fraction
@@ -77,7 +79,7 @@ from .dsl_build_input import (
 if TYPE_CHECKING:
     from ..intervention_schedule import InterventionSchedule
     from ..intervention_schedule_compiler import InterventionExecutionContract
-    from ..temperature import TemperatureScheduleProtocol
+    from ..temperature import TemperatureSchedule
 
 logger = logging.getLogger(__name__)
 
@@ -145,7 +147,7 @@ class DSLIR:
     energy_unit: str
     temperature_K: float
     standard_conc_M: float
-    temperature_schedule: Optional["TemperatureScheduleProtocol"]
+    temperature_schedule: Optional["TemperatureSchedule"]
     intervention_schedule: Optional["InterventionSchedule"]
     steps: List[DslBuildStep]
     inline_initial_conditions: "DslInitialConditionAdmission"
@@ -419,8 +421,6 @@ class DslAnalysis:
         object.__setattr__(self, "temperature_K", temperature_K)
         if type(self.energy_unit) is not str:
             raise TypeError("DSL analysis energy_unit must be an exact string.")
-        from .common import normalize_energy_unit
-
         try:
             energy_unit = normalize_energy_unit(self.energy_unit)
         except ValueError as exc:
@@ -503,9 +503,7 @@ class PreparedDslRequestSet:
 
         shell = Mechanism()
         shell.species = self.__mechanism.species
-        shell.metadata = clone_metadata(
-            getattr(self.__mechanism, "metadata", {}) or {}
-        )
+        shell.metadata = clone_metadata(self.__mechanism.metadata)
         shell.reactions = list(self.__mechanism.reactions)
         shell.equilibria = [
             replace(equilibrium, metadata=clone_metadata(equilibrium.metadata))
@@ -562,15 +560,12 @@ class PreparedDslRequestSet:
                 structure = self.__symbolic_jacobian_structure
         return structure
 
-    def temperature_schedule_for_execution(self) -> Optional["TemperatureScheduleProtocol"]:
+    def temperature_schedule_for_execution(self) -> Optional["TemperatureSchedule"]:
         """Return the accepted mechanism's retained typed schedule directly."""
 
         from kindred.core.mechanism_metadata import MechanismMetadataKeys
 
-        metadata = getattr(self.__mechanism, "metadata", {}) or {}
-        if not isinstance(metadata, Mapping):
-            return None
-        return metadata.get(MechanismMetadataKeys.TEMPERATURE_SCHEDULE)
+        return self.__mechanism.metadata.get(MechanismMetadataKeys.TEMPERATURE_SCHEDULE)
 
     def parameterized_intervention_schedule_for_binding(self) -> InterventionSchedule | None:
         return self.__intervention_schedule
@@ -1536,8 +1531,6 @@ def _parse_dsl_ir(text: str, *, units: UnitsModel | None = None) -> "DSLIR":
 
 
 def _parse_energy_unit_directive(line: str) -> str:
-    from .common import normalize_energy_unit
-
     kv = _parse_keyvals(line, reject_duplicate_canonical_keys=True)
     raw = kv.get("energy")
     if not raw:
@@ -1636,8 +1629,6 @@ def _parse_reaction_like_step(
     line_number: int | None,
     line_content: str | None,
 ) -> DslBuildStep:
-    from .kinetics import normalize_energy_to_J_per_mol
-
     try:
         react, prod, arrow = _parse_stoich(stoich_part)
     except _DSLError as exc:
@@ -1723,7 +1714,7 @@ def _parse_reaction_like_step(
         if value is None:
             raise ValueError(f"{key} must be numeric")
         return admit_energy_j_per_mol(
-            normalize_energy_to_J_per_mol(value, energy_unit), field=key
+            energy_to_j_per_mol(value, energy_unit), field=key
         )
 
     try:
@@ -1842,19 +1833,10 @@ def _source_origins(
     return tuple(origins)
 
 
-def _mechanism_build_input(
-    ir: DSLIR,
-    *,
-    initials: Mapping[str, float] | None,
-):
+def _mechanism_build_input(ir: DSLIR):
     """Freeze the private parse accumulator into the sole builder input."""
 
     from kindred.core.simulator.dsl_build_input import DslMechanismBuildInput
-
-    canonical_initials = {
-        str(name): float(value)
-        for name, value in dict(initials or {}).items()
-    }
 
     return DslMechanismBuildInput(
         energy_unit=ir.energy_unit,
@@ -1862,14 +1844,12 @@ def _mechanism_build_input(
         standard_conc_M=ir.standard_conc_M,
         temperature_schedule=ir.temperature_schedule,
         steps=tuple(ir.steps),
-        initials=tuple(canonical_initials.items()),
     )
 
 
 def prepare_dsl_request_set(
     text: str,
     *,
-    initials: Mapping[str, float] | None = None,
     units: UnitsModel | None = None,
 ) -> PreparedDslRequestSet:
     """Admit source once and publish its one immutable typed analysis."""
@@ -1894,12 +1874,7 @@ def prepare_dsl_request_set(
     intervention_schedule = coerce_intervention_schedule(
         ir.intervention_schedule
     )
-    mechanism = build_mechanism_from_ir(
-        _mechanism_build_input(
-            ir,
-            initials=initials,
-        )
-    )
+    mechanism = build_mechanism_from_ir(_mechanism_build_input(ir))
     mechanism_namespace = build_namespace_from_mechanism(mechanism)
     parameter_algebra_spec = parse_parameter_algebra_spec_from_dsl_text(
         text,
@@ -2022,7 +1997,6 @@ def derive_source_with_parameter_updates(
     spec = base.parameter_algebra_spec_for_execution()
     mechanism = base.accepted_mechanism_for_structure()
     from .step_indexing import lookup_source_coordinate_target
-    from ..equilibrium_rate_authority import step_entry_authored_role_is_editable
     raw_lines = source_text.splitlines(keepends=True)
     source_lines = [_line_content(line) for line in raw_lines]
     line_endings = [
@@ -2101,19 +2075,11 @@ def derive_source_with_parameter_updates(
             raise ValueError(
                 f"Parameter {update.name!r} has no admitted source owner."
             )
-        kind, index, role, entry = source_target
+        _kind, _index, role, _entry = source_target
         if str(role) != coordinate.role:
             raise ValueError(
                 f"Parameter {update.name!r} has inconsistent admitted source role."
             )
-        if bool(entry.get("locked", False)):
-            raise ValueError(f"Parameter {update.name!r} is locked and not writable.")
-        if (
-            str(kind) == "equilibrium"
-            and coordinate.capabilities.equilibrium_authority
-            and not step_entry_authored_role_is_editable(entry, str(role))
-        ):
-            raise ValueError(f"Parameter {update.name!r} is a derived readout, not writable.")
         # Physical and authored indexed source coordinates are already in the
         # exact units and representation expected by their retained span.
         retain_replacement(coordinate, repr(float(update.value)))

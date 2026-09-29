@@ -6,7 +6,21 @@ from typing import Any, Mapping
 import numpy as np
 
 from .errors import UnsupportedSymbolicExpressionError
-from .namespaces import symbolic_status_payload
+
+
+def symbolic_status_payload(
+    *,
+    kind: str,
+    state: str,
+    code: str,
+    reason: str,
+) -> dict[str, str]:
+    return {
+        "kind": str(kind),
+        "state": str(state),
+        "code": str(code),
+        "reason": str(reason),
+    }
 
 
 def normalize_jacobian_sparsity(value: Any) -> np.ndarray | None:

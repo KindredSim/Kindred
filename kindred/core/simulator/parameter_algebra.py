@@ -33,8 +33,8 @@ __all__ = [
 ]
 
 
-def parameter_algebra_spec_from_mechanism(mechanism: object) -> ParameterAlgebraSpec | None:
-    return (getattr(mechanism, "metadata", {}) or {}).get(_PARAMETER_ALGEBRA_SPEC_META_KEY)
+def parameter_algebra_spec_from_mechanism(mechanism: object) -> ParameterAlgebraSpec:
+    return mechanism.metadata[_PARAMETER_ALGEBRA_SPEC_META_KEY]
 
 
 def apply_parameter_algebra_spec_to_mechanism(

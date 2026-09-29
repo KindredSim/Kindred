@@ -3,13 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Mapping, MutableMapping, Optional
 
-from kindred.core.simulator.common import normalize_energy_unit
 from kindred.core.species import validate_c0
-from kindred.core.temperature import (
-    TemperatureScheduleProtocol,
-    coerce_temperature_kelvin,
-    coerce_temperature_schedule,
-)
+from kindred.core.temperature import TemperatureSchedule, coerce_temperature_kelvin
 
 __all__ = [
     "MechanismMetadataKeys",
@@ -37,7 +32,7 @@ class MechanismMetadataView:
     temperature_K: float = 298.15
     standard_conc_M: float = 1.0
     energy_unit: str = "kJ/mol"
-    temperature_schedule: Optional[TemperatureScheduleProtocol] = None
+    temperature_schedule: Optional[TemperatureSchedule] = None
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -52,22 +47,12 @@ class MechanismMetadataView:
         object.__setattr__(self, "standard_conc_M", standard)
 
     @classmethod
-    def from_metadata(cls, meta: Mapping[str, Any] | None) -> "MechanismMetadataView":
-        if not isinstance(meta, Mapping):
-            meta = {}
+    def from_metadata(cls, meta: Mapping[str, Any]) -> "MechanismMetadataView":
         return cls(
-            temperature_K=coerce_temperature_kelvin(
-                meta.get(MechanismMetadataKeys.TEMPERATURE_K, 298.15),
-                field=MechanismMetadataKeys.TEMPERATURE_K,
-            ),
-            standard_conc_M=meta.get(MechanismMetadataKeys.STANDARD_CONC_M, 1.0),
-            energy_unit=normalize_energy_unit(
-                meta.get(MechanismMetadataKeys.ENERGY_UNIT, "kJ/mol"),
-                default="kJ/mol",
-            ),
-            temperature_schedule=coerce_temperature_schedule(
-                meta.get(MechanismMetadataKeys.TEMPERATURE_SCHEDULE)
-            ),
+            temperature_K=meta[MechanismMetadataKeys.TEMPERATURE_K],
+            standard_conc_M=meta[MechanismMetadataKeys.STANDARD_CONC_M],
+            energy_unit=meta[MechanismMetadataKeys.ENERGY_UNIT],
+            temperature_schedule=meta.get(MechanismMetadataKeys.TEMPERATURE_SCHEDULE),
         )
 
     def apply_to_metadata(self, meta: MutableMapping[str, Any]) -> None:

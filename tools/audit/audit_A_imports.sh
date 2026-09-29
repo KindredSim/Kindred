@@ -31,8 +31,8 @@ hard_fail=0
   echo "\$ python3 -c \"import kindred\""
   python3 -c "import kindred"
   echo
-  echo "\$ python3 -c \"import kindred.core.equilibrium_rate_authority, kindred.core.simulator.common, kindred.core.simulator.dsl_parse, kindred.core.validation\""
-  python3 -c "import kindred.core.equilibrium_rate_authority, kindred.core.simulator.common, kindred.core.simulator.dsl_parse, kindred.core.validation"
+  echo "\$ python3 -c \"import kindred.core.equilibrium_rate_authority, kindred.core.units, kindred.core.simulator.dsl_parse, kindred.core.validation\""
+  python3 -c "import kindred.core.equilibrium_rate_authority, kindred.core.units, kindred.core.simulator.dsl_parse, kindred.core.validation"
 } > "${SMOKE_LOG}" 2>&1 || hard_fail=1
 
 if [[ "${hard_fail}" -ne 0 ]]; then

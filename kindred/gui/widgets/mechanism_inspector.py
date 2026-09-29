@@ -11,10 +11,7 @@ from collections.abc import Callable, Mapping
 from PySide6 import QtWidgets
 
 from kindred.core.algebra.printer import expression_to_source
-from kindred.core.equilibrium_rate_authority import (
-    EquilibriumRateAuthorityKind,
-    authority_fields_from_step_entry,
-)
+from kindred.core.equilibrium_rate_authority import EquilibriumRateAuthorityKind
 from kindred.core.intervention_schedule_compiler import (
     InterventionExecutionContract,
 )
@@ -124,9 +121,7 @@ def _format_mechanism_reference(
 ) -> str:
     """Project the accepted symbolic mechanism without evaluating coordinates."""
 
-    metadata = MechanismMetadataView.from_metadata(
-        getattr(mechanism, "metadata", {}) or {}
-    )
+    metadata = MechanismMetadataView.from_metadata(mechanism.metadata)
     parameter_provenance = {
         str(statement.name): expression_to_source(statement.expr)
         for statement in parameter_spec.parameter_block.lines
@@ -192,13 +187,13 @@ def _format_mechanism_step(
     }
 
     if kind == "reaction":
-        reaction = (getattr(mechanism, "reactions", ()) or ())[
+        reaction = mechanism.reactions[
             int(entry["reaction_index"])
         ]
         forward_model = reaction.forward_model
         equilibrium = None
     else:
-        equilibrium = (getattr(mechanism, "equilibria", ()) or ())[
+        equilibrium = mechanism.equilibria[
             int(entry["equilibrium_index"])
         ]
         forward_model = equilibrium.forward_model
@@ -242,8 +237,7 @@ def _format_mechanism_step(
     if equilibrium is not None:
         keq_name = f"Keq{step_index}"
         reverse_name = f"kr{step_index}"
-        authority = authority_fields_from_step_entry(entry)
-        authority_kind = str(authority.get("kind") or "")
+        authority_kind = equilibrium.authority.kind
         keq_provenance = parameter_provenance.get(keq_name)
         if keq_provenance is None and authority_kind == EquilibriumRateAuthorityKind.KR:
             keq_provenance = f"{forward_name} / {reverse_name}"
@@ -350,10 +344,12 @@ def _format_steps(
             parameter_names = parameter_names_by_step_index.get(step_index, [])
             if parameter_names:
                 lines.append(f"  Parameters: {', '.join(parameter_names)}")
-            authority = entry.get("equilibrium_authority")
-            if authority:
+            if kind == "equilibrium":
                 lines.append(
-                    f"  Equilibrium authority: {json.dumps(authority, sort_keys=True)}"
+                    _equilibrium_authority_line(
+                        mechanism.equilibria[int(entry["equilibrium_index"])],
+                        step_index,
+                    )
                 )
             rate_authority = _rate_authority_for_step(
                 mechanism,
@@ -382,6 +378,20 @@ def _format_steps(
     return "\n".join(lines)
 
 
+def _equilibrium_authority_line(equilibrium: object, step_index: int) -> str:
+    """Describe the one authored reverse authority of an equilibrium step."""
+    authority = equilibrium.authority
+    kf, kr, keq = f"kf{step_index}", f"kr{step_index}", f"Keq{step_index}"
+    if authority.kind == EquilibriumRateAuthorityKind.KR:
+        return f"  Equilibrium authority: {kr} authored; {keq} = {kf} / {kr} derived"
+    if authority.has_explicit_keq_param:
+        return f"  Equilibrium authority: {keq} authored; {kr} = {kf} / {keq} derived"
+    return (
+        f"  Equilibrium authority: dG_eq{step_index} authored; "
+        f"{keq} from dG_eq{step_index}, T and C0, {kr} = {kf} / {keq} derived"
+    )
+
+
 def _rate_authority_for_step(
     mechanism: object,
     entry: Mapping[str, object],
@@ -393,7 +403,7 @@ def _rate_authority_for_step(
         if kind == "reaction":
             index = int(entry["reaction_index"])
         elif kind == "equilibrium":
-            index = len(tuple(getattr(mechanism, "reactions", ()) or ())) + int(
+            index = len(tuple(mechanism.reactions)) + int(
                 entry["equilibrium_index"]
             )
         else:

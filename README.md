@@ -30,22 +30,55 @@ environment and install the application:
 
     python -m venv .venv
     python -m pip install --upgrade pip
-    python -m pip install .
+    python -m pip install -e .
+
+Install in editable mode: the fitting runtime imports this same checkout, and a
+regular install gives the GUI a separate copy whose source fingerprint stops
+matching as soon as the checkout changes.
 
 The standard installation includes the required desktop and plotting
 dependencies, including PySide6 and PyQtGraph. The same pinned runtime set is
 listed in `requirements.txt` for environments that install dependencies from a
 requirements file.
 
-Fitting runs in a separate complete native Python 3.15t installation at
-`<GUI sys.prefix>\kindred-fitting-runtime\python\python.exe`. Its own scientific
-dependencies are separate from the GUI dependencies; the fitting entry point
-loads only Qt-free Kindred modules.
+### Fitting runtime
 
-The fitting runtime's Python version, archive checksum and dependency pins are
-defined in `pyproject.toml` under `[tool.kindred.fitting-runtime]`. The GUI's
-Python constraint and dependencies remain under `[project]`. The fitting
-runtime must use matching Kindred source and resources.
+Global Fit runs in a separate native Windows Python 3.15t (free-threaded)
+installation inside the GUI environment,
+`.venv\kindred-fitting-runtime\python\python.exe`. Its scientific dependencies
+are separate from the GUI dependencies, and the fitting entry point loads only
+Qt-free Kindred modules. Kindred never downloads or installs this runtime.
+Provision it once, and again whenever `[tool.kindred.fitting-runtime]` in
+`pyproject.toml` changes; the GUI's Python constraint and dependencies remain
+under `[project]`.
+
+1. Obtain the Windows 64-bit free-threaded Python archive for
+   `python-version` (currently 3.15.0rc2t). Check that
+   `Get-FileHash <archive> -Algorithm SHA256` equals `archive-sha256`.
+2. Unpack the complete installation so that `python.exe` sits directly in
+   `.venv\kindred-fitting-runtime\python\`. Keep this depth; one level higher,
+   CPython would read the GUI environment's `pyvenv.cfg`.
+3. Install the pinned dependencies into the runtime itself:
+
+       .venv\kindred-fitting-runtime\python\python.exe -E -s -m pip install numpy==2.5.3 scipy==1.18.1 sympy==1.14.0 mpmath==1.3.0
+
+   If pip is missing, run `-m ensurepip` with the same interpreter first.
+4. Create `.venv\kindred-fitting-runtime\python\Lib\site-packages\kindred-source.pth`
+   containing one line: the absolute path of the repository root (the folder
+   containing `kindred\`). Do not add the GUI's site-packages.
+5. Verify from the runtime folder, as Kindred itself starts the runtime:
+
+       Push-Location .venv\kindred-fitting-runtime\python
+       $fp = ..\..\Scripts\python.exe -c "from kindred.gui.fitting.runtime import package_fingerprint; print(package_fingerprint())"
+       .\python.exe -E -s -m kindred.gui.fitting.process --source-sha256 $fp --verify-only; "exit code: $LASTEXITCODE"
+       Pop-Location
+
+   Exit code 0 means free-threaded 3.15 with the GIL still disabled after the
+   scientific imports, no Qt modules loaded, and the same Kindred source as the
+   GUI. Failures print a traceback.
+
+Kindred starts the runtime with `-E -s` (ignoring PYTHONPATH, PYTHONHOME,
+PYTHON_GIL and the user site-packages) and limits BLAS/OpenMP to one thread.
 
 ## Launch
 

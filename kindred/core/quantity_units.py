@@ -116,6 +116,10 @@ Dimensions = tuple[Fraction, Fraction, Fraction, Fraction, Fraction]
 _ZERO: Dimensions = (Fraction(0),) * 5
 
 
+# A named unit, optionally with an exponent, needs no grouping after "/".
+_SIMPLE_DENOMINATOR = re.compile(r"1|[A-Za-zµ]+(?:\^(?:-?\d+|\(-?\d+/\d+\)))?")
+
+
 @dataclass(frozen=True)
 class Unit:
     dimensions: Dimensions = _ZERO
@@ -130,8 +134,9 @@ class Unit:
                     self.scale * other.scale, _product_label(self.symbol, other.symbol))
 
     def divide(self, other: Unit) -> Unit:
+        denominator = other.symbol if _SIMPLE_DENOMINATOR.fullmatch(other.symbol) else f"({other.symbol})"
         return Unit(tuple(a - b for a, b in zip(self.dimensions, other.dimensions)),
-                    self.scale / other.scale, f"{self.symbol}/({other.symbol})")
+                    self.scale / other.scale, f"{self.symbol}/{denominator}")
 
     def power(self, exponent: Fraction) -> Unit:
         return Unit(tuple(a * exponent for a in self.dimensions), self.scale.power(exponent),

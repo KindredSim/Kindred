@@ -780,30 +780,22 @@ class InitialConditionsTableActions(QtCore.QObject):
     def render(self) -> None:
         self.apply_render_projection(self.prepare_render())
 
-    def capture_active_editor(
-        self,
-        *,
-        expected_token: ProjectContentToken,
-    ) -> ProjectContentToken | None:
+    def capture_active_editor(self) -> None:
         """Capture the focused numeric editor without committing its value."""
 
-        if not isinstance(expected_token, ProjectContentToken):
-            raise TypeError("expected_token must be ProjectContentToken.")
-        if not self._registry.capture_content_token() == expected_token:
-            return None
         editor = QtWidgets.QApplication.focusWidget()
         if not isinstance(editor, QtWidgets.QLineEdit):
-            return expected_token
+            return
         if editor is self._table or not self._table.isAncestorOf(editor):
-            return expected_token
+            return
         center = editor.mapTo(self._table.viewport(), editor.rect().center())
         index = self._table.indexAt(center)
         if not index.isValid() or index.model() is not self._model:
-            return expected_token
+            return
         species = self._model.species_for_column(index.column())
         set_id = self._model.set_id_for_live_index(index)
         if species is None or set_id is None:
-            return expected_token
+            return
         runtime = self._registry.tab_runtime(self._tab_id)
         runtime.initial_text_by_set_id.setdefault(set_id, {})[species] = editor.text()
         # closeEditor(NoHint) does not emit commitData.  Block the native
@@ -823,7 +815,6 @@ class InitialConditionsTableActions(QtCore.QObject):
             del blockers
         self.render()
         self.draftStateChanged.emit(self._tab_id)
-        return expected_token
 
     def settle_active_editor(self) -> None:
         """Synchronously submit the active cell editor."""
@@ -877,17 +868,14 @@ class InitialConditionsTableActions(QtCore.QObject):
         values = dict(initial_set.values)
         canonical = float(values.get(str(species), 0.0))
         changed = value != canonical
-        result: ProjectContentToken | None = None
         if changed:
             values[str(species)] = value
             candidate = initial_set.with_values(values)
-            result = self._registry.replace_initial_condition_set(
+            self._registry.replace_initial_condition_set(
                 self._tab_id,
                 candidate,
                 expected_token=self._registry.capture_content_token(),
             )
-            if result is None:
-                return False
         invalid_cleared = self._clear_invalid_value(set_id, species)
         self.render()
         if changed:
@@ -951,15 +939,12 @@ class InitialConditionsTableActions(QtCore.QObject):
                 candidate_sets[row_index] = initial_set.with_values(values)
                 changed_ids.append(initial_set.set_id)
 
-        result: ProjectContentToken | None = None
         if changed_ids:
-            result = self._registry.replace_tab(
+            self._registry.replace_tab(
                 self._tab_id,
                 tab.with_initial_condition_sets(tuple(candidate_sets)),
                 expected_token=self._registry.capture_content_token(),
             )
-            if result is None:
-                return False
         invalid_cleared = False
         for set_id, species in cleared_cells:
             invalid_cleared = (
@@ -967,11 +952,11 @@ class InitialConditionsTableActions(QtCore.QObject):
                 or invalid_cleared
             )
         self.render()
-        if result is not None:
+        if changed_ids:
             self.initialValuesChanged.emit(self._tab_id)
         if invalid_cleared:
             self.draftStateChanged.emit(self._tab_id)
-        return bool(result is not None or invalid_cleared)
+        return bool(changed_ids or invalid_cleared)
 
     @QtCore.Slot(str, str)
     def accept_name_edit(self, set_id: str, name: str) -> bool:
@@ -989,16 +974,15 @@ class InitialConditionsTableActions(QtCore.QObject):
             )
         initial_set = tab.initial_condition_set(set_id)
         changed = initial_set.name != normalized
-        result = self._registry.replace_initial_condition_set(
+        self._registry.replace_initial_condition_set(
             self._tab_id,
             replace(initial_set, name=normalized),
             expected_token=self._registry.capture_content_token(),
         )
-        accepted = result is not None
         self.render()
-        if accepted and changed:
+        if changed:
             self.setNameChanged.emit(self._tab_id)
-        return accepted
+        return True
 
     def add_set(self) -> InitialConditionSet | None:
         tab = self._registry.tab(self._tab_id)
@@ -1009,14 +993,13 @@ class InitialConditionsTableActions(QtCore.QObject):
                 (str(species), 0.0) for species in self._species_for_tab(tab)
             ),
         )
-        result = self._registry.mutate_tab(
+        self._registry.mutate_tab(
             self._tab_id,
             lambda current: current.add_initial_condition_set(created),
             expected_token=self._registry.capture_content_token(),
         )
-        accepted = result is not None
         self.render()
-        return created if accepted else None
+        return created
 
     def move_selected(self, delta: int) -> tuple[str, ...]:
         self.settle_active_editor()
@@ -1057,14 +1040,13 @@ class InitialConditionsTableActions(QtCore.QObject):
         targets = self.selected_run_set_ids()
         if not targets:
             return False
-        result = self._registry.remove_initial_condition_sets(
+        self._registry.remove_initial_condition_sets(
             self._tab_id,
             targets,
             expected_token=self._registry.capture_content_token(),
         )
-        accepted = result is not None
         self.render()
-        return accepted
+        return True
 
     @QtCore.Slot(str, bool)
     def set_plot_requested(self, set_id: str, requested: bool) -> bool:
@@ -1185,15 +1167,14 @@ class InitialConditionsTableActions(QtCore.QObject):
         current = dict(tab.run_overrides_by_set_id).get(set_id)
         if current == settings:
             return False
-        result = self._registry.set_run_override(
+        self._registry.set_run_override(
             self._tab_id,
             set_id,
             settings,
             expected_token=self._registry.capture_content_token(),
         )
-        accepted = result is not None
         self.render()
-        return accepted
+        return True
 
     @QtCore.Slot()
     def _capture_run_selection(self, *_args) -> None:

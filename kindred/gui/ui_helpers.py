@@ -276,9 +276,17 @@ def set_compact_label_text(
 
 
 def clamp_initial_size(widget: QtWidgets.QWidget, width: int, height: int) -> None:
-    """Choose a preferred initial size within the current screen's work area."""
+    """Choose a preferred initial size whose window frame fits the work area."""
     available = widget.screen().availableGeometry()
-    widget.resize(min(width, available.width()), min(height, available.height()))
+    parent = widget.parentWidget()
+    frame = (
+        QtCore.QSize(0, 0) if parent is None
+        else parent.window().frameGeometry().size() - parent.window().size()
+    )
+    widget.resize(
+        min(width, available.width() - frame.width()),
+        min(height, available.height() - frame.height()),
+    )
 
 
 SCIENTIFIC_NAME_HTML_ROLE = int(QtCore.Qt.UserRole) + 173

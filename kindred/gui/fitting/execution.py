@@ -9,6 +9,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
+from typing import Literal
 
 import numpy as np
 
@@ -69,6 +70,7 @@ __all__ = [
     "FitCandidate",
     "FitCurveDataset",
     "FitLiveUpdate",
+    "fit_bound_state",
     "project_fit_candidate_curves",
 ]
 
@@ -92,15 +94,126 @@ def _finite_items(
     return tuple(normalized)
 
 
+FitBoundState = Literal["lower", "upper", "interior"]
+
+
+def fit_bound_state(
+    value: float,
+    minimum: float,
+    maximum: float,
+    log_scale: bool = False,
+) -> FitBoundState:
+    """Classify an estimate against bounds in its optimizer coordinate.
+
+    Fit results retain decoded physical values, while a log10 fit optimizes
+    their base-10 logarithms.  Bound classification therefore has to happen
+    after applying the same encoding used by the optimizer.  A side's
+    tolerance is local to that encoded value and bound; the opposite bound
+    must not make a small-scale estimate appear to be on a boundary.
+    """
+
+    value = float(value)
+    minimum = float(minimum)
+    maximum = float(maximum)
+
+    def encode(raw_value: float) -> float | None:
+        if not math.isfinite(raw_value):
+            return None
+        if log_scale:
+            if raw_value <= 0.0:
+                return None
+            return math.log10(raw_value)
+        return raw_value
+
+    encoded_value = encode(value)
+    encoded_minimum = encode(minimum)
+    encoded_maximum = encode(maximum)
+    if encoded_value is None:
+        return "interior"
+
+    def is_at_bound(encoded_bound: float | None) -> bool:
+        if encoded_bound is None:
+            return False
+        # Exact equality is checked separately so a value equal to both
+        # malformed/degenerate sides has deterministic lower precedence.
+        if encoded_value == encoded_bound:
+            return True
+        absolute_tolerance = 8.0 * max(
+            math.ulp(encoded_value), math.ulp(encoded_bound)
+        )
+        return math.isclose(
+            encoded_value,
+            encoded_bound,
+            rel_tol=1.0e-9,
+            abs_tol=absolute_tolerance,
+        )
+
+    if encoded_minimum is not None and encoded_value == encoded_minimum:
+        return "lower"
+    if encoded_maximum is not None and encoded_value == encoded_maximum:
+        return "upper"
+    if is_at_bound(encoded_minimum):
+        return "lower"
+    if is_at_bound(encoded_maximum):
+        return "upper"
+    return "interior"
+
+def _settle_terminal_bounds(
+    setup: FitSetupSnapshot,
+    result: GlobalFitResult,
+) -> GlobalFitResult:
+    """Publish fitted values the report classifies at a bound as that bound."""
+
+    parameters = {item.name: item.selected_config for item in setup.parameters}
+    mapped_set_ids = {item.dataset_id: item.set_id for item in setup.origin.mapped_datasets}
+    initials = {(item.set_id, item.species): item for item in setup.initials}
+    groups = {
+        (dataset_id, group.species): group
+        for group in setup.shared_initial_groups
+        for dataset_id in group.member_dataset_ids
+    }
+
+    def settle(value: float, minimum: float, maximum: float, log10: bool) -> float:
+        state = fit_bound_state(value, minimum, maximum, log10)
+        return minimum if state == "lower" else maximum if state == "upper" else value
+
+    def parameter(name: str, value: float) -> float:
+        config = parameters[name]
+        return settle(value, config.minimum, config.maximum, config.log10)
+
+    def dataset_value(dataset_id: str, name: str, value: float) -> float:
+        if not name.startswith(INITIAL_PREFIX):
+            return parameter(name, value)
+        species = name[len(INITIAL_PREFIX):]
+        initial = groups.get((dataset_id, species)) or initials[(mapped_set_ids[dataset_id], species)]
+        return settle(value, initial.minimum, initial.maximum, initial.log10)
+
+    return replace(
+        result,
+        shared_params={name: parameter(name, value) for name, value in result.shared_params.items()},
+        dataset_params={
+            dataset_id: {name: dataset_value(dataset_id, name, value) for name, value in values.items()}
+            for dataset_id, values in result.dataset_params.items()
+        },
+        centred_fixed_effects_settlements=tuple(
+            replace(
+                item,
+                overall_decoded_value=parameter(item.parameter_name, item.overall_decoded_value),
+                dataset_values={
+                    dataset_id: parameter(item.parameter_name, value)
+                    for dataset_id, value in item.dataset_values.items()
+                },
+            )
+            for item in result.centred_fixed_effects_settlements
+        ),
+    )
+
+
 def _fit_coordinate_display_label(value: FitCoordinate) -> str:
     """Return a human label that cannot alias typed coordinate scopes."""
 
     if value.scope == "centred_overall":
         return f"Overall · {value.name}"
-    if value.scope == "centred_deviation":
-        return f"Deviation · {value.dataset_id}::{value.name}"
-    if value.scope in {"shared", "coupled"}:
-        return value.display_name
     return value.display_name
 
 
@@ -773,6 +886,7 @@ def _assemble_fit_terminal(
             "Fit terminal solver provenance does not exactly match the "
             "included datasets."
         )
+    result = _settle_terminal_bounds(setup, result)
     initial_values_by_set = _initial_values_from_result(
         setup_snapshot,
         setup.origin,

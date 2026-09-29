@@ -431,8 +431,8 @@ def _mechanism_relations(
     """
 
     relations: dict[str, ExactMonomial] = {}
-    equilibria = tuple(getattr(mechanism, "equilibria", ()) or ())
-    reactions = tuple(getattr(mechanism, "reactions", ()) or ())
+    equilibria = tuple(mechanism.equilibria)
+    reactions = tuple(mechanism.reactions)
     temperature = ExactMonomial(Fraction(1), (("T", Fraction(1)),))
     standard_concentration = ExactMonomial(
         Fraction(1), (("C0", Fraction(1)),)

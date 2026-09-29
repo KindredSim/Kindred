@@ -59,10 +59,11 @@ class ChemicalSpaceScanOwner(QtCore.QObject):
     status = QtCore.Signal(str)
     application_close_settlement_changed = QtCore.Signal()
 
-    def __init__(self, gate, exports, parent):
+    def __init__(self, gate, exports, session, parent):
         super().__init__(parent)
         self.gate = gate
         self.exports = exports
+        self._session = session
         self.parent_widget = parent
         self.dialog = None
         self.capture = None
@@ -146,7 +147,7 @@ class ChemicalSpaceScanOwner(QtCore.QObject):
             return False
         if not check_only:
             destination = os.path.abspath(config.destination)
-            if self.parent_widget.project_controller.is_current_project_path(destination):
+            if same_local_path(destination, self._session.current_path):
                 raise ValueError("Cannot overwrite the currently open project archive.")
             if os.path.lexists(destination):
                 answer = QtWidgets.QMessageBox.question(
@@ -160,7 +161,7 @@ class ChemicalSpaceScanOwner(QtCore.QObject):
         # A modal overwrite question may have serviced other application events.
         if self.close_fenced or self.session_closing or self.dialog is None or self.exports.is_exporting:
             return False
-        if not check_only and self.parent_widget.project_controller.is_current_project_path(config.destination):
+        if not check_only and same_local_path(config.destination, self._session.current_path):
             raise ValueError("Cannot overwrite the currently open project archive.")
         if not self.gate.try_acquire(self, "scan"):
             return False

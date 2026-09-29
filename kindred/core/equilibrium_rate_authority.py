@@ -28,11 +28,6 @@ __all__ = [
     "json_safe_equilibrium_authority_payload",
     "validate_equilibrium_rate_authority_flags",
     "normalize_equilibrium_rate_authority",
-    "normalize_existing_equilibrium_rate_authority",
-    "authority_fields_from_step_entry",
-    "step_entry_authored_role_is_editable",
-    "require_step_entry_authored_role_is_editable",
-    "step_entry_authored_role_is_derived",
 ]
 
 
@@ -85,56 +80,17 @@ class EquilibriumRateAuthority:
     forward_model: ForwardRateModel
     kr: object | None
     Keq: object | None
-    derived_role: str
     source: str = ""
     dG_eq_J_per_mol: object | None = None
     has_explicit_keq_param: bool = False
-    has_thermo_param: bool = False
-    kf_editable: bool = True
-    kr_editable: bool = True
 
     def authored_role_is_editable(self, role: str) -> bool:
-        role = str(role)
+        """Whether an indexed kf/kr/Keq coordinate is an authored input."""
         if role == "kf":
-            return bool(self.kf_editable)
+            return isinstance(self.forward_model, ConstantRateModel)
         if role == "kr":
-            return self.kind == EquilibriumRateAuthorityKind.KR and bool(self.kr_editable)
-        if role == "Keq":
-            return bool(self.has_explicit_keq_param)
-        if role == "dG_eq":
-            return self.kind == EquilibriumRateAuthorityKind.KEQ and self.dG_eq_J_per_mol is not None
-        return False
-
-    def authored_role_is_derived(self, role: str) -> bool:
-        role = str(role)
-        if role == "kr":
-            return self.kind == EquilibriumRateAuthorityKind.KEQ
-        if role == "Keq":
-            return not bool(self.has_explicit_keq_param)
-        return False
-
-    def step_map_fields(self) -> dict[str, object]:
-        return {
-            "equilibrium_authority": {
-                "kind": self.kind,
-                "source": self.source,
-                "derived_role": self.derived_role,
-                "has_explicit_keq_param": bool(self.has_explicit_keq_param),
-                "has_thermo_param": bool(self.has_thermo_param),
-                "editable": {
-                    "kf": self.authored_role_is_editable("kf"),
-                    "kr": self.authored_role_is_editable("kr"),
-                    "Keq": self.authored_role_is_editable("Keq"),
-                    "dG_eq": self.authored_role_is_editable("dG_eq"),
-                },
-                "derived": {
-                    "kf": self.authored_role_is_derived("kf"),
-                    "kr": self.authored_role_is_derived("kr"),
-                    "Keq": self.authored_role_is_derived("Keq"),
-                    "dG_eq": self.authored_role_is_derived("dG_eq"),
-                },
-            },
-        }
+            return self.kind == EquilibriumRateAuthorityKind.KR
+        return self.has_explicit_keq_param
 
     def identity_items(self) -> tuple[tuple[str, object], ...]:
         items: list[tuple[str, object]] = [
@@ -166,7 +122,7 @@ def equilibrium_rate_symbolic_relations(
     literal: Callable[[object], object],
     exponential: Callable[[object], object],
     source_coordinate: Callable[[str], object] | None = None,
-    standard_concentration: object | None = None,
+    standard_concentration: object,
     constant: Callable[[str], object] | None = None,
 ) -> EquilibriumRateSymbolicRelations:
     """Project accepted equilibrium authority without choosing a backend.
@@ -203,7 +159,7 @@ def equilibrium_rate_symbolic_relations(
             raise ValueError(f"{label} must be {requirement}.")
         return float(number)
 
-    authority = normalize_existing_equilibrium_rate_authority(equilibrium)
+    authority = equilibrium.authority
     if authority.kind == EquilibriumRateAuthorityKind.KR:
         reverse_value = finite_scalar(
             authority.kr,
@@ -244,30 +200,13 @@ def equilibrium_rate_symbolic_relations(
             / ((constant("R") if constant is not None else literal(float(R))) * temperature)  # type: ignore[operator]
         )
         forward_order = directional_order_fraction(
-            getattr(equilibrium, "stoich_forward", {}) or {},
+            equilibrium.stoich_forward,
         )
         reverse_order = directional_order_fraction(
-            getattr(equilibrium, "stoich_back", {}) or {},
+            equilibrium.stoich_back,
         )
         delta_n = reverse_order - forward_order
         if delta_n:
-            if standard_concentration is None:
-                metadata = getattr(equilibrium, "metadata", {}) or {}
-                raw_standard = (
-                    metadata.get(EquilibriumMetadataKeys.STANDARD_CONC_M, 1.0)
-                    if isinstance(metadata, Mapping)
-                    else 1.0
-                )
-                try:
-                    standard = validate_c0(
-                        raw_standard,
-                        field="equilibrium standard_conc_M",
-                    )
-                except ValueError as exc:
-                    raise ValueError(
-                        "equilibrium standard concentration must be strictly positive and admitted"
-                    ) from exc
-                standard_concentration = literal(float(standard))
             keq_relation *= standard_concentration ** literal(delta_n)  # type: ignore[operator]
     else:
         keq_relation = (
@@ -416,8 +355,7 @@ def normalize_equilibrium_rate_authority(
         reverse = admit_rate(kr, field="kr")
         return EquilibriumRateAuthority(
             kind=EquilibriumRateAuthorityKind.KR, forward_model=forward_model,
-            kr=reverse, Keq=None, derived_role="Keq", source="explicit_kr",
-            kf_editable=isinstance(forward_model, ConstantRateModel),
+            kr=reverse, Keq=None, source="explicit_kr",
         )
     if keq is not None:
         keq = admit_keq(keq, field="Keq")
@@ -427,54 +365,7 @@ def normalize_equilibrium_rate_authority(
                     field="equilibrium standard_conc_M")
     return EquilibriumRateAuthority(
         kind=EquilibriumRateAuthorityKind.KEQ, forward_model=forward_model,
-        kr=None, Keq=keq, derived_role="kr",
+        kr=None, Keq=keq,
         source="explicit_Keq" if keq is not None else "dG_eq",
         dG_eq_J_per_mol=delta_g, has_explicit_keq_param=keq is not None,
-        has_thermo_param=True,
-        kf_editable=isinstance(forward_model, ConstantRateModel),
-        kr_editable=False,
     )
-
-
-def normalize_existing_equilibrium_rate_authority(eq: object) -> EquilibriumRateAuthority:
-    return normalize_equilibrium_rate_authority(
-        forward_model=eq.forward_model, kr=eq.kr, metadata=eq.metadata,
-    )
-
-
-def authority_fields_from_step_entry(entry: Mapping[str, Any] | None) -> Mapping[str, Any]:
-    if not isinstance(entry, Mapping):
-        return {}
-    value = entry.get("equilibrium_authority")
-    return value if isinstance(value, Mapping) else {}
-
-
-def step_entry_authored_role_is_editable(entry: Mapping[str, Any] | None, role: str) -> bool | None:
-    fields = authority_fields_from_step_entry(entry)
-    editable = fields.get("editable")
-    if isinstance(editable, Mapping) and role in editable:
-        return bool(editable[role])
-    return None
-
-
-def require_step_entry_authored_role_is_editable(
-    entry: Mapping[str, Any] | None,
-    role: str,
-    *,
-    parameter_name: str | None = None,
-) -> None:
-    editable = step_entry_authored_role_is_editable(entry, role)
-    name = str(parameter_name or role)
-    if editable is True:
-        return
-    if editable is False:
-        raise ValueError(f"{name} is not editable under normalized equilibrium authority.")
-    raise ValueError(f"{name} is missing normalized equilibrium_authority editability metadata.")
-
-
-def step_entry_authored_role_is_derived(entry: Mapping[str, Any] | None, role: str) -> bool | None:
-    fields = authority_fields_from_step_entry(entry)
-    derived = fields.get("derived")
-    if isinstance(derived, Mapping) and role in derived:
-        return bool(derived[role])
-    return None

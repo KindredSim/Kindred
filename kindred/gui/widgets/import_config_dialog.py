@@ -422,7 +422,9 @@ class ImportConfigDialog(QtWidgets.QDialog):
         else:
             try:
                 unit = resolve_column_unit(sheet.settings.time_column, sheet.unit_row, sheet.settings, time=True)
-                info = f"Time: {unit.symbol} → s. Each measured column uses its selected unit."
+                info = f"Time: {unit.symbol} → s"
+                if sheet.name is not None:
+                    info += " (Excel duration and clock cells are read as elapsed time)"
             except ValueError as exc:
                 info = str(exc)
         set_bounded_label_text(self._unit_info_label, info, max_width=640)

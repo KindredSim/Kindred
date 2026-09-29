@@ -8,7 +8,6 @@ RHS compilation for execution paths that consume it.
 from __future__ import annotations
 
 import logging
-from numbers import Real
 from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Any, Callable, Dict, Iterable, Mapping, Optional
@@ -22,9 +21,7 @@ from kindred.core.exceptions import (
 )
 from kindred.core.species import validate_concentration, validate_input_time_seconds
 from kindred.core.units import OrdinaryParameterDomainError
-from kindred.core.temperature import (
-    TemperatureScheduleProtocol,
-)
+from kindred.core.temperature import TemperatureSchedule
 from kindred.core.intervention_schedule import (
     InterventionSchedule,
     InterventionScheduleDependencyMetadata,
@@ -289,11 +286,11 @@ class PreparedSimulationRun:
     rhs: Callable[..., np.ndarray]
     y0: np.ndarray
     species_names: tuple[str, ...]
-    temperature_schedule: TemperatureScheduleProtocol | None
+    temperature_schedule: TemperatureSchedule | None
     parameter_algebra_spec: Any
     intervention_execution: InterventionExecutionContract | None
     symbolic_jacobian: SymbolicJacobianExecution
-    initials_for_algebra: Optional[Mapping[str, float]]
+    initials_for_algebra: Mapping[str, float]
     request: SimulationExecutionRequest
     unresolved_intervention_schedule: InterventionSchedule | None = None
     cancellation_control: SimulationCancellationControl | None = None
@@ -305,14 +302,11 @@ class PreparedSimulationRun:
         y0.setflags(write=False)
         object.__setattr__(self, "y0", y0)
         object.__setattr__(self, "species_names", tuple(self.species_names))
-        if self.initials_for_algebra is not None:
-            if not isinstance(self.initials_for_algebra, Mapping):
-                raise TypeError("initials_for_algebra must be a mapping or None.")
-            object.__setattr__(
-                self,
-                "initials_for_algebra",
-                freeze_retained_value(self.initials_for_algebra),
-            )
+        object.__setattr__(
+            self,
+            "initials_for_algebra",
+            freeze_retained_value(self.initials_for_algebra),
+        )
 def build_simulation_request_from_prepared_run(
     prepared_run: PreparedSimulationRun,
     *,
@@ -383,17 +377,19 @@ class SimulationExecutionRequest:
             raise ValueError(
                 "execution request species_names must be unique nonblank strings."
             )
-        try:
-            y0 = tuple(
-                validate_concentration(value, field="execution request initial concentration")
-                for value in self.y0
-            )
-        except (TypeError, ValueError) as exc:
-            raise ValueError(
-                "execution request y0 must contain one admitted concentration value per species."
-            ) from exc
-        if len(y0) != len(species_names):
+        if len(self.y0) != len(species_names):
             raise ValueError("execution request y0 must contain one value per species.")
+        y0_values: list[float] = []
+        for name, value in zip(species_names, self.y0):
+            try:
+                y0_values.append(
+                    validate_concentration(value, field=f"initial value for {name!r}")
+                )
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"initial value for {name!r} must be an admitted concentration."
+                ) from exc
+        y0 = tuple(y0_values)
         schedule = self.prepared_dsl.parameterized_intervention_schedule_for_binding()
         contract = self.prepared_dsl.intervention_execution_contract()
         if schedule is None and not isinstance(contract, InterventionExecutionContract):
@@ -419,7 +415,7 @@ class SimulationExecutionRequest:
                 f"Invalid execution time span: {exc}"
             ) from exc
         if t_span[1] <= t_span[0]:
-            raise ValueError("execution request requires t_end > t_start.")
+            raise ValueError("execution t_end must be greater than t_start.")
         if not isinstance(self.solver_config, _PreparedSolverConfig):
             raise TypeError(
                 "execution request solver_config must be PreparedSolverConfig."
@@ -431,22 +427,16 @@ class SimulationExecutionRequest:
             raise TypeError(
                 "execution request parameter_overrides must be a mapping."
             )
-        overrides = (
-            None
-            if self.parameter_overrides is None
-            else {
-                str(name): float(value)
-                for name, value in self.parameter_overrides.items()
-            }
-        )
-        if overrides is not None and any(
-            not name.strip() or not np.isfinite(value)
-            for name, value in overrides.items()
-        ):
-            raise ValueError(
-                "execution request parameter overrides must be finite and "
-                "have nonblank names."
-            )
+        overrides: dict[str, float] | None = None
+        if self.parameter_overrides is not None:
+            overrides = {}
+            for name, raw_value in self.parameter_overrides.items():
+                if not name.strip():
+                    raise ValueError("parameter value names must be nonblank.")
+                value = float(raw_value)
+                if not np.isfinite(value):
+                    raise ValueError(f"parameter value for {name!r} must be finite.")
+                overrides[name] = value
         object.__setattr__(self, "species_names", species_names)
         object.__setattr__(self, "y0", y0)
         object.__setattr__(self, "requested_parameter_names", requested_names)
@@ -599,90 +589,39 @@ def build_simulation_execution_request(
 ) -> SimulationExecutionRequest:
     """Capture, isolate, and compile one direct Run/Preview target."""
 
-    from kindred.core.mechanism_source import (
-        MechanismAuthoringSource,
-        source_matches_analysis,
-    )
+    from kindred.core.mechanism_source import source_matches_analysis
 
-    if not isinstance(prepared_dsl, PreparedDslRequestSet):
-        raise TypeError("prepared_dsl must be a PreparedDslRequestSet.")
-    if not isinstance(mechanism_source, MechanismAuthoringSource):
-        raise TypeError("mechanism_source must be a MechanismAuthoringSource.")
-    normalized_initials: dict[str, float] = {}
-    for raw_name, raw_value in initial_values:
-        name = str(raw_name or "").strip()
-        if not name:
-            raise ValueError("initial value names must be nonblank.")
-        if name in normalized_initials:
-            raise ValueError(f"initial values contain duplicate name {name!r}.")
-        if type(raw_value) is bool or not isinstance(raw_value, Real):
-            raise TypeError(f"initial value for {name!r} must be numeric.")
-        try:
-            normalized_initials[name] = validate_concentration(
-                raw_value,
-                field=f"initial value for {name!r}",
-            )
-        except (TypeError, ValueError) as exc:
-            raise ValueError(
-                f"initial value for {name!r} must be an admitted concentration."
-            ) from exc
-    if not normalized_initials:
-        raise ValueError("a simulation target must contain initial values.")
-    normalized_parameters: dict[str, float] | None = None
-    if parameter_values:
-        normalized_parameters = {}
-        for raw_name, raw_value in parameter_values.items():
-            name = str(raw_name or "").strip()
-            if not name:
-                raise ValueError("parameter value names must be nonblank.")
-            if type(raw_value) is bool or not isinstance(raw_value, Real):
-                raise TypeError(f"parameter value for {name!r} must be numeric.")
-            value = float(raw_value)
-            if not np.isfinite(value):
-                raise ValueError(
-                    f"parameter value for {name!r} must be finite."
-                )
-            normalized_parameters[name] = value
-    try:
-        t_start = validate_input_time_seconds(
-            t_span[0],
-            field="execution t_start",
-        )
-        t_end = validate_input_time_seconds(
-            t_span[1],
-            field="execution t_end",
-        )
-    except (TypeError, ValueError) as exc:
-        raise ValueError(f"Invalid execution time span: {exc}") from exc
-    if t_end <= t_start:
-        raise ValueError("execution t_end must be greater than t_start.")
-    try:
-        # Realize the generated N grid at the Run/Preview request boundary so
-        # binary64-unrepresentable spans fail before worker launch.
-        build_time_grid(t_start, t_end, solver_config.grid)
-    except (TypeError, ValueError) as exc:
-        raise ValueError("execution grid cannot be realized on this time span.") from exc
     if not source_matches_analysis(mechanism_source, prepared_dsl.analysis):
         raise ValueError(
             "prepared DSL source does not match the captured mechanism source."
         )
-    species_names = tuple(str(name) for name in prepared_dsl.analysis.species_names)
-    if not species_names:
-        raise ValueError("prepared execution requires at least one species.")
-    if set(normalized_initials) != set(species_names):
+    initials: dict[str, float] = {}
+    for name, value in initial_values:
+        if name in initials:
+            raise ValueError(f"initial values contain duplicate name {name!r}.")
+        initials[name] = value
+    species_names = prepared_dsl.analysis.species_names
+    if set(initials) != set(species_names):
         raise ValueError(
             "direct execution initial values must cover every accepted species exactly once."
         )
+    # The request value admits every scientific domain; this capture adds only
+    # the source match, species coverage, and generated-grid realization.
     request = SimulationExecutionRequest(
         prepared_dsl=prepared_dsl,
         species_names=species_names,
-        y0=tuple(normalized_initials[name] for name in species_names),
-        t_span=(t_start, t_end),
+        y0=tuple(initials[name] for name in species_names),
+        t_span=t_span,
         solver_config=solver_config,
-        requested_parameter_names=(),
-        parameter_overrides=normalized_parameters,
+        parameter_overrides=parameter_values or None,
         use_authored_stops=use_authored_stops,
     )
+    try:
+        # Realize the generated N grid at the Run/Preview request boundary so
+        # binary64-unrepresentable spans fail before worker launch.
+        build_time_grid(*request.t_span, solver_config.grid)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("execution grid cannot be realized on this time span.") from exc
     return request
 
 

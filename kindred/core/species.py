@@ -3,7 +3,7 @@ Species model and strict initial-concentration coercion.
 
 Current contract
 ----------------
-- Species has fields: `name: str`, `initial_conc: float` (standard state basis).
+- Species has one field: `name: str`.
 - Mechanism owns its ordered species mapping directly.
 
 Design notes
@@ -35,7 +35,6 @@ __all__ = [
     "MAX_GENERATED_TIME_ROWS",
     "MAX_FIT_EVALUATIONS",
     "Species",
-    "coerce_float",
     "concentration_from_text",
     "validate_concentration",
     "validate_c0",
@@ -226,26 +225,10 @@ def validate_evaluation_count(
 class Species:
     """Immutable species record."""
     name: str
-    initial_conc: float
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "name", validate_name(self.name))
-        object.__setattr__(self, "initial_conc", coerce_float(self.initial_conc))
 
 
 # --- helpers -----------------------------------------------------------------
 
-def coerce_float(value) -> float:
-    """
-    Coerce a number-like to float with strict finite check.
-
-    Raises
-    ------
-    TypeError, ValueError
-        If the value is not convertible to a finite float.
-    """
-    try:
-        f = float(value)
-    except (ValueError, TypeError, OverflowError) as e:
-        raise TypeError(f"initial concentration must be a real number, got {value!r}") from e
-    return validate_concentration(f, field="initial concentration")

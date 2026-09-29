@@ -142,6 +142,28 @@ def admit_keq(value: object, *, field: str = "Keq") -> float:
     )
 
 
+# ---------- Energy units ----------
+
+_ENERGY_UNITS = {
+    "j/mol": "J/mol",
+    "kj/mol": "kJ/mol",
+    "kcal/mol": "kcal/mol",
+}
+
+
+def normalize_energy_unit(value: str) -> str:
+    """Return the canonical spelling of an authored energy unit."""
+    canonical = _ENERGY_UNITS.get(value.strip().lower())
+    if canonical is None:
+        raise ValueError(f"unsupported energy_unit {value!r}")
+    return canonical
+
+
+def energy_to_j_per_mol(value: float, unit: str) -> float:
+    """Convert an authored energy to the canonical J/mol."""
+    return convert_value(value, parse_unit(unit), parse_unit("J/mol"))
+
+
 # ---------- Units model ----------
 
 @dataclass(frozen=True)

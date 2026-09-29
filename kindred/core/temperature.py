@@ -25,7 +25,7 @@ from __future__ import annotations
 import logging
 import math
 from dataclasses import dataclass
-from typing import Callable, List, Literal, Mapping, Optional, Protocol, Tuple, runtime_checkable
+from typing import Callable, List, Literal, Mapping, Optional, Tuple
 
 from kindred.core.species import (
     validate_input_time_seconds,
@@ -38,24 +38,11 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "TemperatureSchedule",
     "TemperatureScheduleError",
-    "TemperatureScheduleProtocol",
-    "TemperatureScheduleDictProtocol",
-    "coerce_temperature_schedule",
     "coerce_temperature_kelvin",
     "declared_temperature_step_boundaries",
     "temperature_at_execution_time",
     "temperature_schedule_execution_identity",
 ]
-
-
-@runtime_checkable
-class TemperatureScheduleProtocol(Protocol):
-    def __call__(self, t: float) -> float: ...
-
-
-@runtime_checkable
-class TemperatureScheduleDictProtocol(TemperatureScheduleProtocol, Protocol):
-    def to_dict(self) -> Mapping[str, object]: ...
 
 
 def coerce_temperature_kelvin(value: object, *, field: str = "temperature") -> float:
@@ -70,67 +57,6 @@ def _coerce_nonnegative_time(value: object, *, field: str) -> float:
         return validate_time_seconds(value, field=field)
     except (TypeError, ValueError) as exc:
         raise TemperatureScheduleError(str(exc)) from exc
-
-
-class _ValidatedCallableTemperatureSchedule:
-    def __init__(self, schedule: Callable[[float], float]) -> None:
-        self._schedule = schedule
-
-    def __call__(self, t: float) -> float:
-        time_value = _coerce_nonnegative_time(t, field="temperature schedule time")
-        return coerce_temperature_kelvin(
-            self._schedule(time_value),
-            field="temperature schedule output",
-        )
-
-    def __repr__(self) -> str:
-        return f"validated_temperature_schedule({self._schedule!r})"
-
-
-class _ValidatedDictTemperatureSchedule(_ValidatedCallableTemperatureSchedule):
-    def __init__(self, schedule: TemperatureScheduleDictProtocol) -> None:
-        super().__init__(schedule)
-        self._dict_schedule = schedule
-
-    def to_dict(self) -> Mapping[str, object]:
-        return TemperatureSchedule.from_dict(dict(self._dict_schedule.to_dict())).to_dict()
-
-
-def coerce_temperature_schedule(value: object) -> TemperatureScheduleProtocol | None:
-    """
-    Normalize a temperature schedule value coming from module boundaries.
-
-    Accepted inputs:
-    - None
-    - A callable schedule object (e.g., TemperatureSchedule instance)
-    - A mapping produced by TemperatureSchedule.to_dict() (converted via from_dict)
-
-    Raises TypeError for non-callable, non-mapping values to avoid silent
-    mismatches across parsing/metadata/solver boundaries.
-    """
-    if value is None:
-        return None
-    # Schedule values are admitted once at their genuine ingress.  Keep the
-    # typed schedule (and its validating wrappers) intact when it crosses
-    # trusted in-process boundaries so identity and callable state survive.
-    if isinstance(
-        value,
-        (TemperatureSchedule, _ValidatedCallableTemperatureSchedule),
-    ):
-        return value
-    if isinstance(value, Mapping):
-        if "type" not in value:
-            raise TypeError(
-                "temperature_schedule mapping must contain a 'type' key (expected TemperatureSchedule.to_dict() format)"
-            )
-        return TemperatureSchedule.from_dict(dict(value))
-    if isinstance(value, TemperatureScheduleDictProtocol):
-        return _ValidatedDictTemperatureSchedule(value)
-    if callable(value):
-        return _ValidatedCallableTemperatureSchedule(value)  # type: ignore[arg-type]
-    raise TypeError(
-        f"temperature_schedule must be callable or a mapping (TemperatureSchedule.to_dict()), got {type(value)!r}"
-    )
 
 
 class TemperatureScheduleError(Exception):
@@ -622,7 +548,7 @@ class TemperatureSchedule:
 
 
 def temperature_at_execution_time(
-    schedule: TemperatureScheduleProtocol | None,
+    schedule: TemperatureSchedule | None,
     reference_temperature_K: float,
     time: float,
     *,
@@ -630,14 +556,14 @@ def temperature_at_execution_time(
 ) -> float:
     """Resolve an execution-selected side without changing the scientific clock.
 
-    Only declared piecewise steps have distinct sides. Continuous and arbitrary
-    callable schedules retain their ordinary evaluation at the actual time.
+    Only declared piecewise steps have distinct sides. Response schedules
+    retain their ordinary evaluation at the actual time.
     """
     if schedule is None:
         return reference_temperature_K
     if side == "preceding":
         identity = temperature_schedule_execution_identity(schedule)
-        if identity is not None and identity["type"] == "piecewise_steps":
+        if identity["type"] == "piecewise_steps":
             temperature = float(identity["baseline_temperature"])
             for step in identity["steps"]:
                 if float(step["time"]) >= time:
@@ -648,7 +574,7 @@ def temperature_at_execution_time(
 
 
 def declared_temperature_step_boundaries(
-    schedule: TemperatureScheduleProtocol | None,
+    schedule: TemperatureSchedule | None,
     *,
     t_start: float,
     t_end: float,
@@ -667,35 +593,24 @@ def declared_temperature_step_boundaries(
     if schedule is None:
         return ()
     identity = temperature_schedule_execution_identity(schedule)
-    if identity is None or identity.get("type") != "piecewise_steps":
+    if identity["type"] != "piecewise_steps":
         return ()
     boundaries = {
         float(item["time"])
-        for item in identity.get("steps", ())
-        if isinstance(item, Mapping)
-        and start < float(item["time"]) <= end
+        for item in identity["steps"]
+        if start < float(item["time"]) <= end
     }
     return tuple(sorted(boundaries))
 
 
 def temperature_schedule_execution_identity(
-    schedule: TemperatureScheduleProtocol | None,
+    schedule: TemperatureSchedule | None,
 ) -> Mapping[str, object] | None:
     """Return exact runtime identity with authored semantic no-ops removed."""
 
     if schedule is None:
         return None
-    normalized = schedule
-    if not isinstance(normalized, TemperatureScheduleDictProtocol):
-        return None
-    # Native schedules are already fully admitted.  Only a typed schedule
-    # supplied through the serializable protocol needs its protocol payload
-    # decoded for semantic identity projection.
-    decoded = (
-        normalized
-        if isinstance(normalized, TemperatureSchedule)
-        else TemperatureSchedule.from_dict(dict(normalized.to_dict()))
-    )
+    decoded = schedule
     if decoded.schedule_type == "constant":
         return {
             "type": "constant",
@@ -756,6 +671,3 @@ def temperature_schedule_execution_identity(
             "changes": tuple(changes),
             "tau": float(decoded._response_tau),
         }
-    raise TemperatureScheduleError(
-        f"Unknown schedule type: {decoded.schedule_type}"
-    )

@@ -105,10 +105,6 @@ class ExactCorrectionBasisDialog(QtWidgets.QDialog):
         reasons: list[str] = []
         if not target.source_backed:
             reasons.append("it has no editable source coordinate")
-        elif target.locked:
-            reasons.append("it is locked")
-        elif not target.editable:
-            reasons.append("its authored coordinate is not editable")
         if target.derived:
             reasons.append("it is already derived")
         detail = ", ".join(reasons) or "it is not an admitted correction target"

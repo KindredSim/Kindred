@@ -5,8 +5,9 @@ import numpy as np
 
 from kindred.core.analysis.global_fit_execution import fit_result_target_values
 from kindred.core.project_presentation_state import SimulationSeriesAxisSelection
-from kindred.core.quantity_units import MOLAR, SECOND, conversion_scale, presentation_unit
+from kindred.core.quantity_units import MOLAR, SECOND, conversion_scale
 from kindred.core.result_curve_projection import physical_curve_chunks
+from kindred.core.simulation_result_finalization import result_quantity_units
 
 
 def focused_units(quantity_units, preferred_units, x_name, targets):
@@ -31,12 +32,9 @@ def fit_display_units(units, preferred_units, x_name, targets, x_unit, y_units):
 
 
 def prepared_fit_units(prepared, x_name, targets, x_unit, y_units):
-    spec = prepared.parameter_algebra_spec_for_execution()
-    units = dict(spec.quantity_units)
-    units.update({name: MOLAR for name in prepared.analysis.species_names})
-    units["t"] = SECOND
-    declarations = {line.name: line.declared_unit for line in spec.observable_block.lines}
-    preferred = {name: presentation_unit(unit, declarations.get(name)) for name, unit in units.items()}
+    units, preferred = result_quantity_units(
+        prepared.parameter_algebra_spec_for_execution(), prepared.analysis.species_names
+    )
     return fit_display_units(units, preferred, x_name, targets, x_unit, y_units)
 
 

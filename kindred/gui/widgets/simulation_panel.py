@@ -445,6 +445,15 @@ class SimulationPanel(QtWidgets.QWidget):
         self.runDefaultsDraftStateChanged.emit(False)
         return True
 
+    def run_defaults_draft_is_valid(self) -> bool:
+        """Whether the visible Run-settings draft admits as settings."""
+
+        try:
+            self.current_settings_candidate()
+        except (TypeError, ValueError):
+            return False
+        return True
+
     def current_settings_candidate(self) -> SimulationExecutionSettings:
         values = dict(self._candidate_values)
         changed = set(self._candidate_changed_fields)

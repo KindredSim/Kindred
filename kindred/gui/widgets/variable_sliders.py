@@ -293,12 +293,12 @@ class VariableSliders(QtWidgets.QWidget):
         meta = self._metadata.get(name) or {}
         scale = meta["scale"]
 
-        # Top row: name label and writable/read-only value projection.
+        # Top row: name label and editable value projection.
         top_row = QtWidgets.QHBoxLayout()
         top_row.setSpacing(8)
 
-        title, unit, qualifier = self._label_parts(name)
-        full_label = title + (f" [{unit}]" if unit else "") + qualifier
+        title, unit = self._label_parts(name)
+        full_label = title + (f" [{unit}]" if unit else "")
         symbol_html = scientific_symbol_html(name, family=meta["family"], role=meta["role"])
         spoken = scientific_symbol_spoken(name, family=meta["family"], role=meta["role"])
         context = title
@@ -320,7 +320,7 @@ class VariableSliders(QtWidgets.QWidget):
             unit_label.setTextFormat(QtCore.Qt.TextFormat.RichText)
             unit_label.setText(
                 '<span style="white-space:nowrap">[' + format_unit_for_display(unit)
-                + ']' + escape(qualifier) + "</span>"
+                + "]</span>"
             )
             unit_label.setAccessibleName(unit)
             unit_label.setToolTip(literal_tooltip(unit))
@@ -328,8 +328,6 @@ class VariableSliders(QtWidgets.QWidget):
                 QtWidgets.QSizePolicy.Policy.Fixed,
                 QtWidgets.QSizePolicy.Policy.Preferred,
             )
-        else:
-            context += qualifier
         set_bounded_label_text(
             name_label,
             context,
@@ -341,31 +339,23 @@ class VariableSliders(QtWidgets.QWidget):
         if unit_label is not None:
             top_row.addWidget(unit_label)
 
-        if meta.get("editable") is False:
-            value_label: QtWidgets.QWidget = QtWidgets.QLabel(
-                self._format_value(value)
-            )
-            value_label.setAlignment(QtCore.Qt.AlignRight)
-        else:
-            value_editor = _NumericValueEdit(self._format_value(value))
-            configure_compact_numeric_edit(value_editor, characters=15)
-            value_editor.setAlignment(QtCore.Qt.AlignmentFlag.AlignRight)
-            value_editor.editStarted.connect(
-                lambda item=name: self._on_editor_started(item)
-            )
-            value_editor.editEscape.connect(
-                lambda item=name: self._on_editor_escape(item)
-            )
-            value_editor.textChanged.connect(
-                lambda _text, item=name: self._decorate_editor(item)
-            )
-            value_editor.editingFinished.connect(
-                lambda item=name: self._commit_editor(item)
-            )
-            value_label = value_editor
+        value_label = _NumericValueEdit(self._format_value(value))
+        configure_compact_numeric_edit(value_label, characters=15)
+        value_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignRight)
+        value_label.editStarted.connect(
+            lambda item=name: self._on_editor_started(item)
+        )
+        value_label.editEscape.connect(
+            lambda item=name: self._on_editor_escape(item)
+        )
+        value_label.textChanged.connect(
+            lambda _text, item=name: self._decorate_editor(item)
+        )
+        value_label.editingFinished.connect(
+            lambda item=name: self._commit_editor(item)
+        )
         value_label.setAccessibleName(f"{spoken} value")
-        if isinstance(value_label, QtWidgets.QLineEdit):
-            name_label.setBuddy(value_label)
+        name_label.setBuddy(value_label)
         top_row.addWidget(value_label)
 
         layout.addLayout(top_row)
@@ -428,15 +418,6 @@ class VariableSliders(QtWidgets.QWidget):
 
         layout.addWidget(slider)
 
-        # Derived / read-only variables (computed from other parameters)
-        if meta.get("editable") is False:
-            slider.setEnabled(False)
-            tip = "Derived parameter (computed). Edit its source parameters instead."
-            slider.setToolTip(tip)
-            name_label.setToolTip(full_label + "\n" + tip)
-            value_label.setToolTip(tip)
-            name_label.setStyleSheet("font-style: italic;")
-
         # Range labels
         range_layout = QtWidgets.QHBoxLayout()
         range_layout.setSpacing(0)
@@ -492,14 +473,14 @@ class VariableSliders(QtWidgets.QWidget):
                 SliderInteractionKind.EXACT_DRAG_RELEASE,
             )
 
-    def _label_parts(self, name: str) -> tuple[str, str, str]:
+    def _label_parts(self, name: str) -> tuple[str, str]:
         meta = self._metadata[name]
         title = meta["label"]
         if meta["family"] in {"Constant", "Arrhenius", "Eyring", "reverse"} and meta["role"] in {"k", "kf", "kr", "Keq"}:
             # Only admitted reaction context gets display arrows.
             identity, separator, context = title.partition(" — ")
             title = identity + separator + context.replace(" <-> ", " ⇌ ").replace(" -> ", " → ")
-        return title, meta["unit"], " (derived)" if meta["derived"] else ""
+        return title, meta["unit"]
 
     def _on_slider_changed(self, name: str, slider_pos: int) -> None:
         """
@@ -705,9 +686,8 @@ class VariableSliders(QtWidgets.QWidget):
         """
         Update a variable value programmatically without moving the slider handle.
 
-        This is intended for derived/read-only parameter updates during slider-triggered
-        refreshes, where changing slider ranges/positions can make handles appear to
-        jump/snap.
+        This is intended for refreshes during an active slider press, where
+        changing slider ranges/positions can make handles appear to jump/snap.
         """
         if name not in self._variables:
             logger.warning(f"Cannot update unknown variable: {name}")
@@ -722,10 +702,6 @@ class VariableSliders(QtWidgets.QWidget):
         if self._slider_scales.get(name, "log") == "log":
             self._slider_signs[name] = 1.0 if value_f >= 0 else -1.0
         self._ensure_range_covers(name, value_f, project_slider=False)
-
-        value_label = self._value_labels.get(name)
-        if isinstance(value_label, QtWidgets.QLabel):
-            value_label.setText(self._format_value(value_f))
 
         logger.debug(f"Variable readout updated: {name} = {value}")
 
@@ -757,8 +733,8 @@ class VariableSliders(QtWidgets.QWidget):
     def slider_picker_entries(self) -> list[tuple[str, CompactText, str, bool]]:
         entries = []
         for name in self._variables:
-            title, unit, qualifier = self._label_parts(name)
-            suffix = (f" [{unit}]" if unit else "") + qualifier
+            title, unit = self._label_parts(name)
+            suffix = f" [{unit}]" if unit else ""
             compact = compact_text(title, max_chars=max(1, 48 - len(suffix)))
             label = CompactText(compact.display + suffix, title + suffix, compact.was_elided)
             meta = self._metadata[name]
@@ -768,7 +744,7 @@ class VariableSliders(QtWidgets.QWidget):
                 if symbol != escape(name) and compact.display.startswith(name)
                 else escape(compact.display)
             )
-            markup += (f" [{format_unit_for_display(unit)}]" if unit else "") + escape(qualifier)
+            markup += f" [{format_unit_for_display(unit)}]" if unit else ""
             entries.append((name, label, markup, self.variable_visible(name)))
         return entries
 
@@ -1056,8 +1032,6 @@ class VariableSliders(QtWidgets.QWidget):
                 self._format_value(value_f) if editor_text is None else editor_text,
             )
             self._decorate_editor(name_s)
-        elif isinstance(value_label, QtWidgets.QLabel):
-            value_label.setText(self._format_value(value_f))
         logger.debug("Variable projected: %s = %.12g", name_s, value_f)
         if emit:
             if not isinstance(interaction, SliderInteractionKind):

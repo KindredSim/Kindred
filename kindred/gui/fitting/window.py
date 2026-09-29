@@ -23,6 +23,7 @@ from kindred.gui.fitting.launch import (
     selected_observations,
 )
 from kindred.gui.fitting.parameters_ics_tab import ParametersIcsTab
+from kindred.gui.fitting.reporting import fit_identity_text
 from kindred.gui.fitting.run_results_tab import RunResultsTab
 from kindred.gui.fitting.unified_species_table import UnifiedSpeciesTable
 from kindred.gui.fitting.execution import FitCandidate, FitCurveDataset, FitLiveUpdate
@@ -30,7 +31,7 @@ from kindred.gui.fitting.execution import FitCandidate, FitCurveDataset, FitLive
 __all__ = ["FittingWindow"]
 
 class FittingWindow(QtWidgets.QDialog):
-    """Historical executable Fit shell with current owner-facing contracts.
+    """Fit dialog presenting the typed Fit session owner's snapshots.
 
     This object is deliberately a presentation boundary.  The owner retains
     accepted setup, request construction, worker lifetime, result authority,
@@ -821,6 +822,7 @@ class FittingWindow(QtWidgets.QDialog):
         if self._closing and not self._closing_after_cleanup:
             self.set_execution_status("Closing", "Stopping Fit before closing…")
             return
+        text = fit_identity_text(str(text), self._origin)
         self._status.setText(str(text))
         self._status.setAccessibleName(str(text))
         self._status.setToolTip(str(text))

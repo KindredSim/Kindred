@@ -357,7 +357,9 @@ def prepare_fitting_execution_context(
         unresolved_intervention_schedule = unresolved_intervention_schedule.without_stops()
     parameter_algebra_spec = prepared_dsl.parameter_algebra_spec_for_execution()
     species_names = tuple(mechanism.species_names())
-    y0 = np.asarray([mechanism.species[sp].initial_conc for sp in species_names], dtype=float)
+    # Every Fit initial concentration is a candidate or configured value
+    # applied per evaluation; the retained request starts from exact zeros.
+    y0 = np.zeros(len(species_names), dtype=float)
     if (
         cancellation_control is not None
         and cancellation_control.cancel_requested()

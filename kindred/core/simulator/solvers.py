@@ -22,9 +22,6 @@ from typing import (
 
 import numpy as np
 from kindred.core.scipy_integrate import load_scipy_integrate
-from kindred.core.temperature import (
-    TemperatureScheduleDictProtocol,
-)
 from kindred.core.exceptions import (
     InitialConditionError,
     SimulationCancelled,
@@ -196,11 +193,7 @@ def _build_provenance(req: _SimulationRequest, *, t_eval: np.ndarray) -> Dict[st
         )
 
     if req.temperature_schedule is not None:
-        temperature_schedule = req.temperature_schedule
-        if isinstance(temperature_schedule, TemperatureScheduleDictProtocol):
-            prov["temperature_schedule"] = dict(temperature_schedule.to_dict())
-        else:
-            prov["temperature_schedule"] = str(temperature_schedule)
+        prov["temperature_schedule"] = req.temperature_schedule.to_dict()
 
     return prov
 

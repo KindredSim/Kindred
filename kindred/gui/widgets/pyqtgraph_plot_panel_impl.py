@@ -17,6 +17,7 @@ from kindred.core.quantity_units import (
 )
 
 import io
+import math
 import time
 from dataclasses import dataclass, replace
 from collections.abc import Mapping, Sequence
@@ -2764,7 +2765,9 @@ def _iter_rendered_point_tsv_chunks(
     )
     if not nonempty:
         raise ValueError("No plotted data is available to copy.")
-    block_specs: list[tuple[_RenderedPointBlock, tuple[str, ...], int, int, bool]] = []
+    # Per block: its column parts, the rows kept after de-duplication, and the row count.
+    _BlockPlan = tuple[tuple[tuple[np.ndarray, ...], ...], np.ndarray | None, int]
+    block_specs: list[tuple[_RenderedPointBlock, tuple[str, ...], _BlockPlan, int, bool]] = []
     planned_rows = 0
     planned_width = 0
     previous_group = None
@@ -2776,13 +2779,29 @@ def _iter_rendered_point_tsv_chunks(
             for chunk in chunks[1:]
         ):
             raise ValueError("rendered point chunks must preserve series order.")
-        time_width = int(not block.x_is_time and chunks[0].sample_time is not None)
+        with_time = not block.x_is_time and chunks[0].sample_time is not None
+        columns = (
+            *((tuple(chunk.sample_time for chunk in chunks),) if with_time else ()),
+            tuple(chunk.x for chunk in chunks),
+            *(tuple(dict(chunk.series)[name] for chunk in chunks) for name in series_names),
+        )
         rows = sum(int(chunk.x.size) for chunk in chunks)
-        width = time_width + 1 + len(series_names)
+        keep = None
+        if block.kind != ResultLayerKind.EXPERIMENTAL.value and rows > 1:
+            # Chunk joins repeat shared endpoints; dataset rows keep repeats.
+            # One column at a time keeps the budget check ahead of the matrix.
+            repeated = np.ones(rows - 1, dtype=bool)
+            for parts in columns:
+                column = np.concatenate(parts).astype(float, copy=False)
+                repeated &= (column[1:] == column[:-1]) | (np.isnan(column[1:]) & np.isnan(column[:-1]))
+            keep = np.concatenate(([True], ~repeated))
+            rows = int(keep.sum())
+        width = len(columns)
+        plan = (columns, keep, rows)
         group = (block.kind, block.group_id)
         separator = bool(block_specs) and group != previous_group
         previous_group = group
-        block_specs.append((block, series_names, rows, width, separator))
+        block_specs.append((block, series_names, plan, width, separator))
         planned_rows = max(planned_rows, rows)
         planned_width += width + separator
     planned_cells = (planned_rows + 1) * planned_width
@@ -2817,22 +2836,13 @@ def _iter_rendered_point_tsv_chunks(
         # an adjacent, independently identified column group.
         combined_headers.extend(headers)
 
-    def iter_block_rows(
-        block: _RenderedPointBlock,
-        series_names: tuple[str, ...],
-    ) -> Iterator[tuple[str, ...]]:
-        for chunk in tuple(chunk for chunk in block.chunks if chunk.x.size):
-            series_by_name = dict(chunk.series)
-            for index in range(chunk.x.size):
-                row: list[str] = []
-                if not block.x_is_time and chunk.sample_time is not None:
-                    row.append(repr(float(chunk.sample_time[index])))
-                row.append(repr(float(chunk.x[index])))
-                row.extend(
-                    repr(float(series_by_name[name][index]))
-                    for name in series_names
-                )
-                yield tuple(row)
+    def iter_block_rows(plan: _BlockPlan) -> Iterator[tuple[str, ...]]:
+        columns, keep, _rows = plan
+        matrix = np.column_stack([np.concatenate(parts).astype(float, copy=False) for parts in columns])
+        if keep is not None:
+            matrix = matrix[keep]
+        for row in matrix:
+            yield tuple(repr(value) if math.isfinite(value) else "" for value in row.tolist())
 
     output_chunks: list[str] = []
     total_characters = 0
@@ -2840,17 +2850,17 @@ def _iter_rendered_point_tsv_chunks(
     output.write(encode_tsv_row(combined_headers))
     rows_in_chunk = 1
     row_iterators = [
-        iter_block_rows(block, series_names)
-        for block, series_names, _rows, _width, _separator in block_specs
+        iter_block_rows(plan)
+        for _block, _series_names, plan, _width, _separator in block_specs
     ]
     for row_index in range(planned_rows):
         row: list[str] = []
-        for iterator, (_block, _series_names, rows, width, separator) in zip(
+        for iterator, (_block, _series_names, plan, width, separator) in zip(
             row_iterators, block_specs, strict=True
         ):
             if separator:
                 row.append("")
-            if row_index < rows:
+            if row_index < plan[2]:
                 row.extend(next(iterator))
             else:
                 row.extend("" for _ in range(width))

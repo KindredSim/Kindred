@@ -51,22 +51,6 @@ def try_parse_finite_float(value: object) -> tuple[float, bool]:
     return float(v), True
 
 
-def try_parse_callable_finite_float(value: object) -> tuple[float, bool]:
-    """
-    Best-effort float parsing that accepts either a scalar or a 0-arg callable.
-
-    This is used at boundaries where values may be wrapped in lightweight bindings
-    (e.g., a numerical scalar wrapper) but callers still want a single canonical "finite float"
-    parsing policy.
-    """
-    if callable(value):
-        try:
-            value = value()
-        except Exception:
-            return 0.0, False
-    return try_parse_finite_float(value)
-
-
 def try_parse_nonneg_finite_float(value: object) -> tuple[float, bool]:
     """
     Best-effort float parsing for non-negative finite values.

@@ -12,7 +12,6 @@ import html
 import math
 import statistics
 from collections.abc import Mapping
-from typing import Literal
 
 import numpy as np
 
@@ -21,18 +20,29 @@ from kindred.core.analysis.global_fit_execution import FitCoordinate
 from kindred.core.quantity_units import format_unit_for_display
 from kindred.core.simulation_failure import FactualCause
 from kindred.gui.display_name_policy import scientific_symbol_html
-from kindred.gui.fitting.constants import INITIAL_PREFIX
-from kindred.gui.fitting.launch import FitParameterVariable
-from kindred.gui.fitting.execution import FitCandidate, FitLiveUpdate, _fit_coordinate_display_label
+from kindred.gui.fitting.constants import FIT_DATASET_WEIGHT_MODE_LABELS, INITIAL_PREFIX
+from kindred.gui.fitting.launch import FitOriginSnapshot, FitParameterVariable
+from kindred.gui.fitting.execution import (
+    FitCandidate, FitLiveUpdate, _fit_coordinate_display_label, fit_bound_state,
+)
 
 __all__ = [
     "fit_candidate_presentation",
+    "fit_identity_text",
     "fit_overview",
     "fit_completion_presentation",
     "fit_live_presentation",
 ]
 
-FitBoundState = Literal["lower", "upper", "interior"]
+
+def fit_identity_text(text: str, origin: FitOriginSnapshot) -> str:
+    """Replace retained dataset and set identities with their readable names."""
+
+    for mapped in origin.mapped_datasets:
+        text = text.replace(mapped.dataset_id, mapped.display_name)
+    for mapped in origin.mapped_datasets:
+        text = text.replace(mapped.set_id, mapped.set_name)
+    return text
 
 
 def _plain(value: object) -> object:
@@ -48,8 +58,6 @@ def _plain(value: object) -> object:
         return "Infinity" if value > 0 else "-Infinity"
     if isinstance(value, FitMetric):
         return _plain(value.to_payload())
-    if isinstance(value, FitCoordinate):
-        return _plain(value.to_machine_payload())
     if isinstance(value, FactualCause):
         return _plain(value.to_payload())
     if isinstance(value, np.ndarray):
@@ -57,13 +65,7 @@ def _plain(value: object) -> object:
     if isinstance(value, np.generic):
         return _plain(value.item())
     if isinstance(value, Mapping):
-        result: dict[str, object] = {}
-        for key, item in value.items():
-            normalized_key = (
-                key.to_machine_key() if isinstance(key, FitCoordinate) else str(key)
-            )
-            result[normalized_key] = _plain(item)
-        return result
+        return {str(key): _plain(item) for key, item in value.items()}
     if isinstance(value, (tuple, list)):
         return [_plain(item) for item in value]
     if isinstance(value, (set, frozenset)):
@@ -77,68 +79,6 @@ def _plain(value: object) -> object:
             for field in dataclasses.fields(value)
         }
     return str(value)
-
-
-def fit_bound_state(
-    value: float,
-    minimum: float,
-    maximum: float,
-    log_scale: bool = False,
-) -> FitBoundState:
-    """Classify an estimate against bounds in its optimizer coordinate.
-
-    Fit results retain decoded physical values, while a log10 fit optimizes
-    their base-10 logarithms.  Bound classification therefore has to happen
-    after applying the same encoding used by the optimizer.  A side's
-    tolerance is local to that encoded value and bound; the opposite bound
-    must not make a small-scale estimate appear to be on a boundary.
-    """
-
-    value = float(value)
-    minimum = float(minimum)
-    maximum = float(maximum)
-
-    def encode(raw_value: float) -> float | None:
-        if not math.isfinite(raw_value):
-            return None
-        if log_scale:
-            if raw_value <= 0.0:
-                return None
-            return math.log10(raw_value)
-        return raw_value
-
-    encoded_value = encode(value)
-    encoded_minimum = encode(minimum)
-    encoded_maximum = encode(maximum)
-    if encoded_value is None:
-        return "interior"
-
-    def is_at_bound(encoded_bound: float | None) -> bool:
-        if encoded_bound is None:
-            return False
-        # Exact equality is checked separately so a value equal to both
-        # malformed/degenerate sides has deterministic lower precedence.
-        if encoded_value == encoded_bound:
-            return True
-        absolute_tolerance = 8.0 * max(
-            math.ulp(encoded_value), math.ulp(encoded_bound)
-        )
-        return math.isclose(
-            encoded_value,
-            encoded_bound,
-            rel_tol=1.0e-9,
-            abs_tol=absolute_tolerance,
-        )
-
-    if encoded_minimum is not None and encoded_value == encoded_minimum:
-        return "lower"
-    if encoded_maximum is not None and encoded_value == encoded_maximum:
-        return "upper"
-    if is_at_bound(encoded_minimum):
-        return "lower"
-    if is_at_bound(encoded_maximum):
-        return "upper"
-    return "interior"
 
 
 def _metric(value: FitMetric | None) -> object:
@@ -180,7 +120,7 @@ def _terminal_dataset_value(
 
 def _display(value: object) -> str:
     if value is None:
-        return "unavailable"
+        return "—"
     if isinstance(value, bool):
         return str(value).lower()
     if isinstance(value, float):
@@ -191,33 +131,17 @@ def _display(value: object) -> str:
 
 
 def _profile_endpoint(endpoint: object) -> dict[str, object]:
-    return {
-        "status": endpoint.status,
-        "evaluation_index": endpoint.evaluation_index,
-        "optimizer_value": endpoint.optimizer_value,
-        "likelihood_ratio": endpoint.likelihood_ratio,
-        "coordinate_tolerance": endpoint.coordinate_tolerance,
-        "likelihood_ratio_tolerance": endpoint.likelihood_ratio_tolerance,
-        "bracket_width": endpoint.bracket_width,
-        "reason": endpoint.reason,
-        "last_evaluation_index": endpoint.last_evaluation_index,
-        "evaluation_count": endpoint.evaluation_count,
-        "failure": _plain(endpoint.failure),
-    }
+    return {"reason": endpoint.reason, "failure": _plain(endpoint.failure)}
 
 
-def _profile_interval(coordinate: object, interval: object) -> dict[str, object]:
+def _profile_interval(coordinate: FitCoordinate, interval: object) -> dict[str, object]:
     return {
-        "coordinate": _plain(coordinate),
+        "coordinate": coordinate,
         "status": interval.status,
-        "interval_kind": interval.interval_kind,
-        "estimate": interval.estimate,
         "lower": interval.lower,
         "upper": interval.upper,
         "lower_outcome": interval.lower_outcome,
         "upper_outcome": interval.upper_outcome,
-        "optimizer_bounds": list(interval.optimizer_bounds),
-        "physical_bounds": list(interval.physical_bounds),
         "lower_resolution": _profile_endpoint(interval.lower_resolution),
         "upper_resolution": _profile_endpoint(interval.upper_resolution),
         "endpoint_messages": _plain(interval.endpoint_messages),
@@ -240,21 +164,14 @@ def _profile_data(candidate: FitCandidate) -> dict[str, object]:
         "requested": True,
         "status": result.status,
         "method": result.method,
-        "requested_parameters": list(result.requested_parameters),
         "confidence_level": result.confidence_level,
-        "likelihood_ratio_threshold": result.likelihood_ratio_threshold,
-        "likelihood_model": result.likelihood_model,
-        "likelihood_ratio_transport": result.likelihood_ratio_transport,
-        "fixed_coordinate_policy": result.fixed_coordinate_policy,
-        "warm_start_policy": result.warm_start_policy,
-        "optimizer_method": result.optimizer_method,
-        "max_bracketing_steps_per_side": result.max_bracketing_steps_per_side,
-        "max_nfev_per_point": result.max_nfev_per_point,
-        "observation_count": result.observation_count,
-        "terminal_weighted_residual_sse": result.terminal_weighted_residual_sse,
+        "facts": (
+            ("Likelihood-ratio threshold", result.likelihood_ratio_threshold),
+            ("Likelihood model", result.likelihood_model),
+            ("Observations", result.observation_count),
+        ),
         "unavailable_reason": result.unavailable_reason,
         "diagnostic": _plain(result.diagnostic),
-        "provenance": _plain(result.provenance),
         "intervals": [
             _profile_interval(coordinate, interval)
             for coordinate, interval in sorted(result.intervals.items(), key=lambda item: str(item[0]))
@@ -262,13 +179,12 @@ def _profile_data(candidate: FitCandidate) -> dict[str, object]:
     }
 
 
-def _bootstrap_interval(coordinate: object, interval: object) -> dict[str, object]:
+def _bootstrap_interval(coordinate: FitCoordinate, interval: object) -> dict[str, object]:
     return {
-        "coordinate": _plain(coordinate),
+        "coordinate": coordinate,
         "status": interval.status,
         "lower": interval.lower,
         "upper": interval.upper,
-        "construction": interval.construction,
         "reason": interval.reason,
     }
 
@@ -289,21 +205,16 @@ def _bootstrap_data(candidate: FitCandidate) -> dict[str, object]:
         "requested": True,
         "status": result.status,
         "method": result.method,
-        "requested_parameters": list(result.requested_parameters),
-        "seed": result.seed,
         "replicates": result.replicates,
         "confidence_level": result.confidence_level,
-        "resampling": result.resampling,
-        "draw_algorithm": result.draw_algorithm,
-        "residual_centering": result.residual_centering,
-        "replicate_execution": result.replicate_execution,
-        "refit_validity": result.refit_validity,
-        "minimum_successful_replicates": result.minimum_successful_replicates,
-        "minimum_success_fraction": result.minimum_success_fraction,
-        "required_successes": result.required_successes,
+        "facts": (
+            ("Seed", result.seed),
+            ("Resampling", result.resampling),
+            ("Residual centering", result.residual_centering),
+            ("Required successful refits", result.required_successes),
+        ),
         "successful_replicates": result.successful_replicates,
         "failed_replicates": result.failed_replicates,
-        "interval_construction": result.interval_construction,
         "intervals": [
             _bootstrap_interval(coordinate, interval)
             for coordinate, interval in sorted(result.intervals.items(), key=lambda item: str(item[0]))
@@ -314,7 +225,6 @@ def _bootstrap_data(candidate: FitCandidate) -> dict[str, object]:
         "first_failed_replicate_unavailable": _plain(result.first_failed_replicate_unavailable),
         "unavailable_reason": result.unavailable_reason,
         "diagnostic": _plain(result.diagnostic),
-        "provenance": _plain(result.provenance),
     }
 
 
@@ -629,22 +539,6 @@ def _aggregate_rows(individual: list[dict[str, object]]) -> list[dict[str, objec
     return aggregates
 
 
-def _known_input_context(candidate: FitCandidate) -> dict[str, object]:
-    settings = candidate.origin.scientific_settings
-    request = candidate.request
-    request_setup = request.setup
-    return {"temperature_K": float(candidate.origin.prepared_dsl.analysis.temperature_K), "relative_tolerance": float(settings.rtol),
-        "absolute_tolerance": float(settings.atol), "analytic_jacobian_policy": bool(settings.analytic_jacobian_policy),
-        "solver": str(request_setup.solver), "included_dataset_ids": list(request.dispatch.included_dataset_ids),
-        "dataset_conditions": [{"dataset_id": item.dataset_id, "included": bool(item.included),
-            "simulation_start": item.t_start,
-            "simulation_end": item.simulation_end,
-            "x_quantity": item.parametric.x_name if item.parametric else "t",
-            "data_range_min": None if item.parametric else float(item.data_range_min),
-            "data_range_max": None if item.parametric else float(item.data_range_max)} for item in request_setup.datasets],
-        "known_condition_source": "captured Fit origin scientific settings"}
-
-
 def _metric_text(value: object) -> str:
     if not isinstance(value, Mapping):
         return _display(value)
@@ -671,28 +565,26 @@ def _table(headers: tuple[str, ...], rows: object, *, rich_columns: tuple[int, .
             ) + "</tr>" for row in rows) + "</table>")
 
 
-def _diagnostic(value: object, labels: Mapping[str, str]) -> str:
+def _diagnostic(value: object, origin: FitOriginSnapshot) -> str:
     if value is None:
         return ""
     if isinstance(value, Mapping):
         # Human failure chains retain every message, without a nested dict dump.
         parts = [str(value[key]) for key in ("type", "message", "reason") if value.get(key)]
         if value.get("cause"):
-            parts.append(_diagnostic(value["cause"], labels))
+            parts.append(_diagnostic(value["cause"], origin))
         if not parts:
-            parts = [f"{key.replace('_', ' ')}: {_diagnostic(item, labels)}"
+            parts = [f"{key.replace('_', ' ')}: {_diagnostic(item, origin)}"
                      for key, item in value.items() if item is not None]
         text = " — ".join(parts)
     elif isinstance(value, (list, tuple)):
-        text = "; ".join(_diagnostic(item, labels) for item in value)
+        text = "; ".join(_diagnostic(item, origin) for item in value)
     else:
         text = str(value)
-    for identity, name in labels.items():
-        text = text.replace(identity, name)
-    return text
+    return fit_identity_text(text, origin)
 
 
-def _analysis_section(title: str, data: Mapping[str, object], labels: Mapping[str, str],
+def _analysis_section(title: str, data: Mapping[str, object], origin: FitOriginSnapshot,
                       symbols: Mapping[str, str], coordinate_units: Mapping[tuple[str, str, str | None], str]) -> str:
     if not data["requested"]:
         return ""
@@ -700,32 +592,24 @@ def _analysis_section(title: str, data: Mapping[str, object], labels: Mapping[st
     for key in ("unavailable_reason", "diagnostic", "first_failed_replicate_diagnostic",
                 "first_failed_replicate_unavailable", "primary_fit_diagnostic", "primary_fit_unavailable"):
         if data.get(key):
-            section += f"<p><b>{_text(key.replace('_', ' ').capitalize())}:</b> {_text(_diagnostic(data[key], labels))}</p>"
+            section += f"<p><b>{_text(key.replace('_', ' ').capitalize())}:</b> {_text(_diagnostic(data[key], origin))}</p>"
     if "replicates" in data:
         section += (f"<p>{_text(data['successful_replicates'])} successful; "
                     f"{_text(data['failed_replicates'])} failed of {_text(data['replicates'])} replicates.</p>")
     if data.get("method"):
         section += f"<p>Method: {_text(data['method'])}; confidence level: {_text(data['confidence_level'])}.</p>"
+    labels = {mapped.dataset_id: mapped.display_name for mapped in origin.mapped_datasets}
     rows = []
     for interval in data["intervals"]:
         coordinate = interval["coordinate"]
-        if isinstance(coordinate, Mapping):
-            name = symbols.get(str(coordinate["name"]), _text(coordinate["name"]))
-            dataset = coordinate.get("dataset_id")
-            if dataset:
-                name = f"{_text(labels[dataset])} · {name}"
-            if coordinate["scope"] == "centred_overall":
-                name = "Overall · " + name
-            elif coordinate["scope"] == "centred_deviation":
-                name = "Deviation · " + name
-            unit = coordinate_units.get((
-                str(coordinate.get("scope", "")),
-                str(coordinate.get("name", "")),
-                None if dataset is None else str(dataset),
-            ), "")
-        else:
-            name = _text(coordinate)
-            unit = ""
+        name = symbols.get(coordinate.name, _text(coordinate.name))
+        if coordinate.dataset_id:
+            name = f"{_text(labels[coordinate.dataset_id])} · {name}"
+        if coordinate.scope == "centred_overall":
+            name = "Overall · " + name
+        elif coordinate.scope == "centred_deviation":
+            name = "Deviation · " + name
+        unit = coordinate_units.get((coordinate.scope, coordinate.name, coordinate.dataset_id), "")
         outcomes = [str(interval[key]) for key in ("reason", "lower_outcome", "upper_outcome") if interval.get(key)]
         for side in ("lower", "upper"):
             endpoint = interval.get(side + "_resolution")
@@ -733,24 +617,13 @@ def _analysis_section(title: str, data: Mapping[str, object], labels: Mapping[st
                 if endpoint.get("reason"):
                     outcomes.append(f"{side}: {endpoint['reason']}")
                 if endpoint.get("failure"):
-                    outcomes.append(f"{side}: {_diagnostic(endpoint['failure'], labels)}")
+                    outcomes.append(f"{side}: {_diagnostic(endpoint['failure'], origin)}")
         if interval.get("endpoint_messages"):
-            outcomes.append(_diagnostic(interval["endpoint_messages"], labels))
+            outcomes.append(_diagnostic(interval["endpoint_messages"], origin))
         rows.append((name, interval["lower"], interval["upper"], _unit_html(unit), interval["status"], "; ".join(outcomes)))
     if rows:
         section += _table(("Parameter", "Lower", "Upper", "Unit", "Outcome", "Details"), rows, rich_columns=(0, 3))
     return section
-
-
-def _technical_rows(value: object, prefix: str = "") -> list[tuple[str, object]]:
-    """Lay out captured technical facts without embedding a dictionary dump."""
-    if isinstance(value, Mapping):
-        return [row for key, item in value.items()
-                for row in _technical_rows(item, f"{prefix} · {str(key).replace('_', ' ')}".strip(" ·"))]
-    if isinstance(value, (list, tuple)):
-        return [row for index, item in enumerate(value, 1)
-                for row in _technical_rows(item, f"{prefix} · {index}")]
-    return [(prefix, value)]
 
 
 def fit_overview(phase: str, model: str, objective: str, datasets: int, parameters: int) -> tuple[str, ...]:
@@ -823,21 +696,20 @@ def fit_live_presentation(
 def fit_candidate_presentation(candidate: FitCandidate) -> tuple[tuple[str, ...], str, str, str, tuple[FitValueEntry, ...]]:
     """Project one terminal into its compact header, document and last provenance."""
     result = candidate.result
-    labels = {mapped.dataset_id: mapped.display_name for mapped in candidate.origin.mapped_datasets}
     shared, individual = _estimate_rows(candidate)
     initial = _initial_rows(candidate)
     phase, _complete = fit_completion_presentation(candidate)
     model = candidate.origin.tab_name
     objective = _metric_text(_metric(result.weighted_residual_sse))
     overview = fit_overview(phase, model, objective, len(result.dataset_info), len(candidate.request.setup.parameters))
-    termination = _diagnostic(result.message, labels)
+    termination = _diagnostic(result.message, candidate.origin)
     body = f"<h2>{_text(phase)}</h2><p>{_text(model)}</p><p>{_text(termination)}</p>"
     body += f"<p><b>Weighted residual SSE:</b> {_text(objective)} &nbsp; <b>Weighted MSE:</b> {_text(_metric_text(_metric(result.weighted_residual_mse)))}</p>"
     model_kind = "Centred Fixed Effects" if result.primary_model == "centred_fixed_effects" else "Ordinary global fit"
     body += f"<p>Model: {_text(model_kind)}.</p>"
     body += f"<p>Optimizer {'converged' if result.optimizer_converged else 'did not converge'}.</p>"
     if result.optimizer_diagnostic:
-        body += f"<p><b>Optimizer diagnostic:</b> {_text(_diagnostic(_plain(result.optimizer_diagnostic), labels))}</p>"
+        body += f"<p><b>Optimizer diagnostic:</b> {_text(_diagnostic(_plain(result.optimizer_diagnostic), candidate.origin))}</p>"
     parameters = {parameter.name: parameter for parameter in candidate.setup_snapshot.parameters}
     symbols = {name: scientific_symbol_html(name, family=parameter.family, role=parameter.role)
                for name, parameter in parameters.items()}
@@ -896,36 +768,40 @@ def fit_candidate_presentation(candidate: FitCandidate) -> tuple[tuple[str, ...]
         else:
             for dataset_id, _value in parameter.selected_config.dataset_values:
                 coordinate_units[("dataset", parameter.name, dataset_id)] = parameter.unit
-    body += _analysis_section("Profile likelihood", profile, labels, symbols, coordinate_units)
-    body += _analysis_section("Residual bootstrap", bootstrap, labels, symbols, coordinate_units)
+    body += _analysis_section("Profile likelihood", profile, candidate.origin, symbols, coordinate_units)
+    body += _analysis_section("Residual bootstrap", bootstrap, candidate.origin, symbols, coordinate_units)
     body += "<h3>Apply effect</h3><p>Apply publishes compatible shared estimates and fitted initial values to the project."
     if result.centred_fixed_effects_settlements:
         body += " For centred parameters, only the overall value is published; dataset-specific effective values and deviations remain Fit results."
     if any(parameter.scope == "per_dataset" for parameter in candidate.setup_snapshot.parameters):
         body += " Per-dataset parameter values must first become Shared through Configure Shared Fit and an ordinary Shared Fit."
     body += "</p>"
-    context = _known_input_context(candidate)
-    provenance = "<h3>Technical provenance</h3>" + _table(
-        ("Setting", "Captured value"), ((key.replace("_", " "), value) for key, value in context.items()
-                                          if key not in {"dataset_conditions", "included_dataset_ids"}))
-    provenance += _table(("Dataset", "Dataset ID", "Initial-condition set ID"),
-                         ((mapped.display_name, mapped.dataset_id, mapped.set_id) for mapped in candidate.origin.mapped_datasets))
-    provenance += _table(("Dataset ID", "Included", "X quantity", "Simulation interval", "Experimental time range"),
-                         ((row["dataset_id"], row["included"], row["x_quantity"],
-                           f"{row['simulation_start']} to {row['simulation_end']}",
-                           "All paired observations" if row["data_range_min"] is None else
-                           f"{row['data_range_min']} to {row['data_range_max']}") for row in context["dataset_conditions"]))
-    if any(item.parametric is not None for item in candidate.request.setup.datasets if item.included):
+    settings = candidate.origin.scientific_settings
+    request_setup = candidate.request.setup
+    provenance = "<h3>Technical provenance</h3>" + _table(("Setting", "Value"), (
+        ("Temperature", f"{_display(float(candidate.origin.prepared_dsl.analysis.temperature_K))} K"),
+        ("Relative tolerance", float(settings.rtol)),
+        ("Absolute tolerance", float(settings.atol)),
+        ("Analytic Jacobian", "on" if settings.analytic_jacobian_policy else "off"),
+        ("Solver", request_setup.solver),
+    ))
+    mapped_by_id = {mapped.dataset_id: mapped for mapped in candidate.origin.mapped_datasets}
+    provenance += _table(("Dataset", "Initial-condition set", "X quantity", "Simulation interval", "Experimental time range"),
+                         ((mapped_by_id[item.dataset_id].display_name, mapped_by_id[item.dataset_id].set_name,
+                           item.parametric.x_name if item.parametric else "t",
+                           f"{_display(item.t_start)} to {_display(item.simulation_end)}",
+                           "All paired observations" if item.parametric else
+                           f"{_display(float(item.data_range_min))} to {_display(float(item.data_range_max))}")
+                          for item in request_setup.datasets if item.included))
+    if any(item.parametric is not None for item in request_setup.datasets if item.included):
         provenance += "<p>Measured-X fitting jointly matches weighted X and Y discrepancies on uninterrupted simulation segments. Recorded time is unused. Matched locations do not identify experimental times or establish absolute rate identifiability.</p>"
-    provenance += f"<p>Weighting mode: {_text(candidate.request.setup.dataset_weight_mode)}. Weighted residual = raw residual × √normalized dataset weight × √normalized target weight.</p>"
-    provenance += _table(("Estimate provenance", "Captured value"),
-                         _technical_rows(shared + individual + initial))
-    if aggregates:
-        provenance += _table(("Aggregate fact", "Value"), _technical_rows(aggregates))
+    provenance += f"<p>Weighting: {_text(FIT_DATASET_WEIGHT_MODE_LABELS[request_setup.dataset_weight_mode])}. Weighted residual = raw residual × √normalized dataset weight × √normalized target weight.</p>"
     for title, analysis in (("Profile likelihood", profile), ("Residual bootstrap", bootstrap)):
-        if analysis["requested"]:
-            provenance += f"<h4>{_text(title)} technical facts</h4>" + _table(
-                ("Fact", "Captured value"), _technical_rows(analysis))
+        if analysis.get("facts"):
+            provenance += _table((title, "Value"), (
+                (label, fit_identity_text(value, candidate.origin) if isinstance(value, str) else value)
+                for label, value in analysis["facts"]
+            ))
     entries: list[FitValueEntry] = []
     ordered = shared + [row for mapped in candidate.origin.mapped_datasets
                         for row in effective if mapped.dataset_id == row.get("dataset_id")

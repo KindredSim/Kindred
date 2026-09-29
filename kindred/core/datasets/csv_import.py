@@ -115,6 +115,9 @@ def read_csv_rows_from_bytes(
     reader = csv.reader(handle)
     try:
         header = next(reader, None)
+    except (UnicodeDecodeError, csv.Error) as exc:
+        handle.close()
+        raise ValueError(f"CSV file {label!r}: {exc}") from exc
     except BaseException:
         handle.close()
         raise
@@ -143,6 +146,8 @@ def read_csv_rows_from_bytes(
                     },
                 )
                 previous_end_row = row_end_row
+        except (UnicodeDecodeError, csv.Error) as exc:
+            raise ValueError(f"CSV file {label!r}: {exc}") from exc
         finally:
             handle.close()
 
@@ -180,10 +185,18 @@ def parse_physical_rows(
         if interruption_checker and interruption_checker():
             raise CsvImportInterrupted()
 
+    def _source_prefix() -> str:
+        parts: list[str] = []
+        if str(source_label or "").strip():
+            parts.append(f"File {str(source_label).strip()!r}")
+        if sheet_name is not None:
+            parts.append(f"sheet {sheet_name!r}")
+        return "" if not parts else ", ".join(parts) + ", "
+
     row_iter = iter(rows)
     first_item = next(row_iter, None)
     if first_item is None:
-        raise ValueError("The source contains no data rows.")
+        raise ValueError(f"{_source_prefix()}the source contains no data rows.")
     first_source_row = int(source_row_start)
     if first_source_row <= 0:
         raise ValueError("source_row_start must be a positive physical row number.")
@@ -237,7 +250,7 @@ def parse_physical_rows(
         value = row.get(column, "")
         if isinstance(value, UncachedFormulaCell):
             raise ValueError(
-                f"{_source_prefix()}column {column.assigned_name!r}: selected "
+                f"{_source_prefix()}row {row_index}, column {column.assigned_name!r}: selected "
                 f"XLSX formula {value.formula!r} has no cached value."
             )
         if isinstance(value, TemporalCell):
@@ -247,14 +260,6 @@ def parse_physical_rows(
                 "is not a numeric observation; format measurements as plain numbers."
             )
         return "" if value is None else str(value).strip()
-
-    def _source_prefix() -> str:
-        parts: list[str] = []
-        if str(source_label or "").strip():
-            parts.append(f"file {str(source_label).strip()!r}")
-        if sheet_name is not None:
-            parts.append(f"sheet {sheet_name!r}")
-        return "" if not parts else ", ".join(parts) + ", "
 
     row_items = itertools.chain((first,), row_iter)
     for logical_index, row_item in enumerate(row_items):
@@ -338,7 +343,9 @@ def parse_physical_rows(
             spec["source_rows"].append(row_index)
 
     if not saw_nonempty_row:
-        raise ValueError("The selected columns contain only blank data rows.")
+        raise ValueError(
+            f"{_source_prefix()}the selected columns contain only blank data rows."
+        )
 
     observations: list[ObservationSeries] = []
     retained_columns: list[PhysicalColumn] = []
@@ -357,7 +364,7 @@ def parse_physical_rows(
             source_rows=tuple(spec["source_rows"]),
         ))
     if not observations:
-        raise ValueError("No numeric observation columns were found.")
+        raise ValueError(f"{_source_prefix()}no numeric observation columns were found.")
 
     metadata: dict[str, object] = {
         "original_time_unit": time_unit.symbol,

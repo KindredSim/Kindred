@@ -4,9 +4,6 @@ from dataclasses import dataclass
 import re
 from typing import Iterator, Mapping, Sequence
 
-from kindred.core.equilibrium_rate_authority import (
-    authority_fields_from_step_entry,
-)
 from kindred.core.validation import try_parse_int
 from .dsl_build_input import (
     canonical_source_coordinate_name,
@@ -22,7 +19,6 @@ class MechanismParameterInfo:
     step_index: int | None
     step_kind: str | None
     role: str | None
-    has_explicit_keq: bool | None
 
 
 @dataclass(frozen=True)
@@ -154,15 +150,8 @@ class MechanismParameterNamespace:
 class _NamespaceStepDescriptor:
     step_index: int
     step_kind: str
-    has_explicit_keq: bool
     source_index: int | None = None
     source_coordinates: tuple[tuple[str, str], ...] = ()
-
-
-@dataclass(frozen=True)
-class _StepNamespacePolicy:
-    step_kind: str
-    has_explicit_keq: bool
 
 
 def is_protected_indexed_identifier(raw_name: str) -> bool:
@@ -206,7 +195,6 @@ def _iter_canonical_items(
                     step_index=step_index,
                     step_kind=step_kind,
                     role="k",
-                    has_explicit_keq=bool(descriptor.has_explicit_keq),
                 ),
                 source_index=descriptor.source_index,
             )
@@ -224,7 +212,6 @@ def _iter_canonical_items(
                     step_index=step_index,
                     step_kind=step_kind,
                     role=role,
-                    has_explicit_keq=bool(descriptor.has_explicit_keq),
                 ),
                 source_index=descriptor.source_index,
             )
@@ -236,7 +223,6 @@ def _iter_canonical_items(
                 step_index=step_index,
                 step_kind=step_kind,
                 role="Keq",
-                has_explicit_keq=bool(descriptor.has_explicit_keq),
             ),
             source_index=descriptor.source_index,
         )
@@ -280,12 +266,6 @@ def _build_namespace(descriptors: Sequence[_NamespaceStepDescriptor]) -> Mechani
                 step_index=coordinate.step_index,
                 step_kind=coordinate.step_kind,
                 role=coordinate.role,
-                has_explicit_keq=(
-                    descriptors[coordinate.source_index].has_explicit_keq
-                    if coordinate.source_index is not None
-                    and 0 <= coordinate.source_index < len(descriptors)
-                    else None
-                ),
             ),
         )
     return MechanismParameterNamespace(
@@ -296,30 +276,8 @@ def _build_namespace(descriptors: Sequence[_NamespaceStepDescriptor]) -> Mechani
     )
 
 
-def _namespace_policy_from_step(step: object) -> _StepNamespacePolicy:
-    missing_attrs = [
-        attr
-        for attr in ("reversible", "Keq_input")
-        if not hasattr(step, attr)
-    ]
-    if missing_attrs:
-        raise ValueError(
-            "Step is missing required namespace metadata: " + ", ".join(sorted(missing_attrs))
-        )
-    is_equilibrium_step = bool(getattr(step, "reversible"))
-    return _StepNamespacePolicy(
-        step_kind="equilibrium" if is_equilibrium_step else "reaction",
-        has_explicit_keq=bool(getattr(step, "Keq_input", None) is not None),
-    )
-
-
 def _mechanism_step_descriptors(mechanism: object) -> list[_NamespaceStepDescriptor]:
-    metadata = getattr(mechanism, "metadata", None)
-    if not isinstance(metadata, dict):
-        raise ValueError("Mechanism metadata is missing or invalid; expected a step_index_map-backed mechanism.")
-    raw_mapping = metadata.get("step_index_map")
-    if not isinstance(raw_mapping, list):
-        raise ValueError("Mechanism step_index_map is missing; cannot build an authoritative parameter namespace.")
+    raw_mapping = mechanism.metadata["step_index_map"]
     descriptors: list[_NamespaceStepDescriptor] = []
     seen_step_indices: set[int] = set()
     for source_index, raw_entry in enumerate(raw_mapping):
@@ -336,14 +294,6 @@ def _mechanism_step_descriptors(mechanism: object) -> list[_NamespaceStepDescrip
         step_kind = str(raw_entry.get("kind") or "")
         if step_kind not in {"reaction", "equilibrium"}:
             raise ValueError(f"Mechanism step_index_map entry {source_index} has an invalid kind {step_kind!r}.")
-        has_explicit_keq = False
-        if step_kind == "equilibrium":
-            authority = authority_fields_from_step_entry(raw_entry)
-            if not authority:
-                raise ValueError(
-                    f"Mechanism equilibrium step_index_map entry {source_index} is missing equilibrium_authority."
-            )
-            has_explicit_keq = bool(authority.get("has_explicit_keq_param"))
         raw_source_coordinates = raw_entry.get("source_coordinates") or {}
         if not isinstance(raw_source_coordinates, Mapping):
             raise ValueError(
@@ -367,7 +317,6 @@ def _mechanism_step_descriptors(mechanism: object) -> list[_NamespaceStepDescrip
             _NamespaceStepDescriptor(
                 step_index=step_index,
                 step_kind=step_kind,
-                has_explicit_keq=has_explicit_keq,
                 source_index=source_index,
                 source_coordinates=tuple(source_coordinates),
             )
@@ -387,18 +336,7 @@ def canonical_name_for_mechanism_step_parameter(
     role: str,
     expected_name: str,
 ) -> str:
-    metadata = getattr(mechanism, "metadata", None)
-    if not isinstance(metadata, dict):
-        raise ValueError(
-            f"Cannot resolve authoritative mechanism parameter name {expected_name!r}: "
-            "mechanism metadata is missing or invalid."
-        )
-    raw_mapping = metadata.get("step_index_map")
-    if not isinstance(raw_mapping, list):
-        raise ValueError(
-            f"Cannot resolve authoritative mechanism parameter name {expected_name!r}: "
-            "mechanism step_index_map is missing."
-        )
+    raw_mapping = mechanism.metadata["step_index_map"]
     index_key = "reaction_index" if str(kind) == "reaction" else "equilibrium_index"
     step_index: int | None = None
     for raw_entry in raw_mapping:

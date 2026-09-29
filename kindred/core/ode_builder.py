@@ -21,7 +21,6 @@ import numpy as np
 
 from .equilibrium_rate_authority import (
     json_safe_equilibrium_authority_payload,
-    normalize_existing_equilibrium_rate_authority,
 )
 from .exceptions import KineticRuntimeDomainError
 from .mechanism import Equilibrium, FrozenDict, Mechanism, Reaction
@@ -195,9 +194,7 @@ def build_effective_rate_coefficient_evaluator(
 
     from .mechanism_metadata import MechanismMetadataView
 
-    mech_meta = MechanismMetadataView.from_metadata(
-        getattr(mechanism, "metadata", {}) or {}
-    )
+    mech_meta = MechanismMetadataView.from_metadata(mechanism.metadata)
     nominal_temperature = float(mech_meta.temperature_K)
     from .simulator.parameter_algebra_eval import bind_parameter_evaluation
     from .simulator.step_indexing import get_step_index_map
@@ -221,8 +218,7 @@ def build_effective_rate_coefficient_evaluator(
                         "value_dependencies": tuple(spec.evaluation_dependencies.get(forward_name, ())),
                         "temperature_dependent": forward_name in spec.temperature_dependent_names}
             if kind == "equilibrium":
-                authority = normalize_existing_equilibrium_rate_authority(step)
-                snapshot.update(authority=json_safe_equilibrium_authority_payload(dict(authority.identity_items())), reverse_binding_name=reverse_name)
+                snapshot.update(authority=json_safe_equilibrium_authority_payload(dict(step.authority.identity_items())), reverse_binding_name=reverse_name)
             names.append((forward_name, reverse_name))
             step_kinds.append(kind)
             snapshots.append(snapshot)

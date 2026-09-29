@@ -49,7 +49,7 @@ def execute_input(config, prepared, solver, run, cancellation):
 def _worker(config, connection, cancel):
     try:
         try:
-            prepared = prepare_dsl_request_set(config.source, initials=config.initials, units=UnitsModel(
+            prepared = prepare_dsl_request_set(config.source, units=UnitsModel(
                 energy_unit=config.energy_unit, temperature_K=config.temperature_K,
                 standard_conc_M=config.standard_conc_M))
             solver = build_solver_config(solver_input=config.solver, rtol=config.rtol, atol=config.atol,
@@ -83,14 +83,14 @@ class _Worker:
     stopping: bool = False
 
 
-def _pending(connection, timeout=0.0):
+def _pending(connection):
     """Whether input is buffered; a peer-closed pipe counts as drained.
 
     On Windows, PipeConnection.poll raises BrokenPipeError once the child has
     exited instead of reporting readable EOF as Linux does.
     """
     try:
-        return connection.poll(timeout)
+        return connection.poll()
     except OSError:
         return False
 
@@ -247,7 +247,8 @@ def run_scan(config, prepared, cancel, progress_callback):
                     except (BrokenPipeError, OSError):
                         pass
                 while child.process.is_alive() or _pending(child.connection):
-                    if _pending(child.connection, 0.1):
+                    # wait() reports a peer-closed pipe as readable on every platform.
+                    if wait([child.connection], timeout=0.1):
                         try:
                             kind, payload = child.connection.recv()
                             if kind == "started":

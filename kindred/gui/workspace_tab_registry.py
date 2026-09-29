@@ -78,6 +78,17 @@ class ScientificDocumentDelta:
     affected_targets_by_tab: tuple[tuple[str, tuple[str, ...]], ...] = ()
     removed_targets_by_tab: tuple[tuple[str, tuple[str, ...]], ...] = ()
 
+    def targets_by_tab(self) -> dict[str, tuple[str, ...]]:
+        """Return affected and removed set IDs per tab; the two are disjoint."""
+
+        merged: dict[str, tuple[str, ...]] = {}
+        for tab_id, set_ids in (
+            *self.affected_targets_by_tab, *self.removed_targets_by_tab,
+        ):
+            merged[tab_id] = (*merged.get(tab_id, ()), *set_ids)
+        return merged
+
+
 class WorkspaceTabRegistry:
     """Sole live active-tab ID plus presentation and transient tab state."""
 
@@ -85,7 +96,7 @@ class WorkspaceTabRegistry:
         self,
         session: ProjectSession,
         *,
-        computation_fence: Callable[[ScientificDocumentDelta], object],
+        computation_fence: Callable[[ScientificDocumentDelta], None],
         retire_interactive_plot_targets: Callable[
             [ScientificDocumentDelta], None
         ],
@@ -101,35 +112,34 @@ class WorkspaceTabRegistry:
         self._presentation_by_tab_id: tuple[
             tuple[str, ProjectPresentationState], ...
         ] = ()
-        self._runtime_by_tab_id: tuple[tuple[str, TabRuntimeState], ...] = ()
+        presentation = session.saved_baseline.presentation
         self._assign_workspace_state(
-            session.document,
-            session.saved_baseline.presentation,
+            presentation, self._fresh_runtimes(presentation),
         )
+
+    def _fresh_runtimes(
+        self, presentation: WorkspacePresentationState,
+    ) -> tuple[tuple[str, TabRuntimeState], ...]:
+        """Fresh per-tab runtime; each restored current row is the Run selection."""
+
+        runtimes = []
+        for tab_id, state in presentation.presentation_by_tab_id:
+            runtime = self._runtime_factory(tab_id)
+            if state.current_set_id is not None:
+                runtime.selected_run_set_ids = (state.current_set_id,)
+            runtimes.append((tab_id, runtime))
+        return tuple(runtimes)
 
     def _assign_workspace_state(
         self,
-        document: ProjectDocument,
         presentation: WorkspacePresentationState,
-        *,
-        retain_runtime: bool = True,
-        runtime_by_tab_id: tuple[tuple[str, TabRuntimeState], ...] | None = None,
+        runtime_by_tab_id: tuple[tuple[str, TabRuntimeState], ...],
     ) -> None:
         """Assign the registry's direct presentation/runtime owners once."""
 
         self._active_tab_id = presentation.active_tab_id
         self._presentation_by_tab_id = presentation.presentation_by_tab_id
-        if runtime_by_tab_id is not None:
-            self._runtime_by_tab_id = runtime_by_tab_id
-            return
-        existing_runtime = dict(self._runtime_by_tab_id) if retain_runtime else {}
-        runtime_items: list[tuple[str, TabRuntimeState]] = []
-        for tab in document.tabs:
-            runtime = existing_runtime.get(tab.tab_id)
-            if runtime is None:
-                runtime = self._runtime_factory(tab.tab_id)
-            runtime_items.append((tab.tab_id, runtime))
-        self._runtime_by_tab_id = tuple(runtime_items)
+        self._runtime_by_tab_id = runtime_by_tab_id
 
     @property
     def active_tab_id(self) -> str:
@@ -187,10 +197,7 @@ class WorkspaceTabRegistry:
 
         if not self._session.is_content_token_current(expected_token):
             return None
-        runtime_by_tab_id = tuple(
-            (tab.tab_id, self._runtime_factory(tab.tab_id))
-            for tab in document.tabs
-        )
+        runtime_by_tab_id = self._fresh_runtimes(presentation)
         previous = self._session.document
         delta = self.scientific_document_delta(previous, document)
         if document != previous and (
@@ -206,12 +213,7 @@ class WorkspaceTabRegistry:
         )
         if token is None:
             return None
-        self._assign_workspace_state(
-            document,
-            presentation,
-            retain_runtime=False,
-            runtime_by_tab_id=runtime_by_tab_id,
-        )
+        self._assign_workspace_state(presentation, runtime_by_tab_id)
         return token
 
     def replace_document(
@@ -270,11 +272,7 @@ class WorkspaceTabRegistry:
         )
         if token is None:
             return None
-        self._assign_workspace_state(
-            document,
-            next_workspace,
-            runtime_by_tab_id=next_runtime,
-        )
+        self._assign_workspace_state(next_workspace, next_runtime)
         if changed:
             self._post_document_publication(delta)
         return token
@@ -302,23 +300,7 @@ class WorkspaceTabRegistry:
             for name in tuple(runtime.slider_parameter_draft):
                 if old_units.get(name) != new_units.get(name):
                     runtime.slider_parameter_draft.pop(name, None)
-        affected_by_tab: dict[str, list[str]] = {}
-        removed_by_tab: dict[str, set[str]] = {}
-        for tab_id, set_ids in delta.removed_targets_by_tab:
-            tab = str(tab_id)
-            removed = removed_by_tab.setdefault(tab, set())
-            removed.update(str(set_id) for set_id in set_ids)
-        for tab_id, set_ids in delta.affected_targets_by_tab:
-            tab = str(tab_id)
-            targets = affected_by_tab.setdefault(tab, [])
-            removed = removed_by_tab.get(tab, set())
-            for set_id in set_ids:
-                value = str(set_id)
-                if value not in removed and value not in targets:
-                    targets.append(value)
-        for tab_id, affected_ids in affected_by_tab.items():
-            if not affected_ids:
-                continue
+        for tab_id, affected_ids in delta.affected_targets_by_tab:
             runtime = existing_runtime.get(tab_id)
             repository = None if runtime is None else runtime.result_repository
             if repository is not None:
@@ -329,12 +311,10 @@ class WorkspaceTabRegistry:
                     and replacement_tab is not None
                     and previous_tab.prepared_dsl is not replacement_tab.prepared_dsl
                 ):
-                    repository.purge_sets(tuple(affected_ids))
+                    repository.purge_sets(affected_ids)
                 else:
-                    repository.deauthorize_sets(tuple(affected_ids))
-        for tab_id, removed_ids in removed_by_tab.items():
-            if not removed_ids:
-                continue
+                    repository.deauthorize_sets(affected_ids)
+        for tab_id, removed_ids in delta.removed_targets_by_tab:
             runtime = existing_runtime.get(tab_id)
             if runtime is not None:
                 removed = set(removed_ids)
@@ -348,7 +328,7 @@ class WorkspaceTabRegistry:
                     runtime.slider_species_drafts_by_set_id.pop(set_id, None)
             repository = None if runtime is None else runtime.result_repository
             if repository is not None:
-                repository.purge_sets(tuple(removed_ids))
+                repository.purge_sets(removed_ids)
 
     def select_tab(
         self,
@@ -429,6 +409,11 @@ class WorkspaceTabRegistry:
         ) is None:
             return None
         self._active_tab_id = created.tab_id
+        # A new tab starts like a replaced project: its current row is the
+        # sole Run selection.
+        current_set_id = self.presentation(created.tab_id).current_set_id
+        if current_set_id is not None:
+            self.tab_runtime(created.tab_id).selected_run_set_ids = (current_set_id,)
         return created
 
     def copy_tab(
@@ -520,11 +505,7 @@ class WorkspaceTabRegistry:
             document, final_copy, presentation.reconciled(document, final_copy),
         )
         delta = self.scientific_document_delta(document.replace_tab(copied), document)
-        changed_ids = {
-            sid for target, ids in (
-                *delta.affected_targets_by_tab, *delta.removed_targets_by_tab,
-            ) if target == copied.tab_id for sid in ids
-        }
+        changed_ids = set(delta.targets_by_tab().get(copied.tab_id, ()))
         matching_set_ids = {
             source_id: destination_id for source_id, destination_id in set_ids.items()
             if destination_id not in changed_ids
@@ -616,12 +597,6 @@ class WorkspaceTabRegistry:
             )
             or not self.presentation(tab_id).is_default_for(tab)
             or self.tab_runtime(tab_id).has_dirty_drafts
-        )
-
-    def has_dirty_drafts(self) -> bool:
-        return any(
-            runtime.has_dirty_drafts
-            for _tab_id, runtime in self._runtime_by_tab_id
         )
 
     def replace_tab(

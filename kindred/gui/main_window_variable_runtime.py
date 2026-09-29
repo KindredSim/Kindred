@@ -105,11 +105,7 @@ def build_parameter_slider_projection(
 ) -> ParameterSliderProjection:
     if not isinstance(prepared_dsl, PreparedDslRequestSet):
         raise TypeError("prepared_dsl must be a PreparedDslRequestSet.")
-    coordinates = tuple(
-        item
-        for item in enumerate_parameter_coordinates(prepared_dsl)
-        if item.writable and not item.derived
-    )
+    coordinates = enumerate_parameter_coordinates(prepared_dsl)
     values = tuple((item.name, float(item.value)) for item in coordinates)
     metadata = tuple(
         (
@@ -120,8 +116,6 @@ def build_parameter_slider_projection(
                     "role": item.role,
                     "label": item.display_name,
                     "unit": item.unit,
-                    "editable": item.writable,
-                    "derived": item.derived,
                     "min": item.minimum,
                     "max": item.maximum,
                     "scale": "log" if item.log10_allowed else "linear",
@@ -584,7 +578,7 @@ class TabSliderBinding(QtCore.QObject):
             ),
             None,
         )
-        if coordinate is None or not coordinate.writable or coordinate.derived:
+        if coordinate is None:
             return self._reject_slider_action(f"Parameter {name!r} is not editable.")
         try:
             value_f = admit_gui_parameter_value(
@@ -1038,12 +1032,10 @@ class TabSliderBinding(QtCore.QObject):
         # Capture the session token only after the same-tab request, source,
         # and target-roster guards have passed.  Edits confined to unrelated
         # tabs therefore do not invalidate this tab's settled preview.
-        expected_token = self._registry.capture_content_token()
-        if self._registry.replace_document(
+        self._registry.replace_document(
             candidate,
-            expected_token=expected_token,
-        ) is None:
-            return False
+            expected_token=self._registry.capture_content_token(),
+        )
         self._simulation_jobs.promote_preview_to_run(
             self._tab_id,
             canonical_pairs,

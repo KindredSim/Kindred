@@ -9,7 +9,7 @@ import numpy as np
 
 from kindred.core.intervention_schedule_compiler import InterventionExecutionContract
 from kindred.core.symbolic.jacobian_execution import SymbolicJacobianExecution
-from kindred.core.temperature import TemperatureScheduleProtocol
+from kindred.core.temperature import TemperatureSchedule
 from kindred.core.species import (
     TIME_MAX_S,
     validate_runtime_concentration,
@@ -158,7 +158,7 @@ class SimulationRequest:
     t_eval: Optional[np.ndarray] = None
     grid: Optional[Mapping[str, float | int]] = None
 
-    temperature_schedule: TemperatureScheduleProtocol | None = None
+    temperature_schedule: TemperatureSchedule | None = None
     species_names: Optional[Tuple[str, ...]] = None
     cancellation_control: SimulationCancellationControl | None = None
     candidate_evaluation: bool = False

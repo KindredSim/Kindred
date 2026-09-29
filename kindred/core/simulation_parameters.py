@@ -5,12 +5,7 @@ from dataclasses import dataclass
 import math
 from typing import Literal, Mapping
 
-from kindred.core.equilibrium_rate_authority import (
-    EquilibriumRateAuthorityKind,
-    normalize_existing_equilibrium_rate_authority,
-    step_entry_authored_role_is_derived,
-    step_entry_authored_role_is_editable,
-)
+from kindred.core.equilibrium_rate_authority import EquilibriumRateAuthorityKind
 from kindred.core.kinetics import ArrheniusRateModel, EyringRateModel, ForwardRateModel, forward_rate_family
 from kindred.core.mechanism_metadata import (
     MechanismMetadataView,
@@ -23,7 +18,6 @@ from kindred.core.simulator.parameter_coordinates import build_parameter_target_
 from kindred.core.simulator.parameter_namespace import build_namespace_from_mechanism
 from kindred.core.simulator.dsl_build_input import source_coordinate_capabilities
 from kindred.core.simulator.step_indexing import get_step_index_map
-from kindred.core.validation import try_parse_callable_finite_float
 from kindred.core.quantity_units import convert_value
 from kindred.core.units import (
     UnitsModel,
@@ -38,17 +32,10 @@ class SimulationParameter:
     value: float
     family: str
     role: str
-    writable: bool
-    derived: bool
     scientific_category: SimulationParameterScientificCategory
     allow_exact_zero: bool
     unit: str = "1"
     context: str = ""
-
-
-def _finite(value: object) -> float | None:
-    parsed, ok = try_parse_callable_finite_float(value)
-    return float(parsed) if ok else None
 
 
 def enumerate_simulation_parameters(
@@ -57,7 +44,7 @@ def enumerate_simulation_parameters(
     """Enumerate writable coordinates from one accepted typed DSL authority."""
 
     mechanism = prepared_dsl.mutable_mechanism_shell()
-    metadata = getattr(mechanism, "metadata", {}) or {}
+    metadata = mechanism.metadata
     metadata_view = MechanismMetadataView.from_metadata(metadata)
     parameter_spec = prepared_dsl.parameter_algebra_spec_for_execution()
     parameter_target_map = build_parameter_target_map(mechanism)
@@ -79,8 +66,8 @@ def enumerate_simulation_parameters(
             return None
         return parameter_spec.parameter_assignment_kind(name)
 
-    reactions = tuple(getattr(mechanism, "reactions", ()) or ())
-    equilibria = tuple(getattr(mechanism, "equilibria", ()) or ())
+    reactions = tuple(mechanism.reactions)
+    equilibria = tuple(mechanism.equilibria)
     coordinates: list[SimulationParameter] = []
 
     for item in namespace.ordered_items:
@@ -110,8 +97,6 @@ def enumerate_simulation_parameters(
             continue
         context = str(entry.get("context") or "").strip()
         family = "Constant"
-        derived = False
-        writable = True
         scientific_category: SimulationParameterScientificCategory
         allow_exact_zero = False
         model: ForwardRateModel | None = None
@@ -139,20 +124,7 @@ def enumerate_simulation_parameters(
                 continue
             raw_index = int(entry["equilibrium_index"])
             equilibrium = equilibria[int(raw_index)]
-            authority = normalize_existing_equilibrium_rate_authority(equilibrium)
-            editable = step_entry_authored_role_is_editable(entry, role)
-            derived_truth = step_entry_authored_role_is_derived(entry, role)
-            writable = bool(
-                authority.authored_role_is_editable(role)
-                if editable is None
-                else editable
-            )
-            writable = writable and not bool(entry.get("locked", False))
-            derived = bool(
-                authority.authored_role_is_derived(role)
-                if derived_truth is None
-                else derived_truth
-            )
+            authority = equilibrium.authority
             if role == "kf":
                 model = equilibrium.forward_model
                 family = forward_rate_family(model)
@@ -174,13 +146,7 @@ def enumerate_simulation_parameters(
                 allow_exact_zero = False
         else:
             continue
-        if bool(entry.get("locked", False)):
-            writable = False
         if value is None or not math.isfinite(float(value)):
-            continue
-        # Fit and Preview consume this API directly: derived readouts never
-        # enter their request parameter maps.
-        if not writable or derived:
             continue
         coordinates.append(
             SimulationParameter(
@@ -189,8 +155,6 @@ def enumerate_simulation_parameters(
                 value=float(value),
                 family=family,
                 role=role,
-                writable=True,
-                derived=False,
                 scientific_category=scientific_category,
                 allow_exact_zero=allow_exact_zero,
                 unit=units[name],
@@ -201,7 +165,7 @@ def enumerate_simulation_parameters(
     # admitted into the step map.  Their names are reaction-local (A1/Ea1,
     # dG_act1, dG_eq1, ...); no global uniqueness test or unindexed alias is
     # allowed to collapse repeated reactions.
-    physical_candidates: list[tuple[str, str, str, float, bool, str]] = []
+    physical_candidates: list[tuple[str, str, str, float, str]] = []
     for entry in step_by_index.values():
         kind = str(entry.get("kind") or "")
         source_coordinates = {
@@ -221,11 +185,10 @@ def enumerate_simulation_parameters(
         elif kind == "equilibrium":
             raw_index = int(entry["equilibrium_index"])
             equilibrium = equilibria[int(raw_index)]
-            authority = normalize_existing_equilibrium_rate_authority(equilibrium)
+            authority = equilibrium.authority
             model = equilibrium.forward_model
         if model is None:
             continue
-        editable = not bool(entry.get("locked", False))
         energy_units = UnitsModel(energy_unit=metadata_view.energy_unit)
         for role, name in source_coordinates.items():
             if role == "A" and isinstance(model, ArrheniusRateModel):
@@ -235,7 +198,6 @@ def enumerate_simulation_parameters(
                         "Arrhenius",
                         role,
                         float(model.A),
-                        editable,
                         units[name],
                     )
                 )
@@ -246,7 +208,6 @@ def enumerate_simulation_parameters(
                         "Arrhenius",
                         role,
                         float(energy_units.from_jmol(model.Ea_J_per_mol)),
-                        editable,
                         metadata_view.energy_unit,
                     )
                 )
@@ -257,24 +218,16 @@ def enumerate_simulation_parameters(
                         "Eyring",
                         role,
                         float(energy_units.from_jmol(model.dG_act_J_per_mol)),
-                        editable,
                         metadata_view.energy_unit,
                     )
                 )
-            elif (
-                role == "dG_eq"
-                and authority is not None
-                and authority.dG_eq_J_per_mol is not None
-                and authority.authored_role_is_editable("dG_eq")
-                and not authority.authored_role_is_derived("dG_eq")
-            ):
+            elif role == "dG_eq":
                 physical_candidates.append(
                     (
                         name,
                         "equilibrium",
                         role,
                         float(energy_units.from_jmol(float(authority.dG_eq_J_per_mol))),
-                        editable,
                         metadata_view.energy_unit,
                     )
                 )
@@ -285,18 +238,17 @@ def enumerate_simulation_parameters(
                         "Eyring",
                         role,
                         float(model.kappa),
-                        editable,
                         "1",
                     )
                 )
 
-    for name, family, role, value, editable, unit in physical_candidates:
+    for name, family, role, value, unit in physical_candidates:
         if (
             name in parameter_assignment_names
             and assignment_kind(name) == "mechanism-bound"
         ):
             continue
-        if not editable or not math.isfinite(value):
+        if not math.isfinite(value):
             continue
         allow_zero = role not in {"A", "kappa"}
         coordinates.append(
@@ -305,8 +257,6 @@ def enumerate_simulation_parameters(
                 value=value,
                 family=family,
                 role=role,
-                writable=True,
-                derived=False,
                 scientific_category="finite_scalar",
                 allow_exact_zero=allow_zero,
                 unit=unit,
@@ -319,13 +269,11 @@ def enumerate_simulation_parameters(
     scalar_params = dict(metadata.get("scalar_params") or {})
     input_units = dict(parameter_spec.input_units)
     scientific_units = dict(parameter_spec.quantity_units)
-    for raw_name, raw_value in scalar_params.items():
+    for raw_name, value in scalar_params.items():
         name = str(raw_name)
-        value = _finite(raw_value)
         assignment = assignment_kind(name)
         if (
-            value is None
-            or name in physical_names
+            name in physical_names
             or assignment in {"derived scalar", "mechanism-bound"}
         ):
             continue
@@ -335,8 +283,6 @@ def enumerate_simulation_parameters(
                 value=convert_value(value, scientific_units[name], input_units[name]),
                 family="scalar",
                 role="scalar",
-                writable=True,
-                derived=False,
                 scientific_category="finite_scalar",
                 allow_exact_zero=True,
                 unit=units[name],

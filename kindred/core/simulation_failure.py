@@ -63,7 +63,6 @@ def _context_values(context: ErrorContext | Mapping[str, Any] | None) -> Mapping
     else:
         source = {
             "line": getattr(context, "line", None),
-            "col": getattr(context, "col", None),
             "line_text": getattr(context, "line_text", None),
         }
     def value_for(key: str) -> object:
@@ -73,11 +72,6 @@ def _context_values(context: ErrorContext | Mapping[str, Any] | None) -> Mapping
         "line": (
             int(value_for("line"))
             if value_for("line") is not None
-            else None
-        ),
-        "col": (
-            int(value_for("col"))
-            if value_for("col") is not None
             else None
         ),
         "line_text": (

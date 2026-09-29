@@ -433,8 +433,6 @@ def symbolic_calculator_available(mechanism: Any) -> tuple[bool, str]:
         return False, str(support.reason)
     namespace = build_namespace_from_mechanism(mechanism)
     spec = parameter_algebra_spec_from_mechanism(mechanism)
-    if spec is None:
-        return False, "Calculator requires the retained admitted parameter specification."
     reserved = set(namespace.canonical_names) | set(spec.param_assignment_names()) | set(spec.observable_names)
     reserved |= set(PROTECTED_NAMES) | set(BUILTIN_FUNCTIONS)
     collisions = [name for name in mechanism.species_names() if name in reserved

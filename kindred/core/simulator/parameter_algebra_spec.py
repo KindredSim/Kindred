@@ -158,10 +158,20 @@ def _raise_unsupported_bare_assignment_error(
     )
 
 
+def _reserved_name_message(name: str, declaration: str) -> str:
+    """Say which built-in a rejected parameter or let name would shadow."""
+    if name == "T":
+        reserved = "the built-in temperature"
+    elif name in SymbolTable().functions():
+        reserved = "a built-in function"
+    else:
+        reserved = "a built-in constant"
+    return f"{name!r} is {reserved} and cannot be redefined as a {declaration}."
+
+
 @dataclass(frozen=True)
 class ParameterAssignment:
     name: str
-    expr_src: str
     line_number: int
     line_content: str
     source_coordinate: DslSourceCoordinate | None = None
@@ -435,9 +445,6 @@ def admit_parameter_evaluation_graph(
         chemistry_parameter_dependencies,
     )
     from .exact_constraint_composition import proves_redundant_parameter
-    from kindred.core.equilibrium_rate_authority import (
-        require_step_entry_authored_role_is_editable,
-    )
 
     targets = build_parameter_target_map(mechanism)
     chemistry = chemistry_parameter_dependencies(mechanism, targets)
@@ -452,16 +459,6 @@ def admit_parameter_evaluation_graph(
                 line_number=statement.line,
                 line_content=statement.line_text,
             )
-        if name in targets:
-            route, kind, _index, role, entry = targets[name]
-            if entry.get("locked", False):
-                raise DSLError(
-                    f"Mechanism coordinate {name!r} is locked and not writable."
-                )
-            if kind == "equilibrium" and (route == "indexed" or role == "dG_eq"):
-                require_step_entry_authored_role_is_editable(
-                    entry, role, parameter_name=name
-                )
         graph[name] = tuple(
             dict.fromkeys(
                 dep for dep in _iter_expr_identifiers(statement.expr) if dep in names
@@ -1175,10 +1172,10 @@ def extract_parameter_assignments_from_algebra_lines(
                     line_number=line_no,
                     line_content=original,
                 )
-            expr, declared_unit = _split_unit_clause(_PARAM_STMT_RE.match(code).group(2), line_no, original)
+            declared_unit = _split_unit_clause(_PARAM_STMT_RE.match(code).group(2), line_no, original)[1]
             if name in SymbolTable().protected_names() or name in SymbolTable().functions().keys():
                 raise DSLError(
-                    f"Invalid solver parameter name {name!r}",
+                    _reserved_name_message(name, "parameter"),
                     suggestion="Choose a name that does not shadow protected constants/functions (e.g., 'a', 'Ea', 'scale').",
                     line_number=line_no,
                     line_content=original,
@@ -1203,7 +1200,6 @@ def extract_parameter_assignments_from_algebra_lines(
             assignments.append(
                 ParameterAssignment(
                     name=name,
-                    expr_src=expr,
                     declared_unit=declared_unit,
                     line_number=line_no,
                     line_content=original,
@@ -1290,7 +1286,7 @@ def extract_observable_names_from_algebra_lines(algebra_lines: Sequence[Tuple[in
                 # Evaluation would drop the LET and later references would
                 # silently read the built-in constant or function instead.
                 raise DSLError(
-                    f"Invalid observable name {classification.raw_name!r}",
+                    _reserved_name_message(classification.raw_name, "let value"),
                     suggestion="Choose a name that does not shadow protected constants/functions (e.g., 'ratio', 'rate_A').",
                     line_number=_line_no,
                     line_content=raw.rstrip("\n"),

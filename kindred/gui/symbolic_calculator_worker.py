@@ -11,6 +11,9 @@ from PySide6 import QtCore
 from kindred.core.symbolic.calculator_worker import run_calculator_child
 
 
+_CHILD_EXITED = "Calculator child exited unexpectedly; the next explicit query can start a new context."
+
+
 class CalculatorWorker(QtCore.QThread):
     result = QtCore.Signal(str, str, str, bool, str, object)
     failed = QtCore.Signal(str)
@@ -65,8 +68,12 @@ class CalculatorWorker(QtCore.QThread):
                         self.result.emit(query, result_html, context, error, copy_text, reuse_queries)
                 if process.sentinel in ready:
                     if not self._shutdown.is_set():
-                        self.failed.emit("Calculator child exited unexpectedly; the next explicit query can start a new context.")
+                        self.failed.emit(_CHILD_EXITED)
                     break
+        except (EOFError, BrokenPipeError, ConnectionResetError):
+            # The child's pipe end closed because the child exited.
+            if not self._shutdown.is_set():
+                self.failed.emit(_CHILD_EXITED)
         except Exception as exc:
             if not self._shutdown.is_set():
                 self.failed.emit(f"Calculator process failed: {exc}")

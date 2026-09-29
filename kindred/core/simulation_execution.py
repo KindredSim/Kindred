@@ -32,8 +32,6 @@ def execute_simulation(
         coordinate = by_name.get(name)
         if coordinate is None:
             raise ValueError(f"Preview parameter {name!r} is not a direct GUI coordinate.")
-        if not coordinate.writable or coordinate.derived:
-            raise ValueError(f"Preview parameter {name!r} is owned by retained Algebra.")
     spec = execution_request.prepared_dsl.parameter_algebra_spec_for_execution()
     inputs, quantities = dict(spec.input_units), dict(spec.quantity_units)
     parameters = tuple((item.name, convert_value(overrides.get(item.name, item.value), inputs[item.name], quantities[item.name]), quantities[item.name].symbol) for item in coordinates)

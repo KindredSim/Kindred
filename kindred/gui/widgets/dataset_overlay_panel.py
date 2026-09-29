@@ -259,22 +259,6 @@ class DatasetOverlayPanel(QtWidgets.QWidget):
         self._tree.verticalScrollBar().setValue(vertical_scroll)
         self._tree.horizontalScrollBar().setValue(horizontal_scroll)
 
-    def clear_projection(self) -> None:
-        """Clear only rendered Overlay state and revoke Overlay actions."""
-        self._links_by_dataset_id.clear()
-        self._known_species = ()
-        self._color_buttons.clear()
-        self._raw_columns_by_key.clear()
-        blocker = QtCore.QSignalBlocker(self._tree)
-        try:
-            self._tree.clear()
-        finally:
-            del blocker
-        self._has_rendered_snapshot = False
-        self._tree.hide()
-        self._empty.show()
-        self._appearance.hide()
-
     def render_overlay_selection(
         self,
         *,

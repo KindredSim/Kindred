@@ -33,7 +33,7 @@ from kindred.gui.fitting.launch import (
     prune_fit_analysis_coordinates,
     convert_fit_parameter_scope,
 )
-from kindred.gui.fitting.reporting import fit_completion_presentation
+from kindred.gui.fitting.reporting import fit_completion_presentation, fit_identity_text
 from kindred.gui.fitting.window import FittingWindow
 from kindred.gui.fitting.execution import FitCandidate, FitLiveUpdate
 from kindred.gui.fitting.worker import GlobalFitWorker
@@ -511,12 +511,6 @@ class FitSessionOwner(QtCore.QObject):
                 replace(self._session.document, fit_defaults=defaults),
                 expected_token=expected_token,
             )
-            if successor_token is None:
-                self._set_status(
-                    "Project Fit defaults update rejected: project content "
-                    "changed before document replacement."
-                )
-                return False
         except Exception as exc:
             self._set_status(
                 f"Project Fit defaults update failed: {exc}"
@@ -908,9 +902,6 @@ class FitSessionOwner(QtCore.QObject):
                     origin.tab_id, copied, set_ids, proposed_document,
                     expected_token=token, activate=False,
                 )
-                if published is None:
-                    self._set_status("Fit Apply rejected: the captured project is stale.")
-                    return False
                 self._candidate_copy_name = published.name
                 self._refresh_apply_availability()
                 self.project_document_changed.emit(published.tab_id)
@@ -943,9 +934,7 @@ class FitSessionOwner(QtCore.QObject):
         except (TypeError, ValueError, KeyError, LookupError) as exc:
             self._set_status(f"Fit Apply rejected: {exc}")
             return False
-        if self._registry.replace_document(proposed_document, expected_token=token) is None:
-            self._set_status("Fit Apply rejected: the captured project is stale.")
-            return False
+        self._registry.replace_document(proposed_document, expected_token=token)
         self._candidate_applied_to_project = True
         self._install_setup(rebased_setup)
         self._initial_setup_snapshot = rebased_initial_setup
@@ -1222,25 +1211,8 @@ class FitSessionOwner(QtCore.QObject):
                     detail: str = "", present: bool = True) -> None:
         if self._application_close_fenced:
             return
-        message = str(text)
         origin = self._current_origin()
-        if origin is not None:
-            for mapped in sorted(
-                origin.mapped_datasets,
-                key=lambda item: max(
-                    len(item.dataset_id),
-                    len(item.set_id),
-                ),
-                reverse=True,
-            ):
-                message = message.replace(
-                    mapped.dataset_id,
-                    mapped.display_name,
-                )
-                message = message.replace(
-                    mapped.set_id,
-                    mapped.set_name,
-                )
+        message = str(text) if origin is None else fit_identity_text(str(text), origin)
         if self._window is not None:
             try:
                 if phase is not None:

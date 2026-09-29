@@ -144,28 +144,6 @@ class FitCoordinate:
             return f"{self.dataset_id}::{self.name}"
         return self.name
 
-    def to_machine_payload(self) -> dict[str, object]:
-        """Return the canonical machine-readable coordinate atom."""
-
-        if self.scope == "centred_overall":
-            display_name = f"Overall · {self.name}"
-        elif self.scope == "centred_deviation":
-            display_name = f"Deviation · {self.dataset_id}::{self.name}"
-        else:
-            display_name = self.display_name
-        return {
-            "scope": self.scope,
-            "name": self.name,
-            "dataset_id": self.dataset_id,
-            "display_name": display_name,
-            "optimizer_display_name": self.display_name,
-        }
-
-    def to_machine_key(self) -> str:
-        """Return the canonical collision-proof machine mapping key."""
-
-        return f"{self.scope}|{self.dataset_id or ''}|{self.name}"
-
     def __str__(self) -> str:
         return self.display_name
 
@@ -645,7 +623,7 @@ def fit_result_message(
                 warning_parts.append("Optimizer stopped without a termination message")
         if optimizer_diagnostic is not None:
             detail = _compact_failure_message(optimizer_diagnostic)
-            if detail:
+            if detail and detail != str(base_message or "").strip():
                 warning_parts.append(detail)
         if warning_parts:
             return "Global fit completed with warnings: " + "; ".join(warning_parts)

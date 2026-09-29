@@ -365,6 +365,9 @@ def convert_fit_parameter_scope(
             value = math.exp(math.fsum(math.log(value) for value in selected) / len(selected))
         else:
             value = math.fsum(value / len(selected) for value in selected)
+        if selected:
+            # A mean never leaves the reduced values; rounding must not either.
+            value = min(max(value, min(selected)), max(selected))
         active = replace(active, value=value, dataset_values=())
     elif scope != "shared" and parameter.scope == "shared":
         active = replace(

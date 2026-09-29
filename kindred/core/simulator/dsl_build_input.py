@@ -32,7 +32,6 @@ class DslSourceCoordinateCapabilities:
     continuous: bool
     algebra_target: bool
     correction_target: bool
-    equilibrium_authority: bool = False
     grouped_model_target: bool = False
 
 
@@ -47,7 +46,6 @@ _SOURCE_COORDINATE_CAPABILITIES: Mapping[str, DslSourceCoordinateCapabilities] =
             continuous=True,
             algebra_target=True,
             correction_target=True,
-            equilibrium_authority=role in {"kf", "kr", "Keq", "dG_eq"},
             grouped_model_target=role in {"A", "Ea", "dG_act", "dG_eq", "kappa"},
         )
         for role in (
@@ -209,4 +207,3 @@ class DslMechanismBuildInput:
     standard_conc_M: float
     temperature_schedule: TemperatureSchedule | None
     steps: tuple[DslBuildStep, ...]
-    initials: tuple[tuple[str, float], ...]

@@ -18,12 +18,11 @@ import numpy as np
 from kindred.core.simulator.solvers import normalize_solver_name
 from kindred.core.scipy_integrate import validate_scipy_rtol
 from kindred.core.symbolic.errors import UnsupportedSymbolicExpressionError
-from kindred.core.symbolic.jacobian_execution import SymbolicJacobianExecution
-from kindred.core.symbolic.namespaces import symbolic_status_payload
-from kindred.core.temperature import (
-    TemperatureScheduleDictProtocol,
-    TemperatureScheduleProtocol,
+from kindred.core.symbolic.jacobian_execution import (
+    SymbolicJacobianExecution,
+    symbolic_status_payload,
 )
+from kindred.core.temperature import TemperatureSchedule
 from kindred.core.time_grid import normalize_time_grid_policy
 
 __all__ = [
@@ -122,7 +121,6 @@ def _symbolic_jacobian_for_bind_failure(
 def _bind_symbolic_jacobian_for_current_mechanism(
     *,
     mechanism: Any,
-    temperature_schedule: TemperatureScheduleProtocol | None,
     symbolic_structure: Any = None,
     coefficient_evaluator: Any = None,
 ) -> SymbolicJacobianExecution:
@@ -131,12 +129,6 @@ def _bind_symbolic_jacobian_for_current_mechanism(
         raise UnsupportedSymbolicExpressionError("symbolic structure is unsupported.")
     from kindred.core.ode_builder import build_effective_rate_coefficient_evaluator
 
-    if temperature_schedule is not None:
-        if not isinstance(temperature_schedule, TemperatureScheduleDictProtocol):
-            raise UnsupportedSymbolicExpressionError(
-                "Symbolic Jacobian requires a deterministic typed temperature "
-                "schedule; arbitrary callables are unsupported."
-            )
     if coefficient_evaluator is None:
         coefficient_evaluator = build_effective_rate_coefficient_evaluator(mechanism)
     jacobian_func = structure.bind(coefficient_evaluator)
@@ -149,12 +141,12 @@ def _bind_symbolic_jacobian_for_current_mechanism(
 def build_prepared_run_context(
     *,
     mechanism: Any,
-    temperature_schedule: TemperatureScheduleProtocol | None,
+    temperature_schedule: TemperatureSchedule | None,
     use_analytic_jacobian: bool,
     symbolic_structure: Any = None,
     coefficient_evaluator: Any = None,
 ) -> tuple[
-    TemperatureScheduleProtocol | None,
+    TemperatureSchedule | None,
     SymbolicJacobianExecution,
 ]:
     """Prepare the retained temperature schedule and symbolic Jacobian."""
@@ -175,7 +167,6 @@ def build_prepared_run_context(
         try:
             symbolic_jacobian = _bind_symbolic_jacobian_for_current_mechanism(
                 mechanism=mechanism,
-                temperature_schedule=resolved_temperature_schedule,
                 symbolic_structure=symbolic_structure,
                 coefficient_evaluator=coefficient_evaluator,
             )

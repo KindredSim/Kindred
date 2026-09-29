@@ -31,8 +31,6 @@ class CorrectionTarget:
     name: str
     family: str
     source_backed: bool = True
-    editable: bool = True
-    locked: bool = False
     derived: bool = False
 
     @property
@@ -43,8 +41,6 @@ class CorrectionTarget:
             and isinstance(self.family, str)
             and bool(self.family.strip())
             and self.source_backed
-            and self.editable
-            and not self.locked
             and not self.derived
             and _correction_role_is_admitted(self.family)
         )

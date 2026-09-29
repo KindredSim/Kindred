@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from kindred.core.quantity_units import CUBIC_METRE, MOLAR, SECOND, presentation_unit
+from kindred.core.quantity_units import CUBIC_METRE, MOLAR, SECOND, Unit, presentation_unit
 
 from types import MappingProxyType
 from typing import Any, Callable, Mapping
@@ -21,7 +21,27 @@ from kindred.core.algebra.simulation_series import (
 
 __all__ = [
     "finalize_simulation_result",
+    "result_quantity_units",
 ]
+
+
+def result_quantity_units(
+    parameter_algebra_spec: object,
+    species_names: tuple[str, ...] | list[str],
+) -> tuple[dict[str, Unit | None], dict[str, Unit | None]]:
+    """Scientific units (species in M, t in s) and their presentation units."""
+
+    units = dict(parameter_algebra_spec.quantity_units)
+    units.update({name: MOLAR for name in species_names})
+    units["t"] = SECOND
+    declarations = {
+        line.name: line.declared_unit
+        for line in parameter_algebra_spec.observable_block.lines
+    }
+    return units, {
+        name: presentation_unit(unit, declarations.get(name))
+        for name, unit in units.items()
+    }
 
 
 def _freeze_solver_provenance_value(value: Any) -> Any:
@@ -55,21 +75,6 @@ def _freeze_solver_provenance_mapping(
             for name, item in value.items()
         }
     )
-
-def _initials_for_algebra(
-    mechanism: object,
-    species_names: list[str],
-    initials_for_algebra: Mapping[str, Any] | None,
-) -> dict[str, float]:
-    if isinstance(initials_for_algebra, Mapping):
-        return {str(name): float(value) for name, value in dict(initials_for_algebra).items()}
-    species = getattr(mechanism, "species", {}) or {}
-    return {
-        str(name): float(getattr(species[str(name)], "initial_conc"))
-        for name in species_names
-        if str(name) in species
-    }
-
 
 def _algebra_cause(error: object) -> FactualCause:
     """Project one expected per-observable Algebra failure."""
@@ -113,7 +118,7 @@ def finalize_simulation_result(
     mechanism: object,
     result: FinalSimulationOutput,
     species_names: list[str],
-    initials_for_algebra: Mapping[str, Any] | None,
+    initials_for_algebra: Mapping[str, float],
     parameter_values_at_temperature: Callable[[float, tuple[str, ...]], Mapping[str, float]],
     parameter_algebra_spec: object,
     parameters: tuple[tuple[str, float, str], ...] = (),
@@ -183,17 +188,12 @@ def finalize_simulation_result(
             except Exception as exc:
                 symbol_failures[name] = exc
                 raise
-        initials = _initials_for_algebra(
-            mechanism,
-            base_species_names,
-            initials_for_algebra,
-        )
         algebra_series, algebra_scalars, algebra_errors = (
             evaluate_compiled_algebra_series_for_simulation_partial(
                 compiled_algebra,
                 t=result_time,
                 species_series=species_series,
-                initials=initials,
+                initials=initials_for_algebra,
                 symbol_series={},
                 symbol_values={},
                 symbol_resolver=resolve_symbol,
@@ -243,12 +243,9 @@ def finalize_simulation_result(
         if name not in succeeded_names and name not in failed_names
     )
     check_cancelled()
-    units = dict(parameter_algebra_spec.quantity_units)
-    units.update({name: MOLAR for name in species_names})
-    units["t"] = SECOND
+    units, preferred_units = result_quantity_units(parameter_algebra_spec, species_names)
     names = ("t", *finalized_series, *finalized_algebra_scalars)
-    declarations = {s.name: s.declared_unit for s in parameter_algebra_spec.observable_block.lines}
-    presentation_units = tuple((name, presentation_unit(units.get(name), declarations.get(name))) for name in names)
+    presentation_units = tuple((name, preferred_units.get(name)) for name in names)
     if result.volume is not None:
         initializer, _identity = result.intervention_execution.initial_volume
         declared = initializer.declared_unit
@@ -262,11 +259,11 @@ def finalize_simulation_result(
         quantity_units=tuple((name, units.get(name)) for name in names),
         presentation_units=presentation_units,
         t=result_time,
-        series=finalized_series,
+        series=MappingProxyType(finalized_series),
         segment_ids=result.segment_ids,
         segment_keys=result.segment_keys,
         discontinuity_ids=result.discontinuity_ids,
-        scalars=finalized_algebra_scalars,
+        scalars=MappingProxyType(finalized_algebra_scalars),
         parameters=parameters,
         parameter_classifications=parameter_classifications,
         solver_provenance=frozen_solver_provenance,

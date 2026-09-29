@@ -467,19 +467,6 @@ class DataManagerPanel(QtWidgets.QWidget):
     # ------------------------------------------------------------------
     # Public helpers
     # ------------------------------------------------------------------
-    def clear_projection(self) -> None:
-        """Clear only rendered Data state and revoke all Data actions."""
-        self._snapshot = DataManagerSnapshot((), None, (), ())
-        self._visible_records_by_id.clear()
-        self._dataset_selector.clear()
-        self._browser.hide()
-        self._details_scroll.hide()
-        self._empty.show()
-        self._dataset_summary.clear()
-        self._mapping_available = False
-        self._mechanism_name = ""
-        self._update_mapping_area()
-
     def render_snapshot(
         self,
         snapshot: DataManagerSnapshot,
@@ -612,8 +599,7 @@ class DataManagerPanel(QtWidgets.QWidget):
             self._show_message(
                 QtWidgets.QMessageBox.Icon.Critical,
                 "Load Error",
-                f"Failed to open import configuration for "
-                f"'{source.original_filename}':\n\n{type(exc).__name__}: {exc}",
+                f"Failed to open import configuration:\n\n{exc}",
             )
             return ImportDialogResult(config=None, action="skip")
         try:
