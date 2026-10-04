@@ -41,7 +41,6 @@ __all__ = [
     "coerce_temperature_kelvin",
     "declared_temperature_step_boundaries",
     "temperature_at_execution_time",
-    "temperature_schedule_execution_identity",
 ]
 
 
@@ -604,70 +603,33 @@ def declared_temperature_step_boundaries(
 
 
 def temperature_schedule_execution_identity(
-    schedule: TemperatureSchedule | None,
-) -> Mapping[str, object] | None:
-    """Return exact runtime identity with authored semantic no-ops removed."""
+    schedule: TemperatureSchedule,
+) -> Mapping[str, object]:
+    """Return declared piecewise steps with authored semantic no-ops removed.
 
-    if schedule is None:
-        return None
-    decoded = schedule
-    if decoded.schedule_type == "constant":
-        return {
-            "type": "constant",
-            "temperature": float(decoded(0.0)),
-        }
-    if decoded.schedule_type == "piecewise":
-        intervals = decoded.get_intervals()
-        baseline = float(decoded._baseline_temperature)
-        steps: list[dict[str, float]] = []
-        current = baseline
-        for interval in intervals:
-            temperature = float(interval.temperature)
-            time = float(interval.t_start)
-            if time == 0.0 and not steps:
-                baseline = temperature
-                current = temperature
-                continue
-            if temperature == current:
-                continue
-            steps.append({"time": time, "temperature": temperature})
+    Other schedules report only their type; callers act on piecewise steps.
+    """
+
+    if schedule.schedule_type != "piecewise":
+        return {"type": schedule.schedule_type}
+    baseline = float(schedule._baseline_temperature)
+    steps: list[dict[str, float]] = []
+    current = baseline
+    for interval in schedule.get_intervals():
+        temperature = float(interval.temperature)
+        time = float(interval.t_start)
+        if time == 0.0 and not steps:
+            baseline = temperature
             current = temperature
-        if not steps:
-            return {
-                "type": "constant",
-                "temperature": baseline,
-            }
-        return {
-            "type": "piecewise_steps",
-            "baseline_temperature": baseline,
-            "steps": tuple(steps),
-        }
-    if decoded.schedule_type == "response":
-        baseline = float(decoded._baseline_temperature)
-        times = tuple(float(value) for value in decoded._response_times)
-        temperatures = tuple(
-            float(value) for value in decoded._response_temperatures
-        )
-        changes: list[dict[str, float]] = []
-        current = baseline
-        for index, temperature in enumerate(temperatures):
-            if temperature == current:
-                continue
-            changes.append(
-                {
-                    "time": times[index],
-                    "temperature": temperature,
-                }
-            )
-            current = temperature
-        if not changes:
-            return {
-                "type": "constant",
-                "temperature": baseline,
-            }
-        return {
-            "type": "response_steps",
-            "baseline_temperature": baseline,
-            "changes": tuple(changes),
-            "tau": float(decoded._response_tau),
-        }
+            continue
+        if temperature == current:
+            continue
+        steps.append({"time": time, "temperature": temperature})
+        current = temperature
+    if not steps:
+        return {"type": "constant"}
+    return {
+        "type": "piecewise_steps",
+        "baseline_temperature": baseline,
+        "steps": tuple(steps),
+    }

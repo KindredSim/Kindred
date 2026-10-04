@@ -288,15 +288,6 @@ class DataManagerPanel(QtWidgets.QWidget):
             Parent widget
         """
         super().__init__(parent)
-        if (
-            type(origin_tab_id) is not str
-            or not origin_tab_id
-            or origin_tab_id != origin_tab_id.strip()
-        ):
-            raise ValueError(
-                "DataManagerPanel requires one stable edge-normalized origin "
-                "tab ID."
-            )
         self._origin_tab_id = origin_tab_id
 
         layout = QtWidgets.QVBoxLayout(self)

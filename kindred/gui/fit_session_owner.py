@@ -246,7 +246,7 @@ class FitSessionOwner(QtCore.QObject):
             return False
         if window.has_pending_target_changes:
             self._set_status(
-                "Fit rejected: Apply or Revert the pending target edits first."
+                "Fit rejected: Apply or Revert the pending target, weight, and IC edits first."
             )
             return False
         if window.has_pending_data_changes:

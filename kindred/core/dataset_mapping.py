@@ -46,49 +46,18 @@ class DatasetMappingProposal:
     """One complete, immutable mapping choice for one committed dataset."""
 
     dataset_id: str
-    action: DatasetMappingChoice | str
+    action: DatasetMappingChoice
     target_set_id: str | None = None
     occupied_choice: OccupiedSetChoice | str | None = None
     observation_mapping: tuple[tuple[str, str], ...] = ()
     initial_concentration_source: InitialConcentrationSource | None = None
 
     def __post_init__(self) -> None:
-        dataset_id = str(self.dataset_id).strip()
-        if not dataset_id:
-            raise DatasetMappingError("A mapping proposal requires a dataset ID.")
-        try:
-            action = DatasetMappingChoice(self.action)
-        except (TypeError, ValueError) as exc:
-            raise DatasetMappingError("A mapping proposal requires a valid action.") from exc
-        target = None if self.target_set_id is None else str(self.target_set_id).strip()
-        if target == "":
-            target = None
-        occupied = self.occupied_choice
-        if occupied is not None:
-            try:
-                occupied = OccupiedSetChoice(occupied)
-            except (TypeError, ValueError) as exc:
-                raise DatasetMappingError("A mapping proposal requires a valid occupancy choice.") from exc
-        mapping = tuple(
-            (str(raw_id).strip(), str(species).strip())
-            for raw_id, species in tuple(self.observation_mapping)
-        )
-        if any(not raw_id or not species for raw_id, species in mapping):
-            raise DatasetMappingError("Observation mappings cannot contain blank identities.")
-        if action is DatasetMappingChoice.MAP_EXISTING and not target:
-            raise DatasetMappingError("Map Existing requires a target set.")
-        if action is DatasetMappingChoice.CREATE_SET and target is not None:
-            raise DatasetMappingError("Create Set cannot target an existing set.")
-        if action is DatasetMappingChoice.CREATE_SET:
-            if self.initial_concentration_source is None:
-                raise DatasetMappingError("Choose a source for the initial concentrations.")
-        elif self.initial_concentration_source is not None:
-            raise DatasetMappingError("Only Create Set selects an initial-concentration source.")
-        object.__setattr__(self, "dataset_id", dataset_id)
-        object.__setattr__(self, "action", action)
-        object.__setattr__(self, "target_set_id", target)
-        object.__setattr__(self, "occupied_choice", occupied)
-        object.__setattr__(self, "observation_mapping", mapping)
+        # Producers pass the occupancy choice as its string value.
+        if self.occupied_choice is not None:
+            object.__setattr__(
+                self, "occupied_choice", OccupiedSetChoice(self.occupied_choice)
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -97,19 +66,6 @@ class DatasetMappingBatchProposal:
 
     tab_id: str
     proposals: tuple[DatasetMappingProposal, ...]
-
-    def __post_init__(self) -> None:
-        tab_id = str(self.tab_id).strip()
-        proposals = tuple(self.proposals)
-        if not tab_id:
-            raise DatasetMappingError("A mapping batch requires an origin tab ID.")
-        if not proposals or any(not isinstance(item, DatasetMappingProposal) for item in proposals):
-            raise DatasetMappingError("A mapping batch requires one proposal per dataset.")
-        dataset_ids = tuple(item.dataset_id for item in proposals)
-        if len(set(dataset_ids)) != len(dataset_ids):
-            raise DatasetMappingError("A mapping batch cannot contain a dataset twice.")
-        object.__setattr__(self, "tab_id", tab_id)
-        object.__setattr__(self, "proposals", proposals)
 
 
 @dataclass(frozen=True)
@@ -200,25 +156,13 @@ def apply_dataset_mapping_batch(
     model_targets admits raw observation mappings; the tab's canonical
     mechanism species remain the sole initial-condition roster.
     """
-    if not isinstance(document, ProjectDocument):
-        raise TypeError("document must be a ProjectDocument.")
-    if not isinstance(tab, MechanismTabDocument):
-        raise TypeError("tab must be a MechanismTabDocument.")
-    if not isinstance(batch, DatasetMappingBatchProposal):
-        raise TypeError("batch must be a DatasetMappingBatchProposal.")
     if batch.tab_id != tab.tab_id:
         raise DatasetMappingError("Mapping batch origin does not match its tab.")
     mechanism_species = canonical_species_names(tab)
-    observation_targets = tuple(str(item).strip() for item in model_targets)
+    if not mechanism_species:
+        raise DatasetMappingError("Mapping requires a mechanism with at least one species.")
+    observation_targets = tuple(model_targets)
     species = mechanism_species
-    if not species or any(not item for item in species) or len(set(species)) != len(species):
-        raise DatasetMappingError("Mapping requires a unique mechanism species roster.")
-    if (
-        not observation_targets
-        or any(not item for item in observation_targets)
-        or len(set(observation_targets)) != len(observation_targets)
-    ):
-        raise DatasetMappingError("Mapping requires a unique model target roster.")
     records = {record.dataset_id: record for record in document.datasets}
     if any(item.dataset_id not in records for item in batch.proposals):
         raise DatasetMappingError("Mapping batch references a dataset absent from the committed document.")

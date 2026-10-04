@@ -12,8 +12,10 @@ fitting kinetic parameters.
 - Explore simulation results in interactive plots and analysis views.
 - Import experimental datasets from CSV and XLSX files, map observations to
   model species or observables, and fit one or more datasets.
-- Copy fit results, export current result data to XLSX, and save complete
-  projects as `.kin` files.
+- Copy fit results, export current result data to XLSX, and save projects as
+  `.kin` files. A project keeps its mechanisms, settings, initial conditions,
+  datasets, plotted sets, and plot appearance. Run and fit results, display
+  units, and zoom are not saved, so Run again after opening.
 - Start from bundled mechanism presets and intervention examples.
 
 Mechanism steps use unprefixed reaction lines. Irreversible arrows may be

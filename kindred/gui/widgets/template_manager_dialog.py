@@ -52,7 +52,7 @@ class TemplateEditorDialog(QtWidgets.QDialog):
         template : Template, optional
             Existing template to edit (None for new template)
         mechanism_source : MechanismAuthoringSource, optional
-            Complete mechanism source for new templates.
+            Complete mechanism source; required when ``template`` is None.
         """
         super().__init__(parent)
         self._is_edit_mode = template is not None
@@ -127,13 +127,13 @@ class TemplateEditorDialog(QtWidgets.QDialog):
         self._description_edit.setMaximumHeight(100)
         if template:
             self._description_edit.setPlainText(template.description)
-        form_layout.addRow("Description*:", self._description_edit)
+        form_layout.addRow("Description:", self._description_edit)
 
         layout.addLayout(form_layout)
 
         # Mechanism text editor
         layout.addWidget(QtWidgets.QLabel("Mechanism DSL*:"))
-        if not self._is_edit_mode and mechanism_source is not None:
+        if not self._is_edit_mode:
             review_note = QtWidgets.QLabel(
                 "Review the initial-condition declarations before saving. "
                 "Earlier declarations may need editing or removal."
@@ -145,8 +145,7 @@ class TemplateEditorDialog(QtWidgets.QDialog):
         if template:
             self._mechanism_edit.setPlainText(template.source.reactions_text)
         else:
-            source = mechanism_source or MechanismAuthoringSource()
-            self._mechanism_edit.setPlainText(source.reactions_text)
+            self._mechanism_edit.setPlainText(mechanism_source.reactions_text)
         layout.addWidget(self._mechanism_edit, stretch=1)
 
         # Button box
@@ -239,26 +238,25 @@ class TemplateManagerDialog(QtWidgets.QDialog):
 
     def __init__(
         self,
-        parent: Optional[QtWidgets.QWidget] = None,
-        template_manager: Optional[TemplateManager] = None,
-        current_mechanism_source: Optional[MechanismAuthoringSource] = None,
+        parent: QtWidgets.QWidget,
+        *,
+        template_manager: TemplateManager,
+        current_mechanism_source: MechanismAuthoringSource,
         source_preflight: Callable[
             [MechanismAuthoringSource], MechanismAuthoringSource
-        ] | None = None,
-        destination_apply: (
-            Callable[[MechanismAuthoringSource], bool] | None
-        ) = None,
+        ],
+        destination_apply: Callable[[MechanismAuthoringSource], bool],
     ):
         """
         Initialize template manager dialog.
 
         Parameters
         ----------
-        parent : QWidget, optional
+        parent : QWidget
             Parent widget
-        template_manager : TemplateManager, optional
-            Template manager instance (creates new if None)
-        current_mechanism_source : MechanismAuthoringSource, optional
+        template_manager : TemplateManager
+            Template manager instance
+        current_mechanism_source : MechanismAuthoringSource
             Current complete mechanism source for creating templates.
         source_preflight : callable
             Source-tab structural/scientific admission for persistence edits.
@@ -266,12 +264,14 @@ class TemplateManagerDialog(QtWidgets.QDialog):
             Destination-tab owner returning whether Apply was accepted.
         """
         super().__init__(parent)
-        self._template_manager = template_manager or TemplateManager()
-        self._current_mechanism_source = current_mechanism_source or MechanismAuthoringSource()
-        if not callable(source_preflight):
-            raise TypeError("source_preflight must be callable.")
-        if not callable(destination_apply):
-            raise TypeError("destination_apply must be callable.")
+        self._template_manager = template_manager
+        # Create and Replace both store the current mechanism with its
+        # recorded initial-condition declarations restored.
+        self._current_mechanism_source = MechanismAuthoringSource.from_parts(
+            reactions_text=restore_initial_condition_declarations(
+                current_mechanism_source.reactions_text
+            )
+        )
         self._source_preflight = source_preflight
         self._destination_apply = destination_apply
         self._current_template: Optional[Template] = None
@@ -494,12 +494,16 @@ class TemplateManagerDialog(QtWidgets.QDialog):
         search_query = self._search_edit.text().strip()
         category_filter = self._category_combo.currentData()
 
-        if search_query:
-            templates = self._template_manager.search_templates(search_query)
-        elif category_filter:
-            templates = self._template_manager.get_templates_by_category(category_filter)
-        else:
-            templates = self._template_manager.get_all_templates()
+        templates = (
+            self._template_manager.search_templates(search_query)
+            if search_query
+            else self._template_manager.get_all_templates()
+        )
+        if category_filter:
+            templates = [
+                template for template in templates
+                if template.category == category_filter
+            ]
 
         # Sort by name
         templates.sort(key=lambda t: t.name.lower())
@@ -597,11 +601,7 @@ class TemplateManagerDialog(QtWidgets.QDialog):
         """Create one new template from an admitted source candidate."""
         dialog = TemplateEditorDialog(
             parent=self,
-            mechanism_source=MechanismAuthoringSource.from_parts(
-                reactions_text=restore_initial_condition_declarations(
-                    self._current_mechanism_source.reactions_text
-                )
-            ),
+            mechanism_source=self._current_mechanism_source,
             operation="create",
         )
 

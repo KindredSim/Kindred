@@ -195,8 +195,6 @@ class RawDatasetRecord:
 
 def validate_raw_dataset_record(record: RawDatasetRecord) -> RawDatasetRecord:
     """Fail closed unless one immutable raw record satisfies dataset law."""
-    if not isinstance(record, RawDatasetRecord):
-        raise TypeError("record must be a RawDatasetRecord.")
     def fail(message: str) -> None:
         raise RawDatasetValidationError(message)
 
@@ -348,8 +346,6 @@ def validate_raw_dataset_record(record: RawDatasetRecord) -> RawDatasetRecord:
 def validate_imported_source(source: ImportedSource) -> ImportedSource:
     """Validate one canonical source capture, including exact bytes."""
 
-    if not isinstance(source, ImportedSource):
-        raise TypeError("source must be an ImportedSource.")
     if (
         not isinstance(source.source_id, str)
         or not source.source_id

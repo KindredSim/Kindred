@@ -232,7 +232,16 @@ def enumerate_parameter_coordinates(
         coordinates.append(GuiParameterCoordinate(
             name=item.name, display_name=display_name, value=value,
             minimum=low, maximum=high,
-            log10_allowed=bool(value > 0.0 and low > 0.0),
+            # Rate constants and prefactors span decades; energies and plain
+            # scalars are linear quantities.
+            log10_allowed=bool(
+                (
+                    item.scientific_category in {"rate", "equilibrium_constant"}
+                    or item.role in {"A", "kappa"}
+                )
+                and value > 0.0
+                and low > 0.0
+            ),
             family=item.family, role=item.role,
             scientific_category=item.scientific_category,
             allow_exact_zero=item.allow_exact_zero, unit=item.unit,

@@ -223,7 +223,7 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
         self._set_validation_state("idle")
         reactions_layout.addWidget(self._validation_label)
         # Unified slider surface for interactive parameter adjustment
-        self._variable_sliders = VariableSliders(embedded=True)
+        self._variable_sliders = VariableSliders()
         self._species_sliders = BatchSpeciesSliders()
         self._slider_surface = make_scroll_area(self)
         self._slider_surface.setObjectName("unifiedSliderSurface")
@@ -253,9 +253,6 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
             lambda v: self._variable_sliders.set_fine_mode(v)
         )
         self._fine_btn.toggled.connect(self._species_sliders.set_fine_mode)
-        self._variable_sliders.fineModeReset.connect(
-            self._sync_fine_button_state
-        )
         slider_actions_layout.addWidget(self._fine_btn, 0, 1, alignment=QtCore.Qt.AlignLeft)
 
         # Override mode controls (Commit/Reset)
@@ -311,27 +308,23 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
         self._slider_edit_targets_label.setFont(target_font)
         slider_actions_layout.addWidget(self._slider_edit_targets_label, 1, 0, 1, 5)
 
-        # Bottom pane: slider header + controls + slider surface
+        # Slider pane shown in the Sliders dock: controls + slider surface.
+        # The dock's stacked widget owns the pane's visibility; the editor
+        # only shows or hides the pane's content.
         self._slider_pane_container = QtWidgets.QWidget()
         self._slider_pane_container.setObjectName("mechanismSliderPane")
         slider_pane_layout = QtWidgets.QVBoxLayout(self._slider_pane_container)
         slider_pane_layout.setContentsMargins(0, 0, 0, 0)
-        slider_pane_layout.setSpacing(6)
-        slider_pane_layout.addLayout(slider_actions_layout)
-        slider_pane_layout.addWidget(self._slider_surface, stretch=1)
-        self._slider_workspace_state = (False, False)
-        self._slider_workspace_detached = False
-        self._slider_pane_container.hide()
+        self._slider_pane_content = QtWidgets.QWidget(self._slider_pane_container)
+        slider_content_layout = QtWidgets.QVBoxLayout(self._slider_pane_content)
+        slider_content_layout.setContentsMargins(0, 0, 0, 0)
+        slider_content_layout.setSpacing(6)
+        slider_content_layout.addLayout(slider_actions_layout)
+        slider_content_layout.addWidget(self._slider_surface, stretch=1)
+        slider_pane_layout.addWidget(self._slider_pane_content)
+        self._slider_pane_content.hide()
 
-        # Vertical splitter: DSL editor (top) | sliders (bottom)
-        self._reactions_splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Vertical)
-        self._reactions_splitter.addWidget(self._reactions_text)
-        self._reactions_splitter.addWidget(self._slider_pane_container)
-        self._reactions_splitter.setCollapsible(0, False)
-        self._reactions_splitter.setCollapsible(1, True)
-        self._reactions_splitter.setStretchFactor(0, 4)
-        self._reactions_splitter.setStretchFactor(1, 2)
-        reactions_layout.addWidget(self._reactions_splitter, stretch=1)
+        reactions_layout.addWidget(self._reactions_text, stretch=1)
 
         # Text changes capture literal drafts only. Scientific admission remains
         # owned by explicit Run/Preview/Fit actions.
@@ -365,7 +358,7 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
             "<table border=\"1\" cellpadding=\"5\" cellspacing=\"0\">"
             "<tr><th>Setting</th><th>Meaning</th></tr>"
             "<tr><td><code>T=</code></td><td>Nominal temperature, in K. Used throughout the simulation unless a temperature schedule is specified.</td></tr>"
-            "<tr><td><code>energy=</code></td><td>Unit for <code>Ea</code>, <code>dG_act</code>, and <code>dG_eq</code>. Options: <code>J/mol</code>, <code>kJ/mol</code>, <code>kcal/mol</code>.</td></tr>"
+            "<tr><td><code>energy=</code></td><td>Unit for <code>Ea</code>, <code>dG_act</code>, and <code>dG_eq</code>, on reaction lines and in <code>param</code> lines that set them. Options: <code>J/mol</code>, <code>kJ/mol</code>, <code>kcal/mol</code>.</td></tr>"
             "<tr><td><code>C0=</code></td><td>Standard concentration, from 10<sup>-50</sup> through 10<sup>30</sup> M, inclusive.</td></tr>"
             "</table>"
             "<pre>T=298.15\nenergy=kJ/mol\nC0=1.0</pre>"
@@ -382,7 +375,7 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
             "<tr><td>Reversible</td><td><code>&lt;-&gt;</code> or <code>&lt;=&gt;</code></td></tr>"
             "</table>"
             "<p><code>&lt;-</code> alone is not accepted. Write stoichiometric coefficients as <code>2B</code> or <code>2*B</code>. "
-            "Coefficients can be any positive number, including decimals and scientific notation, such as <code>0.5 C</code> or <code>1e-3*D</code>. "
+            "Coefficients can be any positive number, including decimals and scientific notation, such as <code>0.5 C</code> or <code>1e-3*D</code>; separate a scientific-notation coefficient from its species with a space or <code>*</code>. "
             "An omitted coefficient means 1.</p>"
             "<pre>A + 2B -&gt; C ; k=0.5</pre>"
             "<p>Leave one side empty for a zero-order source or a product-free sink:</p>"
@@ -597,7 +590,6 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
             "<li>A temperature step can trigger stopping. If stopping occurs before the step, the result retains the preceding temperature. If the step triggers stopping, the result retains the changed temperature.</li>"
             "<li>Output samples span the completed simulation interval. Interventions may add rows. Values are not interpolated across concentration jumps. Stopping at the initial time produces one row.</li>"
             "<li>Results record the final time and the reason the simulation ended. Reaching the configured end time also completes normally.</li>"
-            "<li>Crossings between solver steps may go undetected.</li>"
             "</ul>"
             "<h3>Calculated quantities in stopping conditions</h3>"
             "<p>A watched <code>let</code> definition may use concentrations at simulation time <i>t</i>, initial concentrations, <code>t</code>, <code>T</code>, parameters, rate constants, and other <code>let</code> definitions. Parts of its formula that change during the simulation have these restrictions:</p>"
@@ -653,13 +645,14 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
             "<p>Use <code>param</code> to define an adjustable input or a value calculated from other parameters.</p>"
             "<pre>param dose = 5; unit = mM\nparam duration = 2; unit = min\nparam doubled = 2*dose</pre>"
             "<p>An independent parameter without <code>unit=</code> is dimensionless. Kindred determines the units of calculated parameters and <code>let</code> quantities from their formulas.</p>"
+            "<p>A plain number that sets <code>Ea1</code>, <code>dG_act1</code>, or <code>dG_eq1</code> is read in the <code>energy=</code> unit, whether you write it directly, as in <code>param dG_act1 = 60</code>, or through a parameter without a unit. Add <code>; unit = J/mol</code> or another energy unit to that line to use a different unit.</p>"
             "<p>Use <code>let</code> to define a quantity calculated from the model.</p>"
             "<pre>A -&gt; B ; k=0.5\n[A] = 1.0, [B] = 0.0\nlet conversion = 1 - [A]/[A]_0\nlet rate = k1*[A]</pre>"
             "<p><code>[A]</code> means the concentration of A at simulation time <i>t</i>. <code>[A]_0</code> means the initial concentration of A supplied for the run.</p>"
             "<h3>Entering units</h3>"
             "<p>Add <code>; unit = ...</code> after a parameter or calculated quantity:</p>"
             "<pre>param dose = 5; unit = mM\nparam duration = 2; unit = min\nparam volume = 2; unit = mL\nparam doubled = 2*dose; unit = mM</pre>"
-            "<p>For an independent input, enter its value in the declared unit. For a calculated quantity, a compatible unit declaration specifies a preferred output unit and leaves the formula unchanged.</p>"
+            "<p>For an independent input, enter its value in the declared unit. For a calculated quantity, a compatible unit declaration specifies a preferred output unit and leaves the formula unchanged. On a line that sets <code>Ea</code>, <code>dG_act</code>, or <code>dG_eq</code>, the declared unit must be an energy per mole.</p>"
             "<h3>Supported units</h3>"
             "<p>Use the spellings shown below after <code>; unit =</code>. The table includes unit symbols and useful compound forms.</p>"
             '<table border="1" cellpadding="5" cellspacing="0">'
@@ -704,8 +697,11 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
             "<p>Put fractional exponents written as fractions in parentheses. Type powers with ordinary keyboard characters, such as <code>m^3</code>.</p>"
             "<p>Other products, quotients, and powers are supported within the limits listed under <b>Supported input ranges</b>.</p>"
             "<h3>Units of calculated quantities</h3>"
-            "<p>If a declared unit does not match the formula, Kindred keeps the units determined from the formula.</p>"
-            "<p>If Kindred cannot determine consistent units, it still calculates the value and leaves its units unspecified. Invalid or unsupported unit spellings produce an error.</p>"
+            "<p>If a declared unit does not match the formula, Kindred keeps the units determined from the formula. On a line that sets <code>Ea</code>, <code>dG_act</code>, or <code>dG_eq</code>, a unit that is not an energy per mole is an error.</p>"
+            "<p>A formula cannot add, subtract, or compare an energy and a plain number, or choose between them with <code>min</code>, <code>max</code>, <code>clip</code>, or <code>ifelse</code>. Give the number an energy unit with a parameter, then use it:</p>"
+            "<pre>param d = 10; unit = kJ/mol\nparam dG_act2 = dG_act1 - d</pre>"
+            "<p>Multiplying or dividing an energy by a plain number, as in <code>0.5*dG_act1</code>, is accepted, and so is adding <code>0</code>.</p>"
+            "<p>Otherwise, if Kindred cannot determine consistent units, it still calculates the value and leaves its units unspecified. Invalid or unsupported unit spellings produce an error.</p>"
             "<h3>Names you can use</h3>"
             "<p>A <code>param</code> expression can refer to other parameters and available quantities from the reaction mechanism:</p>"
             "<table border=\"1\" cellpadding=\"5\" cellspacing=\"0\">"
@@ -847,21 +843,11 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
             tooltip_text=tooltip,
         )
 
-    def detach_slider_pane_for_dock(self) -> QtWidgets.QWidget:
-        if bool(self._slider_workspace_detached):
-            return self._slider_pane_container
-
-        splitter = getattr(self, "_reactions_splitter", None)
-        if splitter is not None:
-            self._slider_pane_container.hide()
-            self._slider_pane_container.setParent(None)
-
-        self._slider_workspace_detached = True
+    def slider_pane_for_dock(self) -> QtWidgets.QWidget:
         self._sync_slider_workspace_state()
         return self._slider_pane_container
 
     def _sync_slider_workspace_state(self) -> None:
-        self._sync_fine_button_state(self._variable_sliders.fine_mode_enabled)
         has_variable_entries = self._variable_sliders.has_slider_entries()
         has_species_entries = self._species_sliders.has_slider_rows()
         has_available_entries = bool(has_variable_entries or has_species_entries)
@@ -875,30 +861,7 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
         self._slider_surface.setVisible(has_visible_entries)
         self._slider_visibility_picker_btn.setEnabled(has_available_entries)
         self._fine_btn.setEnabled(has_available_entries)
-        self._slider_pane_container.setVisible(has_available_entries)
-
-        state = (has_available_entries, has_visible_entries)
-        if self._slider_workspace_state == state:
-            return
-
-        self._slider_workspace_state = state
-        if bool(self._slider_workspace_detached):
-            return
-        if has_visible_entries:
-            self._reactions_splitter.setSizes([7, 3])
-        elif has_available_entries:
-            self._reactions_splitter.setSizes([11, 1])
-        else:
-            self._reactions_splitter.setSizes([1, 0])
-
-    def _sync_fine_button_state(self, enabled: bool) -> None:
-        """Project child Fine state without re-entering the toggle handler."""
-        self._species_sliders.set_fine_mode(enabled)
-        blocker = QtCore.QSignalBlocker(self._fine_btn)
-        try:
-            self._fine_btn.setChecked(bool(enabled))
-        finally:
-            del blocker
+        self._slider_pane_content.setVisible(has_available_entries)
 
     def render_slider_workspace_presentation(self) -> None:
         """Project Slider child content without publishing user intent."""
@@ -1172,19 +1135,11 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
         """Return the current Reaction DSL text."""
         return str(self._reactions_text.toPlainText())
 
-    def set_reactions_text(self, text: str, *, block_signals: bool = False) -> None:
+    def set_reactions_text(self, text: str) -> None:
         """Replace the Reaction DSL text."""
         replacement = str(text)
-        if self._reactions_text.toPlainText() == replacement:
-            return
-        if not bool(block_signals):
+        if self._reactions_text.toPlainText() != replacement:
             self._reactions_text.setPlainText(replacement)
-            return
-        blocker = QtCore.QSignalBlocker(self._reactions_text)
-        try:
-            self._reactions_text.setPlainText(replacement)
-        finally:
-            del blocker
 
     def apply_accepted_reactions_rewrite(
         self,
@@ -1222,10 +1177,6 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
         notes: str,
     ) -> None:
         """Render one tab snapshot without retaining canonical state."""
-        from kindred.core.mechanism_source import MechanismAuthoringSource
-
-        if not isinstance(source, MechanismAuthoringSource):
-            raise TypeError("source must be MechanismAuthoringSource.")
         editor_blocker = QtCore.QSignalBlocker(self)
         reactions_blocker = QtCore.QSignalBlocker(self._reactions_text)
         notes_blocker = QtCore.QSignalBlocker(self._notes_text)
@@ -1383,9 +1334,7 @@ class MechanismEditorBinding(QtCore.QObject):
 
     @QtCore.Slot(object)
     def _on_source_draft(self, source: object) -> None:
-        from kindred.core.mechanism_source import MechanismAuthoringSource
-
-        if self._rendering or not isinstance(source, MechanismAuthoringSource):
+        if self._rendering:
             return
         tab = self._registry.tab(self._tab_id)
         runtime = self._registry.tab_runtime(self._tab_id)
@@ -1415,12 +1364,6 @@ class MechanismEditorBinding(QtCore.QObject):
     ) -> bool:
         """Keep deterministic parser rewrites inside native editor history."""
 
-        from kindred.core.mechanism_source import MechanismAuthoringSource
-
-        if not isinstance(visible, MechanismAuthoringSource):
-            raise TypeError("visible must be MechanismAuthoringSource.")
-        if not isinstance(accepted, MechanismAuthoringSource):
-            raise TypeError("accepted must be MechanismAuthoringSource.")
         return self._editor.apply_accepted_reactions_rewrite(
             expected_visible_text=visible.reactions_text,
             accepted_text=accepted.reactions_text,

@@ -212,26 +212,26 @@ let signal=response*[P]</pre>
 constants explicitly:</p>
 <pre>solve(subs(eq(dX/dt,0),[A,Y,kf1,kr1,kf2,kr2,k4],[1,0,2,3,5,7,1]),X)</pre>
 <p>The equation is <code>2-8*X-2*X^2=0</code>. Its two answers are
-<code>X=-2-sqrt(5)</code> and <code>X=-2+sqrt(5)</code>.
+<code>X=-2+sqrt(5)</code> and <code>X=-2-sqrt(5)</code>.
 This calculation sets only the rate for X to zero at the chosen A and Y.
 It is not a steady state of the whole mechanism. Calculator solves over real values and does
 not discard the negative concentration automatically.</p>
 <p>Use <code>solution(result,n)</code> to choose usable answer n, starting at 1.
-For this query, select the second answer with:</p>
-<pre>solution(solve(subs(eq(dX/dt,0),[A,Y,kf1,kr1,kf2,kr2,k4],[1,0,2,3,5,7,1]),X),2)</pre>
+For this query, select the first answer with:</p>
+<pre>solution(solve(subs(eq(dX/dt,0),[A,Y,kf1,kr1,kf2,kr2,k4],[1,0,2,3,5,7,1]),X),1)</pre>
 <p>The selected relationship is <code>X=-2+sqrt(5)</code>. In the interface, choose that answer
 from the selector and click <b>Use in query</b> to insert its complete query.
 Selection preserves the conditions attached to the answer. It does not change which alternatives
 are included by <b>Copy Result</b>.</p>
 <p>To calculate the rate for D for every usable answer, apply the unselected solve result to dD/dt:</p>
 <pre>subs(dD/dt,solve(subs(eq(dX/dt,0),[A,Y,kf1,kr1,kf2,kr2,k4],[1,0,2,3,5,7,1]),X))</pre>
-<p>The two rate expressions are <code>k4*(-2-sqrt(5))^2</code> and
-<code>k4*(-2+sqrt(5))^2</code>. As in the calculation for P, k4 remains symbolic in the separate
-rate expression. To insert k4=1 and simplify both expressions, enter:</p>
-<pre>simplify(subs(subs(dD/dt,solve(subs(eq(dX/dt,0),[A,Y,kf1,kr1,kf2,kr2,k4],[1,0,2,3,5,7,1]),X)),k4,1))</pre>
-<p>The rate expressions become <code>9+4*sqrt(5)</code> and <code>9-4*sqrt(5)</code>.
-For only the second answer, select the relationship before applying it:</p>
-<pre>subs(dD/dt,solution(solve(subs(eq(dX/dt,0),[A,Y,kf1,kr1,kf2,kr2,k4],[1,0,2,3,5,7,1]),X),2))</pre>
+<p>The two rate expressions are <code>k4*(-2+sqrt(5))^2</code> and
+<code>k4*(-2-sqrt(5))^2</code>. As in the calculation for P, k4 remains symbolic in the separate
+rate expression. To insert k4=1 and expand both expressions, enter:</p>
+<pre>expand(subs(subs(dD/dt,solve(subs(eq(dX/dt,0),[A,Y,kf1,kr1,kf2,kr2,k4],[1,0,2,3,5,7,1]),X)),k4,1))</pre>
+<p>The rate expressions become <code>9-4*sqrt(5)</code> and <code>9+4*sqrt(5)</code>.
+For only the first answer, select the relationship before applying it:</p>
+<pre>subs(dD/dt,solution(solve(subs(eq(dX/dt,0),[A,Y,kf1,kr1,kf2,kr2,k4],[1,0,2,3,5,7,1]),X),1))</pre>
 <p>The examples from here onward use this four-reaction model with the signal definitions.</p>
 
 <h3>Combine results with alternatives</h3>

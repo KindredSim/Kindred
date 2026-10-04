@@ -27,7 +27,6 @@ __all__ = [
     # Validation
     "ValidationError",
     "ReactionValidationError",
-    "InitialConditionError",
     # Simulation
     "SimulationError",
     "SolverError",
@@ -171,13 +170,6 @@ class ReactionValidationError(ValidationError):
     """Error for invalid reaction specifications."""
     def __init__(self, message: str, **kwargs):
         kwargs.setdefault("code", "E203")
-        super().__init__(message, **kwargs)
-
-
-class InitialConditionError(ValidationError):
-    """Error for invalid or missing initial conditions."""
-    def __init__(self, message: str, **kwargs):
-        kwargs.setdefault("code", "E204")
         super().__init__(message, **kwargs)
 
 

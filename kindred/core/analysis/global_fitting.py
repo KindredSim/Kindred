@@ -123,8 +123,13 @@ def fit_global(
     ] = None,
     optimizer_layout: _fit_execution.FitParameterLayout,
     executor: Executor,
+    optimizer_start: np.ndarray | None = None,
 ) -> _fit_execution.GlobalFitResult | ScientificUnavailable:
-    """Fit immutable dataset captures through one evaluator per dataset."""
+    """Fit immutable dataset captures through one evaluator per dataset.
+
+    ``optimizer_start`` overrides the layout's starting vector (in optimizer
+    coordinates) without changing the layout used to decode results.
+    """
 
     if executor is None:
         raise TypeError("Global Fit requires a borrowed executor.")
@@ -200,7 +205,14 @@ def fit_global(
             )
             optimizer_result = fit_parameters(
                 objective,
-                layout.initial_params(),
+                (
+                    layout.initial_params()
+                    if optimizer_start is None
+                    else {
+                        key: float(optimizer_start[index])
+                        for index, key in enumerate(keys)
+                    }
+                ),
                 bounds=layout.bounds_dict(),
                 method=method,
                 max_nfev=max_nfev,
@@ -377,9 +389,6 @@ def fit_global(
                     status="stopped",
                     cause=stop_cause,
                     observation_count=int(replay_state.weighted_residuals.size),
-                    terminal_weighted_residual_sse=float(
-                        replay_state.weighted_residual_sse.value
-                    ),
                 )
             except Exception as exc:
                 profile_result = profile_likelihood_settlement_result(
@@ -391,9 +400,6 @@ def fit_global(
                         origin="profile_likelihood",
                     ),
                     observation_count=int(replay_state.weighted_residuals.size),
-                    terminal_weighted_residual_sse=float(
-                        replay_state.weighted_residual_sse.value
-                    ),
                 )
 
             if primary_stopped:
@@ -433,6 +439,8 @@ def fit_global(
                     cancellation_control=active_control,
                     optimizer_layout=layout,
                     executor=executor,
+                    # Bootstrap refits start from the converged primary fit.
+                    optimizer_start=vector,
                 )
 
             if optional_analysis_stopped:

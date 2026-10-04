@@ -6,7 +6,6 @@ import math
 from dataclasses import dataclass, replace
 from typing import Iterable, Literal, Sequence
 
-import numpy as np
 from kindred.core.quantity_units import Unit
 
 from kindred.core.analysis.fit_uncertainty import (
@@ -228,9 +227,6 @@ def _admit_fit_parameter_configuration(
 ) -> FitParameterConfiguration:
     """Admit one complete scope candidate using its retained category."""
 
-    if not isinstance(configuration, FitParameterConfiguration):
-        raise TypeError("Fit parameter configuration must be typed.")
-
     def admit(value: object, field: str) -> float:
         return admit_gui_parameter_value(
             value,
@@ -393,8 +389,6 @@ def _replace_fit_parameter(
     typed invariant is checked by ``FitParameterConfiguration`` itself.
     """
 
-    if not isinstance(parameter, FitParameterVariable):
-        raise TypeError("parameter must be FitParameterVariable.")
     allowed = {
         "initial",
         "minimum",
@@ -707,45 +701,18 @@ def _validate_advanced_analysis_setup(
     profile_likelihood: ProfileLikelihoodConfig | None,
     residual_bootstrap: ResidualBootstrapConfig | None,
 ) -> None:
-    allowed_coordinates = fit_uncertainty_coordinates(parameters, datasets)
+    allowed_coordinates = fit_uncertainty_coordinates(
+        parameters, datasets
+    )
     allowed_set = set(allowed_coordinates)
-    allowed_display = {item.display_name for item in allowed_coordinates}
     for config in (profile_likelihood, residual_bootstrap):
         if config is None:
             continue
-        if not config.parameter_names:
+        if any(coordinate not in allowed_set for coordinate in config.parameter_names):
             raise ValueError(
-                "Enabled uncertainty analysis requires at least one coordinate."
+                "Uncertainty configuration references an unavailable fitted "
+                "coordinate."
             )
-        requested = tuple(config.parameter_names)
-        resolved: list[FitCoordinate] = []
-        for item in requested:
-            if isinstance(item, FitCoordinate):
-                coordinate = item
-            else:
-                display = str(item or "").strip()
-                if display not in allowed_display:
-                    raise ValueError(
-                        "Uncertainty configuration references an unavailable "
-                        "fitted coordinate."
-                    )
-                coordinate = next(
-                    value for value in allowed_coordinates
-                    if value.display_name == display
-                )
-            if coordinate not in allowed_set:
-                raise ValueError(
-                    "Uncertainty configuration references an unavailable fitted "
-                    "coordinate."
-                )
-            if coordinate.scope in {"coupled", "centred_deviation"}:
-                raise ValueError(
-                    "Coupled and centred dataset-deviation coordinates cannot "
-                    "be selected as uncertainty targets."
-                )
-            resolved.append(coordinate)
-        if len(resolved) != len(set(resolved)):
-            raise ValueError("Uncertainty coordinates repeat a typed identity.")
 
 
 def fit_uncertainty_coordinates(
@@ -756,9 +723,11 @@ def fit_uncertainty_coordinates(
 
     A centred parameter exposes only its overall coordinate. Its dataset
     deviations are fitted nuisances and are never public uncertainty targets.
+    Excluded datasets' coordinates are listed too; a fit analyses only the
+    included ones.
     """
     parameter_items = tuple(parameters)
-    included_ids = tuple(sorted(item.dataset_id for item in datasets if item.included))
+    dataset_ids = tuple(sorted(item.dataset_id for item in datasets))
     coordinates: list[FitCoordinate] = []
     for parameter in sorted(parameter_items, key=lambda item: item.name):
         if not parameter.selected_config.fit:
@@ -771,7 +740,7 @@ def fit_uncertainty_coordinates(
             values = dict(parameter.selected_config.dataset_values)
             coordinates.extend(
                 FitCoordinate("dataset", parameter.name, dataset_id)
-                for dataset_id in included_ids
+                for dataset_id in dataset_ids
                 if dataset_id in values
             )
     return tuple(coordinates)
@@ -1028,8 +997,6 @@ def _scan_parameters(tab: MechanismTabDocument) -> tuple[FitParameterVariable, .
 def create_initial_fit_setup(origin: FitOriginSnapshot) -> FitSetupSnapshot:
     """Build the sole typed Fit-local setup without consulting widget state."""
 
-    if not isinstance(origin, FitOriginSnapshot):
-        raise TypeError("origin must be FitOriginSnapshot.")
     datasets = tuple(
         FitDatasetLocalSettings(
             dataset_id=mapped.dataset_id,
@@ -1271,15 +1238,11 @@ def selected_observations(
         maximum = local.maximum_observations_per_target
         indices = usable
         if maximum is not None:
-            # Sampling selects observations, never supplies a numerical time.
-            # A/Y selection is independent of any recorded time column.
-            indices = tuple(usable[index] for index in np.unique(
-                np.linspace(0, len(usable) - 1, min(maximum, len(usable)), dtype=int)
-            )) if x_rows is not None else tuple(
-                usable[index] for index in compute_sampled_indices(
-                    t=np.asarray([observation.t[index] for index in usable]),
-                    t_min=-math.inf, t_max=math.inf, n_points=maximum,
-                )
+            # Sampling selects observations, never supplies a numerical time;
+            # time-X and measured-X pick the same rows for the same cap.
+            indices = tuple(
+                usable[index]
+                for index in compute_sampled_indices(count=len(usable), n_points=maximum)
             )
         selected.append(
             FitSelectedObservation(
@@ -1304,6 +1267,8 @@ def fit_setup_readiness(
     parameters: Iterable[FitParameterVariable],
     initials: Iterable[FitInitialVariable],
     shared_initial_groups: Iterable[FitSharedInitialGroup] = (),
+    profile_likelihood: ProfileLikelihoodConfig | None = None,
+    residual_bootstrap: ResidualBootstrapConfig | None = None,
     check_observations: bool = True,
 ) -> str | None:
     """Return the shared cheap structural Run Fit readiness truth.
@@ -1314,8 +1279,6 @@ def fit_setup_readiness(
     varying parameter or initial condition.
     """
 
-    if not isinstance(origin, FitOriginSnapshot):
-        raise TypeError("Fit readiness requires FitOriginSnapshot.")
     dataset_items = tuple(datasets)
     parameter_items = tuple(parameters)
     initial_items = tuple(initials)
@@ -1367,6 +1330,15 @@ def fit_setup_readiness(
     )
     if not any(item.selected_config.fit for item in parameter_items) and not has_fitted_initial:
         return "Select at least one parameter or initial concentration to fit."
+    excluded = tuple(item.dataset_id for item in dataset_items if not item.included)
+    for label, analysis in (
+        ("Profile", profile_likelihood),
+        ("Bootstrap", residual_bootstrap),
+    ):
+        if analysis is not None and prune_fit_analysis_coordinates(
+            analysis, excluded_dataset_ids=excluded
+        ) is None:
+            return f"{label} has no coordinates in the included datasets."
     return None
 
 
@@ -1731,14 +1703,14 @@ def build_fit_execution_request(
     setup: FitSetupSnapshot,
 ) -> FitExecutionRequest:
     """Compile one exact accepted setup into its immutable execution request."""
-    if not isinstance(setup, FitSetupSnapshot):
-        raise TypeError("setup must be FitSetupSnapshot.")
     readiness = fit_setup_readiness(
         origin=setup.origin,
         datasets=setup.datasets,
         parameters=setup.parameters,
         initials=setup.initials,
         shared_initial_groups=setup.shared_initial_groups,
+        profile_likelihood=setup.profile_likelihood,
+        residual_bootstrap=setup.residual_bootstrap,
         check_observations=False,
     )
     if readiness is not None:

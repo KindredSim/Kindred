@@ -89,34 +89,6 @@ def _format_scientific(value: object) -> str:
     return f"{base}e{sign}{digits.lstrip('0') or '0'}"
 
 
-def _resolve_coordinate_selection(
-    values: Sequence[object],
-    available: Sequence[FitCoordinate],
-) -> set[FitCoordinate]:
-    """Resolve stored coordinate identities without guessing display aliases."""
-
-    roster = tuple(available)
-    resolved: set[FitCoordinate] = set()
-    for value in values:
-        if isinstance(value, FitCoordinate):
-            if value not in roster:
-                raise ValueError(f"Unavailable Fit coordinate: {value.display_name!r}.")
-            resolved.add(value)
-            continue
-        display = str(value or "").strip()
-        matches = tuple(
-            coordinate for coordinate in roster if coordinate.display_name == display
-        )
-        if len(matches) != 1:
-            if len(matches) > 1:
-                raise ValueError(
-                    f"Ambiguous Fit coordinate display name: {display!r}."
-                )
-            raise ValueError(f"Unavailable Fit coordinate: {display!r}.")
-        resolved.add(matches[0])
-    return resolved
-
-
 class _ProfileLikelihoodDialog(QtWidgets.QDialog):
     """Transactional Profile likelihood configuration."""
 
@@ -126,7 +98,6 @@ class _ProfileLikelihoodDialog(QtWidgets.QDialog):
         available: Sequence[FitCoordinate],
         display_names: Mapping[FitCoordinate, str] | None = None,
         configuration: ProfileLikelihoodConfig | None,
-        default_selection: Sequence[FitCoordinate] | None = None,
         parent: QtWidgets.QWidget | None = None,
     ) -> None:
         super().__init__(parent)
@@ -144,20 +115,7 @@ class _ProfileLikelihoodDialog(QtWidgets.QDialog):
             for coordinate in available
         )
         selected = (
-            (
-                set(default_selection)
-                if configuration is not None
-                and not configuration.parameter_names
-                and default_selection is not None
-                else _resolve_coordinate_selection(
-                    configuration.parameter_names,
-                    available,
-                )
-            )
-            if configuration
-            else set(
-                default_selection if default_selection is not None else available
-            )
+            set(configuration.parameter_names) if configuration else set(available)
         )
         for coordinate in available:
             if not isinstance(coordinate, FitCoordinate):
@@ -247,7 +205,6 @@ class _ResidualBootstrapDialog(QtWidgets.QDialog):
         available: Sequence[FitCoordinate],
         display_names: Mapping[FitCoordinate, str] | None = None,
         configuration: ResidualBootstrapConfig | None,
-        default_selection: Sequence[FitCoordinate] | None = None,
         parent: QtWidgets.QWidget | None = None,
     ) -> None:
         super().__init__(parent)
@@ -265,14 +222,7 @@ class _ResidualBootstrapDialog(QtWidgets.QDialog):
             for coordinate in available
         )
         selected = (
-            _resolve_coordinate_selection(
-                configuration.parameter_names,
-                available,
-            )
-            if configuration
-            else set(
-                default_selection if default_selection is not None else available
-            )
+            set(configuration.parameter_names) if configuration else set(available)
         )
         for coordinate in available:
             if not isinstance(coordinate, FitCoordinate):
@@ -1408,7 +1358,9 @@ class ParametersIcsTab(QtWidgets.QWidget):
         setup = self._projected_setup
         if setup is None:
             return {}
-        available = set(fit_uncertainty_coordinates(setup.parameters, setup.datasets))
+        available = set(fit_uncertainty_coordinates(
+            setup.parameters, setup.datasets
+        ))
         effects: dict[str, tuple[str, ...]] = {}
         for label, configuration in (
             ("Profile", setup.profile_likelihood),
@@ -1789,7 +1741,9 @@ class ParametersIcsTab(QtWidgets.QWidget):
         setup = self._projected_setup
         if setup is None:
             return ()
-        return fit_uncertainty_coordinates(setup.parameters, setup.datasets)
+        return fit_uncertainty_coordinates(
+            setup.parameters, setup.datasets
+        )
 
     def _analysis_coordinate_display_names(self) -> dict[FitCoordinate, str]:
         return {
@@ -1807,7 +1761,6 @@ class ParametersIcsTab(QtWidgets.QWidget):
             available=self._available_analysis_coordinates(),
             display_names=self._analysis_coordinate_display_names(),
             configuration=setup.profile_likelihood,
-            default_selection=None,
             parent=self,
         )
         if dialog.exec() != QtWidgets.QDialog.DialogCode.Accepted:
@@ -1834,7 +1787,6 @@ class ParametersIcsTab(QtWidgets.QWidget):
             available=self._available_bootstrap_coordinates(),
             display_names=self._analysis_coordinate_display_names(),
             configuration=setup.residual_bootstrap,
-            default_selection=None,
             parent=self,
         )
         if dialog.exec() != QtWidgets.QDialog.DialogCode.Accepted:

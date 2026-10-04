@@ -15,7 +15,7 @@ from kindred.core.kinetics import forward_rate_model_payload
 import math
 import logging
 from dataclasses import dataclass
-from typing import Callable, Mapping, Optional
+from typing import Callable, Mapping
 
 import numpy as np
 
@@ -44,20 +44,14 @@ def _stoichiometric_flux_product(
     stoichiometry: np.ndarray,
     rates: np.ndarray,
     *,
-    workspace: Optional[np.ndarray] = None,
-    out: Optional[np.ndarray] = None,
+    workspace: np.ndarray,
+    out: np.ndarray,
 ) -> np.ndarray:
     """Compute species fluxes without entering the BLAS matrix-vector path."""
     stoich_arr = np.asarray(stoichiometry, dtype=float)
     rate_arr = np.asarray(rates, dtype=float).reshape(-1)
-    if workspace is None:
-        products = np.multiply(stoich_arr, rate_arr)
-    else:
-        products = workspace
-        np.multiply(stoich_arr, rate_arr, out=products)
-    if out is None:
-        return np.sum(products, axis=1, dtype=float)
-    np.sum(products, axis=1, out=out)
+    np.multiply(stoich_arr, rate_arr, out=workspace)
+    np.sum(workspace, axis=1, out=out)
     return out.copy()
 
 
@@ -351,8 +345,8 @@ def _build_bound_ode_rhs(
 
     Notes
     -----
-    - Rates come from the admitted typed forward model and reverse authority;
-      T defaults to the declared reference temperature if omitted.
+    - Rates come from the admitted typed forward model and reverse authority
+      at the temperature T supplied by every caller.
     - Reactions contribute: rate = k * ∏[reactants]^stoich
     - Equilibria remain a single reversible step with rate = v_fwd - v_rev
       (stoichiometry is not duplicated into two irreversible columns).
@@ -360,9 +354,6 @@ def _build_bound_ode_rhs(
     """
     species_names = topology.species_names
     n_species = len(species_names)
-    default_temperature = float(
-        coefficient_evaluator.nominal_temperature_K
-    )
 
     n_steps = len(topology.step_kinds)
     n_reactions = topology.reaction_count
@@ -467,11 +458,10 @@ def _build_bound_ode_rhs(
             sign = np.where(log_f[indices] >= log_r[indices], 1.0, -1.0)
             out[indices] = sign * mag
 
-    def ode_rhs(t: float, y: np.ndarray, *, T: Optional[float] = None) -> np.ndarray:
+    def ode_rhs(t: float, y: np.ndarray, *, T: float) -> np.ndarray:
         """ODE right-hand side from stoichiometry and reaction rates."""
         y_arr = y
-        T_eval = default_temperature if T is None else float(T)
-        coefficients = coefficient_evaluator(T_eval)
+        coefficients = coefficient_evaluator(float(T))
         k_forward_dyn[:] = coefficients.forward
         k_reverse_dyn[:] = coefficients.reverse
 
@@ -582,32 +572,14 @@ def _build_bound_ode_rhs(
         _stable_diff_exp_logs(log_rate_forward, log_rate_reverse, net_rates)
         if n_reactions:
             forward_buffer[:n_reactions].fill(1.0)
-            reaction_fractional_mask = fractional_forward_mask[:n_reactions]
-            if np.any(
-                reaction_fractional_mask & (y_arr[np.newaxis, :] < 0.0)
-            ):
-                # Keep irreversible integer-power trial evaluations signed even
-                # when equilibria require the log-domain calculation below.
-                forward_power_bases[:n_reactions] = y_arr
-                np.maximum(
-                    forward_power_bases[:n_reactions],
-                    0.0,
-                    out=forward_power_bases[:n_reactions],
-                    where=reaction_fractional_mask,
-                )
-                np.power(
-                    forward_power_bases[:n_reactions],
-                    exp_forward[:n_reactions],
-                    out=forward_buffer[:n_reactions],
-                    where=forward_mask[:n_reactions],
-                )
-            else:
-                np.power(
-                    y_arr,
-                    exp_forward[:n_reactions],
-                    out=forward_buffer[:n_reactions],
-                    where=forward_mask[:n_reactions],
-                )
+            # Negative trial states returned above, so every base here is
+            # nonnegative.
+            np.power(
+                y_arr,
+                exp_forward[:n_reactions],
+                out=forward_buffer[:n_reactions],
+                where=forward_mask[:n_reactions],
+            )
             net_rates[:n_reactions] = (
                 k_forward_dyn[:n_reactions]
                 * forward_buffer[:n_reactions].prod(axis=1)

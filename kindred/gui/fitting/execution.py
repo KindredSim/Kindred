@@ -62,6 +62,7 @@ from kindred.gui.fitting.launch import (
     FitPreparedDatasetConfig,
     FitSetupSnapshot,
     _replace_fit_parameter,
+    prune_fit_analysis_coordinates,
 )
 from kindred.gui.parameter_enumeration import admit_gui_parameter_value
 from kindred.core.species import validate_concentration
@@ -527,20 +528,10 @@ def _terminal_setup_snapshot(
     }
     if set(fixed_results) != included_ids:
         raise ValueError("Fit request fixed-value roster is incomplete.")
-    request_parameters = {
-        parameter.name: parameter
-        for parameter in setup_snapshot.parameters
-    }
     parameters = []
     for parameter in setup_snapshot.parameters:
-        requested = request_parameters.get(parameter.name)
-        if requested is None:
-            raise ValueError(
-                f"Terminal Fit setup contains unknown parameter "
-                f"{parameter.name!r}."
-            )
         dataset_values = tuple(parameter.selected_config.dataset_values)
-        requested_config = requested.selected_config
+        requested_config = parameter.selected_config
         if not requested_config.fit:
             retained_values: dict[str, float] = {}
             for dataset_id in included_ids:
@@ -551,7 +542,7 @@ def _terminal_setup_snapshot(
                         f"for included dataset {dataset_id!r}."
                     )
                 retained_values[dataset_id] = float(values[parameter.name])
-            if requested.scope == "shared":
+            if parameter.scope == "shared":
                 unique = set(retained_values.values())
                 if len(unique) != 1:
                     raise ValueError(
@@ -575,7 +566,7 @@ def _terminal_setup_snapshot(
                     )
                 )
             continue
-        if requested.scope == "shared":
+        if parameter.scope == "shared":
             if parameter.name not in shared_results:
                 raise ValueError(
                     f"Fit result omitted shared parameter {parameter.name!r}."
@@ -1308,6 +1299,9 @@ class _FitExecution(_FitControl):
         for evaluator in evaluators.values():
             evaluator.set_cancellation_control(self._cancellation_control)
         defaults = request.setup.defaults
+        excluded = tuple(
+            item.dataset_id for item in request.setup.datasets if not item.included
+        )
         result_or_unavailable = fit_global(
             fit_evaluators=evaluators,
             datasets=datasets,
@@ -1323,8 +1317,12 @@ class _FitExecution(_FitControl):
             cancellation_control=execution_cancellation_control,
             stop_check=self._stopped.is_set,
             starting_facts=tuple(sorted(starting_facts, key=lambda info: info.dataset_id)),
-            profile_likelihood=request.setup.profile_likelihood,
-            residual_bootstrap=request.setup.residual_bootstrap,
+            profile_likelihood=prune_fit_analysis_coordinates(
+                request.setup.profile_likelihood, excluded_dataset_ids=excluded
+            ),
+            residual_bootstrap=prune_fit_analysis_coordinates(
+                request.setup.residual_bootstrap, excluded_dataset_ids=excluded
+            ),
             dataset_overrides=request.dispatch.ordinary_dataset_overrides,
             optimizer_layout=request.dispatch.ordinary_optimizer_layout,
             executor=self._executor,

@@ -322,71 +322,24 @@ class ProfileLikelihoodEndpoint:
     """Resolution facts for one Profile lower or upper endpoint."""
 
     status: ProfileLikelihoodEndpointStatus
-    evaluation_index: int | None = None
-    optimizer_value: float | None = None
-    likelihood_ratio: float | None = None
-    coordinate_tolerance: float | None = None
-    likelihood_ratio_tolerance: float | None = None
-    bracket_width: float | None = None
     reason: str | None = None
-    last_evaluation_index: int | None = None
-    evaluation_count: int = 0
-    failure: FactualCause | None = None
 
     def __post_init__(self) -> None:
         status = str(self.status)
         if status not in {"bound", "limiting", "threshold", "failed", "unavailable"}:
             raise ValueError("Profile endpoint status is invalid.")
         object.__setattr__(self, "status", status)
-        for name in (
-            "evaluation_index",
-            "last_evaluation_index",
-        ):
-            value = getattr(self, name)
-            if value is not None:
-                normalized = int(value)
-                if normalized < 0:
-                    raise ValueError("Profile endpoint evaluation index cannot be negative.")
-                object.__setattr__(self, name, normalized)
-        evaluation_count = int(self.evaluation_count)
-        if evaluation_count < 0:
-            raise ValueError("Profile endpoint evaluation count cannot be negative.")
-        object.__setattr__(self, "evaluation_count", evaluation_count)
-        optimizer_value = self.optimizer_value
-        if optimizer_value is not None:
-            optimizer_value = float(optimizer_value)
-            if not math.isfinite(optimizer_value):
-                raise ValueError("Profile endpoint optimizer_value must be finite.")
-            object.__setattr__(self, "optimizer_value", optimizer_value)
-        for name in (
-            "likelihood_ratio",
-            "coordinate_tolerance",
-            "likelihood_ratio_tolerance",
-            "bracket_width",
-        ):
-            value = getattr(self, name)
-            if value is not None:
-                normalized = float(value)
-                if not math.isfinite(normalized) or normalized < 0.0:
-                    raise ValueError(f"Profile endpoint {name} must be finite and nonnegative.")
-                object.__setattr__(self, name, normalized)
-        if self.failure is not None and not isinstance(self.failure, FactualCause):
-            raise TypeError("Profile endpoint failure must be a FactualCause.")
 
 
 @dataclass(frozen=True, slots=True)
 class ProfileLikelihoodInterval:
-    """One coordinate's estimate, endpoints, and bounded resolution facts."""
+    """One coordinate's endpoints and bounded resolution facts."""
 
     status: Literal["available", "partial", "unavailable"]
-    interval_kind: str
-    estimate: float
     lower: float | None
     upper: float | None
     lower_outcome: ProfileLikelihoodEndpointStatus
     upper_outcome: ProfileLikelihoodEndpointStatus
-    optimizer_bounds: tuple[float, float]
-    physical_bounds: tuple[float, float]
     lower_resolution: ProfileLikelihoodEndpoint
     upper_resolution: ProfileLikelihoodEndpoint
     endpoint_messages: Mapping[str, str] = field(default_factory=dict)
@@ -395,15 +348,6 @@ class ProfileLikelihoodInterval:
         status = str(self.status)
         if status not in {"available", "partial", "unavailable"}:
             raise ValueError("Profile interval status is invalid.")
-        bounds = tuple(float(value) for value in self.optimizer_bounds)
-        physical_bounds = tuple(float(value) for value in self.physical_bounds)
-        if len(bounds) != 2 or len(physical_bounds) != 2:
-            raise ValueError("Profile interval bounds require two values.")
-        if any(not math.isfinite(value) for value in (*bounds, *physical_bounds)):
-            raise ValueError("Profile interval bounds must be finite.")
-        estimate = float(self.estimate)
-        if not math.isfinite(estimate):
-            raise ValueError("Profile interval estimate must be finite.")
         for name in ("lower", "upper"):
             value = getattr(self, name)
             if value is not None:
@@ -411,14 +355,7 @@ class ProfileLikelihoodInterval:
                 if not math.isfinite(value):
                     raise ValueError("Profile interval endpoints must be finite.")
                 object.__setattr__(self, name, value)
-        if not isinstance(self.lower_resolution, ProfileLikelihoodEndpoint):
-            raise TypeError("Profile lower resolution must be a typed endpoint.")
-        if not isinstance(self.upper_resolution, ProfileLikelihoodEndpoint):
-            raise TypeError("Profile upper resolution must be a typed endpoint.")
         object.__setattr__(self, "status", status)
-        object.__setattr__(self, "estimate", estimate)
-        object.__setattr__(self, "optimizer_bounds", bounds)
-        object.__setattr__(self, "physical_bounds", physical_bounds)
         object.__setattr__(
             self,
             "endpoint_messages",
@@ -432,18 +369,10 @@ class ProfileLikelihoodResult:
 
     status: ProfileLikelihoodStatus
     method: str
-    requested_parameters: tuple[str, ...]
     confidence_level: float
     likelihood_ratio_threshold: float
     likelihood_model: str
-    likelihood_ratio_transport: str
-    fixed_coordinate_policy: str
-    warm_start_policy: str
-    optimizer_method: str
-    max_bracketing_steps_per_side: int
-    max_nfev_per_point: int
     observation_count: int | None
-    terminal_weighted_residual_sse: float | None
     intervals: Mapping[object, ProfileLikelihoodInterval]
     unavailable_reason: str | None = None
     diagnostic: FactualCause | None = None
@@ -453,24 +382,10 @@ class ProfileLikelihoodResult:
         status = str(self.status)
         if status not in {"available", "partial", "unavailable", "stopped", "failed"}:
             raise ValueError("Profile result status is invalid.")
-        names = tuple(str(value) for value in self.requested_parameters)
-        if len(names) != len(set(names)) or any(not value.strip() for value in names):
-            raise ValueError("Profile result parameter names must be unique and nonblank.")
         confidence = _confidence(self.confidence_level)
         threshold = float(self.likelihood_ratio_threshold)
         if not math.isfinite(threshold) or threshold <= 0.0:
             raise ValueError("Profile result threshold must be positive.")
-        for name in ("max_bracketing_steps_per_side", "max_nfev_per_point"):
-            value = _bounded_positive_integer(
-                getattr(self, name),
-                field=f"Profile result {name}",
-                maximum=(
-                    _PROFILE_MAX_POINTS_PER_SIDE
-                    if name == "max_bracketing_steps_per_side"
-                    else 100_000
-                ),
-            )
-            object.__setattr__(self, name, value)
         count = self.observation_count
         if count is not None:
             count = _bounded_nonnegative_integer(
@@ -478,11 +393,6 @@ class ProfileLikelihoodResult:
                 field="Profile observation count",
                 maximum=2_147_483_647,
             )
-        sse = self.terminal_weighted_residual_sse
-        if sse is not None:
-            sse = float(sse)
-            if not math.isfinite(sse) or sse < 0.0:
-                raise ValueError("Profile terminal SSE must be finite and nonnegative.")
         intervals = dict(self.intervals)
         if any(not isinstance(item, ProfileLikelihoodInterval) for item in intervals.values()):
             raise TypeError("Profile intervals require typed interval records.")
@@ -498,11 +408,9 @@ class ProfileLikelihoodResult:
             raise ValueError("Profile results require a named method.")
         object.__setattr__(self, "status", status)
         object.__setattr__(self, "method", _PROFILE_METHOD)
-        object.__setattr__(self, "requested_parameters", names)
         object.__setattr__(self, "confidence_level", confidence)
         object.__setattr__(self, "likelihood_ratio_threshold", threshold)
         object.__setattr__(self, "observation_count", count)
-        object.__setattr__(self, "terminal_weighted_residual_sse", sse)
         object.__setattr__(self, "intervals", MappingProxyType(intervals))
         object.__setattr__(self, "unavailable_reason", reason)
         object.__setattr__(self, "provenance", _freeze_fact(dict(self.provenance or {})))
@@ -515,7 +423,6 @@ class BootstrapPercentileInterval:
     status: Literal["available", "unavailable"]
     lower: float | None
     upper: float | None
-    construction: str
     reason: str | None = None
 
     def __post_init__(self) -> None:
@@ -530,7 +437,6 @@ class BootstrapPercentileInterval:
                     raise ValueError("Bootstrap percentile endpoints must be finite.")
                 object.__setattr__(self, name, number)
         object.__setattr__(self, "status", status)
-        object.__setattr__(self, "construction", str(self.construction))
         object.__setattr__(self, "reason", None if self.reason is None else str(self.reason))
 
 
@@ -540,24 +446,15 @@ class ResidualBootstrapResult:
 
     status: BootstrapStatus
     method: str
-    requested_parameters: tuple[str, ...]
     seed: int
     replicates: int
     confidence_level: float
     resampling: str
-    draw_algorithm: str
     residual_centering: str
-    replicate_execution: str
-    refit_validity: str
-    minimum_successful_replicates: int
-    minimum_success_fraction: float
     required_successes: int
     successful_replicates: int
     failed_replicates: int
-    interval_construction: str
     intervals: Mapping[object, BootstrapPercentileInterval]
-    primary_fit_diagnostic: FactualCause | None = None
-    primary_fit_unavailable: ScientificUnavailable | None = None
     first_failed_replicate_diagnostic: FactualCause | None = None
     first_failed_replicate_unavailable: ScientificUnavailable | None = None
     unavailable_reason: str | None = None
@@ -568,9 +465,6 @@ class ResidualBootstrapResult:
         status = str(self.status)
         if status not in {"available", "unavailable", "stopped", "failed"}:
             raise ValueError("Bootstrap result status is invalid.")
-        names = tuple(str(value) for value in self.requested_parameters)
-        if len(names) != len(set(names)) or any(not value.strip() for value in names):
-            raise ValueError("Bootstrap result parameter names must be unique and nonblank.")
         seed = validate_bootstrap_seed(self.seed)
         replicates = _bounded_positive_integer(
             self.replicates,
@@ -578,11 +472,6 @@ class ResidualBootstrapResult:
             maximum=_BOOTSTRAP_MAX_REPLICATES,
         )
         confidence = _confidence(self.confidence_level)
-        minimum = _bounded_positive_integer(
-            self.minimum_successful_replicates,
-            field="Bootstrap result minimum successful replicates",
-            maximum=replicates,
-        )
         required = _bounded_nonnegative_integer(
             self.required_successes,
             field="Bootstrap result required successes",
@@ -598,28 +487,18 @@ class ResidualBootstrapResult:
             field="Bootstrap result failed replicates",
             maximum=replicates,
         )
-        if not 0 < minimum <= replicates or not 0 <= required <= replicates:
-            raise ValueError("Bootstrap result success thresholds are invalid.")
-        if successful < 0 or failed < 0 or successful + failed > replicates:
+        if successful + failed > replicates:
             raise ValueError("Bootstrap result replicate counts are invalid.")
-        fraction = float(self.minimum_success_fraction)
-        if not math.isfinite(fraction) or not 0.0 < fraction <= 1.0:
-            raise ValueError("Bootstrap result success fraction is invalid.")
         intervals = dict(self.intervals)
         if any(not isinstance(item, BootstrapPercentileInterval) for item in intervals.values()):
             raise TypeError("Bootstrap intervals require typed percentile records.")
         for cause_name in (
-            "primary_fit_diagnostic",
             "diagnostic",
             "first_failed_replicate_diagnostic",
         ):
             cause = getattr(self, cause_name)
             if cause is not None and not isinstance(cause, FactualCause):
                 raise TypeError(f"Bootstrap {cause_name} must be a FactualCause.")
-        if self.primary_fit_unavailable is not None and not isinstance(
-            self.primary_fit_unavailable, ScientificUnavailable
-        ):
-            raise TypeError("Bootstrap primary-fit unavailability must be typed.")
         if self.first_failed_replicate_unavailable is not None and not isinstance(
             self.first_failed_replicate_unavailable, ScientificUnavailable
         ):
@@ -634,12 +513,9 @@ class ResidualBootstrapResult:
             raise ValueError("Bootstrap results require a named method.")
         object.__setattr__(self, "status", status)
         object.__setattr__(self, "method", method)
-        object.__setattr__(self, "requested_parameters", names)
         object.__setattr__(self, "seed", seed)
         object.__setattr__(self, "replicates", replicates)
         object.__setattr__(self, "confidence_level", confidence)
-        object.__setattr__(self, "minimum_successful_replicates", minimum)
-        object.__setattr__(self, "minimum_success_fraction", fraction)
         object.__setattr__(self, "required_successes", required)
         object.__setattr__(self, "successful_replicates", successful)
         object.__setattr__(self, "failed_replicates", failed)
@@ -654,25 +530,16 @@ def profile_likelihood_settlement_result(
     status: Literal["stopped", "failed"],
     cause: FactualCause,
     observation_count: int,
-    terminal_weighted_residual_sse: float,
 ) -> ProfileLikelihoodResult:
     """Construct a stopped/failed Profile result from call-local facts."""
 
     return ProfileLikelihoodResult(
         status=status,
         method=_PROFILE_METHOD,
-        requested_parameters=tuple(_coordinate_display(item) for item in config.parameter_names),
         confidence_level=config.confidence_level,
         likelihood_ratio_threshold=float(config.likelihood_ratio_threshold),
         likelihood_model="weighted Gaussian residuals with profiled variance",
-        likelihood_ratio_transport="finite log likelihood ratio",
-        fixed_coordinate_policy="selected coordinate fixed; all others reoptimized",
-        warm_start_policy="previous scientifically available nuisance endpoint",
-        optimizer_method=config.optimizer_method,
-        max_bracketing_steps_per_side=config.max_bracketing_steps_per_side,
-        max_nfev_per_point=config.max_nfev_per_point,
         observation_count=int(observation_count),
-        terminal_weighted_residual_sse=float(terminal_weighted_residual_sse),
         intervals={},
         diagnostic=cause,
         provenance={"settlement": status, "primary_fit_preserved": True},
@@ -709,9 +576,6 @@ def residual_bootstrap_settlement_result(
     status: Literal["stopped", "failed"],
     cause: FactualCause,
     settlement: str,
-    successful_replicates: int = 0,
-    failed_replicates: int = 0,
-    completed_replicates: int = 0,
 ) -> ResidualBootstrapResult:
     """Construct a stopped/failed Bootstrap result from local facts."""
 
@@ -723,27 +587,20 @@ def residual_bootstrap_settlement_result(
     return ResidualBootstrapResult(
         status=status,
         method=_BOOTSTRAP_METHOD,
-        requested_parameters=tuple(_coordinate_display(item) for item in config.parameter_names),
         seed=config.seed,
         replicates=config.replicates,
         confidence_level=config.confidence_level,
         resampling=resampling,
-        draw_algorithm="numpy.default_rng(seed) residual-index draws",
         residual_centering=centering,
-        replicate_execution="full global refit",
-        refit_validity="scientifically available completed refits count regardless of optimizer convergence",
-        minimum_successful_replicates=config.minimum_successful_replicates,
-        minimum_success_fraction=config.minimum_success_fraction,
         required_successes=required_successes,
-        successful_replicates=int(successful_replicates),
-        failed_replicates=int(failed_replicates),
-        interval_construction="equal-tailed percentile",
+        successful_replicates=0,
+        failed_replicates=0,
         intervals={},
         diagnostic=cause,
         provenance={
             "settlement": str(settlement),
             "primary_fit_preserved": True,
-            "completed_replicates": int(completed_replicates),
+            "completed_replicates": 0,
         },
     )
 
@@ -830,40 +687,7 @@ def _profile_endpoint_record(
 ) -> ProfileLikelihoodEndpoint:
     return ProfileLikelihoodEndpoint(
         status=str(record["status"]),  # type: ignore[arg-type]
-        evaluation_index=(
-            None if record.get("evaluation_index") is None else int(record["evaluation_index"])
-        ),
-        optimizer_value=(
-            None if record.get("optimizer_value") is None else float(record["optimizer_value"])
-        ),
-        likelihood_ratio=(
-            None if record.get("likelihood_ratio") is None else float(record["likelihood_ratio"])
-        ),
-        coordinate_tolerance=(
-            None
-            if record.get("coordinate_tolerance") is None
-            else float(record["coordinate_tolerance"])
-        ),
-        likelihood_ratio_tolerance=(
-            None
-            if record.get("likelihood_ratio_tolerance") is None
-            else float(record["likelihood_ratio_tolerance"])
-        ),
-        bracket_width=(
-            None if record.get("bracket_width") is None else float(record["bracket_width"])
-        ),
         reason=None if record.get("reason") is None else str(record["reason"]),
-        last_evaluation_index=(
-            None
-            if record.get("last_evaluation_index") is None
-            else int(record["last_evaluation_index"])
-        ),
-        evaluation_count=int(record.get("evaluation_count", 0)),
-        failure=(
-            record.get("failure")
-            if isinstance(record.get("failure"), FactualCause)
-            else None
-        ),
     )
 
 
@@ -879,14 +703,10 @@ def _profile_interval_record(
         raise TypeError("Profile endpoint resolutions must be mappings before settlement.")
     return ProfileLikelihoodInterval(
         status=str(record["status"]),  # type: ignore[arg-type]
-        interval_kind=str(record["interval_kind"]),
-        estimate=float(record["estimate"]),
         lower=None if record.get("lower") is None else float(record["lower"]),
         upper=None if record.get("upper") is None else float(record["upper"]),
         lower_outcome=str(record["lower_outcome"]),  # type: ignore[arg-type]
         upper_outcome=str(record["upper_outcome"]),  # type: ignore[arg-type]
-        optimizer_bounds=tuple(record["optimizer_bounds"]),  # type: ignore[arg-type]
-        physical_bounds=tuple(record["physical_bounds"]),  # type: ignore[arg-type]
         lower_resolution=_profile_endpoint_record(lower_endpoint),
         upper_resolution=_profile_endpoint_record(upper_endpoint),
         endpoint_messages={
@@ -997,7 +817,6 @@ def profile_likelihood_result(
 
     emit_progress(stage="primary_complete")
 
-    base_sse: float | None = None
     observation_count: int | None = None
 
     def failure_result(
@@ -1009,22 +828,10 @@ def profile_likelihood_result(
             ProfileLikelihoodResult(
                 status="failed",
                 method=_PROFILE_METHOD,
-                requested_parameters=tuple(
-                    _coordinate_display(item) for item in config.parameter_names
-                ),
                 confidence_level=config.confidence_level,
                 likelihood_ratio_threshold=threshold,
                 likelihood_model="weighted Gaussian residuals with profiled variance",
-                likelihood_ratio_transport=(
-                    "finite un-clamped log-ratio with typed exact-fit/overflow crossing outcome"
-                ),
-                fixed_coordinate_policy="selected coordinate fixed; all others reoptimized",
-                warm_start_policy="previous scientifically available nuisance endpoint",
-                optimizer_method=config.optimizer_method,
-                max_bracketing_steps_per_side=config.max_bracketing_steps_per_side,
-                max_nfev_per_point=config.max_nfev_per_point,
                 observation_count=observation_count,
-                terminal_weighted_residual_sse=base_sse,
                 intervals={},
                 diagnostic=cause,
                 provenance={"settlement": "failed", **dict(provenance or {})},
@@ -1050,20 +857,10 @@ def profile_likelihood_result(
         return finish(ProfileLikelihoodResult(
             status="unavailable",
             method=_PROFILE_METHOD,
-            requested_parameters=tuple(
-                _coordinate_display(item) for item in config.parameter_names
-            ),
             confidence_level=config.confidence_level,
             likelihood_ratio_threshold=threshold,
             likelihood_model="weighted Gaussian residuals with profiled variance",
-            likelihood_ratio_transport="finite log likelihood ratio",
-            fixed_coordinate_policy="selected coordinate fixed; all others reoptimized",
-            warm_start_policy="previous scientifically available nuisance endpoint",
-            optimizer_method=config.optimizer_method,
-            max_bracketing_steps_per_side=config.max_bracketing_steps_per_side,
-            max_nfev_per_point=config.max_nfev_per_point,
             observation_count=None,
-            terminal_weighted_residual_sse=None,
             intervals={},
             unavailable_reason="The primary Fit did not provide a scientifically available evaluation.",
             provenance={"base_evaluation": "scientifically_unavailable"},
@@ -1086,19 +883,13 @@ def profile_likelihood_result(
         def side_profile(
             side: str,
             bound: float,
-        ) -> tuple[float | None, str, list[Mapping[str, object]], Mapping[str, object]]:
+        ) -> tuple[float | None, str, Mapping[str, object]]:
             nonlocal work_done, active_side, active_discovery, active_refinement
             active_side = side
             records: list[Mapping[str, object]] = []
             span = abs(bound - best)
             if span == 0.0:
-                return bound, "bound", records, {
-                    "status": "bound",
-                    "evaluation_index": None,
-                    "optimizer_value": bound,
-                    "coordinate_tolerance": 0.0,
-                    "likelihood_ratio_tolerance": max(1e-6, 1e-4 * threshold),
-                }
+                return bound, "bound", {"status": "bound"}
             inner_x = best
             inner_parameters = dict(initial)
             crossed = False
@@ -1151,10 +942,8 @@ def profile_likelihood_result(
                     raise RuntimeError("Fatal Profile nuisance evaluation failed.") from exc
                 if evaluation_residuals is None:
                     record = {
-                        "evaluation_index": len(records),
                         "fixed_optimizer_value": float(fixed),
                         "status": "unavailable",
-                        "reason": "scientific_unavailable",
                     }
                     records.append(record)
                     return record, None
@@ -1165,7 +954,6 @@ def profile_likelihood_result(
                     n=observation_count,
                 )
                 record = {
-                    "evaluation_index": len(records),
                     "fixed_optimizer_value": float(fixed),
                     "status": "success",
                     "likelihood_ratio": (
@@ -1199,20 +987,13 @@ def profile_likelihood_result(
                     warm_start=inner_parameters,
                 )
                 if record["status"] != "success":
-                    return None, "failed", records, {
+                    return None, "failed", {
                         "status": "failed",
-                        "evaluation_index": record["evaluation_index"],
                         "reason": "scientific_unavailable",
-                        "failure": record.get("failure"),
                     }
                 outcome = str(record["likelihood_ratio_outcome"])
                 if outcome == "threshold_exceeded_exact_fit":
-                    return best, "limiting", records, {
-                        "status": "limiting",
-                        "evaluation_index": record["evaluation_index"],
-                        "optimizer_value": best,
-                        "likelihood_ratio_tolerance": max(1e-6, 1e-4 * threshold),
-                    }
+                    return best, "limiting", {"status": "limiting"}
                 lr = float(record["likelihood_ratio"])
                 if lr >= threshold:
                     bracket = (
@@ -1229,14 +1010,8 @@ def profile_likelihood_result(
                 if records and records[-1]["status"] == "success":
                     last_x = float(records[-1]["fixed_optimizer_value"])
                     if last_x == bound:
-                        return bound, "bound", records, {
-                            "status": "bound",
-                            "evaluation_index": records[-1]["evaluation_index"],
-                            "optimizer_value": bound,
-                            "coordinate_tolerance": 0.0,
-                            "likelihood_ratio_tolerance": max(1e-6, 1e-4 * threshold),
-                        }
-                return None, "unavailable", records, {
+                        return bound, "bound", {"status": "bound"}
+                return None, "unavailable", {
                     "status": "unavailable",
                     "reason": "threshold_not_bracketed_within_discovery_budget",
                 }
@@ -1244,7 +1019,6 @@ def profile_likelihood_result(
             assert bracket is not None
             left_x, right_x, right_lr, left_parameters = bracket
             lr_tolerance = max(1e-6, 1e-4 * threshold)
-            best_candidate: tuple[float, int] | None = None
             representability_exhausted = False
             for refinement_step in range(1, 65):
                 coordinate_scale = max(
@@ -1272,67 +1046,33 @@ def profile_likelihood_result(
                     warm_start=left_parameters,
                 )
                 if record["status"] != "success":
-                    return None, "failed", records, {
+                    return None, "failed", {
                         "status": "failed",
-                        "evaluation_index": record["evaluation_index"],
                         "reason": "scientific_unavailable",
-                        "failure": record.get("failure"),
                     }
                 if str(record["likelihood_ratio_outcome"]) == "threshold_exceeded_exact_fit":
-                    return best, "limiting", records, {
-                        "status": "limiting",
-                        "evaluation_index": record["evaluation_index"],
-                        "optimizer_value": best,
-                        "likelihood_ratio_tolerance": lr_tolerance,
-                    }
+                    return best, "limiting", {"status": "limiting"}
                 midpoint_lr = float(record["likelihood_ratio"])
                 width = abs(right_x - left_x)
                 if abs(midpoint_lr - threshold) <= lr_tolerance and width <= coordinate_tolerance:
-                    return midpoint, "threshold", records, {
-                        "status": "threshold",
-                        "evaluation_index": record["evaluation_index"],
-                        "optimizer_value": midpoint,
-                        "likelihood_ratio": midpoint_lr,
-                        "coordinate_tolerance": coordinate_tolerance,
-                        "likelihood_ratio_tolerance": lr_tolerance,
-                        "bracket_width": width,
-                    }
+                    return midpoint, "threshold", {"status": "threshold"}
                 if abs(right_lr - threshold) <= lr_tolerance and width <= coordinate_tolerance:
-                    return right_x, "threshold", records, {
-                        "status": "threshold",
-                        "evaluation_index": next(
-                            int(item["evaluation_index"])
-                            for item in reversed(records)
-                            if float(item["fixed_optimizer_value"]) == right_x
-                        ),
-                        "optimizer_value": right_x,
-                        "likelihood_ratio": right_lr,
-                        "coordinate_tolerance": coordinate_tolerance,
-                        "likelihood_ratio_tolerance": lr_tolerance,
-                        "bracket_width": width,
-                    }
+                    return right_x, "threshold", {"status": "threshold"}
                 if midpoint_lr >= threshold:
                     right_x, right_lr = midpoint, midpoint_lr
                 else:
                     left_x = midpoint
                     left_parameters = dict(fitted_parameters or left_parameters)
-                best_candidate = (midpoint, int(record["evaluation_index"]))
-            return None, "unavailable", records, {
+            return None, "unavailable", {
                 "status": "unavailable",
                 "reason": (
                     "binary64_representability_exhausted"
                     if representability_exhausted
                     else "midpoint_refit_budget_exhausted"
                 ),
-                "coordinate_tolerance": coordinate_tolerance,
-                "likelihood_ratio_tolerance": lr_tolerance,
-                "bracket_width": abs(right_x - left_x),
-                "last_evaluation_index": (
-                    None if best_candidate is None else best_candidate[1]
-                ),
             }
 
-        side_results: dict[str, tuple[float | None, str, list[Mapping[str, object]], Mapping[str, object]]] = {}
+        side_results: dict[str, tuple[float | None, str, Mapping[str, object]]] = {}
         for side, bound in (("lower", low), ("upper", high)):
             try:
                 side_results[side] = side_profile(side, bound)
@@ -1348,19 +1088,10 @@ def profile_likelihood_result(
                     provenance={
                         "coordinate": _coordinate_display(name),
                         "side": side,
-                        "evaluation_count": len(side_results.get(side, (None, None, (), {}))[2]),
                     },
                 )
-        lower, lower_outcome, lower_records, lower_resolution = side_results["lower"]
-        upper, upper_outcome, upper_records, upper_resolution = side_results["upper"]
-        lower_resolution = {
-            **lower_resolution,
-            "evaluation_count": len(lower_records),
-        }
-        upper_resolution = {
-            **upper_resolution,
-            "evaluation_count": len(upper_records),
-        }
+        lower, lower_outcome, lower_resolution = side_results["lower"]
+        upper, upper_outcome, upper_resolution = side_results["upper"]
         endpoint_messages: dict[str, str] = {}
         for side, outcome, bound in (("lower", lower_outcome, low), ("upper", upper_outcome, high)):
             if outcome == "bound":
@@ -1375,37 +1106,18 @@ def profile_likelihood_result(
                 )
         if lower is not None and upper is not None:
             interval_status = "available"
-            if lower_outcome == upper_outcome == "threshold":
-                interval_kind = "two-sided"
-            elif lower_outcome == upper_outcome == "limiting":
-                interval_kind = "exact-fit limiting"
-            else:
-                interval_kind = "bound-limited"
         elif lower is not None or upper is not None:
             interval_status = "partial"
-            interval_kind = (
-                "bound-limited"
-                if lower_outcome == "bound" or upper_outcome == "bound"
-                else "one-sided"
-            )
             any_partial = True
         else:
             interval_status = "unavailable"
-            interval_kind = "unavailable"
             any_partial = True
         intervals[name] = {
             "status": interval_status,
-            "interval_kind": interval_kind,
-            "estimate": decode_coordinate(name, best),
             "lower": None if lower is None else decode_coordinate(name, lower),
             "upper": None if upper is None else decode_coordinate(name, upper),
             "lower_outcome": lower_outcome,
             "upper_outcome": upper_outcome,
-            "optimizer_bounds": (low, high),
-            "physical_bounds": (
-                decode_coordinate(name, low),
-                decode_coordinate(name, high),
-            ),
             "resolution": {
                 "lower": lower_resolution,
                 "upper": upper_resolution,
@@ -1430,22 +1142,10 @@ def profile_likelihood_result(
     return finish(ProfileLikelihoodResult(
         status=result_status,
         method=_PROFILE_METHOD,
-        requested_parameters=tuple(
-            _coordinate_display(item) for item in config.parameter_names
-        ),
         confidence_level=config.confidence_level,
         likelihood_ratio_threshold=threshold,
         likelihood_model="weighted Gaussian residuals with profiled variance",
-        likelihood_ratio_transport=(
-            "finite un-clamped log-ratio with typed exact-fit/overflow crossing outcome"
-        ),
-        fixed_coordinate_policy="selected coordinate fixed; all others reoptimized",
-        warm_start_policy="previous scientifically available nuisance endpoint",
-        optimizer_method=config.optimizer_method,
-        max_bracketing_steps_per_side=config.max_bracketing_steps_per_side,
-        max_nfev_per_point=config.max_nfev_per_point,
         observation_count=observation_count,
-        terminal_weighted_residual_sse=base_sse,
         intervals={
             name: _profile_interval_record(record)
             for name, record in intervals.items()
@@ -1583,7 +1283,6 @@ def _bootstrap_interval_record(
         status=str(record["status"]),  # type: ignore[arg-type]
         lower=None if record.get("lower") is None else float(record["lower"]),
         upper=None if record.get("upper") is None else float(record["upper"]),
-        construction=str(record.get("construction", "")),
         reason=None if record.get("reason") is None else str(record["reason"]),
     )
 
@@ -1618,8 +1317,6 @@ def residual_bootstrap_result(
         *,
         intervals: Mapping[object, BootstrapPercentileInterval] | None = None,
         diagnostic: FactualCause | None = None,
-        primary_fit_diagnostic: FactualCause | None = None,
-        primary_fit_unavailable: ScientificUnavailable | None = None,
         unavailable_reason: str | None = None,
         provenance: Mapping[str, object] | None = None,
     ) -> ResidualBootstrapResult:
@@ -1629,26 +1326,15 @@ def residual_bootstrap_result(
         return ResidualBootstrapResult(
             status=status,
             method=_BOOTSTRAP_METHOD,
-            requested_parameters=tuple(
-                _coordinate_display(item) for item in config.parameter_names
-            ),
             seed=config.seed,
             replicates=config.replicates,
             confidence_level=config.confidence_level,
             resampling=resampling,
-            draw_algorithm="numpy.default_rng(seed) residual-index draws",
             residual_centering=centering,
-            replicate_execution="full global refit",
-            refit_validity="scientifically available completed refits count regardless of optimizer convergence",
-            minimum_successful_replicates=config.minimum_successful_replicates,
-            minimum_success_fraction=config.minimum_success_fraction,
             required_successes=required_successes,
             successful_replicates=successful,
             failed_replicates=failed,
-            interval_construction="equal-tailed percentile",
             intervals={} if intervals is None else intervals,
-            primary_fit_diagnostic=primary_fit_diagnostic,
-            primary_fit_unavailable=primary_fit_unavailable,
             first_failed_replicate_diagnostic=first_failed_replicate_diagnostic,
             first_failed_replicate_unavailable=first_failed_replicate_unavailable,
             unavailable_reason=unavailable_reason,
@@ -1702,13 +1388,6 @@ def residual_bootstrap_result(
     progress_cause = emit_progress(stage="primary_complete")
     if progress_cause is not None:
         return finish(stopped_result(progress_cause))
-    if isinstance(terminal_result, ScientificUnavailable):
-        return finish(build_result(
-            "unavailable",
-            primary_fit_unavailable=terminal_result,
-            unavailable_reason="Residual bootstrap requires a scientifically available primary Fit.",
-            provenance={"primary_fit": {"status": "scientific_unavailable", "cause": terminal_result}},
-        ))
     terminal_infos = getattr(terminal_result, "dataset_info", None)
     if not isinstance(terminal_infos, (tuple, list)) or not terminal_infos:
         raise ValueError(
@@ -1803,7 +1482,6 @@ def residual_bootstrap_result(
             "status": "available",
             "lower": float(interval[0]),
             "upper": float(interval[1]),
-            "construction": "equal-tailed percentile interval",
         }
 
     return finish(build_result(

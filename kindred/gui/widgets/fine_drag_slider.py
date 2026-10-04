@@ -56,6 +56,10 @@ class FineDragSlider(QtWidgets.QSlider):
         if QtGui.QCursor.pos() != self._pointer_origin:
             QtGui.QCursor.setPos(self._pointer_origin)
 
+    def wheelEvent(self, event: QtGui.QWheelEvent) -> None:
+        # The wheel scrolls the Sliders pane; it never changes a value.
+        event.ignore()
+
     def mousePressEvent(self, event: QtGui.QMouseEvent) -> None:
         if (
             event.button() == QtCore.Qt.MouseButton.LeftButton

@@ -1,14 +1,14 @@
 """
-Dynamic evaluator for the Algebra DSL with per-time memoization.
+Dynamic evaluator for the Algebra DSL.
 
 Current contract
 ----------------
-- Dynamic evaluation per time t with memoization keyed by (t, symbol).
+- Dynamic evaluation per time t.
 - [A] pulls series at time t; [A]_0 pulls initial concentration.
 - Builtins/helpers and protected symbols: see symbols.py and constants.py.
 - No shadowing of species or builtins for user-defined algebra symbols (E120).
 - Error taxonomy uses the algebra error classes and codes defined in errors.py.
-- Static vs dynamic: expressions independent of [X] terms fold to scalars.
+- Static vs dynamic: lets independent of [X] terms evaluate to scalars.
 
 Out of scope
 ------------
@@ -24,6 +24,7 @@ Constraints
 from __future__ import annotations
 
 import logging
+import math
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Mapping, Optional, Set, Tuple
 
@@ -85,8 +86,8 @@ class EvaluationContext:
     species_names : set
         Declared species names (for shadow checks).
     symtab : SymbolTable
-        Protected symbols and scalar user symbols. `T` is read-only and may be
-        updated by the application, not by user algebra.
+        Protected symbols. `T` is read-only and may be updated by the
+        application, not by user algebra.
     symbol_series : mapping, optional
         Row-aligned runtime symbols.  These values are resolved before the
         static symbol table and are intended for step-local ``t``, ``T``,
@@ -209,11 +210,11 @@ class _Evaluator:
             str(name): float(value)
             for name, value in (ctx.symbol_values or {}).items()
         }
-        # memo[(i, name)] = float
-        self.memo: Dict[Tuple[int, str], float] = {}
         # results
         self.series: Dict[str, np.ndarray] = {}
         self.scalars: Dict[str, float] = {}
+        # lets whose partial evaluation failed
+        self.failed: Set[str] = set()
         # dependency classification for user-defined symbols
         # Runtime row-aligned symbols are dynamic roots even when their values
         # happen to be constant over one particular grid.
@@ -222,11 +223,10 @@ class _Evaluator:
     def _scalar_let_names(self) -> Set[str]:
         """Classify the complete retained let DAG by row dependence.
 
-        Parser static folding is intentionally conservative and only covers
-        literal RHS trees.  A retained identifier can nevertheless refer to a
-        scalar let several edges away, so classifying one statement from the
-        current output dictionaries makes an equivalent expression a series.
-        Resolve the retained dependency graph recursively instead; a let is
+        A retained identifier can refer to a scalar let several edges away,
+        so classifying one statement from the current output dictionaries
+        makes an equivalent expression a series.  Resolve the retained
+        dependency graph recursively instead; a let is
         row-varying only when its transitive closure reaches a current species,
         time, or row-aligned runtime symbol.
         """
@@ -280,9 +280,8 @@ class _Evaluator:
                 # transitive constants and immediate binary/domain failures.
                 val = _as_float(self._eval_expr(stmt.expr, 0, stmt=stmt), stmt=stmt)
                 self.scalars[name] = val
-                self.ctx.symtab.define_user(name, val, species_names=self.ctx.species_names)
             else:
-                # Compute series across t with memo
+                # Compute series across t
                 arr = np.empty(self.N, dtype=float)
                 for i in range(self.N):
                     if i % 256 == 0:
@@ -316,7 +315,6 @@ class _Evaluator:
                 if not is_dyn:
                     val = _as_float(self._eval_expr(stmt.expr, 0, stmt=stmt), stmt=stmt)
                     self.scalars[name] = val
-                    self.ctx.symtab.define_user(name, val, species_names=self.ctx.species_names)
                     continue
 
                 arr = np.empty(self.N, dtype=float)
@@ -329,8 +327,7 @@ class _Evaluator:
                 raise
             except Exception as exc:
                 errors.append(AlgebraObservableError.from_exception(name, exc, stmt=stmt))
-                self.series.pop(name, None)
-                self.scalars.pop(name, None)
+                self.failed.add(name)
                 continue
 
         self.ctx.check_cancelled()
@@ -364,14 +361,9 @@ class _Evaluator:
             # user-defined scalar
             if name in self.scalars:
                 return float(self.scalars[name])
-            # user-defined series: memoize by (i, name)
+            # user-defined series
             if name in self.series:
-                key = (i, name)
-                if key in self.memo:
-                    return self.memo[key]
-                val = float(self.series[name][i])
-                self.memo[key] = val
-                return val
+                return float(self.series[name][i])
             if name == "t":
                 return float(self.ctx.t[i])
             # Accepted runtime context takes precedence over the static table,
@@ -396,9 +388,14 @@ class _Evaluator:
                         )
                     self.symbol_series[name] = arr
                     return float(arr[i])
-            # protected or previously defined user scalar in symtab
+            # protected symbol in symtab
             if self.ctx.symtab.has(name):
                 return float(self.ctx.symtab.get(name))
+            if name in self.failed:
+                raise AlgebraNameError(
+                    f"depends on {name!r}, which could not be calculated",
+                    line=stmt.line, col=stmt.col, line_text=stmt.line_text,
+                )
             # unknown
             raise AlgebraNameError(f"unknown symbol {name!r}", line=stmt.line, col=stmt.col, line_text=stmt.line_text)
 
@@ -453,7 +450,10 @@ class _Evaluator:
                         raise AlgebraZeroDivError("division by zero", line=stmt.line, col=stmt.col, line_text=stmt.line_text)
                     return _as_float(lv / rv, stmt=stmt)
                 if op in ("**", "^"):
-                    return _as_float(lv ** rv, stmt=stmt)
+                    if lv == 0.0 and rv < 0.0:
+                        # Keep Python's clearer wording; math.pow says "domain error".
+                        raise ZeroDivisionError("0.0 cannot be raised to a negative power")
+                    return _as_float(math.pow(lv, rv), stmt=stmt)
                 if op == "==":
                     return lv == rv
                 if op == "!=":
@@ -725,7 +725,6 @@ def evaluate_block(
     -----
     - The caller should merge species series with returned algebra series
       when constructing SimulationResult.
-    - Memoization is internal and keyed by (t_index, symbol) for series references.
     """
     ctx.check_cancelled()
     # Validate basic shapes once, early

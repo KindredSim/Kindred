@@ -23,16 +23,12 @@ __all__ = [
     "ScientificNameHeaderView",
     "clamp_initial_size",
     "make_bounded_label",
-    "make_placeholder_label",
     "make_scroll_area",
     "set_bounded_label_text",
     "set_compact_label_text",
 ]
 
 
-_PLACEHOLDER_LABEL_STYLE = (
-    "QLabel { font-style: italic; background: transparent; padding: 0px; }"
-)
 DEFAULT_DYNAMIC_LABEL_MAX_WIDTH = 220
 DEFAULT_COMPACT_LABEL_MAX_CHARS = DATASET_LIST_LABEL_MAX_CHARS
 DEFAULT_COMPACT_LABEL_MAX_WIDTH = 220
@@ -174,13 +170,6 @@ def make_scroll_area(parent: Optional[QtWidgets.QWidget] = None) -> QtWidgets.QS
     scroll.setWidgetResizable(True)
     scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
     return scroll
-
-
-def make_placeholder_label(text: str, parent: Optional[QtWidgets.QWidget] = None) -> QtWidgets.QLabel:
-    label = QtWidgets.QLabel(str(text), parent)
-    label.setAlignment(QtCore.Qt.AlignCenter)
-    label.setStyleSheet(_PLACEHOLDER_LABEL_STYLE)
-    return label
 
 
 def _apply_non_layout_bearing_label_policy(label: QtWidgets.QLabel, *, max_width: int) -> None:

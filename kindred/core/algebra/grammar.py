@@ -76,7 +76,7 @@ class TokenKind(str, Enum):
     GTE = "GTE"              # >=
 
 # ----------------------------- lexical spec (data only) ----------------------
-# Intended for a future lexer. Order matters for maximal munch on multi-char ops.
+# Used by the parser's lexer. Order matters for maximal munch on multi-char ops.
 
 # Regex fragments are Python-style, but this module performs no lexing itself.
 # Whitespace (spaces/tabs) should be skipped by the lexer; NEWLINEs are tokens.

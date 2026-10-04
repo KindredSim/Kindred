@@ -85,7 +85,7 @@ class MechanismHighlighter(QtGui.QSyntaxHighlighter):
         # 5. Declaration and intervention keywords
         keywords = [
             'init', 'initial', 'time',
-            'temp_step', 'temp_response', 'state', 'edge', 'intervention',
+            'temp_step', 'temp_response', 'intervention',
             'trigger', 'watch_species', 'watch_observable', 'threshold',
             'threshold_param', 'direction', 'rising', 'falling', 'either',
             'then', 'stop',

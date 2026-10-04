@@ -4,7 +4,7 @@ Inline Axis Toolbar widget.
 Control-surface contract
 ------------------------
 - X dropdown: typed simulation or experimental identity, with `t` by default.
-- Y multi-select: all time-varying species and algebra series. Scalars disabled.
+- Y multi-select: all time-varying species and algebra series.
 - Display units and a separate row of compact manual axis limits.
 
 This widget provides a deterministic, fully functional control strip with:
@@ -21,7 +21,7 @@ unitChanged(axis: str, unit: str)
 Public API
 ----------
 set_x_candidates(candidates, *, selected)
-set_y_candidates(candidates, *, disabled=(), locked_checked=None)
+set_y_candidates(candidates, *, locked_checked=None)
 selected_y() -> tuple[AxisSeriesSelection, ...]
 current_x() -> AxisSeriesSelection
 set_manual_range_controls(*, auto_x: bool, auto_y: bool, enabled: bool) -> None
@@ -222,22 +222,7 @@ class AxisToolbar(QtWidgets.QWidget):
         """Render one already-reconciled typed X selection exactly."""
 
         values = tuple(candidates)
-        if any(not isinstance(item, AxisSelectionCandidate) for item in values):
-            raise TypeError(
-                "X candidates must contain AxisSelectionCandidate values."
-            )
         identities = tuple(item.selection for item in values)
-        if len(identities) != len(set(identities)):
-            raise ValueError("X candidate identities must be unique.")
-        if not isinstance(
-            selected,
-            (SimulationSeriesAxisSelection, ExperimentalAxisSelection, VesselVolumeAxisSelection),
-        ):
-            raise TypeError("Selected X must be a typed axis identity.")
-        if selected not in identities:
-            raise ValueError(
-                "Selected X must already be reconciled into the candidate roster."
-            )
         self._x_combo.blockSignals(True)
         try:
             self._x_combo.clear()
@@ -255,7 +240,6 @@ class AxisToolbar(QtWidgets.QWidget):
         self,
         candidates: Sequence[tuple[AxisSelectionCandidate, bool]],
         *,
-        disabled: Sequence[AxisSeriesSelection] = (),
         locked_checked: Mapping[AxisSeriesSelection, str] | None = None,
     ) -> None:
         """
@@ -265,51 +249,12 @@ class AxisToolbar(QtWidgets.QWidget):
         ----------
         candidates
             Typed candidates paired with their projected checked state.
-        disabled
-            Typed identities that must remain visible but not selectable.
         locked_checked
             Derived overlay identities that remain checked and emit no
             authored Y selection, mapped to their model-series identity.
         """
         values = tuple(candidates)
-        if any(
-            not isinstance(candidate, AxisSelectionCandidate)
-            or type(checked) is not bool
-            for candidate, checked in values
-        ):
-            raise TypeError(
-                "Y candidates must pair AxisSelectionCandidate with bool."
-            )
-        identities = tuple(candidate.selection for candidate, _ in values)
-        if len(identities) != len(set(identities)):
-            raise ValueError("Y candidate identities must be unique.")
-        disabled_set = set(disabled)
         locked_checked_by_identity = dict(locked_checked or {})
-        if any(identity not in identities for identity in disabled_set):
-            raise ValueError("Disabled Y identities must exist in candidates.")
-        if any(
-            not isinstance(identity, ExperimentalAxisSelection)
-            or identity not in identities
-            for identity in locked_checked_by_identity
-        ):
-            raise ValueError(
-                "Locked-checked Y identities must be active experimental "
-                "candidates."
-            )
-        if disabled_set.intersection(locked_checked_by_identity):
-            raise ValueError(
-                "Disabled and locked-checked Y identities must be distinct."
-            )
-        for model_identity in locked_checked_by_identity.values():
-            if (
-                type(model_identity) is not str
-                or not model_identity
-                or model_identity != model_identity.strip()
-            ):
-                raise ValueError(
-                    "Locked-checked Y model identities must be nonblank "
-                    "edge-normalized strings."
-                )
         self._locked_checked_y = frozenset(locked_checked_by_identity)
 
         self._y_list.blockSignals(True)
@@ -322,12 +267,7 @@ class AxisToolbar(QtWidgets.QWidget):
                 candidate.selection,
             )
             it.setFlags(it.flags() | Qt.ItemFlag.ItemIsUserCheckable)
-            # Disable scalars as Y selections per spec
-            if candidate.selection in disabled_set:
-                it.setFlags(it.flags() & ~Qt.ItemFlag.ItemIsEnabled)
-                it.setToolTip(literal_tooltip(candidate.label + "\nScalar values cannot be plotted as Y."))
-                it.setCheckState(Qt.CheckState.Unchecked)
-            elif candidate.selection in locked_checked_by_identity:
+            if candidate.selection in locked_checked_by_identity:
                 it.setFlags(
                     it.flags() & ~Qt.ItemFlag.ItemIsUserCheckable
                 )
@@ -411,16 +351,13 @@ class AxisToolbar(QtWidgets.QWidget):
             del blocker
 
     def invert_y_selection(self) -> None:
-        """Invert enabled Y-series rows while leaving disabled scalar rows unchecked."""
+        """Invert Y-series rows; locked overlay rows stay checked."""
         self._y_list.blockSignals(True)
         for i in range(self._y_list.count()):
             it = self._y_list.item(i)
             selection = it.data(Qt.ItemDataRole.UserRole)
             if selection in self._locked_checked_y:
                 it.setCheckState(Qt.CheckState.Checked)
-                continue
-            if not (it.flags() & Qt.ItemFlag.ItemIsEnabled):
-                it.setCheckState(Qt.CheckState.Unchecked)
                 continue
             next_state = (
                 Qt.CheckState.Unchecked
@@ -436,10 +373,7 @@ class AxisToolbar(QtWidgets.QWidget):
         out: list[AxisSeriesSelection] = []
         for i in range(self._y_list.count()):
             it = self._y_list.item(i)
-            if (
-                it.flags() & Qt.ItemFlag.ItemIsEnabled
-                and it.checkState() == Qt.CheckState.Checked
-            ):
+            if it.checkState() == Qt.CheckState.Checked:
                 selection = it.data(Qt.ItemDataRole.UserRole)
                 if not isinstance(
                     selection,
@@ -574,12 +508,7 @@ class AxisToolbar(QtWidgets.QWidget):
         selected_labels = [
             self._y_list.item(index).text()
             for index in range(self._y_list.count())
-            if (
-                self._y_list.item(index).flags()
-                & Qt.ItemFlag.ItemIsEnabled
-                and self._y_list.item(index).checkState()
-                == Qt.CheckState.Checked
-            )
+            if self._y_list.item(index).checkState() == Qt.CheckState.Checked
         ]
         if not selected_labels:
             summary = "Y: none"

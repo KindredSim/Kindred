@@ -511,6 +511,12 @@ class ProjectController(QtCore.QObject):
 
         if self._reject_mutation_during_close("Open Project"):
             return False
+        if not os.path.isfile(path):
+            self._show_error(
+                "Open Project Error",
+                f"Could not open project:\n\nThe file does not exist:\n{os.fspath(path)}",
+            )
+            return False
         disposition = self._resolve_disposition("Open Project")
         if disposition is None:
             return False
@@ -645,6 +651,7 @@ class ProjectController(QtCore.QObject):
             "Save Project As",
             self._session.current_path or "",
             "Kindred Project (*.kin)",
+            options=QtWidgets.QFileDialog.Option.DontConfirmOverwrite,
         )
         if not path:
             return None

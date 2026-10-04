@@ -6,7 +6,7 @@ from typing import Any, Callable, Mapping
 
 import numpy as np
 
-from kindred.core.mechanism import Equilibrium, Mechanism
+from kindred.core.mechanism import Mechanism
 from kindred.core.ode_builder import (
     EffectiveRateCoefficientEvaluator,
 )
@@ -173,7 +173,6 @@ def _coefficient_values_by_parameter_name(
 class _EquilibriumParameterNames:
     kf_name: str
     kr_name: str
-    keq_name: str
 
 
 def _canonical_step_parameter_name(
@@ -224,7 +223,6 @@ def _power_product(sympy: Any, symbols: Mapping[str, Any], powers: Mapping[str, 
 
 def _equilibrium_parameter_names(
     mechanism: Mechanism,
-    eq: Equilibrium,
     *,
     equilibrium_index: int,
 ) -> _EquilibriumParameterNames:
@@ -242,18 +240,9 @@ def _equilibrium_parameter_names(
         role="kr",
         expected_name=f"kr{int(equilibrium_index) + 1}",
     )
-    keq_name = _canonical_step_parameter_name(
-        mechanism,
-        kind="equilibrium",
-        item_index=int(equilibrium_index),
-        role="Keq",
-        expected_name=f"Keq{int(equilibrium_index) + 1}",
-    )
-
     return _EquilibriumParameterNames(
         kf_name=kf_name,
         kr_name=kr_name,
-        keq_name=keq_name,
     )
 
 
@@ -347,17 +336,12 @@ def _coefficient_public_parameter_names(
                 expected_name=f"k{reaction_index + 1}",
             )
         reaction_count = len(reactions)
-        for equilibrium_index, equilibrium in enumerate(equilibria):
+        for equilibrium_index in range(len(equilibria)):
             step_index = reaction_count + equilibrium_index
             source = _equilibrium_parameter_names(
                 mechanism,
-                equilibrium,
                 equilibrium_index=equilibrium_index,
             )
-            if source.kf_name is None or source.kr_name is None:
-                raise UnsupportedSymbolicExpressionError(
-                    "Equilibrium public coefficient names are incomplete."
-                )
             public_by_internal[
                 _coefficient_parameter_name(step_index, "forward")
             ] = source.kf_name

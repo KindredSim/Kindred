@@ -164,23 +164,6 @@ class SimulationRequest:
     parameter_values_at_temperature: Callable[[float, tuple[str, ...]], Mapping[str, float]] | None = None
 
     def __post_init__(self) -> None:
-        if not isinstance(
-            self.intervention_execution, InterventionExecutionContract
-        ):
-            raise TypeError(
-                "intervention_execution must be an InterventionExecutionContract."
-            )
-        if not isinstance(self.symbolic_jacobian, SymbolicJacobianExecution):
-            raise TypeError(
-                "symbolic_jacobian must be a SymbolicJacobianExecution."
-            )
-        if self.cancellation_control is not None and not isinstance(
-            self.cancellation_control,
-            SimulationCancellationControl,
-        ):
-            raise TypeError(
-                "cancellation_control must be a SimulationCancellationControl."
-            )
         object.__setattr__(self, "candidate_evaluation", bool(self.candidate_evaluation))
         start = validate_time_seconds(self.t_span[0], field="t_span start")
         end = validate_time_seconds(self.t_span[1], field="t_span end")

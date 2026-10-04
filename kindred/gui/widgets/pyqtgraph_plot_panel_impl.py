@@ -42,7 +42,7 @@ from kindred.gui.ui_helpers import (
 )
 from kindred.gui.interactive_preview import InteractivePreviewRequest
 from kindred.gui.plot_config import (
-    TIME_DISPLAY_UNIT_FACTORS,
+    TIME_DISPLAY_UNITS,
     require_pyqtgraph,
 )
 from kindred.gui.widgets.axis_toolbar import AxisToolbar
@@ -1019,7 +1019,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         self._axis_toolbar.set_axis_unit_choices(
             x_units=tuple(
                 (unit, format_unit_for_display(unit))
-                for unit in TIME_DISPLAY_UNIT_FACTORS
+                for unit in TIME_DISPLAY_UNITS
             ),
             selected_x="s",
             y_units=(),

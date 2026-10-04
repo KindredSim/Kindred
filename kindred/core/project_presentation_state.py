@@ -248,18 +248,11 @@ def default_project_presentation_state(
 
 def default_workspace_presentation_state(
     document: ProjectDocument,
-    *,
-    active_tab_id: str | None = None,
 ) -> WorkspacePresentationState:
-    active = (
-        document.tabs[0].tab_id
-        if active_tab_id is None
-        else str(active_tab_id)
-    )
     return validate_workspace_presentation_state(
         document,
         WorkspacePresentationState(
-            active_tab_id=active,
+            active_tab_id=document.tabs[0].tab_id,
             presentation_by_tab_id=tuple(
                 (
                     tab.tab_id,

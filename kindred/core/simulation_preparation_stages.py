@@ -20,7 +20,6 @@ from kindred.core.scipy_integrate import validate_scipy_rtol
 from kindred.core.symbolic.errors import UnsupportedSymbolicExpressionError
 from kindred.core.symbolic.jacobian_execution import (
     SymbolicJacobianExecution,
-    symbolic_status_payload,
 )
 from kindred.core.temperature import TemperatureSchedule
 from kindred.core.time_grid import normalize_time_grid_policy
@@ -50,10 +49,10 @@ class PreparedSolverConfig:
         solver = normalize_solver_name(solver_input)
         if type(self.atol) is bool or not isinstance(self.atol, Real):
             raise TypeError("Prepared solver atol must be a real number.")
-        rtol = validate_scipy_rtol(self.rtol)
+        rtol = validate_scipy_rtol(self.rtol, field="Relative tolerance")
         atol = float(self.atol)
         if not (np.isfinite(atol) and atol > 0.0):
-            raise ValueError("atol must be finite and > 0.")
+            raise ValueError("Absolute tolerance must be finite and positive.")
         if not isinstance(self.grid, Mapping):
             raise TypeError("Prepared solver grid must be a mapping.")
         if type(self.use_analytic_jacobian) is not bool:
@@ -96,16 +95,7 @@ def build_solver_config(
 def _symbolic_jacobian_status_for_mechanism(mechanism: Any) -> Dict[str, Any]:
     from kindred.core.symbolic.jacobian import classify_symbolic_jacobian_support
 
-    try:
-        support = classify_symbolic_jacobian_support(mechanism)
-    except UnsupportedSymbolicExpressionError as exc:
-        return symbolic_status_payload(
-            kind="jacobian",
-            state="unsupported",
-            code="classification-failed",
-            reason=str(exc),
-        )
-    return dict(support.to_status_payload())
+    return dict(classify_symbolic_jacobian_support(mechanism).to_status_payload())
 
 
 def _symbolic_jacobian_for_bind_failure(
@@ -120,17 +110,12 @@ def _symbolic_jacobian_for_bind_failure(
 
 def _bind_symbolic_jacobian_for_current_mechanism(
     *,
-    mechanism: Any,
     symbolic_structure: Any = None,
-    coefficient_evaluator: Any = None,
+    coefficient_evaluator: Any,
 ) -> SymbolicJacobianExecution:
     structure = symbolic_structure
     if structure is None:
         raise UnsupportedSymbolicExpressionError("symbolic structure is unsupported.")
-    from kindred.core.ode_builder import build_effective_rate_coefficient_evaluator
-
-    if coefficient_evaluator is None:
-        coefficient_evaluator = build_effective_rate_coefficient_evaluator(mechanism)
     jacobian_func = structure.bind(coefficient_evaluator)
     return SymbolicJacobianExecution.supported(jacobian_func=jacobian_func)
 
@@ -141,7 +126,7 @@ def build_prepared_run_context(
     temperature_schedule: TemperatureSchedule | None,
     use_analytic_jacobian: bool,
     symbolic_structure: Any = None,
-    coefficient_evaluator: Any = None,
+    coefficient_evaluator: Any,
 ) -> tuple[
     TemperatureSchedule | None,
     SymbolicJacobianExecution,
@@ -159,14 +144,11 @@ def build_prepared_run_context(
                 reason="Analytic Jacobian preference is disabled.",
             ),
         )
-    symbolic_jacobian = SymbolicJacobianExecution()
-    if not symbolic_jacobian.has_executable_jacobian:
-        try:
-            symbolic_jacobian = _bind_symbolic_jacobian_for_current_mechanism(
-                mechanism=mechanism,
-                symbolic_structure=symbolic_structure,
-                coefficient_evaluator=coefficient_evaluator,
-            )
-        except UnsupportedSymbolicExpressionError as exc:
-            symbolic_jacobian = _symbolic_jacobian_for_bind_failure(mechanism, exc)
+    try:
+        symbolic_jacobian = _bind_symbolic_jacobian_for_current_mechanism(
+            symbolic_structure=symbolic_structure,
+            coefficient_evaluator=coefficient_evaluator,
+        )
+    except UnsupportedSymbolicExpressionError as exc:
+        symbolic_jacobian = _symbolic_jacobian_for_bind_failure(mechanism, exc)
     return resolved_temperature_schedule, symbolic_jacobian

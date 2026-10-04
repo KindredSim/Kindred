@@ -16,7 +16,6 @@ from typing import Any, Dict, Iterable, Iterator, List, Mapping, Optional
 
 from .kinetics import ForwardRateModel
 from .species import Species
-from .stoichiometry import directional_order_fraction
 from .validation import validate_name
 from .equilibrium_rate_authority import (
     EquilibriumRateAuthority,
@@ -144,7 +143,6 @@ class Reaction:
     forward_model: ForwardRateModel
     rate_orders: Mapping[str, float] | None = None
     net_stoich: Mapping[str, float] = field(init=False)
-    order: float = field(init=False)
 
     def __post_init__(self) -> None:
         # dataclass with frozen=True; use object.__setattr__
@@ -167,15 +165,6 @@ class Reaction:
         object.__setattr__(self, "products", FrozenDict(products))
         object.__setattr__(self, "rate_orders", FrozenDict(rate_orders))
         object.__setattr__(self, "net_stoich", FrozenDict(net_stoich))
-        object.__setattr__(
-            self,
-            "order",
-            float(
-                directional_order_fraction(
-                    rate_orders,
-                )
-            ),
-        )
 
     def net_stoich_vector(self, species_order: Iterable[str]) -> List[float]:
         """Vectorize net stoichiometry against a given species order."""

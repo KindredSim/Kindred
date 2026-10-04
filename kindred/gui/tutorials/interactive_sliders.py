@@ -67,7 +67,8 @@ class InteractiveSliders(PracticeLesson):
         return True
 
     def _slider_summary_target(self):
-        controls = self.bundle.slider_panel.layout().itemAt(0).layout()
+        content = self.bundle.slider_panel.layout().itemAt(0).widget()
+        controls = content.layout().itemAt(0).layout()
         return self._panel(controls.itemAtPosition(1, 0).widget(), "interactive_sliders")
 
     def _steps(self) -> tuple[Step, ...]:

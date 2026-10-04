@@ -28,12 +28,11 @@ class QuickStart(PracticeLesson):
         panel = self.bundle.simulation_panel
         settings = self.tab.resolved_execution_settings(self.preset_set)
         try:
-            visible_points = int(panel.num_points_spinbox.cleanText())
+            visible_points = int(panel.points_edit.text())
         except ValueError:
             return False
         return (
-            panel.num_points_spinbox.hasAcceptableInput()
-            and visible_points == settings.integration_points == 100
+            visible_points == settings.integration_points == 100
             and panel.solver_method_combo.currentText() == settings.solver
         )
 
@@ -111,13 +110,12 @@ class QuickStart(PracticeLesson):
                 "solver_points",
                 "Solver and Output Points",
                 "<p>Choose <b>BDF</b> or <b>Radau</b> from <b>Solver</b>. Either works for this exercise.</p>"
-                "<p>For more details on stiff problems and numerical solvers, see <b>(Reference to be added soon)</b>.</p>"
                 "<p><b>Points</b> sets the number of evenly spaced output times, including "
                 "<i>t</i><sub>start</sub> and <i>t</i><sub>end</sub>. It does not set the internal integration steps.</p>"
                 "<p>Set <b>Points</b> to <b>100</b> and press <b>Enter</b>.</p>",
                 lambda: tuple(
                     self._panel(widget, "batch_initial_conditions")
-                    for widget in (self.bundle.simulation_panel.solver_method_combo, self.bundle.simulation_panel.num_points_spinbox)
+                    for widget in (self.bundle.simulation_panel.solver_method_combo, self.bundle.simulation_panel.points_edit)
                 ),
                 self._solver_points_ready,
                 "The solver and output points are ready.",

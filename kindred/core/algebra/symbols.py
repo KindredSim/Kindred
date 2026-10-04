@@ -22,7 +22,7 @@ from __future__ import annotations
 import logging
 import math
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, Mapping, Optional, Set
+from typing import Any, Callable, Dict, Mapping, Set
 
 from ..constants import k_B, h, h_bar, N_A, R
 
@@ -111,8 +111,6 @@ BUILTIN_FUNCTIONS: Dict[str, BuiltinFunction] = {
 # Protected names are read-only within Algebra
 PROTECTED_NAMES: Set[str] = {"k_B", "h", "h_bar", "N_A", "R", "T"}
 
-# Names that cannot be defined by users either (functions)
-PROTECTED_FUNCTION_NAMES: Set[str] = set(BUILTIN_FUNCTIONS.keys())
 
 
 # ----------------------------- symbol table ----------------------------------
@@ -120,23 +118,15 @@ PROTECTED_FUNCTION_NAMES: Set[str] = set(BUILTIN_FUNCTIONS.keys())
 @dataclass
 class SymbolTable:
     """
-    Symbol table exposing protected builtins and a space for user symbols.
-
-    Parameters
-    ----------
-    temperature_K : float
-        Initial temperature for protected symbol `T`. Default 298.15.
+    Symbol table exposing protected builtins.
 
     Behavior
     --------
     - Protected names (constants and T) cannot be shadowed by user code.
     - Built-in function names cannot be used as symbols.
-    - The table stores only scalars for values (evaluator enforces this).
     """
 
-    temperature_K: float = 298.15
     _values: Dict[str, float] = field(default_factory=dict, init=False, repr=False)
-    _user: Dict[str, float] = field(default_factory=dict, init=False, repr=False)
 
     def __post_init__(self) -> None:
         # Initialize protected constants and T
@@ -146,44 +136,18 @@ class SymbolTable:
             "h_bar": float(h_bar),
             "N_A": float(N_A),
             "R": float(R),
-            "T": float(self.temperature_K),
+            "T": 298.15,
         }
-        # User namespace starts empty
-        self._user = {}
 
     # --- lookup --------------------------------------------------------------
 
     def has(self, name: str) -> bool:
-        """Return True if a symbol (protected or user-defined) exists."""
-        return name in self._values or name in self._user
+        """Return True if a protected symbol exists."""
+        return name in self._values
 
     def get(self, name: str) -> float:
         """Get a symbol value, raising KeyError if unknown."""
-        if name in self._values:
-            return self._values[name]
-        return self._user[name]  # raises KeyError as desired
-
-    # --- mutation ------------------------------------------------------------
-
-    def define_user(self, name: str, value: float, *, species_names: Optional[Set[str]] = None) -> None:
-        """
-        Define or overwrite a user symbol.
-
-        Guards
-        ------
-        - Cannot use protected constant names or 'T'.
-        - Cannot use built-in function names.
-        - Cannot shadow a declared species.
-        """
-        if not isinstance(name, str) or not name.strip():
-            raise ValueError("symbol name must be a non-empty string")
-        if name in PROTECTED_NAMES:
-            raise ValueError(f"attempted shadowing of protected symbol {name!r}")
-        if name in PROTECTED_FUNCTION_NAMES:
-            raise ValueError(f"attempted shadowing of builtin function {name!r}")
-        if species_names and name in species_names:
-            raise ValueError(f"attempted shadowing of species {name!r}")
-        self._user[name] = float(value)
+        return self._values[name]
 
     # --- function exposure ---------------------------------------------------
 

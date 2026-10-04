@@ -81,7 +81,6 @@ class ActiveSliderRenderProjection:
     targets: tuple[str, ...]
     species_values: tuple[tuple[str, float], ...]
     mixed_species: frozenset[str]
-    preserve_visibility: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -174,6 +173,8 @@ class TabSliderBinding(QtCore.QObject):
         self._rendering = False
         self._disposed = False
         self._interactive_stop_fenced = False
+        # Stop on a Preview holds until the next slider gesture.
+        self._preview_stopped = False
         self._defer_rejected_slider_restore = False
         self._deferred_restore_pending = False
         self.set_preview_settings(points=preview_points, delay_ms=preview_delay_ms)
@@ -223,7 +224,7 @@ class TabSliderBinding(QtCore.QObject):
         if self._deferred_restore_pending:
             self._deferred_restore_pending = False
             if not self._disposed:
-                self.render(preserve_visibility=True)
+                self.render()
 
     def set_preview_settings(self, *, points: int, delay_ms: int) -> None:
         self._preview_points = points
@@ -312,6 +313,7 @@ class TabSliderBinding(QtCore.QObject):
         defer_rejected_restore: bool,
         gesture_capture: _PreviewPreflight | None,
     ) -> bool:
+        self._preview_stopped = False
         self._cancel_deferred_restore()
         self._defer_rejected_slider_restore = defer_rejected_restore
         try:
@@ -364,9 +366,7 @@ class TabSliderBinding(QtCore.QObject):
             dirty or self._variable_sliders.has_rejected_editor_text(),
         )
 
-    def prepare_render(
-        self, *, preserve_visibility: bool = True
-    ) -> ActiveSliderRenderProjection:
+    def prepare_render(self) -> ActiveSliderRenderProjection:
         tab, runtime = (
             self._registry.tab(self._tab_id),
             self._registry.tab_runtime(self._tab_id),
@@ -401,7 +401,6 @@ class TabSliderBinding(QtCore.QObject):
             targets,
             tuple(species.items()),
             mixed,
-            bool(preserve_visibility),
         )
 
     def apply_render_projection(
@@ -418,14 +417,12 @@ class TabSliderBinding(QtCore.QObject):
             self._variable_sliders.render_values(
                 dict(prepared.parameter_values),
                 metadata=prepared.projection.metadata_dict(),
-                preserve_visibility=prepared.preserve_visibility,
                 preserve_editor_drafts=preserve_editor_drafts,
             )
             self._species_sliders.render_values(
                 dict(prepared.species_values),
                 target_set_ids=prepared.targets,
                 mixed_species=prepared.mixed_species,
-                preserve_visibility=prepared.preserve_visibility,
                 preserve_editor_drafts=preserve_editor_drafts,
             )
         finally:
@@ -447,18 +444,18 @@ class TabSliderBinding(QtCore.QObject):
                 return
             self._exact_preview_capture = None
         runtime = self._registry.tab_runtime(prepared.tab.tab_id)
-        if runtime.slider_parameter_draft or runtime.slider_species_drafts_by_set_id:
+        if not self._preview_stopped and (
+            runtime.slider_parameter_draft or runtime.slider_species_drafts_by_set_id
+        ):
             self._begin_preview_cycle(
                 prepared.tab,
                 prepared.targets,
                 interaction=SliderInteractionKind.EXACT_TYPED_COMMIT,
             )
 
-    def render(
-        self, *, preserve_visibility: bool = True, preserve_editor_drafts: bool = True
-    ) -> bool:
+    def render(self, *, preserve_editor_drafts: bool = True) -> bool:
         try:
-            prepared = self.prepare_render(preserve_visibility=preserve_visibility)
+            prepared = self.prepare_render()
             self.apply_render_projection(
                 prepared, preserve_editor_drafts=preserve_editor_drafts
             )
@@ -477,8 +474,8 @@ class TabSliderBinding(QtCore.QObject):
             QtCore.QSignalBlocker(self._species_sliders),
         )
         try:
-            self._variable_sliders.clear(preserve_visibility=True)
-            self._species_sliders.clear(preserve_visibility=True)
+            self._variable_sliders.clear()
+            self._species_sliders.clear()
         finally:
             del sb
             del vb
@@ -876,6 +873,7 @@ class TabSliderBinding(QtCore.QObject):
             )
 
     def discard_slider_draft(self, *, render: bool = True) -> bool:
+        self._preview_stopped = False
         runtime = self._registry.tab_runtime(self._tab_id)
         changed = bool(
             runtime.slider_parameter_draft or runtime.slider_species_drafts_by_set_id
@@ -920,11 +918,13 @@ class TabSliderBinding(QtCore.QObject):
         self._clear_gesture_state()
         return changed
 
-    def settle_stop(self) -> bool:
+    def settle_stop(self, *, hold: bool) -> bool:
         changed = self._simulation_jobs.retire_preview(
             self._tab_id, self.resolve_target_set_ids()
         )
         self._exact_preview_capture = None
+        if hold:
+            self._preview_stopped = True
         return bool(changed)
 
     def _build_slider_candidate(
@@ -1049,6 +1049,7 @@ class TabSliderBinding(QtCore.QObject):
         return True
 
     def reset(self) -> bool:
+        self._preview_stopped = False
         runtime = self._registry.tab_runtime(self._tab_id)
         targets = self.resolve_target_set_ids()
         changed = bool(
@@ -1089,7 +1090,7 @@ class TabSliderBinding(QtCore.QObject):
         if self._defer_rejected_slider_restore:
             self._queue_rejected_slider_restore()
         elif self._active_drag is None:
-            self.render(preserve_visibility=True)
+            self.render()
         return False
 
     def _reject_slider_action(self, message: str) -> bool:

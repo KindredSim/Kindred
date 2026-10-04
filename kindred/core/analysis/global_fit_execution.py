@@ -36,7 +36,6 @@ from kindred.core.analysis.parametric_alignment import (
     project_parametric_y,
 )
 from kindred.core.analysis.dataset_parameter_overrides import (
-    FIT_SCOPE_CENTRED_FIXED_EFFECTS,
     FitCentredFixedEffectsParamSpec,
     FitCoupledVariableParamSpec,
     FitDatasetParameterOverrides,
@@ -325,11 +324,6 @@ class FitProgress:
             MappingProxyType(transient),
         )
 
-    def compact(self) -> "FitProgress":
-        """Drop callback-transient curves before retaining best-candidate custody."""
-
-        return replace(self, transient_simulation_results_by_dataset={})
-
 
 @dataclass(frozen=True, slots=True)
 class DatasetFitInfo:
@@ -519,12 +513,6 @@ class GlobalFitResult:
                 "GlobalFitResult rosters must exactly match the ordered included datasets."
             )
         object.__setattr__(self, "dataset_info", tuple(self.dataset_info))
-
-    @property
-    def cost(self) -> FitMetric:
-        """Return factual terminal cost, never an optimizer penalty."""
-
-        return self.weighted_residual_sse
 
 
 @dataclass(frozen=True, slots=True)
@@ -913,7 +901,6 @@ class FitParameterLayout:
     centred_var_order: tuple[FitCentredFixedEffectsParamSpec, ...] = ()
     centred_overall_index: Mapping[str, int] = field(default_factory=dict)
     centred_deviation_index: Mapping[tuple[str, str], int] = field(default_factory=dict)
-    scope: str = "ordinary"
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -997,14 +984,6 @@ class FitParameterLayout:
             values = np.asarray(getattr(self, name), dtype=float).reshape(-1).copy()
             values.setflags(write=False)
             object.__setattr__(self, name, values)
-        scope = str(self.scope or "ordinary")
-        if scope == "ordinary" and centred_order:
-            scope = FIT_SCOPE_CENTRED_FIXED_EFFECTS
-        if scope not in {"ordinary", FIT_SCOPE_CENTRED_FIXED_EFFECTS}:
-            raise ValueError(f"Unsupported Fit layout scope: {scope!r}")
-        if scope == FIT_SCOPE_CENTRED_FIXED_EFFECTS and not centred_order:
-            raise ValueError("Centred Fit layout scope requires centred coordinates.")
-        object.__setattr__(self, "scope", scope)
 
     def _coordinate_keys(self) -> tuple[FitCoordinate, ...]:
         keys = tuple(FitCoordinate("shared", name) for name in self.param_names)
@@ -1523,7 +1502,6 @@ def build_parameter_layout_for_dataset_ids(
         centred_var_order=centred_order,
         centred_overall_index=centred_overall_index,
         centred_deviation_index=centred_deviation_index,
-        scope=(FIT_SCOPE_CENTRED_FIXED_EFFECTS if centred_order else "ordinary"),
     )
 
 
@@ -1966,12 +1944,6 @@ class GlobalFitObjective:
         self._best_vector: np.ndarray | None = None
         self.best_complete_facts: tuple[DatasetFitInfo, ...] = ()
         self._warned_objective_keys: set[tuple[str, str, str]] = set()
-
-    @property
-    def objective_calls(self) -> int:
-        """Number of distinct candidate objective calls made by this owner."""
-
-        return int(self._objective_calls)
 
     def evaluate_scientific_residuals(
         self,

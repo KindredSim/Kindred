@@ -1201,7 +1201,10 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
                 )
                 if previous_mode not in {value for _label, value, _tip in _VARY_IC_CHOICES}:
                     previous_mode = "disabled"
-            combo.setCurrentIndex(max(0, combo.findData(previous_mode)))
+            # Restore without re-entering this handler, which would rewrite
+            # the row's bounds for the restored mode.
+            with QtCore.QSignalBlocker(combo):
+                combo.setCurrentIndex(max(0, combo.findData(previous_mode)))
             self._set_vary_ic_combo_tooltip(combo)
             self._set_footer_error(_ZERO_IC_PERCENT_MESSAGE)
             self.statusMessage.emit(_ZERO_IC_PERCENT_MESSAGE)
@@ -2123,10 +2126,6 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
     @property
     def invalid_editor_keys(self) -> tuple[tuple[str, ...], ...]:
         return tuple(sorted((*self._invalid_raw, *self._invalid_initial_raw)))
-
-    @property
-    def invalid_raw_values(self) -> dict[tuple[str, ...], str]:
-        return dict(self._invalid_raw)
 
 
 __all__ = ["UnifiedSpeciesTable"]

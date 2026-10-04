@@ -37,13 +37,8 @@ def iter_canonical_parameters(mechanism: object) -> Iterator[Tuple[str, Dict[str
     step_map = get_step_index_map(mechanism)
     namespace = build_namespace_from_mechanism(mechanism)
     for item in namespace.ordered_items:
-        if item.source_index is None:
-            continue
         entry = step_map[int(item.source_index)]
-        role = item.info.role
-        if role is None:
-            continue
-        yield (item.canonical_name, entry, role)
+        yield (item.canonical_name, entry, item.info.role)
 
 
 def lookup_source_coordinate_target(

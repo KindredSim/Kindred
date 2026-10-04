@@ -346,9 +346,6 @@ class TemplateManager:
     def get_all_templates(self) -> List[Template]:
         return list(self._templates.values())
 
-    def get_templates_by_category(self, category: str) -> List[Template]:
-        return [template for template in self._templates.values() if template.category == category]
-
     def get_categories(self) -> List[str]:
         return sorted({template.category for template in self._templates.values()})
 

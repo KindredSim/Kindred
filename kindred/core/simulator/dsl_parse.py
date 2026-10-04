@@ -163,25 +163,6 @@ class DslSourceOrigin:
     coordinates: tuple[DslSourceCoordinate, ...] = ()
 
     def __post_init__(self) -> None:
-        if (
-            type(self.authored_ordinal) is not int
-            or self.authored_ordinal < 0
-        ):
-            raise ValueError("DSL origin ordinal must be a non-negative int.")
-        if type(self.source_text) is not str:
-            raise TypeError("DSL origin source text must be an exact string.")
-        if type(self.physical_line_index) is not int or self.physical_line_index < 0:
-            raise ValueError("DSL origin physical line index must be non-negative.")
-        if self.step_index is not None and (
-            type(self.step_index) is not int or self.step_index <= 0
-        ):
-            raise ValueError("DSL origin step index must be a positive int or None.")
-        if type(self.coordinates) is not tuple or any(
-            type(item) is not DslSourceCoordinate for item in self.coordinates
-        ):
-            raise TypeError(
-                "DSL origin coordinates must be an exact tuple of DslSourceCoordinate values."
-            )
         seen_coordinate_identities: set[tuple[str, str]] = set()
         for coordinate in self.coordinates:
             identity = (coordinate.canonical_name, coordinate.role)
@@ -203,22 +184,6 @@ class DslParameterCoordinateUpdate:
     name: str
     value: float
 
-    def __post_init__(self) -> None:
-        if (
-            type(self.name) is not str
-            or not self.name
-            or self.name != self.name.strip()
-        ):
-            raise ValueError(
-                "DSL parameter update name must be an exact nonempty string."
-            )
-        if type(self.value) not in {int, float}:
-            raise TypeError("DSL parameter update value must be an exact number.")
-        value = float(self.value)
-        if not math.isfinite(value):
-            raise ValueError("DSL parameter update value must be finite.")
-        object.__setattr__(self, "value", value)
-
 
 _DSL_IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
@@ -230,25 +195,6 @@ class DslInitialConditionAssignment:
     species: str
     value: float
 
-    def __post_init__(self) -> None:
-        if (
-            type(self.species) is not str
-            or not _DSL_IDENTIFIER_RE.fullmatch(self.species)
-        ):
-            raise ValueError(
-                "Inline initial-condition species must be an identifier."
-            )
-        if type(self.value) not in {int, float}:
-            raise TypeError(
-                "Inline initial-condition values must be exact numbers."
-            )
-        value = float(self.value)
-        try:
-            value = validate_concentration(value, field="initial concentration")
-        except ValueError as exc:
-            raise ValueError(str(exc)) from exc
-        object.__setattr__(self, "value", value)
-
 
 @dataclass(frozen=True, slots=True)
 class DslInitialConditionDeclaration:
@@ -258,31 +204,6 @@ class DslInitialConditionDeclaration:
     source_name: str | None
     assignments: tuple[DslInitialConditionAssignment, ...]
 
-    def __post_init__(self) -> None:
-        if self.source_kind not in {"named", "anonymous"}:
-            raise ValueError(
-                "Inline initial-condition kind must be named or anonymous."
-            )
-        if self.source_kind == "named":
-            if (
-                type(self.source_name) is not str
-                or not _DSL_IDENTIFIER_RE.fullmatch(self.source_name)
-            ):
-                raise ValueError(
-                    "Named initial-condition set names must be identifiers."
-                )
-        elif self.source_name is not None:
-            raise ValueError(
-                "Anonymous initial-condition declarations have no source name."
-            )
-        if type(self.assignments) is not tuple or any(
-            type(item) is not DslInitialConditionAssignment
-            for item in self.assignments
-        ):
-            raise TypeError(
-                "Inline initial-condition assignments must be an exact tuple."
-            )
-
 
 @dataclass(frozen=True, slots=True)
 class DslInitialConditionAdmission:
@@ -290,51 +211,6 @@ class DslInitialConditionAdmission:
 
     declarations: tuple[DslInitialConditionDeclaration, ...] = ()
     materialized_source: str = ""
-
-    def __post_init__(self) -> None:
-        if type(self.declarations) is not tuple or any(
-            type(item) is not DslInitialConditionDeclaration
-            for item in self.declarations
-        ):
-            raise TypeError(
-                "Inline initial-condition declarations must be an exact tuple."
-            )
-        if type(self.materialized_source) is not str:
-            raise TypeError(
-                "Materialized inline initial-condition source must be text."
-            )
-        names = [
-            declaration.source_name.casefold()
-            for declaration in self.declarations
-            if declaration.source_name is not None
-        ]
-        if len(names) != len(set(names)):
-            raise ValueError(
-                "Inline initial-condition set names must be unique."
-            )
-        named_species: dict[str, set[str]] = {}
-        anonymous_species: set[str] = set()
-        for declaration in self.declarations:
-            seen = (
-                named_species.setdefault(
-                    str(declaration.source_name).casefold(),
-                    set(),
-                )
-                if declaration.source_kind == "named"
-                else anonymous_species
-            )
-            for assignment in declaration.assignments:
-                if assignment.species in seen:
-                    scope = (
-                        f"set {declaration.source_name!r}"
-                        if declaration.source_kind == "named"
-                        else "the anonymous initial-condition set"
-                    )
-                    raise ValueError(
-                        "Duplicate inline initial-condition assignment for "
-                        f"species {assignment.species!r} in {scope}."
-                    )
-                seen.add(assignment.species)
 
     @property
     def has_declarations(self) -> bool:
@@ -361,74 +237,10 @@ class DslAnalysis:
     energy_unit: str
 
     def __post_init__(self) -> None:
-        if type(self.normalized_text) is not str:
-            raise TypeError("Normalized DSL text must be an exact string.")
-        if type(self.origins) is not tuple or any(
-            type(item) is not DslSourceOrigin for item in self.origins
-        ):
-            raise TypeError(
-                "DSL origins must be an exact tuple of DslSourceOrigin values."
-            )
-        if tuple(item.authored_ordinal for item in self.origins) != tuple(
-            range(len(self.origins))
-        ):
-            raise ValueError("DSL origin ordinals must be contiguous.")
-        seen_coordinates: set[tuple[str, str]] = set()
-        for origin in self.origins:
-            for coordinate in origin.coordinates:
-                identity = (coordinate.canonical_name, coordinate.role)
-                if identity in seen_coordinates:
-                    raise ValueError(
-                        "DSL source coordinate identities must be unique."
-                    )
-                seen_coordinates.add(identity)
-        for attr, label in (
-            ("species_names", "species"),
-            ("observable_names", "observable"),
-        ):
-            values = getattr(self, attr)
-            if type(values) is not tuple or any(
-                type(item) is not str
-                or not item
-                or item != item.strip()
-                for item in values
-            ):
-                raise TypeError(
-                    f"DSL {label} names must be an exact tuple of "
-                    "nonempty strings."
-                )
-            if len(set(values)) != len(values):
-                raise ValueError(f"DSL {label} names must be unique.")
         if set(self.species_names) & set(self.observable_names):
             raise ValueError(
                 "DSL observable names must not duplicate model species names."
             )
-        if type(self.inline_initial_conditions) is not DslInitialConditionAdmission:
-            raise TypeError(
-                "DSL inline initial conditions must be one typed admission."
-            )
-        if type(self.temperature_K) not in {int, float} or isinstance(
-            self.temperature_K, bool
-        ):
-            raise TypeError("DSL analysis temperature_K must be numeric.")
-        temperature_K = float(self.temperature_K)
-        try:
-            temperature_K = validate_temperature(
-                temperature_K,
-                field="DSL analysis temperature_K",
-            )
-        except ValueError as exc:
-            raise ValueError(str(exc)) from exc
-        object.__setattr__(self, "temperature_K", temperature_K)
-        if type(self.energy_unit) is not str:
-            raise TypeError("DSL analysis energy_unit must be an exact string.")
-        try:
-            energy_unit = normalize_energy_unit(self.energy_unit)
-        except ValueError as exc:
-            raise ValueError(
-                f"DSL analysis energy_unit is invalid: {self.energy_unit!r}."
-            ) from exc
-        object.__setattr__(self, "energy_unit", energy_unit)
 
 
 class PreparedDslRequestSet:
@@ -457,17 +269,6 @@ class PreparedDslRequestSet:
         intervention_execution: InterventionExecutionContract | None,
         parameter_algebra_spec: object,
     ) -> None:
-        from kindred.core.intervention_schedule import InterventionSchedule
-        from kindred.core.intervention_schedule_compiler import (
-            InterventionExecutionContract,
-        )
-
-        if type(analysis) is not DslAnalysis:
-            raise TypeError("analysis must be DslAnalysis.")
-        if intervention_schedule is not None and type(intervention_schedule) is not InterventionSchedule:
-            raise TypeError("Parameterized intervention authority must be an exact InterventionSchedule.")
-        if intervention_execution is not None and not isinstance(intervention_execution, InterventionExecutionContract):
-            raise TypeError("Literal intervention authority must be an InterventionExecutionContract.")
         if intervention_schedule is not None:
             if not intervention_schedule.is_parameterized:
                 raise ValueError("Only a parameterized intervention schedule may remain declarative on prepared DSL state.")
@@ -636,7 +437,7 @@ def _parse_keyvals(
         if not chunk.strip():
             continue
         if "=" not in chunk:
-            # tolerate stray tokens like "state=..." lines; raise for truly malformed
+            # every chunk must be a key=value pair
             raise invalid_keyvalue_pair_error(chunk)
         k, v = chunk.split("=", 1)
         raw_key = k.strip()
@@ -665,6 +466,14 @@ def _parse_keyvals(
     return out
 
 
+def _ambiguous_stoichiometry_error(text: str) -> _DSLError:
+    return _DSLError(
+        f"Ambiguous stoichiometry {text.strip()!r}: separate coefficients from "
+        "species with spaces, as in '2E + 2S' or '2 E2S', or write a "
+        "scientific-notation coefficient with '*', as in '2e2*S'."
+    )
+
+
 def _parse_species_side(text: str) -> Dict[str, float]:
     """
     Parse a side like "A + 2B + 0.5*C" into {name: coeff}.
@@ -679,16 +488,11 @@ def _parse_species_side(text: str) -> Dict[str, float]:
         if character != "+":
             continue
         prefix = text[term_start:index]
-        if _SCIENTIFIC_COEFFICIENT_MANTISSA_RE.fullmatch(prefix):
-            exponent_start = index + 1
-            exponent_end = exponent_start
-            while (
-                exponent_end < len(text)
-                and text[exponent_end].isdigit()
-            ):
-                exponent_end += 1
-            if exponent_end > exponent_start:
-                continue
+        if (
+            _SCIENTIFIC_COEFFICIENT_MANTISSA_RE.fullmatch(prefix)
+            and text[index + 1:index + 2].isdigit()
+        ):
+            raise _ambiguous_stoichiometry_error(text)
         terms.append(text[term_start:index])
         term_start = index + 1
     terms.append(text[term_start:])
@@ -704,6 +508,13 @@ def _parse_species_side(text: str) -> Dict[str, float]:
         if not m:
             raise invalid_species_term_error(term)
         coef_s, name = m.groups()
+        if (
+            coef_s is not None
+            and "e" in coef_s.casefold()
+            and m.string is term
+            and m.end(1) == m.start(2)
+        ):
+            raise _ambiguous_stoichiometry_error(text)
         if name == "t":
             raise _DSLError(
                 "'t' is reserved for simulation time and cannot be used as a species name"
@@ -844,6 +655,7 @@ def _validate_equilibrium_rate_authority_for_dsl(
 def _forward_rate_family_from_params(
     params: Mapping[str, str],
     *,
+    reversible: bool,
     line_number: int | None,
     line_content: str | None,
 ) -> str:
@@ -871,7 +683,22 @@ def _forward_rate_family_from_params(
             line_number=line_number,
             line_content=line_content,
         )
-    family = next(iter(families), "Eyring")
+    if not families:
+        raise _DSLError(
+            "This reversible step has no forward rate. Add kf=, A= with Ea=, or "
+            "dG_act=, plus one of kr=, Keq= or dG_eq=."
+            if reversible
+            else "This step has no rate. Add k=, A= with Ea=, or dG_act=.",
+            examples=[
+                "A -> B ; k=0.5",
+                "A -> B ; A=1e10 ; Ea=50",
+                "A -> B ; dG_act=80",
+                "A <-> B ; kf=1.0 ; Keq=3.0",
+            ],
+            line_number=line_number,
+            line_content=line_content,
+        )
+    family = next(iter(families))
     if "kappa" in params and family != "Eyring":
         raise _DSLError(
             "Per-step kappa is valid only for an Eyring forward rate.",
@@ -1048,8 +875,6 @@ def _admit_inline_initial_conditions(
 ) -> tuple[DslInitialConditionAdmission, frozenset[int]]:
     """Parse all inline IC syntax once and return claimed zero-based lines."""
 
-    if type(text) is not str:
-        raise TypeError("DSL source must be an exact string.")
     lines = text.splitlines()
     declarations: list[DslInitialConditionDeclaration] = []
     claimed_indexes: set[int] = set()
@@ -1368,18 +1193,13 @@ def _parse_dsl_ir(text: str, *, units: UnitsModel | None = None) -> "DSLIR":
     global_directives: dict[str, tuple[int, str]] = {}
     for line_no, raw in enumerate(lines, start=1):
         line = raw.strip()
-        lower = line.lower()
         if not line or line.startswith("#"):
             continue
-        key: str | None = None
-        if lower.startswith("energy="):
-            key = "energy"
-        elif lower.startswith("c0="):
-            key = "C0"
-        elif lower.startswith("t="):
-            key = "T"
-        if key is None:
+        # Only capital T sets temperature; lowercase t is simulation time.
+        directive = re.match(r"(?:(?i:energy|c0)|T)\s*=(?!>)", line)
+        if directive is None:
             continue
+        key = _KEY_ALIASES[directive.group(0).split("=")[0].strip().lower()]
         assignments = _parse_keyvals(
             line,
             reject_duplicate_canonical_keys=True,
@@ -1515,7 +1335,16 @@ def _parse_dsl_ir(text: str, *, units: UnitsModel | None = None) -> "DSLIR":
             steps.append(parsed_step)
             continue
 
-        raise _DSLError(f"unrecognized line: {line!r}", line_number=line_no, line_content=raw)
+        raise _DSLError(
+            f"unrecognized line: {line!r}",
+            suggestion=(
+                "Temperature is set with capital T=."
+                if re.match(r"t\s*=(?!>)", line)
+                else None
+            ),
+            line_number=line_no,
+            line_content=raw,
+        )
 
 
     return DSLIR(
@@ -1654,6 +1483,7 @@ def _parse_reaction_like_step(
 
     model = _forward_rate_family_from_params(
         params,
+        reversible=reversible,
         line_number=line_number,
         line_content=line_content,
     )
@@ -1714,7 +1544,7 @@ def _parse_reaction_like_step(
     def energy(key: str) -> float:
         value = _float_or_none(params.get(key))
         if value is None:
-            raise ValueError(f"{key} must be numeric")
+            raise ValueError(f"{key}= is missing")
         return admit_energy_j_per_mol(
             energy_to_j_per_mol(value, energy_unit), field=key
         )
@@ -1896,7 +1726,6 @@ def prepare_dsl_request_set(
     # parse-once boundary.
     try:
         compiled_algebra_series = compile_algebra_observables(
-            mechanism_namespace=mechanism_namespace,
             retained_spec=parameter_algebra_spec,
             species_names={str(item) for item in mechanism.species_names()},
         )
@@ -1906,13 +1735,26 @@ def prepare_dsl_request_set(
     species_names = tuple(str(item) for item in mechanism.species_names())
     if intervention_schedule is not None:
         intervention_schedule.validate_species(species_names)
-        from kindred.core.intervention_schedule import ObservableTriggerCondition, InterventionScheduleError
+        from kindred.core.intervention_schedule import (
+            InterventionScheduleError,
+            ObservableTriggerCondition,
+            intervention_schedule_parameter_dependencies,
+        )
         observable_names = set(compiled_algebra_series.observable_names) if compiled_algebra_series is not None else set()
         for trigger in intervention_schedule.triggers:
             if isinstance(trigger.condition, ObservableTriggerCondition) and trigger.condition.name not in observable_names:
                 raise InterventionScheduleError(
                     f"Unknown stopping observable: {trigger.condition.name}",
                     operation="trigger", declaration_ordinal=trigger.declaration_ordinal, field="watch_observable",
+                )
+        for (declaration, _nested, field), (name,) in intervention_schedule_parameter_dependencies(
+            intervention_schedule
+        ).items():
+            if name not in parameter_algebra_spec.evaluation_dependencies:
+                raise InterventionScheduleError(
+                    f"Unknown intervention parameter {name!r} in {field}_param. "
+                    f"Declare it with 'param {name} = ...' or use a rate constant such as k1.",
+                    declaration_ordinal=declaration, field=f"{field}_param",
                 )
     parameterized_intervention_schedule = (
         intervention_schedule

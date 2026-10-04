@@ -10,7 +10,7 @@ from __future__ import annotations
 import logging
 import warnings
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, Mapping, Optional, Tuple
+from typing import Callable, Dict, Mapping, Optional, Tuple
 
 import numpy as np
 
@@ -72,12 +72,7 @@ def fit_parameters_with_fixed(
     bounds: Optional[Dict[object, Tuple[float, float]]] = None,
     method: str,
     max_nfev: int = 1000,
-    seed: Optional[int] = None,
-    ftol: float = 1e-10,
-    xtol: float = 1e-10,
     cancellation_check: Callable[[], bool] | None = None,
-    de_penalty: float | None = None,
-    scipy_loader: Callable[[], tuple[Callable[..., Any], Callable[..., Any]]] | None = None,
 ) -> FitResult:
     """Optimize one canonical objective while holding named coordinates fixed.
 
@@ -93,20 +88,6 @@ def fit_parameters_with_fixed(
         raise ValueError(
             "Fixed Fit coordinates are absent from the optimizer layout: "
             + ", ".join(str(item) for item in unknown)
-        )
-    if not fixed:
-        return fit_parameters(
-            objective_func,
-            initial,
-            bounds=bounds,
-            method=method,
-            max_nfev=max_nfev,
-            seed=seed,
-            ftol=ftol,
-            xtol=xtol,
-            cancellation_check=cancellation_check,
-            de_penalty=de_penalty,
-            scipy_loader=scipy_loader,
         )
     bound_map = dict(bounds or {})
     for name, value in fixed.items():
@@ -155,12 +136,7 @@ def fit_parameters_with_fixed(
         bounds=free_bounds,
         method=method,
         max_nfev=max_nfev,
-        seed=seed,
-        ftol=ftol,
-        xtol=xtol,
         cancellation_check=cancellation_check,
-        de_penalty=de_penalty,
-        scipy_loader=scipy_loader,
     )
     return FitResult(
         success=reduced.success,
@@ -185,7 +161,6 @@ def fit_parameters(
     method: str,
     cancellation_check: Callable[[], bool] | None = None,
     de_penalty: float | None = None,
-    scipy_loader: Callable[[], tuple[Callable[..., Any], Callable[..., Any]]] | None = None,
 ) -> FitResult:
     """Fit parameters, interpreting ``ftol`` as native DE ``tol`` for DE runs."""
 
@@ -196,7 +171,6 @@ def fit_parameters(
     )
     if max_nfev <= 0:
         raise ValueError("Fit evaluation budget must be positive.")
-    scipy_loader = load_scipy_optimize if scipy_loader is None else scipy_loader
     param_names = list(initial_params.keys())
     if not param_names:
         raise ValueError("Fit optimization requires at least one coordinate.")
@@ -235,21 +209,7 @@ def fit_parameters(
 
     try:
         if method == "differential_evolution":
-            _least_squares, differential_evolution = scipy_loader()
-            invalid_params: list[str] = []
-            for idx, name in enumerate(param_names):
-                low = float(scipy_bounds[0][idx])
-                high = float(scipy_bounds[1][idx])
-                if not (np.isfinite(low) and np.isfinite(high)):
-                    invalid_params.append(name)
-                elif low >= high:
-                    invalid_params.append(name)
-            if invalid_params:
-                raise ValueError(
-                    "Differential Evolution requires finite bounds with min < max. "
-                    f"Parameters with invalid bounds: {', '.join(sorted(set(invalid_params)))}"
-                )
-
+            _least_squares, differential_evolution = load_scipy_optimize()
             effective_penalty = float(de_penalty) if de_penalty is not None else 1e12
             de_evaluation_budget = DifferentialEvolutionEvaluationBudget(max_nfev)
             best_de_score: float | None = None
@@ -297,10 +257,15 @@ def fit_parameters(
                     budget=de_evaluation_budget.limit - 1,
                     dim=dim,
                 )
+                # SciPy rescales x0 to [0, 1] and refuses a start that rounds
+                # just outside, as a start on its bound can; such a start moves
+                # inside by a negligible fraction of the range.
+                margin = (upper - lower) * 1e-12
                 try:
                     result = differential_evolution(
                         de_objective,
                         bounds=list(zip(scipy_bounds[0], scipy_bounds[1])),
+                        x0=np.clip(x0, lower + margin, upper - margin),
                         maxiter=maxiter,
                         popsize=popsize,
                         tol=float(ftol),
@@ -329,7 +294,7 @@ def fit_parameters(
                 )
 
         else:
-            least_squares, _de = scipy_loader()
+            least_squares, _de = load_scipy_optimize()
 
             # scipy interprets diff_step as relative to each coordinate.  Passing
             # an already scaled absolute step applies that scaling a second time.
@@ -362,15 +327,19 @@ def fit_parameters(
             if result.status == 1:
                 message = "Fit stopped at zero computed first-order optimality."
             try:
-                J = result.jac
+                J = np.asarray(result.jac, dtype=float)
                 param_count = len(x_opt)
-                rank = int(np.linalg.matrix_rank(np.asarray(J)))
+                # Rank of the column-scaled Jacobian, so parameters on very
+                # different scales are not mistaken for dependent ones.
+                # All-zero columns stay zero and count as deficient.
+                norms = np.linalg.norm(J, axis=0)
+                scaled = np.divide(J, norms, out=np.zeros_like(J), where=norms > 0.0)
+                rank = int(np.linalg.matrix_rank(scaled))
                 if rank < param_count:
                     identifiability_warning = (
                         "Fit Jacobian is rank deficient; parameter identifiability "
                         f"is limited (rank {rank} < {param_count})."
                     )
-                    message = f"{message}; {identifiability_warning}"
             except Exception as exc:
                 logger.debug("Failed to assess Fit Jacobian rank: %s", exc)
     except FittingCancelled:

@@ -237,11 +237,6 @@ def finalize_simulation_result(
         for name in requested_algebra_outputs
         if name in failed_names and name not in succeeded_names
     )
-    omitted_algebra_outputs = tuple(
-        name
-        for name in requested_algebra_outputs
-        if name not in succeeded_names and name not in failed_names
-    )
     check_cancelled()
     units, preferred_units = result_quantity_units(parameter_algebra_spec, species_names)
     names = ("t", *finalized_series, *finalized_algebra_scalars)
@@ -270,7 +265,6 @@ def finalize_simulation_result(
         requested_algebra_outputs=requested_algebra_outputs,
         succeeded_algebra_outputs=succeeded_algebra_outputs,
         failed_algebra_outputs=failed_algebra_outputs,
-        omitted_algebra_outputs=omitted_algebra_outputs,
         algebra_errors=finalized_algebra_errors,
         intervention_execution=getattr(result, "intervention_execution"),
         presentation_boundaries=result.presentation_boundaries,

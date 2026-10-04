@@ -4,9 +4,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from types import MappingProxyType
 from typing import Any
-from kindred.core.quantity_units import parse_unit, conversion_scale, SECOND
 
 from kindred.core.project_presentation_state import (
     AxisSeriesSelection,
@@ -17,15 +15,14 @@ from kindred.core.project_presentation_state import (
 
 __all__ = [
     "AxisSelectionCandidate",
-    "TIME_DISPLAY_UNIT_FACTORS",
+    "TIME_DISPLAY_UNITS",
     "require_pyqtgraph",
 ]
 
 
-TIME_DISPLAY_UNIT_FACTORS = MappingProxyType({
-    symbol: conversion_scale(parse_unit(symbol), SECOND).number()
-    for symbol in ("fs", "ps", "ns", "µs", "ms", "s", "ks", "min", "h", "d", "yr")
-})
+TIME_DISPLAY_UNITS = ("fs", "ps", "ns", "µs", "ms", "s", "ks", "min", "h", "d", "yr")
+
+
 @dataclass(frozen=True, slots=True)
 class AxisSelectionCandidate:
     """One typed axis identity paired with display-only text."""

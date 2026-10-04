@@ -184,14 +184,7 @@ def _try_parse_pyproject(repo_root: Path) -> tuple[dict[str, str], dict[str, dic
         warnings.append("pyproject.toml missing; cannot read declared dependencies")
         return {}, {}, warnings
 
-    try:
-        import tomllib as toml_loader  # pyright: ignore[reportMissingImports]  # stdlib in py3.11+
-    except Exception:
-        try:
-            import tomli as toml_loader  # type: ignore[import-not-found]
-        except Exception:
-            warnings.append("tomllib/tomli not available; cannot parse pyproject.toml dependencies")
-            return {}, {}, warnings
+    import tomllib as toml_loader
 
     try:
         raw = pyproject.read_bytes()

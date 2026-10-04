@@ -34,11 +34,6 @@ dependencies = [
     "ironcalc==0.8.3",
 ]
 
-[project.optional-dependencies]
-test = [
-    "tomli; python_version < '3.11'",
-]
-
 [project.gui-scripts]
 kindred = "kindred.__main__:main"
 kindred-gui = "kindred.__main__:main"

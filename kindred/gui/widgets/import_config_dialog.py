@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from itertools import islice
 from typing import Mapping
 
@@ -24,7 +24,6 @@ from kindred.gui.import_workflow import (
     classify_unit_row,
     resolve_column_unit,
     resolve_sheet_plan,
-    sharing_settings,
 )
 from kindred.gui.theme_manager import semantic_color
 from kindred.gui.ui_helpers import (
@@ -74,6 +73,9 @@ class ImportConfigDialog(QtWidgets.QDialog):
         self._source = source
         self._sheets: list[_Sheet] = []
         self._current_sheet: _Sheet | None = None
+        # The sheet shown when "Use for other sheets" was ticked supplies the
+        # shared settings; None while sharing is off.
+        self._template_sheet: _Sheet | None = None
         self._result: ImportDialogResult | None = None
         self.setWindowTitle(f"Import: {source.original_filename}")
         self.setModal(True)
@@ -245,7 +247,7 @@ class ImportConfigDialog(QtWidgets.QDialog):
             lambda: self._set_checked_sheets(invert=True)
         )
         self._btn_select_compatible.clicked.connect(self._select_compatible_sheets)
-        self._apply_remaining_cb.toggled.connect(self._update_import_enabled)
+        self._apply_remaining_cb.toggled.connect(self._on_share_toggled)
         self._time_combo.currentIndexChanged.connect(self._on_time_column_changed)
         self._time_unit_combo.currentTextChanged.connect(self._on_time_unit_changed)
         self._default_unit_combo.currentTextChanged.connect(self._on_default_unit_changed)
@@ -331,10 +333,13 @@ class ImportConfigDialog(QtWidgets.QDialog):
         if row < 0:
             return
         self._current_sheet = self._sheets[row]
-        sheet = self._current_sheet
+        sheet = self._shown_sheet()
         name = sheet.name if sheet.name is not None else self._source.original_filename
+        shared_note = (
+            "" if self._editable() else f" (using settings from {self._template_sheet.name})"
+        )
         set_bounded_label_text(
-            self._settings_label, f"Settings for: {name}", max_width=640
+            self._settings_label, f"Settings for: {name}{shared_note}", max_width=640
         )
         set_bounded_label_text(self._preview_label, f"Preview: {name}", max_width=1000)
         with QtCore.QSignalBlocker(self._time_combo):
@@ -347,12 +352,11 @@ class ImportConfigDialog(QtWidgets.QDialog):
                     column.assigned_name,
                     QtCore.Qt.ToolTipRole,
                 )
-            index = (
-                sheet.settings.time_column.source_index
-                if sheet.settings.time_column
-                else -1
-            )
-            self._time_combo.setCurrentIndex(self._time_combo.findData(index))
+            time_column = sheet.settings.time_column
+            index = -1 if time_column is None else time_column.source_index
+            # A shared time column this sheet lacks selects nothing.
+            found = time_column is None or time_column in sheet.columns
+            self._time_combo.setCurrentIndex(self._time_combo.findData(index) if found else -1)
         self._render_units()
         self._render_species()
         self._render_preview()
@@ -360,6 +364,7 @@ class ImportConfigDialog(QtWidgets.QDialog):
             self._preview_error_label, sheet.load_error, max_width=1000
         )
         self._preview_error_label.setVisible(bool(sheet.load_error))
+        self._time_combo.setEnabled(self._editable())
         self._update_import_enabled()
 
     @staticmethod
@@ -368,7 +373,8 @@ class ImportConfigDialog(QtWidgets.QDialog):
             combo.setEditable(False)
             combo.clear()
             if default is not None:
-                combo.addItem("Use default", UnitSource.DEFAULT)
+                # Without a declaration, following the file means using the default.
+                combo.addItem("Use default", UnitSource.DEFAULT if declared else UnitSource.FILE)
                 if declared:
                     label = "Dimensionless" if declared == "1" else declared
                     combo.addItem(f"From file ({label})", UnitSource.FILE)
@@ -379,8 +385,8 @@ class ImportConfigDialog(QtWidgets.QDialog):
             if custom:
                 combo.addItem("Custom…", None)
             index = combo.findData(choice)
-            if choice is UnitSource.FILE and not declared:
-                index = combo.findData(UnitSource.DEFAULT)
+            if choice is UnitSource.DEFAULT and not declared:
+                index = combo.findData(UnitSource.FILE)
             if index >= 0:
                 combo.setCurrentIndex(index)
             elif custom:
@@ -402,21 +408,23 @@ class ImportConfigDialog(QtWidgets.QDialog):
         return "" if value is None else str(value).strip()
 
     def _render_units(self) -> None:
-        sheet = self._current_sheet
+        sheet = self._shown_sheet()
         settings = sheet.settings
         self._populate_unit_choices(
             self._time_unit_combo, TIME_UNIT_DISPLAY, settings.time_choice,
             default="s", declared=self._declared_unit(sheet, settings.time_column),
         )
-        self._time_unit_combo.setEnabled(settings.time_column is not None)
+        editable = self._editable()
+        self._time_unit_combo.setEnabled(editable and settings.time_column is not None)
         self._populate_unit_choices(self._default_unit_combo, MEASUREMENT_UNIT_DISPLAY, settings.default_unit)
+        self._default_unit_combo.setEnabled(editable)
         with QtCore.QSignalBlocker(self._unit_row_cb):
-            self._unit_row_cb.setEnabled(sheet.first_row is not None)
+            self._unit_row_cb.setEnabled(editable and sheet.first_row is not None)
             self._unit_row_cb.setChecked(sheet.unit_row is not None)
         self._refresh_unit_info()
 
     def _refresh_unit_info(self) -> None:
-        sheet = self._current_sheet
+        sheet = self._shown_sheet()
         if sheet.settings.time_column is None:
             info = "No recorded time; observations can be fitted against a measured X quantity."
         else:
@@ -430,7 +438,7 @@ class ImportConfigDialog(QtWidgets.QDialog):
         set_bounded_label_text(self._unit_info_label, info, max_width=640)
 
     def _render_preview(self) -> None:
-        sheet = self._current_sheet
+        sheet = self._shown_sheet()
         excluded = sheet.unit_row is not None
         rows = sheet.preview_rows[:_PREVIEW_DATA_ROW_LIMIT + int(excluded)]
         self._preview_limit_label.setVisible(len(sheet.preview_rows) > len(rows))
@@ -464,13 +472,15 @@ class ImportConfigDialog(QtWidgets.QDialog):
             self._preview_table.setColumnWidth(index, min(300, self._preview_table.columnWidth(index)))
 
     def _render_species(self) -> None:
-        sheet = self._current_sheet
+        sheet = self._shown_sheet()
+        editable = self._editable()
+        enabled = QtCore.Qt.ItemIsEnabled if editable else QtCore.Qt.NoItemFlags
         with QtCore.QSignalBlocker(self._species_table):
             columns = [col for col in sheet.columns if col != sheet.settings.time_column]
             self._species_table.setRowCount(len(columns))
             for row, column in enumerate(columns):
                 check = QtWidgets.QTableWidgetItem()
-                check.setFlags(QtCore.Qt.ItemIsEnabled | QtCore.Qt.ItemIsSelectable | QtCore.Qt.ItemIsUserCheckable)
+                check.setFlags(enabled | QtCore.Qt.ItemIsSelectable | QtCore.Qt.ItemIsUserCheckable)
                 check.setData(QtCore.Qt.UserRole, column.source_index)
                 check.setCheckState(QtCore.Qt.Checked if column in sheet.settings.species_columns else QtCore.Qt.Unchecked)
                 self._species_table.setItem(row, 0, check)
@@ -480,6 +490,7 @@ class ImportConfigDialog(QtWidgets.QDialog):
                 combo = ScientificNameComboBox(self._species_table)
                 combo.setInsertPolicy(QtWidgets.QComboBox.NoInsert)
                 combo.setAccessibleName(f"Unit for {column.assigned_name}")
+                combo.setEnabled(editable)
                 self._populate_unit_choices(
                     combo, MEASUREMENT_UNIT_DISPLAY, sheet.settings.column_units.get(column, UnitSource.FILE),
                     default=sheet.settings.default_unit, declared=self._declared_unit(sheet, column), custom=True,
@@ -494,7 +505,7 @@ class ImportConfigDialog(QtWidgets.QDialog):
         self._refresh_conversions()
 
     def _refresh_conversions(self) -> None:
-        sheet = self._current_sheet
+        sheet = self._shown_sheet()
         for row in range(self._species_table.rowCount()):
             source_index = self._species_table.item(row, 0).data(QtCore.Qt.UserRole)
             column = next(col for col in sheet.columns if col.source_index == source_index)
@@ -604,8 +615,27 @@ class ImportConfigDialog(QtWidgets.QDialog):
                 )
         self._update_import_enabled()
 
+    def _settings_for(self, sheet: _Sheet) -> ImportSettings:
+        """While sharing, every other sheet imports with the shared sheet's settings."""
+        template = self._template_sheet
+        return sheet.settings if template is None else template.settings
+
+    def _editable(self) -> bool:
+        """Only the shared sheet, or any sheet while sharing is off, edits settings."""
+        template = self._template_sheet
+        return template is None or template is self._current_sheet
+
+    def _shown_sheet(self) -> _Sheet:
+        """The current sheet as it will import; other sheets show the shared settings."""
+        sheet = self._current_sheet
+        return sheet if self._editable() else replace(sheet, settings=self._template_sheet.settings)
+
+    def _on_share_toggled(self, checked: bool) -> None:
+        self._template_sheet = self._current_sheet if checked else None
+        self._on_current_sheet_changed(self._sheets.index(self._current_sheet))
+
     def _select_compatible_sheets(self) -> None:
-        settings = self._current_sheet.settings
+        settings = self._template_sheet.settings
         required = (settings.species_columns | {settings.time_column}) - {None}
         with QtCore.QSignalBlocker(self._sheet_list):
             for index, sheet in enumerate(self._sheets):
@@ -616,18 +646,16 @@ class ImportConfigDialog(QtWidgets.QDialog):
         self._update_import_enabled()
 
     def _resolved_plans(self):
-        current = self._current_sheet
-        shared = current.settings if current is not None and self._apply_remaining_cb.isChecked() else None
         return tuple(
             resolve_sheet_plan(
                 sheet.name, sheet.columns, sheet.first_row,
-                sheet.settings if sheet is current or shared is None else sharing_settings(shared, destination=sheet.settings),
+                self._settings_for(sheet),
             )
             for sheet in self._sheets if sheet.included
         )
 
     def _update_import_enabled(self) -> None:
-        current = self._current_sheet
+        template = self._template_sheet
         try:
             plans = self._resolved_plans()
             reason = "" if plans else "Select at least one sheet to import."
@@ -637,8 +665,10 @@ class ImportConfigDialog(QtWidgets.QDialog):
         self._btn_import.setToolTip(reason)
         set_bounded_label_text(self._readiness_label, reason, max_width=1000)
         self._readiness_label.setVisible(bool(reason))
-        source_ready = current is not None and bool(current.settings.species_columns - {current.settings.time_column})
-        self._btn_select_compatible.setEnabled(self._apply_remaining_cb.isChecked() and source_ready)
+        self._btn_select_compatible.setEnabled(
+            template is not None
+            and bool(template.settings.species_columns - {template.settings.time_column})
+        )
         self._btn_select_all.setEnabled(bool(self._sheets))
         self._btn_invert_sheets.setEnabled(bool(self._sheets))
 
@@ -650,7 +680,8 @@ class ImportConfigDialog(QtWidgets.QDialog):
         except ValueError as exc:
             QtWidgets.QMessageBox.critical(self, "Import Configuration", str(exc))
             return
-        shared = sharing_settings(self._current_sheet.settings) if self._apply_remaining_cb.isChecked() else None
+        template = self._template_sheet
+        shared = None if template is None else template.settings
         self._result = ImportDialogResult(ImportConfig(self._source, plans, shared), "import")
         self.accept()
 

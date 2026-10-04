@@ -74,6 +74,7 @@ __all__ = [
     "FIT_SEED_RANGE",
     "SIMULATION_POINT_RANGE",
     "TEMPERATURE_RANGE_K",
+    "parse_points_text",
     "SUPPORTED_SOLVERS",
     "validate_fit_solver",
     "fresh_mechanism_tab",
@@ -192,29 +193,11 @@ def _validate_initial_condition_values(
     *,
     context: str,
 ) -> tuple[tuple[str, float], ...]:
-    """Validate one carrier before any species map can be materialized.
+    """Admit one set's species values: nonblank unique species, valid values."""
 
-    The exact tuple/pair shape is part of the immutable project contract.  A
-    forged instance can bypass a dataclass ``__post_init__`` with
-    ``object.__new__``/``object.__setattr__``; callers that are about to build
-    a map therefore repeat this small, centralized preflight.
-    """
-
-    if type(values) is not tuple:
-        raise TypeError(f"{context} values must be an exact tuple.")
     validated: list[tuple[str, float]] = []
     seen: set[str] = set()
-    for index, pair in enumerate(values):
-        if type(pair) is not tuple or len(pair) != 2:
-            raise TypeError(
-                f"{context} values[{index}] must be an exact species/value "
-                "pair."
-            )
-        species, value = pair
-        if type(species) is not str:
-            raise TypeError(
-                f"{context} values[{index}][0] species name must be a str."
-            )
+    for index, (species, value) in enumerate(values):
         _require_name(
             species,
             f"{context} values[{index}][0] species name",
@@ -320,43 +303,22 @@ class InitialConditionSet:
         values: Mapping[str, Real] | Iterable[tuple[str, Real]],
     ) -> "InitialConditionSet":
         items = values.items() if isinstance(values, Mapping) else values
-        return replace(
-            self,
-            values=tuple(
-                (
-                    _require_name(species, "initial-condition species name"),
-                    validate_concentration(
-                        value,
-                        field=f"initial value for {species}",
-                    ),
-                )
-                for species, value in items
-            ),
-        )
+        # The constructor admits species names and concentrations once.
+        return replace(self, values=tuple(items))
 
 
 def _validate_initial_condition_set_carriers(
-    sets: object,
+    sets: Iterable[InitialConditionSet],
     *,
     context: str,
 ) -> tuple[InitialConditionSet, ...]:
-    """Preflight all sets before any set-name/index map can be built."""
+    """Reject duplicate set IDs or names before any set map is built."""
 
-    if type(sets) is not tuple:
-        raise TypeError(f"{context} must be an exact tuple.")
     validated: list[InitialConditionSet] = []
     seen_ids: set[str] = set()
     seen_names: set[str] = set()
-    for index, item in enumerate(sets):
-        if not isinstance(item, InitialConditionSet):
-            raise TypeError(
-                f"{context}[{index}] must be an InitialConditionSet."
-            )
-        set_id = _require_id(item.set_id, "initial-condition set ID")
-        set_name = _require_name(
-            item.name,
-            "initial-condition set name",
-        )
+    for item in sets:
+        set_id, set_name = item.set_id, item.name
         if set_id in seen_ids:
             raise ValueError(
                 f"Duplicate initial-condition set ID {set_id!r} in {context}."
@@ -427,8 +389,6 @@ class MechanismTabDocument:
         self,
         initial_set: InitialConditionSet,
     ) -> "MechanismTabDocument":
-        if not isinstance(initial_set, InitialConditionSet):
-            raise TypeError("initial_set must be an InitialConditionSet.")
         return self.with_initial_condition_sets(
             (*self.initial_condition_sets, initial_set)
         )
@@ -437,8 +397,6 @@ class MechanismTabDocument:
         self,
         initial_set: InitialConditionSet,
     ) -> "MechanismTabDocument":
-        if not isinstance(initial_set, InitialConditionSet):
-            raise TypeError("initial_set must be an InitialConditionSet.")
         if not any(
             item.set_id == initial_set.set_id
             for item in self.initial_condition_sets
@@ -538,8 +496,6 @@ class MechanismTabDocument:
         link: DatasetLink,
     ) -> "MechanismTabDocument":
         target_dataset_id = _require_id(dataset_id, "dataset ID")
-        if not isinstance(link, DatasetLink):
-            raise TypeError("link must be a DatasetLink.")
         links = dict(self.dataset_links)
         if link.set_id is not None:
             occupant = next(
@@ -634,8 +590,6 @@ class ProjectDocument:
         raise KeyError(f"Unknown imported source ID: {target!r}.")
 
     def replace_tab(self, tab: MechanismTabDocument) -> "ProjectDocument":
-        if not isinstance(tab, MechanismTabDocument):
-            raise TypeError("tab must be a MechanismTabDocument.")
         if not any(item.tab_id == tab.tab_id for item in self.tabs):
             raise KeyError(f"Unknown mechanism tab ID: {tab.tab_id!r}.")
         return replace(
@@ -699,8 +653,6 @@ class ProjectDocument:
         self,
         record: dataset_foundation.RawDatasetRecord,
     ) -> "ProjectDocument":
-        if not isinstance(record, dataset_foundation.RawDatasetRecord):
-            raise TypeError("record must be a RawDatasetRecord.")
         if not any(
             item.dataset_id == record.dataset_id for item in self.datasets
         ):
@@ -794,23 +746,6 @@ class MechanismSourceCollision:
 
     existing_names: tuple[str, ...]
     replacement: MechanismSourceReconciliation
-
-    def __post_init__(self) -> None:
-        if (
-            type(self.existing_names) is not tuple
-            or not self.existing_names
-            or any(
-                type(name) is not str or not name or name != name.strip()
-                for name in self.existing_names
-            )
-        ):
-            raise ValueError(
-                "Mechanism source collision names must be nonempty text."
-            )
-        if not isinstance(self.replacement, MechanismSourceReconciliation):
-            raise TypeError(
-                "Mechanism source collision replacement must be prepared."
-            )
 
 
 def default_simulation_execution_settings() -> SimulationExecutionSettings:
@@ -911,24 +846,43 @@ def _validate_unique(
         seen.add(normalized)
 
 
+def parse_points_text(text: str, *, field: str = "Points") -> int:
+    """Admit authored Points text without clamping or reverting it."""
+    minimum, maximum = _SIMULATION_POINT_RANGE
+    message = f"{field} {text!r} must be an integer between {minimum} and {maximum}."
+    try:
+        value = int(str(text).strip())
+    except ValueError as exc:
+        raise ValueError(message) from exc
+    if not minimum <= value <= maximum:
+        raise ValueError(message)
+    return value
+
+
 def validate_simulation_execution_settings(
     settings: SimulationExecutionSettings,
-    label: str = "execution settings",
+    label: str | None = None,
 ) -> SimulationExecutionSettings:
-    if not isinstance(settings, SimulationExecutionSettings):
-        raise TypeError(f"{label} must be SimulationExecutionSettings.")
+    """Admit Run settings; messages name the on-screen fields."""
+    prefix = "" if label is None else f"{label}: "
     normalized_solver = validate_fit_solver(settings.solver)
     if normalized_solver != settings.solver:
         raise ValueError(
-            f"{label}.solver must use canonical supported spelling."
+            f"{prefix}Solver {settings.solver!r} must use canonical supported spelling."
         )
-    start = validate_input_time_seconds(settings.t_start, field=f"{label}.t_start")
-    end = validate_input_time_seconds(settings.t_end, field=f"{label}.t_end")
+    start = validate_input_time_seconds(
+        settings.t_start, field=f"{prefix}Start time {settings.t_start!r}"
+    )
+    end = validate_input_time_seconds(
+        settings.t_end, field=f"{prefix}End time {settings.t_end!r}"
+    )
     if end <= start:
-        raise ValueError(f"{label}.t_end must be greater than t_start.")
+        raise ValueError(
+            f"{prefix}End time {end!r} must be greater than start time {start!r}."
+        )
     _require_int(
         settings.integration_points,
-        f"{label}.integration_points",
+        f"{prefix}Points {settings.integration_points!r}",
         *_SIMULATION_POINT_RANGE,
     )
     return settings
@@ -936,28 +890,31 @@ def validate_simulation_execution_settings(
 
 def validate_tab_scientific_settings(
     settings: TabScientificSettings,
-    label: str = "scientific settings",
+    label: str | None = None,
 ) -> TabScientificSettings:
-    if not isinstance(settings, TabScientificSettings):
-        raise TypeError(f"{label} must be TabScientificSettings.")
-    validate_temperature(settings.temperature, field=f"{label}.temperature")
-    validate_c0(settings.standard_conc_M, field=f"{label}.standard_conc_M")
+    """Admit scientific settings; messages name the on-screen fields."""
+    prefix = "" if label is None else f"{label}: "
+    validate_temperature(settings.temperature, field=f"{prefix}Temperature")
+    validate_c0(settings.standard_conc_M, field=f"{prefix}Standard concentration")
     if settings.energy_unit not in {"J/mol", "kJ/mol", "kcal/mol"}:
-        raise ValueError(f"{label}.energy_unit must be J/mol, kJ/mol, or kcal/mol.")
+        raise ValueError(f"{prefix}Energy units must be J/mol, kJ/mol, or kcal/mol.")
     validate_scipy_rtol(
         settings.rtol,
-        field=f"{label}.rtol",
+        field=f"{prefix}Relative tolerance",
     )
     _require_finite(
         settings.atol,
-        f"{label}.atol",
+        f"{prefix}Absolute tolerance",
         strictly_positive=True,
     )
     _require_bool(
         settings.analytic_jacobian_policy,
-        f"{label}.analytic_jacobian_policy",
+        f"{prefix}Analytic Jacobian preference",
     )
-    _require_bool(settings.use_authored_stops, f"{label}.use_authored_stops")
+    _require_bool(
+        settings.use_authored_stops,
+        f"{prefix}Use authored stopping interventions",
+    )
     return settings
 
 
@@ -966,8 +923,6 @@ def resolve_simulation_execution_settings(
     set_id: str,
 ) -> SimulationExecutionSettings:
     """Resolve one exact set to either its complete override or live default."""
-    if not isinstance(tab, MechanismTabDocument):
-        raise TypeError("tab must be a MechanismTabDocument.")
     target = tab.initial_condition_set(set_id).set_id
     settings = dict(tab.run_overrides_by_set_id).get(
         target,
@@ -979,8 +934,6 @@ def resolve_simulation_execution_settings(
 def validate_fit_defaults(defaults: FitDefaults) -> FitDefaults:
     """Validate the narrow Fit-default value without walking a project."""
 
-    if not isinstance(defaults, FitDefaults):
-        raise TypeError("fit_defaults must be FitDefaults.")
     validate_fit_method(defaults.method)
     if defaults.method != str(defaults.method).strip():
         raise ValueError("fit_defaults.method must use canonical supported spelling.")
@@ -1071,13 +1024,9 @@ def _validate_exact_source_constraints(
 def canonical_species_names(tab: MechanismTabDocument) -> tuple[str, ...]:
     """Return the accepted mechanism species in canonical document order."""
 
-    if not isinstance(tab, MechanismTabDocument):
-        raise TypeError("tab must be a MechanismTabDocument.")
     prepared_dsl = tab.prepared_dsl
     if prepared_dsl is None:
         return ()
-    if type(prepared_dsl) is not PreparedDslRequestSet:
-        raise TypeError("tab prepared_dsl must be PreparedDslRequestSet.")
     return tuple(str(name) for name in prepared_dsl.analysis.species_names)
 
 
@@ -1086,13 +1035,9 @@ def canonical_observation_target_names(
 ) -> tuple[str, ...]:
     """Return accepted species followed by accepted authored observables."""
 
-    if not isinstance(tab, MechanismTabDocument):
-        raise TypeError("tab must be a MechanismTabDocument.")
     prepared_dsl = tab.prepared_dsl
     if prepared_dsl is None:
         return ()
-    if type(prepared_dsl) is not PreparedDslRequestSet:
-        raise TypeError("tab prepared_dsl must be PreparedDslRequestSet.")
     analysis = prepared_dsl.analysis
     return (
         tuple(str(name) for name in analysis.species_names)
@@ -1117,8 +1062,6 @@ def _prepared_dsl_matches_tab(tab: MechanismTabDocument) -> bool:
     prepared = tab.prepared_dsl
     if prepared is None:
         return not tab.mechanism_source.reactions_text.strip()
-    if type(prepared) is not PreparedDslRequestSet:
-        return False
     analysis = prepared.analysis
     if not source_matches_analysis(tab.mechanism_source, analysis):
         return False
@@ -1136,8 +1079,6 @@ def retained_tab_mechanism_source(
     exact source and its matching prepared DSL request set.
     """
 
-    if not isinstance(document, ProjectDocument):
-        raise TypeError("document must be a ProjectDocument.")
     tab = document.tab(tab_id)
     if not _prepared_dsl_matches_tab(tab):
         raise ValueError(
@@ -1158,10 +1099,6 @@ def reconcile_tab_mechanism_source(
     | MechanismSourceCollision
 ):
     """Purely validate and reconcile visible source into one atomic proposal."""
-    if not isinstance(document, ProjectDocument):
-        raise TypeError("document must be a ProjectDocument.")
-    if not isinstance(visible_source, MechanismAuthoringSource):
-        raise TypeError("visible_source must be MechanismAuthoringSource.")
     tab = document.tab(tab_id)
     admitted_dsl = prepare_authored_source_admission(
         visible_source,
@@ -1200,12 +1137,8 @@ def reconcile_tab_mechanism_source(
         for species in new_species
         if species not in old_species_set
     )
-    admitted_initial_sets = _validate_initial_condition_set_carriers(
-        tab.initial_condition_sets,
-        context=f"initial-condition sets in tab {tab.tab_id!r}",
-    )
     reconciled_sets: list[InitialConditionSet] = []
-    for initial_set in admitted_initial_sets:
+    for initial_set in tab.initial_condition_sets:
         source_values = initial_set.values_dict()
         values = {
             species: value
@@ -1574,12 +1507,8 @@ def assess_tab_exact_correction(
     creating a second scientific route.
     """
 
-    if not isinstance(document, ProjectDocument):
-        raise TypeError("document must be a ProjectDocument.")
     tab = document.tab(tab_id)
     source = tab.mechanism_source if visible_source is None else visible_source
-    if not isinstance(source, MechanismAuthoringSource):
-        raise TypeError("visible_source must be MechanismAuthoringSource.")
 
     empty_composition = ExactConstraintComposition(())
     if not source.reactions_text.strip():
@@ -1659,8 +1588,6 @@ def prepare_tab_scientific_settings(
     ``replace_document`` publication and its single result fence.
     """
 
-    if not isinstance(tab, MechanismTabDocument):
-        raise TypeError("tab must be a MechanismTabDocument.")
     validate_tab_scientific_settings(settings)
     if settings.default_units == tab.scientific_settings.default_units:
         prepared = tab.prepared_dsl
@@ -1678,21 +1605,12 @@ def prepare_tab_scientific_settings(
 
 def validate_project_document(document: ProjectDocument) -> ProjectDocument:
     """Validate every canonical value and cross-reference."""
-    if not isinstance(document, ProjectDocument):
-        raise TypeError("document must be a ProjectDocument.")
     from kindred.core.datasets.observation_mapping import (
         normalize_observation_mapping,
     )
 
     if not document.tabs:
         raise ValueError("A project must contain at least one mechanism tab.")
-    if type(document.datasets) is not tuple:
-        raise TypeError("Project datasets must be an immutable tuple.")
-    if type(document.imported_sources) is not tuple or any(
-        not isinstance(source, dataset_foundation.ImportedSource)
-        for source in document.imported_sources
-    ):
-        raise TypeError("Project imported_sources must be an exact ImportedSource tuple.")
     validate_fit_defaults(document.fit_defaults)
 
     for source in document.imported_sources:
@@ -1765,14 +1683,6 @@ def validate_project_document(document: ProjectDocument) -> ProjectDocument:
         for dataset in document.datasets
     )
     for tab in document.tabs:
-        if not isinstance(tab, MechanismTabDocument):
-            raise TypeError("tabs must contain MechanismTabDocument values.")
-        if not isinstance(tab.mechanism_source, MechanismAuthoringSource):
-            raise TypeError(
-                "mechanism_source must be MechanismAuthoringSource."
-            )
-        if not isinstance(tab.notes, str):
-            raise TypeError("tab notes must be a str.")
         if not tab.initial_condition_sets:
             raise ValueError(
                 f"Tab {tab.name!r} must contain at least one "
@@ -1786,14 +1696,6 @@ def validate_project_document(document: ProjectDocument) -> ProjectDocument:
             tab.scientific_settings,
             f"{tab.name}.scientific_settings",
         )
-        if (
-            tab.prepared_dsl is not None
-            and type(tab.prepared_dsl) is not PreparedDslRequestSet
-        ):
-            raise TypeError(
-                f"Tab {tab.tab_id!r} ({tab.name!r}) prepared_dsl must "
-                "be PreparedDslRequestSet or None."
-            )
         try:
             if not _prepared_dsl_matches_tab(tab):
                 prepared_dsl = prepare_authored_source_admission(
@@ -1838,24 +1740,9 @@ def validate_project_document(document: ProjectDocument) -> ProjectDocument:
                 f"initial-condition sets in tab {tab.tab_id!r}"
             ),
         )
-        set_id_values = [
-            _require_id(item.set_id, "initial-condition set ID")
-            for item in admitted_initial_sets
-        ]
-        _validate_unique(
-            set_id_values,
-            f"set IDs in tab {tab.name!r}",
-        )
+        set_id_values = [item.set_id for item in admitted_initial_sets]
         set_ids = set(set_id_values)
         global_set_ids.extend(set_id_values)
-        _validate_unique(
-            (
-                _require_name(item.name, "initial-condition set name")
-                for item in admitted_initial_sets
-            ),
-            f"set names in tab {tab.name!r}",
-            key=lambda value: str(value).casefold(),
-        )
         for item in admitted_initial_sets:
             for species, _value in item.values:
                 if species not in mechanism_species_set:
@@ -1890,10 +1777,6 @@ def validate_project_document(document: ProjectDocument) -> ProjectDocument:
         )
         mapped_set_ids: list[str] = []
         for dataset_id, link in tab.dataset_links:
-            if not isinstance(link, DatasetLink):
-                raise TypeError(
-                    "dataset_links must contain DatasetLink values."
-                )
             if link.set_id is not None:
                 if link.set_id in set_ids:
                     mapped_set_ids.append(link.set_id)

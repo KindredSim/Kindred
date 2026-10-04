@@ -219,18 +219,8 @@ def forward_rate_symbolic_relation(
     preserves the ordinary owned numeric constants without changing the formula.
     """
 
-    if not callable(literal):
-        raise TypeError("literal must be callable.")
-    if not callable(exponential):
-        raise TypeError("exponential must be callable.")
-    if source_coordinate is not None and not callable(source_coordinate):
-        raise TypeError("source_coordinate must be callable when provided.")
-
     def exact(value: object, *, field: str) -> object:
-        number = _numeric_float(value, field=field)
-        if not math.isfinite(number):
-            raise ValueError(f"{field} must be finite.")
-        return constant(field) if constant is not None else literal(float(number))
+        return constant(field) if constant is not None else literal(float(value))
 
     def coordinate(role: str, value: float) -> object:
         """Use a canonical authored coordinate, or the admitted literal."""
@@ -249,54 +239,19 @@ def forward_rate_symbolic_relation(
                 )
         return literal(float(value))
 
+    # The typed models admitted every field at construction.
     if isinstance(model, ConstantRateModel):
-        value = _numeric_float(model.k, field="Constant k")
-        admit_rate(value, field="Constant k", allow_zero=True)
-        return coordinate("kf", value)
+        return coordinate("kf", float(model.k))
     if isinstance(model, ArrheniusRateModel):
-        prefactor = _numeric_float(model.A, field="Arrhenius A")
-        activation = _numeric_float(
-            model.Ea_J_per_mol,
-            field="Arrhenius Ea_J_per_mol",
-        )
-        prefactor = admit_arrhenius_prefactor(prefactor, field="Arrhenius A")
-        activation = admit_energy_j_per_mol(
-            activation,
-            field="Arrhenius Ea_J_per_mol",
-        )
-        return coordinate("A", prefactor) * exponential(  # type: ignore[operator]
-            -coordinate("Ea", activation)
+        return coordinate("A", float(model.A)) * exponential(  # type: ignore[operator]
+            -coordinate("Ea", float(model.Ea_J_per_mol))
             / (exact(R, field="R") * temperature)  # type: ignore[operator]
         )
     if isinstance(model, EyringRateModel):
-        barrier = _numeric_float(
-            model.dG_act_J_per_mol,
-            field="Eyring dG_act_J_per_mol",
-        )
-        transmission = _numeric_float(model.kappa, field="Eyring kappa")
-        barrier = admit_energy_j_per_mol(
-            barrier,
-            field="Eyring dG_act_J_per_mol",
-        )
-        if not math.isfinite(transmission) or transmission <= 0.0:
-            raise ValueError("Eyring kappa must be positive and finite.")
-        standard = _numeric_float(
-            model.standard_conc_M,
-            field="Eyring standard_conc_M",
-        )
-        standard = validate_c0(standard, field="Eyring standard_conc_M")
-        order = _directional_order(
-            model.molecularity,
-            field="Eyring molecularity",
-        )
-        degeneracy = _positive_integer(
-            model.degeneracy,
-            field="Eyring degeneracy",
-        )
-        degeneracy_relation = coordinate("degeneracy", float(degeneracy))
-        kappa_relation = coordinate("kappa", transmission)
+        degeneracy_relation = coordinate("degeneracy", float(model.degeneracy))
+        kappa_relation = coordinate("kappa", float(model.kappa))
         concentration_relation = (
-            literal(float(standard))
+            literal(float(model.standard_conc_M))
             if standard_concentration is None
             else standard_concentration
         )
@@ -307,11 +262,11 @@ def forward_rate_symbolic_relation(
             * temperature
             / exact(h, field="h")
             * exponential(
-                -coordinate("dG_act", barrier)
+                -coordinate("dG_act", float(model.dG_act_J_per_mol))
                 / (exact(R, field="R") * temperature)  # type: ignore[operator]
             )
         )
-        standard_exponent = Fraction(1) - Fraction(str(order))
+        standard_exponent = Fraction(1) - Fraction(str(model.molecularity))
         if standard_exponent:
             relation *= concentration_relation ** literal(standard_exponent)  # type: ignore[operator]
         return relation

@@ -41,7 +41,6 @@ class SimulationResultValue:
     requested_algebra_outputs: tuple[str, ...] = ()
     succeeded_algebra_outputs: tuple[str, ...] = ()
     failed_algebra_outputs: tuple[str, ...] = ()
-    omitted_algebra_outputs: tuple[str, ...] = ()
     algebra_errors: tuple[FactualCause, ...] = ()
     scalars: Mapping[str, float] = MappingProxyType({})
     parameters: tuple[tuple[str, float, str], ...] = ()
@@ -58,7 +57,6 @@ class SimulationResultValue:
         partitions = (
             set(self.succeeded_algebra_outputs),
             set(self.failed_algebra_outputs),
-            set(self.omitted_algebra_outputs),
         )
         if any(not values <= requested for values in partitions):
             raise ValueError("algebra outcome contains an unrequested output.")

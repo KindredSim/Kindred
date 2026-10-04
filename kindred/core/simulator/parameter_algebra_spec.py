@@ -69,42 +69,6 @@ def _raise_invalid_protected_indexed_identifier_error(
     )
 
 
-def invalid_parameter_algebra_identifier_reference_message(
-    raw_name: str,
-    *,
-    mechanism_namespace: MechanismParameterNamespace | None = None,
-    reject_unresolved_protected_indexed: bool = False,
-) -> str | None:
-    name = str(raw_name or "").strip()
-    if not name:
-        return None
-    if is_protected_step_key_identifier(name):
-        return (
-            f"{name!r} is a step-local DSL key and cannot be used as an Algebra identifier. "
-            "Use a canonical indexed mechanism parameter such as k1, kf1, kr1, or Keq1, "
-            "or choose a longer ordinary name such as 'K1_test'."
-        )
-    if mechanism_namespace is not None:
-        if mechanism_namespace.resolve(name).canonical_name is not None:
-            return None
-        invalid_protected = mechanism_namespace.invalid_protected_indexed_identifier(name)
-        if invalid_protected is not None:
-            suggestions = ", ".join(str(suggestion) for suggestion in invalid_protected.suggested_names)
-            suggestion_clause = (
-                f" Use canonical indexed parameter name(s) for this step: {suggestions}."
-                if suggestions
-                else " Use an existing canonical indexed mechanism parameter, or choose a longer ordinary name."
-            )
-            return f"{name!r} is not a valid indexed parameter identifier.{suggestion_clause}"
-        return None
-    if reject_unresolved_protected_indexed and is_protected_indexed_identifier(name):
-        return (
-            f"{name!r} is a protected indexed parameter identifier. "
-            "Exact protected indexed names must resolve through the mechanism namespace."
-        )
-    return None
-
-
 def is_protected_step_key_identifier(raw_name: str) -> bool:
     name = str(raw_name or "").strip()
     return name == "K" or name.lower() in _PROTECTED_STEP_KEY_IDENTIFIERS
@@ -185,7 +149,6 @@ class ParameterAlgebraDeclarationClassification:
     code: str = ""
     line_number: int = 0
     line_content: str = ""
-    canonical_name: str | None = None
     invalid_protected_indexed_identifier: bool = False
     invalid_protected_indexed_suggestions: Tuple[str, ...] = ()
 
@@ -250,7 +213,6 @@ def classify_parameter_algebra_declaration(
             code=code,
             line_number=int(line_number or 0),
             line_content=original,
-            canonical_name=canonical_name,
             invalid_protected_indexed_identifier=bool(invalid_protected_found),
             invalid_protected_indexed_suggestions=invalid_suggestions,
         )
@@ -287,8 +249,6 @@ def classify_parameter_algebra_declaration(
 class ParameterAlgebraNamespace:
     mechanism_param_names: Set[str]
     param_assignment_names: Set[str]
-    scalar_input_names: Set[str]
-    observable_names: Set[str]
     builtin_function_names: Set[str]
     protected_symbol_names: Set[str]
 
@@ -296,8 +256,6 @@ class ParameterAlgebraNamespace:
         for field_name in (
             "mechanism_param_names",
             "param_assignment_names",
-            "scalar_input_names",
-            "observable_names",
             "builtin_function_names",
             "protected_symbol_names",
         ):
@@ -324,7 +282,6 @@ class ParameterAlgebraSpec:
     param_statements: Tuple[ParameterAssignment, ...]
     observable_names: Set[str]
     mechanism_namespace: MechanismParameterNamespace
-    scalar_input_names: Set[str] = field(default_factory=set)
     parameter_block: AlgebraBlock | None = None
     observable_block: AlgebraBlock | None = None
     # Authored-assignment projection for symbolic/source consumers. Numerical
@@ -343,7 +300,6 @@ class ParameterAlgebraSpec:
     def __post_init__(self) -> None:
         object.__setattr__(self, "param_statements", tuple(self.param_statements))
         object.__setattr__(self, "observable_names", frozenset(self.observable_names))
-        object.__setattr__(self, "scalar_input_names", frozenset(self.scalar_input_names))
         dependencies = {
             str(name): tuple(dict.fromkeys(str(dep) for dep in values))
             for name, values in dict(self.parameter_dependencies).items()
@@ -365,7 +321,6 @@ class ParameterAlgebraSpec:
             self.param_statements,
             self.observable_names,
             copy.deepcopy(self.mechanism_namespace, memo),
-            self.scalar_input_names,
             copy.deepcopy(self.parameter_block, memo),
             copy.deepcopy(self.observable_block, memo),
             {
@@ -386,7 +341,6 @@ class ParameterAlgebraSpec:
                 self.param_statements,
                 self.observable_names,
                 self.mechanism_namespace,
-                self.scalar_input_names,
                 self.parameter_block,
                 self.observable_block,
                 {
@@ -420,16 +374,11 @@ class ParameterAlgebraSpec:
             return "derived scalar"
         return "independent scalar"
 
-    def solver_param_names(self) -> Set[str]:
-        return self.namespace_model().solver_param_names()
-
     def namespace_model(self) -> ParameterAlgebraNamespace:
         symtab = SymbolTable()
         return ParameterAlgebraNamespace(
             mechanism_param_names=self.mechanism_namespace.flat_names(),
             param_assignment_names=self.param_assignment_names(),
-            scalar_input_names=set(self.scalar_input_names),
-            observable_names=set(self.observable_names),
             builtin_function_names=set(symtab.functions().keys()),
             protected_symbol_names=set(symtab.protected_names()),
         )
@@ -538,7 +487,6 @@ def _canonicalize_parameter_expr(
     expr: ExprNode,
     *,
     mechanism_namespace: MechanismParameterNamespace,
-    scalar_input_names: Set[str],
     assignment: ParameterAssignment,
 ) -> ExprNode:
     """Canonicalize mechanism identifiers while retaining the parsed AST."""
@@ -566,7 +514,7 @@ def _canonicalize_parameter_expr(
                 line_number=assignment.line_number,
                 line_content=assignment.line_content,
             )
-        if resolution.canonical_name is None or raw_name in scalar_input_names:
+        if resolution.canonical_name is None:
             return expr
         source_info = mechanism_namespace.source_coordinate_info(
             str(resolution.canonical_name)
@@ -583,7 +531,6 @@ def _canonicalize_parameter_expr(
         rhs = _canonicalize_parameter_expr(
             expr.rhs,
             mechanism_namespace=mechanism_namespace,
-            scalar_input_names=scalar_input_names,
             assignment=assignment,
         )
         return UnaryNode(expr.op, rhs)
@@ -591,13 +538,11 @@ def _canonicalize_parameter_expr(
         lhs = _canonicalize_parameter_expr(
             expr.lhs,
             mechanism_namespace=mechanism_namespace,
-            scalar_input_names=scalar_input_names,
             assignment=assignment,
         )
         rhs = _canonicalize_parameter_expr(
             expr.rhs,
             mechanism_namespace=mechanism_namespace,
-            scalar_input_names=scalar_input_names,
             assignment=assignment,
         )
         return BinaryNode(expr.op, lhs, rhs)
@@ -607,7 +552,6 @@ def _canonicalize_parameter_expr(
             canonical_arg = _canonicalize_parameter_expr(
                 arg,
                 mechanism_namespace=mechanism_namespace,
-                scalar_input_names=scalar_input_names,
                 assignment=assignment,
             )
             args.append(canonical_arg)
@@ -619,7 +563,6 @@ def _compile_retained_parameter_block(
     assignments: Sequence[ParameterAssignment],
     *,
     mechanism_namespace: MechanismParameterNamespace,
-    scalar_input_names: Set[str],
     parsed: AlgebraBlock,
 ) -> AlgebraBlock:
     """Canonicalize the parameter slice of the retained admission AST."""
@@ -628,7 +571,6 @@ def _compile_retained_parameter_block(
         expr = _canonicalize_parameter_expr(
             statement.expr,
             mechanism_namespace=mechanism_namespace,
-            scalar_input_names=set(scalar_input_names),
             assignment=assignment,
         )
         canonical_lines.append(
@@ -644,7 +586,6 @@ def _compile_retained_parameter_block(
     block = AlgebraBlock(
         lines=tuple(canonical_lines),
         ast=tuple(stmt.expr for stmt in canonical_lines),
-        static_values=parsed.static_values,
         evaluation_order=parsed.evaluation_order,
     )
     return block
@@ -676,15 +617,6 @@ def _validate_retained_parameter_program(
                 line_number=assignment.line_number,
                 line_content=assignment.line_content,
             )
-        dynamic_scalars = sorted(idents & set(namespace.scalar_input_names))
-        if dynamic_scalars:
-            raise DSLError(
-                "Parameter expression cannot reference dynamic scalar input(s): "
-                + ", ".join(repr(name) for name in dynamic_scalars),
-                suggestion="Use admitted solver parameters in 'param' expressions and consume dynamic scalars from a 'let'.",
-                line_number=assignment.line_number,
-                line_content=assignment.line_content,
-            )
         if not (idents - allowed_constants):
             # Literal/constant-only parameter expressions are statically
             # admitted; reject domain/division failures before mutation.
@@ -697,7 +629,6 @@ def _validate_retained_parameter_program(
                     AlgebraBlock(
                         lines=(statement,),
                         ast=(statement.expr,),
-                        static_values={},
                     ),
                     EvaluationContext(
                         t=np.array([0.0]),
@@ -815,7 +746,6 @@ def _validate_retained_observable_program(
                     AlgebraBlock(
                         lines=(statement,),
                         ast=(statement.expr,),
-                        static_values={},
                     ),
                     EvaluationContext(
                         t=np.array([0.0]),
@@ -853,7 +783,6 @@ def _validate_retained_observable_program(
             and identifier not in defined_lets
             and identifier not in namespace.mechanism_param_names
             and spec.mechanism_namespace.resolve(identifier).canonical_name is None
-            and identifier not in namespace.scalar_input_names
             and identifier not in allowed_constants
             and identifier not in dynamic_identifiers
         }
@@ -948,7 +877,6 @@ def _validate_retained_observable_program(
                 AlgebraBlock(
                     lines=static_statements,
                     ast=tuple(statement.expr for statement in static_statements),
-                    static_values={},
                 ),
                 EvaluationContext(
                     t=np.array([0.0]),
@@ -1312,7 +1240,6 @@ def parse_parameter_algebra_spec_from_dsl_text(
     dsl_text: str,
     *,
     mechanism_namespace: MechanismParameterNamespace,
-    scalar_input_names: Set[str] | None = None,
 ) -> ParameterAlgebraSpec:
     lines = collect_algebra_section_lines(dsl_text)
     assignments = extract_parameter_assignments_from_algebra_lines(lines, mechanism_namespace=mechanism_namespace)
@@ -1332,7 +1259,6 @@ def parse_parameter_algebra_spec_from_dsl_text(
         param_statements=list(assignments),
         observable_names=set(observables),
         mechanism_namespace=mechanism_namespace,
-        scalar_input_names=set(scalar_input_names or ()),
     )
     full_block, descriptors = _compile_retained_algebra_program(lines)
     parameter_indices = [
@@ -1346,17 +1272,11 @@ def parse_parameter_algebra_spec_from_dsl_text(
     parameter_raw_block = AlgebraBlock(
         lines=tuple(full_block.lines[index] for index in parameter_indices),
         ast=tuple(full_block.ast[index] for index in parameter_indices),
-        static_values={
-            name: value
-            for name, value in full_block.static_value_map().items()
-            if name in {assignments[i].name for i in range(len(assignments))}
-        },
     )
     if assignments:
         block = _compile_retained_parameter_block(
             assignments,
             mechanism_namespace=mechanism_namespace,
-            scalar_input_names=set(scalar_input_names or ()),
             parsed=parameter_raw_block,
         )
         parameter_dependencies = _validate_retained_parameter_program(
@@ -1375,11 +1295,6 @@ def parse_parameter_algebra_spec_from_dsl_text(
     observable_block = AlgebraBlock(
         lines=tuple(full_block.lines[index] for index in observable_indices),
         ast=tuple(full_block.ast[index] for index in observable_indices),
-        static_values={
-            name: value
-            for name, value in full_block.static_value_map().items()
-            if name in {observables_name for observables_name in observables}
-        },
     )
     _validate_retained_observable_program(initial_spec, block=observable_block)
     return replace(

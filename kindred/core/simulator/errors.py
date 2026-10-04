@@ -145,7 +145,7 @@ def invalid_keyvalue_pair_error(chunk: str) -> DSLError:
     """Error for malformed key=value pair."""
     return DSLError(
         f"Expected key=value pair, got: {chunk}",
-        suggestion="Use format: key=value with no spaces around '='",
+        suggestion="Use format: key=value",
         examples=[
             "k=1.5",
             "dG_act=75.5",

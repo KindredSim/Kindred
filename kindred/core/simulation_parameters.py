@@ -72,12 +72,10 @@ def enumerate_simulation_parameters(
 
     for item in namespace.ordered_items:
         info = item.info
-        if info.step_index is None:
-            continue
-        step_index = int(info.step_index)
+        step_index = info.step_index
         entry = step_by_index.get(step_index, {})
-        kind = str(info.step_kind or "")
-        role = str(info.role or "")
+        kind = info.step_kind
+        role = info.role
         name = str(item.canonical_name)
         source_coordinates = {
             str(source_role): str(source_name)

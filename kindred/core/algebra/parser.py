@@ -1,5 +1,5 @@
 """
-AST builder and conservative static folding for the Algebra DSL.
+AST builder for the Algebra DSL.
 
 Current contract
 ----------------
@@ -17,15 +17,10 @@ Scope of this module
 - Enforce precedence and right-associative power (** and ^).
 - Validate function-argument arity superficially (min 1 for varargs, exact for unary),
   leave deeper numeric/type checks to the evaluator.
-- Conservative static folding:
-    * Fold any subtree containing only numeric literals, protected constants,
-      and pure math/helpers, with no SpeciesRef and no user identifiers.
-    * Record statically-folded results per let binding when entire RHS is static.
 
 Out of scope here
 -----------------
 - Dynamic evaluation (done in evaluator.py).
-- Time memoization.
 - Shadowing detection with species names (handled by evaluator with symbol table).
 
 Determinism & constraints
@@ -41,9 +36,8 @@ import logging
 import math
 import re
 from dataclasses import dataclass, field
-from collections.abc import Iterable, Mapping
 from fractions import Fraction
-from typing import Dict, List, Literal, Optional, Tuple
+from typing import List, Literal, Optional, Tuple
 
 from kindred.core.quantity_units import Unit, UnitScale, ONE_SCALE
 
@@ -55,7 +49,6 @@ from .grammar import (
     TOKEN_SPEC,
     TokenKind,
 )
-from .symbols import BUILTIN_FUNCTIONS as RUNTIME_FUNCS
 
 logger = logging.getLogger(__name__)
 
@@ -128,8 +121,6 @@ class ExprNode:
     quantity_unit: Unit | None = field(default=None, compare=False, repr=False)
     unit_scale: UnitScale = field(default=ONE_SCALE, compare=False, repr=False)
     unit_factor: float = field(default=1.0, compare=False, repr=False)
-    def is_static(self) -> bool:  # free of species/time refs and user idents
-        return False
 
     def has_species_ref(self) -> bool:
         return False
@@ -147,25 +138,16 @@ class NumberNode(ExprNode):
         except (TypeError, ValueError, ZeroDivisionError, OverflowError):
             return None
 
-    def is_static(self) -> bool:
-        return True
-
 
 @dataclass(frozen=True)
 class IdentNode(ExprNode):
     name: str
-    # Conservatively treat as non-static; evaluator resolves
-    def is_static(self) -> bool:
-        return False
 
 
 @dataclass(frozen=True)
 class UnaryNode(ExprNode):
     op: str
     rhs: ExprNode
-
-    def is_static(self) -> bool:
-        return self.rhs.is_static()
 
     def has_species_ref(self) -> bool:
         return self.rhs.has_species_ref()
@@ -176,9 +158,6 @@ class BinaryNode(ExprNode):
     lhs: ExprNode
     rhs: ExprNode
 
-    def is_static(self) -> bool:
-        return self.lhs.is_static() and self.rhs.is_static()
-
     def has_species_ref(self) -> bool:
         return self.lhs.has_species_ref() or self.rhs.has_species_ref()
 
@@ -186,12 +165,6 @@ class BinaryNode(ExprNode):
 class CallNode(ExprNode):
     name: str
     args: Tuple[ExprNode, ...]
-
-    def is_static(self) -> bool:
-        # static only if all args static and function is a builtin helper/math
-        if any(not a.is_static() for a in self.args):
-            return False
-        return self.name in RUNTIME_FUNCS
 
     def has_species_ref(self) -> bool:
         return any(a.has_species_ref() for a in self.args)
@@ -204,11 +177,6 @@ class SpeciesRefNode(ExprNode):
     def __post_init__(self) -> None:
         if self.kind not in {"now", "init"}:
             raise ValueError("Species reference kind must be 'now' or 'init'.")
-
-    def is_static(self) -> bool:
-        # Species refs are time-varying except _0 which is static w.r.t time,
-        # but evaluator treats it specially; we avoid folding across any ref.
-        return False
 
     def has_species_ref(self) -> bool:
         return True
@@ -302,25 +270,15 @@ class AlgebraBlock:
 
     lines: Tuple[LetStatement, ...]
     ast: Tuple[ExprNode, ...]
-    static_values: Tuple[Tuple[str, float], ...]
     evaluation_order: Tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         lines = tuple(self.lines)
         ast = tuple(self.ast)
-        raw_static: Mapping[str, float] | Iterable[Tuple[str, float]] = self.static_values
-        static_values = tuple(
-            (str(name), float(value))
-            for name, value in (
-                raw_static.items() if isinstance(raw_static, Mapping) else raw_static
-            )
-        )
         if len(lines) != len(ast):
             raise ValueError("AlgebraBlock lines and AST must have identical length.")
         if tuple(stmt.expr for stmt in lines) != ast:
             raise ValueError("AlgebraBlock AST must match its retained statements.")
-        if len({name for name, _value in static_values}) != len(static_values):
-            raise ValueError("AlgebraBlock static-value names must be unique.")
         names = tuple(str(statement.name) for statement in lines)
         if len(set(names)) != len(names):
             duplicate = next(name for name in names if names.count(name) > 1)
@@ -334,11 +292,7 @@ class AlgebraBlock:
             )
         object.__setattr__(self, "lines", lines)
         object.__setattr__(self, "ast", ast)
-        object.__setattr__(self, "static_values", static_values)
         object.__setattr__(self, "evaluation_order", evaluation_order)
-
-    def static_value_map(self) -> Dict[str, float]:
-        return dict(self.static_values)
 
     def statements_in_evaluation_order(self) -> Tuple[LetStatement, ...]:
         """Return retained statements in dependency order."""
@@ -380,7 +334,6 @@ class Parser:
     def parse_block(self) -> AlgebraBlock:
         lines: List[LetStatement] = []
         exprs: List[ExprNode] = []
-        static_values: Dict[str, float] = {}
 
         # Accept optional blank lines
         self._consume_newlines()
@@ -404,17 +357,11 @@ class Parser:
             lines.append(stmt)
             exprs.append(expr)
 
-            # Conservative static fold for an entire RHS
-            folded = _try_static_eval(expr)
-            if folded is not None:
-                static_values[name_tok.text] = folded
-
             self._consume_newlines()
 
         return AlgebraBlock(
             lines=lines,
             ast=exprs,
-            static_values=static_values,
             evaluation_order=_topological_evaluation_order(tuple(lines)),
         )
 
@@ -601,109 +548,14 @@ class Parser:
         raise AlgebraSyntaxError("unexpected token", line=t.line, col=t.col, line_text=t.line_text)
 
 
-# ------------------------------ Static folding -------------------------------
-
-def _try_static_eval(node: ExprNode) -> Optional[float]:
-    """
-    Conservative, side-effect-free evaluation of a subtree.
-
-    Only folds when:
-    - No SpeciesRef present.
-    - No IdentNode (user-defined symbols).
-    - All calls are to known builtins/helpers and all arguments are foldable.
-
-    Returns the folded float if possible, else None.
-    """
-    try:
-        val, ok = _eval_static(node)
-        return val if ok else None
-    except Exception:
-        logger.debug("Static evaluation failed for expression node", exc_info=True)
-        return None
-
-
-def _eval_static(node: ExprNode) -> Tuple[float, bool]:
-    # Number
-    if isinstance(node, NumberNode):
-        return node.value, True
-    # For safety, we never fold bare identifiers or any species refs
-    if isinstance(node, (IdentNode, SpeciesRefNode)):
-        return 0.0, False
-    if isinstance(node, UnaryNode):
-        v, ok = _eval_static(node.rhs)
-        if not ok:
-            return 0.0, False
-        if node.op == "+":
-            return +v, True
-        if node.op == "-":
-            return -v, True
-        if node.op == "!":
-            # numeric-only folding: treat 0 as False, others True -> 0.0 or 1.0
-            return (0.0 if v else 1.0), True
-        return 0.0, False
-    if isinstance(node, BinaryNode):
-        lv, lok = _eval_static(node.lhs)
-        rv, rok = _eval_static(node.rhs)
-        if not (lok and rok):
-            return 0.0, False
-        op = node.op
-        if op == "+":
-            return lv + rv, True
-        if op == "-":
-            return lv - rv, True
-        if op == "*":
-            return lv * rv, True
-        if op == "/":
-            if rv == 0.0:
-                raise ZeroDivisionError()
-            return lv / rv, True
-        if op in ("**", "^"):
-            return float(math.pow(lv, rv)), True
-        if op == "||":
-            return (1.0 if (lv or rv) else 0.0), True
-        if op == "&&":
-            return (1.0 if (lv and rv) else 0.0), True
-        if op == "==":
-            return (1.0 if (lv == rv) else 0.0), True
-        if op == "!=":
-            return (1.0 if (lv != rv) else 0.0), True
-        if op == "<":
-            return (1.0 if (lv < rv) else 0.0), True
-        if op == "<=":
-            return (1.0 if (lv <= rv) else 0.0), True
-        if op == ">":
-            return (1.0 if (lv > rv) else 0.0), True
-        if op == ">=":
-            return (1.0 if (lv >= rv) else 0.0), True
-        return 0.0, False
-    if isinstance(node, CallNode):
-        # Only fold if function is known and all args foldable
-        fn = RUNTIME_FUNCS.get(node.name)
-        if fn is None:
-            return 0.0, False
-        vals: List[float] = []
-        for arg in node.args:
-            v, ok = _eval_static(arg)
-            if not ok:
-                return 0.0, False
-            vals.append(float(v))
-        try:
-            out = float(fn(*vals))
-        except Exception:
-            logger.debug(f"Static evaluation of function {node.name} failed", exc_info=True)
-            return 0.0, False
-        return out, True
-    return 0.0, False
-
-
 # ------------------------------ Public API -----------------------------------
 
 def parse_algebra(src: str) -> AlgebraBlock:
     """
-    Parse an internal synthetic algebra source string and return AlgebraBlock
-    with AST and static_values.
+    Parse an internal synthetic algebra source string and return its
+    AlgebraBlock.
 
-    Raises Algebra* errors with E-series codes and caret spans for diagnostics.
+    Raises Algebra* errors with E-series codes and a caret for diagnostics.
     """
     tokens = _lex(src)
     parser = Parser(tokens)

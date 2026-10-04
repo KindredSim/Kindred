@@ -356,7 +356,7 @@ class DataTab(QtWidgets.QWidget):
             else:
                 self._invalid_raw.pop((dataset_id, field), None)
                 config[field] = value
-        if "maximum_observations_per_target" in changed:
+        if changed_field == "maximum_observations_per_target":
             maximum = int(self._maximum_edit.value())
             config["maximum_observations_per_target"] = (
                 None if maximum == 0 else maximum
@@ -425,16 +425,6 @@ class DataTab(QtWidgets.QWidget):
             )
         config = self._capture(changed_field)
         self._set_maximum_range(config)
-        if changed_field in {
-            "t_start",
-            "data_range_min",
-            "data_range_max",
-            "parametric_x",
-        }:
-            maximum = int(self._maximum_edit.value())
-            config["maximum_observations_per_target"] = (
-                None if maximum == 0 else maximum
-            )
         self._refresh_parametric_presentation()
         error = self._validation_error(self._current_dataset_id, config)
         try:

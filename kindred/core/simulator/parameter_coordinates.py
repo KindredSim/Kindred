@@ -66,16 +66,11 @@ def build_parameter_target_map(
     targets: dict[str, ParameterTarget] = {}
 
     for item in namespace.ordered_items:
-        source_index = item.source_index
-        if source_index is None:
-            continue
-        entry = step_roster[source_index]
+        entry = step_roster[item.source_index]
         kind = str(entry["kind"])
         index_key = "reaction_index" if kind == "reaction" else "equilibrium_index"
         index = int(entry[index_key])
-        role = str(item.info.role or "")
-        if not role:
-            continue
+        role = str(item.info.role)
         targets[str(item.canonical_name)] = (
             "indexed",
             kind,
@@ -88,10 +83,7 @@ def build_parameter_target_map(
         name = str(coordinate.canonical_name)
         if name in targets:
             continue
-        source_index = coordinate.source_index
-        if source_index is None:
-            continue
-        entry = step_roster[source_index]
+        entry = step_roster[coordinate.source_index]
         kind = str(entry["kind"])
         index_key = "reaction_index" if kind == "reaction" else "equilibrium_index"
         index = int(entry[index_key])

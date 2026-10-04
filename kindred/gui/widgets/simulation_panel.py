@@ -4,12 +4,12 @@ from __future__ import annotations
 
 from kindred.gui.display_name_policy import scientific_symbol_html, scientific_symbol_spoken
 
-from PySide6 import QtCore, QtGui, QtWidgets
+from PySide6 import QtCore, QtWidgets
 
 from kindred.core.project_document import (
-    SIMULATION_POINT_RANGE,
     SimulationExecutionSettings,
     SUPPORTED_SOLVERS,
+    parse_points_text,
     validate_simulation_execution_settings,
 )
 from kindred.core.validation import parse_finite_numeric_text
@@ -123,7 +123,6 @@ class SimulationPanel(QtWidgets.QWidget):
     stopRequested = QtCore.Signal()
     workspaceRunDefaultsRequested = QtCore.Signal(object)
     settingsValidationFailed = QtCore.Signal(str)
-    runEnabledChanged = QtCore.Signal(bool)
     runDefaultsDraftStateChanged = QtCore.Signal(bool)
 
     def __init__(
@@ -134,18 +133,9 @@ class SimulationPanel(QtWidgets.QWidget):
     ) -> None:
         super().__init__(parent)
         self._canonical_settings = SimulationExecutionSettings()
-        self._candidate_values: dict[str, object] = {
-            "solver": self._canonical_settings.solver,
-            "t_start": self._canonical_settings.t_start,
-            "t_end": self._canonical_settings.t_end,
-            "integration_points": self._canonical_settings.integration_points,
-        }
-        self._candidate_changed_fields: set[str] = set()
         self._rendering = False
         self._candidate_dirty = False
-        self._run_admitted = True
         self._simulation_job_kind: str | None = None
-        self._last_run_enabled: bool | None = None
 
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -158,19 +148,17 @@ class SimulationPanel(QtWidgets.QWidget):
         self.solver_method_combo.setToolTip(SOLVER_TOOLTIP)
         self.t_start_edit = self._number_edit("0.0", "Absolute Run start time")
         self.t_end_edit = self._number_edit("10.0", "Absolute Run end time")
-        self.num_points_spinbox = QtWidgets.QSpinBox(self)
-        self.num_points_spinbox.setRange(*SIMULATION_POINT_RANGE)
-        self.num_points_spinbox.setSingleStep(10)
-        self.num_points_spinbox.setToolTip(
+        self.points_edit = self._number_edit(
+            "100",
             "Number of evenly spaced base samples over the completed interval, "
             "including both endpoints. Intervention boundary rows are additional. "
-            "A stop at the start returns one sample."
+            "A stop at the start returns one sample.",
         )
         for label, widget in (
             ("Solver", self.solver_method_combo),
             ("t_start", self.t_start_edit),
             ("t_end", self.t_end_edit),
-            ("Points", self.num_points_spinbox),
+            ("Points", self.points_edit),
         ):
             name = label
             label_widget = QtWidgets.QLabel(label, self)
@@ -189,20 +177,10 @@ class SimulationPanel(QtWidgets.QWidget):
             controls.addWidget(group)
 
         self.solver_method_combo.currentTextChanged.connect(self._mark_candidate_dirty)
-        self.t_start_edit.textEdited.connect(self._mark_candidate_dirty)
-        self.t_end_edit.textEdited.connect(self._mark_candidate_dirty)
-        # QSpinBox normalizes its value before ``valueChanged`` reaches us.
-        # Capture the embedded editor's authored text first so an invalid or
-        # intermediate draft remains visible until the owner admits or
-        # explicitly discards it.
-        self.num_points_spinbox.lineEdit().textEdited.connect(
-            self._capture_integration_points_text
-        )
-        self.num_points_spinbox.valueChanged.connect(self._mark_candidate_dirty)
+        for edit in (self.t_start_edit, self.t_end_edit, self.points_edit):
+            edit.textEdited.connect(self._mark_candidate_dirty)
+            edit.editingFinished.connect(self._settle_after_edit)
         self.solver_method_combo.activated.connect(self._settle_after_edit)
-        self.t_start_edit.editingFinished.connect(self._settle_after_edit)
-        self.t_end_edit.editingFinished.connect(self._settle_after_edit)
-        self.num_points_spinbox.editingFinished.connect(self._settle_after_edit)
 
         self._actions_host = QtWidgets.QWidget(self)
         actions_layout = ControlRowsLayout(self._actions_host)
@@ -243,9 +221,6 @@ class SimulationPanel(QtWidgets.QWidget):
         self.batch_table = BatchInitialConditionsTableView(self)
         self.batch_table.setObjectName("batchTable")
         self.batch_table.setModel(batch_model)
-        self.batch_table.selectionModel().selectionChanged.connect(
-            self._sync_run_enabled
-        )
         layout.addWidget(self.batch_table, 1)
 
         self._reproject_canonical()
@@ -267,45 +242,24 @@ class SimulationPanel(QtWidgets.QWidget):
         self,
         settings: SimulationExecutionSettings,
         *,
-        run_admitted: bool,
         simulation_job_kind: str | None,
     ) -> None:
-        validate_simulation_execution_settings(settings)
         kind = None if simulation_job_kind is None else str(simulation_job_kind)
         if kind not in {None, "run", "preview"}:
             raise ValueError("simulation_job_kind must be None, 'run', or 'preview'.")
         previous_rendering = self._rendering
         self._rendering = True
-        blockers = tuple(
-            QtCore.QSignalBlocker(widget)
-            for widget in (
-                self.solver_method_combo,
-                self.t_start_edit,
-                self.t_end_edit,
-                self.num_points_spinbox,
-            )
-        )
         try:
             preserve_candidate = (
                 self._candidate_dirty and settings == self._canonical_settings
             )
             self._canonical_settings = settings
-            if not preserve_candidate:
-                self._candidate_dirty = False
-                self._candidate_values = {
-                    "solver": settings.solver,
-                    "t_start": settings.t_start,
-                    "t_end": settings.t_end,
-                    "integration_points": settings.integration_points,
-                }
-                self._candidate_changed_fields.clear()
-            self._run_admitted = bool(run_admitted)
             self._simulation_job_kind = kind
             if not preserve_candidate:
+                self._candidate_dirty = False
                 self._reproject_canonical()
             self._sync_controls()
         finally:
-            del blockers
             self._rendering = previous_rendering
 
     def render_job_state(self, simulation_job_kind: str | None) -> None:
@@ -337,7 +291,7 @@ class SimulationPanel(QtWidgets.QWidget):
             self.solver_method_combo,
             self.t_start_edit,
             self.t_end_edit,
-            self.num_points_spinbox,
+            self.points_edit,
         )
         if focused is None or not any(
             focused is control or control.isAncestorOf(focused)
@@ -355,34 +309,9 @@ class SimulationPanel(QtWidgets.QWidget):
                 )
             except (TypeError, ValueError):
                 self._candidate_dirty = True
-                points_edit = self.num_points_spinbox.lineEdit()
-                if points_edit.text() != str(
-                    int(self._candidate_values["integration_points"])
-                ):
-                    self._candidate_values["integration_points"] = (
-                        points_edit.text()
-                    )
-                    self._candidate_changed_fields.add("integration_points")
-        if focused is self.solver_method_combo:
-            self._candidate_changed_fields.add("solver")
-            self._candidate_values["solver"] = str(
-                self.solver_method_combo.currentText()
-            )
-        elif focused is self.t_start_edit:
-            self._candidate_changed_fields.add("t_start")
-        elif focused is self.t_end_edit:
-            self._candidate_changed_fields.add("t_end")
-        elif focused is self.num_points_spinbox:
-            self._candidate_changed_fields.add("integration_points")
-        elif (
-            focused is self.num_points_spinbox.lineEdit()
-            or self.num_points_spinbox.lineEdit().isAncestorOf(focused)
-        ):
-            self._candidate_changed_fields.add("integration_points")
         blockers = tuple(QtCore.QSignalBlocker(control) for control in controls)
         try:
             focused.clearFocus()
-            self._restore_integration_points_draft()
         finally:
             del blockers
         self._sync_controls()
@@ -405,24 +334,16 @@ class SimulationPanel(QtWidgets.QWidget):
     ) -> None:
         """Adopt settings already published by the enclosing Save candidate."""
 
-        validate_simulation_execution_settings(settings)
         had_draft = self._candidate_dirty
         self._canonical_settings = settings
         self._candidate_dirty = False
-        self._candidate_values = {
-            "solver": settings.solver,
-            "t_start": settings.t_start,
-            "t_end": settings.t_end,
-            "integration_points": settings.integration_points,
-        }
-        self._candidate_changed_fields.clear()
         self._reproject_canonical()
         self._sync_controls()
         if had_draft:
             self.runDefaultsDraftStateChanged.emit(False)
 
     def settle_run_defaults(self) -> bool:
-        """Commit one complete candidate or reproject canonical and abort once."""
+        """Commit one complete candidate or keep the authored draft and abort once."""
         if not self._candidate_dirty:
             return True
         try:
@@ -431,8 +352,6 @@ class SimulationPanel(QtWidgets.QWidget):
             # Keep the authored Draft visible and blocking.  Reprojecting the
             # canonical values here would make a focus-loss event silently
             # erase the invalid text before Run can observe it.
-            self._candidate_dirty = True
-            self._restore_integration_points_draft()
             self._sync_controls()
             self.settingsValidationFailed.emit(str(exc))
             return False
@@ -452,83 +371,45 @@ class SimulationPanel(QtWidgets.QWidget):
         return True
 
     def current_settings_candidate(self) -> SimulationExecutionSettings:
-        values = dict(self._candidate_values)
-        changed = set(self._candidate_changed_fields)
-        # Direct callers may set a field without the user-edit signal. Detect
-        # only text that differs from the exact projection; untouched fields
-        # continue to come from the accepted backing object.
-        for field, edit in (
-            ("t_start", self.t_start_edit),
-            ("t_end", self.t_end_edit),
-        ):
-            projected = repr(float(values[field]))
-            if edit.text() != projected:
-                changed.add(field)
-        for field, edit in (
-            ("t_start", self.t_start_edit),
-            ("t_end", self.t_end_edit),
-        ):
-            if field not in changed:
-                continue
-            values[field] = parse_finite_numeric_text(edit.text(), field=field)
-        points_edit = self.num_points_spinbox.lineEdit()
-        projected_points = str(int(values["integration_points"]))
-        if points_edit.text() != projected_points:
+        settings = self._canonical_settings
+        # Only text that differs from the exact projection is parsed;
+        # untouched fields come from the accepted backing object.
+        changed = set()
+        if self.t_start_edit.text() != repr(float(settings.t_start)):
+            changed.add("t_start")
+        if self.t_end_edit.text() != repr(float(settings.t_end)):
+            changed.add("t_end")
+        if self.points_edit.text() != str(settings.integration_points):
             changed.add("integration_points")
-            if "integration_points" not in self._candidate_changed_fields:
-                values["integration_points"] = points_edit.text()
-                self._candidate_values["integration_points"] = points_edit.text()
-                self._candidate_changed_fields.add("integration_points")
-        if "integration_points" in changed:
-            raw_points = values["integration_points"]
-            raw_text = str(raw_points)
-            state, _corrected, _position = self.num_points_spinbox.validate(
-                raw_text,
-                0,
-            )
-            if state is not QtGui.QValidator.State.Acceptable:
-                minimum, maximum = SIMULATION_POINT_RANGE
-                raise ValueError(
-                    f"Points {raw_text!r} must be an integer between "
-                    f"{minimum} and {maximum}."
-                )
-            try:
-                values["integration_points"] = int(raw_text)
-            except (TypeError, ValueError, OverflowError) as exc:
-                minimum, maximum = SIMULATION_POINT_RANGE
-                raise ValueError(
-                    f"Points {raw_text!r} must be an integer between "
-                    f"{minimum} and {maximum}."
-                ) from exc
+        t_start, t_end = settings.t_start, settings.t_end
+        if "t_start" in changed:
+            text = self.t_start_edit.text()
+            t_start = parse_finite_numeric_text(text, field=f"Start time {text!r}")
+        if "t_end" in changed:
+            text = self.t_end_edit.text()
+            t_end = parse_finite_numeric_text(text, field=f"End time {text!r}")
+        points = (
+            parse_points_text(self.points_edit.text())
+            if "integration_points" in changed
+            else settings.integration_points
+        )
         candidate = SimulationExecutionSettings(
             solver=str(self.solver_method_combo.currentText()),
-            t_start=float(values["t_start"]),
-            t_end=float(values["t_end"]),
-            integration_points=int(values["integration_points"]),
+            t_start=float(t_start),
+            t_end=float(t_end),
+            integration_points=points,
         )
-        try:
-            validate_simulation_execution_settings(candidate)
-        except ValueError as exc:
-            raise ValueError(f"t_start={values['t_start']!r}, t_end={values['t_end']!r}, "
-                             f"integration_points={values['integration_points']!r}: {exc}") from exc
-        return candidate
+        return validate_simulation_execution_settings(candidate)
 
     def _reproject_canonical(self) -> None:
         settings = self._canonical_settings
-        self._candidate_values = {
-            "solver": settings.solver,
-            "t_start": settings.t_start,
-            "t_end": settings.t_end,
-            "integration_points": settings.integration_points,
-        }
-        self._candidate_changed_fields.clear()
         previous_rendering = self._rendering
         self._rendering = True
         try:
             self.solver_method_combo.setCurrentText(settings.solver)
             self.t_start_edit.setText(repr(float(settings.t_start)))
             self.t_end_edit.setText(repr(float(settings.t_end)))
-            self.num_points_spinbox.setValue(settings.integration_points)
+            self.points_edit.setText(str(settings.integration_points))
         finally:
             self._rendering = previous_rendering
 
@@ -538,55 +419,8 @@ class SimulationPanel(QtWidgets.QWidget):
             return
         was_dirty = self._candidate_dirty
         self._candidate_dirty = True
-        sender = self.sender()
-        if sender is self.solver_method_combo:
-            self._candidate_changed_fields.add("solver")
-            self._candidate_values["solver"] = str(
-                self.solver_method_combo.currentText()
-            )
-        elif sender is self.t_start_edit:
-            self._candidate_changed_fields.add("t_start")
-        elif sender is self.t_end_edit:
-            self._candidate_changed_fields.add("t_end")
-        elif sender is self.num_points_spinbox:
-            self._candidate_changed_fields.add("integration_points")
-            stored = self._candidate_values.get("integration_points")
-            try:
-                stored_value = int(stored) if isinstance(stored, str) else None
-            except (TypeError, ValueError, OverflowError):
-                stored_value = None
-            if stored_value != int(self.num_points_spinbox.value()):
-                self._candidate_values["integration_points"] = (
-                    self.num_points_spinbox.lineEdit().text()
-                )
         if not was_dirty:
             self.runDefaultsDraftStateChanged.emit(True)
-
-    @QtCore.Slot(str)
-    def _capture_integration_points_text(self, text: str) -> None:
-        if self._rendering:
-            return
-        was_dirty = self._candidate_dirty
-        self._candidate_dirty = True
-        self._candidate_changed_fields.add("integration_points")
-        self._candidate_values["integration_points"] = str(text)
-        if not was_dirty:
-            self.runDefaultsDraftStateChanged.emit(True)
-
-    def _restore_integration_points_draft(self) -> None:
-        """Restore exact authored Points text after Qt editor normalization."""
-
-        if "integration_points" not in self._candidate_changed_fields:
-            return
-        value = self._candidate_values.get("integration_points")
-        if not isinstance(value, str):
-            return
-        edit = self.num_points_spinbox.lineEdit()
-        blocker = QtCore.QSignalBlocker(edit)
-        try:
-            edit.setText(value)
-        finally:
-            del blocker
 
     @QtCore.Slot()
     def _settle_after_edit(self, *_args) -> None:
@@ -603,16 +437,3 @@ class SimulationPanel(QtWidgets.QWidget):
         show_stop = self._simulation_job_kind in {"run", "preview"}
         self.stop_btn.setVisible(show_stop)
         self.stop_btn.setEnabled(show_stop)
-        self._sync_run_enabled()
-
-    @QtCore.Slot()
-    def _sync_run_enabled(self, *_args) -> None:
-        enabled = bool(
-            bool(self.batch_table.selected_set_ids())
-            and self._run_admitted
-        )
-        self.run_btn.setEnabled(enabled)
-        if enabled != self._last_run_enabled:
-            self._last_run_enabled = enabled
-            if not self._rendering:
-                self.runEnabledChanged.emit(enabled)

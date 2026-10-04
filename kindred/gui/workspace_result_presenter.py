@@ -347,10 +347,6 @@ def _result_warning_details(result: SimulationResultValue) -> tuple[str, ...]:
             f"{observable_name}: type={cause.type}; code={code}; "
             f"message={cause.message}"
         )
-    if result.omitted_algebra_outputs:
-        details.append(
-            "Algebra omitted: " + ", ".join(result.omitted_algebra_outputs)
-        )
     return tuple(details)
 
 
@@ -370,7 +366,6 @@ def _result_provenance_payload(result: SimulationResultValue) -> Mapping[str, ob
                             "requested": result.requested_algebra_outputs,
                             "succeeded": result.succeeded_algebra_outputs,
                             "failed": result.failed_algebra_outputs,
-                            "omitted": result.omitted_algebra_outputs,
                             "errors": tuple(
                                 cause.to_payload()
                                 for cause in result.algebra_errors
@@ -1393,7 +1388,6 @@ def compose_result_input(
     def add_warning(label: str, result: SimulationResultValue, visible: bool) -> None:
         has_algebra_warnings = bool(
             result.failed_algebra_outputs
-            or result.omitted_algebra_outputs
             or result.algebra_errors
         )
         if visible and has_algebra_warnings and id(result) not in warning_ids:

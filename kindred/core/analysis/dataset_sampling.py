@@ -2,67 +2,20 @@
 
 from __future__ import annotations
 
-from typing import Optional
-
-import numpy as np
-
-__all__ = ["compute_sampled_indices", "compute_windowed_indices"]
+__all__ = ["compute_sampled_indices"]
 
 
-def compute_windowed_indices(
-    *,
-    t: np.ndarray,
-    t_min: float,
-    t_max: float,
-) -> np.ndarray:
-    """Return eligible original-array indices in physical source order."""
-    values = np.asarray(t, dtype=float).reshape(-1)
-    if values.size == 0:
-        return np.asarray([], dtype=int)
-    mask = (values >= float(t_min)) & (values <= float(t_max))
-    eligible = np.nonzero(mask)[0].astype(int, copy=False)
-    return eligible
+def compute_sampled_indices(*, count: int, n_points: int) -> tuple[int, ...]:
+    """Select ``n_points`` of ``count`` rows evenly, including both endpoints.
 
-
-def compute_sampled_indices(
-    *,
-    t: np.ndarray,
-    t_min: float,
-    t_max: float,
-    n_points: Optional[int],
-) -> np.ndarray:
-    """Select existing rows evenly; never interpolate, average, or fabricate."""
-    if float(t_min) > float(t_max):
-        raise ValueError("t_min must be <= t_max.")
-    windowed = compute_windowed_indices(
-        t=t,
-        t_min=float(t_min),
-        t_max=float(t_max),
-    )
-    if windowed.size == 0:
-        raise ValueError("Sampling window contains no points.")
-    if n_points is None:
-        return windowed
-    try:
-        requested = int(n_points)
-    except (TypeError, ValueError, OverflowError) as exc:
-        raise ValueError("n_points must be an int or None.") from exc
-    if requested <= 0:
-        return windowed
-    if requested < 2:
-        raise ValueError("n_points must be All/None or >= 2.")
-    if requested >= int(windowed.size):
-        return windowed
-
-    count = int(windowed.size)
-    denominator = requested - 1
+    Existing rows are selected; nothing is interpolated, averaged, or
+    fabricated. ``n_points`` is at least 2.
+    """
+    if n_points >= count:
+        return tuple(range(count))
+    denominator = n_points - 1
     last = count - 1
-    positions = np.fromiter(
-        (
-            (2 * index * last + denominator) // (2 * denominator)
-            for index in range(requested)
-        ),
-        dtype=int,
-        count=requested,
+    return tuple(
+        (2 * index * last + denominator) // (2 * denominator)
+        for index in range(n_points)
     )
-    return windowed[positions]

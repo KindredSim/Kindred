@@ -8,10 +8,10 @@ from PySide6 import QtCore, QtWidgets
 
 from kindred.core.project_document import (
     TEMPERATURE_RANGE_K,
-    SIMULATION_POINT_RANGE,
     SimulationExecutionSettings,
     SUPPORTED_SOLVERS,
     TabScientificSettings,
+    parse_points_text,
     validate_simulation_execution_settings,
     validate_tab_scientific_settings,
 )
@@ -34,19 +34,18 @@ class _RunSettingsFields:
         self.solver_combo.setToolTip(SOLVER_TOOLTIP)
         self.t_start_edit = self._time_edit(parent, "0", "Absolute Run start time")
         self.t_end_edit = self._time_edit(parent, "10", "Absolute Run end time")
-        self.integration_points_spin = QtWidgets.QSpinBox(parent)
-        self.integration_points_spin.setRange(*SIMULATION_POINT_RANGE)
-        self.integration_points_spin.setSingleStep(10)
-        self.integration_points_spin.setToolTip(
+        self.points_edit = self._time_edit(
+            parent,
+            "100",
             "Number of evenly spaced base samples over the completed interval, "
             "including both endpoints. Intervention boundary rows are additional. "
-            "A stop at the start returns one sample."
+            "A stop at the start returns one sample.",
         )
         for label, widget in (
             ("Solver", self.solver_combo),
             ("t_start", self.t_start_edit),
             ("t_end", self.t_end_edit),
-            ("Points", self.integration_points_spin),
+            ("Points", self.points_edit),
         ):
             form.addRow(label, widget)
             name_label = form.labelForField(widget)
@@ -65,28 +64,20 @@ class _RunSettingsFields:
         return edit
 
     def set_settings(self, settings: SimulationExecutionSettings) -> None:
-        validate_simulation_execution_settings(settings)
         self.solver_combo.setCurrentText(settings.solver)
-        blockers = (
-            QtCore.QSignalBlocker(self.t_start_edit),
-            QtCore.QSignalBlocker(self.t_end_edit),
-        )
-        try:
-            self.t_start_edit.setText(repr(float(settings.t_start)))
-            self.t_end_edit.setText(repr(float(settings.t_end)))
-        finally:
-            del blockers
-        self.integration_points_spin.setValue(settings.integration_points)
+        self.t_start_edit.setText(repr(float(settings.t_start)))
+        self.t_end_edit.setText(repr(float(settings.t_end)))
+        self.points_edit.setText(str(settings.integration_points))
 
     def settings(self) -> SimulationExecutionSettings:
+        t_start, t_end = self.t_start_edit.text(), self.t_end_edit.text()
         candidate = SimulationExecutionSettings(
             solver=str(self.solver_combo.currentText()),
-            t_start=parse_finite_numeric_text(self.t_start_edit.text(), field="t_start"),
-            t_end=parse_finite_numeric_text(self.t_end_edit.text(), field="t_end"),
-            integration_points=int(self.integration_points_spin.value()),
+            t_start=parse_finite_numeric_text(t_start, field=f"Start time {t_start!r}"),
+            t_end=parse_finite_numeric_text(t_end, field=f"End time {t_end!r}"),
+            integration_points=parse_points_text(self.points_edit.text()),
         )
-        validate_simulation_execution_settings(candidate)
-        return candidate
+        return validate_simulation_execution_settings(candidate)
 
 
 class SolverSettingsDialog(QtWidgets.QDialog):
@@ -190,12 +181,10 @@ class SimulationSettingsDialog(QtWidgets.QDialog):
             "this setting. Changing the units changes how existing energy numbers are interpreted."
         )
         self.rtol_edit.setToolTip(
-            "Controls solver error relative to each concentration's magnitude. "
-            "Smaller values request greater accuracy and may increase computation time."
+            "Controls solver error relative to each concentration's magnitude."
         )
         self.atol_edit.setToolTip(
-            "Controls solver error when concentrations are near zero. Smaller values "
-            "resolve smaller concentrations and may increase computation time."
+            "Controls solver error when concentrations are near zero."
         )
         self.analytic_jacobian_check = QtWidgets.QCheckBox(
             "Prefer analytic Jacobian when supported",
@@ -261,20 +250,19 @@ class SimulationSettingsDialog(QtWidgets.QDialog):
 
         preview_box = QtWidgets.QGroupBox("Preview", body)
         preview_form = QtWidgets.QFormLayout(preview_box)
-        self.preview_points_spin = self._integer_spin(
-            *SIMULATION_POINT_RANGE, preview_points, preview_box,
-        )
+        self.preview_points_edit = QtWidgets.QLineEdit(str(int(preview_points)), preview_box)
+        self.preview_points_edit.setMaximumWidth(190)
         self.preview_delay_spin = self._integer_spin(
             0, 1000, preview_delay_ms, preview_box,
         )
-        self.preview_points_spin.setToolTip(
+        self.preview_points_edit.setToolTip(
             "Output points for all slider previews, including release and typed changes."
         )
         self.preview_delay_spin.setToolTip(
             "Delay before requesting a preview while dragging any slider. "
             "Release, clicks, and typed changes request a preview immediately."
         )
-        preview_form.addRow("Preview points", self.preview_points_spin)
+        preview_form.addRow("Preview points", self.preview_points_edit)
         preview_form.addRow("Preview delay (ms)", self.preview_delay_spin)
         body_layout.addWidget(preview_box)
 
@@ -405,7 +393,6 @@ class SimulationSettingsDialog(QtWidgets.QDialog):
         message.exec()
 
     def set_scientific_settings(self, settings: TabScientificSettings) -> None:
-        validate_tab_scientific_settings(settings)
         self.temperature_spin.setValue(settings.temperature)
         self.standard_conc_edit.setText(repr(float(settings.standard_conc_M)))
         self.energy_unit_combo.setCurrentText(settings.energy_unit)
@@ -415,18 +402,18 @@ class SimulationSettingsDialog(QtWidgets.QDialog):
         self.use_authored_stops_check.setChecked(settings.use_authored_stops)
 
     def scientific_settings(self) -> TabScientificSettings:
-        try:
-            rtol = float(self.rtol_edit.text())
-            atol = float(self.atol_edit.text())
-            standard_conc = float(self.standard_conc_edit.text())
-        except (TypeError, ValueError, OverflowError) as exc:
-            raise ValueError("Standard concentration and tolerances must be numbers.") from exc
         candidate = TabScientificSettings(
             temperature=float(self.temperature_spin.value()),
-            standard_conc_M=standard_conc,
+            standard_conc_M=parse_finite_numeric_text(
+                self.standard_conc_edit.text(), field="Default standard concentration"
+            ),
             energy_unit=self.energy_unit_combo.currentText(),
-            rtol=rtol,
-            atol=atol,
+            rtol=parse_finite_numeric_text(
+                self.rtol_edit.text(), field="Relative tolerance"
+            ),
+            atol=parse_finite_numeric_text(
+                self.atol_edit.text(), field="Absolute tolerance"
+            ),
             analytic_jacobian_policy=bool(self.analytic_jacobian_check.isChecked()),
             use_authored_stops=self.use_authored_stops_check.isChecked(),
         )
@@ -444,7 +431,10 @@ class SimulationSettingsDialog(QtWidgets.QDialog):
         return self._run_default_fields.settings()
 
     def preview_settings(self) -> tuple[int, int]:
-        return self.preview_points_spin.value(), self.preview_delay_spin.value()
+        return (
+            parse_points_text(self.preview_points_edit.text(), field="Preview points"),
+            self.preview_delay_spin.value(),
+        )
 
     def set_run_user_maximum(self, value: int | None) -> None:
         self.run_maximum_spin.setRange(1, MAX_PARALLEL_WORKERS_CEILING)

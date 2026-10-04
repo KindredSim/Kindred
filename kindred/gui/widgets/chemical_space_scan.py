@@ -11,7 +11,8 @@ import secrets
 
 from PySide6 import QtCore, QtWidgets
 
-from kindred.core.project_document import canonical_initial_values, SUPPORTED_SOLVERS, SIMULATION_POINT_RANGE
+from kindred.core.project_document import canonical_initial_values, parse_points_text, SUPPORTED_SOLVERS
+from kindred.core.validation import parse_finite_numeric_text
 from kindred.gui.controllers.simulation_job_owner import resolve_run_parallel_capacity
 from kindred.gui.widgets.scan_range_dialog import ScanRangeDialog, ScanConstraintDialog, entry, number
 from kindred.gui.display_name_policy import scientific_symbol_html, scientific_symbol_spoken
@@ -87,7 +88,7 @@ class ChemicalSpaceScanDialog(QtWidgets.QDialog):
         self.owner.progress.connect(self._progress)
         self.owner.completed.connect(self._completed)
         self.owner.application_close_settlement_changed.connect(self._busy_state)
-        self.baseline.currentIndexChanged.connect(self._load)
+        self.baseline.currentIndexChanged.connect(self._baseline_changed)
         self.group.currentIndexChanged.connect(self._counts)
         for edit in (self.requested, self.parameter_count, self.initial_count, self.boundary_count,
                      self.parameter_boundaries, self.initial_boundaries):
@@ -159,8 +160,7 @@ class ChemicalSpaceScanDialog(QtWidgets.QDialog):
         self.solver = QtWidgets.QComboBox()
         self.solver.addItems(SUPPORTED_SOLVERS)
         self.solver.setToolTip(SOLVER_TOOLTIP)
-        self.points = QtWidgets.QSpinBox()
-        self.points.setRange(*SIMULATION_POINT_RANGE)
+        self.points = entry(100)
         self.rtol, self.atol = entry(1e-6), entry(1e-12)
         self.jacobian = QtWidgets.QCheckBox("Use analytic Jacobian")
         self.stops = QtWidgets.QCheckBox("Use authored stopping interventions")
@@ -199,6 +199,7 @@ class ChemicalSpaceScanDialog(QtWidgets.QDialog):
                           temperature_K=science.temperature, standard_conc_M=science.standard_conc_M)
 
     def _load(self):
+        """Build the input rows once; a baseline change only refreshes its values."""
         try:
             self.base = self._baseline_config()
             self.catalog = input_catalog(self.tab.prepared_dsl, self.base)
@@ -206,14 +207,6 @@ class ChemicalSpaceScanDialog(QtWidgets.QDialog):
             self.status.setPlainText(str(exc))
             return
         self.mechanism.setText(f"Mechanism: {self.tab.name}")
-        self.ranges.clear()
-        self.constraints.clear()
-        self.constraint_list.clear()
-        self.inputs.setRowCount(0)
-        for key in (START, END):
-            if key in self.rows:
-                self.time_form.removeRow(self.rows[key][3])
-        self.rows.clear()
         for item in self.catalog:
             mode = QtWidgets.QComboBox()
             mode.addItems(["Fixed", "Scan", "Calculated"])
@@ -257,7 +250,7 @@ class ChemicalSpaceScanDialog(QtWidgets.QDialog):
                 self.inputs.setCellWidget(index, 1, mode)
                 self.inputs.setCellWidget(index, 2, holder)
         self.solver.setCurrentText(self.base.solver)
-        self.points.setValue(self.base.points)
+        self.points.setText(str(self.base.points))
         self.rtol.setText(repr(self.base.rtol))
         self.atol.setText(repr(self.base.atol))
         self.jacobian.setChecked(self.base.analytic_jacobian)
@@ -270,6 +263,26 @@ class ChemicalSpaceScanDialog(QtWidgets.QDialog):
             item.setCheckState(QtCore.Qt.CheckState.Checked if name in self.base.outputs else QtCore.Qt.CheckState.Unchecked)
             self.outputs.addItem(item)
         self._counts()
+
+    def _baseline_changed(self):
+        """Refresh only the values the baseline set supplies; keep the setup."""
+        if not self.rows:
+            self._load()
+            return
+        try:
+            self.base = self._baseline_config()
+            self.catalog = input_catalog(self.tab.prepared_dsl, self.base)
+        except Exception as exc:
+            self.status.setPlainText(str(exc))
+            return
+        for item in self.catalog:
+            mode, value, _, _ = self.rows[item.key]
+            if mode.currentIndex() == 0 and (
+                item.key in (START, END) or item.key.startswith("initial:")
+            ):
+                value.setText(str(item.value))
+        self.solver.setCurrentText(self.base.solver)
+        self.points.setText(str(self.base.points))
 
     def _mode_changed(self, key, index):
         mode, value, edit, _ = self.rows[key]
@@ -378,8 +391,10 @@ class ChemicalSpaceScanDialog(QtWidgets.QDialog):
             raise ValueError("Choose a destination JSON file.")
         grouped, boundary = self.group.currentData(), self.boundaries.isChecked()
         return replace(base, initials=initials, parameters=parameters, ranges=ranges, outputs=selected,
-                       t_start=times[START], t_end=times[END], solver=self.solver.currentText(), points=self.points.value(),
-                       rtol=number(self.rtol), atol=number(self.atol), analytic_jacobian=self.jacobian.isChecked(),
+                       t_start=times[START], t_end=times[END], solver=self.solver.currentText(),
+                       points=parse_points_text(self.points.text(), field="Requested output points"),
+                       rtol=parse_finite_numeric_text(self.rtol.text().strip(), field="Relative tolerance"),
+                       atol=parse_finite_numeric_text(self.atol.text().strip(), field="Absolute tolerance"), analytic_jacobian=self.jacobian.isChecked(),
                        use_authored_stops=self.stops.isChecked(), requested=int(self.requested.text()),
                        destination=destination, seed=int(self.seed.text()), sampler=self.sampler.currentData(),
                        grouped=bool(grouped),
@@ -429,7 +444,7 @@ class ChemicalSpaceScanDialog(QtWidgets.QDialog):
             self.status.appendPlainText(f"Scan {result.state}. Not started: {result.requested-result.attempted}.")
 
     def _browse(self):
-        path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Export Chemical Space Scan", self.destination.text(), "JSON files (*.json)")
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Export Chemical Space Scan", self.destination.text(), "JSON files (*.json)", options=QtWidgets.QFileDialog.Option.DontConfirmOverwrite)
         if path:
             self.destination.setText(path if path.lower().endswith(".json") else path + ".json")
 

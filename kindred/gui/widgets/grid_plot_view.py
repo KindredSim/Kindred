@@ -7,7 +7,6 @@ import html
 import math
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from types import MappingProxyType
-from typing import TypeAlias
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
@@ -32,12 +31,11 @@ from kindred.gui.workspace_result_presenter import (
     encode_tsv_row,
 )
 
-__all__ = ["DatasetPlotPresentation", "GridPlotView"]
+__all__ = ["GridPlotView"]
 
 pg = require_pyqtgraph(context="Kindred GUI")
 
 ColorResolver = Callable[[str], object]
-DatasetPlotPresentation: TypeAlias = tuple[str, str]
 _MAX_FIT_COPY_CELLS = 1_000_000
 _MAX_FIT_COPY_CHARACTERS = 64 * 1024 * 1024
 _FIT_COPY_ROWS_PER_CHUNK = 2048
@@ -248,17 +246,10 @@ class GridPlotView(QtWidgets.QWidget):
         self._canvas.ci.layout.activate()
         self._canvas.grab()
 
-    def set_projection(
-        self,
-        curves: Iterable[FitCurveDataset],
-        presentation: Mapping[str, DatasetPlotPresentation],
-    ) -> None:
+    def set_projection(self, curves: Iterable[FitCurveDataset]) -> None:
         """Retain full Copy data and update only existing model-series data."""
         self.cancel_copy()
         self._curves = tuple(curves)
-        for curve in self._curves:
-            if curve.dataset_id in presentation:
-                self._plot_items[curve.dataset_id].setToolTip(presentation[curve.dataset_id][1])
         self._update_models()
         self._context_actions["copy"].setEnabled(self.copy_eligible())
 

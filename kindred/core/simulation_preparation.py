@@ -141,15 +141,11 @@ def _classify_request_parameter_names(
     requested_parameter_names: Iterable[str] | None = None,
     declared_scalar_names: Iterable[str] | None = None,
     derived_scalar_names: Iterable[str] | None = None,
-    validate_values: bool = True,
 ) -> None:
     raw_values.update(
         {
             str(name): float(value)
-            for name, value in _coerce_parameter_override_items(
-                parameter_overrides,
-                require_finite=bool(validate_values),
-            )
+            for name, value in _coerce_parameter_override_items(parameter_overrides)
         }
     )
     classification_names = list(raw_values)
@@ -361,22 +357,7 @@ class SimulationExecutionRequest:
     use_authored_stops: bool = False
 
     def __post_init__(self) -> None:
-        if type(self.prepared_dsl) is not PreparedDslRequestSet:
-            raise TypeError("execution request prepared_dsl must be PreparedDslRequestSet.")
         species_names = tuple(self.species_names)
-        if (
-            not species_names
-            or any(
-                type(name) is not str
-                or not name
-                or name != name.strip()
-                for name in species_names
-            )
-            or len(species_names) != len(set(species_names))
-        ):
-            raise ValueError(
-                "execution request species_names must be unique nonblank strings."
-            )
         if len(self.y0) != len(species_names):
             raise ValueError("execution request y0 must contain one value per species.")
         y0_values: list[float] = []
@@ -499,23 +480,15 @@ def _expanded_intervention_schedule_dependency_metadata(
 
 
 def _resolve_intervention_schedule_for_request(
-    schedule: InterventionSchedule | None,
+    schedule: InterventionSchedule,
     *,
-    parameter_values: Mapping[str, Any] | None = None,
+    parameter_values: Mapping[str, Any],
     dependency_metadata: InterventionScheduleDependencyMetadata | None = None,
     runtime_parameters: frozenset[str] = frozenset(),
-) -> InterventionSchedule | None:
-    if schedule is None:
-        return None
-    if parameter_values is None and schedule.is_parameterized:
-        raise SimulationPreparationError(
-            "intervention_schedule",
-            "Parameterized intervention schedules require typed request parameter classification before resolution.",
-        )
-    values = dict(parameter_values or {})
+) -> InterventionSchedule:
     try:
         return schedule.resolve_parameters(
-            values,
+            dict(parameter_values),
             dependency_metadata=dependency_metadata,
             runtime_parameters=runtime_parameters,
         )
@@ -539,7 +512,7 @@ def _schedule_parameters_deferred_to_prepared_request(
     execution_request: SimulationExecutionRequest,
     unresolved_intervention_schedule: InterventionSchedule,
     *,
-    parameter_algebra_spec: Any | None = None,
+    parameter_algebra_spec: Any,
 ) -> frozenset[str]:
     if not unresolved_intervention_schedule.is_parameterized:
         return frozenset()
@@ -548,11 +521,6 @@ def _schedule_parameters_deferred_to_prepared_request(
     referenced = set(intervention_schedule_parameter_names(unresolved_intervention_schedule))
     if not requested or not referenced:
         return frozenset()
-
-    if parameter_algebra_spec is None:
-        parameter_algebra_spec = (
-            execution_request.prepared_dsl.parameter_algebra_spec_for_execution()
-        )
 
     requested_names = {
         str(name).strip()
@@ -647,8 +615,6 @@ def fit_simulation_error_from_preparation_error(
 
 def _coerce_parameter_override_items(
     parameter_overrides: Mapping[str, Any] | None,
-    *,
-    require_finite: bool = True,
 ) -> list[tuple[str, float]]:
     if not isinstance(parameter_overrides, Mapping) or not parameter_overrides:
         return []
@@ -665,7 +631,7 @@ def _coerce_parameter_override_items(
                 f"Parameter override {name!r} must be numeric.",
                 parameter_names=(name,),
             ) from exc
-        if bool(require_finite) and not np.isfinite(value):
+        if not np.isfinite(value):
             raise SimulationPreparationError(
                 "parameter_overrides",
                 f"Parameter override {name!r} must be finite.",
@@ -834,16 +800,13 @@ def prepare_simulation_run(
             execution_request
         )
     )
-    try:
-        schedule_only_values = _bind_request_parameter_overrides(
-            mechanism=mechanism,
-            parameter_algebra_spec=parameter_algebra_spec,
-            parameter_overrides=execution_request.parameter_overrides,
-            unresolved_intervention_schedule=unresolved_intervention_schedule,
-            parameter_target_map=parameter_target_map,
-        )
-    except SimulationPreparationError:
-        raise
+    schedule_only_values = _bind_request_parameter_overrides(
+        mechanism=mechanism,
+        parameter_algebra_spec=parameter_algebra_spec,
+        parameter_overrides=execution_request.parameter_overrides,
+        unresolved_intervention_schedule=unresolved_intervention_schedule,
+        parameter_target_map=parameter_target_map,
+    )
     _raise_if_cancelled(cancellation_control)
 
     try:
@@ -887,8 +850,7 @@ def prepare_simulation_run(
                     runtime_parameters=payload_names,
                     dependency_metadata=dependency_metadata,
                 )
-                if resolved_schedule is not None:
-                    resolved_schedule.validate_species(species_names)
+                resolved_schedule.validate_species(species_names)
                 intervention_execution = compile_intervention_schedule(
                     resolved_schedule,
                     authored_payload=unresolved_intervention_schedule.to_payload(),
@@ -928,7 +890,7 @@ def prepare_simulation_run(
             coefficient_evaluator=_coefficient_evaluator,
         )
     except Exception as exc:
-        raise SimulationPreparationError("temperature_schedule", str(exc)) from exc
+        raise SimulationPreparationError("analytic_jacobian", str(exc)) from exc
     _raise_if_cancelled(cancellation_control)
 
     try:

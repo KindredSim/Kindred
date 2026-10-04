@@ -38,14 +38,8 @@ class ProjectSession:
     def __init__(
         self,
         document: ProjectDocument,
-        *,
-        presentation: WorkspacePresentationState | None = None,
     ) -> None:
-        initial_presentation = (
-            default_workspace_presentation_state(document)
-            if presentation is None
-            else presentation
-        )
+        initial_presentation = default_workspace_presentation_state(document)
         self._document = document
         self._current_path: str | None = None
         self._saved_baseline = SavedArchiveBaseline(

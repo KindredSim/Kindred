@@ -202,7 +202,6 @@ def _compile_columns(columns: Sequence[Mapping[str, Any]]) -> dict[int, Compiled
 
     Independent columns supply displayed unit declarations. Calculated columns
     always derive their units from their formula, ignoring prior display labels.
-    No folded numeric value from the Algebra parser supplies a cell result.
     """
     statements = []
     calculated = []

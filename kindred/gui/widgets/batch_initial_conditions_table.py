@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from typing import Callable, Iterable, Sequence
+from typing import Iterable, Sequence
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
@@ -673,7 +673,6 @@ class InitialConditionsTableActions(QtCore.QObject):
         registry,
         model: BatchInitialConditionsTableModel,
         table: BatchInitialConditionsTableView,
-        species_for_tab: Callable[[MechanismTabDocument], Sequence[str]] | None = None,
         parent: QtCore.QObject | None = None,
     ) -> None:
         super().__init__(parent)
@@ -686,7 +685,6 @@ class InitialConditionsTableActions(QtCore.QObject):
         self._registry = registry
         self._model = model
         self._table = table
-        self._species_for_tab = species_for_tab or canonical_species_names
         self._rendering = False
         model.initialValueEditRequested.connect(self.accept_value_edit)
         model.setNameEditRequested.connect(self.accept_name_edit)
@@ -721,7 +719,7 @@ class InitialConditionsTableActions(QtCore.QObject):
                 for set_id, values
                 in runtime.initial_text_by_set_id.items()
             ),
-            species_names=tuple(self._species_for_tab(tab)),
+            species_names=tuple(canonical_species_names(tab)),
             selected_run_set_ids=tuple(runtime.selected_run_set_ids),
         )
 
@@ -908,16 +906,13 @@ class InitialConditionsTableActions(QtCore.QObject):
                 values = [
                     concentration_from_text(
                         raw.strip(),
-                        field="pasted initial concentration",
+                        field=f"Pasted value {raw.strip()!r}",
                     )
                     for raw in row
                 ]
                 parsed.append(values)
-        except ValueError:
-            return self._reject(
-                "Every pasted concentration must be within the supported "
-                "concentration domain."
-            )
+        except ValueError as exc:
+            return self._reject(str(exc))
 
         tab = self._registry.tab(self._tab_id)
         candidate_sets = list(tab.initial_condition_sets)
@@ -990,7 +985,7 @@ class InitialConditionsTableActions(QtCore.QObject):
             set_id=new_set_id(),
             name=next_set_name(item.name for item in tab.initial_condition_sets),
             values=tuple(
-                (str(species), 0.0) for species in self._species_for_tab(tab)
+                (str(species), 0.0) for species in canonical_species_names(tab)
             ),
         )
         self._registry.mutate_tab(
@@ -1046,6 +1041,7 @@ class InitialConditionsTableActions(QtCore.QObject):
             expected_token=self._registry.capture_content_token(),
         )
         self.render()
+        self.initialValuesChanged.emit(self._tab_id)
         return True
 
     @QtCore.Slot(str, bool)
@@ -1174,6 +1170,7 @@ class InitialConditionsTableActions(QtCore.QObject):
             expected_token=self._registry.capture_content_token(),
         )
         self.render()
+        self.initialValuesChanged.emit(self._tab_id)
         return True
 
     @QtCore.Slot()

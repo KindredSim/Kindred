@@ -83,7 +83,6 @@ class BatchSpeciesSliders(QtWidgets.QWidget):
         self._rows: dict[str, _SpeciesSliderRow] = {}
         self._fine_mode = False
         self._values: dict[str, float] = {}
-        self._display_names: dict[str, str] = {}
         self._hidden_species: set[str] = set()
         self._scope_signature: object | None = None
         self._target_set_ids: tuple[str, ...] = ()
@@ -118,33 +117,23 @@ class BatchSpeciesSliders(QtWidgets.QWidget):
         *,
         target_set_ids: Sequence[str],
         mixed_species: Sequence[str] = (),
-        display_names: Mapping[str, str] | None = None,
-        preserve_visibility: bool = True,
         preserve_editor_drafts: bool = True,
     ) -> None:
         normalized: dict[str, float] = {}
-        normalized_display_names: dict[str, str] = {}
-        supplied_names = dict(display_names or {})
         for raw_name, raw_value in values.items():
             name = str(raw_name)
-            display = str(supplied_names.get(name, name)).strip()
             value = float(raw_value)
-            if not name or not display:
+            if not name:
                 raise ValueError("Species Slider names must be nonblank.")
             if not math.isfinite(value) or value < 0.0:
                 raise ValueError(
-                    f"Species Slider value for {display!r} must be finite "
+                    f"Species Slider value for {name!r} must be finite "
                     "and nonnegative."
                 )
             normalized[name] = value
-            normalized_display_names[name] = display
-        self._reconcile_visibility_scope(
-            set(normalized),
-            preserve_visibility=preserve_visibility,
-        )
+        self._reconcile_visibility_scope(set(normalized))
         self._target_set_ids = tuple(str(item) for item in target_set_ids)
         self._values = normalized
-        self._display_names = normalized_display_names
         mixed = {str(name) for name in mixed_species}
         same_rows = (
             tuple(normalized) == tuple(self._rows)
@@ -166,7 +155,7 @@ class BatchSpeciesSliders(QtWidgets.QWidget):
                 self._add_row(
                     species,
                     value,
-                    display_name=normalized_display_names[species],
+                    display_name=species,
                     mixed=species in mixed,
                 )
         if not preserve_editor_drafts:
@@ -187,7 +176,7 @@ class BatchSpeciesSliders(QtWidgets.QWidget):
         return [
             (
                 name,
-                compact_text(self._display_names[name], max_chars=48),
+                compact_text(name, max_chars=48),
                 "",
                 name not in self._hidden_species,
             )
@@ -209,15 +198,11 @@ class BatchSpeciesSliders(QtWidgets.QWidget):
             if species not in self._hidden_species
         )
 
-    def clear(self, *, preserve_visibility: bool = True) -> None:
-        if preserve_visibility:
-            self._clear_rows()
-            self._values.clear()
-            self._display_names.clear()
-            self._target_set_ids = ()
-            self._sync_visibility()
-            return
-        self.render_values({}, target_set_ids=(), preserve_visibility=False)
+    def clear(self) -> None:
+        self._clear_rows()
+        self._values.clear()
+        self._target_set_ids = ()
+        self._sync_visibility()
 
     def _clear_rows(self) -> None:
         self._active_presses.clear()
@@ -380,16 +365,11 @@ class BatchSpeciesSliders(QtWidgets.QWidget):
                     self._hidden_species.add(species)
         self._sync_visibility()
 
-    def _reconcile_visibility_scope(
-        self,
-        names: set[str],
-        *,
-        preserve_visibility: bool,
-    ) -> None:
+    def _reconcile_visibility_scope(self, names: set[str]) -> None:
         """Reconcile choices by stable canonical species identity."""
         signature = frozenset(names)
         previous = self._scope_signature
-        if not preserve_visibility or previous is None:
+        if previous is None:
             self._hidden_species = set(names)
         else:
             preserved = names.intersection(self._hidden_species)
@@ -406,7 +386,7 @@ class BatchSpeciesSliders(QtWidgets.QWidget):
         row = self._rows.get(str(species))
         if row is None:
             return
-        set_bounded_label_text(row.name_label, self._display_names.get(str(species), str(species)), max_width=16777215)
+        set_bounded_label_text(row.name_label, str(species), max_width=16777215)
         if self._editor_has_focus(species):
             return
         self._set_value_projection(

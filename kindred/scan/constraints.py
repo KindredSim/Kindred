@@ -250,7 +250,7 @@ class IntervalChecks:
         for early, (selected, names) in groups.items():
             if selected:
                 lines = tuple(statement for name, statement in statements.items() if name in names)
-                self.blocks[early] = AlgebraBlock(lines, tuple(s.expr for s in lines), ()), tuple(selected)
+                self.blocks[early] = AlgebraBlock(lines, tuple(s.expr for s in lines)), tuple(selected)
 
     def admit(self, values, *, first_group=False):
         if first_group not in self.blocks:

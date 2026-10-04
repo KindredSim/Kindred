@@ -85,8 +85,6 @@ def setup_logging() -> None:
     """
 
     resolved_level = _get_log_level_from_env()
-    if resolved_level not in _VALID_LOG_LEVELS:
-        resolved_level = _DEFAULT_LOG_LEVEL
     numeric_level = getattr(logging, resolved_level)
 
     root_logger = logging.getLogger()

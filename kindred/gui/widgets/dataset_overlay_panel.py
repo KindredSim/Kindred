@@ -62,14 +62,6 @@ class DatasetOverlayPanel(QtWidgets.QWidget):
         experimental_point_opacity: Callable[[], float],
     ) -> None:
         super().__init__(parent)
-        if not callable(color_for_species):
-            raise TypeError("DatasetOverlayPanel requires a species-color callback.")
-        if not callable(experimental_point_size) or not callable(
-            experimental_point_opacity
-        ):
-            raise TypeError(
-                "DatasetOverlayPanel requires field-specific style callbacks."
-            )
         self._color_for_species = color_for_species
         self._experimental_point_shape = experimental_point_shape
         self._experimental_point_size = experimental_point_size

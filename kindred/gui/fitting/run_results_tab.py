@@ -10,7 +10,6 @@ from __future__ import annotations
 import math
 import html
 from collections.abc import Callable, Mapping, Sequence
-from types import MappingProxyType
 
 from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtCore import Qt, Signal
@@ -29,7 +28,7 @@ from kindred.gui.fitting.reporting import (
 from kindred.gui.fitting.launch import FitExecutionRequest, FitParameterVariable
 from kindred.gui.ui_helpers import ControlRowsLayout
 from kindred.gui.fitting.execution import FitCandidate, FitCurveDataset, FitLiveUpdate
-from kindred.gui.widgets.grid_plot_view import DatasetPlotPresentation, GridPlotView
+from kindred.gui.widgets.grid_plot_view import GridPlotView
 
 __all__ = ["FitTrackerPanel", "ResultsSummaryDialog", "RunResultsTab"]
 
@@ -439,9 +438,6 @@ class RunResultsTab(QtWidgets.QWidget):
         self._dark_mode = False
         self._copy_allowed = True
         self._curves: tuple[FitCurveDataset, ...] = ()
-        self._dataset_presentation: Mapping[str, DatasetPlotPresentation] = (
-            MappingProxyType({})
-        )
         self._dataset_tab_ids: list[tuple[str, str]] = []
         self._dataset_labels: dict[str, str] = {}
         self._dataset_plot_views: dict[tuple[str, str], GridPlotView] = {}
@@ -480,7 +476,7 @@ class RunResultsTab(QtWidgets.QWidget):
         self._refresh_summary()
 
     def set_live_curves(self, curves: Sequence[FitCurveDataset]) -> None:
-        self._install_plot_projection(curves, {})
+        self._install_plot_projection(curves)
         self._refresh_summary()
 
     def set_terminal_presentation(
@@ -489,7 +485,6 @@ class RunResultsTab(QtWidgets.QWidget):
         *,
         curves: Sequence[FitCurveDataset] = (),
         curve_failure: str | None = None,
-        plot_presentation: Mapping[str, DatasetPlotPresentation] | None = None,
     ) -> bool:
         """Consume one call-local typed terminal presentation."""
         if candidate is None:
@@ -500,7 +495,7 @@ class RunResultsTab(QtWidgets.QWidget):
         else:
             overview, outcome, self._summary_body, self._summary_provenance, entries = fit_candidate_presentation(candidate)
             self._tracker_panel.set_summary(overview, outcome, entries)
-        self._install_plot_projection(curves, plot_presentation or {})
+        self._install_plot_projection(curves)
         self._refresh_summary()
         if curve_failure is not None:
             self._render_diagnostic_label.setText(
@@ -560,7 +555,7 @@ class RunResultsTab(QtWidgets.QWidget):
         self._empty_label.show()
         self._render_diagnostic_label.clear()
         self._render_diagnostic_label.hide()
-        self._install_plot_projection((), {})
+        self._install_plot_projection(())
         if not keep_plots:
             self._dataset_tab_ids = []
             self._dataset_labels = {}
@@ -772,11 +767,7 @@ class RunResultsTab(QtWidgets.QWidget):
         plot_view.set_copy_allowed(self._copy_allowed)
         return plot_view
 
-    def _install_plot_projection(
-        self,
-        curves: Sequence[FitCurveDataset],
-        presentation: Mapping[str, DatasetPlotPresentation],
-    ) -> None:
+    def _install_plot_projection(self, curves: Sequence[FitCurveDataset]) -> None:
         values = tuple(curves)
         ids = [item.dataset_id for item in values]
         if len(ids) != len(set(ids)):
@@ -784,13 +775,12 @@ class RunResultsTab(QtWidgets.QWidget):
         for index in range(self._subtab_stack.count()):
             self._subtab_stack.widget(index).cancel_copy()
         self._curves = values
-        self._dataset_presentation = MappingProxyType(dict(presentation))
         if values:
             self._empty_label.hide()
             self._refresh_active_plot_view()
         else:
             for index in range(self._subtab_stack.count()):
-                self._subtab_stack.widget(index).set_projection((), {})
+                self._subtab_stack.widget(index).set_projection(())
         self.copyAvailableChanged.emit(self.copy_eligible())
 
     def _active_plot_view_id(self) -> tuple[str, str] | None:
@@ -816,7 +806,7 @@ class RunResultsTab(QtWidgets.QWidget):
         if plot_view is None:
             return
         self._subtab_stack.setCurrentWidget(plot_view)
-        plot_view.set_projection(curves, self._dataset_presentation)
+        plot_view.set_projection(curves)
         self.copyAvailableChanged.emit(self.copy_eligible())
 
     def _on_subtab_changed(self, index: int) -> None:
@@ -835,6 +825,6 @@ class RunResultsTab(QtWidgets.QWidget):
         self._subtabs.hide()
 
     def _remove_plot_view(self, view: GridPlotView) -> None:
-        view.set_projection((), {})
+        view.set_projection(())
         self._subtab_stack.removeWidget(view)
         view.deleteLater()

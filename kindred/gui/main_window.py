@@ -196,7 +196,6 @@ class MainWindow(QtWidgets.QMainWindow):
         if not isinstance(application, QtWidgets.QApplication):
             raise RuntimeError("MainWindow requires an existing QApplication.")
 
-        self._close_mutation_fenced = False
         self._rendering_workspace = False
         self._recent_menu: QtWidgets.QMenu | None = None
         self._tab_surfaces: dict[str, _TabSurfaceBundle] = {}
@@ -226,7 +225,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.statusBar().addWidget(self._status_label, 1)
 
         self._theme_manager = ThemeManager(
-            application,
             self,
             report_failure=self.set_status_text,
         )
@@ -413,7 +411,7 @@ class MainWindow(QtWidgets.QMainWindow):
             raise ValueError(f"Tab surface already exists: {target!r}.")
         editor_panel = EditorPanel(parent=self._mechanism_stack)
         editor = editor_panel.editor
-        slider_panel = editor.detach_slider_pane_for_dock()
+        slider_panel = editor.slider_pane_for_dock()
         slider_panel.setParent(self._slider_stack)
         batch_model = BatchInitialConditionsTableModel(parent=self._workspace)
         simulation_panel = SimulationPanel(
@@ -554,12 +552,6 @@ class MainWindow(QtWidgets.QMainWindow):
             lambda settings, captured=tab_id: self._set_workspace_run_defaults(
                 captured,
                 settings,
-            )
-        )
-        panel.runEnabledChanged.connect(
-            lambda enabled, captured=tab_id: self._set_tab_run_enabled(
-                captured,
-                enabled,
             )
         )
         panel.runDefaultsDraftStateChanged.connect(
@@ -847,10 +839,7 @@ class MainWindow(QtWidgets.QMainWindow):
         """Return whether user mutations may still enter the live shell."""
 
         controller = getattr(self, "project_controller", None)
-        admitted = bool(
-            not self._close_mutation_fenced
-            and (controller is None or controller.mutation_admitted)
-        )
+        admitted = bool(controller is None or controller.mutation_admitted)
         if not admitted and action:
             self.set_status_text(
                 f"{action} rejected: application Close is in progress."
@@ -870,7 +859,6 @@ class MainWindow(QtWidgets.QMainWindow):
     def _fence_shell_for_close(self) -> None:
         """Physically disable writable shell surfaces; Close is one-way."""
 
-        self._close_mutation_fenced = True
         for widget in (
             self._workspace,
             self._mechanism_dock,
@@ -1016,25 +1004,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self,
         tab_id: str,
         *,
-        scientific_fields: frozenset[str] | None = None,
         preserve_reactions_editor: bool = False,
         preserve_slider_editor_drafts: bool = True,
     ) -> None:
-        """Refresh a tab, narrowing scientific-settings invalidation when known."""
+        """Refresh one tab's controls, sliders, data views, and results."""
 
         target = str(tab_id)
         bundle = self._tab_surfaces[target]
-        if scientific_fields and scientific_fields <= {
-            "rtol",
-            "atol",
-            "analytic_jacobian_policy",
-            "use_authored_stops",
-        }:
-            try:
-                self._render_results_for_tab(target)
-            finally:
-                self._refresh_project_state()
-            return
         document = self._project_session.document
         tab = self._workspace_tab_registry.tab(target)
         presentation = self._workspace_tab_registry.presentation(target)
@@ -1048,7 +1024,6 @@ class MainWindow(QtWidgets.QMainWindow):
             )
             bundle.simulation_panel.render_run_defaults(
                 tab.run_defaults,
-                run_admitted=self._run_admitted(target),
                 simulation_job_kind=self._simulation_jobs.current_kind,
             )
             try:
@@ -1409,10 +1384,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._refresh_project_state()
 
     def _repository_for_tab(self, tab_id: str) -> ResultRepository:
-        repository = self._workspace_tab_registry.tab_runtime(tab_id).result_repository
-        if not isinstance(repository, ResultRepository):
-            raise LookupError(f"Tab {tab_id!r} has no ResultRepository.")
-        return repository
+        return self._workspace_tab_registry.tab_runtime(tab_id).result_repository
 
     def _retire_interactive_plot_targets(
         self,
@@ -1442,8 +1414,6 @@ class MainWindow(QtWidgets.QMainWindow):
     ):
         """Build one bound Run target through the direct request path."""
 
-        if not isinstance(tab, MechanismTabDocument):
-            raise TypeError("tab must be MechanismTabDocument.")
         target = tab.initial_condition_set(str(set_id))
         return build_explicit_target(
             prepared_dsl=tab.prepared_dsl,
@@ -1694,7 +1664,6 @@ class MainWindow(QtWidgets.QMainWindow):
         if self._tab_surfaces[tab_id].initial_actions.add_set() is not None:
             self._refresh_dataset_views((tab_id,))
 
-    @QtCore.Slot(int)
     def _move_initial_sets(self, tab_id: str, delta: int) -> None:
         if not self._mutation_input_admitted("Move Initial Conditions Set"):
             return
@@ -1740,7 +1709,6 @@ class MainWindow(QtWidgets.QMainWindow):
         if bundle.initial_actions.delete_selected():
             self._refresh_dataset_views((tab_id,))
 
-    @QtCore.Slot(object)
     def _set_workspace_run_defaults(
         self,
         tab_id: str,
@@ -1758,12 +1726,11 @@ class MainWindow(QtWidgets.QMainWindow):
             tab = self._workspace_tab_registry.tab(tab_id)
             bundle.simulation_panel.render_run_defaults(
                 tab.run_defaults,
-                run_admitted=self._run_admitted(tab_id),
                 simulation_job_kind=self._simulation_jobs.current_kind,
             )
+            bundle.slider_binding.render()
             self._refresh_project_state()
 
-    @QtCore.Slot(str, bool)
     def _on_plot_membership_requested(
         self,
         tab_id: str,
@@ -1825,7 +1792,6 @@ class MainWindow(QtWidgets.QMainWindow):
             self._render_results_for_tab(tab_id)
             self.set_status_text(f"Could not show cached result: {exc}")
 
-    @QtCore.Slot(str, bool)
     def _on_slider_pin_change_requested(
         self,
         bundle: _TabSurfaceBundle,
@@ -1978,7 +1944,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     if raise_invalid:
                         inherited = ", ".join(repr(item.name) for item in tab.initial_condition_sets
                                               if item.set_id not in dict(tab.run_overrides_by_set_id))
-                        raise ValueError(f"Execution defaults (baselines: {inherited or 'none'}): {exc}") from exc
+                        raise ValueError(f"Run settings (baselines: {inherited or 'none'}): {exc}") from exc
                     if not discard_invalid:
                         message = f"Run settings on mechanism tab {tab.name!r} are invalid: {exc}"
                         if report_invalid:
@@ -2363,7 +2329,6 @@ class MainWindow(QtWidgets.QMainWindow):
             bundle.simulation_panel.discard_run_defaults_draft()
             bundle.simulation_panel.render_run_defaults(
                 tab.run_defaults,
-                run_admitted=self._run_admitted(bundle.tab_id),
                 simulation_job_kind=self._simulation_jobs.current_kind,
             )
 
@@ -2576,8 +2541,6 @@ class MainWindow(QtWidgets.QMainWindow):
 
         expected_token = self._project_session.capture_content_token()
         visible = source if source is not None else runtime.reactions_draft
-        if not isinstance(visible, MechanismAuthoringSource):
-            raise TypeError("Mechanism admission requires exact visible source.")
         proposal = self._prepare_source_reconciliation(
             document,
             tab_id,
@@ -3106,8 +3069,6 @@ class MainWindow(QtWidgets.QMainWindow):
     ) -> MechanismAuthoringSource:
         """Scientifically admit a template candidate in its source tab context."""
 
-        if not isinstance(source, MechanismAuthoringSource):
-            raise TypeError("template source must be MechanismAuthoringSource.")
         document = self._project_session.document
         target = str(source_tab_id)
         assessment = assess_tab_exact_correction(document, target, source)
@@ -4306,24 +4267,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 )
                 changed = True
             if changed:
-                changed_fields = frozenset(
-                    field
-                    for field in (
-                        "temperature",
-                        "standard_conc_M",
-                        "energy_unit",
-                        "rtol",
-                        "atol",
-                        "analytic_jacobian_policy",
-                        "use_authored_stops",
-                    )
-                    if getattr(previous_settings, field)
-                    != getattr(settings, field)
-                )
-                self._refresh_tab_controls(
-                    tab_id,
-                    scientific_fields=changed_fields,
-                )
+                self._refresh_tab_controls(tab_id)
             if run_defaults != previous_run_defaults:
                 self.config_controller.persist_run_defaults(run_defaults)
             self.config_controller.set_preview_points(preview_points)
@@ -4371,9 +4315,13 @@ class MainWindow(QtWidgets.QMainWindow):
                 )
 
     def _stop_simulation(self, tab_id: str | None = None) -> bool:
-        """Fence all latent and physical Preview work before cancellation."""
+        """Fence all latent and physical Preview work before cancellation.
 
-        del tab_id  # Stop is application-wide even when requested by one tab.
+        Stop cancels work on every tab; only the tab it was pressed on holds
+        its Preview until the next gesture.
+        """
+
+        held_tab_id = tab_id or self._workspace_tab_registry.active_tab_id
         changed = False
         if self._scan_owner.busy:
             self._scan_owner.cancel()
@@ -4388,8 +4336,11 @@ class MainWindow(QtWidgets.QMainWindow):
                 )
             except KeyError:
                 continue
-        for bundle in tuple(self._tab_surfaces.values()):
-            changed = bundle.slider_binding.settle_stop() or changed
+        for target, bundle in tuple(self._tab_surfaces.items()):
+            changed = (
+                bundle.slider_binding.settle_stop(hold=target == held_tab_id)
+                or changed
+            )
         return bool(self._simulation_jobs.cancel_current() or changed)
 
     def _capture_scan_session(self):
@@ -4619,6 +4570,7 @@ class MainWindow(QtWidgets.QMainWindow):
             "Export Results XLSX",
             start_directory,
             "Excel Workbook (*.xlsx)",
+            options=QtWidgets.QFileDialog.Option.DontConfirmOverwrite,
         )
         if not path:
             return False
@@ -5248,6 +5200,3 @@ class MainWindow(QtWidgets.QMainWindow):
                 "Kindred starts.",
             )
         event.accept()
-
-    def showEvent(self, event: QtGui.QShowEvent) -> None:
-        super().showEvent(event)

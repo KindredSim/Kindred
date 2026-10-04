@@ -9,7 +9,7 @@ from typing import Callable, Mapping, Protocol, Sequence
 
 import numpy as np
 
-from kindred.core.exceptions import SimulationCancelled, SolverError
+from kindred.core.exceptions import SimulationCancelled
 from kindred.core.intervention_schedule import (InterventionScheduleError, InterventionStopAction, SpeciesTriggerCondition, ObservableTriggerCondition, intervention_species)
 from kindred.core.intervention_schedule_compiler import (
     ExecutableFlux,
@@ -33,8 +33,6 @@ from .solver_types import (
     FinalSimulationOutput,
     ODERhs,
     Rhs2,
-    SimulationScientificUnavailability,
-    _SimulationScientificUnavailabilitySignal,
     SimulationPresentationBoundary,
     SimulationRequest,
     SimulationTermination,
@@ -89,7 +87,6 @@ class SegmentExecutionRequest:
     t1: float
     y0: np.ndarray
     t_eval: np.ndarray
-    provenance: dict[str, object]
     method: str
     boundary_events: tuple[Callable[[float, np.ndarray], float], ...] = ()
     boundary_terminal_flags: tuple[bool, ...] = ()
@@ -105,7 +102,6 @@ class SegmentRunResult:
     raw_terminal_state: np.ndarray | None
     trajectory_projection: NonnegativeProjection
     event_state_projection: NonnegativeProjection
-    solver_used: str
     symbolic_jacobian_used: bool = False
     dense_output: Callable[[np.ndarray], np.ndarray] | None = None
 
@@ -228,7 +224,6 @@ class InterventionScheduleExecutionOwner:
             output_segment_keys: list[tuple[str, ...]] = []
             output_discontinuity_ids: list[np.ndarray] = []
             presentation_boundaries: list[SimulationPresentationBoundary] = []
-            segment_solvers: list[str] = []
             integration_segments: list[dict[str, object]] = []
             segment_projections: dict[str, SegmentProjection] = {}
             segment_count = 0
@@ -302,6 +297,10 @@ class InterventionScheduleExecutionOwner:
             )
             _raise_if_cancelled(cancellation_check)
             segment_starts_after_discontinuity = initial_state_transaction
+            # Species released by a drain-release event, and the time of that
+            # release; they are not held again in the sub-segment starting then.
+            released_time: float | None = None
+            released: frozenset[int] = frozenset()
             for boundary_index in range(len(ordered_boundaries) - 1):
                 if termination is not None:
                     break
@@ -335,8 +334,8 @@ class InterventionScheduleExecutionOwner:
                             else "following"
                         ))
 
-                    # A drained species at zero whose free derivative is not
-                    # positive is held at zero like an authored hold; a
+                    # A drained species at zero whose free derivative is
+                    # negative is held at zero like an authored hold; a
                     # terminal release event ends that regime.
                     free_rhs = _InterventionRhs(
                         req.rhs, fluxes=active_fluxes, holds=active_holds, volume=volume,
@@ -348,6 +347,7 @@ class InterventionScheduleExecutionOwner:
                     release_events, release_mapping = _drain_release_events(
                         free_rhs, active_holds=active_holds, species_index=species_index,
                         state=current_y, segment_start=sub_start,
+                        released=released if released_time == sub_start else frozenset(),
                     )
                     active_holds = active_holds + tuple(
                         ExecutableHold(
@@ -436,8 +436,6 @@ class InterventionScheduleExecutionOwner:
                         t_start=sub_start,
                         t_end=sub_end,
                     )
-                    segment_provenance = dict(request.provenance)
-                    segment_provenance["intervention_segment_index"] = segment_count
                     _raise_if_cancelled(cancellation_check)
                     segment_result = self._segment_runner(
                         SegmentExecutionRequest(
@@ -448,7 +446,6 @@ class InterventionScheduleExecutionOwner:
                             t1=sub_end,
                             y0=current_y,
                             t_eval=internal_eval,
-                            provenance=segment_provenance,
                             method=request.method,
                             boundary_events=segment_events,
                             boundary_terminal_flags=segment_terminal_flags,
@@ -499,13 +496,6 @@ class InterventionScheduleExecutionOwner:
                         species_index=species_index,
                         cancellation_check=cancellation_check,
                     times=seg_t, temperatures=seg_temperature, parameter_values=req.parameter_values_at_temperature,)
-                    _validate_segment_output(
-                        seg_t,
-                        seg_y,
-                        species_count=current_y.size,
-                        solver=req.solver,
-                        time=sub_start,
-                    )
                     actual_segment_end = (
                         float(trigger_hit[0])
                         if trigger_hit is not None
@@ -534,9 +524,6 @@ class InterventionScheduleExecutionOwner:
                             identity=segment_output_identity,
                             projection=initial_boundary.projection,
                         )
-                    segment_solvers.append(
-                        str(segment_result.solver_used or request.method)
-                    )
                     segment_payload: dict[str, object] = {
                         "segment_id": segment_count,
                         "segment_key": segment_output_identity.key,
@@ -649,6 +636,10 @@ class InterventionScheduleExecutionOwner:
                                 temperature_K=current_temperature,
                             )
                             sub_start = float(purge_hit[0])
+                            released_time = sub_start
+                            released = frozenset(
+                                index for index in purge_hit[1] if index in release_mapping
+                            )
                             segment_starts_after_discontinuity = False
                             continue
                         if next_rearm is not None and sub_end < outer_end:
@@ -978,12 +969,6 @@ class InterventionScheduleExecutionOwner:
                 raise InterventionScheduleError(
                     "Public result row times must be strictly increasing."
                 )
-            _ensure_finite_nonnegative(
-                output_y,
-                solver=req.solver,
-                time=t0,
-                context="Scheduled simulation output",
-            )
             # Concatenation creates the final owned buffers.  Freeze them here so
             # the standalone result can adopt them without defensive recapture.
             output_t.setflags(write=False)
@@ -1013,13 +998,6 @@ class InterventionScheduleExecutionOwner:
                 provenance,
                 segment_projections,
             )
-            if segment_solvers:
-                distinct = list(dict.fromkeys(segment_solvers))
-                provenance["solver_used"] = (
-                    distinct[0] if len(distinct) == 1 else "segmented"
-                )
-                if len(distinct) > 1:
-                    provenance["intervention_segment_solvers"] = segment_solvers
             _raise_if_cancelled(cancellation_check)
             return FinalSimulationOutput(
                 t=output_t,
@@ -1711,19 +1689,28 @@ def _drain_release_events(
     species_index: Mapping[str, int],
     state: np.ndarray,
     segment_start: float,
+    released: frozenset[int],
 ) -> tuple[tuple[Callable[[float, np.ndarray], float], ...], tuple[int, ...]]:
-    """Hold drained species at zero until their free derivative turns positive."""
+    """Hold drained species at zero until their free derivative turns positive.
+
+    Only a strictly negative free derivative holds a species, and a species
+    just released at ``segment_start`` is not held again there, so every
+    release makes progress.
+    """
 
     values = np.asarray(state, dtype=float).reshape(-1)
     sums, _negative = free_rhs._flux_values(segment_start, free_rhs.temperature_at(segment_start))
     # An authored hold governs its species, as for purge events.
     held = {species_index[hold.species] for hold in active_holds}
-    zero = sorted(index for index in sums if index not in held and values[index] <= 0.0)
+    zero = sorted(
+        index for index in sums
+        if index not in held and index not in released and values[index] <= 0.0
+    )
     if not zero:
         return (), ()
     vessel = () if free_rhs.volume.value is None else (free_rhs.volume.value,)
     free = free_rhs(segment_start, np.append(values, vessel))
-    indices = tuple(index for index in zero if free[index] <= 0.0)
+    indices = tuple(index for index in zero if free[index] < 0.0)
     if not indices:
         return (), ()
     last: list[object] = [None, None]
@@ -2110,48 +2097,3 @@ def _append_identity_row(
         segment_key=segment_key,
         discontinuity_id=discontinuity_id,
     )
-
-
-def _validate_segment_output(
-    times: np.ndarray,
-    states: np.ndarray,
-    *,
-    species_count: int,
-    solver: str,
-    time: float,
-) -> None:
-    if states.ndim != 2 or states.shape != (species_count, times.size):
-        raise SolverError(
-            "Scheduled simulation segment returned invalid shape.",
-            details={"solver": solver},
-        )
-    _ensure_finite_nonnegative(
-        states,
-        solver=solver,
-        time=time,
-        context="Scheduled simulation segment",
-    )
-
-
-def _ensure_finite_nonnegative(
-    values: object, *, solver: str, time: float, context: str
-) -> None:
-    array = np.asarray(values, dtype=float)
-    if not np.all(np.isfinite(array)):
-        raise _SimulationScientificUnavailabilitySignal(
-            SimulationScientificUnavailability(
-                producer="intervention_schedule_execution",
-                stage="segment_arithmetic",
-                details={
-                    "solver": solver,
-                    "time": float(time),
-                    "context": context,
-                },
-            )
-        )
-    if np.any(array < 0.0):
-        raise SolverError(
-            f"{context} contains negative concentration values.",
-            details={"solver": solver},
-        )
-

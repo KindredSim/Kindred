@@ -48,22 +48,6 @@ class DatasetImportUnit:
     display_name: str
     payload: DatasetObservationPayload
 
-    def __post_init__(self) -> None:
-        if not isinstance(self.source, ImportedSource):
-            raise TypeError(
-                "Imported datasets require their immutable source snapshot."
-            )
-        if not isinstance(self.display_name, str):
-            raise TypeError("Imported dataset display name must be a string.")
-        name = self.display_name.strip()
-        if not name:
-            raise ValueError("Imported datasets require a nonblank display name.")
-        if not isinstance(self.payload, DatasetObservationPayload):
-            raise TypeError(
-                "Imported dataset payload must be a DatasetObservationPayload."
-            )
-        object.__setattr__(self, "display_name", name)
-
 
 @dataclass(frozen=True, slots=True)
 class DatasetImportCompletion:
@@ -80,16 +64,6 @@ class RawDatasetBatchProposal:
     origin_tab_id: str
     sources: tuple[ImportedSource, ...]
     records: tuple[RawDatasetRecord, ...]
-
-    def __post_init__(self) -> None:
-        source_ids = tuple(source.source_id for source in self.sources)
-        if len(source_ids) != len(set(source_ids)):
-            raise ValueError("Raw dataset batch source IDs must be unique.")
-        referenced = {record.source_id for record in self.records}
-        if referenced != set(source_ids):
-            raise ValueError(
-                "Raw dataset batch sources must exactly cover dataset source references."
-            )
 
 
 class _DatasetImportCancelled(Exception):

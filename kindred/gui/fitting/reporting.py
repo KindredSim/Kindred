@@ -89,13 +89,6 @@ def _metric(value: FitMetric | None) -> object:
     return _plain(value.to_payload())
 
 
-def _change(fitted: float, nominal: float) -> tuple[float, float | None, str | None]:
-    absolute = float(fitted) - float(nominal)
-    if nominal == 0.0:
-        return absolute, None, "nominal value is zero"
-    return absolute, absolute / abs(float(nominal)) * 100.0, None
-
-
 def _terminal_dataset_value(
     candidate: FitCandidate,
     dataset_id: str,
@@ -131,7 +124,7 @@ def _display(value: object) -> str:
 
 
 def _profile_endpoint(endpoint: object) -> dict[str, object]:
-    return {"reason": endpoint.reason, "failure": _plain(endpoint.failure)}
+    return {"reason": endpoint.reason}
 
 
 def _profile_interval(coordinate: FitCoordinate, interval: object) -> dict[str, object]:
@@ -219,8 +212,6 @@ def _bootstrap_data(candidate: FitCandidate) -> dict[str, object]:
             _bootstrap_interval(coordinate, interval)
             for coordinate, interval in sorted(result.intervals.items(), key=lambda item: str(item[0]))
         ],
-        "primary_fit_diagnostic": _plain(result.primary_fit_diagnostic),
-        "primary_fit_unavailable": _plain(result.primary_fit_unavailable),
         "first_failed_replicate_diagnostic": _plain(result.first_failed_replicate_diagnostic),
         "first_failed_replicate_unavailable": _plain(result.first_failed_replicate_unavailable),
         "unavailable_reason": result.unavailable_reason,
@@ -235,7 +226,6 @@ def _dataset_metrics(candidate: FitCandidate) -> list[dict[str, object]]:
     for info in sorted(result.dataset_info, key=lambda item: str(item.dataset_id)):
         dataset_id = str(info.dataset_id)
         metric: dict[str, object] = {
-            "dataset_id": dataset_id,
             "dataset_display_name": display_names.get(dataset_id, dataset_id),
             "weighted_sse": _metric(info.weighted_residual_sse),
             "weighted_mse": _metric(info.weighted_residual_mse),
@@ -273,46 +263,21 @@ def _estimate_rows(candidate: FitCandidate) -> tuple[list[dict[str, object]], li
             if launch_parameter is None
             else launch_parameter.selected_config
         )
-        starts = dict(launch_configuration.dataset_values)
         if parameter.scope == "centred_fixed_effects":
+            starts = dict(launch_configuration.dataset_values)
             raw_starts = {
                 dataset_id: math.log10(starts[dataset_id]) if configuration.log10 else starts[dataset_id]
                 for dataset_id in included_ids
             }
             starting_centre = float(np.mean(tuple(raw_starts.values())))
             nominal = 10.0 ** starting_centre if configuration.log10 else starting_centre
-        elif parameter.scope == "shared":
-            nominal = launch_configuration.value
-        else:
-            nominal = starts[included_ids[0]]
-        origin_parameter = next(
-            (
-                item
-                for item in candidate.origin.parameter_defaults
-                if item.name == parameter.name
-            ),
-            None,
-        )
-        if origin_parameter is None:
-            captured_value = nominal
-            captured_source = "Fit setup value"
-        elif parameter.scope in {"shared", "centred_fixed_effects"}:
-            captured_value = origin_parameter.shared_config.value
-            captured_source = "captured project Shared default"
-        else:
-            # Project capture can precede dataset seeding. This is labelled
-            # provenance; the dispatched starts below own nominal Fit values.
-            captured_value = origin_parameter.per_dataset_config.value
-            captured_source = "captured project Per-dataset default"
-        if parameter.scope == "centred_fixed_effects":
             settlement = settlements.get(parameter.name)
             if settlement is None:
                 raise ValueError(f"canonical result omitted centred settlement {parameter.name!r}")
             value = float(settlement.overall_decoded_value)
-            absolute, percentage, unavailable = _change(value, nominal)
             append_row(shared, kind="centred_overall", name=parameter.name,
                 display_name=f"Overall · {parameter.display_name}", scope="Overall", unit=parameter.unit,
-                captured_value=captured_value, nominal_value=nominal, fitted_value=value,
+                nominal_value=nominal, fitted_value=value,
                 minimum=configuration.minimum, maximum=configuration.maximum,
                 bound_state=fit_bound_state(
                     value,
@@ -320,10 +285,7 @@ def _estimate_rows(candidate: FitCandidate) -> tuple[list[dict[str, object]], li
                     configuration.maximum,
                     log_scale=configuration.log10,
                 ),
-                absolute_change=absolute, percentage_change=percentage,
-                percentage_unavailable_reason=unavailable,
-                dataset_ids=list(settlement.dataset_ids),
-                captured_value_source=captured_source, nominal_value_source="Fit setup")
+                dataset_ids=list(settlement.dataset_ids))
             for dataset_id in settlement.dataset_ids:
                 value = float(settlement.dataset_values[dataset_id])
                 append_row(individual, kind="centred_effective", name=parameter.name,
@@ -337,21 +299,17 @@ def _estimate_rows(candidate: FitCandidate) -> tuple[list[dict[str, object]], li
                 value = float(deviation.decoded_value)
                 dataset_id = str(deviation.coordinate.dataset_id)
                 nominal_deviation = raw_starts[dataset_id] - starting_centre
-                absolute, percentage, unavailable = _change(value, nominal_deviation)
                 append_row(individual, kind="centred_deviation", name=parameter.name,
                     display_name=parameter.display_name,
                     scope="Log10-coordinate deviation" if configuration.log10 else "Linear-coordinate deviation", unit="decades" if configuration.log10 else parameter.unit,
-                    captured_value=0.0, nominal_value=nominal_deviation, fitted_value=value,
+                    nominal_value=nominal_deviation, fitted_value=value,
                     minimum=-deviation_bounds, maximum=deviation_bounds,
                     bound_state=fit_bound_state(
                         value,
                         -deviation_bounds,
                         deviation_bounds,
                     ),
-                    absolute_change=absolute, percentage_change=percentage,
-                    percentage_unavailable_reason=unavailable,
-                    dataset_id=dataset_id, dataset_ids=[dataset_id], dataset_display_name=display_names.get(dataset_id),
-                    captured_value_source="centred terminal settlement", nominal_value_source="Fit setup")
+                    dataset_id=dataset_id, dataset_ids=[dataset_id], dataset_display_name=display_names.get(dataset_id))
             continue
         if parameter.scope == "shared":
             if parameter.selected_config.fit:
@@ -366,21 +324,16 @@ def _estimate_rows(candidate: FitCandidate) -> tuple[list[dict[str, object]], li
                 # become fitted/presentation rows.
                 continue
             nominal = float(launch_configuration.value)
-            absolute, percentage, unavailable = _change(value, nominal)
             append_row(shared, kind="shared_parameter", name=parameter.name, display_name=parameter.display_name,
                 scope="Shared", unit=parameter.unit,
-                captured_value=captured_value, nominal_value=nominal, fitted_value=value,
+                nominal_value=nominal, fitted_value=value,
                 minimum=configuration.minimum, maximum=configuration.maximum,
                 bound_state=fit_bound_state(
                     value,
                     configuration.minimum,
                     configuration.maximum,
                     log_scale=configuration.log10,
-                ),
-                absolute_change=absolute, percentage_change=percentage,
-                percentage_unavailable_reason=unavailable,
-                captured_value_source=captured_source,
-                nominal_value_source="Fit setup")
+                ))
             continue
         # Fixed Per-dataset coordinates are not terminal fitted values and
         # therefore have no presentation row.  Fitted coordinates below must
@@ -388,11 +341,6 @@ def _estimate_rows(candidate: FitCandidate) -> tuple[list[dict[str, object]], li
         if not configuration.fit:
             continue
         values = dict(launch_configuration.dataset_values)
-        captured_values = (
-            dict(origin_parameter.per_dataset_config.dataset_values)
-            if origin_parameter is not None
-            else values
-        )
         for dataset_id in included_ids:
             value = _terminal_dataset_value(candidate, dataset_id, parameter.name)
             if dataset_id not in values:
@@ -401,11 +349,9 @@ def _estimate_rows(candidate: FitCandidate) -> tuple[list[dict[str, object]], li
                     f"for {parameter.name!r}."
                 )
             nominal = float(values[dataset_id])
-            captured = float(captured_values.get(dataset_id, captured_value))
-            absolute, percentage, unavailable = _change(value, nominal)
             append_row(individual, kind="per_dataset_parameter", name=parameter.name, display_name=parameter.display_name,
                 scope="Per-dataset", unit=parameter.unit,
-                captured_value=captured, nominal_value=nominal, fitted_value=value,
+                nominal_value=nominal, fitted_value=value,
                 minimum=configuration.minimum, maximum=configuration.maximum,
                 bound_state=fit_bound_state(
                     value,
@@ -413,11 +359,7 @@ def _estimate_rows(candidate: FitCandidate) -> tuple[list[dict[str, object]], li
                     configuration.maximum,
                     log_scale=configuration.log10,
                 ),
-                absolute_change=absolute, percentage_change=percentage,
-                percentage_unavailable_reason=unavailable,
-                dataset_id=dataset_id, dataset_ids=[dataset_id], dataset_display_name=display_names.get(dataset_id),
-                captured_value_source=captured_source,
-                nominal_value_source="Fit setup")
+                dataset_id=dataset_id, dataset_ids=[dataset_id], dataset_display_name=display_names.get(dataset_id))
     return shared, individual
 
 
@@ -453,21 +395,16 @@ def _initial_rows(candidate: FitCandidate) -> list[dict[str, object]]:
                 mapped.dataset_id,
                 f"{INITIAL_PREFIX}{item.species}",
             )
-            absolute, percentage, unavailable = _change(value, launch_item.initial)
-            captured = dict(mapped.initial_values).get(item.species, launch_item.initial)
             rows.append({"kind": "initial", "name": item.species, "display_name": item.species,
-                "scope": "Per-dataset IC", "unit": "M", "captured_value": captured,
+                "scope": "Per-dataset IC", "unit": "M",
                 "nominal_value": launch_item.initial, "fitted_value": value, "minimum": launch_item.minimum, "maximum": launch_item.maximum,
                 "bound_state": fit_bound_state(
                     value,
                     launch_item.minimum,
                     launch_item.maximum,
                     log_scale=bool(launch_item.log10),
-                ), "absolute_change": absolute,
-                "percentage_change": percentage, "percentage_unavailable_reason": unavailable,
-                "set_id": item.set_id, "dataset_ids": [mapped.dataset_id], "dataset_display_name": mapped.display_name,
-                "set_display_name": mapped.set_name,
-                "captured_value_source": "captured mapped dataset initial value", "nominal_value_source": "Fit setup"})
+                ),
+                "dataset_ids": [mapped.dataset_id], "dataset_display_name": mapped.display_name})
     launch_groups = {
         (item.species, item.origin_dataset_id): item
         for item in request_setup.shared_initial_groups
@@ -492,22 +429,17 @@ def _initial_rows(candidate: FitCandidate) -> list[dict[str, object]]:
                 dataset_id,
                 f"{INITIAL_PREFIX}{item.species}",
             )
-            absolute, percentage, unavailable = _change(value, launch_item.initial)
-            captured = dict(mapped.initial_values).get(item.species, launch_item.initial)
             rows.append({"kind": "initial", "name": item.species, "display_name": item.species,
                 "scope": "Shared Fit IC group", "unit": "M",
-                "captured_value": captured, "nominal_value": launch_item.initial, "fitted_value": value,
+                "nominal_value": launch_item.initial, "fitted_value": value,
                 "minimum": launch_item.minimum, "maximum": launch_item.maximum,
                 "bound_state": fit_bound_state(
                     value,
                     launch_item.minimum,
                     launch_item.maximum,
                     log_scale=bool(launch_item.log10),
-                ), "absolute_change": absolute,
-                "percentage_change": percentage, "percentage_unavailable_reason": unavailable,
-                "set_id": mapped.set_id, "dataset_ids": [mapped.dataset_id], "dataset_display_name": mapped.display_name,
-                "set_display_name": mapped.set_name,
-                "captured_value_source": "captured mapped dataset initial value", "nominal_value_source": "Fit setup"})
+                ),
+                "dataset_ids": [mapped.dataset_id], "dataset_display_name": mapped.display_name})
     return rows
 
 
@@ -533,9 +465,8 @@ def _aggregate_rows(individual: list[dict[str, object]]) -> list[dict[str, objec
             return values[lower] * (1.0 - fraction) + values[upper] * fraction
 
         aggregates.append({"name": name, "display_name": rows[0]["display_name"], "unit": rows[0]["unit"], "n": count,
-            "arithmetic_mean": mean, "sample_sd": sd, "standard_error": None if sd is None else sd / math.sqrt(count),
-            "median": statistics.median(values), "iqr": percentile(0.75) - percentile(0.25),
-            "minimum": values[0], "maximum": values[-1]})
+            "arithmetic_mean": mean, "sample_sd": sd,
+            "median": statistics.median(values), "iqr": percentile(0.75) - percentile(0.25)})
     return aggregates
 
 
@@ -590,7 +521,7 @@ def _analysis_section(title: str, data: Mapping[str, object], origin: FitOriginS
         return ""
     section = f"<h3>{_text(title)} — {_text(str(data['status']).replace('_', ' '))}</h3>"
     for key in ("unavailable_reason", "diagnostic", "first_failed_replicate_diagnostic",
-                "first_failed_replicate_unavailable", "primary_fit_diagnostic", "primary_fit_unavailable"):
+                "first_failed_replicate_unavailable"):
         if data.get(key):
             section += f"<p><b>{_text(key.replace('_', ' ').capitalize())}:</b> {_text(_diagnostic(data[key], origin))}</p>"
     if "replicates" in data:
@@ -616,8 +547,6 @@ def _analysis_section(title: str, data: Mapping[str, object], origin: FitOriginS
             if endpoint:
                 if endpoint.get("reason"):
                     outcomes.append(f"{side}: {endpoint['reason']}")
-                if endpoint.get("failure"):
-                    outcomes.append(f"{side}: {_diagnostic(endpoint['failure'], origin)}")
         if interval.get("endpoint_messages"):
             outcomes.append(_diagnostic(interval["endpoint_messages"], origin))
         rows.append((name, interval["lower"], interval["upper"], _unit_html(unit), interval["status"], "; ".join(outcomes)))
@@ -708,8 +637,6 @@ def fit_candidate_presentation(candidate: FitCandidate) -> tuple[tuple[str, ...]
     model_kind = "Centred Fixed Effects" if result.primary_model == "centred_fixed_effects" else "Ordinary global fit"
     body += f"<p>Model: {_text(model_kind)}.</p>"
     body += f"<p>Optimizer {'converged' if result.optimizer_converged else 'did not converge'}.</p>"
-    if result.optimizer_diagnostic:
-        body += f"<p><b>Optimizer diagnostic:</b> {_text(_diagnostic(_plain(result.optimizer_diagnostic), candidate.origin))}</p>"
     parameters = {parameter.name: parameter for parameter in candidate.setup_snapshot.parameters}
     symbols = {name: scientific_symbol_html(name, family=parameter.family, role=parameter.role)
                for name, parameter in parameters.items()}

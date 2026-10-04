@@ -16,9 +16,9 @@ _PROTECTED_INDEXED_IDENTIFIER_RE = re.compile(r"^(?:k|kf|kr|keq)([1-9]\d*)$")
 @dataclass(frozen=True)
 class MechanismParameterInfo:
     canonical_name: str
-    step_index: int | None
-    step_kind: str | None
-    role: str | None
+    step_index: int
+    step_kind: str
+    role: str
 
 
 @dataclass(frozen=True)
@@ -29,7 +29,7 @@ class MechanismSourceCoordinateInfo:
     step_index: int
     step_kind: str
     role: str
-    source_index: int | None = None
+    source_index: int
 
 
 @dataclass(frozen=True)
@@ -49,19 +49,17 @@ class InvalidProtectedIndexedIdentifier:
 class MechanismParameterNamespaceItem:
     canonical_name: str
     info: MechanismParameterInfo
-    source_index: int | None = None
+    source_index: int
 
 
 @dataclass(frozen=True)
 class MechanismParameterNamespace:
     canonical_names: frozenset[str]
-    info_by_name: Mapping[str, MechanismParameterInfo]
     ordered_items: tuple[MechanismParameterNamespaceItem, ...]
     source_coordinates: tuple[MechanismSourceCoordinateInfo, ...] = ()
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "canonical_names", frozenset(self.canonical_names))
-        object.__setattr__(self, "info_by_name", dict(self.info_by_name))
         object.__setattr__(self, "ordered_items", tuple(self.ordered_items))
         object.__setattr__(self, "source_coordinates", tuple(self.source_coordinates))
 
@@ -150,7 +148,7 @@ class MechanismParameterNamespace:
 class _NamespaceStepDescriptor:
     step_index: int
     step_kind: str
-    source_index: int | None = None
+    source_index: int
     source_coordinates: tuple[tuple[str, str], ...] = ()
 
 
@@ -243,7 +241,6 @@ def _build_namespace(descriptors: Sequence[_NamespaceStepDescriptor]) -> Mechani
         for _role, canonical_name in descriptor.source_coordinates
     }
     canonical_names = frozenset((*ordered_names, *source_names))
-    info_by_name = {item.canonical_name: item.info for item in ordered_items}
     source_coordinates = tuple(
         MechanismSourceCoordinateInfo(
             canonical_name=str(canonical_name),
@@ -258,19 +255,8 @@ def _build_namespace(descriptors: Sequence[_NamespaceStepDescriptor]) -> Mechani
     source_names = [item.canonical_name for item in source_coordinates]
     if len(source_names) != len(set(source_names)):
         raise ValueError("Duplicate reaction-local source coordinate identity.")
-    for coordinate in source_coordinates:
-        info_by_name.setdefault(
-            coordinate.canonical_name,
-            MechanismParameterInfo(
-                canonical_name=coordinate.canonical_name,
-                step_index=coordinate.step_index,
-                step_kind=coordinate.step_kind,
-                role=coordinate.role,
-            ),
-        )
     return MechanismParameterNamespace(
         canonical_names=canonical_names,
-        info_by_name=info_by_name,
         ordered_items=ordered_items,
         source_coordinates=source_coordinates,
     )

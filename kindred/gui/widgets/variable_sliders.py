@@ -33,8 +33,6 @@ from kindred.gui.display_name_policy import (
 
 from ..ui_helpers import (
     configure_compact_numeric_edit,
-    make_placeholder_label,
-    make_scroll_area,
     set_bounded_label_text,
 )
 
@@ -94,12 +92,9 @@ class VariableSliders(QtWidgets.QWidget):
     """
 
     interactionRequested = Signal(str, float, object)
-    fineModeReset = Signal(bool)
     editorValidityChanged = Signal()
 
-    def __init__(
-        self, parent: Optional[QtWidgets.QWidget] = None, *, embedded: bool = False
-    ):
+    def __init__(self, parent: Optional[QtWidgets.QWidget] = None):
         """
         Initialize variable sliders widget.
 
@@ -109,7 +104,6 @@ class VariableSliders(QtWidgets.QWidget):
             Parent widget
         """
         super().__init__(parent)
-        self._embedded = bool(embedded)
 
         # Storage for variable values and slider metadata
         self._variables: Dict[str, float] = {}  # {name: value}
@@ -128,81 +122,32 @@ class VariableSliders(QtWidgets.QWidget):
         self._slider_callbacks: Dict[str, Dict[str, object]] = {}
         self._hidden_names: set[str] = set()
         self._visibility_scope_signature: object | None = None
-        self._placeholder: QtWidgets.QLabel | None = None
-        self._hidden_placeholder: QtWidgets.QLabel | None = None
         self._active_presses: Dict[str, _SliderPress] = {}
         self._editor_pre_edit_state: Dict[str, tuple[float, str, bool]] = {}
         self._last_committed_editor_text: Dict[str, str] = {}
 
         # Layout
         main_layout = QtWidgets.QVBoxLayout(self)
-        if self._embedded:
-            main_layout.setContentsMargins(0, 0, 0, 0)
-            main_layout.setSpacing(0)
-        else:
-            main_layout.setContentsMargins(4, 4, 4, 4)
-            main_layout.setSpacing(4)
-
-            # Header
-            header = QtWidgets.QLabel("Variable Sliders")
-            header_font = header.font()
-            header_font.setBold(True)
-            header.setFont(header_font)
-            main_layout.addWidget(header)
-
-            # Description
-            desc = QtWidgets.QLabel(
-                "Adjust mechanism parameters and see simulation update automatically"
-            )
-            desc.setWordWrap(True)
-            desc_font = desc.font()
-            desc_font.setPointSize(desc_font.pointSize() - 1)
-            desc.setFont(desc_font)
-            main_layout.addWidget(desc)
-
-        if self._embedded:
-            header = QtWidgets.QLabel("Parameters")
-            header.setStyleSheet("font-weight: bold;")
-            main_layout.addWidget(header)
+        main_layout.setContentsMargins(0, 0, 0, 0)
+        main_layout.setSpacing(0)
+        header = QtWidgets.QLabel("Parameters")
+        header.setStyleSheet("font-weight: bold;")
+        main_layout.addWidget(header)
 
         self._sliders_widget = QtWidgets.QWidget()
         self._sliders_layout = QtWidgets.QVBoxLayout(self._sliders_widget)
         self._sliders_layout.setContentsMargins(0, 0, 0, 0)
         self._sliders_layout.setSpacing(14)
-
-        if self._embedded:
-            main_layout.addWidget(self._sliders_widget)
-        else:
-            scroll = make_scroll_area(self)
-            scroll.setWidget(self._sliders_widget)
-            main_layout.addWidget(scroll)
-
-            # Placeholder message
-            self._placeholder = make_placeholder_label(
-                "No variables defined.\nParse a mechanism to see sliders."
-            )
-            self._sliders_layout.addWidget(self._placeholder)
-            self._hidden_placeholder = make_placeholder_label(
-                "All mechanism sliders hidden by picker."
-            )
-            self._hidden_placeholder.hide()
-            self._sliders_layout.addWidget(self._hidden_placeholder)
-
+        main_layout.addWidget(self._sliders_widget)
         self._sliders_layout.addStretch()
 
         logger.debug("VariableSliders initialized")
-
-    @property
-    def fine_mode_enabled(self) -> bool:
-        """Return the current mechanism-slider Fine projection state."""
-        return bool(self._fine_mode)
 
     def set_variables(
         self,
         variables: Dict[str, float],
         *,
         metadata: Optional[Dict[str, Dict[str, object]]] = None,
-        preserve_visibility: bool = False,
     ) -> None:
         """
         Set variables and create sliders.
@@ -219,28 +164,13 @@ class VariableSliders(QtWidgets.QWidget):
         logger.info(f"Setting {len(normalized_variables)} variables")
 
         current_names = set(normalized_variables)
-        self._reconcile_visibility_scope(
-            current_names,
-            metadata=normalized_metadata,
-            preserve_visibility=preserve_visibility,
-        )
+        self._reconcile_visibility_scope(current_names, metadata=normalized_metadata)
 
-        self._reset_fine_mode_quietly()
-
-        # Clear existing sliders
+        # Clear existing sliders; Fine mode survives the rebuild.
         self._clear_sliders()
 
         self._variables = normalized_variables
         self._metadata = normalized_metadata
-
-        if not normalized_variables:
-            if self._placeholder is not None:
-                self._placeholder.show()
-            logger.debug("No variables to display")
-            return
-
-        if self._placeholder is not None:
-            self._placeholder.hide()
 
         for name, value in normalized_variables.items():
             self._create_slider(name, value)
@@ -249,7 +179,10 @@ class VariableSliders(QtWidgets.QWidget):
         logger.info(f"Created {len(self._sliders)} sliders")
 
     def _clear_sliders(self) -> None:
-        """Clear all existing sliders."""
+        """Clear all existing sliders, ending any active drag."""
+        for slider in self._sliders.values():
+            with QtCore.QSignalBlocker(slider):
+                slider.end_drag()
         for container in list(self._containers.values()):
             self._sliders_layout.removeWidget(container)
             container.deleteLater()
@@ -267,11 +200,6 @@ class VariableSliders(QtWidgets.QWidget):
         self._active_presses.clear()
         self._editor_pre_edit_state.clear()
         self._last_committed_editor_text.clear()
-
-        if self._placeholder is not None:
-            self._placeholder.show()
-        if self._hidden_placeholder is not None:
-            self._hidden_placeholder.hide()
 
     def _create_slider(self, name: str, value: float) -> None:
         """
@@ -365,30 +293,15 @@ class VariableSliders(QtWidgets.QWidget):
         slider.setAccessibleName(f"{spoken} slider")
         slider.setMinimumHeight(28)
         slider.setMinimum(0)
-        slider.setMaximum(1000)  # 1000 steps for smooth control
-        slider.setSingleStep(5)
-        slider.setPageStep(100)
+        # 1000 steps for smooth control, 10000 in Fine mode
+        slider.setMaximum(10000 if self._fine_mode else 1000)
+        slider.setSingleStep(1 if self._fine_mode else 5)
+        slider.setPageStep(50 if self._fine_mode else 100)
         slider.set_fine_mode(self._fine_mode)
         self._slider_scales[name] = "linear" if scale == "linear" else "log"
 
         if scale == "linear":
-            try:
-                lo = (
-                    float(meta.get("min"))
-                    if meta.get("min") is not None
-                    else float(value) - 10.0
-                )
-            except (ArithmeticError, TypeError, ValueError):
-                lo = float(value) - 10.0
-            try:
-                hi = (
-                    float(meta.get("max"))
-                    if meta.get("max") is not None
-                    else float(value) + 10.0
-                )
-            except (ArithmeticError, TypeError, ValueError):
-                hi = float(value) + 10.0
-            self._slider_ranges[name] = (lo, hi)
+            self._slider_ranges[name] = (float(meta["min"]), float(meta["max"]))
             self._slider_signs[name] = 1.0
         else:
             sign = 1.0 if value >= 0 else -1.0
@@ -421,25 +334,18 @@ class VariableSliders(QtWidgets.QWidget):
         # Range labels
         range_layout = QtWidgets.QHBoxLayout()
         range_layout.setSpacing(0)
+        lo, hi = self._slider_ranges[name]
         if scale == "linear":
-            lo, hi = self._slider_ranges[name]
             min_label = QtWidgets.QLabel(self._format_value(float(lo)))
             max_label = QtWidgets.QLabel(self._format_value(float(hi)))
         else:
-            min_label = QtWidgets.QLabel(self._format_power_of_ten(_LOG_SLIDER_EXP_MIN))
-            max_label = QtWidgets.QLabel(self._format_power_of_ten(_LOG_SLIDER_EXP_MAX))
+            min_label = QtWidgets.QLabel(self._format_power_of_ten(lo))
+            max_label = QtWidgets.QLabel(self._format_power_of_ten(hi))
             min_label.setTextFormat(QtCore.Qt.RichText)
             max_label.setTextFormat(QtCore.Qt.RichText)
             min_label.setMinimumHeight(min_label.fontMetrics().height() + 4)
             max_label.setMinimumHeight(max_label.fontMetrics().height() + 4)
         range_layout.addWidget(min_label)
-        if scale != "linear":
-            for mid_text in ["10<sup>-6</sup>", "1", "10<sup>6</sup>"]:
-                range_layout.addStretch()
-                mid_label = QtWidgets.QLabel(mid_text)
-                mid_label.setTextFormat(QtCore.Qt.RichText)
-                mid_label.setMinimumHeight(mid_label.fontMetrics().height() + 4)
-                range_layout.addWidget(mid_label)
         range_layout.addStretch()
         range_layout.addWidget(max_label)
         layout.addLayout(range_layout)
@@ -603,7 +509,6 @@ class VariableSliders(QtWidgets.QWidget):
         variables: Dict[str, float],
         *,
         metadata: Optional[Dict[str, Dict[str, object]]] = None,
-        preserve_visibility: bool = True,
         preserve_editor_drafts: bool = True,
     ) -> None:
         """Render a tab snapshot without treating widget values as canonical."""
@@ -619,7 +524,6 @@ class VariableSliders(QtWidgets.QWidget):
             self._reconcile_visibility_scope(
                 set(normalized_variables),
                 metadata=normalized_metadata,
-                preserve_visibility=preserve_visibility,
             )
             for name, value in normalized_variables.items():
                 if not preserve_editor_drafts:
@@ -644,7 +548,6 @@ class VariableSliders(QtWidgets.QWidget):
             self.set_variables(
                 normalized_variables,
                 metadata=normalized_metadata,
-                preserve_visibility=preserve_visibility,
             )
             for name, (text, baseline, committed, rejected) in retained_editors.items():
                 self._set_value_projection(name, normalized_variables[name], editor_text=text, emit=False)
@@ -705,23 +608,10 @@ class VariableSliders(QtWidgets.QWidget):
 
         logger.debug(f"Variable readout updated: {name} = {value}")
 
-    def clear(self, *, preserve_visibility: bool = True) -> None:
-        """Clear physical controls, optionally retaining visibility preference."""
-        self._reset_fine_mode_quietly()
+    def clear(self) -> None:
+        """Clear physical controls, retaining visibility and Fine preferences."""
         self._clear_sliders()
         self._variables.clear()
-        self._slider_ranges.clear()
-        self._slider_signs.clear()
-        self._slider_scales.clear()
-        self._range_labels.clear()
-        self._last_valid_values.clear()
-        if not preserve_visibility:
-            self._hidden_names.clear()
-            self._visibility_scope_signature = None
-        if self._placeholder is not None:
-            self._placeholder.show()
-        if self._hidden_placeholder is not None:
-            self._hidden_placeholder.hide()
         logger.debug("Variables cleared")
 
     def has_slider_entries(self) -> bool:
@@ -814,22 +704,6 @@ class VariableSliders(QtWidgets.QWidget):
 
         logger.info(f"Fine mode {'enabled' if enabled else 'disabled'}")
 
-    def _reset_fine_mode_quietly(self) -> None:
-        """Return child sliders to quiet Normal state before a rebuild/clear."""
-        was_fine = bool(self._fine_mode)
-        self._fine_mode = False
-        self._active_presses.clear()
-        for slider in self._sliders.values():
-            with QtCore.QSignalBlocker(slider):
-                slider.end_drag()
-                slider.set_fine_mode(False)
-                slider.setMinimum(0)
-                slider.setMaximum(1000)
-                slider.setSingleStep(5)
-                slider.setPageStep(100)
-        if was_fine:
-            self.fineModeReset.emit(False)
-
     def _apply_variable_visibility(self, name: str) -> None:
         container = self._containers.get(str(name))
         if container is None:
@@ -837,26 +711,14 @@ class VariableSliders(QtWidgets.QWidget):
         container.setVisible(self.variable_visible(str(name)))
 
     def _sync_visibility_state(self) -> None:
-        visible_count = 0
         for name, container in self._containers.items():
-            visible = self.variable_visible(name)
-            container.setVisible(visible)
-            if visible:
-                visible_count += 1
-        has_variables = bool(self._variables)
-        if self._placeholder is not None:
-            self._placeholder.setVisible(not has_variables)
-        if self._hidden_placeholder is not None:
-            self._hidden_placeholder.setVisible(
-                has_variables and bool(self._containers) and visible_count == 0
-            )
+            container.setVisible(self.variable_visible(name))
 
     def _reconcile_visibility_scope(
         self,
         names: set[str],
         *,
         metadata: Dict[str, Dict[str, object]],
-        preserve_visibility: bool,
     ) -> None:
         """Reconcile choices by stable parameter identity, not roster order."""
         signature = tuple(
@@ -864,13 +726,12 @@ class VariableSliders(QtWidgets.QWidget):
                 name,
                 metadata[name]["family"],
                 metadata[name]["role"],
-                metadata[name]["scale"],
             )
             for name in names
         )
 
         previous = self._visibility_scope_signature
-        if not preserve_visibility or previous is None:
+        if previous is None:
             self._hidden_names = set(names)
         else:
             previous_by_name = {

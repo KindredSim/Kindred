@@ -1075,7 +1075,7 @@ class InterventionTriggerAction:
         op = _enum(self.op, field="op")
         if op not in {"set", "jump", "scale", "withdraw"}:
             raise InterventionScheduleError(
-                "Trigger then permits exactly op=set or op=jump."
+                "A trigger action is op=set, op=jump, op=scale, or op=withdraw."
             )
         object.__setattr__(self, "op", op)
         if self.physical is not None:
@@ -1734,7 +1734,7 @@ def _trigger_action_from_payload(raw: Mapping[str, Any]) -> InterventionTriggerA
     selected = {"set": "value", "jump": "delta"}.get(op)
     if selected is None:
         raise InterventionScheduleError(
-            "Trigger then permits exactly op=set or op=jump."
+            "Trigger then permits op=set, op=jump, op=scale, op=withdraw, or op=stop."
         )
     _reject_keys(
         data,

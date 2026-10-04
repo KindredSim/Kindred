@@ -18,7 +18,7 @@ preset_set1 = {
   [E] = 0.0
 }
 
-# Editable offsets declare their own units; formulas read energies in J/mol.
+# A plain number assigned to an energy uses the energy= unit; offsets declare their own units.
 param energy_offset = 5.0; unit = kJ/mol
 
 # Constrain the third activation energy using the second.

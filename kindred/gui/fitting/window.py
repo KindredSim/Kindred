@@ -20,7 +20,6 @@ from kindred.gui.fitting.launch import (
     FitDatasetLocalSettings,
     FitSetupSnapshot,
     fit_setup_readiness,
-    prune_fit_analysis_coordinates,
     selected_observations,
 )
 from kindred.gui.fitting.parameters_ics_tab import ParametersIcsTab
@@ -376,7 +375,6 @@ class FittingWindow(QtWidgets.QDialog):
     def _has_invalid_parameter_or_species_edits(self) -> bool:
         return bool(
             self._species_table.invalid_editor_keys
-            or self._species_table.has_pending_initial_changes
             or self._params_ics_tab.has_invalid_edits
         )
 
@@ -403,6 +401,8 @@ class FittingWindow(QtWidgets.QDialog):
                 parameters=setup.parameters,
                 initials=setup.initials,
                 shared_initial_groups=setup.shared_initial_groups,
+                profile_likelihood=setup.profile_likelihood,
+                residual_bootstrap=setup.residual_bootstrap,
             )
         ready = (
             setup is not None
@@ -417,7 +417,7 @@ class FittingWindow(QtWidgets.QDialog):
             reason = "Correct invalid Fit editor values before running."
         elif pending_targets:
             reason = (
-                "Apply or revert pending Fit target and weight edits before running."
+                "Apply or revert pending Fit target, weight, and IC edits before running."
             )
         elif structural is not None:
             reason = structural
@@ -657,7 +657,6 @@ class FittingWindow(QtWidgets.QDialog):
         )
         if current is None:
             return
-        excluded = () if included else (dataset_id,)
         self._on_leaf_snapshot(
             replace(
                 setup,
@@ -665,14 +664,6 @@ class FittingWindow(QtWidgets.QDialog):
                     replace(item, included=bool(included))
                     if item.dataset_id == dataset_id else item
                     for item in setup.datasets
-                ),
-                profile_likelihood=prune_fit_analysis_coordinates(
-                    setup.profile_likelihood,
-                    excluded_dataset_ids=excluded,
-                ),
-                residual_bootstrap=prune_fit_analysis_coordinates(
-                    setup.residual_bootstrap,
-                    excluded_dataset_ids=excluded,
                 ),
             )
         )
@@ -731,7 +722,10 @@ class FittingWindow(QtWidgets.QDialog):
 
     @property
     def has_pending_target_changes(self) -> bool:
-        return self._species_table.has_pending_target_changes
+        return (
+            self._species_table.has_pending_target_changes
+            or self._species_table.has_pending_initial_changes
+        )
 
     @property
     def has_pending_data_changes(self) -> bool:
@@ -760,7 +754,7 @@ class FittingWindow(QtWidgets.QDialog):
             return
         if self.has_pending_target_changes:
             self.set_status(
-                "Apply or revert pending Fit target and weight edits before running."
+                "Apply or revert pending Fit target, weight, and IC edits before running."
             )
             return
         if self.has_pending_data_changes:

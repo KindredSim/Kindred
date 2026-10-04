@@ -6,7 +6,7 @@ import logging
 from collections.abc import Callable
 
 import qdarktheme
-from PySide6 import QtGui, QtWidgets
+from PySide6 import QtGui
 
 logger = logging.getLogger(__name__)
 
@@ -60,17 +60,10 @@ class ThemeManager:
 
     def __init__(
         self,
-        application: QtWidgets.QApplication,
         theme_target: object,
         *,
         report_failure: Callable[[str], None] | None = None,
     ) -> None:
-        if not isinstance(application, QtWidgets.QApplication):
-            raise TypeError("application must be a QApplication.")
-        if not callable(getattr(theme_target, "set_theme", None)):
-            raise TypeError(
-                "theme_target must provide stable set_theme(dark_mode=...)."
-            )
         self._theme_target = theme_target
         self._report_failure = report_failure
         self._applied_dark_mode: bool | None = None

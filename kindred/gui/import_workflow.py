@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from enum import Enum
 import os
 from pathlib import Path
@@ -110,32 +110,6 @@ def resolve_column_unit(
         raise ValueError(f"Column {column.assigned_name!r}: {exc}") from exc
 
 
-def sharing_settings(
-    settings: ImportSettings,
-    *,
-    destination: ImportSettings | None = None,
-) -> ImportSettings:
-    """Share explicit choices without using defaults to replace specific units."""
-    units = {column: unit for column, unit in settings.column_units.items() if unit is not UnitSource.DEFAULT}
-    time_choice = UnitSource.FILE if settings.time_choice is UnitSource.DEFAULT else settings.time_choice
-    if destination is not None:
-        for column, unit in destination.column_units.items():
-            if isinstance(unit, str) and not isinstance(units.get(column), str):
-                units[column] = unit
-        if (
-            destination.time_column == settings.time_column
-            and isinstance(destination.time_choice, str)
-            and not isinstance(time_choice, str)
-        ):
-            time_choice = destination.time_choice
-    return replace(
-        settings,
-        species_columns=set(settings.species_columns),
-        time_choice=time_choice,
-        column_units=units,
-    )
-
-
 @dataclass(frozen=True)
 class ResolvedSheetPlan:
     """Fully resolved import plan for a single sheet (or CSV file)."""
@@ -171,32 +145,35 @@ def resolve_sheet_plan(
     first_row: Mapping[PhysicalColumn, object] | None,
     settings: ImportSettings,
 ) -> ResolvedSheetPlan:
-    time_column = settings.time_column
-    unit_row = classify_unit_row(first_row, contains_units=settings.first_row_contains_units)
-    species = settings.species_columns - {time_column}
-    if not species:
-        raise ValueError("Select at least one species column.")
-    for column in ({time_column, *species} - {None}):
-        if column not in columns:
-            raise ValueError(
-                f"Column {column.assigned_name!r} not found in sheet {sheet_name!r}."
-            )
-    ordered_species = tuple(column for column in columns if column in species)
-    time_unit = (
-        resolve_column_unit(time_column, unit_row, settings, time=True)
-        if time_column is not None else SECOND
-    )
-    observations = {
-        column.assigned_name: resolve_column_unit(
-            column, unit_row, settings
+    try:
+        time_column = settings.time_column
+        unit_row = classify_unit_row(first_row, contains_units=settings.first_row_contains_units)
+        species = settings.species_columns - {time_column}
+        if not species:
+            raise ValueError("Select at least one species column.")
+        for column in ({time_column, *species} - {None}):
+            if column not in columns:
+                raise ValueError(f"Column {column.assigned_name!r} not found.")
+        ordered_species = tuple(column for column in columns if column in species)
+        time_unit = (
+            resolve_column_unit(time_column, unit_row, settings, time=True)
+            if time_column is not None else SECOND
         )
-        for column in ordered_species
-    }
-    return ResolvedSheetPlan(
-        sheet_name=sheet_name,
-        time_column=time_column,
-        species_columns=ordered_species,
-        skip_unit_row=unit_row is not None,
-        time_unit=time_unit,
-        observation_units=observations,
-    )
+        observations = {
+            column.assigned_name: resolve_column_unit(
+                column, unit_row, settings
+            )
+            for column in ordered_species
+        }
+        return ResolvedSheetPlan(
+            sheet_name=sheet_name,
+            time_column=time_column,
+            species_columns=ordered_species,
+            skip_unit_row=unit_row is not None,
+            time_unit=time_unit,
+            observation_units=observations,
+        )
+    except ValueError as exc:
+        if sheet_name is None:
+            raise
+        raise ValueError(f"Sheet {sheet_name!r}: {exc}") from exc
