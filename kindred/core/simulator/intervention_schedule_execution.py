@@ -9,7 +9,7 @@ from typing import Callable, Mapping, Protocol, Sequence
 
 import numpy as np
 
-from kindred.core.exceptions import SimulationCancelled, create_solver_error
+from kindred.core.exceptions import SimulationCancelled, SolverError
 from kindred.core.intervention_schedule import (InterventionScheduleError, InterventionStopAction, SpeciesTriggerCondition, ObservableTriggerCondition, intervention_species)
 from kindred.core.intervention_schedule_compiler import (
     ExecutableFlux,
@@ -107,7 +107,6 @@ class SegmentRunResult:
     event_state_projection: NonnegativeProjection
     solver_used: str
     symbolic_jacobian_used: bool = False
-    jacobian_sparsity_hint: bool = False
     dense_output: Callable[[np.ndarray], np.ndarray] | None = None
 
     def __post_init__(self) -> None:
@@ -336,6 +335,29 @@ class InterventionScheduleExecutionOwner:
                             else "following"
                         ))
 
+                    # A drained species at zero whose free derivative is not
+                    # positive is held at zero like an authored hold; a
+                    # terminal release event ends that regime.
+                    free_rhs = _InterventionRhs(
+                        req.rhs, fluxes=active_fluxes, holds=active_holds, volume=volume,
+                        species_index=species_index,
+                        parameter_values=req.parameter_values_at_temperature,
+                        temperature_at=segment_temperature,
+                        cancellation_check=cancellation_check,
+                    )
+                    release_events, release_mapping = _drain_release_events(
+                        free_rhs, active_holds=active_holds, species_index=species_index,
+                        state=current_y, segment_start=sub_start,
+                    )
+                    active_holds = active_holds + tuple(
+                        ExecutableHold(
+                            species=name, start_time=sub_start, end_time=sub_end,
+                            value=0.0, declaration_ordinal=-1,
+                        )
+                        for name, index in species_index.items()
+                        if index in release_mapping
+                    )
+
                     segment_rhs = _InterventionRhs(
                         req.rhs, fluxes=active_fluxes, holds=active_holds, volume=volume,
                         species_index=species_index,
@@ -366,6 +388,8 @@ class InterventionScheduleExecutionOwner:
                         state=current_y,
                         segment_start=sub_start,
                     )
+                    purge_observers = purge_observers + release_events
+                    purge_mapping = purge_mapping + release_mapping
                     purge_stoppers = purge_observers
                     segment_events = (
                         trigger_observers
@@ -391,23 +415,8 @@ class InterventionScheduleExecutionOwner:
                                     rhs=segment_rhs, holds=active_holds, fluxes=active_fluxes,
                                     species_index=species_index,
                                 ),
-                                jac_sparsity=_transform_jacobian_sparsity(
-                                    segment_symbolic_jacobian.jac_sparsity, holds=active_holds,
-                                    species_index=species_index, size=current_y.size, volume=volume.value is not None,
-                                ),
                             ),
                         )
-                    elif volume.value is not None and segment_symbolic_jacobian.jac_sparsity is not None:
-                        segment_request = replace(segment_request, symbolic_jacobian=replace(
-                            segment_symbolic_jacobian,
-                            jac_sparsity=_transform_jacobian_sparsity(
-                                segment_symbolic_jacobian.jac_sparsity, holds=active_holds,
-                                species_index=species_index, size=current_y.size, volume=True,
-                            ),
-                        ))
-                    segment_request = _request_for_internal_segment(
-                        segment_request, t0=sub_start, t1=sub_end
-                    )
                     requested = _requested_eval(
                         t_eval,
                         start=sub_start,
@@ -544,9 +553,6 @@ class InterventionScheduleExecutionOwner:
                         "symbolic_jacobian_used": bool(
                             segment_result.symbolic_jacobian_used
                         ),
-                        "jacobian_sparsity_hint": bool(
-                            segment_result.jacobian_sparsity_hint
-                        ),
                     }
                     integration_segments.append(segment_payload)
                     segment_count += 1
@@ -573,7 +579,17 @@ class InterventionScheduleExecutionOwner:
                     )
                     if trigger_hit is not None:
                         trigger_hit = (trigger_hit[0], trigger_hit[1], current_y.copy())
-                    if purge_hit is not None:
+                    elif purge_hit is not None:
+                        current_y, purge_projection = project_nonnegative_trajectory(
+                            current_y.reshape(-1, 1),
+                            context=f"Purge continuation state at t={purge_hit[0]:g}",
+                        )
+                        current_y = current_y.reshape(-1)
+                        _record_continuation_projection(
+                            segment_projections,
+                            identity=segment_output_identity,
+                            projection=purge_projection,
+                        )
                         purge_hit = (purge_hit[0], purge_hit[1], current_y.copy())
                     scheduled_discontinuity = (
                         trigger_hit is None
@@ -1673,47 +1689,65 @@ class _InterventionRhs:
             vessel = raw_state[-1]
             volume_rate, mixing = self.volume.flow(self._fluxes, time, temperature_K, vessel, evaluation_state, fixed)
             derivative += mixing
-        sums, negative = self._flux_values(time, temperature_K)
+        sums, _negative = self._flux_values(time, temperature_K)
         for index, rate in sums.items():
-            candidate = float(derivative[index]) + rate
-            if index in negative and raw_state[index] <= 0.0:
-                derivative[index] = max(0.0, candidate)
-            else:
-                derivative[index] = candidate
+            derivative[index] += rate
         for index in fixed:
             derivative[index] = 0.0
         return np.append(derivative, volume_rate) if self.volume.value is not None else derivative
 
-    def purge_jacobian_branches(
-        self,
-        time: float,
-        state: np.ndarray,
-        temperature_K: float,
-    ) -> tuple[set[int], set[int]]:
-        """Return rows and columns masked by the active purge branch."""
+    def clamped_columns(self, time: float, state: np.ndarray, temperature_K: float) -> set[int]:
+        """Drained species evaluated at zero past an unlocated root."""
 
         raw_state = np.asarray(state, dtype=float).reshape(-1)
-        evaluation_state, _fixed = self._base_evaluation_state(raw_state, time, temperature_K)
-        derivative = np.asarray(
-            self._rhs(time, evaluation_state, T=temperature_K), dtype=float
-        )
-        if self.volume.value is not None:
-            _rate, mixing = self.volume.flow(self._fluxes, time, temperature_K, raw_state[-1], evaluation_state, _fixed)
-            derivative = derivative + mixing
-        zero_rows: set[int] = set()
-        zero_columns: set[int] = set()
-        sums, negative = self._flux_values(time, temperature_K)
-        for index in negative:
-            if raw_state[index] < 0.0:
-                zero_columns.add(index)
-            rate = sums[index]
-            if raw_state[index] > 0.0:
-                continue
-            candidate = float(derivative[index]) + rate
-            if candidate <= 0.0:
-                zero_rows.add(index)
-                zero_columns.add(index)
-        return zero_rows, zero_columns
+        _sums, negative = self._flux_values(time, temperature_K)
+        return {index for index in negative if raw_state[index] < 0.0}
+
+
+def _drain_release_events(
+    free_rhs: _InterventionRhs,
+    *,
+    active_holds: Sequence[ExecutableHold],
+    species_index: Mapping[str, int],
+    state: np.ndarray,
+    segment_start: float,
+) -> tuple[tuple[Callable[[float, np.ndarray], float], ...], tuple[int, ...]]:
+    """Hold drained species at zero until their free derivative turns positive."""
+
+    values = np.asarray(state, dtype=float).reshape(-1)
+    sums, _negative = free_rhs._flux_values(segment_start, free_rhs.temperature_at(segment_start))
+    # An authored hold governs its species, as for purge events.
+    held = {species_index[hold.species] for hold in active_holds}
+    zero = sorted(index for index in sums if index not in held and values[index] <= 0.0)
+    if not zero:
+        return (), ()
+    vessel = () if free_rhs.volume.value is None else (free_rhs.volume.value,)
+    free = free_rhs(segment_start, np.append(values, vessel))
+    indices = tuple(index for index in zero if free[index] <= 0.0)
+    if not indices:
+        return (), ()
+    last: list[object] = [None, None]
+
+    def free_derivative(time: float, state: np.ndarray) -> np.ndarray:
+        key = (time, state.tobytes())
+        if last[0] != key:
+            held = np.array(state, dtype=float)
+            held[list(indices)] = 0.0
+            last[0], last[1] = key, free_rhs(time, held)
+        return last[1]
+
+    # A non-positive free derivative reads as -1, so a release fires only when
+    # the derivative turns positive and never at the segment start.
+    events = []
+    for index in indices:
+        def release(time: float, state: np.ndarray, *, _index: int = index) -> float:
+            rate = float(free_derivative(float(time), state)[_index])
+            return rate if rate > 0.0 else -1.0
+
+        release.terminal = True  # type: ignore[attr-defined]
+        release.direction = 1.0  # type: ignore[attr-defined]
+        events.append(release)
+    return tuple(events), indices
 
 
 class _InterventionJacobian:
@@ -1765,53 +1799,10 @@ class _InterventionJacobian:
             indices = np.fromiter(sorted(held), dtype=np.int64)
             matrix[indices, :] = 0.0
             matrix[:, indices] = 0.0
-        purge_rows, purge_columns = self._rhs.purge_jacobian_branches(
-            float(time),
-            np.asarray(state, dtype=float),
-            temperature_K,
-        )
-        if purge_rows:
-            matrix[np.fromiter(sorted(purge_rows), dtype=np.int64), :] = 0.0
+        purge_columns = self._rhs.clamped_columns(float(time), state, temperature_K)
         if purge_columns:
             matrix[:, np.fromiter(sorted(purge_columns), dtype=np.int64)] = 0.0
         return matrix
-
-def _transform_jacobian_sparsity(
-    sparsity: object,
-    *,
-    holds: Sequence[ExecutableHold],
-    species_index: Mapping[str, int],
-    size: int,
-    volume: bool = False,
-) -> object:
-    """Apply the same row/column mask as the exact hold Jacobian."""
-
-    if sparsity is None:
-        return None
-    try:
-        dense = sparsity.toarray()  # scipy sparse matrices
-    except AttributeError:
-        dense = sparsity
-    matrix = np.asarray(dense, dtype=bool).copy()
-    if matrix.shape != (int(size), int(size)):
-        raise ValueError(
-            f"Jacobian sparsity expected {(int(size), int(size))}, got {matrix.shape}"
-        )
-    if volume:
-        coupled = np.zeros((size + 1, size + 1), dtype=bool)
-        coupled[:size, :size] = matrix | np.eye(size, dtype=bool)
-        coupled[:size, -1] = True
-        matrix = coupled
-    held = {
-        species_index[hold.species]
-        for hold in holds
-    }
-    if held:
-        indices = np.fromiter(sorted(held), dtype=np.int64)
-        matrix[indices, :] = False
-        matrix[:, indices] = False
-    return matrix
-
 
 def _trigger_direction(direction: str) -> float:
     return {"rising": 1.0, "falling": -1.0, "either": 0.0}[direction]
@@ -1875,8 +1866,8 @@ def _trigger_callables(
             # At the immutable segment start, report the target side's sign so
             # the first departure can only be neutral or look like the
             # opposite direction, which SciPy ignores.  Every later evaluation
-            # is the pure threshold function. A stopping target that remains
-            # exactly at its initial threshold stays neutral until departure.
+            # is the pure threshold function. A target that remains exactly
+            # at its initial threshold stays neutral until departure.
             # Thus analytic-Jacobian retry and a
             # fresh solve observe identical event semantics.  ``either`` uses
             # one rising and one falling event so genuine later crossings in
@@ -1897,7 +1888,7 @@ def _trigger_callables(
                 state = _apply_holds(state, holds, species_index=species_index, cancellation_check=None, time=time, temperature_K=temperature_K, parameter_values=parameter_values)
                 threshold = _resolve_items((_trigger,), time, parameter_values, temperature_K=temperature_K)[0].threshold
                 value = _trigger_value(_trigger, time, state, species_index=species_index, observable_value=observable_value, temperature_K=temperature_K) - threshold
-                if _starts_at_threshold and (float(time) == _segment_start or (isinstance(_trigger.then, InterventionStopAction) and value == 0.0)):
+                if _starts_at_threshold and (float(time) == _segment_start or value == 0.0):
                     return _neutral_value
                 return value
 
@@ -2130,8 +2121,9 @@ def _validate_segment_output(
     time: float,
 ) -> None:
     if states.ndim != 2 or states.shape != (species_count, times.size):
-        raise create_solver_error(
-            solver, time, "Scheduled simulation segment returned invalid shape."
+        raise SolverError(
+            "Scheduled simulation segment returned invalid shape.",
+            details={"solver": solver},
         )
     _ensure_finite_nonnegative(
         states,
@@ -2158,16 +2150,8 @@ def _ensure_finite_nonnegative(
             )
         )
     if np.any(array < 0.0):
-        raise create_solver_error(
-            solver, time, f"{context} contains negative concentration values."
+        raise SolverError(
+            f"{context} contains negative concentration values.",
+            details={"solver": solver},
         )
 
-
-def _request_for_internal_segment(
-    request: SimulationRequest, *, t0: float, t1: float
-) -> SimulationRequest:
-    if request.first_step is None:
-        return request
-    if float(request.first_step) <= abs(t1 - t0):
-        return request
-    return replace(request, first_step=None)

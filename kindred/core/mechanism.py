@@ -8,6 +8,7 @@ are derived only by scientific consumers at their selected temperature.
 from __future__ import annotations
 
 import math
+from fractions import Fraction
 from collections import OrderedDict
 from collections.abc import Mapping as MappingABC
 from dataclasses import dataclass, field
@@ -124,12 +125,12 @@ def _validate_positive_side(side: Mapping[str, float] | None, *, label: str) -> 
 
 
 def _derive_net_stoich(reactants: Mapping[str, float], products: Mapping[str, float]) -> Dict[str, float]:
-    net: Dict[str, float] = {}
+    net: Dict[str, Fraction] = {}
     for sp, coef in reactants.items():
-        net[sp] = net.get(sp, 0.0) - float(coef)
+        net[sp] = net.get(sp, Fraction(0)) - Fraction(str(coef))
     for sp, coef in products.items():
-        net[sp] = net.get(sp, 0.0) + float(coef)
-    return {sp: coef for sp, coef in net.items() if coef != 0.0}
+        net[sp] = net.get(sp, Fraction(0)) + Fraction(str(coef))
+    return {sp: float(coef) for sp, coef in net.items() if coef != 0}
 
 
 # --------------------------------- models -----------------------------------
@@ -190,6 +191,7 @@ class Equilibrium:
     forward_model: ForwardRateModel
     kr: float | None = None
     metadata: Mapping[str, Any] = field(default_factory=dict)
+    net_stoich: Mapping[str, float] = field(init=False, repr=False, compare=False)
     authority: EquilibriumRateAuthority = field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
@@ -209,6 +211,11 @@ class Equilibrium:
             "stoich_back",
             FrozenDict(stoich_back),
         )
+        object.__setattr__(
+            self,
+            "net_stoich",
+            FrozenDict(_derive_net_stoich(stoich_forward, stoich_back)),
+        )
         object.__setattr__(self, "metadata", FrozenDict(self.metadata))
         object.__setattr__(
             self,
@@ -218,11 +225,10 @@ class Equilibrium:
             ),
         )
 
-    def forward_vector(self, species_order: Iterable[str]) -> List[float]:
-        return [float(self.stoich_forward.get(n, 0.0)) for n in species_order]
-
-    def back_vector(self, species_order: Iterable[str]) -> List[float]:
-        return [float(self.stoich_back.get(n, 0.0)) for n in species_order]
+    def net_stoich_vector(self, species_order: Iterable[str]) -> List[float]:
+        """Vectorize net back-minus-forward stoichiometry against a species order."""
+        s = self.net_stoich
+        return [float(s.get(n, 0.0)) for n in species_order]
 
 
 # --------------------------------- mechanism --------------------------------

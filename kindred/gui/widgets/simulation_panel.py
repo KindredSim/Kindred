@@ -14,7 +14,7 @@ from kindred.core.project_document import (
 )
 from kindred.core.validation import parse_finite_numeric_text
 from kindred.gui.ui_helpers import (
-    ControlRowsLayout, configure_compact_numeric_edit, setup_scientific_validator,
+    ControlRowsLayout, SOLVER_TOOLTIP, configure_compact_numeric_edit,
 )
 from kindred.gui.widgets.batch_initial_conditions_table import (
     BatchInitialConditionsTableModel,
@@ -155,9 +155,7 @@ class SimulationPanel(QtWidgets.QWidget):
         controls = ControlRowsLayout(self._controls_host)
         self.solver_method_combo = QtWidgets.QComboBox(self)
         self.solver_method_combo.addItems(list(SUPPORTED_SOLVERS))
-        self.solver_method_combo.setToolTip(
-            "Choose the numerical method used to calculate the simulation."
-        )
+        self.solver_method_combo.setToolTip(SOLVER_TOOLTIP)
         self.t_start_edit = self._number_edit("0.0", "Absolute Run start time")
         self.t_end_edit = self._number_edit("10.0", "Absolute Run end time")
         self.num_points_spinbox = QtWidgets.QSpinBox(self)
@@ -263,7 +261,6 @@ class SimulationPanel(QtWidgets.QWidget):
         edit = QtWidgets.QLineEdit(value, self)
         configure_compact_numeric_edit(edit, characters=6)
         edit.setToolTip(tooltip)
-        setup_scientific_validator(edit)
         return edit
 
     def render_run_defaults(
@@ -492,7 +489,7 @@ class SimulationPanel(QtWidgets.QWidget):
             if state is not QtGui.QValidator.State.Acceptable:
                 minimum, maximum = SIMULATION_POINT_RANGE
                 raise ValueError(
-                    f"Integration points {raw_text!r} must be an integer between "
+                    f"Points {raw_text!r} must be an integer between "
                     f"{minimum} and {maximum}."
                 )
             try:
@@ -500,7 +497,7 @@ class SimulationPanel(QtWidgets.QWidget):
             except (TypeError, ValueError, OverflowError) as exc:
                 minimum, maximum = SIMULATION_POINT_RANGE
                 raise ValueError(
-                    f"Integration points {raw_text!r} must be an integer between "
+                    f"Points {raw_text!r} must be an integer between "
                     f"{minimum} and {maximum}."
                 ) from exc
         candidate = SimulationExecutionSettings(

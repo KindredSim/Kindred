@@ -11,7 +11,6 @@ from __future__ import annotations
 import html
 
 
-import sys
 from dataclasses import dataclass, replace
 from collections.abc import Mapping, Sequence
 import numpy as np
@@ -20,6 +19,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from kindred.gui.display_name_policy import compact_text, scientific_symbol_html, scientific_symbol_spoken
 from kindred.gui.ui_helpers import (
     SCIENTIFIC_NAME_HTML_ROLE,
+    SOLVER_TOOLTIP,
     ScientificNameDelegate,
     ControlRowsLayout,
     configure_compact_numeric_edit,
@@ -58,7 +58,6 @@ from kindred.gui.fitting.constants import (
     DIFFERENTIAL_EVOLUTION_METHOD,
 )
 from kindred.gui.parameter_enumeration import admit_gui_parameter_value
-from kindred.gui.ui_helpers import setup_scientific_validator
 
 __all__ = ["ParametersIcsTab"]
 
@@ -188,7 +187,6 @@ class _ProfileLikelihoodDialog(QtWidgets.QDialog):
         method = configuration.optimizer_method if configuration else "trf"
         self._method.setCurrentIndex(max(0, self._method.findData(method)))
         configure_compact_numeric_edit(self._confidence, characters=8)
-        setup_scientific_validator(self._confidence)
         form.addRow("Coordinates:", self._coordinates)
         form.addRow("Confidence level:", self._confidence)
         form.addRow("Maximum outward search steps per side", self._points)
@@ -212,7 +210,9 @@ class _ProfileLikelihoodDialog(QtWidgets.QDialog):
             self._reject_ambiguous_display_names(names)
         return ProfileLikelihoodConfig(
             parameter_names=names,
-            confidence_level=float(self._confidence.text()),
+            confidence_level=parse_finite_numeric_text(
+                self._confidence.text(), field="Confidence level"
+            ),
             max_bracketing_steps_per_side=self._points.value(),
             max_nfev_per_point=self._budget.value(),
             optimizer_method=str(self._method.currentData() or "trf"),
@@ -232,7 +232,8 @@ class _ProfileLikelihoodDialog(QtWidgets.QDialog):
     def accept(self) -> None:  # noqa: D401 - Qt override
         try:
             self.configuration()
-        except (TypeError, ValueError, OverflowError):
+        except (TypeError, ValueError, OverflowError) as exc:
+            QtWidgets.QMessageBox.warning(self, self.windowTitle(), str(exc))
             return
         super().accept()
 
@@ -319,9 +320,7 @@ class _ResidualBootstrapDialog(QtWidgets.QDialog):
         method = configuration.optimizer_method if configuration else "trf"
         self._method.setCurrentIndex(max(0, self._method.findData(method)))
         configure_compact_numeric_edit(self._fraction, characters=8)
-        setup_scientific_validator(self._fraction)
         configure_compact_numeric_edit(self._confidence, characters=8)
-        setup_scientific_validator(self._confidence)
         form.addRow("Coordinates:", self._coordinates)
         form.addRow("Number of refits:", self._replicates)
         form.addRow("Minimum successful refits:", self._minimum)
@@ -349,16 +348,21 @@ class _ResidualBootstrapDialog(QtWidgets.QDialog):
             parameter_names=names,
             seed=self._seed.value(),
             replicates=self._replicates.value(),
-            confidence_level=float(self._confidence.text()),
+            confidence_level=parse_finite_numeric_text(
+                self._confidence.text(), field="Confidence level"
+            ),
             minimum_successful_replicates=self._minimum.value(),
-            minimum_success_fraction=float(self._fraction.text()),
+            minimum_success_fraction=parse_finite_numeric_text(
+                self._fraction.text(), field="Required success rate"
+            ),
             optimizer_method=str(self._method.currentData() or "trf"),
         )
 
     def accept(self) -> None:  # noqa: D401 - Qt override
         try:
             self.configuration()
-        except (TypeError, ValueError, OverflowError):
+        except (TypeError, ValueError, OverflowError) as exc:
+            QtWidgets.QMessageBox.warning(self, self.windowTitle(), str(exc))
             return
         super().accept()
 
@@ -602,7 +606,6 @@ class ParametersIcsTab(QtWidgets.QWidget):
         self._maximum_edit.setObjectName("fit_parameter_maximum")
         self._scale_combo.setObjectName("fit_parameter_scale")
         for edit in (self._starting_edit, self._minimum_edit, self._maximum_edit):
-            setup_scientific_validator(edit)
             configure_compact_numeric_edit(edit, characters=20)
         for combo in (self._scale_combo, self._scope_combo):
             combo.setSizeAdjustPolicy(QtWidgets.QComboBox.AdjustToContents)
@@ -733,6 +736,7 @@ class ParametersIcsTab(QtWidgets.QWidget):
         settings_layout = QtWidgets.QVBoxLayout(settings_group)
         self._solver_combo = QtWidgets.QComboBox(settings_group)
         self._solver_combo.setObjectName("global_fit_solver")
+        self._solver_combo.setToolTip(SOLVER_TOOLTIP)
         for solver in SUPPORTED_SOLVERS:
             self._solver_combo.addItem(str(solver), str(solver))
         self._method_combo = QtWidgets.QComboBox(settings_group)
@@ -764,7 +768,6 @@ class ParametersIcsTab(QtWidgets.QWidget):
         self._xtol_label = QtWidgets.QLabel("Parameter-step tolerance:", settings_group)
         for label, edit in ((self._ftol_label, self._ftol_edit), (self._xtol_label, self._xtol_edit)):
             configure_compact_numeric_edit(edit, characters=8)
-            setup_scientific_validator(edit)
             label.setBuddy(edit)
         # Each native form keeps its label and editor together. The existing
         # wrapping layout places the paired forms on one row when they fit.
@@ -1105,13 +1108,6 @@ class ParametersIcsTab(QtWidgets.QWidget):
         ):
             caption.setAccessibleName(f"{label} {parameter.unit}")
         config = parameter.selected_config
-        validator_minimum = (
-            -sys.float_info.max
-            if parameter.scientific_category == "finite_scalar"
-            else 0.0
-        )
-        for edit in (self._starting_edit, self._minimum_edit, self._maximum_edit):
-            setup_scientific_validator(edit, minimum=validator_minimum)
         draft = self._invalid_numeric_drafts.get(("parameter", parameter.name))
         raw_fields = dict(draft.raw_fields) if draft is not None else {}
         blockers = [

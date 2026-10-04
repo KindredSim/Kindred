@@ -1,10 +1,8 @@
 from __future__ import annotations
 
-import sys
 from typing import Optional
 
 from PySide6 import QtCore, QtGui, QtWidgets
-from PySide6.QtGui import QDoubleValidator
 
 from kindred.core.quantity_units import format_unit_for_display
 from kindred.gui.display_name_policy import (
@@ -17,6 +15,7 @@ from kindred.gui.display_name_policy import (
 
 __all__ = [
     "SCIENTIFIC_NAME_HTML_ROLE",
+    "SOLVER_TOOLTIP",
     "ControlRowsLayout",
     "configure_compact_numeric_edit",
     "ScientificNameComboBox",
@@ -28,7 +27,6 @@ __all__ = [
     "make_scroll_area",
     "set_bounded_label_text",
     "set_compact_label_text",
-    "setup_scientific_validator",
 ]
 
 
@@ -291,6 +289,8 @@ def clamp_initial_size(widget: QtWidgets.QWidget, width: int, height: int) -> No
 
 SCIENTIFIC_NAME_HTML_ROLE = int(QtCore.Qt.UserRole) + 173
 
+SOLVER_TOOLTIP = "Choose the numerical method used to calculate simulations."
+
 
 def paint_markup(painter, rect, markup, *, font, alignment, palette) -> None:
     """Paint one unwrapped line of scientific markup, vertically centred in rect."""
@@ -424,21 +424,3 @@ def make_bounded_label(
     label = QtWidgets.QLabel("", parent)
     set_bounded_label_text(label, str(text), max_width=max_width, tooltip=tooltip)
     return label
-
-
-def setup_scientific_validator(
-    line_edit: QtWidgets.QLineEdit,
-    *,
-    minimum: float = 0.0,
-    maximum: float = sys.float_info.max,
-) -> QDoubleValidator:
-    """Install the full binary64 scientific-text admission range.
-
-    The validator only governs text admission. Callers still perform the
-    semantic positive/finite check when constructing their typed value.
-    """
-
-    validator = QDoubleValidator(float(minimum), float(maximum), 323, line_edit)
-    validator.setNotation(QDoubleValidator.Notation.ScientificNotation)
-    line_edit.setValidator(validator)
-    return validator

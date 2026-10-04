@@ -28,7 +28,6 @@ class SymbolicJacobianStructure:
     rhs_expressions: tuple[str, ...]
     jacobian_expressions: tuple[tuple[str, ...], ...]
     _compiled: Callable[..., Any]
-    jac_sparsity: tuple[tuple[bool, ...], ...]
 
     def bind(
         self,
@@ -450,16 +449,12 @@ def _build_symbolic_mechanism_expression_model(
             eq.stoich_back,
         )
         rate_expr = forward_expr - reverse_expr
-        for species_name in species_names:
-            coeff = float(eq.stoich_back.get(species_name, 0.0)) - float(
-                eq.stoich_forward.get(species_name, 0.0)
-            )
-            if coeff:
-                rhs[species_index[species_name]] += _stoichiometric_coefficient_expr(
-                    sympy,
-                    coeff,
-                    exact=bool(exact_stoichiometric_coefficients),
-                ) * rate_expr
+        for species_name, coeff in eq.net_stoich.items():
+            rhs[species_index[str(species_name)]] += _stoichiometric_coefficient_expr(
+                sympy,
+                float(coeff),
+                exact=bool(exact_stoichiometric_coefficients),
+            ) * rate_expr
 
     rhs_matrix = sympy.Matrix(rhs)
     jacobian_matrix = rhs_matrix.jacobian(sympy.Matrix(state_symbols))
@@ -587,10 +582,6 @@ def build_symbolic_jacobian_structure(mechanism: Mechanism) -> SymbolicJacobianS
         )
         for row in projection.jacobian_expressions
     )
-    jac_sparsity = tuple(
-        tuple(bool(expression != 0) for expression in row)
-        for row in jacobian_matrix.tolist()
-    )
     coefficient_parameter_symbols = model.parameter_symbols
     parameter_symbols = projection.parameter_symbols
     parameter_sympy_symbols = tuple(
@@ -604,5 +595,4 @@ def build_symbolic_jacobian_structure(mechanism: Mechanism) -> SymbolicJacobianS
         rhs_expressions=rhs_strings,
         jacobian_expressions=jacobian_strings,
         _compiled=compiled,
-        jac_sparsity=jac_sparsity,
     )

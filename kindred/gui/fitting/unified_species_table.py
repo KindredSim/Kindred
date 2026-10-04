@@ -27,7 +27,6 @@ from kindred.gui.fitting.launch import (
     FitSetupSnapshot,
 )
 from kindred.gui.fitting.ic_tolerance import FitInitialTolerance
-from kindred.gui.ui_helpers import setup_scientific_validator
 
 
 class _Col:
@@ -256,7 +255,6 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
 
         self._dataset_weight_edit = QtWidgets.QLineEdit(self)
         self._dataset_weight_edit.setObjectName("global_fit_dataset_weight_edit")
-        setup_scientific_validator(self._dataset_weight_edit)
         weighting_form.addRow("Dataset weight:", self._dataset_weight_edit)
         self._footer.body_layout.addLayout(weighting_form)
         self._weight_mode_combo.currentIndexChanged.connect(

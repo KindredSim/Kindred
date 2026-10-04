@@ -20,6 +20,7 @@ from kindred.gui.fitting.launch import (
     FitDatasetLocalSettings,
     FitSetupSnapshot,
     fit_setup_readiness,
+    prune_fit_analysis_coordinates,
     selected_observations,
 )
 from kindred.gui.fitting.parameters_ics_tab import ParametersIcsTab
@@ -656,6 +657,7 @@ class FittingWindow(QtWidgets.QDialog):
         )
         if current is None:
             return
+        excluded = () if included else (dataset_id,)
         self._on_leaf_snapshot(
             replace(
                 setup,
@@ -663,6 +665,14 @@ class FittingWindow(QtWidgets.QDialog):
                     replace(item, included=bool(included))
                     if item.dataset_id == dataset_id else item
                     for item in setup.datasets
+                ),
+                profile_likelihood=prune_fit_analysis_coordinates(
+                    setup.profile_likelihood,
+                    excluded_dataset_ids=excluded,
+                ),
+                residual_bootstrap=prune_fit_analysis_coordinates(
+                    setup.residual_bootstrap,
+                    excluded_dataset_ids=excluded,
                 ),
             )
         )

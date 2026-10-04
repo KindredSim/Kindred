@@ -10,7 +10,6 @@ from PySide6 import QtCore, QtWidgets
 from kindred.core.validation import parse_finite_numeric_text
 from kindred.gui.fitting.launch import fit_execution_span
 from kindred.gui.ui_helpers import set_bounded_label_text
-from kindred.gui.ui_helpers import setup_scientific_validator
 from kindred.gui.widgets.config_panel_footer import ConfigPanelFooter
 
 
@@ -194,7 +193,6 @@ class DataTab(QtWidgets.QWidget):
     def _number_edit(object_name: str) -> QtWidgets.QLineEdit:
         edit = QtWidgets.QLineEdit()
         edit.setObjectName(object_name)
-        edit.setValidator(setup_scientific_validator(edit))
         return edit
 
     def _project_controls(self) -> None:

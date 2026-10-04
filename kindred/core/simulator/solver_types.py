@@ -153,8 +153,6 @@ class SimulationRequest:
     solver: str = DEFAULT_SOLVER_NAME
     rtol: float = 1e-6
     atol: float = 1e-12
-    max_step: Optional[float] = None
-    first_step: Optional[float] = None
     t_eval: Optional[np.ndarray] = None
     grid: Optional[Mapping[str, float | int]] = None
 

@@ -271,9 +271,7 @@ class CompiledOdeTopology:
                     forward_exponents[index, species_index[name]] = float(order)
             else:
                 equilibrium = step
-                stoichiometry[:, index] = np.asarray(
-                    equilibrium.back_vector(species_names), dtype=float
-                ) - np.asarray(equilibrium.forward_vector(species_names), dtype=float)
+                stoichiometry[:, index] = equilibrium.net_stoich_vector(species_names)
                 for name, coefficient in equilibrium.stoich_forward.items():
                     forward_exponents[index, species_index[name]] = float(coefficient)
                 for name, coefficient in equilibrium.stoich_back.items():

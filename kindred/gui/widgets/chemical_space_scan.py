@@ -15,7 +15,7 @@ from kindred.core.project_document import canonical_initial_values, SUPPORTED_SO
 from kindred.gui.controllers.simulation_job_owner import resolve_run_parallel_capacity
 from kindred.gui.widgets.scan_range_dialog import ScanRangeDialog, ScanConstraintDialog, entry, number
 from kindred.gui.display_name_policy import scientific_symbol_html, scientific_symbol_spoken
-from kindred.gui.ui_helpers import SCIENTIFIC_NAME_HTML_ROLE, ScientificNameDelegate
+from kindred.gui.ui_helpers import SCIENTIFIC_NAME_HTML_ROLE, SOLVER_TOOLTIP, ScientificNameDelegate
 from kindred.scan.config import ScanConfig, InputRange, START, END
 from kindred.scan.inputs import input_catalog
 from kindred.scan.intervals import Interval
@@ -158,6 +158,7 @@ class ChemicalSpaceScanDialog(QtWidgets.QDialog):
         self.time_form = form
         self.solver = QtWidgets.QComboBox()
         self.solver.addItems(SUPPORTED_SOLVERS)
+        self.solver.setToolTip(SOLVER_TOOLTIP)
         self.points = QtWidgets.QSpinBox()
         self.points.setRange(*SIMULATION_POINT_RANGE)
         self.rtol, self.atol = entry(1e-6), entry(1e-12)

@@ -3,8 +3,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Mapping
 
-import numpy as np
-
 from .errors import UnsupportedSymbolicExpressionError
 
 
@@ -23,27 +21,9 @@ def symbolic_status_payload(
     }
 
 
-def normalize_jacobian_sparsity(value: Any) -> np.ndarray | None:
-    """Materialize one SciPy-compatible immutable boolean sparsity matrix."""
-
-    if value is None:
-        return None
-    try:
-        dense = value.toarray()
-    except AttributeError:
-        dense = value
-    matrix = np.asarray(dense, dtype=bool)
-    if matrix.ndim != 2:
-        raise ValueError("Jacobian sparsity must be a two-dimensional matrix.")
-    matrix = matrix.copy()
-    matrix.setflags(write=False)
-    return matrix
-
-
 @dataclass(frozen=True, slots=True)
 class SymbolicJacobianExecution:
     jacobian_func: Any = None
-    jac_sparsity: Any = None
     status: Mapping[str, Any] | None = None
 
     def __post_init__(self) -> None:
@@ -57,8 +37,6 @@ class SymbolicJacobianExecution:
                 raise ValueError(
                     "Unsupported or disabled symbolic Jacobian state cannot carry a callable."
                 )
-        jac_sparsity = normalize_jacobian_sparsity(self.jac_sparsity)
-        object.__setattr__(self, "jac_sparsity", jac_sparsity)
         object.__setattr__(self, "status", status)
 
     @property
@@ -70,11 +48,9 @@ class SymbolicJacobianExecution:
         cls,
         *,
         jacobian_func: Any,
-        jac_sparsity: Any = None,
     ) -> "SymbolicJacobianExecution":
         return cls(
             jacobian_func=jacobian_func,
-            jac_sparsity=jac_sparsity,
             status=symbolic_status_payload(
                 kind="jacobian",
                 state="supported",
@@ -133,7 +109,6 @@ class SymbolicJacobianExecution:
     def provenance_fields(self) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "symbolic_jacobian": self.has_executable_jacobian,
-            "jacobian_sparsity_hint": self.jac_sparsity is not None,
         }
         if self.status:
             payload["symbolic_jacobian_status"] = dict(self.status)

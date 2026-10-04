@@ -779,22 +779,27 @@ def fit_uncertainty_coordinates(
 
 def prune_fit_analysis_coordinates(
     configuration: ProfileLikelihoodConfig | ResidualBootstrapConfig | None,
-    changed_parameter_names: Iterable[str],
+    changed_parameter_names: Iterable[str] = (),
+    *,
+    excluded_dataset_ids: Iterable[str] = (),
 ) -> ProfileLikelihoodConfig | ResidualBootstrapConfig | None:
-    """Drop stale uncertainty coordinates for changed Fit parameters.
+    """Drop stale uncertainty coordinates for changed Fit parameters or datasets.
 
     Fit-coordinate identities are admitted before this projection.  A scope
     or Vary change invalidates every coordinate for the changed parameter,
-    while unrelated coordinates retain their original order and identity.
+    and excluding a dataset invalidates its Per-dataset coordinates, while
+    unrelated coordinates retain their original order and identity.
     """
 
     if configuration is None:
         return None
     changed_names = set(changed_parameter_names)
+    excluded_ids = set(excluded_dataset_ids)
     remaining = tuple(
         coordinate
         for coordinate in configuration.parameter_names
         if coordinate.name not in changed_names
+        and coordinate.dataset_id not in excluded_ids
     )
     if not remaining:
         return None

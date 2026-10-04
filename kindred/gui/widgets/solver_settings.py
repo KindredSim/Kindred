@@ -17,7 +17,7 @@ from kindred.core.project_document import (
 )
 from kindred.core.runtime_defaults import MAX_PARALLEL_WORKERS_CEILING
 from kindred.core.validation import parse_finite_numeric_text
-from kindred.gui.ui_helpers import clamp_initial_size, make_scroll_area, setup_scientific_validator
+from kindred.gui.ui_helpers import SOLVER_TOOLTIP, clamp_initial_size, make_scroll_area
 
 __all__ = [
     "SimulationSettingsDialog",
@@ -31,9 +31,7 @@ class _RunSettingsFields:
     def __init__(self, form: QtWidgets.QFormLayout, parent: QtWidgets.QWidget) -> None:
         self.solver_combo = QtWidgets.QComboBox(parent)
         self.solver_combo.addItems(list(SUPPORTED_SOLVERS))
-        self.solver_combo.setToolTip(
-            "Choose the numerical method used to calculate the simulation."
-        )
+        self.solver_combo.setToolTip(SOLVER_TOOLTIP)
         self.t_start_edit = self._time_edit(parent, "0", "Absolute Run start time")
         self.t_end_edit = self._time_edit(parent, "10", "Absolute Run end time")
         self.integration_points_spin = QtWidgets.QSpinBox(parent)
@@ -48,7 +46,7 @@ class _RunSettingsFields:
             ("Solver", self.solver_combo),
             ("t_start", self.t_start_edit),
             ("t_end", self.t_end_edit),
-            ("Integration points", self.integration_points_spin),
+            ("Points", self.integration_points_spin),
         ):
             form.addRow(label, widget)
             name_label = form.labelForField(widget)
@@ -64,7 +62,6 @@ class _RunSettingsFields:
         edit = QtWidgets.QLineEdit(str(value), parent)
         edit.setToolTip(str(tooltip))
         edit.setMaximumWidth(190)
-        setup_scientific_validator(edit)
         return edit
 
     def set_settings(self, settings: SimulationExecutionSettings) -> None:
@@ -175,14 +172,11 @@ class SimulationSettingsDialog(QtWidgets.QDialog):
             decimals=2,
         )
         self.standard_conc_edit = QtWidgets.QLineEdit(str(factory.standard_conc_M), science_box)
-        setup_scientific_validator(self.standard_conc_edit)
         self.energy_unit_combo = QtWidgets.QComboBox(science_box)
         self.energy_unit_combo.addItems(["J/mol", "kJ/mol", "kcal/mol"])
         self.energy_unit_combo.setCurrentText(factory.energy_unit)
         self.rtol_edit = QtWidgets.QLineEdit("1e-6", science_box)
         self.atol_edit = QtWidgets.QLineEdit("1e-12", science_box)
-        setup_scientific_validator(self.rtol_edit)
-        setup_scientific_validator(self.atol_edit)
         self.temperature_spin.setToolTip(
             "Default nominal temperature for this mechanism. An explicit T= directive "
             "overrides it. Temperature schedules start from the resolved nominal temperature."

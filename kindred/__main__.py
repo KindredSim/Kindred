@@ -43,6 +43,8 @@ def main() -> int:
     )
 
     app = QtWidgets.QApplication(sys.argv)
+    # One numeric-text convention: Python/repr decimal point, never the OS locale.
+    QtCore.QLocale.setDefault(QtCore.QLocale.c())
     QtCore.QCoreApplication.setOrganizationName("Kindred")
     QtCore.QCoreApplication.setApplicationName("Kindred")
     app.setStyle("Fusion")

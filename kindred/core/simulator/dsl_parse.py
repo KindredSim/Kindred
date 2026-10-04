@@ -33,6 +33,7 @@ from __future__ import annotations
 import logging
 import math
 from dataclasses import dataclass, replace
+from fractions import Fraction
 from threading import Lock
 from typing import Dict, List, Mapping, Optional, Tuple, TYPE_CHECKING
 
@@ -671,7 +672,7 @@ def _parse_species_side(text: str) -> Dict[str, float]:
     """
     if not text.strip():
         return {}
-    result: Dict[str, float] = {}
+    result: Dict[str, Fraction] = {}
     terms: list[str] = []
     term_start = 0
     for index, character in enumerate(text):
@@ -710,10 +711,11 @@ def _parse_species_side(text: str) -> Dict[str, float]:
         coef = _float_or_none(coef_s) if coef_s is not None else 1.0
         if coef is None or coef <= 0.0:
             raise _DSLError("Stoichiometric coefficients must be positive finite real numbers")
-        result[name] = result.get(name, 0.0) + coef
+        exact = Fraction(1) if coef_s is None else Fraction(coef_s)
+        result[name] = result.get(name, Fraction(0)) + exact
     if not result:
         raise empty_stoichiometry_error()
-    return result
+    return {name: float(total) for name, total in result.items()}
 
 
 def _parse_stoich(ar: str) -> Tuple[Dict[str, float], Dict[str, float], str]:

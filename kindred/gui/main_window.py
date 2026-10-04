@@ -62,6 +62,7 @@ from kindred.core.result_repository import (
     ResultRepository,
 )
 from kindred.core.species import concentration_from_text
+from kindred.core.validation import parse_finite_numeric_text
 from kindred.gui.computation_gate import ComputationGate
 from kindred.gui.app_wiring import (
     ANALYSIS_DOCK_SPEC,
@@ -136,7 +137,7 @@ from kindred.gui.widgets.right_panel import RightPanelTabbed
 from kindred.gui.widgets.simulation_panel import SimulationPanel
 from kindred.gui.widgets.solver_settings import SimulationSettingsDialog
 from kindred.gui.widgets.symbolic_calculator_panel import SymbolicCalculatorPanel
-from kindred.gui.ui_helpers import clamp_initial_size, setup_scientific_validator
+from kindred.gui.ui_helpers import clamp_initial_size
 from kindred.gui.workspace_result_presenter import (
     ResultRenderInput,
     VisibleResultSet,
@@ -2150,6 +2151,18 @@ class MainWindow(QtWidgets.QMainWindow):
             )
             return False
         source_proposal = replace(source_proposal, proposed_document=candidate)
+        capture_tab = candidate.tab(target)
+        try:
+            capture = ExplicitRunCapture(
+                tab_id=target,
+                targets=tuple(
+                    self._build_explicit_target_for_tab(capture_tab, set_id)
+                    for set_id in selected
+                ),
+            )
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(self, "Run", str(exc))
+            return False
         published = self._publish_source_proposal(
             target,
             visible_source,
@@ -2162,22 +2175,6 @@ class MainWindow(QtWidgets.QMainWindow):
             (target,), candidate, selected_by_tab={target: selected}
         )
         self._refresh_tab_controls(target, preserve_reactions_editor=True)
-        capture_tab = source_proposal.proposed_document.tab(target)
-        try:
-            targets = tuple(
-                self._build_explicit_target_for_tab(
-                    capture_tab,
-                    set_id,
-                )
-                for set_id in selected
-            )
-            capture = ExplicitRunCapture(
-                tab_id=target,
-                targets=targets,
-            )
-        except Exception as exc:
-            QtWidgets.QMessageBox.warning(self, "Run", str(exc))
-            return False
         bundle.slider_binding.cancel_pending_preview_intent()
         return bool(self._simulation_jobs.start_run(capture))
 
@@ -4483,8 +4480,6 @@ class MainWindow(QtWidgets.QMainWindow):
         max_nfev.setValue(defaults.max_nfev)
         ftol = QtWidgets.QLineEdit(dialog)
         xtol = QtWidgets.QLineEdit(dialog)
-        setup_scientific_validator(ftol)
-        setup_scientific_validator(xtol)
         ftol.setText(repr(float(defaults.ftol)))
         xtol.setText(repr(float(defaults.xtol)))
         ftol_label = QtWidgets.QLabel(FUNCTION_TOLERANCE_LABEL, dialog)
@@ -4540,18 +4535,19 @@ class MainWindow(QtWidgets.QMainWindow):
             parent=dialog,
         )
 
+        def read_candidate() -> FitDefaults:
+            return FitDefaults(
+                method=method.currentData(),
+                max_nfev=int(max_nfev.value()),
+                ftol=parse_finite_numeric_text(ftol.text(), field=ftol_label.text()),
+                xtol=parse_finite_numeric_text(xtol.text(), field=xtol_label.text()),
+                use_seed=bool(use_seed.isChecked()),
+                seed=int(seed.value()),
+            )
+
         def accept_candidate() -> None:
             try:
-                validate_fit_defaults(
-                    FitDefaults(
-                        method=method.currentData(),
-                        max_nfev=int(max_nfev.value()),
-                        ftol=float(ftol.text()),
-                        xtol=float(xtol.text()),
-                        use_seed=bool(use_seed.isChecked()),
-                        seed=int(seed.value()),
-                    )
-                )
+                validate_fit_defaults(read_candidate())
             except (TypeError, ValueError, OverflowError) as exc:
                 QtWidgets.QMessageBox.warning(
                     dialog,
@@ -4568,14 +4564,7 @@ class MainWindow(QtWidgets.QMainWindow):
         clamp_initial_size(dialog, 600, 480)
         if dialog.exec() != QtWidgets.QDialog.DialogCode.Accepted:
             return False
-        candidate = FitDefaults(
-            method=method.currentData(),
-            max_nfev=int(max_nfev.value()),
-            ftol=float(ftol.text()),
-            xtol=float(xtol.text()),
-            use_seed=bool(use_seed.isChecked()),
-            seed=int(seed.value()),
-        )
+        candidate = read_candidate()
         validate_fit_defaults(candidate)
         if scope.currentData() == "project":
             changed = self._fit_session_owner.set_project_defaults(candidate)

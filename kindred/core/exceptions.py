@@ -337,10 +337,5 @@ def create_solver_error(
     }
     return SolverError(
         f"Solver '{solver_name}' failed at t={t_current:.4e}",
-        suggestion="Try reducing tolerances (rtol, atol) or using a different solver method",
-        examples=[
-            "solver='Radau' (implicit, good for stiff systems)",
-            "solver='BDF' (implicit, multistep)",
-        ],
         details=details,
     )

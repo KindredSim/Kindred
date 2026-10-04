@@ -177,14 +177,11 @@ def _build_provenance(req: _SimulationRequest, *, t_eval: np.ndarray) -> Dict[st
         "solver_requested": req.solver,
         "rtol": float(req.rtol),
         "atol": float(req.atol),
-        "max_step": (None if req.max_step is None else float(req.max_step)),
-        "first_step": (None if req.first_step is None else float(req.first_step)),
         "grid_type": ("explicit" if req.t_eval is not None else "N"),
         "grid_params": ({"t_eval": list(t_eval)} if req.t_eval is not None else dict(req.grid or {})),
         "has_temperature_schedule": req.temperature_schedule is not None,
     }
     prov.update(symbolic_jacobian.provenance_fields())
-    prov["jacobian_sparsity_hint"] = symbolic_jacobian.jac_sparsity is not None
     intervention_execution = req.intervention_execution
     prov["has_intervention_schedule"] = not intervention_execution.is_empty
     if not intervention_execution.is_empty:
@@ -259,7 +256,19 @@ def _execute_scipy(
     volume=None,
 ) -> SegmentRunResult:
     species_count = len(y0)
-    base_kwargs: Dict[str, Any] = dict(t_eval=t_eval, rtol=float(req.rtol), atol=float(req.atol))
+    # SciPy integrates on a segment-local clock.  BDF does not rescale its
+    # difference history when ``t + h`` rounds, so an absolute origin makes a
+    # fast transient's error estimate depend on ulp(t0) and collapses the step.
+    # Callbacks, samples, roots and dense output keep the absolute clock, and
+    # both segment ends map exactly.
+    origin = float(t0)
+    local_end = float(t1) - origin
+
+    def absolute(tau: float) -> float:
+        return float(t1) if tau >= local_end else min(origin + float(tau), float(t1))
+
+    local_rhs = rhs if origin == 0.0 else (lambda tau, state: rhs(absolute(tau), state))
+    base_kwargs: Dict[str, Any] = dict(t_eval=t_eval - origin, rtol=float(req.rtol), atol=float(req.atol))
     if volume is not None:
         y0 = np.append(y0, volume.value)
         base_kwargs["atol"] = np.append(np.full(species_count, req.atol), req.atol * volume.initial_value)
@@ -267,10 +276,6 @@ def _execute_scipy(
     retain_dense = volume is not None or any(isinstance(item.then, InterventionStopAction) for item in req.intervention_execution.triggers)
     if retain_dense:
         base_kwargs["dense_output"] = True
-    if req.max_step is not None:
-        base_kwargs["max_step"] = float(req.max_step)
-    if req.first_step is not None:
-        base_kwargs["first_step"] = float(req.first_step)
     boundary_events = tuple(boundary_events)
     events_list: list[Callable[[float, np.ndarray], float]] = []
     for index, event in enumerate(boundary_events):
@@ -286,7 +291,8 @@ def _execute_scipy(
             *,
             _event=event,
         ) -> float:
-            return float(_event(t, y[:species_count]))
+            # Events see the solver state the RHS sees: species, then vessel volume.
+            return float(_event(absolute(t), y))
 
         _wrapped_event.terminal = terminal  # type: ignore[attr-defined]
         if hasattr(event, "direction"):
@@ -294,33 +300,38 @@ def _execute_scipy(
         events_list.append(_wrapped_event)
     if req.cancellation_control is not None:
         events_list.append(_cancellation_event(req.cancellation_control))
-    if events_list:
-        base_kwargs["events"] = events_list
+    # SciPy evaluates every event at each accepted step (root searches stay
+    # inside that step), so the largest observed time is the last accepted
+    # solver time; a failed step returns before events are evaluated.
+    last_accepted_time = origin
+
+    def _observe_accepted_time(tau: float, _y: np.ndarray) -> float:
+        nonlocal last_accepted_time
+        last_accepted_time = max(last_accepted_time, absolute(tau))
+        return 1.0
+
+    events_list.append(_observe_accepted_time)
+    base_kwargs["events"] = events_list
 
     symbolic_jacobian = req.symbolic_jacobian
     jac_callable = symbolic_jacobian.jacobian_func
-    jac_sparsity = symbolic_jacobian.jac_sparsity
 
     if jac_callable is not None and symbolic_jacobian.has_executable_jacobian:
-        jac_callable = _guard_runtime_symbolic_jacobian(
+        guarded_jacobian = _guard_runtime_symbolic_jacobian(
             jac_callable,
             req.cancellation_control,
         )
+        jac_callable = (
+            guarded_jacobian if origin == 0.0
+            else (lambda tau, state: guarded_jacobian(absolute(tau), state))
+        )
     prov["symbolic_jacobian"] = bool(jac_callable is not None)
-    prov["jacobian_sparsity_hint"] = bool(
-        jac_callable is None and jac_sparsity is not None
-    )
     def _kwargs_for_method(method_name: str) -> Dict[str, Any]:
         kwargs = dict(base_kwargs)
         kwargs["method"] = method_name
         if jac_callable is not None:
             kwargs["jac"] = jac_callable
-        elif jac_sparsity is not None:
-            kwargs["jac_sparsity"] = jac_sparsity
         return kwargs
-
-    def _looks_like_brentq_sign_error(exc: BaseException) -> bool:
-        return "different signs" in str(exc).lower()
 
     rhs_preflighted = False
 
@@ -351,20 +362,44 @@ def _execute_scipy(
             rhs_preflighted = True
         try:
             solved = _solve_ivp(
-                fun=rhs,
-                t_span=(t0, t1),
+                fun=local_rhs,
+                t_span=(0.0, local_end),
                 y0=y0,
                 **_kwargs_for_method(method_name),
             )  # type: ignore[misc]
         except ValueError as exc:
-            # SciPy event root-finder can raise on cancellation races (brentq sign error).
+            # SciPy's event root finder raises when an event's sign change
+            # does not survive re-evaluation on the step interpolant.  Its
+            # dense LU factorization or solve raises when a step's Newton
+            # matrix or residual has overflowed to non-finite values.
+            if "different signs" in str(exc).lower():
+                stage, reason = "event_root_finding", "Event root finding failed"
+            elif str(exc) == "array must not contain infs or NaNs":
+                stage, reason = "nonfinite_step", "Solver step became non-finite"
+            else:
+                raise
             if (
-                _looks_like_brentq_sign_error(exc)
-                and req.cancellation_control is not None
+                req.cancellation_control is not None
                 and req.cancellation_control.cancel_requested()
             ):
                 raise SimulationCancelled() from exc
-            raise
+            if req.candidate_evaluation:
+                raise _SimulationScientificUnavailabilitySignal(
+                    _SimulationScientificUnavailability(
+                        producer="scipy",
+                        stage=stage,
+                        details={
+                            "solver": req.solver,
+                            "time": last_accepted_time,
+                            "message": str(exc),
+                        },
+                    )
+                ) from exc
+            raise create_solver_error(
+                req.solver,
+                last_accepted_time,
+                f"{reason}: {exc}",
+            ) from exc
         if (
             req.cancellation_control is not None
             and req.cancellation_control.cancel_requested()
@@ -413,11 +448,10 @@ def _execute_scipy(
 
     try:
         if not sol.success:
-            dense_failure_time = float(sol.sol.ts[-1]) if retain_dense and sol.sol is not None else None
             if retain_dense:
                 sol.sol = None
             prov["solver_failure"] = str(sol.message)
-            t_fail = dense_failure_time if dense_failure_time is not None else (float(sol.t[-1]) if getattr(sol, "t", None) is not None and len(sol.t) > 0 else float(t0))
+            t_fail = last_accepted_time
             if req.candidate_evaluation:
                 raise _SimulationScientificUnavailabilitySignal(
                     _SimulationScientificUnavailability(
@@ -440,14 +474,17 @@ def _execute_scipy(
         # Detach SciPy's time vector at ingress.  The trajectory copy below is
         # owned exactly once by project_nonnegative_trajectory; retain the exact
         # pre-projection terminal column separately for continuation semantics.
-        t_out = np.asarray(sol.t, dtype=float).copy()
+        t_out = np.asarray(t_eval, dtype=float)[:len(sol.t)].copy()
         raw_trajectory = solver_trajectory_array(
             sol.y,
             y0=y0,
             t_out=t_out,
         )
+        local_dense = sol.sol
+        dense = (None if local_dense is None else local_dense if origin == 0.0
+                 else (lambda times: local_dense(np.asarray(times, dtype=float) - origin)))
         if volume is not None:
-            volume.record_segment(t0, float(sol.sol.t_max), sol.sol)
+            volume.record_segment(t0, absolute(float(local_dense.t_max)), dense)
             raw_trajectory = raw_trajectory[:species_count]
         raw_terminal_state = None
         if (
@@ -464,9 +501,12 @@ def _execute_scipy(
         if nonnegative_projection.projected:
             prov["nonnegative_projection"] = nonnegative_projection.to_payload()
         event_count = len(boundary_events)
-        event_times = _normal_event_provenance(
-            getattr(sol, "t_events", None),
-            count=event_count,
+        event_times = tuple(
+            tuple(absolute(value) for value in values)
+            for values in _normal_event_provenance(
+                getattr(sol, "t_events", None),
+                count=event_count,
+            )
         )
         raw_event_states, event_state_projection = (
             _normal_event_states_with_projection(
@@ -494,13 +534,10 @@ def _execute_scipy(
             trajectory_projection=nonnegative_projection,
             event_state_projection=event_state_projection,
             solver_used=str(prov.get("solver_used") or method),
-            dense_output=((lambda times, dense=sol.sol: dense(times)[:species_count]) if volume is not None
-                          else sol.sol if retain_dense else None),
+            dense_output=((lambda times, dense=dense: dense(times)[:species_count]) if volume is not None
+                          else dense if retain_dense else None),
             symbolic_jacobian_used=bool(
                 prov.get("symbolic_jacobian")
-            ),
-            jacobian_sparsity_hint=bool(
-                prov.get("jacobian_sparsity_hint")
             ),
         )
     finally:
@@ -592,9 +629,8 @@ def solve_ode(
             raise SimulationCancelled() from exc
         if req.candidate_evaluation:
             return exc.outcome
-        raise create_solver_error(
-            req.solver,
-            t0,
+        raise SolverError(
             "Simulation produced non-finite values.",
+            details={"solver": req.solver},
         ) from exc
     return output

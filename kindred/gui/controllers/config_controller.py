@@ -262,6 +262,9 @@ class ConfigController(QtCore.QObject):
         expected_type: type,
     ) -> object:
         try:
+            if expected_type is float:
+                # PySide6 coerces typed float reads of stored text via float32.
+                return float(settings.value(key, default))
             return settings.value(key, default, type=expected_type)
         except (TypeError, ValueError, OverflowError):
             logger.warning("Ignoring invalid persisted setting %s.", key)
