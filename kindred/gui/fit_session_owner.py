@@ -244,21 +244,6 @@ class FitSessionOwner(QtCore.QObject):
                 f"Fit rejected: {self._gate.active_kind or 'another computation'} is active."
             )
             return False
-        if window.has_pending_target_changes:
-            self._set_status(
-                "Fit rejected: Apply or Revert the pending target, weight, and IC edits first."
-            )
-            return False
-        if window.has_pending_data_changes:
-            self._set_status(
-                "Fit rejected: Apply or Revert the pending Fit data edits first."
-            )
-            return False
-        if window.has_invalid_setup_edits:
-            self._set_status(
-                "Fit rejected: correct the invalid setup edit first."
-            )
-            return False
         try:
             request = self._build_request()
         except (TypeError, ValueError, KeyError) as exc:
@@ -795,7 +780,7 @@ class FitSessionOwner(QtCore.QObject):
                 )
                 if len(settlements) != 1:
                     raise ValueError(
-                        f"Fit result omitted centred parameter {parameter.name!r}."
+                        f"Fit result omitted centered parameter {parameter.name!r}."
                     )
                 raw_value = settlements[0].overall_decoded_value
             else:
@@ -943,7 +928,7 @@ class FitSessionOwner(QtCore.QObject):
         window.set_last_fit_reset_available(rebased_last_fit_setup)
         self.project_document_changed.emit(origin.tab_id)
         self._refresh_apply_availability()
-        self._set_status("Centred Fit applied: overall values published; dataset estimates not applied (recorded as mechanism-source provenance)." if centred_provenance else "Fit candidate applied to the project.")
+        self._set_status("Fit applied: overall values published; dataset estimates not applied (recorded as mechanism-source provenance)." if centred_provenance else "Fit candidate applied to the project.")
         return True
 
     def _prepare_fit_application(
@@ -1012,7 +997,7 @@ class FitSessionOwner(QtCore.QObject):
             return ()
         display_names = {mapped.dataset_id: mapped.display_name for mapped in candidate.origin.mapped_datasets}
         return tuple(
-            f"# Centred Fit applied: overall {settlement.parameter_name} = "
+            f"# Fit applied: overall {settlement.parameter_name} = "
             f"{settlement.overall_decoded_value:.17g}; "
             "dataset estimates not applied: "
             + ", ".join(

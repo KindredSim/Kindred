@@ -21,7 +21,7 @@ from kindred.core.quantity_units import format_unit_for_display
 from kindred.core.simulation_failure import FactualCause
 from kindred.gui.display_name_policy import scientific_symbol_html
 from kindred.gui.fitting.constants import FIT_DATASET_WEIGHT_MODE_LABELS, INITIAL_PREFIX
-from kindred.gui.fitting.launch import FitOriginSnapshot, FitParameterVariable
+from kindred.gui.fitting.launch import FitOriginSnapshot, FitParameterVariable, fit_uncertainty_coordinates
 from kindred.gui.fitting.execution import (
     FitCandidate, FitLiveUpdate, _fit_coordinate_display_label, fit_bound_state,
 )
@@ -141,6 +141,14 @@ def _profile_interval(coordinate: FitCoordinate, interval: object) -> dict[str, 
     }
 
 
+def _roster_positions(setup) -> dict[FitCoordinate, int]:
+    """Uncertainty coordinates in roster order: parameters, then datasets in Fit order."""
+    return {
+        coordinate: index
+        for index, coordinate in enumerate(fit_uncertainty_coordinates(setup.parameters, setup.datasets))
+    }
+
+
 def _profile_data(candidate: FitCandidate) -> dict[str, object]:
     result = candidate.result.profile_likelihood_result
     request_setup = candidate.request.setup
@@ -153,6 +161,7 @@ def _profile_data(candidate: FitCandidate) -> dict[str, object]:
             "diagnostic": None,
             "intervals": [],
         }
+    roster = _roster_positions(request_setup)
     return {
         "requested": True,
         "status": result.status,
@@ -167,7 +176,7 @@ def _profile_data(candidate: FitCandidate) -> dict[str, object]:
         "diagnostic": _plain(result.diagnostic),
         "intervals": [
             _profile_interval(coordinate, interval)
-            for coordinate, interval in sorted(result.intervals.items(), key=lambda item: str(item[0]))
+            for coordinate, interval in sorted(result.intervals.items(), key=lambda item: roster[item[0]])
         ],
     }
 
@@ -194,6 +203,7 @@ def _bootstrap_data(candidate: FitCandidate) -> dict[str, object]:
             "diagnostic": None,
             "intervals": [],
         }
+    roster = _roster_positions(request_setup)
     return {
         "requested": True,
         "status": result.status,
@@ -210,7 +220,7 @@ def _bootstrap_data(candidate: FitCandidate) -> dict[str, object]:
         "failed_replicates": result.failed_replicates,
         "intervals": [
             _bootstrap_interval(coordinate, interval)
-            for coordinate, interval in sorted(result.intervals.items(), key=lambda item: str(item[0]))
+            for coordinate, interval in sorted(result.intervals.items(), key=lambda item: roster[item[0]])
         ],
         "first_failed_replicate_diagnostic": _plain(result.first_failed_replicate_diagnostic),
         "first_failed_replicate_unavailable": _plain(result.first_failed_replicate_unavailable),
@@ -222,8 +232,9 @@ def _bootstrap_data(candidate: FitCandidate) -> dict[str, object]:
 def _dataset_metrics(candidate: FitCandidate) -> list[dict[str, object]]:
     result = candidate.result
     display_names = {mapped.dataset_id: mapped.display_name for mapped in candidate.origin.mapped_datasets}
+    positions = {dataset_id: index for index, dataset_id in enumerate(display_names)}
     metrics: list[dict[str, object]] = []
-    for info in sorted(result.dataset_info, key=lambda item: str(item.dataset_id)):
+    for info in sorted(result.dataset_info, key=lambda item: positions[str(item.dataset_id)]):
         dataset_id = str(info.dataset_id)
         metric: dict[str, object] = {
             "dataset_display_name": display_names.get(dataset_id, dataset_id),
@@ -264,16 +275,23 @@ def _estimate_rows(candidate: FitCandidate) -> tuple[list[dict[str, object]], li
             else launch_parameter.selected_config
         )
         if parameter.scope == "centred_fixed_effects":
+            # Fixed centered parameters are dispatched as fixed dataset values
+            # and have no settlement or presentation row.
+            if not configuration.fit:
+                continue
             starts = dict(launch_configuration.dataset_values)
             raw_starts = {
                 dataset_id: math.log10(starts[dataset_id]) if configuration.log10 else starts[dataset_id]
                 for dataset_id in included_ids
             }
-            starting_centre = float(np.mean(tuple(raw_starts.values())))
-            nominal = 10.0 ** starting_centre if configuration.log10 else starting_centre
+            # The overall start is the one the optimizer was dispatched with.
+            layout = request.dispatch.ordinary_optimizer_layout
+            overall_index = layout.centred_overall_index[parameter.name]
+            starting_centre = float(layout.x0[overall_index])
+            nominal = float(layout.physical_x0[overall_index])
             settlement = settlements.get(parameter.name)
             if settlement is None:
-                raise ValueError(f"canonical result omitted centred settlement {parameter.name!r}")
+                raise ValueError(f"canonical result omitted centered settlement {parameter.name!r}")
             value = float(settlement.overall_decoded_value)
             append_row(shared, kind="centred_overall", name=parameter.name,
                 display_name=f"Overall · {parameter.display_name}", scope="Overall", unit=parameter.unit,
@@ -289,7 +307,7 @@ def _estimate_rows(candidate: FitCandidate) -> tuple[list[dict[str, object]], li
             for dataset_id in settlement.dataset_ids:
                 value = float(settlement.dataset_values[dataset_id])
                 append_row(individual, kind="centred_effective", name=parameter.name,
-                    display_name=parameter.display_name, scope="Effective centred value",
+                    display_name=parameter.display_name, scope="Effective value",
                     unit=parameter.unit, fitted_value=value, nominal_value=starts[dataset_id],
                     minimum=configuration.minimum, maximum=configuration.maximum,
                     bound_state=fit_bound_state(value, configuration.minimum, configuration.maximum, configuration.log10),
@@ -415,14 +433,10 @@ def _initial_rows(candidate: FitCandidate) -> list[dict[str, object]]:
         launch_item = launch_groups.get(
             (item.species, item.origin_dataset_id), item
         )
-        for dataset_id in item.member_dataset_ids:
-            if dataset_id not in included_ids:
-                continue
-            mapped = next(
-                (value for value in origin.mapped_datasets if value.dataset_id == dataset_id),
-                None,
-            )
-            if mapped is None:
+        # Members are listed in Fit dataset order.
+        for mapped in origin.mapped_datasets:
+            dataset_id = mapped.dataset_id
+            if dataset_id not in item.member_dataset_ids or dataset_id not in included_ids:
                 continue
             value = _terminal_dataset_value(
                 candidate,
@@ -610,7 +624,7 @@ def fit_live_presentation(
         values = scalars.get(dataset_id, {})
         for parameter in parameters:
             if parameter.name in values:
-                context = label + (" · Effective centred value" if parameter.scope == "centred_fixed_effects" else " · Per-dataset")
+                context = label + (" · Effective value" if parameter.scope == "centred_fixed_effects" else " · Per-dataset")
                 scalar(parameter, context, ("dataset", dataset_id, parameter.name), values[parameter.name])
     for set_id, label in initial_labels.items():
         for name, value in initials.get(set_id, {}).items():
@@ -634,7 +648,7 @@ def fit_candidate_presentation(candidate: FitCandidate) -> tuple[tuple[str, ...]
     termination = _diagnostic(result.message, candidate.origin)
     body = f"<h2>{_text(phase)}</h2><p>{_text(model)}</p><p>{_text(termination)}</p>"
     body += f"<p><b>Weighted residual SSE:</b> {_text(objective)} &nbsp; <b>Weighted MSE:</b> {_text(_metric_text(_metric(result.weighted_residual_mse)))}</p>"
-    model_kind = "Centred Fixed Effects" if result.primary_model == "centred_fixed_effects" else "Ordinary global fit"
+    model_kind = "Overall + dataset deviations (centered fixed effects)" if result.primary_model == "centred_fixed_effects" else "Ordinary global fit"
     body += f"<p>Model: {_text(model_kind)}.</p>"
     body += f"<p>Optimizer {'converged' if result.optimizer_converged else 'did not converge'}.</p>"
     parameters = {parameter.name: parameter for parameter in candidate.setup_snapshot.parameters}
@@ -654,7 +668,7 @@ def fit_candidate_presentation(candidate: FitCandidate) -> tuple[tuple[str, ...]
         if not rows:
             return ""
         return f"<h3>{_text(title)}</h3>" + _table(
-            ("Parameter", "Scope", "Estimate", "Unit", "Starting value", "Bounds", "Bound position"),
+            ("Parameter", "Scope", "Estimate", "Unit", "Initial Guess", "Bounds", "Bound Position"),
             ((parameter_name(row), row["scope"], row["fitted_value"], _unit_html(row["unit"]), row["nominal_value"],
               f"{_display(row['minimum'])} to {_display(row['maximum'])}", row["bound_state"])
              for row in rows), rich_columns=(0, 3))
@@ -666,8 +680,8 @@ def fit_candidate_presentation(candidate: FitCandidate) -> tuple[tuple[str, ...]
         body += estimates(f"Effective values · {mapped.display_name}", rows)
     deviations = [row for row in individual if row["kind"] == "centred_deviation"]
     if deviations:
-        body += "<h3>Centred coordinate deviations (Fit only)</h3><p>Linear deviations use physical units; logarithmic deviations are in log10 coordinates (decades). Effective physical values above come directly from the retained settlement.</p>"
-        body += _table(("Dataset", "Parameter", "Coordinate", "Deviation", "Unit", "Starting deviation", "Bounds"),
+        body += "<h3>Dataset deviations (Fit only)</h3><p>Linear deviations use physical units; logarithmic deviations are in log10 coordinates (decades). Effective physical values above come directly from the retained settlement.</p>"
+        body += _table(("Dataset", "Parameter", "Coordinate", "Deviation", "Unit", "Initial Guess", "Bounds"),
                        ((row["dataset_display_name"], parameter_name(row), row["scope"], row["fitted_value"], _unit_html(row["unit"]),
                          row["nominal_value"], f"{_display(row['minimum'])} to {_display(row['maximum'])}") for row in deviations), rich_columns=(1, 4))
     aggregates = _aggregate_rows(individual)
@@ -677,7 +691,7 @@ def fit_candidate_presentation(candidate: FitCandidate) -> tuple[tuple[str, ...]
             ((parameter_name(row), row["n"], row["arithmetic_mean"], row["median"], row["sample_sd"], row["iqr"], _unit_html(row["unit"])) for row in aggregates), rich_columns=(0, 6))
     metrics = _dataset_metrics(candidate)
     body += "<h3>Dataset metrics</h3>" + _table(
-        ("Dataset", "Weighted SSE", "Weighted MSE", "Weighted RMSE", "Weighted MAE", "Effective weight"),
+        ("Dataset", "Weighted SSE", "Weighted MSE", "Weighted RMSE", "Weighted MAE", "Effective Weight"),
         ((row["dataset_display_name"], *(_metric_text(row[key]) for key in ("weighted_sse", "weighted_mse", "weighted_rmse", "weighted_mae")), row["effective_weight"]) for row in metrics))
     r_squared = [(row["dataset_display_name"], name, _metric_text(value)) for row in metrics for name, value in row["r_squared_by_series"].items()]
     if r_squared:
@@ -699,7 +713,7 @@ def fit_candidate_presentation(candidate: FitCandidate) -> tuple[tuple[str, ...]
     body += _analysis_section("Residual bootstrap", bootstrap, candidate.origin, symbols, coordinate_units)
     body += "<h3>Apply effect</h3><p>Apply publishes compatible shared estimates and fitted initial values to the project."
     if result.centred_fixed_effects_settlements:
-        body += " For centred parameters, only the overall value is published; dataset-specific effective values and deviations remain Fit results."
+        body += " For Overall + deviations parameters, only the overall value is published; dataset-specific effective values and deviations remain Fit results."
     if any(parameter.scope == "per_dataset" for parameter in candidate.setup_snapshot.parameters):
         body += " Per-dataset parameter values must first become Shared through Configure Shared Fit and an ordinary Shared Fit."
     body += "</p>"
@@ -713,7 +727,7 @@ def fit_candidate_presentation(candidate: FitCandidate) -> tuple[tuple[str, ...]
         ("Solver", request_setup.solver),
     ))
     mapped_by_id = {mapped.dataset_id: mapped for mapped in candidate.origin.mapped_datasets}
-    provenance += _table(("Dataset", "Initial-condition set", "X quantity", "Simulation interval", "Experimental time range"),
+    provenance += _table(("Dataset", "Initial-Condition Set", "X Quantity", "Simulation Interval", "Experimental Time Range"),
                          ((mapped_by_id[item.dataset_id].display_name, mapped_by_id[item.dataset_id].set_name,
                            item.parametric.x_name if item.parametric else "t",
                            f"{_display(item.t_start)} to {_display(item.simulation_end)}",

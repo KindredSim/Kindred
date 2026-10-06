@@ -1342,8 +1342,9 @@ def build_parameter_layout_for_dataset_ids(
         )
         low = math.log10(spec.minimum) if spec.log10 else float(spec.minimum)
         high = math.log10(spec.maximum) if spec.log10 else float(spec.maximum)
-        # The mean of in-bound starts can round one ulp past a bound.
-        overall_raw = min(max(float(np.mean(raw_starts)), low), high)
+        # The mean stays within the starts' range (and so within bounds), so
+        # equal starts give exactly zero deviations.
+        overall_raw = min(max(float(np.mean(raw_starts)), float(raw_starts.min())), float(raw_starts.max()))
         centred_initials.append(overall_raw)
         centred_bounds.append((low, high))
         overall_physical = (

@@ -22,6 +22,7 @@ __all__ = [
     "ScientificNameDelegate",
     "ScientificNameHeaderView",
     "clamp_initial_size",
+    "ignore_wheel",
     "make_bounded_label",
     "make_scroll_area",
     "set_bounded_label_text",
@@ -163,6 +164,24 @@ def configure_compact_numeric_edit(
     else:
         sizing.characters = characters
         sizing.update()
+
+
+class _WheelScrollsPane(QtCore.QObject):
+    def eventFilter(self, watched, event):
+        if event.type() == QtCore.QEvent.Type.Wheel:
+            event.ignore()  # The containing pane or table scrolls instead.
+            return True
+        return False
+
+
+_WHEEL_SCROLLS_PANE = _WheelScrollsPane()
+
+
+def ignore_wheel(widget: QtWidgets.QWidget) -> None:
+    """The mouse wheel scrolls past this control and never changes its value."""
+
+    widget.setFocusPolicy(QtCore.Qt.FocusPolicy.StrongFocus)
+    widget.installEventFilter(_WHEEL_SCROLLS_PANE)
 
 
 def make_scroll_area(parent: Optional[QtWidgets.QWidget] = None) -> QtWidgets.QScrollArea:

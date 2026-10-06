@@ -373,9 +373,12 @@ class FittingWindow(QtWidgets.QDialog):
         return any(data_issues.values()) or self._has_invalid_parameter_or_species_edits()
 
     def _has_invalid_parameter_or_species_edits(self) -> bool:
-        return bool(
-            self._species_table.invalid_editor_keys
-            or self._params_ics_tab.has_invalid_edits
+        return bool(self._invalid_editor_locations())
+
+    def _invalid_editor_locations(self) -> tuple[tuple[str, str], ...]:
+        return (
+            *(("Data and Targets", text) for text in self._species_table.invalid_editor_locations),
+            *(("Parameters", text) for text in self._params_ics_tab.invalid_edit_locations),
         )
 
     def _refresh_setup_validity(self) -> None:
@@ -412,36 +415,48 @@ class FittingWindow(QtWidgets.QDialog):
             and structural is None
         )
         self._run_button.setEnabled(ready and not self._is_executing())
-        reason = ""
-        if invalid:
-            reason = "Correct invalid Fit editor values before running."
-        elif pending_targets:
-            reason = (
-                "Apply or revert pending Fit target, weight, and IC edits before running."
-            )
-        elif structural is not None:
-            reason = structural
         listing = self._data_targets_tab.unified_list
         listing.set_data_edit_issues(data_issues)
-        accessible_reason = reason
-        if active_issues:
-            dataset_id, issue = next(iter(active_issues.items()))
-            issue = issue or "Pending data changes"
-            name = listing.dataset_display_name(dataset_id) or dataset_id
+
+        def visible(text: str, limit: int) -> str:
             # Authored names and diagnostics cannot grow the footer unboundedly.
-            visible_name = " ".join(name.split())
-            visible_name = visible_name if len(visible_name) <= 60 else visible_name[:59] + "…"
-            visible_issue = " ".join(issue.split())
-            visible_issue = visible_issue if len(visible_issue) <= 160 else visible_issue[:159] + "…"
-            more = f" (+{len(active_issues) - 1} more)" if len(active_issues) > 1 else ""
-            reason = f"Data settings — {visible_name}: {visible_issue}{more} — Resolve in Data and Targets."
-            accessible_reason = "\n".join(
-                f"{listing.dataset_display_name(key) or key}: {value or 'Pending data changes'}"
-                for key, value in active_issues.items()
-            )
+            text = " ".join(text.split())
+            return text if len(text) <= limit else text[: limit - 1] + "…"
+
+        names = {key: visible(listing.dataset_display_name(key) or key, 60) for key in active_issues}
+        # One ordered list of invalid values; pending edits are reported only
+        # when nothing is invalid.
+        invalid_entries = [
+            ("Data and Targets", f"Data settings for {names[key]}: {value.rstrip('.')}")
+            for key, value in active_issues.items() if value
+        ] + list(self._invalid_editor_locations())
+        pending_data_names = [names[key] for key, value in active_issues.items() if not value]
+        reason = ""
+        details: list[str] = []
+        if invalid_entries:
+            tab, first = invalid_entries[0]
+            more = f" (+{len(invalid_entries) - 1} more)" if len(invalid_entries) > 1 else ""
+            reason = f"Invalid value — {visible(first, 160)}{more} — Resolve in {tab}."
+            details = [f"{tab}: {text}" for tab, text in invalid_entries]
+        else:
+            if pending_data_names:
+                more = f" (+{len(pending_data_names) - 1} more)" if len(pending_data_names) > 1 else ""
+                reason = (
+                    f"Data settings — {pending_data_names[0]}: Pending data changes{more}"
+                    " — Resolve in Data and Targets."
+                )
+                details = [f"{name}: Pending data changes" for name in pending_data_names]
+            if pending_targets:
+                targets = "Apply or revert pending Fit target, weight, and IC edits before running."
+                reason = reason or targets
+                details.append(targets)
+            if not reason and structural is not None:
+                reason = structural
+        accessible_reason = "\n".join(details) or reason
         self._run_block_reason_label.setVisible(bool(reason))
         self._run_block_reason_label.setText(reason)
         self._run_block_reason_label.setAccessibleName(accessible_reason)
+        self._run_block_reason_label.setToolTip(accessible_reason)
         self._layout_footer()
 
     def _populate_dataset_list(self, snapshot: FitSetupSnapshot) -> None:
@@ -747,20 +762,12 @@ class FittingWindow(QtWidgets.QDialog):
         focused = self.focusWidget()
         if focused is not None:
             focused.clearFocus()
-        if self.has_invalid_setup_edits:
-            self.set_status(
-                "Fit setup contains an invalid edit; correct it before running."
-            )
-            return
-        if self.has_pending_target_changes:
-            self.set_status(
-                "Apply or revert pending Fit target, weight, and IC edits before running."
-            )
-            return
-        if self.has_pending_data_changes:
-            self.set_status(
-                "Apply or revert pending Fit data edits before running."
-            )
+        if (
+            self.has_invalid_setup_edits
+            or self.has_pending_target_changes
+            or self.has_pending_data_changes
+        ):
+            # The readiness line already reports what blocks Run.
             return
         self.executeRequested.emit()
 
@@ -998,11 +1005,7 @@ class FittingWindow(QtWidgets.QDialog):
         self.close()
 
     def reject(self) -> None:
-        """Route QDialog dismissal through the owner-controlled close fence."""
-
-        if self._closing:
-            return
-        self.close()
+        """Escape never dismisses the Fit window; the title-bar close does."""
 
     def enter_stopping(self) -> None:
         """Make the presentation inert until owner-authorized cleanup closes it."""

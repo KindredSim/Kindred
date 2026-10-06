@@ -296,16 +296,14 @@ def fit_parameters(
         else:
             least_squares, _de = load_scipy_optimize()
 
-            # scipy interprets diff_step as relative to each coordinate.  Passing
-            # an already scaled absolute step applies that scaling a second time.
-            diff_step = 1e-4
+            # SciPy's default finite-difference step keeps an absolute floor, so
+            # coordinates near zero still get usable Jacobian columns.
             lsq_kwargs = build_least_squares_kwargs(
                 ftol=ftol,
                 xtol=xtol,
                 max_nfev=max_nfev,
                 method=method,
                 bounds=scipy_bounds,
-                diff_step=diff_step,
                 verbose=0,
             )
             with warnings.catch_warnings():

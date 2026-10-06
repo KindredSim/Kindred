@@ -9,8 +9,16 @@ from PySide6 import QtCore, QtWidgets
 
 from kindred.core.validation import parse_finite_numeric_text
 from kindred.gui.fitting.launch import fit_execution_span
-from kindred.gui.ui_helpers import set_bounded_label_text
+from kindred.gui.ui_helpers import ignore_wheel, set_bounded_label_text
 from kindred.gui.widgets.config_panel_footer import ConfigPanelFooter
+
+
+_FIELD_LABELS = {
+    "t_start": "Simulation start",
+    "simulation_end": "Simulation end",
+    "data_range_min": "Data Range minimum",
+    "data_range_max": "Data Range maximum",
+}
 
 
 class DataTab(QtWidgets.QWidget):
@@ -135,6 +143,7 @@ class DataTab(QtWidgets.QWidget):
         self._maximum_edit.setObjectName("global_fit_maximum_observations")
         self._maximum_edit.setRange(0, 0)
         self._maximum_edit.setSpecialValueText("All")
+        ignore_wheel(self._maximum_edit)
         range_widget = QtWidgets.QWidget(self._footer)
         range_layout = QtWidgets.QHBoxLayout(range_widget)
         range_layout.setContentsMargins(0, 0, 0, 0)
@@ -149,6 +158,7 @@ class DataTab(QtWidgets.QWidget):
         controls.addRow("N:", self._maximum_edit)
         self._x_combo = QtWidgets.QComboBox(self._footer)
         self._x_combo.setObjectName("global_fit_parametric_x")
+        ignore_wheel(self._x_combo)
         controls.addRow("X quantity", self._x_combo)
         self._used_label = QtWidgets.QLabel("Used: —", self._footer)
         self._used_label.setObjectName("global_fit_used_count")
@@ -385,7 +395,7 @@ class DataTab(QtWidgets.QWidget):
             active_fields += ("data_range_min", "data_range_max")
         for field in active_fields:
             if (dataset_id, field) in self._invalid_raw:
-                return "Fit data values must be finite."
+                return f"{_FIELD_LABELS[field]} must be a finite number."
         try:
             start, end = fit_execution_span(config["t_start"], config["simulation_end"])
             if is_time and float(config["data_range_min"]) > float(config["data_range_max"]):

@@ -2,7 +2,8 @@
 
 The GUI never scans DSL text to invent parameter ownership.  This module
 parses the accepted source once, projects the core's typed rate families, and
-returns the one coordinate representation consumed by Slider and Fit.
+returns the one coordinate representation consumed by Slider and Fit; each
+coordinate carries its Slider range and its independent default Fit range.
 """
 
 from __future__ import annotations
@@ -16,11 +17,11 @@ from kindred.core.simulator.parameter_coordinates import admit_physical_coordina
 from kindred.core.quantity_units import parse_unit, scientific_unit, convert_value
 from kindred.core.simulation_parameters import enumerate_simulation_parameters
 from kindred.core.units import (
+    ARRHENIUS_A_MIN,
     ARRHENIUS_A_MAX,
     ENERGY_ABS_MAX_J_PER_MOL,
     KEQ_MIN,
     KEQ_MAX,
-    RATE_MIN,
     RATE_MAX,
     admit_keq,
     admit_rate,
@@ -92,7 +93,7 @@ def admit_gui_parameter_value(
     raise ValueError(f"Unknown GUI parameter scientific category: {scientific_category!r}.")
 
 
-def _positive_bounds(value: float, *, minimum: float = RATE_MIN, maximum: float = RATE_MAX) -> tuple[float, float]:
+def _positive_bounds(value: float, *, minimum: float, maximum: float) -> tuple[float, float]:
     if value > 0.0:
         low = max(value * 0.01, minimum)
         high = min(value * 100.0, maximum)
@@ -147,6 +148,8 @@ class GuiParameterCoordinate:
     value: float
     minimum: float
     maximum: float
+    fit_minimum: float
+    fit_maximum: float
     log10_allowed: bool
     family: str
     role: str
@@ -202,20 +205,30 @@ def enumerate_parameter_coordinates(
         value = item.value
         if item.scientific_category in {"rate", "equilibrium_constant"}:
             minimum, maximum = (
-                (KEQ_MIN, KEQ_MAX) if item.role == "Keq" else (RATE_MIN, RATE_MAX)
+                (KEQ_MIN, KEQ_MAX) if item.role == "Keq" else (0.0, RATE_MAX)
             )
             low, high = (
                 _positive_bounds(value, minimum=minimum, maximum=maximum)
                 if value >= 0.0 else _signed_bounds(value)
             )
         elif item.role == "A":
-            low, high = _positive_bounds(value, minimum=RATE_MIN, maximum=ARRHENIUS_A_MAX)
+            low, high = _positive_bounds(value, minimum=ARRHENIUS_A_MIN, maximum=ARRHENIUS_A_MAX)
         elif item.role == "kappa":
             low, high = _kappa_bounds(value)
         elif item.role in {"Ea", "dG_act", "dG_eq"}:
-            limit = UnitsModel(energy_unit=item.unit).from_jmol(ENERGY_ABS_MAX_J_PER_MOL)
-            low, high = _signed_bounds(value)
+            energy = UnitsModel(energy_unit=item.unit)
+            limit = energy.from_jmol(ENERGY_ABS_MAX_J_PER_MOL)
+            if item.role == "dG_eq":
+                # Equilibrium energies are signed; the Slider crosses zero.
+                half = max(2.0 * abs(value), energy.from_jmol(10_000.0))
+                low, high = -half, half
+            else:
+                # Barriers run from zero to twice the accepted value.
+                width = max(2.0 * abs(value), energy.from_jmol(1_000.0))
+                low, high = (0.0, width) if value >= 0.0 else (-width, 0.0)
             low, high = max(low, -limit), min(high, limit)
+            span = energy.from_jmol(10_000.0)
+            fit_low, fit_high = max(value - span, -limit), min(value + span, limit)
         else:
             low, high = _signed_bounds(value)
             floor, limit = ordinary_parameter_input_bounds(item.unit)
@@ -226,12 +239,14 @@ def enumerate_parameter_coordinates(
                 high = 0.0
             if low == high:
                 low, high = -floor, floor
+        if item.role not in {"Ea", "dG_act", "dG_eq"}:
+            fit_low, fit_high = low, high
         display_name = item.name
         if item.context:
             display_name = f"{display_name} — {item.context}"
         coordinates.append(GuiParameterCoordinate(
             name=item.name, display_name=display_name, value=value,
-            minimum=low, maximum=high,
+            minimum=low, maximum=high, fit_minimum=fit_low, fit_maximum=fit_high,
             # Rate constants and prefactors span decades; energies and plain
             # scalars are linear quantities.
             log10_allowed=bool(

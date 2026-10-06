@@ -105,6 +105,7 @@ from kindred.gui.fitting.constants import (
     DE_CONVERGENCE_TOLERANCE_LABEL,
     DIFFERENTIAL_EVOLUTION_METHOD,
     FUNCTION_TOLERANCE_LABEL,
+    STEP_TOLERANCE_LABEL,
     fit_method_label,
 )
 from kindred.gui.main_window_variable_runtime import TabSliderBinding
@@ -137,7 +138,7 @@ from kindred.gui.widgets.right_panel import RightPanelTabbed
 from kindred.gui.widgets.simulation_panel import SimulationPanel
 from kindred.gui.widgets.solver_settings import SimulationSettingsDialog
 from kindred.gui.widgets.symbolic_calculator_panel import SymbolicCalculatorPanel
-from kindred.gui.ui_helpers import clamp_initial_size
+from kindred.gui.ui_helpers import clamp_initial_size, ignore_wheel
 from kindred.gui.workspace_result_presenter import (
     ResultRenderInput,
     VisibleResultSet,
@@ -4434,12 +4435,14 @@ class MainWindow(QtWidgets.QMainWindow):
         ftol.setText(repr(float(defaults.ftol)))
         xtol.setText(repr(float(defaults.xtol)))
         ftol_label = QtWidgets.QLabel(FUNCTION_TOLERANCE_LABEL, dialog)
-        xtol_label = QtWidgets.QLabel("Step tolerance", dialog)
+        xtol_label = QtWidgets.QLabel(STEP_TOLERANCE_LABEL, dialog)
         use_seed = QtWidgets.QCheckBox("Use deterministic seed", dialog)
         use_seed.setChecked(defaults.use_seed)
         seed = QtWidgets.QSpinBox(dialog)
         seed.setRange(*FIT_SEED_RANGE)
         seed.setValue(defaults.seed)
+        for control in (scope, method, max_nfev, seed):
+            ignore_wheel(control)
 
         def project_tolerance(editor: QtWidgets.QLineEdit, value: object) -> None:
             # ``repr(float(...))`` is the shortest exact binary64 round-trip;
@@ -4486,12 +4489,18 @@ class MainWindow(QtWidgets.QMainWindow):
             parent=dialog,
         )
 
+        def tolerance(editor: QtWidgets.QLineEdit, label: QtWidgets.QLabel) -> float:
+            value = parse_finite_numeric_text(editor.text(), field=label.text())
+            if value <= 0.0:
+                raise ValueError(f"{label.text()} must be positive.")
+            return value
+
         def read_candidate() -> FitDefaults:
             return FitDefaults(
                 method=method.currentData(),
                 max_nfev=int(max_nfev.value()),
-                ftol=parse_finite_numeric_text(ftol.text(), field=ftol_label.text()),
-                xtol=parse_finite_numeric_text(xtol.text(), field=xtol_label.text()),
+                ftol=tolerance(ftol, ftol_label),
+                xtol=tolerance(xtol, xtol_label),
                 use_seed=bool(use_seed.isChecked()),
                 seed=int(seed.value()),
             )

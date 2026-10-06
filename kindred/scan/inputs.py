@@ -10,7 +10,7 @@ from kindred.core.species import (
     CONCENTRATION_MIN_M, CONCENTRATION_MAX_M, TIME_INPUT_MIN_S, TIME_MAX_S,
 )
 from kindred.core.units import (
-    RATE_MIN, RATE_MAX, KEQ_MIN, KEQ_MAX, ARRHENIUS_A_MAX,
+    RATE_MAX, KEQ_MIN, KEQ_MAX, ARRHENIUS_A_MIN, ARRHENIUS_A_MAX,
     ENERGY_ABS_MAX_J_PER_MOL, UnitsModel, ordinary_parameter_input_bounds,
 )
 from kindred.scan.config import START, END, ScanConfig, initial_key, parameter_key
@@ -37,11 +37,11 @@ def input_catalog(prepared, config: ScanConfig) -> tuple[ScanInput, ...]:
     shell = None
     for item in parameters:
         if item.scientific_category == "rate":
-            bounds = (Interval(RATE_MIN, RATE_MAX),)
+            bounds = (Interval(0.0, RATE_MAX, include_lower=False),)
         elif item.scientific_category == "equilibrium_constant":
             bounds = (Interval(KEQ_MIN, KEQ_MAX),)
         elif item.role == "A":
-            bounds = (Interval(RATE_MIN, ARRHENIUS_A_MAX),)
+            bounds = (Interval(ARRHENIUS_A_MIN, ARRHENIUS_A_MAX),)
         elif item.role in {"Ea", "dG_act", "dG_eq"}:
             limit = UnitsModel(energy_unit=item.unit).from_jmol(ENERGY_ABS_MAX_J_PER_MOL)
             bounds = (Interval(-limit, limit),)
@@ -50,7 +50,7 @@ def input_catalog(prepared, config: ScanConfig) -> tuple[ScanInput, ...]:
             bounds = (Interval(-limit, -floor), Interval(0.0, 0.0), Interval(floor, limit))
         else:
             bounds = (Interval(-sys.float_info.max, sys.float_info.max),)
-        if item.allow_exact_zero and bounds[0].lower > 0:
+        if item.allow_exact_zero and not any(component.contains(0.0) for component in bounds):
             bounds = (Interval(0.0, 0.0),) + bounds
         elif not item.allow_exact_zero:
             bounds = intersect(bounds, (Interval(-sys.float_info.max, 0.0, True, False),

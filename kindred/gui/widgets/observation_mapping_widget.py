@@ -15,7 +15,7 @@ from kindred.core.datasets.observation_mapping import (
     suggest_observation_mapping,
 )
 from kindred.core.quantity_units import MOLAR
-from kindred.gui.ui_helpers import clamp_initial_size, data_unit_labels
+from kindred.gui.ui_helpers import clamp_initial_size, data_unit_labels, ignore_wheel
 
 
 class ObservationMappingWidget(QtWidgets.QWidget):
@@ -50,6 +50,7 @@ class ObservationMappingWidget(QtWidgets.QWidget):
         self._observation_combos: dict[str, QtWidgets.QComboBox] = {}
         for series in record.observations:
             combo = QtWidgets.QComboBox(self)
+            ignore_wheel(combo)
             combo.setAccessibleName(f"Model target for {series.column_name}")
             combo.addItem("Unmapped", None)
             for name in model_targets:
@@ -67,6 +68,7 @@ class ObservationMappingWidget(QtWidgets.QWidget):
         concentrations_layout = QtWidgets.QVBoxLayout(self._concentrations_group)
         source_form = QtWidgets.QFormLayout()
         self._source_combo = QtWidgets.QComboBox(self._concentrations_group)
+        ignore_wheel(self._source_combo)
         self._source_combo.setAccessibleName("Initial concentrations from")
         self._source_combo.addItem("Choose…", None)
         self._source_combo.addItem("Recorded data at t = 0", InitialConcentrationSource.RECORDED_ZERO)

@@ -10,7 +10,8 @@ from kindred.gui.display_name_policy import literal_tooltip
 from kindred.gui.spreadsheet_formulas import formula_at_row
 from kindred.gui.spreadsheet_worker import SpreadsheetWorker
 from kindred.gui.ui_helpers import (
-    SCIENTIFIC_NAME_HTML_ROLE, ScientificNameComboBox, data_unit_labels, paint_markup, set_bounded_label_text,
+    SCIENTIFIC_NAME_HTML_ROLE, ScientificNameComboBox, data_unit_labels, ignore_wheel, paint_markup,
+    set_bounded_label_text,
 )
 
 # Requests that change nothing the user could lose.
@@ -270,6 +271,7 @@ class _SheetHeader(QtWidgets.QHeaderView):
             control.selectAll()
         else:
             control = ScientificNameComboBox(self.viewport())
+            ignore_wheel(control)
             control.setInsertPolicy(QtWidgets.QComboBox.NoInsert)
             control.setAccessibleName("Column unit")
             control.setToolTip("Correct declaration: numbers stay unchanged." if correction else

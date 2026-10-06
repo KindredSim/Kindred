@@ -23,6 +23,7 @@ from kindred.gui.ui_helpers import (
     ScientificNameDelegate,
     ControlRowsLayout,
     configure_compact_numeric_edit,
+    ignore_wheel,
 )
 from kindred.core.analysis.fit_uncertainty import (
     BOOTSTRAP_SEED_RANGE,
@@ -45,7 +46,6 @@ from kindred.core.project_document import (
 )
 from kindred.gui.fitting.launch import (
     FitOriginSnapshot,
-    FitParameterConfiguration,
     FitParameterVariable,
     FitSetupSnapshot,
     fit_uncertainty_coordinates,
@@ -54,18 +54,20 @@ from kindred.gui.fitting.launch import (
     convert_fit_parameter_scope,
 )
 from kindred.gui.fitting.constants import (
-    CENTRED_FIXED_EFFECTS_SCOPE_LABEL,
+    DE_CONVERGENCE_TOLERANCE_LABEL,
     DIFFERENTIAL_EVOLUTION_METHOD,
+    FUNCTION_TOLERANCE_LABEL,
+    STEP_TOLERANCE_LABEL,
 )
-from kindred.gui.parameter_enumeration import admit_gui_parameter_value
+from kindred.gui.fitting.reporting import fit_identity_text
 
 __all__ = ["ParametersIcsTab"]
 
 
 @dataclass(frozen=True, slots=True)
-class _InvalidNumericDraft:
+class _InvalidRow:
     raw_fields: tuple[tuple[str, str], ...]
-    message: str
+    messages: tuple[tuple[str, str], ...]
 
 
 def _format_number(value: object) -> str:
@@ -317,6 +319,76 @@ class _ResidualBootstrapDialog(QtWidgets.QDialog):
         super().accept()
 
 
+class _ParameterBoundsDialog(QtWidgets.QDialog):
+    """Collect one Minimum/Maximum/scale choice for several Fit parameters."""
+
+    def __init__(
+        self,
+        parameters: Sequence[FitParameterVariable],
+        parent: QtWidgets.QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Set Bounds for Parameters")
+        self.setModal(True)
+        form = QtWidgets.QFormLayout(self)
+        self._minimum = QtWidgets.QLineEdit(self)
+        self._maximum = QtWidgets.QLineEdit(self)
+        for edit in (self._minimum, self._maximum):
+            configure_compact_numeric_edit(edit, characters=20)
+        self._log10 = QtWidgets.QCheckBox("Log Scale", self)
+        self._parameters = QtWidgets.QTableWidget(len(parameters), 2, self)
+        self._parameters.setHorizontalHeaderLabels(("Parameter", "Unit"))
+        self._parameters.verticalHeader().setVisible(False)
+        self._parameters.horizontalHeader().setSectionResizeMode(
+            0, QtWidgets.QHeaderView.ResizeMode.Stretch
+        )
+        self._parameters.setItemDelegateForColumn(1, ScientificNameDelegate(self._parameters))
+        for row, parameter in enumerate(parameters):
+            item = QtWidgets.QTableWidgetItem(parameter.display_name)
+            item.setData(QtCore.Qt.ItemDataRole.UserRole, parameter.name)
+            item.setFlags(QtCore.Qt.ItemFlag.ItemIsEnabled | QtCore.Qt.ItemFlag.ItemIsUserCheckable)
+            item.setCheckState(QtCore.Qt.CheckState.Unchecked)
+            self._parameters.setItem(row, 0, item)
+            unit = QtWidgets.QTableWidgetItem(parameter.unit)
+            unit.setData(SCIENTIFIC_NAME_HTML_ROLE, format_unit_for_display(parameter.unit))
+            unit.setFlags(QtCore.Qt.ItemFlag.ItemIsEnabled)
+            self._parameters.setItem(row, 1, unit)
+        form.addRow("Minimum:", self._minimum)
+        form.addRow("Maximum:", self._maximum)
+        form.addRow("", self._log10)
+        form.addRow("Parameters:", self._parameters)
+        buttons = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel, self
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        form.addRow(buttons)
+
+    def selection(self) -> tuple[tuple[str, ...], str, str, bool]:
+        names = tuple(
+            item.data(QtCore.Qt.ItemDataRole.UserRole)
+            for row in range(self._parameters.rowCount())
+            if (item := self._parameters.item(row, 0)).checkState() == QtCore.Qt.CheckState.Checked
+        )
+        if not names:
+            raise ValueError("Select at least one parameter.")
+        minimum = parse_finite_numeric_text(self._minimum.text(), field="Minimum")
+        maximum = parse_finite_numeric_text(self._maximum.text(), field="Maximum")
+        if minimum >= maximum:
+            raise ValueError("Minimum must be less than Maximum.")
+        if self._log10.isChecked() and minimum <= 0.0:
+            raise ValueError("Log Scale requires a positive Minimum.")
+        return names, self._minimum.text(), self._maximum.text(), self._log10.isChecked()
+
+    def accept(self) -> None:  # noqa: D401 - Qt override
+        try:
+            self.selection()
+        except (TypeError, ValueError, OverflowError) as exc:
+            QtWidgets.QMessageBox.warning(self, self.windowTitle(), str(exc))
+            return
+        super().accept()
+
+
 class _ParameterRosterTable(QtWidgets.QTableWidget):
     """Prefer eight visible rows initially; the native splitter owns later sizing."""
 
@@ -327,14 +399,33 @@ class _ParameterRosterTable(QtWidgets.QTableWidget):
             QtCore.QTimer.singleShot(0, self._initialize_columns)
 
     def _initialize_columns(self) -> None:
-        em = self.fontMetrics().horizontalAdvance("M")
-        self.setColumnWidth(2, 12 * em)
-        self.setColumnWidth(3, 18 * em)
-        self.setColumnWidth(4, 9 * em)
-        self.setColumnWidth(1, max(
-            18 * em,
-            self.viewport().width() - sum(self.columnWidth(i) for i in (0, 2, 3, 4)),
-        ))
+        metrics = self.fontMetrics()
+        em = metrics.horizontalAdvance("M")
+        self.horizontalHeader().setMinimumSectionSize(3 * em)
+        header = self.horizontalHeader()
+        # Sized once for realistic values; widths the user drags are kept.
+        for column, sample in (
+            (_C.START, "-0.000123457"), (_C.MIN, "-0.000123457"), (_C.MAX, "-0.000123457"),
+            (_C.LAST, "-1.23457e+07 (Overall)"), (_C.MECH, "-0.000123457"),
+        ):
+            self.setColumnWidth(column, max(header.sectionSizeHint(column), metrics.horizontalAdvance(sample) + em))
+        self.fit_name_column()
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self.fit_name_column()
+
+    def fit_name_column(self) -> None:
+        """Stretch Parameter while it stays readable; otherwise keep it and scroll."""
+
+        minimum = 18 * self.fontMetrics().horizontalAdvance("M")
+        others = sum(self.columnWidth(column) for column in range(self.columnCount()) if column != _C.NAME)
+        header = self.horizontalHeader()
+        if self.viewport().width() - others >= minimum:
+            header.setSectionResizeMode(_C.NAME, QtWidgets.QHeaderView.ResizeMode.Stretch)
+        else:
+            header.setSectionResizeMode(_C.NAME, QtWidgets.QHeaderView.ResizeMode.Interactive)
+            self.setColumnWidth(_C.NAME, minimum)
 
     def sizeHint(self) -> QtCore.QSize:
         size = super().sizeHint()
@@ -347,33 +438,38 @@ class _ParameterRosterTable(QtWidgets.QTableWidget):
         return size
 
 
-class _DatasetValueDelegate(QtWidgets.QStyledItemDelegate):
+class _C:
+    VARY, LOG, NAME, START, MIN, MAX, SCOPE, LAST, MECH, UNIT, COUNT = range(11)
+    HEADERS = ("Vary", "Log Scale", "Parameter", "Initial Guess", "Minimum", "Maximum",
+               "Across Datasets", "Last Fit Result", "Mechanism Tab Value", "Unit")
+
+
+_DATASET_ROLE = QtCore.Qt.ItemDataRole.UserRole + 1
+_COMPACT_ROLE = QtCore.Qt.ItemDataRole.UserRole + 2
+_INVALID_BG = QtGui.QColor(255, 200, 200)
+_INVALID_FG = QtGui.QColor(80, 0, 0)
+
+
+class _CompactNumberDelegate(QtWidgets.QStyledItemDelegate):
     """Paint compact values while native editing retains the complete text."""
 
     def initStyleOption(self, option, index) -> None:
         super().initStyleOption(option, index)
-        if index.column() not in (1, 2):
+        if not index.data(_COMPACT_ROLE):
             return
-        parameter = self.parent()._selected_parameter()
-        dataset_id = index.data(QtCore.Qt.UserRole)
-        if parameter is not None and (
-            "parameter_dataset", parameter.name, dataset_id, "initial"
-        ) in self.parent()._invalid_numeric_drafts and index.column() == 1:
-            return
+        # A just-committed edit can repaint before its row re-renders as invalid.
         try:
             option.text = f"{float(option.text):.6g}"
         except ValueError:
             pass
 
-    def eventFilter(self, watched, event) -> bool:
-        if (
-            event.type() == QtCore.QEvent.ShortcutOverride
-            and event.key() == QtCore.Qt.Key_Escape
-            and self.parent()._discard_parameter_shortcut.isEnabled()
-        ):
-            event.ignore()
-            return True
-        return super().eventFilter(watched, event)
+
+# Row fields in table order, with the column that shows each.
+_FIELD_COLUMNS = {"log10": _C.LOG, "starting": _C.START, "minimum": _C.MIN, "maximum": _C.MAX}
+
+
+def _field_label(field: str) -> str:
+    return _C.HEADERS[_FIELD_COLUMNS["starting" if field.startswith("dataset:") else field]]
 
 
 class ParametersIcsTab(QtWidgets.QWidget):
@@ -403,11 +499,10 @@ class ParametersIcsTab(QtWidgets.QWidget):
         self._roster_height_initialized = False
         self._can_reset_initial = False
         self._can_reset_last_fit = False
-        self._invalid_numeric_drafts: dict[
-            tuple[str, ...], _InvalidNumericDraft
-        ] = {}
+        self._invalid_rows: dict[str, _InvalidRow] = {}
         self._projecting = False
         self._running = False
+        self._row_keys: tuple[tuple[str, str | None], ...] = ()
         self._build_ui()
 
 
@@ -435,7 +530,8 @@ class ParametersIcsTab(QtWidgets.QWidget):
             self._left_splitter.contentsRect().height()
             - self._left_splitter.handle(1).height()
         )
-        preferred = roster.sizeHint().height()
+        options = self._left_splitter.widget(1).widget().sizeHint().height()
+        preferred = max(roster.sizeHint().height(), available - options)
         self._left_splitter.setSizes([preferred, max(0, available - preferred)])
         self._roster_height_initialized = True
     # ------------------------------------------------------------------
@@ -456,10 +552,15 @@ class ParametersIcsTab(QtWidgets.QWidget):
         self.resetRequested.emit("last_fit")
 
 
-    _SCOPE_LABELS = {
-        "shared": "One shared value",
-        "per_dataset": "Independent value for each dataset",
-        "centred_fixed_effects": CENTRED_FIXED_EFFECTS_SCOPE_LABEL,
+    _SCOPE_CHOICES = {
+        "shared": ("Shared", "One shared value for all datasets."),
+        "per_dataset": ("Per-dataset", "An independent value for each dataset."),
+        "centred_fixed_effects": (
+            "Overall + deviations",
+            "One overall value plus a deviation for each dataset. Deviations sum to zero "
+            "on the fitting scale (log10 when Log Scale is on). Apply publishes only the "
+            "overall value.",
+        ),
     }
 
     def _build_parameters_panel(self) -> QtWidgets.QWidget:  # noqa: C901
@@ -475,15 +576,9 @@ class ParametersIcsTab(QtWidgets.QWidget):
         layout.setSpacing(8)
         scroll.setWidget(container)
 
-        split = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal, container)
-        split.setObjectName("fit_parameter_split")
-        split.setChildrenCollapsible(False)
-        split.setStretchFactor(0, 58)
-        split.setStretchFactor(1, 42)
-
-        left = QtWidgets.QWidget(split)
+        left = QtWidgets.QWidget(container)
         left_layout = QtWidgets.QVBoxLayout(left)
-        left_layout.setContentsMargins(0, 0, 4, 0)
+        left_layout.setContentsMargins(0, 0, 0, 0)
         self._left_splitter = QtWidgets.QSplitter(QtCore.Qt.Vertical, left)
         self._left_splitter.setObjectName("fit_parameter_left_split")
         self._left_splitter.setChildrenCollapsible(False)
@@ -492,135 +587,45 @@ class ParametersIcsTab(QtWidgets.QWidget):
         roster_pane = QtWidgets.QWidget(self._left_splitter)
         roster_layout = QtWidgets.QVBoxLayout(roster_pane)
         roster_layout.setContentsMargins(0, 0, 0, 6)
-        roster_layout.addWidget(QtWidgets.QLabel("Parameter list", roster_pane))
-        self._param_table = _ParameterRosterTable(0, 5, roster_pane)
+        self._param_table = _ParameterRosterTable(0, _C.COUNT, roster_pane)
         self._param_table.setObjectName("fit_parameter_roster")
         self._param_table.setWordWrap(False)
-        self._param_table.verticalHeader().setSectionResizeMode(QtWidgets.QHeaderView.ResizeToContents)
-        self._param_table.setHorizontalHeaderLabels(
-            ("Vary", "Parameter", "Mechanism value", "Last result", "Unit")
-        )
-        self._param_table.setSelectionBehavior(
-            QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows
-        )
+        self._param_table.setAlternatingRowColors(True)
+        self._param_table.verticalHeader().setVisible(False)
+        self._param_table.verticalHeader().setSectionResizeMode(QtWidgets.QHeaderView.Fixed)
+        self._param_table.setHorizontalHeaderLabels(_C.HEADERS)
         self._param_table.setSelectionMode(
-            QtWidgets.QAbstractItemView.SelectionMode.SingleSelection
+            QtWidgets.QAbstractItemView.SelectionMode.ContiguousSelection
         )
-        self._param_table.setEditTriggers(
-            QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers
-        )
-        self._param_table.horizontalHeader().setStretchLastSection(False)
-        self._param_table.horizontalHeader().setSectionResizeMode(
-            0, QtWidgets.QHeaderView.ResizeMode.ResizeToContents
-        )
-        self._param_table.horizontalHeader().setSectionResizeMode(
-            1, QtWidgets.QHeaderView.ResizeMode.Interactive
-        )
-        self._param_table.horizontalHeader().setSectionResizeMode(
-            2, QtWidgets.QHeaderView.ResizeMode.Interactive
-        )
-        self._param_table.horizontalHeader().setSectionResizeMode(
-            3, QtWidgets.QHeaderView.ResizeMode.Interactive
-        )
-        self._param_table.horizontalHeader().setSectionResizeMode(
-            4, QtWidgets.QHeaderView.ResizeMode.ResizeToContents
-        )
+        header = self._param_table.horizontalHeader()
+        header.setStretchLastSection(False)
+        for column in range(_C.COUNT):
+            header.setSectionResizeMode(
+                column,
+                QtWidgets.QHeaderView.ResizeMode.Fixed
+                if column in self._CONTENT_COLUMNS
+                else QtWidgets.QHeaderView.ResizeMode.Stretch if column == _C.NAME
+                else QtWidgets.QHeaderView.ResizeMode.Interactive,
+            )
         self._param_table.itemChanged.connect(self._on_roster_item_changed)
-        self._param_table.itemSelectionChanged.connect(self._on_parameter_selection_changed)
-        self._param_table.setItemDelegateForColumn(1, ScientificNameDelegate(self._param_table))
-        self._param_table.setItemDelegateForColumn(4, ScientificNameDelegate(self._param_table))
+        compact = _CompactNumberDelegate(self)
+        for column in (_C.MECH, _C.START, _C.MIN, _C.MAX):
+            self._param_table.setItemDelegateForColumn(column, compact)
+        self._param_table.setItemDelegateForColumn(_C.NAME, ScientificNameDelegate(self._param_table))
+        self._param_table.setItemDelegateForColumn(_C.UNIT, ScientificNameDelegate(self._param_table))
         self._param_table.installEventFilter(self)
         roster_layout.addWidget(self._param_table, 1)
-        split.addWidget(left)
-
-        right = QtWidgets.QWidget(split)
-        right_layout = QtWidgets.QVBoxLayout(right)
-        right_layout.setContentsMargins(4, 0, 0, 0)
-        self._selected_editor = QtWidgets.QGroupBox("Selected parameter", right)
-        self._selected_editor.setObjectName("fit_selected_parameter_editor")
-        editor_layout = QtWidgets.QVBoxLayout(self._selected_editor)
-        form = QtWidgets.QFormLayout()
-        form.setRowWrapPolicy(QtWidgets.QFormLayout.RowWrapPolicy.WrapLongRows)
-        self._starting_edit = QtWidgets.QLineEdit(self._selected_editor)
-        self._minimum_edit = QtWidgets.QLineEdit(self._selected_editor)
-        self._maximum_edit = QtWidgets.QLineEdit(self._selected_editor)
-        self._scale_combo = QtWidgets.QComboBox(self._selected_editor)
-        self._scale_combo.addItem("Linear", False)
-        self._scale_combo.addItem("Logarithmic", True)
-        self._scope_combo = QtWidgets.QComboBox(self._selected_editor)
-        for scope, label in self._SCOPE_LABELS.items():
-            self._scope_combo.addItem(label, scope)
-        self._scope_combo.setObjectName("fit_parameter_scope")
-        self._starting_edit.setObjectName("fit_parameter_starting_value")
-        self._minimum_edit.setObjectName("fit_parameter_minimum")
-        self._maximum_edit.setObjectName("fit_parameter_maximum")
-        self._scale_combo.setObjectName("fit_parameter_scale")
-        for edit in (self._starting_edit, self._minimum_edit, self._maximum_edit):
-            configure_compact_numeric_edit(edit, characters=20)
-        for combo in (self._scale_combo, self._scope_combo):
-            combo.setSizeAdjustPolicy(QtWidgets.QComboBox.AdjustToContents)
-            combo.setSizePolicy(QtWidgets.QSizePolicy.Fixed, QtWidgets.QSizePolicy.Fixed)
-        self._starting_caption = QtWidgets.QLabel(self._selected_editor)
-        self._minimum_caption = QtWidgets.QLabel(self._selected_editor)
-        self._maximum_caption = QtWidgets.QLabel(self._selected_editor)
-        for caption in (self._starting_caption, self._minimum_caption, self._maximum_caption):
-            caption.setTextFormat(QtCore.Qt.TextFormat.RichText)
-        form.addRow(self._starting_caption, self._starting_edit)
-        form.addRow(self._minimum_caption, self._minimum_edit)
-        form.addRow(self._maximum_caption, self._maximum_edit)
-        form.addRow("Scale:", self._scale_combo)
-        form.addRow("Across datasets:", self._scope_combo)
-        editor_layout.addLayout(form)
-
-        self._parameter_error = QtWidgets.QLabel(self._selected_editor)
+        self._parameter_error = QtWidgets.QLabel(roster_pane)
         self._parameter_error.setWordWrap(True)
         self._parameter_error.setVisible(False)
-        editor_layout.addWidget(self._parameter_error)
+        roster_layout.addWidget(self._parameter_error)
         self._discard_parameter_shortcut = QtGui.QShortcut(
-            QtGui.QKeySequence(QtCore.Qt.Key_Escape), self._selected_editor
+            QtGui.QKeySequence(QtCore.Qt.Key_Escape), self._param_table
         )
         self._discard_parameter_shortcut.setContext(QtCore.Qt.WidgetWithChildrenShortcut)
         self._discard_parameter_shortcut.setEnabled(False)
         self._discard_parameter_shortcut.activated.connect(self._revert_selected_parameter_draft)
-
-        self._dataset_values_group = QtWidgets.QGroupBox("Values by dataset", self._selected_editor)
-        self._dataset_values_group.setObjectName("fit_parameter_values_by_dataset")
-        dataset_layout = QtWidgets.QVBoxLayout(self._dataset_values_group)
-        self._dataset_values_table = QtWidgets.QTableWidget(0, 4, self._dataset_values_group)
-        self._dataset_values_table.setObjectName("fit_parameter_dataset_values")
-        self._dataset_values_table.setWordWrap(False)
-        self._dataset_values_table.setItemDelegate(_DatasetValueDelegate(self))
-        self._dataset_values_table.setItemDelegateForColumn(3, ScientificNameDelegate(self._dataset_values_table))
-        self._dataset_values_table.setHorizontalHeaderLabels(
-            ("Dataset", "Starting value", "Last result", "Unit")
-        )
-        self._dataset_values_table.horizontalHeader().setStretchLastSection(True)
-        self._dataset_values_table.horizontalHeader().setSectionResizeMode(
-            0, QtWidgets.QHeaderView.ResizeMode.Stretch
-        )
-        self._dataset_values_table.itemChanged.connect(self._on_dataset_value_changed)
-        self._dataset_values_table.installEventFilter(self)
-        self._dataset_values_table.horizontalScrollBar().rangeChanged.connect(
-            lambda *_: self._size_dataset_values_table(self._dataset_values_table)
-        )
-        dataset_layout.addWidget(self._dataset_values_table)
-        editor_layout.addWidget(self._dataset_values_group)
-
-        right_layout.addWidget(self._selected_editor)
-
-        self._last_fit_group = QtWidgets.QGroupBox("Last Fit", right)
-        last_group = self._last_fit_group
-        last_layout = QtWidgets.QFormLayout(last_group)
-        self._last_result_label = QtWidgets.QLabel("—", last_group)
-        self._last_result_label.setWordWrap(True)
-        self._last_result_caption = QtWidgets.QLabel("Last result:", last_group)
-        self._last_result_label.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse | QtCore.Qt.TextSelectableByKeyboard)
-        last_layout.addRow(self._last_result_caption, self._last_result_label)
-        right_layout.addWidget(last_group)
-        right_layout.addStretch(1)
-        split.addWidget(right)
-        split.setSizes([580, 420])
-        layout.addWidget(split, stretch=1)
+        layout.addWidget(left, stretch=1)
 
         self._roster_actions_host = QtWidgets.QWidget(roster_pane)
         actions = ControlRowsLayout(self._roster_actions_host)
@@ -644,7 +649,10 @@ class ParametersIcsTab(QtWidgets.QWidget):
             "discarding all later accepted and unapplied changes."
         )
         self._reset_last_button.clicked.connect(self._reset_to_last_fit)
+        self._bounds_button = QtWidgets.QPushButton("Set Bounds for Parameters…", left)
+        self._bounds_button.clicked.connect(self._open_bounds_dialog)
         for control in (
+            self._bounds_button,
             self._view_steps_button,
             self._reset_initial_button,
             self._reset_last_button,
@@ -708,14 +716,16 @@ class ParametersIcsTab(QtWidgets.QWidget):
         self._seed_spin.setRange(*FIT_SEED_RANGE)
         self._seed_spin.setValue(defaults.seed)
         self._seed_spin.setSizePolicy(QtWidgets.QSizePolicy.Fixed, QtWidgets.QSizePolicy.Fixed)
+        for control in (self._solver_combo, self._method_combo, self._max_eval_spin, self._seed_spin):
+            ignore_wheel(control)
         self._seed_check.setChecked(defaults.use_seed)
         self._seed_spin.setEnabled(defaults.use_seed)
         self._ftol_edit = QtWidgets.QLineEdit(settings_group)
         self._xtol_edit = QtWidgets.QLineEdit(settings_group)
         self._ftol_edit.setObjectName("fit_objective_tolerance")
         self._xtol_edit.setObjectName("fit_parameter_tolerance")
-        self._ftol_label = QtWidgets.QLabel("Objective-improvement tolerance:", settings_group)
-        self._xtol_label = QtWidgets.QLabel("Parameter-step tolerance:", settings_group)
+        self._ftol_label = QtWidgets.QLabel(f"{FUNCTION_TOLERANCE_LABEL}:", settings_group)
+        self._xtol_label = QtWidgets.QLabel(f"{STEP_TOLERANCE_LABEL}:", settings_group)
         for label, edit in ((self._ftol_label, self._ftol_edit), (self._xtol_label, self._xtol_edit)):
             configure_compact_numeric_edit(edit, characters=8)
             label.setBuddy(edit)
@@ -812,13 +822,6 @@ class ParametersIcsTab(QtWidgets.QWidget):
         for edit in (self._ftol_edit, self._xtol_edit):
             edit.textChanged.connect(self._on_tolerance_text_changed)
             edit.editingFinished.connect(self._emit_defaults_edit)
-        self._scale_combo.currentIndexChanged.connect(self._emit_selected_parameter_edit)
-        self._scope_combo.currentIndexChanged.connect(self._on_scope_changed)
-        for edit in (self._starting_edit, self._minimum_edit, self._maximum_edit):
-            edit.textChanged.connect(self._on_parameter_numeric_text_changed)
-            edit.editingFinished.connect(self._emit_selected_parameter_edit)
-        self._dataset_values_group.setVisible(False)
-        self._selected_editor.setEnabled(False)
         self._project_defaults(defaults)
         return widget
 
@@ -827,31 +830,11 @@ class ParametersIcsTab(QtWidgets.QWidget):
         for method in SUPPORTED_FIT_METHODS:
             combo.addItem(FIT_METHOD_LABELS.get(method, method), method)
 
-    def _parameter_dataset_ids(
-        self,
-        snapshot: FitSetupSnapshot,
-        parameters: Sequence[FitParameterVariable],
-    ) -> tuple[str, ...]:
-        return tuple(
-            dict.fromkeys(
-                [item.dataset_id for item in snapshot.datasets]
-                + [
-                    dataset_id
-                    for parameter in parameters
-                    for dataset_id, _value in parameter.per_dataset_config.dataset_values
-                ]
-            )
-        )
-
     def _dataset_display_name(self, dataset_id: str) -> str:
         if self._origin is not None:
             for mapped in self._origin.mapped_datasets:
                 if mapped.dataset_id == dataset_id:
                     return str(mapped.display_name)
-        if self._projected_setup is not None:
-            for dataset in self._projected_setup.datasets:
-                if dataset.dataset_id == dataset_id:
-                    return str(dataset_id)
         return str(dataset_id)
 
     def _parameter_by_name(self, name: str) -> FitParameterVariable | None:
@@ -881,30 +864,25 @@ class ParametersIcsTab(QtWidgets.QWidget):
         return self._available_analysis_coordinates()
 
     def project_setup_snapshot(self, snapshot: FitSetupSnapshot) -> None:
+        previous = self._projected_setup
         self._origin = snapshot.origin
         self._projected_setup = snapshot
-        blocker = QtCore.QSignalBlocker(self._param_table)
+        if previous is not None:
+            # Any scope change discards that parameter's invalid text, whether it
+            # came from Across Datasets or from Configure Shared Fit.
+            scopes = {item.name: item.scope for item in previous.parameters}
+            for parameter in snapshot.parameters:
+                if scopes[parameter.name] != parameter.scope and self._retire_numeric_drafts({parameter.name}):
+                    self.statusMessage.emit(f"Invalid values for {parameter.display_name} discarded.")
         self._projecting = True
         try:
-            self._param_table.setRowCount(len(snapshot.parameters))
-            for row, parameter in enumerate(snapshot.parameters):
-                self._render_roster_row(row, parameter)
-            self._param_table.resizeRowsToContents()
-            self._param_table.updateGeometry()
+            self._render_roster()
             self._solver_combo.setCurrentText(snapshot.solver)
             self._project_defaults(snapshot.defaults)
             self._project_advanced_analysis(snapshot)
         finally:
             self._projecting = False
-            del blocker
-        if snapshot.parameters:
-            current = self._param_table.currentRow()
-            self._param_table.selectRow(
-                min(max(current, 0), len(snapshot.parameters) - 1)
-            )
-        else:
-            self._clear_selected_editor()
-        self._project_last_fit_columns()
+        self._refresh_parameter_error()
 
     def set_last_fit_reset_available(self, snapshot: FitSetupSnapshot | None) -> None:
         if snapshot is not None:
@@ -916,14 +894,13 @@ class ParametersIcsTab(QtWidgets.QWidget):
             initial=self._can_reset_initial,
             last_fit=snapshot is not None,
         )
-        self._project_last_fit_columns()
-        self._render_selected_parameter()
+        self._rerender_roster()
 
     def set_last_fit_presentation(self, overall_values: Mapping[str, float]) -> None:
         """Display retained centred settlements beside the Last Fit dataset values."""
 
         self._last_fit_overall_values = dict(overall_values)
-        self._project_last_fit_columns()
+        self._rerender_roster()
 
     def set_initial_reset_available(self, snapshot: FitSetupSnapshot) -> None:
         self.set_reset_availability(initial=True, last_fit=self._can_reset_last_fit)
@@ -934,8 +911,93 @@ class ParametersIcsTab(QtWidgets.QWidget):
         self._reset_initial_button.setEnabled(self._can_reset_initial)
         self._reset_last_button.setEnabled(self._can_reset_last_fit)
 
-    def _render_roster_row(self, row: int, parameter: FitParameterVariable) -> None:
+    def _rerender_roster(self) -> None:
+        if self._projected_setup is None:
+            return
+        self._projecting = True
+        try:
+            self._render_roster()
+        finally:
+            self._projecting = False
+
+    def _render_roster(self) -> None:
+        snapshot = self._projected_setup
+        dataset_ids = tuple(item.dataset_id for item in snapshot.datasets)
+        included = {item.dataset_id for item in snapshot.datasets if item.included}
+        rows: list[tuple[FitParameterVariable, str | None]] = []
+        for parameter in snapshot.parameters:
+            rows.append((parameter, None))
+            if parameter.scope != "shared":
+                rows.extend((parameter, dataset_id) for dataset_id in dataset_ids)
+        keys = tuple((parameter.name, dataset_id) for parameter, dataset_id in rows)
+        current = self._param_table.currentIndex()
+        current_key = (
+            self._row_keys[current.row()]
+            if current.isValid() and current.row() < len(self._row_keys) else None
+        )
+        blocker = QtCore.QSignalBlocker(self._param_table)
+        try:
+            if keys != self._row_keys:
+                # Only a structural change (scope, roster) replaces rows; ordinary
+                # edits update cells in place so an open editor stays valid.
+                self._param_table.setRowCount(0)
+                self._param_table.setRowCount(len(rows))
+                self._row_keys = keys
+            for row, (parameter, dataset_id) in enumerate(rows):
+                if dataset_id is None:
+                    self._render_parameter_row(row, parameter)
+                else:
+                    self._render_dataset_row(row, parameter, dataset_id, dataset_id in included)
+            self._resize_to_contents()
+            self._param_table.updateGeometry()
+        finally:
+            del blocker
+        if current_key in keys:
+            self._param_table.setCurrentCell(keys.index(current_key), current.column())
+        elif current_key is not None and (current_key[0], None) in keys:
+            self._param_table.setCurrentCell(keys.index((current_key[0], None)), current.column())
+
+    _CONTENT_COLUMNS = (_C.VARY, _C.LOG, _C.SCOPE, _C.UNIT)
+
+    def _resize_to_contents(self) -> None:
+        """Measure rows and content-sized columns once per render."""
+
+        self._param_table.resizeRowsToContents()
+        for column in self._CONTENT_COLUMNS:
+            self._param_table.resizeColumnToContents(column)
+        self._param_table.fit_name_column()
+
+    @staticmethod
+    def _readonly_item(text: str = "") -> QtWidgets.QTableWidgetItem:
+        item = QtWidgets.QTableWidgetItem(text)
+        item.setFlags(QtCore.Qt.ItemFlag.ItemIsEnabled | QtCore.Qt.ItemFlag.ItemIsSelectable)
+        return item
+
+    def _number_item(self, text: str, message: str | None) -> QtWidgets.QTableWidgetItem:
+        item = QtWidgets.QTableWidgetItem(text)
+        item.setTextAlignment(QtCore.Qt.AlignCenter)
+        item.setData(_COMPACT_ROLE, message is None)
+        item.setData(QtCore.Qt.AccessibleTextRole, text)
+        if message is not None:
+            item.setBackground(_INVALID_BG)
+            item.setForeground(_INVALID_FG)
+            item.setToolTip(message)
+        else:
+            item.setToolTip(text)
+        return item
+
+    def _unit_item(self, unit: str) -> QtWidgets.QTableWidgetItem:
+        item = self._readonly_item(unit)
+        item.setData(SCIENTIFIC_NAME_HTML_ROLE, format_unit_for_display(unit))
+        item.setData(QtCore.Qt.AccessibleTextRole, unit)
+        item.setToolTip(unit)
+        return item
+
+    def _render_parameter_row(self, row: int, parameter: FitParameterVariable) -> None:
         config = parameter.selected_config
+        draft = self._invalid_rows.get(parameter.name)
+        raw = dict(draft.raw_fields) if draft is not None else {}
+        messages = dict(draft.messages) if draft is not None else {}
         vary = QtWidgets.QTableWidgetItem()
         vary.setFlags(
             QtCore.Qt.ItemFlag.ItemIsEnabled
@@ -946,36 +1008,109 @@ class ParametersIcsTab(QtWidgets.QWidget):
             QtCore.Qt.CheckState.Checked if config.fit else QtCore.Qt.CheckState.Unchecked
         )
         vary.setData(QtCore.Qt.ItemDataRole.UserRole, parameter.name)
-        self._param_table.setItem(row, 0, vary)
-        name_item = QtWidgets.QTableWidgetItem(parameter.display_name)
+        self._param_table.setItem(row, _C.VARY, vary)
+        name_item = self._readonly_item(parameter.display_name)
         symbol = scientific_symbol_html(parameter.name, family=parameter.family, role=parameter.role)
         context = parameter.display_name.removeprefix(parameter.name)
         name_item.setData(SCIENTIFIC_NAME_HTML_ROLE,
                           symbol + (" " + html.escape(compact_text(context, max_chars=36).display) if context else ""))
         name_item.setData(QtCore.Qt.ItemDataRole.AccessibleTextRole,
                           scientific_symbol_spoken(parameter.name, family=parameter.family, role=parameter.role))
-        name_item.setFlags(QtCore.Qt.ItemFlag.ItemIsEnabled | QtCore.Qt.ItemFlag.ItemIsSelectable)
         name_item.setData(QtCore.Qt.ItemDataRole.UserRole, parameter.name)
         name_item.setToolTip(f"{parameter.display_name}\nParameter ID: {parameter.name}")
-        self._param_table.setItem(row, 1, name_item)
+        self._param_table.setItem(row, _C.NAME, name_item)
         origin_parameter = next(item for item in self._origin.parameter_defaults if item.name == parameter.name)
-        mechanism_value = origin_parameter.shared_config.value
-        mechanism = QtWidgets.QTableWidgetItem(f"{mechanism_value:.6g}")
-        mechanism.setFlags(QtCore.Qt.ItemIsEnabled | QtCore.Qt.ItemIsSelectable)
-        mechanism.setData(QtCore.Qt.AccessibleTextRole, _format_number(mechanism_value))
-        mechanism.setToolTip(_format_number(mechanism_value))
-        mechanism.setTextAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
-        self._param_table.setItem(row, 2, mechanism)
-        last = QtWidgets.QTableWidgetItem(self._last_fit_summary(parameter.name))
-        last.setFlags(QtCore.Qt.ItemFlag.ItemIsEnabled | QtCore.Qt.ItemFlag.ItemIsSelectable)
-        last.setTextAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
-        self._param_table.setItem(row, 3, last)
-        unit_item = QtWidgets.QTableWidgetItem(parameter.unit)
-        unit_item.setData(SCIENTIFIC_NAME_HTML_ROLE, format_unit_for_display(parameter.unit))
-        unit_item.setData(QtCore.Qt.AccessibleTextRole, parameter.unit)
-        unit_item.setToolTip(parameter.unit)
-        unit_item.setFlags(QtCore.Qt.ItemFlag.ItemIsEnabled | QtCore.Qt.ItemFlag.ItemIsSelectable)
-        self._param_table.setItem(row, 4, unit_item)
+        mechanism = self._readonly_item(_format_number(origin_parameter.shared_config.value))
+        mechanism.setTextAlignment(QtCore.Qt.AlignCenter)
+        mechanism.setData(_COMPACT_ROLE, True)
+        mechanism.setToolTip(
+            "The value currently in the mechanism tab: "
+            f"{_format_number(origin_parameter.shared_config.value)}"
+        )
+        self._param_table.setItem(row, _C.MECH, mechanism)
+        if parameter.scope == "shared":
+            start = self._number_item(raw.get("starting", _format_number(config.value)), messages.get("starting"))
+        else:
+            start = self._readonly_item("By dataset")
+            start.setTextAlignment(QtCore.Qt.AlignCenter)
+            start.setForeground(self.palette().color(QtGui.QPalette.PlaceholderText))
+            start.setToolTip("Edit each dataset's initial guess in the rows below.")
+        self._param_table.setItem(row, _C.START, start)
+        self._param_table.setItem(row, _C.MIN, self._number_item(raw.get("minimum", _format_number(config.minimum)), messages.get("minimum")))
+        self._param_table.setItem(row, _C.MAX, self._number_item(raw.get("maximum", _format_number(config.maximum)), messages.get("maximum")))
+        log_item = QtWidgets.QTableWidgetItem()
+        log_item.setFlags(
+            QtCore.Qt.ItemFlag.ItemIsEnabled
+            | QtCore.Qt.ItemFlag.ItemIsSelectable
+            | QtCore.Qt.ItemFlag.ItemIsUserCheckable
+        )
+        log10 = raw.get("log10", "1" if config.log10 else "") == "1"
+        log_item.setCheckState(QtCore.Qt.Checked if log10 else QtCore.Qt.Unchecked)
+        log_item.setToolTip("Fit this parameter on a logarithmic scale (requires positive bounds).")
+        if "log10" in messages:
+            log_item.setBackground(_INVALID_BG)
+            log_item.setToolTip(messages["log10"])
+        self._param_table.setItem(row, _C.LOG, log_item)
+        self._param_table.setItem(row, _C.SCOPE, self._readonly_item())
+        combo = self._param_table.cellWidget(row, _C.SCOPE)
+        if not isinstance(combo, QtWidgets.QComboBox):
+            combo = QtWidgets.QComboBox(self._param_table)
+            ignore_wheel(combo)
+            combo.setObjectName("fit_parameter_scope")
+            combo.setAccessibleName(f"Across Datasets for {parameter.name}")
+            for scope, (label, tooltip) in self._SCOPE_CHOICES.items():
+                combo.addItem(label, scope)
+                combo.setItemData(combo.count() - 1, tooltip, QtCore.Qt.ToolTipRole)
+            combo.currentIndexChanged.connect(
+                lambda _index, name=parameter.name, box=combo: self._on_scope_changed(name, box)
+            )
+            self._param_table.setCellWidget(row, _C.SCOPE, combo)
+        with QtCore.QSignalBlocker(combo):
+            combo.setCurrentIndex(combo.findData(parameter.scope))
+        combo.setToolTip(self._SCOPE_CHOICES[parameter.scope][1])
+        last = self._readonly_item(self._last_fit_summary(parameter.name))
+        last.setTextAlignment(QtCore.Qt.AlignCenter)
+        complete = self._last_fit_summary(parameter.name, full_precision=True)
+        last.setData(QtCore.Qt.AccessibleTextRole, complete)
+        last.setToolTip(complete)
+        self._param_table.setItem(row, _C.LAST, last)
+        self._param_table.setItem(row, _C.UNIT, self._unit_item(parameter.unit))
+
+    def _render_dataset_row(
+        self, row: int, parameter: FitParameterVariable, dataset_id: str, included: bool,
+    ) -> None:
+        for column in range(_C.COUNT):
+            self._param_table.setItem(row, column, self._readonly_item())
+        name = self._dataset_display_name(dataset_id)
+        name_item = self._readonly_item("    " + name)
+        name_item.setData(QtCore.Qt.ItemDataRole.UserRole, parameter.name)
+        name_item.setData(_DATASET_ROLE, dataset_id)
+        name_item.setToolTip(
+            f"{parameter.display_name} — {name}\nDataset ID: {dataset_id}"
+            + ("" if included else "\nNot included in this Fit")
+        )
+        if not included:
+            name_item.setForeground(self.palette().color(QtGui.QPalette.PlaceholderText))
+        self._param_table.setItem(row, _C.NAME, name_item)
+        draft = self._invalid_rows.get(parameter.name)
+        raw = dict(draft.raw_fields) if draft is not None else {}
+        values = dict(parameter.per_dataset_config.dataset_values)
+        text = raw.get(f"dataset:{dataset_id}", _format_number(values[dataset_id]))
+        start = self._number_item(text, dict(draft.messages).get(f"dataset:{dataset_id}") if draft is not None else None)
+        start.setData(QtCore.Qt.ItemDataRole.UserRole, parameter.name)
+        start.setData(_DATASET_ROLE, dataset_id)
+        self._param_table.setItem(row, _C.START, start)
+        last = self._last_fit_parameters.get(parameter.name)
+        last_values = dict(last.selected_config.dataset_values) if last is not None and last.scope != "shared" else {}
+        last_item = self._readonly_item(
+            f"{last_values[dataset_id]:.6g}" if dataset_id in last_values else "—"
+        )
+        last_item.setTextAlignment(QtCore.Qt.AlignCenter)
+        if dataset_id in last_values:
+            last_item.setToolTip(_format_number(last_values[dataset_id]))
+            last_item.setData(QtCore.Qt.AccessibleTextRole, _format_number(last_values[dataset_id]))
+        self._param_table.setItem(row, _C.LAST, last_item)
+        self._param_table.setItem(row, _C.UNIT, self._unit_item(parameter.unit))
 
     def _last_fit_summary(self, name: str, *, full_precision: bool = False) -> str:
         last = self._last_fit_parameters.get(name)
@@ -983,311 +1118,78 @@ class ParametersIcsTab(QtWidgets.QWidget):
             return "—"
         if last.scope == "shared":
             value = last.selected_config.value
-            text = _format_number(value) if full_precision else f"{value:.6g}"
-            return f"{text} (Shared)"
+            return _format_number(value) if full_precision else f"{value:.6g}"
         if name in self._last_fit_overall_values and last.scope == "centred_fixed_effects":
             value = self._last_fit_overall_values[name]
             text = _format_number(value) if full_precision else f"{value:.6g}"
             return f"{text} (Overall)"
-        return (
-            CENTRED_FIXED_EFFECTS_SCOPE_LABEL
-            if last.scope == "centred_fixed_effects"
-            else "Per dataset"
-        )
+        return "By dataset"
 
-    def _project_last_fit_columns(self) -> None:
-        blocker = QtCore.QSignalBlocker(self._param_table)
-        try:
-            for row in range(self._param_table.rowCount()):
-                item = self._param_table.item(row, 1)
-                last = self._param_table.item(row, 3)
-                if item is not None and last is not None:
-                    name = str(item.data(QtCore.Qt.ItemDataRole.UserRole) or "")
-                    last.setText(self._last_fit_summary(name))
-                    complete = self._last_fit_summary(name, full_precision=True)
-                    last.setData(QtCore.Qt.AccessibleTextRole, complete)
-                    last.setToolTip(complete)
-        finally:
-            del blocker
-        self._render_selected_parameter()
+    def _parameter_rows(self, name: str) -> tuple[int, list[tuple[int, str]]]:
+        parent = -1
+        datasets: list[tuple[int, str]] = []
+        for row in range(self._param_table.rowCount()):
+            item = self._param_table.item(row, _C.NAME)
+            if item is None or item.data(QtCore.Qt.ItemDataRole.UserRole) != name:
+                continue
+            dataset_id = item.data(_DATASET_ROLE)
+            if dataset_id is None:
+                parent = row
+            else:
+                datasets.append((row, str(dataset_id)))
+        return parent, datasets
 
     def _on_roster_item_changed(self, item: QtWidgets.QTableWidgetItem) -> None:
-        if self._projecting or item.column() != 0:
+        if self._projecting:
             return
-        name = str(item.data(QtCore.Qt.ItemDataRole.UserRole) or "")
-        if name:
-            self._emit_vary_edit(
-                name,
-                item.checkState() == QtCore.Qt.CheckState.Checked,
-            )
-
-    def _on_parameter_selection_changed(self) -> None:
-        if not self._projecting:
-            self._render_selected_parameter()
+        name_item = self._param_table.item(item.row(), _C.NAME)
+        name = str(name_item.data(QtCore.Qt.ItemDataRole.UserRole))
+        if item.column() == _C.VARY and name_item.data(_DATASET_ROLE) is None:
+            self._emit_vary_edit(name, item.checkState() == QtCore.Qt.CheckState.Checked)
+        elif item.column() in (_C.START, _C.MIN, _C.MAX, _C.LOG):
+            self._emit_parameter_row_edit(name)
 
     def _selected_parameter(self) -> FitParameterVariable | None:
         row = self._param_table.currentRow()
-        item = self._param_table.item(row, 1) if row >= 0 else None
+        item = self._param_table.item(row, _C.NAME) if row >= 0 else None
         name = str(item.data(QtCore.Qt.ItemDataRole.UserRole) or "") if item is not None else ""
         return self._parameter_by_name(name) if name else None
 
-    def _clear_selected_editor(self) -> None:
-        self._selected_editor.setEnabled(False)
-        self._dataset_values_group.setVisible(False)
-        self._last_result_label.setText("—")
-        self._last_result_caption.setText("Last result:")
-        self._last_result_label.setAccessibleName("No last result")
-        self._last_result_label.setToolTip("")
-        self._refresh_parameter_error()
-
-    def _render_selected_parameter(self) -> None:  # noqa: C901
-        parameter = self._selected_parameter()
-        if parameter is None:
-            self._clear_selected_editor()
-            return
-        self._selected_editor.setEnabled(True)
-        display_unit = format_unit_for_display(parameter.unit)
-        unit_caption = f" ({display_unit})" if parameter.unit != "1" else ""
-        self._starting_caption.setText("Starting value" + unit_caption + ":")
-        self._minimum_caption.setText("Finite minimum" + unit_caption + ":")
-        self._maximum_caption.setText("Finite maximum" + unit_caption + ":")
-        for caption, label in (
-            (self._starting_caption, "Starting value"),
-            (self._minimum_caption, "Finite minimum"),
-            (self._maximum_caption, "Finite maximum"),
-        ):
-            caption.setAccessibleName(f"{label} {parameter.unit}")
-        config = parameter.selected_config
-        draft = self._invalid_numeric_drafts.get(("parameter", parameter.name))
-        raw_fields = dict(draft.raw_fields) if draft is not None else {}
-        blockers = [
-            QtCore.QSignalBlocker(control)
-            for control in (
-                self._starting_edit,
-                self._minimum_edit,
-                self._maximum_edit,
-                self._scale_combo,
-                self._scope_combo,
-                self._dataset_values_table,
-            )
-        ]
-        try:
-            self._project_scope_choices(parameter)
-            self._minimum_edit.setText(_format_number(config.minimum))
-            self._maximum_edit.setText(_format_number(config.maximum))
-            self._scale_combo.setCurrentIndex(self._scale_combo.findData(config.log10))
-            self._scope_combo.setCurrentIndex(self._scope_combo.findData(parameter.scope))
-            if parameter.scope == "shared":
-                self._starting_edit.setReadOnly(False)
-                configure_compact_numeric_edit(self._starting_edit, characters=20)
-                self._starting_edit.setText(_format_number(config.value))
-            else:
-                self._starting_edit.setReadOnly(True)
-                configure_compact_numeric_edit(self._starting_edit, characters=None)
-                self._starting_edit.setText("Values by dataset")
-            controls = {
-                "starting": self._starting_edit,
-                "minimum": self._minimum_edit,
-                "maximum": self._maximum_edit,
-            }
-            for field, edit in controls.items():
-                edit.setStyleSheet("")
-                edit.setToolTip("")
-                if field not in raw_fields:
-                    continue
-                if field == "starting" and parameter.scope != "shared":
-                    continue
-                edit.setText(raw_fields[field])
-                edit.setStyleSheet(
-                    "background: rgb(255, 200, 200); color: rgb(80, 0, 0);"
-                )
-                edit.setToolTip(draft.message)
-            self._render_dataset_values(parameter)
-            last = self._last_fit_parameters.get(parameter.name)
-            overall = self._last_fit_overall_values.get(parameter.name)
-            is_overall = last is not None and last.scope == "centred_fixed_effects" and overall is not None
-            self._last_result_caption.setText("Overall fitted value:" if is_overall else "Last result:")
-            self._last_result_label.setToolTip("")
-            if last is None:
-                self._last_result_label.setText("—")
-            elif is_overall:
-                self._last_result_label.setText(f"{overall:.6g}")
-                self._last_result_label.setToolTip(_format_number(overall))
-            elif last.scope == "shared":
-                self._last_result_label.setText(f"{last.selected_config.value:.6g} (Shared)")
-                self._last_result_label.setToolTip(_format_number(last.selected_config.value))
-            else:
-                self._last_result_label.setText(
-                    CENTRED_FIXED_EFFECTS_SCOPE_LABEL
-                    if last.scope == "centred_fixed_effects"
-                    else "Per dataset"
-                )
-            self._last_result_label.setAccessibleName(
-                self._last_result_caption.text() + " "
-                + (self._last_result_label.toolTip() or self._last_result_label.text())
-            )
-        finally:
-            del blockers
-        self._refresh_parameter_error()
-
-    def _render_dataset_values(self, parameter: FitParameterVariable) -> None:
-        visible = parameter.scope in {"per_dataset", "centred_fixed_effects"}
-        self._dataset_values_group.setVisible(visible)
-        if not visible:
-            self._dataset_values_table.setRowCount(0)
-            self._size_dataset_values_table(self._dataset_values_table)
-            return
-        snapshot = self._projected_setup
-        dataset_ids = (
-            self._parameter_dataset_ids(snapshot, (parameter,))
-            if snapshot is not None
-            else tuple(dataset_id for dataset_id, _value in parameter.per_dataset_config.dataset_values)
-        )
-        values = dict(parameter.per_dataset_config.dataset_values)
-        last = self._last_fit_parameters.get(parameter.name)
-        last_values = dict(last.selected_config.dataset_values) if last is not None and last.scope != "shared" else {}
-        blocker = QtCore.QSignalBlocker(self._dataset_values_table)
-        self._dataset_values_table.setRowCount(len(dataset_ids))
-        for row, dataset_id in enumerate(dataset_ids):
-            dataset_item = QtWidgets.QTableWidgetItem(self._dataset_display_name(dataset_id))
-            dataset_item.setFlags(QtCore.Qt.ItemFlag.ItemIsEnabled | QtCore.Qt.ItemFlag.ItemIsSelectable)
-            dataset_item.setData(QtCore.Qt.ItemDataRole.UserRole, dataset_id)
-            dataset_item.setToolTip(f"{self._dataset_display_name(dataset_id)}\nDataset ID: {dataset_id}")
-            self._dataset_values_table.setItem(row, 0, dataset_item)
-            value_item = QtWidgets.QTableWidgetItem(
-                _format_number(values[dataset_id]) if dataset_id in values else ""
-            )
-            value_item.setData(QtCore.Qt.ItemDataRole.UserRole, dataset_id)
-            value_item.setTextAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
-            key = ("parameter_dataset", parameter.name, dataset_id, "initial")
-            draft = self._invalid_numeric_drafts.get(key)
-            if draft is not None:
-                value_item.setText(dict(draft.raw_fields)["initial"])
-                value_item.setBackground(QtGui.QColor(255, 200, 200))
-                value_item.setForeground(QtGui.QColor(80, 0, 0))
-                value_item.setToolTip(draft.message)
-            self._dataset_values_table.setItem(row, 1, value_item)
-            last_item = QtWidgets.QTableWidgetItem(
-                _format_number(last_values[dataset_id]) if dataset_id in last_values else "—"
-            )
-            last_item.setFlags(QtCore.Qt.ItemFlag.ItemIsEnabled | QtCore.Qt.ItemIsSelectable)
-            last_item.setTextAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
-            last_item.setToolTip(f"Dataset ID: {dataset_id}")
-            self._dataset_values_table.setItem(row, 2, last_item)
-            unit_item = QtWidgets.QTableWidgetItem(parameter.unit)
-            unit_item.setData(SCIENTIFIC_NAME_HTML_ROLE, format_unit_for_display(parameter.unit))
-            unit_item.setData(QtCore.Qt.AccessibleTextRole, parameter.unit)
-            unit_item.setToolTip(parameter.unit)
-            unit_item.setFlags(QtCore.Qt.ItemFlag.ItemIsEnabled | QtCore.Qt.ItemFlag.ItemIsSelectable)
-            self._dataset_values_table.setItem(row, 3, unit_item)
-        del blocker
-        self._size_dataset_values_table(self._dataset_values_table)
-
-    def _project_scope_choices(self, parameter: FitParameterVariable) -> None:
-        """Offer only scopes supported by the accepted parameter authority."""
-
-        allowed = tuple(self._SCOPE_LABELS)
-        current = tuple(
-            str(self._scope_combo.itemData(index) or "")
-            for index in range(self._scope_combo.count())
-        )
-        if current == allowed:
-            return
-        self._scope_combo.clear()
-        for scope in allowed:
-            self._scope_combo.addItem(self._SCOPE_LABELS[scope], scope)
-
-    def _on_dataset_value_changed(self, item: QtWidgets.QTableWidgetItem) -> None:
-        if self._projecting or item.column() != 1:
-            return
-        parameter = self._selected_parameter()
-        if parameter is None:
-            return
-        dataset_id = str(item.data(QtCore.Qt.ItemDataRole.UserRole) or "")
-        key = ("parameter_dataset", parameter.name, dataset_id, "initial")
-        try:
-            parsed = self._parse_number(
-                item.text(), f"{parameter.name} value for dataset {dataset_id}"
-            )
-            admit_gui_parameter_value(
-                parsed,
-                scientific_category=parameter.scientific_category,
-                role=parameter.role,
-                unit=parameter.unit,
-                allow_exact_zero=parameter.allow_exact_zero,
-                field=f"{parameter.name} value for dataset {dataset_id}",
-            )
-            if key in self._invalid_numeric_drafts:
-                self._store_invalid_numeric_draft(
-                    key,
-                    {"initial": item.text()},
-                    "Apply the corrected parameter values or revert this draft.",
-                )
-                item.setBackground(QtGui.QColor(255, 200, 200))
-                item.setForeground(QtGui.QColor(80, 0, 0))
-                item.setToolTip(
-                    "Apply the corrected parameter values or revert this draft."
-                )
-            self._emit_selected_parameter_edit()
-        except (TypeError, ValueError, OverflowError) as exc:
-            self._store_invalid_numeric_draft(
-                key,
-                {"initial": item.text()},
-                str(exc),
-            )
-            item.setBackground(QtGui.QColor(255, 200, 200))
-            item.setForeground(QtGui.QColor(80, 0, 0))
-            item.setToolTip(str(exc))
-            self.statusMessage.emit(str(exc))
-
-    def _on_parameter_numeric_text_changed(self, _raw_text: str) -> None:
-        if self._projecting or self._projected_setup is None:
-            return
-        parameter = self._selected_parameter()
-        if parameter is None:
-            return
-        try:
-            self._parameter_projection_for_change(parameter)
-        except (TypeError, ValueError, OverflowError) as exc:
-            self._store_parameter_editor_draft(parameter, str(exc))
-            return
-        if ("parameter", parameter.name) in self._invalid_numeric_drafts:
-            self._store_parameter_editor_draft(
-                parameter,
-                "Apply the corrected parameter values or revert this draft.",
-            )
-
-    def _store_parameter_editor_draft(
-        self,
-        parameter: FitParameterVariable,
-        message: str,
-    ) -> None:
-        fields = {
-            "minimum": self._minimum_edit,
-            "maximum": self._maximum_edit,
+    def _row_raw_fields(self, parameter: FitParameterVariable) -> dict[str, str]:
+        parent, datasets = self._parameter_rows(parameter.name)
+        table = self._param_table
+        raw = {
+            "minimum": table.item(parent, _C.MIN).text(),
+            "maximum": table.item(parent, _C.MAX).text(),
+            "log10": "1" if table.item(parent, _C.LOG).checkState() == QtCore.Qt.Checked else "",
         }
         if parameter.scope == "shared":
-            fields = {"starting": self._starting_edit, **fields}
-        self._store_invalid_numeric_draft(
-            ("parameter", parameter.name),
-            {field: edit.text() for field, edit in fields.items()},
-            message,
-        )
-        for edit in fields.values():
-            edit.setStyleSheet(
-                "background: rgb(255, 200, 200); color: rgb(80, 0, 0);"
-            )
-            edit.setToolTip(str(message))
+            raw["starting"] = table.item(parent, _C.START).text()
+        for row, dataset_id in datasets:
+            raw[f"dataset:{dataset_id}"] = table.item(row, _C.START).text()
+        return raw
+
+    def _invalid_cells(self) -> list[tuple[str, str, str]]:
+        """Each invalid cell as (parameter name, field, message) in table order."""
+
+        cells = []
+        for parameter in self._projected_setup.parameters if self._projected_setup else ():
+            draft = self._invalid_rows.get(parameter.name)
+            if draft is None:
+                continue
+            messages = dict(draft.messages)
+            fields = [field for field in _FIELD_COLUMNS if field in messages]
+            fields += [field for field, _raw in draft.raw_fields if field.startswith("dataset:") and field in messages]
+            cells += [(parameter.name, field, messages[field]) for field in fields]
+        return cells
 
     def _refresh_parameter_error(self) -> None:
-        parameter = self._selected_parameter()
         messages = tuple(dict.fromkeys(
-            draft.message for key, draft in self._invalid_numeric_drafts.items()
-            if parameter is not None and key[1] == parameter.name
+            f"{name}: {message}" for name, _field, message in self._invalid_cells()
         ))
         self._parameter_error.setText(
             "\n".join(messages)
-            + "\nPress Esc to discard these invalid edits and restore the last accepted values."
+            + "\nSelect a cell of that parameter and press Esc to discard its invalid edits."
             if messages else ""
         )
         self._parameter_error.setVisible(bool(messages))
@@ -1299,55 +1201,79 @@ class ParametersIcsTab(QtWidgets.QWidget):
             return
         if not self._retire_numeric_drafts({parameter.name}):
             return
-        self._render_selected_parameter()
+        self._rerender_roster()
         self.statusMessage.emit(
             f"Invalid values for {parameter.display_name} reverted."
         )
 
-    def _parameter_projection_for_change(self, parameter: FitParameterVariable) -> FitParameterVariable:
-        if self._projected_setup is None:
-            raise ValueError("Fit setup is unavailable.")
-        scope = str(self._scope_combo.currentData() or parameter.scope)
-        log10 = bool(self._scale_combo.currentData())
-        minimum = self._parse_number(self._minimum_edit.text(), f"{parameter.name} minimum")
-        maximum = self._parse_number(self._maximum_edit.text(), f"{parameter.name} maximum")
-        config = parameter.shared_config if scope == "shared" else parameter.per_dataset_config
-        if scope == "shared":
-            value = self._parse_number(self._starting_edit.text(), f"{parameter.name} starting value")
-            dataset_values = config.dataset_values
-        else:
-            value = config.value
-            dataset_values_list: list[tuple[str, float]] = []
-            for row in range(self._dataset_values_table.rowCount()):
-                dataset_item = self._dataset_values_table.item(row, 0)
-                value_item = self._dataset_values_table.item(row, 1)
-                dataset_id = str(dataset_item.data(QtCore.Qt.ItemDataRole.UserRole) or "") if dataset_item else ""
-                raw = value_item.text() if value_item is not None else ""
-                if not dataset_id or not raw.strip():
-                    raise ValueError(f"{parameter.name} requires a starting value for every dataset.")
-                dataset_value = self._parse_number(raw, f"{parameter.name} value for dataset {dataset_id}")
-                dataset_values_list.append((dataset_id, dataset_value))
-            dataset_values = tuple(dataset_values_list)
-        active = FitParameterConfiguration(
-            value=value,
-            minimum=minimum,
-            maximum=maximum,
-            fit=parameter.selected_config.fit,
-            log10=log10,
-            dataset_values=dataset_values,
-        )
-        return FitParameterVariable(
-            name=parameter.name,
-            display_name=parameter.display_name,
-            scope=scope,
-            shared_config=active if scope == "shared" else parameter.shared_config,
-            per_dataset_config=active if scope != "shared" else parameter.per_dataset_config,
-            family=parameter.family,
-            role=parameter.role,
-            scientific_category=parameter.scientific_category,
-            allow_exact_zero=parameter.allow_exact_zero,
-            unit=parameter.unit,
-        )
+    def _parameter_projection_for_change(
+        self, parameter: FitParameterVariable, raw: Mapping[str, str],
+    ) -> tuple[FitParameterVariable | None, dict[str, str]]:
+        """Build one complete parameter from the row texts, or name each offending cell."""
+
+        config = parameter.selected_config
+        parsed: dict[str, float] = {}
+        messages: dict[str, str] = {}
+        for field, text in raw.items():
+            if field == "log10":
+                continue
+            label = (
+                f"{self._dataset_display_name(field.removeprefix('dataset:'))} {_field_label(field)}"
+                if field.startswith("dataset:") else _field_label(field)
+            )
+            try:
+                parsed[field] = self._parse_number(text, label)
+            except ValueError as exc:
+                messages[field] = str(exc)
+        if messages:
+            return None, messages
+        log10 = raw["log10"] == "1"
+
+        def build(values: Mapping[str, float], log_scale: bool) -> FitParameterVariable:
+            active = replace(
+                config,
+                value=values.get("starting", config.value),
+                minimum=values["minimum"],
+                maximum=values["maximum"],
+                log10=log_scale,
+                dataset_values=config.dataset_values if parameter.scope == "shared" else tuple(
+                    (field.removeprefix("dataset:"), value)
+                    for field, value in values.items() if field.startswith("dataset:")
+                ),
+            )
+            return replace(
+                parameter,
+                **{"shared_config" if parameter.scope == "shared" else "per_dataset_config": active},
+            )
+
+        def cell_message(exc: Exception) -> str:
+            text = fit_identity_text(str(exc), self._origin).removeprefix(f"{parameter.name} ")
+            return text[:1].upper() + text[1:]
+
+        try:
+            return build(parsed, log10), {}
+        except (TypeError, ValueError, OverflowError) as exc:
+            combined = exc
+        # The accepted row was admissible, so each changed cell is rechecked
+        # alone on it; only cells that fail by themselves are blamed, and a
+        # purely combined failure marks every changed cell.
+        accepted = {
+            "starting": config.value, "minimum": config.minimum, "maximum": config.maximum,
+            **{f"dataset:{key}": value for key, value in config.dataset_values},
+        }
+        changed = [field for field, value in parsed.items() if value != accepted[field]]
+        if log10 != config.log10:
+            changed.append("log10")
+        alone: dict[str, str] = {}
+        for field in changed:
+            trial = {key: accepted[key] for key in parsed}
+            if field != "log10":
+                trial[field] = parsed[field]
+            try:
+                build(trial, log10 if field == "log10" else config.log10)
+            except (TypeError, ValueError, OverflowError) as exc:
+                alone[field] = cell_message(exc)
+        return None, alone or dict.fromkeys(changed or parsed, cell_message(combined))
 
     def _uncertainty_effects_for_parameter(
         self,
@@ -1421,7 +1347,7 @@ class ParametersIcsTab(QtWidgets.QWidget):
             return
         blocker = QtCore.QSignalBlocker(self._param_table)
         for row in range(self._param_table.rowCount()):
-            item = self._param_table.item(row, 0)
+            item = self._param_table.item(row, _C.VARY)
             if item is not None and str(item.data(QtCore.Qt.ItemDataRole.UserRole) or "") == parameter_name:
                 item.setCheckState(
                     QtCore.Qt.CheckState.Checked
@@ -1465,17 +1391,17 @@ class ParametersIcsTab(QtWidgets.QWidget):
         )
         return True
 
-    def _emit_selected_parameter_edit(self, *_args: object, name: str | None = None) -> bool:
+    def _emit_parameter_row_edit(self, name: str) -> bool:
         if self._projecting or self._running or self._projected_setup is None:
             return False
-        parameter = self._parameter_by_name(name or (self._selected_parameter().name if self._selected_parameter() else ""))
+        parameter = self._parameter_by_name(name)
         if parameter is None:
             return False
-        try:
-            edited = self._parameter_projection_for_change(parameter)
-        except (TypeError, ValueError, OverflowError) as exc:
-            self.statusMessage.emit(f"Fit parameter edit is invalid: {exc}")
-            self._store_parameter_editor_draft(parameter, str(exc))
+        raw = self._row_raw_fields(parameter)
+        edited, messages = self._parameter_projection_for_change(parameter, raw)
+        if edited is None:
+            self._store_invalid_numeric_draft(parameter.name, raw, messages)
+            self._rerender_roster()
             return False
         updated = replace(
             self._projected_setup,
@@ -1485,37 +1411,66 @@ class ParametersIcsTab(QtWidgets.QWidget):
             ),
         )
         self._retire_numeric_drafts({parameter.name})
+        if updated == self._projected_setup:
+            self._rerender_roster()
+            return False
         self.setupSnapshotRequested.emit(updated)
         return True
 
-    def _on_scope_changed(self, _index: int) -> None:
-        if self._projecting or self._projected_setup is None:
+    def _open_bounds_dialog(self) -> None:
+        if self._projecting or self._running or self._projected_setup is None:
             return
-        parameter = self._selected_parameter()
+        setup = self._projected_setup
+        dialog = _ParameterBoundsDialog(setup.parameters, parent=self)
+        if dialog.exec() != QtWidgets.QDialog.DialogCode.Accepted:
+            return
+        names, minimum, maximum, log10 = dialog.selection()
+        edited: dict[str, FitParameterVariable] = {}
+        for parameter in setup.parameters:
+            if parameter.name not in names:
+                continue
+            raw = {
+                **self._row_raw_fields(parameter),
+                "minimum": minimum,
+                "maximum": maximum,
+                "log10": "1" if log10 else "",
+            }
+            replacement, messages = self._parameter_projection_for_change(parameter, raw)
+            if replacement is None:
+                self._store_invalid_numeric_draft(parameter.name, raw, messages)
+            else:
+                edited[parameter.name] = replacement
+                self._retire_numeric_drafts({parameter.name})
+        updated = replace(
+            setup,
+            parameters=tuple(edited.get(item.name, item) for item in setup.parameters),
+        )
+        if updated == setup:
+            self._rerender_roster()
+            return
+        self.setupSnapshotRequested.emit(updated)
+
+    def _on_scope_changed(self, name: str, combo: QtWidgets.QComboBox) -> None:
+        if self._projecting or self._running or self._projected_setup is None:
+            return
+        parameter = self._parameter_by_name(name)
         if parameter is None:
             return
-        desired = str(self._scope_combo.currentData() or "")
+        desired = str(combo.currentData() or "")
         if desired == parameter.scope:
-            return
-        if desired not in {"shared", "per_dataset", "centred_fixed_effects"}:
-            self._restore_scope(parameter.scope)
             return
         replacement = convert_fit_parameter_scope(
             parameter, desired, self._projected_setup.datasets
         )
         profile = prune_fit_analysis_coordinates(
-            self._projected_setup.profile_likelihood,
-            (parameter.name,),
+            self._projected_setup.profile_likelihood, (parameter.name,),
         )
         bootstrap = prune_fit_analysis_coordinates(
-            self._projected_setup.residual_bootstrap,
-            (parameter.name,),
+            self._projected_setup.residual_bootstrap, (parameter.name,),
         )
-        # The combo is an immediate projection of the accepted snapshot.  Put
-        # it back before publishing the candidate snapshot so a rejected
-        # admission cannot leave the control ahead of accepted state.  The
-        # owner's synchronous projection restores the accepted new scope.
-        self._restore_scope(parameter.scope)
+        # Restore the projection first; the owner's accepted snapshot reprojects.
+        with QtCore.QSignalBlocker(combo):
+            combo.setCurrentIndex(combo.findData(parameter.scope))
         self.setupSnapshotRequested.emit(
             replace(
                 self._projected_setup,
@@ -1528,27 +1483,32 @@ class ParametersIcsTab(QtWidgets.QWidget):
             )
         )
 
-    def _restore_scope(self, scope: str) -> None:
-        blocker = QtCore.QSignalBlocker(self._scope_combo)
-        self._scope_combo.setCurrentIndex(self._scope_combo.findData(scope))
-        del blocker
-
     @property
-    def has_invalid_edits(self) -> bool:
-        return bool(self._invalid_numeric_drafts or self._defaults_error_text)
+    def invalid_edit_locations(self) -> tuple[str, ...]:
+        """Name each invalid cell by parameter, dataset and column, in table order."""
+
+        located = [
+            f"{self._dataset_display_name(field.removeprefix('dataset:'))}: {name} {_field_label(field)}"
+            if field.startswith("dataset:")
+            else f"{name} {_field_label(field)}"
+            for name, field, _message in self._invalid_cells()
+        ]
+        if self._defaults_error_text:
+            # Only the tolerance pair rule fails without one box failing alone.
+            located += [
+                f"Fit settings: {label}" for label in self._invalid_tolerance_labels()
+            ] or ["Fit settings: tolerances"]
+        return tuple(located)
 
     def _store_invalid_numeric_draft(
         self,
-        key: tuple[str, ...],
+        name: str,
         raw_fields: Mapping[str, str],
-        message: str,
+        messages: Mapping[str, str],
     ) -> None:
-        draft = _InvalidNumericDraft(
-            tuple((str(field), str(raw)) for field, raw in raw_fields.items()),
-            str(message),
-        )
-        if self._invalid_numeric_drafts.get(key) != draft:
-            self._invalid_numeric_drafts[key] = draft
+        draft = _InvalidRow(tuple(raw_fields.items()), tuple(messages.items()))
+        if self._invalid_rows.get(name) != draft:
+            self._invalid_rows[name] = draft
             self._refresh_parameter_error()
             self.validityChanged.emit()
 
@@ -1557,13 +1517,11 @@ class ParametersIcsTab(QtWidgets.QWidget):
         parameter_names: set[str] | None = None,
     ) -> bool:
         keys = tuple(
-            key
-            for key in self._invalid_numeric_drafts
-            if parameter_names is None
-            or (len(key) > 1 and key[1] in parameter_names)
+            name for name in self._invalid_rows
+            if parameter_names is None or name in parameter_names
         )
         for key in keys:
-            self._invalid_numeric_drafts.pop(key)
+            self._invalid_rows.pop(key)
         if keys:
             self._refresh_parameter_error()
             self.validityChanged.emit()
@@ -1593,7 +1551,7 @@ class ParametersIcsTab(QtWidgets.QWidget):
         self._ftol_edit.setText(self._tolerance_drafts.get("ftol", _format_scientific(defaults.ftol)))
         self._xtol_edit.setText(self._tolerance_drafts.get("xtol", _format_scientific(defaults.xtol)))
         is_de = defaults.method == DIFFERENTIAL_EVOLUTION_METHOD
-        self._ftol_label.setText("Population convergence tolerance:" if is_de else "Objective-improvement tolerance:")
+        self._ftol_label.setText(f"{DE_CONVERGENCE_TOLERANCE_LABEL if is_de else FUNCTION_TOLERANCE_LABEL}:")
         self._xtol_label.setVisible(not is_de)
         self._xtol_edit.setVisible(not is_de)
         self._xtol_group.setVisible(not is_de)
@@ -1603,14 +1561,12 @@ class ParametersIcsTab(QtWidgets.QWidget):
         if self._projected_setup is None:
             raise ValueError("Fit defaults are not available.")
         defaults = self._projected_setup.defaults
-        ftol = self._parse_number(self._ftol_edit.text(), "Convergence tolerance")
         method = str(self._method_combo.currentData() or "trf")
+        ftol = self._tolerance_value(self._ftol_edit, self._ftol_label)
         xtol = (
             defaults.xtol if method == DIFFERENTIAL_EVOLUTION_METHOD
-            else self._parse_number(self._xtol_edit.text(), "Parameter-step tolerance")
+            else self._tolerance_value(self._xtol_edit, self._xtol_label)
         )
-        if ftol <= 0.0 or xtol <= 0.0:
-            raise ValueError("Convergence tolerances must be positive.")
         return validate_fit_defaults(
             replace(
                 defaults,
@@ -1623,6 +1579,27 @@ class ParametersIcsTab(QtWidgets.QWidget):
             )
         )
 
+    def _tolerance_value(self, edit: QtWidgets.QLineEdit, label: QtWidgets.QLabel) -> float:
+        """Parse one tolerance box, naming it by its visible label."""
+
+        name = label.text().removesuffix(":")
+        value = self._parse_number(edit.text(), name)
+        if value <= 0.0:
+            raise ValueError(f"{name} must be positive.")
+        return value
+
+    def _invalid_tolerance_labels(self) -> list[str]:
+        boxes = [(self._ftol_edit, self._ftol_label)]
+        if self._method_combo.currentData() != DIFFERENTIAL_EVOLUTION_METHOD:
+            boxes.append((self._xtol_edit, self._xtol_label))
+        labels = []
+        for edit, label in boxes:
+            try:
+                self._tolerance_value(edit, label)
+            except ValueError:
+                labels.append(label.text().removesuffix(":"))
+        return labels
+
     def _emit_defaults_edit(self, *_args: object) -> None:
         if self._projecting or self._running or self._projected_setup is None:
             return
@@ -1634,7 +1611,6 @@ class ParametersIcsTab(QtWidgets.QWidget):
         except (TypeError, ValueError, OverflowError) as exc:
             self._set_defaults_error(str(exc))
             self._project_defaults(self._projected_setup.defaults)
-            self.statusMessage.emit(f"Fit defaults are invalid: {exc}")
             return
         self._tolerance_drafts.clear()
         self._set_defaults_error("")
@@ -1655,15 +1631,14 @@ class ParametersIcsTab(QtWidgets.QWidget):
             self._set_defaults_error("")
 
     def _set_defaults_error(self, message: str) -> None:
-        changed = bool(message) != bool(self._defaults_error_text)
+        # Readiness names each failing box, so every tolerance change refreshes it.
         self._defaults_error_text = message
         self._defaults_error.setText(
-            message + "\nPress Esc to restore the accepted tolerances." if message else ""
+            message + "\nPress Esc in a tolerance box to restore the accepted tolerances." if message else ""
         )
         self._defaults_error.setVisible(bool(message))
         self._discard_tolerances_shortcut.setEnabled(bool(self._tolerance_drafts))
-        if changed:
-            self.validityChanged.emit()
+        self.validityChanged.emit()
 
     def _discard_tolerance_drafts(self) -> None:
         self._tolerance_drafts.clear()
@@ -1851,7 +1826,7 @@ class ParametersIcsTab(QtWidgets.QWidget):
             self.statusMessage.emit(f"Residual bootstrap settings are invalid: {exc}")
 
     def eventFilter(self, watched, event) -> bool:  # noqa: N802 - Qt override
-        if watched in (getattr(self, "_dataset_values_table", None), getattr(self, "_param_table", None)) and event.type() == QtCore.QEvent.KeyPress:
+        if watched is getattr(self, "_param_table", None) and event.type() == QtCore.QEvent.KeyPress:
             if event.matches(QtGui.QKeySequence.Copy):
                 indexes = watched.selectedIndexes()
                 if indexes:
@@ -1860,11 +1835,7 @@ class ParametersIcsTab(QtWidgets.QWidget):
                     columns = range(min(index.column() for index in indexes), max(index.column() for index in indexes) + 1)
                     payload = "\n".join(
                         "\t".join(
-                            (
-                                watched.item(row, column).data(QtCore.Qt.AccessibleTextRole)
-                                if watched is self._param_table and column in (2, 3)
-                                else watched.item(row, column).text()
-                            ) if (row, column) in selected else ""
+                            self._copy_text(row, column) if (row, column) in selected else ""
                             for column in columns
                         ) for row in rows
                     )
@@ -1887,34 +1858,23 @@ class ParametersIcsTab(QtWidgets.QWidget):
         if watched is getattr(self, "_param_table", None) and event.type() in {
             QtCore.QEvent.Show, QtCore.QEvent.FontChange, QtCore.QEvent.StyleChange,
         }:
-            watched.resizeRowsToContents()
-        if watched is getattr(self, "_dataset_values_table", None) and event.type() in {
-            QtCore.QEvent.Type.Show, QtCore.QEvent.Type.FontChange, QtCore.QEvent.Type.StyleChange,
-            QtCore.QEvent.Type.LayoutRequest,
-        }:
-            self._size_dataset_values_table(watched)
+            self._resize_to_contents()
         return super().eventFilter(watched, event)
 
-    @staticmethod
-    def _size_dataset_values_table(table: QtWidgets.QTableWidget) -> None:
-        font_key = table.font().toString()
-        if getattr(table, "_numeric_column_font", None) != font_key:
-            table._numeric_column_font = font_key
-            metrics = table.fontMetrics()
-            margin = table.style().pixelMetric(QtWidgets.QStyle.PM_HeaderMargin)
-            table.horizontalHeader().setMinimumSectionSize(metrics.horizontalAdvance("M") * 8)
-            for column in (1, 2):
-                table.setColumnWidth(column, max(
-                    metrics.horizontalAdvance("-1.23456e+308"),
-                    metrics.horizontalAdvance(table.horizontalHeaderItem(column).text()),
-                ) + 2 * margin + 8)
-        table.resizeRowsToContents()
-        height = table.horizontalHeader().sizeHint().height() + 2 * table.frameWidth()
-        height += sum(table.rowHeight(row) for row in range(min(8, table.rowCount())))
-        scrollbar = table.horizontalScrollBar()
-        if scrollbar.maximum() > scrollbar.minimum():
-            height += scrollbar.sizeHint().height()
-        table.setFixedHeight(height)
+    def _copy_text(self, row: int, column: int) -> str:
+        """Plain copy text: the visible value, at full precision for numbers."""
+
+        if column == _C.SCOPE:
+            combo = self._param_table.cellWidget(row, column)
+            return combo.currentText() if combo is not None else ""
+        item = self._param_table.item(row, column)
+        if item is None:
+            return ""
+        if column in (_C.VARY, _C.LOG) and item.data(QtCore.Qt.ItemDataRole.CheckStateRole) is not None:
+            return "Yes" if item.checkState() == QtCore.Qt.CheckState.Checked else "No"
+        if column == _C.LAST:
+            return item.data(QtCore.Qt.AccessibleTextRole) or item.text()
+        return item.text().strip()
 
     def _relayout_analysis_cards(self) -> None:
         if not hasattr(self, "_analysis_cards"):

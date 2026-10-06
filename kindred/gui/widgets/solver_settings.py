@@ -17,7 +17,7 @@ from kindred.core.project_document import (
 )
 from kindred.core.runtime_defaults import MAX_PARALLEL_WORKERS_CEILING
 from kindred.core.validation import parse_finite_numeric_text
-from kindred.gui.ui_helpers import SOLVER_TOOLTIP, clamp_initial_size, make_scroll_area
+from kindred.gui.ui_helpers import SOLVER_TOOLTIP, clamp_initial_size, ignore_wheel, make_scroll_area
 
 __all__ = [
     "SimulationSettingsDialog",
@@ -315,6 +315,11 @@ class SimulationSettingsDialog(QtWidgets.QDialog):
         body_layout.addWidget(cache_box)
         scroll.setWidget(body)
         layout.addWidget(scroll, 1)
+        for control in (
+            self.temperature_spin, self.energy_unit_combo, self._run_default_fields.solver_combo,
+            self.preview_delay_spin, self.run_maximum_spin, self.cache_capacity_spin,
+        ):
+            ignore_wheel(control)
 
         for form in (science_form, run_form, preview_form, parallel_form, cache_form):
             for row in range(form.rowCount()):

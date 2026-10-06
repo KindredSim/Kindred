@@ -20,8 +20,8 @@ from .quantity_units import parse_unit, convert_value, scientific_unit, conversi
 # Category-specific admission limits.  These are deliberately explicit rather
 # than one universal scalar envelope: concentrations, rates, energies, and
 # standard-state values have different physical meanings and units.
-RATE_MIN = 1.0e-20
 RATE_MAX = 1.0e20
+ARRHENIUS_A_MIN = 1.0e-20
 ARRHENIUS_A_MAX = 1.0e40
 ENERGY_ABS_MAX_J_PER_MOL = 1.0e20
 KEQ_MIN = 1.0e-20
@@ -101,20 +101,28 @@ def admit_rate(
     field: str = "rate",
     allow_zero: bool = False,
 ) -> float:
-    return _admit_finite_range(
-        value,
-        field=field,
-        minimum=RATE_MIN,
-        maximum=RATE_MAX,
-        allow_zero=allow_zero,
-    )
+    """Admit a typed or computed rate: positive up to RATE_MAX, or zero when allowed."""
+    if type(value) is bool:
+        raise ValueError(f"{field} must be finite and numeric")
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"{field} must be finite and numeric") from exc
+    if not math.isfinite(number):
+        raise ValueError(f"{field} must be finite")
+    if number == 0.0 and allow_zero:
+        return 0.0
+    if not 0.0 < number <= RATE_MAX:
+        lower = "zero or positive" if allow_zero else "positive"
+        raise ValueError(f"{field} must be {lower} and at most {RATE_MAX:g}")
+    return number
 
 
 def admit_arrhenius_prefactor(value: object, *, field: str = "A") -> float:
     return _admit_finite_range(
         value,
         field=field,
-        minimum=RATE_MIN,
+        minimum=ARRHENIUS_A_MIN,
         maximum=ARRHENIUS_A_MAX,
     )
 

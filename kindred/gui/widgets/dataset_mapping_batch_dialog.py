@@ -15,7 +15,7 @@ from kindred.core.dataset_mapping import (
     allocate_initial_condition_set_name,
     apply_dataset_mapping_batch,
 )
-from kindred.gui.ui_helpers import clamp_initial_size
+from kindred.gui.ui_helpers import clamp_initial_size, ignore_wheel
 from kindred.core.datasets.foundation import RawDatasetRecord
 from kindred.core.project_document import (
     MechanismTabDocument,
@@ -108,6 +108,7 @@ class DatasetMappingBatchDialog(QtWidgets.QDialog):
         controls = QtWidgets.QGridLayout()
         controls.addWidget(QtWidgets.QLabel("Action:", group), 0, 0)
         action = QtWidgets.QComboBox(group)
+        ignore_wheel(action)
         action.addItem("Create Set", DatasetMappingChoice.CREATE_SET.value)
         if not self._create_only:
             action.addItem("Map Existing", DatasetMappingChoice.MAP_EXISTING.value)
@@ -116,6 +117,7 @@ class DatasetMappingBatchDialog(QtWidgets.QDialog):
 
         controls.addWidget(QtWidgets.QLabel("Target set:", group), 1, 0)
         target = QtWidgets.QComboBox(group)
+        ignore_wheel(target)
         target.addItem("(none)", None)
         for item in self._tab.initial_condition_sets:
             target.addItem(item.name, item.set_id)
@@ -123,6 +125,7 @@ class DatasetMappingBatchDialog(QtWidgets.QDialog):
 
         controls.addWidget(QtWidgets.QLabel("Occupancy:", group), 2, 0)
         occupancy = QtWidgets.QComboBox(group)
+        ignore_wheel(occupancy)
         occupancy.addItem("(automatic / none)", None)
         occupancy.addItem("Move set to this dataset", OccupiedSetChoice.OVERRIDE.value)
         occupancy.addItem("Create a separate copy", OccupiedSetChoice.CREATE_COPY.value)

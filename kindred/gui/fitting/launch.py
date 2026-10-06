@@ -101,10 +101,10 @@ def fit_execution_span(t_start: object, t_end: object) -> tuple[float, float]:
     """Validate and return a strictly positive Fit solver span."""
     if t_start is None or t_end is None:
         raise ValueError("Enter both Simulation start and Simulation end.")
-    start = validate_input_time_seconds(t_start, field="Fit execution start")
-    end = validate_input_time_seconds(t_end, field="Fit execution end")
+    start = validate_input_time_seconds(t_start, field="Simulation start")
+    end = validate_input_time_seconds(t_end, field="Simulation end")
     if end <= start:
-        raise ValueError("Fit execution end must be greater than its start.")
+        raise ValueError("Simulation end must be greater than Simulation start.")
     return start, end
 
 
@@ -290,7 +290,7 @@ class FitParameterVariable:
         scope = str(self.scope or "").strip().lower()
         if scope not in {"shared", "per_dataset", FIT_SCOPE_CENTRED_FIXED_EFFECTS}:
             raise ValueError(
-                "Scalar Fit scope must be Shared, Per-dataset, or centred fixed effects."
+                "Scalar Fit scope must be Shared, Per-dataset, or Overall + deviations."
             )
         scientific_category = str(self.scientific_category or "").strip()
         if scientific_category not in {
@@ -409,7 +409,7 @@ def _replace_fit_parameter(
     target_scope = str(changes.get("scope", parameter.scope)).strip().lower()
     if target_scope not in {"shared", "per_dataset", FIT_SCOPE_CENTRED_FIXED_EFFECTS}:
         raise ValueError(
-            "Scalar Fit scope must be Shared, Per-dataset, or centred fixed effects."
+            "Scalar Fit scope must be Shared, Per-dataset, or Overall + deviations."
         )
     selected = (
         parameter.shared_config
@@ -727,7 +727,7 @@ def fit_uncertainty_coordinates(
     included ones.
     """
     parameter_items = tuple(parameters)
-    dataset_ids = tuple(sorted(item.dataset_id for item in datasets))
+    dataset_ids = tuple(item.dataset_id for item in datasets)
     coordinates: list[FitCoordinate] = []
     for parameter in sorted(parameter_items, key=lambda item: item.name):
         if not parameter.selected_config.fit:
@@ -959,8 +959,8 @@ def _scan_parameters(tab: MechanismTabDocument) -> tuple[FitParameterVariable, .
     for coordinate in coordinates:
         name = _required(coordinate.name, "parameter name")
         value = _finite(coordinate.value, f"parameter {name}")
-        low = float(coordinate.minimum)
-        high = float(coordinate.maximum)
+        low = float(coordinate.fit_minimum)
+        high = float(coordinate.fit_maximum)
         if not math.isfinite(low) or not math.isfinite(high) or low >= high:
             raise ValueError(
                 f"Accepted parameter {name!r} has invalid Fit bounds."
@@ -1095,10 +1095,12 @@ def capture_fit_origin(
     if not isinstance(tab.prepared_dsl, PreparedDslRequestSet):
         raise ValueError("Fit requires an accepted visible mechanism.")
     mapped: list[FitMappedDatasetSnapshot] = []
-    for dataset_id, link in tab.dataset_links:
-        if link.set_id is None:
+    links = dict(tab.dataset_links)
+    # Fit lists datasets in the project's import order, as the main window does.
+    for dataset in document.datasets:
+        link = links.get(dataset.dataset_id)
+        if link is None or link.set_id is None:
             continue
-        dataset = document.dataset(dataset_id)
         initial_set = tab.initial_condition_set(link.set_id)
         by_raw_id = {
             observation.raw_observation_id: observation

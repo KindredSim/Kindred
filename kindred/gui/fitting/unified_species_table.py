@@ -15,7 +15,9 @@ from PySide6 import QtCore, QtWidgets
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QBrush, QColor, QFontMetrics, QPalette
 
+from kindred.core.validation import parse_finite_numeric_text
 from kindred.gui.fitting.constants import FIT_DATASET_WEIGHT_MODE_LABELS
+from kindred.gui.ui_helpers import ignore_wheel
 from kindred.gui.fitting.contracts import FitTargetSelection, copy_target_selection
 from kindred.gui.fitting.launch import (
     FitDatasetLocalSettings,
@@ -49,11 +51,17 @@ class _Col:
         "Starting IC",
         "Vary IC",
         "Vary Global",
-        "Log scale",
+        "Log Scale",
         "Lower",
         "Upper",
     ]
 
+
+_INITIAL_FIELD_HEADERS = {
+    "initial": _Col.HEADERS[_Col.INITIAL],
+    "lower": _Col.HEADERS[_Col.LOWER],
+    "upper": _Col.HEADERS[_Col.UPPER],
+}
 
 _VARY_IC_CHOICES: tuple[tuple[str, str, str], ...] = (
     (
@@ -84,6 +92,8 @@ _ZERO_IC_PERCENT_MESSAGE = (
     "A zero Starting IC cannot use a percentage Vary IC mode. Choose "
     "Absolute Minimum / Maximum (in M)."
 )
+
+_TARGET_WEIGHT_MESSAGE = "Target weights must be finite and positive."
 
 _COPY_SPECIES_WEIGHTS_VARY_IC_TOOLTIP = (
     "Copies species weights, Vary IC mode and range, and log-scale choices "
@@ -200,7 +210,8 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
             tuple[str, str], FitSharedInitialGroup | None
         ] = {}
         self._invalid_raw: dict[tuple[str, ...], str] = {}
-        self._invalid_initial_raw: dict[tuple[str, str, str], str] = {}
+        # Each invalid IC cell keeps its typed text and its message.
+        self._invalid_initial_raw: dict[tuple[str, str, str], tuple[str, str]] = {}
         self._refreshing = False
         self._running = False
 
@@ -1048,6 +1059,7 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
             if weight_invalid_key in self._invalid_raw:
                 weight_item.setBackground(_INVALID_BG)
                 weight_item.setForeground(_INVALID_FG)
+                weight_item.setToolTip(_TARGET_WEIGHT_MESSAGE)
             self._table.setItem(row, _Col.WEIGHT, weight_item)
 
             species_item = QtWidgets.QTableWidgetItem(species)
@@ -1070,10 +1082,9 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
             ):
                 invalid_key = (mapped.set_id, species, field)
                 initial_item = QtWidgets.QTableWidgetItem(
-                    self._invalid_initial_raw.get(
-                        invalid_key,
-                        str(raw_initial.get(field, "")),
-                    )
+                    self._invalid_initial_raw[invalid_key][0]
+                    if invalid_key in self._invalid_initial_raw
+                    else str(raw_initial.get(field, ""))
                 )
                 tolerance_mode = str(raw_initial.get("mode", "disabled"))
                 self._set_editable(
@@ -1104,10 +1115,11 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
                 if invalid_key in self._invalid_initial_raw:
                     initial_item.setBackground(_INVALID_BG)
                     initial_item.setForeground(_INVALID_FG)
-                    initial_item.setToolTip(self._invalid_initial_raw[invalid_key])
+                    initial_item.setToolTip(self._invalid_initial_raw[invalid_key][1])
                 self._table.setItem(row, column, initial_item)
 
             mode = QtWidgets.QComboBox(self._table)
+            ignore_wheel(mode)
             mode.setObjectName("global_fit_vary_ic_combo")
             for label, value, tooltip in _VARY_IC_CHOICES:
                 mode.addItem(label, value)
@@ -1206,9 +1218,8 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
             with QtCore.QSignalBlocker(combo):
                 combo.setCurrentIndex(max(0, combo.findData(previous_mode)))
             self._set_vary_ic_combo_tooltip(combo)
-            self._set_footer_error(_ZERO_IC_PERCENT_MESSAGE)
+            # A refused mode change is an action outcome, not an invalid edit.
             self.statusMessage.emit(_ZERO_IC_PERCENT_MESSAGE)
-            self.validityChanged.emit()
             return
 
         lower_item = self._table.item(row, _Col.LOWER)
@@ -1330,10 +1341,7 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
                     raise ValueError
             except (TypeError, ValueError, OverflowError):
                 self._invalid_raw[key] = item.text()
-                self._mark_invalid(
-                    item,
-                    "Target weights must be finite and positive.",
-                )
+                self._mark_invalid(item, _TARGET_WEIGHT_MESSAGE)
                 return
             self._invalid_raw.pop(key, None)
             self._clear_invalid(item)
@@ -1442,10 +1450,10 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
             if field not in required_fields:
                 continue
             try:
-                parsed = float(field_item.text())
-                if not math.isfinite(parsed):
-                    raise ValueError("value must be finite")
-            except (TypeError, ValueError, OverflowError) as exc:
+                parsed = parse_finite_numeric_text(
+                    field_item.text(), field=_INITIAL_FIELD_HEADERS[field]
+                )
+            except ValueError as exc:
                 parse_errors[field] = str(exc)
             else:
                 typed[field] = parsed
@@ -1454,7 +1462,7 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
             self._pending_initial_values.pop(key, None)
             for field, message in parse_errors.items():
                 field_key = (set_id, species, field)
-                self._invalid_initial_raw[field_key] = str(raw[field])
+                self._invalid_initial_raw[field_key] = (str(raw[field]), message)
                 self._decorate_initial_field(
                     row,
                     {
@@ -1501,10 +1509,8 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
                 and typed.get("initial") == 0.0
             ):
                 error_message = _ZERO_IC_PERCENT_MESSAGE
-                self._set_footer_error(_ZERO_IC_PERCENT_MESSAGE)
-                self.statusMessage.emit(_ZERO_IC_PERCENT_MESSAGE)
             for field in required_fields:
-                self._invalid_initial_raw[(set_id, species, field)] = str(raw[field])
+                self._invalid_initial_raw[(set_id, species, field)] = (str(raw[field]), error_message)
                 self._decorate_initial_field(row, columns[field], error_message)
         else:
             self._clear_initial_row_errors(set_id, species, row)
@@ -1884,6 +1890,7 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
         copied_ranges = 0
         copied_weights = 0
         skipped = 0
+        not_copied: dict[str, list[str]] = {}
         source_initials = {
             item.species: item
             for item in setup.initials
@@ -1960,18 +1967,12 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
                             log10=source_log10,
                         )
                     except (TypeError, ValueError, OverflowError):
-                        # Preserve the copied range as an invalid draft when the
-                        # destination Starting IC is outside it (or zero for a
-                        # percentage mode).  The destination value remains
-                        # authoritative and Apply stays blocked until the user
-                        # repairs the row.
-                        destination_key = (destination_mapped.set_id, species)
-                        self._pending_initial_rows[destination_key] = destination_raw
-                        self._pending_initial_values.pop(destination_key, None)
-                        for field in ("lower", "upper"):
-                            self._invalid_initial_raw[
-                                (destination_mapped.set_id, species, field)
-                            ] = str(destination_raw[field])
+                        # The copied range cannot contain this destination's
+                        # Starting IC (e.g. a percentage around zero), so this
+                        # row is not compatible and its Vary IC stays as is.
+                        not_copied.setdefault(
+                            destination_mapped.display_name, []
+                        ).append(species)
                         skipped += 1
                     else:
                         for field in ("initial", "lower", "upper"):
@@ -2012,10 +2013,14 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
                     self._pending_target_weights.pop(weight_key, None)
 
         self._refresh_visible_presentation()
+        detail = "; ".join(
+            f"{name}: {', '.join(names)}" for name, names in not_copied.items()
+        )
         self.set_status(
             "Copy Species Weights and Vary IC: "
             f"{copied_ranges} ranges, {copied_weights} weights copied, "
             f"{skipped} skipped."
+            + (f" Range does not fit the Starting IC in {detail}." if detail else "")
         )
 
     # ------------------------------------------------------------------
@@ -2078,37 +2083,39 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
         try:
             item.setBackground(_INVALID_BG)
             item.setForeground(_INVALID_FG)
+            item.setToolTip(message)
         finally:
             self._table.blockSignals(previous_blocked)
-        self._set_footer_error(message)
-        self.validityChanged.emit()
+        self._refresh_footer_validity()
 
     def _clear_invalid(self, item: QtWidgets.QTableWidgetItem) -> None:
         previous_blocked = self._table.blockSignals(True)
         try:
             item.setBackground(_DEFAULT_BG)
             item.setForeground(_DEFAULT_FG)
+            item.setToolTip("")
         finally:
             self._table.blockSignals(previous_blocked)
 
     def _mark_invalid_line_edit(self, edit: QtWidgets.QLineEdit, message: str) -> None:
         edit.setStyleSheet("background: rgb(255, 200, 200); color: rgb(80, 0, 0);")
-        self._set_footer_error(message)
-        self.validityChanged.emit()
+        edit.setToolTip(message)
+        self._refresh_footer_validity()
 
     def _clear_invalid_line_edit(self, edit: QtWidgets.QLineEdit) -> None:
         edit.setStyleSheet("")
+        edit.setToolTip("")
 
     def _set_footer_error(self, message: str | None) -> None:
         self._footer.set_error(message)
 
     def _refresh_footer_validity(self) -> None:
-        message = (
-            "Correct invalid target, weight, or IC values before running."
-            if self._invalid_raw or self._invalid_initial_raw
-            else None
+        locations = self.invalid_editor_locations
+        more = f" (+{len(locations) - 1} more)" if len(locations) > 1 else ""
+        self._footer.set_error(
+            f"Invalid value — {locations[0]}{more}." if locations else None,
+            tooltip_text="\n".join(locations) if locations else None,
         )
-        self._set_footer_error(message)
         self.validityChanged.emit()
 
     @property
@@ -2124,8 +2131,36 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
         return bool(self._pending_initial_rows or self._pending_shared_initial_groups)
 
     @property
-    def invalid_editor_keys(self) -> tuple[tuple[str, ...], ...]:
-        return tuple(sorted((*self._invalid_raw, *self._invalid_initial_raw)))
+    def invalid_editor_locations(self) -> tuple[str, ...]:
+        """Name each invalid draft by dataset, species, and column in table order."""
+
+        datasets = self._projected_setup.datasets if self._projected_setup else ()
+        order = {item.dataset_id: index for index, item in enumerate(datasets)}
+        rows = {item.dataset_id: self._row_species(item) for item in datasets}
+        by_set = {item.set_id: item.dataset_id for item in self._origin.mapped_datasets}
+        columns = {"initial": _Col.INITIAL, "lower": _Col.LOWER, "upper": _Col.UPPER}
+
+        def row(dataset_id: str, species: str) -> int:
+            species_rows = rows.get(dataset_id, [])
+            return species_rows.index(species) if species in species_rows else len(species_rows)
+
+        located = [
+            (key[1], -1, 0, "Dataset weight") if key[0] == "dataset_weight"
+            else (key[1], row(key[1], key[2]), _Col.WEIGHT, f"{key[2]} Weight")
+            for key in self._invalid_raw
+        ]
+        located += [
+            (
+                by_set[set_id], row(by_set[set_id], species), columns[field],
+                f"{species} {_INITIAL_FIELD_HEADERS[field]}",
+            )
+            for set_id, species, field in self._invalid_initial_raw
+        ]
+        located.sort(key=lambda item: (order.get(item[0], len(order)), item[1], item[2]))
+        return tuple(
+            f"{getattr(self._mapped_dataset(dataset_id), 'display_name', dataset_id)}: {label}"
+            for dataset_id, _row, _column, label in located
+        )
 
 
 __all__ = ["UnifiedSpeciesTable"]

@@ -16,7 +16,7 @@ from kindred.core.validation import parse_finite_numeric_text
 from kindred.gui.controllers.simulation_job_owner import resolve_run_parallel_capacity
 from kindred.gui.widgets.scan_range_dialog import ScanRangeDialog, ScanConstraintDialog, entry, number
 from kindred.gui.display_name_policy import scientific_symbol_html, scientific_symbol_spoken
-from kindred.gui.ui_helpers import SCIENTIFIC_NAME_HTML_ROLE, SOLVER_TOOLTIP, ScientificNameDelegate
+from kindred.gui.ui_helpers import SCIENTIFIC_NAME_HTML_ROLE, SOLVER_TOOLTIP, ScientificNameDelegate, ignore_wheel
 from kindred.scan.config import ScanConfig, InputRange, START, END
 from kindred.scan.inputs import input_catalog
 from kindred.scan.intervals import Interval
@@ -209,6 +209,7 @@ class ChemicalSpaceScanDialog(QtWidgets.QDialog):
         self.mechanism.setText(f"Mechanism: {self.tab.name}")
         for item in self.catalog:
             mode = QtWidgets.QComboBox()
+            ignore_wheel(mode)
             mode.addItems(["Fixed", "Scan", "Calculated"])
             mode.model().item(2).setEnabled(False)
             value = entry(item.value)

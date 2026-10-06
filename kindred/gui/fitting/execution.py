@@ -108,9 +108,10 @@ def fit_bound_state(
 
     Fit results retain decoded physical values, while a log10 fit optimizes
     their base-10 logarithms.  Bound classification therefore has to happen
-    after applying the same encoding used by the optimizer.  A side's
-    tolerance is local to that encoded value and bound; the opposite bound
-    must not make a small-scale estimate appear to be on a boundary.
+    after applying the same encoding used by the optimizer.  An estimate is
+    at a bound within a billionth of the encoded range width (or a relative
+    1e-9 of the bound): bounded optimizers stay strictly inside the range, so a
+    result pressed against a zero bound ends a tiny positive distance from it.
     """
 
     value = float(value)
@@ -131,6 +132,11 @@ def fit_bound_state(
     encoded_maximum = encode(maximum)
     if encoded_value is None:
         return "interior"
+    range_width = (
+        encoded_maximum - encoded_minimum
+        if encoded_minimum is not None and encoded_maximum is not None
+        else 0.0
+    )
 
     def is_at_bound(encoded_bound: float | None) -> bool:
         if encoded_bound is None:
@@ -139,8 +145,9 @@ def fit_bound_state(
         # malformed/degenerate sides has deterministic lower precedence.
         if encoded_value == encoded_bound:
             return True
-        absolute_tolerance = 8.0 * max(
-            math.ulp(encoded_value), math.ulp(encoded_bound)
+        absolute_tolerance = max(
+            8.0 * max(math.ulp(encoded_value), math.ulp(encoded_bound)),
+            1.0e-9 * range_width,
         )
         return math.isclose(
             encoded_value,

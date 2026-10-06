@@ -14,7 +14,7 @@ from kindred.core.project_document import (
 )
 from kindred.core.validation import parse_finite_numeric_text
 from kindred.gui.ui_helpers import (
-    ControlRowsLayout, SOLVER_TOOLTIP, configure_compact_numeric_edit,
+    ControlRowsLayout, SOLVER_TOOLTIP, configure_compact_numeric_edit, ignore_wheel,
 )
 from kindred.gui.widgets.batch_initial_conditions_table import (
     BatchInitialConditionsTableModel,
@@ -144,6 +144,7 @@ class SimulationPanel(QtWidgets.QWidget):
         self._controls_host = QtWidgets.QWidget(self)
         controls = ControlRowsLayout(self._controls_host)
         self.solver_method_combo = QtWidgets.QComboBox(self)
+        ignore_wheel(self.solver_method_combo)
         self.solver_method_combo.addItems(list(SUPPORTED_SOLVERS))
         self.solver_method_combo.setToolTip(SOLVER_TOOLTIP)
         self.t_start_edit = self._number_edit("0.0", "Absolute Run start time")

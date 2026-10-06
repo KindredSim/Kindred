@@ -27,7 +27,8 @@ from kindred.gui.import_workflow import (
 )
 from kindred.gui.theme_manager import semantic_color
 from kindred.gui.ui_helpers import (
-    SCIENTIFIC_NAME_HTML_ROLE, ScientificNameComboBox, clamp_initial_size, data_unit_labels, set_bounded_label_text,
+    SCIENTIFIC_NAME_HTML_ROLE, ScientificNameComboBox, clamp_initial_size, data_unit_labels, ignore_wheel,
+    set_bounded_label_text,
 )
 
 __all__ = ["ImportConfigDialog", "ImportDialogResult"]
@@ -489,6 +490,7 @@ class ImportConfigDialog(QtWidgets.QDialog):
                 self._species_table.setItem(row, 1, label)
                 combo = ScientificNameComboBox(self._species_table)
                 combo.setInsertPolicy(QtWidgets.QComboBox.NoInsert)
+                ignore_wheel(combo)
                 combo.setAccessibleName(f"Unit for {column.assigned_name}")
                 combo.setEnabled(editable)
                 self._populate_unit_choices(
