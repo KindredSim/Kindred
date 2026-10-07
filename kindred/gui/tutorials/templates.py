@@ -103,20 +103,20 @@ class CreateAndReuseTemplates(PracticeLesson):
                 create_tab,
                 instruction="<p>A template lets you reuse a mechanism, its comments, and its initial-condition declarations.</p>"
                 "<p>Click <b>+</b> beside the mechanism tabs to create a practice tab. "
-                "We will use M3 to create a template, then load it into another tab.</p>",
+                "Use M3 to create a template, then load it into another tab.</p>",
             ),
             replace(
                 load_preset,
                 title="Load M3",
                 instruction="<p>Open <b>Examples → Preset Mechanisms → M3: A + B -&gt; C</b>.</p>"
-                "<p>We will use this example to explore what Kindred includes in a template. "
+                "<p>Use this example to explore what Kindred includes in a template. "
                 "It supplies <b>preset_set1</b> with <b>A = 1, B = 1, and C = 0</b>, "
                 "and <b>preset_set2</b> with <b>A = 1, B = 2, and C = 0</b>.</p>",
                 success="M3 and the starting values are ready.",
             ),
             Step(
                 "open_templates", "Create a Template from This Tab",
-                "<p>Open <b>Examples → Template Manager</b>, then click <b>Create from Current</b>.</p>"
+                "<p>Open <b>Examples → Template Manager…</b>, then click <b>Create from Current</b>.</p>"
                 "<p>The template editor opens with a copy of the mechanism text from the selected tab. "
                 "Changes made here affect the template being created.</p>",
                 self._creation_target,
@@ -167,7 +167,7 @@ class CreateAndReuseTemplates(PracticeLesson):
                 "save_template", "Create the Template",
                 "<p>Click <b>Create</b> and dismiss the confirmation message.</p>"
                 "<p>Find the saved template in Template Manager, then close the manager. "
-                "Next, we will load it into a fresh mechanism tab.</p>",
+                "Next, load it into a fresh mechanism tab.</p>",
                 self._save_template_target,
                 manual=True,
             ),

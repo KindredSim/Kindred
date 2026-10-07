@@ -274,7 +274,7 @@ def _mechanism_step_descriptors(mechanism: object) -> list[_NamespaceStepDescrip
             raise ValueError(f"Mechanism step_index_map entry {source_index} has an invalid step_index.")
         if step_index in seen_step_indices:
             raise ValueError(
-                f"Mechanism step_index_map entry {source_index} repeats step_index {step_index}; authoritative namespaces require unique step indices."
+                f"Mechanism step_index_map entry {source_index} repeats step_index {step_index}. Authoritative namespaces require unique step indices."
             )
         seen_step_indices.add(step_index)
         step_kind = str(raw_entry.get("kind") or "")
@@ -296,7 +296,7 @@ def _mechanism_step_descriptors(mechanism: object) -> list[_NamespaceStepDescrip
             expected_name = canonical_source_coordinate_name(step_index, role)
             if name != expected_name:
                 raise ValueError(
-                    f"Mechanism step_index_map entry {source_index} has a non-local source identity {name!r}; expected {expected_name!r}."
+                    f"Mechanism step_index_map entry {source_index} has a non-local source identity {name!r}. Expected {expected_name!r}."
                 )
             source_coordinates.append((role, name))
         descriptors.append(

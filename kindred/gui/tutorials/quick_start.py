@@ -86,7 +86,7 @@ class QuickStart(PracticeLesson):
                 "and loading M1 supplied the values in <b>preset_set1</b>.</p>"
                 "<p>Select only <b>preset_set1</b>. Check that <b>A = 1</b> and <b>B = 0</b>.</p>"
                 "<p>Selected rows choose what to run. The <b>Plot</b> checkbox chooses which results to display.</p>"
-                "<p>For more details, see <b>Reactions and Initial Conditions</b> in <b>Help → Interactive Tutorials</b>.</p>",
+                "<p>For more details, see <b>Reactions and Initial Conditions</b> in <b>Help → Interactive Tutorials…</b>.</p>",
                 lambda: self._table_target(),
                 lambda: self._values(self.preset_set, 1.0)
                 and self.bundle.initial_actions.selected_run_set_ids() == (self.preset_set,),
@@ -159,8 +159,8 @@ class QuickStart(PracticeLesson):
             replace(
                 self._finish_step(),
                 instruction="<p>Your practice tabs stay in the project. You can keep exploring or save your work.</p>"
-                "<p>To resume saved work, choose <b>File → Open Project...</b> and open your saved <b>.kin file</b>.</p>"
-                "<p>Choose <b>Finish</b> to close this lesson. Open <b>Help → Interactive Tutorials</b> to choose another. "
+                "<p>To resume saved work, choose <b>File → Open Project…</b> and open your saved <b>.kin file</b>.</p>"
+                "<p>Choose <b>Finish</b> to close this lesson. Open <b>Help → Interactive Tutorials…</b> to choose another. "
                 "Each lesson includes its own setup.</p>",
             ),
         )

@@ -62,7 +62,6 @@ from kindred.core.result_repository import (
     ResultRepository,
 )
 from kindred.core.species import concentration_from_text
-from kindred.core.validation import parse_finite_numeric_text
 from kindred.gui.computation_gate import ComputationGate
 from kindred.gui.app_wiring import (
     ANALYSIS_DOCK_SPEC,
@@ -106,6 +105,7 @@ from kindred.gui.fitting.constants import (
     DIFFERENTIAL_EVOLUTION_METHOD,
     FUNCTION_TOLERANCE_LABEL,
     STEP_TOLERANCE_LABEL,
+    admit_fit_tolerance,
     fit_method_label,
 )
 from kindred.gui.main_window_variable_runtime import TabSliderBinding
@@ -2498,7 +2498,7 @@ class MainWindow(QtWidgets.QMainWindow):
         finally:
             self._slider_apply_refreshing.discard(target)
         self._refresh_tab_controls(target, preserve_slider_editor_drafts=False)
-        self.set_status_text("Slider values applied; exact Preview promoted to current results.")
+        self.set_status_text("Slider values applied. The exact preview became the current results.")
         return True
 
     # ------------------------------------------------------------------
@@ -2686,7 +2686,7 @@ class MainWindow(QtWidgets.QMainWindow):
             buttons.addButton("Accept", QtWidgets.QDialogButtonBox.ButtonRole.AcceptRole)
         if assessment.proposal is not None and visible_source is not None:
             choose_button = buttons.addButton(
-                "Choose dependent parameters…",
+                "Choose Dependent Parameters…",
                 QtWidgets.QDialogButtonBox.ButtonRole.ActionRole,
             )
 
@@ -2760,7 +2760,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 return None
 
         dialog = QtWidgets.QDialog(self)
-        dialog.setWindowTitle("Review incoming project exact corrections")
+        dialog.setWindowTitle("Review Incoming Project Exact Corrections")
         layout = QtWidgets.QVBoxLayout(dialog)
         layout.addWidget(
             QtWidgets.QLabel(
@@ -2783,7 +2783,7 @@ class MainWindow(QtWidgets.QMainWindow):
             for index, (tab, _assessment) in enumerate(corrections):
                 tab_choice.addItem(f"{tab.name} ({tab.tab_id})", index)
             choose_button = buttons.addButton(
-                "Choose dependent parameters…",
+                "Choose Dependent Parameters…",
                 QtWidgets.QDialogButtonBox.ButtonRole.ActionRole,
             )
 
@@ -2933,7 +2933,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 self,
                 "Replace Active Mechanism",
                 "Loading this source affects only the active mechanism tab and "
-                "will discard that tab's unapplied Reactions and Slider drafts. "
+                "will discard the unapplied Reactions of that tab and Slider drafts. "
                 "Continue?",
                 QtWidgets.QMessageBox.StandardButton.Yes
                 | QtWidgets.QMessageBox.StandardButton.Cancel,
@@ -3083,7 +3083,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 action="Apply mechanism template",
             )
             if corrected_proposal is None:
-                raise AuthoredSourceError("Template source correction was cancelled.")
+                raise AuthoredSourceError("Template source correction was canceled.")
             source_for_admission = corrected_proposal
         prepare_authored_source_admission(
             source_for_admission,
@@ -3106,7 +3106,7 @@ class MainWindow(QtWidgets.QMainWindow):
         dataset_count = sum(len(config.plans) for config in configs)
         label = f"{dataset_count} dataset{'s' if dataset_count != 1 else ''}"
         self._dataset_import_progress_dialog = QtWidgets.QProgressDialog(
-            f"Loading {label}...",
+            f"Loading {label}…",
             "Cancel",
             0,
             100,
@@ -3150,7 +3150,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     @QtCore.Slot()
     def _on_import_cancellation(self) -> None:
-        self.set_status_text("Dataset import cancelled.")
+        self.set_status_text("Dataset import canceled.")
 
     @QtCore.Slot()
     def _cancel_dataset_import(self) -> None:
@@ -3182,7 +3182,7 @@ class MainWindow(QtWidgets.QMainWindow):
     ) -> None:
         if not self._mutation_input_admitted("Commit Dataset Import"):
             self.set_status_text(
-                "Dataset import completed after Close armed; publication was skipped."
+                "Dataset import completed after Close was requested, so publication was skipped."
             )
             return
         try:
@@ -3207,7 +3207,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 f"{exc}",
             )
             self.set_status_text(
-                "Dataset import publication was rejected; staging is idle and "
+                "Dataset import publication was rejected. Staging is idle and "
                 "the next import is available."
             )
             self._refresh_project_state()
@@ -3219,7 +3219,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if origin_tab_id not in self._tab_surfaces:
             self.set_status_text(
                 message
-                + " The initiating mechanism no longer exists; raw data "
+                + " The initiating mechanism no longer exists. Raw data "
                 "remains committed and optional mapping was skipped."
             )
             return
@@ -3232,7 +3232,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 message
                 + " Optional mapping was canceled or blocked by visible "
                 "Reactions, so it was skipped."
-                + " Raw data remains committed and unmapped; fix Reactions, then"
+                + " Raw data remains committed and unmapped. Fix Reactions, then"
                 + " use Map."
             )
             return
@@ -3262,7 +3262,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 mapping_expected_token = self._project_session.capture_content_token()
                 if review.exec() != QtWidgets.QDialog.DialogCode.Accepted:
                     self.set_status_text(
-                        message + " Mapping canceled; raw data remains unmapped."
+                        message + " Mapping canceled. Raw data remains unmapped."
                     )
                     return
                 batch = review.proposal()
@@ -3281,7 +3281,7 @@ class MainWindow(QtWidgets.QMainWindow):
             )
             if result is None:
                 self.set_status_text(
-                    message + " Mapping was not published; raw data remains unmapped."
+                    message + " Mapping was not published. Raw data remains unmapped."
                 )
                 return
             mapping_changed = result != mapping_expected_token
@@ -3293,7 +3293,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 f"The reviewed mapping was not applied:\n\n{exc}",
             )
             self.set_status_text(
-                message + " Mapping failed validation; raw data remains unmapped."
+                message + " Mapping failed validation. Raw data remains unmapped."
             )
             return
         if mapping_changed:
@@ -3894,7 +3894,7 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         self._open_project_action = self._add_action(
             file_menu,
-            "Open Project...",
+            "Open Project…",
             self._open_project,
             QtGui.QKeySequence.StandardKey.Open,
             "openProjectAction",
@@ -3918,7 +3918,7 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         self._add_action(
             file_menu,
-            "Save Project As...",
+            "Save Project As…",
             self.project_controller.save_project_as,
             QtGui.QKeySequence.StandardKey.SaveAs,
             "saveProjectAsAction",
@@ -3928,7 +3928,7 @@ class MainWindow(QtWidgets.QMainWindow):
         file_menu.addAction(self._load_data_action)
         self._xlsx_export_action = self._add_action(
             file_menu,
-            "Export Results XLSX...",
+            "Export Results XLSX…",
             self._export_xlsx,
             "Ctrl+E",
             "exportResultsXlsxAction",
@@ -4067,7 +4067,7 @@ class MainWindow(QtWidgets.QMainWindow):
         examples.addSeparator()
         self._add_action(
             examples,
-            "Template Manager...",
+            "Template Manager…",
             self._open_template_manager,
             "Ctrl+T",
             "templateManagerAction",
@@ -4110,7 +4110,7 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         self._add_action(
             simulation,
-            "Symbolic Calculator...",
+            "Symbolic Calculator…",
             lambda: self._open_symbolic_calculator(
                 self._workspace_tab_registry.active_tab_id
             ),
@@ -4120,7 +4120,7 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         self._add_action(
             simulation,
-            "Inspect Mechanism...",
+            "Inspect Mechanism…",
             lambda: self._open_mechanism_inspector(
                 self._workspace_tab_registry.active_tab_id
             ),
@@ -4131,13 +4131,13 @@ class MainWindow(QtWidgets.QMainWindow):
         simulation.addSeparator()
         self._add_action(
             simulation,
-            "Simulation Settings...",
+            "Simulation Settings…",
             self._open_simulation_settings,
             None,
             "simulationSettingsAction",
             tooltip=(
                 "Configure mechanism settings, solver tolerances, stopping "
-                "behavior, Run defaults for new projects and tabs, previews, "
+                "behavior, Run Defaults for New Projects and Tabs, previews, "
                 "parallel execution, and result caching."
             ),
         )
@@ -4147,7 +4147,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._fitting_menu = fitting
         self._add_action(
             fitting,
-            "Fitting Defaults...",
+            "Fitting Defaults…",
             self._configure_fitting,
             None,
             "fittingDefaultsAction",
@@ -4155,7 +4155,7 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         self._global_fit_action = self._add_action(
             fitting,
-            "Global Fit...",
+            "Global Fit…",
             self._run_global_fit,
             "Ctrl+Shift+F",
             "globalFitAction",
@@ -4179,7 +4179,7 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         self._add_action(
             help_menu,
-            "Panel Layout Tips...",
+            "Panel Layout Tips…",
             self._show_panel_layout_tips,
             None,
             "panelLayoutTipsAction",
@@ -4187,7 +4187,7 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         self._add_action(
             help_menu,
-            "Diagnostic Log...",
+            "Diagnostic Log…",
             self._show_diagnostic_log,
             None,
             "diagnosticLogAction",
@@ -4436,7 +4436,7 @@ class MainWindow(QtWidgets.QMainWindow):
         xtol.setText(repr(float(defaults.xtol)))
         ftol_label = QtWidgets.QLabel(FUNCTION_TOLERANCE_LABEL, dialog)
         xtol_label = QtWidgets.QLabel(STEP_TOLERANCE_LABEL, dialog)
-        use_seed = QtWidgets.QCheckBox("Use deterministic seed", dialog)
+        use_seed = QtWidgets.QCheckBox("Use Deterministic Seed", dialog)
         use_seed.setChecked(defaults.use_seed)
         seed = QtWidgets.QSpinBox(dialog)
         seed.setRange(*FIT_SEED_RANGE)
@@ -4489,18 +4489,12 @@ class MainWindow(QtWidgets.QMainWindow):
             parent=dialog,
         )
 
-        def tolerance(editor: QtWidgets.QLineEdit, label: QtWidgets.QLabel) -> float:
-            value = parse_finite_numeric_text(editor.text(), field=label.text())
-            if value <= 0.0:
-                raise ValueError(f"{label.text()} must be positive.")
-            return value
-
         def read_candidate() -> FitDefaults:
             return FitDefaults(
                 method=method.currentData(),
                 max_nfev=int(max_nfev.value()),
-                ftol=tolerance(ftol, ftol_label),
-                xtol=tolerance(xtol, xtol_label),
+                ftol=admit_fit_tolerance(ftol.text(), ftol_label.text()),
+                xtol=admit_fit_tolerance(xtol.text(), xtol_label.text()),
                 use_seed=bool(use_seed.isChecked()),
                 seed=int(seed.value()),
             )
@@ -4654,7 +4648,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     @QtCore.Slot(str)
     def _on_xlsx_export_cancelled(self, path: str) -> None:
-        self.set_status_text(f"XLSX export cancelled: {path}")
+        self.set_status_text(f"XLSX export canceled: {path}")
         self._refresh_actions()
 
     # ------------------------------------------------------------------
@@ -4999,7 +4993,7 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception as exc:
             logger.warning("Could not save layout preferences: %s", exc)
             self.set_status_text(
-                "Could not save layout preferences; the new value remains active "
+                "Could not save layout preferences. The new value remains active "
                 "for this session."
             )
             return False
@@ -5099,7 +5093,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._workspace.plot_for_tab(target).discard_interactive_display()
             except KeyError:
                 continue
-        self.set_status_text("Closing Kindred; waiting for active work to stop.")
+        self.set_status_text("Closing Kindred. Waiting for active work to stop.")
 
     def _refresh_title(self) -> None:
         path = self._project_session.current_path

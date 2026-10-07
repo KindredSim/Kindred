@@ -16,6 +16,7 @@ from kindred.core.simulator.dsl_parse import PreparedDslRequestSet
 from kindred.core.simulator.parameter_coordinates import admit_physical_coordinate_value
 from kindred.core.quantity_units import parse_unit, scientific_unit, convert_value
 from kindred.core.simulation_parameters import enumerate_simulation_parameters
+from kindred.core.validation import six_digit_value
 from kindred.core.units import (
     ARRHENIUS_A_MIN,
     ARRHENIUS_A_MAX,
@@ -246,7 +247,9 @@ def enumerate_parameter_coordinates(
             display_name = f"{display_name} — {item.context}"
         coordinates.append(GuiParameterCoordinate(
             name=item.name, display_name=display_name, value=value,
-            minimum=low, maximum=high, fit_minimum=fit_low, fit_maximum=fit_high,
+            minimum=low, maximum=high,
+            # Generated Fit bounds are authored at six significant digits.
+            fit_minimum=six_digit_value(fit_low), fit_maximum=six_digit_value(fit_high),
             # Rate constants and prefactors span decades; energies and plain
             # scalars are linear quantities.
             log10_allowed=bool(

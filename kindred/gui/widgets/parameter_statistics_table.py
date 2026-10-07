@@ -6,6 +6,7 @@ from __future__ import annotations
 from kindred.gui.display_name_policy import literal_tooltip
 from kindred.gui.display_name_policy import scientific_symbol_html, scientific_symbol_spoken
 from kindred.core.quantity_units import format_unit_for_display
+from kindred.core.validation import six_digit_text
 from kindred.gui.ui_helpers import SCIENTIFIC_NAME_HTML_ROLE, ScientificNameDelegate
 
 from typing import Mapping, Optional
@@ -83,7 +84,7 @@ class ParameterStatisticsTable(QtWidgets.QTableWidget):
             name_item.setData(QtCore.Qt.AccessibleTextRole,
                               scientific_symbol_spoken(name, family=family, role=role))
             name_item.setToolTip(literal_tooltip(name))
-            self.item(row, 1).setText("Unavailable" if value is None else f"{value:.6g}")
+            self.item(row, 1).setText("Unavailable" if value is None else six_digit_text(value))
             unit_item = self.item(row, 2)
             unit_item.setText(unit)
             unit_item.setData(SCIENTIFIC_NAME_HTML_ROLE, format_unit_for_display(unit))

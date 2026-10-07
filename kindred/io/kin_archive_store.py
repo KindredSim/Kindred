@@ -83,7 +83,7 @@ class ArchiveProject:
 
 
 def _reject_constant(value: str) -> object:
-    raise ValueError(f"Non-finite JSON constant {value!r} is not allowed.")
+    raise ValueError(f"Nonfinite JSON constant {value!r} is not allowed.")
 
 
 def _unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
@@ -1346,8 +1346,8 @@ def _decode_project(
     )
     if project_format != CURRENT_PROJECT_FORMAT:
         raise ValueError(
-            f"Unsupported project format {project_format!r}; "
-            f"expected {CURRENT_PROJECT_FORMAT!r}."
+            f"Unsupported project format {project_format!r}. "
+            f"Expected {CURRENT_PROJECT_FORMAT!r}."
         )
     document = _decode_document(
         root["document"], source_bytes_by_member,

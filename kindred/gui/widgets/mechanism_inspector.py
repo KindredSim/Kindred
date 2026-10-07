@@ -139,7 +139,7 @@ def _format_mechanism_reference(
         uses_standard_concentration |= step_uses_standard_concentration
 
     temperature_note = (
-        " (nominal; runtime schedule defined)"
+        " (nominal, runtime schedule defined)"
         if metadata.temperature_schedule is not None
         else ""
     )
@@ -383,11 +383,11 @@ def _equilibrium_authority_line(equilibrium: object, step_index: int) -> str:
     authority = equilibrium.authority
     kf, kr, keq = f"kf{step_index}", f"kr{step_index}", f"Keq{step_index}"
     if authority.kind == EquilibriumRateAuthorityKind.KR:
-        return f"  Equilibrium authority: {kr} authored; {keq} = {kf} / {kr} derived"
+        return f"  Equilibrium authority: {kr} authored, {keq} = {kf} / {kr} derived"
     if authority.has_explicit_keq_param:
-        return f"  Equilibrium authority: {keq} authored; {kr} = {kf} / {keq} derived"
+        return f"  Equilibrium authority: {keq} authored, {kr} = {kf} / {keq} derived"
     return (
-        f"  Equilibrium authority: dG_eq{step_index} authored; "
+        f"  Equilibrium authority: dG_eq{step_index} authored, "
         f"{keq} from dG_eq{step_index}, T and C0, {kr} = {kf} / {keq} derived"
     )
 
@@ -418,7 +418,7 @@ def _format_equations(structure: object, *, has_interventions: bool) -> str:
     lines = ["Canonical symbolic RHS equations:"]
     if has_interventions:
         lines.append(
-            "Note: intervention schedules are compiled execution inputs; equations here are the base unscheduled mechanism RHS."
+            "Note: intervention schedules are compiled execution inputs. Equations here are the base unscheduled mechanism RHS."
         )
         lines.append("")
     for species_name, rhs_expression in zip(

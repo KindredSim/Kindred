@@ -78,7 +78,7 @@ class TemplateEditorDialog(QtWidgets.QDialog):
 
         # Name
         self._name_edit = QtWidgets.QLineEdit()
-        self._name_edit.setPlaceholderText("e.g., Enzyme Kinetics")
+        self._name_edit.setPlaceholderText("For example: Enzyme Kinetics")
         if template:
             self._name_edit.setText(template.name)
         form_layout.addRow("Name*:", self._name_edit)
@@ -107,7 +107,7 @@ class TemplateEditorDialog(QtWidgets.QDialog):
 
         # Tags
         self._tags_edit = QtWidgets.QLineEdit()
-        self._tags_edit.setPlaceholderText("e.g., enzyme, michaelis-menten, steady-state")
+        self._tags_edit.setPlaceholderText("For example: enzyme, michaelis-menten, steady-state")
         if template:
             self._tags_edit.setText(", ".join(template.tags))
         form_layout.addRow("Tags:", self._tags_edit)
@@ -122,7 +122,7 @@ class TemplateEditorDialog(QtWidgets.QDialog):
         # Description
         self._description_edit = QtWidgets.QTextEdit()
         self._description_edit.setPlaceholderText(
-            "Describe the template, its purpose, and any key features..."
+            "Describe the template, its purpose, and any key features."
         )
         self._description_edit.setMaximumHeight(100)
         if template:
@@ -291,7 +291,7 @@ class TemplateManagerDialog(QtWidgets.QDialog):
 
         # Search bar
         self._search_edit = QtWidgets.QLineEdit()
-        self._search_edit.setPlaceholderText("Search templates...")
+        self._search_edit.setPlaceholderText("Search templates…")
         self._search_edit.textChanged.connect(self._on_search_changed)
         toolbar_layout.addWidget(QtWidgets.QLabel("Search:"))
         toolbar_layout.addWidget(self._search_edit, stretch=1)
@@ -398,7 +398,7 @@ class TemplateManagerDialog(QtWidgets.QDialog):
 
         self._replace_btn = QtWidgets.QPushButton("Replace from Current")
         self._replace_btn.setToolTip(
-            "Replace the selected template's mechanism with the current mechanism"
+            "Replace the mechanism of the selected template with the current mechanism"
         )
         self._replace_btn.clicked.connect(self._on_replace_clicked)
         button_layout.addWidget(self._replace_btn, 0, 2)
@@ -459,7 +459,7 @@ class TemplateManagerDialog(QtWidgets.QDialog):
             ),
             (
                 self._replace_btn,
-                "Replace the selected template's mechanism with the current mechanism.",
+                "Replace the mechanism of the selected template with the current mechanism.",
                 True,
             ),
             (

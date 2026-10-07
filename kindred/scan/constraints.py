@@ -100,7 +100,7 @@ def compile_constraints(prepared, config: ScanConfig, fixed: dict[str, float]):
             return Affine({}, literal_fraction(node.literal if node.literal is not None else str(node.value)))
         if isinstance(node, SpeciesRefNode):
             if node.kind != "init":
-                raise ValueError(f"[{node.name}] depends on simulated concentrations; use an input-only quantity.")
+                raise ValueError(f"[{node.name}] depends on simulated concentrations. Use an input-only quantity.")
             return coordinate(initial_key(node.name))
         if isinstance(node, IdentNode):
             if node.name in {"t", "T"}:
@@ -169,7 +169,7 @@ def compile_constraints(prepared, config: ScanConfig, fixed: dict[str, float]):
     precedence = set()
     for condition, expression in conditional:
         if condition.dependent in derived:
-            raise ValueError(f"{condition.observable}: {condition.dependent} is already calculated by an equality; select a free input to sample conditionally.")
+            raise ValueError(f"{condition.observable}: {condition.dependent} is already calculated by an equality. Select a free input to sample conditionally.")
         for key in expression.substitute(derived).terms:
             if key != condition.dependent:
                 precedence.add((key, condition.dependent))

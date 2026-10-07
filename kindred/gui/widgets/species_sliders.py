@@ -93,7 +93,7 @@ class BatchSpeciesSliders(QtWidgets.QWidget):
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(5)
-        title = QtWidgets.QLabel("Initial concentrations (M)", self)
+        title = QtWidgets.QLabel("Initial Concentrations (M)", self)
         title.setStyleSheet("font-weight: bold;")
         layout.addWidget(title)
         self._content = QtWidgets.QWidget(self)

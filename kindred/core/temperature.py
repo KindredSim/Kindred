@@ -282,7 +282,7 @@ class TemperatureSchedule:
         # Create lookup function
         def T_piecewise(t: float) -> float:
             if t < 0:
-                raise ValueError(f"Time must be non-negative, got t={t}")
+                raise ValueError(f"Time must be nonnegative, got t={t}")
             if t < time_intervals[0].t_start:
                 return baseline
 
@@ -369,7 +369,7 @@ class TemperatureSchedule:
 
         def T_response(t: float) -> float:
             if t < 0:
-                raise ValueError(f"Time must be non-negative, got t={t}")
+                raise ValueError(f"Time must be nonnegative, got t={t}")
             if t < time_intervals[0].t_start:
                 return baseline
 

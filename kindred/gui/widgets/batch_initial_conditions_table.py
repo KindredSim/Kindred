@@ -18,6 +18,8 @@ from kindred.core.project_document import (
 from kindred.core.project_presentation_state import ProjectPresentationState
 from kindred.core.project_session import ProjectContentToken
 from kindred.core.species import concentration_from_text
+from kindred.core.validation import six_digit_text
+from kindred.gui.ui_helpers import copy_current_cell_as_shown
 from kindred.gui.widgets.solver_settings import SolverSettingsDialog
 
 __all__ = [
@@ -79,8 +81,8 @@ class _ProjectedRow:
         raw = dict(self.raw_values)
         if species in raw:
             return raw[species]
-        # Preserve the exact accepted binary64 value in the editable
-        # projection; formatting must never become a scientific write.
+        # The item text is the exact accepted binary64 value, so editing never
+        # becomes a scientific write; the delegate paints six digits.
         return repr(float(dict(self.canonical_values).get(species, 0.0)))
 
 
@@ -407,7 +409,23 @@ class BatchInitialConditionsTableModel(QtCore.QAbstractTableModel):
 
 
 class _InitialConditionsItemDelegate(QtWidgets.QStyledItemDelegate):
-    """Keep rejected numeric edits available for correction."""
+    """Keep rejected numeric edits available for correction.
+
+    Valid concentrations paint at six significant digits; rejected text shows
+    as typed, and an open editor keeps the full text.
+    """
+
+    def initStyleOption(self, option, index) -> None:  # noqa: N802 - Qt override
+        super().initStyleOption(option, index)
+        if (
+            not index.model().is_numeric_column(index.column())
+            or index.data(QtCore.Qt.ItemDataRole.BackgroundRole) is not None
+        ):
+            return
+        try:
+            option.text = six_digit_text(float(option.text))
+        except ValueError:
+            pass
 
     def createEditor(  # noqa: N802 - Qt override
         self,
@@ -597,6 +615,10 @@ class BatchInitialConditionsTableView(QtWidgets.QTableView):
                     and model.request_run_settings_for_index(self.currentIndex())):
                 event.accept()
                 return
+        if event.matches(QtGui.QKeySequence.StandardKey.Copy):
+            copy_current_cell_as_shown(self)
+            event.accept()
+            return
         if event.matches(QtGui.QKeySequence.StandardKey.Paste):
             model = self.model()
             index = self.currentIndex()
@@ -1118,7 +1140,7 @@ class InitialConditionsTableActions(QtCore.QObject):
         answer = QtWidgets.QMessageBox.question(
             self._table,
             "Use Tab Defaults",
-            "Remove this set's complete custom Run settings and restore live "
+            "Remove the complete custom Run settings of this set and restore live "
             "inheritance from the tab defaults?",
             QtWidgets.QMessageBox.StandardButton.Yes
             | QtWidgets.QMessageBox.StandardButton.Cancel,

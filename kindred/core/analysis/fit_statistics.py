@@ -14,6 +14,7 @@ __all__ = [
     "finite_sum_of_squares",
     "fit_error_metrics",
     "r_squared_metric",
+    "root_mean_square",
 ]
 
 
@@ -127,13 +128,23 @@ def finite_sum_of_squares(values: Iterable[object]) -> Optional[float]:
     return float(result) if math.isfinite(result) else None
 
 
+def root_mean_square(residuals: object) -> FitMetric:
+    """Root-mean-square of one admitted, finite, nonempty residual vector."""
+
+    values = np.asarray(residuals, dtype=float).reshape(-1)
+    sse = finite_sum_of_squares(values)
+    if sse is None:
+        return FitMetric.unavailable("residual sum of squares overflowed")
+    return FitMetric.finite(math.sqrt(sse / float(values.size)))
+
+
 def fit_error_metrics(weighted_residuals: object) -> FitErrorMetrics:
     residuals = np.asarray(weighted_residuals, dtype=float).reshape(-1)
     if residuals.size == 0:
         unavailable = FitMetric.unavailable("no residual observations")
         return FitErrorMetrics(unavailable, unavailable, unavailable, unavailable)
     if not np.all(np.isfinite(residuals)):
-        unavailable = FitMetric.unavailable("residuals are non-finite")
+        unavailable = FitMetric.unavailable("residuals are nonfinite")
         return FitErrorMetrics(unavailable, unavailable, unavailable, unavailable)
     sse = finite_sum_of_squares(residuals)
     if sse is None:
@@ -161,7 +172,7 @@ def r_squared_metric(observed: object, residuals: object) -> FitMetric:
         np.all(np.isfinite(observations))
         and np.all(np.isfinite(residual_array))
     ):
-        return FitMetric.unavailable("observations or residuals are non-finite")
+        return FitMetric.unavailable("observations or residuals are nonfinite")
     if bool(np.all(observations == observations[0])):
         return FitMetric.unavailable("observations are constant")
     centered = observations - float(np.mean(observations))
@@ -171,5 +182,5 @@ def r_squared_metric(observed: object, residuals: object) -> FitMetric:
         return FitMetric.unavailable("R-squared arithmetic overflowed")
     value = 1.0 - (ss_res / ss_tot)
     if not math.isfinite(value):
-        return FitMetric.unavailable("R-squared arithmetic was non-finite")
+        return FitMetric.unavailable("R-squared arithmetic was nonfinite")
     return FitMetric.finite(value)

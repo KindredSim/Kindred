@@ -8,9 +8,10 @@ operates on an objective callable that returns residual vectors.
 from __future__ import annotations
 
 import logging
+import math
 import warnings
 from dataclasses import dataclass
-from typing import Callable, Dict, Mapping, Optional, Tuple
+from typing import Callable, Dict, Literal, Mapping, Optional, Tuple
 
 import numpy as np
 
@@ -36,9 +37,42 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "FitResult",
+    "fit_bound_position",
     "fit_parameters",
     "fit_parameters_with_fixed",
 ]
+
+FitBoundPosition = Literal["lower", "upper", "interior"]
+
+
+def fit_bound_position(
+    value: float,
+    minimum: float,
+    maximum: float,
+    *,
+    log10: bool = False,
+) -> FitBoundPosition:
+    """Classify a fitted value as at its lower or upper bound, or interior.
+
+    A value is at a bound when its distance from it, in the coordinate the
+    optimizer moved (log10 under Log Scale), is at most one billionth of the
+    bounds' width there, and it is nearer that bound than the other.  The
+    result is an informational label; values are always published as fitted.
+    """
+
+    def encode(raw: float) -> float:
+        return math.log10(raw) if log10 else float(raw)
+
+    encoded, low, high = encode(value), encode(minimum), encode(maximum)
+    lower_distance = encoded - low
+    upper_distance = high - encoded
+    tolerance = 1e-9 * (high - low)
+    position: FitBoundPosition = "interior"
+    if lower_distance <= min(upper_distance, tolerance):
+        position = "lower"
+    if upper_distance <= min(lower_distance, tolerance):
+        position = "upper"
+    return position
 
 
 def _is_cancelled_error(exc: BaseException) -> bool:
@@ -72,6 +106,8 @@ def fit_parameters_with_fixed(
     bounds: Optional[Dict[object, Tuple[float, float]]] = None,
     method: str,
     max_nfev: int = 1000,
+    ftol: float,
+    xtol: float,
     cancellation_check: Callable[[], bool] | None = None,
 ) -> FitResult:
     """Optimize one canonical objective while holding named coordinates fixed.
@@ -136,6 +172,8 @@ def fit_parameters_with_fixed(
         bounds=free_bounds,
         method=method,
         max_nfev=max_nfev,
+        ftol=ftol,
+        xtol=xtol,
         cancellation_check=cancellation_check,
     )
     return FitResult(
@@ -155,9 +193,9 @@ def fit_parameters(
     bounds: Optional[Dict[object, Tuple[float, float]]] = None,
     max_nfev: int = 1000,
     seed: Optional[int] = None,
-    ftol: float = 1e-10,
-    xtol: float = 1e-10,
     *,
+    ftol: float,
+    xtol: float,
     method: str,
     cancellation_check: Callable[[], bool] | None = None,
     de_penalty: float | None = None,
@@ -237,7 +275,7 @@ def fit_parameters(
                 else:
                     if residuals.size == 0 or not np.all(np.isfinite(residuals)):
                         raise OptimizationError(
-                            "Fit objective returned empty or non-finite residuals."
+                            "Fit objective returned empty or nonfinite residuals."
                         )
                     finite_score = finite_sum_of_squares(residuals)
                     score = (
@@ -335,8 +373,8 @@ def fit_parameters(
                 rank = int(np.linalg.matrix_rank(scaled))
                 if rank < param_count:
                     identifiability_warning = (
-                        "Fit Jacobian is rank deficient; parameter identifiability "
-                        f"is limited (rank {rank} < {param_count})."
+                        "These data cannot determine every fitted value independently. "
+                        f"The fit Jacobian has rank {rank} for {param_count} fitted values."
                     )
             except Exception as exc:
                 logger.debug("Failed to assess Fit Jacobian rank: %s", exc)

@@ -153,7 +153,7 @@ class SimulationSettingsDialog(QtWidgets.QDialog):
         body = QtWidgets.QWidget(scroll)
         body_layout = QtWidgets.QVBoxLayout(body)
         body_layout.setContentsMargins(0, 0, 0, 0)
-        science_box = QtWidgets.QGroupBox("Mechanism settings", body)
+        science_box = QtWidgets.QGroupBox("Mechanism Settings", body)
         science_form = QtWidgets.QFormLayout(science_box)
         factory = TabScientificSettings()
         self.temperature_spin = self._positive_spin(
@@ -181,25 +181,25 @@ class SimulationSettingsDialog(QtWidgets.QDialog):
             "this setting. Changing the units changes how existing energy numbers are interpreted."
         )
         self.rtol_edit.setToolTip(
-            "Controls solver error relative to each concentration's magnitude."
+            "Controls solver error relative to the magnitude of each concentration."
         )
         self.atol_edit.setToolTip(
             "Controls solver error when concentrations are near zero."
         )
         self.analytic_jacobian_check = QtWidgets.QCheckBox(
-            "Prefer analytic Jacobian when supported",
+            "Prefer Analytic Jacobian When Supported",
             science_box,
         )
         self.analytic_jacobian_check.setToolTip(
             "Uses the symbolic analytic Jacobian when supported. If any "
             "individual reaction-order or equilibrium concentration exponent "
-            "is non-integral, Kindred uses the solver's numerical Jacobian "
+            "is non-integral, Kindred uses the numerical Jacobian of the solver "
             "from the start. Supported intervention schedules retain analytic "
             "Jacobian handling. If analytic Jacobian evaluation fails after "
             "execution begins, the execution fails and is not retried."
         )
         self.scientific_defaults_check = QtWidgets.QCheckBox(
-            "Use these settings as defaults for new projects and tabs.",
+            "Use These Settings as Defaults for New Projects and Tabs",
             science_box,
         )
         self.scientific_defaults_check.setChecked(False)
@@ -216,7 +216,7 @@ class SimulationSettingsDialog(QtWidgets.QDialog):
         science_form.addRow("", self.analytic_jacobian_check)
 
         self.use_authored_stops_check = QtWidgets.QCheckBox(
-            "Use authored stopping interventions", science_box
+            "Use Authored Stopping Interventions", science_box
         )
         self.use_authored_stops_check.setToolTip(
             "Apply stopping interventions authored in this mechanism to Run and Preview "
@@ -225,7 +225,7 @@ class SimulationSettingsDialog(QtWidgets.QDialog):
             "Fitting always ignores stopping interventions."
         )
         self._stopping_declarations: tuple[str, ...] = ()
-        self.stopping_info_button = QtWidgets.QPushButton("Authored rules…", science_box)
+        self.stopping_info_button = QtWidgets.QPushButton("Authored Rules…", science_box)
         self.stopping_info_button.setSizePolicy(
             QtWidgets.QSizePolicy.Policy.Fixed, QtWidgets.QSizePolicy.Policy.Fixed,
         )
@@ -239,10 +239,10 @@ class SimulationSettingsDialog(QtWidgets.QDialog):
         self.set_stopping_declarations(())
         body_layout.addWidget(science_box)
 
-        run_box = QtWidgets.QGroupBox("Run defaults for new projects and tabs", body)
+        run_box = QtWidgets.QGroupBox("Run Defaults for New Projects and Tabs", body)
         run_box.setToolTip(
             "Run settings that new projects and tabs start with. Existing tabs "
-            "keep their settings; edit those in each tab's Run panel."
+            "keep their settings. Edit those in the Run panel of each tab."
         )
         run_form = QtWidgets.QFormLayout(run_box)
         self._run_default_fields = _RunSettingsFields(run_form, run_box)
@@ -266,10 +266,10 @@ class SimulationSettingsDialog(QtWidgets.QDialog):
         preview_form.addRow("Preview delay (ms)", self.preview_delay_spin)
         body_layout.addWidget(preview_box)
 
-        parallel_box = QtWidgets.QGroupBox("Parallel execution", body)
+        parallel_box = QtWidgets.QGroupBox("Parallel Execution", body)
         parallel_form = QtWidgets.QFormLayout(parallel_box)
         self.run_maximum_automatic_check = QtWidgets.QCheckBox(
-            "Automatic (CPU fallback)",
+            "Automatic (CPU Fallback)",
             parallel_box,
         )
         self.run_maximum_spin = self._integer_spin(
@@ -294,7 +294,7 @@ class SimulationSettingsDialog(QtWidgets.QDialog):
         parallel_form.addRow("Explicit maximum", self.run_maximum_spin)
         body_layout.addWidget(parallel_box)
 
-        cache_box = QtWidgets.QGroupBox("Result cache", body)
+        cache_box = QtWidgets.QGroupBox("Result Cache", body)
         cache_form = QtWidgets.QFormLayout(cache_box)
         self.cache_capacity_spin = self._integer_spin(
             1,
@@ -391,7 +391,7 @@ class SimulationSettingsDialog(QtWidgets.QDialog):
 
     def _show_stopping_declarations(self) -> None:
         message = QtWidgets.QMessageBox(self)
-        message.setWindowTitle("Authored stopping interventions")
+        message.setWindowTitle("Authored Stopping Interventions")
         message.setTextFormat(QtCore.Qt.PlainText)
         message.setText("\n".join(self._stopping_declarations))
         message.setStandardButtons(QtWidgets.QMessageBox.Ok)

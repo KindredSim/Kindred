@@ -97,7 +97,7 @@ def _canonical_reversible_steps(
     expected_count = len(reactions) + len(equilibria)
     if len(raw_mapping) != expected_count:
         raise DSLError(
-            "Canonical mechanism step_index_map is incomplete; Wegscheider "
+            "Canonical mechanism step_index_map is incomplete. Wegscheider "
             "analysis requires one entry for every authored kinetic step."
         )
 
@@ -116,7 +116,7 @@ def _canonical_reversible_steps(
         )
         if step_index <= 0 or step_index in seen_step_indices:
             raise DSLError(
-                "Canonical mechanism step_index_map has duplicate or non-positive "
+                "Canonical mechanism step_index_map has duplicate or nonpositive "
                 f"step_index {step_index}."
             )
         seen_step_indices.add(step_index)

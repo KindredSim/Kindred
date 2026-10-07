@@ -323,7 +323,7 @@ class ProjectController(QtCore.QObject):
         if transient.active_calculator:
             details.append("A Calculator query is still active.")
         if transient.active_spreadsheet:
-            details.append("The spreadsheet editor has temporary data. Closing discards it; Save saves only project data already created.")
+            details.append("The spreadsheet editor has temporary data. Closing discards it, and Save saves only project data already created.")
         details.append(f"Choose once how to proceed before {request.action}.")
 
         dialog = QtWidgets.QMessageBox(self._parent_widget)
@@ -459,7 +459,7 @@ class ProjectController(QtCore.QObject):
                 self._config.record_recent_project(path)
             except Exception as exc:
                 logger.warning("Recent-project update failed", exc_info=True)
-                status += f"; recent-project persistence failed: {exc}"
+                status += f" Updating the recent projects list failed: {exc}"
         self._set_status(status)
         self.projectStateChanged.emit(True)
         return True
@@ -747,7 +747,7 @@ class ProjectController(QtCore.QObject):
             self._config.record_recent_project(absolute_path)
         except Exception as exc:
             logger.warning("Recent-project update failed", exc_info=True)
-            status += f"; recent-project persistence failed: {exc}"
+            status += f" Updating the recent projects list failed: {exc}"
         self._set_status(status)
         self.projectStateChanged.emit(False)
         return committed_token
@@ -791,7 +791,7 @@ class ProjectController(QtCore.QObject):
             # cleanup problem. Continue through the normal owner settlement
             # path so Close remains pending until every owner is settled.
             self._set_status(
-                "Idle window cleanup did not finish; waiting for active work to settle."
+                "Idle window cleanup did not finish. Waiting for active work to settle."
             )
         self._close_started = True
         self._close_pending = True

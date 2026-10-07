@@ -79,7 +79,7 @@ class InteractiveSliders(PracticeLesson):
                 load_preset,
                 instruction="<p>Open <b>Examples → Preset Mechanisms → M5: A &lt;-&gt; B, B -&gt; C</b>.</p>"
                 "<p>M5 contains <b>A ⇌ B</b> with <b>kf1 = 1.5</b> and <b>kr1 = 0.25</b>, "
-                "and <b>B → C</b> with <b>k2 = 0.1</b>. We will change kf1 and k2 with sliders "
+                "and <b>B → C</b> with <b>k2 = 0.1</b>. You will change kf1 and k2 with sliders "
                 "and keep kr1 at 0.25 throughout this lesson.</p>"
                 "<p>The preset adds <b>preset_set1</b> with <b>A = 1</b>, <b>B = 0</b>, and <b>C = 0</b>. "
                 "Use that set for the first run. The original set1 row can stay.</p>",
@@ -106,7 +106,7 @@ class InteractiveSliders(PracticeLesson):
                 "show_slider", "Show Both Rate Sliders",
                 "<p>If the <b>Interactive Sliders panel</b> is hidden, open "
                 "<b>View → Panels → Interactive Sliders</b>. You can also click <b>Show this control</b> below.</p>"
-                "<p>In the Interactive Sliders panel, open <b>Visible sliders</b>. "
+                "<p>In the Interactive Sliders panel, open <b>Visible Sliders</b>. "
                 "Check <b>kf1 — A → B</b> and <b>k2 — B → C</b>, then close the menu.</p>"
                 "<p><b>kf1</b> controls the forward rate of A ⇌ B and <b>k2</b> controls B → C. "
                 "You can drag either slider or type a value. Leave <b>kr1 = 0.25</b>.</p>",

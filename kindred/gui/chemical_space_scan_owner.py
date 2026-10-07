@@ -40,7 +40,7 @@ class _ScanThread(QtCore.QThread):
                 lines = ["Setup is feasible. No simulations were attempted."]
                 for key, intervals in design.effective_ranges.items():
                     if key in self.config.ranges:
-                        lines.append(f"{key}: " + "; ".join(
+                        lines.append(f"{key}: " + " ∪ ".join(
                             f"{'[' if i.include_lower else '('}{i.lower:g}, {i.upper:g}{']' if i.include_upper else ')'}"
                             for i in intervals))
                 for key, expression in design.derived.items():
@@ -48,7 +48,7 @@ class _ScanThread(QtCore.QThread):
                     lines.append(f"Calculate {key} = {float(expression.constant):g} {terms}")
                 self.result = "\n".join(lines)
         except SimulationCancelled:
-            self.result = "Setup check cancelled. No simulations were attempted."
+            self.result = "Setup check canceled. No simulations were attempted."
         except Exception as exc:
             self.result = f"Setup cannot start: {exc}"
 
@@ -192,7 +192,8 @@ class ChemicalSpaceScanOwner(QtCore.QObject):
             message = worker.result
         else:
             result = worker.result
-            message = (f"Scan {result.state}: {result.attempted}/{result.requested} attempted; "
+            state = "canceled" if result.state == "cancelled" else result.state
+            message = (f"Scan {state}: {result.attempted}/{result.requested} attempted, "
                        f"{result.saved} records saved. {result.path} {result.error}")
         logger.info(message)
         self.status.emit(message)

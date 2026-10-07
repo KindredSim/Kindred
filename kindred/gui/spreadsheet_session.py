@@ -269,7 +269,7 @@ class SpreadsheetSession:
                 top, left, bottom, right = args
                 selected = [column for column in range(left, right + 1) if columns[column - 1]["formula"] is None]
                 if not selected:
-                    raise ValueError("Formula cells can't be cleared. Clear the cells the formula uses, or edit or delete the formula.")
+                    raise ValueError("Formula cells cannot be cleared. Clear the cells the formula uses, or edit or delete the formula.")
                 raw = self._raw()
                 if all(raw.get_cell_value(sheet, row, column) is None
                        for column in selected for row in range(top, bottom + 1)):

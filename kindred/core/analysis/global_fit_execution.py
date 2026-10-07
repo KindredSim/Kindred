@@ -36,7 +36,6 @@ from kindred.core.analysis.parametric_alignment import (
     project_parametric_y,
 )
 from kindred.core.analysis.dataset_parameter_overrides import (
-    FitCentredFixedEffectsParamSpec,
     FitCoupledVariableParamSpec,
     FitDatasetParameterOverrides,
 )
@@ -48,6 +47,7 @@ from kindred.core.analysis.fit_statistics import (
     finite_sum_of_squares,
     fit_error_metrics,
     r_squared_metric,
+    root_mean_square,
 )
 from kindred.core.exceptions import (
     FitCandidateDomainError,
@@ -81,7 +81,6 @@ _DATASET_DEADLINE_SECONDS = 10.0
 
 __all__ = [
     "FitCoordinate",
-    "CentredFixedEffectsSettlement",
     "FitProgress",
     "DatasetFitInfo",
     "GlobalFitResult",
@@ -92,6 +91,7 @@ __all__ = [
     "normalize_weights",
     "evaluate_dataset_simulation",
     "fit_result_target_values",
+    "parameter_group_variable_id",
 ]
 
 
@@ -101,16 +101,13 @@ class FitCoordinate:
 
     ``display_name`` is a report/UI serialization only.  Optimizer maps retain
     the typed identity so a shared ``D::p`` cannot alias dataset ``D``
-    parameter ``p``.
+    parameter ``p``.  A ``group`` coordinate is the public uncertainty target
+    of one Per-dataset parameter group, identified by its parameter and origin
+    dataset; the optimizer moves it as the coupled variable named by
+    :func:`parameter_group_variable_id`.
     """
 
-    scope: Literal[
-        "shared",
-        "dataset",
-        "coupled",
-        "centred_overall",
-        "centred_deviation",
-    ]
+    scope: Literal["shared", "dataset", "coupled", "group"]
     name: str
     dataset_id: str | None = None
 
@@ -120,18 +117,9 @@ class FitCoordinate:
         dataset_id = None if self.dataset_id is None else str(self.dataset_id).strip()
         if not name:
             raise ValueError("Fit coordinate name must be nonblank.")
-        if scope in {
-            "dataset",
-            "centred_deviation",
-        } and not dataset_id:
+        if scope in {"dataset", "group"} and not dataset_id:
             raise ValueError(f"{scope} coordinates require a dataset identity.")
-        if scope not in {
-            "shared",
-            "dataset",
-            "coupled",
-            "centred_overall",
-            "centred_deviation",
-        }:
+        if scope not in {"shared", "dataset", "coupled", "group"}:
             raise ValueError(f"Unsupported Fit coordinate scope: {scope!r}")
         object.__setattr__(self, "scope", scope)
         object.__setattr__(self, "name", name)
@@ -139,76 +127,20 @@ class FitCoordinate:
 
     @property
     def display_name(self) -> str:
-        if self.scope in {"dataset", "centred_deviation"}:
+        if self.scope == "dataset":
             return f"{self.dataset_id}::{self.name}"
+        if self.scope == "group":
+            return f"group {self.dataset_id}::{self.name}"
         return self.name
 
     def __str__(self) -> str:
         return self.display_name
 
 
-@dataclass(frozen=True, slots=True)
-class CentredFixedEffectsDeviation:
-    """One typed dataset deviation in a centred terminal settlement."""
+def parameter_group_variable_id(parameter_name: str, origin_dataset_id: str) -> str:
+    """Stable coupled-variable ID of one Per-dataset parameter group."""
 
-    coordinate: FitCoordinate
-    decoded_value: float
-
-    def __post_init__(self) -> None:
-        if self.coordinate.scope != "centred_deviation":
-            raise ValueError(
-                "Centred settlement deviations require a centred_deviation coordinate."
-            )
-        decoded_value = float(self.decoded_value)
-        if not math.isfinite(decoded_value):
-            raise ValueError("Centred settlement deviations must be finite.")
-        object.__setattr__(self, "decoded_value", decoded_value)
-
-
-@dataclass(frozen=True, slots=True)
-class CentredFixedEffectsSettlement:
-    """Immutable terminal authority for one centred fixed-effects parameter."""
-
-    parameter_name: str
-    dataset_ids: tuple[str, ...]
-    overall_decoded_value: float
-    deviations: tuple[CentredFixedEffectsDeviation, ...]
-    dataset_values: Mapping[str, float]
-
-    def __post_init__(self) -> None:
-        name = str(self.parameter_name or "").strip()
-        roster = tuple(str(value or "").strip() for value in self.dataset_ids)
-        if (
-            not name
-            or not roster
-            or any(not value for value in roster)
-            or len(roster) != len(set(roster))
-            or roster != tuple(sorted(roster))
-        ):
-            raise ValueError("Centred settlement requires a sorted unique dataset roster.")
-        deviations = tuple(self.deviations)
-        if any(not isinstance(item, CentredFixedEffectsDeviation) for item in deviations):
-            raise TypeError("Centred settlement deviations require typed rows.")
-        expected_deviation_coordinates = tuple(
-            FitCoordinate("centred_deviation", name, dataset_id)
-            for dataset_id in roster
-        )
-        if tuple(item.coordinate for item in deviations) != expected_deviation_coordinates:
-            raise ValueError(
-                "Centred settlement deviations require the exact typed dataset identities, "
-                "including the derived reference."
-            )
-        values = {str(dataset_id): float(value) for dataset_id, value in self.dataset_values.items()}
-        if tuple(values) != roster or any(not math.isfinite(value) for value in values.values()):
-            raise ValueError("Centred settlement decoded dataset values must match its roster.")
-        overall_decoded = float(self.overall_decoded_value)
-        if not math.isfinite(overall_decoded):
-            raise ValueError("Centred settlement overall values must be finite.")
-        object.__setattr__(self, "parameter_name", name)
-        object.__setattr__(self, "dataset_ids", roster)
-        object.__setattr__(self, "overall_decoded_value", overall_decoded)
-        object.__setattr__(self, "deviations", deviations)
-        object.__setattr__(self, "dataset_values", MappingProxyType(values))
+    return f"parameter:{parameter_name}:{origin_dataset_id}"
 
 
 def _decode_log10_physical(raw_value: object, *, coordinate: str) -> float:
@@ -223,7 +155,7 @@ def _decode_log10_physical(raw_value: object, *, coordinate: str) -> float:
         ) from exc
     if not math.isfinite(value):
         raise FitCandidateDomainError(
-            f"Non-finite Log10 optimizer coordinate for {coordinate!r}.",
+            f"Nonfinite Log10 optimizer coordinate for {coordinate!r}.",
             stage="log10_decode",
         )
     try:
@@ -336,6 +268,9 @@ class DatasetFitInfo:
     """
     dataset_id: str  # Identifier for this dataset
     r_squared_by_series: Dict[str, FitMetric]  # Ordinary, unweighted R² by series
+    # Unweighted RMS residual by series in its scientific unit; the X block
+    # of a measured-X dataset is keyed by its X quantity.
+    raw_rms_by_series: Dict[str, FitMetric]
     weighted_residual_sse: FitMetric  # Exact contribution to the objective
     weighted_residual_mse: FitMetric  # Exact objective contribution per observation
     weighted_rmse: FitMetric
@@ -357,6 +292,11 @@ class DatasetFitInfo:
             self,
             "r_squared_by_series",
             MappingProxyType(dict(self.r_squared_by_series)),
+        )
+        object.__setattr__(
+            self,
+            "raw_rms_by_series",
+            MappingProxyType(dict(self.raw_rms_by_series)),
         )
         object.__setattr__(
             self, "model_series", MappingProxyType(dict(self.model_series)),
@@ -405,8 +345,6 @@ class GlobalFitResult:
     optimizer_diagnostic: FactualCause | None = None
     profile_likelihood_result: ProfileLikelihoodResult | None = None
     residual_bootstrap_result: ResidualBootstrapResult | None = None
-    primary_model: Literal["ordinary", "centred_fixed_effects"] = "ordinary"
-    centred_fixed_effects_settlements: tuple[CentredFixedEffectsSettlement, ...] = ()
 
     def __post_init__(self) -> None:
         status = str(self.status or "")
@@ -422,12 +360,8 @@ class GlobalFitResult:
             raise ValueError("An ok GlobalFitResult cannot carry a factual diagnostic.")
         if status == "warn" and optimizer_diagnostic is None:
             raise ValueError("A warning GlobalFitResult requires a factual diagnostic.")
-        primary_model = str(self.primary_model or "ordinary")
-        if primary_model not in {"ordinary", "centred_fixed_effects"}:
-            raise ValueError(f"Unsupported GlobalFitResult primary model: {primary_model!r}")
         object.__setattr__(self, "status", status)
         object.__setattr__(self, "optimizer_converged", optimizer_converged)
-        object.__setattr__(self, "primary_model", primary_model)
         if not (
             isinstance(self.weighted_residual_sse, FitMetric)
             and isinstance(self.weighted_residual_mse, FitMetric)
@@ -447,15 +381,6 @@ class GlobalFitResult:
             )
         optimizer_vector.setflags(write=False)
         object.__setattr__(self, "optimizer_vector", optimizer_vector)
-        settlements = tuple(self.centred_fixed_effects_settlements or ())
-        if any(not isinstance(item, CentredFixedEffectsSettlement) for item in settlements):
-            raise TypeError("GlobalFitResult centred settlements require typed DTOs.")
-        expected_primary_model = "centred_fixed_effects" if settlements else "ordinary"
-        if self.primary_model != expected_primary_model:
-            raise ValueError(
-                "GlobalFitResult primary model must match its centred settlement roster."
-            )
-        object.__setattr__(self, "centred_fixed_effects_settlements", settlements)
         shared_params = {
             str(name): float(value)
             for name, value in self.shared_params.items()
@@ -532,7 +457,6 @@ class _FitReplayState:
     weighted_residuals: np.ndarray
     profile_likelihood_result: ProfileLikelihoodResult | None = None
     residual_bootstrap_result: ResidualBootstrapResult | None = None
-    centred_fixed_effects_settlements: tuple[CentredFixedEffectsSettlement, ...] = ()
 
     def __post_init__(self) -> None:
         raw_vector = np.asarray(self.optimizer_vector, dtype=float)
@@ -557,8 +481,6 @@ def _construct_global_fit_result(
 
     if not isinstance(state, _FitReplayState):
         raise TypeError("Global Fit publication requires private replay state.")
-    settlements = tuple(state.centred_fixed_effects_settlements or ())
-    primary_model = "centred_fixed_effects" if settlements else "ordinary"
     return GlobalFitResult(
         shared_params=dict(state.shared_params),
         dataset_params={
@@ -575,8 +497,6 @@ def _construct_global_fit_result(
         optimizer_diagnostic=state.optimizer_diagnostic,
         profile_likelihood_result=state.profile_likelihood_result,
         residual_bootstrap_result=state.residual_bootstrap_result,
-        primary_model=primary_model,
-        centred_fixed_effects_settlements=settlements,
     )
 
 
@@ -614,7 +534,7 @@ def fit_result_message(
             if detail and detail != str(base_message or "").strip():
                 warning_parts.append(detail)
         if warning_parts:
-            return "Global fit completed with warnings: " + "; ".join(warning_parts)
+            return "Global fit completed with warnings: " + ", ".join(warning_parts)
         fallback = str(base_message or "").strip()
         if fallback and "success" not in fallback.lower():
             return fallback
@@ -854,7 +774,7 @@ def fit_result_target_values(
         value = float(result.scalars[target_name])
         if not np.isfinite(value):
             raise FitSimulationError(
-                f"Fit scalar target {target_name!r} is non-finite.",
+                f"Fit scalar target {target_name!r} is nonfinite.",
                 details=details,
             )
         values = np.full(time_size, value, dtype=float)
@@ -898,9 +818,6 @@ class FitParameterLayout:
     physical_x0: np.ndarray
     physical_lower: np.ndarray
     physical_upper: np.ndarray
-    centred_var_order: tuple[FitCentredFixedEffectsParamSpec, ...] = ()
-    centred_overall_index: Mapping[str, int] = field(default_factory=dict)
-    centred_deviation_index: Mapping[tuple[str, str], int] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -956,30 +873,6 @@ class FitParameterLayout:
                 {str(variable_id): int(index) for variable_id, index in self.coupled_var_index.items()}
             ),
         )
-        centred_order = tuple(self.centred_var_order)
-        if any(not isinstance(item, FitCentredFixedEffectsParamSpec) for item in centred_order):
-            raise TypeError("Centred layout entries require typed parameter specs.")
-        centred_names = tuple(item.parameter_name for item in centred_order)
-        if len(centred_names) != len(set(centred_names)):
-            raise ValueError("Centred layout parameter names must be unique.")
-        object.__setattr__(self, "centred_var_order", centred_order)
-        object.__setattr__(
-            self,
-            "centred_overall_index",
-            MappingProxyType(
-                {str(name): int(index) for name, index in self.centred_overall_index.items()}
-            ),
-        )
-        object.__setattr__(
-            self,
-            "centred_deviation_index",
-            MappingProxyType(
-                {
-                    (str(name), str(dataset_id)): int(index)
-                    for (name, dataset_id), index in self.centred_deviation_index.items()
-                }
-            ),
-        )
         for name in ("x0", "lower", "upper", "physical_x0", "physical_lower", "physical_upper"):
             values = np.asarray(getattr(self, name), dtype=float).reshape(-1).copy()
             values.setflags(write=False)
@@ -987,17 +880,6 @@ class FitParameterLayout:
 
     def _coordinate_keys(self) -> tuple[FitCoordinate, ...]:
         keys = tuple(FitCoordinate("shared", name) for name in self.param_names)
-        keys += tuple(
-            coordinate
-            for item in self.centred_var_order
-            for coordinate in (
-                FitCoordinate("centred_overall", item.parameter_name),
-                *tuple(
-                    FitCoordinate("centred_deviation", item.parameter_name, dataset_id)
-                    for dataset_id in item.dataset_ids[1:]
-                ),
-            )
-        )
         keys += tuple(
             FitCoordinate("dataset", parameter_name, ds_id)
             for ds_id, parameter_name in self.dataset_var_order
@@ -1019,51 +901,15 @@ class FitParameterLayout:
         keys = self.opt_param_keys()
         return {key: (float(self.lower[i]), float(self.upper[i])) for i, key in enumerate(keys)}
 
-    def coordinate_identity(self, coordinate: FitCoordinate) -> FitCoordinate:
-        keys = self.opt_param_keys()
-        if not isinstance(coordinate, FitCoordinate):
-            raise TypeError("Fit coordinate identity must be a typed FitCoordinate.")
-        if coordinate not in keys:
-            raise KeyError(coordinate)
-        return coordinate
-
-    def coordinate_index(self, coordinate: FitCoordinate) -> int:
-        identity = self.coordinate_identity(coordinate)
-        return self.opt_param_keys().index(identity)
-
-    def coordinate_log10(self, coordinate: FitCoordinate) -> bool:
-        identity = self.coordinate_identity(coordinate)
-        if identity.scope == "shared":
-            return bool(self.shared_log10.get(identity.name, False))
-        if identity.scope == "dataset":
-            return bool(self.dataset_var_log10.get((identity.dataset_id, identity.name), False))
-        if identity.scope == "coupled":
-            return next(item.log10 for item in self.coupled_var_order if item.variable_id == identity.name)
-        if identity.scope == "centred_overall":
-            return next(item.log10 for item in self.centred_var_order if item.parameter_name == identity.name)
-        if identity.scope == "centred_deviation":
-            return next(item.log10 for item in self.centred_var_order if item.parameter_name == identity.name)
-        raise KeyError(identity)
-
     def decode_coordinate(self, coordinate: FitCoordinate, optimizer_value: float) -> float:
-        identity = self.coordinate_identity(coordinate)
-        value = float(optimizer_value)
-        self.coordinate_index(identity)
-        if identity.scope == "centred_deviation":
-            # Deviations live on the admitted raw scale.  Only a complete
-            # derived dataset value is physically decoded for log10 effects.
-            if not math.isfinite(value):
-                raise FitCandidateDomainError(
-                    "Centred deviation coordinate must be finite.",
-                    stage="centred_fixed_effects_domain",
-                )
-            return value
-        return self._decode_index(
-            self.coordinate_index(identity),
-            value,
-            log10=self.coordinate_log10(identity),
-            coordinate=identity.display_name,
-        )
+        index = self.opt_param_keys().index(coordinate)
+        if coordinate.scope == "shared":
+            log10 = bool(self.shared_log10.get(coordinate.name, False))
+        elif coordinate.scope == "dataset":
+            log10 = bool(self.dataset_var_log10.get((coordinate.dataset_id, coordinate.name), False))
+        else:
+            log10 = next(item.log10 for item in self.coupled_var_order if item.variable_id == coordinate.name)
+        return self._decode_index(index, float(optimizer_value), log10=log10, coordinate=coordinate.display_name)
 
     def _decode_index(
         self, index: int, raw_value: float, *, log10: bool, coordinate: str,
@@ -1081,58 +927,8 @@ class FitParameterLayout:
             coordinate=coordinate,
         )
 
-    def _centred_physical_value(
-        self, spec: FitCentredFixedEffectsParamSpec, dataset_id: str, raw_value: float,
-    ) -> float:
-        if not spec.log10:
-            return float(raw_value)
-        start = float(dict(spec.initial_values)[dataset_id])
-        return _decode_admitted_physical(
-            float(raw_value),
-            encoded=(math.log10(start), math.log10(spec.minimum), math.log10(spec.maximum)),
-            physical=(start, float(spec.minimum), float(spec.maximum)),
-            coordinate=spec.parameter_name,
-        )
-
-    def _centred_raw_values_for_spec(
-        self,
-        spec: FitCentredFixedEffectsParamSpec,
-        vector: np.ndarray,
-    ) -> tuple[float, dict[str, float]]:
-        overall_index = self.centred_overall_index[spec.parameter_name]
-        indices = (
-            overall_index,
-            *(
-                self.centred_deviation_index[(spec.parameter_name, dataset_id)]
-                for dataset_id in spec.dataset_ids[1:]
-            ),
-        )
-        block = tuple(float(vector[index]) for index in indices)
-        overall_raw = block[0]
-        if block == tuple(float(self.x0[index]) for index in indices):
-            # The admitted start vector reconstructs the admitted starts exactly.
-            return overall_raw, {
-                str(dataset_id): (math.log10(value) if spec.log10 else float(value))
-                for dataset_id, value in spec.initial_values
-            }
-        deltas = dict(zip(spec.dataset_ids[1:], block[1:], strict=True))
-        deltas[spec.dataset_ids[0]] = -math.fsum(block[1:])
-        low = float(self.lower[overall_index])
-        high = float(self.upper[overall_index])
-        # Values within the reconstruction's rounding of a bound settle on it.
-        rounding = 4.0 * np.finfo(float).eps * math.fsum(abs(value) for value in block)
-        raw_values: dict[str, float] = {}
-        for dataset_id in spec.dataset_ids:
-            raw = overall_raw + deltas[dataset_id]
-            if abs(raw - low) <= rounding:
-                raw = low
-            elif abs(raw - high) <= rounding:
-                raw = high
-            raw_values[dataset_id] = raw
-        return overall_raw, raw_values
-
     def validate_optimizer_vector(self, vector: np.ndarray) -> None:
-        """Validate exact optimizer shape/finiteness and centred-domain custody."""
+        """Validate exact optimizer shape and finiteness."""
 
         values = np.asarray(vector, dtype=float)
         if (
@@ -1141,84 +937,9 @@ class FitParameterLayout:
             or not np.all(np.isfinite(values))
         ):
             raise FitCandidateDomainError(
-                "Fit candidate has a non-finite or incomplete optimizer vector.",
+                "Fit candidate has a nonfinite or incomplete optimizer vector.",
                 stage="optimizer_vector_domain",
             )
-        for spec in self.centred_var_order:
-            _overall_raw, raw_values = self._centred_raw_values_for_spec(spec, values)
-            low = math.log10(spec.minimum) if spec.log10 else spec.minimum
-            high = math.log10(spec.maximum) if spec.log10 else spec.maximum
-            invalid = tuple(
-                dataset_id
-                for dataset_id, raw_value in raw_values.items()
-                if not math.isfinite(raw_value) or raw_value < low or raw_value > high
-            )
-            if invalid:
-                raise FitCandidateDomainError(
-                    f"Centred parameter {spec.parameter_name!r} leaves its configured domain "
-                    f"for dataset(s): {', '.join(invalid)}.",
-                    stage="centred_fixed_effects_domain",
-                    details={
-                        "parameter": spec.parameter_name,
-                        "invalid_dataset_ids": invalid,
-                        "bounds": (low, high),
-                    },
-                )
-
-    def centred_params_for_dataset(
-        self,
-        dataset_id: str,
-        vector: np.ndarray,
-    ) -> dict[str, float]:
-        dataset_id = str(dataset_id or "").strip()
-        values: dict[str, float] = {}
-        for spec in self.centred_var_order:
-            if dataset_id not in spec.dataset_ids:
-                continue
-            _overall_raw, raw_values = self._centred_raw_values_for_spec(spec, vector)
-            values[spec.parameter_name] = self._centred_physical_value(
-                spec, dataset_id, raw_values[dataset_id],
-            )
-        return values
-
-    def centred_settlements_for_vector(
-        self,
-        vector: np.ndarray,
-    ) -> tuple[CentredFixedEffectsSettlement, ...]:
-        self.validate_optimizer_vector(vector)
-        values = np.asarray(vector, dtype=float).reshape(-1)
-        settlements: list[CentredFixedEffectsSettlement] = []
-        for spec in self.centred_var_order:
-            overall_raw, raw_values = self._centred_raw_values_for_spec(spec, values)
-            overall_decoded = self._decode_index(
-                self.centred_overall_index[spec.parameter_name],
-                overall_raw,
-                log10=spec.log10,
-                coordinate=spec.parameter_name,
-            )
-            deviations = tuple(
-                CentredFixedEffectsDeviation(
-                    coordinate=FitCoordinate(
-                        "centred_deviation", spec.parameter_name, dataset_id
-                    ),
-                    decoded_value=float(raw_values[dataset_id] - overall_raw),
-                )
-                for dataset_id in spec.dataset_ids
-            )
-            decoded_dataset_values = {
-                dataset_id: self._centred_physical_value(spec, dataset_id, raw_value)
-                for dataset_id, raw_value in raw_values.items()
-            }
-            settlements.append(
-                CentredFixedEffectsSettlement(
-                    parameter_name=spec.parameter_name,
-                    dataset_ids=tuple(sorted(spec.dataset_ids)),
-                    overall_decoded_value=overall_decoded,
-                    deviations=deviations,
-                    dataset_values=decoded_dataset_values,
-                )
-            )
-        return tuple(settlements)
 
     def shared_param_dict_from_vector(self, vector: np.ndarray) -> Dict[str, float]:
         out: Dict[str, float] = {}
@@ -1267,7 +988,6 @@ def build_parameter_layout_for_dataset_ids(
     coupled_variables: Sequence[FitCoupledVariableParamSpec],
     bounds: Optional[Dict[str, Tuple[float, float]]],
     log10_params: Optional[Dict[str, bool]],
-    centred_variables: Sequence[FitCentredFixedEffectsParamSpec] = (),
 ) -> FitParameterLayout:
     """Build the optimizer layout from the admitted included-dataset roster."""
 
@@ -1296,74 +1016,6 @@ def build_parameter_layout_for_dataset_ids(
         else:
             shared_initials.append(value)
 
-    raw_centred_order = tuple(centred_variables)
-    if any(not isinstance(item, FitCentredFixedEffectsParamSpec) for item in raw_centred_order):
-        raise TypeError("Centred Fit variables must use typed parameter specifications.")
-    centred_order = tuple(
-        sorted(raw_centred_order, key=lambda item: item.parameter_name)
-    )
-    centred_names = tuple(item.parameter_name for item in centred_order)
-    if len(centred_names) != len(set(centred_names)):
-        raise ValueError("Centred Fit parameter names must be unique.")
-    overlap = set(param_names).intersection(centred_names)
-    if overlap:
-        raise ValueError(
-            "A Fit parameter cannot be both Shared and centred: "
-            + ", ".join(sorted(overlap))
-        )
-    if set(centred_names).intersection(
-        name
-        for override in dataset_overrides
-        for name in (
-            *(item.name for item in override.variable_params),
-            *(item[0] for item in override.fixed_params),
-        )
-    ):
-        raise ValueError("A centred Fit parameter cannot have a dataset override route.")
-    if set(centred_names).intersection(item.parameter_name for item in coupled_variables):
-        raise ValueError("A centred Fit parameter cannot have a coupled route.")
-
-    centred_initials: list[float] = []
-    centred_bounds: list[tuple[float, float]] = []
-    centred_physical: list[tuple[float, float, float]] = []
-    centred_overall_index: dict[str, int] = {}
-    centred_deviation_index: dict[tuple[str, str], int] = {}
-    for spec in centred_order:
-        if tuple(spec.dataset_ids) != normalized_dataset_ids:
-            raise ValueError(
-                f"Centred parameter {spec.parameter_name!r} must use the exact included dataset roster."
-            )
-        raw_starts = np.asarray(
-            [
-                math.log10(value) if spec.log10 else float(value)
-                for _dataset_id, value in spec.initial_values
-            ],
-            dtype=float,
-        )
-        low = math.log10(spec.minimum) if spec.log10 else float(spec.minimum)
-        high = math.log10(spec.maximum) if spec.log10 else float(spec.maximum)
-        # The mean stays within the starts' range (and so within bounds), so
-        # equal starts give exactly zero deviations.
-        overall_raw = min(max(float(np.mean(raw_starts)), float(raw_starts.min())), float(raw_starts.max()))
-        centred_initials.append(overall_raw)
-        centred_bounds.append((low, high))
-        overall_physical = (
-            min(max(_decode_log10_physical(overall_raw, coordinate=spec.parameter_name),
-                    float(spec.minimum)), float(spec.maximum))
-            if spec.log10 else overall_raw
-        )
-        centred_physical.append((overall_physical, float(spec.minimum), float(spec.maximum)))
-        overall_index = len(param_names) + len(centred_initials) - 1
-        centred_overall_index[spec.parameter_name] = overall_index
-        for dataset_id, raw_start in zip(spec.dataset_ids[1:], raw_starts[1:], strict=True):
-            delta = float(raw_start - overall_raw)
-            centred_initials.append(delta)
-            centred_bounds.append((low - high, high - low))
-            centred_physical.append((delta, low - high, high - low))
-            centred_deviation_index[(spec.parameter_name, dataset_id)] = (
-                len(param_names) + len(centred_initials) - 1
-            )
-
     dataset_var_order: List[Tuple[str, str]] = []
     dataset_var_index: Dict[str, Dict[str, int]] = {}
     dataset_var_inits: List[float] = []
@@ -1385,7 +1037,7 @@ def build_parameter_layout_for_dataset_ids(
             log10_flag = bool(spec.log10)
             dataset_var_order.append((ds_id, param_name))
             dataset_var_index[ds_id][param_name] = (
-                len(param_names) + len(centred_initials) + len(dataset_var_inits)
+                len(param_names) + len(dataset_var_inits)
             )
             init_val = float(spec.initial)
             min_val = float(spec.minimum)
@@ -1422,7 +1074,7 @@ def build_parameter_layout_for_dataset_ids(
         for item in coupled_order
     ]
     x0 = np.array(
-        shared_initials + centred_initials + dataset_var_inits + coupled_initials,
+        shared_initials + dataset_var_inits + coupled_initials,
         dtype=float,
     )
 
@@ -1461,26 +1113,23 @@ def build_parameter_layout_for_dataset_ids(
     ]
     lower = np.array(
         shared_lower
-        + [b[0] for b in centred_bounds]
         + [b[0] for b in dataset_var_bounds]
         + [b[0] for b in coupled_bounds],
         dtype=float,
     )
     upper = np.array(
         shared_upper
-        + [b[1] for b in centred_bounds]
         + [b[1] for b in dataset_var_bounds]
         + [b[1] for b in coupled_bounds],
         dtype=float,
     )
     physical = np.array(
         shared_physical
-        + centred_physical
         + dataset_var_physical
         + [(float(item.initial), float(item.minimum), float(item.maximum)) for item in coupled_order],
         dtype=float,
     ).reshape(-1, 3)
-    coupled_start = len(param_names) + len(centred_initials) + len(dataset_var_inits)
+    coupled_start = len(param_names) + len(dataset_var_inits)
     coupled_index = {
         item.variable_id: coupled_start + index
         for index, item in enumerate(coupled_order)
@@ -1500,9 +1149,6 @@ def build_parameter_layout_for_dataset_ids(
         physical_x0=physical[:, 0],
         physical_lower=physical[:, 1],
         physical_upper=physical[:, 2],
-        centred_var_order=centred_order,
-        centred_overall_index=centred_overall_index,
-        centred_deviation_index=centred_deviation_index,
     )
 
 
@@ -1662,6 +1308,7 @@ def _build_dataset_fit_info(
     weighted_blocks: list[np.ndarray] = []
     model_series: dict[str, np.ndarray] = {}
     r_squared: dict[str, FitMetric] = {}
+    raw_rms: dict[str, FitMetric] = {}
     for species_name in sorted(payload.species_list):
         _raise_if_fitting_cancel_requested(cancellation_control)
         species_obs = observations[species_name]
@@ -1707,6 +1354,7 @@ def _build_dataset_fit_info(
         weighted_blocks.append(weighted)
         model_series[species_name] = y_sim
         r_squared[str(species_name)] = r_squared_metric(y_exp, raw_residual)
+        raw_rms[str(species_name)] = root_mean_square(raw_residual)
 
     if x_projection is not None:
         x_multiplier = dataset_weight * float(target_multipliers[payload.x_name])
@@ -1720,6 +1368,7 @@ def _build_dataset_fit_info(
             ))
         raw_blocks.append(x_raw)
         weighted_blocks.append(x_weighted)
+        raw_rms[str(payload.x_name)] = root_mean_square(x_raw)
     _raise_if_fitting_cancel_requested(cancellation_control)
     residuals = np.concatenate(raw_blocks)
     weighted_residuals = np.concatenate(weighted_blocks)
@@ -1731,6 +1380,7 @@ def _build_dataset_fit_info(
     return DatasetFitInfo(
         dataset_id=dataset_id,
         r_squared_by_series=r_squared,
+        raw_rms_by_series=raw_rms,
         weighted_residual_sse=dataset_metrics.weighted_sse,
         weighted_residual_mse=dataset_metrics.weighted_mse,
         weighted_rmse=dataset_metrics.weighted_rmse,
@@ -1922,11 +1572,6 @@ class GlobalFitObjective:
             raise ValueError(
                 "Fit objective layout references datasets absent from its payload roster."
             )
-        for spec in layout.centred_var_order:
-            if tuple(spec.dataset_ids) != tuple(sorted(dataset_ids)):
-                raise ValueError(
-                    "Fit objective centred layout must use the exact sorted payload roster."
-                )
         self._payloads = tuple(
             sorted(payload_roster, key=lambda item: item.dataset_id)
         )
@@ -2372,10 +2017,6 @@ class GlobalFitObjective:
             for values, origin in (
                 (param_dict, FITTING_PARAM_ORIGIN_OPTIMIZER_SHARED),
                 (
-                    self._layout.centred_params_for_dataset(ds_id, params),
-                    FITTING_PARAM_ORIGIN_OPTIMIZER_DATASET,
-                ),
-                (
                     self._dataset_params.get(ds_id, {}),
                     FITTING_PARAM_ORIGIN_CONFIGURED_DATASET,
                 ),
@@ -2535,7 +2176,7 @@ def _raise_final_replay_candidate_error(
             }
         )
         terminal_error = FitSimulationError(
-            "Final Fit replay rejected the optimizer's terminal candidate.",
+            "Final Fit replay rejected the terminal candidate of the optimizer.",
             failed_params=failed_params,
             details=details,
         )
@@ -2563,7 +2204,7 @@ def _raise_final_replay_candidate_error(
                 },
             )
     terminal_error = FitSimulationError(
-        "Final Fit replay rejected the optimizer's terminal candidate.",
+        "Final Fit replay rejected the terminal candidate of the optimizer.",
         failed_params=failed_params,
         details={"fatal": True, "stage": str(stage)},
     )
@@ -2595,7 +2236,6 @@ def _assemble_fit_replay_state(
     fitted_params = layout.shared_param_dict_from_vector(candidate_vector)
     combined_dataset_params = {
         payload.dataset_id: {
-            **layout.centred_params_for_dataset(payload.dataset_id, candidate_vector),
             **layout.dataset_var_params_for_dataset(payload.dataset_id, candidate_vector),
             **layout.coupled_params_for_dataset(payload.dataset_id, candidate_vector),
         }
@@ -2609,15 +2249,12 @@ def _assemble_fit_replay_state(
         _raise_if_fitting_cancel_requested(cancellation_control)
 
         full_params = dict(fitted_params)
-        full_params.update(layout.centred_params_for_dataset(ds_id, candidate_vector))
         full_params.update(fixed_dataset_params.get(ds_id, {}))
         full_params.update(combined_dataset_params.get(ds_id, {}))
         parameter_origins = {
             name: FITTING_PARAM_ORIGIN_OPTIMIZER_SHARED
             for name in fitted_params
         }
-        for name in layout.centred_params_for_dataset(ds_id, candidate_vector).keys():
-            parameter_origins[name] = FITTING_PARAM_ORIGIN_OPTIMIZER_DATASET
         for name in fixed_dataset_params.get(ds_id, {}):
             parameter_origins[name] = FITTING_PARAM_ORIGIN_CONFIGURED_DATASET
         for name in combined_dataset_params.get(ds_id, {}):
@@ -2626,15 +2263,9 @@ def _assemble_fit_replay_state(
                 for item in layout.coupled_var_order
                 if ds_id in item.dataset_ids
             }
-            centred_names = {
-                item.parameter_name
-                for item in layout.centred_var_order
-                if ds_id in item.dataset_ids
-            }
             if (
                 name in layout.dataset_var_index.get(ds_id, {})
                 or name in coupled_names
-                or name in centred_names
             ):
                 parameter_origins[name] = FITTING_PARAM_ORIGIN_OPTIMIZER_DATASET
             else:
@@ -2713,7 +2344,6 @@ def _assemble_fit_result_facts(
     fitted_params = layout.shared_param_dict_from_vector(candidate_vector)
     combined_dataset_params = {
         payload.dataset_id: {
-            **layout.centred_params_for_dataset(payload.dataset_id, candidate_vector),
             **layout.dataset_var_params_for_dataset(payload.dataset_id, candidate_vector),
             **layout.coupled_params_for_dataset(payload.dataset_id, candidate_vector),
         }
@@ -2788,11 +2418,6 @@ def _assemble_fit_result_facts(
             info.weighted_rmse.value,
         )
 
-    centred_settlements = (
-        layout.centred_settlements_for_vector(candidate_vector)
-        if layout.centred_var_order
-        else ()
-    )
     return _FitReplayState(
         shared_params=fitted_params,
         dataset_params=combined_dataset_params,
@@ -2807,5 +2432,4 @@ def _assemble_fit_result_facts(
         weighted_residuals=np.concatenate(global_weighted_residual_blocks),
         profile_likelihood_result=None,
         residual_bootstrap_result=None,
-        centred_fixed_effects_settlements=centred_settlements,
     )

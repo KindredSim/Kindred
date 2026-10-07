@@ -641,7 +641,7 @@ class GridPlotView(QtWidgets.QWidget):
             for quantity in (x_name, *names):
                 model = format_unit_for_display(model_display[quantity]) or "Unspecified"
                 measured = format_unit_for_display(measured_display[quantity]) or "Unspecified"
-                details.append(f"{html.escape(quantity)}: model {model}; measured {measured}")
+                details.append(f"{html.escape(quantity)}: model {model}, measured {measured}")
             tooltip = "<qt>" + "<br>".join(details) + "</qt>"
         state = (x_name, title, tooltip, label, units, x_display, len(self._dataset_ids) > 1,
                  self._dark_mode, self.font().toString())

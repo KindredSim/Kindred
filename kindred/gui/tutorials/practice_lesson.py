@@ -410,7 +410,7 @@ class PracticeLesson(Lesson):
                 "<p>Follow the highlighted menu entries. There is no need to press Next between menus.</p>"
                 "<p>M1 adds <b>preset_set1</b> with starting concentrations "
                 "<b>A = 1</b> and <b>B = 0</b>. A set is a named group of starting values for one simulation.</p>"
-                "<p>The original <b>set1</b> row can stay. We will use preset_set1.</p>",
+                "<p>The original <b>set1</b> row can stay. Use preset_set1.</p>",
                 self._preset_target,
                 self._loaded,
                 "M1 and the starting values are ready.",
@@ -422,9 +422,9 @@ class PracticeLesson(Lesson):
             "prepare_run",
             "Choose the Starting Values and Time",
             "<p>In <b>Initial Conditions</b>, select only <b>preset_set1</b>. Check <b>A = 1</b> and <b>B = 0</b>.</p>"
-            "<p>Set <b>t_start</b> to <b>0</b>, <b>t_end</b> to <b>5</b> seconds, and <b>Points</b> to <b>100</b>. "
+            "<p>Set <b><i>t</i><sub>start</sub></b> to <b>0</b>, <b><i>t</i><sub>end</sub></b> to <b>5</b> seconds, and <b>Points</b> to <b>100</b>. "
             "Press <b>Enter</b> after each edit.</p>"
-            "<p><b>t_start</b> and <b>t_end</b> set the simulation interval. <b>Points</b> sets the number of evenly spaced "
+            "<p><b><i>t</i><sub>start</sub></b> and <b><i>t</i><sub>end</sub></b> set the simulation interval. <b>Points</b> sets the number of evenly spaced "
             "output samples, including both endpoints. It does not set the internal integration steps. "
             "Intervention boundary rows are additional.</p>"
             "<p><b>Solver</b> selects the numerical method. Either available solver works for this exercise.</p>"
@@ -500,7 +500,7 @@ class PracticeLesson(Lesson):
             "<p>Choose <b>File → Save Project</b>.</p>"
             "<p>For a new project, choose a filename and destination. "
             "If the project is already saved, this updates that file. "
-            "Use <b>Save Project As...</b> when you want a separate copy.</p>"
+            "Use <b>Save Project As…</b> when you want a separate copy.</p>"
             "<p>Check that saving completed. If you canceled the dialog, try again before choosing <b>Continue</b>.</p>",
             self._save_target,
             manual=True,
@@ -511,9 +511,9 @@ class PracticeLesson(Lesson):
             "finish",
             "Lesson Complete",
             "<p>Your practice tabs stay in the project. You can keep exploring or save your work.</p>"
-            "<p>Use <b>File → Open Project...</b> to reopen a saved <b>.kin file</b>. "
-            "Open <b>Examples → Template Manager</b> to reuse a saved mechanism template.</p>"
-            "<p>Choose <b>Finish</b> to close this lesson. Open <b>Help → Interactive Tutorials</b> to choose another. "
+            "<p>Use <b>File → Open Project…</b> to reopen a saved <b>.kin file</b>. "
+            "Open <b>Examples → Template Manager…</b> to reuse a saved mechanism template.</p>"
+            "<p>Choose <b>Finish</b> to close this lesson. Open <b>Help → Interactive Tutorials…</b> to choose another. "
             "Each lesson includes its own setup.</p>",
             lambda: None,
         )

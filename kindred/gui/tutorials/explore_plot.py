@@ -48,7 +48,7 @@ class ExplorePlot(PracticeLesson):
             Step(
                 "invert_selection",
                 "Invert the Y Selection",
-                "<p>With only A selected, open Y and click <b>Invert selection</b>. B and total are now selected.</p>"
+                "<p>With only A selected, open Y and click <b>Invert Selection</b>. B and total are now selected.</p>"
                 "<p>Click it again to return to A alone. This swaps checked and unchecked quantities. "
                 "It does not reverse the axis direction.</p>",
                 plot,

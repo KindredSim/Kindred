@@ -58,6 +58,7 @@ from ..units import (
     normalize_energy_unit,
 )
 from ..species import validate_c0, validate_concentration, validate_temperature
+from ..validation import six_digit_source_text
 from ..stoichiometry import directional_order_fraction
 from .errors import (
     DSLError as _DSLError,
@@ -500,7 +501,7 @@ def _parse_species_side(text: str) -> Dict[str, float]:
     for term in terms:
         term = term.strip()
         if not term:
-            raise _DSLError("Malformed stoichiometry: empty term (e.g., consecutive '+' signs)")
+            raise _DSLError("Malformed stoichiometry: empty term, for example consecutive '+' signs.")
         m = _SPECIES_TERM_RE.match(term)
         if not m and "*" in term:
             # Allow patterns like "2 * B" while rejecting "A B"
@@ -1073,7 +1074,7 @@ def _admit_temperature_directive(text: str) -> str | None:
         kinds = ", ".join(kind for _number, _raw, kind in directives)
         raise _DSLError(
             "At most one top-level temperature schedule directive is "
-            f"allowed; found {len(directives)} ({kinds}).",
+            f"allowed. Found {len(directives)} ({kinds}).",
             suggestion="Keep only one temp_step: or temp_response: directive.",
             line_number=line_number,
             line_content=raw,
@@ -1425,12 +1426,12 @@ def _reject_per_step_globals(
     """Reject per-reaction T= and energy= overrides."""
     if "T" in params:
         raise _DSLError(
-            "Per-reaction T= is not supported; use a global T= directive.",
+            "Per-reaction T= is not supported. Use a global T= directive.",
             line_number=line_number, line_content=line_content,
         )
     if "energy" in params:
         raise _DSLError(
-            "Per-reaction energy= is not supported; use a global energy= directive",
+            "Per-reaction energy= is not supported. Use a global energy= directive",
             line_number=line_number, line_content=line_content,
         )
 
@@ -1904,7 +1905,7 @@ def derive_source_with_parameter_updates(
                 raise ValueError(
                     f"Parameter {update.name!r} is not a continuous writable coordinate."
                 )
-            retain_replacement(coordinate, repr(float(update.value)))
+            retain_replacement(coordinate, six_digit_source_text(update.value))
             continue
         if coordinate.role == "param":
             raise LookupError(
@@ -1926,7 +1927,7 @@ def derive_source_with_parameter_updates(
             )
         # Physical and authored indexed source coordinates are already in the
         # exact units and representation expected by their retained span.
-        retain_replacement(coordinate, repr(float(update.value)))
+        retain_replacement(coordinate, six_digit_source_text(update.value))
 
     for line_index, line_replacements in replacements.items():
         seen_spans: set[tuple[int, int]] = set()

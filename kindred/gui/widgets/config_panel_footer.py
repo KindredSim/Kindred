@@ -76,7 +76,7 @@ class ConfigPanelFooter(QtWidgets.QWidget):
         self.hint_label.setWordWrap(True)
         layout.addWidget(self.hint_label)
 
-        self.dirty_label = QtWidgets.QLabel("Pending changes")
+        self.dirty_label = QtWidgets.QLabel("Pending Changes")
         self.dirty_label.setStyleSheet("font-weight: bold;")
         self.dirty_label.setVisible(False)
         layout.addWidget(self.dirty_label)

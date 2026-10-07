@@ -34,7 +34,7 @@ def capture_import_source(
     if suffix not in {".csv", ".xlsx"}:
         shown = suffix or "(none)"
         raise ValueError(
-            f"Unsupported dataset extension {shown!r}; choose a .csv or .xlsx file."
+            f"Unsupported dataset extension {shown!r}. Choose a .csv or .xlsx file."
         )
     if not path.is_file():
         raise ValueError(f"Dataset source does not exist: {path}.")
@@ -105,7 +105,7 @@ def resolve_column_unit(
             raise ValueError(
                 f"Column {column.assigned_name!r}: {text!r} is a time format, not a "
                 "unit. Excel duration and clock cells need no unit (set Time unit "
-                "to Use default); CSV times must be plain numbers."
+                "to Use default), and CSV times must be plain numbers."
             ) from exc
         raise ValueError(f"Column {column.assigned_name!r}: {exc}") from exc
 

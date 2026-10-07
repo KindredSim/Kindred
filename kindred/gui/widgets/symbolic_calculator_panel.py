@@ -87,7 +87,7 @@ class SymbolicCalculatorPanel(QtWidgets.QWidget):
         self._solution_combo.setSizeAdjustPolicy(QtWidgets.QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
         self._solution_combo.setMinimumContentsLength(20)
         use_row.addWidget(self._solution_combo, stretch=1)
-        self._use_button = QtWidgets.QPushButton("Use result", self)
+        self._use_button = QtWidgets.QPushButton("Use Result", self)
         self._use_button.setObjectName("symbolicCalculatorUseButton")
         self._use_button.clicked.connect(self.use_result)
         use_row.addWidget(self._use_button)
@@ -147,13 +147,13 @@ class SymbolicCalculatorPanel(QtWidgets.QWidget):
         self._solution_combo.setVisible(len(state.reuse_queries) > 1)
         self._use_button.setVisible(bool(state.reuse_queries))
         self._use_button.setEnabled(available and not state.busy and bool(state.reuse_queries))
-        self._use_button.setText("Use in query" if len(state.reuse_queries) > 1 else "Use result")
+        self._use_button.setText("Use in Query" if len(state.reuse_queries) > 1 else "Use Result")
         self._use_button.setToolTip(
             "Put a calculation for the selected answer in the input box so you can build on it. "
-            "Click Evaluate when you’re ready."
+            "Click Evaluate when you are ready."
             if len(state.reuse_queries) > 1 else
             "Put this calculation back in the input box so you can edit it. "
-            "Click Evaluate when you’re ready."
+            "Click Evaluate when you are ready."
         )
         reason = state.reason
         self._status_label.setText(state.status if available else reason)

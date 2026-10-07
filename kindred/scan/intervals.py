@@ -27,7 +27,7 @@ def normalize(intervals: tuple[Interval, ...]) -> tuple[Interval, ...]:
         if item.lower > item.upper or (item.lower == item.upper and not (
             item.include_lower and item.include_upper
         )):
-            raise ValueError("An interval is empty; check its bounds and endpoint choices.")
+            raise ValueError("An interval is empty. Check its bounds and endpoint choices.")
         if result and (item.lower < result[-1].upper or (
             item.lower == result[-1].upper and (item.include_lower or result[-1].include_upper)
         )):

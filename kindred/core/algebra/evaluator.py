@@ -168,7 +168,7 @@ def _as_float(x: Any, *, stmt: LetStatement) -> float:
         logger.debug(f"Failed to convert value to float: {x}", exc_info=True)
         raise AlgebraTypeError("non scalar where scalar required", line=stmt.line, col=stmt.col, line_text=stmt.line_text)
     if not np.isfinite(xf):
-        raise AlgebraTypeError("non-finite result in numeric context", line=stmt.line, col=stmt.col, line_text=stmt.line_text)
+        raise AlgebraTypeError("nonfinite result in numeric context", line=stmt.line, col=stmt.col, line_text=stmt.line_text)
     return xf
 
 
@@ -470,7 +470,7 @@ class _Evaluator:
                 raise
             except OverflowError as exc:
                 raise AlgebraTypeError(
-                    "non-finite result in numeric context",
+                    "nonfinite result in numeric context",
                     line=stmt.line,
                     col=stmt.col,
                     line_text=stmt.line_text,
@@ -504,7 +504,7 @@ class _Evaluator:
                 logger.debug(f"Function {node.name} call failed", exc_info=True)
                 raise AlgebraTypeError(f"invalid function call: {e}", line=stmt.line, col=stmt.col, line_text=stmt.line_text)
             if not np.isfinite(out):
-                raise AlgebraTypeError("non-finite function result", line=stmt.line, col=stmt.col, line_text=stmt.line_text)
+                raise AlgebraTypeError("nonfinite function result", line=stmt.line, col=stmt.col, line_text=stmt.line_text)
             return out
 
         # Should not reach here

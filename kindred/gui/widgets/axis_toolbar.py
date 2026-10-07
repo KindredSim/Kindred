@@ -125,9 +125,9 @@ class AxisToolbar(QtWidgets.QWidget):
         y_popup_layout.setContentsMargins(6, 6, 6, 6)
         y_popup_layout.setSpacing(4)
 
-        self._y_popup_label = QtWidgets.QLabel("Visible series", self._y_popup_container)
+        self._y_popup_label = QtWidgets.QLabel("Visible Series", self._y_popup_container)
         self._y_popup_label.setToolTip(self._y_list.toolTip())
-        self._invert_y_selection_btn = QtWidgets.QPushButton("Invert selection", self._y_popup_container)
+        self._invert_y_selection_btn = QtWidgets.QPushButton("Invert Selection", self._y_popup_container)
         self._invert_y_selection_btn.setObjectName("axisToolbarInvertYSelectionButton")
         self._invert_y_selection_btn.setToolTip(
             "Select the unselected Y series and deselect the selected ones. "

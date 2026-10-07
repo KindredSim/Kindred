@@ -111,7 +111,7 @@ def missing_arrow_error(line: str) -> DSLError:
 def invalid_species_term_error(term: str) -> DSLError:
     """Error for malformed species term."""
     suggestion = (
-        "Use format: 'A' or '2A' or '0.5A' (optionally with '*', e.g. '2*A'). "
+        "Use format: 'A' or '2A' or '0.5A' (optionally with '*', for example '2*A'). "
         "Species names must start with a letter/underscore and contain only letters, digits, and underscores."
     )
 

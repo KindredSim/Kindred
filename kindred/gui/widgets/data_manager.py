@@ -193,10 +193,10 @@ class _SourceDialog(QtWidgets.QDialog):
         for title, value in fields:
             form.addRow(title, _source_label(value))
         layout.addWidget(original)
-        layout.addWidget(QtWidgets.QLabel("Measured columns"))
+        layout.addWidget(QtWidgets.QLabel("Measured Columns"))
         table = QtWidgets.QTableWidget(len(record.observations), 4 if source is not None else 3)
         table.setAccessibleName("Measured columns, measurement counts and units")
-        table.setHorizontalHeaderLabels(["Column in file", "Measurements", "Imported unit", "Converted to"] if source is not None else ["Column", "Measurements", "Scientific unit"])
+        table.setHorizontalHeaderLabels(["Column in File", "Measurements", "Imported Unit", "Converted To"] if source is not None else ["Column", "Measurements", "Scientific Unit"])
         table.verticalHeader().hide()
         table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
         table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
@@ -242,7 +242,7 @@ class _ICSetDialog(QtWidgets.QDialog):
             self.sets.setEnabled(False)
         form.addRow("Existing IC set", self.sets)
         layout.addLayout(form)
-        create = QtWidgets.QPushButton("Create IC set from data…")
+        create = QtWidgets.QPushButton("Create IC Set from Data…")
         create.setAutoDefault(False)
         create.clicked.connect(lambda: self.done(self.CREATE_FROM_DATA))
         layout.addWidget(create, 0, Qt.AlignLeft)
@@ -315,7 +315,7 @@ class DataManagerPanel(QtWidgets.QWidget):
         self.create_action.changed.connect(lambda: self._create_btn.setEnabled(self.create_action.isEnabled()))
         self._creation_busy = False
         self._rename_btn = QtWidgets.QPushButton("Rename…")
-        self._rename_btn.setToolTip("Change this dataset’s name in Kindred.")
+        self._rename_btn.setToolTip("Change the name of this dataset in Kindred.")
         self._rename_btn.clicked.connect(self._rename_dataset)
         self._export_original_btn = QtWidgets.QPushButton("Export Original…")
         self._export_original_btn.setToolTip("Save a copy of the original imported file, with its original contents and units.")
@@ -716,7 +716,7 @@ class DataManagerPanel(QtWidgets.QWidget):
         self._tab_name.set_name(self._mechanism_name or "No active mechanism")
         self._mapping_status.setVisible(not self._mapping_available)
         if not self._mechanism_name:
-            self._mapping_status.setText("No active mechanism. Datasets remain available; select a mechanism to assign data.")
+            self._mapping_status.setText("No active mechanism. Datasets remain available. Select a mechanism to assign data.")
         elif not self._mapping_available:
             self._mapping_status.setText("Apply a valid mechanism with observation targets to assign data.")
         else:
@@ -771,7 +771,7 @@ class DataManagerPanel(QtWidgets.QWidget):
             )
             box = QtWidgets.QMessageBox(self)
             box.setIcon(QtWidgets.QMessageBox.Icon.Question)
-            box.setWindowTitle("Initial-condition set already in use")
+            box.setWindowTitle("Initial-Condition Set Already in Use")
             box.setTextFormat(QtCore.Qt.TextFormat.PlainText)
             box.setText(
                 f'"{label}" is already mapped to "{occupant_name}" in this '
@@ -781,11 +781,11 @@ class DataManagerPanel(QtWidgets.QWidget):
                 f'Moving the set unmaps "{occupant_name}".'
             )
             override_button = box.addButton(
-                "Move set to this dataset",
+                "Move Set to This Dataset",
                 QtWidgets.QMessageBox.ButtonRole.AcceptRole,
             )
             copy_button = box.addButton(
-                "Create a separate copy",
+                "Create a Separate Copy",
                 QtWidgets.QMessageBox.ButtonRole.ActionRole,
             )
             cancel_button = box.addButton(

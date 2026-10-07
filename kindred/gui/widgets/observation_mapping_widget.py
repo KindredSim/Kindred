@@ -64,7 +64,7 @@ class ObservationMappingWidget(QtWidgets.QWidget):
             form.addRow(label, combo)
         layout.addLayout(form)
 
-        self._concentrations_group = QtWidgets.QGroupBox("Initial concentrations", self)
+        self._concentrations_group = QtWidgets.QGroupBox("Initial Concentrations", self)
         concentrations_layout = QtWidgets.QVBoxLayout(self._concentrations_group)
         source_form = QtWidgets.QFormLayout()
         self._source_combo = QtWidgets.QComboBox(self._concentrations_group)
@@ -86,7 +86,7 @@ class ObservationMappingWidget(QtWidgets.QWidget):
         concentrations_layout.addWidget(self._source_label)
         self._preview = QtWidgets.QTableWidget(0, 3, self._concentrations_group)
         self._preview.setAccessibleName("Initial concentration preview")
-        self._preview.setHorizontalHeaderLabels(["Species", "Initial concentration", "Source"])
+        self._preview.setHorizontalHeaderLabels(["Species", "Initial Concentration", "Source"])
         self._preview.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
         self._preview.verticalHeader().hide()
         self._preview.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.ResizeToContents)

@@ -147,7 +147,7 @@ def normalize_solver_name(name: object) -> str:
     if normalized in scipy_methods:
         return scipy_methods[normalized]
     allowed = ", ".join(sorted(scipy_methods.values()))
-    raise SolverError(f"Unsupported solver name {name!r}; expected one of: {allowed}.")
+    raise SolverError(f"Unsupported solver name {name!r}. Expected one of: {allowed}.")
 
 
 def _prepare_time_grid(req: _SimulationRequest, *, t0: float, t1: float) -> np.ndarray:
@@ -226,13 +226,13 @@ def _guard_runtime_symbolic_jacobian(
                 time=float(time),
                 reason=(
                     "Analytic Jacobian callback returned shape "
-                    f"{matrix.shape}; expected {expected_shape}."
+                    f"{matrix.shape}, expected {expected_shape}."
                 ),
             )
         if not np.all(np.isfinite(matrix)):
             raise _SymbolicJacobianEvaluationError(
                 time=float(time),
-                reason="Analytic Jacobian callback returned non-finite values.",
+                reason="Analytic Jacobian callback returned nonfinite values.",
             )
         return matrix
 
@@ -361,7 +361,7 @@ def _execute_scipy(
             if "different signs" in str(exc).lower():
                 stage, reason = "event_root_finding", "Event root finding failed"
             elif str(exc) == "array must not contain infs or NaNs":
-                stage, reason = "nonfinite_step", "Solver step became non-finite"
+                stage, reason = "nonfinite_step", "Solver step became nonfinite"
             else:
                 raise
             if (
@@ -421,7 +421,7 @@ def _execute_scipy(
             f"t={exc.time:.4e}: {exc.reason}",
             suggestion=(
                 "Disable the analytic Jacobian preference to execute with the "
-                "solver's numerical Jacobian, or correct the reported "
+                "numerical Jacobian of the solver, or correct the reported "
                 "analytic evaluation condition."
             ),
             details={
@@ -597,7 +597,7 @@ def solve_ode(
         if req.candidate_evaluation:
             return exc.outcome
         raise SolverError(
-            "Simulation produced non-finite values.",
+            "Simulation produced nonfinite values.",
             details={"solver": req.solver},
         ) from exc
     return output

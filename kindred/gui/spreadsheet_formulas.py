@@ -51,7 +51,7 @@ def _reference_column(name: str) -> int:
 
 def _source(source: str) -> str:
     if not source:
-        raise ValueError("Type an expression after =, e.g. =B5*2.")
+        raise ValueError("Type an expression after =, for example =B5*2.")
     if "\n" in source or "\r" in source:
         raise ValueError("A formula must fit on one line.")
     return source

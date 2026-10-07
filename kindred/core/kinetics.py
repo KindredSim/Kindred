@@ -125,7 +125,7 @@ def _positive_integer(value: object, *, field: str) -> int:
 def _directional_order(value: object, *, field: str = "molecularity") -> float:
     order = _numeric_float(value, field=field)
     if not math.isfinite(order) or order < 0.0:
-        raise ValueError(f"{field} must be a finite non-negative real.")
+        raise ValueError(f"{field} must be a finite nonnegative real.")
     return float(order)
 
 

@@ -134,7 +134,7 @@ def _parse_directive_fields(
     for field in _split_directive_fields(payload, syntax_name=syntax_name):
         if field.count("=") != 1:
             raise TemperatureDSLError(
-                f"Invalid {syntax_name} field {field!r}; expected name=value."
+                f"Invalid {syntax_name} field {field!r}. Expected name=value."
             )
         name, value = (part.strip() for part in field.split("=", 1))
         if not name or not value:
@@ -156,7 +156,7 @@ def _parse_directive_fields(
         if unknown:
             details.append("unknown " + ", ".join(unknown))
         raise TemperatureDSLError(
-            f"Invalid {syntax_name} fields: " + "; ".join(details) + "."
+            f"Invalid {syntax_name} fields: " + ", ".join(details) + "."
         )
     return parsed
 

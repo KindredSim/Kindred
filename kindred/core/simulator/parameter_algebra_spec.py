@@ -613,7 +613,7 @@ def _validate_retained_parameter_program(
         if statement.expr.has_species_ref() or "T" in idents or "t" in idents:
             raise DSLError(
                 f"Parameter expression for {assignment.name!r} must be static.",
-                suggestion="Use numeric literals, other static parameters, and supported constants; put dynamic state expressions in a 'let'.",
+                suggestion="Use numeric literals, other static parameters, and supported constants. Put dynamic state expressions in a 'let'.",
                 line_number=assignment.line_number,
                 line_content=assignment.line_content,
             )
@@ -1104,7 +1104,7 @@ def extract_parameter_assignments_from_algebra_lines(
             if name in SymbolTable().protected_names() or name in SymbolTable().functions().keys():
                 raise DSLError(
                     _reserved_name_message(name, "parameter"),
-                    suggestion="Choose a name that does not shadow protected constants/functions (e.g., 'a', 'Ea', 'scale').",
+                    suggestion="Choose a name that does not shadow protected constants or functions, for example 'a', 'Ea', or 'scale'.",
                     line_number=line_no,
                     line_content=original,
                 )
@@ -1112,7 +1112,7 @@ def extract_parameter_assignments_from_algebra_lines(
             if m_mech and resolution.canonical_name is None and name not in mechanism_param_names:
                 raise DSLError(
                     f"Unknown mechanism parameter {raw_name!r} in Algebra param statement",
-                    suggestion="Use an existing mechanism parameter (e.g., k1, k2, kf1, kr1, Keq1) or define the parameter on a reaction line.",
+                    suggestion="Use an existing mechanism parameter, such as k1, k2, kf1, kr1, or Keq1, or define the parameter on a reaction line.",
                     examples=["A -> B; k=1.0", "param k1 = 4*k2"],
                     line_number=line_no,
                     line_content=original,
@@ -1157,7 +1157,7 @@ def extract_parameter_assignments_from_algebra_lines(
             target = resolution.canonical_name or target_raw
             if resolution.canonical_name is not None and target in mechanism_param_names:
                 raise DSLError(
-                    f"{target_raw!r} is a rate/equilibrium parameter; use 'param {target_raw} = ...' for parameter algebra",
+                    f"{target_raw!r} is a rate/equilibrium parameter. Use 'param {target_raw} = ...' for parameter algebra",
                     suggestion=f"Replace this with: param {target_raw} = ...",
                     examples=[f"param {target_raw} = 4*k2"],
                     line_number=line_no,
@@ -1215,7 +1215,7 @@ def extract_observable_names_from_algebra_lines(algebra_lines: Sequence[Tuple[in
                 # silently read the built-in constant or function instead.
                 raise DSLError(
                     _reserved_name_message(classification.raw_name, "let value"),
-                    suggestion="Choose a name that does not shadow protected constants/functions (e.g., 'ratio', 'rate_A').",
+                    suggestion="Choose a name that does not shadow protected constants or functions, for example 'ratio' or 'rate_A'.",
                     line_number=_line_no,
                     line_content=raw.rstrip("\n"),
                 )
@@ -1249,8 +1249,8 @@ def parse_parameter_algebra_spec_from_dsl_text(
             raise DSLError(
                 f"Name {assignment.name!r} is defined as both a solver parameter (param) and an observable (let)",
                 suggestion=(
-                    f"Use only 'param {assignment.name} = ...' for solver parameters; "
-                    f"use 'let {assignment.name}_obs = ...' for observables."
+                    f"Use only 'param {assignment.name} = ...' for solver parameters, "
+                    f"and 'let {assignment.name}_obs = ...' for observables."
                 ),
                 line_number=assignment.line_number,
                 line_content=assignment.line_content,

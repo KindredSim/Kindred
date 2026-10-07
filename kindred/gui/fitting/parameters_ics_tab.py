@@ -22,6 +22,7 @@ from kindred.gui.ui_helpers import (
     SOLVER_TOOLTIP,
     ScientificNameDelegate,
     ControlRowsLayout,
+    cell_text_as_shown,
     configure_compact_numeric_edit,
     ignore_wheel,
 )
@@ -32,9 +33,9 @@ from kindred.core.analysis.fit_uncertainty import (
 )
 from kindred.core.analysis.global_fit_execution import FitCoordinate
 from kindred.core.quantity_units import format_unit_for_display
-from kindred.core.validation import parse_finite_numeric_text
+from kindred.core.validation import parse_finite_numeric_text, six_digit_text
 
-from kindred.core.fitting_method_policy import SUPPORTED_FIT_METHODS
+from kindred.core.fitting_method_policy import SUPPORTED_FIT_METHODS, UNCERTAINTY_FIT_METHODS
 from kindred.gui.fitting.constants import FIT_METHOD_LABELS
 from kindred.core.project_document import (
     FIT_MAX_NFEV_RANGE,
@@ -48,6 +49,8 @@ from kindred.gui.fitting.launch import (
     FitOriginSnapshot,
     FitParameterVariable,
     FitSetupSnapshot,
+    fit_coordinate_datasets_text,
+    fit_group_labels,
     fit_uncertainty_coordinates,
     prune_fit_analysis_coordinates,
     _replace_fit_parameter,
@@ -55,6 +58,7 @@ from kindred.gui.fitting.launch import (
 )
 from kindred.gui.fitting.constants import (
     DE_CONVERGENCE_TOLERANCE_LABEL,
+    admit_fit_tolerance,
     DIFFERENTIAL_EVOLUTION_METHOD,
     FUNCTION_TOLERANCE_LABEL,
     STEP_TOLERANCE_LABEL,
@@ -98,12 +102,12 @@ class _ProfileLikelihoodDialog(QtWidgets.QDialog):
         self,
         *,
         available: Sequence[FitCoordinate],
-        display_names: Mapping[FitCoordinate, str] | None = None,
+        display_names: Mapping[FitCoordinate, str],
         configuration: ProfileLikelihoodConfig | None,
         parent: QtWidgets.QWidget | None = None,
     ) -> None:
         super().__init__(parent)
-        self.setWindowTitle("Profile likelihood")
+        self.setWindowTitle("Profile Likelihood")
         self.setModal(True)
         self.resize(520, 420)
         form = QtWidgets.QFormLayout(self)
@@ -111,21 +115,13 @@ class _ProfileLikelihoodDialog(QtWidgets.QDialog):
         self._coordinates.setSelectionMode(
             QtWidgets.QAbstractItemView.SelectionMode.SingleSelection
         )
-        display_names = dict(display_names or {})
-        self._typed_identity_mode = any(
-            coordinate.scope in {"centred_overall", "centred_deviation"}
-            for coordinate in available
-        )
         selected = (
             set(configuration.parameter_names) if configuration else set(available)
         )
         for coordinate in available:
-            if not isinstance(coordinate, FitCoordinate):
-                raise TypeError("Uncertainty rosters require typed FitCoordinate values.")
-            label = display_names.get(coordinate, coordinate.display_name)
+            label = display_names[coordinate]
             item = QtWidgets.QListWidgetItem(label, self._coordinates)
             item.setData(QtCore.Qt.ItemDataRole.UserRole, coordinate)
-            item.setToolTip(coordinate.display_name)
             item.setFlags(item.flags() | QtCore.Qt.ItemFlag.ItemIsUserCheckable)
             item.setCheckState(
                 QtCore.Qt.Checked if coordinate in selected else QtCore.Qt.Unchecked
@@ -166,8 +162,6 @@ class _ProfileLikelihoodDialog(QtWidgets.QDialog):
             for index in range(self._coordinates.count())
             if (item := self._coordinates.item(index)).checkState() == QtCore.Qt.Checked
         )
-        if not self._typed_identity_mode:
-            self._reject_ambiguous_display_names(names)
         return ProfileLikelihoodConfig(
             parameter_names=names,
             confidence_level=parse_finite_numeric_text(
@@ -177,17 +171,6 @@ class _ProfileLikelihoodDialog(QtWidgets.QDialog):
             max_nfev_per_point=self._budget.value(),
             optimizer_method=str(self._method.currentData() or "trf"),
         )
-
-    @staticmethod
-    def _reject_ambiguous_display_names(
-        coordinates: Sequence[FitCoordinate],
-    ) -> None:
-        labels = [coordinate.display_name for coordinate in coordinates]
-        if len(labels) != len(set(labels)):
-            raise ValueError(
-                "Selected uncertainty coordinates have ambiguous display names; "
-                "select only one coordinate with each displayed identity."
-            )
 
     def accept(self) -> None:  # noqa: D401 - Qt override
         try:
@@ -205,12 +188,12 @@ class _ResidualBootstrapDialog(QtWidgets.QDialog):
         self,
         *,
         available: Sequence[FitCoordinate],
-        display_names: Mapping[FitCoordinate, str] | None = None,
+        display_names: Mapping[FitCoordinate, str],
         configuration: ResidualBootstrapConfig | None,
         parent: QtWidgets.QWidget | None = None,
     ) -> None:
         super().__init__(parent)
-        self.setWindowTitle("Residual bootstrap")
+        self.setWindowTitle("Residual Bootstrap")
         self.setModal(True)
         self.resize(520, 440)
         form = QtWidgets.QFormLayout(self)
@@ -218,21 +201,13 @@ class _ResidualBootstrapDialog(QtWidgets.QDialog):
         self._coordinates.setSelectionMode(
             QtWidgets.QAbstractItemView.SelectionMode.SingleSelection
         )
-        display_names = dict(display_names or {})
-        self._typed_identity_mode = any(
-            coordinate.scope in {"centred_overall", "centred_deviation"}
-            for coordinate in available
-        )
         selected = (
             set(configuration.parameter_names) if configuration else set(available)
         )
         for coordinate in available:
-            if not isinstance(coordinate, FitCoordinate):
-                raise TypeError("Uncertainty rosters require typed FitCoordinate values.")
-            label = display_names.get(coordinate, coordinate.display_name)
+            label = display_names[coordinate]
             item = QtWidgets.QListWidgetItem(label, self._coordinates)
             item.setData(QtCore.Qt.ItemDataRole.UserRole, coordinate)
-            item.setToolTip(coordinate.display_name)
             item.setFlags(item.flags() | QtCore.Qt.ItemFlag.ItemIsUserCheckable)
             item.setCheckState(
                 QtCore.Qt.Checked if coordinate in selected else QtCore.Qt.Unchecked
@@ -294,8 +269,6 @@ class _ResidualBootstrapDialog(QtWidgets.QDialog):
             for index in range(self._coordinates.count())
             if (item := self._coordinates.item(index)).checkState() == QtCore.Qt.Checked
         )
-        if not self._typed_identity_mode:
-            _ProfileLikelihoodDialog._reject_ambiguous_display_names(names)
         return ResidualBootstrapConfig(
             parameter_names=names,
             seed=self._seed.value(),
@@ -405,8 +378,8 @@ class _ParameterRosterTable(QtWidgets.QTableWidget):
         header = self.horizontalHeader()
         # Sized once for realistic values; widths the user drags are kept.
         for column, sample in (
-            (_C.START, "-0.000123457"), (_C.MIN, "-0.000123457"), (_C.MAX, "-0.000123457"),
-            (_C.LAST, "-1.23457e+07 (Overall)"), (_C.MECH, "-0.000123457"),
+            (_C.START, "-1.23457e-04"), (_C.MIN, "-1.23457e-04"), (_C.MAX, "-1.23457e-04"),
+            (_C.LAST, "-1.23457e-04"), (_C.MECH, "-1.23457e-04"),
         ):
             self.setColumnWidth(column, max(header.sectionSizeHint(column), metrics.horizontalAdvance(sample) + em))
         self.fit_name_column()
@@ -457,9 +430,10 @@ class _CompactNumberDelegate(QtWidgets.QStyledItemDelegate):
         super().initStyleOption(option, index)
         if not index.data(_COMPACT_ROLE):
             return
-        # A just-committed edit can repaint before its row re-renders as invalid.
+        # The edited cell can repaint during the edit's own resize, before its
+        # row re-renders, while it still holds the unparsed text.
         try:
-            option.text = f"{float(option.text):.6g}"
+            option.text = six_digit_text(float(option.text))
         except ValueError:
             pass
 
@@ -470,6 +444,13 @@ _FIELD_COLUMNS = {"log10": _C.LOG, "starting": _C.START, "minimum": _C.MIN, "max
 
 def _field_label(field: str) -> str:
     return _C.HEADERS[_FIELD_COLUMNS["starting" if field.startswith("dataset:") else field]]
+
+
+def _parse_label(field: str, dataset_name: str) -> str:
+    """Name a numeric field in its own parse message; a dataset start names its dataset."""
+    if field.startswith("dataset:"):
+        return f"Initial guess for dataset {dataset_name}"
+    return "Initial guess" if field == "starting" else _field_label(field)
 
 
 class ParametersIcsTab(QtWidgets.QWidget):
@@ -493,7 +474,7 @@ class ParametersIcsTab(QtWidgets.QWidget):
         self._origin = origin
         self._projected_setup: FitSetupSnapshot | None = None
         self._last_fit_parameters: dict[str, FitParameterVariable] = {}
-        self._last_fit_overall_values: dict[str, float] = {}
+        self._last_fit_included: set[str] = set()
         self._tolerance_drafts: dict[str, str] = {}
         self._defaults_error_text = ""
         self._roster_height_initialized = False
@@ -555,12 +536,6 @@ class ParametersIcsTab(QtWidgets.QWidget):
     _SCOPE_CHOICES = {
         "shared": ("Shared", "One shared value for all datasets."),
         "per_dataset": ("Per-dataset", "An independent value for each dataset."),
-        "centred_fixed_effects": (
-            "Overall + deviations",
-            "One overall value plus a deviation for each dataset. Deviations sum to zero "
-            "on the fitting scale (log10 when Log Scale is on). Apply publishes only the "
-            "overall value.",
-        ),
     }
 
     def _build_parameters_panel(self) -> QtWidgets.QWidget:  # noqa: C901
@@ -630,7 +605,7 @@ class ParametersIcsTab(QtWidgets.QWidget):
         self._roster_actions_host = QtWidgets.QWidget(roster_pane)
         actions = ControlRowsLayout(self._roster_actions_host)
         self._roster_actions_host.installEventFilter(self)
-        self._view_steps_button = QtWidgets.QPushButton("View mechanism steps", left)
+        self._view_steps_button = QtWidgets.QPushButton("View Mechanism Steps", left)
         self._view_steps_button.setObjectName("global_fit_parameters_view_steps")
         self._view_steps_button.clicked.connect(self.viewStepsRequested)
         self._reset_initial_button = QtWidgets.QPushButton(
@@ -683,7 +658,7 @@ class ParametersIcsTab(QtWidgets.QWidget):
         self._analysis_cards_layout.setHorizontalSpacing(8)
         self._analysis_cards_layout.setVerticalSpacing(8)
 
-        settings_group = QtWidgets.QGroupBox("Fit settings", options_pane)
+        settings_group = QtWidgets.QGroupBox("Fit Settings", options_pane)
         self._settings_group = settings_group
         settings_group.installEventFilter(self)
         settings_group.setObjectName("fit_settings_group")
@@ -710,7 +685,7 @@ class ParametersIcsTab(QtWidgets.QWidget):
         self._max_eval_spin.setValue(defaults.max_nfev)
         self._max_eval_spin.setSizePolicy(QtWidgets.QSizePolicy.Fixed, QtWidgets.QSizePolicy.Fixed)
         self._seed_check = QtWidgets.QCheckBox(
-            "Fixed seed", settings_group
+            "Fixed Seed", settings_group
         )
         self._seed_spin = QtWidgets.QSpinBox(settings_group)
         self._seed_spin.setRange(*FIT_SEED_RANGE)
@@ -768,7 +743,7 @@ class ParametersIcsTab(QtWidgets.QWidget):
 
         options_layout.addWidget(settings_group)
 
-        profile_card = QtWidgets.QGroupBox("Profile likelihood", self._analysis_cards_host)
+        profile_card = QtWidgets.QGroupBox("Profile Likelihood", self._analysis_cards_host)
         profile_card.setObjectName("fit_profile_card")
         profile_layout = QtWidgets.QVBoxLayout(profile_card)
         self._profile_enabled = QtWidgets.QCheckBox("Enabled", profile_card)
@@ -780,7 +755,7 @@ class ParametersIcsTab(QtWidgets.QWidget):
         profile_layout.addStretch(1)
         profile_layout.addWidget(self._profile_configure)
 
-        bootstrap_card = QtWidgets.QGroupBox("Residual bootstrap", self._analysis_cards_host)
+        bootstrap_card = QtWidgets.QGroupBox("Residual Bootstrap", self._analysis_cards_host)
         bootstrap_card.setObjectName("fit_bootstrap_card")
         bootstrap_layout = QtWidgets.QVBoxLayout(bootstrap_card)
         self._bootstrap_enabled = QtWidgets.QCheckBox("Enabled", bootstrap_card)
@@ -827,7 +802,7 @@ class ParametersIcsTab(QtWidgets.QWidget):
 
     @staticmethod
     def _add_method_items(combo: QtWidgets.QComboBox) -> None:
-        for method in SUPPORTED_FIT_METHODS:
+        for method in UNCERTAINTY_FIT_METHODS:
             combo.addItem(FIT_METHOD_LABELS.get(method, method), method)
 
     def _dataset_display_name(self, dataset_id: str) -> str:
@@ -847,18 +822,9 @@ class ParametersIcsTab(QtWidgets.QWidget):
         return parameter.display_name if parameter is not None else name
 
     def _coordinate_display_name(self, coordinate: FitCoordinate) -> str:
-        if not isinstance(coordinate, FitCoordinate):
-            raise TypeError("Uncertainty roster entries require FitCoordinate values.")
-        if coordinate.scope == "shared":
-            return self._display_parameter_name(coordinate.name)
-        if coordinate.scope == "centred_overall":
-            return f"{self._display_parameter_name(coordinate.name)} — overall"
-        if coordinate.scope == "dataset":
-            return (
-                f"{self._display_parameter_name(coordinate.name)} — "
-                f"{self._dataset_display_name(str(coordinate.dataset_id))}"
-            )
-        return coordinate.display_name
+        datasets = fit_coordinate_datasets_text(coordinate, self._projected_setup)
+        name = self._display_parameter_name(coordinate.name)
+        return f"{name} — {datasets}" if datasets else name
 
     def _available_bootstrap_coordinates(self) -> tuple[FitCoordinate, ...]:
         return self._available_analysis_coordinates()
@@ -868,11 +834,15 @@ class ParametersIcsTab(QtWidgets.QWidget):
         self._origin = snapshot.origin
         self._projected_setup = snapshot
         if previous is not None:
-            # Any scope change discards that parameter's invalid text, whether it
-            # came from Across Datasets or from Configure Shared Fit.
-            scopes = {item.name: item.scope for item in previous.parameters}
+            # A scope or group change discards that parameter's invalid text.
+            structure = {
+                item.name: (item.scope, item.per_dataset_config.groups) for item in previous.parameters
+            }
             for parameter in snapshot.parameters:
-                if scopes[parameter.name] != parameter.scope and self._retire_numeric_drafts({parameter.name}):
+                if (
+                    structure[parameter.name] != (parameter.scope, parameter.per_dataset_config.groups)
+                    and self._retire_numeric_drafts({parameter.name})
+                ):
                     self.statusMessage.emit(f"Invalid values for {parameter.display_name} discarded.")
         self._projecting = True
         try:
@@ -887,19 +857,14 @@ class ParametersIcsTab(QtWidgets.QWidget):
     def set_last_fit_reset_available(self, snapshot: FitSetupSnapshot | None) -> None:
         if snapshot is not None:
             self._last_fit_parameters = {item.name: item for item in snapshot.parameters}
+            self._last_fit_included = {item.dataset_id for item in snapshot.datasets if item.included}
         else:
             self._last_fit_parameters.clear()
-            self._last_fit_overall_values.clear()
+            self._last_fit_included = set()
         self.set_reset_availability(
             initial=self._can_reset_initial,
             last_fit=snapshot is not None,
         )
-        self._rerender_roster()
-
-    def set_last_fit_presentation(self, overall_values: Mapping[str, float]) -> None:
-        """Display retained centred settlements beside the Last Fit dataset values."""
-
-        self._last_fit_overall_values = dict(overall_values)
         self._rerender_roster()
 
     def set_initial_reset_available(self, snapshot: FitSetupSnapshot) -> None:
@@ -982,8 +947,6 @@ class ParametersIcsTab(QtWidgets.QWidget):
             item.setBackground(_INVALID_BG)
             item.setForeground(_INVALID_FG)
             item.setToolTip(message)
-        else:
-            item.setToolTip(text)
         return item
 
     def _unit_item(self, unit: str) -> QtWidgets.QTableWidgetItem:
@@ -1004,8 +967,11 @@ class ParametersIcsTab(QtWidgets.QWidget):
             | QtCore.Qt.ItemFlag.ItemIsSelectable
             | QtCore.Qt.ItemFlag.ItemIsUserCheckable
         )
+        # Partly ticked when some datasets are varied and some fixed.
         vary.setCheckState(
-            QtCore.Qt.CheckState.Checked if config.fit else QtCore.Qt.CheckState.Unchecked
+            QtCore.Qt.CheckState.Unchecked if not config.fit
+            else QtCore.Qt.CheckState.PartiallyChecked if config.fixed_dataset_ids
+            else QtCore.Qt.CheckState.Checked
         )
         vary.setData(QtCore.Qt.ItemDataRole.UserRole, parameter.name)
         self._param_table.setItem(row, _C.VARY, vary)
@@ -1025,16 +991,16 @@ class ParametersIcsTab(QtWidgets.QWidget):
         mechanism.setData(_COMPACT_ROLE, True)
         mechanism.setToolTip(
             "The value currently in the mechanism tab: "
-            f"{_format_number(origin_parameter.shared_config.value)}"
+            f"{six_digit_text(origin_parameter.shared_config.value)}"
         )
         self._param_table.setItem(row, _C.MECH, mechanism)
         if parameter.scope == "shared":
             start = self._number_item(raw.get("starting", _format_number(config.value)), messages.get("starting"))
         else:
-            start = self._readonly_item("By dataset")
+            start = self._readonly_item("Per-dataset")
             start.setTextAlignment(QtCore.Qt.AlignCenter)
             start.setForeground(self.palette().color(QtGui.QPalette.PlaceholderText))
-            start.setToolTip("Edit each dataset's initial guess in the rows below.")
+            start.setToolTip("Edit the initial guess of each dataset in the rows below.")
         self._param_table.setItem(row, _C.START, start)
         self._param_table.setItem(row, _C.MIN, self._number_item(raw.get("minimum", _format_number(config.minimum)), messages.get("minimum")))
         self._param_table.setItem(row, _C.MAX, self._number_item(raw.get("maximum", _format_number(config.maximum)), messages.get("maximum")))
@@ -1070,9 +1036,6 @@ class ParametersIcsTab(QtWidgets.QWidget):
         combo.setToolTip(self._SCOPE_CHOICES[parameter.scope][1])
         last = self._readonly_item(self._last_fit_summary(parameter.name))
         last.setTextAlignment(QtCore.Qt.AlignCenter)
-        complete = self._last_fit_summary(parameter.name, full_precision=True)
-        last.setData(QtCore.Qt.AccessibleTextRole, complete)
-        last.setToolTip(complete)
         self._param_table.setItem(row, _C.LAST, last)
         self._param_table.setItem(row, _C.UNIT, self._unit_item(parameter.unit))
 
@@ -1087,43 +1050,79 @@ class ParametersIcsTab(QtWidgets.QWidget):
         name_item.setData(_DATASET_ROLE, dataset_id)
         name_item.setToolTip(
             f"{parameter.display_name} — {name}\nDataset ID: {dataset_id}"
-            + ("" if included else "\nNot included in this Fit")
+            + ("" if included else "\nNot included in this fit")
         )
         if not included:
             name_item.setForeground(self.palette().color(QtGui.QPalette.PlaceholderText))
         self._param_table.setItem(row, _C.NAME, name_item)
+        config = parameter.per_dataset_config
+        group = next((item for item in config.groups if dataset_id in item), None)
+        varied = dataset_id in config.varied_dataset_ids
+        checkable = (
+            QtCore.Qt.ItemFlag.ItemIsSelectable
+            | QtCore.Qt.ItemFlag.ItemIsEnabled
+            | QtCore.Qt.ItemFlag.ItemIsUserCheckable
+        )
+        vary = QtWidgets.QTableWidgetItem()
+        vary.setFlags(checkable)
+        vary.setCheckState(QtCore.Qt.CheckState.Checked if varied else QtCore.Qt.CheckState.Unchecked)
+        vary.setToolTip("Fit the value of this dataset. Uncheck to use it as entered.")
+        self._param_table.setItem(row, _C.VARY, vary)
+        labels = fit_group_labels(parameter, self._projected_setup.datasets, self._origin)
+        group_box = QtWidgets.QTableWidgetItem(
+            f"Group {labels[group[0]][0]}" if group is not None else "Group —"
+        )
+        # Only a varied dataset can share a fitted value.
+        group_box.setFlags(checkable if varied else QtCore.Qt.ItemFlag.ItemIsSelectable)
+        group_box.setCheckState(
+            QtCore.Qt.CheckState.Checked if group is not None else QtCore.Qt.CheckState.Unchecked
+        )
+        group_box.setToolTip(
+            "Share one fitted value with other datasets. Uncheck to leave the group."
+            if varied else "A fixed dataset cannot share a fitted value."
+        )
+        self._param_table.setItem(row, _C.SCOPE, group_box)
         draft = self._invalid_rows.get(parameter.name)
         raw = dict(draft.raw_fields) if draft is not None else {}
-        values = dict(parameter.per_dataset_config.dataset_values)
+        values = dict(config.dataset_values)
         text = raw.get(f"dataset:{dataset_id}", _format_number(values[dataset_id]))
-        start = self._number_item(text, dict(draft.messages).get(f"dataset:{dataset_id}") if draft is not None else None)
+        if group is not None and dataset_id != group[0]:
+            # A member shows its group's start; only the origin row edits it.
+            start = self._readonly_item(text)
+            start.setTextAlignment(QtCore.Qt.AlignCenter)
+            start.setData(_COMPACT_ROLE, True)
+            start.setToolTip(
+                f"Shared with {self._dataset_display_name(group[0])}. Edit the initial guess there."
+            )
+        else:
+            start = self._number_item(text, dict(draft.messages).get(f"dataset:{dataset_id}") if draft is not None else None)
+            if not varied and draft is None:
+                start.setToolTip("Fixed: used as entered.")
         start.setData(QtCore.Qt.ItemDataRole.UserRole, parameter.name)
         start.setData(_DATASET_ROLE, dataset_id)
         self._param_table.setItem(row, _C.START, start)
         last = self._last_fit_parameters.get(parameter.name)
-        last_values = dict(last.selected_config.dataset_values) if last is not None and last.scope != "shared" else {}
+        # A dataset outside the last fit shows no result, even when a group
+        # wrote that fit's value into it.
+        last_values = (
+            dict(last.selected_config.dataset_values)
+            if last is not None and last.scope != "shared" and dataset_id in self._last_fit_included
+            else {}
+        )
         last_item = self._readonly_item(
-            f"{last_values[dataset_id]:.6g}" if dataset_id in last_values else "—"
+            six_digit_text(last_values[dataset_id]) if dataset_id in last_values else "—"
         )
         last_item.setTextAlignment(QtCore.Qt.AlignCenter)
-        if dataset_id in last_values:
-            last_item.setToolTip(_format_number(last_values[dataset_id]))
-            last_item.setData(QtCore.Qt.AccessibleTextRole, _format_number(last_values[dataset_id]))
         self._param_table.setItem(row, _C.LAST, last_item)
         self._param_table.setItem(row, _C.UNIT, self._unit_item(parameter.unit))
 
-    def _last_fit_summary(self, name: str, *, full_precision: bool = False) -> str:
+    def _last_fit_summary(self, name: str) -> str:
         last = self._last_fit_parameters.get(name)
         if last is None:
             return "—"
         if last.scope == "shared":
-            value = last.selected_config.value
-            return _format_number(value) if full_precision else f"{value:.6g}"
-        if name in self._last_fit_overall_values and last.scope == "centred_fixed_effects":
-            value = self._last_fit_overall_values[name]
-            text = _format_number(value) if full_precision else f"{value:.6g}"
-            return f"{text} (Overall)"
-        return "By dataset"
+            return six_digit_text(last.selected_config.value)
+        return "Per-dataset"
 
     def _parameter_rows(self, name: str) -> tuple[int, list[tuple[int, str]]]:
         parent = -1
@@ -1144,8 +1143,14 @@ class ParametersIcsTab(QtWidgets.QWidget):
             return
         name_item = self._param_table.item(item.row(), _C.NAME)
         name = str(name_item.data(QtCore.Qt.ItemDataRole.UserRole))
-        if item.column() == _C.VARY and name_item.data(_DATASET_ROLE) is None:
-            self._emit_vary_edit(name, item.checkState() == QtCore.Qt.CheckState.Checked)
+        dataset_id = name_item.data(_DATASET_ROLE)
+        checked = item.checkState() == QtCore.Qt.CheckState.Checked
+        if item.column() == _C.VARY and dataset_id is None:
+            self._emit_vary_edit(name, checked)
+        elif item.column() == _C.VARY:
+            self._on_dataset_vary_changed(name, str(dataset_id), checked)
+        elif item.column() == _C.SCOPE and dataset_id is not None:
+            self._on_group_box_changed(name, str(dataset_id), checked)
         elif item.column() in (_C.START, _C.MIN, _C.MAX, _C.LOG):
             self._emit_parameter_row_edit(name)
 
@@ -1184,6 +1189,7 @@ class ParametersIcsTab(QtWidgets.QWidget):
         return cells
 
     def _refresh_parameter_error(self) -> None:
+        # Every message names its field (and a dataset start its dataset once).
         messages = tuple(dict.fromkeys(
             f"{name}: {message}" for name, _field, message in self._invalid_cells()
         ))
@@ -1209,7 +1215,11 @@ class ParametersIcsTab(QtWidgets.QWidget):
     def _parameter_projection_for_change(
         self, parameter: FitParameterVariable, raw: Mapping[str, str],
     ) -> tuple[FitParameterVariable | None, dict[str, str]]:
-        """Build one complete parameter from the row texts, or name each offending cell."""
+        """Build one complete parameter from the row texts, or mark the changed cells.
+
+        A row that is not admissible marks every cell the user changed with
+        the row's admission message; unchanged cells are never marked.
+        """
 
         config = parameter.selected_config
         parsed: dict[str, float] = {}
@@ -1217,46 +1227,40 @@ class ParametersIcsTab(QtWidgets.QWidget):
         for field, text in raw.items():
             if field == "log10":
                 continue
-            label = (
-                f"{self._dataset_display_name(field.removeprefix('dataset:'))} {_field_label(field)}"
-                if field.startswith("dataset:") else _field_label(field)
-            )
             try:
-                parsed[field] = self._parse_number(text, label)
+                parsed[field] = self._parse_number(text, _parse_label(
+                    field, self._dataset_display_name(field.removeprefix("dataset:")),
+                ))
             except ValueError as exc:
                 messages[field] = str(exc)
         if messages:
             return None, messages
         log10 = raw["log10"] == "1"
-
-        def build(values: Mapping[str, float], log_scale: bool) -> FitParameterVariable:
+        dataset_values = dict(config.dataset_values)
+        dataset_values.update(
+            (field.removeprefix("dataset:"), value)
+            for field, value in parsed.items() if field.startswith("dataset:")
+        )
+        # Admitting an origin edit copies its value to every group member.
+        for group in config.groups:
+            for member in group[1:]:
+                dataset_values[member] = dataset_values[group[0]]
+        try:
             active = replace(
                 config,
-                value=values.get("starting", config.value),
-                minimum=values["minimum"],
-                maximum=values["maximum"],
-                log10=log_scale,
-                dataset_values=config.dataset_values if parameter.scope == "shared" else tuple(
-                    (field.removeprefix("dataset:"), value)
-                    for field, value in values.items() if field.startswith("dataset:")
-                ),
+                value=parsed.get("starting", config.value),
+                minimum=parsed["minimum"],
+                maximum=parsed["maximum"],
+                log10=log10,
+                dataset_values=config.dataset_values if parameter.scope == "shared" else tuple(dataset_values.items()),
             )
             return replace(
                 parameter,
                 **{"shared_config" if parameter.scope == "shared" else "per_dataset_config": active},
-            )
-
-        def cell_message(exc: Exception) -> str:
-            text = fit_identity_text(str(exc), self._origin).removeprefix(f"{parameter.name} ")
-            return text[:1].upper() + text[1:]
-
-        try:
-            return build(parsed, log10), {}
+            ), {}
         except (TypeError, ValueError, OverflowError) as exc:
-            combined = exc
-        # The accepted row was admissible, so each changed cell is rechecked
-        # alone on it; only cells that fail by themselves are blamed, and a
-        # purely combined failure marks every changed cell.
+            text = fit_identity_text(str(exc), self._origin).removeprefix(f"{parameter.name} ")
+            message = text[:1].upper() + text[1:]
         accepted = {
             "starting": config.value, "minimum": config.minimum, "maximum": config.maximum,
             **{f"dataset:{key}": value for key, value in config.dataset_values},
@@ -1264,70 +1268,88 @@ class ParametersIcsTab(QtWidgets.QWidget):
         changed = [field for field, value in parsed.items() if value != accepted[field]]
         if log10 != config.log10:
             changed.append("log10")
-        alone: dict[str, str] = {}
-        for field in changed:
-            trial = {key: accepted[key] for key in parsed}
-            if field != "log10":
-                trial[field] = parsed[field]
-            try:
-                build(trial, log10 if field == "log10" else config.log10)
-            except (TypeError, ValueError, OverflowError) as exc:
-                alone[field] = cell_message(exc)
-        return None, alone or dict.fromkeys(changed or parsed, cell_message(combined))
+        return None, dict.fromkeys(changed, message)
 
-    def _uncertainty_effects_for_parameter(
-        self,
-        parameter: FitParameterVariable,
-    ) -> dict[str, tuple[str, ...]]:
-        """Return accepted typed uncertainty coordinates affected by Vary off."""
+    def _emit_parameter_replacement(
+        self, replacement: FitParameterVariable, *, confirm: str,
+    ) -> None:
+        """Emit the setup with one parameter replaced.
+
+        Profile and Bootstrap keep every selected target that still exists; a
+        group whose origin left keeps its targets under its new origin.
+        Removing a selected target first asks the user, naming ``confirm`` as
+        the change.
+        """
 
         setup = self._projected_setup
-        if setup is None:
-            return {}
-        available = set(fit_uncertainty_coordinates(
-            setup.parameters, setup.datasets
-        ))
-        effects: dict[str, tuple[str, ...]] = {}
-        for label, configuration in (
-            ("Profile", setup.profile_likelihood),
-            ("Bootstrap", setup.residual_bootstrap),
-        ):
-            if configuration is None:
-                continue
-            coordinates = tuple(
-                coordinate
-                for coordinate in configuration.parameter_names
-                if isinstance(coordinate, FitCoordinate)
-                and coordinate in available
-                and coordinate.name == parameter.name
+        previous = self._parameter_by_name(replacement.name)
+        parameters = tuple(
+            replacement if item.name == replacement.name else item for item in setup.parameters
+        )
+        available = set(fit_uncertainty_coordinates(parameters, setup.datasets))
+        renamed = {
+            FitCoordinate("group", replacement.name, group[0]):
+                FitCoordinate("group", replacement.name, remaining[0])
+            for group in previous.selected_config.groups
+            for remaining in replacement.selected_config.groups
+            if remaining[0] != group[0] and set(remaining) <= set(group)
+        }
+        configurations = {
+            label: configuration if configuration is None or not renamed else replace(
+                configuration,
+                parameter_names=tuple(renamed.get(item, item) for item in configuration.parameter_names),
             )
-            if coordinates:
-                effects[label] = tuple(
-                    self._coordinate_display_name(coordinate)
-                    for coordinate in coordinates
-                )
-        return effects
+            for label, configuration in (
+                ("Profile", setup.profile_likelihood), ("Bootstrap", setup.residual_bootstrap),
+            )
+        }
+        analyses = {
+            label: prune_fit_analysis_coordinates(configuration, available=available, parameters=parameters)
+            for label, configuration in configurations.items()
+        }
+        removed = {
+            label: tuple(
+                coordinate for coordinate in configuration.parameter_names
+                if coordinate not in available
+            )
+            for label, configuration in configurations.items()
+            if configuration is not None
+        }
+        removed = {label: coordinates for label, coordinates in removed.items() if coordinates}
+        turned_off = {label for label in removed if analyses[label] is None}
+        if removed and not self._confirm_removed_targets(confirm, removed, turned_off):
+            self._rerender_roster()
+            return
+        self.setupSnapshotRequested.emit(
+            replace(
+                setup,
+                parameters=parameters,
+                profile_likelihood=analyses["Profile"],
+                residual_bootstrap=analyses["Bootstrap"],
+            )
+        )
+        self._rerender_roster()
 
-    def _confirm_vary_analysis_update(
-        self,
-        parameter: FitParameterVariable,
+    def _confirm_removed_targets(
+        self, action: str, removed: Mapping[str, tuple[FitCoordinate, ...]], turned_off: set[str],
     ) -> bool:
-        effects = self._uncertainty_effects_for_parameter(parameter)
-        if not effects:
-            return True
-        details = [
-            f"Stopping Vary for {parameter.display_name} will update these analyses:"
-        ]
+        """Ask before a change removes selected Profile or Bootstrap targets.
+
+        An analysis left with no target is named as turned off.
+        """
+
+        details = [f"{action} will update these analyses:"]
         details.extend(
-            f"{label}: {', '.join(coordinates)}"
-            for label, coordinates in effects.items()
+            f"{label}: {', '.join(self._coordinate_display_name(item) for item in coordinates)}"
+            + (f" (no targets remain, so {label} will be turned off)" if label in turned_off else "")
+            for label, coordinates in removed.items()
         )
         message = QtWidgets.QMessageBox(self)
         message.setIcon(QtWidgets.QMessageBox.Icon.Warning)
-        message.setWindowTitle("Update uncertainty analyses?")
+        message.setWindowTitle("Update Uncertainty Analyses?")
         message.setText("\n".join(details))
-        stop_button = message.addButton(
-            "Stop varying and update analyses",
+        update_button = message.addButton(
+            "Update Analyses",
             QtWidgets.QMessageBox.ButtonRole.AcceptRole,
         )
         cancel_button = message.addButton(
@@ -1336,73 +1358,73 @@ class ParametersIcsTab(QtWidgets.QWidget):
         )
         message.setDefaultButton(cancel_button)
         message.exec()
-        return message.clickedButton() is stop_button
+        return message.clickedButton() is update_button
 
-    def _reproject_vary_truth(self, parameter_name: str) -> None:
-        """Restore the visible Vary controls from the accepted setup only."""
+    def _emit_vary_edit(self, name: str, desired_fit: bool) -> None:
+        """Apply the parameter row's Vary: every dataset varied, or every one fixed."""
 
-        setup = self._projected_setup
-        parameter = self._parameter_by_name(parameter_name)
-        if setup is None or parameter is None:
+        if self._running:
             return
-        blocker = QtCore.QSignalBlocker(self._param_table)
-        for row in range(self._param_table.rowCount()):
-            item = self._param_table.item(row, _C.VARY)
-            if item is not None and str(item.data(QtCore.Qt.ItemDataRole.UserRole) or "") == parameter_name:
-                item.setCheckState(
-                    QtCore.Qt.CheckState.Checked
-                    if parameter.selected_config.fit
-                    else QtCore.Qt.CheckState.Unchecked
-                )
-                break
-        del blocker
-
-    def _emit_vary_edit(self, name: str, desired_fit: bool) -> bool:
-        if self._projecting or self._running or self._projected_setup is None:
-            return False
-        parameter = self._parameter_by_name(str(name or ""))
-        if parameter is None:
-            return False
-        desired = bool(desired_fit)
-        if desired == parameter.selected_config.fit:
-            self._reproject_vary_truth(parameter.name)
-            return False
-        if not desired and not self._confirm_vary_analysis_update(parameter):
-            self._reproject_vary_truth(parameter.name)
-            return False
-        setup = self._projected_setup
-        self._reproject_vary_truth(parameter.name)
-        replacement = _replace_fit_parameter(parameter, fit=desired)
-        profile = setup.profile_likelihood
-        bootstrap = setup.residual_bootstrap
-        if not desired:
-            profile = prune_fit_analysis_coordinates(profile, (parameter.name,))
-            bootstrap = prune_fit_analysis_coordinates(bootstrap, (parameter.name,))
-        self.setupSnapshotRequested.emit(
-            replace(
-                setup,
-                parameters=tuple(
-                    replacement if item.name == replacement.name else item
-                    for item in setup.parameters
-                ),
-                profile_likelihood=profile,
-                residual_bootstrap=bootstrap,
-            )
-        )
-        return True
-
-    def _emit_parameter_row_edit(self, name: str) -> bool:
-        if self._projecting or self._running or self._projected_setup is None:
-            return False
         parameter = self._parameter_by_name(name)
-        if parameter is None:
-            return False
+        config = parameter.selected_config
+        if desired_fit == config.fit and not config.fixed_dataset_ids:
+            self._rerender_roster()
+            return
+        if desired_fit:
+            replacement = _replace_fit_parameter(parameter, fit=True, fixed_dataset_ids=())
+            self._emit_parameter_replacement(
+                replacement, confirm=f"Varying {parameter.display_name}",
+            )
+            return
+        # Vary off fixes every dataset and dissolves the parameter's groups.
+        replacement = _replace_fit_parameter(parameter, fit=False, groups=(), fixed_dataset_ids=())
+        self._emit_parameter_replacement(
+            replacement, confirm=f"Stopping Vary for {parameter.display_name}",
+        )
+
+    def _on_dataset_vary_changed(self, name: str, dataset_id: str, checked: bool) -> None:
+        """Vary or fix one dataset's value; a dataset that is fixed leaves its group."""
+
+        if self._running:
+            return
+        parameter = self._parameter_by_name(name)
+        config = parameter.per_dataset_config
+        all_ids = {item for item, _value in config.dataset_values}
+        fixed = set(config.fixed_dataset_ids) if config.fit else set(all_ids)
+        if checked == (dataset_id not in fixed):
+            self._rerender_roster()
+            return
+        if checked:
+            replacement = _replace_fit_parameter(
+                parameter, fit=True, fixed_dataset_ids=tuple(fixed - {dataset_id}),
+            )
+            self._emit_parameter_replacement(
+                replacement,
+                confirm=f"Varying {parameter.display_name} on {self._dataset_display_name(dataset_id)}",
+            )
+            return
+        fixed.add(dataset_id)
+        groups = self._groups_without(parameter, dataset_id)
+        replacement = (
+            _replace_fit_parameter(parameter, fit=False, groups=(), fixed_dataset_ids=())
+            if fixed == all_ids
+            else _replace_fit_parameter(parameter, groups=groups, fixed_dataset_ids=tuple(fixed))
+        )
+        self._emit_parameter_replacement(
+            replacement,
+            confirm=f"Stopping Vary for {parameter.display_name} on {self._dataset_display_name(dataset_id)}",
+        )
+
+    def _emit_parameter_row_edit(self, name: str) -> None:
+        if self._running:
+            return
+        parameter = self._parameter_by_name(name)
         raw = self._row_raw_fields(parameter)
         edited, messages = self._parameter_projection_for_change(parameter, raw)
         if edited is None:
             self._store_invalid_numeric_draft(parameter.name, raw, messages)
             self._rerender_roster()
-            return False
+            return
         updated = replace(
             self._projected_setup,
             parameters=tuple(
@@ -1413,9 +1435,8 @@ class ParametersIcsTab(QtWidgets.QWidget):
         self._retire_numeric_drafts({parameter.name})
         if updated == self._projected_setup:
             self._rerender_roster()
-            return False
+            return
         self.setupSnapshotRequested.emit(updated)
-        return True
 
     def _open_bounds_dialog(self) -> None:
         if self._projecting or self._running or self._projected_setup is None:
@@ -1460,27 +1481,132 @@ class ParametersIcsTab(QtWidgets.QWidget):
         if desired == parameter.scope:
             return
         replacement = convert_fit_parameter_scope(
-            parameter, desired, self._projected_setup.datasets
-        )
-        profile = prune_fit_analysis_coordinates(
-            self._projected_setup.profile_likelihood, (parameter.name,),
-        )
-        bootstrap = prune_fit_analysis_coordinates(
-            self._projected_setup.residual_bootstrap, (parameter.name,),
+            parameter, desired, self._projected_setup.datasets, self._origin,
         )
         # Restore the projection first; the owner's accepted snapshot reprojects.
         with QtCore.QSignalBlocker(combo):
             combo.setCurrentIndex(combo.findData(parameter.scope))
-        self.setupSnapshotRequested.emit(
-            replace(
-                self._projected_setup,
-                parameters=tuple(
-                    replacement if item.name == replacement.name else item
-                    for item in self._projected_setup.parameters
-                ),
-                profile_likelihood=profile,
-                residual_bootstrap=bootstrap,
+        self._emit_parameter_replacement(
+            replacement, confirm=f"Changing the scope of {parameter.display_name}",
+        )
+
+    def _groups_without(
+        self, parameter: FitParameterVariable, dataset_id: str,
+    ) -> tuple[tuple[str, ...], ...]:
+        """The parameter's groups after one dataset leaves.
+
+        A group left with one member dissolves; when its origin leaves, the
+        first remaining member in table order becomes the origin.
+        """
+
+        order = tuple(item.dataset_id for item in self._projected_setup.datasets)
+        groups = []
+        for group in parameter.per_dataset_config.groups:
+            remaining = sorted((item for item in group if item != dataset_id), key=order.index)
+            if len(remaining) < 2:
+                continue
+            origin = group[0] if group[0] in remaining else remaining[0]
+            groups.append((origin, *(item for item in remaining if item != origin)))
+        return tuple(groups)
+
+    def _on_group_box_changed(self, name: str, dataset_id: str, checked: bool) -> None:
+        """Unchecking leaves the dataset's group; checking opens the membership dialog."""
+
+        if self._running:
+            return
+        parameter = self._parameter_by_name(name)
+        config = parameter.per_dataset_config
+        if not checked:
+            self._emit_group_change(parameter, self._groups_without(parameter, dataset_id))
+            return
+        choice = self._group_membership_dialog(parameter, dataset_id)
+        if choice is None:
+            self._rerender_roster()
+            return
+        joined, added = choice
+        if joined is None:
+            if not added:
+                self.statusMessage.emit("A group needs at least one other dataset.")
+                self._rerender_roster()
+                return
+            self._emit_group_change(parameter, (*config.groups, (dataset_id, *added)))
+            return
+        self._emit_group_change(parameter, tuple(
+            (*group, dataset_id, *added) if group[0] == joined else group for group in config.groups
+        ))
+
+    def _group_membership_dialog(
+        self, parameter: FitParameterVariable, dataset_id: str,
+    ) -> tuple[str | None, tuple[str, ...]] | None:
+        """Ask which group the dataset joins, or which datasets form a new group with it.
+
+        Returns the joined group's origin (None for a new group) and the other
+        datasets added, or None on Cancel.  The dialog only adds: existing
+        members stay, and datasets in other groups or fixed are greyed.
+        """
+
+        config = parameter.per_dataset_config
+        labels = fit_group_labels(parameter, self._projected_setup.datasets, self._origin)
+        groups = sorted(config.groups, key=lambda group: labels[group[0]][0])
+        included = {item.dataset_id for item in self._projected_setup.datasets if item.included}
+        dialog = QtWidgets.QDialog(self)
+        dialog.setWindowTitle(f"Datasets sharing {parameter.display_name}")
+        layout = QtWidgets.QVBoxLayout(dialog)
+        layout.addWidget(QtWidgets.QLabel(f"Datasets sharing {parameter.display_name}:", dialog))
+        target = QtWidgets.QComboBox(dialog)
+        target.addItem("New group", None)
+        for group in groups:
+            target.addItem(labels[group[0]][1], group[0])
+        layout.addWidget(target)
+        checks: dict[str, QtWidgets.QCheckBox] = {}
+        for dataset in self._projected_setup.datasets:
+            name = self._dataset_display_name(dataset.dataset_id)
+            check = QtWidgets.QCheckBox(
+                name if dataset.dataset_id in included else f"{name} (not in fit)", dialog,
             )
+            layout.addWidget(check)
+            checks[dataset.dataset_id] = check
+
+        def project() -> None:
+            """Tick and lock the clicked dataset and the chosen group's members."""
+
+            joined = target.currentData()
+            members = next((group for group in groups if group[0] == joined), ())
+            occupied = {member for group in groups for member in group}
+            for item, check in checks.items():
+                locked = item == dataset_id or item in members
+                free = not locked and item not in occupied and item in config.varied_dataset_ids
+                check.setChecked(locked or (free and check.isChecked()))
+                check.setEnabled(free)
+
+        target.currentIndexChanged.connect(project)
+        project()
+        buttons = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.StandardButton.Ok
+            | QtWidgets.QDialogButtonBox.StandardButton.Cancel,
+            parent=dialog,
+        )
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        if dialog.exec() != QtWidgets.QDialog.DialogCode.Accepted:
+            return None
+        return target.currentData(), tuple(
+            item for item, check in checks.items() if check.isChecked() and check.isEnabled()
+        )
+
+    def _emit_group_change(
+        self, parameter: FitParameterVariable, groups: tuple[tuple[str, ...], ...],
+    ) -> None:
+        """Emit the setup with new groups; every member stores its origin's value."""
+
+        values = dict(parameter.per_dataset_config.dataset_values)
+        for group in groups:
+            for member in group[1:]:
+                values[member] = values[group[0]]
+        self._emit_parameter_replacement(
+            _replace_fit_parameter(parameter, dataset_values=tuple(values.items()), groups=groups),
+            confirm=f"Changing the groups of {parameter.display_name}",
         )
 
     @property
@@ -1582,11 +1708,7 @@ class ParametersIcsTab(QtWidgets.QWidget):
     def _tolerance_value(self, edit: QtWidgets.QLineEdit, label: QtWidgets.QLabel) -> float:
         """Parse one tolerance box, naming it by its visible label."""
 
-        name = label.text().removesuffix(":")
-        value = self._parse_number(edit.text(), name)
-        if value <= 0.0:
-            raise ValueError(f"{name} must be positive.")
-        return value
+        return admit_fit_tolerance(edit.text(), label.text().removesuffix(":"))
 
     def _invalid_tolerance_labels(self) -> list[str]:
         boxes = [(self._ftol_edit, self._ftol_label)]
@@ -1828,16 +1950,15 @@ class ParametersIcsTab(QtWidgets.QWidget):
     def eventFilter(self, watched, event) -> bool:  # noqa: N802 - Qt override
         if watched is getattr(self, "_param_table", None) and event.type() == QtCore.QEvent.KeyPress:
             if event.matches(QtGui.QKeySequence.Copy):
-                indexes = watched.selectedIndexes()
-                if indexes:
-                    selected = {(index.row(), index.column()) for index in indexes}
-                    rows = range(min(index.row() for index in indexes), max(index.row() for index in indexes) + 1)
-                    columns = range(min(index.column() for index in indexes), max(index.column() for index in indexes) + 1)
+                # Contiguous selection: one rectangle, disabled cells included.
+                ranges = watched.selectedRanges()
+                if ranges:
+                    area = ranges[0]
                     payload = "\n".join(
                         "\t".join(
-                            self._copy_text(row, column) if (row, column) in selected else ""
-                            for column in columns
-                        ) for row in rows
+                            self._copy_text(row, column)
+                            for column in range(area.leftColumn(), area.rightColumn() + 1)
+                        ) for row in range(area.topRow(), area.bottomRow() + 1)
                     )
                     mime = QtCore.QMimeData()
                     mime.setText(payload)
@@ -1862,19 +1983,21 @@ class ParametersIcsTab(QtWidgets.QWidget):
         return super().eventFilter(watched, event)
 
     def _copy_text(self, row: int, column: int) -> str:
-        """Plain copy text: the visible value, at full precision for numbers."""
+        """Plain copy text: every cell as displayed."""
 
-        if column == _C.SCOPE:
-            combo = self._param_table.cellWidget(row, column)
-            return combo.currentText() if combo is not None else ""
+        combo = self._param_table.cellWidget(row, column)
+        if combo is not None:
+            return combo.currentText()
         item = self._param_table.item(row, column)
         if item is None:
             return ""
         if column in (_C.VARY, _C.LOG) and item.data(QtCore.Qt.ItemDataRole.CheckStateRole) is not None:
-            return "Yes" if item.checkState() == QtCore.Qt.CheckState.Checked else "No"
-        if column == _C.LAST:
-            return item.data(QtCore.Qt.AccessibleTextRole) or item.text()
-        return item.text().strip()
+            return {
+                QtCore.Qt.CheckState.Checked: "Yes",
+                QtCore.Qt.CheckState.PartiallyChecked: "Some datasets",
+            }.get(item.checkState(), "No")
+        # Copy carries the delegate's display text (numbers at six digits).
+        return cell_text_as_shown(self._param_table, self._param_table.indexFromItem(item)).strip()
 
     def _relayout_analysis_cards(self) -> None:
         if not hasattr(self, "_analysis_cards"):

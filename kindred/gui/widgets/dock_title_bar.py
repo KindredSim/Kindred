@@ -51,7 +51,7 @@ class DockTitleBar(QtWidgets.QWidget):
         self._minimize_btn.setObjectName("dockMinimizeButton")
         self._minimize_btn.setText(_MINIMIZE_GLYPH)
         self._minimize_btn.setAutoRaise(True)
-        self._minimize_btn.setToolTip("Minimize panel")
+        self._minimize_btn.setToolTip("Minimize panel.")
         self._minimize_btn.setAccessibleName("Minimize panel")
         self._minimize_btn.setFocusPolicy(QtCore.Qt.FocusPolicy.StrongFocus)
         self._minimize_btn.clicked.connect(self._toggle_minimize)
@@ -61,7 +61,7 @@ class DockTitleBar(QtWidgets.QWidget):
         self._close_btn.setObjectName("dockCloseButton")
         self._close_btn.setText(_CLOSE_GLYPH)
         self._close_btn.setAutoRaise(True)
-        self._close_btn.setToolTip("Close panel")
+        self._close_btn.setToolTip("Close panel.")
         self._close_btn.setAccessibleName("Close panel")
         self._close_btn.setFocusPolicy(QtCore.Qt.FocusPolicy.StrongFocus)
         self._close_btn.clicked.connect(self._close_dock)
@@ -77,7 +77,7 @@ class DockTitleBar(QtWidgets.QWidget):
             return
         self._minimized = False
         self._minimize_btn.setText(_MINIMIZE_GLYPH)
-        self._minimize_btn.setToolTip("Minimize panel")
+        self._minimize_btn.setToolTip("Minimize panel.")
         self._minimize_btn.setAccessibleName("Minimize panel")
         content = self._dock.widget()
         if content is not None:
@@ -93,7 +93,7 @@ class DockTitleBar(QtWidgets.QWidget):
         else:
             self._minimized = True
             self._minimize_btn.setText(_RESTORE_GLYPH)
-            self._minimize_btn.setToolTip("Restore panel")
+            self._minimize_btn.setToolTip("Restore panel.")
             self._minimize_btn.setAccessibleName("Restore panel")
             self._dock_minimum_width_before_minimize = int(self._dock.minimumWidth())
             self._dock.setMinimumWidth(

@@ -34,7 +34,7 @@ class SpreadsheetSelectionDialog(QtWidgets.QDialog):
         layout.addWidget(self._list)
         buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel, self)
         self._open = buttons.button(QtWidgets.QDialogButtonBox.Ok)
-        self._open.setText("Open editor")
+        self._open.setText("Open Editor")
         self._list.itemChanged.connect(lambda: self._open.setEnabled(bool(self.selected_ids())))
         self._open.setEnabled(bool(self.selected_ids()))
         buttons.accepted.connect(self.accept)
@@ -85,7 +85,7 @@ class _SheetModel(QtCore.QAbstractTableModel):
             column = self.info["columns"][section]
             tip = f"{column["name"]}\n{_unit_labels(column)[0]}\nDouble-click the name to edit."
             if column["formula"] is not None and column["unit"] is None:
-                tip += ("\n\nThe formula's unit could not be inferred. Its numbers are calculated from the "
+                tip += ("\n\nThe unit of the formula could not be inferred. Its numbers are calculated from the "
                         "scientific values (M, s, K, J/mol, m³) of the columns it uses and are used as they are. "
                         "To give it a unit, take plain numbers from a column that has a unit, or delete the "
                         "formula including = and use Correct unit declaration.")
@@ -276,7 +276,7 @@ class _SheetHeader(QtWidgets.QHeaderView):
             control.setAccessibleName("Column unit")
             control.setToolTip("Correct declaration: numbers stay unchanged." if correction else
                                "Changing an established unit converts its values. The first unit declares their meaning.")
-            control.addItem(_unit_labels(spec)[0] if spec["unit"] is None else "Choose unit...", None)
+            control.addItem(_unit_labels(spec)[0] if spec["unit"] is None else "Choose Unit…", None)
             choices = list(TIME_UNIT_DISPLAY if timed else MEASUREMENT_UNIT_DISPLAY)
             if spec["unit"] is not None:
                 # The column's unit takes the place of a preset displayed the same way (uM as µM).
@@ -288,7 +288,7 @@ class _SheetHeader(QtWidgets.QHeaderView):
                 label, markup = data_unit_labels(parse_unit(choice))
                 control.addItem(label, choice)
                 control.setItemData(control.count() - 1, markup, SCIENTIFIC_NAME_HTML_ROLE)
-            control.addItem("Custom expression...", "custom")
+            control.addItem("Custom Expression…", "custom")
             control.setCurrentIndex(max(0, control.findData(spec["unit"])))
             control.activated.connect(lambda: self._unit_selected(control))
         self._input = control
@@ -497,13 +497,13 @@ class SpreadsheetEditorDialog(QtWidgets.QDialog):
         self._clear = self._action("Clear cells", self._clear_cells, "Delete", toolbar=False)
         self._toolbar.addSeparator()
         self._rows_menu = QtWidgets.QMenu(self)
-        self._rows_menu.addAction("Insert rows", lambda: self._rows(False))
-        self._rows_menu.addAction("Delete rows", lambda: self._rows(True))
+        self._rows_menu.addAction("Insert Rows", lambda: self._rows(False))
+        self._rows_menu.addAction("Delete Rows", lambda: self._rows(True))
         self._columns_menu = QtWidgets.QMenu(self)
-        self._columns_menu.addAction("Insert column", lambda: self._columns("insert"))
-        self._columns_menu.addAction("Add column", lambda: self._columns("append"))
-        self._columns_menu.addAction("Correct unit declaration…", self._correct_declaration)
-        self._columns_menu.addAction("Delete columns", lambda: self._columns("delete"))
+        self._columns_menu.addAction("Insert Column", lambda: self._columns("insert"))
+        self._columns_menu.addAction("Add Column", lambda: self._columns("append"))
+        self._columns_menu.addAction("Correct Unit Declaration…", self._correct_declaration)
+        self._columns_menu.addAction("Delete Columns", lambda: self._columns("delete"))
         for text, menu in (("Rows", self._rows_menu), ("Columns", self._columns_menu)):
             button = QtWidgets.QToolButton(self)
             button.setText(text)
@@ -543,12 +543,12 @@ class SpreadsheetEditorDialog(QtWidgets.QDialog):
         layout.addWidget(self._tabs)
         # One fixed line: longer messages elide and show in full on hover.
         self._feedback = QtWidgets.QLabel(self)
-        set_bounded_label_text(self._feedback, "Opening worksheets...", max_width=16777215)
+        set_bounded_label_text(self._feedback, "Opening worksheets…", max_width=16777215)
         layout.addWidget(self._feedback)
         footer = QtWidgets.QHBoxLayout()
         footer.addStretch(1)
         self._cancel = QtWidgets.QPushButton("Cancel", self)
-        self._review = QtWidgets.QPushButton("Review and create...", self)
+        self._review = QtWidgets.QPushButton("Review and Create…", self)
         self._cancel.setAutoDefault(False)
         self._review.setAutoDefault(False)
         footer.addWidget(self._cancel)
@@ -686,7 +686,7 @@ class SpreadsheetEditorDialog(QtWidgets.QDialog):
         self._command = operation
         self._availability()
         if operation != "view":
-            self._feedback.setText("Calculating..." if operation != "outputs" else "Preparing numeric measurements...")
+            self._feedback.setText("Calculating…" if operation != "outputs" else "Preparing numeric measurements…")
         self._worker.submit(operation, sheet, args)
 
     def _receive(self, operation, data, error):
@@ -733,7 +733,7 @@ class SpreadsheetEditorDialog(QtWidgets.QDialog):
                 self._formula_edit = None
                 spec = self._sheets[sheet]["columns"][column - 1]
                 if spec["formula"] is not None and spec["unit"] is None:
-                    self._feedback.setText(f"Column {ironcalc.column_name_from_number(column)} has no unit; it is "
+                    self._feedback.setText(f"Column {ironcalc.column_name_from_number(column)} has no unit. It is "
                                            "calculated from scientific values (M, s, …). Hover its unit for how to set one.")
             area = None
             if self._result_area is not None and operation == self._result_area[0]:
@@ -1138,7 +1138,7 @@ class SpreadsheetEditorDialog(QtWidgets.QDialog):
         self._delegate.discard_edit()
         self._view_timer.stop()
         self.setEnabled(False)
-        self._feedback.setText("Closing editor...")
+        self._feedback.setText("Closing editor…")
         self._worker.request_shutdown()
         if self._worker.isFinished():
             self._worker_finished()

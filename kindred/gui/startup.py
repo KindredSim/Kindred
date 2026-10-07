@@ -52,8 +52,8 @@ def apply_qt_startup_workarounds(
         mode = raw_mode.strip().lower()
         if mode not in {"auto", "software", "default"}:
             raise ValueError(
-                f"Invalid KINDRED_QT_OPENGL value {raw_mode!r}; "
-                "expected one of: auto, software, default."
+                f"Invalid KINDRED_QT_OPENGL value {raw_mode!r}. "
+                "Expected one of: auto, software, default."
             )
     else:
         mode = "auto"

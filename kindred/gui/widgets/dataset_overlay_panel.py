@@ -114,7 +114,7 @@ class DatasetOverlayPanel(QtWidgets.QWidget):
         appearance_layout = QtWidgets.QVBoxLayout(self._appearance)
         appearance_layout.setContentsMargins(0, 0, 0, 0)
         appearance_layout.setSpacing(6)
-        title = QtWidgets.QLabel("Marker appearance")
+        title = QtWidgets.QLabel("Marker Appearance")
         title_font = title.font()
         title_font.setBold(True)
         title.setFont(title_font)

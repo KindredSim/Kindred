@@ -42,12 +42,13 @@ def main() -> int:
         QtCore.Qt.HighDpiScaleFactorRoundingPolicy.PassThrough
     )
 
-    app = QtWidgets.QApplication(sys.argv)
+    # Fusion is the application's style override, so the theme's proxy style
+    # wraps Fusion rather than the platform default.
+    app = QtWidgets.QApplication([*sys.argv, "-style", "Fusion"])
     # One numeric-text convention: Python/repr decimal point, never the OS locale.
     QtCore.QLocale.setDefault(QtCore.QLocale.c())
     QtCore.QCoreApplication.setOrganizationName("Kindred")
     QtCore.QCoreApplication.setApplicationName("Kindred")
-    app.setStyle("Fusion")
 
     icon = gui_startup.load_app_icon(QtGui.QIcon)
     if icon is not None and not icon.isNull():

@@ -239,7 +239,7 @@ def _enum(value: object, *, field: str) -> str:
 
 def _ordinal(value: object, *, field: str) -> int:
     if type(value) is not int or value < 0:
-        raise InterventionScheduleError(f"{field} must be a non-negative integer.")
+        raise InterventionScheduleError(f"{field} must be a nonnegative integer.")
     return value
 
 
@@ -1299,7 +1299,7 @@ class InterventionSchedule:
                     initializers.append((physical.initial_volume, identity))
         if len(initializers) > 1:
             raise InterventionScheduleError(
-                "Declare initial_volume or initial_volume_param only once; it defines the vessel volume at simulation start.",
+                "Declare initial_volume or initial_volume_param only once. It defines the vessel volume at simulation start.",
                 field="initial_volume", field_identities=tuple(identity for _, identity in initializers),
             )
         object.__setattr__(self, "initial_volume", initializers[0] if initializers else None)
@@ -1827,7 +1827,7 @@ def _physical_from_fields(data: Mapping[str, Any], *, extra_keys: set[str] = fro
                 for record in _split_nested(inner, ";", context="stock")
             ]
         if not isinstance(composition, (list, tuple)):
-            raise InterventionScheduleError("solution requires stock composition; stock={} denotes solvent.")
+            raise InterventionScheduleError("A solution requires a stock composition, and stock={} denotes solvent.")
         for component in composition:
             if not isinstance(component, Mapping):
                 raise InterventionScheduleError("Stock components must be records.")

@@ -61,7 +61,7 @@ def unit_samples(count, keys, method, seed, directory, check):
 
 def validate_endpoint_budget(endpoints, quota, count):
     if quota < 0 or quota > count:
-        raise ValueError("Endpoint attempts must be between zero and this design's total count.")
+        raise ValueError("Endpoint attempts must be between zero and the total count of this design.")
     if endpoints and not quota:
         raise ValueError("Selected endpoints require a nonzero endpoint budget.")
     if quota and not endpoints:
@@ -228,7 +228,7 @@ class PreparedScanDesign:
             return
         for key, expression in derived.items():
             if any(k.startswith("initial:") != key.startswith("initial:") for k in expression.terms):
-                raise ValueError(f"Calculated {key} depends on the other group. These inputs cannot be reused unchanged; use joint sampling.")
+                raise ValueError(f"Calculated {key} depends on the other group. These inputs cannot be reused unchanged. Use joint sampling.")
 
         def group_of(key):
             return "initial" if key.startswith("initial:") else "parameter"
@@ -302,7 +302,7 @@ class PreparedScanDesign:
                     parameters, parameter_error = self.groups["parameter"].slot(p)
                     initials, initial_error = self.groups["initial"].slot(c)
                     values = self.fixed | parameters | initials
-                    error = "; ".join(message for message in (parameter_error, initial_error) if message)
+                    error = " ".join(message for message in (parameter_error, initial_error) if message)
                     if not error:
                         try:
                             self.interval_checks.admit(values)

@@ -97,7 +97,7 @@ class VolumeExecution:
         for index in held_indices:
             output[index] = state[index]
         if np.any(~np.isfinite(output)):
-            raise self._error(item, time, "Physical intervention produced non-finite concentrations.",
+            raise self._error(item, time, "Physical intervention produced nonfinite concentrations.",
                 field="concentrations", unit="M", amount=amount, volume_before=old_volume,
                 concentrations_before=tuple(map(float, state)), concentrations_after=tuple(map(float, output)))
         self.value = new_volume

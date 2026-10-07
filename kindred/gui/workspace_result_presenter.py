@@ -344,8 +344,8 @@ def _result_warning_details(result: SimulationResultValue) -> tuple[str, ...]:
         code = cause.code if cause.code is not None else "<none>"
         details.append(
             "Algebra error for "
-            f"{observable_name}: type={cause.type}; code={code}; "
-            f"message={cause.message}"
+            f"{observable_name}: {cause.message}"
+            + (f" [{code}]" if code else "")
         )
     return tuple(details)
 
@@ -899,8 +899,8 @@ def _selected_x_unavailable_diagnostic(
     labels = ", ".join(repr(str(label)) for label in unavailable_labels)
     return (
         f"Selected X {selected.label!r} is unavailable for result layer(s) {labels}. "
-        "Those layer(s) are omitted from the current plot only; "
-        "full-resolution Copy All/XLSX exports remain unaffected."
+        "Those layer(s) are omitted from the current plot only. "
+        "Full-resolution Copy All/XLSX exports remain unaffected."
     )
 
 
@@ -959,7 +959,7 @@ def _xlsx_literal_cell(sheet: object, value: object) -> object:
     length = len(value)
     if length > _MAX_XLSX_STRING_LENGTH:
         raise ValueError(
-            "XLSX string cell exceeds Excel's physical limit of "
+            "XLSX string cell exceeds the physical limit of Excel of "
             f"{_MAX_XLSX_STRING_LENGTH:,} characters (got {length:,})."
         )
     cell = WriteOnlyCell(sheet, value=value)
@@ -982,12 +982,12 @@ def _validate_xlsx_worksheet_dimensions(
     for title, rows, columns in dimensions:
         if rows > _EXCEL_MAX_ROWS:
             raise ValueError(
-                f"XLSX worksheet {title!r} requires {rows:,} rows; "
+                f"XLSX worksheet {title!r} requires {rows:,} rows, but "
                 f"Excel permits at most {_EXCEL_MAX_ROWS:,}."
             )
         if columns > _EXCEL_MAX_COLUMNS:
             raise ValueError(
-                f"XLSX worksheet {title!r} requires {columns:,} columns; "
+                f"XLSX worksheet {title!r} requires {columns:,} columns, but "
                 f"Excel permits at most {_EXCEL_MAX_COLUMNS:,}."
             )
 

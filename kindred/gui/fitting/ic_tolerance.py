@@ -71,7 +71,7 @@ class FitInitialTolerance:
             )
         if mode in {"symmetric_percent", "asymmetric_percent"} and lower >= 100.0:
             raise ValueError(
-                "Vary IC lower percentage must be below 100; use Absolute "
+                "Vary IC lower percentage must be below 100. Use Absolute "
                 "Minimum / Maximum (in M) to allow zero."
             )
         if mode == "absolute":
@@ -125,7 +125,7 @@ class FitInitialTolerance:
             if nominal == 0.0:
                 raise ValueError(
                     "A zero Starting IC cannot move through percentage "
-                    "bounds; use meaningful absolute bounds."
+                    "bounds. Use meaningful absolute bounds."
                 )
             # Preserve the exact authored percentage formula.
             minimum = nominal * (1.0 - self.lower / 100.0)
@@ -134,7 +134,7 @@ class FitInitialTolerance:
             minimum, maximum = self.lower, self.upper
         if not math.isfinite(minimum) or not math.isfinite(maximum):
             raise ValueError(
-                "Vary IC resolves to non-finite bounds; reduce the "
+                "Vary IC resolves to nonfinite bounds. Reduce the "
                 "percentage or use explicit finite absolute bounds."
             )
         minimum = validate_concentration(

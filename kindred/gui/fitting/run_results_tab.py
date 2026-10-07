@@ -15,8 +15,8 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtCore import Qt, Signal
 
 from kindred.core.analysis.fit_evaluation_outcome import ScientificUnavailable
-from kindred.core.analysis.fit_statistics import FitMetric
 from kindred.core.quantity_units import format_unit_for_display
+from kindred.core.validation import six_digit_text
 from kindred.gui.display_name_policy import (
     TAB_LABEL_MAX_CHARS,
     compact_dataset_label,
@@ -25,7 +25,7 @@ from kindred.gui.display_name_policy import (
 from kindred.gui.fitting.reporting import (
     FitValueEntry, fit_candidate_presentation, fit_live_presentation, fit_overview,
 )
-from kindred.gui.fitting.launch import FitExecutionRequest, FitParameterVariable
+from kindred.gui.fitting.launch import FitExecutionRequest, FitSetupSnapshot
 from kindred.gui.ui_helpers import ControlRowsLayout
 from kindred.gui.fitting.execution import FitCandidate, FitCurveDataset, FitLiveUpdate
 from kindred.gui.widgets.grid_plot_view import GridPlotView
@@ -33,20 +33,6 @@ from kindred.gui.widgets.grid_plot_view import GridPlotView
 __all__ = ["FitTrackerPanel", "ResultsSummaryDialog", "RunResultsTab"]
 
 ColorResolver = Callable[[str], object]
-
-
-def _format_metric(value: object) -> str:
-    if isinstance(value, FitMetric):
-        return (
-            f"{value.value:.2e}"
-            if value.available
-            else f"unavailable ({value.unavailable_reason})"
-        )
-    try:
-        number = float(value)
-        return f"{number:.2e}" if math.isfinite(number) else "unavailable"
-    except Exception:
-        return "unavailable"
 
 
 
@@ -109,19 +95,22 @@ class _FitValueLabel(QtWidgets.QLabel):
         self.setSelection(0, document.characterCount() - 1)
 
 
-class _SummaryBrowser(QtWidgets.QTextBrowser):
-    def createMimeDataFromSelection(self) -> QtCore.QMimeData:
-        data = QtCore.QMimeData()
-        data.setText(self.textCursor().selection().toPlainText())
-        return data
+def _cause_chain(cause: object) -> str:
+    """Each message in a failure chain with its error code, outermost first."""
+    parts: list[str] = []
+    while cause is not None:
+        code = getattr(cause, "code", None)
+        parts.append(str(getattr(cause, "message", cause)) + (f" [{code}]" if code else ""))
+        cause = getattr(cause, "cause", None)
+    return " Caused by: ".join(parts)
 
 
 class ResultsSummaryDialog(QtWidgets.QDialog):
-    """A physical summary popup rendered from one synchronous summary value."""
+    """A Summary popup with Results and Provenance tabs, each a selectable document."""
 
     def __init__(
         self,
-        summary: str | None = None,
+        documents: tuple[str, str] = ("", ""),
         *,
         parent: QtWidgets.QWidget | None = None,
     ) -> None:
@@ -133,53 +122,65 @@ class ResultsSummaryDialog(QtWidgets.QDialog):
         self._info_label = QtWidgets.QLabel("Review the most recent fit run.")
         self._info_label.setWordWrap(True)
         layout.addWidget(self._info_label)
-        self._displayed_html = ""
-        self._pending_html: str | None = None
-        self._body = _SummaryBrowser(self)
-        self._body.setOpenLinks(False)
-        self._body.setOpenExternalLinks(False)
-        self._body.setObjectName("results_summary_body")
-        self._body.setReadOnly(True)
-        self._body.setWordWrapMode(QtGui.QTextOption.WrapMode.WordWrap)
-        self._body.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
-        self._body.selectionChanged.connect(self._flush_pending)
-        self._body.setTextInteractionFlags(
-            Qt.TextInteractionFlag.TextSelectableByMouse
-            | Qt.TextInteractionFlag.TextSelectableByKeyboard
-        )
-        layout.addWidget(self._body, stretch=1)
-        self.refresh(summary or "")
+        self._tabs = QtWidgets.QTabWidget(self)
+        self._browsers: list[QtWidgets.QTextBrowser] = []
+        self._displayed_html = ["", ""]
+        self._pending_html: list[str | None] = [None, None]
+        for index, title in enumerate(("Results", "Provenance")):
+            browser = QtWidgets.QTextBrowser(self)
+            browser.setOpenLinks(False)
+            browser.setOpenExternalLinks(False)
+            browser.setObjectName(f"results_summary_{title.lower()}")
+            browser.setReadOnly(True)
+            browser.setWordWrapMode(QtGui.QTextOption.WrapMode.WordWrap)
+            browser.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+            browser.selectionChanged.connect(lambda index=index: self._flush_pending(index))
+            browser.setTextInteractionFlags(
+                Qt.TextInteractionFlag.TextSelectableByMouse
+                | Qt.TextInteractionFlag.TextSelectableByKeyboard
+            )
+            self._tabs.addTab(browser, title)
+            self._browsers.append(browser)
+        layout.addWidget(self._tabs, stretch=1)
+        self.refresh(documents)
 
-    def refresh(self, summary: str, *, reset: bool = False) -> None:
-        """Keep the reader's position; defer only the latest update during selection."""
-        summary = summary or "<p>No summary available.</p>"
-        if reset:
-            self._pending_html = None
-            self._replace_document(summary, preserve_scroll=False)
-        elif summary == self._displayed_html:
-            self._pending_html = None
-        elif self._body.textCursor().hasSelection():
-            self._pending_html = summary
-        else:
-            self._pending_html = None
-            self._replace_document(summary, preserve_scroll=True)
+    def refresh(self, documents: tuple[str, str], *, reset: bool = False) -> None:
+        """Keep each reader's position; defer only the latest update during a selection."""
+        for index, document in enumerate(documents):
+            document = document or "<p>No summary available.</p>"
+            browser = self._browsers[index]
+            if reset:
+                self._pending_html[index] = None
+                self._replace_document(index, document, preserve_scroll=False)
+            elif document == self._displayed_html[index]:
+                self._pending_html[index] = None
+            elif browser.textCursor().hasSelection():
+                self._pending_html[index] = document
+            else:
+                self._pending_html[index] = None
+                self._replace_document(index, document, preserve_scroll=True)
         self._info_label.setText("An update is waiting. Clear the selection to show it."
-                                 if self._pending_html is not None else "Review the most recent fit run.")
+                                 if any(item is not None for item in self._pending_html)
+                                 else "Review the most recent fit run.")
 
-    def _replace_document(self, summary: str, *, preserve_scroll: bool) -> None:
-        horizontal = self._body.horizontalScrollBar()
-        vertical = self._body.verticalScrollBar()
+    def _replace_document(self, index: int, document: str, *, preserve_scroll: bool) -> None:
+        browser = self._browsers[index]
+        horizontal = browser.horizontalScrollBar()
+        vertical = browser.verticalScrollBar()
         positions = (horizontal.value(), vertical.value()) if preserve_scroll else (0, 0)
         # setHtml clears selection; block that signal during this synchronous replacement.
-        with QtCore.QSignalBlocker(self._body):
-            self._body.setHtml(summary)
-        self._displayed_html = summary
+        with QtCore.QSignalBlocker(browser):
+            browser.setHtml(document)
+        self._displayed_html[index] = document
         horizontal.setValue(positions[0])
         vertical.setValue(positions[1])
 
-    def _flush_pending(self) -> None:
-        if not self._body.textCursor().hasSelection() and self._pending_html is not None:
-            self.refresh(self._pending_html)
+    def _flush_pending(self, index: int) -> None:
+        if not self._browsers[index].textCursor().hasSelection() and self._pending_html[index] is not None:
+            self.refresh(tuple(
+                pending if pending is not None else displayed
+                for pending, displayed in zip(self._pending_html, self._displayed_html)
+            ))
 
 
 class FitTrackerPanel(QtWidgets.QWidget):
@@ -191,10 +192,10 @@ class FitTrackerPanel(QtWidgets.QWidget):
         self.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding, QtWidgets.QSizePolicy.Policy.Fixed)
         self._overview: tuple[str, ...] = ()
         self._outcome = self._phase = self._model = ""
-        self._parameter_count = self._dataset_count = self._calls = 0
+        self._fitted_value_count = self._dataset_count = self._calls = 0
         self._objective = "not evaluated"
         self._values_html = ""
-        self._parameters: tuple[FitParameterVariable, ...] = ()
+        self._setup: FitSetupSnapshot | None = None
         self._entries: tuple[FitValueEntry, ...] = ()
         self._entry_labels: list[_FitValueLabel] = []
         self._entry_layout_key: tuple | None = None
@@ -212,7 +213,7 @@ class FitTrackerPanel(QtWidgets.QWidget):
         self._values_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         self._values_scroll.setStyleSheet("QScrollArea#global_fit_tracker_values { border: 0; padding: 0; margin: 0; }")
         self._values_scroll.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
-        self._values_scroll.setAccessibleName("Fitted values; use arrow or Page keys to scroll")
+        self._values_scroll.setAccessibleName("Fitted values. Use the arrow or Page keys to scroll.")
         self._values_widget = QtWidgets.QWidget()
         self._values_layout = ControlRowsLayout(self._values_widget)
         self._values_layout.setSpacing(8)
@@ -233,25 +234,29 @@ class FitTrackerPanel(QtWidgets.QWidget):
             label.hide()
         self.hide()
 
-    def start(self, model: str, parameters: tuple[FitParameterVariable, ...], dataset_count: int) -> None:
+    def start(self, setup: FitSetupSnapshot, dataset_count: int, fitted_value_count: int) -> None:
         self.clear()
-        self._model, self._parameters = model, parameters
-        self._parameter_count, self._dataset_count = len(parameters), dataset_count
+        self._model, self._setup = setup.origin.tab_name, setup
+        self._fitted_value_count, self._dataset_count = fitted_value_count, dataset_count
         self._values_scroll.verticalScrollBar().setValue(0)
         self.set_phase("Starting", "Waiting for the first complete candidate")
+
+    def restart(self) -> None:
+        """Start again with the setup and counts of the current run."""
+        self.start(self._setup, self._dataset_count, self._fitted_value_count)
 
     def set_phase(self, phase: str, detail: str) -> None:
         self._phase = phase
         self._overview = fit_overview(phase, self._model, self._objective,
-                                     self._dataset_count, self._parameter_count)
+                                     self._dataset_count, self._fitted_value_count)
         self._outcome = detail
         self._render()
 
     def update_from_best(self, update: FitLiveUpdate, *, dataset_labels: Mapping[str, str],
                          initial_labels: Mapping[str, str]) -> None:
-        entries, self._values_html = fit_live_presentation(update, self._parameters, dataset_labels, initial_labels)
+        entries, self._values_html = fit_live_presentation(update, self._setup, dataset_labels, initial_labels)
         self._set_entries(entries)
-        self._objective = _format_metric(update.cost)
+        self._objective = six_digit_text(update.cost)
         self._calls = update.iteration
         phase, detail = self._phase, self._outcome
         if phase in {"Starting", "Running"}:
@@ -266,7 +271,7 @@ class FitTrackerPanel(QtWidgets.QWidget):
 
     def summary_html(self) -> str:
         if not self._overview:
-            return "<h2>Fit ready</h2><p>Run a fit to obtain results.</p>"
+            return "<h2>Fit Ready</h2><p>Run a fit to obtain results.</p>"
         return (f"<h2>{html.escape(" | ".join(self._overview))}</h2><p>{html.escape(self._outcome)}</p>"
                 f"<p>Objective calls: {self._calls}</p>" + self._values_html)
 
@@ -309,7 +314,7 @@ class FitTrackerPanel(QtWidgets.QWidget):
         for label, (_identity, symbol, plain_symbol, context, value, unit) in zip(self._entry_labels, self._entries):
             label.copy_break_positions.clear()
             metrics = label.fontMetrics()
-            number = f"{value:.6g}"
+            number = six_digit_text(value)
             suffix = "" if unit == "1" else " " + format_unit_for_display(unit)
             document = QtGui.QTextDocument()
             document.setDefaultFont(label.font())
@@ -430,8 +435,6 @@ class RunResultsTab(QtWidgets.QWidget):
         self._observation_style = observation_style
         self._color_resolver = color_resolver
         self._summary_dialog: ResultsSummaryDialog | None = None
-        self._apply_reason = ""
-        self._apply_copy_reason = ""
         self._summary_body = ""
         self._summary_provenance = ""
         self._progress = 0
@@ -493,8 +496,8 @@ class RunResultsTab(QtWidgets.QWidget):
             self._render_diagnostic_label.clear()
             self._render_diagnostic_label.hide()
         else:
-            overview, outcome, self._summary_body, self._summary_provenance, entries = fit_candidate_presentation(candidate)
-            self._tracker_panel.set_summary(overview, outcome, entries)
+            overview, self._summary_body, self._summary_provenance, entries = fit_candidate_presentation(candidate)
+            self._tracker_panel.set_summary(overview, "", entries)
         self._install_plot_projection(curves)
         self._refresh_summary()
         if curve_failure is not None:
@@ -504,28 +507,16 @@ class RunResultsTab(QtWidgets.QWidget):
             self._render_diagnostic_label.show()
         return self.copy_eligible()
 
-    def set_apply_reasons(self, reason: str, copy_reason: str) -> None:
-        self._apply_reason = reason
-        self._apply_copy_reason = copy_reason
-        self._refresh_summary()
-
     def set_progress(self, value: int) -> None:
         self._progress = value
         self._refresh_summary()
 
-    def _summary_html(self) -> str:
+    def _summary_html(self) -> tuple[str, str]:
+        """The Results and Provenance documents."""
         body = self._summary_body or self._tracker_panel.summary_html()
         if not self._summary_body:
             body += f"<p>Progress: {self._progress}%</p>"
-        body += ("<h3>Apply Fit to Project availability</h3><p>"
-                 + html.escape(self._apply_reason or "Apply is available for compatible shared estimates and fitted initial values.").replace("\n", "<br>") + "</p>")
-        body += ("<h3>Apply Fit to Tab Copy availability</h3><p>"
-                 + html.escape(self._apply_copy_reason or "Apply to a new tab copy is available; the fitting session remains attached to the original tab.").replace("\n", "<br>") + "</p>")
-        view = self._subtab_stack.currentWidget()
-        if view is not None and self._curves:
-            legend, _plain = view.legend_text()
-            body += "<h3>Plot legend</h3><p>" + legend + "</p>"
-        return body + self._summary_provenance
+        return body, self._summary_provenance
 
     def _refresh_summary(self) -> None:
         if self._summary_dialog is not None and self._summary_dialog.isVisible():
@@ -570,19 +561,11 @@ class RunResultsTab(QtWidgets.QWidget):
         if dataset_label is not None and tuple(self._dataset_labels.values()).count(dataset_label) > 1:
             dataset_label = f"{dataset_label} ({dataset_id})"
         caption = f"Dataset: {dataset_label}" if dataset_label is not None else ""
-        chain: list[str] = []
-        current = failure
-        while current is not None:
-            code = getattr(current, "code", None)
-            code_text = f" [{code}]" if code else ""
-            message = getattr(current, "message", str(current))
-            chain.append(f"{type(current).__name__}{code_text}: {message}")
-            current = getattr(current, "cause", None)
         message = getattr(failure, "message", str(failure))
         self.set_execution_status("Failed", f"{caption}: {message}" if caption else message)
         self._summary_body = (
-            "<h2>Fit failed</h2>" + (f"<p>{html.escape(caption)}</p>" if caption else "")
-            + "<p>" + html.escape(" Caused by: ".join(chain)).replace("\n", "<br>") + "</p>"
+            "<h2>Fit Failed</h2>" + (f"<p>{html.escape(caption)}</p>" if caption else "")
+            + "<p>" + html.escape(_cause_chain(failure)).replace("\n", "<br>") + "</p>"
         )
         self._summary_provenance = ""
         self._refresh_summary()
@@ -590,19 +573,10 @@ class RunResultsTab(QtWidgets.QWidget):
     def set_terminal_unavailable(self, cause: ScientificUnavailable) -> None:
         self._empty_label.hide()
         self._tracker_panel.clear()
-        chain: list[str] = []
-        current = cause.factual_cause
-        while current is not None:
-            code = getattr(current, "code", None)
-            code_text = f" [{code}]" if code else ""
-            chain.append(
-                f"{type(current).__name__}{code_text}: "
-                f"{getattr(current, 'message', current)}"
-            )
-            current = getattr(current, "cause", None)
         self.set_execution_status("No valid candidate found",
                                   cause.factual_cause.message if cause.factual_cause is not None else cause.stage)
-        self._summary_body = "<h2>No valid candidate found</h2><p>" + html.escape(" Caused by: ".join(chain)).replace("\n", "<br>") + "</p>"
+        self._summary_body = ("<h2>No Valid Candidate Found</h2><p>"
+                              + html.escape(_cause_chain(cause.factual_cause)).replace("\n", "<br>") + "</p>")
         self._summary_provenance = ""
         self._refresh_summary()
 
@@ -655,10 +629,22 @@ class RunResultsTab(QtWidgets.QWidget):
             self._all_datasets_plot_view.set_observation_style(shape, size, opacity)
         self._refresh_summary()
 
-    def set_waiting(self, model: str, parameters: tuple[FitParameterVariable, ...], dataset_count: int) -> None:
+    def set_waiting(self, request: FitExecutionRequest) -> None:
         self.clear_candidate(keep_plots=True)
         self._progress = 0
-        self._tracker_panel.start(model, parameters, dataset_count)
+        self._tracker_panel.start(
+            request.setup,
+            len(request.dispatch.included_dataset_ids),
+            len(request.dispatch.ordinary_optimizer_layout.opt_param_keys()),
+        )
+        if self._summary_dialog is not None and self._summary_dialog.isVisible():
+            self._summary_dialog.refresh(self._summary_html(), reset=True)
+
+    def restart_waiting(self) -> None:
+        """Wait again for the running request the tracker already holds."""
+        self.clear_candidate(keep_plots=True)
+        self._progress = 0
+        self._tracker_panel.restart()
         if self._summary_dialog is not None and self._summary_dialog.isVisible():
             self._summary_dialog.refresh(self._summary_html(), reset=True)
 

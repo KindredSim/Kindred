@@ -3,11 +3,18 @@
 from __future__ import annotations
 
 __all__ = [
+    "LEAST_SQUARES_TOLERANCE",
     "SUPPORTED_FIT_METHODS",
+    "UNCERTAINTY_FIT_METHODS",
     "validate_fit_method",
 ]
 
 SUPPORTED_FIT_METHODS = ("trf", "dogbox", "differential_evolution")
+# Profile and Bootstrap refit from the completed Fit with a local optimizer.
+UNCERTAINTY_FIT_METHODS = ("trf", "dogbox")
+# Default objective and step tolerance of a least-squares fit, also used by the
+# Profile and Bootstrap refits after Differential Evolution.
+LEAST_SQUARES_TOLERANCE = 1e-10
 
 
 def validate_fit_method(value: object) -> str:

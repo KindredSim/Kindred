@@ -67,7 +67,7 @@ class DatasetMappingBatchDialog(QtWidgets.QDialog):
         intro = QtWidgets.QLabel(
             "Review mappings and starting concentrations for each new dataset. Each receives a new initial-condition set."
             if self._create_only else "Review every committed dataset below. Suggestions are never "
-            "applied until you press OK; each observation may be explicitly "
+            "applied until you click OK, and each observation may be explicitly "
             "mapped or left Unmapped.",
             self,
         )
@@ -92,8 +92,8 @@ class DatasetMappingBatchDialog(QtWidgets.QDialog):
             parent=self,
         )
         if self._create_only:
-            buttons.button(QtWidgets.QDialogButtonBox.Ok).setText(f"Create {len(self._records)} datasets")
-            buttons.button(QtWidgets.QDialogButtonBox.Cancel).setText("Back to editor")
+            buttons.button(QtWidgets.QDialogButtonBox.Ok).setText(f"Create {len(self._records)} Datasets")
+            buttons.button(QtWidgets.QDialogButtonBox.Cancel).setText("Back to Editor")
         buttons.accepted.connect(self._accept_review)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
@@ -231,7 +231,7 @@ class DatasetMappingBatchDialog(QtWidgets.QDialog):
                     if current_occupant == occupant:
                         del projected_occupants[set_id]
                 projected_occupants[target.set_id] = row.record.dataset_id
-                row.proposed_name.setText("(existing set; override earlier mapping)")
+                row.proposed_name.setText("(existing set, override earlier mapping)")
             elif choice == OccupiedSetChoice.CREATE_COPY.value:
                 proposed = allocate_initial_condition_set_name(
                     target.name,
@@ -242,7 +242,7 @@ class DatasetMappingBatchDialog(QtWidgets.QDialog):
             elif choice == OccupiedSetChoice.CANCEL.value:
                 row.proposed_name.setText("(mapping canceled)")
             else:
-                row.proposed_name.setText("(existing set; choose occupancy disposition)")
+                row.proposed_name.setText("(existing set, choose occupancy disposition)")
 
     @staticmethod
     def _set_occupancy_choice(

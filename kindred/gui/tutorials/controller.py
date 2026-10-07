@@ -113,7 +113,7 @@ class TutorialController(QtCore.QObject):
         self._chooser = dialog
         dialog.setWindowTitle("Interactive Tutorials")
         layout = QtWidgets.QVBoxLayout(dialog)
-        heading = QtWidgets.QLabel("Learn Kindred by doing", dialog)
+        heading = QtWidgets.QLabel("Learn Kindred by Doing", dialog)
         font = heading.font()
         font.setBold(True)
         font.setPointSize(font.pointSize() + 3)
@@ -132,7 +132,7 @@ class TutorialController(QtCore.QObject):
         layout.addWidget(description)
         buttons = QtWidgets.QDialogButtonBox(dialog)
         start = buttons.addButton(
-            "Start tutorial", QtWidgets.QDialogButtonBox.ButtonRole.AcceptRole
+            "Start Tutorial", QtWidgets.QDialogButtonBox.ButtonRole.AcceptRole
         )
         buttons.addButton(QtWidgets.QDialogButtonBox.StandardButton.Close)
         buttons.accepted.connect(dialog.accept)
@@ -178,7 +178,7 @@ class TutorialController(QtCore.QObject):
 
     def _ended(self, reason: str) -> None:
         self.stop()
-        QtWidgets.QMessageBox.information(self._window, "Tutorial ended", reason)
+        QtWidgets.QMessageBox.information(self._window, "Tutorial Ended", reason)
 
     def next(self) -> None:
         lesson = self.lesson
@@ -302,7 +302,7 @@ class TutorialController(QtCore.QObject):
 
                     self._recovery = reveal_hidden
                 recovery_text = (
-                    "Show this control" if self._recovery is not None else ""
+                    "Show This Control" if self._recovery is not None else ""
                 )
                 if complete and (step.complete is not None or skipped):
                     status += " The control is currently outside the visible area."

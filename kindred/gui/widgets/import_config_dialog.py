@@ -102,7 +102,7 @@ class ImportConfigDialog(QtWidgets.QDialog):
         sheet_layout = QtWidgets.QVBoxLayout(sheets)
         sheet_layout.setSpacing(6)
         bulk = QtWidgets.QHBoxLayout()
-        self._btn_select_all = QtWidgets.QPushButton("Select all", sheets)
+        self._btn_select_all = QtWidgets.QPushButton("Select All", sheets)
         self._btn_invert_sheets = QtWidgets.QPushButton("Invert", sheets)
         bulk.addWidget(self._btn_select_all)
         bulk.addWidget(self._btn_invert_sheets)
@@ -119,11 +119,11 @@ class ImportConfigDialog(QtWidgets.QDialog):
         self._apply_remaining_cb.setVisible(excel or remaining_count > 0)
         sheet_layout.addWidget(self._apply_remaining_cb)
         self._btn_select_compatible = QtWidgets.QPushButton(
-            "Select compatible sheets", sheets
+            "Select Compatible Sheets", sheets
         )
         sheet_layout.addWidget(self._btn_select_compatible)
         if not excel:
-            sheets.setTitle("Shared settings")
+            sheets.setTitle("Shared Settings")
             self._sheet_list.hide()
             self._btn_select_all.hide()
             self._btn_invert_sheets.hide()
@@ -155,17 +155,17 @@ class ImportConfigDialog(QtWidgets.QDialog):
         self._populate_unit_choices(self._default_unit_combo, MEASUREMENT_UNIT_DISPLAY, "M")
         self._default_unit_combo.setToolTip(
             "Used by columns set to Use default. Choose Dimensionless for ratios and fractions. "
-            "Enter other supported units in each column's Unit control."
+            "Enter other supported units in the Unit control of each column."
         )
         form.addRow("Default unit", self._default_unit_combo)
         settings_layout.addLayout(form)
-        self._unit_row_cb = QtWidgets.QCheckBox("First data row contains units", settings)
+        self._unit_row_cb = QtWidgets.QCheckBox("First Data Row Contains Units", settings)
         self._unit_row_cb.setToolTip("Exclude this row from measurements. Column units are selected separately.")
         settings_layout.addWidget(self._unit_row_cb)
         self._unit_info_label = QtWidgets.QLabel(settings)
         settings_layout.addWidget(self._unit_info_label)
         species_header = QtWidgets.QHBoxLayout()
-        species_header.addWidget(QtWidgets.QLabel("Species columns", settings))
+        species_header.addWidget(QtWidgets.QLabel("Species Columns", settings))
         species_header.addStretch(1)
         self._species_count_label = QtWidgets.QLabel(settings)
         species_header.addWidget(self._species_count_label)
@@ -427,7 +427,7 @@ class ImportConfigDialog(QtWidgets.QDialog):
     def _refresh_unit_info(self) -> None:
         sheet = self._shown_sheet()
         if sheet.settings.time_column is None:
-            info = "No recorded time; observations can be fitted against a measured X quantity."
+            info = "No recorded time. Observations can be fitted against a measured X quantity."
         else:
             try:
                 unit = resolve_column_unit(sheet.settings.time_column, sheet.unit_row, sheet.settings, time=True)
@@ -517,7 +517,7 @@ class ImportConfigDialog(QtWidgets.QDialog):
                 unit = resolve_column_unit(column, sheet.unit_row, sheet.settings)
                 label.setTextFormat(QtCore.Qt.RichText)
                 label.setText(f"{format_unit_for_display(unit)} → {format_unit_for_display(scientific_unit(unit.dimensions))}")
-                label.setToolTip(f"Incoming {unit.symbol}; stored as {scientific_unit(unit.dimensions).symbol}.")
+                label.setToolTip(f"Incoming {unit.symbol}, stored as {scientific_unit(unit.dimensions).symbol}.")
             except ValueError as exc:
                 label.setText("Invalid unit")
                 label.setToolTip(str(exc))

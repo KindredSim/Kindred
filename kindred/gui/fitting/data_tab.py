@@ -109,7 +109,7 @@ class DataTab(QtWidgets.QWidget):
         layout = QtWidgets.QVBoxLayout(panel)
         layout.setContentsMargins(0, 0, 0, 0)
         self._header = QtWidgets.QLabel(panel)
-        set_bounded_label_text(self._header, "Fit data", max_width=16777215)
+        set_bounded_label_text(self._header, "Fit Data", max_width=16777215)
         self._header.setStyleSheet("font-weight: bold;")
         layout.addWidget(self._header)
 
@@ -209,7 +209,7 @@ class DataTab(QtWidgets.QWidget):
         enabled = bool(self._current_dataset_id)
         label = self._display_names.get(self._current_dataset_id, self._current_dataset_id)
         set_bounded_label_text(self._header,
-                               f"Fit data — {label}" if enabled else "Fit data — no dataset selected",
+                               f"Fit Data — {label}" if enabled else "Fit Data — No Dataset Selected",
                                max_width=16777215)
         self._header.setEnabled(enabled)
         for editor in (
@@ -403,7 +403,7 @@ class DataTab(QtWidgets.QWidget):
         except ValueError as exc:
             return str(exc)
         except (KeyError, TypeError):
-            return "Complete the Fit data values before applying."
+            return "Complete the Fit Data values before applying."
         maximum = config.get("maximum_observations_per_target")
         if maximum not in (None, 0):
             try:

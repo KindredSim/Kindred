@@ -171,7 +171,7 @@ def _condition_tuple(result):
     """Package an evaluated predicate without evaluating it again."""
     sp = require_sympy()
     if result == sp.false:
-        raise _ConditionInapplicable("The answer's conditions are not satisfied.")
+        raise _ConditionInapplicable("The conditions of the answer are not satisfied.")
     return result.args if isinstance(result, sp.And) else () if result == sp.true else (result,)
 
 
@@ -186,7 +186,7 @@ def _branches(values):
     """Enumerate one complete family; no status, mathematics or metadata work."""
     families = [i for i, value in enumerate(values) if isinstance(value, _Alternatives)]
     if len(families) > 1:
-        raise SymbolicCalculatorError("Select independent answer operands explicitly with solution(result,n); branches are not paired automatically.")
+        raise SymbolicCalculatorError("Select independent answer operands explicitly with solution(result,n). Branches are not paired automatically.")
     if not families:
         yield tuple(values)
     else:
@@ -221,7 +221,7 @@ def _map(expression: Any, operation) -> Any:
     if isinstance(expression, sp.Equality):
         return sp.Eq(_map(expression.lhs, operation), _map(expression.rhs, operation), evaluate=False)
     if not isinstance(expression, sp.Expr):
-        raise SymbolicCalculatorError("Unsupported: this operation requires expressions, equations, tuples or matrices; apply solutions with subs first.")
+        raise SymbolicCalculatorError("Unsupported: this operation requires expressions, equations, tuples, or matrices. Apply solutions with subs first.")
     return operation(expression)
 
 
@@ -585,7 +585,7 @@ def _translate_node(context: CalculatorContext, node: Any) -> _Value:
         if node.name in _FUNCTIONS:
             return operation(node.name, tuple(lower(child) for child in node.args))
     raise SymbolicCalculatorError(
-        f"Unsupported: admitted {type(node).__name__}; dynamic conditions and logical expressions are not Calculator mathematics."
+        f"Unsupported: admitted {type(node).__name__}. Dynamic conditions and logical expressions are not Calculator mathematics."
     )
 
 
@@ -620,7 +620,7 @@ def _coordinate(context: CalculatorContext, symbol: Any, operation: str) -> Any:
         definition = context.parameter_definitions.get(str(symbol))
         detail = f" Defined as {definition}." if definition is not None else " It is a derived quantity."
         raise SymbolicCalculatorError(
-            f"Invalid input: {operation} requires an independent coordinate; {symbol} is not one.{detail} "
+            f"Invalid input: {operation} requires an independent coordinate, and {symbol} is not one.{detail} "
             "Use independent coordinates from the definition."
         )
     return symbol
@@ -1027,7 +1027,7 @@ def _evaluate_call(context: CalculatorContext, name: str, args: Sequence[_Value 
                 raise SymbolicCalculatorError("Select the replacement explicitly with solution(result,n) when alternatives or unresolved possibilities remain.")
             args = (args[0], usable[0])
     if selection and all(isinstance(v, _Alternatives) for v in args):
-        raise SymbolicCalculatorError("Select independent answer operands explicitly with solution(result,n); branches are not paired automatically.")
+        raise SymbolicCalculatorError("Select independent answer operands explicitly with solution(result,n). Branches are not paired automatically.")
     operands = args[1:] if selection else args
     family = any(isinstance(v, _Alternatives) for v in operands)
     answers = []
@@ -1071,7 +1071,7 @@ def _select(result, index):
             usable = tuple(v for v in _entries(result) if not isinstance(v.expression, (_UnresolvedProblem, _UnavailableDiagnostic)))
             offset = _integer(index, "solution", minimum=1) - 1
             if offset >= len(usable):
-                raise SymbolicCalculatorError("Invalid input: no resolved solution with this number; unresolved and unavailable alternatives cannot be selected.")
+                raise SymbolicCalculatorError("Invalid input: no resolved solution with this number. Unresolved and unavailable alternatives cannot be selected.")
             selected = usable[offset]
         conditions = tuple(dict.fromkeys((*selected.conditions, *index.conditions)))
         conditions = _conditions(selected.conditions, additional=index.conditions)
@@ -1231,7 +1231,7 @@ def _dispatch_call(context: CalculatorContext, name: str, args: Sequence[_Value]
                 if isinstance(rows, sp.Tuple):
                     rows = sp.Tuple(*(row if isinstance(row, sp.Tuple) else sp.Tuple(row) for row in rows))
                 if not isinstance(rows, sp.Tuple) or not rows or any(not row for row in rows):
-                    raise SymbolicCalculatorError("Invalid input: matrix requires nonempty rows, e.g. matrix([[1,2],[3,4]]).")
+                    raise SymbolicCalculatorError("Invalid input: matrix requires nonempty rows, for example matrix([[1,2],[3,4]]).")
                 if len({len(row) for row in rows}) != 1 or any(not isinstance(x, sp.Expr) for row in rows for x in row):
                     raise SymbolicCalculatorError("Invalid input: matrix rows require equally many scalar entries.")
                 quantity = tuple(row if isinstance(row, tuple) else (row,) for row in args[0].quantity) if isinstance(args[0].quantity, tuple) else None
@@ -1275,7 +1275,7 @@ def _dispatch_call(context: CalculatorContext, name: str, args: Sequence[_Value]
                 def remove(x):
                     result = x.removeO()
                     if result.has(sp.Order):
-                        raise SymbolicCalculatorError("Unsupported: native remove_order does not remove this nested remainder; apply it to the series before nesting.")
+                        raise SymbolicCalculatorError("Unsupported: native remove_order does not remove this nested remainder. Apply it to the series before nesting.")
                     return result
                 return _map(args[0].expression, remove)
             raise SymbolicCalculatorError(f"Unsupported calculator operation {name!r}.")
@@ -1285,7 +1285,7 @@ def _dispatch_call(context: CalculatorContext, name: str, args: Sequence[_Value]
             if unresolved is not None:
                 return replace(unresolved, conditions=conditions)
             raise
-        notices = ("Series order term explicitly removed; the result is truncated.",) if name == "remove_order" and args[0].expression.has(sp.Order) else ()
+        notices = ("Series order term explicitly removed. The result is truncated.",) if name == "remove_order" and args[0].expression.has(sp.Order) else ()
         if unresolved is not None:
             return _Value(_UnresolvedProblem(expression, unresolved.expression.explanation), conditions)
         if args and expression == args[0].expression:
@@ -1400,13 +1400,13 @@ def _calculus_call(context: CalculatorContext, name: str, args: Sequence[_Value]
                 notices = (f"Local series about {_render(variable)}={_render(point)}, direction {direction}.",)
             if name == "series" and dependent:
                 if any(item.has(sp.nan) for item in result.atoms(*operators)):
-                    raise SymbolicCalculatorError("Unsupported: stock SymPy retained the condition-restricted operator; Calculator cannot publish that temporary restriction as an ordinary expression.")
+                    raise SymbolicCalculatorError("Unsupported: stock SymPy retained the condition-restricted operator. Calculator cannot publish that temporary restriction as an ordinary expression.")
 
         def classify(body, restrictions, conditional):
             if restricted:
                 current = sp.Tuple(body, *restrictions)
                 if current.atoms(*operators) - inherited or bound in current.free_symbols:
-                    raise SymbolicCalculatorError("Unsupported: stock SymPy retained the condition-restricted operator; Calculator cannot publish that temporary restriction as an ordinary expression.")
+                    raise SymbolicCalculatorError("Unsupported: stock SymPy retained the condition-restricted operator. Calculator cannot publish that temporary restriction as an ordinary expression.")
             if conditional and body.atoms(*operators) - inherited:
                 return _UnresolvedProblem(body, "The native conditional fallback remains unresolved.")
             return body
@@ -1571,7 +1571,7 @@ class _CalculatorExpressionParser:
                     continue
                 definition = self.context.parameter_definitions.get(str(symbol), "derived model quantity")
             raise SymbolicCalculatorError(
-                f"{name}: {authored} is defined as {definition}; use independent coordinates from its definition."
+                f"{name}: {authored} is defined as {definition}. Use independent coordinates from its definition."
             )
 
     def primary(self):
@@ -1916,15 +1916,15 @@ def _package_result(context: CalculatorContext, query: str, result) -> SymbolicC
         rows_text = "Rows: " + ", ".join(f"d{name}/dt" for name in context.species_names)
         display_html_lines.append(escape(rows_text))
     assumptions = (
-        "Accepted-source symbolic system; no schedules, execution overrides, Fit candidates or Slider drafts.",
-        "Coordinates are real; T is positive and fixed in time unless explicit expression dependence is supplied.",
-        "Definitions are prepared before calculation. Independent parameters and initial concentrations are fixed in time; partial differentiates prepared mathematics.",
-        "Independent inputs remain symbolic; supply concrete values explicitly with subs. Accepted defaults are not Calculator inputs.",
-        "Physical constants retain their names and owned values; approximation does not increase source precision.",
-        "Special functions, conditional/unresolved sets and some root/order forms may not round-trip as direct input; nested operation composition remains supported.",
+        "Accepted-source symbolic system, with no schedules, execution overrides, fit candidates, or slider drafts.",
+        "Coordinates are real. T is positive and fixed in time unless explicit expression dependence is supplied.",
+        "Definitions are prepared before calculation. Independent parameters and initial concentrations are fixed in time, and partial differentiates prepared mathematics.",
+        "Independent inputs remain symbolic. Supply concrete values explicitly with subs. Accepted defaults are not Calculator inputs.",
+        "Physical constants retain their names and owned values. Approximation does not increase source precision.",
+        "Special functions, conditional/unresolved sets, and some root/order forms may not round-trip as direct input. Nested operation composition remains supported.",
         "Stock SymPy 1.14.0 supplies mathematical algorithms. Its known parameter-dependent rational integration bug (sympy/sympy#28596) is not corrected or independently verified by Kindred.",
-        "Ordinary algebra and formal calculus use native CAS semantics, without historical operand domains. A simplified result does not certify the original expression's domain or a parameterized integral's regularity.",
-        "Actual answer conditions, unavailable cases and unresolved alternatives are retained. Active-condition definite integrals require coordinate-free bounds and no other condition parameters; active-condition limits remain unsupported. Series retain direction and order, not inferred neighborhood conditions.",
+        "Ordinary algebra and formal calculus use native CAS semantics, without historical operand domains. A simplified result does not certify the domain of the original expression or the regularity of a parameterized integral.",
+        "Actual answer conditions, unavailable cases and unresolved alternatives are retained. Active-condition definite integrals require coordinate-free bounds and no other condition parameters. Active-condition limits remain unsupported. Series retain direction and order, not inferred neighborhood conditions.",
     )
     return SymbolicCalculatorResult(
         query=query,

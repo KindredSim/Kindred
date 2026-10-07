@@ -9,8 +9,6 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
-from typing import Literal
-
 import numpy as np
 
 from kindred.core.analysis.fit_dataset_payload import (
@@ -20,6 +18,7 @@ from kindred.core.analysis.fit_dataset_payload import (
 from kindred.core.analysis.global_fitting import fit_global
 from kindred.core.analysis.global_fit_execution import (
     FitCoordinate,
+    parameter_group_variable_id,
     DatasetFitInfo,
     FitProgress,
     GlobalFitResult,
@@ -62,17 +61,19 @@ from kindred.gui.fitting.launch import (
     FitPreparedDatasetConfig,
     FitSetupSnapshot,
     _replace_fit_parameter,
+    fit_coordinate_datasets_text,
     prune_fit_analysis_coordinates,
 )
 from kindred.gui.parameter_enumeration import admit_gui_parameter_value
-from kindred.core.species import validate_concentration
+from kindred.core.species import CONCENTRATION_MIN_M, validate_concentration
+from kindred.core.validation import six_digit_text
 
 __all__ = [
     "FitCandidate",
     "FitCurveDataset",
     "FitLiveUpdate",
-    "fit_bound_state",
     "project_fit_candidate_curves",
+    "published_fitted_concentration",
 ]
 
 _BEST_INTERVAL_SECONDS = 0.25
@@ -95,134 +96,17 @@ def _finite_items(
     return tuple(normalized)
 
 
-FitBoundState = Literal["lower", "upper", "interior"]
+def published_fitted_concentration(value: float, *, field: str) -> float:
+    """Publish a fitted initial concentration; one below the floor is 0.
 
-
-def fit_bound_state(
-    value: float,
-    minimum: float,
-    maximum: float,
-    log_scale: bool = False,
-) -> FitBoundState:
-    """Classify an estimate against bounds in its optimizer coordinate.
-
-    Fit results retain decoded physical values, while a log10 fit optimizes
-    their base-10 logarithms.  Bound classification therefore has to happen
-    after applying the same encoding used by the optimizer.  An estimate is
-    at a bound within a billionth of the encoded range width (or a relative
-    1e-9 of the bound): bounded optimizers stay strictly inside the range, so a
-    result pressed against a zero bound ends a tiny positive distance from it.
+    The optimizer can end a concentration pressed against a zero bound at a
+    tiny positive value below the authored-concentration floor.  That value
+    publishes as exact zero, the off state; its Bound Position stays lower.
     """
 
-    value = float(value)
-    minimum = float(minimum)
-    maximum = float(maximum)
-
-    def encode(raw_value: float) -> float | None:
-        if not math.isfinite(raw_value):
-            return None
-        if log_scale:
-            if raw_value <= 0.0:
-                return None
-            return math.log10(raw_value)
-        return raw_value
-
-    encoded_value = encode(value)
-    encoded_minimum = encode(minimum)
-    encoded_maximum = encode(maximum)
-    if encoded_value is None:
-        return "interior"
-    range_width = (
-        encoded_maximum - encoded_minimum
-        if encoded_minimum is not None and encoded_maximum is not None
-        else 0.0
-    )
-
-    def is_at_bound(encoded_bound: float | None) -> bool:
-        if encoded_bound is None:
-            return False
-        # Exact equality is checked separately so a value equal to both
-        # malformed/degenerate sides has deterministic lower precedence.
-        if encoded_value == encoded_bound:
-            return True
-        absolute_tolerance = max(
-            8.0 * max(math.ulp(encoded_value), math.ulp(encoded_bound)),
-            1.0e-9 * range_width,
-        )
-        return math.isclose(
-            encoded_value,
-            encoded_bound,
-            rel_tol=1.0e-9,
-            abs_tol=absolute_tolerance,
-        )
-
-    if encoded_minimum is not None and encoded_value == encoded_minimum:
-        return "lower"
-    if encoded_maximum is not None and encoded_value == encoded_maximum:
-        return "upper"
-    if is_at_bound(encoded_minimum):
-        return "lower"
-    if is_at_bound(encoded_maximum):
-        return "upper"
-    return "interior"
-
-def _settle_terminal_bounds(
-    setup: FitSetupSnapshot,
-    result: GlobalFitResult,
-) -> GlobalFitResult:
-    """Publish fitted values the report classifies at a bound as that bound."""
-
-    parameters = {item.name: item.selected_config for item in setup.parameters}
-    mapped_set_ids = {item.dataset_id: item.set_id for item in setup.origin.mapped_datasets}
-    initials = {(item.set_id, item.species): item for item in setup.initials}
-    groups = {
-        (dataset_id, group.species): group
-        for group in setup.shared_initial_groups
-        for dataset_id in group.member_dataset_ids
-    }
-
-    def settle(value: float, minimum: float, maximum: float, log10: bool) -> float:
-        state = fit_bound_state(value, minimum, maximum, log10)
-        return minimum if state == "lower" else maximum if state == "upper" else value
-
-    def parameter(name: str, value: float) -> float:
-        config = parameters[name]
-        return settle(value, config.minimum, config.maximum, config.log10)
-
-    def dataset_value(dataset_id: str, name: str, value: float) -> float:
-        if not name.startswith(INITIAL_PREFIX):
-            return parameter(name, value)
-        species = name[len(INITIAL_PREFIX):]
-        initial = groups.get((dataset_id, species)) or initials[(mapped_set_ids[dataset_id], species)]
-        return settle(value, initial.minimum, initial.maximum, initial.log10)
-
-    return replace(
-        result,
-        shared_params={name: parameter(name, value) for name, value in result.shared_params.items()},
-        dataset_params={
-            dataset_id: {name: dataset_value(dataset_id, name, value) for name, value in values.items()}
-            for dataset_id, values in result.dataset_params.items()
-        },
-        centred_fixed_effects_settlements=tuple(
-            replace(
-                item,
-                overall_decoded_value=parameter(item.parameter_name, item.overall_decoded_value),
-                dataset_values={
-                    dataset_id: parameter(item.parameter_name, value)
-                    for dataset_id, value in item.dataset_values.items()
-                },
-            )
-            for item in result.centred_fixed_effects_settlements
-        ),
-    )
-
-
-def _fit_coordinate_display_label(value: FitCoordinate) -> str:
-    """Return a human label that cannot alias typed coordinate scopes."""
-
-    if value.scope == "centred_overall":
-        return f"Overall · {value.name}"
-    return value.display_name
+    if 0.0 < value < CONCENTRATION_MIN_M:
+        return 0.0
+    return validate_concentration(value, field=field)
 
 
 @dataclass(frozen=True, slots=True)
@@ -444,13 +328,10 @@ def _initial_values_from_result(
                     f"Fit result omitted coupled initial {species!r} for "
                     f"included dataset {dataset_id!r}."
                 )
-            value = validate_concentration(
+            values.add(published_fitted_concentration(
                 float(dataset_result[parameter_name]),
                 field=f"fitted initial {species!r}",
-            )
-            if not math.isfinite(value):
-                raise ValueError(f"Fit result contains a non-finite initial {species!r}.")
-            values.add(value)
+            ))
         if len(values) != 1:
             raise ValueError(f"Fit result disagrees across coupled initial rows for {species!r}.")
         return values.pop()
@@ -581,7 +462,7 @@ def _terminal_setup_snapshot(
             value = shared_results[parameter.name]
             if not math.isfinite(value):
                 raise ValueError(
-                    f"Fit result contains non-finite parameter "
+                    f"Fit result contains nonfinite parameter "
                     f"{parameter.name!r}."
                 )
             parameters.append(
@@ -603,7 +484,8 @@ def _terminal_setup_snapshot(
             )
         fitted_by_id = dict(requested_config.dataset_values)
         for dataset_id, _launch_value in requested_config.dataset_values:
-            if dataset_id not in included_ids:
+            # A fixed dataset keeps the value it was given.
+            if dataset_id not in included_ids or dataset_id in requested_config.fixed_dataset_ids:
                 continue
             values = dataset_results.get(dataset_id)
             if values is None or parameter.name not in values:
@@ -614,10 +496,16 @@ def _terminal_setup_snapshot(
             value = values[parameter.name]
             if not math.isfinite(value):
                 raise ValueError(
-                    f"Fit result contains non-finite parameter "
+                    f"Fit result contains nonfinite parameter "
                     f"{parameter.name!r} for {dataset_id!r}."
                 )
             fitted_by_id[dataset_id] = value
+        # A group's fitted value is every member's, excluded members included.
+        for group in requested_config.groups:
+            members = [item for item in group if item in included_ids]
+            if members:
+                for dataset_id in group:
+                    fitted_by_id[dataset_id] = fitted_by_id[members[0]]
         fitted_values = [
             (dataset_id, fitted_by_id[dataset_id])
             for dataset_id, _value in requested_config.dataset_values
@@ -852,7 +740,7 @@ def _assemble_fit_terminal(
             for dataset_id in included_ids:
                 source_values = (
                     result.dataset_params
-                    if parameter.selected_config.fit
+                    if dataset_id in parameter.selected_config.varied_dataset_ids
                     else fixed_by_dataset
                 )
                 admitted = admit_gui_parameter_value(
@@ -884,7 +772,6 @@ def _assemble_fit_terminal(
             "Fit terminal solver provenance does not exactly match the "
             "included datasets."
         )
-    result = _settle_terminal_bounds(setup, result)
     initial_values_by_set = _initial_values_from_result(
         setup_snapshot,
         setup.origin,
@@ -1076,18 +963,15 @@ class _FitExecution(_FitControl):
         fitted_shared_names = {
             item.name for item in execution_shared_variables
         }
+        # A Per-dataset parameter may be fitted for some datasets and fixed for others.
         fitted_dataset_names = {
-            item.name
+            values.dataset_id: {item.name for item in values.variable_params}
+            | {
+                item.parameter_name for item in execution_coupled_variables
+                if values.dataset_id in item.dataset_ids
+            }
             for values in execution_dataset_overrides
-            for item in values.variable_params
         }
-        fitted_dataset_names.update(
-            item.parameter_name for item in execution_coupled_variables
-        )
-        fitted_dataset_names.update(
-            item.parameter_name
-            for item in dispatch.ordinary_centred_variables
-        )
         starting_weights = normalize_weights(
             [
                 _compile_dataset_spec(
@@ -1105,7 +989,7 @@ class _FitExecution(_FitControl):
             starting_values = {
                 parameter.name: (
                     dict(parameter.selected_config.dataset_values)[local.dataset_id]
-                    if parameter.scope in {"per_dataset", "centred_fixed_effects"}
+                    if parameter.scope == "per_dataset"
                     else parameter.selected_config.value
                 )
                 for parameter in setup.parameters
@@ -1128,7 +1012,7 @@ class _FitExecution(_FitControl):
                     FITTING_PARAM_ORIGIN_OPTIMIZER_SHARED
                     if name in fitted_shared_names
                     else FITTING_PARAM_ORIGIN_OPTIMIZER_DATASET
-                    if name in fitted_dataset_names
+                    if name in fitted_dataset_names[local.dataset_id]
                     else FITTING_PARAM_ORIGIN_CONFIGURED_DATASET
                 )
                 for name in starting_values
@@ -1204,7 +1088,7 @@ class _FitExecution(_FitControl):
                         ),
                     ),
                 ),
-                f"Objective calls {objective_calls}: weighted objective SSQ={cost:.4g}",
+                f"Objective calls {objective_calls}: weighted SSE {six_digit_text(cost)}",
             )
             if self._checkpoint():
                 raise FittingCancelled()
@@ -1248,6 +1132,19 @@ class _FitExecution(_FitControl):
         def execution_cancellation_check() -> bool:
             return self._checkpoint(honor_stop=False)
 
+        # Profile progress names each target by its parameter and datasets.
+        coordinate_labels = {
+            coordinate.display_name: " — ".join(
+                text for text in (
+                    next(item.display_name for item in setup.parameters if item.name == coordinate.name),
+                    fit_coordinate_datasets_text(coordinate, setup),
+                ) if text
+            )
+            for coordinate in (
+                () if setup.profile_likelihood is None else setup.profile_likelihood.parameter_names
+            )
+        }
+
         def extension_progress(update: FitExtensionProgress) -> None:
             nonlocal extension_progress_value
             if self._checkpoint():
@@ -1264,15 +1161,16 @@ class _FitExecution(_FitControl):
                     else 0.0
                 )
                 percent = 95 + min(2, int(math.floor(3.0 * fraction)))
+                label = coordinate_labels[update.coordinate]
                 if update.stage == "discovery":
                     detail = (
-                        f"Profile likelihood · {update.coordinate} · {update.side} "
+                        f"Profile likelihood · {label} · {update.side} "
                         f"discovery {update.discovery_step}/"
                         f"{setup.profile_likelihood.max_bracketing_steps_per_side}"
                     )
                 elif update.stage == "refinement":
                     detail = (
-                        f"Profile likelihood · {update.coordinate} · {update.side} "
+                        f"Profile likelihood · {label} · {update.side} "
                         f"refinement {update.refinement_step}/64"
                     )
                 else:
@@ -1325,10 +1223,12 @@ class _FitExecution(_FitControl):
             stop_check=self._stopped.is_set,
             starting_facts=tuple(sorted(starting_facts, key=lambda info: info.dataset_id)),
             profile_likelihood=prune_fit_analysis_coordinates(
-                request.setup.profile_likelihood, excluded_dataset_ids=excluded
+                request.setup.profile_likelihood, excluded_dataset_ids=excluded,
+                parameters=request.setup.parameters,
             ),
             residual_bootstrap=prune_fit_analysis_coordinates(
-                request.setup.residual_bootstrap, excluded_dataset_ids=excluded
+                request.setup.residual_bootstrap, excluded_dataset_ids=excluded,
+                parameters=request.setup.parameters,
             ),
             dataset_overrides=request.dispatch.ordinary_dataset_overrides,
             optimizer_layout=request.dispatch.ordinary_optimizer_layout,
@@ -1412,22 +1312,25 @@ class _FitExecution(_FitControl):
             }
             for set_id in applicable_set_ids:
                 initials_by_set.setdefault(set_id, {})[group.species] = float(value)
-        centred_values_by_dataset = {
-            dataset_id: layout.centred_params_for_dataset(dataset_id, vector)
-            for dataset_id in included_dataset_ids
+        # Each Per-dataset value comes from its own coordinate or, for a group
+        # member, from the group's coupled coordinate.
+        dataset_coordinates = {
+            (dataset_id, parameter.name): FitCoordinate(
+                "coupled", parameter_group_variable_id(parameter.name, group[0]),
+            )
+            for parameter in setup.parameters
+            if parameter.scope == "per_dataset"
+            for group in parameter.selected_config.groups
+            for dataset_id in group
         }
         return FitLiveUpdate(
             iteration=best_progress.objective_calls,
             cost=best_progress.cost,
             parameters=_finite_items(
                 {
-                    _fit_coordinate_display_label(coordinate): value
+                    coordinate.display_name: value
                     for coordinate, value in coordinate_values.items()
-                    if coordinate.scope not in {"dataset", "centred_deviation"}
-                    and not (
-                        coordinate.scope == "coupled"
-                        and coordinate.name.startswith("initial:")
-                    )
+                    if coordinate.scope == "shared"
                 },
                 field="live Fit parameters",
             ),
@@ -1436,19 +1339,16 @@ class _FitExecution(_FitControl):
                     dataset_id,
                     _finite_items(
                         {
-                            parameter.name: coordinate_values.get(
-                                FitCoordinate("dataset", parameter.name, dataset_id),
-                                centred_values_by_dataset[dataset_id].get(
-                                    parameter.name,
-                                    dict(parameter.selected_config.dataset_values)[dataset_id],
-                                ),
-                            )
+                            parameter.name: coordinate_values[
+                                dataset_coordinates.get(
+                                    (dataset_id, parameter.name),
+                                    FitCoordinate("dataset", parameter.name, dataset_id),
+                                )
+                            ]
                             for parameter in setup.parameters
                             if (
-                                parameter.selected_config.fit
-                                and parameter.scope in {"per_dataset", "centred_fixed_effects"}
-                                and dataset_id
-                                in dict(parameter.selected_config.dataset_values)
+                                parameter.scope == "per_dataset"
+                                and dataset_id in parameter.selected_config.varied_dataset_ids
                             )
                         },
                         field=f"live Fit scalars {dataset_id}",

@@ -43,7 +43,7 @@ class ChemicalSpaceScanDialog(QtWidgets.QDialog):
         self.tabs = QtWidgets.QTabWidget()
         layout.addWidget(self.tabs, 1)
         self.inputs = QtWidgets.QTableWidget(0, 4)
-        self.inputs.setHorizontalHeaderLabels(["Input", "Mode", "Value / allowed ranges", "Units"])
+        self.inputs.setHorizontalHeaderLabels(["Input", "Mode", "Value / Allowed Ranges", "Units"])
         self.inputs.setItemDelegateForColumn(0, ScientificNameDelegate(self.inputs))
         self.inputs.setItemDelegateForColumn(3, ScientificNameDelegate(self.inputs))
         self.inputs.setToolTip("Only independently editable inputs appear here. Derived parameters remain controlled by their authored Algebra expressions.")
@@ -74,9 +74,9 @@ class ChemicalSpaceScanDialog(QtWidgets.QDialog):
         self.status.setMaximumHeight(155)
         layout.addWidget(self.status)
         buttons = QtWidgets.QHBoxLayout()
-        self.check_button = QtWidgets.QPushButton("Check setup")
+        self.check_button = QtWidgets.QPushButton("Check Setup")
         self.start_button = QtWidgets.QPushButton("Start")
-        self.cancel_button = QtWidgets.QPushButton("Cancel remaining")
+        self.cancel_button = QtWidgets.QPushButton("Cancel Remaining")
         self.close_button = QtWidgets.QPushButton("Close")
         self.check_button.clicked.connect(lambda: self._start(True))
         self.start_button.clicked.connect(lambda: self._start(False))
@@ -108,7 +108,7 @@ class ChemicalSpaceScanDialog(QtWidgets.QDialog):
         row = QtWidgets.QHBoxLayout(seed_row)
         row.setContentsMargins(0, 0, 0, 0)
         self.seed = entry(1729)
-        reseed = QtWidgets.QPushButton("New seed")
+        reseed = QtWidgets.QPushButton("New Seed")
         reseed.clicked.connect(lambda: self.seed.setText(str(secrets.randbelow(2**32))))
         row.addWidget(self.seed)
         row.addWidget(reseed)
@@ -120,7 +120,7 @@ class ChemicalSpaceScanDialog(QtWidgets.QDialog):
         self.parameter_count, self.initial_count = entry(1000), entry(100)
         form.addRow("Parameter/time sets", self.parameter_count)
         form.addRow("Initial-condition sets", self.initial_count)
-        self.boundaries = QtWidgets.QCheckBox("Deliberately sample selected included endpoints")
+        self.boundaries = QtWidgets.QCheckBox("Deliberately Sample Selected Included Endpoints")
         form.addRow(self.boundaries)
         self.boundary_count, self.parameter_boundaries, self.initial_boundaries = entry(0), entry(0), entry(0)
         form.addRow("Joint endpoint attempts", self.boundary_count)
@@ -130,7 +130,7 @@ class ChemicalSpaceScanDialog(QtWidgets.QDialog):
         self.count_summary.setWordWrap(True)
         form.addRow(self.count_summary)
         note = QtWidgets.QLabel("Every attempt counts, including failures. No extra runs are generated to obtain successes.\n"
-                                "Conditional sampling explores allowed intervals; it does not promise uniform coverage of a constrained space.")
+                                "Conditional sampling explores allowed intervals. It does not promise uniform coverage of a constrained space.")
         note.setWordWrap(True)
         form.addRow(note)
         self.tabs.addTab(page, "Sampling")
@@ -145,7 +145,7 @@ class ChemicalSpaceScanDialog(QtWidgets.QDialog):
         self.constraint_list.setItemDelegate(ScientificNameDelegate(self.constraint_list))
         layout.addWidget(self.constraint_list)
         row = QtWidgets.QHBoxLayout()
-        add, remove = QtWidgets.QPushButton("Add constraint…"), QtWidgets.QPushButton("Remove selected")
+        add, remove = QtWidgets.QPushButton("Add Constraint…"), QtWidgets.QPushButton("Remove Selected")
         add.clicked.connect(self._add_constraint)
         remove.clicked.connect(self._remove_constraint)
         row.addWidget(add)
@@ -162,9 +162,9 @@ class ChemicalSpaceScanDialog(QtWidgets.QDialog):
         self.solver.setToolTip(SOLVER_TOOLTIP)
         self.points = entry(100)
         self.rtol, self.atol = entry(1e-6), entry(1e-12)
-        self.jacobian = QtWidgets.QCheckBox("Use analytic Jacobian")
-        self.stops = QtWidgets.QCheckBox("Use authored stopping interventions")
-        show = QtWidgets.QPushButton("Show authored stopping declarations")
+        self.jacobian = QtWidgets.QCheckBox("Use Analytic Jacobian")
+        self.stops = QtWidgets.QCheckBox("Use Authored Stopping Interventions")
+        show = QtWidgets.QPushButton("Show Authored Stopping Declarations")
         show.clicked.connect(self._show_stops)
         form.addRow("Solver", self.solver)
         form.addRow("Requested output points", self.points)
@@ -184,7 +184,7 @@ class ChemicalSpaceScanDialog(QtWidgets.QDialog):
         self.workers.setRange(1, maximum)
         self.workers.setValue(capacity)
         form.addRow("Local workers", self.workers)
-        self.tabs.addTab(page, "Execution and output")
+        self.tabs.addTab(page, "Execution and Output")
 
     def _baseline_config(self):
         tab = self.tab
@@ -213,7 +213,7 @@ class ChemicalSpaceScanDialog(QtWidgets.QDialog):
             mode.addItems(["Fixed", "Scan", "Calculated"])
             mode.model().item(2).setEnabled(False)
             value = entry(item.value)
-            edit = QtWidgets.QPushButton("Edit ranges…")
+            edit = QtWidgets.QPushButton("Edit Ranges…")
             edit.clicked.connect(lambda checked=False, key=item.key: self._edit_range(key))
             holder = QtWidgets.QWidget()
             row = QtWidgets.QHBoxLayout(holder)
@@ -299,7 +299,7 @@ class ChemicalSpaceScanDialog(QtWidgets.QDialog):
 
     @staticmethod
     def _range_label(selection):
-        return "; ".join(f"{i.lower:g} to {i.upper:g}" for i in selection.intervals)
+        return ", ".join(f"{i.lower:g} to {i.upper:g}" for i in selection.intervals)
 
     def _edit_range(self, key):
         item = next(item for item in self.catalog if item.key == key)
@@ -432,9 +432,9 @@ class ChemicalSpaceScanDialog(QtWidgets.QDialog):
     def _progress(self, progress):
         finished = progress.succeeded + progress.failed + progress.cancelled
         self.progress_bar.setValue(int(1000 * finished / max(1, progress.requested)))
-        self.status.setPlainText(f"{progress.phase}: attempted {progress.attempted} / {progress.requested}; running {progress.running}\n"
-                                 f"Simulation successes: {progress.succeeded}; failures: {progress.failed}; cancelled: {progress.cancelled}\n"
-                                 f"Saved records: {progress.saved}; export errors: {progress.export_errors}\n"
+        self.status.setPlainText(f"{progress.phase}: attempted {progress.attempted} / {progress.requested}, running {progress.running}\n"
+                                 f"Simulation successes: {progress.succeeded}, failures: {progress.failed}, canceled: {progress.cancelled}\n"
+                                 f"Saved records: {progress.saved}, export errors: {progress.export_errors}\n"
                                  f"{progress.latest_failure}\n{progress.error}\n{progress.path}")
 
     def _completed(self, result):
@@ -442,7 +442,8 @@ class ChemicalSpaceScanDialog(QtWidgets.QDialog):
             self.status.setPlainText(result)
         elif result is not None:
             self._progress(result)
-            self.status.appendPlainText(f"Scan {result.state}. Not started: {result.requested-result.attempted}.")
+            state = "canceled" if result.state == "cancelled" else result.state
+            self.status.appendPlainText(f"Scan {state}. Not started: {result.requested-result.attempted}.")
 
     def _browse(self):
         path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Export Chemical Space Scan", self.destination.text(), "JSON files (*.json)", options=QtWidgets.QFileDialog.Option.DontConfirmOverwrite)
@@ -453,7 +454,7 @@ class ChemicalSpaceScanDialog(QtWidgets.QDialog):
         try:
             tab = self.tab
             declarations = tab.prepared_dsl.authored_stop_declarations()
-            QtWidgets.QMessageBox.information(self, "Authored stopping interventions", "\n\n".join(declarations) or "This mechanism has no stopping declarations.")
+            QtWidgets.QMessageBox.information(self, "Authored Stopping Interventions", "\n\n".join(declarations) or "This mechanism has no stopping declarations.")
         except Exception as exc:
             self.status.setPlainText(str(exc))
 

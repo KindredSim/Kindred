@@ -11,7 +11,7 @@ from PySide6 import QtCore
 from kindred.core.symbolic.calculator_worker import run_calculator_child
 
 
-_CHILD_EXITED = "Calculator child exited unexpectedly; the next explicit query can start a new context."
+_CHILD_EXITED = "Calculator child exited unexpectedly. The next explicit query can start a new context."
 
 
 class CalculatorWorker(QtCore.QThread):

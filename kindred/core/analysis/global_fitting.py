@@ -15,7 +15,6 @@ from kindred.core.analysis.dataset_parameter_overrides import (
 )
 from kindred.core.analysis.fit_dataset_payload import FitDatasetSpec
 from kindred.core.analysis.fit_uncertainty import (
-    bootstrap_de_seed,
     ProfileLikelihoodConfig,
     ProfileLikelihoodResult,
     ResidualBootstrapConfig,
@@ -34,7 +33,7 @@ from kindred.core.exceptions import (
 )
 from kindred.core.fitting_optimization import fit_parameters
 from kindred.core.fitting_completion import FitExtensionProgress
-from kindred.core.fitting_method_policy import validate_fit_method
+from kindred.core.fitting_method_policy import LEAST_SQUARES_TOLERANCE, validate_fit_method
 from kindred.core.species import validate_evaluation_count
 from kindred.core.simulation_failure import (
     FactualCause,
@@ -62,7 +61,7 @@ def _validate_run_inputs(
 ]:
     payloads = sorted(datasets, key=lambda item: str(getattr(item, "dataset_id", "")))
     if not payloads:
-        raise ValueError("At least one Fit dataset is required.")
+        raise ValueError("At least one fit dataset is required.")
     if any(not isinstance(item, FitDatasetSpec) for item in payloads):
         raise TypeError("fit_global accepts only FitDatasetSpec dataset captures.")
     dataset_ids = [item.dataset_id for item in payloads]
@@ -80,7 +79,7 @@ def _validate_run_inputs(
             details.append(f"extra={','.join(extra)}")
         raise ValueError(
             "Fit evaluator keys must exactly match captured dataset IDs"
-            + (f" ({'; '.join(details)})" if details else "")
+            + (f" ({', '.join(details)})" if details else "")
             + "."
         )
 
@@ -106,8 +105,8 @@ def fit_global(
     weights: Optional[Mapping[str, float]] = None,
     method: str,
     max_nfev: int = 1000,
-    ftol: float = 1e-10,
-    xtol: float = 1e-10,
+    ftol: float,
+    xtol: float,
     seed: Optional[int] = None,
     progress_callback: Optional[
         Callable[[_fit_execution.FitProgress], None]
@@ -131,8 +130,6 @@ def fit_global(
     coordinates) without changing the layout used to decode results.
     """
 
-    if executor is None:
-        raise TypeError("Global Fit requires a borrowed executor.")
     method = validate_fit_method(method)
     max_nfev = validate_evaluation_count(
         max_nfev,
@@ -153,8 +150,6 @@ def fit_global(
         payloads,
         None if weights is None else dict(weights),
     )
-    if not isinstance(optimizer_layout, _fit_execution.FitParameterLayout):
-        raise TypeError("Global Fit requires its pre-dispatch optimizer layout.")
     layout = optimizer_layout
 
     logger.info(
@@ -356,23 +351,47 @@ def fit_global(
             key: float(vector[index])
             for index, key in enumerate(keys)
         }
+        # A parameter group's public uncertainty target is moved by the
+        # optimizer as its coupled variable; analyses see the group identity.
+        group_targets = {
+            _fit_execution.FitCoordinate(
+                "coupled",
+                _fit_execution.parameter_group_variable_id(coordinate.name, coordinate.dataset_id),
+            ): coordinate
+            for analysis in (profile_likelihood, residual_bootstrap)
+            if analysis is not None
+            for coordinate in analysis.parameter_names
+            if coordinate.scope == "group"
+        }
+        optimizer_keys = {target: key for key, target in group_targets.items()}
+        # Profile and Bootstrap refit by least squares.  After Differential
+        # Evolution, whose ftol is its population tolerance, they use the
+        # least-squares default tolerances.
+        refit_ftol, refit_xtol = (
+            (LEAST_SQUARES_TOLERANCE, LEAST_SQUARES_TOLERANCE)
+            if method == "differential_evolution" else (ftol, xtol)
+        )
         if profile_likelihood is not None:
-            profile_config = replace(
-                profile_likelihood,
-                parameter_names=tuple(
-                    layout.coordinate_identity(name)
-                    for name in profile_likelihood.parameter_names
-                ),
-            )
+            fitted_value_count = len(keys)
             try:
                 if primary_stopped:
                     raise FittingCancelled("Profile likelihood was not started after Fit stopped.")
                 profile_result = profile_likelihood_result(
                     objective=terminal_objective,
-                    initial_parameters=terminal_parameters,
-                    bounds=layout.bounds_dict(),
-                    config=profile_config,
-                    decode_coordinate=layout.decode_coordinate,
+                    initial_parameters={
+                        group_targets.get(key, key): value
+                        for key, value in terminal_parameters.items()
+                    },
+                    bounds={
+                        group_targets.get(key, key): value
+                        for key, value in layout.bounds_dict().items()
+                    },
+                    config=profile_likelihood,
+                    decode_coordinate=lambda coordinate, value: layout.decode_coordinate(
+                        optimizer_keys.get(coordinate, coordinate), value,
+                    ),
+                    ftol=refit_ftol,
+                    xtol=refit_xtol,
                     base_residuals=replay_state.weighted_residuals,
                     cancellation_check=active_cancelled,
                     progress_callback=extension_progress_callback,
@@ -385,14 +404,15 @@ def fit_global(
                     origin="profile_likelihood",
                 )
                 profile_result = profile_likelihood_settlement_result(
-                    config=profile_config,
+                    config=profile_likelihood,
                     status="stopped",
                     cause=stop_cause,
                     observation_count=int(replay_state.weighted_residuals.size),
+                    fitted_value_count=fitted_value_count,
                 )
             except Exception as exc:
                 profile_result = profile_likelihood_settlement_result(
-                    config=profile_config,
+                    config=profile_likelihood,
                     status="failed",
                     cause=factual_cause_from_exception(
                         exc,
@@ -400,6 +420,7 @@ def fit_global(
                         origin="profile_likelihood",
                     ),
                     observation_count=int(replay_state.weighted_residuals.size),
+                    fitted_value_count=fitted_value_count,
                 )
 
             if primary_stopped:
@@ -411,18 +432,7 @@ def fit_global(
         if residual_bootstrap is not None:
             def refit_bootstrap(
                 synthetic_payloads: Sequence[FitDatasetSpec],
-                replicate_index: int,
             ) -> _fit_execution.GlobalFitResult | ScientificUnavailable:
-                replicate_seed = (
-                    bootstrap_de_seed(
-                        residual_bootstrap.seed,
-                        replicate_index,
-                    )
-                    if (
-                        residual_bootstrap.optimizer_method == "differential_evolution"
-                    )
-                    else None
-                )
                 return fit_global(
                     fit_evaluators=evaluators,
                     datasets=synthetic_payloads,
@@ -430,9 +440,8 @@ def fit_global(
                     weights=weights_norm,
                     method=residual_bootstrap.optimizer_method,
                     max_nfev=max_nfev,
-                    ftol=ftol,
-                    xtol=xtol,
-                    seed=replicate_seed,
+                    ftol=refit_ftol,
+                    xtol=refit_xtol,
                     progress_callback=None,
                     extension_progress_callback=None,
                     cancellation_check=active_cancelled,
@@ -464,6 +473,14 @@ def fit_global(
                         payloads=payloads,
                         config=residual_bootstrap,
                         refit=refit_bootstrap,
+                        group_member_ids={
+                            target: next(
+                                spec.dataset_ids[0]
+                                for spec in layout.coupled_var_order
+                                if spec.variable_id == key.name
+                            )
+                            for key, target in group_targets.items()
+                        },
                         cancellation_check=active_cancelled,
                         progress_callback=extension_progress_callback,
                     )

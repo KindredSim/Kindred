@@ -99,7 +99,7 @@ class JsonScanWriter:
                   "constraint_units": {c.observable: constraint_units[c.observable].symbol if constraint_units[c.observable] is not None else None for c in config.constraints}, "created_utc": datetime.now(timezone.utc).isoformat(),
                   "versions": versions, "configuration": asdict(config),
                   "effective_ranges": plain(design.effective_ranges),
-                  "sampling_note": "Conditional interval sampling; constrained physical coordinates are not guaranteed uniform or Latin-hypercube stratified."}
+                  "sampling_note": "Conditional interval sampling. Constrained physical coordinates are not guaranteed uniform or Latin-hypercube stratified."}
         encoded = json.dumps(header, allow_nan=False, ensure_ascii=False, separators=(",", ":"))
         self.stream.write(encoded[:-1] + ',"runs":[\n')
 

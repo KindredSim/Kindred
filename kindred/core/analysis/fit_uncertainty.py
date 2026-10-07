@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from statistics import NormalDist
 from types import MappingProxyType
 from typing import Callable, Literal, Mapping, Sequence
 
@@ -26,8 +25,8 @@ from kindred.core.exceptions import (
     SimulationCancelled,
 )
 from kindred.core.fitting_completion import FitExtensionProgress
-from kindred.core.fitting_optimization import fit_parameters_with_fixed
-from kindred.core.fitting_method_policy import validate_fit_method
+from kindred.core.fitting_optimization import fit_bound_position, fit_parameters_with_fixed
+from kindred.core.fitting_method_policy import UNCERTAINTY_FIT_METHODS, validate_fit_method
 from kindred.core.simulation_failure import (
     FactualCause,
     factual_cause_from_exception,
@@ -36,7 +35,6 @@ from kindred.core.species import validate_evaluation_count
 
 __all__ = [
     "BOOTSTRAP_SEED_RANGE",
-    "bootstrap_de_seed",
     "validate_bootstrap_seed",
     "ProfileLikelihoodConfig",
     "ResidualBootstrapConfig",
@@ -52,7 +50,7 @@ __all__ = [
 ]
 
 
-_PROFILE_METHOD = "weighted-Gaussian profile likelihood"
+_PROFILE_METHOD = "weighted Gaussian profile likelihood"
 _BOOTSTRAP_METHOD = "stratified residual bootstrap"
 _PROFILE_MAX_POINTS_PER_SIDE = 10_000
 _BOOTSTRAP_MAX_REPLICATES = 1_000_000
@@ -71,29 +69,6 @@ def validate_bootstrap_seed(value: object) -> int:
             f"Bootstrap seed must be within {lower} and {upper}."
         )
     return normalized
-
-
-def bootstrap_de_seed(
-    bootstrap_seed: object,
-    replicate_index: object,
-) -> int:
-    """Derive one deterministic DE seed for a zero-based replicate."""
-
-    seed = validate_bootstrap_seed(bootstrap_seed)
-    if isinstance(replicate_index, bool) or not isinstance(
-        replicate_index, (int, np.integer)
-    ):
-        raise TypeError("Bootstrap replicate index must be an integer.")
-    index = int(replicate_index)
-    if not 0 <= index <= int(np.iinfo(np.uint32).max):
-        raise ValueError(
-            "Bootstrap replicate index must be zero-based within the uint32 domain."
-        )
-    return int(
-        np.random.SeedSequence(
-            [seed, 0x424F4F54, 1, index]
-        ).generate_state(1, dtype=np.uint32)[0]
-    )
 
 
 def _bounded_positive_integer(
@@ -171,7 +146,6 @@ class ProfileLikelihoodConfig:
     max_bracketing_steps_per_side: int = 8
     max_nfev_per_point: int = 300
     optimizer_method: str = "trf"
-    likelihood_ratio_threshold: float | None = None
 
     def __post_init__(self) -> None:
         requested = tuple(self.parameter_names)
@@ -188,10 +162,9 @@ class ProfileLikelihoodConfig:
                     "Profile coordinates require typed FitCoordinate identities."
                 )
             scope = getattr(coordinate, "scope", None)
-            if scope in {"coupled", "centred_deviation"}:
+            if scope == "coupled":
                 raise ValueError(
-                    "Coupled and centred dataset-deviation coordinates are not "
-                    "public Profile targets."
+                    "Coupled coordinates are not public Profile targets."
                 )
         confidence = _confidence(self.confidence_level)
         points = _bounded_positive_integer(
@@ -206,21 +179,32 @@ class ProfileLikelihoodConfig:
         if evaluations <= 0:
             raise ValueError("Profile likelihood requires a positive evaluation budget.")
         method = validate_fit_method(self.optimizer_method)
-        if not method:
-            raise ValueError("Profile likelihood requires a named optimizer method.")
-        threshold = self.likelihood_ratio_threshold
-        if threshold is None:
-            # For one profiled coordinate, chi-square(1) is the square of a
-            # standard normal.  This avoids a second statistical dependency.
-            threshold = NormalDist().inv_cdf((1.0 + confidence) / 2.0) ** 2
-        threshold = float(threshold)
-        if not math.isfinite(threshold) or threshold <= 0.0:
-            raise ValueError("Profile likelihood-ratio threshold must be positive.")
+        if method not in UNCERTAINTY_FIT_METHODS:
+            raise ValueError("Profile likelihood refits with Trust Region Reflective or Dogbox.")
         object.__setattr__(self, "confidence_level", confidence)
         object.__setattr__(self, "max_bracketing_steps_per_side", points)
         object.__setattr__(self, "max_nfev_per_point", evaluations)
         object.__setattr__(self, "optimizer_method", method)
-        object.__setattr__(self, "likelihood_ratio_threshold", threshold)
+
+
+def _profile_likelihood_threshold(
+    confidence_level: float,
+    observation_count: int,
+    fitted_value_count: int,
+) -> float | None:
+    """Likelihood-ratio threshold n·ln(1 + F_level(1, n−p)/(n−p)).
+
+    ``n`` is the weighted residual count and ``p`` the optimizer coordinate
+    count.  The threshold does not exist when n ≤ p.
+    """
+
+    from scipy.special import fdtri
+
+    freedom = int(observation_count) - int(fitted_value_count)
+    if freedom <= 0:
+        return None
+    quantile = float(fdtri(1.0, float(freedom), float(confidence_level)))
+    return float(observation_count) * math.log1p(quantile / float(freedom))
 
 
 @dataclass(frozen=True, slots=True)
@@ -250,10 +234,9 @@ class ResidualBootstrapConfig:
                     "Bootstrap coordinates require typed FitCoordinate identities."
                 )
             scope = getattr(coordinate, "scope", None)
-            if scope in {"coupled", "centred_deviation"}:
+            if scope == "coupled":
                 raise ValueError(
-                    "Coupled and centred dataset-deviation coordinates are not "
-                    "residual Bootstrap targets."
+                    "Coupled coordinates are not residual Bootstrap targets."
                 )
         seed = validate_bootstrap_seed(self.seed)
         replicates = _bounded_positive_integer(
@@ -274,8 +257,8 @@ class ResidualBootstrapConfig:
         if not math.isfinite(fraction) or not 0.0 < fraction <= 1.0:
             raise ValueError("Bootstrap minimum success fraction must be in (0, 1].")
         method = validate_fit_method(self.optimizer_method)
-        if not method:
-            raise ValueError("Residual bootstrap requires a named optimizer method.")
+        if method not in UNCERTAINTY_FIT_METHODS:
+            raise ValueError("Residual bootstrap refits with Trust Region Reflective or Dogbox.")
         object.__setattr__(self, "seed", seed)
         object.__setattr__(self, "replicates", replicates)
         object.__setattr__(self, "confidence_level", _confidence(self.confidence_level))
@@ -319,10 +302,18 @@ def _freeze_fact(value: object) -> object:
 
 @dataclass(frozen=True, slots=True)
 class ProfileLikelihoodEndpoint:
-    """Resolution facts for one Profile lower or upper endpoint."""
+    """Resolution facts for one Profile lower or upper endpoint.
+
+    ``bound`` means the side is a one-sided limit: the profile reached its
+    search limit, or the estimate already sits at that limit, without crossing
+    the threshold.  At a threshold crossing, ``limiting_bounds`` names each
+    other fitted coordinate that reached a configured bound along the profile,
+    with that bound's side; bounds already active at the optimum are left out.
+    """
 
     status: ProfileLikelihoodEndpointStatus
     reason: str | None = None
+    limiting_bounds: tuple[tuple[object, str], ...] = ()
 
     def __post_init__(self) -> None:
         status = str(self.status)
@@ -333,20 +324,21 @@ class ProfileLikelihoodEndpoint:
 
 @dataclass(frozen=True, slots=True)
 class ProfileLikelihoodInterval:
-    """One coordinate's endpoints and bounded resolution facts."""
+    """One coordinate's endpoints and bounded resolution facts.
 
-    status: Literal["available", "partial", "unavailable"]
+    A ``one-sided`` interval has at least one side that is a limit rather
+    than a threshold crossing; its value on that side is ``None``.
+    """
+
+    status: Literal["available", "one-sided", "partial", "unavailable"]
     lower: float | None
     upper: float | None
-    lower_outcome: ProfileLikelihoodEndpointStatus
-    upper_outcome: ProfileLikelihoodEndpointStatus
     lower_resolution: ProfileLikelihoodEndpoint
     upper_resolution: ProfileLikelihoodEndpoint
-    endpoint_messages: Mapping[str, str] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         status = str(self.status)
-        if status not in {"available", "partial", "unavailable"}:
+        if status not in {"available", "one-sided", "partial", "unavailable"}:
             raise ValueError("Profile interval status is invalid.")
         for name in ("lower", "upper"):
             value = getattr(self, name)
@@ -356,11 +348,6 @@ class ProfileLikelihoodInterval:
                     raise ValueError("Profile interval endpoints must be finite.")
                 object.__setattr__(self, name, value)
         object.__setattr__(self, "status", status)
-        object.__setattr__(
-            self,
-            "endpoint_messages",
-            MappingProxyType({str(key): str(value) for key, value in self.endpoint_messages.items()}),
-        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -370,9 +357,10 @@ class ProfileLikelihoodResult:
     status: ProfileLikelihoodStatus
     method: str
     confidence_level: float
-    likelihood_ratio_threshold: float
+    likelihood_ratio_threshold: float | None
     likelihood_model: str
-    observation_count: int | None
+    observation_count: int
+    fitted_value_count: int
     intervals: Mapping[object, ProfileLikelihoodInterval]
     unavailable_reason: str | None = None
     diagnostic: FactualCause | None = None
@@ -383,16 +371,6 @@ class ProfileLikelihoodResult:
         if status not in {"available", "partial", "unavailable", "stopped", "failed"}:
             raise ValueError("Profile result status is invalid.")
         confidence = _confidence(self.confidence_level)
-        threshold = float(self.likelihood_ratio_threshold)
-        if not math.isfinite(threshold) or threshold <= 0.0:
-            raise ValueError("Profile result threshold must be positive.")
-        count = self.observation_count
-        if count is not None:
-            count = _bounded_nonnegative_integer(
-                count,
-                field="Profile observation count",
-                maximum=2_147_483_647,
-            )
         intervals = dict(self.intervals)
         if any(not isinstance(item, ProfileLikelihoodInterval) for item in intervals.values()):
             raise TypeError("Profile intervals require typed interval records.")
@@ -409,8 +387,6 @@ class ProfileLikelihoodResult:
         object.__setattr__(self, "status", status)
         object.__setattr__(self, "method", _PROFILE_METHOD)
         object.__setattr__(self, "confidence_level", confidence)
-        object.__setattr__(self, "likelihood_ratio_threshold", threshold)
-        object.__setattr__(self, "observation_count", count)
         object.__setattr__(self, "intervals", MappingProxyType(intervals))
         object.__setattr__(self, "unavailable_reason", reason)
         object.__setattr__(self, "provenance", _freeze_fact(dict(self.provenance or {})))
@@ -423,7 +399,6 @@ class BootstrapPercentileInterval:
     status: Literal["available", "unavailable"]
     lower: float | None
     upper: float | None
-    reason: str | None = None
 
     def __post_init__(self) -> None:
         status = str(self.status)
@@ -437,7 +412,6 @@ class BootstrapPercentileInterval:
                     raise ValueError("Bootstrap percentile endpoints must be finite.")
                 object.__setattr__(self, name, number)
         object.__setattr__(self, "status", status)
-        object.__setattr__(self, "reason", None if self.reason is None else str(self.reason))
 
 
 @dataclass(frozen=True, slots=True)
@@ -449,13 +423,12 @@ class ResidualBootstrapResult:
     seed: int
     replicates: int
     confidence_level: float
-    resampling: str
-    residual_centering: str
+    resampling: Mapping[str, str]
+    residual_centering: Mapping[str, str]
     required_successes: int
     successful_replicates: int
     failed_replicates: int
     intervals: Mapping[object, BootstrapPercentileInterval]
-    first_failed_replicate_diagnostic: FactualCause | None = None
     first_failed_replicate_unavailable: ScientificUnavailable | None = None
     unavailable_reason: str | None = None
     diagnostic: FactualCause | None = None
@@ -492,13 +465,8 @@ class ResidualBootstrapResult:
         intervals = dict(self.intervals)
         if any(not isinstance(item, BootstrapPercentileInterval) for item in intervals.values()):
             raise TypeError("Bootstrap intervals require typed percentile records.")
-        for cause_name in (
-            "diagnostic",
-            "first_failed_replicate_diagnostic",
-        ):
-            cause = getattr(self, cause_name)
-            if cause is not None and not isinstance(cause, FactualCause):
-                raise TypeError(f"Bootstrap {cause_name} must be a FactualCause.")
+        if self.diagnostic is not None and not isinstance(self.diagnostic, FactualCause):
+            raise TypeError("Bootstrap diagnostic must be a FactualCause.")
         if self.first_failed_replicate_unavailable is not None and not isinstance(
             self.first_failed_replicate_unavailable, ScientificUnavailable
         ):
@@ -520,6 +488,8 @@ class ResidualBootstrapResult:
         object.__setattr__(self, "successful_replicates", successful)
         object.__setattr__(self, "failed_replicates", failed)
         object.__setattr__(self, "intervals", MappingProxyType(intervals))
+        object.__setattr__(self, "resampling", MappingProxyType(dict(self.resampling)))
+        object.__setattr__(self, "residual_centering", MappingProxyType(dict(self.residual_centering)))
         object.__setattr__(self, "unavailable_reason", reason)
         object.__setattr__(self, "provenance", _freeze_fact(dict(self.provenance or {})))
 
@@ -530,6 +500,7 @@ def profile_likelihood_settlement_result(
     status: Literal["stopped", "failed"],
     cause: FactualCause,
     observation_count: int,
+    fitted_value_count: int,
 ) -> ProfileLikelihoodResult:
     """Construct a stopped/failed Profile result from call-local facts."""
 
@@ -537,9 +508,12 @@ def profile_likelihood_settlement_result(
         status=status,
         method=_PROFILE_METHOD,
         confidence_level=config.confidence_level,
-        likelihood_ratio_threshold=float(config.likelihood_ratio_threshold),
+        likelihood_ratio_threshold=_profile_likelihood_threshold(
+            config.confidence_level, observation_count, fitted_value_count,
+        ),
         likelihood_model="weighted Gaussian residuals with profiled variance",
         observation_count=int(observation_count),
+        fitted_value_count=int(fitted_value_count),
         intervals={},
         diagnostic=cause,
         provenance={"settlement": status, "primary_fit_preserved": True},
@@ -548,25 +522,24 @@ def profile_likelihood_settlement_result(
 
 def _bootstrap_resampling_descriptions(
     payloads: Sequence[FitDatasetSpec],
-) -> tuple[str, str]:
-    """Describe each dataset's actual donor grouping and centering policy."""
-    resampling: list[str] = []
-    centering: list[str] = []
+) -> tuple[dict[str, str], dict[str, str]]:
+    """Describe each dataset's actual donor grouping and centering policy, by dataset."""
+    resampling: dict[str, str] = {}
+    centering: dict[str, str] = {}
     for payload in payloads:
-        label = f"Dataset {payload.dataset_id!r} (X={payload.x_name})"
         if payload.x_name == "t":
-            resampling.append(f"{label}: independent residual-index draws per target")
-            centering.append(f"{label}: arithmetic mean subtraction per target")
+            resampling[payload.dataset_id] = "Residuals are drawn independently for each target."
+            centering[payload.dataset_id] = "The residuals of each target are centered on their mean."
         else:
-            resampling.append(
-                f"{label}: joint X/Y residual-vector donor draws within each "
-                "missing-value pattern; one donor row shared by all available quantities"
+            resampling[payload.dataset_id] = (
+                "Joint X and Y residual rows are drawn within each missing-value pattern, "
+                "and one row serves every available quantity."
             )
-            centering.append(
-                f"{label}: arithmetic mean subtraction per quantity within each "
-                "missing-value pattern"
+            centering[payload.dataset_id] = (
+                "The residuals of each quantity are centered on their mean within each "
+                "missing-value pattern."
             )
-    return "; ".join(resampling), "; ".join(centering)
+    return resampling, centering
 
 
 def residual_bootstrap_settlement_result(
@@ -654,7 +627,7 @@ def _likelihood_ratio_details(
     The profile comparison is a log likelihood ratio.
     Exact-fit and overflow limits use a finite
     transport sentinel plus a typed outcome; they are never falsely clamped to
-    the configured threshold before crossing interpolation.
+    the likelihood-ratio threshold before crossing interpolation.
     """
 
     candidate = float(candidate_sse)
@@ -688,31 +661,22 @@ def _profile_endpoint_record(
     return ProfileLikelihoodEndpoint(
         status=str(record["status"]),  # type: ignore[arg-type]
         reason=None if record.get("reason") is None else str(record["reason"]),
+        limiting_bounds=tuple(record.get("limiting_bounds", ())),
     )
 
 
 def _profile_interval_record(
     record: Mapping[str, object],
 ) -> ProfileLikelihoodInterval:
-    lower_resolution = record.get("resolution", {})
-    if not isinstance(lower_resolution, Mapping):
-        raise TypeError("Profile interval resolution must be a mapping before settlement.")
-    lower_endpoint = lower_resolution.get("lower", {})
-    upper_endpoint = lower_resolution.get("upper", {})
-    if not isinstance(lower_endpoint, Mapping) or not isinstance(upper_endpoint, Mapping):
-        raise TypeError("Profile endpoint resolutions must be mappings before settlement.")
+    resolution = record.get("resolution", {})
+    lower_endpoint = resolution.get("lower", {})
+    upper_endpoint = resolution.get("upper", {})
     return ProfileLikelihoodInterval(
         status=str(record["status"]),  # type: ignore[arg-type]
         lower=None if record.get("lower") is None else float(record["lower"]),
         upper=None if record.get("upper") is None else float(record["upper"]),
-        lower_outcome=str(record["lower_outcome"]),  # type: ignore[arg-type]
-        upper_outcome=str(record["upper_outcome"]),  # type: ignore[arg-type]
         lower_resolution=_profile_endpoint_record(lower_endpoint),
         upper_resolution=_profile_endpoint_record(upper_endpoint),
-        endpoint_messages={
-            str(key): str(value)
-            for key, value in dict(lower_resolution.get("messages", {})).items()
-        },
     )
 
 
@@ -723,7 +687,9 @@ def profile_likelihood_result(
     bounds: Mapping[object, tuple[float, float]],
     config: ProfileLikelihoodConfig,
     decode_coordinate: Callable[[object, float], float],
-    base_residuals: np.ndarray | None = None,
+    ftol: float,
+    xtol: float,
+    base_residuals: np.ndarray,
     cancellation_check: Callable[[], bool] | None = None,
     progress_callback: Callable[[FitExtensionProgress], None] | None = None,
 ) -> ProfileLikelihoodResult:
@@ -731,22 +697,16 @@ def profile_likelihood_result(
 
     Discovery moves monotonically away from the optimum and stops at the first
     successful threshold bracket.  A bracket is then refined only through
-    actual nuisance refits; no endpoint is produced by interpolation.
+    actual nuisance refits; no endpoint is produced by interpolation.  The
+    likelihood-ratio threshold is calibrated when the analysis runs, from the
+    weighted residual count and the optimizer coordinate count.  Refits use
+    ``ftol`` and ``xtol``.
     """
 
     if not isinstance(config, ProfileLikelihoodConfig):
         raise TypeError("Profile likelihood requires ProfileLikelihoodConfig.")
     if not config.parameter_names:
         raise ValueError("Ordinary Profile likelihood requires at least one coordinate.")
-    forbidden_coordinates = tuple(
-        item for item in config.parameter_names
-        if getattr(item, "scope", None) in {"coupled", "centred_deviation"}
-    )
-    if forbidden_coordinates:
-        raise ValueError(
-            "Coupled and centred dataset-deviation coordinates cannot be public "
-            "Profile targets."
-        )
     initial = {name: float(value) for name, value in initial_parameters.items()}
     bound_map = {
         name: (float(value[0]), float(value[1]))
@@ -769,7 +729,16 @@ def profile_likelihood_result(
             "Requested Profile optimizer coordinates are absent: "
             + ", ".join(_coordinate_display(item) for item in missing)
         )
-    threshold = float(config.likelihood_ratio_threshold)
+    fitted_value_count = len(initial)
+    base_sse = _sse(base_residuals)
+    observation_count = int(base_residuals.size)
+    threshold = _profile_likelihood_threshold(
+        config.confidence_level, observation_count, fitted_value_count,
+    )
+    optimum_positions = {
+        coordinate: fit_bound_position(initial[coordinate], low, high)
+        for coordinate, (low, high) in bound_map.items()
+    }
     planned_work = len(config.parameter_names) * 2 * (
         config.max_bracketing_steps_per_side + 64
     )
@@ -817,8 +786,6 @@ def profile_likelihood_result(
 
     emit_progress(stage="primary_complete")
 
-    observation_count: int | None = None
-
     def failure_result(
         cause: FactualCause,
         *,
@@ -832,41 +799,29 @@ def profile_likelihood_result(
                 likelihood_ratio_threshold=threshold,
                 likelihood_model="weighted Gaussian residuals with profiled variance",
                 observation_count=observation_count,
+                fitted_value_count=fitted_value_count,
                 intervals={},
                 diagnostic=cause,
                 provenance={"settlement": "failed", **dict(provenance or {})},
             )
         )
 
-    if base_residuals is None:
-        try:
-            base_vector = np.asarray([initial[name] for name in initial], dtype=float)
-            base_residuals = _objective_scientific_residuals(objective, base_vector)
-        except (FittingCancelled, SimulationCancelled):
-            raise
-        except Exception as exc:
-            return failure_result(
-                factual_cause_from_exception(
-                    exc,
-                    domain="fit",
-                    origin="profile_likelihood",
-                ),
-                provenance={"stage": "primary_profile_evaluation"},
-            )
-    if base_residuals is None:
+    if threshold is None:
         return finish(ProfileLikelihoodResult(
             status="unavailable",
             method=_PROFILE_METHOD,
             confidence_level=config.confidence_level,
-            likelihood_ratio_threshold=threshold,
+            likelihood_ratio_threshold=None,
             likelihood_model="weighted Gaussian residuals with profiled variance",
-            observation_count=None,
+            observation_count=observation_count,
+            fitted_value_count=fitted_value_count,
             intervals={},
-            unavailable_reason="The primary Fit did not provide a scientifically available evaluation.",
-            provenance={"base_evaluation": "scientifically_unavailable"},
+            unavailable_reason=(
+                f"Profile likelihood is unavailable: {observation_count} weighted "
+                f"residuals do not exceed {fitted_value_count} fitted values."
+            ),
+            provenance={"settlement": "unavailable"},
         ))
-    base_sse = _sse(base_residuals)
-    observation_count = int(base_residuals.size)
     intervals: dict[object, object] = {}
     any_partial = False
     for name in config.parameter_names:
@@ -886,14 +841,35 @@ def profile_likelihood_result(
         ) -> tuple[float | None, str, Mapping[str, object]]:
             nonlocal work_done, active_side, active_discovery, active_refinement
             active_side = side
-            records: list[Mapping[str, object]] = []
-            span = abs(bound - best)
-            if span == 0.0:
-                return bound, "bound", {"status": "bound"}
+            if bound == best:
+                # The estimate sits on this side's bound, so the search range
+                # leaves nothing to profile on this side.
+                return None, "bound", {"status": "bound", "reason": "search_limit_reached"}
             inner_x = best
             inner_parameters = dict(initial)
-            crossed = False
-            bracket: tuple[float, float, float, Mapping[str, float]] | None = None
+            bracket: tuple[
+                float, float, float, Mapping[str, float], Mapping[str, float]
+            ] | None = None
+
+            def threshold_resolution(parameters: Mapping[str, float]) -> Mapping[str, object]:
+                """Name each other fitted coordinate that reached a bound along the profile.
+
+                Bounds already active at the optimum are left out.
+                """
+
+                return {
+                    "status": "threshold",
+                    "limiting_bounds": tuple(
+                        (coordinate, position)
+                        for coordinate, (other_low, other_high) in bound_map.items()
+                        if coordinate != name
+                        and (
+                            position := fit_bound_position(
+                                float(parameters[coordinate]), other_low, other_high,
+                            )
+                        ) not in {"interior", optimum_positions[coordinate]}
+                    ),
+                }
 
             def append_fit(
                 fixed: float,
@@ -914,6 +890,8 @@ def profile_likelihood_result(
                         bounds=bound_map,
                         method=config.optimizer_method,
                         max_nfev=config.max_nfev_per_point,
+                        ftol=ftol,
+                        xtol=xtol,
                         cancellation_check=cancellation_check,
                     )
                 except (FittingCancelled, SimulationCancelled):
@@ -945,7 +923,6 @@ def profile_likelihood_result(
                         "fixed_optimizer_value": float(fixed),
                         "status": "unavailable",
                     }
-                    records.append(record)
                     return record, None
                 candidate_sse = _sse(evaluation_residuals)
                 lr_details = _likelihood_ratio_details(
@@ -963,7 +940,6 @@ def profile_likelihood_result(
                     ),
                     "likelihood_ratio_outcome": lr_details.outcome,
                 }
-                records.append(record)
                 return record, fit.parameters
 
             for discovery_step in range(1, config.max_bracketing_steps_per_side + 1):
@@ -978,7 +954,8 @@ def profile_likelihood_result(
                     )
                 )
                 if fixed == inner_x:
-                    break
+                    # A step that rounds back onto the estimate moves on.
+                    continue
                 record, fitted_parameters = append_fit(
                     fixed,
                     stage="discovery",
@@ -1001,23 +978,15 @@ def profile_likelihood_result(
                         float(fixed),
                         lr,
                         dict(inner_parameters),
+                        dict(fitted_parameters),
                     )
-                    crossed = True
                     break
                 inner_x = float(fixed)
                 inner_parameters = dict(fitted_parameters or inner_parameters)
-            if not crossed:
-                if records and records[-1]["status"] == "success":
-                    last_x = float(records[-1]["fixed_optimizer_value"])
-                    if last_x == bound:
-                        return bound, "bound", {"status": "bound"}
-                return None, "unavailable", {
-                    "status": "unavailable",
-                    "reason": "threshold_not_bracketed_within_discovery_budget",
-                }
-
-            assert bracket is not None
-            left_x, right_x, right_lr, left_parameters = bracket
+            if bracket is None:
+                # The last discovery step refits at the bound itself.
+                return None, "bound", {"status": "bound", "reason": "search_limit_reached"}
+            left_x, right_x, right_lr, left_parameters, right_parameters = bracket
             lr_tolerance = max(1e-6, 1e-4 * threshold)
             representability_exhausted = False
             for refinement_step in range(1, 65):
@@ -1055,11 +1024,12 @@ def profile_likelihood_result(
                 midpoint_lr = float(record["likelihood_ratio"])
                 width = abs(right_x - left_x)
                 if abs(midpoint_lr - threshold) <= lr_tolerance and width <= coordinate_tolerance:
-                    return midpoint, "threshold", {"status": "threshold"}
+                    return midpoint, "threshold", threshold_resolution(fitted_parameters)
                 if abs(right_lr - threshold) <= lr_tolerance and width <= coordinate_tolerance:
-                    return right_x, "threshold", {"status": "threshold"}
+                    return right_x, "threshold", threshold_resolution(right_parameters)
                 if midpoint_lr >= threshold:
                     right_x, right_lr = midpoint, midpoint_lr
+                    right_parameters = dict(fitted_parameters)
                 else:
                     left_x = midpoint
                     left_parameters = dict(fitted_parameters or left_parameters)
@@ -1092,36 +1062,24 @@ def profile_likelihood_result(
                 )
         lower, lower_outcome, lower_resolution = side_results["lower"]
         upper, upper_outcome, upper_resolution = side_results["upper"]
-        endpoint_messages: dict[str, str] = {}
-        for side, outcome, bound in (("lower", lower_outcome, low), ("upper", upper_outcome, high)):
-            if outcome == "bound":
-                endpoint_messages[side] = (
-                    f"{_coordinate_display(name)} reached its configured {side} bound; "
-                    "the profile is bound-limited."
-                )
-            elif outcome == "failed":
-                endpoint_messages[side] = (
-                    f"{_coordinate_display(name)} {side} profile stopped at the first "
-                    "scientifically unavailable refit; no later trial was bridged."
-                )
-        if lower is not None and upper is not None:
-            interval_status = "available"
-        elif lower is not None or upper is not None:
-            interval_status = "partial"
+        outcomes = (lower_outcome, upper_outcome)
+        if any(outcome in {"failed", "unavailable"} for outcome in outcomes):
+            interval_status = (
+                "unavailable" if lower is None and upper is None and "bound" not in outcomes
+                else "partial"
+            )
             any_partial = True
+        elif "bound" in outcomes:
+            interval_status = "one-sided"
         else:
-            interval_status = "unavailable"
-            any_partial = True
+            interval_status = "available"
         intervals[name] = {
             "status": interval_status,
             "lower": None if lower is None else decode_coordinate(name, lower),
             "upper": None if upper is None else decode_coordinate(name, upper),
-            "lower_outcome": lower_outcome,
-            "upper_outcome": upper_outcome,
             "resolution": {
                 "lower": lower_resolution,
                 "upper": upper_resolution,
-                "messages": endpoint_messages,
             },
         }
 
@@ -1146,6 +1104,7 @@ def profile_likelihood_result(
         likelihood_ratio_threshold=threshold,
         likelihood_model="weighted Gaussian residuals with profiled variance",
         observation_count=observation_count,
+        fitted_value_count=fitted_value_count,
         intervals={
             name: _profile_interval_record(record)
             for name, record in intervals.items()
@@ -1158,58 +1117,28 @@ def profile_likelihood_result(
     ))
 
 
-def _parameter_value(result: object, name: object) -> float:
-    """Resolve one typed uncertainty coordinate from terminal Fit custody."""
+def _parameter_value(
+    result: object,
+    name: object,
+    group_member_ids: Mapping[object, str],
+) -> float:
+    """Resolve one typed uncertainty coordinate from terminal Fit custody.
 
-    from kindred.core.analysis.global_fit_execution import FitCoordinate
+    A parameter group's value is read from one of its included members, all
+    of which carry the same fitted value.
+    """
 
-    if not isinstance(name, FitCoordinate):
-        raise TypeError("Bootstrap coordinates require typed FitCoordinate identities.")
-    scope = getattr(name, "scope", None)
-    parameter_name = str(getattr(name, "name", "") or "").strip()
-    if scope not in {
-        "shared",
-        "dataset",
-        "coupled",
-        "centred_overall",
-        "centred_deviation",
-    }:
-        raise TypeError("Bootstrap coordinates require a typed FitCoordinate scope.")
-    if not parameter_name:
-        raise ValueError("Bootstrap coordinates require a nonblank parameter name.")
-    if scope in {"coupled", "centred_deviation"}:
-        raise ValueError(
-            "Coupled and centred dataset-deviation coordinates cannot be bootstrapped."
-        )
-    shared = getattr(result, "shared_params", None)
-    datasets = getattr(result, "dataset_params", None)
+    scope = name.scope
     if scope == "shared":
-        if not isinstance(shared, Mapping) or parameter_name not in shared:
-            raise KeyError(name)
-        value = float(shared[parameter_name])
+        value = float(result.shared_params[name.name])
     elif scope == "dataset":
-        dataset_id = str(getattr(name, "dataset_id", "") or "").strip()
-        if not dataset_id or not isinstance(datasets, Mapping):
-            raise KeyError(name)
-        values = datasets.get(dataset_id)
-        if not isinstance(values, Mapping) or parameter_name not in values:
-            raise KeyError(name)
-        value = float(values[parameter_name])
-    elif scope == "centred_overall":
-        settlements = getattr(result, "centred_fixed_effects_settlements", ())
-        matching = tuple(
-            item
-            for item in settlements
-            if getattr(item, "parameter_name", None) == parameter_name
-        )
-        if len(matching) != 1:
-            raise KeyError(name)
-        value = float(matching[0].overall_decoded_value)
+        value = float(result.dataset_params[name.dataset_id][name.name])
     else:
-        raise KeyError(name)
+        # The configurations admit only shared, dataset and group targets.
+        value = float(result.dataset_params[group_member_ids[name]][name.name])
     if not math.isfinite(value):
         raise ValueError(
-            f"Bootstrap Fit returned non-finite parameter {_coordinate_display(name)!r}."
+            f"Bootstrap fit returned nonfinite parameter {_coordinate_display(name)!r}."
         )
     return value
 
@@ -1283,7 +1212,6 @@ def _bootstrap_interval_record(
         status=str(record["status"]),  # type: ignore[arg-type]
         lower=None if record.get("lower") is None else float(record["lower"]),
         upper=None if record.get("upper") is None else float(record["upper"]),
-        reason=None if record.get("reason") is None else str(record["reason"]),
     )
 
 
@@ -1292,11 +1220,15 @@ def residual_bootstrap_result(
     terminal_result: object,
     payloads: Sequence[FitDatasetSpec],
     config: ResidualBootstrapConfig,
-    refit: Callable[[Sequence[FitDatasetSpec], int], _BootstrapRefitOutcome],
+    refit: Callable[[Sequence[FitDatasetSpec]], _BootstrapRefitOutcome],
+    group_member_ids: Mapping[object, str],
     cancellation_check: Callable[[], bool] | None = None,
     progress_callback: Callable[[FitExtensionProgress], None] | None = None,
 ) -> ResidualBootstrapResult:
-    """Run deterministic full refits for stratified residual replicates."""
+    """Run deterministic full refits for stratified residual replicates.
+
+    ``group_member_ids`` names one included member of each group target.
+    """
 
     if not isinstance(config, ResidualBootstrapConfig):
         raise TypeError("Residual bootstrap requires ResidualBootstrapConfig.")
@@ -1305,7 +1237,6 @@ def residual_bootstrap_result(
     completed = 0
     successful = 0
     failed = 0
-    first_failed_replicate_diagnostic: FactualCause | None = None
     first_failed_replicate_unavailable: ScientificUnavailable | None = None
     required_successes = max(
         config.minimum_successful_replicates,
@@ -1335,7 +1266,6 @@ def residual_bootstrap_result(
             successful_replicates=successful,
             failed_replicates=failed,
             intervals={} if intervals is None else intervals,
-            first_failed_replicate_diagnostic=first_failed_replicate_diagnostic,
             first_failed_replicate_unavailable=first_failed_replicate_unavailable,
             unavailable_reason=unavailable_reason,
             diagnostic=diagnostic,
@@ -1401,7 +1331,7 @@ def residual_bootstrap_result(
     if len(fitted_info) != len(terminal_infos):
         raise ValueError("The terminal Fit dataset roster is malformed for Bootstrap.")
     for name in config.parameter_names:
-        _parameter_value(terminal_result, name)
+        _parameter_value(terminal_result, name, group_member_ids)
 
     rng = np.random.default_rng(config.seed)
     successes: dict[str, list[float]] = {
@@ -1419,7 +1349,7 @@ def residual_bootstrap_result(
                 fitted_info=fitted_info,
                 rng=rng,
             )
-            fitted = refit(synthetic, index)
+            fitted = refit(synthetic)
         except (FittingCancelled, SimulationCancelled) as exc:
             return finish(stopped_result(factual_cause_from_exception(
                 exc, domain="fit", origin="bootstrap",
@@ -1427,13 +1357,9 @@ def residual_bootstrap_result(
         except Exception as exc:
             completed += 1
             failed += 1
-            if first_failed_replicate_diagnostic is None:
-                first_failed_replicate_diagnostic = factual_cause_from_exception(
-                    exc, domain="fit", origin="bootstrap"
-                )
             return finish(build_result(
                 "failed",
-                diagnostic=first_failed_replicate_diagnostic,
+                diagnostic=factual_cause_from_exception(exc, domain="fit", origin="bootstrap"),
                 provenance={"replicate": index, "settlement": "failed"},
             ))
         if isinstance(fitted, ScientificUnavailable):
@@ -1446,7 +1372,7 @@ def residual_bootstrap_result(
                 return finish(stopped_result(progress_cause))
             continue
         values = {
-            name: _parameter_value(fitted, name)
+            name: _parameter_value(fitted, name, group_member_ids)
             for name in config.parameter_names
         }
         for name, value in values.items():
@@ -1464,15 +1390,8 @@ def residual_bootstrap_result(
     intervals: dict[str, object] = {}
     for name, values in successes.items():
         if not threshold_met:
-            intervals[name] = {
-                "status": "unavailable",
-                "lower": None,
-                "upper": None,
-                "reason": (
-                    f"Only {success_count} of {config.replicates} full refits "
-                    f"succeeded; {required} are required."
-                ),
-            }
+            # The result's unavailable reason states the shortfall once.
+            intervals[name] = {"status": "unavailable", "lower": None, "upper": None}
             continue
         interval = np.percentile(
             np.asarray(values, dtype=float),
@@ -1495,7 +1414,7 @@ def residual_bootstrap_result(
             if threshold_met
             else (
                 f"Bootstrap validity threshold was not met: {success_count} "
-                f"successful full refits; {required} required."
+                f"successful full refits, {required} required."
             )
         ),
         provenance={"primary_fit_preserved": True},

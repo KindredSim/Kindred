@@ -226,7 +226,7 @@ class KineticRuntimeDomainError(SimulationError):
 
 class SimulationCancelled(SimulationError):
     """Raised when a simulation is cancelled by user request."""
-    def __init__(self, message: str = "Simulation cancelled by user", **kwargs):
+    def __init__(self, message: str = "Simulation canceled by user", **kwargs):
         kwargs.setdefault("code", "E305")
         super().__init__(message, **kwargs)
 
@@ -286,7 +286,7 @@ class FitCandidateDomainError(FitSimulationError):
 class FittingCancelled(FittingError):
     """Raised when a fitting run is cancelled by user request."""
 
-    def __init__(self, message: str = "Fit cancelled by user", **kwargs):
+    def __init__(self, message: str = "Fit canceled by user", **kwargs):
         kwargs.setdefault("code", "E405")
         super().__init__(message, **kwargs)
 

@@ -70,10 +70,10 @@ class SpeciesStatisticsTable(QtWidgets.QTableWidget):
 
         # Add tooltips to explain each column
         header = self.horizontalHeader()
-        self.horizontalHeaderItem(0).setToolTip("Species name")
+        self.horizontalHeaderItem(0).setToolTip("Species name.")
         self.horizontalHeaderItem(1).setToolTip("Concentration at the last returned simulation sample.")
-        self.horizontalHeaderItem(2).setToolTip("Maximum concentration reached")
-        self.horizontalHeaderItem(3).setToolTip("Time at which maximum concentration occurs")
+        self.horizontalHeaderItem(2).setToolTip("Maximum concentration reached.")
+        self.horizontalHeaderItem(3).setToolTip("Time at which maximum concentration occurs.")
         self.horizontalHeaderItem(4).setToolTip(
             "Concentration-time integral. If the final concentration is zero, "
             "integrate the concentration over time. Otherwise, integrate its "

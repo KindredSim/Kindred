@@ -28,7 +28,7 @@ class ExactCorrectionBasisDialog(QtWidgets.QDialog):
         parent: QtWidgets.QWidget | None = None,
     ) -> None:
         super().__init__(parent)
-        self.setWindowTitle("Choose dependent parameters")
+        self.setWindowTitle("Choose Dependent Parameters")
         self.setObjectName("exact_correction_basis_dialog")
         self._assessment = assessment
         self._visible_source = visible_source
@@ -79,7 +79,7 @@ class ExactCorrectionBasisDialog(QtWidgets.QDialog):
         self.buttons = QtWidgets.QDialogButtonBox(self)
         self.buttons.addButton(QtWidgets.QDialogButtonBox.StandardButton.Cancel)
         self.apply_button = self.buttons.addButton(
-            "Apply selection",
+            "Apply Selection",
             QtWidgets.QDialogButtonBox.ButtonRole.AcceptRole,
         )
         self.apply_button.setObjectName("exact_correction_apply_selection")

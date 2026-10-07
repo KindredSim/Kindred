@@ -625,8 +625,8 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         self._volume_unit_combo = ScientificNameComboBox(volume_host)
         self._volume_unit_combo.setAccessibleName("Volume Unit")
         self._volume_unit_combo.setToolTip(
-            "Use one volume unit for plot axes and intervention labels. Authored uses the initial-volume "
-            "declaration's unit, or L when no compatible unit is declared. "
+            "Use one volume unit for plot axes and intervention labels. Authored uses the unit of the "
+            "initial-volume declaration, or L when no compatible unit is declared. "
             "Inflow labels use this volume unit divided by the selected time unit."
         )
         volume_layout.addWidget(self._volume_unit_combo)
@@ -649,7 +649,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
                 menu, f"fraction_{axis}", "Auto-range coverage", minimum=1,
                 tooltip="Choose the central percentage of each curve used to adjust the axis automatically. "
                 "Lower percentages can leave extreme values outside the view. "
-                "Copy Plotted Data keeps those points; Copy Visible Data uses the current view.",
+                "Copy Plotted Data keeps those points, and Copy Visible Data uses the current view.",
             )
         self._add_plot_percentage(
             appearance, "grid_opacity", "Grid opacity",
@@ -1633,7 +1633,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
 
     def _show_completion_warning_details(self) -> None:
         dialog = QtWidgets.QDialog(self)
-        dialog.setWindowTitle("Completion warning details")
+        dialog.setWindowTitle("Completion Warning Details")
         layout = QtWidgets.QVBoxLayout(dialog)
         details = QtWidgets.QPlainTextEdit(dialog)
         details.setReadOnly(True)
@@ -1996,7 +1996,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
                 ))
             result.append(replace(
                 block, chunks=tuple(chunks), left_endpoint=True,
-                x_name=f"{y_names[group[0]]} [phase; left endpoint]" if transform == "phase" else f"{block.x_name} [left endpoint]",
+                x_name=f"{y_names[group[0]]} [phase, left endpoint]" if transform == "phase" else f"{block.x_name} [left endpoint]",
                 x_is_time=block.x_is_time and transform != "phase",
                 x_unit=y_units[group[0]] if transform == "phase" else block.x_unit,
                 y_names=tuple(

@@ -53,7 +53,7 @@ class FloatingDockContainer(QtWidgets.QWidget):
         )
         self._restore_default_layout_button.setObjectName("restoreDefaultLayoutButton")
         self._restore_default_layout_button.setToolTip(
-            "Restore Kindred’s factory panel arrangement and default panel visibility."
+            "Restore the factory panel arrangement and default panel visibility."
         )
         self._restore_default_layout_button.clicked.connect(self._on_restore_default_layout)
         banner_layout.addWidget(self._restore_default_layout_button)

@@ -14,7 +14,7 @@ from kindred.core.mechanism_source import (
     MechanismAuthoringSource,
     source_matches_analysis,
 )
-from kindred.core.fitting_method_policy import validate_fit_method
+from kindred.core.fitting_method_policy import LEAST_SQUARES_TOLERANCE, validate_fit_method
 from kindred.core.simulator.errors import DSLError
 from kindred.core.simulator.dsl_parse import (
     DslAnalysis,
@@ -270,8 +270,8 @@ class TabScientificSettings:
 class FitDefaults:
     method: str = "trf"
     max_nfev: int = 1000
-    ftol: float = 1e-10
-    xtol: float = 1e-10
+    ftol: float = LEAST_SQUARES_TOLERANCE
+    xtol: float = LEAST_SQUARES_TOLERANCE
     use_seed: bool = True
     seed: int = 42
 
@@ -841,7 +841,7 @@ def _validate_unique(
         normalized = transform(value)
         if normalized in seen:
             raise ValueError(
-                f"{label} must be unique; duplicate {value!r}."
+                f"{label} must be unique. Duplicate: {value!r}."
             )
         seen.add(normalized)
 
@@ -913,7 +913,7 @@ def validate_tab_scientific_settings(
     )
     _require_bool(
         settings.use_authored_stops,
-        f"{prefix}Use authored stopping interventions",
+        f"{prefix}Use Authored Stopping Interventions",
     )
     return settings
 
@@ -1007,7 +1007,7 @@ def _validate_exact_source_constraints(
     )
     if not invalid:
         return
-    details = "; ".join(
+    details = ", ".join(
         f"{constraint.cycle_id}: {constraint.expression}"
         + (
             f" ({constraint.reason})"

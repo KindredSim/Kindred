@@ -22,6 +22,8 @@ __all__ = [
     "ScientificNameDelegate",
     "ScientificNameHeaderView",
     "clamp_initial_size",
+    "cell_text_as_shown",
+    "copy_current_cell_as_shown",
     "ignore_wheel",
     "make_bounded_label",
     "make_scroll_area",
@@ -182,6 +184,22 @@ def ignore_wheel(widget: QtWidgets.QWidget) -> None:
 
     widget.setFocusPolicy(QtCore.Qt.FocusPolicy.StrongFocus)
     widget.installEventFilter(_WHEEL_SCROLLS_PANE)
+
+
+def cell_text_as_shown(view: QtWidgets.QAbstractItemView, index: QtCore.QModelIndex) -> str:
+    """A cell's text exactly as its delegate paints it."""
+
+    option = QtWidgets.QStyleOptionViewItem()
+    view.itemDelegateForIndex(index).initStyleOption(option, index)
+    return option.text
+
+
+def copy_current_cell_as_shown(view: QtWidgets.QAbstractItemView) -> None:
+    """Copy the current cell's text exactly as its delegate paints it."""
+
+    index = view.currentIndex()
+    if index.isValid():
+        QtWidgets.QApplication.clipboard().setText(cell_text_as_shown(view, index))
 
 
 def make_scroll_area(parent: Optional[QtWidgets.QWidget] = None) -> QtWidgets.QScrollArea:

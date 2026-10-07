@@ -42,7 +42,6 @@ class FittingWindow(QtWidgets.QDialog):
     executeRequested = QtCore.Signal()
     applyRequested = QtCore.Signal()
     applyToCopyRequested = QtCore.Signal()
-    sharedSeedRequested = QtCore.Signal(str)
     stopRequested = QtCore.Signal()
     pauseRequested = QtCore.Signal()
     resumeRequested = QtCore.Signal()
@@ -203,15 +202,6 @@ class FittingWindow(QtWidgets.QDialog):
         self._apply_copy_button.setEnabled(False)
         self._apply_copy_button.clicked.connect(self.applyToCopyRequested)
         self._footer_widgets.append(self._apply_copy_button)
-        self._shared_seed_combo = QtWidgets.QComboBox(footer)
-        self._shared_seed_combo.addItem("Arithmetic mean", "arithmetic")
-        self._shared_seed_combo.addItem("Geometric mean", "geometric")
-        self._footer_widgets.append(self._shared_seed_combo)
-        self._shared_seed_button = QtWidgets.QPushButton("Configure S&hared Fit", footer)
-        self._shared_seed_button.clicked.connect(
-            lambda: self.sharedSeedRequested.emit(self._shared_seed_combo.currentData()))
-        self._footer_widgets.append(self._shared_seed_button)
-        self.set_shared_seed_available(False)
         reason_row = QtWidgets.QHBoxLayout()
         self._apply_reason_label = QtWidgets.QLabel(footer)
         self._apply_reason_label.setTextFormat(QtCore.Qt.TextFormat.PlainText)
@@ -250,7 +240,7 @@ class FittingWindow(QtWidgets.QDialog):
                 row.addStretch(1)
                 self._footer_actions.addLayout(row)
                 used = 0
-            if isinstance(widget, (QtWidgets.QPushButton, QtWidgets.QComboBox)):
+            if isinstance(widget, QtWidgets.QPushButton):
                 widget.setSizePolicy(QtWidgets.QSizePolicy.Policy.Fixed, QtWidgets.QSizePolicy.Policy.Fixed)
             row.addWidget(widget)
             used += width + 6
@@ -442,10 +432,10 @@ class FittingWindow(QtWidgets.QDialog):
             if pending_data_names:
                 more = f" (+{len(pending_data_names) - 1} more)" if len(pending_data_names) > 1 else ""
                 reason = (
-                    f"Data settings — {pending_data_names[0]}: Pending data changes{more}"
+                    f"Data settings for {pending_data_names[0]}: pending changes{more}"
                     " — Resolve in Data and Targets."
                 )
-                details = [f"{name}: Pending data changes" for name in pending_data_names]
+                details = [f"Data settings for {name}: pending changes" for name in pending_data_names]
             if pending_targets:
                 targets = "Apply or revert pending Fit target, weight, and IC edits before running."
                 reason = reason or targets
@@ -785,7 +775,10 @@ class FittingWindow(QtWidgets.QDialog):
         self._refresh_copy_allowed()
         self.pauseRequested.emit()
 
-    def prepare_fit_plots(self, request) -> None:
+    def prepare_fit_plots(self, request, *, waiting: bool) -> None:
+        """Prepare the plots; at a run start the tracker also waits for its first candidate."""
+        if waiting:
+            self._run_results_tab.set_waiting(request)
         self._run_results_tab.prepare(request)
         self.layout().activate()
         self._run_results_tab.finish_preparation()
@@ -800,11 +793,8 @@ class FittingWindow(QtWidgets.QDialog):
             if not was_executing:
                 self._progress.setValue(0)
             self._paused = False
-            if not was_executing:
-                self._start_results_presentation()
             self._tabs.setCurrentIndex(2)
             self.set_apply_available(False, "Fit is running.")
-            self.set_shared_seed_available(False)
         else:
             self._paused = False
         self._refresh_copy_allowed()
@@ -891,11 +881,6 @@ class FittingWindow(QtWidgets.QDialog):
             curve_failure=curve_failure,
         )
         self._results_summary_button.setEnabled(candidate is not None)
-        if candidate is not None:
-            self._params_ics_tab.set_last_fit_presentation({
-                settlement.parameter_name: settlement.overall_decoded_value
-                for settlement in candidate.result.centred_fixed_effects_settlements
-            })
         self._layout_footer()
         self._tabs.setCurrentIndex(2)
         return bool(rendered)
@@ -920,27 +905,13 @@ class FittingWindow(QtWidgets.QDialog):
             ) if text
         )
         set_bounded_label_text(self._apply_reason_label, feedback, max_width=16777215)
-        self._run_results_tab.set_apply_reasons(reason, copy_reason)
         self._layout_footer()
-
-    def set_shared_seed_available(self, available: bool) -> None:
-        for widget in (self._shared_seed_combo, self._shared_seed_button):
-            widget.setEnabled(available and not self._executing)
-        self._layout_footer()
-
-    def _start_results_presentation(self) -> None:
-        setup = self._projected_setup
-        self._run_results_tab.set_waiting(
-            "Fit" if setup is None else setup.origin.tab_name,
-            () if setup is None else setup.parameters,
-            0 if setup is None else sum(dataset.included for dataset in setup.datasets),
-        )
 
     def clear_candidate(self) -> None:
         self.set_apply_available(False, "Run a fit to obtain current values to apply.")
         self._results_summary_button.setEnabled(True)
         if self._executing:
-            self._start_results_presentation()
+            self._run_results_tab.restart_waiting()
         else:
             self._run_results_tab.clear_candidate()
 
@@ -1025,7 +996,6 @@ class FittingWindow(QtWidgets.QDialog):
         self._pause_button.setEnabled(False)
         self._results_summary_button.setEnabled(False)
         self.set_apply_available(False, "Fit is closing.")
-        self.set_shared_seed_available(False)
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:  # noqa: N802
         if self._closing_after_cleanup:

@@ -13,11 +13,11 @@ from typing import Sequence
 
 from PySide6 import QtCore, QtWidgets
 from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QBrush, QColor, QFontMetrics, QPalette
+from PySide6.QtGui import QBrush, QColor, QFontMetrics, QKeySequence, QPalette
 
-from kindred.core.validation import parse_finite_numeric_text
+from kindred.core.validation import parse_finite_numeric_text, six_digit_text, six_digit_value
 from kindred.gui.fitting.constants import FIT_DATASET_WEIGHT_MODE_LABELS
-from kindred.gui.ui_helpers import ignore_wheel
+from kindred.gui.ui_helpers import copy_current_cell_as_shown, ignore_wheel
 from kindred.gui.fitting.contracts import FitTargetSelection, copy_target_selection
 from kindred.gui.fitting.launch import (
     FitDatasetLocalSettings,
@@ -116,8 +116,27 @@ _SPECIES_ROLE = Qt.ItemDataRole.UserRole + 5
 _EXACT_VALUE_ROLE = Qt.ItemDataRole.UserRole + 6
 
 
+_NUMBER_COLUMNS = (_Col.WEIGHT, _Col.INITIAL, _Col.LOWER, _Col.UPPER)
+
+
 class _ValidationCellDelegate(QtWidgets.QStyledItemDelegate):
-    """Paint cell text using ForegroundRole, bypassing stylesheet overrides."""
+    """Paint cell text using ForegroundRole, bypassing stylesheet overrides.
+
+    Valid numbers paint at six significant digits; invalid cells show their
+    text as typed, and an open editor keeps the full text.
+    """
+
+    def initStyleOption(self, option, index) -> None:  # noqa: N802 - Qt override
+        super().initStyleOption(option, index)
+        foreground = index.data(Qt.ItemDataRole.ForegroundRole)
+        if index.column() not in _NUMBER_COLUMNS or (
+            isinstance(foreground, QBrush) and foreground.color() == _INVALID_FG.color()
+        ):
+            return
+        try:
+            option.text = six_digit_text(float(option.text))
+        except ValueError:
+            pass
 
     def paint(self, painter, option, index):  # noqa: N802 - Qt override
         opt = QtWidgets.QStyleOptionViewItem(option)
@@ -159,6 +178,17 @@ class _ValidationCellDelegate(QtWidgets.QStyledItemDelegate):
             painter.restore()
             return
         super().paint(painter, option, index)
+
+
+class _SpeciesTableWidget(QtWidgets.QTableWidget):
+    """Copy carries a cell exactly as it is shown."""
+
+    def keyPressEvent(self, event) -> None:  # noqa: N802 - Qt override
+        if event.matches(QKeySequence.StandardKey.Copy):
+            copy_current_cell_as_shown(self)
+            event.accept()
+            return
+        super().keyPressEvent(event)
 
 
 class UnifiedSpeciesTable(QtWidgets.QWidget):
@@ -250,7 +280,7 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
         self._footer.applyRequested.connect(self._apply_presentation_edits)
         self._footer.revertRequested.connect(self._revert_presentation_edits)
 
-        self._context_label = QtWidgets.QLabel("Targets and initial conditions", self)
+        self._context_label = QtWidgets.QLabel("Targets and Initial Conditions", self)
         self._context_label.setStyleSheet("font-weight: bold;")
         self._context_label.setWordWrap(True)
         self._footer.body_layout.addWidget(self._context_label)
@@ -326,7 +356,7 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
         self._relayout_bulk_buttons()
         self._footer.body_layout.addLayout(bulk_row)
 
-        self._table = QtWidgets.QTableWidget(self)
+        self._table = _SpeciesTableWidget(self)
         self._table.setObjectName("global_fit_unified_species_table")
         self._table.setItemDelegate(_ValidationCellDelegate(self._table))
         self._table.setColumnCount(_Col.COUNT)
@@ -532,8 +562,8 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
 
     @staticmethod
     def _float_text(value: float) -> str:
-        # ``repr`` is the display projection of the accepted binary64 value;
-        # it round-trips without silently changing scientific state.
+        # Cells keep the exact accepted binary64 value as their item text;
+        # tolerance edits re-parse it.  The delegate paints six digits.
         return repr(float(value))
 
     @staticmethod
@@ -712,73 +742,70 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
         self._set_checkable(global_item, checked, enabled)
         del blocker
 
-    def _compatible_group_members(
-        self,
-        species: str,
-        origin_dataset_id: str,
-    ) -> tuple[str, ...]:
-        """List compatible datasets not occupied by another species group."""
-
-        occupied = {
-            member
-            for group in self._shared_initial_groups()
-            if group.species == species
-            and group.origin_dataset_id != origin_dataset_id
-            for member in group.member_dataset_ids
-        }
-        members: list[str] = []
-        for dataset in self._current_setup().datasets if self._current_setup() else ():
-            dataset_id = dataset.dataset_id
-            if dataset_id == origin_dataset_id or dataset_id in occupied:
-                continue
-            if self._local_initial(dataset, species) is not None:
-                members.append(dataset_id)
-        return tuple(members)
-
     def _group_edit_dialog(
         self,
-        group: FitSharedInitialGroup,
-    ) -> tuple[str, ...] | None:
-        """Show the small membership checklist for one shared IC group."""
+        species: str,
+        dataset_id: str,
+    ) -> tuple[str | None, tuple[str, ...]] | None:
+        """Ask which shared IC group the dataset joins, or which datasets form a new one.
+
+        Returns the joined group's origin (None for a new group) and the other
+        datasets added, or None on Cancel.  The dialog only adds: existing
+        members stay, and datasets in other groups of the species are greyed.
+        Groups are numbered by the table position of their origin dataset, and
+        datasets excluded from the fit are marked.
+        """
 
         setup = self._current_setup()
         if setup is None:
             return None
+        order = tuple(item.dataset_id for item in setup.datasets)
+        names = {item.dataset_id: item.display_name for item in self._origin.mapped_datasets}
+        included = {item.dataset_id for item in setup.datasets if item.included}
+        groups = sorted(
+            (item for item in self._shared_initial_groups() if item.species == species),
+            key=lambda item: order.index(item.origin_dataset_id),
+        )
         dialog = QtWidgets.QDialog(self)
-        dialog.setWindowTitle(f"Vary Global — {group.species}")
+        dialog.setWindowTitle(f"Vary Global — {species}")
         layout = QtWidgets.QVBoxLayout(dialog)
         layout.addWidget(QtWidgets.QLabel("Datasets sharing this initial concentration:"))
+        target = QtWidgets.QComboBox(dialog)
+        target.addItem("New group", None)
+        for number, group in enumerate(groups, start=1):
+            members = sorted(group.member_dataset_ids, key=order.index)
+            target.addItem(
+                f"Group {number} ({', '.join(names[item] for item in members)})",
+                group.origin_dataset_id,
+            )
+        layout.addWidget(target)
         checks: dict[str, QtWidgets.QCheckBox] = {}
         for dataset in setup.datasets:
-            dataset_id = dataset.dataset_id
-            local = self._local_initial(dataset, group.species)
-            if local is None and dataset_id != group.origin_dataset_id:
+            if dataset.dataset_id != dataset_id and self._local_initial(dataset, species) is None:
                 continue
+            name = names[dataset.dataset_id]
             check = QtWidgets.QCheckBox(
-                next(
-                    (
-                        mapped.display_name
-                        for mapped in self._origin.mapped_datasets
-                        if mapped.dataset_id == dataset_id
-                    ),
-                    dataset_id,
-                ),
-                dialog,
+                name if dataset.dataset_id in included else f"{name} (not in fit)", dialog,
             )
-            check.setChecked(dataset_id in group.member_dataset_ids)
-            if dataset_id == group.origin_dataset_id:
-                check.setChecked(True)
-                check.setEnabled(False)
-            elif any(
-                dataset_id in other.member_dataset_ids
-                for other in self._shared_initial_groups()
-                if other.species == group.species
-                and other.origin_dataset_id != group.origin_dataset_id
-            ):
-                check.setChecked(False)
-                check.setEnabled(False)
             layout.addWidget(check)
-            checks[dataset_id] = check
+            checks[dataset.dataset_id] = check
+
+        def project() -> None:
+            """Tick and lock the clicked dataset and the chosen group's members."""
+
+            joined = target.currentData()
+            members = next(
+                (group.member_dataset_ids for group in groups if group.origin_dataset_id == joined), (),
+            )
+            occupied = {member for group in groups for member in group.member_dataset_ids}
+            for item, check in checks.items():
+                locked = item == dataset_id or item in members
+                free = not locked and item not in occupied
+                check.setChecked(locked or (free and check.isChecked()))
+                check.setEnabled(free)
+
+        target.currentIndexChanged.connect(project)
+        project()
         buttons = QtWidgets.QDialogButtonBox(
             QtWidgets.QDialogButtonBox.StandardButton.Ok
             | QtWidgets.QDialogButtonBox.StandardButton.Cancel,
@@ -789,13 +816,9 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
         layout.addWidget(buttons)
         if dialog.exec() != QtWidgets.QDialog.DialogCode.Accepted:
             return None
-        members = tuple(
-            dataset_id for dataset_id, check in checks.items() if check.isChecked()
+        return target.currentData(), tuple(
+            item for item, check in checks.items() if check.isChecked() and check.isEnabled()
         )
-        if len(members) < 2:
-            self.set_status("Vary Global needs an additional compatible dataset.")
-            return ()
-        return members
 
     def _retain_departing_initials(
         self, group: FitSharedInitialGroup, remaining: tuple[str, ...]
@@ -844,6 +867,11 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
 
     def _dissolve_shared_initial_group(self, group: FitSharedInitialGroup) -> None:
         self._retain_departing_initials(group, ())
+        self._drop_shared_initial_group(group)
+
+    def _drop_shared_initial_group(self, group: FitSharedInitialGroup) -> None:
+        """Remove one group identity from the pending overlay."""
+
         identity = (group.species, group.origin_dataset_id)
         setup = self._current_setup()
         if setup is not None and any(
@@ -855,7 +883,31 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
             self._pending_shared_initial_groups.pop(identity, None)
         self._refresh_visible_presentation()
 
+    def _leave_shared_initial_group(self, group: FitSharedInitialGroup, dataset_id: str) -> None:
+        """One dataset leaves; a group left with one member dissolves.
+
+        When the origin leaves, the first remaining member in table order
+        becomes the origin.  Departing rows keep the group's configuration.
+        """
+
+        order = tuple(item.dataset_id for item in self._current_setup().datasets)
+        remaining = tuple(sorted(
+            (item for item in group.member_dataset_ids if item != dataset_id), key=order.index,
+        ))
+        if len(remaining) < 2:
+            self._dissolve_shared_initial_group(group)
+        elif dataset_id == group.origin_dataset_id:
+            self._retain_departing_initials(group, remaining)
+            self._drop_shared_initial_group(group)
+            self._stage_shared_initial_group(replace(
+                group, origin_dataset_id=remaining[0], member_dataset_ids=remaining,
+            ))
+        else:
+            self._stage_shared_initial_group(replace(group, member_dataset_ids=remaining))
+
     def _on_vary_global_changed(self, row: int, item: QtWidgets.QTableWidgetItem) -> None:
+        """Untick leaves the dataset's group; tick opens the membership dialog."""
+
         if self._refreshing or self._running:
             return
         dataset_id = str(item.data(_DATASET_ROLE) or "").strip()
@@ -864,23 +916,8 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
             return
         group = self._shared_initial_group(dataset_id, species)
         if group is not None:
-            if (
-                dataset_id == group.origin_dataset_id
-                and item.checkState() != Qt.CheckState.Checked
-            ):
-                self._dissolve_shared_initial_group(group)
-                return
-            members = self._group_edit_dialog(group)
-            if members is None:
-                self._refresh_visible_presentation()
-                return
-            if not members:
-                self._dissolve_shared_initial_group(group)
-                return
-            if len(members) < 2:
-                self._dissolve_shared_initial_group(group)
-                return
-            self._stage_shared_initial_group(replace(group, member_dataset_ids=members))
+            if item.checkState() != Qt.CheckState.Checked:
+                self._leave_shared_initial_group(group, dataset_id)
             return
         if item.checkState() != Qt.CheckState.Checked:
             return
@@ -902,27 +939,40 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
                 self._refresh_visible_presentation()
                 return
             group_local = local
-        members = self._compatible_group_members(species, dataset_id)
-        if not members:
+        choice = self._group_edit_dialog(species, dataset_id)
+        if choice is None:
+            self._refresh_visible_presentation()
+            return
+        joined, added = choice
+        if joined is None and not added:
             self.set_status("Vary Global needs an additional compatible dataset.")
             self._refresh_visible_presentation()
             return
-        group = FitSharedInitialGroup(
-            species=species,
-            origin_dataset_id=dataset_id,
-            member_dataset_ids=(dataset_id, members[0]),
-            initial=group_local.initial,
-            tolerance=group_local.tolerance,
-            log10=group_local.log10,
+        # Every joiner takes the group's configuration over its unapplied
+        # edit, valid or not.
+        for member in (dataset_id, *added):
+            set_id = self._mapped_dataset(member).set_id
+            self._pending_initial_rows.pop((set_id, species), None)
+            self._pending_initial_values.pop((set_id, species), None)
+            for field in ("initial", "lower", "upper"):
+                self._invalid_initial_raw.pop((set_id, species, field), None)
+        if joined is None:
+            self._stage_shared_initial_group(FitSharedInitialGroup(
+                species=species,
+                origin_dataset_id=dataset_id,
+                member_dataset_ids=(dataset_id, *added),
+                initial=group_local.initial,
+                tolerance=group_local.tolerance,
+                log10=group_local.log10,
+            ))
+            return
+        existing = next(
+            group for group in self._shared_initial_groups()
+            if group.species == species and group.origin_dataset_id == joined
         )
-        selected = self._group_edit_dialog(group)
-        if selected:
-            if mapped is not None:
-                self._pending_initial_rows.pop(key, None)
-                self._pending_initial_values.pop(key, None)
-            self._stage_shared_initial_group(replace(group, member_dataset_ids=selected))
-        else:
-            self._refresh_visible_presentation()
+        self._stage_shared_initial_group(replace(
+            existing, member_dataset_ids=(*existing.member_dataset_ids, dataset_id, *added),
+        ))
 
     def _observations_for_target(
         self,
@@ -1235,7 +1285,7 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
         else:
             lower = "0"
             upper = (
-                self._float_text(10.0 * initial)
+                self._float_text(six_digit_value(10.0 * initial))
                 if initial is not None and initial > 0.0
                 else ""
             )
@@ -2013,14 +2063,15 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
                     self._pending_target_weights.pop(weight_key, None)
 
         self._refresh_visible_presentation()
-        detail = "; ".join(
-            f"{name}: {', '.join(names)}" for name, names in not_copied.items()
+        detail = " ".join(
+            f"The {name} range does not fit the Starting IC in {', '.join(names)}."
+            for name, names in not_copied.items()
         )
         self.set_status(
             "Copy Species Weights and Vary IC: "
             f"{copied_ranges} ranges, {copied_weights} weights copied, "
             f"{skipped} skipped."
-            + (f" Range does not fit the Starting IC in {detail}." if detail else "")
+            + (f" {detail}" if detail else "")
         )
 
     # ------------------------------------------------------------------
@@ -2105,9 +2156,6 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
     def _clear_invalid_line_edit(self, edit: QtWidgets.QLineEdit) -> None:
         edit.setStyleSheet("")
         edit.setToolTip("")
-
-    def _set_footer_error(self, message: str | None) -> None:
-        self._footer.set_error(message)
 
     def _refresh_footer_validity(self) -> None:
         locations = self.invalid_editor_locations

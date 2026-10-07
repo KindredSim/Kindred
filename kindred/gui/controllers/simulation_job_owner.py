@@ -206,7 +206,7 @@ class _DirectSimulationWorker(QtCore.QThread):
                     _TargetTerminalOutcome(
                         target=target,
                         state="cancelled",
-                        message="Simulation cancelled.",
+                        message="Simulation canceled.",
                     ),
                 )
             return
@@ -231,13 +231,13 @@ class _DirectSimulationWorker(QtCore.QThread):
         target: ExplicitRunTarget | PreviewTarget | InteractivePreviewTarget,
     ) -> _TargetTerminalOutcome:
         if self.cancelled:
-            return _TargetTerminalOutcome(target, "cancelled", message="Simulation cancelled.")
+            return _TargetTerminalOutcome(target, "cancelled", message="Simulation canceled.")
         try:
             result = execute_simulation(
                 target.execution_request, cancellation_control=self._control,
             )
         except SimulationCancelled:
-            return _TargetTerminalOutcome(target, "cancelled", message="Simulation cancelled.")
+            return _TargetTerminalOutcome(target, "cancelled", message="Simulation canceled.")
         except BaseException as exc:  # noqa: BLE001
             return _TargetTerminalOutcome(target, "failure", message=str(exc) or type(exc).__name__)
         return _TargetTerminalOutcome(target, "success", result=result)
@@ -1109,9 +1109,10 @@ class SimulationJobOwner(QtCore.QObject):
 
     @staticmethod
     def _terminal_status(summary: SimulationTerminalSummary) -> str:
-        status = f"{summary.kind.capitalize()} {summary.state}: {summary.succeeded} succeeded, {summary.failed} failed, {summary.cancelled} cancelled, {summary.discarded} discarded."
+        state = "canceled" if summary.state == "cancelled" else summary.state
+        status = f"{summary.kind.capitalize()} {state}: {summary.succeeded} succeeded, {summary.failed} failed, {summary.cancelled} canceled, {summary.discarded} discarded."
         if summary.details:
-            status += " " + "; ".join(summary.details)
+            status += " " + " ".join(item if item.endswith(".") else item + "." for item in summary.details)
         return status
 
     @QtCore.Slot()

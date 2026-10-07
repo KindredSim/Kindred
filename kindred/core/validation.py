@@ -26,6 +26,31 @@ def parse_finite_numeric_text(text: str, *, field: str = "Value") -> float:
     return value
 
 
+def six_digit_value(value: float) -> float:
+    """The value rounded to six significant digits."""
+    return float(format(float(value), ".6g"))
+
+
+def six_digit_text(value: float) -> str:
+    """Display text for one value at six significant digits.
+
+    Plain notation for 0.01 <= |v| < 10000 and scientific notation otherwise,
+    chosen from the rounded value; exact zero stays 0 and a nonzero value never
+    becomes 0.
+    """
+    rounded = six_digit_value(value)
+    if rounded == 0.0 or 0.01 <= abs(rounded) < 10000.0:
+        return format(rounded, ".6g")
+    mantissa, exponent = format(rounded, ".5e").split("e")
+    return f"{mantissa.rstrip('0').rstrip('.')}e{exponent}"
+
+
+def six_digit_source_text(value: float) -> str:
+    """Writer spelling: the six-digit text when it parses back exactly, else repr."""
+    text = six_digit_text(value)
+    return text if float(text) == float(value) else repr(float(value))
+
+
 def validate_name(name: str) -> str:
     if not isinstance(name, str):
         raise TypeError("species name must be a string")

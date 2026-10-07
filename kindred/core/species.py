@@ -98,7 +98,7 @@ def validate_concentration(
     if parsed < CONCENTRATION_MIN_M:
         raise ValueError(
             f"{field} is below the supported concentration floor "
-            f"{CONCENTRATION_MIN_M:g} M; enter exact 0 if zero is intended."
+            f"{CONCENTRATION_MIN_M:g} M. Enter exact 0 if zero is intended."
         )
     if parsed > CONCENTRATION_MAX_M:
         raise ValueError(

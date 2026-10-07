@@ -21,17 +21,16 @@ from kindred.core.simulator.dsl_parse import (
     derive_source_with_parameter_updates,
 )
 from kindred.gui.computation_gate import ComputationGate
+from kindred.core.validation import six_digit_text, six_digit_value
 from kindred.gui.parameter_enumeration import admit_gui_parameter_value
 from kindred.gui.fitting.launch import (
     FitExecutionRequest,
     FitOriginSnapshot,
-    FitParameterVariable,
     FitSetupSnapshot,
     build_fit_execution_request,
     capture_fit_origin,
     create_initial_fit_setup,
-    prune_fit_analysis_coordinates,
-    convert_fit_parameter_scope,
+    fit_parameter_overall,
 )
 from kindred.gui.fitting.reporting import fit_completion_presentation, fit_identity_text
 from kindred.gui.fitting.window import FittingWindow
@@ -79,6 +78,8 @@ class FitSessionOwner(QtCore.QObject):
         self._candidate_copy_name: str | None = None
         self._candidate_applied_to_project = False
         self._candidate_projection = None
+        # A failed retry's status, shown after the earlier result returns.
+        self._failure_status: str | None = None
         self._setup_state: FitSetupSnapshot | None = None
         self._initial_setup_snapshot: FitSetupSnapshot | None = None
         self._last_fit_setup_snapshot: FitSetupSnapshot | None = None
@@ -174,7 +175,6 @@ class FitSessionOwner(QtCore.QObject):
         try:
             window.project_setup_snapshot(setup)
             window.set_initial_reset_available(setup)
-            window.set_shared_seed_available(False)
             window.set_apply_available(False, "Run a fit to obtain values to apply.")
         except (TypeError, ValueError, KeyError) as exc:
             window.deleteLater()
@@ -190,7 +190,6 @@ class FitSessionOwner(QtCore.QObject):
         window.pauseRequested.connect(self.pause)
         window.resumeRequested.connect(self.resume)
         window.resultsSummaryRequested.connect(self.results_summary)
-        window.sharedSeedRequested.connect(self.seed_shared_fit)
         window.applyRequested.connect(self.apply_fit_to_project)
         window.applyToCopyRequested.connect(self.apply_fit_to_tab_copy)
         window.setupSnapshotRequested.connect(self._on_setup_snapshot)
@@ -203,7 +202,7 @@ class FitSessionOwner(QtCore.QObject):
         declarations = origin.prepared_dsl.authored_stop_declarations()
         if declarations:
             message = QtWidgets.QMessageBox(window)
-            message.setWindowTitle("Stopping interventions are ignored during fitting")
+            message.setWindowTitle("Stopping Interventions Are Ignored During Fitting")
             message.setIcon(QtWidgets.QMessageBox.Information)
             message.setTextFormat(QtCore.Qt.PlainText)
             message.setText(
@@ -231,7 +230,7 @@ class FitSessionOwner(QtCore.QObject):
             self._set_status("Fit rejected: there is no accepted Fit setup.")
             return False
         if self._worker is not None:
-            self._set_status("Fit rejected: this Fit is already executing.")
+            self._set_status("Fit rejected: this fit is already running.")
             return False
         if self._closing or self._application_close_fenced:
             self._set_status("Fit rejected while the window is closing.")
@@ -296,8 +295,8 @@ class FitSessionOwner(QtCore.QObject):
             self._application_close_settlement_pending = True
             window.set_executing(True)
             self.execution_changed.emit(True)
+            window.prepare_fit_plots(request, waiting=True)
             self._set_status("Preparing Fit plots.", phase="Preparing", detail="Preparing all dataset views")
-            window.prepare_fit_plots(request)
         except Exception as exc:
             self._set_status(f"Fit preparation failed before dispatch: {exc}")
             self._finish_worker(worker, request)
@@ -384,7 +383,7 @@ class FitSessionOwner(QtCore.QObject):
         if worker is None:
             return False
         worker.request_stop()
-        self._set_status("Fit stop requested; retaining this run's best complete candidate.",
+        self._set_status("Fit stop requested. The best complete candidate of this run is kept.",
                          phase="Stopping", detail="Best complete candidate will be retained")
         return True
 
@@ -398,7 +397,7 @@ class FitSessionOwner(QtCore.QObject):
             return False
         self._worker.pause()
         self._set_status(
-            "Fit pause requested; the current evaluation will finish before execution pauses.",
+            "Fit pause requested. The current evaluation will finish before execution pauses.",
             phase="Pause requested", detail="Current evaluation is finishing"
         )
         return True
@@ -607,7 +606,7 @@ class FitSessionOwner(QtCore.QObject):
         self._closing = worker is not None
         self.window_changed.emit(False)
         self._notify_application_close_settled()
-        self._set_status("Fit closed; all transient Fit state was discarded.")
+        self._set_status("Fit closed. All temporary fit state was discarded.")
 
     def _on_progress(self, worker: GlobalFitWorker, value: int, text: str) -> None:
         if (
@@ -687,84 +686,17 @@ class FitSessionOwner(QtCore.QObject):
         except Exception as exc:
             self._set_status(f"Fit result presentation failed: {exc}")
 
-    @QtCore.Slot(str)
-    def seed_shared_fit(self, statistic: str) -> bool:
-        """Convert local dataset-based values into an idle Shared setup."""
-
-        self._require_thread()
-        setup = self._accepted_setup()
-        origin = self._current_origin()
-        window = self._window
-        if (
-            self._closing
-            or self._application_close_fenced
-            or setup is None
-            or origin is None
-            or window is None
-            or self._worker is not None
-        ):
-            return False
-        if not self._setup_can_seed_shared(setup):
-            self._set_status(
-                "Shared Fit setup rejected: no local dataset-based values are available."
-            )
-            return False
-        statistic = str(statistic or "").strip().lower()
-        if statistic not in {"arithmetic", "geometric"}:
-            self._set_status("Shared Fit setup rejected: unknown seed statistic.")
-            return False
-        parameters: list[FitParameterVariable] = []
-        changed_parameter_names: list[str] = []
-        try:
-            for parameter in setup.parameters:
-                if parameter.scope == "shared":
-                    parameters.append(parameter)
-                    continue
-                parameters.append(
-                    convert_fit_parameter_scope(parameter, "shared", setup.datasets, statistic=statistic)
-                )
-                changed_parameter_names.append(parameter.name)
-        except (TypeError, ValueError, KeyError, ZeroDivisionError) as exc:
-            self._set_status(f"Shared Fit setup rejected: {exc}")
-            return False
-        shared_setup = replace(
-            setup,
-            parameters=tuple(parameters),
-            profile_likelihood=prune_fit_analysis_coordinates(
-                setup.profile_likelihood,
-                changed_parameter_names,
-            ),
-            residual_bootstrap=prune_fit_analysis_coordinates(
-                setup.residual_bootstrap,
-                changed_parameter_names,
-            ),
-        )
-        self._install_setup(shared_setup)
-        self._invalidate_candidate_custody()
-        self._clear_candidate_presentation(window)
-        window.project_setup_snapshot(shared_setup)
-        window.set_shared_seed_available(False)
-        self._set_status(
-            "Shared Fit setup prepared from "
-            f"{statistic} Per-dataset estimates; press Run Fit to execute."
-        )
-        return True
-
     @classmethod
     def _candidate_publishable_parameter_values(
         cls,
         candidate: FitCandidate,
     ) -> dict[str, float]:
-        """Return complete canonical Shared/centred parameter values."""
+        """Return the fitted Shared values and each Per-dataset parameter's mean."""
 
-        parameters = {item.name: item for item in candidate.setup_snapshot.parameters}
-        if len(parameters) != len(candidate.setup_snapshot.parameters):
-            raise ValueError("Fit terminal setup repeats a parameter identity.")
+        setup = candidate.setup_snapshot
         values: dict[str, float] = {}
-        for parameter in candidate.setup_snapshot.parameters:
-            if (
-                not parameter.selected_config.fit
-            ):
+        for parameter in setup.parameters:
+            if not parameter.selected_config.fit:
                 continue
             if parameter.scope == "shared":
                 raw_value = candidate.result.shared_params.get(parameter.name)
@@ -772,19 +704,11 @@ class FitSessionOwner(QtCore.QObject):
                     raise ValueError(
                         f"Fit result omitted shared parameter {parameter.name!r}."
                     )
-            elif parameter.scope == "centred_fixed_effects":
-                settlements = tuple(
-                    item
-                    for item in candidate.result.centred_fixed_effects_settlements
-                    if item.parameter_name == parameter.name
-                )
-                if len(settlements) != 1:
-                    raise ValueError(
-                        f"Fit result omitted centered parameter {parameter.name!r}."
-                    )
-                raw_value = settlements[0].overall_decoded_value
             else:
-                continue
+                overall = fit_parameter_overall(parameter, setup.datasets, candidate.origin)
+                if overall is None:
+                    continue
+                raw_value = overall[1]
             values[parameter.name] = admit_gui_parameter_value(
                 raw_value,
                 scientific_category=parameter.scientific_category,
@@ -795,20 +719,8 @@ class FitSessionOwner(QtCore.QObject):
             )
         return values
 
-    @staticmethod
-    def _setup_can_seed_shared(setup: FitSetupSnapshot) -> bool:
-        return bool(
-            any(
-                parameter.scope != "shared"
-                for parameter in setup.parameters
-            )
-        )
-
     @classmethod
     def _candidate_apply_reason(cls, candidate: FitCandidate) -> str:
-        if any(parameter.scope == "per_dataset" and parameter.selected_config.fit
-               for parameter in candidate.setup_snapshot.parameters):
-            return "Configure an ordinary Shared Fit before applying per-dataset parameters."
         try:
             parameter_values = cls._candidate_publishable_parameter_values(candidate)
             initial_values = candidate.initial_values_by_set
@@ -874,7 +786,6 @@ class FitSessionOwner(QtCore.QObject):
             return False
         token = self._session.capture_content_token()
         try:
-            centred_provenance = self._candidate_centred_fixed_effects_provenance(candidate)
             if to_copy:
                 document, copied, set_ids = self._registry.prepare_tab_copy(
                     origin.tab_id, name_suffix="Fit",
@@ -895,8 +806,6 @@ class FitSessionOwner(QtCore.QObject):
                     f'Fit applied to “{published.name}”. '
                     f'This fitting session remains attached to “{origin_name}”.'
                 )
-                if centred_provenance:
-                    message += " Overall values published; dataset estimates not applied (recorded as mechanism-source provenance)."
                 self._set_status(message)
                 return True
             proposed_document = self._prepare_fit_application(
@@ -928,7 +837,7 @@ class FitSessionOwner(QtCore.QObject):
         window.set_last_fit_reset_available(rebased_last_fit_setup)
         self.project_document_changed.emit(origin.tab_id)
         self._refresh_apply_availability()
-        self._set_status("Fit applied: overall values published; dataset estimates not applied (recorded as mechanism-source provenance)." if centred_provenance else "Fit candidate applied to the project.")
+        self._set_status("Fit applied to the project.")
         return True
 
     def _prepare_fit_application(
@@ -939,11 +848,18 @@ class FitSessionOwner(QtCore.QObject):
         *,
         set_ids: Mapping[str, str] | None = None,
     ) -> ProjectDocument:
-        """Admit the same complete Fit values for either destination, detached."""
+        """Admit the same complete Fit values for either destination, detached.
 
-        parameter_values = self._candidate_publishable_parameter_values(candidate)
+        Admitted values are rounded once to six significant digits; the Fit
+        session keeps the exact values.
+        """
+
+        parameter_values = {
+            name: six_digit_value(value)
+            for name, value in self._candidate_publishable_parameter_values(candidate).items()
+        }
         initial_values = {
-            (set_ids[set_id] if set_ids is not None else set_id, species): value
+            (set_ids[set_id] if set_ids is not None else set_id, species): six_digit_value(value)
             for set_id, values in candidate.initial_values_by_set
             for species, value in values
         }
@@ -955,9 +871,11 @@ class FitSessionOwner(QtCore.QObject):
         )
         if updates:
             source_text = derive_source_with_parameter_updates(source_text, origin.prepared_dsl, updates)
-        source_text = self._append_centred_fixed_effects_provenance(
-            source_text, self._candidate_centred_fixed_effects_provenance(candidate),
-        )
+        comments = self._per_dataset_apply_comments(candidate)
+        if comments:
+            newline = "\r\n" if "\r\n" in source_text else "\n"
+            separator = "" if source_text.endswith(("\n", "\r")) else newline
+            source_text += separator + newline.join(comments)
         source = MechanismAuthoringSource.from_parts(reactions_text=source_text)
         if source == document.tab(tab_id).mechanism_source:
             # IC-only and unchanged-value Apply retain the accepted owner so
@@ -989,37 +907,27 @@ class FitSessionOwner(QtCore.QObject):
         return proposed_document
 
     @staticmethod
-    def _candidate_centred_fixed_effects_provenance(candidate: FitCandidate) -> tuple[str, ...]:
-        """Build non-executable provenance for fitted centred parameters."""
+    def _per_dataset_apply_comments(candidate: FitCandidate) -> tuple[str, ...]:
+        """One comment line per fitted Per-dataset parameter: its mean and values."""
 
-        settlements = tuple(sorted(candidate.result.centred_fixed_effects_settlements, key=lambda item: item.parameter_name))
-        if not settlements:
-            return ()
-        display_names = {mapped.dataset_id: mapped.display_name for mapped in candidate.origin.mapped_datasets}
-        return tuple(
-            f"# Fit applied: overall {settlement.parameter_name} = "
-            f"{settlement.overall_decoded_value:.17g}; "
-            "dataset estimates not applied: "
-            + ", ".join(
-                (
-                    " ".join(str(display_names[dataset_id]).splitlines())
-                    + f" = {settlement.dataset_values[dataset_id]:.17g}"
+        setup = candidate.setup_snapshot
+        lines: list[str] = []
+        for parameter in setup.parameters:
+            if parameter.scope != "per_dataset":
+                continue
+            overall = fit_parameter_overall(parameter, setup.datasets, candidate.origin)
+            if overall is None:
+                continue
+            entries, mean = overall
+            lines.append(
+                f"# Fit applied: {parameter.name} = {six_digit_text(mean)} (mean); "
+                "per-dataset values not applied: "
+                + ", ".join(
+                    f"{' '.join(label.splitlines())} = {six_digit_text(value)}"
+                    for label, value in entries
                 )
-                for dataset_id in settlement.dataset_ids
             )
-            for settlement in settlements
-        )
-
-    @staticmethod
-    def _append_centred_fixed_effects_provenance(
-        source: str,
-        comments: Sequence[str],
-    ) -> str:
-        if not comments:
-            return source
-        newline = "\r\n" if "\r\n" in source else "\n"
-        separator = "" if source.endswith(("\n", "\r")) else newline
-        return source + separator + newline.join(comments)
+        return tuple(lines)
 
     def _on_failure(self, worker: GlobalFitWorker, failure: object) -> None:
         """Present the worker's direct factual failure terminal once."""
@@ -1033,7 +941,8 @@ class FitSessionOwner(QtCore.QObject):
         if self._window is not None:
             self._clear_candidate_presentation(self._window)
             self._window.set_terminal_failure(failure)
-        self._set_status(f"Fit failed: {failure.message}", present=False)
+        self._failure_status = f"Fit failed: {failure.message}"
+        self._set_status(self._failure_status, present=False)
 
     def _on_unavailable(
         self,
@@ -1078,17 +987,21 @@ class FitSessionOwner(QtCore.QObject):
             return
         self._worker = None
         self._gate.release(self)
+        failure_status, self._failure_status = self._failure_status, None
         closing = self._closing
         if self._window is not None and not self._application_close_fenced and not closing:
             self._window.set_executing(False)
             if self._candidate is not None:
                 if self._candidate.request is request:
                     self._present_candidate(self._candidate)
-                elif not worker.process_started:
-                    self._window.prepare_fit_plots(self._candidate.request)
+                elif not worker.process_started and not self._candidate_applied_to_project:
+                    # An applied result is not re-shown: its setup predates
+                    # Apply, and the failure stays visible instead.  A result
+                    # that returns keeps the failure in the status line.
+                    self._window.prepare_fit_plots(self._candidate.request, waiting=False)
                     self._present_candidate(self._candidate)
-            setup = self._accepted_setup()
-            self._window.set_shared_seed_available(setup is not None and self._setup_can_seed_shared(setup))
+                    if failure_status is not None:
+                        self._window.set_status(failure_status)
         self.execution_changed.emit(False)
         if worker is not None:
             worker.deleteLater()
@@ -1189,8 +1102,6 @@ class FitSessionOwner(QtCore.QObject):
         if not isinstance(setup, FitSetupSnapshot):
             raise TypeError("Accepted Fit setup must be FitSetupSnapshot.")
         self._setup_state = setup
-        if self._window is not None:
-            self._window.set_shared_seed_available(self._setup_can_seed_shared(setup))
 
     def _set_status(self, text: str, *, phase: str | None = None,
                     detail: str = "", present: bool = True) -> None:

@@ -819,7 +819,7 @@ class CorrectionPlanner:
             item for item in self.composition.constraints if item.status == "unresolved"
         )
         if unresolved:
-            reasons = "; ".join(
+            reasons = ", ".join(
                 f"{item.cycle_id}: {item.reason or 'unresolved exact constraint'}"
                 for item in unresolved
             )
@@ -855,7 +855,7 @@ class CorrectionPlanner:
             item for item in self.composition.constraints if item.status == "unresolved"
         )
         if unresolved:
-            reasons = "; ".join(
+            reasons = ", ".join(
                 f"{item.cycle_id}: {item.reason or 'unresolved exact constraint'}"
                 for item in unresolved
             )

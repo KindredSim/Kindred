@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, replace
-from typing import Iterable, Literal, Sequence
+from typing import Iterable, Literal, Mapping, Sequence
 
 from kindred.core.quantity_units import Unit
 
@@ -12,15 +12,14 @@ from kindred.core.analysis.fit_uncertainty import (
     ProfileLikelihoodConfig,
     ResidualBootstrapConfig,
 )
-from kindred.core.analysis.global_fit_execution import FitCoordinate
 from kindred.core.analysis.global_fit_execution import (
+    FitCoordinate,
     FitParameterLayout,
     build_parameter_layout_for_dataset_ids,
+    parameter_group_variable_id,
 )
 from kindred.core.analysis.dataset_parameter_overrides import (
-    FIT_SCOPE_CENTRED_FIXED_EFFECTS,
     FitCoupledVariableParamSpec,
-    FitCentredFixedEffectsParamSpec,
     FitDatasetParameterOverrides,
     FitDatasetVariableParamSpec,
     FitSharedVariableParamSpec,
@@ -74,6 +73,9 @@ __all__ = [
     "create_initial_fit_setup",
     "selected_observations",
     "fit_execution_span",
+    "fit_coordinate_datasets_text",
+    "fit_group_labels",
+    "fit_parameter_overall",
     "fit_uncertainty_coordinates",
     "prune_fit_analysis_coordinates",
     "fit_setup_readiness",
@@ -185,7 +187,11 @@ class FitParameterConfiguration:
 
     ``FitParameterVariable`` retains one value for each scope and exposes its
     selected configuration directly.  The carriers are deliberately narrow
-    and immutable.
+    and immutable.  ``groups`` lists the Per-dataset parameter groups, each
+    as its origin dataset followed by its other members in sorted order;
+    every member stores the group's value in ``dataset_values``.
+    ``fixed_dataset_ids`` lists the datasets of a varied Per-dataset
+    parameter whose values are used as entered rather than fitted.
     """
 
     value: float
@@ -194,6 +200,8 @@ class FitParameterConfiguration:
     fit: bool = True
     log10: bool = False
     dataset_values: tuple[tuple[str, float], ...] = ()
+    groups: tuple[tuple[str, ...], ...] = ()
+    fixed_dataset_ids: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         value = _finite(self.value, "parameter value")
@@ -213,6 +221,52 @@ class FitParameterConfiguration:
         object.__setattr__(self, "fit", bool(self.fit))
         object.__setattr__(self, "log10", bool(self.log10))
         object.__setattr__(self, "dataset_values", values)
+        groups = tuple(
+            (group[0], *sorted(group[1:])) if group else ()
+            for group in self.groups
+        )
+        object.__setattr__(self, "groups", tuple(sorted(groups)))
+        object.__setattr__(self, "fixed_dataset_ids", tuple(sorted(set(self.fixed_dataset_ids))))
+
+    @property
+    def varied_dataset_ids(self) -> frozenset[str]:
+        """Datasets whose value this configuration fits."""
+
+        if not self.fit:
+            return frozenset()
+        return frozenset(dataset_id for dataset_id, _value in self.dataset_values) - set(self.fixed_dataset_ids)
+
+
+def _admit_parameter_groups(
+    configuration: FitParameterConfiguration,
+    dataset_values: Mapping[str, float],
+    *,
+    parameter_name: str,
+) -> None:
+    """Admit disjoint groups of at least two retained, equal-valued, varied members.
+
+    Fixed datasets must be retained, and a varied parameter keeps at least one
+    varied dataset; every dataset fixed is the parameter's Vary off.
+    """
+
+    fixed = set(configuration.fixed_dataset_ids)
+    if fixed and (not configuration.fit or not fixed.issubset(dataset_values)):
+        raise ValueError(f"{parameter_name} fixed datasets require Vary and retained datasets.")
+    if fixed and fixed == set(dataset_values):
+        raise ValueError(f"{parameter_name} with every dataset fixed is Vary off.")
+    occupied: set[str] = set()
+    for group in configuration.groups:
+        if not configuration.fit or fixed.intersection(group):
+            raise ValueError(f"{parameter_name} groups require Vary.")
+        if len(group) < 2 or len(set(group)) != len(group):
+            raise ValueError(f"{parameter_name} groups require at least two unique datasets.")
+        if occupied.intersection(group):
+            raise ValueError(f"{parameter_name} groups cannot share a dataset.")
+        occupied.update(group)
+        if any(member not in dataset_values for member in group):
+            raise ValueError(f"{parameter_name} group members must be retained datasets.")
+        if len({dataset_values[member] for member in group}) != 1:
+            raise ValueError(f"{parameter_name} group members must hold one value.")
 
 
 def _admit_fit_parameter_configuration(
@@ -252,12 +306,21 @@ def _admit_fit_parameter_configuration(
     value = configuration.value
     dataset_values = configuration.dataset_values
     if dataset_scoped and dataset_values:
+        # A group member holds its origin's start (group admission checks
+        # that), so only origins and ungrouped datasets are checked and named.
+        members = {member for group in configuration.groups for member in group[1:]}
         dataset_values = tuple(
-            (dataset_id, admit_start(item, f"value for dataset {dataset_id}"))
+            (dataset_id, item if dataset_id in members
+             else admit_start(item, f"Initial guess for dataset {dataset_id}"))
             for dataset_id, item in dataset_values
         )
     else:
-        value = admit_start(value, "value")
+        value = admit_start(value, "Initial guess")
+    _admit_parameter_groups(
+        configuration,
+        dict(dataset_values) if dataset_scoped else {},
+        parameter_name=parameter_name,
+    )
     return replace(
         configuration,
         value=value,
@@ -288,10 +351,8 @@ class FitParameterVariable:
             _required(self.display_name, "parameter display name"),
         )
         scope = str(self.scope or "").strip().lower()
-        if scope not in {"shared", "per_dataset", FIT_SCOPE_CENTRED_FIXED_EFFECTS}:
-            raise ValueError(
-                "Scalar Fit scope must be Shared, Per-dataset, or Overall + deviations."
-            )
+        if scope not in {"shared", "per_dataset"}:
+            raise ValueError("Scalar Fit scope must be Shared or Per-dataset.")
         scientific_category = str(self.scientific_category or "").strip()
         if scientific_category not in {
             "rate",
@@ -338,43 +399,104 @@ class FitParameterVariable:
         )
 
 
+def fit_group_labels(
+    parameter: FitParameterVariable,
+    datasets: Sequence[FitDatasetLocalSettings],
+    origin: FitOriginSnapshot,
+) -> dict[str, tuple[int, str]]:
+    """Number and label each group of a Per-dataset parameter, by origin dataset.
+
+    Groups are numbered by the table position of the dataset each was created
+    from, so joining or excluding never renumbers them.  The label names the
+    included members in table order, or every member when none is included.
+    This is the only owner of a group's number and name.
+    """
+
+    order = tuple(item.dataset_id for item in datasets)
+    included = {item.dataset_id for item in datasets if item.included}
+    names = {item.dataset_id: item.display_name for item in origin.mapped_datasets}
+    labels: dict[str, tuple[int, str]] = {}
+    for number, group in enumerate(
+        sorted(parameter.per_dataset_config.groups, key=lambda item: order.index(item[0])), start=1,
+    ):
+        members = sorted(group, key=order.index)
+        shown = [item for item in members if item in included] or members
+        labels[group[0]] = (number, f"Group {number} ({', '.join(names[item] for item in shown)})")
+    return labels
+
+
+def _mean(values: Sequence[float]) -> float:
+    """Arithmetic mean kept within the range of the values."""
+
+    mean = math.fsum(value / len(values) for value in values)
+    # A mean never leaves the reduced values; rounding must not either.
+    return min(max(mean, min(values)), max(values))
+
+
+def fit_parameter_overall(
+    parameter: FitParameterVariable,
+    datasets: Sequence[FitDatasetLocalSettings],
+    origin: FitOriginSnapshot,
+) -> tuple[tuple[tuple[str, float], ...], float] | None:
+    """Return one Per-dataset parameter's fitted values in table order and their mean.
+
+    Only included, varied datasets count: each group with an included member
+    once, under its group label, and each other such dataset under its name.
+    Every entry is (label, value).  The mean is
+    arithmetic.  This is the only place an overall of a Per-dataset parameter
+    is computed.
+    """
+
+    config = parameter.per_dataset_config
+    values = dict(config.dataset_values)
+    varied = config.varied_dataset_ids
+    names = {item.dataset_id: item.display_name for item in origin.mapped_datasets}
+    labels = fit_group_labels(parameter, datasets, origin)
+    included = tuple(item.dataset_id for item in datasets if item.included and item.dataset_id in varied)
+    group_of = {member: group for group in config.groups for member in group}
+    entries: list[tuple[str, float]] = []
+    for dataset_id in included:
+        group = group_of.get(dataset_id)
+        if group is None:
+            entries.append((names[dataset_id], values[dataset_id]))
+        elif dataset_id == next(item for item in included if item in group):
+            entries.append((labels[group[0]][1], values[group[0]]))
+    if not entries:
+        return None
+    return tuple(entries), _mean(tuple(value for _label, value in entries))
+
+
 def convert_fit_parameter_scope(
     parameter: FitParameterVariable,
     scope: str,
     datasets: Sequence[FitDatasetLocalSettings],
-    *,
-    statistic: str = "arithmetic",
+    origin: FitOriginSnapshot,
 ) -> FitParameterVariable:
-    """Convert accepted local values together with their active configuration."""
+    """Convert accepted local values together with their active configuration.
+
+    Switching to Shared seeds the value with the parameter's overall mean, over
+    every varied dataset when none of them is included and over every value when
+    none is varied; it dissolves the groups and clears the fixed datasets.
+    Switching to Per-dataset gives every dataset the Shared value and Vary.
+    """
     active = parameter.selected_config
+    per_dataset = parameter.per_dataset_config
     if scope == "shared" and parameter.scope != "shared":
-        roster = tuple(item.dataset_id for item in datasets if item.included) or tuple(
-            item.dataset_id for item in datasets
+        overall = fit_parameter_overall(parameter, datasets, origin) or fit_parameter_overall(
+            parameter, tuple(replace(item, included=True) for item in datasets), origin,
         )
-        values = dict(active.dataset_values)
-        selected = tuple(values[dataset_id] for dataset_id in roster)
-        if not selected:
-            value = active.value
-        elif statistic == "geometric":
-            if any(value <= 0.0 for value in selected):
-                raise ValueError("Geometric Shared seed requires positive values.")
-            value = math.exp(math.fsum(math.log(value) for value in selected) / len(selected))
-        else:
-            value = math.fsum(value / len(selected) for value in selected)
-        if selected:
-            # A mean never leaves the reduced values; rounding must not either.
-            value = min(max(value, min(selected)), max(selected))
-        active = replace(active, value=value, dataset_values=())
+        values = tuple(value for _dataset_id, value in active.dataset_values)
+        value = overall[1] if overall is not None else _mean(values) if values else active.value
+        active = replace(active, value=value, dataset_values=(), groups=(), fixed_dataset_ids=())
+        per_dataset = replace(per_dataset, groups=(), fixed_dataset_ids=())
     elif scope != "shared" and parameter.scope == "shared":
         active = replace(
             active,
             dataset_values=tuple((item.dataset_id, active.value) for item in datasets),
         )
-    return replace(
-        parameter,
-        scope=scope,
-        **{"shared_config" if scope == "shared" else "per_dataset_config": active},
-    )
+    configs = {"shared_config": parameter.shared_config, "per_dataset_config": per_dataset}
+    configs["shared_config" if scope == "shared" else "per_dataset_config"] = active
+    return replace(parameter, scope=scope, **configs)
 
 
 def _replace_fit_parameter(
@@ -397,6 +519,8 @@ def _replace_fit_parameter(
         "log10",
         "scope",
         "dataset_values",
+        "groups",
+        "fixed_dataset_ids",
         "name",
         "display_name",
         "family",
@@ -407,10 +531,8 @@ def _replace_fit_parameter(
     if unknown:
         raise TypeError("Unsupported Fit parameter replacement fields: " + ", ".join(sorted(unknown)))
     target_scope = str(changes.get("scope", parameter.scope)).strip().lower()
-    if target_scope not in {"shared", "per_dataset", FIT_SCOPE_CENTRED_FIXED_EFFECTS}:
-        raise ValueError(
-            "Scalar Fit scope must be Shared, Per-dataset, or Overall + deviations."
-        )
+    if target_scope not in {"shared", "per_dataset"}:
+        raise ValueError("Scalar Fit scope must be Shared or Per-dataset.")
     selected = (
         parameter.shared_config
         if target_scope == "shared"
@@ -423,12 +545,17 @@ def _replace_fit_parameter(
         "fit": selected.fit,
         "log10": selected.log10,
         "dataset_values": selected.dataset_values,
+        "groups": selected.groups,
+        "fixed_dataset_ids": selected.fixed_dataset_ids,
     }
     values.update(
         {
             ("value" if key == "initial" else key): value
             for key, value in changes.items()
-            if key in {"initial", "minimum", "maximum", "fit", "log10", "dataset_values"}
+            if key in {
+                "initial", "minimum", "maximum", "fit", "log10", "dataset_values", "groups",
+                "fixed_dataset_ids",
+            }
         }
     )
     active = FitParameterConfiguration(**values)
@@ -721,10 +848,9 @@ def fit_uncertainty_coordinates(
 ) -> tuple[FitCoordinate, ...]:
     """Return the exact ordinary typed uncertainty roster.
 
-    A centred parameter exposes only its overall coordinate. Its dataset
-    deviations are fitted nuisances and are never public uncertainty targets.
-    Excluded datasets' coordinates are listed too; a fit analyses only the
-    included ones.
+    A Per-dataset parameter lists one target per group, at its first member,
+    and one per ungrouped varied dataset, in import order.  Excluded datasets'
+    coordinates are listed too; a fit analyses only the included ones.
     """
     parameter_items = tuple(parameters)
     dataset_ids = tuple(item.dataset_id for item in datasets)
@@ -734,41 +860,75 @@ def fit_uncertainty_coordinates(
             continue
         if parameter.scope == "shared":
             coordinates.append(FitCoordinate("shared", parameter.name))
-        elif parameter.scope == FIT_SCOPE_CENTRED_FIXED_EFFECTS:
-            coordinates.append(FitCoordinate("centred_overall", parameter.name))
-        else:
-            values = dict(parameter.selected_config.dataset_values)
-            coordinates.extend(
-                FitCoordinate("dataset", parameter.name, dataset_id)
-                for dataset_id in dataset_ids
-                if dataset_id in values
-            )
+            continue
+        varied = parameter.selected_config.varied_dataset_ids
+        group_of = {
+            member: group for group in parameter.selected_config.groups for member in group
+        }
+        for dataset_id in dataset_ids:
+            group = group_of.get(dataset_id)
+            if group is None and dataset_id in varied:
+                coordinates.append(FitCoordinate("dataset", parameter.name, dataset_id))
+            elif group is not None and dataset_id == next(
+                item for item in dataset_ids if item in group
+            ):
+                coordinates.append(FitCoordinate("group", parameter.name, group[0]))
     return tuple(coordinates)
+
+
+def fit_coordinate_datasets_text(
+    coordinate: FitCoordinate,
+    setup: FitSetupSnapshot,
+) -> str | None:
+    """Name the datasets of one uncertainty target, or None for a Shared one."""
+
+    if coordinate.scope == "dataset":
+        return next(
+            item.display_name for item in setup.origin.mapped_datasets
+            if item.dataset_id == coordinate.dataset_id
+        )
+    if coordinate.scope != "group":
+        return None
+    parameter = next(item for item in setup.parameters if item.name == coordinate.name)
+    return fit_group_labels(parameter, setup.datasets, setup.origin)[coordinate.dataset_id][1]
 
 
 def prune_fit_analysis_coordinates(
     configuration: ProfileLikelihoodConfig | ResidualBootstrapConfig | None,
-    changed_parameter_names: Iterable[str] = (),
     *,
+    available: Iterable[FitCoordinate] | None = None,
     excluded_dataset_ids: Iterable[str] = (),
+    parameters: Iterable[FitParameterVariable],
 ) -> ProfileLikelihoodConfig | ResidualBootstrapConfig | None:
-    """Drop stale uncertainty coordinates for changed Fit parameters or datasets.
+    """Drop uncertainty coordinates that no longer exist or are not analysed.
 
-    Fit-coordinate identities are admitted before this projection.  A scope
-    or Vary change invalidates every coordinate for the changed parameter,
-    and excluding a dataset invalidates its Per-dataset coordinates, while
-    unrelated coordinates retain their original order and identity.
+    Fit-coordinate identities are admitted before this projection.  After a
+    scope, Vary or group change, callers pass the new roster as ``available``
+    and every target still in it is kept.  Excluding a dataset invalidates its
+    Per-dataset coordinate, and a group target only when all its members are
+    excluded, by the group membership in ``parameters``.
+    Remaining coordinates retain their original order and identity.
     """
 
     if configuration is None:
         return None
-    changed_names = set(changed_parameter_names)
+    kept = None if available is None else set(available)
     excluded_ids = set(excluded_dataset_ids)
+    members = {
+        FitCoordinate("group", parameter.name, group[0]): group
+        for parameter in parameters
+        for group in parameter.selected_config.groups
+    }
     remaining = tuple(
         coordinate
         for coordinate in configuration.parameter_names
-        if coordinate.name not in changed_names
-        and coordinate.dataset_id not in excluded_ids
+        if (kept is None or coordinate in kept)
+        and not (
+            excluded_ids
+            and excluded_ids.issuperset(
+                members[coordinate] if coordinate.scope == "group" else (coordinate.dataset_id,)
+            )
+        )
     )
     if not remaining:
         return None
@@ -833,7 +993,6 @@ class _FitDispatchCompilation:
     ordinary_dataset_overrides: tuple[FitDatasetParameterOverrides, ...]
     candidate_names: tuple[str, ...]
     ordinary_optimizer_layout: FitParameterLayout
-    ordinary_centred_variables: tuple[FitCentredFixedEffectsParamSpec, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -913,7 +1072,7 @@ class FitSetupSnapshot:
         incomplete_parameter_maps = sorted(
             item.name
             for item in parameters
-            if item.scope in {"per_dataset", FIT_SCOPE_CENTRED_FIXED_EFFECTS}
+            if item.scope == "per_dataset"
             and {
                 dataset_id
                 for dataset_id, _value in item.selected_config.dataset_values
@@ -1330,7 +1489,13 @@ def fit_setup_readiness(
         )
         for group in shared_initial_group_items
     )
-    if not any(item.selected_config.fit for item in parameter_items) and not has_fitted_initial:
+    has_fitted_parameter = any(
+        item.selected_config.fit
+        if item.scope == "shared"
+        else bool(item.selected_config.varied_dataset_ids & included_ids)
+        for item in parameter_items
+    )
+    if not has_fitted_parameter and not has_fitted_initial:
         return "Select at least one parameter or initial concentration to fit."
     excluded = tuple(item.dataset_id for item in dataset_items if not item.included)
     for label, analysis in (
@@ -1338,7 +1503,7 @@ def fit_setup_readiness(
         ("Bootstrap", residual_bootstrap),
     ):
         if analysis is not None and prune_fit_analysis_coordinates(
-            analysis, excluded_dataset_ids=excluded
+            analysis, excluded_dataset_ids=excluded, parameters=parameter_items,
         ) is None:
             return f"{label} has no coordinates in the included datasets."
     return None
@@ -1537,7 +1702,6 @@ def _compile_fit_dispatch(
         raise ValueError("Fit dispatch requires at least one included dataset.")
 
     shared_variables: list[FitSharedVariableParamSpec] = []
-    centred_variables: list[FitCentredFixedEffectsParamSpec] = []
     coupled_variables: list[FitCoupledVariableParamSpec] = []
     variable_by_dataset: dict[str, list[FitDatasetVariableParamSpec]] = {
         dataset_id: [] for dataset_id in included_ids
@@ -1558,22 +1722,31 @@ def _compile_fit_dispatch(
                     log10=config.log10,
                 )
             )
-        elif config.fit and parameter.scope == FIT_SCOPE_CENTRED_FIXED_EFFECTS:
-            centred_variables.append(
-                FitCentredFixedEffectsParamSpec(
-                    parameter_name=parameter.name,
-                    dataset_ids=tuple(included_ids),
-                    initial_values=tuple(
-                        (dataset_id, dataset_values[dataset_id])
-                        for dataset_id in included_ids
-                    ),
-                    minimum=config.minimum,
-                    maximum=config.maximum,
-                    log10=config.log10,
-                )
-            )
         elif config.fit:
+            # A group with an included member is one coupled variable over its
+            # included members; a group with none contributes nothing.
+            grouped = {member for group in config.groups for member in group}
+            fixed = set(config.fixed_dataset_ids)
+            for group in config.groups:
+                members = tuple(item for item in group if item in included_ids)
+                if members:
+                    coupled_variables.append(
+                        FitCoupledVariableParamSpec(
+                            variable_id=parameter_group_variable_id(parameter.name, group[0]),
+                            parameter_name=parameter.name,
+                            dataset_ids=members,
+                            initial=dataset_values[group[0]],
+                            minimum=config.minimum,
+                            maximum=config.maximum,
+                            log10=config.log10,
+                        )
+                    )
             for dataset_id in included_ids:
+                if dataset_id in grouped:
+                    continue
+                if dataset_id in fixed:
+                    fixed_by_dataset[dataset_id][parameter.name] = dataset_values[dataset_id]
+                    continue
                 if dataset_id not in dataset_values:
                     raise ValueError(
                         f"Fit dispatch parameter {parameter.name!r} omitted "
@@ -1588,7 +1761,7 @@ def _compile_fit_dispatch(
                         log10=config.log10,
                     )
                 )
-        elif parameter.scope in {"per_dataset", FIT_SCOPE_CENTRED_FIXED_EFFECTS}:
+        elif parameter.scope == "per_dataset":
             for dataset_id in included_ids:
                 if dataset_id not in dataset_values:
                     raise ValueError(
@@ -1668,7 +1841,6 @@ def _compile_fit_dispatch(
         shared_params={item.name: item.initial for item in shared_variables},
         dataset_overrides=overrides,
         coupled_variables=tuple(coupled_variables),
-        centred_variables=tuple(centred_variables),
         bounds={
             item.name: (item.minimum, item.maximum)
             for item in shared_variables
@@ -1688,7 +1860,6 @@ def _compile_fit_dispatch(
             for item in overrides
         ),
         ordinary_dataset_overrides=overrides,
-        ordinary_centred_variables=tuple(centred_variables),
         candidate_names=tuple(
             sorted(
                 parameter.name

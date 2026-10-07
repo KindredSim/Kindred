@@ -122,7 +122,7 @@ def _coerce_consumed_parameter_value(
         else FitSimulationError
     )
     raise error_type(
-        f"Non-finite parameter value for {name!r}: {raw_value!r}",
+        f"Nonfinite parameter value for {name!r}: {raw_value!r}",
         **(
             {"stage": "parameter_binding"}
             if error_type is FitCandidateDomainError
@@ -330,7 +330,7 @@ def prepare_fitting_execution_context(
         or np.any(objective_times > t_end)
     ):
         raise ValueError(
-            "Objective observation times must be finite and inside the Fit span."
+            "Objective observation times must be finite and inside the fit span."
         )
     requested_sample_times = tuple(
         float(value)

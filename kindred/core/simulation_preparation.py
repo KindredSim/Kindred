@@ -937,7 +937,7 @@ def prepare_simulation_run(
                     for item in intervention_execution.triggers
                     if isinstance(item.then, InterventionStopAction) and isinstance(item.condition, ObservableTriggerCondition)
                 )
-                context = "; ".join(f"declaration {ordinal + 1}, quantity {name!r}" for ordinal, name in declarations)
+                context = " and ".join(f"declaration {ordinal + 1}, quantity {name!r}" for ordinal, name in declarations)
                 raise SimulationPreparationError("stopping_intervention", f"Stopping {context}: {exc}",
                                                  details={"stop_declarations": declarations}) from exc
 

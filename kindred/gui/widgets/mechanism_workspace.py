@@ -633,7 +633,7 @@ class ProjectWorkspaceWidget(QtWidgets.QMainWindow):
         menu.setToolTipsVisible(True)
         rename = menu.addAction("Rename…")
         rename.setToolTip("Change the name of this mechanism tab.")
-        copy = menu.addAction("Create copy")
+        copy = menu.addAction("Create Copy")
         copy.setToolTip(
             "Copy this mechanism and its settings into a new tab, including "
             "simulation results that still match them. Unapplied edits and "

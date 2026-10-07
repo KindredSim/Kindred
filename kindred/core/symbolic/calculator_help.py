@@ -5,24 +5,24 @@ from __future__ import annotations
 def calculator_help_html() -> str:
     return """
 <h1>Symbolic Calculator</h1>
-<p>Use Calculator to examine rates, differentiate expressions, solve equations and substitute the
+<p>Use Calculator to examine rates, differentiate expressions, solve equations, and substitute the
 answers into further calculations. It uses the model in the current tab without changing it.
-Independent parameters stay symbolic. Values from reaction defaults, simulations or slider previews
+Independent parameters stay symbolic. Values from reaction defaults, simulations, or slider previews
 are not inserted automatically.</p>
 
-<h2>Calculate a product rate</h2>
+<h2>Calculate a Product Rate</h2>
 <p>The examples follow this mechanism, with two intermediates X and Y leading to product P:</p>
 <pre>A &lt;-&gt; X; kf=2; kr=3
 X &lt;-&gt; Y; kf=5; kr=7
 Y -&gt; P; k=11</pre>
-<p>We will calculate the product rate, examine its dependence on Y and k3, then solve for both
+<p>The examples calculate the product rate, examine its dependence on Y and k3, then solve for both
 intermediates and use those answers to express the rate in terms of A. Later sections add signal
 definitions and one reaction to this same model. Each addition is shown before it is used.</p>
 <p>Enter one query and click <b>Evaluate</b>, or press <b>Enter</b>.
 The tables show the mathematical results. Calculator may arrange equivalent terms differently
-and also display conditions, notices or queries for reusing an answer.</p>
+and also display conditions, notices, or queries for reusing an answer.</p>
 <table border="1" cellpadding="5" cellspacing="0">
-<tr><th>Task</th><th>Query</th><th>Mathematical result</th></tr>
+<tr><th>Task</th><th>Query</th><th>Mathematical Result</th></tr>
 <tr><td>Get the product rate</td><td><code>dP/dt</code></td><td><code>Y*k3</code></td></tr>
 <tr><td>Insert the rate constant</td><td><code>subs(dP/dt,k3,11)</code></td><td><code>11*Y</code></td></tr>
 <tr><td>Evaluate at Y=0.1 and k3=11</td><td><code>subs(dP/dt,[Y,k3],[1/10,11])</code></td><td><code>11/10</code></td></tr>
@@ -30,16 +30,16 @@ and also display conditions, notices or queries for reusing an answer.</p>
 <p>The third reaction supplies the name k3. Although the source says k=11, the first query keeps k3
 symbolic. Each substitution applies only to the expression in that query. It does not set a value
 for later queries or change the model.</p>
-<p>For one usable answer, click <b>Use result</b> to insert the complete query needed to reproduce it.
+<p>For one usable answer, click <b>Use Result</b> to insert the complete query needed to reproduce it.
 This does not evaluate the query. For example, after evaluating <code>dP/dt</code>, click
-<b>Use result</b>, change the inserted text to <code>subs(dP/dt,k3,11)</code>, then click
+<b>Use Result</b>, change the inserted text to <code>subs(dP/dt,k3,11)</code>, then click
 <b>Evaluate</b>.</p>
-<p>Results use mathematical formatting to make fractions, equations and matrices easier to read.
+<p>Results use mathematical formatting to make fractions, equations, and matrices easier to read.
 Scroll horizontally to read wide expressions. The displayed notation is not necessarily valid input.
-Use <b>Use result</b> or <b>Use in query</b> to insert an executable query.</p>
+Use <b>Use Result</b> or <b>Use in Query</b> to insert an executable query.</p>
 <p><b>Copy Result</b> copies the text report with exact values, all evaluated alternatives,
-conditions, notices and any reuse queries. Selecting an answer does not narrow this report.
-<b>Copy Context</b> adds the reaction source, definitions and assumptions to the same text report.</p>
+conditions, notices, and any reuse queries. Selecting an answer does not narrow this report.
+<b>Copy Context</b> adds the reaction source, definitions, and assumptions to the same text report.</p>
 
 <h2>Units in Calculator Queries</h2>
 <p>When substituting numerical values, use M for concentrations, s for time, K for temperature,
@@ -51,8 +51,8 @@ J/mol for energy parameters, and m<sup>3</sup> for volume.</p>
 <p>These query units apply even when the corresponding slider or fitting field uses another input unit.</p>
 <p>Results and <b>Copy Context</b> include known units. If Kindred cannot determine consistent units,
 it leaves them unspecified and continues the calculation.</p>
-<p>Use <b>Use result</b> or <b>Use in query</b> to reuse an answer with its unit conversions preserved.</p>
-<h2>Names, definitions and exact values</h2>
+<p>Use <b>Use Result</b> or <b>Use in Query</b> to reuse an answer with its unit conversions preserved.</p>
+<h2>Names, Definitions, and Exact Values</h2>
 <p>Queries can use species, parameters, and definitions from the model in the current tab.</p>
 <p>For species A, <code>A</code> and <code>[A]</code> both represent its concentration at simulation
 time <i>t</i>. <code>initial(A)</code> and <code>[A]_0</code> represent its symbolic initial concentration.
@@ -74,28 +74,28 @@ a value. Worked queries use the actual names from the example model.</p>
 <p>Fixed constants are <code>k_B</code>, <code>h</code>, <code>h_bar</code>, <code>N_A</code>, and
 <code>R</code>. The gas constant <i>R</i> uses J/(mol·K). Their values cannot be substituted or solved for.</p>
 
-<h3>Use a parameter definition in a signal calculation</h3>
+<h3>Use a Parameter Definition in a Signal Calculation</h3>
 <p>Extend the three-reaction example with these definitions for a signal proportional to P:</p>
 <pre>param gain=2
 param response=2*gain
 let signal=response*[P]</pre>
 <p>Gain is an independent parameter. Its default is 2, but Calculator keeps it symbolic.
 Response is defined in terms of gain, so Calculator replaces response with 2*gain.
-The LET name signal represents the resulting expression 2*gain*P.</p>
+The let name signal represents the resulting expression 2*gain*P.</p>
 <table border="1" cellpadding="5" cellspacing="0">
-<tr><th>Query</th><th>Mathematical result</th></tr>
+<tr><th>Query</th><th>Mathematical Result</th></tr>
 <tr><td><code>signal</code></td><td><code>2*gain*P</code></td></tr>
 <tr><td><code>partial(signal,gain)</code></td><td><code>2*P</code></td></tr>
 <tr><td><code>subs(signal,gain,2)</code></td><td><code>4*P</code></td></tr>
 </table>
-<p>When choosing a variable to solve for, differentiate with respect to, integrate over or substitute,
+<p>When choosing a variable to solve for, differentiate with respect to, integrate over, or substitute,
 use an independent variable. Here, use gain rather than response or signal.
 This requirement applies to <code>solve</code>, <code>partial</code>, <code>integrate</code>,
-<code>limit</code>, <code>series</code>, <code>collect</code> and three-argument <code>subs</code>.
+<code>limit</code>, <code>series</code>, <code>collect</code>, and three-argument <code>subs</code>.
 The operations <code>initial</code> and <code>steady_state</code> take species names.
 The remaining examples keep these signal definitions.</p>
 
-<h2>Rates and derivatives</h2>
+<h2>Rates and Derivatives</h2>
 <p>The following queries use the three-reaction mechanism and the signal definitions above.</p>
 <table border="1" cellpadding="5" cellspacing="0">
 <tr><th>Write</th><th>Meaning</th></tr>
@@ -105,10 +105,10 @@ The remaining examples keep these signal definitions.</p>
 <tr><td><code>dX/dY</code></td><td>The trajectory slope <code>(dX/dt)/(dY/dt)</code>, simplified algebraically.</td></tr>
 </table>
 <p>For both dt and partial, n is a nonnegative integer and defaults to 1.
-Independent parameters, initial concentrations and T stay fixed during dt, even when they appear
+Independent parameters, initial concentrations, and T stay fixed during dt, even when they appear
 in the expression.</p>
 <table border="1" cellpadding="5" cellspacing="0">
-<tr><th>Task</th><th>Query</th><th>Mathematical result</th></tr>
+<tr><th>Task</th><th>Query</th><th>Mathematical Result</th></tr>
 <tr><td>Differentiate the product rate with respect to Y</td><td><code>partial(dP/dt,Y)</code></td><td><code>k3</code></td></tr>
 <tr><td>Differentiate the product rate with respect to k3</td><td><code>partial(dP/dt,k3)</code></td><td><code>Y</code></td></tr>
 <tr><td>Differentiate the product rate along the model dynamics</td><td><code>dt(dP/dt)</code></td><td><code>k3*(kf2*X-(kr2+k3)*Y)</code></td></tr>
@@ -119,16 +119,16 @@ in the expression.</p>
 <pre>(kf1*A-(kr1+kf2)*X+kr2*Y)/(kf2*X-(kr2+k3)*Y)</pre>
 <p>This rate ratio is a different calculation from partial(X,Y).
 For any model with species A and B, the notation <code>d(dA/dt)/dB</code> means the partial
-derivative of the rate for A with respect to B. In our example, X takes the place of B.</p>
+derivative of the rate for A with respect to B. In this example, X takes the place of B.</p>
 
-<h2>Substitution and algebra</h2>
+<h2>Substitution and Algebra</h2>
 <p><code>subs(F,x,value)</code> replaces one independent variable.
 Use <code>subs(F,[x,y],[a,b])</code> to replace several variables at once.
 Here x and y are the targets, and a and b are their replacement expressions.
 Targets must be distinct and the two lists must have the same length.</p>
 <p>List substitution is simultaneous. Nested calls perform substitutions in sequence:</p>
 <table border="1" cellpadding="5" cellspacing="0">
-<tr><th>Query</th><th>Mathematical result</th></tr>
+<tr><th>Query</th><th>Mathematical Result</th></tr>
 <tr><td><code>subs(X+Y,[X,Y],[Y,2])</code></td><td><code>Y+2</code>. The Y introduced by the first replacement is not replaced again.</td></tr>
 <tr><td><code>subs(subs(X+Y,X,Y),Y,2)</code></td><td><code>4</code>. The outer call replaces both occurrences of Y.</td></tr>
 </table>
@@ -147,7 +147,7 @@ An expression already found to be undefined, such as <code>X/0</code> or <code>(
 remains unavailable. An algebraically simplified formula does not prove that the original
 calculation was defined at every value.</p>
 
-<h2>Solve equations and eliminate intermediates</h2>
+<h2>Solve Equations and Eliminate Intermediates</h2>
 <p>Use the three-reaction model with its signal definitions in this section.
 Make an equation with eq, then name the variables to solve for. Other variables remain symbolic.</p>
 <table border="1" cellpadding="5" cellspacing="0">
@@ -157,7 +157,7 @@ Make an equation with eq, then name the variables to solve for. Other variables 
 <tr><td><code>steady_state(X)</code><br><code>steady_state([X,Y])</code></td><td>Set the rates for the named species to zero and solve for those species.</td></tr>
 <tr><td><code>steady_state([X,Y],[equation1,equation2])</code></td><td>Add equations to the zero-rate equations. The extra equations do not add new unknowns.</td></tr>
 <tr><td><code>stationary_state()</code><br><code>stationary_state([equation1,equation2])</code></td><td>Set every species rate to zero and solve for all species. The second form includes extra equations. Add any conservation totals you need explicitly.</td></tr>
-<tr><td><code>subs(F,solutions)</code></td><td>Apply the relationships returned by solve, steady_state or stationary_state to F.</td></tr>
+<tr><td><code>subs(F,solutions)</code></td><td>Apply the relationships returned by solve, steady_state, or stationary_state to F.</td></tr>
 </table>
 <p>First, find the product concentration that gives a signal of 1 when gain is 2:</p>
 <pre>solve(eq(subs(signal,gain,2),1),P)</pre>
@@ -165,9 +165,9 @@ Make an equation with eq, then name the variables to solve for. Other variables 
 solving. A solve answer describes a relationship. To use it in another expression, apply it with
 subs. A calculated number or expression alone is not a set of replacement relationships.</p>
 
-<h3>Solve for both intermediates together</h3>
+<h3>Solve for Both Intermediates Together</h3>
 <p>Enter <code>steady_state([X,Y])</code> to solve both zero-rate equations while keeping the rate
-constants symbolic. Calculator displays the relationships it finds, their conditions and any
+constants symbolic. Calculator displays the relationships it finds, their conditions, and any
 remaining unresolved cases.</p>
 <p>For a calculation with the five rate constants specified, substitute into the equations before
 solving:</p>
@@ -184,12 +184,12 @@ expression can bring back a species that was eliminated. Apply the relationships
 each derivative step if you want to eliminate that species again. Solving zero-rate equations
 does not prove stability or produce concentration trajectories.</p>
 
-<h3>Substitute into answers or solve with new values?</h3>
+<h3>Substitute into Answers or Solve with New Values?</h3>
 <p>To find solutions for particular parameter values, substitute into the equations before solving.
 To evaluate answers already obtained, substitute into the solve result.
 For the signal definition, setting gain to zero demonstrates the difference:</p>
 <table border="1" cellpadding="5" cellspacing="0">
-<tr><th>Query</th><th>What happens</th></tr>
+<tr><th>Query</th><th>What Happens</th></tr>
 <tr><td><code>subs(solve(eq(signal,0),P),gain,0)</code></td><td>Substitutes into the existing answers. P=0 remains, and any unresolved case stays visible. Substitution does not solve again.</td></tr>
 <tr><td><code>solve(subs(eq(signal,0),gain,0),P)</code></td><td>The equation becomes 0=0 before solving, so P is free to take any real value.</td></tr>
 </table>
@@ -198,7 +198,7 @@ numbers. If you want a new solve for those numbers, use the second order of oper
 In solve answers, substitution changes the expressions on the right of =, not the variable
 names on the left. The same variable name still means the same variable on both sides.</p>
 
-<h2>Multiple answers after adding a reaction</h2>
+<h2>Multiple Answers After Adding a Reaction</h2>
 <p>Add <code>2 X -&gt; D; k=1</code> to <b>Reactions</b>. The complete example is now:</p>
 <pre>A &lt;-&gt; X; kf=2; kr=3
 X &lt;-&gt; Y; kf=5; kr=7
@@ -220,7 +220,7 @@ not discard the negative concentration automatically.</p>
 For this query, select the first answer with:</p>
 <pre>solution(solve(subs(eq(dX/dt,0),[A,Y,kf1,kr1,kf2,kr2,k4],[1,0,2,3,5,7,1]),X),1)</pre>
 <p>The selected relationship is <code>X=-2+sqrt(5)</code>. In the interface, choose that answer
-from the selector and click <b>Use in query</b> to insert its complete query.
+from the selector and click <b>Use in Query</b> to insert its complete query.
 Selection preserves the conditions attached to the answer. It does not change which alternatives
 are included by <b>Copy Result</b>.</p>
 <p>To calculate the rate for D for every usable answer, apply the unselected solve result to dD/dt:</p>
@@ -234,7 +234,7 @@ For only the first answer, select the relationship before applying it:</p>
 <pre>subs(dD/dt,solution(solve(subs(eq(dX/dt,0),[A,Y,kf1,kr1,kf2,kr2,k4],[1,0,2,3,5,7,1]),X),1))</pre>
 <p>The examples from here onward use this four-reaction model with the signal definitions.</p>
 
-<h3>Combine results with alternatives</h3>
+<h3>Combine Results with Alternatives</h3>
 <p>An ordinary expression, such as dD/dt above, can use every alternative from one solve result.
 When both operands contain alternatives, select an answer from one operand first.
 Calculator does not pair answers by their numbers or calculate every possible combination.</p>
@@ -244,7 +244,7 @@ alternatives. Otherwise, select the replacement with <code>solution(result,n)</c
 This requirement still applies when an unselected result shows only one usable answer alongside
 unresolved or unavailable cases.</p>
 
-<h2>Tuples, matrices and the Jacobian</h2>
+<h2>Tuples, Matrices, and the Jacobian</h2>
 <p>Square brackets group expressions into a tuple. For example, <code>[dP/dt,dD/dt]</code>
 returns both product rates together. A single species in brackets, such as <code>[X]</code>,
 still means a concentration. Write <code>[(X)]</code> for a one-entry tuple and
@@ -253,7 +253,7 @@ still means a concentration. Write <code>[(X)]</code> for a one-entry tuple and
 <tr><th>Write</th><th>Meaning</th></tr>
 <tr><td><code>odes()</code></td><td>A column matrix of all species rates. The displayed Rows line names their order.</td></tr>
 <tr><td><code>jacobian()</code></td><td>A matrix of partial derivatives of the species rates. Rows identify rates and columns identify concentration variables, both in the species order used by odes().</td></tr>
-<tr><td><code>matrix([[a,b],[c,d]])</code></td><td>Create a matrix from scalar entries. Replace a, b, c and d with expressions. Rows must be nonempty and have the same length.</td></tr>
+<tr><td><code>matrix([[a,b],[c,d]])</code></td><td>Create a matrix from scalar entries. Replace a, b, c, and d with expressions. Rows must be nonempty and have the same length.</td></tr>
 <tr><td><code>at(M,i)</code><br><code>at(M,i,j)</code></td><td>Extract item i from a tuple or column, or the matrix entry at row i and column j. Indices start at 0.</td></tr>
 <tr><td><code>transpose(M)</code></td><td>Exchange rows and columns.</td></tr>
 <tr><td><code>det(M)</code></td><td>Calculate the determinant of a square matrix.</td></tr>
@@ -270,13 +270,13 @@ More generally, <code>eq(M,0)</code> compares each entry with zero, and
 <code>eq(M,N)</code> compares corresponding entries of two matrices with the same shape.
 These operations create equations. They do not choose unknowns or add conservation totals.</p>
 
-<h2>Integrals, limits and series</h2>
+<h2>Integrals, Limits, and Series</h2>
 <p>These operations act on mathematical expressions. They do not solve the coupled kinetic
 equations or produce concentration trajectories. The exponential expressions below are supplied
 directly to demonstrate calculus with the parameter k3 from the example model.</p>
 <table border="1" cellpadding="5" cellspacing="0">
 <tr><th>Write</th><th>Meaning</th></tr>
-<tr><td><code>integrate(F,x)</code><br><code>integrate(F,x,a,b)</code></td><td>Find an antiderivative, or integrate from a to b. The indefinite form does not add an arbitrary integration constant. Symbolic bounds, unevaluated integrals and signed infinity can appear in results.</td></tr>
+<tr><td><code>integrate(F,x)</code><br><code>integrate(F,x,a,b)</code></td><td>Find an antiderivative, or integrate from a to b. The indefinite form does not add an arbitrary integration constant. Symbolic bounds, unevaluated integrals, and signed infinity can appear in results.</td></tr>
 <tr><td><code>limit(F,x,a)</code><br><code>limit(F,x,a,left)</code><br><code>limit(F,x,a,right)</code></td><td>Find a limit at a. The default is two-sided at a finite point. Use the literal, unquoted word left or right for a one-sided limit. At infinity, the direction follows the endpoint.</td></tr>
 <tr><td><code>series(F,x,a,n)</code><br><code>series(F,x,a,n,left)</code><br><code>series(F,x,a,n,right)</code></td><td>Expand around a to positive integer order n. The default direction is right. The result retains an order term indicating the truncation.</td></tr>
 <tr><td><code>remove_order(F)</code></td><td>Remove the top-level series order term before substituting for the expansion variable. When an order term is removed, a truncation notice remains.</td></tr>
@@ -290,7 +290,7 @@ For a definite integral from t=0 to t=1, enter:</p>
 A limit can keep k3 symbolic. For example,
 <code>limit((1-exp(-k3*t))/t,t,0)</code> gives <code>k3</code>.</p>
 
-<h3>An integral with conditions</h3>
+<h3>An Integral with Conditions</h3>
 <pre>integrate(exp(-k3*t),t,0,infinity())</pre>
 <p>The integral is <code>1/k3</code> for positive k3. Calculator displays the condition on its
 answer and an unresolved integral for the remaining cases. To apply k3=11 to this result, enter:</p>
@@ -298,7 +298,7 @@ answer and an unresolved integral for the remaining cases. To apply k3=11 to thi
 <p>The result is <code>1/11</code>. The unresolved alternative no longer applies.
 This substitution evaluates the existing result without running a new solve.</p>
 
-<h3>Evaluate a truncated series</h3>
+<h3>Evaluate a Truncated Series</h3>
 <p>Expand the same exponential around t=0:</p>
 <pre>series(exp(-k3*t),t,0,3)</pre>
 <p>The series is <code>1-k3*t+k3^2*t^2/2+O(t^3)</code>.
@@ -311,12 +311,12 @@ polynomial:</p>
 It is the value of the truncated polynomial, not the exact value of <code>exp(-11/100)</code>.
 Use the complete query to reuse a series result. The displayed O notation is not an input command.</p>
 
-<h2>Scalar functions</h2>
+<h2>Scalar Functions</h2>
 <p>Replace the arguments below with expressions from your model or literal values.
-Write the parentheses in <code>pi()</code>, <code>e()</code> and <code>infinity()</code>.</p>
+Write the parentheses in <code>pi()</code>, <code>e()</code>, and <code>infinity()</code>.</p>
 <table border="1" cellpadding="5" cellspacing="0">
 <tr><th>Write</th><th>Meaning</th></tr>
-<tr><td><code>pi()</code>, <code>e()</code>, <code>infinity()</code></td><td>Exact pi, Euler's number and positive infinity. Use <code>-infinity()</code> for negative infinity.</td></tr>
+<tr><td><code>pi()</code>, <code>e()</code>, <code>infinity()</code></td><td>Exact pi, Euler's number, and positive infinity. Use <code>-infinity()</code> for negative infinity.</td></tr>
 <tr><td><code>sqrt(x)</code>, <code>pow(x,y)</code></td><td>Principal square root and x raised to y. Complex results are allowed.</td></tr>
 <tr><td><code>exp(x)</code></td><td>The exponential function, e raised to x.</td></tr>
 <tr><td><code>expm1(x)</code></td><td><code>exp(x)-1</code>.</td></tr>
@@ -329,8 +329,8 @@ Write the parentheses in <code>pi()</code>, <code>e()</code> and <code>infinity(
 <tr><td><code>clip(x,lo,hi)</code></td><td>Clamp x between lo and hi. If lo is greater than hi, the bounds are swapped.</td></tr>
 </table>
 
-<h2>Conditions, unresolved results and limitations</h2>
-<p>A result can contain usable answers, unresolved alternatives and unavailable results together:</p>
+<h2>Conditions, Unresolved Results, and Limitations</h2>
+<p>A result can contain usable answers, unresolved alternatives, and unavailable results together:</p>
 <ul>
 <li><b>Usable answers</b> provide expressions or relationships you can use in further calculations,
 subject to any displayed conditions. Only usable answers receive selectable solution numbers.</li>
@@ -349,18 +349,18 @@ Ordinary complex expressions are allowed, so <code>subs(X,X,sqrt(-1))</code> giv
 <code>sqrt(-1)</code>. A substitution that makes a solved value infinite cannot produce a usable
 real answer either.</p>
 
-<h3>Reuse the calculation when the displayed expression is not valid input</h3>
+<h3>Reuse the Calculation When the Displayed Expression Is Not Valid Input</h3>
 <p>Some outputs contain functions or notation that Calculator can display but cannot accept
 directly as input. For example, gamma may appear in an integral result, but it is not an input
-command. Conditional sets, some constants, roots, order terms and numbers outside the accepted
+command. Conditional sets, some constants, roots, order terms, and numbers outside the accepted
 input range can also require the complete query.
-Use <b>Use result</b>, or select an answer and use <b>Use in query</b>, to insert that query.
+Use <b>Use Result</b>, or select an answer and use <b>Use in Query</b>, to insert that query.
 It includes the solves and substitutions needed to reproduce the answer.</p>
 <p>If a definition cannot be calculated, you can still evaluate queries that do not use it.
 Queries that need the failed definition show that failure.</p>
 
-<h3>Conditions in substitution and calculus</h3>
-<p>Substitution respects variables defined locally inside integrals, derivatives and sets.
+<h3>Conditions in Substitution and Calculus</h3>
+<p>Substitution respects variables defined locally inside integrals, derivatives, and sets.
 It changes existing expressions and conditions without solving unresolved problems again.</p>
 <p>Conditions normally remain attached when you use an expression in another calculation.
 An indefinite integral keeps them. A definite integral can account for a condition on the
@@ -373,7 +373,7 @@ an interval around the expansion point. Symbolic calculus does not establish whe
 expression is defined or prove smoothness. Substituting an exceptional parameter value into a
 formal result does not establish that the original integral or derivative is valid there.</p>
 
-<h3>Known integration problem and unsupported models</h3>
+<h3>Known Integration Problem and Unsupported Models</h3>
 <p>A parameter-dependent integral such as <code>integrate(1/(X^2-gain),X)</code> can incorrectly
 return a zero antiderivative. This is a known problem in SymPy 1.14.0,
 <code>sympy/sympy#28596</code>. Calculator does not independently check that result.</p>

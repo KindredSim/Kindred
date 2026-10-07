@@ -257,7 +257,7 @@ def parse_physical_rows(
             raise ValueError(
                 f"{_source_prefix()}row {row_index}, column "
                 f"{column.assigned_name!r}: date or time cell {str(value)!r} "
-                "is not a numeric observation; format measurements as plain numbers."
+                "is not a numeric observation. Format measurements as plain numbers."
             )
         return "" if value is None else str(value).strip()
 
@@ -284,7 +284,7 @@ def parse_physical_rows(
                     raise ValueError(
                         f"{_source_prefix()}row {row_index}, time column "
                         f"{resolved_time.assigned_name!r}: calendar date cell "
-                        f"{str(temporal)!r} is not an elapsed time; format "
+                        f"{str(temporal)!r} is not an elapsed time. Format "
                         "times as [h]:mm:ss durations or plain numbers."
                     )
             else:

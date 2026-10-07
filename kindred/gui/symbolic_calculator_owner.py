@@ -109,7 +109,7 @@ class SymbolicCalculatorOwner(QtCore.QObject):
             worker.request_shutdown()
 
     def cancel(self) -> SymbolicCalculatorViewState:
-        self._status = "Cancelling…" if self.busy else ""
+        self._status = "Canceling…" if self.busy else ""
         self._retire_worker()
         return self._publish()
 
@@ -184,8 +184,8 @@ class SymbolicCalculatorOwner(QtCore.QObject):
             self._worker = None
         if self._request is not None and self._request[0] is worker:
             self._request = None
-            if self._status.startswith("Cancelling") or self._status.startswith("Evaluating"):
-                self._status = "Cancelled."
+            if self._status.startswith("Canceling") or self._status.startswith("Evaluating"):
+                self._status = "Canceled."
             self._gate.release(self)
         worker.deleteLater()
         self._publish()

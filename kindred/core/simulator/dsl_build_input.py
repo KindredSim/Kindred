@@ -171,7 +171,7 @@ class DslSourceCoordinate:
                 )
         if type(self.physical_line_index) is not int or self.physical_line_index < 0:
             raise ValueError(
-                "DSL source coordinate physical line index must be non-negative."
+                "DSL source coordinate physical line index must be nonnegative."
             )
         if type(self.value_start) is not int or type(self.value_end) is not int:
             raise TypeError("DSL source coordinate offsets must be exact integers.")
