@@ -302,7 +302,11 @@ class PreparedScanDesign:
                     parameters, parameter_error = self.groups["parameter"].slot(p)
                     initials, initial_error = self.groups["initial"].slot(c)
                     values = self.fixed | parameters | initials
-                    error = " ".join(message for message in (parameter_error, initial_error) if message)
+                    messages = [message for message in (parameter_error, initial_error) if message]
+                    # Two messages are joined as sentences; one passes through as it is.
+                    error = " ".join(
+                        message if message.endswith(".") else message + "." for message in messages
+                    ) if len(messages) > 1 else "".join(messages)
                     if not error:
                         try:
                             self.interval_checks.admit(values)

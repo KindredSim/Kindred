@@ -139,7 +139,7 @@ def _parse_directive_fields(
         name, value = (part.strip() for part in field.split("=", 1))
         if not name or not value:
             raise TemperatureDSLError(
-                f"Invalid {syntax_name} field {field!r}; name and value are required."
+                f"Invalid {syntax_name} field {field!r}. Name and value are required."
             )
         if name in parsed:
             raise TemperatureDSLError(
@@ -152,11 +152,11 @@ def _parse_directive_fields(
     if missing or unknown:
         details: list[str] = []
         if missing:
-            details.append("missing " + ", ".join(missing))
+            details.append("Missing: " + ", ".join(missing) + ".")
         if unknown:
-            details.append("unknown " + ", ".join(unknown))
+            details.append("Unknown: " + ", ".join(unknown) + ".")
         raise TemperatureDSLError(
-            f"Invalid {syntax_name} fields: " + ", ".join(details) + "."
+            f"Invalid {syntax_name} fields. " + " ".join(details)
         )
     return parsed
 

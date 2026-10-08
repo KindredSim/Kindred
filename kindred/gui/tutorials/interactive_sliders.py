@@ -105,7 +105,7 @@ class InteractiveSliders(PracticeLesson):
             Step(
                 "show_slider", "Show Both Rate Sliders",
                 "<p>If the <b>Interactive Sliders panel</b> is hidden, open "
-                "<b>View → Panels → Interactive Sliders</b>. You can also click <b>Show this control</b> below.</p>"
+                "<b>View → Panels → Interactive Sliders</b>. You can also click <b>Show This Control</b> below.</p>"
                 "<p>In the Interactive Sliders panel, open <b>Visible Sliders</b>. "
                 "Check <b>kf1 — A → B</b> and <b>k2 — B → C</b>, then close the menu.</p>"
                 "<p><b>kf1</b> controls the forward rate of A ⇌ B and <b>k2</b> controls B → C. "

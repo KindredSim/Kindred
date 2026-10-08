@@ -27,6 +27,7 @@ from kindred.gui.fitting.launch import (
     FitOriginSnapshot,
     FitSharedInitialGroup,
     FitSetupSnapshot,
+    shared_initial_group_labels,
 )
 from kindred.gui.fitting.ic_tolerance import FitInitialTolerance
 
@@ -759,25 +760,19 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
         setup = self._current_setup()
         if setup is None:
             return None
-        order = tuple(item.dataset_id for item in setup.datasets)
         names = {item.dataset_id: item.display_name for item in self._origin.mapped_datasets}
         included = {item.dataset_id for item in setup.datasets if item.included}
-        groups = sorted(
-            (item for item in self._shared_initial_groups() if item.species == species),
-            key=lambda item: order.index(item.origin_dataset_id),
-        )
+        groups = tuple(group for group in self._shared_initial_groups() if group.species == species)
         dialog = QtWidgets.QDialog(self)
         dialog.setWindowTitle(f"Vary Global — {species}")
         layout = QtWidgets.QVBoxLayout(dialog)
         layout.addWidget(QtWidgets.QLabel("Datasets sharing this initial concentration:"))
         target = QtWidgets.QComboBox(dialog)
-        target.addItem("New group", None)
-        for number, group in enumerate(groups, start=1):
-            members = sorted(group.member_dataset_ids, key=order.index)
-            target.addItem(
-                f"Group {number} ({', '.join(names[item] for item in members)})",
-                group.origin_dataset_id,
-            )
+        target.addItem("New Group", None)
+        for origin_dataset_id, (_number, label) in shared_initial_group_labels(
+            groups, species, setup.datasets, self._origin,
+        ).items():
+            target.addItem(label, origin_dataset_id)
         layout.addWidget(target)
         checks: dict[str, QtWidgets.QCheckBox] = {}
         for dataset in setup.datasets:

@@ -274,7 +274,6 @@ def fit_global(
                         factual_cause=getattr(exc, "factual_cause", None),
                     )
                 retained_best_vector = np.asarray(retained_best, dtype=float).reshape(-1)
-                success = False
                 optimizer_diagnostic = FactualCause(
                     domain="fit",
                     origin="optimizer_endpoint",
@@ -287,6 +286,8 @@ def fit_global(
                     details={
                         "endpoint_replaced": True,
                         "settlement": "best_scientifically_available_evaluated_candidate",
+                        # Whether the optimizer itself converged before its endpoint failed.
+                        "optimizer_converged": success,
                     },
                     cause=optimizer_diagnostic,
                 )

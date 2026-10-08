@@ -4,7 +4,7 @@ C + D -> E ; k=0.02
 # stop finishes the simulation at the threshold crossing.
 # It has no species or value fields.
 # Stopping triggers do not use max_count or min_interval.
-# Enable Use authored stopping interventions in Simulation Settings.
+# Enable Use Authored Stopping Interventions in Simulation Settings.
 intervention: op=trigger; watch_species=A; threshold=0.1; direction=falling; then={op=stop}
 
 intervention_set1 = {

@@ -75,6 +75,9 @@ __all__ = [
     "fit_execution_span",
     "fit_coordinate_datasets_text",
     "fit_group_labels",
+    "shared_initial_group_labels",
+    "shared_initial_group_variable_id",
+    "skipped_fit_analysis_coordinates",
     "fit_parameter_overall",
     "fit_uncertainty_coordinates",
     "prune_fit_analysis_coordinates",
@@ -412,16 +415,33 @@ def fit_group_labels(
     This is the only owner of a group's number and name.
     """
 
+    return _numbered_group_labels(
+        ((group[0], group) for group in parameter.per_dataset_config.groups), datasets, origin,
+    )
+
+
+def _numbered_group_labels(
+    groups: Iterable[tuple[str, Iterable[str]]],
+    datasets: Sequence[FitDatasetLocalSettings],
+    origin: FitOriginSnapshot,
+) -> dict[str, tuple[int, str]]:
+    """Number (origin dataset, members) groups and label them "Group n (members)".
+
+    Groups are numbered by the table position of their origin dataset.  The
+    label names the included members in table order, or every member when
+    none is included.
+    """
+
     order = tuple(item.dataset_id for item in datasets)
     included = {item.dataset_id for item in datasets if item.included}
     names = {item.dataset_id: item.display_name for item in origin.mapped_datasets}
     labels: dict[str, tuple[int, str]] = {}
-    for number, group in enumerate(
-        sorted(parameter.per_dataset_config.groups, key=lambda item: order.index(item[0])), start=1,
+    for number, (origin_dataset_id, members) in enumerate(
+        sorted(groups, key=lambda item: order.index(item[0])), start=1,
     ):
-        members = sorted(group, key=order.index)
-        shown = [item for item in members if item in included] or members
-        labels[group[0]] = (number, f"Group {number} ({', '.join(names[item] for item in shown)})")
+        ordered = sorted(members, key=order.index)
+        shown = [item for item in ordered if item in included] or ordered
+        labels[origin_dataset_id] = (number, f"Group {number} ({', '.join(names[item] for item in shown)})")
     return labels
 
 
@@ -690,6 +710,32 @@ class FitSharedInitialGroup:
         return self.tolerance.bounds_for(self.initial)[1]
 
 
+def shared_initial_group_labels(
+    groups: Iterable[FitSharedInitialGroup],
+    species: str,
+    datasets: Sequence[FitDatasetLocalSettings],
+    origin: FitOriginSnapshot,
+) -> dict[str, tuple[int, str]]:
+    """Number and label one species' shared initial groups by origin dataset, Group 1 first.
+
+    Groups are numbered by the table position of their origin dataset.  The
+    label names the included members in table order, or every member when none
+    is included, as fit_group_labels does for parameter groups.  This is the
+    only owner of a shared initial group's number and name.
+    """
+
+    return _numbered_group_labels(
+        ((group.origin_dataset_id, group.member_dataset_ids) for group in groups if group.species == species),
+        datasets, origin,
+    )
+
+
+def shared_initial_group_variable_id(species: str, origin_dataset_id: str) -> str:
+    """Stable coupled-variable ID of one fitted shared initial group."""
+
+    return f"initial:{species}:{origin_dataset_id}"
+
+
 @dataclass(frozen=True, slots=True)
 class FitDatasetLocalSettings:
     dataset_id: str
@@ -893,6 +939,36 @@ def fit_coordinate_datasets_text(
     return fit_group_labels(parameter, setup.datasets, setup.origin)[coordinate.dataset_id][1]
 
 
+def skipped_fit_analysis_coordinates(
+    coordinates: Iterable[FitCoordinate],
+    *,
+    excluded_dataset_ids: Iterable[str],
+    parameters: Iterable[FitParameterVariable],
+) -> frozenset[FitCoordinate]:
+    """The uncertainty targets a fit skips because their datasets are excluded.
+
+    A Per-dataset target is skipped when its dataset is excluded, and a group
+    target only when all its members are excluded.  This is the one rule for
+    which selected targets a fit analyses.
+    """
+
+    excluded_ids = set(excluded_dataset_ids)
+    if not excluded_ids:
+        return frozenset()
+    members = {
+        FitCoordinate("group", parameter.name, group[0]): group
+        for parameter in parameters
+        for group in parameter.selected_config.groups
+    }
+    return frozenset(
+        coordinate for coordinate in coordinates
+        if coordinate.scope != "shared"
+        and excluded_ids.issuperset(
+            members[coordinate] if coordinate.scope == "group" else (coordinate.dataset_id,)
+        )
+    )
+
+
 def prune_fit_analysis_coordinates(
     configuration: ProfileLikelihoodConfig | ResidualBootstrapConfig | None,
     *,
@@ -913,22 +989,15 @@ def prune_fit_analysis_coordinates(
     if configuration is None:
         return None
     kept = None if available is None else set(available)
-    excluded_ids = set(excluded_dataset_ids)
-    members = {
-        FitCoordinate("group", parameter.name, group[0]): group
-        for parameter in parameters
-        for group in parameter.selected_config.groups
-    }
+    skipped = skipped_fit_analysis_coordinates(
+        configuration.parameter_names,
+        excluded_dataset_ids=excluded_dataset_ids,
+        parameters=parameters,
+    )
     remaining = tuple(
         coordinate
         for coordinate in configuration.parameter_names
-        if (kept is None or coordinate in kept)
-        and not (
-            excluded_ids
-            and excluded_ids.issuperset(
-                members[coordinate] if coordinate.scope == "group" else (coordinate.dataset_id,)
-            )
-        )
+        if (kept is None or coordinate in kept) and coordinate not in skipped
     )
     if not remaining:
         return None
@@ -1793,7 +1862,7 @@ def _compile_fit_dispatch(
         if group.fit and applicable_ids:
             coupled_variables.append(
                 FitCoupledVariableParamSpec(
-                    variable_id=f"initial:{group.species}:{group.origin_dataset_id}",
+                    variable_id=shared_initial_group_variable_id(group.species, group.origin_dataset_id),
                     parameter_name=f"init:{group.species}",
                     dataset_ids=applicable_ids,
                     initial=group.initial,

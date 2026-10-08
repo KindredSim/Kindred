@@ -817,8 +817,8 @@ def profile_likelihood_result(
             fitted_value_count=fitted_value_count,
             intervals={},
             unavailable_reason=(
-                f"Profile likelihood is unavailable: {observation_count} weighted "
-                f"residuals do not exceed {fitted_value_count} fitted values."
+                f"{observation_count} observations do not exceed "
+                f"{fitted_value_count} fitted values."
             ),
             provenance={"settlement": "unavailable"},
         ))
@@ -1090,7 +1090,7 @@ def profile_likelihood_result(
     }
     if interval_statuses == {"unavailable"}:
         result_status = "unavailable"
-        unavailable_reason = "No requested profile interval could be determined."
+        unavailable_reason = "no requested interval could be determined."
     elif any_partial:
         result_status = "partial"
         unavailable_reason = None
@@ -1413,8 +1413,8 @@ def residual_bootstrap_result(
             None
             if threshold_met
             else (
-                f"Bootstrap validity threshold was not met: {success_count} "
-                f"successful full refits, {required} required."
+                f"{success_count} successful refit{'' if success_count == 1 else 's'}, "
+                f"{required} required."
             )
         ),
         provenance={"primary_fit_preserved": True},

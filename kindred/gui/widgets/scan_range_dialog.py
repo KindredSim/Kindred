@@ -30,7 +30,7 @@ def entry(value, parent=None):
 class ScanRangeDialog(QtWidgets.QDialog):
     def __init__(self, label, selection, parent=None):
         super().__init__(parent)
-        self.setWindowTitle(f"Allowed values — {label}")
+        self.setWindowTitle(f"Allowed Values — {label}")
         self.resize(720, 370)
         self.selection = selection
         layout = QtWidgets.QVBoxLayout(self)

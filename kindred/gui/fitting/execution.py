@@ -63,6 +63,7 @@ from kindred.gui.fitting.launch import (
     _replace_fit_parameter,
     fit_coordinate_datasets_text,
     prune_fit_analysis_coordinates,
+    shared_initial_group_variable_id,
 )
 from kindred.gui.parameter_enumeration import admit_gui_parameter_value
 from kindred.core.species import CONCENTRATION_MIN_M, validate_concentration
@@ -1161,16 +1162,17 @@ class _FitExecution(_FitControl):
                     else 0.0
                 )
                 percent = 95 + min(2, int(math.floor(3.0 * fraction)))
-                label = coordinate_labels[update.coordinate]
+                # A settlement update can arrive before any coordinate started,
+                # so only discovery and refinement show one.
                 if update.stage == "discovery":
                     detail = (
-                        f"Profile likelihood · {label} · {update.side} "
+                        f"Profile likelihood · {coordinate_labels[update.coordinate]} · {update.side} "
                         f"discovery {update.discovery_step}/"
                         f"{setup.profile_likelihood.max_bracketing_steps_per_side}"
                     )
                 elif update.stage == "refinement":
                     detail = (
-                        f"Profile likelihood · {label} · {update.side} "
+                        f"Profile likelihood · {coordinate_labels[update.coordinate]} · {update.side} "
                         f"refinement {update.refinement_step}/64"
                     )
                 else:
@@ -1301,7 +1303,7 @@ class _FitExecution(_FitControl):
             if not group.fit:
                 continue
             value = coordinate_values.get(
-                FitCoordinate("coupled", f"initial:{group.species}:{group.origin_dataset_id}")
+                FitCoordinate("coupled", shared_initial_group_variable_id(group.species, group.origin_dataset_id))
             )
             if value is None or not math.isfinite(float(value)):
                 continue

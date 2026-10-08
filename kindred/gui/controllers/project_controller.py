@@ -459,7 +459,7 @@ class ProjectController(QtCore.QObject):
                 self._config.record_recent_project(path)
             except Exception as exc:
                 logger.warning("Recent-project update failed", exc_info=True)
-                status += f" Updating the recent projects list failed: {exc}"
+                status += f". Updating the recent projects list failed: {exc}"
         self._set_status(status)
         self.projectStateChanged.emit(True)
         return True
@@ -747,7 +747,7 @@ class ProjectController(QtCore.QObject):
             self._config.record_recent_project(absolute_path)
         except Exception as exc:
             logger.warning("Recent-project update failed", exc_info=True)
-            status += f" Updating the recent projects list failed: {exc}"
+            status += f". Updating the recent projects list failed: {exc}"
         self._set_status(status)
         self.projectStateChanged.emit(False)
         return committed_token

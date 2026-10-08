@@ -612,7 +612,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
             (transforms, (("original", "Original"), ("derivative", "Derivative (dy/dx)"),
                           ("phase", "Derivative versus Y"))),
             (axes, (("visible_x", "Fit Y to Visible X"),)),
-            (self._plot_menu, (("sampling", "Downsampling: 1k points/curve"), ("warnings", "Warning details…"))),
+            (self._plot_menu, (("sampling", "Downsampling: 1k Points/Curve"), ("warnings", "Warning Details…"))),
         )
         for menu, group in groups:
             for key, text in group:
@@ -646,17 +646,17 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
                 action.setCheckable(True)
                 self._plot_actions[key] = action
             self._add_plot_percentage(
-                menu, f"fraction_{axis}", "Auto-range coverage", minimum=1,
+                menu, f"fraction_{axis}", "Auto-Range Coverage", minimum=1,
                 tooltip="Choose the central percentage of each curve used to adjust the axis automatically. "
                 "Lower percentages can leave extreme values outside the view. "
                 "Copy Plotted Data keeps those points, and Copy Visible Data uses the current view.",
             )
         self._add_plot_percentage(
-            appearance, "grid_opacity", "Grid opacity",
+            appearance, "grid_opacity", "Grid Opacity",
             tooltip="Adjust how clearly the grid lines appear. At 0%, the grid is invisible.",
         )
         self._add_plot_percentage(
-            appearance, "simulation_opacity", "Simulation opacity",
+            appearance, "simulation_opacity", "Simulation Opacity",
             tooltip="Adjust the visibility of simulation curves and their points. At 100%, references and previews "
             "keep their usual transparency. At 0%, the curves and points are invisible.",
         )

@@ -2663,7 +2663,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         selected_assessment = assessment
         dialog = QtWidgets.QDialog(self)
-        dialog.setWindowTitle(f"Review exact correction — {action}")
+        dialog.setWindowTitle(f"Review Exact Correction — {action}")
         layout = QtWidgets.QVBoxLayout(dialog)
         layout.addWidget(
             QtWidgets.QLabel(
@@ -2933,7 +2933,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 self,
                 "Replace Active Mechanism",
                 "Loading this source affects only the active mechanism tab and "
-                "will discard the unapplied Reactions of that tab and Slider drafts. "
+                "will discard the unapplied Reactions and Slider drafts of that tab. "
                 "Continue?",
                 QtWidgets.QMessageBox.StandardButton.Yes
                 | QtWidgets.QMessageBox.StandardButton.Cancel,

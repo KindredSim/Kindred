@@ -375,11 +375,11 @@ class SpreadsheetSession:
                     columns, compiled = _prepared_columns(columns)
                     if before["declared"] and not correction and before["unit"] != unit.symbol:
                         if before["unit"] is None:
-                            raise ValueError("This column has Unspecified units. Use Correct unit declaration to assign its meaning.")
+                            raise ValueError("This column has Unspecified units. Use Correct Unit Declaration… to assign its meaning.")
                         previous = parse_unit(before["unit"])
                         if not previous.compatible(unit):
-                            raise ValueError(f"Incompatible units: {before['unit']} and {unit.symbol}. Use Correct unit "
-                                             "declaration to change what the numbers mean.")
+                            raise ValueError(f"Incompatible units: {before['unit']} and {unit.symbol}. Use Correct Unit "
+                                             "Declaration… to change what the numbers mean.")
                         scale = conversion_scale(previous, unit)
                         if scale != ONE_SCALE:
                             raw = self._raw()

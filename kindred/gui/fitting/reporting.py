@@ -8,6 +8,7 @@ define a versioned action graph, identity, or serialization format.
 from __future__ import annotations
 
 import dataclasses
+from decimal import ROUND_CEILING, ROUND_FLOOR, ROUND_HALF_UP, Decimal
 import html
 import math
 import statistics
@@ -40,6 +41,9 @@ from kindred.gui.fitting.launch import (
     fit_group_labels,
     fit_parameter_overall,
     fit_uncertainty_coordinates,
+    shared_initial_group_labels,
+    shared_initial_group_variable_id,
+    skipped_fit_analysis_coordinates,
 )
 from kindred.gui.fitting.execution import (
     FitCandidate, FitLiveUpdate, published_fitted_concentration,
@@ -173,7 +177,7 @@ def _profile_data(candidate: FitCandidate) -> dict[str, object]:
         return {
             "requested": requested,
             "status": "not_requested" if not requested else "unavailable",
-            "unavailable_reason": None if not requested else "Profile likelihood result is unavailable.",
+            "unavailable_reason": None if not requested else "no result was returned.",
             "diagnostic": None,
             "intervals": [],
         }
@@ -190,6 +194,7 @@ def _profile_data(candidate: FitCandidate) -> dict[str, object]:
         ),
         "unavailable_reason": result.unavailable_reason,
         "diagnostic": _plain(result.diagnostic),
+        "settlement": result.provenance.get("settlement"),
         "intervals": [
             _profile_interval(coordinate, interval)
             for coordinate, interval in sorted(result.intervals.items(), key=lambda item: roster[item[0]])
@@ -223,7 +228,7 @@ def _bootstrap_data(candidate: FitCandidate) -> dict[str, object]:
         return {
             "requested": requested,
             "status": "not_requested" if not requested else "unavailable",
-            "unavailable_reason": None if not requested else "Residual Bootstrap result is unavailable.",
+            "unavailable_reason": None if not requested else "no result was returned.",
             "diagnostic": None,
             "intervals": [],
         }
@@ -264,6 +269,7 @@ def _bootstrap_data(candidate: FitCandidate) -> dict[str, object]:
         ),
         "unavailable_reason": result.unavailable_reason,
         "diagnostic": _plain(result.diagnostic),
+        "settlement": result.provenance.get("settlement"),
     }
 
 
@@ -449,14 +455,23 @@ def _initial_rows(candidate: FitCandidate) -> list[dict[str, object]]:
         (item.species, item.origin_dataset_id): item
         for item in request_setup.shared_initial_groups
     }
-    for item in terminal_setup.shared_initial_groups:
+    labels = {
+        species: shared_initial_group_labels(
+            request_setup.shared_initial_groups, species, request_setup.datasets, origin,
+        )
+        for species in {item.species for item in terminal_setup.shared_initial_groups}
+    }
+    # A shared initial group is one fitted value: one row under its group
+    # label, in group order.
+    for item in sorted(
+        terminal_setup.shared_initial_groups,
+        key=lambda group: (group.species, labels[group.species][group.origin_dataset_id][0]),
+    ):
         if not item.fit:
             continue
         launch_item = launch_groups.get(
             (item.species, item.origin_dataset_id), item
         )
-        # A shared initial group is one fitted value: one row naming its
-        # included members in Fit dataset order.
         members = [mapped for mapped in origin.mapped_datasets
                    if mapped.dataset_id in item.member_dataset_ids and mapped.dataset_id in included_ids]
         if not members:
@@ -467,7 +482,7 @@ def _initial_rows(candidate: FitCandidate) -> list[dict[str, object]]:
             f"{INITIAL_PREFIX}{item.species}",
         )
         rows.append({"kind": "initial", "name": item.species, "display_name": f"initial {item.species}",
-            "scope": ", ".join(mapped.display_name for mapped in members), "unit": "M",
+            "scope": labels[item.species][item.origin_dataset_id][1], "unit": "M",
             "nominal_value": launch_item.initial,
             "fitted_value": published_fitted_concentration(value, field=f"fitted initial {item.species!r}"),
             "minimum": launch_item.minimum, "maximum": launch_item.maximum,
@@ -585,12 +600,15 @@ def _and_join(items: Sequence[str]) -> str:
     return ", ".join(items[:-1]) + ", and " + items[-1]
 
 
-def _interval_text(interval: Mapping[str, object], confidence: float) -> tuple[str, str]:
+def _interval_text(interval: Mapping[str, object], confidence: float, bound: str) -> tuple[str, str]:
     """The interval as stated, and its confidence label.
 
-    A confidence level is stated only beside numbers.  A Profile interval with
-    one number is one-sided at (1 + level)/2, whether its other side is a
-    limit or did not resolve.
+    The section heading states the two-sided level, so a row states a level
+    only when it is one-sided.  A Profile interval with one number is
+    one-sided at (1 + level)/2, whether its other side is a limit or did not
+    resolve.  An interval whose estimate is at a bound (``bound``) stays
+    two-sided, but its Result is a limit from the other end, so the label
+    names the Result.
     """
 
     lower, upper = interval["lower"], interval["upper"]
@@ -606,25 +624,144 @@ def _interval_text(interval: Mapping[str, object], confidence: float) -> tuple[s
     text = f"{_display(lower)} to {_display(upper)}"
     if lower is None or upper is None:
         return text, one_sided
-    return text, f"{_display(100.0 * confidence)}%"
+    if bound != "interior":
+        return text, f"Result {one_sided}"
+    return text, ""
+
+
+_SUPERSCRIPTS = str.maketrans("-0123456789", "⁻⁰¹²³⁴⁵⁶⁷⁸⁹")
+
+
+def _round_figures(value: float, rounding: str, figures: int = 1) -> Decimal:
+    """``value`` at ``figures`` significant figures, rounded in the given direction."""
+
+    number = Decimal(format(value, ".12g"))
+    if number == 0:
+        return number
+    place = number.adjusted() - figures + 1
+    digits = number.scaleb(-place).quantize(Decimal(1), rounding=rounding)
+    if digits.adjusted() == figures:
+        # Rounding 9.5 up to 10 gains a figure; the carry keeps the stated count.
+        return Decimal(int(digits) // 10).scaleb(place + 1)
+    return digits.scaleb(place)
+
+
+def _error(value: float) -> Decimal:
+    """An error rounded up: two figures when it starts with 1 or 2, else one."""
+
+    number = Decimal(format(value, ".12g"))
+    if number and int(number.scaleb(-number.adjusted())) < 3:
+        return _round_figures(value, ROUND_CEILING, 2)
+    error = _round_figures(value, ROUND_CEILING)
+    # Rounding 0.96 up to 1 makes an error that starts with 1, so it reads 1.0.
+    return error if error.adjusted() == number.adjusted() else error.quantize(Decimal(1).scaleb(error.adjusted() - 1))
+
+
+def _result_text(estimate: float, lower: float | None, upper: float | None, bound: str) -> str:
+    """A publishable result: errors rounded up, limits outward to two figures.
+
+    ``bound`` is the estimate's Bound Position.  A value at its bound has no
+    error on that side, so it is stated as a limit from the other end, as
+    Profile states it.
+    """
+
+    if bound == "lower":
+        lower = None
+    elif bound == "upper":
+        upper = None
+    if lower is None and upper is None:
+        return ""
+    if upper is None:
+        return f"≥ {_single_number(_round_figures(lower, ROUND_FLOOR, 2))}"
+    if lower is None:
+        return f"≤ {_single_number(_round_figures(upper, ROUND_CEILING, 2))}"
+    if not lower <= estimate <= upper:
+        # A percentile interval can lie beside the estimate.  It is stated as an
+        # interval, its ends one place finer than its width (or than the value,
+        # when the width is zero), in one notation.
+        width = upper - lower or abs(upper)
+        step = Decimal(1).scaleb(_round_figures(width, ROUND_CEILING).adjusted() - 1)
+        ends = (Decimal(repr(lower)).quantize(step, ROUND_FLOOR),
+                Decimal(repr(upper)).quantize(step, ROUND_CEILING))
+        scale = _power(max(abs(end) for end in ends))
+        return _scaled(" to ".join(_plain_number(end.scaleb(-scale)) for end in ends), scale)
+    below = _error(estimate - lower)
+    above = _error(upper - estimate)
+    if max(below, above) == 0:
+        return ""
+    # The estimate and both errors share the finer error's last place, in the
+    # estimate's own power of ten.
+    step = Decimal(1).scaleb(min(error.as_tuple().exponent for error in (below, above) if error))
+    value = Decimal(repr(estimate)).quantize(step, ROUND_HALF_UP)
+    below, above = below.quantize(step), above.quantize(step)
+    scale = _power(value if value else max(below, above))
+
+    def mantissa(number: Decimal) -> str:
+        return _plain_number(number.scaleb(-scale))
+
+    error = f"± {mantissa(above)}" if below == above else f"+{mantissa(above)}/−{mantissa(below)}"
+    return _scaled(f"{mantissa(value)} {error}", scale)
+
+
+def _power(number: Decimal) -> int:
+    """The power of ten written for ``number``: none from 0.01 to below 10000."""
+
+    return 0 if not number or -2 <= number.adjusted() < 4 else number.adjusted()
+
+
+def _scaled(text: str, scale: int) -> str:
+    return text if scale == 0 else f"({text}) × 10{str(scale).translate(_SUPERSCRIPTS)}"
+
+
+def _single_number(number: Decimal) -> str:
+    """One rounded number, with a power of ten outside 0.01 to below 10000."""
+
+    power = _power(number)
+    text = _plain_number(number.scaleb(-power))
+    return text if power == 0 else f"{text} × 10{str(power).translate(_SUPERSCRIPTS)}"
+
+
+def _plain_number(number: Decimal) -> str:
+    """A decimal without exponent notation, keeping its zeros; a minus sign is typographic."""
+
+    return format(abs(number) if number == 0 else number, "f").replace("-", "−")
 
 
 def _analysis_section(title: str, data: Mapping[str, object], request: object,
-                      names: Mapping[str, str], coordinate_units: Mapping[FitCoordinate, str]) -> str:
-    """One analysis's rows; ``names`` holds each parameter's rich Summary name."""
+                      names: Mapping[str, str], coordinate_units: Mapping[FitCoordinate, str],
+                      estimates: Mapping[FitCoordinate, tuple[float, str]],
+                      skipped: Sequence[FitCoordinate]) -> str:
+    """One analysis's rows; ``names`` holds each parameter's rich Summary name.
+
+    ``estimates`` holds each target's estimate and Bound Position as the
+    Estimates table shows them.
+
+    The heading names the analysis and its confidence level.  A plain sentence
+    follows only when the analysis did not complete normally.
+    """
     if not data["requested"]:
         return ""
     setup = request.setup
     origin = setup.origin
-    section = f"<h3>{_text(title)} — {_text(str(data['status']).capitalize())}</h3>"
-    if data.get("unavailable_reason"):
-        section += f"<p>{_text(_diagnostic(data['unavailable_reason'], origin))}</p>"
-    if data.get("diagnostic"):
-        section += f"<p>Cause: {_text(_diagnostic(data['diagnostic'], origin))}</p>"
+    level = data.get("confidence_level")
+    heading = title if level is None else f"{title} ({_display(100.0 * float(level))}%)"
+    section = f"<h3>{_text(heading)}</h3>"
+    status = data["status"]
+    if status == "unavailable":
+        section += f"<p>{_text('Not available: ' + _diagnostic(data['unavailable_reason'], origin))}</p>"
+    elif status == "failed":
+        section += f"<p>{_text('Failed: ' + _diagnostic(data['diagnostic'], origin))}</p>"
+    elif status == "stopped" and data.get("settlement") == "not_started_after_stop":
+        section += "<p>Not started, because <b>Stop</b> was pressed.</p>"
+    elif status == "stopped":
+        unit = "replicates were refitted" if "replicates" in data else "parameters were profiled"
+        section += f"<p>Stopped before all {unit}.</p>"
+    elif status == "partial":
+        section += "<p>Some interval ends could not be determined.</p>"
     if data.get("first_unavailable_replicate"):
         section += (f"<p>First unavailable replicate: "
                     f"{_text(_diagnostic(data['first_unavailable_replicate'], origin))}</p>")
-    if "replicates" in data:
+    if "replicates" in data and data["successful_replicates"] + data["failed_replicates"]:
         section += (f"<p>{_text(data['successful_replicates'])} of {_text(data['replicates'])} "
                     f"replicates succeeded, {_text(data['failed_replicates'])} failed.</p>")
     if data.get("method"):
@@ -636,12 +773,21 @@ def _analysis_section(title: str, data: Mapping[str, object], request: object,
         for parameter in setup.parameters
         for group in parameter.selected_config.groups
     }
+    initial_groups = {
+        shared_initial_group_variable_id(group.species, group.origin_dataset_id): f"initial {group.species} — "
+        + shared_initial_group_labels(
+            setup.shared_initial_groups, group.species, setup.datasets, origin,
+        )[group.origin_dataset_id][1]
+        for group in setup.shared_initial_groups
+    }
 
     def label(coordinate: FitCoordinate) -> str:
         """Rich name of any fitted coordinate, including an initial concentration or group."""
 
         if coordinate.scope == "coupled" and coordinate.name in group_targets:
             coordinate = group_targets[coordinate.name]
+        elif coordinate.scope == "coupled" and coordinate.name in initial_groups:
+            return _text(initial_groups[coordinate.name])
         elif coordinate.scope == "coupled":
             spec = coupled[coordinate.name]
             members = ", ".join(dataset_names[item] for item in spec.dataset_ids)
@@ -652,8 +798,9 @@ def _analysis_section(title: str, data: Mapping[str, object], request: object,
     rows = []
     for interval in data["intervals"]:
         coordinate = interval["coordinate"]
-        text, level = _interval_text(interval, float(data["confidence_level"]))
-        details = [_text(level)] if level else []
+        estimate, position = estimates[coordinate]
+        text, level_label = _interval_text(interval, float(data["confidence_level"]), position)
+        details = [_text(level_label)] if level_label else []
         for side in ("lower", "upper"):
             endpoint = interval.get(side + "_resolution") or {}
             reason = endpoint.get("reason")
@@ -664,9 +811,13 @@ def _analysis_section(title: str, data: Mapping[str, object], request: object,
                         for other, bound in endpoint.get("limiting_bounds", ())]
             if limiting:
                 details.append(f"{_text(side.capitalize())} end is set by {_and_join(limiting)}")
-        rows.append((label(coordinate), text, _unit_html(coordinate_units[coordinate]), "<br>".join(details)))
+        result = _result_text(estimate, interval["lower"], interval["upper"], position)
+        rows.append((label(coordinate), result, text, _unit_html(coordinate_units[coordinate]), "<br>".join(details)))
     if rows:
-        section += _table(("Parameter", "Interval", "Unit", "Details"), rows, rich_columns=(0, 2, 3))
+        section += _table(("Parameter", "Result", "Interval", "Unit", "Details"), rows, rich_columns=(0, 3, 4))
+    if skipped:
+        section += ("<p>Not analyzed, because their datasets were excluded: "
+                    + ", ".join(label(coordinate) for coordinate in skipped) + ".</p>")
     return section
 
 
@@ -738,16 +889,17 @@ def fit_live_presentation(
             else:
                 shown_groups.add(group)
                 scalar(parameter, labels[group[0]][1], ("group", group[0], parameter.name), value)
-    # A shared initial group shows once, under its first included member,
-    # naming every included member; later members are skipped.
+    # A shared initial group shows once, under its first included member, as
+    # "Group n" naming every included member; later members are skipped.
     group_context: dict[tuple[str, str], str | None] = {}
     for group in setup.shared_initial_groups:
+        label = shared_initial_group_labels(
+            setup.shared_initial_groups, group.species, setup.datasets, setup.origin,
+        )[group.origin_dataset_id][1]
         members = [mapped.set_id for mapped in setup.origin.mapped_datasets
                    if mapped.dataset_id in group.member_dataset_ids and mapped.set_id in initial_labels]
         for index, set_id in enumerate(members):
-            group_context[(set_id, group.species)] = (
-                ", ".join(initial_labels[member] for member in members) if index == 0 else None
-            )
+            group_context[(set_id, group.species)] = label if index == 0 else None
     for set_id, label in initial_labels.items():
         for name, value in initials.get(set_id, {}).items():
             context = group_context.get((set_id, name), label)
@@ -818,8 +970,28 @@ def fit_candidate_presentation(candidate: FitCandidate) -> tuple[tuple[str, ...]
         parameter.name: parameter_name({"name": parameter.name, "display_name": parameter.display_name})
         for parameter in candidate.setup_snapshot.parameters
     }
-    body += _analysis_section("Profile Likelihood", profile, candidate.request, names, coordinate_units)
-    body += _analysis_section("Residual Bootstrap", bootstrap, candidate.request, names, coordinate_units)
+    # Each analysed target's estimate and Bound Position, as the Estimates table shows them.
+    estimates = {
+        FitCoordinate("shared", str(row["name"])) if row["kind"] == "shared_parameter"
+        else FitCoordinate(str(row["identity"][0]), str(row["name"]), str(row["identity"][1])):
+            (float(row["fitted_value"]), str(row["bound_state"]))
+        for row in shared + individual
+    }
+    excluded = tuple(item.dataset_id for item in candidate.request.setup.datasets if not item.included)
+
+    def skipped(configuration: object | None) -> tuple[FitCoordinate, ...]:
+        if configuration is None:
+            return ()
+        names_skipped = skipped_fit_analysis_coordinates(
+            configuration.parameter_names, excluded_dataset_ids=excluded,
+            parameters=candidate.request.setup.parameters,
+        )
+        return tuple(item for item in configuration.parameter_names if item in names_skipped)
+
+    body += _analysis_section("Profile Likelihood", profile, candidate.request, names, coordinate_units,
+                              estimates, skipped(candidate.request.setup.profile_likelihood))
+    body += _analysis_section("Residual Bootstrap", bootstrap, candidate.request, names, coordinate_units,
+                              estimates, skipped(candidate.request.setup.residual_bootstrap))
 
     settings = candidate.origin.scientific_settings
     request_setup = candidate.request.setup
@@ -882,14 +1054,47 @@ def fit_candidate_presentation(candidate: FitCandidate) -> tuple[tuple[str, ...]
          for item in included))
     if any(item.parametric is not None for item in included):
         provenance += "<p>Measured-X fitting jointly matches weighted X and Y discrepancies on uninterrupted simulation segments. Recorded time is unused. Matched locations do not identify experimental times or establish absolute rate identifiability.</p>"
-    # The starting concentration each included dataset used, in M.
-    starts = {(item.set_id, item.species): item.initial for item in request_setup.initials}
+    # Each included dataset's starting concentrations in M: the mechanism-tab
+    # value, the start the fit used where it differs (read from the fit's own
+    # dispatch), and the shared group it belongs to.
+    dispatch = candidate.request.dispatch
+    used = {
+        (dataset_id, name[len(INITIAL_PREFIX):]): value
+        for dataset_id, values in dispatch.fixed_by_dataset
+        for name, value in values if name.startswith(INITIAL_PREFIX)
+    }
+    used.update({
+        (dataset_id, spec.parameter_name[len(INITIAL_PREFIX):]): spec.initial
+        for spec in dispatch.ordinary_coupled_variables if spec.parameter_name.startswith(INITIAL_PREFIX)
+        for dataset_id in spec.dataset_ids
+    })
     species = [name for name, _value in mapped_by_id[included[0].dataset_id].initial_values] if included else []
+    group_labels = {
+        name: shared_initial_group_labels(
+            request_setup.shared_initial_groups, name, request_setup.datasets, candidate.origin,
+        )
+        for name in species
+    }
+    group_numbers = {
+        (dataset_id, group.species): group_labels[group.species][group.origin_dataset_id][0]
+        for group in request_setup.shared_initial_groups if group.species in group_labels
+        for dataset_id in group.member_dataset_ids
+    }
+
+    def start_text(dataset_id: str, name: str) -> str:
+        # Apply writes six-digit values while the Fit keeps exact ones, so the
+        # arrow appears only when the displayed values differ.
+        tab = _display(dict(mapped_by_id[dataset_id].initial_values)[name])
+        start = _display(used[(dataset_id, name)])
+        text = tab if start == tab else f"{tab} → {start}"
+        number = group_numbers.get((dataset_id, name))
+        return text if number is None else f"{text} (Group {number})"
+
     if species:
         provenance += "<h3>Initial Concentrations (M)</h3>" + _table(
             ("Dataset", *species),
             ((mapped_by_id[item.dataset_id].display_name,
-              *(starts[(mapped_by_id[item.dataset_id].set_id, name)] for name in species))
+              *(start_text(item.dataset_id, name) for name in species))
              for item in included))
     provenance += f"<p>Weighting: {_text(FIT_DATASET_WEIGHT_MODE_LABELS[request_setup.dataset_weight_mode])}. Weighted residual = raw residual × √normalized dataset weight × √normalized target weight.</p>"
     for title, analysis in (("Profile Likelihood", profile), ("Residual Bootstrap", bootstrap)):

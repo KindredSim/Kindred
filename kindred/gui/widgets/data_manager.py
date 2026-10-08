@@ -163,7 +163,7 @@ class _SourceDialog(QtWidgets.QDialog):
         layout = QtWidgets.QVBoxLayout(self)
         layout.setSpacing(8)
         metadata = thaw_json_value(record.source_metadata)
-        original = QtWidgets.QGroupBox("Original file" if source is not None else "Created in Kindred")
+        original = QtWidgets.QGroupBox("Original File" if source is not None else "Created in Kindred")
         form = QtWidgets.QFormLayout(original)
         form.setRowWrapPolicy(QtWidgets.QFormLayout.WrapLongRows)
         form.setVerticalSpacing(6)

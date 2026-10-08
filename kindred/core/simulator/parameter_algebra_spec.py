@@ -976,7 +976,7 @@ def _split_unit_clause(rhs: str, line_number: int, line_content: str) -> tuple[s
             raise ValueError("Expected one trailing '; unit = ...' declaration.")
         key, value = parts[1].split("=", 1)
         if key.strip() != "unit":
-            raise ValueError(f"Unknown parameter/observable annotation {key.strip()!r}; expected 'unit'.")
+            raise ValueError(f"Unknown parameter/observable annotation {key.strip()!r}. Expected 'unit'.")
         return parts[0].strip(), parse_declared_unit(value)
     except ValueError as exc:
         raise DSLError(str(exc), line_number=line_number, line_content=line_content) from exc
@@ -1157,7 +1157,7 @@ def extract_parameter_assignments_from_algebra_lines(
             target = resolution.canonical_name or target_raw
             if resolution.canonical_name is not None and target in mechanism_param_names:
                 raise DSLError(
-                    f"{target_raw!r} is a rate/equilibrium parameter. Use 'param {target_raw} = ...' for parameter algebra",
+                    f"{target_raw!r} is a rate/equilibrium parameter. Use 'param {target_raw} = ...' for parameter algebra.",
                     suggestion=f"Replace this with: param {target_raw} = ...",
                     examples=[f"param {target_raw} = 4*k2"],
                     line_number=line_no,

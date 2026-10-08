@@ -341,12 +341,7 @@ def _result_warning_details(result: SimulationResultValue) -> tuple[str, ...]:
     for cause in result.algebra_errors:
         raw_name = cause.details.get("name")
         observable_name = str(raw_name or "<unknown observable>")
-        code = cause.code if cause.code is not None else "<none>"
-        details.append(
-            "Algebra error for "
-            f"{observable_name}: {cause.message}"
-            + (f" [{code}]" if code else "")
-        )
+        details.append(f"Algebra error for {observable_name}: {cause.message}")
     return tuple(details)
 
 
@@ -959,7 +954,7 @@ def _xlsx_literal_cell(sheet: object, value: object) -> object:
     length = len(value)
     if length > _MAX_XLSX_STRING_LENGTH:
         raise ValueError(
-            "XLSX string cell exceeds the physical limit of Excel of "
+            "XLSX string cell exceeds the Excel limit of "
             f"{_MAX_XLSX_STRING_LENGTH:,} characters (got {length:,})."
         )
     cell = WriteOnlyCell(sheet, value=value)

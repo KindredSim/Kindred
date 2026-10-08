@@ -263,8 +263,8 @@ class FitTrackerPanel(QtWidgets.QWidget):
             phase, detail = "Running", f"Objective calls {update.iteration} · Best complete candidate"
         self.set_phase(phase, detail)
 
-    def set_summary(self, overview: tuple[str, ...], outcome: str, entries: tuple[FitValueEntry, ...]) -> None:
-        self._overview, self._outcome = overview, outcome
+    def set_summary(self, overview: tuple[str, ...], entries: tuple[FitValueEntry, ...]) -> None:
+        self._overview, self._outcome = overview, ""
         self._phase = ""
         self._set_entries(entries)
         self._render()
@@ -497,7 +497,7 @@ class RunResultsTab(QtWidgets.QWidget):
             self._render_diagnostic_label.hide()
         else:
             overview, self._summary_body, self._summary_provenance, entries = fit_candidate_presentation(candidate)
-            self._tracker_panel.set_summary(overview, "", entries)
+            self._tracker_panel.set_summary(overview, entries)
         self._install_plot_projection(curves)
         self._refresh_summary()
         if curve_failure is not None:

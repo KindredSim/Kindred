@@ -1431,7 +1431,7 @@ def _reject_per_step_globals(
         )
     if "energy" in params:
         raise _DSLError(
-            "Per-reaction energy= is not supported. Use a global energy= directive",
+            "Per-reaction energy= is not supported. Use a global energy= directive.",
             line_number=line_number, line_content=line_content,
         )
 

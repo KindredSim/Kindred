@@ -88,7 +88,7 @@ class _SheetModel(QtCore.QAbstractTableModel):
                 tip += ("\n\nThe unit of the formula could not be inferred. Its numbers are calculated from the "
                         "scientific values (M, s, K, J/mol, m³) of the columns it uses and are used as they are. "
                         "To give it a unit, take plain numbers from a column that has a unit, or delete the "
-                        "formula including = and use Correct unit declaration.")
+                        "formula including = and use Correct Unit Declaration… on this column.")
             return literal_tooltip(tip)
         return None
 
@@ -153,7 +153,7 @@ class _CellDelegate(QtWidgets.QStyledItemDelegate):
 def _unit_labels(column):
     """Plain text and scientific markup for a column's unit."""
     if column["unit"] is None:
-        text = "Unspecified" if column["declared"] else "Choose unit"
+        text = "Unspecified" if column["declared"] else "Choose Unit"
         return text, text
     return data_unit_labels(parse_unit(column["unit"]))
 
@@ -276,7 +276,7 @@ class _SheetHeader(QtWidgets.QHeaderView):
             control.setAccessibleName("Column unit")
             control.setToolTip("Correct declaration: numbers stay unchanged." if correction else
                                "Changing an established unit converts its values. The first unit declares their meaning.")
-            control.addItem(_unit_labels(spec)[0] if spec["unit"] is None else "Choose Unit…", None)
+            control.addItem(_unit_labels(spec)[0] if spec["unit"] is None else "Choose Unit", None)
             choices = list(TIME_UNIT_DISPLAY if timed else MEASUREMENT_UNIT_DISPLAY)
             if spec["unit"] is not None:
                 # The column's unit takes the place of a preset displayed the same way (uM as µM).
@@ -493,8 +493,8 @@ class SpreadsheetEditorDialog(QtWidgets.QDialog):
         self._toolbar.addSeparator()
         self._action("Copy", self._copy, QtGui.QKeySequence.Copy)
         self._action("Paste", self._paste, QtGui.QKeySequence.Paste)
-        self._action("Fill down", self._fill, "Ctrl+D")
-        self._clear = self._action("Clear cells", self._clear_cells, "Delete", toolbar=False)
+        self._action("Fill Down", self._fill, "Ctrl+D")
+        self._clear = self._action("Clear Cells", self._clear_cells, "Delete", toolbar=False)
         self._toolbar.addSeparator()
         self._rows_menu = QtWidgets.QMenu(self)
         self._rows_menu.addAction("Insert Rows", lambda: self._rows(False))

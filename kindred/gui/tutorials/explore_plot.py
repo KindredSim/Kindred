@@ -134,7 +134,7 @@ class ExplorePlot(PracticeLesson):
                 "<p>Open <b>Appearance</b> in the plot menu. <b>Show Grid</b> switches both directions together. "
                 "<b>X Grid</b> shows vertical lines and <b>Y Grid</b> shows horizontal lines.</p>"
                 "<p>Turn off X Grid and notice that Show Grid is no longer checked. Enable Show Grid to restore both.</p>"
-                "<p>Try <b>Grid opacity</b>. Lower values make the lines fainter. Restore both grid directions "
+                "<p>Try <b>Grid Opacity</b>. Lower values make the lines fainter. Restore both grid directions "
                 "and set the opacity to <b>25%</b>.</p>",
                 plot,
                 manual=True,
@@ -144,7 +144,7 @@ class ExplorePlot(PracticeLesson):
                 "Show Points and Adjust Visibility",
                 "<p>Enable <b>Appearance → Simulation Sample Markers</b>. The points mark the samples supplied to the curves. "
                 "Downsampling changes which points are shown. Experimental markers have separate settings.</p>"
-                "<p>Lower <b>Simulation opacity</b>, then restore <b>100%</b>. Reference and Preview curves keep their usual "
+                "<p>Lower <b>Simulation Opacity</b>, then restore <b>100%</b>. Reference and Preview curves keep their usual "
                 "relative transparency when you adjust this setting.</p>"
                 "<p>Try <b>Appearance → Show Legend</b> off and on. Finish with the legend visible and simulation markers off.</p>",
                 plot,

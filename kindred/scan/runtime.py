@@ -217,7 +217,7 @@ def run_scan(config, prepared, cancel, progress_callback):
                             record.update(simulation_status="failed", export_status="not_applicable", stage="worker",
                                           error={"type": "WorkerExit", "message": "Worker exited before returning its result."})
                             consume(record)
-                        fail("A worker exited unexpectedly; remaining work was canceled without retries.")
+                        fail("A worker exited unexpectedly. Remaining work was canceled without retries.")
                     child.process.join()
                     if child.process.exitcode and not progress.error:
                         fail(f"A local worker exited with code {child.process.exitcode}.")

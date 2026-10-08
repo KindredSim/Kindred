@@ -374,7 +374,7 @@ def fit_parameters(
                 if rank < param_count:
                     identifiability_warning = (
                         "These data cannot determine every fitted value independently. "
-                        f"The fit Jacobian has rank {rank} for {param_count} fitted values."
+                        f"The fit Jacobian has rank {rank} for {param_count} fitted value{'' if param_count == 1 else 's'}."
                     )
             except Exception as exc:
                 logger.debug("Failed to assess Fit Jacobian rank: %s", exc)

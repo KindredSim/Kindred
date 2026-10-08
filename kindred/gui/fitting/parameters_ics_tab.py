@@ -53,6 +53,7 @@ from kindred.gui.fitting.launch import (
     fit_group_labels,
     fit_uncertainty_coordinates,
     prune_fit_analysis_coordinates,
+    skipped_fit_analysis_coordinates,
     _replace_fit_parameter,
     convert_fit_parameter_scope,
 )
@@ -1550,11 +1551,11 @@ class ParametersIcsTab(QtWidgets.QWidget):
         groups = sorted(config.groups, key=lambda group: labels[group[0]][0])
         included = {item.dataset_id for item in self._projected_setup.datasets if item.included}
         dialog = QtWidgets.QDialog(self)
-        dialog.setWindowTitle(f"Datasets sharing {parameter.display_name}")
+        dialog.setWindowTitle(f"Datasets Sharing {parameter.display_name}")
         layout = QtWidgets.QVBoxLayout(dialog)
         layout.addWidget(QtWidgets.QLabel(f"Datasets sharing {parameter.display_name}:", dialog))
         target = QtWidgets.QComboBox(dialog)
-        target.addItem("New group", None)
+        target.addItem("New Group", None)
         for group in groups:
             target.addItem(labels[group[0]][1], group[0])
         layout.addWidget(target)
@@ -1622,8 +1623,8 @@ class ParametersIcsTab(QtWidgets.QWidget):
         if self._defaults_error_text:
             # Only the tolerance pair rule fails without one box failing alone.
             located += [
-                f"Fit settings: {label}" for label in self._invalid_tolerance_labels()
-            ] or ["Fit settings: tolerances"]
+                f"Fit Settings: {label}" for label in self._invalid_tolerance_labels()
+            ] or ["Fit Settings: tolerances"]
         return tuple(located)
 
     def _store_invalid_numeric_draft(
@@ -1791,29 +1792,38 @@ class ParametersIcsTab(QtWidgets.QWidget):
         try:
             self._profile_enabled.setChecked(profile is not None)
             self._bootstrap_enabled.setChecked(bootstrap is not None)
-            self._profile_summary.setText(self._analysis_summary(profile, "Profile"))
+            excluded = tuple(item.dataset_id for item in snapshot.datasets if not item.included)
+
+            def skipped(configuration: object | None) -> int:
+                return 0 if configuration is None else len(skipped_fit_analysis_coordinates(
+                    configuration.parameter_names, excluded_dataset_ids=excluded, parameters=snapshot.parameters,
+                ))
+
+            self._profile_summary.setText(self._analysis_summary(profile, "Profile", skipped(profile)))
             self._bootstrap_summary.setText(
-                self._analysis_summary(bootstrap, "Bootstrap")
+                self._analysis_summary(bootstrap, "Bootstrap", skipped(bootstrap))
             )
         finally:
             del blockers
 
     @staticmethod
-    def _analysis_summary(configuration: object | None, label: str) -> str:
+    def _analysis_summary(configuration: object | None, label: str, skipped: int) -> str:
+        """The card text; ``skipped`` counts selected targets whose datasets are all excluded."""
         if configuration is None:
             return "Not configured"
         names = tuple(getattr(configuration, "parameter_names", ()))
+        not_in_fit = f" ({skipped} not in fit)" if skipped else ""
         method = str(getattr(configuration, "optimizer_method", "trf"))
         if label == "Profile":
             detail = (
-                f"{len(names)} coordinate{'s' if len(names) != 1 else ''} · "
+                f"{len(names)} coordinate{'s' if len(names) != 1 else ''}{not_in_fit} · "
                 f"{getattr(configuration, 'confidence_level', 0.95):.0%} · "
                 f"{getattr(configuration, 'max_bracketing_steps_per_side', 0)} "
                 "maximum outward search steps/side"
             )
         else:
             detail = (
-                f"{len(names)} coordinate{'s' if len(names) != 1 else ''} · "
+                f"{len(names)} coordinate{'s' if len(names) != 1 else ''}{not_in_fit} · "
                 f"{getattr(configuration, 'replicates', 0)} refits · "
                 f"{getattr(configuration, 'minimum_success_fraction', 0.0):.0%} minimum"
             )
@@ -1843,9 +1853,17 @@ class ParametersIcsTab(QtWidgets.QWidget):
         )
 
     def _analysis_coordinate_display_names(self) -> dict[FitCoordinate, str]:
+        """Dialog labels; a target whose datasets are all excluded reads "(not in fit)"."""
+        setup = self._projected_setup
+        available = self._available_analysis_coordinates()
+        skipped = skipped_fit_analysis_coordinates(
+            available,
+            excluded_dataset_ids=(item.dataset_id for item in setup.datasets if not item.included),
+            parameters=setup.parameters,
+        )
         return {
-            raw: self._coordinate_display_name(raw)
-            for raw in self._available_analysis_coordinates()
+            raw: self._coordinate_display_name(raw) + (" (not in fit)" if raw in skipped else "")
+            for raw in available
         }
 
     def _open_profile_dialog(self) -> None:

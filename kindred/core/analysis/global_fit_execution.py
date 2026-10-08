@@ -522,10 +522,21 @@ def fit_result_message(
             return f"Fit completed. Optimizer stopped: {stopped}"
         return str(base_message)
     if status == "warn":
+        # A Stop's own message already says the fit stopped.
+        if optimizer_diagnostic is not None and optimizer_diagnostic.type == "FittingStopped":
+            return str(optimizer_diagnostic.message)
         warning_parts: list[str] = []
+        # A converged optimizer whose endpoint was replaced did not stop early.
+        replaced_after_convergence = (
+            optimizer_diagnostic is not None
+            and optimizer_diagnostic.type == "FittingUnavailableEndpointReplaced"
+            and optimizer_diagnostic.details.get("optimizer_converged") is True
+        )
         if not optimizer_converged:
             fallback = str(base_message or "").strip()
-            if fallback:
+            if fallback and replaced_after_convergence:
+                warning_parts.append(fallback)
+            elif fallback:
                 warning_parts.append(f"Optimizer stopped: {fallback}")
             else:
                 warning_parts.append("Optimizer stopped without a termination message")
@@ -534,7 +545,7 @@ def fit_result_message(
             if detail and detail != str(base_message or "").strip():
                 warning_parts.append(detail)
         if warning_parts:
-            return "Global fit completed with warnings: " + ", ".join(warning_parts)
+            return "Global fit completed with warnings: " + " ".join(warning_parts)
         fallback = str(base_message or "").strip()
         if fallback and "success" not in fallback.lower():
             return fallback
