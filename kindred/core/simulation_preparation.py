@@ -260,18 +260,11 @@ def _resolve_intervention_schedule_for_request(
             runtime_parameters=runtime_parameters,
         )
     except InterventionScheduleError as exc:
-        details = dict(getattr(exc, "details", {}) or {})
-        dependencies = tuple(
-            getattr(exc, "value_dependencies", ())
-            or details.get("value_dependencies", ())
-        )
-        if dependencies:
-            details["value_dependencies"] = dependencies
         raise SimulationPreparationError(
             "intervention_schedule",
             str(exc),
-            parameter_names=dependencies,
-            details=details,
+            parameter_names=exc.value_dependencies,
+            details=exc.details,
         ) from exc
 
 

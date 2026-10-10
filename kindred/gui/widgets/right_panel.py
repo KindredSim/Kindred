@@ -43,12 +43,6 @@ class RightPanelTabbed(QtWidgets.QWidget):
         self._tabs = QtWidgets.QTabWidget()
         layout.addWidget(self._tabs)
 
-        if not isinstance(data_panel, DataManagerPanel):
-            raise TypeError("RightPanelTabbed requires the retained DataManagerPanel.")
-        if not isinstance(overlay_panel, DatasetOverlayPanel):
-            raise TypeError(
-                "RightPanelTabbed requires the retained DatasetOverlayPanel."
-            )
         self._data_manager = data_panel
         self._data_manager.setObjectName("dataPanel")
         self._tabs.addTab(self._data_manager, "Data")

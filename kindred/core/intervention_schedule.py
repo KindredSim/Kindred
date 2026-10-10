@@ -61,11 +61,10 @@ class InterventionScheduleError(AuthoredSourceError):
         "operation",
         "declaration_ordinal",
         "field",
-        "nested_location",
         "domain",
         "field_identities",
         "value_dependencies",
-        "details",
+        "_extra_details",
         "_locked",
     )
 
@@ -76,7 +75,6 @@ class InterventionScheduleError(AuthoredSourceError):
         operation: str | None = None,
         declaration_ordinal: int | None = None,
         field: str | None = None,
-        nested_location: Mapping[str, Any] | None = None,
         domain: str | None = None,
         field_identities: Sequence[InterventionScheduleFieldIdentity] = (),
         value_dependencies: Sequence[str] = (),
@@ -96,21 +94,6 @@ class InterventionScheduleError(AuthoredSourceError):
             (int(declaration), None if nested is None else int(nested), str(path))
             for declaration, nested, path in field_identities
         )
-        payload = dict(details or {})
-        if operation is not None:
-            payload["operation"] = str(operation)
-        if declaration_ordinal is not None:
-            payload["declaration_ordinal"] = int(declaration_ordinal)
-        if field is not None:
-            payload["field"] = str(field)
-        if nested_location is not None:
-            payload["nested_location"] = nested_location
-        if domain is not None:
-            payload["domain"] = str(domain)
-        if normalized_field_identities:
-            payload["field_identities"] = normalized_field_identities
-        if normalized_dependencies:
-            payload["value_dependencies"] = normalized_dependencies
         object.__setattr__(self, "operation", None if operation is None else str(operation))
         object.__setattr__(
             self,
@@ -118,22 +101,30 @@ class InterventionScheduleError(AuthoredSourceError):
             None if declaration_ordinal is None else int(declaration_ordinal),
         )
         object.__setattr__(self, "field", None if field is None else str(field))
-        object.__setattr__(self, "nested_location", _freeze_schedule_value(nested_location))
         object.__setattr__(self, "domain", None if domain is None else str(domain))
         object.__setattr__(self, "field_identities", normalized_field_identities)
         object.__setattr__(self, "value_dependencies", normalized_dependencies)
         object.__setattr__(
             self,
-            "details",
-            MappingProxyType(
-                {
-                    str(key): _freeze_schedule_value(value)
-                    for key, value in payload.items()
-                }
-            ),
+            "_extra_details",
+            _freeze_schedule_value(details or {}),
         )
         super().__init__(str(message))
         object.__setattr__(self, "_locked", True)
+
+    @property
+    def details(self) -> Mapping[str, Any]:
+        """Project the owned facts for diagnostic consumers without a stored mirror."""
+        payload = dict(self._extra_details)
+        for name in ("operation", "declaration_ordinal", "field", "domain"):
+            value = getattr(self, name)
+            if value is not None:
+                payload[name] = value
+        if self.field_identities:
+            payload["field_identities"] = self.field_identities
+        if self.value_dependencies:
+            payload["value_dependencies"] = self.value_dependencies
+        return MappingProxyType(payload)
 
     def __setattr__(self, name: str, value: object) -> None:
         if getattr(self, "_locked", False):
@@ -1010,32 +1001,10 @@ class InterventionProtocol:
     def resolve_parameters(self, values: Mapping[str, Any], *, runtime_parameters: frozenset[str] = frozenset()) -> "InterventionProtocol":
         resolved_phases: dict[str, tuple[InterventionProtocolOperation, ...]] = {}
         for phase in ("before", "during", "after"):
-            resolved_items: list[InterventionProtocolOperation] = []
-            for nested in getattr(self, phase):
-                try:
-                    resolved_items.append(nested.resolve_parameters(values, runtime_parameters=runtime_parameters))
-                except InterventionScheduleError as exc:
-                    details = dict(getattr(exc, "details", {}) or {})
-                    details["nested_location"] = {
-                        "phase": phase,
-                        "authored_ordinal": nested.authored_ordinal,
-                    }
-                    dependencies = tuple(
-                        getattr(exc, "value_dependencies", ())
-                        or details.get("value_dependencies", ())
-                    )
-                    raise InterventionScheduleError(
-                        str(exc),
-                        operation=self.op,
-                        declaration_ordinal=self.declaration_ordinal,
-                        field=getattr(exc, "field", None),
-                        nested_location=details["nested_location"],
-                        domain=getattr(exc, "domain", None),
-                        field_identities=getattr(exc, "field_identities", ()),
-                        value_dependencies=dependencies,
-                        details=details,
-                    ) from exc
-            resolved_phases[phase] = tuple(resolved_items)
+            resolved_phases[phase] = tuple(
+                nested.resolve_parameters(values, runtime_parameters=runtime_parameters)
+                for nested in getattr(self, phase)
+            )
         return InterventionProtocol(
             start_time=_resolved(
                 self.start_time,
@@ -1227,15 +1196,7 @@ class InterventionTrigger:
         return self.threshold_param is not None or self.then.is_parameterized
 
     def resolve_parameters(self, values: Mapping[str, Any], *, runtime_parameters: frozenset[str] = frozenset()) -> InterventionTrigger:
-        try:
-            then = self.then.resolve_parameters(values, runtime_parameters=runtime_parameters)
-        except InterventionScheduleError as exc:
-            raise InterventionScheduleError(
-                str(exc), operation=self.op, declaration_ordinal=self.declaration_ordinal,
-                field=exc.field, nested_location={"path": "then"}, domain=exc.domain,
-                field_identities=exc.field_identities, value_dependencies=exc.value_dependencies,
-                details=exc.details,
-            ) from exc
+        then = self.then.resolve_parameters(values, runtime_parameters=runtime_parameters)
         return replace(
             self, then=then,
             **_resolved_payload(
@@ -1391,82 +1352,29 @@ class InterventionSchedule:
         return tuple(item for item in self.operations if isinstance(item, InterventionTrigger))
 
 
-def _schedule_field_identities(
-    operation: object,
-    fields: Sequence[str],
-    *,
-    nested_location: Mapping[str, Any] | None = None,
-) -> tuple[InterventionScheduleFieldIdentity, ...]:
-    declaration = int(getattr(operation, "declaration_ordinal", -1))
-    location = nested_location
-    if location is None:
-        nested_ordinal = getattr(operation, "authored_ordinal", None)
-        phase = str(getattr(operation, "phase", ""))
-        if nested_ordinal is not None and phase:
-            location = {"phase": phase, "authored_ordinal": int(nested_ordinal)}
-    nested_ordinal = None if location is None else location.get("authored_ordinal")
-    phase = "" if location is None else str(location.get("phase", ""))
-    path_prefix = ""
-    if nested_ordinal is not None and phase:
-        path_prefix = phase + "."
-    elif location is not None and location.get("path"):
-        path_prefix = str(location["path"]).rstrip(".") + "."
-    return tuple(
-        (
-            declaration,
-            None if nested_ordinal is None else int(nested_ordinal),
-            path_prefix + str(field),
-        )
-        for field in fields
-    )
-
-
 def _annotate_schedule_resolution_error(
     exc: InterventionScheduleError,
     *,
-    operation: object,
+    operation: InterventionOperation,
     dependency_metadata: InterventionScheduleDependencyMetadata,
 ) -> InterventionScheduleError:
-    details = dict(getattr(exc, "details", {}) or {})
-    nested_location = getattr(exc, "nested_location", None)
-    if nested_location is None:
-        raw_location = details.get("nested_location")
-        if isinstance(raw_location, Mapping):
-            nested_location = raw_location
-    existing_identities = tuple(getattr(exc, "field_identities", ()) or ())
-    fields = (getattr(exc, "field", None),) if getattr(exc, "field", None) else ()
-    identities = existing_identities or _schedule_field_identities(
-        operation,
-        tuple(str(field) for field in fields),
-        nested_location=nested_location,
+    identities = exc.field_identities or (
+        ((operation.declaration_ordinal, None, exc.field),)
+        if exc.field is not None else ()
     )
-    dependencies = {
-        str(name).strip()
-        for name in getattr(exc, "value_dependencies", ())
-        if str(name).strip()
-    }
     metadata_dependencies = {
-        str(name).strip()
+        name
         for identity in identities
         for name in dependency_metadata.get(identity, ())
-        if str(name).strip()
     }
-    if metadata_dependencies:
-        dependencies = metadata_dependencies
-    if identities:
-        details["field_identities"] = identities
-    if dependencies:
-        details["value_dependencies"] = tuple(sorted(dependencies))
     return InterventionScheduleError(
         str(exc),
-        operation=str(getattr(operation, "op", type(operation).__name__)),
-        declaration_ordinal=int(getattr(operation, "declaration_ordinal", -1)),
-        field=getattr(exc, "field", None),
-        nested_location=nested_location,
-        domain=getattr(exc, "domain", None),
+        operation=operation.op,
+        declaration_ordinal=operation.declaration_ordinal,
+        field=exc.field,
+        domain=exc.domain,
         field_identities=identities,
-        value_dependencies=tuple(sorted(dependencies)),
-        details=details,
+        value_dependencies=tuple(sorted(metadata_dependencies)) or exc.value_dependencies,
     )
 
 

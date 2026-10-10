@@ -11,17 +11,16 @@ from kindred.core.quantity_units import format_unit_for_display, parse_unit
 from kindred.core.validation import parse_finite_numeric_text
 
 from functools import partial
-from dataclasses import dataclass
 import logging
 import math
 import sys
 from typing import Dict, Iterable, Optional, Tuple
 
-from PySide6 import QtCore, QtGui, QtWidgets
+from PySide6 import QtCore, QtWidgets
 from PySide6.QtCore import Signal
 
 from kindred.gui.interactive_preview import SliderInteractionKind
-from kindred.gui.widgets.fine_drag_slider import FineDragSlider
+from kindred.gui.widgets.fine_drag_slider import FineDragSlider, NumericValueEdit, SliderPress
 from html import escape
 from kindred.gui.display_name_policy import (
     CompactText,
@@ -41,36 +40,11 @@ logger = logging.getLogger(__name__)
 __all__ = ["VariableSliders"]
 
 
-@dataclass(slots=True)
-class _SliderPress:
-    """Single physical press record owned by one Slider widget."""
-
-    start_position: int
-    moved: bool = False
-
 _LOG_SLIDER_VALUE_MIN = 1e-12
 _LOG_SLIDER_EXP_MIN = -12.0
 _LOG_SLIDER_EXP_MAX = 12.0
 _LOG_DOMAIN_MIN = math.log10(float.fromhex("0x0.0000000000001p-1022"))
 _LOG_DOMAIN_MAX = math.log10(sys.float_info.max)
-
-
-class _NumericValueEdit(QtWidgets.QLineEdit):
-    """A raw numeric draft editor with local Escape/focus notifications."""
-
-    editStarted = Signal()
-    editEscape = Signal()
-
-    def focusInEvent(self, event: QtGui.QFocusEvent) -> None:
-        super().focusInEvent(event)
-        self.editStarted.emit()
-
-    def keyPressEvent(self, event: QtGui.QKeyEvent) -> None:
-        if event.key() == QtCore.Qt.Key.Key_Escape:
-            self.editEscape.emit()
-            event.accept()
-            return
-        super().keyPressEvent(event)
 
 
 class VariableSliders(QtWidgets.QWidget):
@@ -121,7 +95,7 @@ class VariableSliders(QtWidgets.QWidget):
         self._slider_callbacks: Dict[str, Dict[str, object]] = {}
         self._hidden_names: set[str] = set()
         self._visibility_scope_signature: object | None = None
-        self._active_presses: Dict[str, _SliderPress] = {}
+        self._active_presses: Dict[str, SliderPress] = {}
         self._editor_pre_edit_state: Dict[str, tuple[float, str, bool]] = {}
         self._last_committed_editor_text: Dict[str, str] = {}
 
@@ -265,7 +239,7 @@ class VariableSliders(QtWidgets.QWidget):
         if unit_label is not None:
             top_row.addWidget(unit_label)
 
-        value_label = _NumericValueEdit(self._format_value(value))
+        value_label = NumericValueEdit(self._format_value(value))
         configure_compact_numeric_edit(value_label, characters=15)
         value_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignRight)
         value_label.editStarted.connect(
@@ -361,7 +335,7 @@ class VariableSliders(QtWidgets.QWidget):
         name_s = str(name)
         slider = self._sliders.get(name_s)
         if slider is not None:
-            self._active_presses[name_s] = _SliderPress(
+            self._active_presses[name_s] = SliderPress(
                 start_position=int(slider.sliderPosition()),
             )
 
@@ -721,11 +695,11 @@ class VariableSliders(QtWidgets.QWidget):
 
     def _editor_has_focus(self, name: str) -> bool:
         editor = self._value_labels.get(str(name))
-        return isinstance(editor, _NumericValueEdit) and editor.hasFocus()
+        return isinstance(editor, NumericValueEdit) and editor.hasFocus()
 
     def _on_editor_started(self, name: str) -> None:
         editor = self._value_labels.get(str(name))
-        if not isinstance(editor, _NumericValueEdit):
+        if not isinstance(editor, NumericValueEdit):
             return
         self.remember_editor_state(name)
         self._last_committed_editor_text.pop(str(name), None)
@@ -741,7 +715,7 @@ class VariableSliders(QtWidgets.QWidget):
 
     def _on_editor_escape(self, name: str) -> None:
         editor = self._value_labels.get(str(name))
-        if not isinstance(editor, _NumericValueEdit):
+        if not isinstance(editor, NumericValueEdit):
             return
         value = self._variables.get(str(name), 0.0)
         value, text, rejected = self._editor_pre_edit_state.get(
@@ -769,7 +743,7 @@ class VariableSliders(QtWidgets.QWidget):
 
     def _decorate_editor(self, name: str, *, rejected: bool = False) -> None:
         editor = self._value_labels.get(str(name))
-        if not isinstance(editor, _NumericValueEdit):
+        if not isinstance(editor, NumericValueEdit):
             return
         try:
             value = parse_finite_numeric_text(editor.text().strip())
@@ -789,7 +763,7 @@ class VariableSliders(QtWidgets.QWidget):
     def _commit_editor(self, name: str) -> None:
         name_s = str(name)
         editor = self._value_labels.get(name_s)
-        if not isinstance(editor, _NumericValueEdit):
+        if not isinstance(editor, NumericValueEdit):
             return
         raw = editor.text()
         if raw == self._last_committed_editor_text.get(name_s):
@@ -835,7 +809,7 @@ class VariableSliders(QtWidgets.QWidget):
         with QtCore.QSignalBlocker(slider):
             slider.setValue(self._value_to_slider_pos(name_s, value_f))
         value_label = self._value_labels.get(name_s)
-        if isinstance(value_label, _NumericValueEdit):
+        if isinstance(value_label, NumericValueEdit):
             if (
                 not emit and editor_text is None
                 and value_label.property("invalidNumeric")

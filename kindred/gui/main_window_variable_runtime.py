@@ -17,11 +17,7 @@ from kindred.core.project_document import (
     canonical_species_names,
     reconcile_tab_mechanism_source,
 )
-from kindred.core.simulation_preparation import (
-    SimulationExecutionRequest,
-    build_simulation_execution_request,
-)
-from kindred.core.simulation_preparation_stages import build_solver_config
+from kindred.core.simulation_preparation import SimulationExecutionRequest
 from kindred.core.species import validate_concentration
 from kindred.core.simulator.dsl_parse import (
     DslParameterCoordinateUpdate,
@@ -32,6 +28,7 @@ from kindred.gui.controllers.simulation_job_owner import (
     PreviewCapture,
     PreviewTarget,
     build_explicit_target,
+    build_execution_request,
 )
 from kindred.gui.interactive_preview import (
     InteractivePreviewRequest,
@@ -675,21 +672,13 @@ class TabSliderBinding(QtCore.QObject):
             settings = tab.resolved_execution_settings(set_id)
             initials = dict(canonical_initial_values(tab, set_id))
             initials.update(runtime.slider_species_drafts_by_set_id.get(set_id, {}))
-            request = build_simulation_execution_request(
+            request = build_execution_request(
                 prepared_dsl=tab.prepared_dsl,
                 initial_values=initials.items(),
-                t_span=(settings.t_start, settings.t_end),
-                solver_config=build_solver_config(
-                    solver_input=settings.solver,
-                    rtol=tab.scientific_settings.rtol,
-                    atol=tab.scientific_settings.atol,
-                    grid={"N": self._preview_points},
-                    use_analytic_jacobian=(
-                        tab.scientific_settings.analytic_jacobian_policy
-                    ),
-                ),
+                execution_settings=settings,
+                scientific_settings=tab.scientific_settings,
+                point_count=self._preview_points,
                 parameter_values=runtime.slider_parameter_draft or None,
-                use_authored_stops=tab.scientific_settings.use_authored_stops,
             )
             output.append((set_id, tab.initial_condition_set(set_id).name, request))
         return tuple(output)

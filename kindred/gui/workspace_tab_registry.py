@@ -571,7 +571,7 @@ class WorkspaceTabRegistry:
             ].tab_id
         return result
 
-    def tab_has_content_or_drafts(
+    def tab_has_content(
         self,
         tab_id: str,
         *,
@@ -585,7 +585,6 @@ class WorkspaceTabRegistry:
                 fresh_scientific_settings=fresh_scientific_settings,
             )
             or not self.presentation(tab_id).is_default_for(tab)
-            or self.tab_runtime(tab_id).has_dirty_drafts
         )
 
     def replace_tab(

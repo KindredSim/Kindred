@@ -6,7 +6,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 import os
 from threading import Event
-from typing import Callable, Iterable, Literal
+from typing import Callable, Iterable, Literal, Mapping
 
 from PySide6 import QtCore
 
@@ -37,6 +37,7 @@ __all__ = [
     "PreviewCapture",
     "SimulationJobOwner",
     "build_explicit_target",
+    "build_execution_request",
 ]
 
 
@@ -134,22 +135,41 @@ class _TargetTerminalOutcome:
     message: str = ""
 
 
-def build_explicit_target(*, prepared_dsl: PreparedDslRequestSet, tab_id: str, set_id: str, set_name: str,
-                          initial_values: Iterable[tuple[str, float]],
-                          execution_settings: SimulationExecutionSettings, scientific_settings: TabScientificSettings) -> ExplicitRunTarget:
+def build_execution_request(
+    *,
+    prepared_dsl: PreparedDslRequestSet,
+    initial_values: Iterable[tuple[str, float]],
+    execution_settings: SimulationExecutionSettings,
+    scientific_settings: TabScientificSettings,
+    point_count: int | None = None,
+    parameter_values: Mapping[str, float] | None = None,
+) -> SimulationExecutionRequest:
+    """Assemble Run or Preview science from its owner's captured inputs."""
     solver_config = build_solver_config(
         solver_input=execution_settings.solver,
         rtol=scientific_settings.rtol,
         atol=scientific_settings.atol,
-        grid={"N": execution_settings.integration_points},
+        grid={"N": execution_settings.integration_points if point_count is None else point_count},
         use_analytic_jacobian=scientific_settings.analytic_jacobian_policy,
     )
-    execution_request = build_simulation_execution_request(
+    return build_simulation_execution_request(
         prepared_dsl=prepared_dsl,
         initial_values=initial_values,
         t_span=(execution_settings.t_start, execution_settings.t_end),
         solver_config=solver_config,
+        parameter_values=parameter_values,
         use_authored_stops=scientific_settings.use_authored_stops,
+    )
+
+
+def build_explicit_target(*, prepared_dsl: PreparedDslRequestSet, tab_id: str, set_id: str, set_name: str,
+                          initial_values: Iterable[tuple[str, float]],
+                          execution_settings: SimulationExecutionSettings, scientific_settings: TabScientificSettings) -> ExplicitRunTarget:
+    execution_request = build_execution_request(
+        prepared_dsl=prepared_dsl,
+        initial_values=initial_values,
+        execution_settings=execution_settings,
+        scientific_settings=scientific_settings,
     )
     return ExplicitRunTarget(tab_id, set_id, set_name, execution_request)
 

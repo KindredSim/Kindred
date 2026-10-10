@@ -110,10 +110,6 @@ class BatchInitialConditionsTableModel(QtCore.QAbstractTableModel):
         invalid_raw_by_set: dict[str, dict[str, str]] | None = None,
         species_names: Sequence[str] | None = None,
     ) -> None:
-        if not isinstance(tab, MechanismTabDocument):
-            raise TypeError("tab must be a MechanismTabDocument.")
-        if not isinstance(presentation, ProjectPresentationState):
-            raise TypeError("presentation must be ProjectPresentationState.")
         if species_names is None:
             species = canonical_species_names(tab)
         else:
@@ -746,10 +742,6 @@ class InitialConditionsTableActions(QtCore.QObject):
     ) -> None:
         """Apply one fully prepared table projection."""
 
-        if not isinstance(projection, _InitialConditionsRenderProjection):
-            raise TypeError(
-                "projection must be _InitialConditionsRenderProjection."
-            )
         selection = self._table.selectionModel()
         selection_blocker = QtCore.QSignalBlocker(selection)
         self._rendering = True

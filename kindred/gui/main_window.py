@@ -55,6 +55,7 @@ from kindred.core.project_session import (
 from kindred.core.project_presentation_state import (
     AxisSeriesSelection,
     ExperimentalAxisSelection,
+    ProjectPresentationState,
     SimulationSeriesAxisSelection,
 )
 from kindred.core.result_repository import (
@@ -1018,17 +1019,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 bundle.slider_binding.settle_render_projection(slider_projection)
             finally:
                 bundle.slider_binding.publish_slider_draft_state()
-            data_snapshot = build_data_manager_snapshot(
-                document=document,
-                active_tab=tab,
-                presentation=presentation,
-            )
-            bundle.data_panel.render_snapshot(data_snapshot, document)
-            bundle.overlay_panel.render_snapshot(
-                records=data_snapshot.datasets,
-                active_links=data_snapshot.active_links,
-                known_species=tuple(canonical_observation_target_names(tab)),
-            )
+            self._render_dataset_panels(bundle, document, tab, presentation)
             target_names = tuple(
                 tab.initial_condition_set(set_id).name
                 for set_id in slider_projection.targets
@@ -1057,6 +1048,25 @@ class MainWindow(QtWidgets.QMainWindow):
             self._render_results_for_tab(tab.tab_id)
         self._refresh_actions()
 
+    @staticmethod
+    def _render_dataset_panels(
+        bundle: _TabSurfaceBundle,
+        document: ProjectDocument,
+        tab: MechanismTabDocument,
+        presentation: ProjectPresentationState,
+    ) -> None:
+        snapshot = build_data_manager_snapshot(
+            document=document,
+            active_tab=tab,
+            presentation=presentation,
+        )
+        bundle.data_panel.render_snapshot(snapshot, document)
+        bundle.overlay_panel.render_snapshot(
+            records=snapshot.datasets,
+            active_links=snapshot.active_links,
+            known_species=tuple(canonical_observation_target_names(tab)),
+        )
+
     def _refresh_dataset_views(
         self,
         tab_ids: Iterable[str] | None = None,
@@ -1075,16 +1085,9 @@ class MainWindow(QtWidgets.QMainWindow):
                 if bundle is None:
                     continue
                 tab = document.tab(tab_id)
-                snapshot = build_data_manager_snapshot(
-                    document=document,
-                    active_tab=tab,
-                    presentation=self._workspace_tab_registry.presentation(tab_id),
-                )
-                bundle.data_panel.render_snapshot(snapshot, document)
-                bundle.overlay_panel.render_snapshot(
-                    records=snapshot.datasets,
-                    active_links=snapshot.active_links,
-                    known_species=tuple(canonical_observation_target_names(tab)),
+                self._render_dataset_panels(
+                    bundle, document, tab,
+                    self._workspace_tab_registry.presentation(tab_id),
                 )
                 self._render_results_for_tab(tab_id)
         finally:
@@ -1546,15 +1549,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self._capture_visible_tab_inputs(tab_id=str(tab_id))
         runtime = self._workspace_tab_registry.tab_runtime(tab_id)
         bundle = self._tab_surfaces[str(tab_id)]
-        has_content = self._workspace_tab_registry.tab_has_content_or_drafts(
+        has_content = self._workspace_tab_registry.tab_has_content(
             tab_id,
             fresh_run_defaults=self.config_controller.application_run_defaults(),
             fresh_scientific_settings=(
                 self.config_controller.application_scientific_defaults()
             ),
         )
-        has_content = bool(has_content or bundle.simulation_panel.has_run_defaults_draft)
-        if has_content:
+        if has_content or self._tab_has_drafts(tab_id):
             dialog = QtWidgets.QMessageBox(self)
             dialog.setWindowTitle("Delete Mechanism")
             dialog.setIcon(QtWidgets.QMessageBox.Icon.Warning)
@@ -2662,8 +2664,6 @@ class MainWindow(QtWidgets.QMainWindow):
                 )
                 if isinstance(proposal, MechanismSourceCollision):
                     proposal = proposal.replacement
-                if not isinstance(proposal, MechanismSourceReconciliation):
-                    raise TypeError("Incoming source reconciliation returned an invalid result.")
                 candidate = proposal.proposed_document
             return validate_project_document(candidate)
         except Exception as exc:
@@ -2726,8 +2726,6 @@ class MainWindow(QtWidgets.QMainWindow):
             if dialog.clickedButton() is not replace_button:
                 return None
             proposal = proposal.replacement
-        if not isinstance(proposal, MechanismSourceReconciliation):
-            raise TypeError("Mechanism reconciliation returned an invalid result.")
         return proposal
 
     def _accept_external_source(

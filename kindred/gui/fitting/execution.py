@@ -57,7 +57,7 @@ from kindred.gui.fitting.launch import (
     _FitDispatchCompilation,
     FitExecutionRequest,
     FitOriginSnapshot,
-    FitSelectedObservation,
+    FitObservationSnapshot,
     FitPreparedDatasetConfig,
     FitSetupSnapshot,
     _replace_fit_parameter,
@@ -209,7 +209,7 @@ class FitCandidate:
         )
 
 def _observed_curve_parts(
-    observations: tuple[FitSelectedObservation, ...],
+    observations: tuple[FitObservationSnapshot, ...],
     *,
     x_observations: FitObservationSeries | None = None,
 ) -> tuple[
@@ -256,7 +256,7 @@ def _observed_curve_parts(
 
 
 def _series_from_selected(
-    observation: FitSelectedObservation,
+    observation: FitObservationSnapshot,
 ) -> FitObservationSeries:
     """Lower one retained immutable selection into the evaluator payload."""
 

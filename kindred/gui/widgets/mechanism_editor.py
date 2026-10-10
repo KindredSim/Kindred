@@ -1288,14 +1288,7 @@ class MechanismEditorBinding(QtCore.QObject):
         parent: QtCore.QObject | None = None,
     ) -> None:
         super().__init__(parent)
-        target = str(tab_id).strip()
-        if not target:
-            raise ValueError("tab_id must be nonblank.")
-        if not isinstance(editor, MechanismEditorTabbed):
-            raise TypeError("editor must be MechanismEditorTabbed.")
-        if not callable(getattr(registry, "tab", None)):
-            raise TypeError("registry must provide tab(tab_id).")
-        self._tab_id = target
+        self._tab_id = tab_id
         self._editor = editor
         self._registry = registry
         self._rendering = False
@@ -1328,10 +1321,6 @@ class MechanismEditorBinding(QtCore.QObject):
         self,
         projection: _MechanismEditorRenderProjection,
     ) -> None:
-        if not isinstance(projection, _MechanismEditorRenderProjection):
-            raise TypeError(
-                "projection must be _MechanismEditorRenderProjection."
-            )
         self._rendering = True
         try:
             self._editor.render_authoring_snapshot(

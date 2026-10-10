@@ -63,7 +63,6 @@ __all__ = [
     "FitObservationSnapshot",
     "FitOriginSnapshot",
     "FitParameterVariable",
-    "FitSelectedObservation",
     "FitSetupSnapshot",
     "build_fit_execution_request",
     "capture_fit_origin",
@@ -855,8 +854,8 @@ class FitPreparedDatasetConfig:
     """
 
     dataset_id: str
-    selected_observations: tuple[FitSelectedObservation, ...]
-    parametric_x_observation: FitSelectedObservation | None
+    selected_observations: tuple[FitObservationSnapshot, ...]
+    parametric_x_observation: FitObservationSnapshot | None
     retained_times: tuple[float, ...]
     execution_t_start: float
     execution_t_end: float
@@ -937,16 +936,6 @@ class FitSetupSnapshot:
             profile_likelihood=self.profile_likelihood,
             residual_bootstrap=self.residual_bootstrap,
         )
-
-@dataclass(frozen=True, slots=True)
-class FitSelectedObservation:
-    raw_observation_id: str
-    raw_column: str
-    model_target: str
-    unit: Unit | None
-    t: tuple[float, ...]
-    y: tuple[float, ...]
-    source_rows: tuple[int, ...]
 
 
 def _scan_parameters(
@@ -1141,8 +1130,8 @@ def capture_fit_origin(
 def selected_observations(
     mapped: FitMappedDatasetSnapshot,
     local: FitDatasetLocalSettings,
-) -> tuple[FitSelectedObservation, ...]:
-    """Materialize the retained observation projection for one dataset."""
+) -> tuple[tuple[FitObservationSnapshot, ...], FitObservationSnapshot | None]:
+    """Select Y observations and their shared measured-X row capture."""
     target_by_raw_id = {
         raw_id: model_target
         for raw_id, model_target in local.observation_targets
@@ -1167,6 +1156,7 @@ def selected_observations(
         )
 
     x_rows: set[int] | None = None
+    x_observation: FitObservationSnapshot | None = None
     if local.parametric is not None:
         x_raw_ids = tuple(
             raw_id
@@ -1205,7 +1195,7 @@ def selected_observations(
             )
         x_rows = set(x_observation.source_rows)
 
-    selected: list[FitSelectedObservation] = []
+    selected: list[FitObservationSnapshot] = []
     for target in local.target_species:
         observation = observations_by_target[target]
         if x_rows is None and not observation.t:
@@ -1234,7 +1224,7 @@ def selected_observations(
                 for index in compute_sampled_indices(count=len(usable), n_points=maximum)
             )
         selected.append(
-            FitSelectedObservation(
+            FitObservationSnapshot(
                 raw_observation_id=observation.raw_observation_id,
                 raw_column=observation.raw_column,
                 model_target=target,
@@ -1246,7 +1236,24 @@ def selected_observations(
                 ),
             )
         )
-    return tuple(selected)
+    if x_observation is None or not selected:
+        return tuple(selected), None
+    retained_rows = {
+        row for observation in selected for row in observation.source_rows
+    }
+    indices = tuple(
+        index for index, row in enumerate(x_observation.source_rows)
+        if row in retained_rows
+    )
+    return tuple(selected), FitObservationSnapshot(
+        raw_observation_id=x_observation.raw_observation_id,
+        raw_column=x_observation.raw_column,
+        model_target=local.parametric.x_name,
+        unit=x_observation.unit,
+        t=tuple(float(x_observation.t[index]) for index in indices) if x_observation.t else (),
+        y=tuple(float(x_observation.y[index]) for index in indices),
+        source_rows=tuple(x_observation.source_rows[index] for index in indices),
+    )
 
 
 def fit_setup_readiness(
@@ -1284,7 +1291,7 @@ def fit_setup_readiness(
             return f"Dataset {mapped.display_name!r} must select at least one target."
         if check_observations:
             try:
-                observations = selected_observations(mapped, local)
+                observations, _ = selected_observations(mapped, local)
             except (KeyError, TypeError, ValueError) as exc:
                 return str(exc)
             if not observations:
@@ -1337,65 +1344,6 @@ def fit_setup_readiness(
     return None
 
 
-def _selected_parametric_x_observation(
-    mapped: FitMappedDatasetSnapshot,
-    local: FitDatasetLocalSettings,
-    selected: tuple[FitSelectedObservation, ...],
-) -> FitSelectedObservation | None:
-    """Materialize the one row-aligned Parametric-X capture with the Y rows."""
-
-    parametric = local.parametric
-    if parametric is None:
-        return None
-    x_raw_ids = tuple(
-        raw_id
-        for raw_id, target in local.observation_targets
-        if target == parametric.x_name
-    )
-    if len(x_raw_ids) != 1:
-        raise ValueError(
-            f"Dataset {mapped.display_name!r} Parametric-X series "
-            f"{parametric.x_name!r} must map to exactly one observation."
-        )
-    x_source = next(
-        (
-            observation
-            for observation in mapped.observations
-            if observation.raw_observation_id == x_raw_ids[0]
-        ),
-        None,
-    )
-    if x_source is None:
-        raise ValueError(
-            f"Dataset {mapped.display_name!r} Parametric-X mapping references "
-            f"missing raw observation {x_raw_ids[0]!r}."
-        )
-    retained_rows = {
-        int(row)
-        for observation in selected
-        for row in observation.source_rows
-    }
-    indices = tuple(
-        index
-        for index, row in enumerate(x_source.source_rows)
-        if int(row) in retained_rows
-    )
-    if not indices:
-        raise ValueError(
-            f"Dataset {mapped.display_name!r} Parametric-X series "
-            f"{parametric.x_name!r} has no observations paired by dataset row."
-        )
-    return FitSelectedObservation(
-        raw_observation_id=x_source.raw_observation_id,
-        raw_column=x_source.raw_column,
-        model_target=parametric.x_name,
-        unit=x_source.unit,
-        t=tuple(float(x_source.t[index]) for index in indices) if x_source.t else (),
-        y=tuple(float(x_source.y[index]) for index in indices),
-        source_rows=tuple(int(x_source.source_rows[index]) for index in indices),
-    )
-
-
 def _prepare_fit_datasets(
     *,
     setup: FitSetupSnapshot,
@@ -1413,8 +1361,7 @@ def _prepare_fit_datasets(
     prepared: list[FitPreparedDatasetConfig] = []
     for local in included:
         mapped = mapped_by_id[local.dataset_id]
-        selected = selected_observations(mapped, local)
-        x_observation = _selected_parametric_x_observation(mapped, local, selected)
+        selected, x_observation = selected_observations(mapped, local)
         retained_times = (() if local.parametric is not None else tuple(
             sorted({float(value) for item in selected for value in item.t})
         ))

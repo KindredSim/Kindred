@@ -6,28 +6,20 @@ from dataclasses import dataclass
 import math
 from typing import Mapping, Sequence
 
-from PySide6 import QtCore, QtGui, QtWidgets
+from PySide6 import QtCore, QtWidgets
 
 from kindred.gui.display_name_policy import CompactText, compact_text
 from kindred.gui.ui_helpers import (
     configure_compact_numeric_edit, make_bounded_label, set_bounded_label_text,
 )
 from kindred.gui.interactive_preview import SliderInteractionKind
-from kindred.gui.widgets.fine_drag_slider import FineDragSlider
+from kindred.gui.widgets.fine_drag_slider import FineDragSlider, NumericValueEdit, SliderPress
 from kindred.gui.species_sliders_logic import (
     compute_slider_max_option_c,
     _scale_finite_gui_range,
 )
 
 __all__ = ["BatchSpeciesSliders", "format_slider_value"]
-
-
-@dataclass(slots=True)
-class _SliderPress:
-    """Single physical press record owned by one concentration Slider."""
-
-    start_position: int
-    moved: bool = False
 
 
 def format_slider_value(value: float) -> str:
@@ -54,24 +46,6 @@ class _SpeciesSliderRow:
     maximum_label: QtWidgets.QLabel
 
 
-class _NumericValueEdit(QtWidgets.QLineEdit):
-    """A raw numeric draft editor with local Escape/focus notifications."""
-
-    editStarted = QtCore.Signal()
-    editEscape = QtCore.Signal()
-
-    def focusInEvent(self, event: QtGui.QFocusEvent) -> None:
-        super().focusInEvent(event)
-        self.editStarted.emit()
-
-    def keyPressEvent(self, event: QtGui.QKeyEvent) -> None:
-        if event.key() == QtCore.Qt.Key.Key_Escape:
-            self.editEscape.emit()
-            event.accept()
-            return
-        super().keyPressEvent(event)
-
-
 class BatchSpeciesSliders(QtWidgets.QWidget):
     interactionRequested = QtCore.Signal(str, float, object)
 
@@ -86,7 +60,7 @@ class BatchSpeciesSliders(QtWidgets.QWidget):
         self._hidden_species: set[str] = set()
         self._scope_signature: object | None = None
         self._target_set_ids: tuple[str, ...] = ()
-        self._active_presses: dict[str, _SliderPress] = {}
+        self._active_presses: dict[str, SliderPress] = {}
         self._editor_pre_edit_values: dict[str, float] = {}
         self._editor_pre_edit_text: dict[str, str] = {}
         self._last_committed_editor_text: dict[str, str] = {}
@@ -233,7 +207,7 @@ class BatchSpeciesSliders(QtWidgets.QWidget):
             initial_text = "Multiple values"
         else:
             initial_text = format_slider_value(value)
-        value_editor = _NumericValueEdit(initial_text, container)
+        value_editor = NumericValueEdit(initial_text, container)
         value_editor.setAccessibleName(f"{display_name} initial concentration")
         name_label.setBuddy(value_editor)
         configure_compact_numeric_edit(value_editor, characters=15)
@@ -324,7 +298,7 @@ class BatchSpeciesSliders(QtWidgets.QWidget):
         species_s = str(species)
         row = self._rows.get(species_s)
         if row is not None:
-            self._active_presses[species_s] = _SliderPress(
+            self._active_presses[species_s] = SliderPress(
                 start_position=int(row.slider.sliderPosition()),
             )
 
@@ -426,7 +400,7 @@ class BatchSpeciesSliders(QtWidgets.QWidget):
                 row.slider.setValue(self._value_to_position(value_f, row.maximum))
             finally:
                 del blocker
-        if isinstance(row.value_label, _NumericValueEdit):
+        if isinstance(row.value_label, NumericValueEdit):
             if editor_text is not None:
                 self._set_editor_text(row.value_label, editor_text)
             elif not row.value_label.hasFocus():
@@ -444,13 +418,13 @@ class BatchSpeciesSliders(QtWidgets.QWidget):
         row = self._rows.get(str(species))
         return bool(
             row is not None
-            and isinstance(row.value_label, _NumericValueEdit)
+            and isinstance(row.value_label, NumericValueEdit)
             and row.value_label.hasFocus()
         )
 
     def _on_editor_started(self, species: str) -> None:
         row = self._rows.get(str(species))
-        if row is None or not isinstance(row.value_label, _NumericValueEdit):
+        if row is None or not isinstance(row.value_label, NumericValueEdit):
             return
         self.remember_editor_state(species)
         self._last_committed_editor_text.pop(str(species), None)
@@ -464,7 +438,7 @@ class BatchSpeciesSliders(QtWidgets.QWidget):
     def _on_editor_escape(self, species: str) -> None:
         species_s = str(species)
         row = self._rows.get(species_s)
-        if row is None or not isinstance(row.value_label, _NumericValueEdit):
+        if row is None or not isinstance(row.value_label, NumericValueEdit):
             return
         value = self._editor_pre_edit_values.get(
             species_s, self._values.get(species_s, 0.0)
@@ -486,7 +460,7 @@ class BatchSpeciesSliders(QtWidgets.QWidget):
 
     def _decorate_editor(self, species: str) -> None:
         row = self._rows.get(str(species))
-        if row is None or not isinstance(row.value_label, _NumericValueEdit):
+        if row is None or not isinstance(row.value_label, NumericValueEdit):
             return
         try:
             value = float(row.value_label.text().strip())
@@ -506,7 +480,7 @@ class BatchSpeciesSliders(QtWidgets.QWidget):
     def _commit_editor(self, species: str) -> None:
         species_s = str(species)
         row = self._rows.get(species_s)
-        if row is None or not isinstance(row.value_label, _NumericValueEdit):
+        if row is None or not isinstance(row.value_label, NumericValueEdit):
             return
         raw = row.value_label.text()
         if raw == self._last_committed_editor_text.get(species_s):

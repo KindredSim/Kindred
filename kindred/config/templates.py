@@ -259,8 +259,6 @@ class TemplateManager:
 
     def _write_template(self, template: Template) -> None:
         self._require_writable_collection()
-        if not isinstance(template, Template):
-            raise TypeError("template must be a Template.")
         payload = template.to_dict()
         target = self._template_path(payload["id"], create_root=True)
         descriptor, temporary_path = tempfile.mkstemp(
@@ -348,7 +346,7 @@ class TemplateManager:
         logger.info("Deleted template: %s", normalized_id)
 
     def get_template(self, template_id: str) -> Optional[Template]:
-        return self._templates.get(str(template_id))
+        return self._templates.get(template_id)
 
     def get_all_templates(self) -> List[Template]:
         return list(self._templates.values())
@@ -380,8 +378,6 @@ class TemplateManager:
         """Create a new template; never select or overwrite an existing one."""
 
         self._require_writable_collection()
-        if not isinstance(source, MechanismAuthoringSource):
-            raise TypeError("source must be a MechanismAuthoringSource.")
         normalized_name = _template_name(name)
         self._assert_available_name(normalized_name)
         template = Template(
@@ -418,8 +414,6 @@ class TemplateManager:
         current = self._templates.get(normalized_id)
         if current is None:
             raise KeyError(f"Unknown template ID: {normalized_id!r}.")
-        if source is not _UNSET and not isinstance(source, MechanismAuthoringSource):
-            raise TypeError("source must be a MechanismAuthoringSource.")
         candidate = Template(
             id=current.id,
             name=current.name if name is _UNSET else name,
@@ -448,8 +442,6 @@ class TemplateManager:
         normalized_id = _template_id(template_id)
         if normalized_id not in self._templates:
             raise KeyError(f"Unknown template ID: {normalized_id!r}.")
-        if not isinstance(template, Template):
-            raise TypeError("template must be a Template.")
         candidate = Template.from_dict(template.to_dict())
         if candidate.id != normalized_id:
             raise ValueError("Replacement template must retain the target stable ID.")

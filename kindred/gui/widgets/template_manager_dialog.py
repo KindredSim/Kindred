@@ -631,7 +631,7 @@ class TemplateManagerDialog(QtWidgets.QDialog):
         operation = dialog._operation
         try:
             data = dialog.get_template_data()
-            source = self._preflight_source(data["source"])
+            source = self._source_preflight(data["source"])
             if source is None:
                 return
             data["source"] = source
@@ -678,7 +678,7 @@ class TemplateManagerDialog(QtWidgets.QDialog):
         if reply != QtWidgets.QMessageBox.Yes:
             return
         try:
-            admitted_source = self._preflight_source(
+            admitted_source = self._source_preflight(
                 self._current_mechanism_source
             )
             if admitted_source is None:
@@ -768,17 +768,9 @@ class TemplateManagerDialog(QtWidgets.QDialog):
         if accepted:
             self.accept()
 
-    def _preflight_source(
-        self,
-        source: MechanismAuthoringSource,
-    ) -> MechanismAuthoringSource | None:
-        if not isinstance(source, MechanismAuthoringSource):
-            raise TypeError("template source must be MechanismAuthoringSource.")
-        return self._source_preflight(source)
-
     def _select_template(self, template_id: str) -> None:
         for index in range(self._template_list.count()):
             item = self._template_list.item(index)
-            if item.data(QtCore.Qt.UserRole) == str(template_id):
+            if item.data(QtCore.Qt.UserRole) == template_id:
                 self._template_list.setCurrentItem(item)
                 return

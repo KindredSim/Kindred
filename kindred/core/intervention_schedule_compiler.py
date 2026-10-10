@@ -99,10 +99,10 @@ def _protocol_boundary(
     index: int,
     *,
     duration: float | None = None,
-    operation: InterventionProtocol | None = None,
+    operation: InterventionProtocol,
+    dependency_metadata: InterventionScheduleDependencyMetadata,
     field: str = "start_time",
     fields: Sequence[str] = (),
-    value_dependencies: Sequence[str] = (),
 ) -> float:
     try:
         if duration == every:
@@ -113,46 +113,24 @@ def _protocol_boundary(
             if duration is not None:
                 value += duration
     except (OverflowError, ValueError) as exc:
-        raise InterventionScheduleError(
+        raise _annotated_schedule_error(
             "Protocol boundary arithmetic must remain finite.",
-            operation=None if operation is None else operation.op,
-            declaration_ordinal=(
-                None if operation is None else operation.declaration_ordinal
-            ),
+            operation=operation,
+            dependency_metadata=dependency_metadata,
             field=field,
+            fields=fields,
             domain="finite",
-            field_identities=(
-                ()
-                if operation is None
-                else _operation_field_identities(
-                    operation,
-                    fields=fields,
-                    field=field,
-                )
-            ),
-            value_dependencies=value_dependencies,
         ) from exc
     try:
         return validate_time_seconds(value, field="Protocol boundary")
     except (TypeError, ValueError) as exc:
-        raise InterventionScheduleError(
+        raise _annotated_schedule_error(
             str(exc),
-            operation=None if operation is None else operation.op,
-            declaration_ordinal=(
-                None if operation is None else operation.declaration_ordinal
-            ),
+            operation=operation,
+            dependency_metadata=dependency_metadata,
             field=field,
+            fields=fields,
             domain="finite",
-            field_identities=(
-                ()
-                if operation is None
-                else _operation_field_identities(
-                    operation,
-                    fields=fields,
-                    field=field,
-                )
-            ),
-            value_dependencies=value_dependencies,
         ) from exc
 
 
@@ -680,63 +658,20 @@ def _execution_order(item: ExecutableInstant) -> tuple[float, int, int, int, int
     )
 
 
-def _operation_value_dependencies(
-    operation: object,
-    dependency_metadata: InterventionScheduleDependencyMetadata,
-    *,
-    field: str | None = None,
-    fields: Sequence[str] = (),
-) -> tuple[str, ...]:
-    """Resolve dependencies for one executable/authored operation.
-
-    Executable protocol records carry the nested authored ordinal, while their
-    generated bounds are owned by the protocol's top-level ``start_time`` and
-    ``duration`` fields.  Resolving those identities here keeps predicates
-    complete without making diagnostics depend on executable payload shape.
-    """
-    declaration = int(getattr(operation, "declaration_ordinal", -1))
-    requested = tuple(str(item) for item in fields) or (() if field is None else (str(field),))
-    phase = str(getattr(operation, "phase", "ordinary"))
-    nested_ordinal = getattr(operation, "authored_ordinal", None)
-    if nested_ordinal is not None:
-        nested_ordinal = int(nested_ordinal)
-    names: set[str] = set()
-
-    def add(identity: InterventionScheduleFieldIdentity) -> None:
-        for value in dependency_metadata.get(identity, ()):
-            if str(value).strip():
-                names.add(str(value).strip())
-
-    if nested_ordinal is not None and phase != "ordinary":
-        selected_fields = requested or ("value", "delta", "flux_rate")
-        for requested_field in selected_fields:
-            if requested_field in {"time", "start_time", "end_time"}:
-                # Protocol windows are generated from these authored bounds.
-                add((declaration, None, "start_time"))
-                if phase in {"during", "after"}:
-                    add((declaration, None, "duration"))
-            else:
-                add((declaration, nested_ordinal, f"{phase}.{requested_field}"))
-        return tuple(sorted(names))
-
-    for requested_field in requested:
-        add((declaration, None, requested_field))
-    return tuple(sorted(names))
-
-
 def _operation_field_identities(
-    operation: object,
+    operation: InterventionProtocol | ExecutableInstant | ExecutableHold,
     *,
     fields: Sequence[str] = (),
     field: str | None = None,
 ) -> tuple[InterventionScheduleFieldIdentity, ...]:
-    declaration = int(getattr(operation, "declaration_ordinal", -1))
-    requested = tuple(str(item) for item in fields) or (
-        () if field is None else (str(field),)
+    declaration = operation.declaration_ordinal
+    requested = tuple(fields) or (
+        () if field is None else (field,)
     )
-    phase = str(getattr(operation, "phase", "ordinary"))
-    nested = getattr(operation, "authored_ordinal", None)
-    nested_ordinal = None if nested is None else int(nested)
+    if isinstance(operation, InterventionProtocol):
+        phase, nested_ordinal = "ordinary", None
+    else:
+        phase, nested_ordinal = operation.phase, operation.authored_ordinal
     identities: list[InterventionScheduleFieldIdentity] = []
     for requested_field in requested:
         if nested_ordinal is not None and phase != "ordinary":
@@ -751,38 +686,6 @@ def _operation_field_identities(
         else:
             identities.append((declaration, None, requested_field))
     return tuple(dict.fromkeys(identities))
-
-
-def _operation_details(
-    operation: object,
-    dependency_metadata: InterventionScheduleDependencyMetadata,
-    *,
-    field: str | None = None,
-) -> dict[str, object]:
-    details: dict[str, object] = {
-        "operation": str(getattr(operation, "op", type(operation).__name__)),
-        "declaration_ordinal": int(getattr(operation, "declaration_ordinal", -1)),
-    }
-    if field is not None:
-        details["field"] = str(field)
-    nested_ordinal = getattr(operation, "authored_ordinal", None)
-    if nested_ordinal is not None:
-        details["authored_ordinal"] = int(nested_ordinal)
-        details["nested_location"] = {
-            "phase": str(getattr(operation, "phase", "")),
-            "authored_ordinal": int(nested_ordinal),
-        }
-    dependencies = _operation_value_dependencies(
-        operation,
-        dependency_metadata,
-        field=field,
-    )
-    if dependencies:
-        details["value_dependencies"] = dependencies
-    identities = _operation_field_identities(operation, field=field)
-    if identities:
-        details["field_identities"] = identities
-    return details
 
 
 def _all_schedule_dependencies(
@@ -801,109 +704,62 @@ def _all_schedule_dependencies(
 
 
 def _annotated_schedule_error(
-    exc: InterventionScheduleError,
+    message: str,
     *,
-    operation: object | None,
+    operation: InterventionProtocol | None,
     dependency_metadata: InterventionScheduleDependencyMetadata,
     field: str | None = None,
     fields: Sequence[str] = (),
-    operations: Sequence[object] = (),
-    value_dependencies: Sequence[str] = (),
+    operations: Sequence[ExecutableInstant | ExecutableHold] = (),
+    domain: str | None = None,
 ) -> InterventionScheduleError:
     if operation is not None:
-        details = dict(getattr(exc, "details", {}) or {})
-        details.update(_operation_details(operation, dependency_metadata, field=field))
-        requested_fields = tuple(str(item) for item in fields) or (
-            () if field is None else (str(field),)
-        )
-        dependencies = set(
-            _operation_value_dependencies(
-                operation,
-                dependency_metadata,
-                fields=requested_fields,
-            )
-        )
-        dependencies.update(
-            str(name).strip() for name in value_dependencies if str(name).strip()
-        )
-        if dependencies:
-            details["value_dependencies"] = tuple(sorted(dependencies))
-        identities = _operation_field_identities(
-            operation,
-            fields=requested_fields,
-            field=field,
-        )
-        if identities:
-            details["field_identities"] = identities
+        identities = _operation_field_identities(operation, fields=fields, field=field)
         return InterventionScheduleError(
-            str(exc),
-            operation=str(getattr(operation, "op", type(operation).__name__)),
-            declaration_ordinal=int(getattr(operation, "declaration_ordinal", -1)),
-            field=field or getattr(exc, "field", None),
-            nested_location=(
-                {
-                    "phase": str(getattr(operation, "phase", "")),
-                    "authored_ordinal": int(getattr(operation, "authored_ordinal")),
-                }
-                if getattr(operation, "authored_ordinal", None) is not None
-                else None
-            ),
-            domain=getattr(exc, "domain", None),
+            message,
+            operation=operation.op,
+            declaration_ordinal=operation.declaration_ordinal,
+            field=field,
+            domain=domain,
             field_identities=identities,
-            value_dependencies=tuple(sorted(dependencies)),
-            details=details,
+            value_dependencies=tuple(
+                name for identity in identities
+                for name in dependency_metadata.get(identity, ())
+            ),
         )
-    details = dict(getattr(exc, "details", {}) or {})
-    all_dependencies: set[str] = set(
-        str(value)
-        for value in (
-            getattr(exc, "value_dependencies", ())
-            or details.get("value_dependencies", ())
-        )
-        if str(value).strip()
-    )
     declarations: list[int] = []
     operation_names: list[str] = []
     operation_locations: list[dict[str, object]] = []
     field_identities: list[InterventionScheduleFieldIdentity] = []
-    requested_fields = tuple(str(item) for item in fields) or (
-        () if field is None else (str(field),)
-    )
     for item in operations:
-        declarations.append(int(getattr(item, "declaration_ordinal", -1)))
-        operation_names.append(str(getattr(item, "op", type(item).__name__)))
+        declarations.append(item.declaration_ordinal)
+        operation_names.append(item.op)
         location: dict[str, object] = {
-            "operation": str(getattr(item, "op", type(item).__name__)),
-            "declaration_ordinal": int(getattr(item, "declaration_ordinal", -1)),
+            "operation": item.op,
+            "declaration_ordinal": item.declaration_ordinal,
         }
-        if getattr(item, "authored_ordinal", None) is not None:
-            location["phase"] = str(getattr(item, "phase", ""))
-            location["authored_ordinal"] = int(getattr(item, "authored_ordinal"))
+        if item.authored_ordinal is not None:
+            location["phase"] = item.phase
+            location["authored_ordinal"] = item.authored_ordinal
         operation_locations.append(location)
-        all_dependencies.update(
-            _operation_value_dependencies(
-                item,
-                dependency_metadata,
-                fields=requested_fields,
-            )
-        )
         field_identities.extend(
-            _operation_field_identities(item, fields=requested_fields)
+            _operation_field_identities(item, fields=fields, field=field)
         )
+    identities = tuple(dict.fromkeys(field_identities))
+    details: dict[str, object] = {}
     if declarations:
         details["declaration_ordinals"] = tuple(sorted(set(declarations)))
     if operation_names:
         details["operations"] = tuple(operation_names)
         details["operation_locations"] = tuple(operation_locations)
-    if all_dependencies:
-        details["value_dependencies"] = tuple(sorted(all_dependencies))
-    if field_identities:
-        details["field_identities"] = tuple(dict.fromkeys(field_identities))
     return InterventionScheduleError(
-        str(exc),
+        message,
         field=field,
-        field_identities=tuple(dict.fromkeys(field_identities)),
-        value_dependencies=tuple(sorted(all_dependencies)),
+        field_identities=identities,
+        value_dependencies=tuple(
+            name for identity in identities
+            for name in dependency_metadata.get(identity, ())
+        ),
         details=details,
     )
 
@@ -926,9 +782,6 @@ def compile_intervention_schedule(
             "Parameterized intervention schedule must be resolved before compilation.",
             field_identities=schedule_field_identities,
             value_dependencies=_all_schedule_dependencies(dependency_metadata),
-            details={
-                "value_dependencies": _all_schedule_dependencies(dependency_metadata),
-            },
         )
     instants: list[ExecutableInstant] = []
     fluxes: list[ExecutableFlux] = []
@@ -990,18 +843,7 @@ def compile_intervention_schedule(
                 operation=operation,
                 field="every",
                 fields=("start_time", "every", "duration"),
-                value_dependencies=(
-                    _operation_value_dependencies(
-                        operation,
-                        dependency_metadata,
-                        field="start_time",
-                    )
-                    + _operation_value_dependencies(
-                        operation,
-                        dependency_metadata,
-                        field="duration",
-                    )
-                ),
+                dependency_metadata=dependency_metadata,
             )
             previous_window_start: float | None = None
             for window_ordinal in range(operation.count):
@@ -1013,29 +855,18 @@ def compile_intervention_schedule(
                     operation=operation,
                     field="start_time",
                     fields=("start_time", "every"),
-                    value_dependencies=_operation_value_dependencies(
-                        operation,
-                        dependency_metadata,
-                        field="start_time",
-                    ),
+                    dependency_metadata=dependency_metadata,
                 )
                 if (
                     previous_window_start is not None
                     and window_start <= previous_window_start
                 ):
                     raise _annotated_schedule_error(
-                        InterventionScheduleError(
-                            "Protocol windows must advance exactly in binary64."
-                        ),
+                        "Protocol windows must advance exactly in binary64.",
                         operation=operation,
                         dependency_metadata=dependency_metadata,
                         field="every",
                         fields=("start_time", "every"),
-                        value_dependencies=_operation_value_dependencies(
-                            operation,
-                            dependency_metadata,
-                            field="start_time",
-                        ),
                     )
                 previous_window_start = window_start
                 window_end: float | None = None
@@ -1048,42 +879,17 @@ def compile_intervention_schedule(
                         operation=operation,
                         field="duration",
                         fields=("start_time", "every", "duration"),
-                        value_dependencies=(
-                            _operation_value_dependencies(
-                                operation,
-                                dependency_metadata,
-                                field="start_time",
-                            )
-                            + _operation_value_dependencies(
-                                operation,
-                                dependency_metadata,
-                                field="duration",
-                            )
-                        ),
+                        dependency_metadata=dependency_metadata,
                     )
                     if window_end <= window_start:
                         raise _annotated_schedule_error(
-                            InterventionScheduleError(
-                                "Protocol window duration must remain positive "
-                                "after binary64 expansion."
-                            ),
+                            "Protocol window duration must remain positive "
+                            "after binary64 expansion.",
                             operation=operation,
-                        dependency_metadata=dependency_metadata,
-                        field="duration",
-                        fields=("start_time", "every", "duration"),
-                        value_dependencies=(
-                            _operation_value_dependencies(
-                                operation,
-                                dependency_metadata,
-                                field="start_time",
-                            )
-                            + _operation_value_dependencies(
-                                operation,
-                                dependency_metadata,
-                                field="duration",
-                            )
-                        ),
-                    )
+                            dependency_metadata=dependency_metadata,
+                            field="duration",
+                            fields=("start_time", "every", "duration"),
+                        )
                 for nested in operation.before:
                     _raise_if_cancelled(cancellation_check)
                     primitive = _protocol_instant(
@@ -1105,9 +911,7 @@ def compile_intervention_schedule(
                     _raise_if_cancelled(cancellation_check)
                     if window_end is None:
                         raise _annotated_schedule_error(
-                            InterventionScheduleError(
-                                "Protocol during requires a finite duration."
-                            ),
+                            "Protocol during requires a finite duration.",
                             operation=operation,
                             dependency_metadata=dependency_metadata,
                             field="duration",
@@ -1136,9 +940,7 @@ def compile_intervention_schedule(
                     _raise_if_cancelled(cancellation_check)
                     if window_end is None:
                         raise _annotated_schedule_error(
-                            InterventionScheduleError(
-                                "Protocol after requires a finite duration."
-                            ),
+                            "Protocol after requires a finite duration.",
                             operation=operation,
                             dependency_metadata=dependency_metadata,
                             field="duration",
@@ -1262,9 +1064,7 @@ def validate_boundary_conflicts(
         holds = [item for item in candidates if isinstance(item, ExecutableHold)]
         if sets and jumps:
             raise _annotated_schedule_error(
-                InterventionScheduleError(
-                    f"set and jump conflict for {species} at t={time:g}."
-                ),
+                f"set and jump conflict for {species} at t={time:g}.",
                 operation=None,
                 dependency_metadata=dependency_metadata,
                 field="time",
@@ -1279,9 +1079,7 @@ def validate_boundary_conflicts(
             value != absolute_values[0] for value in absolute_values[1:]
         ):
             raise _annotated_schedule_error(
-                InterventionScheduleError(
-                    f"Declarations set {species} to different values at t={time:g}."
-                ),
+                f"Declarations set {species} to different values at t={time:g}.",
                 operation=None,
                 dependency_metadata=dependency_metadata,
                 field="value",
@@ -1290,9 +1088,7 @@ def validate_boundary_conflicts(
             )
         if holds and jumps:
             raise _annotated_schedule_error(
-                InterventionScheduleError(
-                    f"hold start and jump conflict for {species} at t={time:g}."
-                ),
+                f"hold start and jump conflict for {species} at t={time:g}.",
                 operation=None,
                 dependency_metadata=dependency_metadata,
                 field="time",
@@ -1323,14 +1119,12 @@ def _validate_hold_overlaps(
     if conflict is not None:
         left, right = conflict
         raise _annotated_schedule_error(
-            InterventionScheduleError(
-                f"Overlapping holds for {left.species}: "
-                f"declaration {left.declaration_ordinal + 1} "
-                f"[{left.start_time!r}, {left.end_time!r}) and "
-                f"declaration {right.declaration_ordinal + 1} "
-                f"[{right.start_time!r}, {right.end_time!r}). "
-                "Only one hold per species may be active at a time."
-            ),
+            f"Overlapping holds for {left.species}: "
+            f"declaration {left.declaration_ordinal + 1} "
+            f"[{left.start_time!r}, {left.end_time!r}) and "
+            f"declaration {right.declaration_ordinal + 1} "
+            f"[{right.start_time!r}, {right.end_time!r}). "
+            "Only one hold per species may be active at a time.",
             operation=None,
             dependency_metadata=dependency_metadata,
             fields=("start_time", "end_time"),

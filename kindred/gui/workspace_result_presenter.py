@@ -320,19 +320,6 @@ def _series_tuple(
     return tuple(projected)
 
 
-def _series_names(result: SimulationResultValue) -> tuple[str, ...]:
-    """Return projected display names without allocating scalar arrays."""
-
-    names = list(result.series)
-    existing_names = set(names)
-    names.extend(
-        name
-        for name in result.succeeded_algebra_outputs
-        if name in result.scalars and name not in existing_names
-    )
-    return tuple(names)
-
-
 def _result_warning_details(result: SimulationResultValue) -> tuple[str, ...]:
     # Every failed let line has one cause, located on its authored line.
     return tuple(
@@ -388,7 +375,7 @@ class ResultLayerKind(Enum):
 
 @dataclass(frozen=True, slots=True)
 class ResultDataBlock:
-    """One immutable full-resolution result/data table and its render style."""
+    """One immutable full-resolution table, with colors only when used for plotting."""
 
     block_id: str | ExperimentalAxisSelection
     label: str
@@ -477,7 +464,7 @@ class ResultDataBlock:
         if len(provenance_names) != len(set(provenance_names)) or not names.issuperset(provenance_names):
             raise ValueError("data series provenance must uniquely reference data.")
         colors = tuple(self.color_by_series)
-        if not names.issubset({name for name, _color in colors}):
+        if colors and not names.issubset({name for name, _color in colors}):
             raise ValueError("data series colors must cover every data series.")
         if len(colors) != len({name for name, _color in colors}):
             raise ValueError("data series colors must be unique by series.")
@@ -651,7 +638,7 @@ def _result_block(
     result: SimulationResultValue,
     prepared_dsl: PreparedDslRequestSet,
     kind: ResultLayerKind,
-    color_by_axis_selection: Mapping[AxisSeriesSelection, str],
+    color_by_axis_selection: Mapping[AxisSeriesSelection, str] | None = None,
     visible: bool = True,
 ) -> ResultDataBlock:
     display_label = (
@@ -675,10 +662,12 @@ def _result_block(
         x_axis=SimulationSeriesAxisSelection("t"), result=result,
         segment_ids=result.segment_ids, segment_keys=result.segment_keys,
         discontinuity_ids=result.discontinuity_ids, source_row=None,
-        color_by_series=tuple(
-            (selection.series_name, str(color))
-            for selection, color in color_by_axis_selection.items()
-            if isinstance(selection, SimulationSeriesAxisSelection)
+        color_by_series=(
+            tuple(
+                (selection.series_name, str(color))
+                for selection, color in color_by_axis_selection.items()
+                if isinstance(selection, SimulationSeriesAxisSelection)
+            ) if color_by_axis_selection is not None else ()
         ),
         visible=visible, dashed=kind is ResultLayerKind.REFERENCE,
         opacity=0.42 if kind is ResultLayerKind.REFERENCE else 1.0,
@@ -738,10 +727,6 @@ def compose_canonical_export_blocks(
                     result=current,
                     prepared_dsl=repository.current_request(set_id).prepared_dsl,
                     kind=kind,
-                    color_by_axis_selection={
-                        SimulationSeriesAxisSelection(name): "#000000"
-                        for name in _series_names(current)
-                    },
                 )
             )
         if reference is not None:
@@ -753,10 +738,6 @@ def compose_canonical_export_blocks(
                     result=reference,
                     prepared_dsl=repository.reference_request(set_id).prepared_dsl,
                     kind=ResultLayerKind.REFERENCE,
-                    color_by_axis_selection={
-                        SimulationSeriesAxisSelection(name): "#000000"
-                        for name in _series_names(reference)
-                    },
                 )
             )
 
@@ -811,7 +792,6 @@ def compose_canonical_export_blocks(
                     series_provenance=(
                         (source.raw_column, _observation_provenance(source)),
                     ),
-                    color_by_series=((source.raw_column, "#000000"),),
                 )
             )
     return tuple(blocks)

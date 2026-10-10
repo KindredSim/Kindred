@@ -1,8 +1,36 @@
-"""Shared groove-click slider with cursor-attached Fine dragging."""
+"""Shared slider dragging, press state, and numeric-editor interaction."""
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 from PySide6 import QtCore, QtGui, QtWidgets
+
+
+@dataclass(slots=True)
+class SliderPress:
+    """Single physical press record owned by its Slider widget."""
+
+    start_position: int
+    moved: bool = False
+
+
+class NumericValueEdit(QtWidgets.QLineEdit):
+    """A raw numeric draft editor with local Escape/focus notifications."""
+
+    editStarted = QtCore.Signal()
+    editEscape = QtCore.Signal()
+
+    def focusInEvent(self, event: QtGui.QFocusEvent) -> None:
+        super().focusInEvent(event)
+        self.editStarted.emit()
+
+    def keyPressEvent(self, event: QtGui.QKeyEvent) -> None:
+        if event.key() == QtCore.Qt.Key.Key_Escape:
+            self.editEscape.emit()
+            event.accept()
+            return
+        super().keyPressEvent(event)
 
 
 class FineDragSlider(QtWidgets.QSlider):

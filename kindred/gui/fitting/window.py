@@ -594,7 +594,8 @@ class FittingWindow(QtWidgets.QDialog):
             item for item in setup.datasets if item.dataset_id == dataset_id
         )
         edited = self._project_dataset_settings(current, config)
-        return selected_observations(mapped, edited)
+        observations, _ = selected_observations(mapped, edited)
+        return observations
 
     @staticmethod
     def _project_dataset_settings(
