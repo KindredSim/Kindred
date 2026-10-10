@@ -71,10 +71,6 @@ class ParametricProjection:
             if isinstance(value, np.ndarray):
                 value.setflags(write=False)
 
-    @property
-    def size(self) -> int:
-        return len(self.source_rows)
-
     def subset(self, source_rows: Sequence[int]) -> "ParametricProjection":
         positions = {row: index for index, row in enumerate(self.source_rows)}
         indexes = [positions[row] for row in source_rows]

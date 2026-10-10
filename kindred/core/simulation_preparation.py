@@ -10,7 +10,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import Any, Callable, Dict, Iterable, Mapping, Optional
+from typing import Any, Callable, Iterable, Mapping
 
 import numpy as np
 
@@ -60,64 +60,7 @@ __all__ = [
     "build_simulation_execution_request",
     "prepare_simulation_run",
     "fit_simulation_error_from_preparation_error",
-    "simulation_execution_requests_equal",
 ]
-
-
-def _simulation_container_values_equal(left: object, right: object) -> bool:
-    """Compare only the plain containers used by retained request values."""
-
-    if type(left) is not type(right):
-        return False
-    if isinstance(left, np.ndarray):
-        return bool(np.array_equal(left, right))
-    if isinstance(left, Mapping):
-        other = right
-        if len(left) != len(other):  # type: ignore[arg-type]
-            return False
-        return all(
-            key in other  # type: ignore[operator]
-            and _simulation_container_values_equal(value, other[key])  # type: ignore[index]
-            for key, value in left.items()
-        )
-    if isinstance(left, tuple):
-        return len(left) == len(right) and all(  # type: ignore[arg-type]
-            _simulation_container_values_equal(item, other)
-            for item, other in zip(left, right, strict=True)  # type: ignore[arg-type]
-        )
-    if isinstance(left, list):
-        return len(left) == len(right) and all(  # type: ignore[arg-type]
-            _simulation_container_values_equal(item, other)
-            for item, other in zip(left, right, strict=True)  # type: ignore[arg-type]
-        )
-    if isinstance(left, (set, frozenset)):
-        return left == right
-    if isinstance(left, (str, bytes, int, float, bool, type(None))):
-        return bool(left == right)
-    return False
-
-def simulation_execution_requests_equal(
-    left: SimulationExecutionRequest,
-    right: SimulationExecutionRequest,
-) -> bool:
-    """Compare one accepted owner identity and its typed target values."""
-
-    return (
-        left.prepared_dsl is right.prepared_dsl
-        and left.species_names == right.species_names
-        and left.y0 == right.y0
-        and left.t_span == right.t_span
-        and type(left.solver_config) is type(right.solver_config)
-        and left.solver_config.solver_input == right.solver_config.solver_input
-        and left.solver_config.solver == right.solver_config.solver
-        and left.solver_config.rtol == right.solver_config.rtol
-        and left.solver_config.atol == right.solver_config.atol
-        and _simulation_container_values_equal(left.solver_config.grid, right.solver_config.grid)
-        and left.solver_config.use_analytic_jacobian == right.solver_config.use_analytic_jacobian
-        and left.use_authored_stops == right.use_authored_stops
-        and left.requested_parameter_names == right.requested_parameter_names
-        and _simulation_container_values_equal(left.parameter_overrides, right.parameter_overrides)
-    )
 
 
 class SimulationPreparationError(RuntimeError):
@@ -187,7 +130,6 @@ class PreparedSimulationRun:
     symbolic_jacobian: SymbolicJacobianExecution
     initials_for_algebra: Mapping[str, float]
     request: SimulationExecutionRequest
-    unresolved_intervention_schedule: InterventionSchedule | None = None
     cancellation_control: SimulationCancellationControl | None = None
     stop_observable_value: Callable[[str, float, np.ndarray, float], float] | None = None
     parameter_values_at_temperature: Callable[[float, tuple[str, ...]], Mapping[str, float]] | None = None
@@ -405,8 +347,6 @@ def build_simulation_execution_request(
 
 def fit_simulation_error_from_preparation_error(
     exc: SimulationPreparationError,
-    *,
-    failed_params: Optional[Dict[str, float]] = None,
 ) -> FitSimulationError:
     details = dict(exc.details)
     if exc.parameter_names:
@@ -414,7 +354,6 @@ def fit_simulation_error_from_preparation_error(
         details.setdefault("parameter_names", tuple(exc.parameter_names))
     return FitSimulationError(
         str(exc),
-        failed_params=failed_params,
         details=details,
     )
 
@@ -570,7 +509,6 @@ def prepare_simulation_run(
                     ),
                     dependency_metadata=dependency_metadata,
                 )
-                unresolved_intervention_schedule = None
             except (InterventionScheduleError, ValueError) as exc:
                 structured_details = dict(getattr(exc, "details", {}) or {})
                 structured_dependencies = tuple(
@@ -664,7 +602,6 @@ def prepare_simulation_run(
         symbolic_jacobian=runtime_symbolic_jacobian,
         initials_for_algebra=initials_for_algebra,
         request=request,
-        unresolved_intervention_schedule=unresolved_intervention_schedule,
         cancellation_control=cancellation_control,
         stop_observable_value=stop_observable_value,
         parameter_values_at_temperature=symbols,

@@ -72,7 +72,6 @@ def _coerce_consumed_parameter_value(
     name: str,
     raw_value: object,
     origins: Optional[Mapping[str, str]],
-    failed_params: Optional[Dict[str, float]],
 ) -> float:
     try:
         value = float(raw_value)  # type: ignore[arg-type]
@@ -93,7 +92,6 @@ def _coerce_consumed_parameter_value(
                 if error_type is FitCandidateDomainError
                 else {}
             ),
-            failed_params=dict(failed_params or {}) or None,
             details={
                 "fatal": error_type is FitSimulationError,
                 "parameter_origin": _parameter_origin_for(name, origins),
@@ -118,7 +116,6 @@ def _coerce_consumed_parameter_value(
             if error_type is FitCandidateDomainError
             else {}
         ),
-        failed_params=dict(failed_params or {}) or None,
         details={
             "fatal": error_type is FitSimulationError,
             "parameter_origin": origin,
@@ -131,24 +128,18 @@ def _scientific_unavailability_from_exception(
     *,
     producer: str,
     stage: str,
-    failed_params: Optional[Dict[str, float]],
 ) -> ScientificUnavailable:
     details = dict(getattr(exc, "details", None) or {})
     return ScientificUnavailable(
         producer=producer,
         stage=stage,
-        details={
-            **details,
-            "failed_params": dict(failed_params or {}),
-        },
+        details=details,
         factual_cause=getattr(exc, "factual_cause", None),
     )
 
 
 def _known_candidate_unavailability(
     exc: BaseException,
-    *,
-    failed_params: Optional[Dict[str, float]],
 ) -> ScientificUnavailable | None:
     """Translate producer-owned typed candidate failures at this boundary.
 
@@ -161,7 +152,7 @@ def _known_candidate_unavailability(
     if isinstance(exc, PhysicalDomainError):
         return ScientificUnavailable(
             producer="physical_intervention", stage="execution",
-            details={**exc.details, "failed_params": dict(failed_params or {})},
+            details=exc.details,
             factual_cause=factual_cause_from_exception(exc),
         )
     if isinstance(exc, FitCandidateDomainError):
@@ -175,7 +166,6 @@ def _known_candidate_unavailability(
             exc,
             producer="fit_candidate",
             stage=stage,
-            failed_params=failed_params,
         )
     return None
 
@@ -184,7 +174,6 @@ def _fatal_evaluation_error(
     exc: BaseException,
     *,
     stage: str,
-    failed_params: Optional[Dict[str, float]],
 ) -> FitSimulationError:
     """A fatal Fit failure states its cause's sentence and authored line;
     the evaluation stage stays a structured fact."""
@@ -197,7 +186,6 @@ def _fatal_evaluation_error(
     )
     return FitSimulationError(
         str(getattr(exc, "message", None) or exc).strip() or type(exc).__name__,
-        failed_params=failed_params,
         details=details,
         context=getattr(exc, "context", None),
     )
@@ -335,8 +323,6 @@ class FittingEvaluator:
         self,
         params: Mapping[str, float],
         origins: Optional[Mapping[str, str]] = None,
-        *,
-        failed_params: Optional[Dict[str, float]] = None,
     ) -> SimulationResultValue | ScientificUnavailable:
         """Evaluate one candidate, returning only natural scientific values.
 
@@ -349,14 +335,12 @@ class FittingEvaluator:
             result = self._evaluate_series(
                 params,
                 origins,
-                failed_params=failed_params,
             )
         except (FittingCancelled, SimulationCancelled) as exc:
             raise FittingCancelled() from exc
         except Exception as exc:
             unavailable = _known_candidate_unavailability(
                 exc,
-                failed_params=failed_params,
             )
             if unavailable is not None:
                 return unavailable
@@ -367,7 +351,6 @@ class FittingEvaluator:
                 unavailability,
                 producer=unavailability.producer,
                 stage=unavailability.stage,
-                failed_params=failed_params,
             )
             return unavailable
         return result
@@ -376,8 +359,6 @@ class FittingEvaluator:
         self,
         params: Mapping[str, float],
         origins: Optional[Mapping[str, str]] = None,
-        *,
-        failed_params: Optional[Dict[str, float]] = None,
     ) -> SimulationResultValue | SimulationScientificUnavailability:
         self._raise_if_cancel_requested()
         param_map = {
@@ -400,7 +381,6 @@ class FittingEvaluator:
                 name=name,
                 raw_value=value,
                 origins=origin_map,
-                failed_params=failed_params,
             )
             for name, value in non_initial_parameters.items()
         }
@@ -425,12 +405,11 @@ class FittingEvaluator:
                 for name in exc.parameter_names
             ):
                 raise FitCandidateDomainError(
-                    str(exc), stage=exc.stage, failed_params=failed_params,
+                    str(exc), stage=exc.stage,
                     details=dict(exc.details),
                 ) from exc
             raise fit_simulation_error_from_preparation_error(
                 exc,
-                failed_params=failed_params,
             ) from exc
         except SimulationCancelled as exc:
             raise FittingCancelled() from exc
@@ -441,7 +420,6 @@ class FittingEvaluator:
                 raise
             raise _fatal_evaluation_error(
                 exc,
-                failed_params=failed_params,
                 stage="candidate_preparation",
             ) from exc
 
@@ -460,7 +438,6 @@ class FittingEvaluator:
                     name=name,
                     raw_value=raw_val,
                     origins=origin_map,
-                    failed_params=failed_params,
                 )
 
         y0 = np.asarray(prepared_run.y0, dtype=float).copy()
@@ -498,7 +475,6 @@ class FittingEvaluator:
             raise _fatal_evaluation_error(
                 exc,
                 stage="solver",
-                failed_params=failed_params,
             ) from exc
         if isinstance(result, SimulationScientificUnavailability):
             return result
@@ -536,7 +512,6 @@ class FittingEvaluator:
             raise _fatal_evaluation_error(
                 exc,
                 stage="result_finalization",
-                failed_params=failed_params,
             ) from exc
         self._raise_if_cancel_requested()
         return admitted

@@ -334,59 +334,6 @@ class GlobalFitResult:
         object.__setattr__(self, "dataset_info", tuple(self.dataset_info))
 
 
-@dataclass(frozen=True, slots=True)
-class _FitReplayState:
-    """Private replay evidence held until the sole publishable result build."""
-
-    shared_params: Mapping[str, float]
-    dataset_params: Mapping[str, Mapping[str, float]]
-    weighted_residual_sse: FitMetric
-    weighted_residual_mse: FitMetric
-    dataset_info: tuple[DatasetFitInfo, ...]
-    message: str
-    status: Literal["ok", "warn"]
-    optimizer_converged: bool
-    optimizer_diagnostic: FactualCause | None
-    optimizer_vector: np.ndarray
-    weighted_residuals: np.ndarray
-    profile_likelihood_result: ProfileLikelihoodResult | None = None
-    residual_bootstrap_result: ResidualBootstrapResult | None = None
-
-    def __post_init__(self) -> None:
-        # The final replay admitted this vector as a candidate and its
-        # residuals through each dataset's finite residual check.
-        vector = np.asarray(self.optimizer_vector, dtype=float).copy()
-        vector.setflags(write=False)
-        object.__setattr__(self, "optimizer_vector", vector)
-        residuals = np.asarray(self.weighted_residuals, dtype=float).reshape(-1).copy()
-        residuals.setflags(write=False)
-        object.__setattr__(self, "weighted_residuals", residuals)
-
-
-def _construct_global_fit_result(
-    state: _FitReplayState,
-) -> GlobalFitResult:
-    """Construct the sole immutable publishable result after settlement."""
-
-    return GlobalFitResult(
-        shared_params=dict(state.shared_params),
-        dataset_params={
-            str(dataset_id): dict(values)
-            for dataset_id, values in state.dataset_params.items()
-        },
-        weighted_residual_sse=state.weighted_residual_sse,
-        weighted_residual_mse=state.weighted_residual_mse,
-        dataset_info=list(state.dataset_info),
-        message=state.message,
-        optimizer_vector=state.optimizer_vector,
-        status=state.status,
-        optimizer_converged=state.optimizer_converged,
-        optimizer_diagnostic=state.optimizer_diagnostic,
-        profile_likelihood_result=state.profile_likelihood_result,
-        residual_bootstrap_result=state.residual_bootstrap_result,
-    )
-
-
 def _compact_failure_message(failure: FactualCause) -> str:
     raw_message = failure.message
     return " ".join(part.strip() for part in str(raw_message).splitlines() if part.strip())
@@ -973,12 +920,10 @@ class ObjectiveDatasetInput:
     payload: FitDatasetSpec
     full_params: Dict[str, float]
     parameter_origins: Dict[str, str]
-    failed_param_snapshot: Dict[str, float]
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "full_params", dict(self.full_params))
         object.__setattr__(self, "parameter_origins", dict(self.parameter_origins))
-        object.__setattr__(self, "failed_param_snapshot", dict(self.failed_param_snapshot))
 
 
 class _DatasetFitUnavailable(Exception):
@@ -1257,7 +1202,6 @@ def evaluate_dataset_simulation(
         series_result = evaluator.evaluate_series_with_parameter_origins(
             item.full_params,
             origins=item.parameter_origins,
-            failed_params=item.failed_param_snapshot,
         )
         _raise_if_fitting_cancel_requested(worker_cancel)
         if time.monotonic() >= deadline:
@@ -1433,22 +1377,6 @@ class GlobalFitObjective:
         if formatted:
             return formatted
         return {str(key): float(value) for key, value in params_map.items()}
-
-    @staticmethod
-    def build_failed_param_snapshot(
-        *,
-        ds_id: str,
-        shared_params: Dict[str, float],
-        full_params: Dict[str, float],
-    ) -> Dict[str, float]:
-        snapshot = GlobalFitObjective.format_params(shared_params)
-        shared_keys = set(snapshot)
-        for name, value in GlobalFitObjective.format_params(full_params).items():
-            if name in shared_keys:
-                snapshot[name] = float(value)
-            else:
-                snapshot[f"{ds_id}::{name}"] = float(value)
-        return snapshot
 
     def __call__(self, params: np.ndarray) -> np.ndarray:
         _raise_if_fitting_cancelled(self._cancellation_check)
@@ -1818,17 +1746,11 @@ class GlobalFitObjective:
                 for name in full_params
                 if name in parameter_origins
             }
-            failed_param_snapshot = self.build_failed_param_snapshot(
-                ds_id=ds_id,
-                shared_params=param_dict,
-                full_params=full_params,
-            )
             dataset_inputs.append(
                 ObjectiveDatasetInput(
                     payload=payload,
                     full_params=full_params,
                     parameter_origins=parameter_origins,
-                    failed_param_snapshot=failed_param_snapshot,
                 )
             )
 
@@ -1937,64 +1859,7 @@ class GlobalFitObjective:
         return residuals
 
 
-def _raise_final_replay_candidate_error(
-    exc: BaseException | ScientificUnavailable,
-    *,
-    stage: str,
-    failed_params: Optional[Dict[str, float]] = None,
-) -> None:
-    """Raise one factual final-replay error.
-
-    Scientific-unavailability remains tagged as such at the replay boundary.
-    """
-
-    if isinstance(exc, ScientificUnavailable):
-        details = dict(exc.details)
-        details.update(
-            {
-                "scientific_unavailable": True,
-                "stage": str(stage),
-            }
-        )
-        terminal_error = FitSimulationError(
-            "Final Fit replay rejected the terminal candidate of the optimizer.",
-            failed_params=failed_params,
-            details=details,
-        )
-        if exc.factual_cause is not None:
-            terminal_error.factual_cause = exc.factual_cause
-        raise terminal_error
-    factual_cause = getattr(exc, "factual_cause", None)
-    if not isinstance(factual_cause, FactualCause):
-        exc_details = getattr(exc, "details", None)
-        if isinstance(exc_details, Mapping) and str(
-            exc_details.get("producer", "")
-        ) == "parametric_alignment":
-            factual_cause = factual_cause_from_exception(
-                exc,
-                domain="fit",
-                origin="parametric_x_alignment",
-            )
-            factual_cause = replace(
-                factual_cause,
-                details={
-                    **dict(factual_cause.details),
-                    "candidate_parameter_facts": {
-                        "failed_params": dict(failed_params or {}),
-                    },
-                },
-            )
-    terminal_error = FitSimulationError(
-        "Final Fit replay rejected the terminal candidate of the optimizer.",
-        failed_params=failed_params,
-        details={"fatal": True, "stage": str(stage)},
-    )
-    if isinstance(factual_cause, FactualCause):
-        terminal_error.factual_cause = factual_cause
-    raise terminal_error from exc
-
-
-def _assemble_fit_replay_state(
+def _replay_fit_result(
     *,
     fit_evaluators: Mapping[str, object],
     payloads: List[FitDatasetSpec],
@@ -2008,7 +1873,7 @@ def _assemble_fit_replay_state(
     optimizer_diagnostic: FactualCause | None = None,
     cancellation_control: SimulationCancellationControl | None = None,
     executor: Executor,
-) -> _FitReplayState:
+) -> GlobalFitResult | ScientificUnavailable:
     layout.validate_optimizer_vector(candidate_vector)
     candidate_vector = np.asarray(candidate_vector, dtype=float).reshape(-1).copy()
     candidate_vector.setflags(write=False)
@@ -2049,17 +1914,11 @@ def _assemble_fit_replay_state(
                 parameter_origins[name] = FITTING_PARAM_ORIGIN_OPTIMIZER_DATASET
             else:
                 parameter_origins[name] = FITTING_PARAM_ORIGIN_CONFIGURED_DATASET
-        failed_param_snapshot = GlobalFitObjective.build_failed_param_snapshot(
-            ds_id=ds_id,
-            shared_params=fitted_params,
-            full_params=full_params,
-        )
         dataset_inputs.append(
             ObjectiveDatasetInput(
                 payload=payload,
                 full_params=full_params,
                 parameter_origins=parameter_origins,
-                failed_param_snapshot=failed_param_snapshot,
             )
         )
 
@@ -2078,16 +1937,10 @@ def _assemble_fit_replay_state(
         simulation_evaluations,
     )
     if timeout_unavailability is not None:
-        _raise_final_replay_candidate_error(
-            timeout_unavailability,
-            stage="final_replay_simulation",
-        )
+        return timeout_unavailability
     for evaluation in simulation_evaluations:
         if isinstance(evaluation, ScientificUnavailable):
-            _raise_final_replay_candidate_error(
-                evaluation,
-                stage="final_replay_simulation",
-            )
+            return evaluation
 
     return _assemble_fit_result_facts(
         payloads=payloads,
@@ -2113,7 +1966,7 @@ def _assemble_fit_result_facts(
     success: bool,
     message: str,
     optimizer_diagnostic: FactualCause | None,
-) -> _FitReplayState:
+) -> GlobalFitResult:
     """Construct terminal metrics and values from complete scientific facts.
 
     The replay admitted the candidate vector and found every dataset's facts
@@ -2174,7 +2027,7 @@ def _assemble_fit_result_facts(
             info.weighted_rmse.value,
         )
 
-    return _FitReplayState(
+    return GlobalFitResult(
         shared_params=fitted_params,
         dataset_params=combined_dataset_params,
         weighted_residual_sse=aggregate_metrics.weighted_sse,
@@ -2185,7 +2038,6 @@ def _assemble_fit_result_facts(
         optimizer_converged=optimizer_converged,
         optimizer_diagnostic=factual_optimizer_diagnostic,
         optimizer_vector=candidate_vector,
-        weighted_residuals=np.concatenate(global_weighted_residual_blocks),
         profile_likelihood_result=None,
         residual_bootstrap_result=None,
     )

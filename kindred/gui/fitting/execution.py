@@ -372,7 +372,6 @@ def _terminal_setup_snapshot(
     origin: FitOriginSnapshot,
     result: GlobalFitResult,
     dispatch: _FitDispatchCompilation,
-    effective_datasets: Mapping[str, FitDatasetLocalSettings],
     initial_values_by_set: tuple[
         tuple[str, tuple[tuple[str, float], ...]], ...
     ],
@@ -400,11 +399,9 @@ def _terminal_setup_snapshot(
         if dataset_id in included_ids
     }
     fixed_results = {
-        dataset_id: {
-            str(name): float(value) for name, value in values
-        }
-        for dataset_id, values in dispatch.fixed_by_dataset
-        if dataset_id in included_ids
+        item.dataset_id: dict(item.fixed_params)
+        for item in dispatch.ordinary_dataset_overrides
+        if item.dataset_id in included_ids
     }
     if set(fixed_results) != included_ids:
         raise ValueError("Fit request fixed-value roster is incomplete.")
@@ -555,10 +552,6 @@ def _terminal_setup_snapshot(
             groups.append(group)
     return replace(
         setup_snapshot,
-        datasets=tuple(
-            effective_datasets.get(item.dataset_id, item)
-            for item in setup_snapshot.datasets
-        ),
         parameters=tuple(parameters),
         initials=initials,
         shared_initial_groups=tuple(groups),
@@ -568,7 +561,6 @@ def _terminal_setup_snapshot(
 def _curves_from_simulations(
     *,
     request: FitExecutionRequest,
-    effective_local: Mapping[str, FitDatasetLocalSettings],
     evaluations: Mapping[str, SimulationResultValue],
 ) -> tuple[FitCurveDataset, ...]:
     """Draw model trajectories in simulation order, independently of fit matching."""
@@ -576,6 +568,7 @@ def _curves_from_simulations(
     mapped_by_id = {
         item.dataset_id: item for item in request.setup.origin.mapped_datasets
     }
+    local_by_id = {item.dataset_id: item for item in request.setup.datasets}
     prepared_by_id = {
         item.dataset_id: item for item in request.dispatch.prepared_datasets
     }
@@ -587,7 +580,7 @@ def _curves_from_simulations(
         simulation = evaluations.get(dataset_id)
         if simulation is None:
             continue
-        local = effective_local[dataset_id]
+        local = local_by_id[dataset_id]
         mapped = mapped_by_id[dataset_id]
         prepared = prepared_by_id[dataset_id]
         if not isinstance(simulation, SimulationResultValue):
@@ -635,11 +628,9 @@ def project_fit_candidate_curves(
 
     if not isinstance(candidate, FitCandidate):
         raise TypeError("candidate must be FitCandidate.")
-    setup = candidate.setup_snapshot
     info_by_id = {info.dataset_id: info for info in candidate.result.dataset_info}
     return _curves_from_simulations(
         request=candidate.request,
-        effective_local={item.dataset_id: item for item in setup.datasets},
         evaluations={
             dataset_id: info_by_id[dataset_id].simulation_result
             for dataset_id in candidate.request.dispatch.included_dataset_ids
@@ -652,7 +643,6 @@ def _assemble_fit_terminal(
     request: FitExecutionRequest,
     result: GlobalFitResult,
     included_ids: tuple[str, ...],
-    effective_local: Mapping[str, FitDatasetLocalSettings],
     setup_snapshot: FitSetupSnapshot,
     evaluators: Mapping[str, FittingEvaluator],
 ) -> FitCandidate:
@@ -690,8 +680,8 @@ def _assemble_fit_terminal(
             "Fit terminal parameter results do not exactly match the included datasets."
         )
     fixed_by_dataset = {
-        dataset_id: dict(values)
-        for dataset_id, values in request.dispatch.fixed_by_dataset
+        item.dataset_id: dict(item.fixed_params)
+        for item in request.dispatch.ordinary_dataset_overrides
     }
     setup = request.setup
     for parameter in setup.parameters:
@@ -762,7 +752,6 @@ def _assemble_fit_terminal(
         origin=setup.origin,
         result=result,
         dispatch=request.dispatch,
-        effective_datasets=effective_local,
         initial_values_by_set=initial_values_by_set,
     )
     candidate = FitCandidate(
@@ -889,8 +878,8 @@ class _FitExecution(_FitControl):
         dispatch = request.dispatch
         included_ids = dispatch.included_dataset_ids
         fixed_by_dataset = {
-            dataset_id: dict(values)
-            for dataset_id, values in dispatch.fixed_by_dataset
+            item.dataset_id: dict(item.fixed_params)
+            for item in dispatch.ordinary_dataset_overrides
         }
         candidate_names = list(dispatch.candidate_names)
         prepared_datasets = {
@@ -929,7 +918,6 @@ class _FitExecution(_FitControl):
             thread_name_prefix="kindred-fit-dataset",
         )
 
-        effective_local: dict[str, FitDatasetLocalSettings] = {}
         starting_evaluations = {}
         starting_facts: list[DatasetFitInfo] = []
         execution_shared_variables = dispatch.ordinary_shared_variables
@@ -1000,7 +988,6 @@ class _FitExecution(_FitControl):
                 payload=starting_payload,
                 full_params=starting_values,
                 parameter_origins=starting_origins,
-                failed_param_snapshot={},
             )
             starting_futures[local.dataset_id] = self._executor.submit(
                 evaluate_dataset_simulation,
@@ -1010,19 +997,16 @@ class _FitExecution(_FitControl):
                 weights=starting_weights,
             )
         for local in included:
-            chosen = local
             dataset_id = local.dataset_id
-            mapped = mapped_by_id[dataset_id]
             evaluation = starting_futures[dataset_id].result()
             fit_info = None if isinstance(evaluation, ScientificUnavailable) else evaluation
             if fit_info is not None:
                 starting_evaluations[dataset_id] = fit_info.simulation_result
                 starting_facts.append(fit_info)
-            effective_local[local.dataset_id] = chosen
         datasets = [
             _compile_dataset_spec(
                 prepared_datasets[item.dataset_id],
-                effective_local[item.dataset_id],
+                item,
             )
             for item in included
         ]
@@ -1031,7 +1015,6 @@ class _FitExecution(_FitControl):
         initial_curves = _curves_from_simulations(
             request=request,
             evaluations=starting_evaluations,
-            effective_local=effective_local,
         )
         if self._checkpoint(honor_stop=False):
             raise FittingCancelled()
@@ -1077,7 +1060,6 @@ class _FitExecution(_FitControl):
                             _curves_from_simulations(
                                 request=request,
                                 evaluations=update.transient_simulation_results_by_dataset,
-                                effective_local=effective_local,
                             )
                             if update.transient_simulation_results_by_dataset
                             else ()
@@ -1213,7 +1195,6 @@ class _FitExecution(_FitControl):
             request=request,
             result=result,
             included_ids=included_ids,
-            effective_local=effective_local,
             setup_snapshot=setup,
             evaluators=evaluators,
         )

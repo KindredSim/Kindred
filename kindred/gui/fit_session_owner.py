@@ -10,7 +10,6 @@ from PySide6 import QtCore, QtWidgets
 from kindred.core.exceptions import located
 from kindred.core.project_document import (
     FitDefaults,
-    MechanismSourceCollision,
     MechanismSourceReconciliation,
     ProjectDocument,
     reconcile_tab_mechanism_source,
@@ -815,8 +814,6 @@ class FitSessionOwner(QtCore.QObject):
             reconciliation = MechanismSourceReconciliation(proposed_document=document)
         else:
             reconciliation = reconcile_tab_mechanism_source(document, tab_id, source)
-        if isinstance(reconciliation, MechanismSourceCollision):
-            reconciliation = reconciliation.replacement
         proposed_document = reconciliation.proposed_document
         proposed_tab = proposed_document.tab(tab_id)
         if initial_values:
@@ -1014,10 +1011,7 @@ class FitSessionOwner(QtCore.QObject):
     def _accepted_setup(self) -> FitSetupSnapshot | None:
         """Return the one accepted setup owner for the current route."""
 
-        state = self._setup_state
-        if state is not None and not isinstance(state, FitSetupSnapshot):
-            raise TypeError("Fit setup owner contains an invalid state.")
-        return state
+        return self._setup_state
 
     def _current_origin(self) -> FitOriginSnapshot | None:
         """Return the concrete origin retained by the accepted setup."""
@@ -1031,8 +1025,6 @@ class FitSessionOwner(QtCore.QObject):
     ) -> None:
         """Install one complete accepted Fit setup."""
 
-        if not isinstance(setup, FitSetupSnapshot):
-            raise TypeError("Accepted Fit setup must be FitSetupSnapshot.")
         self._setup_state = setup
 
     def _set_status(self, text: str, *, phase: str | None = None,

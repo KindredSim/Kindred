@@ -398,19 +398,10 @@ class DataTab(QtWidgets.QWidget):
                 return f"{_FIELD_LABELS[field]} must be a finite number."
         try:
             start, end = fit_execution_span(config["t_start"], config["simulation_end"])
-            if is_time and float(config["data_range_min"]) > float(config["data_range_max"]):
-                return "Data Range minimum must be ≤ maximum."
         except ValueError as exc:
             return str(exc)
         except (KeyError, TypeError):
             return "Complete the Fit Data values before applying."
-        maximum = config.get("maximum_observations_per_target")
-        if maximum not in (None, 0):
-            try:
-                if int(maximum) < 2:
-                    return "Maximum observations must be All or an integer ≥ 2."
-            except (TypeError, ValueError, OverflowError):
-                return "Maximum observations must be All or an integer ≥ 2."
         try:
             retained = self._retained_observations_getter(dataset_id, config)
         except ValueError as exc:

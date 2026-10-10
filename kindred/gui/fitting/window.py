@@ -20,6 +20,7 @@ from kindred.gui.fitting.launch import (
     FitDatasetLocalSettings,
     FitSetupSnapshot,
     fit_setup_readiness,
+    fit_dataset_time_defaults,
     selected_observations,
 )
 from kindred.gui.fitting.parameters_ics_tab import ParametersIcsTab
@@ -458,7 +459,6 @@ class FittingWindow(QtWidgets.QDialog):
                 if dataset.dataset_id in by_id
                 else dataset.dataset_id,
                 "include": dataset.included,
-                "selected_species": list(dataset.target_species),
             }
             for dataset in snapshot.datasets
         ]
@@ -570,12 +570,12 @@ class FittingWindow(QtWidgets.QDialog):
                 "parametric_x": "t",
                 "eligible_parametric_x": (),
             }
-        times = [float(value) for item in mapped.observations for value in item.t]
+        start, end, low, high = fit_dataset_time_defaults(mapped)
         return {
-            "t_start": mapped.resolved_t_start if times else None,
-            "simulation_end": max(times, default=None),
-            "data_range_min": min(times, default=mapped.resolved_t_start),
-            "data_range_max": max(times, default=mapped.resolved_t_start),
+            "t_start": start,
+            "simulation_end": end,
+            "data_range_min": low,
+            "data_range_max": high,
             "maximum_observations_per_target": None,
             "parametric_x": "t",
             "eligible_parametric_x": self._eligible_parametric_x(dataset_id),

@@ -70,6 +70,7 @@ __all__ = [
     "create_initial_fit_setup",
     "selected_observations",
     "fit_execution_span",
+    "fit_dataset_time_defaults",
     "fit_coordinate_datasets_text",
     "fit_group_labels",
     "shared_initial_group_labels",
@@ -872,7 +873,6 @@ class _FitDispatchCompilation:
     prepared_datasets: tuple[FitPreparedDatasetConfig, ...]
     ordinary_shared_variables: tuple[FitSharedVariableParamSpec, ...]
     ordinary_coupled_variables: tuple[FitCoupledVariableParamSpec, ...]
-    fixed_by_dataset: tuple[tuple[str, tuple[tuple[str, float], ...]], ...]
     ordinary_dataset_overrides: tuple[FitDatasetParameterOverrides, ...]
     candidate_names: tuple[str, ...]
     ordinary_optimizer_layout: FitParameterLayout
@@ -996,38 +996,33 @@ def _scan_parameters(
     return tuple(variables)
 
 
+def fit_dataset_time_defaults(
+    mapped: FitMappedDatasetSnapshot,
+) -> tuple[float | None, float | None, float, float]:
+    """Return the initial simulation span and observation range for a dataset."""
+
+    times = [value for observation in mapped.observations for value in observation.t]
+    return (
+        mapped.resolved_t_start if times else None,
+        max(times, default=None),
+        min(times, default=mapped.resolved_t_start),
+        max(times, default=mapped.resolved_t_start),
+    )
+
+
 def create_initial_fit_setup(origin: FitOriginSnapshot) -> FitSetupSnapshot:
     """Build the sole typed Fit-local setup without consulting widget state."""
 
-    datasets = tuple(
-        FitDatasetLocalSettings(
+    datasets = []
+    for mapped in origin.mapped_datasets:
+        start, end, low, high = fit_dataset_time_defaults(mapped)
+        datasets.append(FitDatasetLocalSettings(
             dataset_id=mapped.dataset_id,
             included=False,
-            t_start=(
-                mapped.resolved_t_start
-                if any(observation.t for observation in mapped.observations)
-                else None
-            ),
-            simulation_end=max(
-                (value for observation in mapped.observations for value in observation.t),
-                default=None,
-            ),
-            data_range_min=min(
-                (
-                    value
-                    for observation in mapped.observations
-                    for value in observation.t
-                ),
-                default=mapped.resolved_t_start,
-            ),
-            data_range_max=max(
-                (
-                    value
-                    for observation in mapped.observations
-                    for value in observation.t
-                ),
-                default=mapped.resolved_t_start,
-            ),
+            t_start=start,
+            simulation_end=end,
+            data_range_min=low,
+            data_range_max=high,
             maximum_observations_per_target=None,
             weight=1.0,
             target_species=tuple(
@@ -1045,9 +1040,7 @@ def create_initial_fit_setup(origin: FitOriginSnapshot) -> FitSetupSnapshot:
                 )
                 for observation in mapped.observations
             ),
-        )
-        for mapped in origin.mapped_datasets
-    )
+        ))
     values_by_key = {
         (mapped.set_id, species): value
         for mapped in origin.mapped_datasets
@@ -1071,7 +1064,7 @@ def create_initial_fit_setup(origin: FitOriginSnapshot) -> FitSetupSnapshot:
     return FitSetupSnapshot(
         origin=origin,
         solver="BDF",
-        datasets=datasets,
+        datasets=tuple(datasets),
         parameters=parameters,
         initials=initials,
         defaults=origin.fit_defaults,
@@ -1631,10 +1624,6 @@ def _compile_fit_dispatch(
         prepared_datasets=tuple(prepared_datasets),
         ordinary_shared_variables=tuple(shared_variables),
         ordinary_coupled_variables=tuple(coupled_variables),
-        fixed_by_dataset=tuple(
-            (item.dataset_id, item.fixed_params)
-            for item in overrides
-        ),
         ordinary_dataset_overrides=overrides,
         candidate_names=tuple(
             sorted(

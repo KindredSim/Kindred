@@ -8,12 +8,10 @@ cd -- "${REPO_ROOT}"
 
 # Names vulture cannot see being used: Qt, pyqtgraph and QSyntaxHighlighter
 # overrides, sympy printer hooks and signature parameters, pickle hooks,
-# attributes read by openpyxl/zipfile/decimal/pyqtgraph, and menus that MainWindow
-# reaches through getattr.
+# attributes read by openpyxl/zipfile/decimal/pyqtgraph.
 VULTURE_IGNORE_NAMES="closeEvent,expandingDirections,minimumHeightForWidth,highlightBlock,showAxRect,\
 _print_*,bold_name,persistent_id,persistent_load,\
-sheet_state,create_system,external_attr,prec,border,\
-_edit_menu,_view_menu,_simulation_menu,_fitting_menu"
+sheet_state,create_system,external_attr,prec,border"
 
 # Checks are only meaningful against the pinned environment, so a failed sync
 # stops CI before any check runs.

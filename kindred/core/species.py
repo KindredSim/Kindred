@@ -43,7 +43,6 @@ __all__ = [
     "validate_input_time_seconds",
     "validate_imported_time_seconds",
     "validate_observation",
-    "validate_runtime_concentration",
     "validate_evaluation_count",
 ]
 
@@ -184,19 +183,6 @@ def validate_observation(value: object, *, field: str = "observation") -> float:
     """Admit an arbitrary finite observation, including signed values."""
 
     return _numeric(value, field=field)
-
-
-def validate_runtime_concentration(
-    value: object,
-    *,
-    field: str = "runtime concentration",
-) -> float:
-    """Check solver state finiteness/nonnegativity without an authored floor."""
-
-    parsed = _numeric(value, field=field)
-    if parsed < 0.0:
-        raise ValueError(f"{field} must be nonnegative.")
-    return parsed
 
 
 def _validate_count(value: object, *, field: str, maximum: int) -> int:

@@ -1,4 +1,4 @@
-"""Fail on kindred.core -> kindred.gui imports and on internal import cycles.
+"""Enforce internal layering, acyclic imports, and the Fit child's Qt exclusion.
 
 Every runtime import counts, including imports inside functions; imports under
 ``if TYPE_CHECKING:`` do not.
@@ -51,7 +51,7 @@ def _runtime_imports(node: ast.AST):
 
 def _targets(node: ast.Import | ast.ImportFrom, module: str, is_package: bool, index) -> list[str]:
     if isinstance(node, ast.Import):
-        return [alias.name for alias in node.names if alias.name in index]
+        return [alias.name for alias in node.names]
     if node.level:
         package = (module if is_package else module.rpartition(".")[0]).split(".")
         base_parts = package[: len(package) - (node.level - 1)]
@@ -63,9 +63,36 @@ def _targets(node: ast.Import | ast.ImportFrom, module: str, is_package: bool, i
         submodule = f"{base}.{alias.name}"
         if alias.name != "*" and submodule in index:
             found.append(submodule)
-        elif base in index:
+        else:
             found.append(base)
     return found
+
+
+def _fit_child_import_problems(index, imports) -> list[str]:
+    """Follow child dependencies, including package initializers and local imports."""
+
+    pending = ["kindred.gui.fitting.process"]
+    visited: set[str] = set()
+    problems: list[str] = []
+    while pending:
+        module = pending.pop()
+        if module in visited:
+            continue
+        visited.add(module)
+        parts = module.split(".")
+        pending.extend(
+            parent for length in range(1, len(parts))
+            if (parent := ".".join(parts[:length])) in index
+        )
+        path, _is_package = index[module]
+        for line, target in imports[module]:
+            if target.split(".")[0].lower() in {"pyside6", "shiboken6", "pyqtgraph"}:
+                problems.append(
+                    f"{path.relative_to(REPO_ROOT)}:{line}: Fit child must not import {target}"
+                )
+            elif target in index:
+                pending.append(target)
+    return problems
 
 
 def _cycles(graph: dict[str, set[str]]) -> list[list[str]]:
@@ -107,12 +134,14 @@ def _cycles(graph: dict[str, set[str]]) -> list[list[str]]:
 def main() -> int:
     index = _module_index()
     graph: dict[str, set[str]] = {module: set() for module in index}
+    imports: dict[str, list[tuple[int, str]]] = {module: [] for module in index}
     problems: list[str] = []
     for module, (path, is_package) in index.items():
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
         for node in _runtime_imports(tree):
             for target in _targets(node, module, is_package, index):
-                if target == module:
+                imports[module].append((node.lineno, target))
+                if target == module or target not in index:
                     continue
                 graph[module].add(target)
                 if module.startswith("kindred.core") and target.startswith("kindred.gui"):
@@ -120,6 +149,7 @@ def main() -> int:
                         f"{path.relative_to(REPO_ROOT)}:{node.lineno}: kindred.core must not import {target}"
                     )
     problems.extend(f"import cycle: {' <-> '.join(component)}" for component in _cycles(graph))
+    problems.extend(_fit_child_import_problems(index, imports))
     for problem in problems:
         print(problem)
     print(f"import graph: {len(index)} modules, {len(problems)} problems")

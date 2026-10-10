@@ -17,7 +17,6 @@ __all__ = [
     "DslSourceCoordinateCapabilities",
     "canonical_source_coordinate_name",
     "source_coordinate_capabilities",
-    "source_coordinate_roles",
     "source_coordinate_name_pattern",
     "source_coordinate_name_parts",
 ]
@@ -83,12 +82,6 @@ _SOURCE_COORDINATE_CAPABILITIES: Mapping[str, DslSourceCoordinateCapabilities] =
 _SOURCE_COORDINATE_NAME_RE = re.compile(
     r"^(?P<role>degeneracy|dG_act|dG_eq|kappa|Keq|kf|kr|Ea|A|k)(?P<step>[1-9]\d*)$"
 )
-
-
-def source_coordinate_roles() -> frozenset[str]:
-    """Return all admitted source roles from the central immutable catalogue."""
-
-    return frozenset(_SOURCE_COORDINATE_CAPABILITIES)
 
 
 def source_coordinate_name_pattern() -> re.Pattern[str]:

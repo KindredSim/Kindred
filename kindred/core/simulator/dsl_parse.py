@@ -1215,7 +1215,7 @@ def _parse_dsl_ir(text: str, *, units: UnitsModel | None = None) -> "DSLIR":
             )
         except TemperatureDSLError as exc:
             raise _DSLError(
-                exc.message, suggestion=exc.suggestion, examples=exc.examples,
+                exc.message, examples=exc.examples,
                 line_number=line_no, line_content=raw,
             ) from exc
 

@@ -12,7 +12,6 @@ from PySide6 import QtCore
 
 from kindred.core.mechanism_source import MechanismAuthoringSource
 from kindred.core.project_document import (
-    MechanismSourceCollision,
     MechanismTabDocument,
     canonical_initial_values,
     canonical_species_names,
@@ -21,7 +20,6 @@ from kindred.core.project_document import (
 from kindred.core.simulation_preparation import (
     SimulationExecutionRequest,
     build_simulation_execution_request,
-    simulation_execution_requests_equal,
 )
 from kindred.core.simulation_preparation_stages import build_solver_config
 from kindred.core.species import validate_concentration
@@ -46,7 +44,6 @@ from kindred.gui.parameter_enumeration import (
     enumerate_parameter_coordinates,
 )
 from kindred.gui.widgets.batch_initial_conditions_table import (
-    BatchInitialConditionsTableModel,
     BatchInitialConditionsTableView,
     resolve_live_slider_target_set_ids,
 )
@@ -149,16 +146,7 @@ class TabSliderBinding(QtCore.QObject):
         parent: QtCore.QObject | None = None,
     ) -> None:
         super().__init__(parent)
-        target = str(tab_id).strip()
-        if not target:
-            raise ValueError("tab_id must be nonblank.")
-        if not callable(getattr(registry, "tab", None)):
-            raise TypeError("registry must provide tab(tab_id).")
-        if not isinstance(slider_workspace_owner, MechanismEditorTabbed):
-            raise TypeError("slider_workspace_owner must be MechanismEditorTabbed.")
-        if not isinstance(table.model(), BatchInitialConditionsTableModel):
-            raise TypeError("table must use BatchInitialConditionsTableModel.")
-        self._tab_id, self._registry, self._table = target, registry, table
+        self._tab_id, self._registry, self._table = tab_id, registry, table
         self._variable_sliders, self._species_sliders = (
             variable_sliders,
             species_sliders,
@@ -762,10 +750,7 @@ class TabSliderBinding(QtCore.QObject):
         except (TypeError, ValueError, KeyError):
             return False
         return all(
-            simulation_execution_requests_equal(
-                target.canonical_run_target.execution_request,
-                current_request,
-            )
+            (target.canonical_run_target.execution_request == current_request)
             for target, current_request in zip(
                 capture.targets,
                 current_requests,
@@ -925,8 +910,6 @@ class TabSliderBinding(QtCore.QObject):
                 self._tab_id,
                 visible_source,
             )
-            if isinstance(reconciliation, MechanismSourceCollision):
-                reconciliation = reconciliation.replacement
             candidate_document = reconciliation.proposed_document
             candidate_tab = candidate_document.tab(self._tab_id)
 

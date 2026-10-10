@@ -698,12 +698,7 @@ class InitialConditionsTableActions(QtCore.QObject):
         parent: QtCore.QObject | None = None,
     ) -> None:
         super().__init__(parent)
-        target = str(tab_id).strip()
-        if not target:
-            raise ValueError("tab_id must be nonblank.")
-        if not callable(getattr(registry, "tab", None)):
-            raise TypeError("registry must provide tab(tab_id).")
-        self._tab_id = target
+        self._tab_id = tab_id
         self._registry = registry
         self._model = model
         self._table = table

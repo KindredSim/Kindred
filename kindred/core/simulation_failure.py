@@ -102,20 +102,6 @@ class FactualCause:
     examples: tuple[str, ...] = ()
     cause: "FactualCause | None" = None
 
-    @classmethod
-    def from_exception(
-        cls,
-        exc: BaseException,
-        *,
-        domain: str = "simulation",
-        origin: str = "exception",
-    ) -> "FactualCause":
-        return factual_cause_from_exception(
-            exc,
-            domain=domain,
-            origin=origin,
-        )
-
     def location(self) -> tuple[object, object]:
         """The first authored line named along this cause chain, as (line, text)."""
         cause: FactualCause | None = self

@@ -27,7 +27,6 @@ from kindred.core.analysis.fit_uncertainty import (
 from kindred.core.analysis import global_fit_execution as _fit_execution
 from kindred.core.exceptions import (
     FitCandidateDomainError,
-    FitSimulationError,
     FittingCancelled,
     SimulationCancelled,
 )
@@ -186,38 +185,37 @@ def fit_global(
                 candidate_vector: np.ndarray,
                 *,
                 converged: bool,
-            ) -> _fit_execution._FitReplayState:
-                return _fit_execution._assemble_fit_replay_state(
-                    fit_evaluators=evaluators,
-                    payloads=payloads,
-                    layout=layout,
-                    candidate_vector=candidate_vector,
-                    fixed_dataset_params=fixed_dataset_params,
-                    weights=weights_norm,
-                    cancellation_check=active_cancelled,
-                    cancellation_control=active_control,
-                    success=converged,
-                    message=message,
-                    optimizer_diagnostic=optimizer_diagnostic,
-                    executor=executor,
-                )
-
-            try:
-                # Scientific availability belongs to the actual optimizer endpoint
-                # replay.  A better fully evaluated probe must not replace it.
-                replay_state = replay(optimizer_endpoint_vector, converged=success)
-            except FitSimulationError as exc:
-                details = dict(getattr(exc, "details", None) or {})
-                if not isinstance(exc, FitCandidateDomainError) and not details.get("scientific_unavailable"):
-                    raise
-                retained_best = objective.best_complete_vector
-                if retained_best is None:
+            ) -> _fit_execution.GlobalFitResult | ScientificUnavailable:
+                try:
+                    return _fit_execution._replay_fit_result(
+                        fit_evaluators=evaluators,
+                        payloads=payloads,
+                        layout=layout,
+                        candidate_vector=candidate_vector,
+                        fixed_dataset_params=fixed_dataset_params,
+                        weights=weights_norm,
+                        cancellation_check=active_cancelled,
+                        cancellation_control=active_control,
+                        success=converged,
+                        message=message,
+                        optimizer_diagnostic=optimizer_diagnostic,
+                        executor=executor,
+                    )
+                except FitCandidateDomainError as exc:
                     return ScientificUnavailable(
-                        producer=str(details.get("producer", "global_fit_replay")),
-                        stage=str(details.get("stage", "final_replay")),
-                        details=details,
+                        producer="global_fit_replay",
+                        stage=exc.details["stage"],
+                        details=exc.details,
                         factual_cause=getattr(exc, "factual_cause", None),
                     )
+
+            # Scientific availability belongs to the actual optimizer endpoint
+            # replay. A better fully evaluated probe must not replace it.
+            result = replay(optimizer_endpoint_vector, converged=success)
+            if isinstance(result, ScientificUnavailable):
+                retained_best = objective.best_complete_vector
+                if retained_best is None:
+                    return result
                 retained_best_vector = np.asarray(retained_best, dtype=float).reshape(-1)
                 optimizer_diagnostic = FactualCause(
                     domain="fit",
@@ -236,22 +234,9 @@ def fit_global(
                     },
                     cause=optimizer_diagnostic,
                 )
-                try:
-                    replay_state = replay(retained_best_vector, converged=False)
-                except FitSimulationError as fallback_exc:
-                    fallback_details = dict(
-                        getattr(fallback_exc, "details", None) or {}
-                    )
-                    if not isinstance(fallback_exc, FitCandidateDomainError) and not fallback_details.get("scientific_unavailable"):
-                        raise
-                    return ScientificUnavailable(
-                        producer=str(
-                            fallback_details.get("producer", "global_fit_replay")
-                        ),
-                        stage=str(fallback_details.get("stage", "final_replay")),
-                        details=fallback_details,
-                        factual_cause=getattr(fallback_exc, "factual_cause", None),
-                    )
+                result = replay(retained_best_vector, converged=False)
+                if isinstance(result, ScientificUnavailable):
+                    return result
         except (FittingCancelled, SimulationCancelled):
             if hard_cancelled() or stop_check is None or not stop_check():
                 raise
@@ -260,7 +245,7 @@ def fit_global(
                 raise FittingCancelled()
             primary_stopped = True
             message = "Fit stopped. Best complete candidate retained."
-            replay_state = _fit_execution._assemble_fit_result_facts(
+            result = _fit_execution._assemble_fit_result_facts(
                 payloads=payloads,
                 layout=layout,
                 candidate_vector=retained_vector,
@@ -274,7 +259,7 @@ def fit_global(
                     type="FittingStopped", message=message, details={},
                 ),
             )
-        vector = np.asarray(replay_state.optimizer_vector, dtype=float)
+        vector = np.asarray(result.optimizer_vector, dtype=float)
         # Post-fit methods receive a fresh objective without progress emission.
         # It retains the same evaluators, candidate/fatal taxonomy, coordinates,
         # normalized weights, cancellation owner, and immutable captures.
@@ -318,6 +303,10 @@ def fit_global(
             if method == "differential_evolution" else (ftol, xtol)
         )
         if profile_likelihood is not None:
+            base_residuals = np.concatenate(
+                [info.weighted_residuals for info in result.dataset_info]
+            )
+            base_residuals.setflags(write=False)
             fitted_value_count = len(keys)
             try:
                 if primary_stopped:
@@ -338,7 +327,7 @@ def fit_global(
                     ),
                     ftol=refit_ftol,
                     xtol=refit_xtol,
-                    base_residuals=replay_state.weighted_residuals,
+                    base_residuals=base_residuals,
                     cancellation_check=active_cancelled,
                     progress_callback=extension_progress_callback,
                 )
@@ -353,7 +342,7 @@ def fit_global(
                     config=profile_likelihood,
                     status="stopped",
                     cause=stop_cause,
-                    observation_count=int(replay_state.weighted_residuals.size),
+                    observation_count=int(base_residuals.size),
                     fitted_value_count=fitted_value_count,
                 )
             except Exception as exc:
@@ -365,7 +354,7 @@ def fit_global(
                         domain="fit",
                         origin="profile_likelihood",
                     ),
-                    observation_count=int(replay_state.weighted_residuals.size),
+                    observation_count=int(base_residuals.size),
                     fitted_value_count=fitted_value_count,
                 )
 
@@ -415,7 +404,7 @@ def fit_global(
             else:
                 try:
                     bootstrap_result = residual_bootstrap_result(
-                        terminal_result=replay_state,
+                        terminal_result=result,
                         payloads=payloads,
                         config=residual_bootstrap,
                         refit=refit_bootstrap,
@@ -463,15 +452,14 @@ def fit_global(
                     if analysis.provenance.get("settlement") == "not_started_after_stop"
                     else f"{label} stopped."
                 )
-        replay_state = replace(
-            replay_state,
-            message=" ".join((replay_state.message, *analysis_messages)),
+        result = replace(
+            result,
+            message=" ".join((result.message, *analysis_messages)),
             profile_likelihood_result=profile_result,
             residual_bootstrap_result=bootstrap_result,
         )
         if hard_cancelled():
             raise FittingCancelled()
-        result = _fit_execution._construct_global_fit_result(replay_state)
         return result
 
     except FittingCancelled:

@@ -40,6 +40,7 @@ __all__ = [
 class TabRuntimeState:
     """Noncanonical authoring and transient view state for exactly one tab."""
 
+    result_repository: ResultRepository
     reactions_draft: MechanismAuthoringSource | None = None
     notes_draft: str | None = None
     # Raw authored concentration text which has not yet crossed the normal
@@ -53,7 +54,6 @@ class TabRuntimeState:
     slider_species_drafts_by_set_id: dict[str, dict[str, float]] = field(
         default_factory=dict
     )
-    result_repository: "ResultRepository | None" = None
 
     @property
     def has_dirty_drafts(self) -> bool:
@@ -154,13 +154,13 @@ class WorkspaceTabRegistry:
     def tab(self, tab_id: str) -> MechanismTabDocument:
         """Return canonical truth for exactly one caller-supplied tab ID."""
 
-        return self._session.document.tab(str(tab_id))
+        return self._session.document.tab(tab_id)
 
     def capture_content_token(self) -> ProjectContentToken:
         return self._session.capture_content_token()
 
     def presentation(self, tab_id: str) -> ProjectPresentationState:
-        target = str(tab_id)
+        target = tab_id
         self._session.document.tab(target)
         for current_id, state in self._presentation_by_tab_id:
             if current_id == target:
@@ -168,7 +168,7 @@ class WorkspaceTabRegistry:
         raise KeyError(f"Unknown presentation tab ID: {target!r}.")
 
     def tab_runtime(self, tab_id: str) -> TabRuntimeState:
-        target = str(tab_id)
+        target = tab_id
         self._session.document.tab(target)
         for current_id, runtime in self._runtime_by_tab_id:
             if current_id == target:
@@ -198,12 +198,6 @@ class WorkspaceTabRegistry:
         if not self._session.is_content_token_current(expected_token):
             return None
         runtime_by_tab_id = self._fresh_runtimes(presentation)
-        previous = self._session.document
-        delta = self.scientific_document_delta(previous, document)
-        if document != previous and (
-            delta.affected_targets_by_tab or delta.removed_targets_by_tab
-        ):
-            self._prepare_document_delta(delta, previous, document)
         token = self._session.replace_project(
             document,
             presentation,
@@ -300,8 +294,8 @@ class WorkspaceTabRegistry:
                 runtime.slider_species_drafts_by_set_id.clear()
         for tab_id, affected_ids in delta.affected_targets_by_tab:
             runtime = existing_runtime.get(tab_id)
-            repository = None if runtime is None else runtime.result_repository
-            if repository is not None:
+            if runtime is not None:
+                repository = runtime.result_repository
                 previous_tab = previous_by_tab_id.get(tab_id)
                 replacement_tab = replacement_by_tab_id.get(tab_id)
                 if (
@@ -324,15 +318,13 @@ class WorkspaceTabRegistry:
                 for set_id in removed:
                     runtime.initial_text_by_set_id.pop(set_id, None)
                     runtime.slider_species_drafts_by_set_id.pop(set_id, None)
-            repository = None if runtime is None else runtime.result_repository
-            if repository is not None:
-                repository.purge_sets(removed_ids)
+                runtime.result_repository.purge_sets(removed_ids)
 
     def select_tab(
         self,
         tab_id: str,
     ) -> None:
-        target = str(tab_id)
+        target = tab_id
         self._session.document.tab(target)
         if target == self.active_tab_id:
             return
@@ -520,8 +512,7 @@ class WorkspaceTabRegistry:
         runtime.selected_run_set_ids = tuple(
             set_ids[sid] for sid in source_runtime.selected_run_set_ids
         )
-        if repository is not None and runtime.result_repository is not None:
-            runtime.result_repository.copy_accepted_runs_from(repository, matching_set_ids)
+        runtime.result_repository.copy_accepted_runs_from(repository, matching_set_ids)
         if activate:
             self.select_tab(copied.tab_id)
         return final_copy
@@ -559,7 +550,7 @@ class WorkspaceTabRegistry:
         Return ``None`` when the expected project content is no longer current.
         """
         document = self._session.document
-        target = str(tab_id)
+        target = tab_id
         index = next(
             (index for index, tab in enumerate(document.tabs) if tab.tab_id == target),
             None,
@@ -617,12 +608,8 @@ class WorkspaceTabRegistry:
         *,
         expected_token: ProjectContentToken,
     ) -> ProjectContentToken | None:
-        if not callable(mutation):
-            raise TypeError("mutation must be callable.")
         target = self.tab(tab_id)
         candidate = mutation(target)
-        if not isinstance(candidate, MechanismTabDocument):
-            raise TypeError("mutation must return a MechanismTabDocument.")
         return self.replace_tab(
             target.tab_id,
             candidate,

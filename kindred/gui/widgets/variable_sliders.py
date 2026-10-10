@@ -117,7 +117,6 @@ class VariableSliders(QtWidgets.QWidget):
         self._slider_scales: Dict[str, str] = {}  # 'log' (default) or 'linear'
         self._containers: Dict[str, QtWidgets.QWidget] = {}
         self._metadata: Dict[str, Dict[str, object]] = {}
-        self._last_valid_values: Dict[str, float] = {}
         self._fine_mode: bool = False
         self._slider_callbacks: Dict[str, Dict[str, object]] = {}
         self._hidden_names: set[str] = set()
@@ -196,7 +195,6 @@ class VariableSliders(QtWidgets.QWidget):
         self._slider_signs.clear()
         self._slider_scales.clear()
         self._metadata.clear()
-        self._last_valid_values.clear()
         self._active_presses.clear()
         self._editor_pre_edit_state.clear()
         self._last_committed_editor_text.clear()
@@ -315,7 +313,6 @@ class VariableSliders(QtWidgets.QWidget):
         self._ensure_range_covers(name, value_f, project_slider=False)
         slider_pos = self._value_to_slider_pos(name, value_f)
         slider.setValue(slider_pos)
-        self._last_valid_values[name] = value_f
 
         # Connect slider to update handler
         callbacks = self._slider_callbacks.setdefault(str(name), {})
@@ -402,46 +399,8 @@ class VariableSliders(QtWidgets.QWidget):
         if name not in self._sliders:
             return
 
-        try:
-            value = float(self._slider_pos_to_value(name, slider_pos))
-        except (ArithmeticError, TypeError, ValueError) as exc:
-            fallback = self._last_valid_values.get(name, self._variables.get(name, 0.0))
-            try:
-                value = float(fallback)
-            except (ArithmeticError, TypeError, ValueError):
-                value = 0.0
+        value = self._slider_pos_to_value(name, slider_pos)
 
-            if not math.isfinite(value):
-                scale = self._slider_scales.get(name, "log")
-                if scale == "log":
-                    sign = self._slider_signs.get(name, 1.0)
-                    value = (1.0 if sign >= 0 else -1.0) * _LOG_SLIDER_VALUE_MIN
-                else:
-                    value = 0.0
-
-            slider = self._sliders.get(name)
-            if slider is not None:
-                try:
-                    restore_pos = self._value_to_slider_pos(name, value)
-                except (ArithmeticError, TypeError, ValueError):
-                    restore_pos = max(
-                        slider.minimum(), min(int(slider_pos), slider.maximum())
-                    )
-                with QtCore.QSignalBlocker(slider):
-                    slider.setValue(restore_pos)
-
-            self._set_value_projection(name, value, editor_text=None, emit=False)
-
-            logger.warning(
-                "Slider conversion failed for %s at pos=%s (%s); restored last valid value %.12g",
-                str(name),
-                int(slider_pos),
-                type(exc).__name__,
-                float(value),
-            )
-            return
-
-        slider = self._sliders.get(name)
         physically_pressed = str(name) in self._active_presses
         if physically_pressed:
             press = self._active_presses.get(str(name))
@@ -599,10 +558,6 @@ class VariableSliders(QtWidgets.QWidget):
 
         value_f = float(value)
         self._variables[name] = value_f
-        try:
-            self._last_valid_values[name] = value_f
-        except (TypeError, ValueError, OverflowError):
-            self._last_valid_values.pop(name, None)
         if self._slider_scales.get(name, "log") == "log":
             self._slider_signs[name] = 1.0 if value_f >= 0 else -1.0
         self._ensure_range_covers(name, value_f, project_slider=False)
@@ -687,9 +642,7 @@ class VariableSliders(QtWidgets.QWidget):
         for name, slider in self._sliders.items():
             # Preserve the authoritative scientific value rather than
             # reconstructing it from the quantized slider position.
-            val = float(
-                self._variables.get(name, self._last_valid_values.get(name, 0.0))
-            )
+            val = self._variables[name]
 
             # Switch resolution without emitting valueChanged (Fine must not trigger simulations).
             new_max = 10000 if enabled else 1000
@@ -700,7 +653,7 @@ class VariableSliders(QtWidgets.QWidget):
                 slider.setPageStep(50 if enabled else 100)
 
                 # Restore position for the same numeric value
-                slider.setValue(self._value_to_slider_pos(name, float(val)))
+                slider.setValue(self._value_to_slider_pos(name, val))
                 slider.set_fine_mode(enabled)
 
         logger.info(f"Fine mode {'enabled' if enabled else 'disabled'}")
@@ -878,7 +831,6 @@ class VariableSliders(QtWidgets.QWidget):
             self._slider_signs[name_s] = 1.0 if value_f >= 0 else -1.0
         self._ensure_range_covers(name_s, value_f)
         self._variables[name_s] = value_f
-        self._last_valid_values[name_s] = value_f
         slider = self._sliders[name_s]
         with QtCore.QSignalBlocker(slider):
             slider.setValue(self._value_to_slider_pos(name_s, value_f))
@@ -926,92 +878,21 @@ class VariableSliders(QtWidgets.QWidget):
     def _compute_initial_range(self, value: float) -> Tuple[float, float]:
         """Derive an appropriate log range for a slider based on its value."""
         default_min, default_max = _LOG_SLIDER_EXP_MIN, _LOG_SLIDER_EXP_MAX
-        if not math.isfinite(float(value)) or float(value) == 0.0:
+        if value == 0.0:
             return default_min, default_max
 
-        magnitude = self._clamp_log_magnitude(value)
+        magnitude = self._log_magnitude(value)
         log_center = math.log10(magnitude)
         span = 4.0  # ±4 orders of magnitude around current value
         log_min = max(log_center - span, _LOG_DOMAIN_MIN)
         log_max = min(log_center + span, _LOG_DOMAIN_MAX)
 
-        if log_max - log_min < 0.5:
-            log_min = max(log_center - 0.25, _LOG_DOMAIN_MIN)
-            log_max = min(log_center + 0.25, _LOG_DOMAIN_MAX)
-
-        # Ensure sane ordering
-        if log_max <= log_min:
-            if log_center <= _LOG_DOMAIN_MIN:
-                return _LOG_DOMAIN_MIN, min(
-                    _LOG_DOMAIN_MIN + 1.0, _LOG_DOMAIN_MAX
-                )
-            if log_center >= _LOG_DOMAIN_MAX:
-                return max(
-                    _LOG_DOMAIN_MAX - 1.0, _LOG_DOMAIN_MIN
-                ), _LOG_DOMAIN_MAX
-            log_min = max(log_center - 0.5, _LOG_DOMAIN_MIN)
-            log_max = min(log_center + 0.5, _LOG_DOMAIN_MAX)
-            if log_max <= log_min:
-                return default_min, default_max
-
-        return log_min, log_max
-
-    def _clamp_log_magnitude(self, value: float) -> float:
-        """Clamp a magnitude to the representable log slider domain."""
-        try:
-            magnitude = abs(float(value))
-        except (ArithmeticError, TypeError, ValueError):
-            magnitude = _LOG_SLIDER_VALUE_MIN
-
-        if not math.isfinite(magnitude) or magnitude <= 0.0:
-            return _LOG_SLIDER_VALUE_MIN
-        return min(max(magnitude, float.fromhex("0x0.0000000000001p-1022")), sys.float_info.max)
-
-    def _validated_log_range(self, name: str) -> Tuple[float, float]:
-        """Return a finite, ordered, bounded log10 range for a slider."""
-        raw_min, raw_max = self._slider_ranges.get(
-            name, (_LOG_SLIDER_EXP_MIN, _LOG_SLIDER_EXP_MAX)
-        )
-        try:
-            log_min = float(raw_min)
-        except (ArithmeticError, TypeError, ValueError):
-            log_min = _LOG_SLIDER_EXP_MIN
-        try:
-            log_max = float(raw_max)
-        except (ArithmeticError, TypeError, ValueError):
-            log_max = _LOG_SLIDER_EXP_MAX
-
-        if not math.isfinite(log_min):
-            log_min = _LOG_SLIDER_EXP_MIN
-        if not math.isfinite(log_max):
-            log_max = _LOG_SLIDER_EXP_MAX
-
-        log_min = min(max(log_min, _LOG_DOMAIN_MIN), _LOG_DOMAIN_MAX)
-        log_max = min(max(log_max, _LOG_DOMAIN_MIN), _LOG_DOMAIN_MAX)
-        if log_max <= log_min:
-            log_min, log_max = _LOG_DOMAIN_MIN, _LOG_DOMAIN_MAX
         return log_min, log_max
 
     @staticmethod
-    def _representable_linear_range(value: float) -> Tuple[float, float]:
-        """Return finite ordered neighbors containing one finite value."""
-        value_f = float(value)
-        if not math.isfinite(value_f):
-            raise ValueError("Linear slider values must be finite.")
-
-        lower = math.nextafter(value_f, -math.inf)
-        upper = math.nextafter(value_f, math.inf)
-        if not math.isfinite(lower):
-            lower = value_f
-        if not math.isfinite(upper):
-            upper = value_f
-        if lower < value_f < upper:
-            return lower, upper
-        if lower < value_f:
-            return lower, value_f
-        if value_f < upper:
-            return value_f, upper
-        raise ValueError("Could not construct an ordered linear slider range.")
+    def _log_magnitude(value: float) -> float:
+        """Place an exact zero on the log handle without changing its value."""
+        return _LOG_SLIDER_VALUE_MIN if value == 0.0 else abs(value)
 
     @staticmethod
     def _linear_fraction(value: float, lower: float, upper: float) -> float:
@@ -1084,23 +965,10 @@ class VariableSliders(QtWidgets.QWidget):
         frac = min(max(pos / steps, 0.0), 1.0)
 
         if scale == "linear":
-            lo, hi = self._slider_ranges.get(name, (0.0, 1.0))
-            lo = float(lo)
-            hi = float(hi)
-            if not (
-                math.isfinite(lo)
-                and math.isfinite(hi)
-                and hi > lo
-            ):
-                reference = self._last_valid_values.get(
-                    name,
-                    self._variables.get(name, 0.0),
-                )
-                lo, hi = self._representable_linear_range(float(reference))
-                self._slider_ranges[name] = (lo, hi)
+            lo, hi = self._slider_ranges[name]
             return self._linear_value_at_fraction(frac, lo, hi)
 
-        log_min, log_max = self._validated_log_range(name)
+        log_min, log_max = self._slider_ranges[name]
         log_value = log_min + frac * (log_max - log_min)
         log_value = min(max(log_value, log_min), log_max)
         magnitude = 10 ** float(log_value)
@@ -1116,26 +984,15 @@ class VariableSliders(QtWidgets.QWidget):
         scale = self._slider_scales.get(name, "log")
         steps = max(1, self._sliders[name].maximum())
         if scale == "linear":
-            lo, hi = self._slider_ranges.get(name, (0.0, 1.0))
-            lo = float(lo)
-            hi = float(hi)
-            if not (
-                math.isfinite(lo)
-                and math.isfinite(hi)
-                and hi > lo
-            ):
-                lo, hi = self._representable_linear_range(float(value_abs))
-                self._slider_ranges[name] = (lo, hi)
+            lo, hi = self._slider_ranges[name]
             frac = self._linear_fraction(float(value_abs), lo, hi)
             return max(0, min(int(round(frac * steps)), int(steps)))
 
-        log_min, log_max = self._validated_log_range(name)
+        log_min, log_max = self._slider_ranges[name]
         log_span = log_max - log_min
-        if log_span <= 0:
-            log_span = _LOG_DOMAIN_MAX - _LOG_DOMAIN_MIN
 
         sign = self._slider_signs.get(name, 1.0)
-        magnitude = self._clamp_log_magnitude(value_abs)
+        magnitude = self._log_magnitude(value_abs)
         log_value = math.log10(magnitude)
         log_value = min(max(log_value, log_min), log_max)
         frac = (log_value - log_min) / log_span
@@ -1157,24 +1014,11 @@ class VariableSliders(QtWidgets.QWidget):
 
         if self._slider_scales.get(name, "log") == "linear":
             value_f = float(value)
-            raw_min, raw_max = self._slider_ranges[name]
-            try:
-                linear_min = float(raw_min)
-                linear_max = float(raw_max)
-            except (ArithmeticError, TypeError, ValueError):
-                linear_min, linear_max = math.nan, math.nan
-
-            if (
-                math.isfinite(linear_min)
-                and math.isfinite(linear_max)
-                and linear_max > linear_min
-            ):
-                if value_f < linear_min:
-                    linear_min = value_f
-                elif value_f > linear_max:
-                    linear_max = value_f
-            else:
-                linear_min, linear_max = self._representable_linear_range(value_f)
+            linear_min, linear_max = self._slider_ranges[name]
+            if value_f < linear_min:
+                linear_min = value_f
+            elif value_f > linear_max:
+                linear_max = value_f
 
             self._slider_ranges[name] = (linear_min, linear_max)
             self._update_range_labels(name)
@@ -1184,9 +1028,8 @@ class VariableSliders(QtWidgets.QWidget):
                     slider.setValue(self._value_to_slider_pos(name, value_f))
             return
 
-        log_min, log_max = self._validated_log_range(name)
-        self._slider_ranges[name] = (log_min, log_max)
-        magnitude = self._clamp_log_magnitude(value)
+        log_min, log_max = self._slider_ranges[name]
+        magnitude = self._log_magnitude(value)
         log_value = math.log10(magnitude)
 
         needs_expand = log_value < log_min or log_value > log_max
@@ -1214,17 +1057,13 @@ class VariableSliders(QtWidgets.QWidget):
             min_label.setText(self._format_value(float(linear_min)))
             max_label.setText(self._format_value(float(linear_max)))
             return
-        log_min, log_max = self._validated_log_range(name)
-        self._slider_ranges[name] = (log_min, log_max)
+        log_min, log_max = self._slider_ranges[name]
         min_label.setText(self._format_power_of_ten(log_min))
         max_label.setText(self._format_power_of_ten(log_max))
 
     @staticmethod
     def _format_power_of_ten(log_value: float) -> str:
         """Format a base-10 exponent as a compact string."""
-        if not math.isfinite(log_value):
-            log_value = _LOG_SLIDER_EXP_MIN
-        log_value = min(max(float(log_value), _LOG_DOMAIN_MIN), _LOG_DOMAIN_MAX)
         exponent = int(round(log_value))
         if abs(log_value - exponent) < 1e-6:
             return f"10<sup>{exponent}</sup>"

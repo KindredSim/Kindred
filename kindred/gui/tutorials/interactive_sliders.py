@@ -107,7 +107,7 @@ class InteractiveSliders(PracticeLesson):
                 "<p>If the <b>Interactive Sliders panel</b> is hidden, open "
                 "<b>View → Panels → Interactive Sliders</b>. You can also click <b>Show This Control</b> below.</p>"
                 "<p>In the Interactive Sliders panel, open <b>Visible Sliders</b>. "
-                "Check <b>kf1 — A → B</b> and <b>k2 — B → C</b>, then close the menu.</p>"
+                "Check <b>kf1 — A ⇌ B</b> and <b>k2 — B → C</b>, then close the menu.</p>"
                 "<p><b>kf1</b> controls the forward rate of A ⇌ B and <b>k2</b> controls B → C. "
                 "You can drag either slider or type a value. Leave <b>kr1 = 0.25</b>.</p>",
                 self._slider_target,

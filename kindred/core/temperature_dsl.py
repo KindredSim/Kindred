@@ -35,15 +35,12 @@ class TemperatureDSLError(AuthoredSourceError):
 
     Provides helpful context and examples for common mistakes.
     """
-    def __init__(self, message: str, *, suggestion: str = None, examples: list = None):
+    def __init__(self, message: str, *, examples: list = None):
         self.message = message
-        self.suggestion = suggestion
         self.examples = examples or []
 
         # Build comprehensive error message
         parts = [message]
-        if suggestion:
-            parts.append(f"\nSuggestion: {suggestion}")
         if examples:
             parts.append("\nValid examples:")
             for ex in examples:

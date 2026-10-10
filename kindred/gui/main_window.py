@@ -855,17 +855,14 @@ class MainWindow(QtWidgets.QMainWindow):
             self._symbolic_calculator_dock,
         ):
             widget.setEnabled(False)
-        for menu_name in (
-            "_file_menu",
-            "_edit_menu",
-            "_view_menu",
-            "_examples_menu",
-            "_simulation_menu",
-            "_fitting_menu",
+        for menu in (
+            self._file_menu,
+            self._edit_menu,
+            self._view_menu,
+            self._examples_menu,
+            self._simulation_menu,
+            self._fitting_menu,
         ):
-            menu = getattr(self, menu_name, None)
-            if not isinstance(menu, QtWidgets.QMenu):
-                continue
             menu.setEnabled(False)
             for action in self._menu_actions(menu):
                 action.setEnabled(False)

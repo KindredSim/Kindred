@@ -20,7 +20,6 @@ from kindred.core.runtime_defaults import MAX_PARALLEL_WORKERS_CEILING
 from kindred.core.simulation_preparation import (
     SimulationExecutionRequest,
     build_simulation_execution_request,
-    simulation_execution_requests_equal,
 )
 from kindred.core.simulation_execution import execute_simulation
 from kindred.core.simulation_preparation_stages import build_solver_config
@@ -411,10 +410,7 @@ class SimulationJobOwner(QtCore.QObject):
         pending = self._pending_preview
         if pending is not None and pending.tab_id == operation["tab_id"] and any(
             run_target.set_id == target.set_id
-            and simulation_execution_requests_equal(
-                run_target.execution_request,
-                target.canonical_run_target.execution_request,
-            )
+            and (run_target.execution_request == target.canonical_run_target.execution_request)
             for run_target in operation["targets"]
             for target in pending.targets
         ):
@@ -584,10 +580,7 @@ class SimulationJobOwner(QtCore.QObject):
         return bool(
             current_request is not None
             and current_result is not None
-            and simulation_execution_requests_equal(
-                current_request,
-                target.execution_request,
-            )
+            and (current_request == target.execution_request)
         )
 
     def capture_settled_preview(
@@ -671,19 +664,17 @@ class SimulationJobOwner(QtCore.QObject):
         for target in targets:
             canonical = target.canonical_run_target.execution_request
             reference_request = repository.reference_request(target.set_id)
-            if reference_request is not None and simulation_execution_requests_equal(
-                reference_request, canonical,
-            ):
+            if reference_request is not None and (reference_request == canonical):
                 continue
             current_request = repository.current_request(target.set_id)
             if (
                 target.set_id not in preview_ids
                 and current_request is not None
-                and simulation_execution_requests_equal(current_request, canonical)
+                and (current_request == canonical)
             ):
                 continue
             failed = self._failed_run_requests.get((tab_id, target.set_id))
-            if failed is not None and simulation_execution_requests_equal(failed, canonical):
+            if failed is not None and (failed == canonical):
                 unavailable.append(target.set_name)
                 continue
             missing_targets.append(target)
@@ -947,21 +938,14 @@ class SimulationJobOwner(QtCore.QObject):
         if operation["kind"] == "preview":
             operation["preview_results"][target.set_id] = outcome.result
         else:
-            try:
-                repository = self._repository(operation["tab_id"])
-                repository.publish_run(
-                    target.set_id, target.execution_request, outcome.result
-                )
-            except Exception as exc:  # noqa: BLE001
-                operation["outcomes"].append((target, "discarded"))
-                operation["details"].append(f"{target.set_name}: repository rejected publication ({exc})")
-                return
+            repository = self._repository(operation["tab_id"])
+            repository.publish_run(
+                target.set_id, target.execution_request, outcome.result
+            )
             # A success of the remembered failed request supersedes that failure.
             key = (operation["tab_id"], target.set_id)
             failed = self._failed_run_requests.get(key)
-            if failed is not None and simulation_execution_requests_equal(
-                failed, target.execution_request,
-            ):
+            if failed is not None and (failed == target.execution_request):
                 del self._failed_run_requests[key]
         operation["outcomes"].append((target, "success"))
         self._terminal_state = "success"

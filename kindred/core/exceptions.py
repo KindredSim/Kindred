@@ -209,11 +209,10 @@ class FittingError(KindredError):
 
 class FitSimulationError(FittingError):
     """Raised when a simulation fails while evaluating a fitting objective."""
-    def __init__(self, message: str, *, failed_params: Optional[Dict[str, float]] = None, **kwargs):
+    def __init__(self, message: str, **kwargs):
         kwargs.setdefault("code", "E404")
         details = dict(kwargs.pop("details", {}) or {})
         super().__init__(message, details=details, **kwargs)
-        self.failed_params = failed_params
 
 
 class FitCandidateDomainError(FitSimulationError):
@@ -230,7 +229,6 @@ class FitCandidateDomainError(FitSimulationError):
         message: str,
         *,
         stage: str,
-        failed_params: Optional[Dict[str, float]] = None,
         **kwargs: Any,
     ) -> None:
         details = dict(kwargs.pop("details", {}) or {})
@@ -243,7 +241,6 @@ class FitCandidateDomainError(FitSimulationError):
         )
         super().__init__(
             message,
-            failed_params=failed_params,
             details=details,
             **kwargs,
         )

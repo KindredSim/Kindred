@@ -529,23 +529,9 @@ class ProjectController(QtCore.QObject):
                 f"Could not open project:\n\n{file_error_text(exc, path)}",
             )
             return False
-        try:
-            admitted_document = self._admit_incoming_document(archive.document)
-        except Exception as exc:
-            logger.exception("Incoming project admission failed")
-            self._show_error(
-                "Open Project Error",
-                f"Could not admit the incoming project:\n\n{exc}",
-            )
-            return False
+        admitted_document = self._admit_incoming_document(archive.document)
         if admitted_document is None:
             return False
-        decoded_tab_ids = tuple(tab.tab_id for tab in archive.document.tabs)
-        admitted_tab_ids = tuple(tab.tab_id for tab in admitted_document.tabs)
-        if admitted_tab_ids != decoded_tab_ids:
-            raise ValueError(
-                "Incoming project admission must preserve decoded tab IDs."
-            )
         try:
             presentation = validate_workspace_presentation_state(
                 admitted_document,
@@ -774,20 +760,8 @@ class ProjectController(QtCore.QObject):
             return False
         self._apply_discard(disposition)
         if disposition.clean_idle and self._async_owners_are_settled():
-            try:
-                fit_idle_closed = bool(
-                    self._fit_session.close_idle_for_application_close()
-                )
-            except Exception:
-                logger.exception(
-                    "Idle Fit cleanup failed during application Close"
-                )
-                fit_idle_closed = False
-            try:
-                scan_idle_closed = self._scan.close_idle_for_application_close()
-            except Exception:
-                logger.exception("Idle Scan cleanup failed during application Close")
-                scan_idle_closed = False
+            fit_idle_closed = self._fit_session.close_idle_for_application_close()
+            scan_idle_closed = self._scan.close_idle_for_application_close()
             if fit_idle_closed and scan_idle_closed:
                 self._close_started = True
                 self._native_close_authorized = True
@@ -802,34 +776,11 @@ class ProjectController(QtCore.QObject):
         self._close_started = True
         self._close_pending = True
         self.closeStarted.emit()
-        try:
-            self._simulation_jobs.cancel_for_application_close()
-        except Exception:
-            logger.exception(
-                "Simulation admission fencing/cancellation failed during Close"
-            )
-        try:
-            self._dataset_imports.cancel_for_application_close()
-        except Exception:
-            logger.exception(
-                "Dataset-import admission fencing/cancellation failed during Close"
-            )
-        try:
-            self._fit_session.cancel_for_application_close()
-        except Exception:
-            logger.exception(
-                "Fit admission fencing/cancellation failed during Close"
-            )
-        try:
-            self._xlsx_exports.cancel_for_application_close()
-        except Exception:
-            logger.exception(
-                "XLSX export admission fencing/cancellation failed during Close"
-            )
-        try:
-            self._scan.cancel_for_application_close()
-        except Exception:
-            logger.exception("Chemical Space Scan cancellation failed during Close")
+        self._simulation_jobs.cancel_for_application_close()
+        self._dataset_imports.cancel_for_application_close()
+        self._fit_session.cancel_for_application_close()
+        self._xlsx_exports.cancel_for_application_close()
+        self._scan.cancel_for_application_close()
         for calculator in self._calculator_owners():
             calculator.cancel_for_application_close()
         spreadsheet = self._spreadsheet_editor()
@@ -852,24 +803,15 @@ class ProjectController(QtCore.QObject):
         spreadsheet = self._spreadsheet_editor()
         if spreadsheet is not None and not spreadsheet.application_close_settled:
             settled = False
-        for owner_label, owner in (
-            ("Simulation", self._simulation_jobs),
-            ("Dataset import", self._dataset_imports),
-            ("Fit", self._fit_session),
-            ("XLSX export", self._xlsx_exports),
-            ("Chemical Space Scan", self._scan),
-            *(("Calculator", owner) for owner in self._calculator_owners()),
+        for owner in (
+            self._simulation_jobs,
+            self._dataset_imports,
+            self._fit_session,
+            self._xlsx_exports,
+            self._scan,
+            *self._calculator_owners(),
         ):
-            try:
-                owner_settled = owner.application_close_settled
-            except Exception:
-                logger.exception(
-                    "%s settlement could not be read during Close",
-                    owner_label,
-                )
-                settled = False
-                continue
-            if not owner_settled:
+            if not owner.application_close_settled:
                 settled = False
         return settled
 

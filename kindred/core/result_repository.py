@@ -16,7 +16,6 @@ from kindred.core.simulator.solver_types import SimulationPresentationBoundary, 
 from kindred.core.simulation_failure import FactualCause
 from kindred.core.simulation_preparation import (
     SimulationExecutionRequest,
-    simulation_execution_requests_equal,
 )
 
 __all__ = [
@@ -203,10 +202,7 @@ class ResultRepository:
             cached
             for cached in self._explicit_cache
             if cached[0] != sid
-            or not simulation_execution_requests_equal(
-                cached[1],
-                entry[1],
-            )
+            or not (cached[1] == entry[1])
         ]
         self._explicit_cache.append(entry)
         self._trim_explicit_cache()
@@ -237,7 +233,7 @@ class ResultRepository:
                 cached
                 for cached in reversed(self._explicit_cache)
                 if cached[0] == sid
-                and simulation_execution_requests_equal(cached[1], execution_request)
+                and (cached[1] == execution_request)
             ),
             None,
         )

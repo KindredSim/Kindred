@@ -1059,9 +1059,9 @@ def fit_candidate_presentation(candidate: FitCandidate) -> tuple[tuple[str, ...]
     # dispatch), and the shared group it belongs to.
     dispatch = candidate.request.dispatch
     used = {
-        (dataset_id, name[len(INITIAL_PREFIX):]): value
-        for dataset_id, values in dispatch.fixed_by_dataset
-        for name, value in values if name.startswith(INITIAL_PREFIX)
+        (item.dataset_id, name[len(INITIAL_PREFIX):]): value
+        for item in dispatch.ordinary_dataset_overrides
+        for name, value in item.fixed_params if name.startswith(INITIAL_PREFIX)
     }
     used.update({
         (dataset_id, spec.parameter_name[len(INITIAL_PREFIX):]): spec.initial
