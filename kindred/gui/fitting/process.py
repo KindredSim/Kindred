@@ -13,7 +13,6 @@ from kindred.gui.fitting import codec, runtime
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--source-sha256", required=True)
     parser.add_argument("--verify-only", action="store_true")
     args = parser.parse_args()
 
@@ -30,11 +29,6 @@ def main() -> int:
     command_errors = []
     try:
         runtime.check_scientific_runtime()
-        if runtime.package_fingerprint() != args.source_sha256:
-            raise RuntimeError(
-                "The fitting runtime source does not match the installed application. "
-                "Reinstall the fitting runtime after updating Kindred."
-            )
         from kindred.gui.fitting import execution
         from kindred.core.simulator.dsl_parse import prepare_dsl_request_set
         from kindred.core.simulation_failure import factual_cause_from_exception
@@ -64,12 +58,7 @@ def main() -> int:
             }
             if name == "candidate_ready":
                 candidate, = values
-                try:
-                    curves = tuple(execution.project_fit_candidate_curves(candidate))
-                    error = None if curves else "Fit result produced no curve datasets."
-                except Exception as exc:
-                    curves, error = (), f"{type(exc).__name__}: {exc}"
-                values = (candidate, curves, error)
+                values = (candidate, tuple(execution.project_fit_candidate_curves(candidate)))
             encoded = codec._encode_fit((name, values), references)
             if terminal:
                 runtime.check_scientific_runtime()

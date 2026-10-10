@@ -453,20 +453,11 @@ class TabSliderBinding(QtCore.QObject):
                 interaction=SliderInteractionKind.EXACT_TYPED_COMMIT,
             )
 
-    def render(self, *, preserve_editor_drafts: bool = True) -> bool:
-        try:
-            prepared = self.prepare_render()
-            self.apply_render_projection(
-                prepared, preserve_editor_drafts=preserve_editor_drafts
-            )
-            self.settle_render_projection(prepared)
-        except (TypeError, ValueError, RuntimeError) as exc:
-            self.errorRaised.emit(f"Slider projection failed: {exc}")
-            self.clear_projection()
-            self.publish_slider_draft_state()
-            return False
+    def render(self, *, preserve_editor_drafts: bool = True) -> None:
+        prepared = self.prepare_render()
+        self.apply_render_projection(prepared, preserve_editor_drafts=preserve_editor_drafts)
+        self.settle_render_projection(prepared)
         self.publish_slider_draft_state()
-        return True
 
     def clear_projection(self) -> None:
         vb, sb = (
@@ -534,8 +525,6 @@ class TabSliderBinding(QtCore.QObject):
             projection = build_parameter_slider_projection(tab.prepared_dsl)
         except (TypeError, ValueError):
             return None
-        if set(runtime.slider_parameter_draft) - set(projection.values_dict()):
-            return None
         return _PreviewPreflight(tab, projection, tuple(targets))
 
     def _captured_gesture_transaction(
@@ -580,7 +569,6 @@ class TabSliderBinding(QtCore.QObject):
         try:
             value_f = admit_gui_parameter_value(
                 value,
-                scientific_category=coordinate.scientific_category,
                 role=coordinate.role,
                 unit=coordinate.unit,
                 allow_exact_zero=coordinate.allow_exact_zero,
@@ -701,7 +689,6 @@ class TabSliderBinding(QtCore.QObject):
             initials.update(runtime.slider_species_drafts_by_set_id.get(set_id, {}))
             request = build_simulation_execution_request(
                 prepared_dsl=tab.prepared_dsl,
-                mechanism_source=tab.mechanism_source,
                 initial_values=initials.items(),
                 t_span=(settings.t_start, settings.t_end),
                 solver_config=build_solver_config(
@@ -724,39 +711,32 @@ class TabSliderBinding(QtCore.QObject):
         targets: Iterable[str],
         *,
         tab: MechanismTabDocument | None = None,
-    ) -> PreviewCapture | None:
+    ) -> PreviewCapture:
         base = self._registry.tab(self._tab_id) if tab is None else tab
         roster = tuple(str(item) for item in targets)
-        try:
-            built = self._construct_preview_requests(base, roster)
-            explicit = tuple(
-                build_explicit_target(
-                    prepared_dsl=base.prepared_dsl,
-                    tab_id=base.tab_id,
-                    set_id=set_id,
-                    set_name=set_name,
-                    mechanism_source=base.mechanism_source,
-                    initial_values=canonical_initial_values(base, set_id),
-                    execution_settings=base.resolved_execution_settings(set_id),
-                    scientific_settings=base.scientific_settings,
+        built = self._construct_preview_requests(base, roster)
+        explicit = tuple(
+            build_explicit_target(
+                prepared_dsl=base.prepared_dsl,
+                tab_id=base.tab_id,
+                set_id=set_id,
+                set_name=set_name,
+                initial_values=canonical_initial_values(base, set_id),
+                execution_settings=base.resolved_execution_settings(set_id),
+                scientific_settings=base.scientific_settings,
+            )
+            for set_id, set_name, _ in built
+        )
+        capture = PreviewCapture(
+            base.tab_id,
+            tuple(
+                PreviewTarget(base.tab_id, set_id, set_name, request, canonical)
+                for (set_id, set_name, request), canonical in zip(
+                    built, explicit, strict=True
                 )
-                for set_id, set_name, _ in built
-            )
-            capture = PreviewCapture(
-                base.tab_id,
-                tuple(
-                    PreviewTarget(base.tab_id, set_id, set_name, request, canonical)
-                    for (set_id, set_name, request), canonical in zip(
-                        built, explicit, strict=True
-                    )
-                ),
-            )
-            return capture
-        except (TypeError, ValueError, KeyError) as exc:
-            self.errorRaised.emit(
-                f"Preview construction failed before admission: {exc}"
-            )
-            return None
+            ),
+        )
+        return capture
 
     def _canonical_preview_requests_match(
         self,
@@ -773,7 +753,6 @@ class TabSliderBinding(QtCore.QObject):
                     tab_id=tab.tab_id,
                     set_id=set_id,
                     set_name=tab.initial_condition_set(set_id).name,
-                    mechanism_source=tab.mechanism_source,
                     initial_values=canonical_initial_values(tab, set_id),
                     execution_settings=tab.resolved_execution_settings(set_id),
                     scientific_settings=tab.scientific_settings,
@@ -799,22 +778,18 @@ class TabSliderBinding(QtCore.QObject):
         targets: Iterable[str],
         *,
         tab: MechanismTabDocument | None = None,
-    ) -> InteractivePreviewRequest | None:
+    ) -> InteractivePreviewRequest:
         base = self._registry.tab(self._tab_id) if tab is None else tab
-        try:
-            built = self._construct_preview_requests(
-                base, tuple(str(item) for item in targets)
-            )
-            return InteractivePreviewRequest(
-                base.tab_id,
-                tuple(
-                    InteractivePreviewTarget(set_id, set_name, request)
-                    for set_id, set_name, request in built
-                ),
-            )
-        except (TypeError, ValueError, KeyError) as exc:
-            self.errorRaised.emit(f"Interactive Preview construction failed: {exc}")
-            return None
+        built = self._construct_preview_requests(
+            base, tuple(str(item) for item in targets)
+        )
+        return InteractivePreviewRequest(
+            base.tab_id,
+            tuple(
+                InteractivePreviewTarget(set_id, set_name, request)
+                for set_id, set_name, request in built
+            ),
+        )
 
     def continue_interactive_preview(self, request: InteractivePreviewRequest) -> bool:
         self._stop_preview_timers()
@@ -842,13 +817,8 @@ class TabSliderBinding(QtCore.QObject):
                     targets,
                 )
                 return True
-            request = self.capture_interactive_preview(targets, tab=tab)
-            if request is None:
-                return False
-            return self.continue_interactive_preview(request)
+            return self.continue_interactive_preview(self.capture_interactive_preview(targets, tab=tab))
         capture = self.capture_exact_preview(targets, tab=tab)
-        if capture is None:
-            return False
         self._stop_preview_timers()
         started = self._simulation_jobs.request_preview(capture)
         accepted = bool(
@@ -1017,13 +987,7 @@ class TabSliderBinding(QtCore.QObject):
             return self._reject(
                 "Slider Apply requires one settled exact Preview for the current draft and target roster."
         )
-        try:
-            candidate = self._build_slider_candidate(
-                current_tab,
-                targets,
-            )
-        except (KeyError, LookupError, TypeError, ValueError) as exc:
-            return self._reject(f"Slider Apply could not be admitted: {exc}")
+        candidate = self._build_slider_candidate(current_tab, targets)
         # The settled Preview request is the admitted authority for Apply.
         # Rebuilding an equivalent request from the candidate document would
         # lose the strict object identity checked above and could publish a

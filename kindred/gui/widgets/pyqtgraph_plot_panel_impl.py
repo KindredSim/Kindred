@@ -1038,19 +1038,6 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         self._clear_interactive_display(reset_currentness=True)
         self._clear_annotation_items()
 
-    def clear_result_input(self) -> None:
-        """Clear the current result scene and its transient display."""
-
-        self._render_input = None
-        self._copy_all_available = False
-        self._rendered_point_roster = ()
-        self.discard_interactive_display()
-        self._end_interactive_gesture_session()
-        self._clear_plot_items()
-        self._parameter_table.setRowCount(0)
-        self._species_table.setRowCount(0)
-        self._clear_completion_warning()
-
     @property
     def _interactive_has_visible_frame(self) -> bool:
         return bool(
@@ -2435,17 +2422,6 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         starts = np.concatenate((np.asarray((0,), dtype=int), changes))
         ends = np.concatenate((changes - 1, np.asarray((count - 1,), dtype=int)))
         return np.unique(np.concatenate((starts, ends)))
-
-    def _clear_plot_items(self) -> None:
-        self._annotation_labels.clear()
-        self._plot_widget.clear()
-        self._plot_items_by_key.clear()
-        self._annotation_items.clear()
-        self._rendered_point_roster = ()
-        self._legend = self._plot_widget.addLegend(
-            offset=(-10, 10),
-            labelTextColor=plot_foreground_color(self._plot_widget.backgroundBrush().color().lightness() < 128),
-        )
 
     def _remove_annotation_item(self, item: object) -> None:
         try:

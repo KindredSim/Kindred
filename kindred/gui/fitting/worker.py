@@ -124,14 +124,12 @@ class GlobalFitWorker(QtCore.QThread):
                 ), {})
                 if not self._cancelled.is_set():
                     argv, env, cwd = runtime.fitting_process_command()
-                    # Cancellation can arrive during encoding or source hashing.
-                    if not self._cancelled.is_set():
-                        process = subprocess.Popen(
-                            argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                            stderr=subprocess.PIPE, bufsize=0, shell=False,
-                            env=env, cwd=cwd,
-                            creationflags=subprocess.CREATE_NO_WINDOW,
-                        )
+                    process = subprocess.Popen(
+                        argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE, bufsize=0, shell=False,
+                        env=env, cwd=cwd,
+                        creationflags=subprocess.CREATE_NO_WINDOW,
+                    )
                 if process is None:
                     terminal = ("cancelled", ())
                 else:
@@ -149,8 +147,7 @@ class GlobalFitWorker(QtCore.QThread):
                             if terminal is not None:
                                 raise RuntimeError("Fit process sent output after its terminal event.")
                             if name == "candidate_ready":
-                                candidate, curves, curve_failure = args
-                                projection = (curves, curve_failure)
+                                candidate, projection = args
                                 terminal = (name, (candidate,))
                             elif name in _TERMINAL_EVENTS:
                                 terminal = (name, args)
@@ -197,7 +194,7 @@ class GlobalFitWorker(QtCore.QThread):
                 settled.set()
 
         if errors:
-            detail = str(errors[0]) or type(errors[0]).__name__
+            detail = str(errors[0])
             if diagnostics:
                 detail += "\nFitting runtime diagnostics:\n" + diagnostics.decode("utf-8", errors="replace")
             terminal = ("factual_failure", (factual_cause_from_exception(

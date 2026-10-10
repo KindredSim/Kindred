@@ -33,8 +33,7 @@ from kindred.core.exceptions import (
 )
 from kindred.core.fitting_optimization import fit_parameters
 from kindred.core.fitting_completion import FitExtensionProgress
-from kindred.core.fitting_method_policy import LEAST_SQUARES_TOLERANCE, validate_fit_method
-from kindred.core.species import validate_evaluation_count
+from kindred.core.fitting_method_policy import LEAST_SQUARES_TOLERANCE
 from kindred.core.simulation_failure import (
     FactualCause,
     factual_cause_from_exception,
@@ -47,54 +46,6 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "fit_global",
 ]
-
-
-def _validate_run_inputs(
-    *,
-    fit_evaluators: Mapping[str, object],
-    datasets: Sequence[FitDatasetSpec],
-    dataset_overrides: Sequence[FitDatasetParameterOverrides],
-) -> tuple[
-    list[FitDatasetSpec],
-    dict[str, object],
-    tuple[FitDatasetParameterOverrides, ...],
-]:
-    payloads = sorted(datasets, key=lambda item: str(getattr(item, "dataset_id", "")))
-    if not payloads:
-        raise ValueError("At least one fit dataset is required.")
-    if any(not isinstance(item, FitDatasetSpec) for item in payloads):
-        raise TypeError("fit_global accepts only FitDatasetSpec dataset captures.")
-    dataset_ids = [item.dataset_id for item in payloads]
-    if len(dataset_ids) != len(set(dataset_ids)):
-        raise ValueError("Fit dataset IDs must be unique.")
-
-    evaluators = dict(fit_evaluators)
-    if set(evaluators) != set(dataset_ids):
-        missing = sorted(set(dataset_ids) - set(evaluators))
-        extra = sorted(set(evaluators) - set(dataset_ids))
-        details = []
-        if missing:
-            details.append(f"missing={','.join(missing)}")
-        if extra:
-            details.append(f"extra={','.join(extra)}")
-        raise ValueError(
-            "Fit evaluator keys must exactly match captured dataset IDs"
-            + (f" ({', '.join(details)})" if details else "")
-            + "."
-        )
-
-    overrides = tuple(sorted(dataset_overrides, key=lambda item: item.dataset_id))
-    override_ids = [item.dataset_id for item in overrides]
-    if len(override_ids) != len(set(override_ids)):
-        raise ValueError("Each Fit dataset may have only one override record.")
-    unknown_overrides = sorted(set(override_ids) - set(dataset_ids))
-    if unknown_overrides:
-        raise ValueError(
-            "Fit overrides reference unknown datasets: "
-            + ", ".join(unknown_overrides)
-            + "."
-        )
-    return payloads, evaluators, overrides
 
 
 def fit_global(
@@ -130,18 +81,12 @@ def fit_global(
     coordinates) without changing the layout used to decode results.
     """
 
-    method = validate_fit_method(method)
-    max_nfev = validate_evaluation_count(
-        max_nfev,
-        field="Fit evaluation budget",
-    )
-    if max_nfev <= 0:
-        raise ValueError("Fit evaluation budget must be positive.")
-    payloads, evaluators, overrides = _validate_run_inputs(
-        fit_evaluators=fit_evaluators,
-        datasets=datasets,
-        dataset_overrides=dataset_overrides,
-    )
+    # The Fit setup admits the method and evaluation budget (Fit defaults), and
+    # its dispatch compiles one evaluator, dataset capture and override record
+    # for each unique included dataset, in roster order.
+    payloads = list(datasets)
+    evaluators = dict(fit_evaluators)
+    overrides = dataset_overrides
     fixed_dataset_params = {
         item.dataset_id: dict(item.fixed_params)
         for item in overrides

@@ -115,7 +115,10 @@ def read_csv_rows_from_bytes(
     reader = csv.reader(handle)
     try:
         header = next(reader, None)
-    except (UnicodeDecodeError, csv.Error) as exc:
+    except UnicodeDecodeError as exc:
+        handle.close()
+        raise ValueError(f"CSV file {label!r} is not UTF-8 text.") from exc
+    except csv.Error as exc:
         handle.close()
         raise ValueError(f"CSV file {label!r}: {exc}") from exc
     except BaseException:
@@ -146,7 +149,9 @@ def read_csv_rows_from_bytes(
                     },
                 )
                 previous_end_row = row_end_row
-        except (UnicodeDecodeError, csv.Error) as exc:
+        except UnicodeDecodeError as exc:
+            raise ValueError(f"CSV file {label!r} is not UTF-8 text.") from exc
+        except csv.Error as exc:
             raise ValueError(f"CSV file {label!r}: {exc}") from exc
         finally:
             handle.close()
@@ -300,7 +305,7 @@ def parse_physical_rows(
                     raise ValueError(
                         f"{_source_prefix()}row {row_index}, time column "
                         f"{resolved_time.assigned_name!r}: invalid numeric value "
-                        f"{raw_time!r}: {exc}"
+                        f"{raw_time!r}."
                     ) from exc
             try:
                 parsed_time = validate_imported_time_seconds(
@@ -324,7 +329,7 @@ def parse_physical_rows(
                 raise ValueError(
                     f"{_source_prefix()}row {row_index}, column "
                     f"{column.assigned_name!r}: invalid numeric observation "
-                    f"{raw_value!r}: {exc}"
+                    f"{raw_value!r}."
                 ) from exc
             try:
                 parsed_value = validate_observation(

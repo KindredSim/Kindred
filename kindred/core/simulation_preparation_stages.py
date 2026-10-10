@@ -13,16 +13,13 @@ from numbers import Real
 from types import MappingProxyType
 from typing import Any, Dict
 
-import numpy as np
 
 from kindred.core.simulator.solvers import normalize_solver_name
-from kindred.core.scipy_integrate import validate_scipy_rtol
 from kindred.core.symbolic.errors import UnsupportedSymbolicExpressionError
 from kindred.core.symbolic.jacobian_execution import (
     SymbolicJacobianExecution,
 )
 from kindred.core.temperature import TemperatureSchedule
-from kindred.core.time_grid import normalize_time_grid_policy
 
 __all__ = [
     "PreparedSolverConfig",
@@ -33,7 +30,12 @@ __all__ = [
 
 @dataclass(frozen=True, slots=True)
 class PreparedSolverConfig:
-    """Validated solver policy consumed by all direct execution paths."""
+    """Solver policy consumed by all direct execution paths.
+
+    Its values arrive admitted: Run and Preview from the tab settings and
+    Preview points, Fit from its setup and tab settings, and Scan from its
+    dialog.
+    """
 
     solver_input: str
     solver: str = field(init=False)
@@ -43,29 +45,8 @@ class PreparedSolverConfig:
     use_analytic_jacobian: bool
 
     def __post_init__(self) -> None:
-        if type(self.solver_input) is not str or not self.solver_input.strip():
-            raise TypeError("Prepared solver input must be a nonblank string.")
-        solver_input = self.solver_input.strip()
-        solver = normalize_solver_name(solver_input)
-        if type(self.atol) is bool or not isinstance(self.atol, Real):
-            raise TypeError("Prepared solver atol must be a real number.")
-        rtol = validate_scipy_rtol(self.rtol, field="Relative tolerance")
-        atol = float(self.atol)
-        if not (np.isfinite(atol) and atol > 0.0):
-            raise ValueError("Absolute tolerance must be finite and positive.")
-        if not isinstance(self.grid, Mapping):
-            raise TypeError("Prepared solver grid must be a mapping.")
-        if type(self.use_analytic_jacobian) is not bool:
-            raise TypeError("use_analytic_jacobian must be a bool.")
-        object.__setattr__(self, "solver_input", solver_input)
-        object.__setattr__(self, "solver", solver)
-        object.__setattr__(self, "rtol", rtol)
-        object.__setattr__(self, "atol", atol)
-        object.__setattr__(
-            self,
-            "grid",
-            MappingProxyType(normalize_time_grid_policy(self.grid)),
-        )
+        object.__setattr__(self, "solver", normalize_solver_name(self.solver_input))
+        object.__setattr__(self, "grid", MappingProxyType(dict(self.grid)))
 
 
 def build_solver_config(
@@ -76,15 +57,10 @@ def build_solver_config(
     grid: Mapping[str, Any],
     use_analytic_jacobian: bool,
 ) -> PreparedSolverConfig:
-    """Validate and normalize one typed solver policy."""
+    """Build one typed solver policy from admitted settings."""
 
-    if type(solver_input) is not str:
-        raise TypeError("solver_input must be a string.")
-    solver_label = solver_input.strip()
-    if not solver_label:
-        raise ValueError("solver_input must be nonblank.")
     return PreparedSolverConfig(
-        solver_input=solver_label,
+        solver_input=solver_input,
         rtol=rtol,
         atol=atol,
         grid=grid,

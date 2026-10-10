@@ -18,6 +18,7 @@ from kindred.core.datasets.units import (
     parse_time_unit,
 )
 from kindred.core.quantity_units import Unit, SECOND
+from kindred.io.paths import file_error_text
 
 
 def capture_import_source(
@@ -42,7 +43,8 @@ def capture_import_source(
         with path.open("rb") as source:
             source_bytes = source.read()
     except OSError as exc:
-        raise ValueError(f"Cannot read dataset source {path!s}: {exc}") from exc
+        # The rejection list names the file.
+        raise ValueError(file_error_text(exc, None)) from exc
     source = ImportedSource(
         source_id=f"source-{uuid.uuid4().hex}",
         original_format=suffix[1:],

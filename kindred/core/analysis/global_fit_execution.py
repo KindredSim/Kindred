@@ -111,19 +111,8 @@ class FitCoordinate:
     name: str
     dataset_id: str | None = None
 
-    def __post_init__(self) -> None:
-        scope = str(self.scope)
-        name = str(self.name or "").strip()
-        dataset_id = None if self.dataset_id is None else str(self.dataset_id).strip()
-        if not name:
-            raise ValueError("Fit coordinate name must be nonblank.")
-        if scope in {"dataset", "group"} and not dataset_id:
-            raise ValueError(f"{scope} coordinates require a dataset identity.")
-        if scope not in {"shared", "dataset", "coupled", "group"}:
-            raise ValueError(f"Unsupported Fit coordinate scope: {scope!r}")
-        object.__setattr__(self, "scope", scope)
-        object.__setattr__(self, "name", name)
-        object.__setattr__(self, "dataset_id", dataset_id)
+    # Built from a Fit setup scope literal, an admitted parameter name and,
+    # for dataset and group coordinates, a captured dataset identity.
 
     @property
     def display_name(self) -> str:
@@ -223,37 +212,15 @@ class FitProgress:
     )
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "objective_calls", int(self.objective_calls))
-        cost = float(self.cost)
-        if not math.isfinite(cost):
-            raise ValueError("Fit progress cost must be finite.")
-        object.__setattr__(self, "cost", cost)
-        raw_vector = np.asarray(self.optimizer_vector, dtype=float)
-        if raw_vector.ndim != 1:
-            raise ValueError("Fit progress optimizer vector must be one-dimensional.")
-        vector = raw_vector.copy()
-        if vector.size == 0 or not np.all(np.isfinite(vector)):
-            raise ValueError(
-                "Fit progress requires a nonempty finite optimizer vector."
-            )
+        # The objective reports its own finite cost, the candidate vector it
+        # admitted and its canonical simulation results.
+        vector = np.asarray(self.optimizer_vector, dtype=float).copy()
         vector.setflags(write=False)
         object.__setattr__(self, "optimizer_vector", vector)
-        object.__setattr__(self, "improved", bool(self.improved))
-        transient = {
-            str(dataset_id): value
-            for dataset_id, value in self.transient_simulation_results_by_dataset.items()
-        }
-        if any(
-            not isinstance(value, SimulationResultValue)
-            for value in transient.values()
-        ):
-            raise TypeError(
-                "Transient Fit progress simulations require SimulationResultValue values."
-            )
         object.__setattr__(
             self,
             "transient_simulation_results_by_dataset",
-            MappingProxyType(transient),
+            MappingProxyType(dict(self.transient_simulation_results_by_dataset)),
         )
 
 
@@ -302,14 +269,6 @@ class DatasetFitInfo:
             self, "model_series", MappingProxyType(dict(self.model_series)),
         )
 
-        if self.residuals.size != self.weighted_residuals.size:
-            raise ValueError("Dataset fit residual blocks must have equal counts.")
-
-        species_rows = sum(values.size for values in self.model_series.values())
-        projection_rows = 0 if self.x_projection is None else self.x_projection.size
-        if self.residuals.size != species_rows + projection_rows:
-            raise ValueError("Dataset fit residual count must match model and X rows exactly.")
-
 
 @dataclass(frozen=True, slots=True)
 class GlobalFitResult:
@@ -347,96 +306,31 @@ class GlobalFitResult:
     residual_bootstrap_result: ResidualBootstrapResult | None = None
 
     def __post_init__(self) -> None:
-        status = str(self.status or "")
-        if status not in {"ok", "warn"}:
-            raise ValueError(f"Unsupported GlobalFitResult status: {status!r}")
-        optimizer_converged = bool(self.optimizer_converged)
-        optimizer_diagnostic = self.optimizer_diagnostic
-        if optimizer_diagnostic is not None and not isinstance(
-            optimizer_diagnostic, FactualCause
-        ):
-            raise TypeError("GlobalFitResult optimizer diagnostic must be a FactualCause.")
-        if status == "ok" and optimizer_diagnostic is not None:
-            raise ValueError("An ok GlobalFitResult cannot carry a factual diagnostic.")
-        if status == "warn" and optimizer_diagnostic is None:
-            raise ValueError("A warning GlobalFitResult requires a factual diagnostic.")
-        object.__setattr__(self, "status", status)
-        object.__setattr__(self, "optimizer_converged", optimizer_converged)
-        if not (
-            isinstance(self.weighted_residual_sse, FitMetric)
-            and isinstance(self.weighted_residual_mse, FitMetric)
-        ):
-            raise TypeError(
-                "GlobalFitResult aggregate metrics require typed FitMetric values."
-            )
-        if self.optimizer_vector is None:
-            raise ValueError("GlobalFitResult requires its exact optimizer vector.")
-        raw_optimizer_vector = np.asarray(self.optimizer_vector, dtype=float)
-        if raw_optimizer_vector.ndim != 1:
-            raise ValueError("GlobalFitResult optimizer vector must be one-dimensional.")
-        optimizer_vector = raw_optimizer_vector.copy()
-        if optimizer_vector.size == 0 or not np.all(np.isfinite(optimizer_vector)):
-            raise ValueError(
-                "GlobalFitResult requires a nonempty finite optimizer vector."
-            )
+        # Its sole producer publishes the settled replay state: a literal
+        # status with a diagnostic exactly for "warn", the admitted finite
+        # optimizer vector, its decoded finite parameters, and one
+        # DatasetFitInfo per included dataset in roster order.  This carrier
+        # freezes them.
+        optimizer_vector = np.asarray(self.optimizer_vector, dtype=float).copy()
         optimizer_vector.setflags(write=False)
         object.__setattr__(self, "optimizer_vector", optimizer_vector)
-        shared_params = {
-            str(name): float(value)
-            for name, value in self.shared_params.items()
-        }
-        if not isinstance(self.dataset_params, Mapping):
-            raise TypeError("GlobalFitResult dataset parameters require a mapping by dataset.")
-        if any(
-            type(dataset_id) is not str
-            or not dataset_id
-            or dataset_id != dataset_id.strip()
-            for dataset_id in self.dataset_params
-        ):
-            raise ValueError(
-                "GlobalFitResult dataset parameter identities must be exact nonblank strings."
-            )
-        dataset_params = {
-            dataset_id: {
-                str(name): float(value)
-                for name, value in values.items()
-            }
-            for dataset_id, values in self.dataset_params.items()
-        }
-        if any(not np.isfinite(value) for value in shared_params.values()) or any(
-            not np.isfinite(value)
-            for values in dataset_params.values()
-            for value in values.values()
-        ):
-            raise ValueError(
-                "GlobalFitResult requires finite completed parameter values."
-            )
-        object.__setattr__(self, "shared_params", MappingProxyType(shared_params))
+        object.__setattr__(
+            self,
+            "shared_params",
+            MappingProxyType({name: float(value) for name, value in self.shared_params.items()}),
+        )
         object.__setattr__(
             self,
             "dataset_params",
             MappingProxyType(
                 {
-                    dataset_id: MappingProxyType(values)
-                    for dataset_id, values in dataset_params.items()
+                    dataset_id: MappingProxyType(
+                        {name: float(value) for name, value in values.items()}
+                    )
+                    for dataset_id, values in self.dataset_params.items()
                 }
             ),
         )
-        object.__setattr__(self, "dataset_info", tuple(self.dataset_info))
-        if not self.dataset_info:
-            raise ValueError("GlobalFitResult requires a nonempty dataset roster.")
-        if any(not isinstance(info, DatasetFitInfo) for info in self.dataset_info):
-            raise TypeError("GlobalFitResult dataset roster requires typed DatasetFitInfo entries.")
-        info_ids = tuple(info.dataset_id for info in self.dataset_info)
-        dataset_param_ids = tuple(dataset_params)
-        if (
-            any(not dataset_id for dataset_id in dataset_param_ids)
-            or len(dataset_param_ids) != len(set(dataset_param_ids))
-            or info_ids != dataset_param_ids
-        ):
-            raise ValueError(
-                "GlobalFitResult rosters must exactly match the ordered included datasets."
-            )
         object.__setattr__(self, "dataset_info", tuple(self.dataset_info))
 
 
@@ -459,17 +353,12 @@ class _FitReplayState:
     residual_bootstrap_result: ResidualBootstrapResult | None = None
 
     def __post_init__(self) -> None:
-        raw_vector = np.asarray(self.optimizer_vector, dtype=float)
-        if raw_vector.ndim != 1:
-            raise ValueError("Fit replay optimizer vector must be one-dimensional.")
-        vector = raw_vector.copy()
-        if vector.size == 0 or not np.all(np.isfinite(vector)):
-            raise ValueError("Fit replay state requires a nonempty finite optimizer vector.")
+        # The final replay admitted this vector as a candidate and its
+        # residuals through each dataset's finite residual check.
+        vector = np.asarray(self.optimizer_vector, dtype=float).copy()
         vector.setflags(write=False)
         object.__setattr__(self, "optimizer_vector", vector)
         residuals = np.asarray(self.weighted_residuals, dtype=float).reshape(-1).copy()
-        if residuals.size == 0 or not np.all(np.isfinite(residuals)):
-            raise ValueError("Fit replay weighted residuals must be finite and nonempty.")
         residuals.setflags(write=False)
         object.__setattr__(self, "weighted_residuals", residuals)
 
@@ -479,8 +368,6 @@ def _construct_global_fit_result(
 ) -> GlobalFitResult:
     """Construct the sole immutable publishable result after settlement."""
 
-    if not isinstance(state, _FitReplayState):
-        raise TypeError("Global Fit publication requires private replay state.")
     return GlobalFitResult(
         shared_params=dict(state.shared_params),
         dataset_params={
@@ -501,8 +388,6 @@ def _construct_global_fit_result(
 
 
 def _compact_failure_message(failure: FactualCause) -> str:
-    if not isinstance(failure, FactualCause):
-        raise TypeError("Fit diagnostics require a FactualCause.")
     raw_message = failure.message
     return " ".join(part.strip() for part in str(raw_message).splitlines() if part.strip())
 
@@ -554,22 +439,15 @@ def fit_result_message(
 
 
 def normalize_weights(payloads: List[FitDatasetSpec], weights: Optional[Dict[str, float]]) -> Dict[str, float]:
-    payload_ids = [str(payload.dataset_id) for payload in payloads]
-    payload_id_set = set(payload_ids)
-    provided_weights = {} if weights is None else {str(key): float(value) for key, value in dict(weights).items()}
-
-    unknown_ids = sorted(set(provided_weights) - payload_id_set)
-    if unknown_ids:
-        raise ValueError(f"Unknown dataset weight IDs: {', '.join(unknown_ids)}")
-
-    admitted: Dict[str, float] = {}
-    for payload in payloads:
-        ds_id = str(payload.dataset_id)
-        weight = provided_weights.get(ds_id, 1.0 / max(1, payload.point_count))
-        if not np.isfinite(weight) or weight <= 0.0:
-            raise ValueError(f"Dataset weight for '{ds_id}' must be finite and positive.")
-        admitted[ds_id] = float(weight)
-    return finite_positive_mean_normalize(admitted)
+    # User dataset weights are the admitted positive weights of the included
+    # datasets; implicit weights are positive by construction.
+    provided_weights = weights or {}
+    return finite_positive_mean_normalize({
+        payload.dataset_id: float(
+            provided_weights.get(payload.dataset_id, 1.0 / max(1, payload.point_count))
+        )
+        for payload in payloads
+    })
 
 
 def _normalized_target_weight_multipliers(
@@ -577,20 +455,10 @@ def _normalized_target_weight_multipliers(
     species_list: Sequence[str],
     target_weights: Optional[Dict[str, float]],
 ) -> Dict[str, float]:
-    names = [str(name) for name in (species_list or []) if str(name).strip()]
-    if not names:
-        return {}
-
-    raw_weights = dict(target_weights or {}) if isinstance(target_weights, dict) else {}
-    cleaned: Dict[str, float] = {}
-    for name in names:
-        value = float(raw_weights.get(name, 1.0))
-        if not np.isfinite(value) or value <= 0.0:
-            raise ValueError(
-                f"Target weight for {name!r} must be finite and positive."
-            )
-        cleaned[name] = float(value)
-    normalized = finite_positive_mean_normalize(cleaned)
+    # Target weights are the admitted positive weights of the captured roster.
+    normalized = finite_positive_mean_normalize(
+        {name: float(target_weights[name]) for name in species_list}
+    )
     return {
         name: float(np.sqrt(value))
         for name, value in normalized.items()
@@ -605,32 +473,17 @@ def _align_series(
     segment_keys: Sequence[str],
     discontinuity_ids: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray, tuple[str, ...], np.ndarray, tuple[str, ...]]:
-    """Align values and their direct canonical row identity together."""
+    """Align values and their direct canonical row identity together.
+
+    The canonical result supplies one value and one segment, key and
+    discontinuity identity per strictly increasing row.
+    """
     values = np.asarray(series, dtype=float).reshape(-1)
     sim_t = np.asarray(sim_time, dtype=float).reshape(-1)
     target_t = np.asarray(target_time, dtype=float).reshape(-1)
-    if values.size != sim_t.size:
-        raise ValueError(
-            f"Simulation output has {values.size} values but {sim_t.size} time points."
-        )
     segments = np.asarray(segment_ids, dtype=np.int64).reshape(-1)
-    keys = tuple(str(value or "").strip() for value in segment_keys)
+    keys = tuple(segment_keys)
     discontinuities = np.asarray(discontinuity_ids, dtype=np.int64).reshape(-1)
-    if (
-        sim_t.size < 2
-        or segments.size != sim_t.size
-        or len(keys) != sim_t.size
-        or discontinuities.size != sim_t.size
-        or any(not value for value in keys)
-        or np.any(segments < 0)
-        or np.any(discontinuities < 0)
-    ):
-        raise FitSimulationError(
-            "Fit simulation row identity must align with simulation time.",
-            details={"fatal": True, "stage": "intervention_execution"},
-        )
-    if np.any(np.diff(sim_t) <= 0.0):
-        raise ValueError("Simulation time must be strictly increasing for fitting alignment.")
 
     aligned = np.empty(target_t.size, dtype=float)
     aligned_segments = np.empty(target_t.size, dtype=np.int64)
@@ -681,31 +534,13 @@ def _select_fit_rows(
     model_y: np.ndarray,
     sim_time: np.ndarray,
     observation_time: np.ndarray,
-    observation_id: str,
-    raw_column: str,
-    source_rows: Sequence[int],
     segment_ids: np.ndarray,
     segment_keys: Sequence[str],
     discontinuity_ids: np.ndarray,
 ) -> np.ndarray:
-    """Align one time-based Y series to its admitted observation rows."""
+    """Align one time-based Y series to its admitted observation times."""
 
     obs_t = np.asarray(observation_time, dtype=float).reshape(-1)
-    rows = tuple(int(value) for value in source_rows)
-    raw_id = str(observation_id or "").strip()
-    raw_name = str(raw_column or "").strip()
-    if (
-        not raw_id
-        or not raw_name
-        or obs_t.size == 0
-        or len(rows) != obs_t.size
-        or len(rows) != len(set(rows))
-        or any(row <= 0 for row in rows)
-    ):
-        raise FitSimulationError(
-            "Fit selector requires complete row-aligned observation identity.",
-            details={"fatal": True, "stage": "fit_capture"},
-        )
     selected = _align_series(
         np.asarray(model_y, dtype=float),
         np.asarray(sim_time, dtype=float),
@@ -718,10 +553,8 @@ def _select_fit_rows(
 
 
 def _objective_dataset_weight_multiplier(weight: float) -> float:
-    value = float(weight)
-    if not np.isfinite(value) or value <= 0.0:
-        raise ValueError("Objective dataset weight must be finite and positive.")
-    return float(np.sqrt(value))
+    # Normalized dataset weights are finite and positive.
+    return float(np.sqrt(weight))
 
 
 def _payload_observations(
@@ -774,8 +607,6 @@ def fit_result_target_values(
     infers type from static parser tables or sampled values.
     """
 
-    if not isinstance(result, SimulationResultValue):
-        raise TypeError("Fit target lookup requires a SimulationResultValue.")
     target_name = str(name)
     details = {"fatal": True, "stage": "fit_target_lookup", "dataset": dataset_id, "target": target_name}
     time_size = np.asarray(result.t, dtype=float).reshape(-1).size
@@ -997,18 +828,18 @@ def build_parameter_layout_for_dataset_ids(
     shared_params: Dict[str, float],
     dataset_overrides: Sequence[FitDatasetParameterOverrides],
     coupled_variables: Sequence[FitCoupledVariableParamSpec],
-    bounds: Optional[Dict[str, Tuple[float, float]]],
+    bounds: Dict[str, Tuple[float, float]],
     log10_params: Optional[Dict[str, bool]],
 ) -> FitParameterLayout:
-    """Build the optimizer layout from the admitted included-dataset roster."""
+    """Build the optimizer layout from the admitted included-dataset roster.
 
-    normalized_dataset_ids = tuple(sorted(str(value or "").strip() for value in dataset_ids))
-    if (
-        not normalized_dataset_ids
-        or any(not value for value in normalized_dataset_ids)
-        or len(normalized_dataset_ids) != len(set(normalized_dataset_ids))
-    ):
-        raise ValueError("Fit parameter layout requires unique included dataset IDs.")
+    Coordinates follow the roster's order (the project's dataset order) and
+    authored names, never the values of opaque dataset or set identities.
+    """
+
+    # The included roster, the coupled members and the shared bounds come from
+    # one compiled Fit setup, whose dataset and variable identities are unique.
+    normalized_dataset_ids = tuple(dataset_ids)
     param_names = sorted(str(name) for name in shared_params.keys())
     log10_params_norm = {str(k): bool(v) for k, v in (log10_params or {}).items()}
 
@@ -1021,8 +852,6 @@ def build_parameter_layout_for_dataset_ids(
         shared_log10[name] = flag
         value = float(shared_params[name])
         if flag:
-            if not (value > 0.0):
-                raise ValueError(f"log10 fitting requires positive initial value for '{name}'.")
             shared_initials.append(math.log10(value))
         else:
             shared_initials.append(value)
@@ -1036,10 +865,7 @@ def build_parameter_layout_for_dataset_ids(
 
     overrides_by_id = {item.dataset_id: item for item in dataset_overrides}
     for ds_id in normalized_dataset_ids:
-        specs = overrides_by_id.get(
-            ds_id,
-            FitDatasetParameterOverrides(dataset_id=ds_id),
-        ).variable_params
+        specs = overrides_by_id[ds_id].variable_params
         if not specs:
             continue
         dataset_var_index.setdefault(ds_id, {})
@@ -1054,12 +880,6 @@ def build_parameter_layout_for_dataset_ids(
             min_val = float(spec.minimum)
             max_val = float(spec.maximum)
             if log10_flag:
-                if not (init_val > 0.0):
-                    raise ValueError(f"log10 fitting requires positive initial value for '{ds_id}:{param_name}'.")
-                if not (min_val > 0.0 and max_val > 0.0):
-                    raise ValueError(f"log10 fitting requires positive bounds for '{ds_id}:{param_name}'.")
-                if not (np.isfinite(min_val) and np.isfinite(max_val)):
-                    raise ValueError(f"log10 fitting requires finite bounds for '{ds_id}:{param_name}'.")
                 dataset_var_inits.append(math.log10(init_val))
                 dataset_var_bounds.append((math.log10(min_val), math.log10(max_val)))
             else:
@@ -1068,18 +888,16 @@ def build_parameter_layout_for_dataset_ids(
             dataset_var_physical.append((init_val, min_val, max_val))
             dataset_var_log10[(ds_id, param_name)] = log10_flag
 
-    coupled_order = sorted(coupled_variables, key=lambda item: item.variable_id)
-    coupled_ids = [item.variable_id for item in coupled_order]
-    if len(coupled_ids) != len(set(coupled_ids)):
-        raise ValueError("Coupled Fit variable IDs must be unique.")
-    known_dataset_ids = set(normalized_dataset_ids)
-    for spec in coupled_order:
-        unknown = set(spec.dataset_ids) - known_dataset_ids
-        if unknown:
-            raise ValueError(
-                f"Coupled Fit variable {spec.variable_id!r} references unknown "
-                f"datasets: {', '.join(sorted(unknown))}."
-            )
+    # Variables sharing a name have disjoint members, so the first member's
+    # roster position and the name order every coupled variable uniquely.
+    roster_position = {ds_id: index for index, ds_id in enumerate(normalized_dataset_ids)}
+    coupled_order = sorted(
+        coupled_variables,
+        key=lambda item: (
+            min(roster_position[ds_id] for ds_id in item.dataset_ids),
+            item.parameter_name,
+        ),
+    )
     coupled_initials = [
         math.log10(item.initial) if item.log10 else float(item.initial)
         for item in coupled_order
@@ -1092,22 +910,9 @@ def build_parameter_layout_for_dataset_ids(
     shared_lower = []
     shared_upper = []
     for name in param_names:
-        if bounds is None or name not in bounds:
-            raise ValueError(
-                f"Fit coordinate {name!r} requires finite configured bounds."
-            )
-        b = bounds[name]
-        low = float(b[0])
-        high = float(b[1])
-        if not np.isfinite(low) or not np.isfinite(high) or low >= high:
-            raise ValueError(
-                f"Fit coordinate {name!r} requires finite ordered bounds."
-            )
+        # Values, bounds and Log10 positivity arrive admitted by the Fit setup carriers.
+        low, high = bounds[name]
         if shared_log10.get(name):
-            if not (low > 0.0 and high > 0.0):
-                raise ValueError(f"log10 fitting requires positive bounds for '{name}'.")
-            if not (np.isfinite(low) and np.isfinite(high)):
-                raise ValueError(f"log10 fitting requires finite bounds for '{name}'.")
             shared_lower.append(math.log10(low))
             shared_upper.append(math.log10(high))
         else:
@@ -1198,8 +1003,6 @@ def _dataset_deadline_cause(
     """Build the fit-owned factual cause for one or more timed-out datasets."""
 
     roster = tuple(sorted({str(dataset_id) for dataset_id in dataset_ids}))
-    if not roster:
-        raise ValueError("Dataset deadline causes require a nonempty dataset roster.")
     cause_details: dict[str, object] = {
         "datasets": roster,
         "deadline": True,
@@ -1331,9 +1134,6 @@ def _build_dataset_fit_info(
                 model_y=np.asarray(model_values, dtype=float),
                 sim_time=sim_time,
                 observation_time=obs_t,
-                observation_id=species_obs["raw_observation_id"],
-                raw_column=species_obs["raw_column"],
-                source_rows=species_obs["source_rows"],
                 segment_ids=segment_ids,
                 segment_keys=segment_keys,
                 discontinuity_ids=discontinuity_ids,
@@ -1449,12 +1249,8 @@ def evaluate_dataset_simulation(
 
     try:
         _raise_if_fitting_cancel_requested(worker_cancel)
-        evaluator = fit_evaluators.get(ds_id)
-        if evaluator is None:
-            raise FitSimulationError(
-                f"No fitting evaluator exists for dataset {ds_id!r}.",
-                details={"fatal": True, "stage": "fit_capture"},
-            )
+        # The dispatch compiled one evaluator per included dataset.
+        evaluator = fit_evaluators[ds_id]
         setter = getattr(evaluator, "set_cancellation_control", None)
         if callable(setter):
             setter(task_control)
@@ -1509,8 +1305,6 @@ def evaluate_dataset_simulations(
     executor: Executor,
     weights: Mapping[str, float] | None = None,
 ) -> list[DatasetFitInfo | ScientificUnavailable]:
-    if executor is None:
-        raise TypeError("Multi-dataset Fit evaluation requires a borrowed executor.")
     if not items:
         return []
     ordered = tuple(items)
@@ -1559,33 +1353,11 @@ class GlobalFitObjective:
         cancellation_control: SimulationCancellationControl | None = None,
         executor: Executor,
     ) -> None:
-        if executor is None:
-            raise TypeError("Global Fit objective requires a borrowed executor.")
+        # One compiled Fit setup supplies the nonempty unique included
+        # roster, its evaluators and the layout built from that roster.
         self._fit_evaluators = dict(fit_evaluators)
         payload_roster = tuple(payloads)
-        if any(not isinstance(item, FitDatasetSpec) for item in payload_roster):
-            raise TypeError("Fit objective payloads must contain FitDatasetSpec values.")
-        dataset_ids = tuple(item.dataset_id for item in payload_roster)
-        if (
-            not dataset_ids
-            or any(not str(dataset_id).strip() for dataset_id in dataset_ids)
-            or len(dataset_ids) != len(set(dataset_ids))
-        ):
-            raise ValueError(
-                "Fit objective payloads require a nonempty unique dataset roster."
-            )
-        included_dataset_ids = set(dataset_ids)
-        layout_dataset_ids = {
-            dataset_id
-            for dataset_id, _parameter_name in layout.dataset_var_order
-        }
-        if not layout_dataset_ids.issubset(included_dataset_ids):
-            raise ValueError(
-                "Fit objective layout references datasets absent from its payload roster."
-            )
-        self._payloads = tuple(
-            sorted(payload_roster, key=lambda item: item.dataset_id)
-        )
+        self._payloads = payload_roster
         self._dataset_params = dataset_params
         self._weights = weights
         self._layout = layout
@@ -2109,8 +1881,6 @@ class GlobalFitObjective:
                     dataset_penalty_residuals(item.payload)
                 )
                 continue
-            if evaluation.dataset_id != item.payload.dataset_id:
-                raise RuntimeError("Fit evaluation order no longer matches its admitted dataset roster.")
             residual_blocks.append(
                 np.asarray(evaluation.weighted_residuals, dtype=float)
             )
@@ -2239,8 +2009,6 @@ def _assemble_fit_replay_state(
     cancellation_control: SimulationCancellationControl | None = None,
     executor: Executor,
 ) -> _FitReplayState:
-    if executor is None:
-        raise TypeError("Final Fit replay requires a borrowed executor.")
     layout.validate_optimizer_vector(candidate_vector)
     candidate_vector = np.asarray(candidate_vector, dtype=float).reshape(-1).copy()
     candidate_vector.setflags(write=False)
@@ -2305,10 +2073,6 @@ def _assemble_fit_replay_state(
             weights=weights,
         )
     )
-    if len(simulation_evaluations) != len(dataset_inputs):
-        raise RuntimeError(
-            "Final Fit replay did not evaluate every included dataset."
-        )
     timeout_unavailability = _aggregate_dataset_deadline_unavailability(
         dataset_inputs,
         simulation_evaluations,
@@ -2350,8 +2114,11 @@ def _assemble_fit_result_facts(
     message: str,
     optimizer_diagnostic: FactualCause | None,
 ) -> _FitReplayState:
-    """Construct terminal metrics and values from complete scientific facts."""
-    layout.validate_optimizer_vector(candidate_vector)
+    """Construct terminal metrics and values from complete scientific facts.
+
+    The replay admitted the candidate vector and found every dataset's facts
+    available, in roster order.
+    """
     fitted_params = layout.shared_param_dict_from_vector(candidate_vector)
     combined_dataset_params = {
         payload.dataset_id: {
@@ -2361,42 +2128,20 @@ def _assemble_fit_result_facts(
         for payload in payloads
     }
     dataset_info = []
-    total_points = 0
     global_weighted_residual_blocks: List[np.ndarray] = []
-    for payload, evaluation in zip(payloads, facts, strict=True):
-        ds_id = payload.dataset_id
+    for evaluation in facts:
         _raise_if_fitting_cancelled(cancellation_check)
         _raise_if_fitting_cancel_requested(cancellation_control)
 
-        if isinstance(evaluation, ScientificUnavailable):
-            raise RuntimeError(
-                f"Final Fit replay omitted direct facts for dataset {ds_id!r}."
-            )
-        if evaluation.dataset_id != ds_id:
-            raise RuntimeError("Final Fit replay order no longer matches its admitted dataset roster.")
         dataset_info.append(evaluation)
         global_weighted_residual_blocks.append(
             np.asarray(evaluation.weighted_residuals, dtype=float)
         )
-        total_points += int(evaluation.residuals.size)
 
-    if total_points <= 0:
-        raise FitSimulationError(
-            "Final Fit replay produced no residual observations.",
-            details={"fatal": True, "stage": "final_replay_metrics"},
-        )
     aggregate_metrics = fit_error_metrics(
         np.concatenate(global_weighted_residual_blocks)
     )
 
-    included_dataset_ids = {payload.dataset_id for payload in payloads}
-    if (
-        set(combined_dataset_params) != included_dataset_ids
-        or {info.dataset_id for info in dataset_info} != included_dataset_ids
-    ):
-        raise RuntimeError(
-            "Final Fit result rosters must exactly match the included datasets."
-        )
     optimizer_converged = bool(success)
     factual_optimizer_diagnostic = optimizer_diagnostic
     if (

@@ -12,6 +12,7 @@ import secrets
 from PySide6 import QtCore, QtWidgets
 
 from kindred.core.project_document import canonical_initial_values, parse_points_text, SUPPORTED_SOLVERS
+from kindred.core.scipy_integrate import validate_scipy_rtol
 from kindred.core.validation import parse_finite_numeric_text
 from kindred.gui.controllers.simulation_job_owner import resolve_run_parallel_capacity
 from kindred.gui.widgets.scan_range_dialog import ScanRangeDialog, ScanConstraintDialog, entry, number
@@ -46,7 +47,7 @@ class ChemicalSpaceScanDialog(QtWidgets.QDialog):
         self.inputs.setHorizontalHeaderLabels(["Input", "Mode", "Value / Allowed Ranges", "Units"])
         self.inputs.setItemDelegateForColumn(0, ScientificNameDelegate(self.inputs))
         self.inputs.setItemDelegateForColumn(3, ScientificNameDelegate(self.inputs))
-        self.inputs.setToolTip("Only independently editable inputs appear here. Derived parameters remain controlled by their authored Algebra expressions.")
+        self.inputs.setToolTip("Only independently editable inputs appear here. Calculated parameters keep the values their formulas give.")
         self.inputs.horizontalHeader().setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
         self.inputs.horizontalHeader().setSectionResizeMode(2, QtWidgets.QHeaderView.ResizeMode.Stretch)
         self.tabs.addTab(self.inputs, "Inputs")
@@ -391,11 +392,17 @@ class ChemicalSpaceScanDialog(QtWidgets.QDialog):
         if not check_only and not destination:
             raise ValueError("Choose a destination JSON file.")
         grouped, boundary = self.group.currentData(), self.boundaries.isChecked()
+        rtol = validate_scipy_rtol(
+            parse_finite_numeric_text(self.rtol.text().strip(), field="Relative tolerance"),
+            field="Relative tolerance",
+        )
+        atol = parse_finite_numeric_text(self.atol.text().strip(), field="Absolute tolerance")
+        if atol <= 0.0:
+            raise ValueError("Absolute tolerance must be finite and positive.")
         return replace(base, initials=initials, parameters=parameters, ranges=ranges, outputs=selected,
                        t_start=times[START], t_end=times[END], solver=self.solver.currentText(),
                        points=parse_points_text(self.points.text(), field="Requested output points"),
-                       rtol=parse_finite_numeric_text(self.rtol.text().strip(), field="Relative tolerance"),
-                       atol=parse_finite_numeric_text(self.atol.text().strip(), field="Absolute tolerance"), analytic_jacobian=self.jacobian.isChecked(),
+                       rtol=rtol, atol=atol, analytic_jacobian=self.jacobian.isChecked(),
                        use_authored_stops=self.stops.isChecked(), requested=int(self.requested.text()),
                        destination=destination, seed=int(self.seed.text()), sampler=self.sampler.currentData(),
                        grouped=bool(grouped),

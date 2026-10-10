@@ -18,7 +18,7 @@ from dataclasses import dataclass
 import math
 from numbers import Real
 
-from .validation import parse_finite_numeric_text, validate_name
+from .validation import parse_finite_numeric_text
 
 __all__ = [
     "CONCENTRATION_MIN_M",
@@ -44,7 +44,6 @@ __all__ = [
     "validate_imported_time_seconds",
     "validate_observation",
     "validate_runtime_concentration",
-    "validate_row_count",
     "validate_evaluation_count",
 ]
 
@@ -209,10 +208,6 @@ def _validate_count(value: object, *, field: str, maximum: int) -> int:
     return parsed
 
 
-def validate_row_count(value: object, *, field: str = "time-grid rows") -> int:
-    return _validate_count(value, field=field, maximum=MAX_GENERATED_TIME_ROWS)
-
-
 def validate_evaluation_count(
     value: object,
     *,
@@ -223,11 +218,8 @@ def validate_evaluation_count(
 
 @dataclass(frozen=True)
 class Species:
-    """Immutable species record."""
+    """Immutable species record; DSL parsing admits its name."""
     name: str
-
-    def __post_init__(self) -> None:
-        object.__setattr__(self, "name", validate_name(self.name))
 
 
 # --- helpers -----------------------------------------------------------------

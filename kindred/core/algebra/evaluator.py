@@ -30,7 +30,7 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Set, Tuple
 
 import numpy as np
 
-from kindred.core.exceptions import SimulationCancelled
+from kindred.core.exceptions import KindredError, SimulationCancelled
 
 from .errors import (
     AlgebraBoolCastError,
@@ -52,7 +52,7 @@ from .parser import (
     SpeciesRefNode,
     UnaryNode,
 )
-from .symbols import SymbolTable
+from .symbols import POWER_DOMAIN, SymbolTable
 
 logger = logging.getLogger(__name__)
 
@@ -141,13 +141,16 @@ class AlgebraObservableError:
     @staticmethod
     def from_exception(name: str, exc: Exception, *, stmt: LetStatement) -> "AlgebraObservableError":
         code = getattr(exc, "code", None)
-        line = getattr(exc, "line", None) or getattr(stmt, "line", None)
+        # A Kindred error keeps its message and its own authored line apart.
+        context = exc.context if isinstance(exc, KindredError) else None
+        line = getattr(exc, "line", None) or getattr(context, "line", None) or getattr(stmt, "line", None)
         col = getattr(exc, "col", None) or getattr(stmt, "col", None)
-        line_text = getattr(exc, "line_text", None) or getattr(stmt, "line_text", None)
+        line_text = (getattr(exc, "line_text", None) or getattr(context, "line_text", None)
+                     or getattr(stmt, "line_text", None))
         return AlgebraObservableError(
             name=str(name),
             exc_type=exc.__class__.__name__,
-            message=str(exc),
+            message=exc.message if isinstance(exc, KindredError) else str(exc),
             code=str(code) if code is not None else None,
             line=int(line) if line is not None else None,
             col=int(col) if col is not None else None,
@@ -161,14 +164,14 @@ class AlgebraObservableError:
 def _as_float(x: Any, *, stmt: LetStatement) -> float:
     """Coerce to float but reject booleans (E170)."""
     if isinstance(x, bool):
-        raise AlgebraBoolCastError("boolean in numeric-only context", line=stmt.line, col=stmt.col, line_text=stmt.line_text)
+        raise AlgebraBoolCastError("A true/false result cannot be used as a number.", line=stmt.line, col=stmt.col, line_text=stmt.line_text)
     try:
         xf = float(x)
     except Exception:
         logger.debug(f"Failed to convert value to float: {x}", exc_info=True)
         raise AlgebraTypeError("non scalar where scalar required", line=stmt.line, col=stmt.col, line_text=stmt.line_text)
     if not np.isfinite(xf):
-        raise AlgebraTypeError("nonfinite result in numeric context", line=stmt.line, col=stmt.col, line_text=stmt.line_text)
+        raise AlgebraTypeError("The result is not a finite number.", line=stmt.line, col=stmt.col, line_text=stmt.line_text)
     return xf
 
 
@@ -393,11 +396,11 @@ class _Evaluator:
                 return float(self.ctx.symtab.get(name))
             if name in self.failed:
                 raise AlgebraNameError(
-                    f"depends on {name!r}, which could not be calculated",
+                    f"It depends on {name!r}, which could not be calculated.",
                     line=stmt.line, col=stmt.col, line_text=stmt.line_text,
                 )
             # unknown
-            raise AlgebraNameError(f"unknown symbol {name!r}", line=stmt.line, col=stmt.col, line_text=stmt.line_text)
+            raise AlgebraNameError(f"Unknown name {name!r}.", line=stmt.line, col=stmt.col, line_text=stmt.line_text)
 
         # Species references
         if isinstance(node, SpeciesRefNode):
@@ -406,10 +409,10 @@ class _Evaluator:
                 try:
                     return float(self.ctx.species_series[nm][i])
                 except KeyError:
-                    raise AlgebraNameError(f"unknown species {nm!r}", line=stmt.line, col=stmt.col, line_text=stmt.line_text)
+                    raise AlgebraNameError(f"Unknown species {nm!r}.", line=stmt.line, col=stmt.col, line_text=stmt.line_text)
             if node.kind == "init":
                 if nm not in self.ctx.initials:
-                    raise AlgebraNameError(f"unknown species {nm!r}", line=stmt.line, col=stmt.col, line_text=stmt.line_text)
+                    raise AlgebraNameError(f"Unknown species {nm!r}.", line=stmt.line, col=stmt.col, line_text=stmt.line_text)
                 return float(self.ctx.initials[nm])
         # Unary
         if isinstance(node, UnaryNode):
@@ -447,13 +450,14 @@ class _Evaluator:
                     return _as_float(lv * rv, stmt=stmt)
                 if op == "/":
                     if rv == 0.0:
-                        raise AlgebraZeroDivError("division by zero", line=stmt.line, col=stmt.col, line_text=stmt.line_text)
+                        raise AlgebraZeroDivError("Division by zero.", line=stmt.line, col=stmt.col, line_text=stmt.line_text)
                     return _as_float(lv / rv, stmt=stmt)
                 if op in ("**", "^"):
-                    if lv == 0.0 and rv < 0.0:
-                        # Keep Python's clearer wording; math.pow says "domain error".
-                        raise ZeroDivisionError("0.0 cannot be raised to a negative power")
-                    return _as_float(math.pow(lv, rv), stmt=stmt)
+                    try:
+                        return _as_float(math.pow(lv, rv), stmt=stmt)
+                    except ValueError:
+                        raise AlgebraDomainError("^ " + POWER_DOMAIN, line=stmt.line, col=stmt.col,
+                                                 line_text=stmt.line_text) from None
                 if op == "==":
                     return lv == rv
                 if op == "!=":
@@ -466,11 +470,11 @@ class _Evaluator:
                     return lv > rv
                 if op == ">=":
                     return lv >= rv
-            except (AlgebraTypeError, AlgebraZeroDivError):
+            except (AlgebraTypeError, AlgebraZeroDivError, AlgebraDomainError):
                 raise
             except OverflowError as exc:
                 raise AlgebraTypeError(
-                    "nonfinite result in numeric context",
+                    "The result is not a finite number.",
                     line=stmt.line,
                     col=stmt.col,
                     line_text=stmt.line_text,
@@ -484,7 +488,7 @@ class _Evaluator:
         if isinstance(node, CallNode):
             fn = self.ctx.symtab.functions().get(node.name)
             if fn is None:
-                raise AlgebraNameError(f"unknown function {node.name!r}", line=stmt.line, col=stmt.col, line_text=stmt.line_text)
+                raise AlgebraNameError(f"Unknown function {node.name!r}.", line=stmt.line, col=stmt.col, line_text=stmt.line_text)
             args: List[Any] = []
             for index, a in enumerate(node.args):
                 av = self._eval_expr(a, i, stmt=stmt)
@@ -495,7 +499,10 @@ class _Evaluator:
             try:
                 out = float(fn(*args))
             except ZeroDivisionError:
-                raise AlgebraZeroDivError("division by zero", line=stmt.line, col=stmt.col, line_text=stmt.line_text)
+                raise AlgebraZeroDivError("Division by zero.", line=stmt.line, col=stmt.col, line_text=stmt.line_text)
+            except OverflowError:
+                raise AlgebraTypeError("The function result is not a finite number.", line=stmt.line, col=stmt.col,
+                                       line_text=stmt.line_text) from None
             except ValueError as e:
                 # e.g., sqrt of negative
                 logger.debug(f"Function {node.name} raised ValueError", exc_info=True)
@@ -504,7 +511,7 @@ class _Evaluator:
                 logger.debug(f"Function {node.name} call failed", exc_info=True)
                 raise AlgebraTypeError(f"invalid function call: {e}", line=stmt.line, col=stmt.col, line_text=stmt.line_text)
             if not np.isfinite(out):
-                raise AlgebraTypeError("nonfinite function result", line=stmt.line, col=stmt.col, line_text=stmt.line_text)
+                raise AlgebraTypeError("The function result is not a finite number.", line=stmt.line, col=stmt.col, line_text=stmt.line_text)
             return out
 
         # Should not reach here
@@ -521,12 +528,11 @@ class _PointEvaluator(_Evaluator):
     def quantity(self, name: str) -> float:
         if name not in self.scalars:
             stmt = self.prepared.statements[name]
-            try:
-                self.scalars[name] = _as_float(
-                    self._eval_expr(stmt.expr, 0, stmt=stmt), stmt=stmt
-                )
-            except AlgebraError as exc:
-                raise ValueError(f"Algebra quantity {name!r}: {exc}") from exc
+            # A refusal is the failing statement's sentence, on its line; the
+            # stopping declaration that watches the quantity names it.
+            self.scalars[name] = _as_float(
+                self._eval_expr(stmt.expr, 0, stmt=stmt), stmt=stmt
+            )
         return self.scalars[name]
 
     def _eval_expr(self, node: ExprNode, i: int, *, stmt: LetStatement) -> float | bool:
@@ -559,7 +565,6 @@ class PreparedAlgebraStopEvaluator:
         self,
         block: AlgebraBlock,
         *,
-        target_names: Tuple[str, ...],
         species_names: Tuple[str, ...],
         initials: Mapping[str, float],
         symbol_values: Mapping[str, float],
@@ -580,17 +585,14 @@ class PreparedAlgebraStopEvaluator:
             symtab=SymbolTable(),
             symbol_values=dict(symbol_values),
         )
-        static_evaluator = _PointEvaluator(self, self._context)
-        for name in target_names:
-            if name not in self.statements:
-                raise ValueError(f"stop target {name!r}: unknown authored Algebra quantity")
-            stmt = self.statements[name]
-            try:
-                self._admit(stmt.expr, stmt, static_evaluator)
-                if not self._is_dynamic(stmt.expr):
-                    static_evaluator.quantity(name)
-            except (AlgebraError, ValueError) as exc:
-                raise ValueError(f"stop target {name!r}: {exc}") from exc
+        self._static_evaluator = _PointEvaluator(self, self._context)
+
+    def admit(self, name: str) -> None:
+        """Admit one stop target; its stopping declaration names it in a refusal."""
+        stmt = self.statements[name]
+        self._admit(stmt.expr, stmt, self._static_evaluator)
+        if not self._is_dynamic(stmt.expr):
+            self._static_evaluator.quantity(name)
 
     def _is_dynamic(self, node: ExprNode) -> bool:
         key = id(node)
@@ -644,16 +646,16 @@ class PreparedAlgebraStopEvaluator:
 
         def reject(reason: str) -> None:
             raise AlgebraTypeError(
-                f"quantity {stmt.name!r} is unsupported as a stop target: {reason}",
+                f"{stmt.name} uses {reason}.",
                 line=stmt.line, col=stmt.col, line_text=stmt.line_text,
             )
 
         def admit_power(exponent: ExprNode) -> None:
             if self._is_dynamic(exponent):
-                reject("the exponent must be an input-only nonnegative integer")
+                reject("an exponent that is not an input-only nonnegative integer")
             value = _as_float(self._static_value(exponent, stmt, evaluator), stmt=stmt)
             if value < 0.0 or not value.is_integer():
-                reject("the exponent must be an input-only nonnegative integer")
+                reject("an exponent that is not an input-only nonnegative integer")
 
         if isinstance(node, IdentNode):
             if node.name in self.statements:
@@ -663,27 +665,28 @@ class PreparedAlgebraStopEvaluator:
             pass
         elif isinstance(node, UnaryNode):
             if node.op not in {"+", "-"}:
-                reject(f"runtime operator {node.op!r}")
+                reject(f"the runtime operator {node.op!r}")
             self._admit(node.rhs, stmt, evaluator)
         elif isinstance(node, BinaryNode):
             if node.op in {"^", "**"}:
                 admit_power(node.rhs)
             elif node.op == "/":
                 if not self._safe_denominator(node.rhs, stmt, evaluator):
-                    reject("division needs a finite nonzero input-only denominator or a signed min/max guard")
+                    reject("a division whose denominator is neither finite, nonzero, and input-only "
+                           "nor a signed min/max guard")
             elif node.op not in {"+", "-", "*"}:
-                reject(f"runtime operator {node.op!r}")
+                reject(f"the runtime operator {node.op!r}")
             self._admit(node.lhs, stmt, evaluator)
             self._admit(node.rhs, stmt, evaluator)
         elif isinstance(node, CallNode):
             if node.name == "pow" and len(node.args) == 2:
                 admit_power(node.args[1])
             elif node.name not in {"abs", "min", "max", "clip", "exp", "expm1", "sin", "cos", "erf"}:
-                reject(f"runtime function {node.name!r}")
+                reject(f"the runtime function {node.name!r}")
             for arg in node.args:
                 self._admit(arg, stmt, evaluator)
         else:
-            reject("runtime expression")
+            reject("an unsupported runtime expression")
         self._admitted.add(id(node))
 
     def evaluate(
@@ -699,10 +702,8 @@ class PreparedAlgebraStopEvaluator:
             symbol_values=self._context.symbol_values,
             symbol_series=runtime_symbols,
         )
-        try:
-            return _PointEvaluator(self, ctx).quantity(name)
-        except (AlgebraError, ValueError) as exc:
-            raise ValueError(f"stop target {name!r}: {exc}") from exc
+        # The stopping declaration that watches the quantity names it.
+        return _PointEvaluator(self, ctx).quantity(name)
 
 
 # ----------------------------- public API ------------------------------------

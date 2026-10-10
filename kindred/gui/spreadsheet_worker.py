@@ -1,6 +1,7 @@
 """Spreadsheet process and pipe lifetime, supervised off the GUI thread."""
 from __future__ import annotations
 
+import logging
 from multiprocessing import Pipe, get_context
 from multiprocessing.connection import wait
 import queue
@@ -9,6 +10,8 @@ import threading
 from PySide6 import QtCore
 
 from kindred.gui.spreadsheet_session import run_spreadsheet_child
+
+logger = logging.getLogger(__name__)
 
 
 class SpreadsheetWorker(QtCore.QThread):
@@ -70,9 +73,10 @@ class SpreadsheetWorker(QtCore.QThread):
                         break
                     if not self._shutdown.is_set():
                         self.result.emit(operation, value, error)
-        except Exception as exc:
+        except Exception:
+            logger.exception("Spreadsheet calculation process failed.")
             if not self._shutdown.is_set():
-                self.failed.emit(f"Spreadsheet calculation failed: {exc}")
+                self.failed.emit("Spreadsheet calculation stopped.")
         finally:
             self._shutdown.set()
             if watchdog is not None:

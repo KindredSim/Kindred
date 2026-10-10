@@ -82,6 +82,7 @@ PRESET_MECHANISM_TITLES = {
     "M10": "A + B <-> C, C -> D, D -> E (Temperature Change)",
     "M11": "PB cascade",
     "M12": "Intermolecular Competition",
+    "M13": "Coupled Reversible Cycles",
 }
 
 

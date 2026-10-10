@@ -542,8 +542,9 @@ class VariableSliders(QtWidgets.QWidget):
             if preserve_editor_drafts:
                 for name, editor in self._value_labels.items():
                     old, new = self._metadata.get(name), normalized_metadata.get(name)
-                    dirty = (bool(editor.property("invalidNumeric")) or editor.text() != self._last_committed_editor_text.get(name, self._format_value(self._variables[name])))
-                    if dirty and old is not None and new is not None and parse_unit(str(old["unit"])) == parse_unit(str(new["unit"])):
+                    # Only rejected text survives a new mechanism; valid text shows the new values.
+                    rejected = bool(editor.property("invalidNumeric"))
+                    if rejected and old is not None and new is not None and parse_unit(str(old["unit"])) == parse_unit(str(new["unit"])):
                         retained_editors[name] = (editor.text(), self._editor_pre_edit_state.get(name), self._last_committed_editor_text.get(name), bool(editor.property("invalidNumeric")))
             self.set_variables(
                 normalized_variables,

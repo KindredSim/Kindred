@@ -7,13 +7,13 @@ from multiprocessing.connection import wait
 import time
 
 from kindred.core.exceptions import SimulationCancelled
-from kindred.core.mechanism_source import MechanismAuthoringSource
 from kindred.core.simulation_execution import execute_simulation
 from kindred.core.simulation_preparation import build_simulation_execution_request, SimulationPreparationError
 from kindred.core.simulation_preparation_stages import build_solver_config
 from kindred.core.simulator.dsl_parse import prepare_dsl_request_set
 from kindred.core.simulator.solver_types import SimulationCancellationControl
 from kindred.core.units import UnitsModel
+from kindred.io.paths import file_error_text
 from kindred.scan.config import START, END, ScanProgress
 from kindred.scan.json_export import JsonScanWriter, input_record, result_record
 from kindred.scan.sampling import PreparedScanDesign
@@ -26,7 +26,7 @@ def execute_input(config, prepared, solver, run, cancellation):
         if run.generation_error:
             raise ValueError(run.generation_error)
         request = build_simulation_execution_request(
-            prepared_dsl=prepared, mechanism_source=MechanismAuthoringSource(config.source),
+            prepared_dsl=prepared,
             initial_values=record["inputs"]["initials"].items(),
             parameter_values=record["inputs"]["parameters"],
             t_span=(run.values[START], run.values[END]), solver_config=solver,
@@ -55,7 +55,7 @@ def _worker(config, connection, cancel):
             solver = build_solver_config(solver_input=config.solver, rtol=config.rtol, atol=config.atol,
                                          grid={"N": config.points}, use_analytic_jacobian=config.analytic_jacobian)
         except Exception as exc:
-            connection.send(("bootstrap_failure", f"{type(exc).__name__}: {exc}"))
+            connection.send(("bootstrap_failure", str(exc)))
             return
         control = SimulationCancellationControl(cancel.is_set)
         while True:
@@ -135,7 +135,7 @@ def run_scan(config, prepared, cancel, progress_callback):
             except SimulationCancelled:
                 process_cancel.set()
             except Exception as exc:
-                fail(f"Input generation could not continue: {type(exc).__name__}: {exc}")
+                fail(f"Input generation could not continue: {exc}")
         if child.run is None:
             child.stopping = True
         child.connection.send(child.run)
@@ -146,7 +146,8 @@ def run_scan(config, prepared, cancel, progress_callback):
         setattr(progress, state, getattr(progress, state) + 1)
         progress.running -= 1
         if state == "failed":
-            progress.latest_failure = f"Run {record['run_id']} — {record.get('stage', 'execution')} — {record['error']['message']}"
+            # The failure stage stays in the record; the text is the message.
+            progress.latest_failure = f"Run {record['run_id']}: {record['error']['message']}"
         if record["export_status"] == "failed":
             progress.export_errors += 1
             progress.latest_failure = f"Run {record['run_id']} — unavailable exported outputs: {', '.join(record['missing_outputs'])}"
@@ -156,16 +157,24 @@ def run_scan(config, prepared, cancel, progress_callback):
                 progress.saved += 1
             except Exception as exc:
                 writing = False
-                fail(f"JSON writing failed: {type(exc).__name__}: {exc}")
+                fail(f"JSON writing failed: {file_error_text(exc, writer.destination)}")
 
     try:
         emit(True)
         context = get_context("spawn")
         process_cancel = context.Event()
-        design = PreparedScanDesign(config, prepared, check)
+        try:
+            design = PreparedScanDesign(config, prepared, check)
+        except ValueError as exc:
+            fail(f"Setup cannot start: {exc}")
+            return progress
         check()
         writer = JsonScanWriter(config)
-        writer.initialize(config, design)
+        try:
+            writer.initialize(config, design)
+        except OSError as exc:
+            fail(file_error_text(exc, writer.destination))
+            return progress
         progress.path = writer.path
         writing = True
         iterator = iter(design.inputs())
@@ -234,7 +243,7 @@ def run_scan(config, prepared, cancel, progress_callback):
         if process_cancel is not None:
             process_cancel.set()
     except Exception as exc:
-        fail(f"{type(exc).__name__}: {exc}")
+        fail(str(exc))
     finally:
         if process_cancel is not None:
             process_cancel.set()
@@ -275,23 +284,23 @@ def run_scan(config, prepared, cancel, progress_callback):
             try:
                 iterator.close()
             except Exception as exc:
-                fail(f"Input generator cleanup failed: {type(exc).__name__}: {exc}")
+                fail(f"Input generator cleanup failed: {exc}")
         if writer is not None:
             progress.path = writer.path
             if writing:
                 try:
                     progress.path = writer.finish(progress)
                 except Exception as exc:
-                    fail(f"JSON finalization failed: {type(exc).__name__}: {exc}")
+                    fail(f"JSON finalization failed: {file_error_text(exc, writer.destination)}")
             try:
                 writer.close()
             except Exception as exc:
-                fail(f"JSON closing failed: {type(exc).__name__}: {exc}")
+                fail(f"JSON closing failed: {file_error_text(exc, writer.destination)}")
         if design is not None:
             try:
                 design.close()
             except Exception as exc:
-                fail(f"Scan storage cleanup failed: {type(exc).__name__}: {exc}")
+                fail(f"Scan storage cleanup failed: {file_error_text(exc, None)}")
         progress.phase = "Finished"
         emit(True)
     return progress

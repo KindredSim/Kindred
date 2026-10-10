@@ -26,10 +26,7 @@ from kindred.core.analysis.dataset_parameter_overrides import (
 )
 from kindred.gui.fitting.constants import INITIAL_PREFIX
 from kindred.core.analysis.dataset_sampling import compute_sampled_indices
-from kindred.core.mechanism_source import (
-    MechanismAuthoringSource,
-    source_matches_analysis,
-)
+from kindred.core.mechanism_source import MechanismAuthoringSource
 from kindred.core.project_document import (
     FitDefaults,
     MechanismTabDocument,
@@ -38,6 +35,7 @@ from kindred.core.project_document import (
     canonical_initial_values,
     validate_fit_solver,
 )
+from kindred.core.simulation_parameters import names_affecting
 from kindred.core.species import validate_concentration, validate_input_time_seconds
 from kindred.core.time_grid import build_time_grid
 from kindred.core.simulator.dsl_parse import PreparedDslRequestSet
@@ -46,7 +44,6 @@ from kindred.core.simulation_preparation_stages import (
     build_solver_config,
 )
 from kindred.gui.parameter_enumeration import (
-    GuiParameterScientificCategory,
     admit_gui_parameter_value,
     enumerate_parameter_coordinates,
 )
@@ -136,6 +133,10 @@ class FitObservationSnapshot:
 
 @dataclass(frozen=True, slots=True)
 class FitMappedDatasetSnapshot:
+    """One mapped dataset copied by ``capture_fit_origin`` from the admitted
+    document: its identities, canonical initial values, uniquely mapped
+    observations and resolved Run start."""
+
     dataset_id: str
     display_name: str
     time_column_name: str | None
@@ -144,44 +145,6 @@ class FitMappedDatasetSnapshot:
     initial_values: tuple[tuple[str, float], ...]
     observations: tuple[FitObservationSnapshot, ...]
     resolved_t_start: float
-
-    def __post_init__(self) -> None:
-        object.__setattr__(self, "dataset_id", _required(self.dataset_id, "dataset ID"))
-        object.__setattr__(self, "display_name", _required(self.display_name, "dataset name"))
-        object.__setattr__(self, "set_id", _required(self.set_id, "set ID"))
-        object.__setattr__(self, "set_name", _required(self.set_name, "set name"))
-        names: set[str] = set()
-        values: list[tuple[str, float]] = []
-        for raw_name, raw_value in self.initial_values:
-            name = _required(raw_name, "initial species")
-            if name in names:
-                raise ValueError(f"Duplicate initial species {name!r}.")
-            names.add(name)
-            value = validate_concentration(
-                _finite(raw_value, f"initial value {name}"),
-                field=f"initial value {name}",
-            )
-            values.append((name, value))
-        object.__setattr__(self, "initial_values", tuple(values))
-        observations = tuple(self.observations)
-        if any(
-            not isinstance(item, FitObservationSnapshot)
-            for item in observations
-        ):
-            raise TypeError(
-                "Mapped Fit observations must be FitObservationSnapshot values."
-            )
-        raw_ids = [item.raw_observation_id for item in observations]
-        if len(raw_ids) != len(set(raw_ids)):
-            raise ValueError(
-                "Mapped Fit dataset-local raw observation IDs must be unique."
-            )
-        object.__setattr__(self, "observations", observations)
-        object.__setattr__(
-            self,
-            "resolved_t_start",
-            _finite(self.resolved_t_start, "resolved mapped start"),
-        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -207,23 +170,8 @@ class FitParameterConfiguration:
     fixed_dataset_ids: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
-        value = _finite(self.value, "parameter value")
-        minimum = _finite(self.minimum, "parameter minimum")
-        maximum = _finite(self.maximum, "parameter maximum")
-        if minimum >= maximum:
+        if self.minimum >= self.maximum:
             raise ValueError("Parameter requires minimum < maximum.")
-        values = tuple(
-            (_required(dataset_id, "dataset ID"), _finite(item, "dataset value"))
-            for dataset_id, item in self.dataset_values
-        )
-        if len({dataset_id for dataset_id, _value in values}) != len(values):
-            raise ValueError("Parameter dataset values repeat a dataset ID.")
-        object.__setattr__(self, "value", value)
-        object.__setattr__(self, "minimum", minimum)
-        object.__setattr__(self, "maximum", maximum)
-        object.__setattr__(self, "fit", bool(self.fit))
-        object.__setattr__(self, "log10", bool(self.log10))
-        object.__setattr__(self, "dataset_values", values)
         groups = tuple(
             (group[0], *sorted(group[1:])) if group else ()
             for group in self.groups
@@ -278,7 +226,6 @@ def _admit_fit_parameter_configuration(
     parameter_name: str,
     role: str,
     unit: str,
-    scientific_category: GuiParameterScientificCategory,
     allow_exact_zero: bool,
     dataset_scoped: bool,
 ) -> FitParameterConfiguration:
@@ -287,7 +234,6 @@ def _admit_fit_parameter_configuration(
     def admit(value: object, field: str) -> float:
         return admit_gui_parameter_value(
             value,
-            scientific_category=scientific_category,
             role=role,
             unit=unit,
             allow_exact_zero=allow_exact_zero,
@@ -335,42 +281,28 @@ def _admit_fit_parameter_configuration(
 
 @dataclass(frozen=True, slots=True)
 class FitParameterVariable:
+    """One Fit scalar; its values are admitted here, before any commit.
+
+    Identity and category fields come from the accepted GUI coordinate and
+    ``scope`` from the Scope choices.
+    """
+
     name: str
     display_name: str
-    scope: str
+    scope: Literal["shared", "per_dataset"]
     shared_config: FitParameterConfiguration
     per_dataset_config: FitParameterConfiguration
-    scientific_category: GuiParameterScientificCategory
     allow_exact_zero: bool
     family: str = ""
     role: str = ""
     unit: str = "1"
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "name", _required(self.name, "parameter name"))
-        object.__setattr__(
-            self,
-            "display_name",
-            _required(self.display_name, "parameter display name"),
-        )
-        scope = str(self.scope or "").strip().lower()
-        if scope not in {"shared", "per_dataset"}:
-            raise ValueError("Scalar Fit scope must be Shared or Per-dataset.")
-        scientific_category = str(self.scientific_category or "").strip()
-        if scientific_category not in {
-            "rate",
-            "equilibrium_constant",
-            "finite_scalar",
-        }:
-            raise ValueError("Fit parameter scientific category is invalid.")
-        if type(self.allow_exact_zero) is not bool:
-            raise TypeError("Fit parameter exact-zero authority must be a bool.")
         shared_config = _admit_fit_parameter_configuration(
             self.shared_config,
             parameter_name=self.name,
             role=self.role,
             unit=self.unit,
-            scientific_category=scientific_category,
             allow_exact_zero=self.allow_exact_zero,
             dataset_scoped=False,
         )
@@ -379,17 +311,11 @@ class FitParameterVariable:
             parameter_name=self.name,
             role=self.role,
             unit=self.unit,
-            scientific_category=scientific_category,
             allow_exact_zero=self.allow_exact_zero,
             dataset_scoped=True,
         )
-        object.__setattr__(self, "scope", scope)
         object.__setattr__(self, "shared_config", shared_config)
         object.__setattr__(self, "per_dataset_config", per_dataset_config)
-        object.__setattr__(self, "family", str(self.family or "").strip())
-        object.__setattr__(self, "role", str(self.role or "").strip())
-        object.__setattr__(self, "scientific_category", scientific_category)
-        object.__setattr__(self, "unit", str(self.unit or "1").strip() or "1")
 
     @property
     def selected_config(self) -> FitParameterConfiguration:
@@ -523,81 +449,15 @@ def _replace_fit_parameter(
     parameter: FitParameterVariable,
     **changes: object,
 ) -> FitParameterVariable:
-    """Replace fields in the selected scalar configuration.
+    """Replace fields of the selected scope configuration.
 
-    The inactive scope configuration is intentionally retained byte-for-byte;
-    only the selected configuration is rebuilt from the requested active
-    fields.  All production replacements of a scalar use this helper so the
-    typed invariant is checked by ``FitParameterConfiguration`` itself.
+    The inactive scope configuration is retained byte-for-byte.  All
+    production replacements of a scalar use this helper, so the replacement
+    is admitted again by ``FitParameterVariable``.
     """
 
-    allowed = {
-        "initial",
-        "minimum",
-        "maximum",
-        "fit",
-        "log10",
-        "scope",
-        "dataset_values",
-        "groups",
-        "fixed_dataset_ids",
-        "name",
-        "display_name",
-        "family",
-        "role",
-        "unit",
-    }
-    unknown = set(changes).difference(allowed)
-    if unknown:
-        raise TypeError("Unsupported Fit parameter replacement fields: " + ", ".join(sorted(unknown)))
-    target_scope = str(changes.get("scope", parameter.scope)).strip().lower()
-    if target_scope not in {"shared", "per_dataset"}:
-        raise ValueError("Scalar Fit scope must be Shared or Per-dataset.")
-    selected = (
-        parameter.shared_config
-        if target_scope == "shared"
-        else parameter.per_dataset_config
-    )
-    values = {
-        "value": selected.value,
-        "minimum": selected.minimum,
-        "maximum": selected.maximum,
-        "fit": selected.fit,
-        "log10": selected.log10,
-        "dataset_values": selected.dataset_values,
-        "groups": selected.groups,
-        "fixed_dataset_ids": selected.fixed_dataset_ids,
-    }
-    values.update(
-        {
-            ("value" if key == "initial" else key): value
-            for key, value in changes.items()
-            if key in {
-                "initial", "minimum", "maximum", "fit", "log10", "dataset_values", "groups",
-                "fixed_dataset_ids",
-            }
-        }
-    )
-    active = FitParameterConfiguration(**values)
-    configs = {
-        "shared_config": parameter.shared_config,
-        "per_dataset_config": parameter.per_dataset_config,
-    }
-    configs[
-        "shared_config" if target_scope == "shared" else "per_dataset_config"
-    ] = active
-    presentation = {
-        key: value
-        for key, value in changes.items()
-        if key in {"name", "display_name", "family", "role", "unit"}
-    }
-    return replace(
-        parameter,
-        scope=target_scope,
-        shared_config=configs["shared_config"],
-        per_dataset_config=configs["per_dataset_config"],
-        **presentation,
-    )
+    selected = "shared_config" if parameter.scope == "shared" else "per_dataset_config"
+    return replace(parameter, **{selected: replace(parameter.selected_config, **changes)})
 
 
 def _complete_fit_parameter_scopes(
@@ -842,29 +702,8 @@ class FitOriginSnapshot:
     mapped_datasets: tuple[FitMappedDatasetSnapshot, ...]
     parameter_defaults: tuple[FitParameterVariable, ...]
     def __post_init__(self) -> None:
-        if not source_matches_analysis(
-            self.mechanism_source,
-            self.prepared_dsl.analysis,
-        ):
-            raise ValueError(
-                "Fit origin prepared DSL must be the retained analysis for "
-                "the captured source."
-            )
-        mapped_datasets = tuple(self.mapped_datasets)
-        parameter_defaults = tuple(self.parameter_defaults)
-        dataset_ids = [item.dataset_id for item in mapped_datasets]
-        set_ids = [item.set_id for item in mapped_datasets]
-        parameter_names = [item.name for item in parameter_defaults]
-        if len(dataset_ids) != len(set(dataset_ids)):
-            raise ValueError("Fit origin dataset IDs must be unique.")
-        if len(set_ids) != len(set(set_ids)):
-            raise ValueError(
-                "Fit origin mapped set IDs must be unique across datasets."
-            )
-        if len(parameter_names) != len(set(parameter_names)):
-            raise ValueError("Fit origin parameter names must be unique.")
-        object.__setattr__(self, "mapped_datasets", mapped_datasets)
-        object.__setattr__(self, "parameter_defaults", parameter_defaults)
+        object.__setattr__(self, "mapped_datasets", tuple(self.mapped_datasets))
+        object.__setattr__(self, "parameter_defaults", tuple(self.parameter_defaults))
 
 
 def _validate_advanced_analysis_setup(
@@ -1008,7 +847,11 @@ def prune_fit_analysis_coordinates(
 
 @dataclass(frozen=True, slots=True)
 class FitPreparedDatasetConfig:
-    """One admitted dataset/grid solver policy completed before dispatch."""
+    """One admitted dataset/grid solver policy completed before dispatch.
+
+    Its sole producer selects the observations and retains their sorted
+    distinct admitted times.
+    """
 
     dataset_id: str
     selected_observations: tuple[FitSelectedObservation, ...]
@@ -1019,35 +862,6 @@ class FitPreparedDatasetConfig:
     fit_sampling_policy: str
     fit_sampling_identity: tuple[tuple[str, object], ...]
     solver_config: PreparedSolverConfig
-
-    def __post_init__(self) -> None:
-        dataset_id = _required(self.dataset_id, "prepared Fit dataset ID")
-        selected = tuple(self.selected_observations)
-        if not selected or any(
-            not isinstance(item, FitSelectedObservation) for item in selected
-        ):
-            raise TypeError(
-                "Prepared Fit dataset requires selected Fit observations."
-            )
-        if self.parametric_x_observation is not None and not isinstance(
-            self.parametric_x_observation,
-            FitSelectedObservation,
-        ):
-            raise TypeError(
-                "Prepared Fit dataset Parametric-X observation must be typed."
-            )
-        retained_times = tuple(float(value) for value in self.retained_times)
-        if (
-            (not retained_times and self.parametric_x_observation is None)
-            or any(not math.isfinite(value) for value in retained_times)
-            or any(right <= left for left, right in zip(retained_times, retained_times[1:]))
-        ):
-            raise ValueError("Prepared Fit dataset times must be finite and ordered.")
-        if not isinstance(self.solver_config, PreparedSolverConfig):
-            raise TypeError("Prepared Fit dataset requires PreparedSolverConfig.")
-        object.__setattr__(self, "dataset_id", dataset_id)
-        object.__setattr__(self, "selected_observations", selected)
-        object.__setattr__(self, "retained_times", retained_times)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1068,12 +882,6 @@ class _FitDispatchCompilation:
 class FitExecutionRequest:
     setup: FitSetupSnapshot
     dispatch: _FitDispatchCompilation
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.setup, FitSetupSnapshot):
-            raise TypeError("setup must be FitSetupSnapshot.")
-        if not isinstance(self.dispatch, _FitDispatchCompilation):
-            raise TypeError("Fit request dispatch must be compiled.")
 
 
 @dataclass(frozen=True, slots=True)
@@ -1101,43 +909,7 @@ class FitSetupSnapshot:
         parameters = tuple(self.parameters)
         initials = tuple(self.initials)
         shared_initial_groups = tuple(self.shared_initial_groups)
-        dataset_ids = [item.dataset_id for item in datasets]
-        parameter_names = [item.name for item in parameters]
-        initial_keys = [(item.set_id, item.species) for item in initials]
-        group_identities = [(item.species, item.origin_dataset_id) for item in shared_initial_groups]
-        if len(dataset_ids) != len(set(dataset_ids)):
-            raise ValueError("Fit snapshot dataset identities repeat.")
-        if len(parameter_names) != len(set(parameter_names)):
-            raise ValueError("Fit snapshot parameter identities repeat.")
-        if len(initial_keys) != len(set(initial_keys)):
-            raise ValueError("Fit snapshot initial-condition identities repeat.")
-        if len(group_identities) != len(set(group_identities)):
-            raise ValueError("Fit snapshot shared initial group identities repeat.")
-        retained_by_id = {item.dataset_id: item for item in datasets}
-        initial_by_set_species = {(item.set_id, item.species) for item in initials}
-        occupied: set[tuple[str, str]] = set()
-        for group in shared_initial_groups:
-            if group.origin_dataset_id not in retained_by_id:
-                raise ValueError("Shared initial group origin is not retained.")
-            origin = self.origin.mapped_datasets
-            mapped_by_id = {item.dataset_id: item for item in origin}
-            for dataset_id in group.member_dataset_ids:
-                if dataset_id not in retained_by_id:
-                    raise ValueError("Shared initial group member is not retained.")
-                mapped = mapped_by_id.get(dataset_id)
-                if mapped is None:
-                    raise ValueError("Shared initial group member is not captured.")
-                if not any(species == group.species for species, _value in mapped.initial_values):
-                    raise ValueError("Shared initial group members must contain the species.")
-                if (mapped.set_id, group.species) not in initial_by_set_species:
-                    raise ValueError(
-                        "Shared initial group members require compatible retained initials."
-                    )
-                key = (dataset_id, group.species)
-                if key in occupied:
-                    raise ValueError("Shared initial groups cannot overlap a dataset/species row.")
-                occupied.add(key)
-        retained_dataset_ids = set(dataset_ids)
+        retained_dataset_ids = {item.dataset_id for item in datasets}
         incomplete_parameter_maps = sorted(
             item.name
             for item in parameters
@@ -1177,46 +949,48 @@ class FitSelectedObservation:
     source_rows: tuple[int, ...]
 
 
-def _scan_parameters(tab: MechanismTabDocument) -> tuple[FitParameterVariable, ...]:
+def _scan_parameters(
+    tab: MechanismTabDocument,
+    mapped: Iterable[FitMappedDatasetSnapshot],
+) -> tuple[FitParameterVariable, ...]:
     if not tab.mechanism_source.reactions_text.strip():
         return ()
     variables: list[FitParameterVariable] = []
     if not isinstance(tab.prepared_dsl, PreparedDslRequestSet):
         raise ValueError("Fit requires an accepted prepared mechanism.")
     coordinates = enumerate_parameter_coordinates(tab.prepared_dsl)
+    # Vary starts on only for parameters a mapped observation can depend on.
+    relevant = names_affecting(
+        tab.prepared_dsl,
+        {observation.model_target for item in mapped for observation in item.observations},
+    )
     for coordinate in coordinates:
-        name = _required(coordinate.name, "parameter name")
-        value = _finite(coordinate.value, f"parameter {name}")
-        low = float(coordinate.fit_minimum)
-        high = float(coordinate.fit_maximum)
-        if not math.isfinite(low) or not math.isfinite(high) or low >= high:
-            raise ValueError(
-                f"Accepted parameter {name!r} has invalid Fit bounds."
-            )
+        value = coordinate.value
+        low, high = coordinate.fit_minimum, coordinate.fit_maximum
+        vary = coordinate.name in relevant
         variables.append(
             FitParameterVariable(
-                name=name,
-                display_name=str(coordinate.display_name or name),
+                name=coordinate.name,
+                display_name=coordinate.display_name,
                 scope="shared",
                 shared_config=FitParameterConfiguration(
                     value=value,
                     minimum=low,
                     maximum=high,
-                    fit=True,
+                    fit=vary,
                     log10=False,
                 ),
                 per_dataset_config=FitParameterConfiguration(
                     value=value,
                     minimum=low,
                     maximum=high,
-                    fit=True,
+                    fit=vary,
                     log10=False,
                 ),
-                family=str(coordinate.family),
-                role=str(coordinate.role),
-                scientific_category=coordinate.scientific_category,
+                family=coordinate.family,
+                role=coordinate.role,
                 allow_exact_zero=coordinate.allow_exact_zero,
-                unit=str(coordinate.unit),
+                unit=coordinate.unit,
             )
         )
     return tuple(variables)
@@ -1274,17 +1048,11 @@ def create_initial_fit_setup(origin: FitOriginSnapshot) -> FitSetupSnapshot:
         )
         for mapped in origin.mapped_datasets
     )
-    values_by_key: dict[tuple[str, str], float] = {}
-    for mapped in origin.mapped_datasets:
-        for species, value in mapped.initial_values:
-            key = (mapped.set_id, species)
-            previous = values_by_key.get(key)
-            if previous is not None and previous != value:
-                raise ValueError(
-                    f"Mapped set {mapped.set_id!r} repeats initial {species!r} "
-                    "with conflicting values."
-                )
-            values_by_key[key] = value
+    values_by_key = {
+        (mapped.set_id, species): value
+        for mapped in origin.mapped_datasets
+        for species, value in mapped.initial_values
+    }
     initials = tuple(
         FitInitialVariable(
             set_id=set_id,
@@ -1317,11 +1085,9 @@ def capture_fit_origin(
     tab_id: str,
 ) -> FitOriginSnapshot:
     """Copy mapped dataset science from one exact tab."""
-    if not isinstance(document, ProjectDocument):
-        raise TypeError("document must be ProjectDocument.")
     tab = document.tab(tab_id)
     if not isinstance(tab.prepared_dsl, PreparedDslRequestSet):
-        raise ValueError("Fit requires an accepted visible mechanism.")
+        raise ValueError("Enter a valid mechanism before opening Global Fit.")
     mapped: list[FitMappedDatasetSnapshot] = []
     links = dict(tab.dataset_links)
     # Fit lists datasets in the project's import order, as the main window does.
@@ -1375,7 +1141,7 @@ def capture_fit_origin(
         scientific_settings=tab.scientific_settings,
         fit_defaults=document.fit_defaults,
         mapped_datasets=tuple(mapped),
-        parameter_defaults=_scan_parameters(tab),
+        parameter_defaults=_scan_parameters(tab, mapped),
     )
 
 
@@ -1641,60 +1407,19 @@ def _prepare_fit_datasets(
     *,
     setup: FitSetupSnapshot,
 ) -> tuple[FitPreparedDatasetConfig, ...]:
-    """Perform deferred inclusion science and retain each selection once."""
+    """Perform deferred inclusion science and retain each selection once.
+
+    The setup holds one local settings value per captured dataset, its
+    readiness gate found an included dataset, and its captured initial values
+    and observation targets come from the admitted document.
+    """
 
     mapped_by_id = {item.dataset_id: item for item in setup.origin.mapped_datasets}
-    setup_ids = tuple(item.dataset_id for item in setup.datasets)
-    if len(setup_ids) != len(set(setup_ids)) or set(setup_ids) != set(mapped_by_id):
-        raise ValueError("Fit request must contain each mapped dataset exactly once.")
-    mechanism_species = set(setup.origin.prepared_dsl.analysis.species_names)
-    allowed_targets = mechanism_species | set(
-        setup.origin.prepared_dsl.analysis.observable_names
-    )
     included = tuple(item for item in setup.datasets if item.included)
-    if not included:
-        raise ValueError("Select at least one mapped dataset for fitting.")
     science = setup.origin.scientific_settings
-    initials_by_set: dict[str, set[str]] = {}
-    for initial in setup.initials:
-        initials_by_set.setdefault(initial.set_id, set()).add(initial.species)
     prepared: list[FitPreparedDatasetConfig] = []
     for local in included:
-        mapped = mapped_by_id.get(local.dataset_id)
-        if mapped is None:
-            raise ValueError(
-                f"Included dataset {local.dataset_id!r} is not captured."
-            )
-        if not math.isfinite(mapped.resolved_t_start) or mapped.resolved_t_start < 0.0:
-            raise ValueError(
-                f"Dataset {mapped.display_name!r} has no finite captured start."
-            )
-        captured_initials = {species for species, _value in mapped.initial_values}
-        if not mechanism_species.issubset(captured_initials):
-            raise ValueError(
-                f"Dataset {mapped.display_name!r} captured initials do not "
-                "cover the mechanism species."
-            )
-        if initials_by_set.get(mapped.set_id, set()) != captured_initials:
-            raise ValueError(
-                f"Dataset {mapped.display_name!r} mapped set identity is not "
-                "retained by the accepted initial-condition rows."
-            )
-        captured_by_raw = {
-            item.raw_observation_id: item for item in mapped.observations
-        }
-        for raw_id, model_target in local.observation_targets:
-            if raw_id not in captured_by_raw:
-                raise ValueError(
-                    f"Dataset {mapped.display_name!r} mapping references "
-                    f"uncaptured raw observation {raw_id!r}."
-                )
-            if model_target not in allowed_targets:
-                raise ValueError(
-                    f"Dataset {mapped.display_name!r} mapped target "
-                    f"{model_target!r} is not a mechanism target or admitted "
-                    "canonical Algebra target."
-                )
+        mapped = mapped_by_id[local.dataset_id]
         selected = selected_observations(mapped, local)
         x_observation = _selected_parametric_x_observation(mapped, local, selected)
         retained_times = (() if local.parametric is not None else tuple(
@@ -1761,14 +1486,8 @@ def _compile_fit_dispatch(
 ) -> _FitDispatchCompilation:
     """Complete all static Fit facts before a worker can be constructed."""
 
-    mapped_by_id = {item.dataset_id: item for item in setup.origin.mapped_datasets}
-    request_ids = tuple(item.dataset_id for item in setup.datasets)
-    if len(request_ids) != len(set(request_ids)) or set(request_ids) != set(mapped_by_id):
-        raise ValueError("Fit dispatch dataset roster does not match its capture.")
     included = tuple(item for item in setup.datasets if item.included)
     included_ids = tuple(item.dataset_id for item in included)
-    if not included_ids:
-        raise ValueError("Fit dispatch requires at least one included dataset.")
 
     shared_variables: list[FitSharedVariableParamSpec] = []
     coupled_variables: list[FitCoupledVariableParamSpec] = []
@@ -1816,11 +1535,6 @@ def _compile_fit_dispatch(
                 if dataset_id in fixed:
                     fixed_by_dataset[dataset_id][parameter.name] = dataset_values[dataset_id]
                     continue
-                if dataset_id not in dataset_values:
-                    raise ValueError(
-                        f"Fit dispatch parameter {parameter.name!r} omitted "
-                        f"included dataset {dataset_id!r}."
-                    )
                 variable_by_dataset[dataset_id].append(
                     FitDatasetVariableParamSpec(
                         name=parameter.name,
@@ -1831,12 +1545,8 @@ def _compile_fit_dispatch(
                     )
                 )
         elif parameter.scope == "per_dataset":
+            # The setup retains one value for every captured dataset.
             for dataset_id in included_ids:
-                if dataset_id not in dataset_values:
-                    raise ValueError(
-                        f"Fit dispatch fixed parameter {parameter.name!r} omitted "
-                        f"included dataset {dataset_id!r}."
-                    )
                 fixed_by_dataset[dataset_id][parameter.name] = dataset_values[dataset_id]
         else:
             for dataset_id in included_ids:
@@ -1916,9 +1626,6 @@ def _compile_fit_dispatch(
         },
         log10_params={item.name: item.log10 for item in shared_variables},
     )
-    prepared_by_id = {item.dataset_id: item for item in prepared_datasets}
-    if set(prepared_by_id) != set(included_ids):
-        raise ValueError("Fit dispatch prepared dataset roster is incomplete.")
     return _FitDispatchCompilation(
         included_dataset_ids=included_ids,
         prepared_datasets=tuple(prepared_datasets),

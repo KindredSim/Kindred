@@ -51,15 +51,6 @@ def six_digit_source_text(value: float) -> str:
     return text if float(text) == float(value) else repr(float(value))
 
 
-def validate_name(name: str) -> str:
-    if not isinstance(name, str):
-        raise TypeError("species name must be a string")
-    s = name.strip()
-    if not s:
-        raise ValueError("species name cannot be empty or whitespace")
-    return s
-
-
 def try_parse_finite_float(value: object) -> tuple[float, bool]:
     """
     Best-effort float parsing with an explicit validity flag.

@@ -5,10 +5,11 @@ from collections.abc import Mapping
 
 from kindred.core.algebra.errors import AlgebraError
 from kindred.core.algebra.evaluator import bind_scalar_expression_evaluator
-from kindred.core.exceptions import KineticRuntimeDomainError
+from kindred.core.exceptions import ErrorContext, KineticRuntimeDomainError
 from kindred.core.mechanism_metadata import MechanismMetadataView
 from kindred.core.simulator.errors import DSLError
-from kindred.core.simulator.parameter_algebra_spec import ParameterAlgebraSpec, _iter_expr_identifiers
+from kindred.core.algebra.parser import _iter_identifiers
+from kindred.core.simulator.parameter_algebra_spec import ParameterAlgebraSpec
 from kindred.core.simulator.parameter_coordinates import (
     build_parameter_target_map, read_mechanism_parameter_values, bind_chemistry_readout,
     _admit_coordinate_value,
@@ -24,9 +25,15 @@ def bind_parameter_evaluation(
     targets = build_parameter_target_map(mechanism)
     graph = spec.evaluation_dependencies
     statements = {statement.name: statement for statement in spec.parameter_block.lines}
+    # A mechanism input's param line was seeded into its coordinate, so the
+    # coordinate is read like any other authored leaf.
+    inputs = {
+        name for name in statements
+        if spec.parameter_assignment_kind(name) == "mechanism input"
+    }
     leaves = {
         name for name, deps in graph.items() if not deps and name not in statements
-    } | set(spec.identity_checks)
+    } | set(spec.identity_checks) | inputs
     values = read_mechanism_parameter_values(
         mechanism, names=leaves, parameter_target_map=targets
     )
@@ -43,7 +50,7 @@ def bind_parameter_evaluation(
     expression = bind_scalar_expression_evaluator(spec.parameter_block, values)
     operations = {}
     for name in graph:
-        if name in spec.identity_checks:
+        if name in spec.identity_checks or name in inputs:
             continue
         if name in statements:
             if (
@@ -69,20 +76,13 @@ def bind_parameter_evaluation(
         visit(name)
         return tuple(sorted(result))
 
+    input_units = dict(spec.input_units)
+
     def calculate(name: str, operation, *, check: bool = False) -> None:
         try:
             value = float(operation())
             if name in targets and name in statements:
-                route, kind, index, role, _entry = targets[name]
-                _admit_coordinate_value(
-                    mechanism,
-                    name,
-                    value,
-                    route=route,
-                    kind=kind,
-                    index=index,
-                    role=role,
-                )
+                _admit_coordinate_value(mechanism, name, value, targets[name], unit=input_units[name].symbol)
             if not check:
                 values[name] = value
         except AlgebraError as exc:
@@ -98,15 +98,22 @@ def bind_parameter_evaluation(
             )
             raise error from exc
         except (ArithmeticError, ValueError) as exc:
+            # The refusal is shown on the line that calculates the value: its
+            # param line, else its reaction line.
+            statement = statements.get(name)
+            entry = targets[name][4] if statement is None else None
             raise KineticRuntimeDomainError(
-                f"Parameter {name}: {exc}",
+                str(exc),
                 parameter_names=dependencies(name),
                 details={"assignment": name, "value_dependencies": dependencies(name)},
+                context=(ErrorContext(line=statement.line, line_text=statement.line_text)
+                         if statement is not None
+                         else ErrorContext(line=entry["line"], line_text=entry["line_text"])),
             ) from exc
 
     dynamic = set(operations) & spec.temperature_dependent_names
     check_dependencies = {
-        name: tuple(_iter_expr_identifiers(statements[name].expr))
+        name: tuple(_iter_identifiers(statements[name].expr))
         for name in spec.identity_checks
     }
     dynamic_checks = {

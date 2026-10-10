@@ -6,7 +6,7 @@ from typing import Callable
 
 from PySide6 import QtCore
 
-from kindred.core.mechanism_source import MechanismAuthoringSource, source_matches_analysis
+from kindred.core.mechanism_source import MechanismAuthoringSource
 from kindred.core.simulator.dsl_parse import PreparedDslRequestSet
 from kindred.core.simulator.errors import DSLError
 from kindred.core.symbolic.calculator import SymbolicCalculatorError, symbolic_calculator_available
@@ -66,7 +66,7 @@ class SymbolicCalculatorOwner(QtCore.QObject):
         self._retiring: set[CalculatorWorker] = set()
         self._request: tuple[CalculatorWorker, SymbolicCalculatorSnapshot, str] | None = None
         self._available = False
-        self._reason = "Canonical mechanism unavailable."
+        self._reason = "Write reactions and click Run to use the Calculator."
         self._status = ""
         self._closed = False
         self._disposing = False
@@ -95,7 +95,7 @@ class SymbolicCalculatorOwner(QtCore.QObject):
         self._snapshot, self._available, self._reason = snapshot, available, reason
         return self.view_state()
 
-    def invalidate_current_snapshot(self, reason="Canonical mechanism has unapplied Reactions.") -> SymbolicCalculatorViewState:
+    def invalidate_current_snapshot(self, reason="The Reactions have unapplied edits. Click Run to use them in the Calculator.") -> SymbolicCalculatorViewState:
         self._retire_worker()
         self._snapshot = None
         self._available = False
@@ -235,16 +235,14 @@ class SymbolicCalculatorOwner(QtCore.QObject):
         try:
             prepared = self._canonical_prepared_dsl()
             if prepared is None:
-                return None, False, "Canonical mechanism is empty."
+                return None, False, "Write reactions and click Run to use the Calculator."
             source = self._canonical_source()
             if self._snapshot is not None and self._snapshot.prepared_dsl is prepared and self._snapshot.source == source.reactions_text:
                 return self._snapshot, True, ""
-            if not source_matches_analysis(source, prepared.analysis):
-                return None, False, "Canonical mechanism source and analysis no longer match."
             schedule = prepared.parameterized_intervention_schedule_for_binding()
             intervention = prepared.intervention_execution_contract()
             if schedule is not None or intervention is not None and not intervention.is_empty:
-                return None, False, "Symbolic calculator is unavailable for scheduled interventions."
+                return None, False, "Calculator does not support intervention schedules."
             mechanism = prepared.mutable_mechanism_shell()
             available, reason = symbolic_calculator_available(mechanism)
             if not available:

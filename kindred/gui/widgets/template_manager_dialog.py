@@ -18,6 +18,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from kindred.gui.ui_helpers import clamp_initial_size, set_bounded_label_text
 
 from kindred.config.templates import Template, TemplateManager
+from kindred.io.paths import file_error_text
 from kindred.core.mechanism_source import (
     MechanismAuthoringSource,
     restore_initial_condition_declarations,
@@ -243,7 +244,7 @@ class TemplateManagerDialog(QtWidgets.QDialog):
         template_manager: TemplateManager,
         current_mechanism_source: MechanismAuthoringSource,
         source_preflight: Callable[
-            [MechanismAuthoringSource], MechanismAuthoringSource
+            [MechanismAuthoringSource], MechanismAuthoringSource | None
         ],
         destination_apply: Callable[[MechanismAuthoringSource], bool],
     ):
@@ -259,7 +260,8 @@ class TemplateManagerDialog(QtWidgets.QDialog):
         current_mechanism_source : MechanismAuthoringSource
             Current complete mechanism source for creating templates.
         source_preflight : callable
-            Source-tab structural/scientific admission for persistence edits.
+            Source-tab structural/scientific admission for persistence edits;
+            ``None`` when the user cancels its correction review.
         destination_apply : callable
             Destination-tab owner returning whether Apply was accepted.
         """
@@ -629,7 +631,10 @@ class TemplateManagerDialog(QtWidgets.QDialog):
         operation = dialog._operation
         try:
             data = dialog.get_template_data()
-            data["source"] = self._preflight_source(data["source"])
+            source = self._preflight_source(data["source"])
+            if source is None:
+                return
+            data["source"] = source
             if operation == "create":
                 template = self._template_manager.create_template(**data)
             else:
@@ -637,7 +642,7 @@ class TemplateManagerDialog(QtWidgets.QDialog):
         except Exception as exc:
             logger.error("Failed to %s template: %s", operation, exc, exc_info=True)
             QtWidgets.QMessageBox.critical(
-                dialog, "Error", f"Failed to {operation} template:\n\n{exc}"
+                dialog, "Error", f"Failed to {operation} template:\n\n{file_error_text(exc, self._template_manager.templates_directory)}"
             )
             self._render_storage_state()
             return
@@ -676,6 +681,8 @@ class TemplateManagerDialog(QtWidgets.QDialog):
             admitted_source = self._preflight_source(
                 self._current_mechanism_source
             )
+            if admitted_source is None:
+                return
             candidate = replace(
                 current,
                 reactions_text=admitted_source.reactions_text,
@@ -699,7 +706,7 @@ class TemplateManagerDialog(QtWidgets.QDialog):
             QtWidgets.QMessageBox.critical(
                 self,
                 "Error",
-                f"Failed to replace template:\n\n{exc}",
+                f"Failed to replace template:\n\n{file_error_text(exc, self._template_manager.templates_directory)}",
             )
 
     def _on_delete_clicked(self):
@@ -735,7 +742,7 @@ class TemplateManagerDialog(QtWidgets.QDialog):
                 QtWidgets.QMessageBox.critical(
                     self,
                     "Error",
-                    f"Failed to delete template:\n\n{e}"
+                    f"Failed to delete template:\n\n{file_error_text(e, self._template_manager.templates_directory)}"
                 )
 
     def _on_apply_clicked(self, *_args: object) -> None:
@@ -764,7 +771,7 @@ class TemplateManagerDialog(QtWidgets.QDialog):
     def _preflight_source(
         self,
         source: MechanismAuthoringSource,
-    ) -> MechanismAuthoringSource:
+    ) -> MechanismAuthoringSource | None:
         if not isinstance(source, MechanismAuthoringSource):
             raise TypeError("template source must be MechanismAuthoringSource.")
         return self._source_preflight(source)

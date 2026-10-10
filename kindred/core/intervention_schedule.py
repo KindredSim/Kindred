@@ -8,7 +8,10 @@ from types import MappingProxyType
 from typing import Any, Mapping, Sequence, TypeAlias
 
 from kindred.core.authored_source_errors import AuthoredSourceError
-from kindred.core.quantity_units import CUBIC_METRE, MOLAR, SECOND, Unit, convert_value, parse_declared_unit
+from kindred.core.simulator.errors import DSLError
+from kindred.core.quantity_units import (
+    CUBIC_METRE, DIMENSIONLESS, MOLAR, SECOND, Unit, convert_value, parse_declared_unit,
+)
 from kindred.core.validation import parse_finite_numeric_text
 from kindred.core.volume import volume_input_in_range
 from kindred.core.species import (
@@ -36,7 +39,7 @@ __all__ = [
     "InterventionStopAction",
     "SpeciesTriggerCondition",
     "ObservableTriggerCondition",
-    "coerce_intervention_schedule",
+    "admit_intervention_parameter_units",
     "intervention_schedule_parameter_dependencies",
     "intervention_schedule_parameter_names",
 ]
@@ -152,18 +155,26 @@ def _freeze_schedule_value(value: object) -> object:
     return value
 
 
-_PARAM_FIELDS = frozenset(
+# The scientific unit each field that has a ``_param`` form is read in. A
+# threshold on an observable is read in that observable's unit instead.
+_FIELD_UNITS = MappingProxyType(
     {
-        "time_param",
-        "start_time_param",
-        "end_time_param",
-        "value_param",
-        "delta_param",
-        "flux_rate_param",
-        "threshold_param",
-        "volume_param", "volume_rate_param", "initial_volume_param", "factor_param",
+        "time": SECOND,
+        "start_time": SECOND,
+        "end_time": SECOND,
+        "value": MOLAR,
+        "delta": MOLAR,
+        "flux_rate": MOLAR.divide(SECOND),
+        "threshold": MOLAR,
+        "volume": CUBIC_METRE,
+        "volume_rate": CUBIC_METRE.divide(SECOND),
+        "initial_volume": CUBIC_METRE,
+        "factor": DIMENSIONLESS,
     }
 )
+_PARAM_FIELDS = frozenset(f"{field}_param" for field in _FIELD_UNITS)
+# Fields whose values need an explicit volume unit, typed or through a parameter.
+_VOLUME_FIELDS = frozenset({"volume", "volume_rate", "initial_volume"})
 _DIRECTIONS = frozenset({"rising", "falling", "either"})
 _PHASES = frozenset({"before", "during", "after"})
 _AUTHORED_TIME_FIELDS = frozenset(
@@ -220,6 +231,8 @@ def _positive_int(value: object, *, field: str) -> int:
 
 
 def _name(value: object, *, field: str) -> str:
+    if value is None:
+        raise InterventionScheduleError(f"{field} is required.")
     if not isinstance(value, str):
         raise InterventionScheduleError(f"{field} must be a string.")
     name = value.strip()
@@ -229,6 +242,8 @@ def _name(value: object, *, field: str) -> str:
 
 
 def _enum(value: object, *, field: str) -> str:
+    if value is None:
+        raise InterventionScheduleError(f"{field} is required.")
     if not isinstance(value, str):
         raise InterventionScheduleError(f"{field} must be a string.")
     text = value.strip().lower()
@@ -1257,31 +1272,12 @@ class InterventionSchedule:
     initial_volume: tuple[PhysicalQuantity, InterventionScheduleFieldIdentity] | None = dataclass_field(init=False, default=None)
 
     def __post_init__(self) -> None:
+        # The directive admission numbers its typed operations in authored
+        # order; resolution and stop removal keep that order.
         operations = tuple(self.operations)
-        allowed = (
-            InterventionSet,
-            InterventionPhysical,
-            InterventionJump,
-            InterventionFlux,
-            InterventionHold,
-            InterventionProtocol,
-            InterventionTrigger,
-        )
-        if any(not isinstance(item, allowed) for item in operations):
-            raise InterventionScheduleError(
-                "operations contains an unsupported intervention type."
-            )
-        ordinals = [item.declaration_ordinal for item in operations]
-        if len(ordinals) != len(set(ordinals)):
-            raise InterventionScheduleError(
-                "Intervention declaration ordinals must be unique."
-            )
-        if ordinals != sorted(ordinals):
-            raise InterventionScheduleError(
-                "Intervention operations must remain in authored ordinal order."
-            )
         object.__setattr__(self, "operations", operations)
         initializers = []
+        volume_users = []
         for operation in operations:
             if isinstance(operation, InterventionProtocol):
                 sources = tuple(
@@ -1294,6 +1290,8 @@ class InterventionSchedule:
                 sources = ((operation, None, ""),)
             for source, nested, prefix in sources:
                 physical = getattr(source, "physical", None)
+                if physical is not None and physical.op != "scale":
+                    volume_users.append(operation.declaration_ordinal)
                 if physical is not None and physical.initial_volume is not None:
                     identity = (operation.declaration_ordinal, nested, prefix + "initial_volume")
                     initializers.append((physical.initial_volume, identity))
@@ -1301,6 +1299,12 @@ class InterventionSchedule:
             raise InterventionScheduleError(
                 "Declare initial_volume or initial_volume_param only once. It defines the vessel volume at simulation start.",
                 field="initial_volume", field_identities=tuple(identity for _, identity in initializers),
+                declaration_ordinal=initializers[1][1][0],
+            )
+        if volume_users and not initializers:
+            raise InterventionScheduleError(
+                "A volume-aware intervention requires an initial_volume declaration.",
+                declaration_ordinal=volume_users[0],
             )
         object.__setattr__(self, "initial_volume", initializers[0] if initializers else None)
 
@@ -1309,31 +1313,6 @@ class InterventionSchedule:
             item for item in self.operations
             if not (isinstance(item, InterventionTrigger) and isinstance(item.then, InterventionStopAction))
         ))
-
-    @classmethod
-    def from_payload(
-        cls, payload: Mapping[str, Any] | None
-    ) -> "InterventionSchedule":
-        if payload is None:
-            return cls()
-        _reject_keys(payload, frozenset({"operations"}), context="schedule")
-        raw_operations = payload.get("operations")
-        if raw_operations is None:
-            raw_operations = ()
-        if not isinstance(raw_operations, Sequence) or isinstance(
-            raw_operations, (str, bytes)
-        ):
-            raise InterventionScheduleError("operations must be a sequence.")
-        operations: list[InterventionOperation] = []
-        for index, raw in enumerate(raw_operations):
-            if not isinstance(raw, Mapping):
-                raise InterventionScheduleError("operations entries must be mappings.")
-            data = dict(raw)
-            ordinal = data.pop("declaration_ordinal", index)
-            operations.append(
-                _operation_from_fields(data, declaration_ordinal=ordinal, parsed=False)
-            )
-        return cls(tuple(operations))
 
     def is_empty(self) -> bool:
         return not self.operations
@@ -1387,7 +1366,8 @@ class InterventionSchedule:
             for name in names:
                 if name not in available:
                     raise InterventionScheduleError(
-                        f"Unknown intervention species: {name}"
+                        f"Unknown intervention species: {name}.",
+                        declaration_ordinal=operation.declaration_ordinal,
                     )
 
     @property
@@ -1502,7 +1482,6 @@ def _operation_from_fields(
     fields: Mapping[str, Any],
     *,
     declaration_ordinal: object,
-    parsed: bool,
 ) -> InterventionOperation:
     data = dict(fields)
     _literal_fields(data, context="intervention")
@@ -1608,19 +1587,7 @@ def _operation_from_fields(
         phases: dict[str, tuple[InterventionProtocolOperation, ...]] = {}
         for phase in ("before", "during", "after"):
             raw = data.get(phase)
-            if raw is None:
-                phases[phase] = ()
-            elif parsed:
-                phases[phase] = _parse_phase_envelope(str(raw), phase=phase)
-            elif isinstance(raw, Sequence) and not isinstance(raw, (str, bytes)):
-                phases[phase] = tuple(
-                    _protocol_operation_from_payload(item, phase=phase, index=index)
-                    for index, item in enumerate(raw)
-                )
-            else:
-                raise InterventionScheduleError(
-                    f"Protocol {phase} must be a sequence of typed records."
-                )
+            phases[phase] = () if raw is None else _parse_phase_envelope(str(raw), phase=phase)
         return InterventionProtocol(
             start_time=data.get("start_time"),
             start_time_param=data.get("start_time_param"),
@@ -1645,13 +1612,7 @@ def _operation_from_fields(
             }
         )
         _reject_keys(data, allowed, context="trigger")
-        raw_then = data.get("then")
-        if parsed:
-            then = _parse_trigger_envelope(str(raw_then or ""))
-        elif isinstance(raw_then, Mapping):
-            then = _trigger_action_from_payload(raw_then)
-        else:
-            raise InterventionScheduleError("then must be one typed trigger action.")
+        then = _parse_trigger_envelope(str(data.get("then") or ""))
         if isinstance(then, InterventionStopAction) and ({"max_count", "min_interval"} & data.keys()):
             raise InterventionScheduleError("Stopping triggers do not permit max_count or min_interval.")
         if ("watch_species" in data) == ("watch_observable" in data):
@@ -1671,20 +1632,6 @@ def _operation_from_fields(
             declaration_ordinal=ordinal,
         )
     raise InterventionScheduleError(f"Unsupported intervention op: {op!r}.")
-
-
-def _protocol_operation_from_payload(
-    raw: object, *, phase: str, index: int
-) -> InterventionProtocolOperation:
-    if not isinstance(raw, Mapping):
-        raise InterventionScheduleError(
-            f"Protocol {phase} entries must be mappings."
-        )
-    data = dict(raw)
-    authored = data.pop("authored_ordinal", index)
-    return _protocol_operation_from_fields(
-        data, phase=phase, authored_ordinal=authored
-    )
 
 
 def _protocol_operation_from_fields(
@@ -1784,21 +1731,23 @@ def _physical_quantity(data: Mapping[str, Any], field: str, *, optional: bool = 
         if match is None:
             raise InterventionScheduleError(f"{field} requires a finite numeric quantity.")
         number, unit_text = match.groups()
+        if field == "factor" and unit_text:
+            raise InterventionScheduleError("factor is a dimensionless number without a unit suffix.")
+        if field in _VOLUME_FIELDS and not unit_text:
+            raise InterventionScheduleError(f"{field} requires an explicit volume unit.")
         try:
             if convert_literal:
                 value = parse_finite_numeric_text(number, field=field)
-            if field == "factor":
-                if unit_text:
-                    raise ValueError("factor is a dimensionless number without a unit suffix.")
-            else:
-                if not unit_text and field != "value":
-                    raise ValueError(f"{field} requires an explicit volume unit.")
-                target = MOLAR if field == "value" else CUBIC_METRE.divide(SECOND) if field == "volume_rate" else CUBIC_METRE
+        except ValueError as exc:
+            raise InterventionScheduleError(str(exc)) from exc
+        if field != "factor":
+            try:
                 declared_unit = parse_declared_unit(unit_text or "M")
                 if convert_literal:
-                    value = convert_value(value, declared_unit, target)
-        except ValueError as exc:
-            raise InterventionScheduleError(f"{field}: {exc}") from exc
+                    value = convert_value(value, declared_unit, _FIELD_UNITS[field])
+            except ValueError as exc:
+                # The unit refusal does not name the field it was written for.
+                raise InterventionScheduleError(f"{field}: {exc}") from exc
     return PhysicalQuantity(value, parameter, authored, declared_unit)
 
 
@@ -1848,14 +1797,9 @@ def _lower_authored_fields(
     for key, value in fields.items():
         if key in _AUTHORED_FLOAT_FIELDS:
             try:
-                lowered[key] = (
-                    parse_finite_numeric_text(value, field=f"{context} field {key!r}")
-                    if key in _AUTHORED_TIME_FIELDS else float(value)
-                )
-            except (TypeError, ValueError, OverflowError) as exc:
-                raise InterventionScheduleError(
-                    f"{context} field {key!r} must be a numeric literal: {exc}"
-                ) from exc
+                lowered[key] = parse_finite_numeric_text(value, field=f"{context} field {key!r}")
+            except ValueError as exc:
+                raise InterventionScheduleError(str(exc)) from exc
         elif key in _AUTHORED_INTEGER_FIELDS:
             try:
                 lowered[key] = int(value)
@@ -1934,11 +1878,11 @@ def _parse_trigger_envelope(value: str) -> InterventionTriggerAction | Intervent
     )
 
 
-def _parse_directive(rest: str, *, line_no: int) -> dict[str, Any]:
+def _parse_directive(rest: str) -> dict[str, Any]:
     text = str(rest).strip()
     if not text:
         raise InterventionScheduleError(
-            f"Line {line_no}: intervention directive must not be empty."
+            "Intervention directive must not be empty."
         )
     fields: dict[str, str] = {}
     chunk: list[str] = []
@@ -1949,74 +1893,83 @@ def _parse_directive(rest: str, *, line_no: int) -> dict[str, Any]:
             depth += 1
             if depth > 3:
                 raise InterventionScheduleError(
-                    f"Line {line_no}: intervention nesting is too deep."
+                    "Intervention nesting is too deep."
                 )
         elif character == "}":
             depth -= 1
             if depth < 0:
                 raise InterventionScheduleError(
-                    f"Line {line_no}: unmatched closing brace."
+                    "Unmatched closing brace."
                 )
         if character == ";" and depth == 0:
             part = "".join(chunk).strip()
             if not part:
                 raise InterventionScheduleError(
-                    f"Line {line_no}: empty intervention field."
+                    "Empty intervention field."
                 )
             chunks.append(part)
             chunk = []
         else:
             chunk.append(character)
     if depth != 0:
-        raise InterventionScheduleError(f"Line {line_no}: unmatched opening brace.")
+        raise InterventionScheduleError("Unmatched opening brace.")
     tail = "".join(chunk).strip()
     if not tail:
         raise InterventionScheduleError(
-            f"Line {line_no}: empty intervention field."
+            "Empty intervention field."
         )
     chunks.append(tail)
     for part in chunks:
         if "=" not in part:
             raise InterventionScheduleError(
-                f"Line {line_no}: intervention field {part!r} must use key=value."
+                f"Intervention field {part!r} must use key=value."
             )
         key, value = part.split("=", 1)
         key = key.strip().lower()
         value = value.strip()
         if not key or not value:
             raise InterventionScheduleError(
-                f"Line {line_no}: intervention fields must not be empty."
+                "Intervention fields must not be empty."
             )
         if key in fields:
             raise InterventionScheduleError(
-                f"Line {line_no}: duplicate intervention field {key!r}."
+                f"Duplicate intervention field {key!r}."
             )
         fields[key] = value
-    return _lower_authored_fields(fields, context=f"Line {line_no}: intervention")
+    return _lower_authored_fields(fields, context="Intervention")
 
 
 def _admit_intervention_directives(
     text: str,
-) -> InterventionSchedule | None:
+) -> tuple[InterventionSchedule | None, tuple[tuple[int, str], ...]]:
+    """Admit the intervention declarations and their authored lines.
+
+    A declaration's refusal is shown on its line; a later refusal names its
+    declaration ordinal, which indexes the returned lines.
+    """
     operations: list[InterventionOperation] = []
+    lines: list[tuple[int, str]] = []
     for line_no, raw_line in enumerate(str(text or "").splitlines(), start=1):
         line = raw_line.strip()
         if not line or line.startswith("#") or not line.lower().startswith("intervention:"):
             continue
         _, rest = line.split(":", 1)
         try:
-            fields = _parse_directive(rest, line_no=line_no)
-            operation = _operation_from_fields(fields, declaration_ordinal=len(operations), parsed=True)
-            if isinstance(operation, InterventionTrigger):
-                operation = replace(operation, source_text=raw_line)
-            operations.append(operation)
+            fields = _parse_directive(rest)
+            operation = _operation_from_fields(fields, declaration_ordinal=len(operations))
         except InterventionScheduleError as exc:
-            message = str(exc)
-            if message.startswith(f"Line {line_no}:"):
-                raise
-            raise InterventionScheduleError(f"Line {line_no}: {message}") from exc
-    schedule = InterventionSchedule(tuple(operations))
-    return None if schedule.is_empty() else schedule
+            raise DSLError(str(exc), line_number=line_no, line_content=raw_line) from exc
+        if isinstance(operation, InterventionTrigger):
+            operation = replace(operation, source_text=raw_line)
+        operations.append(operation)
+        lines.append((line_no, raw_line))
+    try:
+        schedule = InterventionSchedule(tuple(operations))
+    except InterventionScheduleError as exc:
+        # A refusal across declarations names the one whose line is shown.
+        line_no, raw_line = lines[exc.declaration_ordinal]
+        raise DSLError(str(exc), line_number=line_no, line_content=raw_line) from exc
+    return (None if schedule.is_empty() else schedule), tuple(lines)
 
 
 def intervention_schedule_parameter_names(
@@ -2111,14 +2064,32 @@ def intervention_schedule_parameter_dependencies(
     return MappingProxyType(dict(dependencies))
 
 
-def coerce_intervention_schedule(value: object) -> InterventionSchedule | None:
-    if value is None:
-        return None
-    if isinstance(value, InterventionSchedule):
-        return None if value.is_empty() else value
-    if isinstance(value, Mapping):
-        schedule = InterventionSchedule.from_payload(value)
-        return None if schedule.is_empty() else schedule
-    raise InterventionScheduleError(
-        "Intervention schedule must be a final typed schedule or final payload."
-    )
+
+
+def admit_intervention_parameter_units(
+    schedule: InterventionSchedule,
+    quantity_units: Mapping[str, Unit | None],
+    input_units: Mapping[str, Unit],
+) -> None:
+    """Refuse a ``_param`` reference whose unit does not fit its field.
+
+    A parameter without a unit is accepted exactly where a plain number is; one
+    whose unit Kindred cannot determine is read in the field's SI unit.
+    """
+    watched = {trigger.declaration_ordinal: trigger.condition for trigger in schedule.triggers}
+    for (declaration, _nested, field), (name,) in intervention_schedule_parameter_dependencies(schedule).items():
+        unit = quantity_units.get(name)
+        leaf = field.rsplit(".", 1)[-1]
+        condition = watched.get(declaration) if leaf == "threshold" else None
+        expected = (quantity_units.get(condition.name) if isinstance(condition, ObservableTriggerCondition)
+                    else _FIELD_UNITS[leaf])
+        if unit is None or expected is None or unit.compatible(expected):
+            continue
+        if unit.compatible(DIMENSIONLESS):
+            if leaf not in _VOLUME_FIELDS:
+                continue
+            message = f"{field}_param needs a parameter with a volume unit, such as unit = mL."
+        else:
+            wanted = "no unit" if expected.compatible(DIMENSIONLESS) else expected.symbol
+            message = f"{name} is in {input_units.get(name, unit).symbol}, which does not fit {field}_param ({wanted})."
+        raise InterventionScheduleError(message, declaration_ordinal=declaration, field=f"{field}_param")

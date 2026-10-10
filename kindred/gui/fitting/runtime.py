@@ -1,32 +1,11 @@
-"""Installed Windows fitting runtime and matching package source (stdlib only)."""
+"""Installed Windows fitting runtime (stdlib only)."""
 
 from __future__ import annotations
 
-import hashlib
 import os
 from pathlib import Path
 import sys
 import sysconfig
-
-
-def package_fingerprint(package: Path | None = None) -> str:
-    """Hash package source and resources identically in both interpreters."""
-    package = package or Path(__file__).resolve().parents[2]
-    digest = hashlib.sha256()
-    for path in sorted(package.rglob("*")):
-        relative = path.relative_to(package)
-        if (
-            not path.is_file()
-            or "__pycache__" in relative.parts
-            or path.suffix in {".pyc", ".pyo"}
-        ):
-            continue
-        name = relative.as_posix().encode("utf-8")
-        content = path.read_bytes()
-        for value in (name, content):
-            digest.update(len(value).to_bytes(8, "big"))
-            digest.update(value)
-    return digest.hexdigest()
 
 
 def scientific_environment() -> dict[str, str]:
@@ -52,8 +31,7 @@ def fitting_process_command() -> tuple[list[str], dict[str, str], Path]:
             "Python 3.15t runtime with matching Kindred code and scientific dependencies."
         )
     return (
-        [str(executable), "-E", "-s", "-m", "kindred.gui.fitting.process",
-         "--source-sha256", package_fingerprint()],
+        [str(executable), "-E", "-s", "-m", "kindred.gui.fitting.process"],
         scientific_environment(),
         directory,
     )

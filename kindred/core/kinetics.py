@@ -14,16 +14,10 @@ from fractions import Fraction
 from typing import Callable, TypeAlias
 
 from .constants import R, h, k_B
-from .species import validate_c0, validate_temperature
-from .units import (
-    admit_arrhenius_prefactor,
-    admit_energy_j_per_mol,
-    admit_rate,
-)
+from .units import admit_rate
 
 __all__ = [
     "arrhenius_rate",
-    "eyring_prefactor",
     "eyring_rate",
     "ConstantRateModel",
     "ArrheniusRateModel",
@@ -36,37 +30,20 @@ __all__ = [
 ]
 
 
+# k, A, Ea, dG_act and kappa arrive admitted against their role domains: authored
+# fields by DSL parsing, coordinate writes by the grouped coordinate owner.
+# DSL parsing also admits Eyring's standard concentration (C0), molecularity
+# (the summed positive reactant coefficients) and positive integer degeneracy.
+# Temperatures arrive admitted by the DSL T directive or its admitted schedule.
 @dataclass(frozen=True, slots=True)
 class ConstantRateModel:
     k: float
-
-    def __post_init__(self) -> None:
-        object.__setattr__(
-            self,
-            "k",
-            admit_rate(self.k, field="Constant k", allow_zero=True),
-        )
 
 
 @dataclass(frozen=True, slots=True)
 class ArrheniusRateModel:
     A: float
     Ea_J_per_mol: float
-
-    def __post_init__(self) -> None:
-        object.__setattr__(
-            self,
-            "A",
-            admit_arrhenius_prefactor(self.A, field="Arrhenius A"),
-        )
-        object.__setattr__(
-            self,
-            "Ea_J_per_mol",
-            admit_energy_j_per_mol(
-                self.Ea_J_per_mol,
-                field="Arrhenius Ea_J_per_mol",
-            ),
-        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -77,63 +54,10 @@ class EyringRateModel:
     molecularity: float
     degeneracy: int = 1
 
-    def __post_init__(self) -> None:
-        object.__setattr__(
-            self,
-            "dG_act_J_per_mol",
-            admit_energy_j_per_mol(
-                self.dG_act_J_per_mol,
-                field="Eyring dG_act_J_per_mol",
-            ),
-        )
-        kappa = _numeric_float(self.kappa, field="Eyring kappa")
-        if not math.isfinite(kappa) or kappa <= 0.0:
-            raise ValueError("Eyring kappa must be positive and finite.")
-        object.__setattr__(self, "kappa", kappa)
-        standard = validate_c0(
-            self.standard_conc_M,
-            field="Eyring standard_conc_M",
-        )
-        object.__setattr__(self, "standard_conc_M", standard)
-        _positive_integer(self.degeneracy, field="Eyring degeneracy")
-        object.__setattr__(self, "molecularity", _directional_order(self.molecularity))
-
 
 ForwardRateModel: TypeAlias = (
     ConstantRateModel | ArrheniusRateModel | EyringRateModel
 )
-
-
-def _numeric_float(value: object, *, field: str) -> float:
-    if type(value) is bool:
-        raise TypeError(f"{field} must be numeric.")
-    try:
-        return float(value)
-    except (TypeError, ValueError, OverflowError) as exc:
-        raise ValueError(f"{field} must be numeric.") from exc
-
-
-def _positive_integer(value: object, *, field: str) -> int:
-    """Admit only a positive, non-boolean builtin integer coordinate."""
-    if type(value) is not int:
-        raise TypeError(f"{field} must be a positive integer.")
-    if value <= 0:
-        raise ValueError(f"{field} must be a positive integer.")
-    return value
-
-
-def _directional_order(value: object, *, field: str = "molecularity") -> float:
-    order = _numeric_float(value, field=field)
-    if not math.isfinite(order) or order < 0.0:
-        raise ValueError(f"{field} must be a finite nonnegative real.")
-    return float(order)
-
-
-def _finite_result(value: float, *, field: str) -> float:
-    try:
-        return admit_rate(value, field=field)
-    except ValueError as exc:
-        raise ValueError(str(exc)) from exc
 
 
 def forward_rate_family(model: ForwardRateModel) -> str:
@@ -175,9 +99,7 @@ def forward_rate_at_temperature(
 ) -> float:
     """Evaluate exactly one typed forward-rate family."""
     if isinstance(model, ConstantRateModel):
-        value = _numeric_float(model.k, field="Constant k")
-        admit_rate(value, field="Constant k", allow_zero=True)
-        return value
+        return model.k
     if isinstance(model, ArrheniusRateModel):
         return arrhenius_rate(model.A, model.Ea_J_per_mol, temperature_K)
     if isinstance(model, EyringRateModel):
@@ -187,10 +109,7 @@ def forward_rate_at_temperature(
             kappa=model.kappa,
             standard_conc_M=model.standard_conc_M,
             molecularity=model.molecularity,
-            degeneracy=_positive_integer(
-                model.degeneracy,
-                field="Eyring degeneracy",
-            ),
+            degeneracy=model.degeneracy,
         )
     raise TypeError("model must be one typed forward-rate model.")
 
@@ -239,7 +158,7 @@ def forward_rate_symbolic_relation(
                 )
         return literal(float(value))
 
-    # The typed models admitted every field at construction.
+    # The typed models carry admitted fields.
     if isinstance(model, ConstantRateModel):
         return coordinate("kf", float(model.k))
     if isinstance(model, ArrheniusRateModel):
@@ -273,12 +192,6 @@ def forward_rate_symbolic_relation(
     raise TypeError("model must be one typed forward-rate model.")
 
 
-def eyring_prefactor(T: float) -> float:
-    """(k_B T / h) in 1/s."""
-    temperature = validate_temperature(T, field="T")
-    return _finite_result((k_B * temperature) / h, field="Eyring prefactor")
-
-
 def eyring_rate(
     dG_act_J_per_mol: float,
     T: float,
@@ -294,36 +207,18 @@ def eyring_rate(
     - Unimolecular: g * kappa * (k_B T / h) * exp(-dG_act/(R T))  [1/s]
     - n-molecular (n >= 2): multiply by 1/(C0^(n-1))        [1/(M^(n-1)*s)]
     """
-    T = validate_temperature(T, field="T")
-    standard = _numeric_float(
-        standard_conc_M,
-        field="standard_conc_M",
-    )
-    standard = validate_c0(standard, field="standard_conc_M")
-    n = _directional_order(molecularity)
-    degeneracy = _positive_integer(degeneracy, field="Eyring degeneracy")
-
-    transmission = _numeric_float(kappa, field="kappa")
-    if not math.isfinite(transmission) or transmission <= 0.0:
-        raise ValueError("kappa must be positive and finite")
-
-    dG = _numeric_float(
-        dG_act_J_per_mol,
-        field="dG_act_J_per_mol",
-    )
-    dG = admit_energy_j_per_mol(dG, field="dG_act_J_per_mol")
-    exponent = -dG / (R * T)
+    exponent = -dG_act_J_per_mol / (R * T)
     try:
         k = (
             degeneracy
-            * transmission
-            * eyring_prefactor(T)
+            * kappa
+            * (k_B * T / h)
             * math.exp(exponent)
-            * math.pow(standard, 1.0 - n)
+            * math.pow(standard_conc_M, 1.0 - molecularity)
         )
     except OverflowError as exc:
         raise ValueError("Eyring rate overflows the finite real domain") from exc
-    return _finite_result(k, field="Eyring rate")
+    return admit_rate(k, field="Eyring rate")
 
 
 def arrhenius_rate(A: float, Ea_J_per_mol: float, T: float) -> float:
@@ -337,12 +232,9 @@ def arrhenius_rate(A: float, Ea_J_per_mol: float, T: float) -> float:
     - A should already carry the correct order unit (1/s or 1/(M^(n-1)*s)).
     - This function does not attempt to infer molecularity from A.
     """
-    T = validate_temperature(T, field="T")
-    prefactor = admit_arrhenius_prefactor(A, field="A")
-    activation = admit_energy_j_per_mol(Ea_J_per_mol, field="Ea_J_per_mol")
-    exponent = -activation / (R * T)
+    exponent = -Ea_J_per_mol / (R * T)
     try:
-        rate = prefactor * math.exp(exponent)
+        rate = A * math.exp(exponent)
     except OverflowError as exc:
         raise ValueError("Arrhenius rate overflows the finite real domain") from exc
-    return _finite_result(rate, field="Arrhenius rate")
+    return admit_rate(rate, field="Arrhenius rate")

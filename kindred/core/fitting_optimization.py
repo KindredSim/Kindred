@@ -30,8 +30,6 @@ from kindred.core.optimization_de import (
 )
 from kindred.core.optimization_least_squares import build_least_squares_kwargs
 from kindred.core.scipy_optimize import load_scipy_optimize
-from kindred.core.fitting_method_policy import validate_fit_method
-from kindred.core.species import validate_evaluation_count
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +41,11 @@ __all__ = [
 ]
 
 FitBoundPosition = Literal["lower", "upper", "interior"]
+
+# Finite-difference Jacobians resolve exactly dependent fitted values only to
+# singular-value ratios of roughly 1e-8 to 1e-5, far above numpy's default
+# rank tolerance, so the rank uses a tolerance above that level.
+_JACOBIAN_RANK_RTOL = 1e-4
 
 
 def fit_bound_position(
@@ -117,28 +120,11 @@ def fit_parameters_with_fixed(
     retain the original full coordinate order and include the fixed values.
     """
 
+    # Profile fixes one layout coordinate at a point between its fitted value
+    # and one of its admitted bounds.
     initial = {name: float(value) for name, value in initial_params.items()}
     fixed = {name: float(value) for name, value in fixed_parameters.items()}
-    unknown = sorted(set(fixed) - set(initial))
-    if unknown:
-        raise ValueError(
-            "Fixed Fit coordinates are absent from the optimizer layout: "
-            + ", ".join(str(item) for item in unknown)
-        )
     bound_map = dict(bounds or {})
-    for name, value in fixed.items():
-        if not np.isfinite(value):
-            raise ValueError(f"Fixed Fit coordinate {name!r} must be finite.")
-        if name not in bound_map:
-            raise ValueError(f"Fixed Fit coordinate {name!r} requires finite bounds.")
-        low, high = bound_map[name]
-        if (
-            not np.isfinite(float(low))
-            or not np.isfinite(float(high))
-            or float(low) >= float(high)
-            or not float(low) <= value <= float(high)
-        ):
-            raise ValueError(f"Fixed Fit coordinate {name!r} lies outside its bounds.")
 
     names = tuple(initial)
     free = {name: value for name, value in initial.items() if name not in fixed}
@@ -202,39 +188,14 @@ def fit_parameters(
 ) -> FitResult:
     """Fit parameters, interpreting ``ftol`` as native DE ``tol`` for DE runs."""
 
-    method = validate_fit_method(method)
-    max_nfev = validate_evaluation_count(
-        max_nfev,
-        field="Fit evaluation budget",
-    )
-    if max_nfev <= 0:
-        raise ValueError("Fit evaluation budget must be positive.")
+    # The method, evaluation budget, coordinates and their bounds arrive
+    # admitted by the Fit setup or its Profile/Bootstrap configuration.
     param_names = list(initial_params.keys())
-    if not param_names:
-        raise ValueError("Fit optimization requires at least one coordinate.")
-    if bounds is None:
-        raise ValueError("Fit optimization requires finite ordered bounds for every coordinate.")
-    missing_bounds = sorted(set(param_names) - set(bounds))
-    if missing_bounds:
-        raise ValueError(
-            "Fit optimization requires bounds for every coordinate: "
-            + ", ".join(missing_bounds)
-        )
+    # Starts are admitted values or optimizer results inside their admitted
+    # finite ordered bounds.
     x0 = np.asarray([float(initial_params[name]) for name in param_names], dtype=float)
     lower = np.asarray([float(bounds[name][0]) for name in param_names], dtype=float)
     upper = np.asarray([float(bounds[name][1]) for name in param_names], dtype=float)
-    if (
-        not np.all(np.isfinite(x0))
-        or not np.all(np.isfinite(lower))
-        or not np.all(np.isfinite(upper))
-        or np.any(lower >= upper)
-        or np.any(x0 < lower)
-        or np.any(x0 > upper)
-    ):
-        raise ValueError(
-            "Fit optimization requires finite ordered bounds and initial values "
-            "inside those bounds."
-        )
     scipy_bounds = (lower, upper)
 
     de_evaluation_budget: DifferentialEvolutionEvaluationBudget | None = None
@@ -370,7 +331,7 @@ def fit_parameters(
                 # All-zero columns stay zero and count as deficient.
                 norms = np.linalg.norm(J, axis=0)
                 scaled = np.divide(J, norms, out=np.zeros_like(J), where=norms > 0.0)
-                rank = int(np.linalg.matrix_rank(scaled))
+                rank = int(np.linalg.matrix_rank(scaled, rtol=_JACOBIAN_RANK_RTOL))
                 if rank < param_count:
                     identifiability_warning = (
                         "These data cannot determine every fitted value independently. "

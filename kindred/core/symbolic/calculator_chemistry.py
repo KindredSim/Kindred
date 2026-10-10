@@ -8,7 +8,7 @@ from typing import Any
 from kindred.core.equilibrium_rate_authority import equilibrium_rate_symbolic_relations
 from kindred.core.kinetics import forward_rate_symbolic_relation
 from kindred.core.mechanism import Mechanism
-from kindred.core.mechanism_metadata import EquilibriumMetadataKeys, MechanismMetadataView
+from kindred.core.mechanism_metadata import EquilibriumMetadataKeys
 from kindred.core.simulator.parameter_algebra_spec import ParameterAlgebraSpec
 from kindred.core.simulator.step_indexing import get_step_index_map
 
@@ -23,7 +23,6 @@ def build_calculator_chemistry_relations(
     """Lower chemistry readouts without evaluating Algebra or independent inputs."""
 
     sympy = require_sympy()
-    metadata = MechanismMetadataView.from_metadata(mechanism.metadata)
 
     def exact_literal(value: object) -> Any:
         if isinstance(value, Fraction):
@@ -74,11 +73,7 @@ def build_calculator_chemistry_relations(
                 chemistry_relations[forward_name] = forward
             if reaction:
                 continue
-            standard_concentration = step.metadata.get(
-                EquilibriumMetadataKeys.STANDARD_CONC_M, metadata.standard_conc_M
-            )
-            if standard_concentration is None:
-                standard_concentration = metadata.standard_conc_M
+            standard_concentration = step.metadata[EquilibriumMetadataKeys.STANDARD_CONC_M]
             relations = equilibrium_rate_symbolic_relations(
                 step,
                 forward_relation=symbols[forward_name],

@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
-from dataclasses import dataclass
+from collections.abc import Collection, Mapping
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 from fractions import Fraction
 
@@ -18,9 +18,9 @@ from kindred.core.algebra.parser import (
 )
 from kindred.core.quantity_units import Unit
 from kindred.core._bounded_rational import ExactWorkLimit, literal_fraction, rational_binary
-from kindred.core.constants import N_A, R, h, h_bar, k_B
 from kindred.core.equilibrium_rate_authority import equilibrium_rate_symbolic_relations
 from kindred.core.kinetics import forward_rate_symbolic_relation
+from kindred.core.simulator.dsl_build_input import source_coordinate_name_parts
 from kindred.core.simulator.step_indexing import (
     get_step_index_map,
     lookup_source_coordinate_target,
@@ -35,15 +35,34 @@ __all__ = [
     "ExactConstraint",
     "ExactConstraintComposition",
     "compose_exact_constraints",
+    "cycle_message",
 ]
 
-_EXACT_CONSTANTS = {
-    "k_B": Fraction(str(k_B)),
-    "h": Fraction(str(h)),
-    "h_bar": Fraction(str(h_bar)),
-    "N_A": Fraction(str(N_A)),
-    "R": Fraction(str(R)),
-}
+# Roles whose admitted values are always positive, so a root of their powers
+# never hides a sign.  Energies and free Algebra parameters may be negative.
+_POSITIVE_ROLES = frozenset({"k", "kf", "kr", "Keq", "A", "kappa", "degeneracy"})
+
+
+def _known_positive(name: str) -> bool:
+    if name in {"T", "C0"} or name in _EXACT_CONSTANTS:
+        return True
+    parts = source_coordinate_name_parts(name)
+    return parts is not None and parts[0] in _POSITIVE_ROLES
+
+
+_EXACT_CONSTANTS = frozenset({"k_B", "h", "h_bar", "N_A", "R"})
+
+
+def _constant(name: str) -> ExactMonomial:
+    """Lower a physical constant as a positive symbol.
+
+    ``R`` is exactly ``k_B * N_A`` (both defined exactly in SI), so ``k_B``
+    is lowered as ``R / N_A`` and closures may use either spelling.
+    """
+
+    if name == "k_B":
+        return ExactMonomial(Fraction(1), (("N_A", Fraction(-1)), ("R", Fraction(1))))
+    return ExactMonomial(Fraction(1), ((name, Fraction(1)),))
 
 
 @dataclass(frozen=True, slots=True)
@@ -52,33 +71,42 @@ class ExactMonomial:
     powers: tuple[tuple[str, Fraction], ...] = ()
     exponentials: tuple["ExactMonomial", ...] = ()
     # A compact immutable additive expression is needed only as an
-    # exponential argument (for example ``exp(-Ea/(R*T) + dG)``).  General
-    # products of sums remain unresolved rather than becoming a second
-    # symbolic engine.
+    # exponential argument (for example ``exp(-Ea/(R*T) + dG)``).  Products,
+    # and quotients by a single term, are multiplied out over sums; a sum as
+    # a multiplicative factor is never expanded (its name stays a free
+    # symbol), so this does not become a second symbolic engine.
     sum_terms: tuple["ExactMonomial", ...] = ()
+    # One ``ln(name)`` factor of a sum term.  It enters only through ``ln`` and
+    # is consumed by an exponential: ``exp(c*ln(x))`` is the power ``x**c``,
+    # and any other term reading it stays its own exponential factor.
+    logarithm: str | None = None
 
     def __post_init__(self) -> None:
         coefficient = Fraction(self.coefficient)
-        powers = {str(name): Fraction(power) for name, power in self.powers if Fraction(power) != 0}
+        powers: dict[str, Fraction] = {}
+        for name, power in self.powers:
+            powers[str(name)] = Fraction(power)
+        logarithm = self.logarithm
         sum_terms = tuple(self.sum_terms)
         if sum_terms:
             flat_terms: list[ExactMonomial] = []
             for term in sum_terms:
                 flat_terms.extend(term.sum_terms or (term,))
             grouped_terms: dict[
-                tuple[tuple[tuple[str, Fraction], ...], tuple["ExactMonomial", ...]],
+                tuple[tuple[tuple[str, Fraction], ...], tuple["ExactMonomial", ...], str | None],
                 Fraction,
             ] = {}
             for term in flat_terms:
-                key = (term.powers, term.exponentials)
+                key = (term.powers, term.exponentials, term.logarithm)
                 grouped_terms[key] = grouped_terms.get(key, Fraction(0)) + term.coefficient
             normalized_terms = tuple(
-                ExactMonomial(coefficient, powers, nested)
-                for (powers, nested), coefficient in grouped_terms.items()
+                ExactMonomial(coefficient, powers, nested, logarithm=log)
+                for (powers, nested, log), coefficient in grouped_terms.items()
                 if coefficient != 0
             )
             coefficient = Fraction(1)
             powers = {}
+            logarithm = None
             normalized_exponentials: tuple["ExactMonomial", ...] = ()
             sum_terms = normalized_terms
             if not sum_terms:
@@ -86,43 +114,44 @@ class ExactMonomial:
         elif coefficient == 0:
             powers = {}
             normalized_exponentials: tuple["ExactMonomial", ...] = ()
+            logarithm = None
         else:
-            normalized_exponentials = tuple(self.exponentials)
+            normalized_exponentials = ()
+            for argument in self.exponentials:
+                terms = argument.sum_terms or (argument,)
+                rest = []
+                for term in terms:
+                    if term.logarithm is not None and not term.powers and not term.exponentials:
+                        name = term.logarithm
+                        powers[name] = powers.get(name, Fraction(0)) + term.coefficient
+                    else:
+                        rest.append(term)
+                if len(rest) == len(terms):
+                    normalized_exponentials += (argument,)
+                elif rest:
+                    normalized_exponentials += (
+                        rest[0] if len(rest) == 1 else ExactMonomial(sum_terms=tuple(rest)),
+                    )
         object.__setattr__(self, "coefficient", coefficient)
-        object.__setattr__(self, "powers", tuple(sorted(powers.items())))
+        object.__setattr__(
+            self, "powers", tuple(sorted((name, power) for name, power in powers.items() if power))
+        )
         object.__setattr__(self, "exponentials", normalized_exponentials)
         object.__setattr__(self, "sum_terms", sum_terms)
+        object.__setattr__(self, "logarithm", logarithm)
+
+    def names(self) -> set[str]:
+        """Every name this expression reads, inside exponentials and sums too."""
+        found = {name for name, _power in self.powers}
+        if self.logarithm is not None:
+            found.add(self.logarithm)
+        for child in (*self.exponentials, *self.sum_terms):
+            found |= child.names()
+        return found
 
     @property
     def base_powers(self) -> tuple[tuple[str, Fraction], ...]:
         return self.powers
-
-    def coordinate_power_map(self) -> dict[str, Fraction]:
-        """Return powers for every symbol retained in this expression.
-
-        The top-level ``powers`` tuple is the multiplicative projection used
-        by the direct rate-coordinate solver.  Exact energy coordinates live
-        in exponential arguments, however, so consumers that need to find
-        authored coordinates must walk the retained expression tree instead
-        of inspecting rendered ``exp(...)`` text.
-        """
-
-        result: dict[str, Fraction] = {}
-
-        def visit(value: ExactMonomial) -> None:
-            for name, power in value.powers:
-                result[name] = result.get(name, Fraction(0)) + Fraction(power)
-            for argument in value.exponentials:
-                visit(argument)
-            for term in value.sum_terms:
-                visit(term)
-
-        visit(self)
-        return {
-            name: power
-            for name, power in result.items()
-            if power
-        }
 
     def scale(self, factor: Fraction) -> "ExactMonomial":
         """Scale a scalar expression by an exact factor.
@@ -142,6 +171,7 @@ class ExactMonomial:
             self.coefficient * factor,
             self.powers,
             self.exponentials,
+            logarithm=self.logarithm,
         )
 
     @staticmethod
@@ -174,7 +204,7 @@ class ExactMonomial:
         return (argument,)
 
     def multiply(self, other: "ExactMonomial") -> "ExactMonomial":
-        if self.sum_terms or other.sum_terms:
+        if self.sum_terms or other.sum_terms or (self.logarithm and other.logarithm):
             return None  # type: ignore[return-value]
         powers = dict(self.powers)
         for name, power in other.powers:
@@ -183,10 +213,11 @@ class ExactMonomial:
             self.coefficient * other.coefficient,
             tuple(powers.items()),
             self._aggregate_exponentials(self.exponentials + other.exponentials),
+            logarithm=self.logarithm or other.logarithm,
         )
 
     def divide(self, other: "ExactMonomial") -> "ExactMonomial | None":
-        if self.sum_terms or other.sum_terms:
+        if self.sum_terms or other.sum_terms or other.logarithm:
             return None
         if other.coefficient == 0:
             return None
@@ -200,6 +231,7 @@ class ExactMonomial:
                 self.exponentials
                 + tuple(-argument for argument in other.exponentials)
             ),
+            logarithm=self.logarithm,
         )
 
     def __mul__(self, other: "ExactMonomial") -> "ExactMonomial":
@@ -217,7 +249,9 @@ class ExactMonomial:
     def __neg__(self) -> "ExactMonomial":
         if self.sum_terms:
             return ExactMonomial(sum_terms=tuple(-term for term in self.sum_terms))
-        return ExactMonomial(-self.coefficient, self.powers, self.exponentials)
+        return ExactMonomial(
+            -self.coefficient, self.powers, self.exponentials, logarithm=self.logarithm
+        )
 
     def __pow__(self, exponent: "ExactMonomial") -> "ExactMonomial | None":
         if exponent.powers or exponent.exponentials or exponent.sum_terms:
@@ -226,7 +260,7 @@ class ExactMonomial:
 
     def power(self, exponent: Fraction) -> "ExactMonomial" | None:
         exponent = Fraction(exponent)
-        if self.sum_terms:
+        if self.sum_terms or self.logarithm:
             return self if exponent == 1 else None
         if self.coefficient == 0 and exponent == 0:
             return None
@@ -239,6 +273,8 @@ class ExactMonomial:
                 tuple(argument.scale(exponent) for argument in self.exponentials),
             )
         numerator, denominator = exponent.numerator, exponent.denominator
+        if denominator != 1 and not self._factors_positive():
+            return None
         root = _exact_rational_root(self.coefficient, denominator)
         if root is None:
             return None
@@ -251,6 +287,39 @@ class ExactMonomial:
             tuple((name, power * exponent) for name, power in self.powers),
             tuple(argument.scale(exponent) for argument in self.exponentials),
         )
+
+    def _factors_positive(self) -> bool:
+        """Whether a positive value has only positive factors.
+
+        (x**p)**q == x**(p*q) and ln(x*y) == ln(x) + ln(y) only when no
+        factor can be negative: an even power, or a product of signed values,
+        would hide the sign that the numerical root or logarithm removes.
+        """
+
+        signed = [
+            power
+            for name, power in self.powers
+            if power.denominator == 1 and not _known_positive(name)
+        ]
+        return not (
+            self.coefficient < 0
+            or len(signed) > 1
+            or any(power.numerator % 2 == 0 for power in signed)
+        )
+
+    def ln(self) -> "ExactMonomial | None":
+        """``ln`` of a product: a sum of ``power*ln(name)`` and its exponents.
+
+        ``None`` for a sum, a logarithm, or a number other than 1, whose
+        logarithm has no exact form here.
+        """
+
+        if self.sum_terms or self.logarithm or self.coefficient != 1 or not self._factors_positive():
+            return None
+        terms = [ExactMonomial(power, logarithm=name) for name, power in self.powers]
+        for argument in self.exponentials:
+            terms.extend(argument.sum_terms or (argument,))
+        return ExactMonomial(sum_terms=tuple(terms)) if terms else ExactMonomial(Fraction(0))
 
 
 def _exact_integer_root(value: int, degree: int) -> int | None:
@@ -290,6 +359,15 @@ def _exact_rational_root(value: Fraction, degree: int) -> Fraction | None:
     return Fraction(numerator, denominator)
 
 
+def _power(base: ExactMonomial | None, exponent: ExactMonomial | None) -> ExactMonomial | None:
+    # A power is exact only when its full exponent is a scalar literal;
+    # silently dropping a symbolic or additive exponent would change the
+    # admitted relation.
+    if base is None or exponent is None or exponent.powers or exponent.exponentials or exponent.sum_terms:
+        return None
+    return base.power(exponent.coefficient)
+
+
 def _exact_monomial_from_ast(expr, *, canonical_names):
     try:
         value = _unscaled_monomial_from_ast(expr, canonical_names=canonical_names)
@@ -324,11 +402,24 @@ def _unscaled_monomial_from_ast(
     if isinstance(expr, IdentNode):
         name = str(expr.name)
         if name in _EXACT_CONSTANTS:
-            return ExactMonomial(_EXACT_CONSTANTS[name])
+            return _constant(name)
         if name == "T" or name in canonical_names:
             return ExactMonomial(Fraction(1), ((name, Fraction(1)),))
         return None
-    if isinstance(expr, SpeciesRefNode) or isinstance(expr, CallNode):
+    if isinstance(expr, CallNode):
+        if expr.name not in {"exp", "sqrt", "ln"} or len(expr.args) != 1:
+            return None
+        argument = _exact_monomial_from_ast(expr.args[0], canonical_names=canonical_names)
+        if argument is None:
+            return None
+        if expr.name == "sqrt":
+            return argument.power(Fraction(1, 2))
+        if expr.name == "ln":
+            return argument.ln()
+        return ExactMonomial(
+            Fraction(1), (), ExactMonomial._aggregate_exponentials((argument,))
+        )
+    if isinstance(expr, SpeciesRefNode):
         return None
     if isinstance(expr, UnaryNode):
         value = _exact_monomial_from_ast(
@@ -352,16 +443,25 @@ def _unscaled_monomial_from_ast(
     if expr.op in {"+", "-", "*", "/"} and (expr.op != "/" or right.coefficient):
         rational_binary(expr.op, left.coefficient, right.coefficient)
     if expr.op == "*":
+        if left.sum_terms or right.sum_terms:
+            products = [
+                left_term.multiply(right_term)
+                for left_term in left.sum_terms or (left,)
+                for right_term in right.sum_terms or (right,)
+            ]
+            if any(product is None for product in products):
+                return None
+            return ExactMonomial(sum_terms=tuple(products))
         return left.multiply(right)
     if expr.op == "/":
+        if left.sum_terms and not right.sum_terms:
+            quotients = [term.divide(right) for term in left.sum_terms]
+            if any(quotient is None for quotient in quotients):
+                return None
+            return ExactMonomial(sum_terms=tuple(quotients))
         return left.divide(right)
     if expr.op in {"**", "^"}:
-        # A power is exact only when its full exponent is a scalar literal;
-        # silently dropping a symbolic or additive exponent would change the
-        # admitted relation.
-        if right.powers or right.exponentials or right.sum_terms:
-            return None
-        return left.power(right.coefficient)
+        return _power(left, right)
     if expr.op in {"+", "-"}:
         if (
             left.powers == right.powers
@@ -385,36 +485,81 @@ def _unscaled_monomial_from_ast(
 class ExactConstraint:
     cycle_id: str
     monomial: ExactMonomial
-    expression: str
+    # The authored reaction lines of the cycle's steps.
+    lines: tuple[str, ...]
     status: str = "resolved"
+    # The user sentence naming the cycle by its lines, when it is not an identity.
     reason: str | None = None
+    step_coefficients: tuple[tuple[int, int], ...] = ()
+    # Defined names kept as free symbols that survive in an unresolved product.
+    kept: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class ExactStep:
+    """One cycle step's composed ``KeqN`` readout."""
+
+    step_index: int
+    keq: ExactMonomial | None
 
 
 @dataclass(frozen=True, slots=True)
 class ExactConstraintComposition:
     constraints: tuple[ExactConstraint, ...]
     coordinate_units: tuple[tuple[str, Unit | None], ...] = ()
+    steps: tuple[ExactStep, ...] = ()
+    # Every name each defined name reads through the admitted evaluation
+    # graph, transitively.
+    reads: Mapping[str, frozenset[str]] = field(default_factory=dict)
+    relations: Mapping[str, ExactMonomial] = field(default_factory=dict)
+    unresolved: frozenset[str] = frozenset()
+    # The steps each coordinate or helper line stands for (``_step_names``).
+    step_names: Mapping[str, frozenset[int]] = field(default_factory=dict)
 
+    def compose(
+        self,
+        name: str,
+        through: Collection[str] | None = None,
+    ) -> ExactMonomial | None:
+        """Lower ``name`` through the relations of ``through`` (all when omitted).
 
-def _render_monomial(value: ExactMonomial) -> str:
-    if value.sum_terms:
-        return "(" + " + ".join(_render_monomial(term) for term in value.sum_terms) + ")"
-    factors: list[str] = []
-    if value.coefficient != 1 or not value.powers:
-        factors.append(str(value.coefficient))
-    factors.extend(
-        name
-        if power == 1
-        else f"{name}**({power.numerator}/{power.denominator})"
-        if power.denominator != 1
-        else f"{name}**({power.numerator})"
-        for name, power in value.powers
-    )
-    factors.extend(
-        f"exp({_render_monomial(argument)})"
-        for argument in value.exponentials
-    )
-    return " * ".join(factors) if factors else "1"
+        Every other name stays its own symbol, so a value can be written in
+        terms of the names that do not depend on ``through``.
+        """
+
+        relations = (
+            self.relations
+            if through is None
+            else {key: value for key, value in self.relations.items() if key in through}
+        )
+        return _substitute(
+            ExactMonomial(Fraction(1), ((name, Fraction(1)),)), relations, self.unresolved
+        )
+
+    def closes(
+        self,
+        cycles: Collection[ExactConstraint],
+        lines: Mapping[str, object],
+    ) -> bool:
+        """Whether new unit-prepared ``param`` lines make every cycle an identity.
+
+        Each line is lowered and composed exactly as the cycle check reads an
+        admitted closure, so correction offers only what admission accepts.
+        """
+
+        relations = dict(self.relations)
+        for name, expr in lines.items():
+            lowered = _exact_monomial_from_ast(
+                expr, canonical_names=set(_iter_identifiers(expr))
+            )
+            if lowered is None:
+                return False
+            relations[name] = lowered
+        return all(
+            _substitute(_cycle_product(cycle.step_coefficients), relations, self.unresolved)
+            == ExactMonomial()
+            for cycle in cycles
+        )
 
 
 def _mechanism_relations(
@@ -500,25 +645,29 @@ def _mechanism_relations(
                 exponential=exponential,
                 source_coordinate=source_coordinate,
                 standard_concentration=standard_concentration,
+                constant=_constant,
             )
             if kind == "reaction":
                 name = f"k{step}"
                 if projected != ExactMonomial(Fraction(1), ((name, Fraction(1)),)):
                     relations[name] = projected
                 continue
+            # Reverse and equilibrium relations name ``kfN`` so a step's
+            # readout can be written through its own coordinates.
             equilibrium_relations = equilibrium_rate_symbolic_relations(
                 equilibria[index],
-                forward_relation=projected,
+                forward_relation=ExactMonomial(Fraction(1), ((kf, Fraction(1)),)),
                 temperature=temperature,
                 literal=literal,
                 exponential=exponential,
                 source_coordinate=source_coordinate,
                 standard_concentration=standard_concentration,
+                constant=_constant,
             )
         except (TypeError, ValueError, ZeroDivisionError, OverflowError):
             continue
         for name, relation in (
-            (kf, equilibrium_relations.kf),
+            (kf, projected),
             (kr, equilibrium_relations.kr),
             (keq, equilibrium_relations.Keq),
         ):
@@ -531,10 +680,15 @@ def _mechanism_relations(
     return relations
 
 
+class _CyclicRelation(Exception):
+    """A relation reaches itself; it is never kept as a free symbol."""
+
+
 def _substitute(
     monomial: ExactMonomial,
     relations: Mapping[str, ExactMonomial],
     unresolved: set[str] | frozenset[str] = frozenset(),
+    kept: set[str] | None = None,
 ) -> ExactMonomial | None:
     """Recursively lower retained exact expressions in evaluation order.
 
@@ -543,17 +697,24 @@ def _substitute(
     reparsed), so ``exp(-Ea/(R*T))`` retains its exact coefficient, fraction,
     symbolic temperature, and constants.  A sum is valid inside an
     exponential argument but not as a top-level multiplicative factor.
+    A defined name whose value cannot be represented where it is used
+    (unlowered, a multiplicative or powered sum, an inexact root) stays its
+    own free symbol and is recorded in ``kept``: treating one value as
+    independent can lose an identity but never create one.  A cyclic
+    relation fails.
     """
 
     cache: dict[tuple[str, bool], ExactMonomial | None] = {}
     visiting: set[str] = set()
+    kept = set() if kept is None else kept
 
     def resolve(name: str, *, allow_sum: bool) -> ExactMonomial | None:
         cache_key = (name, bool(allow_sum))
         if cache_key in cache:
             return cache[cache_key]
-        if name in unresolved or name in visiting:
-            cache[cache_key] = None
+        if name in visiting:
+            raise _CyclicRelation(name)
+        if name in unresolved:
             return None
         relation = relations.get(name)
         if relation is None:
@@ -572,35 +733,45 @@ def _substitute(
         allow_sum: bool,
     ) -> ExactMonomial | None:
         if value.sum_terms:
-            if not allow_sum:
+            # Terms are always traversed so a cycle inside a sum fails even
+            # where the sum itself is kept as a named symbol.
+            terms = tuple(
+                substitute_value(term, allow_sum=True) for term in value.sum_terms
+            )
+            if not allow_sum or any(term is None for term in terms):
                 return None
-            terms: list[ExactMonomial] = []
-            for term in value.sum_terms:
-                substituted = substitute_value(term, allow_sum=False)
-                if substituted is None:
-                    return None
-                terms.append(substituted)
-            return ExactMonomial(sum_terms=tuple(terms))
+            return ExactMonomial(sum_terms=terms)
 
-        arguments: list[ExactMonomial] = []
-        for argument in value.exponentials:
-            substituted = substitute_value(argument, allow_sum=True)
-            if substituted is None:
-                return None
-            arguments.append(substituted)
-        result = ExactMonomial(value.coefficient, (), tuple(arguments))
+        arguments = tuple(
+            substitute_value(argument, allow_sum=True)
+            for argument in value.exponentials
+        )
+        if any(argument is None for argument in arguments):
+            return None
+        result = ExactMonomial(value.coefficient, (), arguments)
+        factors = []
         for name, power in value.base_powers:
             resolved = resolve(name, allow_sum=allow_sum)
             powered = resolved.power(power) if resolved is not None else None
-            if powered is None:
-                return None
+            if powered is None or (powered.sum_terms and not allow_sum):
+                kept.add(name)
+                powered = ExactMonomial(Fraction(1), ((name, power),))
+            factors.append(powered)
+        if value.logarithm is not None:
+            # ln(x) is written through x's value; a value without an exact
+            # logarithm keeps ln(x) as its own factor.
+            resolved = resolve(value.logarithm, allow_sum=False)
+            logarithm = resolved.ln() if resolved is not None else None
+            if logarithm is None:
+                kept.add(value.logarithm)
+                logarithm = ExactMonomial(logarithm=value.logarithm)
+            factors.append(logarithm)
+        for powered in factors:
             if result.sum_terms or powered.sum_terms:
-                if not allow_sum:
-                    return None
                 result = _multiply_with_sums(result, powered)
             else:
                 result = result.multiply(powered)
-            if result is None:
+            if result is None or (result.sum_terms and not allow_sum):
                 return None
         return result
 
@@ -621,69 +792,102 @@ def _substitute(
                 products.append(product)
         return ExactMonomial(sum_terms=tuple(products))
 
-    return substitute_value(monomial, allow_sum=False)
+    try:
+        return substitute_value(monomial, allow_sum=False)
+    except _CyclicRelation:
+        return None
 
 
-def _render_constraint(monomial: ExactMonomial) -> str:
-    if monomial.sum_terms:
-        return f"product({_render_monomial(monomial)}) = 1"
-    factors: list[str] = []
-    if monomial.coefficient != 1 or not monomial.powers:
-        factors.append(str(monomial.coefficient))
-    factors.extend(
-        name
-        if power == 1
-        else f"{name}**({power.numerator}/{power.denominator})"
-        if power.denominator != 1
-        else f"{name}**({power.numerator})"
-        for name, power in monomial.powers
-    )
-    factors.extend(
-        f"exp({_render_monomial(argument)})"
-        for argument in monomial.exponentials
-    )
-    return f"product({' * '.join(factors)}) = 1"
+def _step_names(
+    statements: Mapping[str, object],
+    coordinates: set[str] | frozenset[str],
+) -> dict[str, frozenset[int]]:
+    """The steps each coordinate or helper ``param`` line stands for.
+
+    A coordinate stands for its own step.  A helper line stands for every step
+    whose coordinate it names, directly or through other helper lines; the
+    walk stops at coordinates, so a coordinate's own line never adds steps.
+    """
+
+    found = {
+        name: frozenset({source_coordinate_name_parts(name)[1]}) for name in coordinates
+    }
+
+    def steps(name: str) -> frozenset[int]:
+        if name not in found:
+            found[name] = frozenset()
+            if name in statements:
+                found[name] = frozenset().union(
+                    *map(steps, _iter_identifiers(statements[name].expr))
+                )
+        return found[name]
+
+    for name in statements:
+        steps(name)
+    return {name: value for name, value in found.items() if value}
+
+
+def names_other_step(
+    step_names: Mapping[str, frozenset[int]],
+    names: Collection[str],
+    step: int,
+) -> bool:
+    """Whether a value of ``step`` written from ``names`` is a closure.
+
+    Only a formula naming a coordinate of another step, directly or through
+    helper lines, relates steps; numbers, ``T`` and parameters inside a
+    formula naming no other step never decide a reversible cycle.
+    """
+
+    return any(step_names.get(name, frozenset()) - {step} for name in names)
+
+
+def _free_statements(
+    spec: ParameterAlgebraSpec,
+    statements: Mapping[str, object],
+    coordinates: set[str] | frozenset[str],
+    step_names: Mapping[str, frozenset[int]],
+) -> frozenset[str]:
+    """Name every ``param`` line that authors a free symbol.
+
+    An independent scalar is a free symbol.  A line setting a step coordinate
+    is a free symbol unless it is a closure (:func:`names_other_step`).
+    """
+
+    free = set()
+    for name, statement in statements.items():
+        if name in coordinates:
+            if not names_other_step(
+                step_names,
+                set(_iter_identifiers(statement.expr)),
+                source_coordinate_name_parts(name)[1],
+            ):
+                free.add(name)
+        elif spec.parameter_assignment_kind(name) == "independent scalar":
+            free.add(name)
+    return frozenset(free)
 
 
 def _algebra_relations(
     spec: ParameterAlgebraSpec,
-) -> tuple[dict[str, ExactMonomial], set[str]]:
-    """Lower retained parameter assignments in their admitted order."""
+    identities: Collection[str],
+) -> tuple[dict[str, ExactMonomial], set[str], dict[str, frozenset[int]], set[str]]:
+    """Lower the retained ``param`` lines that relate other values."""
 
-    dependencies = spec.parameter_dependencies
-    assignment_kind = spec.parameter_assignment_kind
-    statements_in_order = spec.parameter_block.statements_in_evaluation_order
-
-    # Build one direct name -> retained statement view.  The spec's dependency
-    # mapping supplies the already-admitted topological order; no identifier
-    # walk or local cycle analysis is performed here.
-    statement_by_name = {
+    statements = {
         str(statement.name): statement
-        for statement in tuple(statements_in_order())
+        for statement in spec.parameter_block.statements_in_evaluation_order()
     }
-    assignment_names = tuple(str(name) for name in dependencies)
-    canonical_names = set(assignment_names)
-    namespace = getattr(spec, "mechanism_namespace", None)
-    flat_names = getattr(namespace, "flat_names", None)
-    if callable(flat_names):
-        canonical_names.update(str(name) for name in flat_names())
-    canonical_names.update(_EXACT_CONSTANTS)
-    canonical_names.add("T")
+    coordinates = {str(name) for name in spec.mechanism_param_names}
+    canonical_names = set(statements) | coordinates | set(_EXACT_CONSTANTS) | {"T"}
+    step_names = _step_names(statements, coordinates)
+    free = _free_statements(spec, statements, coordinates, step_names) | set(identities)
 
     relations: dict[str, ExactMonomial] = {}
     unresolved: set[str] = set()
-    for name in assignment_names:
-        statement = statement_by_name.get(name)
-        if statement is None:
-            unresolved.add(name)
-            continue
-        kind = str(assignment_kind(name))
-        if kind in {"independent scalar", "source identity"}:
-            # An independent scalar is an exact symbolic leaf.  Its numeric
-            # execution seed is intentionally not consumed here.
-            continue
-        if kind not in {"derived scalar", "mechanism-bound"}:
-            unresolved.add(name)
+    for name, statement in statements.items():
+        if name in free:
+            # A free symbol: its formula and numbers are never consumed here.
             continue
         lowered = _exact_monomial_from_ast(
             statement.expr,
@@ -693,88 +897,46 @@ def _algebra_relations(
             unresolved.add(name)
         else:
             relations[name] = lowered
-    return relations, unresolved
+    return relations, unresolved, step_names, canonical_names
 
 
 def proves_redundant_parameter(
     mechanism: object,
-    statements: Mapping[str, object],
+    spec: ParameterAlgebraSpec,
     target: str,
-    discharged: list[str],
+    identities: Collection[str],
 ) -> bool:
-    """Prove a source identity without numeric defaults or branch cancellation."""
+    """Whether ``target``'s line only restates its value through chemistry.
+
+    Every other line is read exactly as the cycle check reads it
+    (:func:`_algebra_relations`), so a free line stays its own symbol whatever
+    its formula and its numbers never make an identity.
+    """
     relations = _mechanism_relations(mechanism)
-    sources = {
-        name
-        for entry in get_step_index_map(mechanism)
-        for name in dict(entry.get("source_coordinates") or {}).values()
-    }
-    names = set(statements) | set(relations) | sources
-    visited: set[str] = set()
-
-    def symbols(value):
-        found = {name for name, _power in value.powers}
-        for child in (*value.exponentials, *value.sum_terms):
-            found.update(symbols(child))
-        return found
-
-    def eligible(expr: object) -> bool:
-        if isinstance(expr, (NumberNode, IdentNode)):
-            return True
-        if isinstance(expr, UnaryNode):
-            return expr.op in {"+", "-"} and eligible(expr.rhs)
-        if not isinstance(expr, BinaryNode) or expr.op not in {
-            "+",
-            "-",
-            "*",
-            "/",
-            "^",
-            "**",
-        }:
-            return False
-        if expr.op in {"^", "**"}:
-            exponent = _exact_monomial_from_ast(expr.rhs, canonical_names=set())
-            if (
-                exponent is None
-                or exponent.powers
-                or exponent.exponentials
-                or exponent.sum_terms
-                or exponent.coefficient.denominator != 1
-            ):
-                return False
-        return eligible(expr.lhs) and eligible(expr.rhs)
-
-    def visit(name: str) -> bool:
-        if name in visited or name in discharged:
-            return True
-        visited.add(name)
-        statement = statements.get(name)
-        if statement is None:
-            # Chemistry may lead to further authored coordinates.
-            relation = relations.get(name)
-            if relation is not None:
-                return all(visit(dep) for dep in symbols(relation) if dep != target)
-            return True
-        references = set(_iter_identifiers(statement.expr)) & names
-        if name not in sources and not references:
-            return True  # Adjustable scalar default, never an exact relation.
-        if not eligible(statement.expr):
-            return False
-        lowered = _exact_monomial_from_ast(statement.expr, canonical_names=names)
-        if lowered is None:
-            return False
-        if name != target:
-            relations[name] = lowered
-        return all(visit(dep) for dep in references if dep != target)
-
-    if not visit(target):
-        return False
+    algebra, unresolved, _step_names_, canonical_names = _algebra_relations(spec, identities)
+    relations.update(algebra)
     relations.pop(target, None)
-    for name in discharged:
-        relations.pop(name, None)
-    rhs = _exact_monomial_from_ast(statements[target].expr, canonical_names=names)
-    return rhs is not None and _substitute(rhs, relations, set()) == ExactMonomial(
+    statement = next(line for line in spec.parameter_block.lines if line.name == target)
+    rhs = _exact_monomial_from_ast(statement.expr, canonical_names=canonical_names)
+    return rhs is not None and _substitute(rhs, relations, unresolved) == ExactMonomial(
         Fraction(1), ((target, Fraction(1)),)
+    )
+
+
+def cycle_message(sentence: str, lines: Collection[str]) -> str:
+    """One sentence about reversible cycles, followed by their authored lines."""
+
+    return sentence + "\n" + "\n".join(lines)
+
+
+def _cycle_product(step_coefficients: Collection[tuple[int, int]]) -> ExactMonomial:
+    return ExactMonomial(
+        Fraction(1),
+        tuple(
+            (f"Keq{step_index}", Fraction(coefficient))
+            for step_index, coefficient in step_coefficients
+            if coefficient
+        ),
     )
 
 
@@ -787,54 +949,112 @@ def compose_exact_constraints(
 
     topology = analyze_wegscheider_topology(mechanism)
     relations = _mechanism_relations(mechanism)
-    algebra, unresolved = _algebra_relations(parameter_algebra_spec)
-    relations.update({name: value for name, value in algebra.items()
-                      if name not in parameter_algebra_spec.identity_checks})
+    algebra, unresolved, step_names, _names = _algebra_relations(
+        parameter_algebra_spec, parameter_algebra_spec.identity_checks
+    )
+    relations.update(algebra)
+    line_of = {
+        entry["step_index"]: entry["line_text"].strip()
+        for entry in mechanism.metadata["step_index_map"]
+    }
+    # A step's own param lines belong to the cycle text after its reaction lines.
+    param_lines = tuple(
+        (source_coordinate_name_parts(line.name)[1], line.line_text.strip())
+        for line in parameter_algebra_spec.parameter_block.lines
+        if source_coordinate_name_parts(line.name) is not None
+    )
     result: list[ExactConstraint] = []
     for cycle in topology.cycles:
-        initial = ExactMonomial(
-            Fraction(1),
-            tuple(
-                (f"Keq{step_index}", Fraction(coefficient))
-                for step_index, coefficient in zip(
-                    cycle.step_indices,
-                    cycle.coefficients,
-                    strict=True,
-                )
-                if int(coefficient) != 0
-            ),
+        step_coefficients = tuple(zip(cycle.step_indices, cycle.coefficients, strict=True))
+        lines = tuple(line_of[step] for step in cycle.step_indices) + tuple(
+            text for step, text in param_lines if step in cycle.step_indices
         )
-        composed = _substitute(initial, relations, unresolved)
+        initial = _cycle_product(step_coefficients)
+        kept: set[str] = set()
+        composed = _substitute(initial, relations, unresolved, kept)
+        status, sentence = "unresolved", None
+        surviving: tuple[str, ...] = ()
         if composed is None:
-            result.append(
-                ExactConstraint(
-                    cycle_id=cycle.cycle_id,
-                    monomial=initial,
-                    expression=_render_constraint(initial),
-                    status="unresolved",
-                    reason=(
-                        "constraint depends on an unsupported, cyclic, or "
-                        "unprovable relation"
-                    ),
-                )
+            composed = initial
+            sentence = (
+                "The values around this reversible cycle are calculated from "
+                "each other in a loop, so Kindred cannot check the cycle."
             )
-            continue
-        if composed.coefficient != 1:
+        elif surviving := tuple(sorted(kept & composed.names())):
+            # A kept value is treated as independent, so the product cannot
+            # prove the cycle inconsistent.
+            sentence = (
+                ", ".join(surviving)
+                + (
+                    " is used as its own value because its formula cannot"
+                    if len(surviving) == 1
+                    else " are used as their own values because their formulas cannot"
+                )
+                + " be combined into this reversible cycle."
+            )
+        elif composed.coefficient != 1 and not (
+            composed.powers or composed.exponentials or composed.sum_terms
+        ):
             status = "unsatisfied"
-            reason = "exact multiplicative product is not an identity"
-        elif composed.powers or composed.exponentials or composed.sum_terms:
+            sentence = (
+                "The formulas around this reversible cycle make its equilibrium "
+                f"constants multiply to {composed.coefficient}, not 1."
+            )
+        elif composed.coefficient != 1 or composed.powers or composed.exponentials or composed.sum_terms:
             status = "unsatisfied"
-            reason = "exact symbolic product is not an identity"
+            sentence = "This reversible cycle is not closed."
         else:
             status = "resolved"
-            reason = None
         result.append(
             ExactConstraint(
                 cycle_id=cycle.cycle_id,
                 monomial=composed,
-                expression=_render_constraint(composed),
+                lines=lines,
                 status=status,
-                reason=reason,
+                reason=None if sentence is None else cycle_message(sentence, lines),
+                step_coefficients=step_coefficients,
+                kept=surviving,
             )
         )
-    return ExactConstraintComposition(tuple(result), tuple(parameter_algebra_spec.quantity_units))
+    cycle_steps = sorted({step for cycle in topology.cycles for step in cycle.step_indices})
+    steps = tuple(
+        ExactStep(
+            step_index,
+            _substitute(
+                ExactMonomial(Fraction(1), ((f"Keq{step_index}", Fraction(1)),)),
+                relations,
+                unresolved,
+            ),
+        )
+        for step_index in cycle_steps
+    )
+    # Admission empties a discharged identity's edges; its statement still
+    # reads its operands.
+    graph = {
+        name: set(dependencies)
+        for name, dependencies in parameter_algebra_spec.evaluation_dependencies.items()
+    }
+    statements = {statement.name: statement for statement in parameter_algebra_spec.parameter_block.lines}
+    for name in parameter_algebra_spec.identity_checks:
+        graph.setdefault(name, set()).update(_iter_identifiers(statements[name].expr))
+
+    def transitive_reads(name: str) -> frozenset[str]:
+        found: set[str] = set()
+        pending = list(graph.get(name, ()))
+        while pending:
+            dependency = pending.pop()
+            if dependency not in found:
+                found.add(dependency)
+                pending.extend(graph.get(dependency, ()))
+        return frozenset(found)
+
+    reads = {name: transitive_reads(name) for name in graph}
+    return ExactConstraintComposition(
+        tuple(result),
+        tuple(parameter_algebra_spec.quantity_units),
+        steps,
+        reads,
+        relations,
+        frozenset(unresolved),
+        step_names,
+    )

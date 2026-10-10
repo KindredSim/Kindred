@@ -186,6 +186,7 @@ def _named_units() -> dict[str, Unit]:
     units = {u.symbol: u for u in (DIMENSIONLESS, JOULE, MOLE, METRE, SECOND, KELVIN, MOLAR)}
     units["L"] = Unit(CUBIC_METRE.dimensions, rational_scale(Fraction(1, 1000)), "L")
     units["kcal"] = Unit(JOULE.dimensions, rational_scale(Fraction(4184)), "kcal")
+    units["cal"] = Unit(JOULE.dimensions, rational_scale(Fraction(4184, 1000)), "cal")
     for base in (MOLAR, MOLE, METRE, SECOND, JOULE, units["L"]):
         for prefix, exponent in (("f", -15), ("p", -12), ("n", -9), ("µ", -6), ("m", -3), ("c", -2), ("k", 3)):
             # Centi is useful for length, not a second concentration/time menu.
@@ -252,7 +253,7 @@ def parse_unit(source: str) -> Unit:
             try:
                 result = NAMED_UNITS[name]
             except KeyError as exc:
-                raise ValueError(f"Unsupported unit {name!r} in {source!r}.") from exc
+                raise ValueError(f"Unsupported unit {name!r}" + ("." if name == source else f" in {source!r}.")) from exc
         if index < len(tokens) and tokens[index] in {"^", "**"}:
             take()
             power = exponent()

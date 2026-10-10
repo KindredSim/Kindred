@@ -93,18 +93,11 @@ def _references(node: ExprNode, column_count: int) -> tuple[int, ...]:
             raise ValueError(f"Unsupported formula operator {node.op!r}.")
         children = (node.lhs, node.rhs)
     elif isinstance(node, CallNode):
-        arity = (1 if node.name in _UNARY_FUNCTIONS else
-                 2 if node.name == "pow" else
-                 3 if node.name in {"ifelse", "clip"} else None)
-        if node.name in {"min", "max"}:
-            if not node.args:
-                raise ValueError(f"{node.name} requires at least one argument.")
-        elif arity is None:
+        # The parser admitted the argument count of every builtin.
+        if node.name not in _FUNCTIONS:
             if node.name.lower() in _FUNCTIONS:
                 raise ValueError(f"Use lower-case function names: {node.name.lower()} instead of {node.name}.")
             raise ValueError(f"Unsupported formula function {node.name!r}.")
-        elif len(node.args) != arity:
-            raise ValueError(f"{node.name} requires {arity} argument(s).")
         children = node.args
     else:
         raise ValueError("Formula patterns support column references, not species or context references.")

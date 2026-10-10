@@ -291,15 +291,13 @@ class WorkspaceTabRegistry:
         existing_runtime = dict(self._runtime_by_tab_id)
         previous_by_tab_id = {tab.tab_id: tab for tab in previous.tabs}
         replacement_by_tab_id = {tab.tab_id: tab for tab in replacement.tabs}
+        # Unapplied Slider values belong to the parsed mechanism they were set
+        # on; any accepted change to a tab's mechanism discards them.
         for tab_id, runtime in existing_runtime.items():
             old_tab, new_tab = previous_by_tab_id.get(tab_id), replacement_by_tab_id.get(tab_id)
-            if old_tab is None or new_tab is None or old_tab.prepared_dsl is new_tab.prepared_dsl:
-                continue
-            old_units = {} if old_tab.prepared_dsl is None else dict(old_tab.prepared_dsl.parameter_algebra_spec_for_execution().input_units)
-            new_units = {} if new_tab.prepared_dsl is None else dict(new_tab.prepared_dsl.parameter_algebra_spec_for_execution().input_units)
-            for name in tuple(runtime.slider_parameter_draft):
-                if old_units.get(name) != new_units.get(name):
-                    runtime.slider_parameter_draft.pop(name, None)
+            if old_tab is not None and new_tab is not None and old_tab.prepared_dsl is not new_tab.prepared_dsl:
+                runtime.slider_parameter_draft.clear()
+                runtime.slider_species_drafts_by_set_id.clear()
         for tab_id, affected_ids in delta.affected_targets_by_tab:
             runtime = existing_runtime.get(tab_id)
             repository = None if runtime is None else runtime.result_repository

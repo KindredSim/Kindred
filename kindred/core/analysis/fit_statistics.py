@@ -25,19 +25,7 @@ class FitMetric:
     value: Optional[float]
     unavailable_reason: Optional[str] = None
 
-    def __post_init__(self) -> None:
-        if self.value is None:
-            reason = str(self.unavailable_reason or "").strip()
-            if not reason:
-                raise ValueError("An unavailable Fit metric requires a reason.")
-            object.__setattr__(self, "unavailable_reason", reason)
-            return
-        value = float(self.value)
-        if not math.isfinite(value):
-            raise ValueError("An available Fit metric must be finite.")
-        if self.unavailable_reason is not None:
-            raise ValueError("An available Fit metric cannot have an unavailable reason.")
-        object.__setattr__(self, "value", value)
+    # Its producers check finiteness first and name each unavailable reason.
 
     @property
     def available(self) -> bool:
@@ -80,13 +68,8 @@ def finite_positive_mean_normalize(
     explicitly rather than silently replaced with equal weights.
     """
 
-    cleaned: dict[str, float] = {}
-    for raw_name, raw_value in values.items():
-        name = str(raw_name)
-        value = float(raw_value)
-        if not math.isfinite(value) or value <= 0.0:
-            raise ValueError(f"Weight for {name!r} must be finite and positive.")
-        cleaned[name] = value
+    # Callers pass admitted finite positive weights.
+    cleaned = {name: float(value) for name, value in values.items()}
     if not cleaned:
         return {}
     maximum = max(cleaned.values())

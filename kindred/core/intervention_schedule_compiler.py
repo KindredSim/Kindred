@@ -26,7 +26,6 @@ from kindred.core.intervention_schedule import (
     InterventionStopAction,
     SpeciesTriggerCondition,
     ObservableTriggerCondition,
-    coerce_intervention_schedule,
     intervention_schedule_parameter_dependencies,
     _resolved,
 )
@@ -910,14 +909,14 @@ def _annotated_schedule_error(
 
 
 def compile_intervention_schedule(
-    schedule: InterventionSchedule | Mapping[str, Any] | None,
+    schedule: InterventionSchedule | None,
     *,
     cancellation_check: Callable[[], bool] | None = None,
     dependency_metadata: InterventionScheduleDependencyMetadata | None = None,
     authored_payload: Mapping[str, Any] | None = None,
 ) -> InterventionExecutionContract:
     _raise_if_cancelled(cancellation_check)
-    schedule_obj = coerce_intervention_schedule(schedule) or InterventionSchedule()
+    schedule_obj = schedule or InterventionSchedule()
     dependency_metadata = dependency_metadata or intervention_schedule_parameter_dependencies(
         schedule_obj
     )
@@ -1237,7 +1236,10 @@ def validate_boundary_conflicts(
         if physical.physical is not None and physical.op != "withdraw":
             absolute = first_set_by_time.get(physical.time)
             if absolute is not None:
-                raise InterventionScheduleError(f"set and {physical.op} conflict for {absolute.species} at t={physical.time:g}.")
+                raise InterventionScheduleError(
+                    f"set and {physical.op} conflict for {absolute.species} at t={physical.time:g}.",
+                    declaration_ordinal=max(absolute.declaration_ordinal, physical.declaration_ordinal),
+                )
     for instant in instants:
         _raise_if_cancelled(cancellation_check)
         if instant.physical is None:
@@ -1278,7 +1280,7 @@ def validate_boundary_conflicts(
         ):
             raise _annotated_schedule_error(
                 InterventionScheduleError(
-                    f"Incompatible absolute/hold conflict for {species} at t={time:g}."
+                    f"Declarations set {species} to different values at t={time:g}."
                 ),
                 operation=None,
                 dependency_metadata=dependency_metadata,

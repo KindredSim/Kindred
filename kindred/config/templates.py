@@ -15,6 +15,7 @@ from typing import Any, Dict, List, Mapping, Optional
 from PySide6.QtCore import QStandardPaths
 
 from kindred.core.mechanism_source import MechanismAuthoringSource
+from kindred.io.paths import file_error_text
 
 logger = logging.getLogger(__name__)
 
@@ -195,6 +196,12 @@ class TemplateManager:
         )
 
     @property
+    def templates_directory(self) -> Path:
+        """The folder that holds the stored template files."""
+
+        return self._templates_dir
+
+    @property
     def write_disabled_reason(self) -> str | None:
         """Explain why persistence is unavailable for the admitted collection."""
 
@@ -206,9 +213,9 @@ class TemplateManager:
             raise RuntimeError(reason)
 
     def _record_storage_failure(self, action: str, exc: Exception) -> None:
-        detail = str(exc).strip() or type(exc).__name__
+        detail = file_error_text(exc, self._templates_dir).strip() or type(exc).__name__
         self._write_disabled_reason = (
-            f"Template persistence is disabled because {action}: {detail}"
+            f"Template changes are disabled because {action}: {detail}"
         )
 
     def _get_templates_directory(self) -> Path:
@@ -222,7 +229,7 @@ class TemplateManager:
     def _templates_root(self, *, create: bool = False) -> Path:
         root = Path(self._templates_dir).resolve()
         if root.exists() and not root.is_dir():
-            raise NotADirectoryError(f"Template path is not a directory: {root}")
+            raise NotADirectoryError(f"Template path is not a directory: {root}.")
         if create:
             root.mkdir(parents=True, exist_ok=True)
         return root
@@ -321,7 +328,7 @@ class TemplateManager:
                     names.add(name_key)
         except Exception as exc:
             self._record_storage_failure(
-                "the stored collection could not be admitted",
+                "the stored templates could not be read",
                 exc,
             )
             raise

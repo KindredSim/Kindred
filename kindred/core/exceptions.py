@@ -2,10 +2,10 @@
 Structured exception types for Kindred user-facing and integration boundaries.
 
 This module defines the `KindredError` hierarchy plus optional context, error
-codes, suggestions, and examples for call sites that choose to surface richer
-structured failures. Lower-level core helpers still use builtin exceptions for
-many validation and invariant checks, so this module should be treated as the
-supported structured error path rather than a repo-wide mandatory policy.
+codes, suggestions, and examples. Every display shows ``str(exc)``, so the text
+of an error is its user-facing message, with the authored line it names, a
+suggestion and examples. Codes and details are structured facts for reports
+and logs and never appear in the text.
 
 Error Categories
 ----------------
@@ -18,19 +18,18 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Optional, List, Dict, Any
-import textwrap
 
 __all__ = [
     # Base
     "KindredError",
     "ErrorContext",
+    "located",
     # Validation
     "ValidationError",
     "ReactionValidationError",
     # Simulation
     "SimulationError",
     "SolverError",
-    "TimeGridError",
     "KineticRuntimeDomainError",
     # Fitting
     "FittingError",
@@ -60,16 +59,17 @@ class ErrorContext:
     line_text: Optional[str] = None
 
 
+def located(message: str, line: Optional[int], line_text: Optional[str]) -> str:
+    """One-line text for a message about an authored line, when the line is known."""
+    return message if line is None or line_text is None else f"Line {line} ({line_text.strip()}): {message}"
+
+
 class KindredError(Exception):
     """
     Base exception for all Kindred errors.
 
-    Provides enhanced error messages with:
-    - Error code for programmatic handling
-    - Clear problem description
-    - Helpful suggestions
-    - Valid examples
-    - Source context when available
+    Its text is the message, the authored line from ``context`` when known,
+    the suggestion, and the examples. The code and details are attributes.
 
     Attributes
     ----------
@@ -109,50 +109,23 @@ class KindredError(Exception):
         super().__init__(full_message)
 
     def _build_message(self) -> str:
-        """Build user-friendly error message."""
-        parts = [f"{self.code} {self.__class__.__name__}: {self.message}"]
+        """The user-facing text: message, authored line, suggestion, examples.
 
-        # Add context (line)
-        if self.context:
-            ctx_parts = []
-            if self.context.line is not None:
-                ctx_parts.append(f"Location: L{self.context.line}")
-
-            if ctx_parts:
-                parts.append("")
-                parts.extend(ctx_parts)
-
-            # Add source line
-            if self.context.line_text:
-                parts.append("")
-                parts.append(f"  {self.context.line_text}")
-
-        # Add suggestion
+        Code, class name and details stay structured attributes for reports
+        and logs; they are never part of the text.
+        """
+        parts = [self.message]
+        if self.context and self.context.line is not None and self.context.line_text is not None:
+            parts.append("")
+            parts.append(f"  Line {self.context.line}: {self.context.line_text}")
         if self.suggestion:
             parts.append("")
             parts.append(f"Suggestion: {self.suggestion}")
-
-        # Add examples
         if self.examples:
             parts.append("")
             parts.append("Valid examples:")
             for example in self.examples:
-                # Wrap long examples
-                wrapped = textwrap.fill(
-                    example,
-                    width=70,
-                    initial_indent="  • ",
-                    subsequent_indent="    "
-                )
-                parts.append(wrapped)
-
-        # Add details
-        if self.details:
-            parts.append("")
-            parts.append("Details:")
-            for key, value in self.details.items():
-                parts.append(f"  {key}: {value}")
-
+                parts.append(f"  • {example}")
         return "\n".join(parts)
 
 
@@ -187,13 +160,6 @@ class SolverError(SimulationError):
     """Error during ODE solver execution."""
     def __init__(self, message: str, **kwargs):
         kwargs.setdefault("code", "E301")
-        super().__init__(message, **kwargs)
-
-
-class TimeGridError(SimulationError):
-    """Error in time grid specification or generation."""
-    def __init__(self, message: str, **kwargs):
-        kwargs.setdefault("code", "E303")
         super().__init__(message, **kwargs)
 
 
@@ -304,30 +270,16 @@ class OptimizationError(FittingError):
 def create_solver_error(
     solver_name: str,
     t_current: float,
-    message: str,
+    reason: str,
+    solver_message: str,
 ) -> SolverError:
-    """
-    Factory for ODE solver errors.
-
-    Parameters
-    ----------
-    solver_name : str
-        Solver method name
-    t_current : float
-        Time at which error occurred
-    message : str
-        Error message from solver
-
-    Returns
-    -------
-    SolverError
-    """
+    """An ODE solver failure stated by Kindred; the solver's own text stays a detail."""
     details: Dict[str, Any] = {
         "solver": solver_name,
         "time": t_current,
-        "solver_message": message,
+        "solver_message": solver_message,
     }
     return SolverError(
-        f"Solver '{solver_name}' failed at t={t_current:.4e}",
+        f"The {solver_name} solver stopped at t = {t_current:g} s because {reason}.",
         details=details,
     )

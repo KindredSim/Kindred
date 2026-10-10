@@ -22,18 +22,8 @@ class ScientificUnavailable:
     factual_cause: FactualCause | None = None
 
     def __post_init__(self) -> None:
-        producer = str(self.producer or "").strip()
-        stage = str(self.stage or "").strip()
-        if not producer or not stage:
-            raise ValueError("Scientific-unavailability producer and stage are required.")
-        object.__setattr__(self, "producer", producer)
-        object.__setattr__(self, "stage", stage)
+        # Producers name themselves and their stage with literals.
         object.__setattr__(self, "details", freeze_factual_value(dict(self.details or {})))
-        if self.factual_cause is not None and not isinstance(
-            self.factual_cause,
-            FactualCause,
-        ):
-            raise TypeError("Scientific-unavailability factual cause must be typed.")
 
 
 

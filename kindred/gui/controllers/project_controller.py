@@ -26,7 +26,7 @@ from kindred.gui.dataset_import_staging import DatasetImportStaging
 from kindred.gui.fit_session_owner import FitSessionOwner
 from kindred.gui.workspace_tab_registry import WorkspaceTabRegistry
 from kindred.io.kin_archive_store import KinArchiveStore
-from kindred.io.paths import same_local_path
+from kindred.io.paths import file_error_text, same_local_path
 
 logger = logging.getLogger(__name__)
 
@@ -524,7 +524,10 @@ class ProjectController(QtCore.QObject):
             archive = self._archive_store.load(path)
         except Exception as exc:
             logger.exception("Project archive load failed")
-            self._show_error("Open Project Error", f"Could not open project:\n\n{exc}")
+            self._show_error(
+                "Open Project Error",
+                f"Could not open project:\n\n{file_error_text(exc, path)}",
+            )
             return False
         try:
             admitted_document = self._admit_incoming_document(archive.document)
@@ -735,7 +738,10 @@ class ProjectController(QtCore.QObject):
                 presentation,
             )
         except Exception as exc:
-            self._show_error("Save Error", f"Failed to save project:\n\n{exc}")
+            self._show_error(
+                "Save Error",
+                f"Failed to save project:\n\n{file_error_text(exc, absolute_path)}",
+            )
             return None
         self._session.mark_saved(
             absolute_path,

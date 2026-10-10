@@ -9,6 +9,7 @@ from threading import Event
 from PySide6 import QtCore, QtWidgets
 
 from kindred.core.exceptions import SimulationCancelled
+from kindred.scan.config import input_label
 from kindred.scan.runtime import run_scan
 from kindred.scan.sampling import PreparedScanDesign
 from kindred.io.paths import same_local_path
@@ -40,12 +41,12 @@ class _ScanThread(QtCore.QThread):
                 lines = ["Setup is feasible. No simulations were attempted."]
                 for key, intervals in design.effective_ranges.items():
                     if key in self.config.ranges:
-                        lines.append(f"{key}: " + " ∪ ".join(
+                        lines.append(f"{input_label(key)}: " + " ∪ ".join(
                             f"{'[' if i.include_lower else '('}{i.lower:g}, {i.upper:g}{']' if i.include_upper else ')'}"
                             for i in intervals))
                 for key, expression in design.derived.items():
-                    terms = " ".join(f"{float(value):+g} × {name}" for name, value in expression.terms.items())
-                    lines.append(f"Calculate {key} = {float(expression.constant):g} {terms}")
+                    terms = " ".join(f"{float(value):+g} × {input_label(name)}" for name, value in expression.terms.items())
+                    lines.append(f"Calculate {input_label(key)} = {float(expression.constant):g} {terms}")
                 self.result = "\n".join(lines)
         except SimulationCancelled:
             self.result = "Setup check canceled. No simulations were attempted."
@@ -78,6 +79,8 @@ class ChemicalSpaceScanOwner(QtCore.QObject):
             if self.exports.is_exporting or not self.gate.is_idle:
                 raise ValueError("Another computation or export is active.")
             capture = initial_capture()
+            if capture is None:
+                return
             if capture.prepared_dsl is None:
                 raise ValueError("Enter a valid mechanism before opening Chemical Space Scan.")
             from kindred.gui.widgets.chemical_space_scan import ChemicalSpaceScanDialog

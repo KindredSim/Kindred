@@ -25,11 +25,13 @@ def run_calculator_child(connection, mechanism, source) -> None:
                     (),
                 ))
             else:
+                context_text = (f"Query: {query}\nError: {result.copy_text}\nMechanism source:\n{source}" if result.failed
+                                else result.full_context_copy_text(context.authored_definitions))
                 connection.send((
                     query,
                     result.result_html,
-                    result.full_context_copy_text(context.authored_definitions),
-                    False,
+                    context_text,
+                    result.failed,
                     result.copy_text,
                     result.reuse_queries,
                 ))

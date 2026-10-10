@@ -14,12 +14,11 @@ from typing import Any, Callable, Dict, Iterable, Mapping, Optional
 
 import numpy as np
 
-from kindred.core.algebra.symbols import PROTECTED_NAMES
 from kindred.core.exceptions import (
     FitSimulationError,
     SimulationCancelled,
+    located,
 )
-from kindred.core.species import validate_concentration, validate_input_time_seconds
 from kindred.core.units import OrdinaryParameterDomainError
 from kindred.core.temperature import TemperatureSchedule
 from kindred.core.intervention_schedule import (
@@ -39,9 +38,6 @@ from kindred.core.simulator.solver_types import (
     freeze_retained_value,
 )
 from kindred.core.symbolic.jacobian_execution import SymbolicJacobianExecution
-from kindred.core.simulator.parameter_namespace import (
-    build_namespace_from_mechanism,
-)
 from kindred.core.simulator.parameter_coordinates import (
     ParameterTarget,
     build_parameter_target_map,
@@ -64,8 +60,6 @@ __all__ = [
     "build_simulation_execution_request",
     "prepare_simulation_run",
     "fit_simulation_error_from_preparation_error",
-    "prepare_preparation_failure",
-    "raise_unowned_request_parameter_values",
     "simulation_execution_requests_equal",
 ]
 
@@ -126,107 +120,12 @@ def simulation_execution_requests_equal(
     )
 
 
-def _classify_request_parameter_names(
-    *,
-    mechanism: Any,
-    parameter_overrides: Mapping[str, Any] | None,
-    unresolved_intervention_schedule: InterventionSchedule | None,
-    raw_values: dict[str, float],
-    mechanism_names: set[str],
-    schedule_names: set[str],
-    scalar_names: set[str],
-    unknown_names: set[str],
-    invalid_messages: dict[str, str],
-    parameter_target_map: Mapping[str, ParameterTarget],
-    requested_parameter_names: Iterable[str] | None = None,
-    declared_scalar_names: Iterable[str] | None = None,
-    derived_scalar_names: Iterable[str] | None = None,
-) -> None:
-    raw_values.update(
-        {
-            str(name): float(value)
-            for name, value in _coerce_parameter_override_items(parameter_overrides)
-        }
-    )
-    classification_names = list(raw_values)
-    for requested_name in requested_parameter_names or ():
-        name = str(requested_name or "").strip()
-        if name and name not in classification_names:
-            classification_names.append(name)
-    write_names = set(classification_names)
-    schedule_names.update(intervention_schedule_parameter_names(unresolved_intervention_schedule))
-    for schedule_name in schedule_names:
-        name = str(schedule_name or "").strip()
-        if name and name not in classification_names:
-            classification_names.append(name)
-    if not raw_values and not classification_names:
-        return
-    declared_scalar_names = {
-        str(name or "").strip()
-        for name in declared_scalar_names or ()
-        if str(name or "").strip()
-    }
-    derived_scalar_names = {
-        str(name or "").strip()
-        for name in derived_scalar_names or ()
-        if str(name or "").strip()
-    }
-    for name in classification_names:
-        if name in write_names and name in PROTECTED_NAMES:
-            invalid_messages[name] = (
-                f"protected symbol {name!r} cannot be overridden or fitted."
-            )
-            continue
-        claimed = False
-        target = parameter_target_map.get(name)
-        if target is not None:
-            # Classification owns namespace routing only.  Concrete target
-            # editability, locking, and scientific admission belong to the
-            # grouped coordinate owner at the actual write ingress.
-            mechanism_names.add(name)
-            continue
-        invalid_message = invalid_request_parameter_identifier_message(mechanism, name)
-        if invalid_message is not None:
-            invalid_messages[name] = invalid_message
-            continue
-        if name in raw_values and name in derived_scalar_names:
-            invalid_messages[name] = (
-                f"derived scalar parameter {name!r} cannot be used as direct runtime "
-                "or schedule override authority."
-            )
-            continue
-        if name in schedule_names:
-            claimed = True
-        if name in declared_scalar_names:
-            scalar_names.add(name)
-            claimed = True
-        if not claimed:
-            unknown_names.add(name)
-
-
-def raise_unowned_request_parameter_values(
-    *,
-    unknown_names: Iterable[str],
-    invalid_messages: Mapping[str, str],
-) -> None:
-    if invalid_messages:
-        first_name = sorted(invalid_messages)[0]
-        raise ValueError(invalid_messages[first_name])
-    unknown = sorted(str(name) for name in unknown_names)
-    if unknown:
-        raise ValueError(
-            "Unknown request parameter(s): "
-            + ", ".join(repr(name) for name in unknown)
-            + ". Request parameters must belong to the mechanism, schedule, scalar algebra, or initial-condition namespace."
-        )
-
-
 class SimulationPreparationError(RuntimeError):
     """
     Error raised when preparing a scientific execution request fails.
 
-    The GUI worker maps `stage` values to user-facing messages while keeping the
-    preparation logic in core.
+    Its text is the user-facing message; ``stage`` and ``details`` are
+    structured facts for reports.
     """
 
     def __init__(
@@ -338,6 +237,7 @@ def build_simulation_request_from_prepared_run(
         candidate_evaluation=candidate_evaluation,
         stop_observable_value=prepared_run.stop_observable_value,
         parameter_values_at_temperature=prepared_run.parameter_values_at_temperature,
+        intervention_lines=request.prepared_dsl.analysis.intervention_lines,
     )
     _raise_if_cancelled(cancellation_control)
     return result
@@ -357,72 +257,13 @@ class SimulationExecutionRequest:
     use_authored_stops: bool = False
 
     def __post_init__(self) -> None:
-        species_names = tuple(self.species_names)
-        if len(self.y0) != len(species_names):
-            raise ValueError("execution request y0 must contain one value per species.")
-        y0_values: list[float] = []
-        for name, value in zip(species_names, self.y0):
-            try:
-                y0_values.append(
-                    validate_concentration(value, field=f"initial value for {name!r}")
-                )
-            except (TypeError, ValueError) as exc:
-                raise ValueError(
-                    f"initial value for {name!r} must be an admitted concentration."
-                ) from exc
-        y0 = tuple(y0_values)
-        schedule = self.prepared_dsl.parameterized_intervention_schedule_for_binding()
-        contract = self.prepared_dsl.intervention_execution_contract()
-        if schedule is None and not isinstance(contract, InterventionExecutionContract):
-            raise TypeError("prepared DSL must retain one compiled intervention contract.")
-        if schedule is not None and not schedule.is_parameterized:
-            raise TypeError("prepared DSL declarative intervention state must be parameterized.")
-        if schedule is not None and contract is not None:
-            raise ValueError("prepared DSL intervention state cannot be both declarative and compiled.")
-        requested_names = tuple(str(name).strip() for name in self.requested_parameter_names)
-        if any(not name for name in requested_names) or len(requested_names) != len(set(requested_names)):
-            raise ValueError(
-                "execution request requested parameter names must be unique and nonblank."
-            )
-        if type(self.t_span) is not tuple or len(self.t_span) != 2:
-            raise TypeError("execution request t_span must be an exact pair.")
-        try:
-            t_span = (
-                validate_input_time_seconds(self.t_span[0], field="execution t_start"),
-                validate_input_time_seconds(self.t_span[1], field="execution t_end"),
-            )
-        except (TypeError, ValueError) as exc:
-            raise ValueError(
-                f"Invalid execution time span: {exc}"
-            ) from exc
-        if t_span[1] <= t_span[0]:
-            raise ValueError("execution t_end must be greater than t_start.")
-        if not isinstance(self.solver_config, _PreparedSolverConfig):
-            raise TypeError(
-                "execution request solver_config must be PreparedSolverConfig."
-            )
-        if self.parameter_overrides is not None and not isinstance(
-            self.parameter_overrides,
-            Mapping,
-        ):
-            raise TypeError(
-                "execution request parameter_overrides must be a mapping."
-            )
-        overrides: dict[str, float] | None = None
+        # Its producers pass admitted values: initial concentrations from the
+        # document or Slider and Scan admission (exact zeros for Fit), the span
+        # from Run settings or Scan and Fit admission, and override values from
+        # Slider, Scan or Fit candidate admission.  The request keeps its own
+        # copy of the caller's override mapping.
         if self.parameter_overrides is not None:
-            overrides = {}
-            for name, raw_value in self.parameter_overrides.items():
-                if not name.strip():
-                    raise ValueError("parameter value names must be nonblank.")
-                value = float(raw_value)
-                if not np.isfinite(value):
-                    raise ValueError(f"parameter value for {name!r} must be finite.")
-                overrides[name] = value
-        object.__setattr__(self, "species_names", species_names)
-        object.__setattr__(self, "y0", y0)
-        object.__setattr__(self, "requested_parameter_names", requested_names)
-        object.__setattr__(self, "t_span", t_span)
-        object.__setattr__(self, "parameter_overrides", overrides)
+            object.__setattr__(self, "parameter_overrides", dict(self.parameter_overrides))
 
 
 def _fresh_preparation_unresolved_intervention_schedule_for_request(
@@ -442,36 +283,20 @@ def _expanded_intervention_schedule_dependency_metadata(
     direct_metadata = intervention_schedule_parameter_dependencies(schedule)
     if not direct_metadata:
         return direct_metadata
-    admitted_dependencies = getattr(parameter_algebra_spec, "evaluation_dependencies", {})
-    if not isinstance(admitted_dependencies, Mapping):
-        admitted_dependencies = {}
+    # Admission rejected dependency cycles in this graph.
+    admitted_dependencies = parameter_algebra_spec.evaluation_dependencies
 
     expanded: dict[tuple[int, int | None, str], tuple[str, ...]] = {}
     for identity, raw_names in direct_metadata.items():
         leaves: set[str] = set()
-        visiting: set[str] = set()
 
-        def visit(raw_name: object) -> None:
-            name = str(raw_name or "").strip()
-            if name in visiting:
-                # Admission has already rejected cycles; this keeps the
-                # consumer fail-closed if supplied typed state is corrupted.
-                raise ValueError(
-                    "Parameter algebra dependency map contains a cycle."
-                )
+        def visit(name: str) -> None:
             dependencies = admitted_dependencies.get(name)
-            if dependencies is None:
+            if not dependencies:
                 leaves.add(name)
                 return
-            dependencies_tuple = tuple(str(item).strip() for item in dependencies)
-            if not dependencies_tuple:
-                leaves.add(name)
-                return
-            visiting.add(name)
-            for dependency in dependencies_tuple:
-                if dependency:
-                    visit(dependency)
-            visiting.remove(name)
+            for dependency in dependencies:
+                visit(dependency)
 
         for raw_name in raw_names:
             visit(raw_name)
@@ -548,7 +373,6 @@ def _schedule_parameters_deferred_to_prepared_request(
 def build_simulation_execution_request(
     *,
     prepared_dsl: PreparedDslRequestSet,
-    mechanism_source: Any,
     initial_values: Iterable[tuple[str, float]],
     t_span: tuple[float, float],
     solver_config: _PreparedSolverConfig,
@@ -557,24 +381,10 @@ def build_simulation_execution_request(
 ) -> SimulationExecutionRequest:
     """Capture, isolate, and compile one direct Run/Preview target."""
 
-    from kindred.core.mechanism_source import source_matches_analysis
-
-    if not source_matches_analysis(mechanism_source, prepared_dsl.analysis):
-        raise ValueError(
-            "prepared DSL source does not match the captured mechanism source."
-        )
-    initials: dict[str, float] = {}
-    for name, value in initial_values:
-        if name in initials:
-            raise ValueError(f"initial values contain duplicate name {name!r}.")
-        initials[name] = value
+    initials = dict(initial_values)
     species_names = prepared_dsl.analysis.species_names
-    if set(initials) != set(species_names):
-        raise ValueError(
-            "direct execution initial values must cover every accepted species exactly once."
-        )
-    # The request value admits every scientific domain; this capture adds only
-    # the source match, species coverage, and generated-grid realization.
+    # Every value arrives admitted, one per accepted species; this capture adds
+    # only generated-grid realization.
     request = SimulationExecutionRequest(
         prepared_dsl=prepared_dsl,
         species_names=species_names,
@@ -593,10 +403,6 @@ def build_simulation_execution_request(
     return request
 
 
-def prepare_preparation_failure(stage: str, message: object) -> SimulationPreparationError:
-    return SimulationPreparationError(str(stage or "unknown"), str(message or ""))
-
-
 def fit_simulation_error_from_preparation_error(
     exc: SimulationPreparationError,
     *,
@@ -613,101 +419,10 @@ def fit_simulation_error_from_preparation_error(
     )
 
 
-def _coerce_parameter_override_items(
-    parameter_overrides: Mapping[str, Any] | None,
-) -> list[tuple[str, float]]:
-    if not isinstance(parameter_overrides, Mapping) or not parameter_overrides:
-        return []
-    items: list[tuple[str, float]] = []
-    for raw_name, raw_value in parameter_overrides.items():
-        name = str(raw_name or "").strip()
-        if not name:
-            continue
-        try:
-            value = float(raw_value)
-        except (TypeError, ValueError, OverflowError) as exc:
-            raise SimulationPreparationError(
-                "parameter_overrides",
-                f"Parameter override {name!r} must be numeric.",
-                parameter_names=(name,),
-            ) from exc
-        if not np.isfinite(value):
-            raise SimulationPreparationError(
-                "parameter_overrides",
-                f"Parameter override {name!r} must be finite.",
-                parameter_names=(name,),
-            )
-        items.append((name, value))
-    return items
-
-
-def _parameter_algebra_scalar_authority_names(spec: Any) -> tuple[frozenset[str], frozenset[str]]:
-    dependencies = getattr(spec, "parameter_dependencies", None)
-    assignment_kind = getattr(spec, "parameter_assignment_kind", None)
-    if not isinstance(dependencies, Mapping) or not callable(assignment_kind):
-        return frozenset(), frozenset()
-    independent: set[str] = set()
-    derived: set[str] = set()
-    for raw_name in dependencies:
-        name = str(raw_name or "").strip()
-        if not name:
-            continue
-        try:
-            kind = str(assignment_kind(name))
-        except KeyError:
-            continue
-        if kind == "independent scalar":
-            independent.add(name)
-        elif kind == "derived scalar":
-            derived.add(name)
-    return frozenset(independent), frozenset(derived)
-
-
-def invalid_request_parameter_identifier_message(mechanism: Any, name: str) -> str | None:
-    name_s = str(name or "").strip()
-    if not name_s:
-        return None
-    namespace = build_namespace_from_mechanism(mechanism)
-    resolution = namespace.resolve(name_s)
-    if resolution.canonical_name is not None:
-        return None
-    if name_s == "K":
-        bare_step_key_suggestions = ("Keq1",)
-    else:
-        bare_step_key_suggestions = {
-            "k": ("k1",),
-            "kf": ("kf1",),
-            "kr": ("kr1",),
-            "keq": ("Keq1",),
-        }.get(name_s.lower())
-    if bare_step_key_suggestions is not None:
-        canonical_by_fold = {
-            str(canonical).casefold(): str(canonical)
-            for canonical in namespace.canonical_names
-        }
-        suggestions = tuple(
-            canonical
-            for suggestion in bare_step_key_suggestions
-            for canonical in [canonical_by_fold.get(suggestion.casefold())]
-            if canonical is not None
-        )
-        suggestion_text = ", ".join(suggestions)
-        suggestion_clause = (
-            f"Use canonical indexed parameter name(s): {suggestion_text}. "
-            if suggestion_text
-            else "Use an existing canonical indexed mechanism parameter, a schedule parameter, or a longer ordinary name. "
-        )
-        return (
-            f"{name_s!r} is not a valid mechanism parameter identifier. "
-            f"{suggestion_clause}"
-            "Bare step-local DSL keys are not runtime or fitting parameter names."
-        )
-    invalid_message = namespace.invalid_protected_indexed_identifier_message(name_s)
-    if invalid_message is None:
-        return None
-    return (
-        f"{invalid_message} "
-        "Protected indexed parameter classes cannot be used as ordinary runtime parameter names."
+def _independent_scalar_names(spec: Any) -> frozenset[str]:
+    return frozenset(
+        name for name in spec.parameter_dependencies
+        if spec.parameter_assignment_kind(name) == "independent scalar"
     )
 
 
@@ -718,15 +433,9 @@ def _apply_parameter_overrides_to_prepared_mechanism(
     raw_values: Mapping[str, float],
     mechanism_parameter_names: set[str],
     scalar_parameter_names: Iterable[str],
-    unknown_parameter_names: Iterable[str],
-    invalid_parameter_identifier_messages: Mapping[str, str],
     parameter_target_map: Mapping[str, ParameterTarget],
 ) -> None:
     """Apply slider-style values to one isolated execution mechanism."""
-    raise_unowned_request_parameter_values(
-        unknown_names=unknown_parameter_names,
-        invalid_messages=invalid_parameter_identifier_messages,
-    )
     mechanism_coordinate_values = {
         name: value
         for name, value in raw_values.items()
@@ -893,10 +602,7 @@ def prepare_simulation_run(
         raise SimulationPreparationError("analytic_jacobian", str(exc)) from exc
     _raise_if_cancelled(cancellation_control)
 
-    try:
-        initials_for_algebra = {sp: float(y0[idx]) for idx, sp in enumerate(species_names)}
-    except Exception as exc:
-        raise SimulationPreparationError("initials_for_algebra", str(exc)) from exc
+    initials_for_algebra = {sp: float(y0[idx]) for idx, sp in enumerate(species_names)}
 
     from kindred.core.simulation_algebra_context import runtime_algebra_symbol_names
     from kindred.core.temperature import temperature_at_execution_time
@@ -905,11 +611,13 @@ def prepare_simulation_run(
     stop_observable_value = None
     if intervention_execution is not None:
         from kindred.core.intervention_schedule import ObservableTriggerCondition, InterventionStopAction
-        targets = tuple(dict.fromkeys(
-            item.condition.name for item in intervention_execution.triggers
+        stops = tuple(
+            item for item in intervention_execution.triggers
             if isinstance(item.then, InterventionStopAction) and isinstance(item.condition, ObservableTriggerCondition)
-        ))
+        )
+        targets = tuple(dict.fromkeys(item.condition.name for item in stops))
         if targets:
+            from kindred.core.algebra.errors import AlgebraError
             from kindred.core.algebra.simulation_series import compiled_algebra_for_mechanism, prepare_algebra_stop_evaluator
             try:
                 compiled = compiled_algebra_for_mechanism(mechanism)
@@ -927,19 +635,18 @@ def prepare_simulation_run(
                     execution_request.t_span[0],
                 ), static_roots) if static_roots else {})
                 evaluator = prepare_algebra_stop_evaluator(
-                    compiled, target_names=targets,
+                    compiled,
                     species_names=tuple(species_names), initials=initials_for_algebra,
                     symbol_values=static, runtime_symbol_names=set(runtime_names),
                 )
+                for target in targets:
+                    evaluator.admit(target)
             except Exception as exc:
-                declarations = tuple(
-                    (item.declaration_ordinal, item.condition.name)
-                    for item in intervention_execution.triggers
-                    if isinstance(item.then, InterventionStopAction) and isinstance(item.condition, ObservableTriggerCondition)
-                )
-                context = " and ".join(f"declaration {ordinal + 1}, quantity {name!r}" for ordinal, name in declarations)
-                raise SimulationPreparationError("stopping_intervention", f"Stopping {context}: {exc}",
-                                                 details={"stop_declarations": declarations}) from exc
+                # The refusal states what failed on the line it read.
+                line, text = (exc.line, exc.line_text) if isinstance(exc, AlgebraError) else (None, None)
+                raise SimulationPreparationError(
+                    "stopping_intervention", located(f"A stop condition cannot watch this value: {exc}", line, text),
+                ) from exc
 
             def stop_observable_value(name: str, time: float, state: np.ndarray, temperature_K: float) -> float:
                 return evaluator.evaluate(name, time, state, symbols(temperature_K, target_roots[name]))
@@ -972,41 +679,26 @@ def _bind_request_parameter_overrides(
     unresolved_intervention_schedule: Any,
     parameter_target_map: Mapping[str, ParameterTarget],
 ) -> Mapping[str, float]:
-    """Apply owned coordinates and return admitted schedule-only bindings."""
+    """Apply owned coordinates and return admitted schedule-only bindings.
 
-    declared_scalar_names, derived_scalar_names = (
-        _parameter_algebra_scalar_authority_names(
-            parameter_algebra_spec,
-        )
-    )
-    raw_values: dict[str, float] = {}
-    mechanism_names: set[str] = set()
-    schedule_names: set[str] = set()
-    scalar_names: set[str] = set()
-    unknown_names: set[str] = set()
-    invalid_messages: dict[str, str] = {}
-    _classify_request_parameter_names(
-        mechanism=mechanism,
-        parameter_overrides=parameter_overrides,
-        unresolved_intervention_schedule=unresolved_intervention_schedule,
-        raw_values=raw_values,
-        mechanism_names=mechanism_names,
-        schedule_names=schedule_names,
-        scalar_names=scalar_names,
-        unknown_names=unknown_names,
-        invalid_messages=invalid_messages,
-        parameter_target_map=parameter_target_map,
-        declared_scalar_names=declared_scalar_names,
-        derived_scalar_names=derived_scalar_names,
-    )
+    Override names and values arrive admitted by Slider, Scan or Fit as
+    enumerated independent coordinates and scalars of this accepted mechanism.
+    """
+
+    declared_scalar_names = _independent_scalar_names(parameter_algebra_spec)
+    raw_values = dict(parameter_overrides or {})
+    schedule_names = set(intervention_schedule_parameter_names(unresolved_intervention_schedule))
+    mechanism_names = {name for name in raw_values if name in parameter_target_map}
+    scalar_names = {
+        name for name in raw_values
+        if name not in mechanism_names and name in declared_scalar_names
+    }
     _apply_parameter_overrides_to_prepared_mechanism(
         mechanism,
         parameter_algebra_spec=parameter_algebra_spec,
         raw_values=raw_values,
         mechanism_parameter_names=mechanism_names,
         scalar_parameter_names=scalar_names,
-        unknown_parameter_names=unknown_names,
-        invalid_parameter_identifier_messages=invalid_messages,
         parameter_target_map=parameter_target_map,
     )
     return {

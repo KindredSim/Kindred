@@ -60,13 +60,9 @@ def build_mechanism_from_ir(
 
         if is_equilibrium_step:
             eq_metadata = EquilibriumMetadataView(
-                dG_eq_J_per_mol=step.dG_eq_J_per_mol
-                if step.dG_eq_J_per_mol is not None
-                else None,
+                dG_eq_J_per_mol=step.dG_eq_J_per_mol,
                 Keq_input=step.Keq_input,
-                standard_conc_M=step.standard_conc_M
-                if step.standard_conc_M is not None
-                else None,
+                standard_conc_M=step.standard_conc_M,
             ).to_metadata()
 
             eq_index = len(mechanism.equilibria)
@@ -93,6 +89,8 @@ def build_mechanism_from_ir(
             "step_index": int(authored_step_no),
             "kind": "equilibrium" if is_equilibrium_step else "reaction",
             "context": context,
+            "line": step.line,
+            "line_text": step.line_text,
         }
         # Project only the parser-admitted physical source roles into the
         # established metadata map.  Canonical indexed rate coordinates stay

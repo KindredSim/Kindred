@@ -13,7 +13,6 @@ from __future__ import annotations
 
 from collections.abc import Iterator, Mapping
 from dataclasses import replace
-import math
 from typing import Any, TypeAlias
 
 from kindred.core.equilibrium_rate_authority import (
@@ -22,22 +21,15 @@ from kindred.core.equilibrium_rate_authority import (
     effective_reverse_rate_from_keq,
 )
 from kindred.core.kinetics import ArrheniusRateModel, ConstantRateModel, EyringRateModel, ForwardRateModel, forward_rate_at_temperature
-from kindred.core.mechanism_metadata import (
-    EquilibriumMetadataKeys,
-    MechanismMetadataView,
-)
+from kindred.core.mechanism_metadata import EquilibriumMetadataKeys
+from kindred.core.quantity_units import Unit
 from kindred.core.stoichiometry import directional_order_fraction
 from kindred.core.thermodynamics import concentration_Keq_from_deltaG_eq
 from kindred.core.simulator.dsl_build_input import source_coordinate_capabilities
 from kindred.core.simulator.errors import DSLError
 from kindred.core.simulator.parameter_namespace import build_namespace_from_mechanism
 from kindred.core.simulator.step_indexing import get_step_index_map
-from kindred.core.units import (
-    admit_arrhenius_prefactor,
-    admit_energy_j_per_mol,
-    admit_keq,
-    admit_rate,
-)
+from kindred.core.units import admit_role_value
 
 ParameterTarget: TypeAlias = tuple[
     str,
@@ -52,7 +44,7 @@ __all__ = [
     "build_parameter_target_map",
     "apply_mechanism_coordinate_values",
     "read_mechanism_parameter_values",
-    "admit_physical_coordinate_value",
+    "coordinate_allows_zero",
 ]
 
 
@@ -148,7 +140,6 @@ def bind_chemistry_readout(
         if kind == "reaction"
         else mechanism.equilibria[index]
     )
-    metadata = MechanismMetadataView.from_metadata(mechanism.metadata)
     source = dict(entry.get("source_coordinates") or {})
     number = entry["step_index"]
     if role in {"k", "kf"}:
@@ -166,15 +157,7 @@ def bind_chemistry_readout(
             for coordinate, field in fields.items():
                 if coordinate in source:
                     value = values[source[coordinate]]
-                    updates[field] = (
-                        int(value)
-                        if coordinate == "degeneracy"
-                        else admit_physical_coordinate_value(
-                            value,
-                            role=coordinate,
-                            field=source[coordinate],
-                        )
-                    )
+                    updates[field] = int(value) if coordinate == "degeneracy" else value
             return forward_rate_at_temperature(replace(model, **updates), values["T"])
 
         return forward
@@ -192,86 +175,45 @@ def bind_chemistry_readout(
         directional_order_fraction(step.stoich_back)
         - directional_order_fraction(step.stoich_forward)
     )
-    standard_conc = float(
-        step.metadata.get(
-            EquilibriumMetadataKeys.STANDARD_CONC_M, metadata.standard_conc_M
-        )
-    )
     return lambda: concentration_Keq_from_deltaG_eq(
-        admit_physical_coordinate_value(
-            values[source["dG_eq"]],
-            role="dG_eq",
-            field=source["dG_eq"],
-        ),
+        values[source["dG_eq"]],
         values["T"],
-        standard_conc,
+        step.metadata[EquilibriumMetadataKeys.STANDARD_CONC_M],
         delta_n,
     )
 
 
-def admit_physical_coordinate_value(
-    value: object,
-    *,
-    role: str,
-    field: str,
-) -> float:
-    """Admit a physical coordinate already expressed in scientific units."""
-    if role == "A":
-        return admit_arrhenius_prefactor(value, field=field)
-    if role == "kappa":
-        try:
-            numeric = float(value)
-        except (TypeError, ValueError, OverflowError) as exc:
-            raise ValueError(f"{field} must be positive and finite") from exc
-        if type(value) is bool or not math.isfinite(numeric) or numeric <= 0.0:
-            raise ValueError(f"{field} must be positive and finite")
-        return numeric
-    if role not in {"Ea", "dG_act", "dG_eq"}:
-        raise ValueError(f"Unsupported source coordinate role {role!r}")
-    return admit_energy_j_per_mol(value, field=field)
+def coordinate_allows_zero(mechanism: object, target: ParameterTarget) -> bool:
+    """Whether one writable coordinate admits exact zero in its concrete context.
+
+    Writable targets are a reaction's ``k``, an equilibrium's ``kf``, ``kr`` or
+    ``Keq``, or a continuous physical coordinate (A, Ea, dG_act, dG_eq, kappa).
+    """
+
+    route, kind, index, role, _entry = target
+    if route == "physical":
+        return role not in {"A", "kappa"}
+    if role == "Keq":
+        return False
+    if kind == "reaction":
+        return isinstance(mechanism.reactions[index].forward_model, ConstantRateModel)
+    equilibrium = mechanism.equilibria[index]
+    return (
+        role == "kf"
+        and isinstance(equilibrium.forward_model, ConstantRateModel)
+        and equilibrium.authority.kind == EquilibriumRateAuthorityKind.KEQ
+    )
 
 
 def _admit_coordinate_value(
-    mechanism: object,
-    name: str,
-    value: object,
-    *,
-    route: str,
-    kind: str,
-    index: int,
-    role: str,
+    mechanism: object, name: str, value: float, target: ParameterTarget, *, unit: str,
 ) -> float:
-    """Admit one value in its target's concrete scientific context."""
+    """Admit one scientific value in its target's concrete context, reporting in ``unit``."""
 
-    if route == "physical":
-        return admit_physical_coordinate_value(
-            value, role=role, field=name,
-        )
-
-    if role == "Keq":
-        return admit_keq(value, field=name)
-
-    if kind == "reaction" and role == "k":
-        reactions = mechanism.reactions
-        model = reactions[index].forward_model
-        return admit_rate(
-            value,
-            field=name,
-            allow_zero=isinstance(model, ConstantRateModel),
-        )
-
-    if kind == "equilibrium" and role in {"kf", "kr"}:
-        equilibria = mechanism.equilibria
-        equilibrium = equilibria[index]
-        model = equilibrium.forward_model
-        allow_zero = (
-            role == "kf"
-            and isinstance(model, ConstantRateModel)
-            and equilibrium.authority.kind == EquilibriumRateAuthorityKind.KEQ
-        )
-        return admit_rate(value, field=name, allow_zero=allow_zero)
-
-    raise ValueError(f"Unsupported parameter target for {name!r}")
+    return admit_role_value(
+        float(value), role=target[3], unit=unit,
+        allow_exact_zero=coordinate_allows_zero(mechanism, target), field=name,
+    )
 
 
 def _admit_coordinate_groups(
@@ -279,6 +221,7 @@ def _admit_coordinate_groups(
     values: Mapping[str, object],
     *,
     parameter_target_map: Mapping[str, ParameterTarget],
+    units: Mapping[str, Unit],
 ) -> dict[tuple[str, int], tuple[Mapping[str, object], dict[str, float]]]:
     grouped: dict[
         tuple[str, int],
@@ -305,13 +248,7 @@ def _admit_coordinate_groups(
             )
         try:
             admitted = _admit_coordinate_value(
-                mechanism,
-                name,
-                raw_value,
-                route=route,
-                kind=kind,
-                index=index,
-                role=role,
+                mechanism, name, raw_value, target, unit=units[name].symbol,
             )
         except (TypeError, ValueError, OverflowError) as exc:
             raise DSLError(str(exc)) from exc
@@ -443,13 +380,15 @@ def apply_mechanism_coordinate_values(
     values: Mapping[str, object],
     *,
     parameter_target_map: Mapping[str, ParameterTarget],
+    units: Mapping[str, Unit],
 ) -> None:
-    """Compose each complete changed step and publish it once."""
+    """Compose each complete changed step and publish it once; refusals report ``units``."""
 
     grouped = _admit_coordinate_groups(
         mechanism,
         values,
         parameter_target_map=parameter_target_map,
+        units=units,
     )
     if not grouped:
         return
@@ -514,6 +453,6 @@ def read_mechanism_parameter_values(
                 value = float(model.degeneracy)
             elif role == "dG_eq":
                 value = step.authority.dG_eq_J_per_mol
-        if value is not None and math.isfinite(value):
+        if value is not None:
             out[name] = float(value)
     return out

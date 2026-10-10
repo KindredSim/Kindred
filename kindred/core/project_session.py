@@ -72,8 +72,6 @@ class ProjectSession:
     def is_content_token_current(self, token: ProjectContentToken) -> bool:
         """Return whether ``token`` belongs to this session's current content."""
 
-        if not isinstance(token, ProjectContentToken):
-            raise TypeError("token must be ProjectContentToken.")
         return bool(
             token._owner is self._content_token_owner
             and token.revision == self._content_revision

@@ -83,10 +83,11 @@ def _algebra_cause(error: object) -> FactualCause:
     name = getattr(error, "name", None)
     if name is not None:
         details["name"] = str(name)
-    for source_name in ("line", "col", "line_text"):
-        value = getattr(error, source_name, None)
-        if value is not None:
-            details[source_name] = value
+    if getattr(error, "col", None) is not None:
+        details["col"] = error.col
+    # The authored statement is the cause's location, as for every other cause.
+    context = {key: getattr(error, key) for key in ("line", "line_text")
+               if getattr(error, key, None) is not None}
     code = getattr(error, "code", None)
     return FactualCause(
         domain="simulation",
@@ -94,6 +95,7 @@ def _algebra_cause(error: object) -> FactualCause:
         code=str(code) if code is not None else None,
         type=str(getattr(error, "exc_type", None) or type(error).__name__),
         message=str(getattr(error, "message", None) or str(error)),
+        context=context,
         details=details,
     )
 
@@ -140,17 +142,8 @@ def finalize_simulation_result(
     check_cancelled()
     result_time = result.t
     result_y = result.Y
-    base_species_names = [str(name) for name in species_names]
-    if (
-        not base_species_names
-        or any(not name.strip() for name in base_species_names)
-        or len(set(base_species_names)) != len(base_species_names)
-    ):
-        raise ValueError("base simulation species names must be nonblank and unique.")
-    if result_y.shape[0] != len(base_species_names):
-        raise ValueError(
-            "solver result matrix must align with base species and row time."
-        )
+    # The accepted mechanism's unique species name the solver's state rows.
+    base_species_names = list(species_names)
 
     finalized_series: dict[str, np.ndarray] = {
         name: result_y[index, :]
@@ -247,7 +240,7 @@ def finalize_simulation_result(
         if initializer.parameter is not None:
             parameter_units = {s.name: s.declared_unit for s in parameter_algebra_spec.parameter_block.lines}
             parameter_unit = units.get(initializer.parameter)
-            declared = parameter_units.get(initializer.parameter) if parameter_unit is not None and parameter_unit.compatible(CUBIC_METRE) else None
+            declared = parameter_units.get(initializer.parameter) if parameter_unit is not None else None
         presentation_units += (("Vessel volume", presentation_unit(CUBIC_METRE, declared)),)
     return SimulationResultValue(
         temperature_K=result.temperature_K,

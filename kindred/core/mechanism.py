@@ -7,7 +7,6 @@ are derived only by scientific consumers at their selected temperature.
 
 from __future__ import annotations
 
-import math
 from fractions import Fraction
 from collections import OrderedDict
 from collections.abc import Mapping as MappingABC
@@ -16,7 +15,6 @@ from typing import Any, Dict, Iterable, Iterator, List, Mapping, Optional
 
 from .kinetics import ForwardRateModel
 from .species import Species
-from .validation import validate_name
 from .equilibrium_rate_authority import (
     EquilibriumRateAuthority,
     normalize_equilibrium_rate_authority,
@@ -28,28 +26,6 @@ __all__ = [
     "Equilibrium",
     "Mechanism",
 ]
-
-
-class _SpeciesMap(OrderedDict):
-    def __init__(self, values: Mapping[str, Species] | Iterable[tuple[str, Species]] | None = None) -> None:
-        super().__init__()
-        if values is not None:
-            self.update(values)
-
-    def __setitem__(self, key: object, value: object) -> None:
-        name = validate_name(key)
-        if not isinstance(value, Species):
-            raise TypeError("mechanism species entries must be Species objects.")
-        if value.name != name:
-            raise ValueError("mechanism species map key must match Species.name.")
-        super().__setitem__(name, value)
-
-    def update(self, values: Mapping[str, Species] | Iterable[tuple[str, Species]] = (), **kwargs: Species) -> None:  # type: ignore[override]
-        items = values.items() if isinstance(values, MappingABC) else values
-        for key, value in items:
-            self[key] = value
-        for key, value in kwargs.items():
-            self[key] = value
 
 
 # --------------------------------- helpers ----------------------------------
@@ -96,33 +72,6 @@ def _freeze_value(value: Any) -> Any:
     return value
 
 
-def _ensure_species_exist(stoich: Mapping[str, float], declared: Mapping[str, Species]) -> None:
-    for n in stoich:
-        if n not in declared:
-            raise KeyError(f"unknown species in stoichiometry: {n!r}")
-
-
-def _validate_positive_side(side: Mapping[str, float] | None, *, label: str) -> Dict[str, float]:
-    """Validate a physical reaction side with positive coefficients."""
-    if side is None:
-        return {}
-    if not isinstance(side, Mapping):
-        raise TypeError(f"{label} must be a mapping of name -> positive coefficient")
-    out: Dict[str, float] = {}
-    for k, v in side.items():
-        n = validate_name(k)
-        if type(v) is bool:
-            raise TypeError(f"{label} coefficient for {n!r} must be a positive finite real")
-        try:
-            fv = float(v)
-        except (ValueError, TypeError, OverflowError) as e:
-            raise TypeError(f"{label} coefficient for {n!r} must be a positive finite real, got {v!r}") from e
-        if not math.isfinite(fv) or fv <= 0.0:
-            raise ValueError(f"{label} coefficient for {n!r} must be a positive finite real")
-        out[n] = fv
-    return out
-
-
 def _derive_net_stoich(reactants: Mapping[str, float], products: Mapping[str, float]) -> Dict[str, float]:
     net: Dict[str, Fraction] = {}
     for sp, coef in reactants.items():
@@ -135,35 +84,24 @@ def _derive_net_stoich(reactants: Mapping[str, float], products: Mapping[str, fl
 # --------------------------------- models -----------------------------------
 
 
+# Species names and positive finite coefficients arrive admitted by DSL parsing.
 @dataclass(frozen=True, kw_only=True)
 class Reaction:
     """Immutable physical sides, kinetic orders, and one forward model."""
     reactants: Mapping[str, float]
     products: Mapping[str, float]
     forward_model: ForwardRateModel
-    rate_orders: Mapping[str, float] | None = None
+    rate_orders: Mapping[str, float] = field(init=False)
     net_stoich: Mapping[str, float] = field(init=False)
 
     def __post_init__(self) -> None:
         # dataclass with frozen=True; use object.__setattr__
-        reactants = _validate_positive_side(self.reactants, label="reactants")
-        products = _validate_positive_side(self.products, label="products")
-        if not reactants and not products:
-            raise ValueError("reaction requires reactants or products")
-        rate_orders = (
-            dict(reactants)
-            if self.rate_orders is None
-            else _validate_positive_side(
-                self.rate_orders,
-                label="rate_orders",
-            )
-        )
-        net_stoich = _derive_net_stoich(reactants, products)
-        if not net_stoich:
-            raise ValueError("reaction net stoichiometry cannot be empty")
-        object.__setattr__(self, "reactants", FrozenDict(reactants))
-        object.__setattr__(self, "products", FrozenDict(products))
-        object.__setattr__(self, "rate_orders", FrozenDict(rate_orders))
+        # DSL parsing refuses a step whose sides are equal.
+        net_stoich = _derive_net_stoich(self.reactants, self.products)
+        object.__setattr__(self, "reactants", FrozenDict(self.reactants))
+        object.__setattr__(self, "products", FrozenDict(self.products))
+        # Kinetic orders are the reactant coefficients (mass action).
+        object.__setattr__(self, "rate_orders", self.reactants)
         object.__setattr__(self, "net_stoich", FrozenDict(net_stoich))
 
     def net_stoich_vector(self, species_order: Iterable[str]) -> List[float]:
@@ -184,26 +122,24 @@ class Equilibrium:
     authority: EquilibriumRateAuthority = field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
-        stoich_forward = _validate_positive_side(self.stoich_forward, label="stoich_forward")
-        stoich_back = _validate_positive_side(self.stoich_back, label="stoich_back")
-        if not stoich_forward:
+        if not self.stoich_forward:
             raise ValueError("stoich_forward cannot be empty")
-        if not stoich_back:
+        if not self.stoich_back:
             raise ValueError("stoich_back cannot be empty")
         object.__setattr__(
             self,
             "stoich_forward",
-            FrozenDict(stoich_forward),
+            FrozenDict(self.stoich_forward),
         )
         object.__setattr__(
             self,
             "stoich_back",
-            FrozenDict(stoich_back),
+            FrozenDict(self.stoich_back),
         )
         object.__setattr__(
             self,
             "net_stoich",
-            FrozenDict(_derive_net_stoich(stoich_forward, stoich_back)),
+            FrozenDict(_derive_net_stoich(self.stoich_forward, self.stoich_back)),
         )
         object.__setattr__(self, "metadata", FrozenDict(self.metadata))
         object.__setattr__(
@@ -236,7 +172,7 @@ class Mechanism:
     """
 
     def __init__(self) -> None:
-        self._species: "OrderedDict[str, Species]" = _SpeciesMap()
+        self._species: "OrderedDict[str, Species]" = OrderedDict()
         self.reactions: List[Reaction] = []
         self.equilibria: List[Equilibrium] = []
         self.metadata: Dict[str, Any] = {}
@@ -247,16 +183,14 @@ class Mechanism:
 
     @species.setter
     def species(self, value: Mapping[str, Species] | Iterable[tuple[str, Species]] | None) -> None:
-        self._species = _SpeciesMap(value)
+        self._species = OrderedDict(value)
 
     # ---------- species management ----------
 
     def add_species(self, name: str) -> Species:
-        n = validate_name(name)
-        if n in self.species:
-            raise ValueError(f"species {n!r} already exists")
-        sp = Species(n)
-        self.species[n] = sp
+        """Add one parser-admitted species name, declared once by its builder."""
+        sp = Species(name)
+        self.species[name] = sp
         return sp
 
     def species_names(self) -> List[str]:
@@ -270,25 +204,9 @@ class Mechanism:
         reactants: Mapping[str, float],
         products: Mapping[str, float],
         forward_model: ForwardRateModel,
-        rate_orders: Optional[Mapping[str, float]] = None,
     ) -> Reaction:
-        """
-        Add a reaction step.
-
-        Validates physical sides and ensures all species are declared.
-        """
-        r = _validate_positive_side(reactants, label="reactants")
-        p = _validate_positive_side(products, label="products")
-        ro = (
-            dict(r)
-            if rate_orders is None
-            else _validate_positive_side(rate_orders, label="rate_orders")
-        )
-        net = _derive_net_stoich(r, p)
-        if not net:
-            raise ValueError("reaction net stoichiometry cannot be empty")
-        _ensure_species_exist({**r, **p, **ro}, self.species)
-        rxn = Reaction(reactants=r, products=p, forward_model=forward_model, rate_orders=ro)
+        """Add a reaction step; its builder declared every species it names."""
+        rxn = Reaction(reactants=reactants, products=products, forward_model=forward_model)
         self.reactions.append(rxn)
         return rxn
 
@@ -302,13 +220,10 @@ class Mechanism:
         metadata: Optional[Mapping[str, Any]] = None,
     ) -> Equilibrium:
         """Add one admitted forward model and exactly one reverse authority."""
-        sf = _validate_positive_side(stoich_forward, label="stoich_forward")
-        sb = _validate_positive_side(stoich_back, label="stoich_back")
-        _ensure_species_exist({**sf, **sb}, self.species)
         meta = dict(metadata or {})
         meta.setdefault(EquilibriumMetadataKeys.STANDARD_CONC_M,
                         self.metadata.get(MechanismMetadataKeys.STANDARD_CONC_M, 1.0))
-        eq = Equilibrium(stoich_forward=sf, stoich_back=sb,
+        eq = Equilibrium(stoich_forward=stoich_forward, stoich_back=stoich_back,
                          forward_model=forward_model, kr=kr, metadata=meta)
         self.equilibria.append(eq)
         return eq

@@ -79,33 +79,65 @@ def ifelse(cond: Any, a: float, b: float) -> float:
 
 # ----------------------------- builtins catalog ------------------------------
 
+_COUNTS = {1: "one argument", 2: "two arguments", 3: "three arguments"}
+
+
 @dataclass(frozen=True)
 class BuiltinFunction:
+    """One builtin: its evaluation, unit rule and argument count (None: one or more).
+
+    The parser admits its argument count; a call outside its domain raises
+    ValueError stating that domain.
+    """
+
     evaluate: Callable[..., float]
     unit_rule: str
+    arity: int | None = 1
+
+    def admits(self, count: int) -> bool:
+        return count >= 1 if self.arity is None else count == self.arity
+
+    def expected(self) -> str:
+        return "at least one argument" if self.arity is None else _COUNTS[self.arity]
 
     def __call__(self, *args):
         return self.evaluate(*args)
 
 
+def _domain(function: Callable[..., float], domain: str) -> Callable[..., float]:
+    """A math-module function whose out-of-domain refusal states its domain, not Python's text."""
+
+    def evaluate(*args):
+        try:
+            return function(*(float(arg) for arg in args))
+        except ValueError:
+            raise ValueError(domain) from None
+
+    return evaluate
+
+
+_POSITIVE = "{} needs a positive argument."
+POWER_DOMAIN = "needs a nonnegative base for a fractional exponent and a nonzero base for a negative exponent."
+
+
 BUILTIN_FUNCTIONS: Dict[str, BuiltinFunction] = {
-    "sqrt": BuiltinFunction(lambda x: math.sqrt(float(x)), "sqrt"),
-    "ln": BuiltinFunction(lambda x: math.log(float(x)), "dimensionless"),
-    "log10": BuiltinFunction(lambda x: math.log10(float(x)), "dimensionless"),
-    "log1p": BuiltinFunction(lambda x: math.log1p(float(x)), "dimensionless"),
+    "sqrt": BuiltinFunction(_domain(math.sqrt, "sqrt needs a nonnegative argument."), "sqrt"),
+    "ln": BuiltinFunction(_domain(math.log, _POSITIVE.format("ln")), "dimensionless"),
+    "log10": BuiltinFunction(_domain(math.log10, _POSITIVE.format("log10")), "dimensionless"),
+    "log1p": BuiltinFunction(_domain(math.log1p, "log1p needs an argument greater than -1."), "dimensionless"),
     "exp": BuiltinFunction(lambda x: math.exp(float(x)), "dimensionless"),
     "expm1": BuiltinFunction(lambda x: math.expm1(float(x)), "dimensionless"),
     "sin": BuiltinFunction(lambda x: math.sin(float(x)), "dimensionless"),
     "cos": BuiltinFunction(lambda x: math.cos(float(x)), "dimensionless"),
     "tan": BuiltinFunction(lambda x: math.tan(float(x)), "dimensionless"),
     "abs": BuiltinFunction(lambda x: abs(float(x)), "preserve"),
-    "min": BuiltinFunction(lambda *xs: float(min(float(v) for v in xs)), "compatible"),
-    "max": BuiltinFunction(lambda *xs: float(max(float(v) for v in xs)), "compatible"),
-    "pow": BuiltinFunction(lambda x, y: float(math.pow(float(x), float(y))), "power"),
+    "min": BuiltinFunction(lambda *xs: float(min(float(v) for v in xs)), "compatible", None),
+    "max": BuiltinFunction(lambda *xs: float(max(float(v) for v in xs)), "compatible", None),
+    "pow": BuiltinFunction(_domain(math.pow, "pow " + POWER_DOMAIN), "power", 2),
     "erf": BuiltinFunction(lambda x: math.erf(float(x)), "dimensionless"),
     "heaviside": BuiltinFunction(heaviside, "predicate"),
-    "clip": BuiltinFunction(clip, "compatible"),
-    "ifelse": BuiltinFunction(ifelse, "branches"),
+    "clip": BuiltinFunction(clip, "compatible", 3),
+    "ifelse": BuiltinFunction(ifelse, "branches", 3),
 }
 
 # Protected names are read-only within Algebra

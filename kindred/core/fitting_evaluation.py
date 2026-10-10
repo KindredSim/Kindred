@@ -19,7 +19,6 @@ from kindred.core.exceptions import (
     FitCandidateDomainError,
     FitSimulationError,
     FittingCancelled,
-    KindredError,
     KineticRuntimeDomainError,
     SimulationCancelled,
 )
@@ -27,23 +26,14 @@ from kindred.core.analysis.fit_evaluation_outcome import (
     ScientificUnavailable,
 )
 from kindred.core.algebra.errors import AlgebraError
-from kindred.core.intervention_schedule_compiler import (
-    InterventionExecutionContract,
-)
-from kindred.core.intervention_schedule import coerce_intervention_schedule
 from kindred.core.simulation_preparation import (
     SimulationExecutionRequest,
     PreparedSimulationRun,
-    _classify_request_parameter_names,
-    _parameter_algebra_scalar_authority_names,
     fit_simulation_error_from_preparation_error,
-    prepare_preparation_failure,
-    raise_unowned_request_parameter_values,
     build_simulation_request_from_prepared_run,
     prepare_simulation_run,
     SimulationPreparationError,
 )
-from kindred.core.simulator.parameter_coordinates import build_parameter_target_map
 from kindred.core.simulation_preparation_stages import PreparedSolverConfig
 from kindred.core.result_repository import SimulationResultValue
 from kindred.core.simulation_result_finalization import finalize_simulation_result
@@ -193,10 +183,11 @@ def _known_candidate_unavailability(
 def _fatal_evaluation_error(
     exc: BaseException,
     *,
-    message: str,
     stage: str,
     failed_params: Optional[Dict[str, float]],
 ) -> FitSimulationError:
+    """A fatal Fit failure states its cause's sentence and authored line;
+    the evaluation stage stays a structured fact."""
     details = dict(getattr(exc, "details", None) or {})
     details.update(
         {
@@ -204,17 +195,8 @@ def _fatal_evaluation_error(
             "stage": str(stage),
         }
     )
-    source_message = str(getattr(exc, "message", None) or str(exc)).strip()
-    rendered_message = str(message or "").strip()
-    if source_message and source_message in rendered_message:
-        prefix, separator, _ = rendered_message.partition(":")
-        rendered_message = (
-            prefix.strip()
-            if separator
-            else rendered_message.replace(source_message, "").rstrip(" :")
-        )
     return FitSimulationError(
-        rendered_message or "Fitting evaluation failed.",
+        str(getattr(exc, "message", None) or exc).strip() or type(exc).__name__,
         failed_params=failed_params,
         details=details,
         context=getattr(exc, "context", None),
@@ -223,7 +205,11 @@ def _fatal_evaluation_error(
 
 @dataclass(frozen=True)
 class PreparedFittingExecutionContext:
-    """Typed fitting request and preparation metadata."""
+    """Typed fitting request and preparation metadata.
+
+    Its sole producer unions the admitted regular grid with the admitted
+    observation times inside the Fit span.
+    """
 
     prepared_run: PreparedSimulationRun
     requested_sample_times: tuple[float, ...]
@@ -231,39 +217,6 @@ class PreparedFittingExecutionContext:
     fit_sampling_identity: Mapping[str, object] = field(default_factory=dict)
     initial_prefix: str = "init:"
 
-    def __post_init__(self) -> None:
-        prepared_run = self.prepared_run
-        if not isinstance(prepared_run, PreparedSimulationRun):
-            raise TypeError(
-                "prepared_run must be PreparedSimulationRun."
-            )
-        object.__setattr__(self, "prepared_run", prepared_run)
-        sample_times = tuple(float(value) for value in self.requested_sample_times)
-        request = prepared_run.request
-        t_start, t_end = request.t_span
-        if (
-            not sample_times
-            or any(not np.isfinite(value) for value in sample_times)
-            or any(right <= left for left, right in zip(sample_times, sample_times[1:]))
-            or sample_times[0] < float(t_start)
-            or sample_times[-1] > float(t_end)
-        ):
-            raise ValueError(
-                "Fitting requested sample times must be finite, strictly "
-                "increasing, and inside the execution span."
-            )
-        object.__setattr__(self, "requested_sample_times", sample_times)
-        object.__setattr__(
-            self,
-            "fit_sampling_policy",
-            str(self.fit_sampling_policy or "fit_internal_regular_grid"),
-        )
-        object.__setattr__(
-            self,
-            "fit_sampling_identity",
-            dict(self.fit_sampling_identity or {}),
-        )
-        object.__setattr__(self, "initial_prefix", str(self.initial_prefix or "init:"))
 
 def prepare_fitting_execution_context(
     *,
@@ -271,7 +224,6 @@ def prepare_fitting_execution_context(
     param_names: List[str],
     t_start: float = 0.0,
     t_end: float,
-    num_points: int,
     objective_sample_times: Sequence[float],
     prepared_solver_config: PreparedSolverConfig,
     initial_prefix: str = "init:",
@@ -279,31 +231,17 @@ def prepare_fitting_execution_context(
     fit_sampling_identity: Mapping[str, object] | None = None,
     cancellation_control: SimulationCancellationControl | None = None,
 ) -> PreparedFittingExecutionContext:
-    """Prepare structured execution data for one per-dataset evaluator."""
+    """Prepare structured execution data for one per-dataset evaluator.
 
-    if not isinstance(prepared_dsl, PreparedDslRequestSet):
-        raise TypeError("prepared_dsl must be a PreparedDslRequestSet.")
-    if cancellation_control is not None and not isinstance(
-        cancellation_control,
-        SimulationCancellationControl,
-    ):
-        raise TypeError(
-            "cancellation_control must be a SimulationCancellationControl."
-        )
+    The Fit request admits the span, solver policy, regular grid and the
+    observation times inside the span; this builds one dataset's context.
+    """
+
     if (
         cancellation_control is not None
         and cancellation_control.cancel_requested()
     ):
         raise FittingCancelled()
-    t_start = float(t_start)
-    t_end = float(t_end)
-    if not np.isfinite(t_start) or not np.isfinite(t_end) or t_end <= t_start:
-        raise ValueError("Fitting execution requires finite t_end > t_start.")
-    if type(num_points) is not int:
-        raise TypeError("Fitting num_points must be an integer.")
-    if num_points < 2:
-        raise ValueError("Fitting num_points must be >= 2.")
-    grid_n = num_points
     initial_prefix = str(initial_prefix or "init:")
     mechanism_param_names = [
         str(name)
@@ -311,27 +249,9 @@ def prepare_fitting_execution_context(
         if str(name).strip()
         and not str(name).startswith(initial_prefix)
     ]
-    if not isinstance(prepared_solver_config, PreparedSolverConfig):
-        raise TypeError("Fit preparation requires a PreparedSolverConfig.")
-    if prepared_solver_config.grid != {"N": grid_n}:
-        raise ValueError(
-            "Fit prepared solver grid must exactly match requested sampling grid."
-        )
-    try:
-        # Validate and realize the regular N grid before any exact observation
-        # union/deduplication; an unrepresentable grid must fail prelaunch.
-        regular_grid = build_time_grid(t_start, t_end, prepared_solver_config.grid)
-    except (TypeError, ValueError) as exc:
-        raise ValueError("Fit regular grid cannot be realized on this time span.") from exc
+    # The Fit request realized this regular grid on this span before launch.
+    regular_grid = build_time_grid(t_start, t_end, prepared_solver_config.grid)
     objective_times = np.asarray(tuple(objective_sample_times), dtype=float).reshape(-1)
-    if (
-        np.any(~np.isfinite(objective_times))
-        or np.any(objective_times < t_start)
-        or np.any(objective_times > t_end)
-    ):
-        raise ValueError(
-            "Objective observation times must be finite and inside the fit span."
-        )
     requested_sample_times = tuple(
         float(value)
         for value in np.unique(
@@ -349,14 +269,9 @@ def prepare_fitting_execution_context(
         and cancellation_control.cancel_requested()
     ):
         raise FittingCancelled()
-    mechanism = prepared_dsl.accepted_mechanism_for_structure()
-    unresolved_intervention_schedule = coerce_intervention_schedule(
-        prepared_dsl.parameterized_intervention_schedule_for_binding()
-    )
-    if unresolved_intervention_schedule is not None:
-        unresolved_intervention_schedule = unresolved_intervention_schedule.without_stops()
-    parameter_algebra_spec = prepared_dsl.parameter_algebra_spec_for_execution()
-    species_names = tuple(mechanism.species_names())
+    # The candidate names are the Fit setup's parameters, enumerated from this
+    # prepared mechanism's writable coordinates and independent scalars.
+    species_names = tuple(prepared_dsl.accepted_mechanism_for_structure().species_names())
     # Every Fit initial concentration is a candidate or configured value
     # applied per evaluation; the retained request starts from exact zeros.
     y0 = np.zeros(len(species_names), dtype=float)
@@ -365,51 +280,6 @@ def prepare_fitting_execution_context(
         and cancellation_control.cancel_requested()
     ):
         raise FittingCancelled()
-    try:
-        parameter_target_map = build_parameter_target_map(mechanism)
-        declared_scalar_names, derived_scalar_names = _parameter_algebra_scalar_authority_names(
-            parameter_algebra_spec
-        )
-        requested_derived_scalar_names = sorted(
-            name for name in mechanism_param_names if str(name) in derived_scalar_names
-        )
-        if requested_derived_scalar_names:
-            raise SimulationPreparationError(
-                "parameter_binding",
-                "derived scalar parameter(s) cannot be used as fitting write authority: "
-                + ", ".join(repr(name) for name in requested_derived_scalar_names),
-            )
-        raw_values: dict[str, float] = {}
-        mechanism_names: set[str] = set()
-        schedule_names: set[str] = set()
-        scalar_names: set[str] = set()
-        unknown_names: set[str] = set()
-        invalid_messages: dict[str, str] = {}
-        _classify_request_parameter_names(
-            mechanism=mechanism,
-            parameter_overrides=None,
-            unresolved_intervention_schedule=unresolved_intervention_schedule,
-            raw_values=raw_values,
-            mechanism_names=mechanism_names,
-            schedule_names=schedule_names,
-            scalar_names=scalar_names,
-            unknown_names=unknown_names,
-            invalid_messages=invalid_messages,
-            parameter_target_map=parameter_target_map,
-            requested_parameter_names=mechanism_param_names,
-            declared_scalar_names=declared_scalar_names,
-            derived_scalar_names=derived_scalar_names,
-        )
-        raise_unowned_request_parameter_values(
-            unknown_names=unknown_names,
-            invalid_messages=invalid_messages,
-        )
-    except SimulationPreparationError as exc:
-        raise fit_simulation_error_from_preparation_error(exc) from exc
-    except ValueError as exc:
-        raise fit_simulation_error_from_preparation_error(
-            prepare_preparation_failure("parameter_binding", exc)
-        ) from exc
     execution_request = SimulationExecutionRequest(
         prepared_dsl=prepared_dsl,
         species_names=species_names,
@@ -451,13 +321,6 @@ class FittingEvaluator:
         self,
         cancellation_control: SimulationCancellationControl | None,
     ) -> "FittingEvaluator":
-        if cancellation_control is not None and not isinstance(
-            cancellation_control,
-            SimulationCancellationControl,
-        ):
-            raise TypeError(
-                "cancellation_control must be a SimulationCancellationControl."
-            )
         self._cancellation_control = cancellation_control
         return self
 
@@ -507,8 +370,6 @@ class FittingEvaluator:
                 failed_params=failed_params,
             )
             return unavailable
-        if not isinstance(result, SimulationResultValue):
-            raise TypeError("Fit evaluator must return a SimulationResultValue.")
         return result
 
     def _evaluate_series(
@@ -580,7 +441,6 @@ class FittingEvaluator:
                 raise
             raise _fatal_evaluation_error(
                 exc,
-                message=f"Structured fitting candidate preparation failed: {exc}",
                 failed_params=failed_params,
                 stage="candidate_preparation",
             ) from exc
@@ -610,23 +470,9 @@ class FittingEvaluator:
                 continue
             y0[idx] = float(value)
 
+        # Candidate preparation resolves and compiles every schedule (an empty
+        # one included) while its admitted target map is alive.
         intervention_execution = prepared_run.intervention_execution
-        if intervention_execution is None:
-            # Candidate preparation owns schedule resolution while its admitted
-            # target map is alive.  Reconstructing here would create a second
-            # authority and could silently run without an authored schedule.
-            if prepared_run.unresolved_intervention_schedule is not None:
-                raise FitSimulationError(
-                    "Candidate preparation left a parameterized intervention "
-                    "schedule unresolved.",
-                    failed_params=failed_params,
-                    details={"fatal": True, "stage": "candidate_preparation"},
-                )
-            raise FitSimulationError(
-                "Candidate preparation produced no intervention execution contract.",
-                failed_params=failed_params,
-                details={"fatal": True, "stage": "candidate_preparation"},
-            )
 
         symbolic_jacobian = prepared_run.symbolic_jacobian
 
@@ -644,25 +490,13 @@ class FittingEvaluator:
         )
         try:
             result = solve_ode(request)
-        except PhysicalDomainError:
-            raise
-        except FitSimulationError:
+        except (PhysicalDomainError, FitSimulationError, KineticRuntimeDomainError):
             raise
         except SimulationCancelled as exc:
             raise FittingCancelled() from exc
-        except KindredError as exc:
-            if isinstance(exc, KineticRuntimeDomainError):
-                raise
-            raise _fatal_evaluation_error(
-                exc,
-                message=f"Fitting simulation failed: {exc}",
-                stage="solver",
-                failed_params=failed_params,
-            ) from exc
         except Exception as exc:
             raise _fatal_evaluation_error(
                 exc,
-                message=f"Fitting simulation failed: {exc}",
                 stage="solver",
                 failed_params=failed_params,
             ) from exc
@@ -701,15 +535,8 @@ class FittingEvaluator:
                 raise
             raise _fatal_evaluation_error(
                 exc,
-                message=f"Fitting result finalization failed: {exc}",
                 stage="result_finalization",
                 failed_params=failed_params,
             ) from exc
-        result_execution = admitted.intervention_execution
-        if not isinstance(result_execution, InterventionExecutionContract):
-            raise FitSimulationError(
-                "Fitting result is missing its intervention execution contract.",
-                details={"fatal": True, "stage": "intervention_execution"},
-            )
         self._raise_if_cancel_requested()
         return admitted

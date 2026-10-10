@@ -16,6 +16,7 @@ from typing import Any, Mapping, Sequence
 
 from kindred.core import constants
 from kindred.core.algebra.errors import AlgebraError
+from kindred.core.exceptions import located
 from kindred.core.algebra.parser import BinaryNode, CallNode, IdentNode, NumberNode, SpeciesRefNode, UnaryNode
 from kindred.core.algebra.printer import expression_to_source
 from kindred.core.algebra.simulation_series import compiled_algebra_for_mechanism
@@ -27,7 +28,7 @@ from kindred.core.simulator.parameter_namespace import build_namespace_from_mech
 from .backend import require_sympy
 from .calculator_chemistry import build_calculator_chemistry_relations
 from .errors import UnsupportedSymbolicExpressionError
-from .jacobian import build_symbolic_mechanism_public_projection, classify_symbolic_jacobian_support
+from .jacobian import build_symbolic_mechanism_public_projection, fractional_order_step
 
 _FIXED_CONSTANTS = tuple(name for name in constants.__all__)
 _TRANSFORMS = frozenset({"simplify", "factor", "expand", "cancel"})
@@ -70,11 +71,13 @@ class _Relationships:
 class _UnresolvedProblem:
     problem: Any
     explanation: str
+    detail: str = ""
 
 
 @dataclass(frozen=True, slots=True)
 class _UnavailableDiagnostic:
     explanation: str
+    detail: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -120,6 +123,13 @@ def _entries(result):
 
 class _ConditionInapplicable(SymbolicCalculatorError):
     """A current condition is false, distinct from an operation failure."""
+
+
+def _unavailable(exc: Exception) -> _UnavailableDiagnostic:
+    """Kindred states the failure; library text stays a copied detail."""
+    if isinstance(exc, (SymbolicCalculatorError, AlgebraError)):
+        return _UnavailableDiagnostic(str(exc))
+    return _UnavailableDiagnostic("Calculator could not complete this calculation.", str(exc))
 
 
 def _fixed_constant_values():
@@ -345,7 +355,7 @@ def _substitute_value(value, replacements: Mapping[Any, Any], *, replacement_con
     except _ConditionInapplicable:
         raise
     except (SymbolicCalculatorError, ValueError, TypeError, ArithmeticError, NotImplementedError) as exc:
-        return _Value(_UnavailableDiagnostic(f"Operation is unavailable: {exc}"), conditions)
+        return _Value(_unavailable(exc), conditions)
 
 
 def _calculus_domain(variable: Any) -> Any:
@@ -360,28 +370,17 @@ def _relationship_domains(replacements):
     return tuple(sp.Contains(rhs, _calculus_domain(key), evaluate=False) for key, rhs in replacements.items())
 
 
-def _native_arithmetic(left: _Value, operator: str, right: _Value) -> Any:
-    sp = require_sympy()
-    lhs, rhs = left.expression, right.expression
-    matrix = isinstance(lhs, sp.MatrixBase) or isinstance(rhs, sp.MatrixBase)
-    if not matrix:
-        lhs, rhs = _scalar(left, "arithmetic"), _scalar(right, "arithmetic")
-    elif operator not in {"+", "-", "*"}:
-        raise SymbolicCalculatorError("Unsupported: matrix arithmetic supports +, - and *.")
-    try:
-        if operator == "+":
-            result = lhs + rhs
-        elif operator == "-":
-            result = lhs - rhs
-        elif operator == "*":
-            result = lhs * rhs
-        elif operator == "/":
-            result = lhs / rhs
-        else:
-            result = lhs ** rhs
-    except (TypeError, ValueError, sp.ShapeError) as exc:
-        raise SymbolicCalculatorError(f"Invalid input: incompatible arithmetic operands ({exc}).") from exc
-    return result
+def _native_arithmetic(lhs: Any, operator: str, rhs: Any) -> Any:
+    """Native scalar arithmetic; operands are admitted scalar expressions."""
+    if operator == "+":
+        return lhs + rhs
+    if operator == "-":
+        return lhs - rhs
+    if operator == "*":
+        return lhs * rhs
+    if operator == "/":
+        return lhs / rhs
+    return lhs ** rhs
 
 
 @dataclass(frozen=True, slots=True)
@@ -393,6 +392,7 @@ class SymbolicCalculatorResult:
     symbol_legend: Mapping[str, Sequence[str]]
     mechanism_source: str
     reuse_queries: tuple[tuple[str, str], ...] = ()
+    failed: bool = False
 
     def full_context_copy_text(self, authored_definitions: tuple[str, ...]) -> str:
         legend = [f"{kind}: {', '.join(names) or 'none'}" for kind, names in self.symbol_legend.items()]
@@ -427,10 +427,12 @@ def symbolic_calculator_available(mechanism: Any) -> tuple[bool, str]:
     """Cheap structural availability; expression construction is first-query work."""
     metadata = MechanismMetadataView.from_metadata(mechanism.metadata)
     if metadata.temperature_schedule is not None:
-        return False, "Symbolic calculator is unavailable for scheduled temperature."
-    support = classify_symbolic_jacobian_support(mechanism)
-    if not support.supported:
-        return False, str(support.reason)
+        return False, "Calculator does not support temperature schedules."
+    if not mechanism.species_names():
+        return False, "Calculator needs at least one reaction."
+    step = fractional_order_step(mechanism)
+    if step is not None:
+        return False, located("Calculator does not support fractional reaction orders.", step["line"], step["line_text"])
     namespace = build_namespace_from_mechanism(mechanism)
     spec = parameter_algebra_spec_from_mechanism(mechanism)
     reserved = set(namespace.canonical_names) | set(spec.param_assignment_names()) | set(spec.observable_names)
@@ -459,7 +461,7 @@ def build_calculator_context(mechanism: Any, *, mechanism_source: str) -> Calcul
     symbols["T"] = sp.Symbol("T", positive=True)
     symbols.update({f"initial({name})": sp.Symbol(f"initial({name})", real=True) for name in names})
     kinds = {name: spec.parameter_assignment_kind(name) for name in statements}
-    independent = {name for name, deps in graph.items() if not deps and kinds.get(name) != "mechanism-bound"}
+    independent = {name for name, deps in graph.items() if not deps and kinds.get(name) not in {"mechanism-bound", "derived scalar"}}
     coordinates = {symbol for name, symbol in symbols.items() if name not in graph and name not in _FIXED_CONSTANTS}
     coordinates.update(symbols[name] for name in independent)
     compiled = compiled_algebra_for_mechanism(mechanism)
@@ -503,7 +505,7 @@ def build_calculator_context(mechanism: Any, *, mechanism_source: str) -> Calcul
             except _ConditionInapplicable:
                 continue
             except (SymbolicCalculatorError, ValueError, TypeError, ArithmeticError, NotImplementedError) as exc:
-                result = _Value(_UnavailableDiagnostic(str(exc)))
+                result = _Value(_unavailable(exc))
             family |= isinstance(result, _Alternatives)
             answers.extend(_metadata(item, *args) for item in _entries(result))
         return _Alternatives(tuple(answers)) if family or not answers else answers[0]
@@ -520,13 +522,13 @@ def build_calculator_context(mechanism: Any, *, mechanism_source: str) -> Calcul
         try:
             values[name] = definition()
         except (SymbolicCalculatorError, AlgebraError, ValueError, TypeError, ArithmeticError, NotImplementedError) as exc:
-            values[name] = _Value(_UnavailableDiagnostic(str(exc)))
+            values[name] = _Value(_unavailable(exc))
     if compiled:
         for statement in compiled.block.statements_in_evaluation_order():
             try:
                 values[statement.name] = _translate_node(context, statement.expr)
             except (SymbolicCalculatorError, AlgebraError, ValueError, TypeError, ArithmeticError, NotImplementedError) as exc:
-                values[statement.name] = _Value(_UnavailableDiagnostic(str(exc)))
+                values[statement.name] = _Value(_unavailable(exc))
     projection = build_symbolic_mechanism_public_projection(mechanism, exact_stoichiometric_coefficients=True)
     canonical = {symbol: symbols[str(symbol)] for expression in projection.rhs_expressions for symbol in expression.free_symbols}
     def field(expression):
@@ -585,13 +587,12 @@ def _translate_node(context: CalculatorContext, node: Any) -> _Value:
         if node.name in _FUNCTIONS:
             return operation(node.name, tuple(lower(child) for child in node.args))
     raise SymbolicCalculatorError(
-        f"Unsupported: admitted {type(node).__name__}. Dynamic conditions and logical expressions are not Calculator mathematics."
+        "Unsupported: the Calculator does not handle comparisons, logical operators, or ifelse."
     )
 
 
-def _math_call(name: str, arguments: Sequence[_Value]) -> Any:
+def _math_call(name: str, args: Sequence[Any]) -> Any:
     sp = require_sympy()
-    args = [_scalar(arg, name) for arg in arguments]
     unary = {"sqrt": sp.sqrt, "ln": sp.log, "log": sp.log,
              "log10": lambda x: sp.log(x, 10), "log1p": lambda x: sp.log(1+x),
              "exp": sp.exp, "expm1": lambda x: sp.exp(x)-1,
@@ -657,7 +658,7 @@ def _differentiate(context: CalculatorContext, value: _Value, variable: Any | No
                 if not isinstance(value, _Alternatives):
                     raise
             except (SymbolicCalculatorError, ValueError, TypeError, ArithmeticError, NotImplementedError) as exc:
-                answers.append(_Value(_UnavailableDiagnostic(str(exc)), item.conditions))
+                answers.append(_Value(_unavailable(exc), item.conditions))
         value = _Alternatives(tuple(answers)) if family else answers[0]
     return value
 
@@ -698,12 +699,15 @@ def _kinetic_derivative(context, value):
                 if not family:
                     raise
             except (SymbolicCalculatorError, ValueError, TypeError, ArithmeticError, NotImplementedError) as exc:
-                answers.append(_Value(_UnavailableDiagnostic(str(exc)), conditions))
+                answers.append(_Value(_unavailable(exc), conditions))
     return _Alternatives(tuple(answers)) if family else answers[0]
 
 
 def _scalar_operation(name, args, *, conversion=None):
     """Consume source preparation, or prepare a new query's scalar operation."""
+    arithmetic = name in {"+", "-", "*", "/", "^", "**"}
+    for arg in args:
+        _scalar(arg, "arithmetic" if arithmetic else name)
     if conversion is None:
         exponent = None
         if name in {"^", "**", "pow"} and len(args) == 2 and args[1].expression.is_Rational:
@@ -711,10 +715,8 @@ def _scalar_operation(name, args, *, conversion=None):
         conversion = operation_units("ln" if name == "log" else name,
             tuple(arg.quantity if isinstance(arg.quantity, Unit) else None for arg in args),
             zeros=tuple(arg.expression == 0 and isinstance(arg.quantity, Unit) for arg in args), exponent=exponent)
-    working = tuple(replace(arg, expression=arg.expression * factor.symbolic())
-                    for arg, factor in zip(args, conversion.arguments))
-    expression = (_native_arithmetic(working[0], name, working[1])
-                  if name in {"+", "-", "*", "/", "^", "**"} else _math_call(name, working))
+    working = tuple(arg.expression * factor.symbolic() for arg, factor in zip(args, conversion.arguments))
+    expression = _native_arithmetic(working[0], name, working[1]) if arithmetic else _math_call(name, working)
     return expression * conversion.result.symbolic(), conversion.unit
 
 
@@ -921,7 +923,7 @@ def _solve(context: CalculatorContext, problem: _Value, coordinates: _Value, con
             parameters = equations.free_symbols - set(variables)
             candidates = []
             complete = False
-            explanation = "The native solver has not resolved these remaining possibilities."
+            explanation, detail = "Calculator could not resolve these remaining possibilities.", ""
             try:
                 try:
                     matrix, vector = sp.linear_eq_to_matrix(expressions, variables)
@@ -950,7 +952,7 @@ def _solve(context: CalculatorContext, problem: _Value, coordinates: _Value, con
                     complete = isinstance(native, sp.FiniteSet) and (constant_matrix or unique)
                 complete |= not parameters and (isinstance(native, sp.FiniteSet) or native == sp.S.EmptySet)
             except (NotImplementedError, ValueError, TypeError, ArithmeticError, KeyError) as exc:
-                explanation = f"Native solver could not resolve this system: {exc}."
+                detail = str(exc)
 
             answers = []
             for candidate in candidates:
@@ -981,7 +983,7 @@ def _solve(context: CalculatorContext, problem: _Value, coordinates: _Value, con
                     tuple(sp.Eq(x, y) for x, y in zip(variables, v.expression, strict=True)), v.conditions, variables) for v in answers))
                 remainder = sp.Complement(original, represented)
                 if remainder != sp.S.EmptySet:
-                    answers += _entries(_admit_native(_UnresolvedProblem(remainder, explanation)))
+                    answers += _entries(_admit_native(_UnresolvedProblem(remainder, explanation, detail)))
             return _Alternatives(tuple(answers))
         answers = []
         for branch in _entries(bound):
@@ -998,7 +1000,8 @@ def _solve(context: CalculatorContext, problem: _Value, coordinates: _Value, con
         for item in answers:
             payload = item.expression
             if isinstance(payload, _UnresolvedProblem):
-                problem = canonical(payload.problem)
+                # A condition set binds its variable, so restore bound names too.
+                problem = payload.problem.xreplace(aliases)
                 payload = payload if problem == payload.problem else replace(payload, problem=problem)
             elif not isinstance(payload, _UnavailableDiagnostic):
                 payload = _Relationships({key: canonical(rhs)
@@ -1010,7 +1013,7 @@ def _solve(context: CalculatorContext, problem: _Value, coordinates: _Value, con
     except _ConditionInapplicable:
         raise
     except (SymbolicCalculatorError, ValueError, TypeError, ArithmeticError, NotImplementedError) as exc:
-        return _Value(_UnavailableDiagnostic(f"Operation is unavailable: {exc}"), applicable)
+        return _Value(_unavailable(exc), applicable)
 
 
 def _evaluate_call(context: CalculatorContext, name: str, args: Sequence[_Value | _Alternatives], *, direction=None, conversion=None):
@@ -1060,7 +1063,7 @@ def _select(result, index):
                     continue
                 value = _Value(_UnavailableDiagnostic(str(exc)))
             except (SymbolicCalculatorError, ValueError, TypeError, ArithmeticError, NotImplementedError) as exc:
-                value = _Value(_UnavailableDiagnostic(str(exc)), conditions)
+                value = _Value(_unavailable(exc), conditions)
             values.append(_metadata(value, item))
         return _Alternatives(tuple(values)) if isinstance(result, _Alternatives) else values[0]
     selected, conditions = index, index.conditions
@@ -1079,7 +1082,7 @@ def _select(result, index):
     except _ConditionInapplicable as exc:
         return replace(selected, expression=_UnavailableDiagnostic(str(exc)), conditions=())
     except (SymbolicCalculatorError, ValueError, TypeError, ArithmeticError, NotImplementedError) as exc:
-        return replace(selected, expression=_UnavailableDiagnostic(f"Operation is unavailable: {exc}"), conditions=conditions)
+        return replace(selected, expression=_unavailable(exc), conditions=conditions)
 
 
 def _shape(value):
@@ -1163,7 +1166,7 @@ def _dispatch_call(context: CalculatorContext, name: str, args: Sequence[_Value]
                     extra = _shape(extra_args[0])
                     equations += tuple(extra) if isinstance(extra, sp.Tuple) else (extra,)
                 if failure is not None:
-                    return _Value(_UnresolvedProblem(sp.Tuple(*equations), failure.expression.explanation), applicable)
+                    return _Value(replace(failure.expression, problem=sp.Tuple(*equations)), applicable)
                 meanings = tuple(DIMENSIONLESS if _known_quantity(rate.quantity) else None for rate in rates)
                 if extra_args:
                     extra_units = extra_args[0].quantity
@@ -1187,7 +1190,7 @@ def _dispatch_call(context: CalculatorContext, name: str, args: Sequence[_Value]
                 unavailable = _unusable(rates)
                 expression = sp.ImmutableMatrix([_shape(rate) for rate in rates]) if unavailable is None or isinstance(unavailable.expression, _UnresolvedProblem) else None
                 answers.append(replace(unavailable, conditions=applicable) if expression is None else
-                               _Value(_UnresolvedProblem(expression, unavailable.expression.explanation) if unavailable else expression, applicable,
+                               _Value(replace(unavailable.expression, problem=expression) if unavailable else expression, applicable,
                                       quantity=tuple((rate.quantity,) for rate in rates)))
             return _Alternatives(tuple(answers)) if any(isinstance(rate, _Alternatives) for rate in context.rhs) else answers[0]
         quantity = None
@@ -1244,19 +1247,20 @@ def _dispatch_call(context: CalculatorContext, name: str, args: Sequence[_Value]
                 count(2, 3)
                 expression = args[0].expression
                 indices = tuple(_integer(arg, name) for arg in args[1:])
-                try:
-                    if len(indices) == 2 and isinstance(expression, sp.MatrixBase):
-                        quantity = _matrix_cell(args[0], *indices).quantity
-                        return expression[indices]
-                    if len(indices) == 1 and isinstance(expression, (sp.Tuple, sp.MatrixBase)):
-                        units = args[0].quantity
-                        if isinstance(units, tuple):
-                            units = tuple(cell for row in units for cell in row) if isinstance(expression, sp.MatrixBase) else units
-                            quantity = units[indices[0]]
-                        return expression[indices[0]]
-                    raise TypeError("unsupported indexed object")
-                except (IndexError, TypeError) as exc:
-                    raise SymbolicCalculatorError(f"Invalid input: {name}: {exc}.") from exc
+                if len(indices) == 2 and isinstance(expression, sp.MatrixBase):
+                    if indices[0] >= expression.rows or indices[1] >= expression.cols:
+                        raise SymbolicCalculatorError(f"Invalid input: at index ({indices[0]}, {indices[1]}) is out of range. Indices start at 0, and this matrix has {expression.rows} rows and {expression.cols} columns.")
+                    quantity = _matrix_cell(args[0], *indices).quantity
+                    return expression[indices]
+                if len(indices) == 1 and isinstance(expression, (sp.Tuple, sp.MatrixBase)):
+                    if indices[0] >= len(expression):
+                        raise SymbolicCalculatorError(f"Invalid input: at index {indices[0]} is out of range. Indices start at 0, and this {'matrix' if isinstance(expression, sp.MatrixBase) else 'tuple'} has {len(expression)} entries.")
+                    units = args[0].quantity
+                    if isinstance(units, tuple):
+                        units = tuple(cell for row in units for cell in row) if isinstance(expression, sp.MatrixBase) else units
+                        quantity = units[indices[0]]
+                    return expression[indices[0]]
+                raise SymbolicCalculatorError("Invalid input: at takes a tuple or matrix with one index, or a matrix with two indices.")
             if name in {"transpose", "det"}:
                 count(1)
                 matrix = args[0].expression
@@ -1275,7 +1279,7 @@ def _dispatch_call(context: CalculatorContext, name: str, args: Sequence[_Value]
                 def remove(x):
                     result = x.removeO()
                     if result.has(sp.Order):
-                        raise SymbolicCalculatorError("Unsupported: native remove_order does not remove this nested remainder. Apply it to the series before nesting.")
+                        raise SymbolicCalculatorError("Unsupported: remove_order cannot remove an order term inside another expression. Apply remove_order to each series first.")
                     return result
                 return _map(args[0].expression, remove)
             raise SymbolicCalculatorError(f"Unsupported calculator operation {name!r}.")
@@ -1287,7 +1291,7 @@ def _dispatch_call(context: CalculatorContext, name: str, args: Sequence[_Value]
             raise
         notices = ("Series order term explicitly removed. The result is truncated.",) if name == "remove_order" and args[0].expression.has(sp.Order) else ()
         if unresolved is not None:
-            return _Value(_UnresolvedProblem(expression, unresolved.expression.explanation), conditions)
+            return _Value(replace(unresolved.expression, problem=expression), conditions)
         if args and expression == args[0].expression:
             return replace(args[0], quantity=quantity, conditions=conditions, notices=(*args[0].notices, *notices))
         if structural or name in {"at", "transpose", "initial"}:
@@ -1298,7 +1302,7 @@ def _dispatch_call(context: CalculatorContext, name: str, args: Sequence[_Value]
     except (SymbolicCalculatorError, AlgebraError, ValueError, TypeError, ArithmeticError, NotImplementedError) as exc:
         if name == "subs":
             conditions = _conditions(args[0].conditions, additional=(c for value in args[1:] for c in value.conditions)) if args else ()
-        return _Value(_UnavailableDiagnostic(f"Operation is unavailable: {exc}"), conditions)
+        return _Value(_unavailable(exc), conditions)
 
 
 def _conditions_cover_interval(conditions, variable, lower, upper):
@@ -1369,7 +1373,9 @@ def _calculus_call(context: CalculatorContext, name: str, args: Sequence[_Value]
                 fixed = _fixed_constant_values().keys()
                 if dependent and ((lower.free_symbols | upper.free_symbols) - fixed
                                   or any(c.free_symbols - {variable} - fixed for c in dependent)):
-                    raise SymbolicCalculatorError("Unsupported: definite integration with active answer conditions requires coordinate-free bounds and conditions involving only the integration coordinate. Substitute other coordinates first.")
+                    raise SymbolicCalculatorError(
+                        f"Unsupported: for a result with conditions, the integration limits must be numbers and "
+                        f"its conditions can contain only {variable}. Substitute values for the other names first.")
                 if dependent and _conditions_cover_interval(dependent, variable, lower, upper):
                     dependent = ()
                 restricted = bool(dependent)
@@ -1400,22 +1406,22 @@ def _calculus_call(context: CalculatorContext, name: str, args: Sequence[_Value]
                 notices = (f"Local series about {_render(variable)}={_render(point)}, direction {direction}.",)
             if name == "series" and dependent:
                 if any(item.has(sp.nan) for item in result.atoms(*operators)):
-                    raise SymbolicCalculatorError("Unsupported: stock SymPy retained the condition-restricted operator. Calculator cannot publish that temporary restriction as an ordinary expression.")
+                    raise SymbolicCalculatorError("Unsupported: Calculator cannot complete this calculation under the conditions of its input.")
 
         def classify(body, restrictions, conditional):
             if restricted:
                 current = sp.Tuple(body, *restrictions)
                 if current.atoms(*operators) - inherited or bound in current.free_symbols:
-                    raise SymbolicCalculatorError("Unsupported: stock SymPy retained the condition-restricted operator. Calculator cannot publish that temporary restriction as an ordinary expression.")
+                    raise SymbolicCalculatorError("Unsupported: Calculator cannot complete this calculation under the conditions of its input.")
             if conditional and body.atoms(*operators) - inherited:
-                return _UnresolvedProblem(body, "The native conditional fallback remains unresolved.")
+                return _UnresolvedProblem(body, "Calculator could not evaluate this case under its conditions.")
             return body
 
         return _with_quantity(_admit_native(result, independent, notices=notices, classify=classify), quantity)
     except _ConditionInapplicable:
         raise
     except (SymbolicCalculatorError, ValueError, TypeError, ArithmeticError, NotImplementedError) as exc:
-        return _Value(_UnavailableDiagnostic(f"Operation is unavailable: {exc}"), applicable, notices)
+        return _Value(_unavailable(exc), applicable, notices)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1425,12 +1431,11 @@ class _Token:
 
 
 def _validate_numeric_literal(literal: str) -> None:
-    literal = literal.replace("_", "")
     try:
-        exact = Decimal(literal)
-        value = float(literal)
+        exact = Decimal(literal.replace("_", ""))
+        value = float(literal.replace("_", ""))
     except (InvalidOperation, ValueError, OverflowError) as exc:
-        raise SymbolicCalculatorError("Invalid input: numeric literal.") from exc
+        raise SymbolicCalculatorError(f"Invalid input: {literal} is not a number.") from exc
     if not math.isfinite(value):
         raise SymbolicCalculatorError("Invalid input: numeric literal exceeds finite query ingress.")
     if exact != 0 and value == 0:
@@ -1481,7 +1486,7 @@ class _CalculatorExpressionParser:
                 tokens.append(_Token(char, char))
                 i += 1
             else:
-                raise SymbolicCalculatorError(f"Invalid input: unexpected token {char!r}.")
+                raise SymbolicCalculatorError(f"Invalid input: {char} cannot be used in a query.")
         return [*tokens, _Token("EOF", "")]
 
     def at(self, kind):
@@ -1490,7 +1495,9 @@ class _CalculatorExpressionParser:
     def take(self, kind=None):
         token = self.tokens[self.index]
         if kind is not None and token.kind != kind:
-            raise SymbolicCalculatorError(f"Invalid input: expected {kind}, got {token.text or 'end of query'!r}.")
+            expected = "a value" if kind == "IDENT" else "the end of the query" if kind == "EOF" else f"'{kind}'"
+            got = "the end of the query" if token.kind == "EOF" else f"'{token.text}'"
+            raise SymbolicCalculatorError(f"Invalid input: expected {expected}, got {got}.")
         self.index += 1
         return token.text
 
@@ -1609,7 +1616,7 @@ class _CalculatorExpressionParser:
             inner_tokens = self.tokens[inner_start:self.index]
             self.take(")")
             self.take("/")
-            denominator = self.take("IDENT")
+            denominator = self.take() if self.at("IDENT") else ""
             if denominator == "dt":
                 return _evaluate_call(self.context, "dt", (inner,))
             legacy_rate = (len(inner_tokens) == 3 and inner_tokens[0].text.startswith("d")
@@ -1631,14 +1638,14 @@ class _CalculatorExpressionParser:
                 return _evaluate_call(self.context, "simplify", (result,))
         if self.at("("):
             if name not in _OPERATIONS:
-                raise SymbolicCalculatorError(f"Unsupported calculator operation {name!r}.")
+                raise SymbolicCalculatorError(f"Unsupported: {name} is not a Calculator operation.")
             self.take()
             args, spans = [], []
             direction = None
             if not self.at(")"):
                 while True:
                     if name == "limit" and len(args) == 3 or name == "series" and len(args) == 4:
-                        direction = self.take("IDENT")
+                        direction = self.take() if self.at("IDENT") else ""
                         if direction not in {"left", "right"}:
                             raise SymbolicCalculatorError("Invalid input: direction is left or right.")
                         break
@@ -1785,7 +1792,7 @@ def _admit_native(expression, conditions=(), *, notices=(), classify=None):
         values = tuple(materialize(child, choices, check=check) for child in children)
         result = rebuild(values)
         if check and (result is sp.nan or result is sp.zoo):
-            raise SymbolicCalculatorError("Undefined: native mathematics produced an undefined value.")
+            raise SymbolicCalculatorError("Undefined: this expression has no defined value.")
         return result
 
     unchanged = tuple(c for c in conditions if conditional(c, {}) is None)
@@ -1821,7 +1828,7 @@ def _admit_native(expression, conditions=(), *, notices=(), classify=None):
         except _ConditionInapplicable:
             continue
         except (SymbolicCalculatorError, ValueError, TypeError, ArithmeticError, NotImplementedError) as exc:
-            body = _UnavailableDiagnostic(str(exc))
+            body = _unavailable(exc)
         answers.append(_Value(body, restrictions, notices))
     return _Alternatives(tuple(answers)) if branched else answers[0]
 
@@ -1856,7 +1863,7 @@ def evaluate_symbolic_query(context: CalculatorContext, query: str) -> SymbolicC
     except SymbolicCalculatorError:
         raise
     except (ValueError, TypeError, ArithmeticError, NotImplementedError, AttributeError, RecursionError) as exc:
-        raise SymbolicCalculatorError(f"Unsupported or undefined mathematics: {exc}") from exc
+        return _package_result(context, query, _Value(_unavailable(exc)))
 
 
 def _package_result(context: CalculatorContext, query: str, result) -> SymbolicCalculatorResult:
@@ -1872,13 +1879,15 @@ def _package_result(context: CalculatorContext, query: str, result) -> SymbolicC
 
     for value in entries:
         payload = value.expression
-        if isinstance(payload, _UnavailableDiagnostic):
-            append("Unavailable expression (not selectable):")
+        if isinstance(payload, (_UnavailableDiagnostic, _UnresolvedProblem)):
+            if isinstance(payload, _UnavailableDiagnostic):
+                append("Unavailable expression (not selectable):")
+            else:
+                append("Unresolved alternative (not a selectable solved answer):")
+                append(_render(payload.problem), _pretty_render(payload.problem))
             append(payload.explanation)
-        elif isinstance(payload, _UnresolvedProblem):
-            append("Unresolved alternative (not a selectable solved answer):")
-            append(_render(payload.problem), _pretty_render(payload.problem))
-            append(payload.explanation)
+            if payload.detail:
+                lines.append("Detail: " + " ".join(payload.detail.split()))
         else:
             label = _render(payload)
             index = len(choices) + 1
@@ -1910,8 +1919,6 @@ def _package_result(context: CalculatorContext, query: str, result) -> SymbolicC
     if family:
         append("Complete query (all answers and unresolved possibilities): " + query)
     copy_text = "\n".join(lines).rstrip()
-    if entries and all(isinstance(v.expression, _UnavailableDiagnostic) for v in entries):
-        raise SymbolicCalculatorError(copy_text)
     if expression == "odes()":
         rows_text = "Rows: " + ", ".join(f"d{name}/dt" for name in context.species_names)
         display_html_lines.append(escape(rows_text))
@@ -1920,11 +1927,11 @@ def _package_result(context: CalculatorContext, query: str, result) -> SymbolicC
         "Coordinates are real. T is positive and fixed in time unless explicit expression dependence is supplied.",
         "Definitions are prepared before calculation. Independent parameters and initial concentrations are fixed in time, and partial differentiates prepared mathematics.",
         "Independent inputs remain symbolic. Supply concrete values explicitly with subs. Accepted defaults are not Calculator inputs.",
-        "Physical constants retain their names and owned values. Approximation does not increase source precision.",
-        "Special functions, conditional/unresolved sets, and some root/order forms may not round-trip as direct input. Nested operation composition remains supported.",
-        "Stock SymPy 1.14.0 supplies mathematical algorithms. Its known parameter-dependent rational integration bug (sympy/sympy#28596) is not corrected or independently verified by Kindred.",
-        "Ordinary algebra and formal calculus use native CAS semantics, without historical operand domains. A simplified result does not certify the domain of the original expression or the regularity of a parameterized integral.",
-        "Actual answer conditions, unavailable cases and unresolved alternatives are retained. Active-condition definite integrals require coordinate-free bounds and no other condition parameters. Active-condition limits remain unsupported. Series retain direction and order, not inferred neighborhood conditions.",
+        "Physical constants keep their names and the values Kindred uses. Approximation does not add precision beyond the source.",
+        "Special functions, conditional or unresolved sets, and some root or order forms may not be accepted back as typed input. Nested operations still work.",
+        "Calculations use SymPy 1.14.0. Its known error when integrating rational functions that contain parameters (sympy/sympy#28596) is not corrected or checked by Kindred.",
+        "Algebra and calculus follow the expression as written. A simplified result does not show where the original expression is defined, or that an integral with parameters is well behaved.",
+        "Answer conditions, unavailable cases, and unresolved alternatives are kept. A definite integral of a result with conditions needs limits and conditions that contain only the integration coordinate. Limits of a result with conditions on its coordinate are not supported. Series keep their direction and order, not conditions on the neighborhood.",
     )
     return SymbolicCalculatorResult(
         query=query,
@@ -1938,4 +1945,5 @@ def _package_result(context: CalculatorContext, query: str, result) -> SymbolicC
          "Initial coordinates": tuple(f"initial({name})" for name in context.species_names)},
         mechanism_source=context.mechanism_source,
         reuse_queries=tuple(choices),
+        failed=bool(entries) and all(isinstance(v.expression, _UnavailableDiagnostic) for v in entries),
     )

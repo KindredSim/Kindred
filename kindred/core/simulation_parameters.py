@@ -2,29 +2,21 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-import math
-from typing import Literal, Mapping
+from typing import Iterable, Mapping
 
-from kindred.core.equilibrium_rate_authority import EquilibriumRateAuthorityKind
+from kindred.core.algebra.parser import _iter_identifiers
+from kindred.core.intervention_schedule import ObservableTriggerCondition, intervention_schedule_parameter_dependencies
 from kindred.core.kinetics import ArrheniusRateModel, EyringRateModel, ForwardRateModel, forward_rate_family
-from kindred.core.mechanism_metadata import (
-    MechanismMetadataView,
-)
 from kindred.core.simulator.dsl_parse import PreparedDslRequestSet
 from kindred.core.simulator.parameter_algebra import (
     apply_parameter_algebra_spec_to_mechanism,
 )
-from kindred.core.simulator.parameter_coordinates import build_parameter_target_map
+from kindred.core.simulator.parameter_coordinates import build_parameter_target_map, coordinate_allows_zero
 from kindred.core.simulator.parameter_namespace import build_namespace_from_mechanism
 from kindred.core.simulator.dsl_build_input import source_coordinate_capabilities
 from kindred.core.simulator.step_indexing import get_step_index_map
 from kindred.core.quantity_units import convert_value
-from kindred.core.units import (
-    UnitsModel,
-)
-
-SimulationParameterScientificCategory = Literal["rate", "equilibrium_constant", "finite_scalar"]
-
+from kindred.core.units import input_unit_bounds, role_domain
 
 @dataclass(frozen=True, slots=True)
 class SimulationParameter:
@@ -32,10 +24,24 @@ class SimulationParameter:
     value: float
     family: str
     role: str
-    scientific_category: SimulationParameterScientificCategory
     allow_exact_zero: bool
     unit: str = "1"
     context: str = ""
+
+    @property
+    def domain(self) -> tuple[float, float]:
+        """Admissible magnitudes in ``unit``: the scientific domain projected inward.
+
+        A zero floor is open; exact zero is ``allow_exact_zero``.
+        """
+        low, high, _signed = role_domain(self.role)
+        return input_unit_bounds(self.unit, low, high)
+
+    @property
+    def signed(self) -> bool:
+        """Whether the mirrored negative magnitudes are admissible too."""
+        return role_domain(self.role)[2]
+
 
 
 def enumerate_simulation_parameters(
@@ -45,7 +51,6 @@ def enumerate_simulation_parameters(
 
     mechanism = prepared_dsl.mutable_mechanism_shell()
     metadata = mechanism.metadata
-    metadata_view = MechanismMetadataView.from_metadata(metadata)
     parameter_spec = prepared_dsl.parameter_algebra_spec_for_execution()
     parameter_target_map = build_parameter_target_map(mechanism)
     apply_parameter_algebra_spec_to_mechanism(
@@ -58,7 +63,22 @@ def enumerate_simulation_parameters(
     step_by_index: dict[int, Mapping[str, object]] = {}
     for entry in get_step_index_map(mechanism):
         step_by_index[int(entry["step_index"])] = entry
-    units = {name: unit.symbol for name, unit in parameter_spec.input_units}
+    # Every coordinate is reported in its input unit: the param line's unit
+    # for a mechanism input, energy= for energies, otherwise scientific units.
+    input_units = dict(parameter_spec.input_units)
+    scientific_units = dict(parameter_spec.quantity_units)
+    units = {name: unit.symbol for name, unit in input_units.items()}
+
+    def input_value(name: str, value: float) -> float:
+        """The shortest input-unit number that converts back to ``value`` exactly."""
+        source, target = scientific_units[name], input_units[name]
+        converted = convert_value(float(value), source, target)
+        for digits in range(1, 17):
+            shortest = float(f"{converted:.{digits}g}")
+            if convert_value(shortest, target, source) == value:
+                return shortest
+        return converted
+
     parameter_assignment_names = parameter_spec.param_assignment_names()
 
     def assignment_kind(name: str) -> str | None:
@@ -95,8 +115,6 @@ def enumerate_simulation_parameters(
             continue
         context = str(entry.get("context") or "").strip()
         family = "Constant"
-        scientific_category: SimulationParameterScientificCategory
-        allow_exact_zero = False
         model: ForwardRateModel | None = None
         value: float | None = None
 
@@ -111,8 +129,6 @@ def enumerate_simulation_parameters(
             model = reactions[int(raw_index)].forward_model
             family = forward_rate_family(model)
             value = model.k
-            scientific_category = "rate"
-            allow_exact_zero = family == "Constant"
         elif kind == "equilibrium":
             # The indexed forward/reverse/Keq names are independent only when
             # their exact source role was authored.  This keeps derived
@@ -127,34 +143,24 @@ def enumerate_simulation_parameters(
                 model = equilibrium.forward_model
                 family = forward_rate_family(model)
                 value = model.k
-                scientific_category = "rate"
-                allow_exact_zero = (
-                    authority.kind == EquilibriumRateAuthorityKind.KEQ
-                    and family == "Constant"
-                )
             elif role == "kr":
                 family = "reverse"
                 value = authority.kr
-                scientific_category = "rate"
-                allow_exact_zero = False
             elif role == "Keq":
                 family = "reverse"
                 value = authority.Keq
-                scientific_category = "equilibrium_constant"
-                allow_exact_zero = False
         else:
             continue
-        if value is None or not math.isfinite(float(value)):
+        if value is None:
             continue
         coordinates.append(
             SimulationParameter(
                 name=name,
                 context=context,
-                value=float(value),
+                value=input_value(name, value),
                 family=family,
                 role=role,
-                scientific_category=scientific_category,
-                allow_exact_zero=allow_exact_zero,
+                allow_exact_zero=coordinate_allows_zero(mechanism, parameter_target_map[name]),
                 unit=units[name],
             )
         )
@@ -163,7 +169,7 @@ def enumerate_simulation_parameters(
     # admitted into the step map.  Their names are reaction-local (A1/Ea1,
     # dG_act1, dG_eq1, ...); no global uniqueness test or unindexed alias is
     # allowed to collapse repeated reactions.
-    physical_candidates: list[tuple[str, str, str, float, str]] = []
+    physical_candidates: list[tuple[str, str, str, float]] = []
     for entry in step_by_index.values():
         kind = str(entry.get("kind") or "")
         source_coordinates = {
@@ -187,77 +193,32 @@ def enumerate_simulation_parameters(
             model = equilibrium.forward_model
         if model is None:
             continue
-        energy_units = UnitsModel(energy_unit=metadata_view.energy_unit)
         for role, name in source_coordinates.items():
             if role == "A" and isinstance(model, ArrheniusRateModel):
-                physical_candidates.append(
-                    (
-                        name,
-                        "Arrhenius",
-                        role,
-                        float(model.A),
-                        units[name],
-                    )
-                )
+                physical_candidates.append((name, "Arrhenius", role, float(model.A)))
             elif role == "Ea" and isinstance(model, ArrheniusRateModel):
-                physical_candidates.append(
-                    (
-                        name,
-                        "Arrhenius",
-                        role,
-                        float(energy_units.from_jmol(model.Ea_J_per_mol)),
-                        metadata_view.energy_unit,
-                    )
-                )
+                physical_candidates.append((name, "Arrhenius", role, float(model.Ea_J_per_mol)))
             elif role == "dG_act" and isinstance(model, EyringRateModel):
-                physical_candidates.append(
-                    (
-                        name,
-                        "Eyring",
-                        role,
-                        float(energy_units.from_jmol(model.dG_act_J_per_mol)),
-                        metadata_view.energy_unit,
-                    )
-                )
+                physical_candidates.append((name, "Eyring", role, float(model.dG_act_J_per_mol)))
             elif role == "dG_eq":
-                physical_candidates.append(
-                    (
-                        name,
-                        "equilibrium",
-                        role,
-                        float(energy_units.from_jmol(float(authority.dG_eq_J_per_mol))),
-                        metadata_view.energy_unit,
-                    )
-                )
+                physical_candidates.append((name, "equilibrium", role, float(authority.dG_eq_J_per_mol)))
             elif role == "kappa" and isinstance(model, EyringRateModel):
-                physical_candidates.append(
-                    (
-                        name,
-                        "Eyring",
-                        role,
-                        float(model.kappa),
-                        "1",
-                    )
-                )
+                physical_candidates.append((name, "Eyring", role, float(model.kappa)))
 
-    for name, family, role, value, unit in physical_candidates:
+    for name, family, role, value in physical_candidates:
         if (
             name in parameter_assignment_names
             and assignment_kind(name) == "mechanism-bound"
         ):
             continue
-        if not math.isfinite(value):
-            continue
-        allow_zero = role not in {"A", "kappa"}
         coordinates.append(
             SimulationParameter(
                 name=name,
-                value=value,
+                value=input_value(name, value),
                 family=family,
                 role=role,
-                scientific_category="finite_scalar",
-                allow_exact_zero=allow_zero,
-                unit=unit,
+                allow_exact_zero=coordinate_allows_zero(mechanism, parameter_target_map[name]),
+                unit=units[name],
             )
         )
 
@@ -265,8 +226,6 @@ def enumerate_simulation_parameters(
         item[0] for item in physical_candidates
     }
     scalar_params = dict(metadata.get("scalar_params") or {})
-    input_units = dict(parameter_spec.input_units)
-    scientific_units = dict(parameter_spec.quantity_units)
     for raw_name, value in scalar_params.items():
         name = str(raw_name)
         assignment = assignment_kind(name)
@@ -278,12 +237,41 @@ def enumerate_simulation_parameters(
         coordinates.append(
             SimulationParameter(
                 name=name,
-                value=convert_value(value, scientific_units[name], input_units[name]),
+                value=input_value(name, value),
                 family="scalar",
                 role="scalar",
-                scientific_category="finite_scalar",
                 allow_exact_zero=True,
                 unit=units[name],
             )
         )
     return tuple(coordinates)
+
+
+def names_affecting(prepared_dsl: PreparedDslRequestSet, observables: Iterable[str]) -> frozenset[str]:
+    """Names the kinetics, interventions, stops or the given observables depend on.
+
+    The kinetics read every mechanism coordinate; Algebra, intervention
+    parameters and the observables watched by triggers or given here bring in
+    the parameters they read.
+    """
+
+    spec = prepared_dsl.parameter_algebra_spec_for_execution()
+    lets = {statement.name: statement.expr for statement in spec.observable_block.lines}
+    schedule = prepared_dsl.parameterized_intervention_schedule_for_binding()
+    triggers = schedule.triggers if schedule is not None else (
+        () if prepared_dsl.intervention_execution_contract() is None
+        else prepared_dsl.intervention_execution_contract().triggers
+    )
+    pending = [*spec.mechanism_param_names, *observables]
+    pending += [name for names in intervention_schedule_parameter_dependencies(schedule).values() for name in names]
+    pending += [item.condition.name for item in triggers if isinstance(item.condition, ObservableTriggerCondition)]
+    reached: set[str] = set()
+    while pending:
+        name = pending.pop()
+        if name in reached:
+            continue
+        reached.add(name)
+        pending += spec.evaluation_dependencies.get(name, ())
+        if name in lets:
+            pending += _iter_identifiers(lets[name])
+    return frozenset(reached)

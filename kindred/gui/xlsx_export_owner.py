@@ -13,7 +13,7 @@ from kindred.gui.workspace_result_presenter import (
     ResultDataBlock,
     write_xlsx,
 )
-from kindred.io.paths import same_local_path
+from kindred.io.paths import file_error_text, same_local_path
 
 logger = logging.getLogger(__name__)
 
@@ -65,7 +65,7 @@ class _XlsxExportWorker(QtCore.QThread):
             parent = os.path.dirname(self._path) or os.curdir
             if not os.path.isdir(parent):
                 raise FileNotFoundError(
-                    f"Export directory does not exist: {parent}"
+                    f"Export directory does not exist: {parent}."
                 )
             descriptor, temporary_path = tempfile.mkstemp(
                 prefix=f".{os.path.basename(self._path)}.",
@@ -101,7 +101,8 @@ class _XlsxExportWorker(QtCore.QThread):
             if not self._commit_started and self.isInterruptionRequested():
                 self.cancelled.emit(self._path)
             else:
-                self.failed.emit(self._path, f"{type(exc).__name__}: {exc}")
+                # The failure is shown with its path.
+                self.failed.emit(self._path, file_error_text(exc, None))
         else:
             self.succeeded.emit(self._path, completion)
         finally:
@@ -171,27 +172,13 @@ class XlsxExportOwner(QtCore.QObject):
             parent=self,
         )
         self._active_worker = worker
-        try:
-            # Direct signal-to-signal publication carries the worker's admitted
-            # path and terminal result without a forwarding/revalidation layer.
-            worker.succeeded.connect(self.succeeded)
-            worker.failed.connect(self.failed)
-            worker.cancelled.connect(self.cancelled)
-            worker.finished.connect(self._worker_finished)
-            worker.start()
-        except Exception as exc:
-            try:
-                unstarted = not worker.isRunning() and not worker.isFinished()
-            except RuntimeError:
-                unstarted = False
-            if unstarted:
-                self._active_worker = None
-                try:
-                    worker.deleteLater()
-                except RuntimeError:
-                    pass
-            logger.exception("XLSX worker startup failed")
-            raise RuntimeError(f"Could not start XLSX export: {exc}") from exc
+        # Direct signal-to-signal publication carries the worker's admitted
+        # path and terminal result without a forwarding/revalidation layer.
+        worker.succeeded.connect(self.succeeded)
+        worker.failed.connect(self.failed)
+        worker.cancelled.connect(self.cancelled)
+        worker.finished.connect(self._worker_finished)
+        worker.start()
 
     @QtCore.Slot()
     def _worker_finished(self) -> None:

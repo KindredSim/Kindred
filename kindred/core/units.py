@@ -26,6 +26,7 @@ ARRHENIUS_A_MAX = 1.0e40
 ENERGY_ABS_MAX_J_PER_MOL = 1.0e20
 KEQ_MIN = 1.0e-20
 KEQ_MAX = 1.0e20
+KAPPA_MAX = 1.0e20
 ORDINARY_PARAMETER_MIN_ABS = 1.0e-30
 ORDINARY_PARAMETER_MAX_ABS = 1.0e30
 
@@ -33,51 +34,70 @@ ORDINARY_PARAMETER_MAX_ABS = 1.0e30
 class OrdinaryParameterDomainError(ValueError):
     """A finite independent scalar lies outside its scientific input domain."""
 
-    def __init__(self, field: str):
+    def __init__(self, field: str, message: str):
         self.field = field
-        super().__init__(
-            f"{field} must be exact zero or have an absolute value between "
-            f"{ORDINARY_PARAMETER_MIN_ABS:g} and {ORDINARY_PARAMETER_MAX_ABS:g} "
-            "in scientific units."
-        )
+        super().__init__(message)
 
 
-def admit_ordinary_parameter(value: object, *, field: str = "parameter") -> float:
-    """Admit an independent ordinary parameter already in scientific units."""
-    if type(value) is bool:
-        raise ValueError(f"{field} must be finite and numeric")
-    try:
-        number = float(value)
-    except (TypeError, ValueError, OverflowError) as exc:
-        raise ValueError(f"{field} must be finite and numeric") from exc
-    if not math.isfinite(number):
-        raise ValueError(f"{field} must be finite")
-    if number != 0.0 and not ORDINARY_PARAMETER_MIN_ABS <= abs(number) <= ORDINARY_PARAMETER_MAX_ABS:
-        raise OrdinaryParameterDomainError(field)
-    return number
+# Scientific magnitude domain and sign per coordinate role; a role not listed is a rate.
+_ROLE_DOMAINS = {
+    "Keq": (KEQ_MIN, KEQ_MAX, False),
+    "A": (ARRHENIUS_A_MIN, ARRHENIUS_A_MAX, False),
+    "kappa": (0.0, KAPPA_MAX, False),
+    "Ea": (0.0, ENERGY_ABS_MAX_J_PER_MOL, True),
+    "dG_act": (0.0, ENERGY_ABS_MAX_J_PER_MOL, True),
+    "dG_eq": (0.0, ENERGY_ABS_MAX_J_PER_MOL, True),
+    "scalar": (ORDINARY_PARAMETER_MIN_ABS, ORDINARY_PARAMETER_MAX_ABS, True),
+}
+_RATE_DOMAIN = (0.0, RATE_MAX, False)
 
 
-def ordinary_parameter_input_bounds(unit: str) -> tuple[float, float]:
-    """Positive closed input component, projected inward into editable units."""
+def role_domain(role: str) -> tuple[float, float, bool]:
+    """Scientific magnitude floor (open when zero), ceiling and sign of one coordinate role."""
+    return _ROLE_DOMAINS.get(role, _RATE_DOMAIN)
+
+
+def admit_role_value(
+    value: float, *, role: str, unit: str, allow_exact_zero: bool, field: str,
+) -> float:
+    """Admit a scientific value of one coordinate; a refusal states its domain in ``unit``."""
+    low, high, signed = role_domain(role)
+    magnitude = abs(value) if signed else value
+    if (value == 0.0 and allow_exact_zero) or (
+        (low < magnitude if low == 0.0 else low <= magnitude) and magnitude <= high
+    ):
+        return value
+    floor, limit = input_unit_bounds(unit, low, high)
+    label = "" if unit == "1" else f" {unit}"
+    if low > 0.0 and signed:
+        zero = "be exact zero or " if allow_exact_zero else ""
+        message = f"{field} must {zero}have an absolute value between {floor:g} and {limit:g}{label}."
+    elif low > 0.0:
+        message = f"{field} must be between {floor:g} and {limit:g}{label}."
+    elif signed:
+        message = f"{field} must have an absolute value of at most {limit:g}{label}."
+    else:
+        message = f"{field} must be {'zero or positive' if allow_exact_zero else 'positive'} and at most {limit:g}{label}."
+    if role == "scalar":
+        raise OrdinaryParameterDomainError(field, message)
+    raise ValueError(message)
+
+
+def input_unit_bounds(unit: str, low: float, high: float) -> tuple[float, float]:
+    """A nonnegative closed scientific interval, projected inward into an editable unit."""
     editable = parse_unit(unit)
     scientific = scientific_unit(editable.dimensions)
     conversion_scale(editable, scientific).check_exact_work()
-    low = convert_value(ORDINARY_PARAMETER_MIN_ABS, scientific, editable)
-    high = convert_value(ORDINARY_PARAMETER_MAX_ABS, scientific, editable)
-    while convert_value(low, editable, scientific) < ORDINARY_PARAMETER_MIN_ABS:
-        low = math.nextafter(low, math.inf)
-    while convert_value(high, editable, scientific) > ORDINARY_PARAMETER_MAX_ABS:
-        high = math.nextafter(high, 0.0)
-    return low, high
+    lower = convert_value(low, scientific, editable)
+    upper = convert_value(high, scientific, editable)
+    while convert_value(lower, editable, scientific) < low:
+        lower = math.nextafter(lower, math.inf)
+    while convert_value(upper, editable, scientific) > high:
+        upper = math.nextafter(upper, 0.0)
+    return lower, upper
 
-def _admit_finite_range(
-    value: object,
-    *,
-    field: str,
-    minimum: float,
-    maximum: float,
-    allow_zero: bool = False,
-) -> float:
+
+def _finite(value: object, field: str) -> float:
     if type(value) is bool:
         raise ValueError(f"{field} must be finite and numeric")
     try:
@@ -86,68 +106,25 @@ def _admit_finite_range(
         raise ValueError(f"{field} must be finite and numeric") from exc
     if not math.isfinite(number):
         raise ValueError(f"{field} must be finite")
-    if number == 0.0 and allow_zero:
-        return 0.0
-    if number < minimum or number > maximum:
-        raise ValueError(
-            f"{field} must be between {minimum:g} and {maximum:g}"
-        )
-    return float(number)
-
-
-def admit_rate(
-    value: object,
-    *,
-    field: str = "rate",
-    allow_zero: bool = False,
-) -> float:
-    """Admit a typed or computed rate: positive up to RATE_MAX, or zero when allowed."""
-    if type(value) is bool:
-        raise ValueError(f"{field} must be finite and numeric")
-    try:
-        number = float(value)
-    except (TypeError, ValueError, OverflowError) as exc:
-        raise ValueError(f"{field} must be finite and numeric") from exc
-    if not math.isfinite(number):
-        raise ValueError(f"{field} must be finite")
-    if number == 0.0 and allow_zero:
-        return 0.0
-    if not 0.0 < number <= RATE_MAX:
-        lower = "zero or positive" if allow_zero else "positive"
-        raise ValueError(f"{field} must be {lower} and at most {RATE_MAX:g}")
     return number
 
 
+# Typed and computed values in scientific units, admitted against the role domains above.
+def admit_rate(value: object, *, field: str = "rate", allow_zero: bool = False) -> float:
+    return admit_role_value(_finite(value, field), role="k", unit="1", allow_exact_zero=allow_zero, field=field)
+
+
 def admit_arrhenius_prefactor(value: object, *, field: str = "A") -> float:
-    return _admit_finite_range(
-        value,
-        field=field,
-        minimum=ARRHENIUS_A_MIN,
-        maximum=ARRHENIUS_A_MAX,
-    )
+    return admit_role_value(_finite(value, field), role="A", unit="1", allow_exact_zero=False, field=field)
 
 
 def admit_energy_j_per_mol(value: object, *, field: str = "energy") -> float:
-    if type(value) is bool:
-        raise ValueError(f"{field} must be finite and numeric")
-    try:
-        number = float(value)
-    except (TypeError, ValueError, OverflowError) as exc:
-        raise ValueError(f"{field} must be finite and numeric") from exc
-    if not math.isfinite(number) or abs(number) > ENERGY_ABS_MAX_J_PER_MOL:
-        raise ValueError(
-            f"{field} absolute value must be at most {ENERGY_ABS_MAX_J_PER_MOL:g} J/mol"
-        )
-    return float(number)
+    # Every energy role shares one domain.
+    return admit_role_value(_finite(value, field), role="Ea", unit="J/mol", allow_exact_zero=True, field=field)
 
 
 def admit_keq(value: object, *, field: str = "Keq") -> float:
-    return _admit_finite_range(
-        value,
-        field=field,
-        minimum=KEQ_MIN,
-        maximum=KEQ_MAX,
-    )
+    return admit_role_value(_finite(value, field), role="Keq", unit="1", allow_exact_zero=False, field=field)
 
 
 # ---------- Energy units ----------
@@ -180,22 +157,12 @@ class UnitsModel:
     Portable container for numeric unit preferences.
 
     Only energy units are actively converted here; temperature/standard
-    state values are carried through for provenance.
+    state values are carried through for provenance.  Its temperature and
+    standard concentration arrive admitted with the tab's scientific settings.
     """
     energy_unit: str = "kJ/mol"           # or "kcal/mol"
     temperature_K: float = 298.15
     standard_conc_M: float = 1.0
-
-    def __post_init__(self) -> None:
-        from .species import validate_c0, validate_temperature
-
-        object.__setattr__(
-            self,
-            "temperature_K",
-            validate_temperature(self.temperature_K, field="temperature_K"),
-        )
-        standard = validate_c0(self.standard_conc_M, field="C0")
-        object.__setattr__(self, "standard_conc_M", standard)
 
     def from_jmol(self, value: float) -> float:
         """Convert from canonical J/mol to current energy_unit."""

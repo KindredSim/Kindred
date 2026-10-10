@@ -96,26 +96,6 @@ def _bounded_positive_integer(
     return result
 
 
-def _bounded_nonnegative_integer(
-    value: object,
-    *,
-    field: str,
-    maximum: int,
-) -> int:
-    if isinstance(value, bool):
-        raise TypeError(f"{field} must be an integer.")
-    try:
-        result = int(value)
-        exact = float(value)
-    except (TypeError, ValueError, OverflowError) as exc:
-        raise TypeError(f"{field} must be an integer.") from exc
-    if not math.isfinite(exact) or exact != result:
-        raise ValueError(f"{field} must be an integer.")
-    if result < 0 or result > int(maximum):
-        raise ValueError(f"{field} must be within 0 and {int(maximum)}.")
-    return result
-
-
 def _confidence(value: object) -> float:
     result = float(value)
     if not math.isfinite(result) or not 0.0 < result < 1.0:
@@ -154,18 +134,8 @@ class ProfileLikelihoodConfig:
             "parameter_names",
             _names(requested, field="Profile parameter names"),
         )
-        for coordinate in self.parameter_names:
-            from kindred.core.analysis.global_fit_execution import FitCoordinate
-
-            if not isinstance(coordinate, FitCoordinate):
-                raise TypeError(
-                    "Profile coordinates require typed FitCoordinate identities."
-                )
-            scope = getattr(coordinate, "scope", None)
-            if scope == "coupled":
-                raise ValueError(
-                    "Coupled coordinates are not public Profile targets."
-                )
+        # The dialog offers only the ordinary (shared, dataset and group)
+        # coordinates of the Fit setup.
         confidence = _confidence(self.confidence_level)
         points = _bounded_positive_integer(
             self.max_bracketing_steps_per_side,
@@ -226,18 +196,8 @@ class ResidualBootstrapConfig:
             "parameter_names",
             _names(requested, field="Bootstrap parameter names"),
         )
-        for coordinate in self.parameter_names:
-            from kindred.core.analysis.global_fit_execution import FitCoordinate
-
-            if not isinstance(coordinate, FitCoordinate):
-                raise TypeError(
-                    "Bootstrap coordinates require typed FitCoordinate identities."
-                )
-            scope = getattr(coordinate, "scope", None)
-            if scope == "coupled":
-                raise ValueError(
-                    "Coupled coordinates are not residual Bootstrap targets."
-                )
+        # The dialog offers only the ordinary (shared, dataset and group)
+        # coordinates of the Fit setup.
         seed = validate_bootstrap_seed(self.seed)
         replicates = _bounded_positive_integer(
             self.replicates,
@@ -315,11 +275,7 @@ class ProfileLikelihoodEndpoint:
     reason: str | None = None
     limiting_bounds: tuple[tuple[object, str], ...] = ()
 
-    def __post_init__(self) -> None:
-        status = str(self.status)
-        if status not in {"bound", "limiting", "threshold", "failed", "unavailable"}:
-            raise ValueError("Profile endpoint status is invalid.")
-        object.__setattr__(self, "status", status)
+    # The Profile loop builds it from literal statuses.
 
 
 @dataclass(frozen=True, slots=True)
@@ -337,17 +293,12 @@ class ProfileLikelihoodInterval:
     upper_resolution: ProfileLikelihoodEndpoint
 
     def __post_init__(self) -> None:
-        status = str(self.status)
-        if status not in {"available", "one-sided", "partial", "unavailable"}:
-            raise ValueError("Profile interval status is invalid.")
+        # The Profile loop passes a literal status and endpoints that are
+        # threshold crossings between the finite optimum and its finite bounds.
         for name in ("lower", "upper"):
             value = getattr(self, name)
             if value is not None:
-                value = float(value)
-                if not math.isfinite(value):
-                    raise ValueError("Profile interval endpoints must be finite.")
-                object.__setattr__(self, name, value)
-        object.__setattr__(self, "status", status)
+                object.__setattr__(self, name, float(value))
 
 
 @dataclass(frozen=True, slots=True)
@@ -367,28 +318,11 @@ class ProfileLikelihoodResult:
     provenance: Mapping[str, object] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        status = str(self.status)
-        if status not in {"available", "partial", "unavailable", "stopped", "failed"}:
-            raise ValueError("Profile result status is invalid.")
-        confidence = _confidence(self.confidence_level)
-        intervals = dict(self.intervals)
-        if any(not isinstance(item, ProfileLikelihoodInterval) for item in intervals.values()):
-            raise TypeError("Profile intervals require typed interval records.")
-        if self.diagnostic is not None and not isinstance(self.diagnostic, FactualCause):
-            raise TypeError("Profile result diagnostic must be a FactualCause.")
-        reason = None if self.unavailable_reason is None else str(self.unavailable_reason).strip() or None
-        if status == "unavailable" and reason is None:
-            raise ValueError("Unavailable Profile results require a factual reason.")
-        if status in {"stopped", "failed"} and self.diagnostic is None:
-            raise ValueError("Stopped or failed Profile results require a diagnostic.")
-        method = str(self.method).strip()
-        if not method:
-            raise ValueError("Profile results require a named method.")
-        object.__setattr__(self, "status", status)
+        # The Profile owner builds every result from its admitted
+        # configuration, literal statuses, a factual reason for an unavailable
+        # result and a diagnostic for a stopped or failed one.
         object.__setattr__(self, "method", _PROFILE_METHOD)
-        object.__setattr__(self, "confidence_level", confidence)
-        object.__setattr__(self, "intervals", MappingProxyType(intervals))
-        object.__setattr__(self, "unavailable_reason", reason)
+        object.__setattr__(self, "intervals", MappingProxyType(dict(self.intervals)))
         object.__setattr__(self, "provenance", _freeze_fact(dict(self.provenance or {})))
 
 
@@ -401,17 +335,11 @@ class BootstrapPercentileInterval:
     upper: float | None
 
     def __post_init__(self) -> None:
-        status = str(self.status)
-        if status not in {"available", "unavailable"}:
-            raise ValueError("Bootstrap interval status is invalid.")
+        # Percentiles of admitted finite replicate values, with a literal status.
         for name in ("lower", "upper"):
             value = getattr(self, name)
             if value is not None:
-                number = float(value)
-                if not math.isfinite(number):
-                    raise ValueError("Bootstrap percentile endpoints must be finite.")
-                object.__setattr__(self, name, number)
-        object.__setattr__(self, "status", status)
+                object.__setattr__(self, name, float(value))
 
 
 @dataclass(frozen=True, slots=True)
@@ -435,62 +363,13 @@ class ResidualBootstrapResult:
     provenance: Mapping[str, object] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        status = str(self.status)
-        if status not in {"available", "unavailable", "stopped", "failed"}:
-            raise ValueError("Bootstrap result status is invalid.")
-        seed = validate_bootstrap_seed(self.seed)
-        replicates = _bounded_positive_integer(
-            self.replicates,
-            field="Bootstrap result replicate count",
-            maximum=_BOOTSTRAP_MAX_REPLICATES,
-        )
-        confidence = _confidence(self.confidence_level)
-        required = _bounded_nonnegative_integer(
-            self.required_successes,
-            field="Bootstrap result required successes",
-            maximum=replicates,
-        )
-        successful = _bounded_nonnegative_integer(
-            self.successful_replicates,
-            field="Bootstrap result successful replicates",
-            maximum=replicates,
-        )
-        failed = _bounded_nonnegative_integer(
-            self.failed_replicates,
-            field="Bootstrap result failed replicates",
-            maximum=replicates,
-        )
-        if successful + failed > replicates:
-            raise ValueError("Bootstrap result replicate counts are invalid.")
-        intervals = dict(self.intervals)
-        if any(not isinstance(item, BootstrapPercentileInterval) for item in intervals.values()):
-            raise TypeError("Bootstrap intervals require typed percentile records.")
-        if self.diagnostic is not None and not isinstance(self.diagnostic, FactualCause):
-            raise TypeError("Bootstrap diagnostic must be a FactualCause.")
-        if self.first_failed_replicate_unavailable is not None and not isinstance(
-            self.first_failed_replicate_unavailable, ScientificUnavailable
-        ):
-            raise TypeError("Bootstrap first-failure unavailability must be typed.")
-        reason = None if self.unavailable_reason is None else str(self.unavailable_reason).strip() or None
-        if status == "unavailable" and reason is None:
-            raise ValueError("Unavailable Bootstrap results require a factual reason.")
-        if status in {"stopped", "failed"} and self.diagnostic is None:
-            raise ValueError("Stopped or failed Bootstrap results require a diagnostic.")
-        method = str(self.method).strip()
-        if not method:
-            raise ValueError("Bootstrap results require a named method.")
-        object.__setattr__(self, "status", status)
-        object.__setattr__(self, "method", method)
-        object.__setattr__(self, "seed", seed)
-        object.__setattr__(self, "replicates", replicates)
-        object.__setattr__(self, "confidence_level", confidence)
-        object.__setattr__(self, "required_successes", required)
-        object.__setattr__(self, "successful_replicates", successful)
-        object.__setattr__(self, "failed_replicates", failed)
-        object.__setattr__(self, "intervals", MappingProxyType(intervals))
+        # The Bootstrap owner builds every result from its admitted
+        # configuration and its own replicate counters, with literal statuses,
+        # a factual reason for an unavailable result and a diagnostic for a
+        # stopped or failed one.
+        object.__setattr__(self, "intervals", MappingProxyType(dict(self.intervals)))
         object.__setattr__(self, "resampling", MappingProxyType(dict(self.resampling)))
         object.__setattr__(self, "residual_centering", MappingProxyType(dict(self.residual_centering)))
-        object.__setattr__(self, "unavailable_reason", reason)
         object.__setattr__(self, "provenance", _freeze_fact(dict(self.provenance or {})))
 
 
@@ -598,12 +477,7 @@ def _objective_scientific_residuals(
 ) -> np.ndarray | None:
     """Evaluate one scientific residual call, never an optimizer penalty."""
 
-    scientific_evaluator = getattr(objective, "evaluate_scientific_residuals", None)
-    if not callable(scientific_evaluator):
-        raise TypeError(
-            "Profile objective must expose its canonical scientific residual evaluator."
-        )
-    raw = scientific_evaluator(np.asarray(vector, dtype=float))
+    raw = objective.evaluate_scientific_residuals(np.asarray(vector, dtype=float))
     if raw is None:
         return None
     values = np.asarray(raw, dtype=float).reshape(-1)
@@ -703,24 +577,13 @@ def profile_likelihood_result(
     ``ftol`` and ``xtol``.
     """
 
-    if not isinstance(config, ProfileLikelihoodConfig):
-        raise TypeError("Profile likelihood requires ProfileLikelihoodConfig.")
-    if not config.parameter_names:
-        raise ValueError("Ordinary Profile likelihood requires at least one coordinate.")
+    # The admitted configuration names at least one coordinate, and the Fit
+    # layout supplies finite ordered bounds.
     initial = {name: float(value) for name, value in initial_parameters.items()}
     bound_map = {
         name: (float(value[0]), float(value[1]))
         for name, value in bounds.items()
     }
-    for coordinate, (low, high) in bound_map.items():
-        if not (
-            math.isfinite(low)
-            and math.isfinite(high)
-            and low < high
-        ):
-            raise ValueError(
-                f"Profile coordinate {coordinate!r} requires finite ordered bounds."
-            )
     missing = tuple(
         item for item in config.parameter_names if item not in initial
     )
@@ -827,12 +690,9 @@ def profile_likelihood_result(
     for name in config.parameter_names:
         if cancellation_check is not None and cancellation_check():
             raise FittingCancelled()
+        # The fitted optimum lies inside its admitted bounds.
         low, high = bound_map[name]
         best = initial[name]
-        if not low <= best <= high:
-            raise ValueError(
-                f"Profile optimum for {_coordinate_display(name)!r} lies outside bounds."
-            )
         active_coordinate = _coordinate_display(name)
 
         def side_profile(
@@ -1230,10 +1090,7 @@ def residual_bootstrap_result(
     ``group_member_ids`` names one included member of each group target.
     """
 
-    if not isinstance(config, ResidualBootstrapConfig):
-        raise TypeError("Residual bootstrap requires ResidualBootstrapConfig.")
-    if not config.parameter_names:
-        raise ValueError("Ordinary residual Bootstrap requires at least one coordinate.")
+    # The admitted configuration names at least one coordinate.
     completed = 0
     successful = 0
     failed = 0
@@ -1318,18 +1175,8 @@ def residual_bootstrap_result(
     progress_cause = emit_progress(stage="primary_complete")
     if progress_cause is not None:
         return finish(stopped_result(progress_cause))
-    terminal_infos = getattr(terminal_result, "dataset_info", None)
-    if not isinstance(terminal_infos, (tuple, list)) or not terminal_infos:
-        raise ValueError(
-            "The terminal Fit did not retain aligned dataset facts for Bootstrap."
-        )
-    fitted_info = {
-        info.dataset_id: info
-        for info in terminal_infos
-        if isinstance(info, _fit_execution.DatasetFitInfo)
-    }
-    if len(fitted_info) != len(terminal_infos):
-        raise ValueError("The terminal Fit dataset roster is malformed for Bootstrap.")
+    # The terminal Fit retains one DatasetFitInfo per included dataset.
+    fitted_info = {info.dataset_id: info for info in terminal_result.dataset_info}
     for name in config.parameter_names:
         _parameter_value(terminal_result, name, group_member_ids)
 

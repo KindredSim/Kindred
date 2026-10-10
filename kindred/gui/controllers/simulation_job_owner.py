@@ -10,8 +10,7 @@ from typing import Callable, Iterable, Literal
 
 from PySide6 import QtCore
 
-from kindred.core.exceptions import SimulationCancelled
-from kindred.core.mechanism_source import MechanismAuthoringSource
+from kindred.core.exceptions import KindredError, SimulationCancelled, located
 from kindred.core.project_document import (
     SimulationExecutionSettings,
     TabScientificSettings,
@@ -42,13 +41,6 @@ __all__ = [
 ]
 
 
-def _required_id(value: object, field: str) -> str:
-    result = str(value or "").strip()
-    if not result:
-        raise ValueError(f"{field} must be nonblank.")
-    return result
-
-
 def resolve_run_parallel_capacity(*, cpu_count: object, user_max: object, target_count: int) -> int:
     if type(target_count) is not int or target_count <= 0:
         raise ValueError("Run requires a positive exact target count.")
@@ -61,19 +53,12 @@ def resolve_run_parallel_capacity(*, cpu_count: object, user_max: object, target
 
 @dataclass(frozen=True, slots=True)
 class ExplicitRunTarget:
+    """One Run target, built from document identities without Preview values."""
+
     tab_id: str
     set_id: str
     set_name: str
     execution_request: SimulationExecutionRequest
-
-    def __post_init__(self) -> None:
-        object.__setattr__(self, "tab_id", _required_id(self.tab_id, "tab_id"))
-        object.__setattr__(self, "set_id", _required_id(self.set_id, "set_id"))
-        object.__setattr__(self, "set_name", _required_id(self.set_name, "set_name"))
-        request = self.execution_request
-        if request.parameter_overrides:
-            raise ValueError("explicit Run targets cannot carry Preview values.")
-        object.__setattr__(self, "execution_request", request)
 
 
 @dataclass(frozen=True, slots=True)
@@ -82,16 +67,14 @@ class ExplicitRunCapture:
     targets: tuple[ExplicitRunTarget, ...]
 
     def __post_init__(self) -> None:
-        tab = _required_id(self.tab_id, "tab_id")
         targets = tuple(self.targets)
-        if not targets or any(not isinstance(target, ExplicitRunTarget) for target in targets):
+        if not targets:
             raise TypeError("Run requires ExplicitRunTarget values.")
-        if any(target.tab_id != tab for target in targets):
+        if any(target.tab_id != self.tab_id for target in targets):
             raise ValueError("every Run target must belong to the capture tab.")
         ids = tuple(target.set_id for target in targets)
         if len(ids) != len(set(ids)):
             raise ValueError("Run target set IDs must be unique.")
-        object.__setattr__(self, "tab_id", tab)
         object.__setattr__(self, "targets", targets)
 
 
@@ -103,11 +86,6 @@ class PreviewTarget:
     execution_request: SimulationExecutionRequest
     canonical_run_target: ExplicitRunTarget
 
-    def __post_init__(self) -> None:
-        object.__setattr__(self, "tab_id", _required_id(self.tab_id, "tab_id"))
-        object.__setattr__(self, "set_id", _required_id(self.set_id, "set_id"))
-        object.__setattr__(self, "set_name", _required_id(self.set_name, "set_name"))
-
 
 @dataclass(frozen=True, slots=True)
 class PreviewCapture:
@@ -117,16 +95,14 @@ class PreviewCapture:
     targets: tuple[PreviewTarget, ...]
 
     def __post_init__(self) -> None:
-        tab = _required_id(self.tab_id, "tab_id")
         targets = tuple(self.targets)
-        if not targets or any(not isinstance(item, PreviewTarget) for item in targets):
+        if not targets:
             raise TypeError("Preview requires PreviewTarget values.")
-        if any(item.tab_id != tab for item in targets):
+        if any(item.tab_id != self.tab_id for item in targets):
             raise ValueError("every Preview target must belong to the capture tab.")
         ids = tuple(item.set_id for item in targets)
         if len(ids) != len(set(ids)):
             raise ValueError("Preview target set IDs must be unique.")
-        object.__setattr__(self, "tab_id", tab)
         object.__setattr__(self, "targets", targets)
 
 
@@ -141,6 +117,16 @@ class SimulationTerminalSummary:
     details: tuple[str, ...] = ()
 
 
+def _status_line(exc: BaseException) -> str:
+    """A failure on the one-line status bar: the authored line it names,
+    its message and its suggestion."""
+    if not isinstance(exc, KindredError):
+        return str(exc) or type(exc).__name__
+    context = exc.context
+    text = exc.message if context is None else located(exc.message, context.line, context.line_text)
+    return text + (f" Suggestion: {exc.suggestion}" if exc.suggestion else "")
+
+
 @dataclass(frozen=True, slots=True)
 class _TargetTerminalOutcome:
     target: ExplicitRunTarget | PreviewTarget | InteractivePreviewTarget
@@ -150,7 +136,7 @@ class _TargetTerminalOutcome:
 
 
 def build_explicit_target(*, prepared_dsl: PreparedDslRequestSet, tab_id: str, set_id: str, set_name: str,
-                          mechanism_source: MechanismAuthoringSource, initial_values: Iterable[tuple[str, float]],
+                          initial_values: Iterable[tuple[str, float]],
                           execution_settings: SimulationExecutionSettings, scientific_settings: TabScientificSettings) -> ExplicitRunTarget:
     solver_config = build_solver_config(
         solver_input=execution_settings.solver,
@@ -160,7 +146,7 @@ def build_explicit_target(*, prepared_dsl: PreparedDslRequestSet, tab_id: str, s
         use_analytic_jacobian=scientific_settings.analytic_jacobian_policy,
     )
     execution_request = build_simulation_execution_request(
-        prepared_dsl=prepared_dsl, mechanism_source=mechanism_source,
+        prepared_dsl=prepared_dsl,
         initial_values=initial_values,
         t_span=(execution_settings.t_start, execution_settings.t_end),
         solver_config=solver_config,
@@ -219,7 +205,7 @@ class _DirectSimulationWorker(QtCore.QThread):
                 except BaseException as exc:  # noqa: BLE001
                     outcome = _TargetTerminalOutcome(
                         target=target, state="cancelled" if self.cancelled else "failure",
-                        message=str(exc) or type(exc).__name__,
+                        message=_status_line(exc),
                     )
                 self.target_terminal.emit(self._generation, outcome)
                 if self.cancelled:
@@ -239,7 +225,7 @@ class _DirectSimulationWorker(QtCore.QThread):
         except SimulationCancelled:
             return _TargetTerminalOutcome(target, "cancelled", message="Simulation canceled.")
         except BaseException as exc:  # noqa: BLE001
-            return _TargetTerminalOutcome(target, "failure", message=str(exc) or type(exc).__name__)
+            return _TargetTerminalOutcome(target, "failure", message=_status_line(exc))
         return _TargetTerminalOutcome(target, "success", result=result)
 
 
@@ -391,8 +377,8 @@ class SimulationJobOwner(QtCore.QObject):
         *,
         include_run: bool = True,
     ) -> bool:
-        tab = _required_id(tab_id, "tab_id")
-        ids = {_required_id(value, "set_id") for value in set_ids}
+        tab = tab_id
+        ids = set(set_ids)
         if not ids:
             return False
         operation = self._operation
@@ -446,10 +432,7 @@ class SimulationJobOwner(QtCore.QObject):
         pending = self._pending_preview
         if pending is None or pending.tab_id != str(tab_id):
             return False
-        ids = {
-            _required_id(value, "set_id")
-            for value in set_ids
-        }
+        ids = set(set_ids)
         if not ids.intersection(target.set_id for target in pending.targets):
             return False
         self._pending_preview = None
@@ -495,7 +478,7 @@ class SimulationJobOwner(QtCore.QObject):
             self._emit_settled_if_complete()
 
     def reconcile_canonical_targets(self, tab_id: str, set_ids: Iterable[str], *, clear_pending: bool = True) -> tuple[tuple[str, bool], ...]:
-        ids = tuple(dict.fromkeys(_required_id(value, "set_id") for value in set_ids))
+        ids = tuple(dict.fromkeys(set_ids))
         operation = self._operation
         if not (
             operation is not None
@@ -573,15 +556,7 @@ class SimulationJobOwner(QtCore.QObject):
         self._terminal_state = None
         worker.target_terminal.connect(self._on_target_terminal)
         worker.finished.connect(self._on_worker_finished)
-        try:
-            worker.start()
-        except BaseException as exc:  # noqa: BLE001
-            self._worker = None
-            self._operation = None
-            self._gate.release(self)
-            self.status_changed.emit(f"{kind.capitalize()} dispatch failed: {exc}")
-            self._emit_settled_if_complete()
-            return False
+        worker.start()
         if kind == "run" and purpose == "ordinary":
             repository = self._repository(str(tab_id))
             changed_request_ids = tuple(
@@ -802,10 +777,8 @@ class SimulationJobOwner(QtCore.QObject):
     ) -> bool:
         """Retire transient Slider Preview computation and display targets."""
 
-        tab = None if tab_id is None else _required_id(tab_id, "tab_id")
-        ids = None if set_ids is None else {
-            _required_id(value, "set_id") for value in set_ids
-        }
+        tab = tab_id
+        ids = None if set_ids is None else set(set_ids)
         changed = False
         operation = self._operation
         if (
@@ -844,10 +817,8 @@ class SimulationJobOwner(QtCore.QObject):
     ) -> bool:
         """Retire affected exact Preview work and reconcile its display truth."""
 
-        tab = _required_id(tab_id, "tab_id")
-        ids = None if set_ids is None else tuple(
-            dict.fromkeys(_required_id(value, "set_id") for value in set_ids)
-        )
+        tab = tab_id
+        ids = None if set_ids is None else tuple(dict.fromkeys(set_ids))
         interactive_changed = self.retire_interactive_preview(tab, ids)
         changed = interactive_changed
         restore_ids: tuple[str, ...] = ()

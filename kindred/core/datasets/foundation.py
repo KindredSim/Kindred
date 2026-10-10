@@ -149,7 +149,7 @@ def validate_original_basename(value: object, *, label: str = "original filename
     if not isinstance(value, str):
         raise ValueError(f"{label} must be a string.")
     if not value or value != value.strip():
-        raise ValueError(f"{label} must be a nonblank edge-normalized basename.")
+        raise ValueError(f"{label} cannot be blank or start or end with a space.")
     if (
         value in {".", ".."}
         or "\x00" in value
@@ -158,7 +158,7 @@ def validate_original_basename(value: object, *, label: str = "original filename
         or ":" in value
         or value.endswith((".", " "))
     ):
-        raise ValueError(f"{label} must be an exact basename without path semantics.")
+        raise ValueError(f"{label} cannot contain /, \\, or :, or end with a period or a space.")
     posix = PurePosixPath(value)
     windows = PureWindowsPath(value)
     if (
@@ -168,7 +168,7 @@ def validate_original_basename(value: object, *, label: str = "original filename
         or windows.root
         or any(part in {".", ".."} for part in (*posix.parts, *windows.parts))
     ):
-        raise ValueError(f"{label} must be an exact basename without path semantics.")
+        raise ValueError(f"{label} cannot contain /, \\, or :, or end with a period or a space.")
     windows_reserved = {
         "con",
         "prn",
@@ -355,7 +355,7 @@ def validate_imported_source(source: ImportedSource) -> ImportedSource:
     if source.original_format not in {"csv", "xlsx"}:
         raise RawDatasetValidationError("Imported source format must be exactly 'csv' or 'xlsx'.")
     try:
-        validate_original_basename(source.original_filename)
+        validate_original_basename(source.original_filename, label="The file name")
     except ValueError as exc:
         raise RawDatasetValidationError(str(exc)) from exc
     expected_suffix = f".{source.original_format}"
@@ -370,5 +370,5 @@ def validate_imported_source(source: ImportedSource) -> ImportedSource:
             source_label=source.original_filename,
         )
     except (TypeError, ValueError) as exc:
-        raise RawDatasetValidationError(f"Imported source admission failed: {exc}") from exc
+        raise RawDatasetValidationError(str(exc)) from exc
     return source

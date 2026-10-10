@@ -27,17 +27,8 @@ class SymbolicJacobianExecution:
     status: Mapping[str, Any] | None = None
 
     def __post_init__(self) -> None:
-        status = dict(self.status or {}) if isinstance(self.status, Mapping) else None
-        state = str((status or {}).get("state") or "")
-        if self.jacobian_func is None:
-            if state == "supported":
-                raise ValueError("Executable symbolic Jacobian state requires a Jacobian callable.")
-        else:
-            if state in {"unsupported", "disabled"}:
-                raise ValueError(
-                    "Unsupported or disabled symbolic Jacobian state cannot carry a callable."
-                )
-        object.__setattr__(self, "status", status)
+        # Its binder pairs a callable only with a supported state.
+        object.__setattr__(self, "status", None if self.status is None else dict(self.status))
 
     @property
     def has_executable_jacobian(self) -> bool:

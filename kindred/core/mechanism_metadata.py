@@ -3,8 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Mapping, MutableMapping, Optional
 
-from kindred.core.species import validate_c0
-from kindred.core.temperature import TemperatureSchedule, coerce_temperature_kelvin
+from kindred.core.temperature import TemperatureSchedule
 
 __all__ = [
     "MechanismMetadataKeys",
@@ -27,24 +26,13 @@ class EquilibriumMetadataKeys:
     STANDARD_CONC_M = "standard_conc_M"
 
 
+# Temperature and standard concentrations arrive admitted by DSL parsing.
 @dataclass(frozen=True)
 class MechanismMetadataView:
     temperature_K: float = 298.15
     standard_conc_M: float = 1.0
     energy_unit: str = "kJ/mol"
     temperature_schedule: Optional[TemperatureSchedule] = None
-
-    def __post_init__(self) -> None:
-        object.__setattr__(
-            self,
-            "temperature_K",
-            coerce_temperature_kelvin(self.temperature_K, field=MechanismMetadataKeys.TEMPERATURE_K),
-        )
-        standard = validate_c0(
-            self.standard_conc_M,
-            field=MechanismMetadataKeys.STANDARD_CONC_M,
-        )
-        object.__setattr__(self, "standard_conc_M", standard)
 
     @classmethod
     def from_metadata(cls, meta: Mapping[str, Any]) -> "MechanismMetadataView":
@@ -68,17 +56,6 @@ class EquilibriumMetadataView:
     dG_eq_J_per_mol: Optional[float] = None
     Keq_input: Optional[object] = None
     standard_conc_M: Optional[float] = None
-
-    def __post_init__(self) -> None:
-        if self.standard_conc_M is not None:
-            object.__setattr__(
-                self,
-                "standard_conc_M",
-                validate_c0(
-                    self.standard_conc_M,
-                    field=EquilibriumMetadataKeys.STANDARD_CONC_M,
-                ),
-            )
 
     def to_metadata(self) -> dict[str, object]:
         out: dict[str, object] = {

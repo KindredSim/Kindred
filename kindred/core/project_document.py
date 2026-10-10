@@ -10,10 +10,7 @@ from typing import Callable, Iterable, Mapping, Sequence
 
 from kindred.core.authored_source_errors import AuthoredSourceError
 from kindred.core.datasets import foundation as dataset_foundation
-from kindred.core.mechanism_source import (
-    MechanismAuthoringSource,
-    source_matches_analysis,
-)
+from kindred.core.mechanism_source import MechanismAuthoringSource
 from kindred.core.fitting_method_policy import LEAST_SQUARES_TOLERANCE, validate_fit_method
 from kindred.core.simulator.errors import DSLError
 from kindred.core.simulator.dsl_parse import (
@@ -36,11 +33,6 @@ from kindred.core.simulator.source_correction import (
     CorrectionTarget,
     build_correction_expressions,
 )
-from kindred.core.simulator.step_indexing import (
-    iter_canonical_parameters,
-    lookup_source_coordinate_target,
-)
-from kindred.core.simulator.wegscheider_symbolic import analyze_wegscheider_topology
 from kindred.core.simulator.solvers import normalize_solver_name
 from kindred.core.scipy_integrate import validate_scipy_rtol
 from kindred.core.units import UnitsModel
@@ -88,7 +80,6 @@ __all__ = [
     "canonical_observation_target_names",
     "canonical_species_names",
     "prepare_authored_source_admission",
-    "retained_tab_mechanism_source",
     "reconcile_tab_mechanism_source",
     "assess_tab_exact_correction",
     "select_exact_correction_basis",
@@ -415,7 +406,7 @@ class MechanismTabDocument:
         self,
         settings: SimulationExecutionSettings,
     ) -> "MechanismTabDocument":
-        validate_simulation_execution_settings(settings)
+        # Run settings arrive admitted by their editor.
         return replace(self, run_defaults=settings)
 
     def with_run_override(
@@ -428,7 +419,6 @@ class MechanismTabDocument:
         if settings is None:
             overrides.pop(target, None)
         else:
-            validate_simulation_execution_settings(settings)
             overrides[target] = settings
         return replace(
             self,
@@ -726,6 +716,8 @@ class ExactCorrectionAssessment:
     plan: CorrectionPlan
     proposal: MechanismAuthoringSource | None = None
     unavailable_reason: str | None = None
+    # The param lines the proposal adds, as name and expression.
+    corrections: Mapping[str, str] = field(default_factory=dict)
 
     @property
     def requires_correction(self) -> bool:
@@ -924,11 +916,7 @@ def resolve_simulation_execution_settings(
 ) -> SimulationExecutionSettings:
     """Resolve one exact set to either its complete override or live default."""
     target = tab.initial_condition_set(set_id).set_id
-    settings = dict(tab.run_overrides_by_set_id).get(
-        target,
-        tab.run_defaults,
-    )
-    return validate_simulation_execution_settings(settings)
+    return dict(tab.run_overrides_by_set_id).get(target, tab.run_defaults)
 
 
 def validate_fit_defaults(defaults: FitDefaults) -> FitDefaults:
@@ -1005,20 +993,8 @@ def _validate_exact_source_constraints(
         for constraint in composition.constraints
         if constraint.status in {"unsatisfied", "unresolved"}
     )
-    if not invalid:
-        return
-    details = ", ".join(
-        f"{constraint.cycle_id}: {constraint.expression}"
-        + (
-            f" ({constraint.reason})"
-            if constraint.reason
-            else ""
-        )
-        for constraint in invalid
-    )
-    raise AuthoredSourceError(
-        "Authored reversible-cycle consistency failed: " + details
-    )
+    if invalid:
+        raise AuthoredSourceError("\n\n".join(item.reason for item in invalid))
 
 
 def canonical_species_names(tab: MechanismTabDocument) -> tuple[str, ...]:
@@ -1055,38 +1031,6 @@ def canonical_initial_values(
     return tuple(
         (species, float(canonical.get(species, 0.0)))
         for species in canonical_species_names(tab)
-    )
-
-
-def _prepared_dsl_matches_tab(tab: MechanismTabDocument) -> bool:
-    prepared = tab.prepared_dsl
-    if prepared is None:
-        return not tab.mechanism_source.reactions_text.strip()
-    analysis = prepared.analysis
-    if not source_matches_analysis(tab.mechanism_source, analysis):
-        return False
-    return prepared.default_units == tab.scientific_settings.default_units
-
-
-def retained_tab_mechanism_source(
-    document: ProjectDocument,
-    tab_id: str,
-) -> MechanismSourceReconciliation:
-    """Return one action admission from retained accepted mechanism truth.
-
-    This is the no-draft half of the mechanism-dependent admission boundary.
-    It never parses or rewrites source: the canonical tab already owns the
-    exact source and its matching prepared DSL request set.
-    """
-
-    tab = document.tab(tab_id)
-    if not _prepared_dsl_matches_tab(tab):
-        raise ValueError(
-            f"Mechanism tab {tab.tab_id!r} has no matching retained prepared DSL."
-        )
-    _validate_exact_source_constraints(tab.prepared_dsl)
-    return MechanismSourceReconciliation(
-        proposed_document=document,
     )
 
 
@@ -1365,106 +1309,59 @@ def reconcile_tab_mechanism_source(
 
 def _admitted_correction_targets(
     tab: MechanismTabDocument,
-    composition: object,
+    composition: ExactConstraintComposition,
 ) -> tuple[CorrectionTarget, ...]:
-    """Derive every potential correction target and its owned availability."""
+    """List, in source order, the reaction-line values the open cycles involve.
+
+    A value is listed when an open cycle's requirement reads it, and a param
+    line written from other steps' values when it sets a step of an open
+    cycle.  Calculated readouts and values outside the open cycles are not
+    listed.
+    """
 
     prepared = tab.prepared_dsl
-    if prepared is None:
-        raise ValueError("Correction requires admitted prepared DSL.")
-    mechanism = prepared.accepted_mechanism_for_structure()
-    parameter_spec = prepared.parameter_algebra_spec_for_execution()
-    parameter_dependencies = parameter_spec.parameter_dependencies
-    assignment_kinds = {
-        str(name): parameter_spec.parameter_assignment_kind(str(name))
-        for name in parameter_dependencies
-    }
-    coordinates = tuple(
-        coordinate
-        for origin in prepared.analysis.origins
-        for coordinate in origin.coordinates
+    param_lines = prepared.parameter_algebra_spec_for_execution().parameter_dependencies
+    open_cycles = tuple(
+        item for item in composition.constraints if item.status != "resolved"
     )
-    powers: set[str] = set()
-    for item in getattr(composition, "constraints", ()):
-        powers.update(str(name) for name in item.monomial.coordinate_power_map())
-    admitted: list[CorrectionTarget] = []
-    admitted_names: set[str] = set()
-    for coordinate in coordinates:
-        name = str(coordinate.canonical_name)
-        role = str(coordinate.role)
-        capabilities = source_coordinate_capabilities(role)
-        assignment_kind = assignment_kinds.get(name)
-        if (
-            not capabilities.correction_target
-            or (
-                name not in powers
-                and assignment_kind not in {"derived scalar", "mechanism-bound"}
-            )
-        ):
-            continue
-        admitted_names.add(name)
-        source_target = lookup_source_coordinate_target(mechanism, name)
-        if source_target is None:
-            admitted.append(
-                CorrectionTarget(
-                    name=name,
-                    family=role,
-                    source_backed=False,
-                    derived=assignment_kind in {"derived scalar", "mechanism-bound"},
-                )
-            )
-            continue
-        _kind, _item_index, target_role, _entry = source_target
-        if str(target_role) != role:
-            admitted.append(
-                CorrectionTarget(
-                    name=name,
-                    family=role,
-                    source_backed=False,
-                    derived=assignment_kind in {"derived scalar", "mechanism-bound"},
-                )
-            )
-            continue
-        admitted.append(
-            CorrectionTarget(
-                name=name,
-                family=role,
-                derived=assignment_kind in {"derived scalar", "mechanism-bound"},
-            )
-        )
-    cycle_steps = {
-        step_index
-        for cycle in analyze_wegscheider_topology(mechanism).cycles
-        for step_index in cycle.step_indices
+    read = {name for item in open_cycles for name in item.monomial.names()}
+    open_steps = {
+        step for item in open_cycles for step, coefficient in item.step_coefficients if coefficient
     }
-    for name, entry, role in iter_canonical_parameters(mechanism):
-        if role != "Keq" or name in admitted_names:
-            continue
-        step_index = int(entry["step_index"])
-        if step_index not in cycle_steps:
-            continue
-        admitted.append(
-            CorrectionTarget(
-                name=name,
-                family=role,
-                source_backed=False,
-                derived=True,
-            )
-        )
-    return tuple(admitted)
+    context = {
+        entry["step_index"]: entry["context"]
+        for entry in prepared.accepted_mechanism_for_structure().metadata["step_index_map"]
+    }
+    targets: list[CorrectionTarget] = []
+    for origin in prepared.analysis.origins:
+        for coordinate in origin.coordinates:
+            name = coordinate.canonical_name
+            if not source_coordinate_capabilities(coordinate.role).correction_target:
+                continue
+            closure = name in composition.relations or name in composition.unresolved
+            if name in read or (closure and origin.step_index in open_steps):
+                targets.append(
+                    CorrectionTarget(
+                        name=name,
+                        family=coordinate.role,
+                        param_line=name in param_lines,
+                        context=context[origin.step_index],
+                    )
+                )
+    return tuple(targets)
 
 
 def _correction_proposal(
     source: MechanismAuthoringSource,
     composition: ExactConstraintComposition,
     plan: CorrectionPlan,
-) -> MechanismAuthoringSource:
+) -> tuple[MechanismAuthoringSource, dict[str, str]]:
     corrections = build_correction_expressions(composition, plan)
     updated_source = insert_scalar_source_declarations(
         source.reactions_text,
         corrections,
     )
-    return MechanismAuthoringSource.from_parts(reactions_text=updated_source)
+    return MechanismAuthoringSource.from_parts(reactions_text=updated_source), corrections
 
 
 def select_exact_correction_basis(
@@ -1482,12 +1379,13 @@ def select_exact_correction_basis(
     )
     if not plan.available:
         raise ValueError(plan.reason or "Selected correction basis is unavailable.")
-    proposal = _correction_proposal(visible_source, composition, plan)
+    proposal, corrections = _correction_proposal(visible_source, composition, plan)
     return replace(
         assessment,
         plan=plan,
         proposal=proposal,
         unavailable_reason=None,
+        corrections=corrections,
     )
 
 
@@ -1559,7 +1457,7 @@ def assess_tab_exact_correction(
         )
 
     try:
-        proposal = _correction_proposal(source, composition, plan)
+        proposal, corrections = _correction_proposal(source, composition, plan)
     except (TypeError, ValueError, OverflowError) as exc:
         return ExactCorrectionAssessment(
             composition=composition,
@@ -1572,6 +1470,7 @@ def assess_tab_exact_correction(
         targets=targets,
         plan=plan,
         proposal=proposal,
+        corrections=corrections,
     )
 
 
@@ -1588,7 +1487,6 @@ def prepare_tab_scientific_settings(
     ``replace_document`` publication and its single result fence.
     """
 
-    validate_tab_scientific_settings(settings)
     if settings.default_units == tab.scientific_settings.default_units:
         prepared = tab.prepared_dsl
     else:
@@ -1609,19 +1507,16 @@ def validate_project_document(document: ProjectDocument) -> ProjectDocument:
         normalize_observation_mapping,
     )
 
+    # Settings, Fit defaults, imported sources and dataset records arrive
+    # admitted by archive decoding, their editors or spreadsheet admission.
     if not document.tabs:
         raise ValueError("A project must contain at least one mechanism tab.")
-    validate_fit_defaults(document.fit_defaults)
-
-    for source in document.imported_sources:
-        dataset_foundation.validate_imported_source(source)
     _validate_unique(
         (source.source_id for source in document.imported_sources),
         "imported source IDs",
     )
     referenced_source_ids: set[str] = set()
     for dataset in document.datasets:
-        dataset_foundation.validate_raw_dataset_record(dataset)
         if dataset.source_id is not None:
             referenced_source_ids.add(dataset.source_id)
             if not any(source.source_id == dataset.source_id for source in document.imported_sources):
@@ -1688,16 +1583,9 @@ def validate_project_document(document: ProjectDocument) -> ProjectDocument:
                 f"Tab {tab.name!r} must contain at least one "
                 "initial-condition set."
             )
-        validate_simulation_execution_settings(
-            tab.run_defaults,
-            f"{tab.name}.run_defaults",
-        )
-        validate_tab_scientific_settings(
-            tab.scientific_settings,
-            f"{tab.name}.scientific_settings",
-        )
         try:
-            if not _prepared_dsl_matches_tab(tab):
+            # Opened archives arrive unparsed; an empty tab stays unparsed.
+            if tab.prepared_dsl is None and tab.mechanism_source.reactions_text.strip():
                 prepared_dsl = prepare_authored_source_admission(
                     tab.mechanism_source,
                     tab.scientific_settings,
@@ -1706,8 +1594,6 @@ def validate_project_document(document: ProjectDocument) -> ProjectDocument:
                     tab,
                     prepared_dsl=prepared_dsl,
                 )
-            else:
-                _validate_exact_source_constraints(tab.prepared_dsl)
             analysis = tab.dsl_analysis
             if (
                 analysis is not None
@@ -1763,10 +1649,6 @@ def validate_project_document(document: ProjectDocument) -> ProjectDocument:
                 raise ValueError(
                     f"Run override references missing set ID {set_id!r}."
                 )
-            validate_simulation_execution_settings(
-                settings,
-                f"{tab.name}.run_override[{set_id}]",
-            )
 
         _validate_unique(
             (

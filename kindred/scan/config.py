@@ -95,3 +95,13 @@ def parameter_key(name: str) -> str:
 
 START = "time:start"
 END = "time:end"
+
+
+def input_label(key: str) -> str:
+    """The name an input key is shown under."""
+    if key == START:
+        return "Start time"
+    if key == END:
+        return "End time"
+    kind, _, name = key.partition(":")
+    return f"Initial {name}" if kind == "initial" else name

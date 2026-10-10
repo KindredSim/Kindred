@@ -455,45 +455,42 @@ class ConfigController(QtCore.QObject):
     def persist_run_defaults(
         self, candidate: SimulationExecutionSettings,
     ) -> SimulationExecutionSettings:
-        accepted = validate_simulation_execution_settings(candidate)
+        # The Simulation Settings dialog admitted the candidate.
         settings = self._settings()
         snapshot = self._snapshot_settings(settings, tuple(_RUN_SETTINGS_KEYS.values()))
         for field_name, key in _RUN_SETTINGS_KEYS.items():
-            settings.setValue(key, getattr(accepted, field_name))
+            settings.setValue(key, getattr(candidate, field_name))
         self._sync_or_report(settings, "Run defaults", snapshot=snapshot)
-        return accepted
+        return candidate
 
     def persist_scientific_defaults(
         self,
         candidate: TabScientificSettings,
     ) -> TabScientificSettings:
-        accepted = validate_tab_scientific_settings(
-            candidate,
-            "application tab-scientific defaults",
-        )
+        # The Simulation Settings dialog admitted the candidate.
         settings = self._settings()
         snapshot = self._snapshot_settings(
             settings,
             tuple(_SCIENTIFIC_SETTINGS_KEYS.values()),
         )
         for field_name, key in _SCIENTIFIC_SETTINGS_KEYS.items():
-            settings.setValue(key, getattr(accepted, field_name))
+            settings.setValue(key, getattr(candidate, field_name))
         self._sync_or_report(
             settings,
-            "tab-scientific defaults",
+            "default scientific settings",
             snapshot=snapshot,
         )
-        return accepted
+        return candidate
 
     def persist_fit_defaults(self, candidate: FitDefaults) -> FitDefaults:
-        accepted = validate_fit_defaults(candidate)
+        # The Fit defaults dialog admitted the candidate.
         settings = self._settings()
         snapshot = self._snapshot_settings(
             settings,
             tuple(_FIT_SETTINGS_KEYS.values()),
         )
         for field_name, key in _FIT_SETTINGS_KEYS.items():
-            settings.setValue(key, getattr(accepted, field_name))
+            settings.setValue(key, getattr(candidate, field_name))
         self._sync_or_report(
             settings,
             "Fit defaults",
@@ -502,7 +499,7 @@ class ConfigController(QtCore.QObject):
                 "Application Fit defaults updated for newly created projects."
             ),
         )
-        return accepted
+        return candidate
 
     def persist_theme(self, dark_mode: bool) -> None:
         settings = self._settings()
@@ -594,30 +591,21 @@ class ConfigController(QtCore.QObject):
         snapshot: Sequence[tuple[str, bool, object]],
         success_message: str | None = None,
     ) -> None:
+        message = f"{label[:1].upper()}{label[1:]} could not be saved."
         try:
-            try:
-                settings.sync()
-            except Exception as exc:
-                logger.warning("Could not persist %s: %s", label, exc)
-                raise
-            status = settings.status()
-            if status != QtCore.QSettings.Status.NoError:
-                error = RuntimeError(f"Could not persist {label}: {status}.")
-                logger.warning("Could not persist %s: %s", label, error)
-                raise error
-        except Exception:
+            settings.sync()
+            if settings.status() != QtCore.QSettings.Status.NoError:
+                raise OSError(f"QSettings status {settings.status()}")
+        except Exception as exc:
+            logger.warning("%s (%s)", message, exc)
             self._restore_settings(settings, snapshot)
             try:
                 # QSettings may write new values while retaining a prior
-                # FormatError status. Persist the restored accepted values;
-                # the original failure remains the caller-visible error.
+                # FormatError status. Persist the restored accepted values.
                 settings.sync()
             except Exception:
-                logger.exception(
-                    "Could not synchronize restored setting values for %s.",
-                    label,
-                )
-            raise
+                logger.exception("Could not synchronize restored setting values for %s.", label)
+            raise OSError(message) from exc
         if success_message is not None:
             logger.info(success_message)
 

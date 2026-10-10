@@ -6,7 +6,7 @@ from kindred.core.quantity_units import convert_value
 from kindred.core.result_repository import SimulationResultValue
 from kindred.core.simulation_parameters import enumerate_simulation_parameters
 from kindred.core.simulation_preparation import (
-    SimulationExecutionRequest, SimulationPreparationError, prepare_simulation_run,
+    SimulationExecutionRequest, prepare_simulation_run,
     build_simulation_request_from_prepared_run,
 )
 from kindred.core.simulation_result_finalization import finalize_simulation_result
@@ -26,18 +26,13 @@ def execute_simulation(
 
     check_cancelled()
     coordinates = enumerate_simulation_parameters(execution_request.prepared_dsl)
-    by_name = {item.name: item for item in coordinates}
+    # Preview and Scan admitted their override names as these coordinates.
     overrides = dict(execution_request.parameter_overrides or {})
-    for name in overrides:
-        coordinate = by_name.get(name)
-        if coordinate is None:
-            raise ValueError(f"Preview parameter {name!r} is not a direct GUI coordinate.")
     spec = execution_request.prepared_dsl.parameter_algebra_spec_for_execution()
     inputs, quantities = dict(spec.input_units), dict(spec.quantity_units)
     parameters = tuple((item.name, convert_value(overrides.get(item.name, item.value), inputs[item.name], quantities[item.name]), quantities[item.name].symbol) for item in coordinates)
+    # Preparation resolves and compiles every schedule, an empty one included.
     prepared = prepare_simulation_run(execution_request=execution_request, cancellation_control=cancellation_control)
-    if prepared.intervention_execution is None:
-        raise SimulationPreparationError("intervention_schedule", "Prepared Run retained an unresolved intervention schedule.")
     solved = solve_ode(build_simulation_request_from_prepared_run(
         prepared, y0=prepared.y0, intervention_execution=prepared.intervention_execution,
         symbolic_jacobian=prepared.symbolic_jacobian, cancellation_control=cancellation_control,

@@ -95,6 +95,12 @@ def _operation_units(operation, units, *, zeros, exponent):
         raw = units[0].multiply(units[1]) if rule == "*" else units[0].divide(units[1])
     elif rule in {"preserve", "unary"}:
         raw = units[0]
+    elif rule == "dimensionless" and all(unit.dimensions[0] == 0 and unit.dimensions[2] == -3 * unit.dimensions[1]
+                                         for unit in units):
+        # A function of a concentration, time or temperature takes its argument
+        # relative to 1 M, 1 s and 1 K, so the result has no unit.
+        return UnitOperation(DIMENSIONLESS, tuple(conversion_scale(unit, scientific_unit(unit.dimensions))
+                                                  for unit in units))
     elif rule in {"dimensionless", "!", "&&", "||"}:
         return UnitOperation(DIMENSIONLESS, tuple(unit.scale for unit in units)) if all(unit.compatible(DIMENSIONLESS) for unit in units) else unknown
     else:

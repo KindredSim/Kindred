@@ -15,7 +15,6 @@ from typing import (
     Any,
     Callable,
     Dict,
-    Mapping,
     Sequence,
     Tuple,
 )
@@ -25,7 +24,6 @@ from kindred.core.scipy_integrate import load_scipy_integrate
 from kindred.core.exceptions import (
     SimulationCancelled,
     SolverError,
-    TimeGridError,
     create_solver_error,
 )
 from kindred.core.time_grid import build_time_grid as _build_time_grid
@@ -151,23 +149,11 @@ def normalize_solver_name(name: object) -> str:
 
 
 def _prepare_time_grid(req: _SimulationRequest, *, t0: float, t1: float) -> np.ndarray:
+    # Run, Preview and Scan requests realized this grid when they were built;
+    # Fit supplies its admitted sample times inside the span.
     if req.t_eval is None:
-        if not isinstance(req.grid, Mapping) or not req.grid:
-            raise TimeGridError("SimulationRequest.grid is required when t_eval is not provided")
-        try:
-            return _build_time_grid(t0, t1, req.grid)
-        except ValueError as exc:
-            raise TimeGridError(str(exc)) from exc
-    t_eval = np.asarray(req.t_eval, dtype=float).reshape(-1)
-    if t_eval.size == 0:
-        raise TimeGridError("t_eval must contain at least one time point")
-    if np.any(~np.isfinite(t_eval)):
-        raise TimeGridError("t_eval must contain only finite values")
-    if np.any(np.diff(t_eval) <= 0):
-        raise TimeGridError("t_eval must be strictly increasing")
-    if t_eval[0] < t0 or t_eval[-1] > t1:
-        raise TimeGridError("t_eval must lie within t_span")
-    return t_eval
+        return _build_time_grid(t0, t1, req.grid)
+    return req.t_eval
 
 
 def _build_provenance(req: _SimulationRequest, *, t_eval: np.ndarray) -> Dict[str, object]:
@@ -359,9 +345,9 @@ def _execute_scipy(
             # dense LU factorization or solve raises when a step's Newton
             # matrix or residual has overflowed to non-finite values.
             if "different signs" in str(exc).lower():
-                stage, reason = "event_root_finding", "Event root finding failed"
+                stage, reason = "event_root_finding", "it could not find the time at which a trigger threshold is crossed"
             elif str(exc) == "array must not contain infs or NaNs":
-                stage, reason = "nonfinite_step", "Solver step became nonfinite"
+                stage, reason = "nonfinite_step", "a step produced values that are not finite"
             else:
                 raise
             if (
@@ -381,11 +367,7 @@ def _execute_scipy(
                         },
                     )
                 ) from exc
-            raise create_solver_error(
-                req.solver,
-                last_accepted_time,
-                f"{reason}: {exc}",
-            ) from exc
+            raise create_solver_error(req.solver, last_accepted_time, reason, str(exc)) from exc
         if (
             req.cancellation_control is not None
             and req.cancellation_control.cancel_requested()
@@ -449,10 +431,10 @@ def _execute_scipy(
                         },
                     )
                 )
+            # BDF and Radau report one failure: the step size fell below
+            # the spacing of floating-point numbers at the current time.
             raise create_solver_error(
-                req.solver,
-                t_fail,
-                str(sol.message),
+                req.solver, t_fail, "its step size became too small to continue", str(sol.message),
             )
 
         # Detach SciPy's time vector at ingress.  The trajectory copy below is
@@ -578,7 +560,7 @@ def solve_ode(
     t_eval = _prepare_time_grid(req, t0=t0, t1=t1)
     prov = _build_provenance(req, t_eval=t_eval)
 
-    method = normalize_solver_name(req.solver)
+    method = req.solver
     try:
         output = InterventionScheduleExecutionOwner(_run_scipy_segment).execute(
             ScheduleExecutionRequest(

@@ -8,6 +8,8 @@ from fractions import Fraction as F
 from itertools import product
 from typing import Callable
 
+from kindred.core.algebra.errors import AlgebraError
+from kindred.core.exceptions import located
 from kindred.core.algebra.parser import (
     AlgebraBlock, NumberNode, IdentNode, SpeciesRefNode, UnaryNode, BinaryNode, CallNode,
 )
@@ -16,7 +18,7 @@ from kindred.core.algebra.evaluator import EvaluationContext, evaluate_block
 from kindred.core.simulation_parameters import enumerate_simulation_parameters
 from kindred.core.quantity_units import conversion_scale, convert_value, presentation_unit
 import numpy as np
-from kindred.scan.config import START, END, ScanConfig, initial_key, parameter_key
+from kindred.scan.config import START, END, ScanConfig, initial_key, input_label, parameter_key
 from kindred.scan.intervals import Interval, normalize, representable, sample
 
 
@@ -169,7 +171,7 @@ def compile_constraints(prepared, config: ScanConfig, fixed: dict[str, float]):
     precedence = set()
     for condition, expression in conditional:
         if condition.dependent in derived:
-            raise ValueError(f"{condition.observable}: {condition.dependent} is already calculated by an equality. Select a free input to sample conditionally.")
+            raise ValueError(f"{condition.observable}: {input_label(condition.dependent)} is already calculated by an equality. Select a free input to sample conditionally.")
         for key in expression.substitute(derived).terms:
             if key != condition.dependent:
                 precedence.add((key, condition.dependent))
@@ -260,7 +262,10 @@ class IntervalChecks:
                                     initials={k.removeprefix("initial:"): v for k, v in values.items() if k.startswith("initial:")},
                                     symtab=SymbolTable(),
                                     symbol_values={k.removeprefix("parameter:"): convert_value(v, self.input_units[k.removeprefix("parameter:")], self.quantity_units[k.removeprefix("parameter:")]) for k, v in values.items() if k.startswith("parameter:")})
-        _, scalars = evaluate_block(block, context)
+        try:
+            _, scalars = evaluate_block(block, context)
+        except AlgebraError as exc:
+            raise ValueError(located(str(exc), exc.line, exc.line_text)) from exc
         for condition in conditions:
             value = scalars[condition.observable]
             if not Interval(condition.lower, condition.upper, condition.include_lower, condition.include_upper).contains(value):
@@ -389,7 +394,7 @@ class FeasibleSpace:
                 except ValueError:
                     continue
         if not intervals:
-            raise ValueError(f"No representable feasible value exists for {key}.")
+            raise ValueError(f"No representable feasible value exists for {input_label(key)}.")
         return normalize(tuple(intervals))
 
     def draw(self, units: dict[str, float], allocations: dict[str, str]) -> dict[str, float]:
@@ -426,7 +431,7 @@ class FeasibleSpace:
                     except ValueError:
                         pass
             if not intervals:
-                raise InputGenerationError(f"No representable feasible value remains for {key}.", values)
+                raise InputGenerationError(f"No representable feasible value remains for {input_label(key)}.", values)
             values[key] = sample(tuple(intervals), units[key], allocations.get(key, "width"))
         return values
 
@@ -462,5 +467,5 @@ def build_spaces(ranges, derived, inequalities, check, order):
         spaces.append(FeasibleSpace(keys, pieces, check))
     for key, expression in derived.items():
         if not expression.terms and not any(i.contains(float(expression.constant)) for i in ranges[key]):
-            raise ValueError(f"Calculated {key} is outside its allowed ranges.")
+            raise ValueError(f"Calculated {input_label(key)} is outside its allowed ranges.")
     return spaces

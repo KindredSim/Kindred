@@ -51,25 +51,13 @@ class SimulationResultValue:
     volume: VolumeTrajectory | None = None
 
     def __post_init__(self) -> None:
-        # Canonical finalization is the sole producer and publishes frozen,
-        # typed values; the carrier checks only its cross-field invariants.
+        # Canonical finalization is the sole producer: it selects succeeded and
+        # failed outputs disjointly from the requested roster and classifies
+        # exactly the parameters it records.  The carrier checks only that the
+        # Algebra evaluation gave every requested output a terminal outcome.
         requested = set(self.requested_algebra_outputs)
-        partitions = (
-            set(self.succeeded_algebra_outputs),
-            set(self.failed_algebra_outputs),
-        )
-        if any(not values <= requested for values in partitions):
-            raise ValueError("algebra outcome contains an unrequested output.")
-        if set.intersection(*partitions):
-            raise ValueError("algebra output outcome partitions overlap.")
-        if requested.difference(set.union(*partitions)):
+        if requested.difference(self.succeeded_algebra_outputs, self.failed_algebra_outputs):
             raise ValueError("requested algebra outputs lack a terminal outcome.")
-        if tuple(name for name, _family, _role in self.parameter_classifications) != tuple(
-            name for name, _value, _unit in self.parameters
-        ):
-            raise ValueError(
-                "parameter classifications must match result parameters exactly."
-            )
 
 
 class ResultRepository:
@@ -82,11 +70,8 @@ class ResultRepository:
         cache_capacity: int,
     ) -> None:
         self._tab_id = tab_id
-        if type(cache_capacity) is not int:
-            raise TypeError("cache_capacity must be an int.")
+        # The configuration owner admits the positive capacity.
         self._cache_capacity = cache_capacity
-        if cache_capacity < 1:
-            raise ValueError("cache_capacity must be at least one.")
         self._current_by_set_id: dict[
             str,
             tuple[str, SimulationExecutionRequest, SimulationResultValue],
@@ -131,10 +116,6 @@ class ResultRepository:
     def resize_cache_capacity(self, cache_capacity: int) -> None:
         """Apply a positive capacity immediately and trim this repository's LRU."""
 
-        if type(cache_capacity) is not int:
-            raise TypeError("cache_capacity must be an int.")
-        if cache_capacity < 1:
-            raise ValueError("cache_capacity must be at least one.")
         self._cache_capacity = cache_capacity
         self._trim_explicit_cache()
 

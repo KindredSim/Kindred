@@ -36,6 +36,7 @@ class TemperatureDSLError(AuthoredSourceError):
     Provides helpful context and examples for common mistakes.
     """
     def __init__(self, message: str, *, suggestion: str = None, examples: list = None):
+        self.message = message
         self.suggestion = suggestion
         self.examples = examples or []
 
@@ -255,8 +256,7 @@ def _parse_piecewise_temperature(
     # Validate
     if len(times) < 2:
         raise TemperatureDSLError(
-            f"At least 2 time points required, got {len(times)}",
-            suggestion="Provide at least 2 time points to define an interval",
+            "t needs at least two time points.",
             examples=[
                 "t=[0,100], T=[298]  (one interval)",
                 "t=[0,50,100], T=[298,350]  (two intervals)"
@@ -265,8 +265,7 @@ def _parse_piecewise_temperature(
 
     if len(temperatures) != len(times) - 1:
         raise TemperatureDSLError(
-            f"Temperature count mismatch: {len(temperatures)} temperatures for {len(times)} time points",
-            suggestion=f"Need exactly {len(times)-1} temperature(s) for {len(times)} time points",
+            "T must have one temperature fewer than t has time points.",
             examples=[
                 "t=[0,50,100], T=[298,350]  (2 intervals: [0,50)→298K, [50,100)→350K)",
                 "t=[0,25,50,75], T=[298,310,320]  (3 intervals)"
@@ -291,7 +290,7 @@ def _parse_piecewise_temperature(
             baseline_temperature=nominal_temperature,
         )
     except TemperatureScheduleError as e:
-        raise TemperatureDSLError(f"Invalid piecewise schedule: {e}")
+        raise TemperatureDSLError(str(e)) from e
 
 
 def _parse_response_temperature(
@@ -315,20 +314,11 @@ def _parse_response_temperature(
     )
     tau = _parse_finite_number(fields["tau"], field="temp_response tau")
     if tau <= 0:
-        raise TemperatureDSLError(
-            f"tau must be positive, got {tau}",
-            suggestion="Use a strictly positive time constant",
-        )
+        raise TemperatureDSLError("tau must be positive.")
     if len(times) < 2:
-        raise TemperatureDSLError(
-            f"At least 2 time points required, got {len(times)}",
-            suggestion="Provide at least 2 time points to define an interval",
-        )
+        raise TemperatureDSLError("t needs at least two time points.")
     if len(temperatures) != len(times) - 1:
-        raise TemperatureDSLError(
-            f"Temperature count mismatch: {len(temperatures)} temperatures for {len(times)} time points",
-            suggestion=f"Need exactly {len(times)-1} temperature(s) for {len(times)} time points",
-        )
+        raise TemperatureDSLError("T must have one temperature fewer than t has time points.")
 
     try:
         return TemperatureSchedule.response(
@@ -338,4 +328,4 @@ def _parse_response_temperature(
             baseline_temperature=nominal_temperature,
         )
     except TemperatureScheduleError as e:
-        raise TemperatureDSLError(f"Invalid response schedule: {e}")
+        raise TemperatureDSLError(str(e)) from e

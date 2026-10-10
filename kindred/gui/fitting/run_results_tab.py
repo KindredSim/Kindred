@@ -15,6 +15,8 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtCore import Qt, Signal
 
 from kindred.core.analysis.fit_evaluation_outcome import ScientificUnavailable
+from kindred.core.exceptions import located
+from kindred.core.simulation_failure import FactualCause
 from kindred.core.quantity_units import format_unit_for_display
 from kindred.core.validation import six_digit_text
 from kindred.gui.display_name_policy import (
@@ -95,14 +97,19 @@ class _FitValueLabel(QtWidgets.QLabel):
         self.setSelection(0, document.characterCount() - 1)
 
 
-def _cause_chain(cause: object) -> str:
-    """Each message in a failure chain with its error code, outermost first."""
+def _cause_chain(cause: FactualCause | None) -> str:
+    """Each message in a failure chain, outermost first, on the authored line
+    the chain names. Error codes stay in the report's cause payload."""
+    if cause is None:
+        return ""
     parts: list[str] = []
-    while cause is not None:
-        code = getattr(cause, "code", None)
-        parts.append(str(getattr(cause, "message", cause)) + (f" [{code}]" if code else ""))
-        cause = getattr(cause, "cause", None)
-    return " Caused by: ".join(parts)
+    link: FactualCause | None = cause
+    while link is not None:
+        if not parts or link.message != parts[-1]:
+            # A link that only re-raises the same message adds nothing.
+            parts.append(link.message)
+        link = link.cause
+    return located(" Caused by: ".join(parts), *cause.location())
 
 
 class ResultsSummaryDialog(QtWidgets.QDialog):
@@ -455,11 +462,6 @@ class RunResultsTab(QtWidgets.QWidget):
         self._empty_label.setWordWrap(True)
         layout.addWidget(self._empty_label)
 
-        self._render_diagnostic_label = QtWidgets.QLabel(self)
-        self._render_diagnostic_label.setWordWrap(True)
-        self._render_diagnostic_label.hide()
-        layout.addWidget(self._render_diagnostic_label)
-
         self._subtabs = QtWidgets.QTabBar(self)
         self._subtabs.setObjectName("global_fit_results_subtabs")
         self._subtabs.setDocumentMode(True)
@@ -487,24 +489,16 @@ class RunResultsTab(QtWidgets.QWidget):
         candidate: FitCandidate | None,
         *,
         curves: Sequence[FitCurveDataset] = (),
-        curve_failure: str | None = None,
     ) -> bool:
         """Consume one call-local typed terminal presentation."""
         if candidate is None:
             self._summary_body = self._summary_provenance = ""
             self._tracker_panel.clear()
-            self._render_diagnostic_label.clear()
-            self._render_diagnostic_label.hide()
         else:
             overview, self._summary_body, self._summary_provenance, entries = fit_candidate_presentation(candidate)
             self._tracker_panel.set_summary(overview, entries)
         self._install_plot_projection(curves)
         self._refresh_summary()
-        if curve_failure is not None:
-            self._render_diagnostic_label.setText(
-                "Fit curves unavailable: " + str(curve_failure)
-            )
-            self._render_diagnostic_label.show()
         return self.copy_eligible()
 
     def set_progress(self, value: int) -> None:
@@ -544,8 +538,6 @@ class RunResultsTab(QtWidgets.QWidget):
         self._summary_body = self._summary_provenance = ""
         self._empty_label.setText("Run a fit to see results here.")
         self._empty_label.show()
-        self._render_diagnostic_label.clear()
-        self._render_diagnostic_label.hide()
         self._install_plot_projection(())
         if not keep_plots:
             self._dataset_tab_ids = []

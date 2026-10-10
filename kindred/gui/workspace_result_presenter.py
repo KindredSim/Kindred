@@ -37,6 +37,7 @@ from kindred.core.project_presentation_state import (
     VesselVolumeAxisSelection,
     SimulationSeriesAxisSelection,
 )
+from kindred.core.exceptions import located
 from kindred.core.project_document import ProjectDocument
 from kindred.core.result_repository import (
     ResultRepository,
@@ -333,16 +334,11 @@ def _series_names(result: SimulationResultValue) -> tuple[str, ...]:
 
 
 def _result_warning_details(result: SimulationResultValue) -> tuple[str, ...]:
-    details: list[str] = []
-    if result.failed_algebra_outputs:
-        details.append(
-            "Algebra failed: " + ", ".join(result.failed_algebra_outputs)
-        )
-    for cause in result.algebra_errors:
-        raw_name = cause.details.get("name")
-        observable_name = str(raw_name or "<unknown observable>")
-        details.append(f"Algebra error for {observable_name}: {cause.message}")
-    return tuple(details)
+    # Every failed let line has one cause, located on its authored line.
+    return tuple(
+        located(cause.message, cause.context.get("line"), cause.context.get("line_text"))
+        for cause in result.algebra_errors
+    )
 
 
 def _result_provenance_payload(result: SimulationResultValue) -> Mapping[str, object]:

@@ -231,7 +231,7 @@ class _DatasetImportBatchWorker(QtCore.QThread):
             self.cancelled.emit()
         except Exception as exc:
             logger.exception("Dataset import failed")
-            self.failed.emit(str(exc) or type(exc).__name__)
+            self.failed.emit(str(exc))
 
 
 def build_raw_record_batch_proposal(
@@ -329,24 +329,7 @@ class DatasetImportStaging(QtCore.QObject):
         worker.progressed.connect(self.progressed)
         worker.finished.connect(self._worker_finished)
         self.busyChanged.emit(True)
-        try:
-            worker.start()
-        except Exception as exc:
-            try:
-                unstarted = not worker.isRunning() and not worker.isFinished()
-            except RuntimeError:
-                unstarted = False
-            if unstarted:
-                self._active_worker = None
-                self.busyChanged.emit(False)
-                try:
-                    worker.deleteLater()
-                except RuntimeError:
-                    pass
-                raise DatasetImportAdmissionError(
-                    f"Failed to start dataset import: {type(exc).__name__}: {exc}"
-                ) from exc
-            raise
+        worker.start()
 
     def cancel_active(self) -> None:
         worker = self._active_worker

@@ -15,8 +15,8 @@ Scope of this module
 - Build a typed AST with nodes:
     Number, Ident, Unary, Binary, Call, SpeciesRef(kind="now"|"init")
 - Enforce precedence and right-associative power (** and ^).
-- Validate function-argument arity superficially (min 1 for varargs, exact for unary),
-  leave deeper numeric/type checks to the evaluator.
+- Admit builtin argument counts from the builtin table; numeric and type
+  checks belong to the evaluator.
 
 Out of scope here
 -----------------
@@ -26,7 +26,7 @@ Out of scope here
 Determinism & constraints
 -------------------------
 - No I/O, no cwd, no registry, no network.
-- Pure functions; all diagnostics use AlgebraError* with code and caret.
+- Pure functions; every diagnostic is an AlgebraError* carrying its location.
 
 """
 
@@ -37,13 +37,14 @@ import math
 import re
 from dataclasses import dataclass, field
 from fractions import Fraction
-from typing import List, Literal, Optional, Tuple
+from typing import List, Literal, Optional, Sequence, Tuple
 
 from kindred.core.quantity_units import Unit, UnitScale, ONE_SCALE
 
 from .errors import (
     AlgebraSyntaxError,
 )
+from .symbols import BUILTIN_FUNCTIONS
 from .grammar import (
     KEYWORDS,
     TOKEN_SPEC,
@@ -81,13 +82,13 @@ def _lex(src: str) -> List[Token]:
         m = _TOKEN_RE.match(src, i)
         if not m:
             # Shouldn't happen given MISMATCH, but guard anyway
-            raise AlgebraSyntaxError("lexical error", line=line, col=(i - bol + 1), line_text=_line_of(src, line))
+            raise AlgebraSyntaxError("Lexical error.", line=line, col=(i - bol + 1), line_text=_line_of(src, line))
         kind_name = m.lastgroup or "MISMATCH"
         text = m.group(0)
         if kind_name == "SKIP":
             pass
         elif kind_name == "MISMATCH":
-            raise AlgebraSyntaxError(f"unexpected character {text!r}", line=line, col=(i - bol + 1), line_text=_line_of(src, line))
+            raise AlgebraSyntaxError(f"Unexpected character {text!r}.", line=line, col=(i - bol + 1), line_text=_line_of(src, line))
         else:
             tk = TokenKind[kind_name]
             # Apply keyword recognition: if IDENT matches a keyword, use that TokenKind instead
@@ -209,20 +210,17 @@ def _iter_identifiers(node: ExprNode):
             yield from _iter_identifiers(argument)
 
 
+def circular_definition_message(target: str, steps: Sequence[str]) -> str:
+    """One sentence for a value that depends on itself, naming each read in turn."""
+    joined = steps[0] if len(steps) == 1 else ", ".join(steps[:-1]) + f", and {steps[-1]}"
+    return f"{target} depends on its own value: {joined}."
+
+
 def _topological_evaluation_order(
     statements: Tuple[LetStatement, ...],
 ) -> Tuple[str, ...]:
     """Retain a stable dependency order without changing source order."""
     names = tuple(str(statement.name) for statement in statements)
-    if len(set(names)) != len(names):
-        duplicate = next(name for name in names if names.count(name) > 1)
-        statement = next(item for item in statements if item.name == duplicate)
-        raise AlgebraSyntaxError(
-            f"duplicate Algebra assignment {duplicate!r}",
-            line=statement.line,
-            col=statement.col,
-            line_text=statement.line_text,
-        )
     positions = {name: index for index, name in enumerate(names)}
     dependencies = {
         str(statement.name): {
@@ -244,7 +242,7 @@ def _topological_evaluation_order(
             cycle = visiting[start:] + [name]
             statement = statements[positions[name]]
             raise AlgebraSyntaxError(
-                "Algebra dependency cycle: " + " -> ".join(cycle),
+                circular_definition_message(name, [f"{a} reads {b}" for a, b in zip(cycle, cycle[1:])]),
                 line=statement.line,
                 col=statement.col,
                 line_text=statement.line_text,
@@ -339,9 +337,9 @@ class Parser:
         self._consume_newlines()
 
         while self._cur().kind is not TokenKind.EOF:
-            let_tok = self._expect(TokenKind.LET, "expected 'let' at beginning of statement")
-            name_tok = self._expect(TokenKind.IDENT, "expected identifier after 'let'")
-            self._expect(TokenKind.EQUALS, "expected '=' after identifier")
+            let_tok = self._expect(TokenKind.LET, "Expected 'let' at the beginning of the statement.")
+            name_tok = self._expect(TokenKind.IDENT, "Expected a name after 'let'.")
+            self._expect(TokenKind.EQUALS, "Expected '=' after the name.")
             expr = self._parse_expr()
             # Require newline after each let
             if self._cur().kind is TokenKind.NEWLINE:
@@ -351,7 +349,7 @@ class Parser:
                 pass
             else:
                 t = self._cur()
-                raise AlgebraSyntaxError("expected end of line", line=t.line, col=t.col, line_text=t.line_text)
+                raise AlgebraSyntaxError("Expected the end of the line.", line=t.line, col=t.col, line_text=t.line_text)
 
             stmt = LetStatement(name=name_tok.text, expr=expr, line=let_tok.line, col=let_tok.col, line_text=let_tok.line_text)
             lines.append(stmt)
@@ -395,7 +393,7 @@ class Parser:
             if isinstance(node, BinaryNode) and node.op in {"<", "<=", ">", ">="}:
                 t = self._cur()
                 raise AlgebraSyntaxError(
-                    "chained comparisons are not supported",
+                    "Chained comparisons are not supported.",
                     line=t.line,
                     col=t.col,
                     line_text=t.line_text,
@@ -405,7 +403,7 @@ class Parser:
             if isinstance(rhs, BinaryNode) and rhs.op in {"<", "<=", ">", ">="}:
                 t = self._cur()
                 raise AlgebraSyntaxError(
-                    "chained comparisons are not supported",
+                    "Chained comparisons are not supported.",
                     line=t.line,
                     col=t.col,
                     line_text=t.line_text,
@@ -414,7 +412,7 @@ class Parser:
         if self._cur().kind in (TokenKind.EQ2, TokenKind.NEQ):
             t = self._cur()
             raise AlgebraSyntaxError(
-                "chained equality comparisons are not supported",
+                "Chained equality comparisons are not supported.",
                 line=t.line,
                 col=t.col,
                 line_text=t.line_text,
@@ -436,7 +434,7 @@ class Parser:
         if self._cur().kind in (TokenKind.LT, TokenKind.LTE, TokenKind.GT, TokenKind.GTE):
             t = self._cur()
             raise AlgebraSyntaxError(
-                "chained comparisons are not supported",
+                "Chained comparisons are not supported.",
                 line=t.line,
                 col=t.col,
                 line_text=t.line_text,
@@ -495,10 +493,10 @@ class Parser:
                 val = float(t.text)
             except Exception:
                 logger.debug(f"Failed to parse numeric literal: {t.text}", exc_info=True)
-                raise AlgebraSyntaxError("invalid numeric literal", line=t.line, col=t.col, line_text=t.line_text)
+                raise AlgebraSyntaxError("Invalid number.", line=t.line, col=t.col, line_text=t.line_text)
             if not math.isfinite(val):
                 raise AlgebraSyntaxError(
-                    "numeric literal must be finite",
+                    "Numbers must be finite.",
                     line=t.line,
                     col=t.col,
                     line_text=t.line_text,
@@ -507,14 +505,14 @@ class Parser:
 
         # Species refs: "[" IDENT "]" [ "_0" ]
         if self._match(TokenKind.LBRACK):
-            ident_tok = self._expect(TokenKind.IDENT, "expected species name inside [ ]")
-            self._expect(TokenKind.RBRACK, "expected closing ']'")
+            ident_tok = self._expect(TokenKind.IDENT, "Expected a species name inside [ ].")
+            self._expect(TokenKind.RBRACK, "Expected a closing ']'.")
             # Either _0 or nothing
             if self._match(TokenKind.IDENT):
                 # Only legal tail is "_0" but tokenized as IDENT; validate text
                 tail = self.toks[self.i - 1]
                 if tail.text != "_0":
-                    raise AlgebraSyntaxError("expected '_0' after species reference", line=tail.line, col=tail.col, line_text=tail.line_text)
+                    raise AlgebraSyntaxError("Expected '_0' after a species reference.", line=tail.line, col=tail.col, line_text=tail.line_text)
                 return SpeciesRefNode(ident_tok.text, "init")
             return SpeciesRefNode(ident_tok.text, "now")
 
@@ -527,9 +525,11 @@ class Parser:
                     args.append(self._parse_expr())
                     while self._match(TokenKind.COMMA):
                         args.append(self._parse_expr())
-                self._expect(TokenKind.RPAREN, "expected ')' to close function call")
-                # Basic arity sanity for known simple unary funcs
-                # Deeper checks left to evaluator
+                self._expect(TokenKind.RPAREN, "Expected ')' to close the function call.")
+                builtin = BUILTIN_FUNCTIONS.get(ident)
+                if builtin is not None and not builtin.admits(len(args)):
+                    raise AlgebraSyntaxError(f"{ident} takes {builtin.expected()}.",
+                                             line=t.line, col=t.col, line_text=t.line_text)
                 return CallNode(ident, tuple(args))
             else:
                 return IdentNode(ident)
@@ -537,15 +537,15 @@ class Parser:
         # Parenthesized
         if self._match(TokenKind.LPAREN):
             node = self._parse_expr()
-            self._expect(TokenKind.RPAREN, "expected ')'")
+            self._expect(TokenKind.RPAREN, "Expected ')'.")
             return node
 
         # NEWLINE inside expression is unexpected
         if t.kind is TokenKind.NEWLINE:
-            raise AlgebraSyntaxError("unexpected end of line in expression", line=t.line, col=t.col, line_text=t.line_text)
+            raise AlgebraSyntaxError("The expression ends too early.", line=t.line, col=t.col, line_text=t.line_text)
 
         # Fallback
-        raise AlgebraSyntaxError("unexpected token", line=t.line, col=t.col, line_text=t.line_text)
+        raise AlgebraSyntaxError("Unexpected token.", line=t.line, col=t.col, line_text=t.line_text)
 
 
 # ------------------------------ Public API -----------------------------------
@@ -555,7 +555,7 @@ def parse_algebra(src: str) -> AlgebraBlock:
     Parse an internal synthetic algebra source string and return its
     AlgebraBlock.
 
-    Raises Algebra* errors with E-series codes and a caret for diagnostics.
+    Raises Algebra* errors carrying their line and column.
     """
     tokens = _lex(src)
     parser = Parser(tokens)

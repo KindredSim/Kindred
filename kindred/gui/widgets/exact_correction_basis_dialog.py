@@ -10,11 +10,7 @@ from kindred.core.project_document import (
     ExactCorrectionAssessment,
     select_exact_correction_basis,
 )
-from kindred.core.simulator.source_correction import (
-    CorrectionPlanner,
-    CorrectionTarget,
-    build_correction_expressions,
-)
+from kindred.core.simulator.source_correction import CorrectionPlanner
 
 
 class ExactCorrectionBasisDialog(QtWidgets.QDialog):
@@ -33,6 +29,7 @@ class ExactCorrectionBasisDialog(QtWidgets.QDialog):
         self._assessment = assessment
         self._visible_source = visible_source
         self._planner = CorrectionPlanner(assessment.composition, assessment.targets)
+        self._usable = set(self._planner.viable_next_targets(()))
         self._targets = {target.name: target for target in assessment.targets}
         self._selected = set(assessment.plan.basis)
         self._selected_assessment = assessment
@@ -42,7 +39,7 @@ class ExactCorrectionBasisDialog(QtWidgets.QDialog):
         instruction = QtWidgets.QLabel(
             f"Select {required} dependent parameter"
             + ("." if required == 1 else "s.")
-            + " The remaining parameters stay independent.",
+            + " The others keep their current lines.",
             self,
         )
         instruction.setObjectName("exact_correction_required_count")
@@ -54,7 +51,7 @@ class ExactCorrectionBasisDialog(QtWidgets.QDialog):
             QtWidgets.QAbstractItemView.SelectionMode.NoSelection
         )
         for target in assessment.targets:
-            item = QtWidgets.QListWidgetItem(f"{target.name} ({target.family})")
+            item = QtWidgets.QListWidgetItem(f"{target.name} — {target.context}")
             item.setData(Qt.ItemDataRole.UserRole, target.name)
             item.setFlags(
                 Qt.ItemFlag.ItemIsUserCheckable
@@ -69,7 +66,7 @@ class ExactCorrectionBasisDialog(QtWidgets.QDialog):
             self.target_list.addItem(item)
         layout.addWidget(self.target_list)
 
-        layout.addWidget(QtWidgets.QLabel("Generated parameter equations:", self))
+        layout.addWidget(QtWidgets.QLabel("Lines to Add:", self))
         self.equations = QtWidgets.QPlainTextEdit(self)
         self.equations.setObjectName("exact_correction_generated_equations")
         self.equations.setReadOnly(True)
@@ -101,22 +98,13 @@ class ExactCorrectionBasisDialog(QtWidgets.QDialog):
         )
 
     @staticmethod
-    def _intrinsic_unavailability(target: CorrectionTarget) -> str:
-        reasons: list[str] = []
-        if not target.source_backed:
-            reasons.append("it has no editable source coordinate")
-        if target.derived:
-            reasons.append("it is already derived")
-        detail = ", ".join(reasons) or "it is not an admitted correction target"
-        return f"Cannot be selected because {detail}."
-
-    @staticmethod
     def _set_description(item: QtWidgets.QListWidgetItem, description: str) -> None:
         item.setToolTip(description)
         item.setData(Qt.ItemDataRole.AccessibleDescriptionRole, description)
 
     def _refresh_state(self) -> None:
         selected = self._selection_in_target_order()
+        required = self._planner.required_basis_size
         viable = set(self._planner.viable_next_targets(selected))
         self.target_list.blockSignals(True)
         try:
@@ -135,18 +123,20 @@ class ExactCorrectionBasisDialog(QtWidgets.QDialog):
                 )
                 if checked:
                     description = "Selected as a dependent parameter. Uncheck it to change the selection."
-                elif not target.eligible:
-                    description = self._intrinsic_unavailability(target)
+                elif target.param_line:
+                    description = "Cannot be selected because it has its own param line."
                 elif enabled:
+                    description = "Check it to calculate this value from the others."
+                elif name not in self._usable:
+                    description = "Cannot be the dependent parameter for this correction."
+                elif len(selected) == required:
                     description = (
-                        "This parameter can be selected while keeping a valid "
-                        "solution of the correction equations possible."
+                        f"{required} dependent parameter"
+                        + (" is" if required == 1 else "s are")
+                        + " already selected."
                     )
                 else:
-                    description = (
-                        "Cannot be selected with the current choices because no valid "
-                        "full-rank basis would remain."
-                    )
+                    description = "Cannot be combined with the parameters already selected."
                 self._set_description(item, description)
         finally:
             self.target_list.blockSignals(False)
@@ -158,18 +148,14 @@ class ExactCorrectionBasisDialog(QtWidgets.QDialog):
                 self._visible_source,
                 selected,
             )
-            expressions = build_correction_expressions(
-                self._assessment.composition,
-                plan,
-            )
             self.equations.setPlainText(
                 "\n".join(
                     f"param {name} = {expression}"
-                    for name, expression in expressions.items()
+                    for name, expression in self._selected_assessment.corrections.items()
                 )
             )
         else:
-            remaining = self._planner.required_basis_size - len(selected)
+            remaining = required - len(selected)
             self.equations.setPlainText(
                 f"Select {remaining} more dependent parameter"
                 + ("." if remaining == 1 else "s.")

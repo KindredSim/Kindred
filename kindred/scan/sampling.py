@@ -11,9 +11,8 @@ import warnings
 import numpy as np
 from scipy.stats import qmc
 
-from kindred.core.simulation_preparation_stages import build_solver_config
 from kindred.core.algebra.errors import AlgebraError
-from kindred.scan.config import ScanConfig, RunInput
+from kindred.scan.config import ScanConfig, RunInput, input_label
 from kindred.scan.inputs import input_catalog, admitted_ranges
 from kindred.scan.intervals import Interval
 from kindred.scan.constraints import Affine, Inequality, IntervalChecks, InputGenerationError, compile_constraints, build_spaces, conditional_order, FeasibleSpace, interval_rows
@@ -93,7 +92,7 @@ class InputDesign:
                         projected.marginal_ranges(coordinate)
                     face.append(projected)
             except ValueError as exc:
-                raise ValueError(f"Selected endpoint {key} = {endpoint:g}: {exc}") from exc
+                raise ValueError(f"Selected endpoint {input_label(key)} = {endpoint:g}: {exc}") from exc
             self.faces.append((key, endpoint, face))
 
     def _draw(self, spaces, units):
@@ -105,7 +104,7 @@ class InputDesign:
                 values[key] = expression.evaluate(values)
             for key, value in values.items():
                 if not any(interval.contains(value) for interval in self.ranges[key]):
-                    raise ValueError(f"Calculated {key} cannot be represented inside its allowed ranges: {value!r}.")
+                    raise ValueError(f"Calculated {input_label(key)} = {value:g} cannot be represented inside its allowed ranges.")
         except (ValueError, OverflowError, ZeroDivisionError) as exc:
             if isinstance(exc, InputGenerationError):
                 values.update(exc.values)
@@ -120,7 +119,7 @@ class InputDesign:
                 if values[key] != endpoint:
                     raise InputGenerationError("The dependent expression did not produce the exact endpoint.", values)
             except InputGenerationError as exc:
-                raise InputGenerationError(f"Selected endpoint {key} = {endpoint!r}: {exc}", exc.values) from exc
+                raise InputGenerationError(f"Selected endpoint {input_label(key)} = {endpoint:g}: {exc}", exc.values) from exc
             return values
         return self._draw(self.spaces, units)
 
@@ -190,8 +189,6 @@ class PreparedScanDesign:
             raise ValueError("Choose Sobol or Latin hypercube sampling.")
         if not cfg.outputs:
             raise ValueError("Select at least one exported species or authored quantity.")
-        build_solver_config(solver_input=cfg.solver, rtol=cfg.rtol, atol=cfg.atol,
-                            grid={"N": cfg.points}, use_analytic_jacobian=cfg.analytic_jacobian)
         self.check()
         prepared = self.prepared
         self.catalog = input_catalog(prepared, cfg)
@@ -228,7 +225,7 @@ class PreparedScanDesign:
             return
         for key, expression in derived.items():
             if any(k.startswith("initial:") != key.startswith("initial:") for k in expression.terms):
-                raise ValueError(f"Calculated {key} depends on the other group. These inputs cannot be reused unchanged. Use joint sampling.")
+                raise ValueError(f"Calculated {input_label(key)} depends on the other group. These inputs cannot be reused unchanged. Use joint sampling.")
 
         def group_of(key):
             return "initial" if key.startswith("initial:") else "parameter"

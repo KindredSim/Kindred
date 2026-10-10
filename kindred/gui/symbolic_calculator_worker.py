@@ -1,6 +1,7 @@
 """Calculator-owned process transport and settlement, entirely off the Qt GUI thread."""
 from __future__ import annotations
 
+import logging
 from multiprocessing import get_context
 from multiprocessing.connection import wait
 import queue
@@ -10,8 +11,10 @@ from PySide6 import QtCore
 
 from kindred.core.symbolic.calculator_worker import run_calculator_child
 
+logger = logging.getLogger(__name__)
 
-_CHILD_EXITED = "Calculator child exited unexpectedly. The next explicit query can start a new context."
+
+_CHILD_EXITED = "The Calculator stopped. The next query starts it again."
 
 
 class CalculatorWorker(QtCore.QThread):
@@ -74,9 +77,10 @@ class CalculatorWorker(QtCore.QThread):
             # The child's pipe end closed because the child exited.
             if not self._shutdown.is_set():
                 self.failed.emit(_CHILD_EXITED)
-        except Exception as exc:
+        except Exception:
+            logger.exception("Calculator process failed.")
             if not self._shutdown.is_set():
-                self.failed.emit(f"Calculator process failed: {exc}")
+                self.failed.emit(_CHILD_EXITED)
         finally:
             self._shutdown.set()
             if watchdog is not None:

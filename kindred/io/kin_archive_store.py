@@ -23,6 +23,9 @@ from kindred.core.project_document import (
     ProjectDocument,
     SimulationExecutionSettings,
     TabScientificSettings,
+    validate_fit_defaults,
+    validate_simulation_execution_settings,
+    validate_tab_scientific_settings,
 )
 from kindred.core.datasets.foundation import (
     ImportedSource,
@@ -213,7 +216,8 @@ def _decode_execution(
         label,
         {"solver", "t_start", "t_end", "integration_points"},
     )
-    return SimulationExecutionSettings(
+    # The archive is where its Run settings enter; they are admitted here.
+    return validate_simulation_execution_settings(SimulationExecutionSettings(
         solver=_string(
             data["solver"],
             f"{label}.solver",
@@ -225,7 +229,7 @@ def _decode_execution(
             data["integration_points"],
             f"{label}.integration_points",
         ),
-    )
+    ), label)
 
 
 def _encode_science(
@@ -259,7 +263,9 @@ def _decode_science(
             "use_authored_stops",
         },
     )
-    return TabScientificSettings(
+    # The archive is where its scientific settings enter; they are admitted
+    # here, before any source is parsed under them.
+    return validate_tab_scientific_settings(TabScientificSettings(
         temperature=_finite(
             data["temperature"],
             f"{label}.temperature",
@@ -275,7 +281,7 @@ def _decode_science(
         use_authored_stops=_boolean(
             data["use_authored_stops"], f"{label}.use_authored_stops",
         ),
-    )
+    ), label)
 
 
 def _encode_fit(defaults: FitDefaults) -> dict[str, object]:
@@ -295,7 +301,7 @@ def _decode_fit(value: object, label: str) -> FitDefaults:
         label,
         {"method", "max_nfev", "ftol", "xtol", "use_seed", "seed"},
     )
-    return FitDefaults(
+    return validate_fit_defaults(FitDefaults(
         method=_string(
             data["method"],
             f"{label}.method",
@@ -312,7 +318,7 @@ def _decode_fit(value: object, label: str) -> FitDefaults:
             f"{label}.use_seed",
         ),
         seed=_integer(data["seed"], f"{label}.seed"),
-    )
+    ))
 
 
 def _encode_document(
@@ -1456,7 +1462,7 @@ class KinArchiveStore:
         parent = os.path.dirname(archive_path) or os.curdir
         if not os.path.isdir(parent):
             raise FileNotFoundError(
-                f"Project directory does not exist: {parent}"
+                f"Project directory does not exist: {parent}."
             )
         payload, source_members = _encode_project(
             document,

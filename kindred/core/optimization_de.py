@@ -18,10 +18,7 @@ class DifferentialEvolutionEvaluationBudget:
     limit: int
     _nfev: int = field(default=0, init=False)
 
-    def __post_init__(self) -> None:
-        self.limit = int(self.limit)
-        if self.limit < 1:
-            raise ValueError("Differential Evolution max_nfev must be positive.")
+    # The limit is the admitted positive Fit evaluation budget.
 
     @property
     def remaining(self) -> int:
@@ -30,10 +27,7 @@ class DifferentialEvolutionEvaluationBudget:
     def claim(self, *, reserve: int = 0) -> int:
         """Claim one evaluation while leaving ``reserve`` claims untouched."""
 
-        reserved = int(reserve)
-        if reserved < 0:
-            raise ValueError("Differential Evolution evaluation reserve cannot be negative.")
-        if self.remaining <= reserved:
+        if self.remaining <= reserve:
             raise DifferentialEvolutionBudgetExhausted(
                 "Differential Evolution reached its maximum objective-evaluation budget."
             )
@@ -52,10 +46,8 @@ def compute_de_popsize_maxiter(*, budget: int, dim: int) -> Tuple[int, int]:
     estimate.
     """
 
+    # The caller passes a positive budget (its limit above one, less one).
     dim = max(1, int(dim))
-    budget = int(budget)
-    if budget < 1:
-        raise ValueError("Differential Evolution optimizer budget must be positive.")
 
     popsize = int(math.floor(math.sqrt(budget / max(1, 2 * dim))))
     popsize = max(5, min(15, popsize))

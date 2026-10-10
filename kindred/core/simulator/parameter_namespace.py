@@ -2,13 +2,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import re
-from typing import Iterator, Mapping, Sequence
+from typing import Iterator, Sequence
 
 from kindred.core.validation import try_parse_int
-from .dsl_build_input import (
-    canonical_source_coordinate_name,
-    source_coordinate_roles,
-)
 
 _PROTECTED_INDEXED_IDENTIFIER_RE = re.compile(r"^(?:k|kf|kr|keq)([1-9]\d*)$")
 
@@ -57,11 +53,6 @@ class MechanismParameterNamespace:
     canonical_names: frozenset[str]
     ordered_items: tuple[MechanismParameterNamespaceItem, ...]
     source_coordinates: tuple[MechanismSourceCoordinateInfo, ...] = ()
-
-    def __post_init__(self) -> None:
-        object.__setattr__(self, "canonical_names", frozenset(self.canonical_names))
-        object.__setattr__(self, "ordered_items", tuple(self.ordered_items))
-        object.__setattr__(self, "source_coordinates", tuple(self.source_coordinates))
 
     @property
     def source_coordinate_names(self) -> frozenset[str]:
@@ -198,9 +189,6 @@ def _iter_canonical_items(
             )
             continue
 
-        if step_kind != "equilibrium":
-            raise ValueError(f"Unsupported step kind in parameter namespace: {step_kind!r}")
-
         for role in ("kf", "kr"):
             name = f"{role}{step_index}"
             yield MechanismParameterNamespaceItem(
@@ -227,87 +215,41 @@ def _iter_canonical_items(
 
 
 def _build_namespace(descriptors: Sequence[_NamespaceStepDescriptor]) -> MechanismParameterNamespace:
+    # Unique step indices give unique indexed names and reaction-local source names.
     ordered_items = tuple(_iter_canonical_items(descriptors))
-    ordered_names: list[str] = []
-    seen_names: set[str] = set()
-    for item in ordered_items:
-        if item.canonical_name in seen_names:
-            raise ValueError(f"Duplicate mechanism parameter name {item.canonical_name!r} in authoritative namespace.")
-        seen_names.add(item.canonical_name)
-        ordered_names.append(item.canonical_name)
-    source_names = {
-        str(canonical_name)
-        for descriptor in descriptors
-        for _role, canonical_name in descriptor.source_coordinates
-    }
-    canonical_names = frozenset((*ordered_names, *source_names))
     source_coordinates = tuple(
         MechanismSourceCoordinateInfo(
-            canonical_name=str(canonical_name),
-            step_index=int(descriptor.step_index),
-            step_kind=str(descriptor.step_kind),
-            role=str(role),
+            canonical_name=canonical_name,
+            step_index=descriptor.step_index,
+            step_kind=descriptor.step_kind,
+            role=role,
             source_index=descriptor.source_index,
         )
         for descriptor in descriptors
         for role, canonical_name in descriptor.source_coordinates
     )
-    source_names = [item.canonical_name for item in source_coordinates]
-    if len(source_names) != len(set(source_names)):
-        raise ValueError("Duplicate reaction-local source coordinate identity.")
     return MechanismParameterNamespace(
-        canonical_names=canonical_names,
+        canonical_names=frozenset(
+            (*(item.canonical_name for item in ordered_items),
+             *(item.canonical_name for item in source_coordinates))
+        ),
         ordered_items=ordered_items,
         source_coordinates=source_coordinates,
     )
 
 
 def _mechanism_step_descriptors(mechanism: object) -> list[_NamespaceStepDescriptor]:
-    raw_mapping = mechanism.metadata["step_index_map"]
-    descriptors: list[_NamespaceStepDescriptor] = []
-    seen_step_indices: set[int] = set()
-    for source_index, raw_entry in enumerate(raw_mapping):
-        if not isinstance(raw_entry, dict):
-            raise ValueError(f"Mechanism step_index_map entry {source_index} is not a dict.")
-        step_index, ok = try_parse_int(raw_entry.get("step_index"))
-        if not ok or step_index <= 0:
-            raise ValueError(f"Mechanism step_index_map entry {source_index} has an invalid step_index.")
-        if step_index in seen_step_indices:
-            raise ValueError(
-                f"Mechanism step_index_map entry {source_index} repeats step_index {step_index}. Authoritative namespaces require unique step indices."
-            )
-        seen_step_indices.add(step_index)
-        step_kind = str(raw_entry.get("kind") or "")
-        if step_kind not in {"reaction", "equilibrium"}:
-            raise ValueError(f"Mechanism step_index_map entry {source_index} has an invalid kind {step_kind!r}.")
-        raw_source_coordinates = raw_entry.get("source_coordinates") or {}
-        if not isinstance(raw_source_coordinates, Mapping):
-            raise ValueError(
-                f"Mechanism step_index_map entry {source_index} has invalid source coordinates."
-            )
-        source_coordinates: list[tuple[str, str]] = []
-        for raw_role, raw_name in raw_source_coordinates.items():
-            role = str(raw_role)
-            name = str(raw_name)
-            if role not in source_coordinate_roles():
-                raise ValueError(
-                    f"Mechanism step_index_map entry {source_index} has an invalid source coordinate role {role!r}."
-                )
-            expected_name = canonical_source_coordinate_name(step_index, role)
-            if name != expected_name:
-                raise ValueError(
-                    f"Mechanism step_index_map entry {source_index} has a non-local source identity {name!r}. Expected {expected_name!r}."
-                )
-            source_coordinates.append((role, name))
-        descriptors.append(
-            _NamespaceStepDescriptor(
-                step_index=step_index,
-                step_kind=step_kind,
-                source_index=source_index,
-                source_coordinates=tuple(source_coordinates),
-            )
+    # The DSL builder writes one entry per authored step, numbered from 1, with
+    # its kind and canonical reaction-local source identities.
+    return [
+        _NamespaceStepDescriptor(
+            step_index=entry["step_index"],
+            step_kind=entry["kind"],
+            source_index=source_index,
+            source_coordinates=tuple(entry["source_coordinates"].items()),
         )
-    return descriptors
+        for source_index, entry in enumerate(mechanism.metadata["step_index_map"])
+    ]
 
 
 def build_namespace_from_mechanism(mechanism: object) -> MechanismParameterNamespace:
@@ -320,37 +262,12 @@ def canonical_name_for_mechanism_step_parameter(
     kind: str,
     item_index: int,
     role: str,
-    expected_name: str,
 ) -> str:
-    raw_mapping = mechanism.metadata["step_index_map"]
-    index_key = "reaction_index" if str(kind) == "reaction" else "equilibrium_index"
-    step_index: int | None = None
-    for raw_entry in raw_mapping:
-        if not isinstance(raw_entry, dict):
-            continue
-        if str(raw_entry.get("kind") or "") != str(kind):
-            continue
-        parsed_item_index, item_ok = try_parse_int(raw_entry.get(index_key))
-        parsed_step_index, step_ok = try_parse_int(raw_entry.get("step_index"))
-        if not item_ok or not step_ok:
-            continue
-        if int(parsed_item_index) != int(item_index):
-            continue
-        step_index = int(parsed_step_index)
-        break
-    if step_index is None or step_index <= 0:
-        raise ValueError(
-            f"Cannot resolve authoritative mechanism parameter name {expected_name!r}: "
-            f"no step_index_map entry matched {kind} item {item_index}."
-        )
-
-    role_s = str(role)
-    candidate = f"{role_s}{step_index}"
-    namespace = build_namespace_from_mechanism(mechanism)
-    resolved = namespace.resolve(candidate)
-    if resolved.canonical_name is not None:
-        return str(resolved.canonical_name)
-    raise ValueError(
-        f"Cannot resolve authoritative mechanism parameter name {expected_name!r}: "
-        f"{candidate!r} is not a canonical parameter in the mechanism namespace."
+    """Return the indexed name of one mechanism step's rate role."""
+    index_key = "reaction_index" if kind == "reaction" else "equilibrium_index"
+    step_index = next(
+        entry["step_index"]
+        for entry in mechanism.metadata["step_index_map"]
+        if entry["kind"] == kind and entry[index_key] == item_index
     )
+    return f"{role}{step_index}"

@@ -868,7 +868,6 @@ class FittingWindow(QtWidgets.QDialog):
         candidate: FitCandidate | None,
         *,
         curves: tuple[FitCurveDataset, ...] = (),
-        curve_failure: str | None = None,
     ) -> bool:
         """Consume one call-local typed candidate presentation."""
 
@@ -878,7 +877,6 @@ class FittingWindow(QtWidgets.QDialog):
         rendered = self._run_results_tab.set_terminal_presentation(
             candidate,
             curves=curves,
-            curve_failure=curve_failure,
         )
         self._results_summary_button.setEnabled(candidate is not None)
         self._layout_footer()

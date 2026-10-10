@@ -1,4 +1,4 @@
-"""Export-dialog start folders and local destination identity."""
+"""Export-dialog start folders, local destination identity, and file error text."""
 
 from __future__ import annotations
 
@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 
 __all__ = [
+    "file_error_text",
     "resolve_export_start_dir",
     "same_local_path",
 ]
@@ -44,3 +45,22 @@ def same_local_path(
     return second is not None and (
         _canonical_local_path(first) == _canonical_local_path(second)
     )
+
+
+def file_error_text(
+    exc: BaseException,
+    path: str | os.PathLike[str] | None,
+) -> str:
+    """Display text for a caught file error.
+
+    An operating-system refusal reads as its reason, never its errno, class or
+    internal temporary file name, and names ``path``. A caller passes ``None``
+    only when its surrounding text already names the file, or the file is an
+    internal one. Kindred's own errors already carry their sentence.
+    """
+
+    if not isinstance(exc, OSError) or not exc.strerror:
+        return str(exc)
+    if path is None:
+        return f"{exc.strerror}."
+    return f"{exc.strerror}: {os.fspath(path)}."

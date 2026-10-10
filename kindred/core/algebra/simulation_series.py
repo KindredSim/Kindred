@@ -7,6 +7,7 @@ from typing import Callable, Dict, Mapping, Tuple
 
 import numpy as np
 
+from kindred.core.algebra.errors import AlgebraNameError
 from kindred.core.algebra.evaluator import (
     AlgebraObservableError,
     EvaluationContext,
@@ -18,9 +19,9 @@ from kindred.core.algebra.parser import (
     BinaryNode,
     CallNode,
     ExprNode,
-    IdentNode,
     SpeciesRefNode,
     UnaryNode,
+    _iter_identifiers,
 )
 from kindred.core.algebra.symbols import SymbolTable
 
@@ -29,25 +30,6 @@ __all__ = [
     "compile_algebra_observables",
     "prepare_algebra_stop_evaluator",
 ]
-
-
-def _iter_identifiers(expr: ExprNode):
-    if isinstance(expr, IdentNode):
-        yield str(expr.name)
-        return
-    if isinstance(expr, SpeciesRefNode):
-        return
-    if isinstance(expr, UnaryNode):
-        yield from _iter_identifiers(expr.rhs)
-        return
-    if isinstance(expr, BinaryNode):
-        yield from _iter_identifiers(expr.lhs)
-        yield from _iter_identifiers(expr.rhs)
-        return
-    if isinstance(expr, CallNode):
-        for arg in expr.args:
-            yield from _iter_identifiers(arg)
-        return
 
 
 def _iter_species_refs(expr: ExprNode):
@@ -77,9 +59,9 @@ def _reject_unknown_species_references(
             set(_iter_species_refs(stmt.expr)) - set(species_names or ())
         )
         if unknown_species:
-            raise ValueError(
-                "Unknown species in Algebra expression: "
-                + ", ".join(repr(name) for name in unknown_species)
+            raise AlgebraNameError(
+                "Unknown species " + ", ".join(repr(name) for name in unknown_species) + ".",
+                line=stmt.line, col=stmt.col, line_text=stmt.line_text,
             )
 
 
@@ -139,16 +121,14 @@ def compile_algebra_observables(
 def prepare_algebra_stop_evaluator(
     compiled: CompiledAlgebraSeries,
     *,
-    target_names: Tuple[str, ...],
     species_names: Tuple[str, ...],
     initials: Mapping[str, float],
     symbol_values: Mapping[str, float],
     runtime_symbol_names: set[str],
 ) -> PreparedAlgebraStopEvaluator:
-    """Bind enabled stopping targets directly to the accepted retained AST."""
+    """Bind stopping to the accepted retained AST; the caller admits each target."""
     return PreparedAlgebraStopEvaluator(
         compiled.block,
-        target_names=target_names,
         species_names=species_names,
         initials=initials,
         symbol_values=symbol_values,

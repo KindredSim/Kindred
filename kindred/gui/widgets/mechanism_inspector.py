@@ -122,9 +122,11 @@ def _format_mechanism_reference(
     """Project the accepted symbolic mechanism without evaluating coordinates."""
 
     metadata = MechanismMetadataView.from_metadata(mechanism.metadata)
+    # A mechanism input's param line is its authored value, not a derivation.
     parameter_provenance = {
         str(statement.name): expression_to_source(statement.expr)
         for statement in parameter_spec.parameter_block.lines
+        if parameter_spec.parameter_assignment_kind(statement.name) != "mechanism input"
     }
     step_lines: list[str] = []
     uses_standard_concentration = False
@@ -356,14 +358,13 @@ def _format_steps(
                 entry,
                 authority_snapshot,
             )
-            if rate_authority is not None:
-                lines.append(
-                    "  Immutable model/default inputs (before retained assignments): "
-                    + json.dumps(
-                        _plain_json_value(rate_authority),
-                        sort_keys=True,
-                    )
+            lines.append(
+                "  Model inputs (before calculated param lines): "
+                + json.dumps(
+                    _plain_json_value(rate_authority),
+                    sort_keys=True,
                 )
+            )
             coordinate_names = set((entry.get("source_coordinates") or {}).values()) | set(parameter_names)
             for statement in parameter_spec.parameter_block.lines:
                 if statement.name in coordinate_names:
@@ -396,22 +397,14 @@ def _rate_authority_for_step(
     mechanism: object,
     entry: Mapping[str, object],
     authority_snapshot: tuple[Mapping[str, object], ...],
-) -> Mapping[str, object] | None:
-    """Select the evaluator-owned snapshot for one indexed mechanism step."""
-    kind = str(entry.get("kind") or "")
-    try:
-        if kind == "reaction":
-            index = int(entry["reaction_index"])
-        elif kind == "equilibrium":
-            index = len(tuple(mechanism.reactions)) + int(
-                entry["equilibrium_index"]
-            )
-        else:
-            return None
-        snapshot = authority_snapshot[index]
-    except (KeyError, IndexError, TypeError, ValueError):
-        return None
-    return snapshot if isinstance(snapshot, Mapping) else None
+) -> Mapping[str, object]:
+    """Select the evaluator-owned snapshot for one indexed mechanism step.
+
+    The evaluator lists reactions, then equilibria, in their mechanism order.
+    """
+    if entry["kind"] == "reaction":
+        return authority_snapshot[entry["reaction_index"]]
+    return authority_snapshot[len(mechanism.reactions) + entry["equilibrium_index"]]
 
 
 def _format_equations(structure: object, *, has_interventions: bool) -> str:

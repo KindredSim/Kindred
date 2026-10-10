@@ -6,12 +6,14 @@ import math
 
 import numpy as np
 
-from kindred.core.intervention_schedule import InterventionScheduleError, PhysicalQuantity
+from kindred.core.intervention_schedule import PhysicalQuantity
+from kindred.core.quantity_units import CUBIC_METRE, convert_value, parse_unit
 from kindred.core.volume import PhysicalDomainError, VolumeTrajectory, volume_input_in_range
 
 
 class VolumeExecution:
-    def __init__(self, *, species_names, parameter_values, end_time):
+    def __init__(self, *, species_names, parameter_values, end_time, lines):
+        self.lines = lines
         self.names = tuple(species_names)
         self.parameters = parameter_values
         self.end_time = end_time
@@ -23,7 +25,7 @@ class VolumeExecution:
 
     def _error(self, item, time, message, **operands):
         return PhysicalDomainError(
-            message, time=time, declaration=item.declaration_ordinal,
+            message, time=time, declaration=item.declaration_ordinal, line=self.lines[item.declaration_ordinal],
             operation=item.physical.op, phase=item.phase,
             authored_ordinal=item.authored_ordinal, window_ordinal=item.window_ordinal,
             **operands,
@@ -36,15 +38,17 @@ class VolumeExecution:
 
     def _quantity(self, item, path, quantity, time, temperature, *, positive=False):
         value = self._value(quantity, temperature)
-        if path in {"volume", "solution.volume", "solution.volume_rate"} and not volume_input_in_range(value, allow_zero=True):
-            unit = "m³/s" if path == "solution.volume_rate" else "m³"
-            raise self._error(item, time,
-                f"{path} must be zero or from 1e-30 through 1e30 {unit}.",
-                field=path, value=value, unit=unit, parameter=quantity.parameter)
+        # A literal was admitted with its line; an evaluated parameter is named.
+        subject = path if quantity.parameter is None else quantity.parameter
         if not math.isfinite(value) or value < 0 or (positive and value == 0):
             unit = "M" if ".stock." in path else "1" if path == "factor" else "m³/s" if "rate" in path else "m³"
             raise self._error(item, time,
-                f"{path} must be {'positive' if positive else 'nonnegative'} and finite.",
+                f"{subject} must be {'positive' if positive else 'nonnegative'} and finite",
+                field=path, value=value, unit=unit, parameter=quantity.parameter)
+        if path in {"volume", "solution.volume", "solution.volume_rate"} and not volume_input_in_range(value, allow_zero=True):
+            unit = "m³/s" if path == "solution.volume_rate" else "m³"
+            raise self._error(item, time,
+                f"{subject} must be zero or from 1e-30 through 1e30 {unit}",
                 field=path, value=value, unit=unit, parameter=quantity.parameter)
         return value
 
@@ -52,21 +56,17 @@ class VolumeExecution:
         quantity, identity = declaration
         value = self._value(quantity, temperature)
         if not volume_input_in_range(value):
+            subject = "initial_volume" if quantity.parameter is None else quantity.parameter
             raise PhysicalDomainError(
-                "initial_volume must be from 1e-30 through 1e30 m³.", time=time, declaration=identity[0],
+                f"{subject} must be positive and finite" if not (math.isfinite(value) and value > 0)
+                else f"{subject} must be from 1e-30 through 1e30 m³", time=time, declaration=identity[0],
+                line=self.lines[identity[0]],
                 operation="initial_volume", field=identity[2], authored_ordinal=identity[1],
                 value=value, unit="m³", parameter=quantity.parameter,
             )
         self.value = self.initial_value = value
         self.initial_time = time
         self.rows[time] = value
-
-    def require_volume(self, item, time):
-        if self.value is None:
-            raise InterventionScheduleError(
-                "A volume-aware intervention requires an initial_volume declaration.",
-                declaration_ordinal=item.declaration_ordinal, details={"time": time},
-            )
 
     def apply(self, item, state, *, time, temperature, held_indices):
         physical = item.physical
@@ -92,12 +92,17 @@ class VolumeExecution:
             else:
                 new_volume = old_volume - amount
         if new_volume is not None and (not math.isfinite(new_volume) or new_volume <= 0):
-            raise self._error(item, time, "Physical intervention must leave positive finite vessel volume.",
+            # A withdrawal shows both volumes in its authored unit, else in mL.
+            unit = physical.amount.declared_unit or parse_unit("mL")
+            raise self._error(item, time,
+                f"The withdrawn volume ({convert_value(amount, CUBIC_METRE, unit):g} {unit.symbol}) must be less "
+                f"than the vessel volume ({convert_value(old_volume, CUBIC_METRE, unit):g} {unit.symbol})"
+                if physical.op == "withdraw" else "Physical intervention must leave positive finite vessel volume",
                 field="volume", unit="m³", volume_before=old_volume, amount=amount, volume_after=new_volume)
         for index in held_indices:
             output[index] = state[index]
         if np.any(~np.isfinite(output)):
-            raise self._error(item, time, "Physical intervention produced nonfinite concentrations.",
+            raise self._error(item, time, "Physical intervention produced nonfinite concentrations",
                 field="concentrations", unit="M", amount=amount, volume_before=old_volume,
                 concentrations_before=tuple(map(float, state)), concentrations_after=tuple(map(float, output)))
         self.value = new_volume
@@ -113,7 +118,7 @@ class VolumeExecution:
             if item.physical is None:
                 continue
             if not math.isfinite(vessel) or vessel <= 0:
-                raise self._error(item, time, "Solution inflow requires positive finite vessel volume.",
+                raise self._error(item, time, "Solution inflow requires positive finite vessel volume",
                                   field="volume", value=vessel, unit="m³")
             q = self._quantity(item, "solution.volume_rate", item.physical.amount, time, temperature)
             rate += q
@@ -125,7 +130,7 @@ class VolumeExecution:
             for index in held_indices:
                 contribution[index] = 0.0
             if not math.isfinite(rate) or np.any(~np.isfinite(contribution)):
-                raise self._error(item, time, "Solution inflow must produce finite volume and concentration rates.",
+                raise self._error(item, time, "Solution inflow must produce finite volume and concentration rates",
                     field="inflow", volume=vessel, volume_unit="m³", volume_rate=rate, volume_rate_unit="m³/s",
                     mixing=tuple(map(float, contribution)), mixing_unit="M/s")
         return rate, contribution

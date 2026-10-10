@@ -1,11 +1,7 @@
-# Backups & audit artifacts
-_audit_reports/
-
 # Virtual environments
-.venv/
+.venv*/
 venv/
 .claude/
-.venv-win312/
 kindred.egg-info/
 
 # Python caches / test caches

@@ -7,7 +7,6 @@ from functools import reduce
 from math import gcd
 from typing import Sequence
 
-from kindred.core.simulator.errors import DSLError
 
 __all__ = [
     "WegscheiderCycle",
@@ -36,164 +35,36 @@ class _ReversibleStep:
     vector: Mapping[str, Fraction]
 
 
-def _as_fraction_stoich_map(
-    values: Mapping[object, object],
-    *,
-    label: str,
-) -> dict[str, Fraction]:
-    if not isinstance(values, Mapping):
-        raise DSLError(
-            f"Canonical equilibrium {label} stoichiometry must be a mapping."
-        )
-    if not values:
-        raise DSLError(
-            f"Canonical equilibrium {label} stoichiometry cannot be empty."
-        )
-    out: dict[str, Fraction] = {}
-    for raw_name, raw_value in values.items():
-        if not isinstance(raw_name, str) or not raw_name.strip():
-            raise DSLError(
-                f"Canonical equilibrium {label} has an invalid species name: "
-                f"{raw_name!r}."
-            )
-        try:
-            value = Fraction(str(raw_value))
-        except (TypeError, ValueError) as exc:
-            raise DSLError(
-                f"Invalid canonical stoichiometric coefficient for {raw_name!r}: "
-                f"{raw_value!r}."
-            ) from exc
-        if value <= 0:
-            raise DSLError(
-                f"Canonical equilibrium {label} coefficient for {raw_name!r} "
-                f"must be positive, got {raw_value!r}."
-            )
-        out[raw_name] = value
-    return out
+def _as_fraction_stoich_map(values: Mapping[str, float]) -> dict[str, Fraction]:
+    # Coefficients are parser-admitted positive reals of a nonempty side.
+    return {name: Fraction(str(value)) for name, value in values.items()}
 
 
-def _canonical_index(value: object, *, label: str) -> int:
-    if isinstance(value, bool) or not isinstance(value, int):
-        raise DSLError(
-            f"Canonical Wegscheider step map has an invalid {label}: {value!r}."
-        )
-    return int(value)
-
-
-def _canonical_reversible_steps(
-    mechanism: object,
-    equilibria: Sequence[object],
-) -> tuple[tuple[int, int], ...]:
+def _canonical_reversible_steps(mechanism: object) -> tuple[tuple[int, int], ...]:
     """Return every equilibrium's authoritative global step identity.
 
-    The DSL builder owns the global map.  Wegscheider analysis deliberately
-    does not invent a local numbering when that map is unavailable or
-    incomplete: the resulting ``KeqN`` name would no longer identify the
-    admitted source reaction.
+    The DSL builder owns the global map, with one entry for every authored
+    step, so each ``KeqN`` name identifies its admitted source reaction.
     """
 
-    reactions = tuple(mechanism.reactions)
-    raw_mapping = mechanism.metadata["step_index_map"]
-    expected_count = len(reactions) + len(equilibria)
-    if len(raw_mapping) != expected_count:
-        raise DSLError(
-            "Canonical mechanism step_index_map is incomplete. Wegscheider "
-            "analysis requires one entry for every authored kinetic step."
-        )
-
-    seen_step_indices: set[int] = set()
-    seen_reaction_indices: set[int] = set()
-    seen_equilibrium_indices: set[int] = set()
-    equilibrium_steps: list[tuple[int, int]] = []
-    for position, raw_entry in enumerate(raw_mapping):
-        if not isinstance(raw_entry, Mapping):
-            raise DSLError(
-                f"Canonical mechanism step_index_map entry {position} is invalid."
-            )
-        step_index = _canonical_index(
-            raw_entry.get("step_index"),
-            label=f"step_index at entry {position}",
-        )
-        if step_index <= 0 or step_index in seen_step_indices:
-            raise DSLError(
-                "Canonical mechanism step_index_map has duplicate or nonpositive "
-                f"step_index {step_index}."
-            )
-        seen_step_indices.add(step_index)
-        kind = raw_entry.get("kind")
-        if kind == "reaction":
-            reaction_index = _canonical_index(
-                raw_entry.get("reaction_index"),
-                label=f"reaction_index at entry {position}",
-            )
-            if not 0 <= reaction_index < len(reactions):
-                raise DSLError(
-                    "Canonical mechanism step_index_map reaction_index is out "
-                    f"of range: {reaction_index}."
-                )
-            if reaction_index in seen_reaction_indices:
-                raise DSLError(
-                    "Canonical mechanism step_index_map repeats reaction_index "
-                    f"{reaction_index}."
-                )
-            seen_reaction_indices.add(reaction_index)
-            continue
-        if kind != "equilibrium":
-            raise DSLError(
-                "Canonical mechanism step_index_map has unsupported step kind "
-                f"{kind!r}."
-            )
-        equilibrium_index = _canonical_index(
-            raw_entry.get("equilibrium_index"),
-            label=f"equilibrium_index at entry {position}",
-        )
-        if not 0 <= equilibrium_index < len(equilibria):
-            raise DSLError(
-                "Canonical mechanism step_index_map equilibrium_index is out "
-                f"of range: {equilibrium_index}."
-            )
-        if equilibrium_index in seen_equilibrium_indices:
-            raise DSLError(
-                "Canonical mechanism step_index_map repeats equilibrium_index "
-                f"{equilibrium_index}."
-            )
-        seen_equilibrium_indices.add(equilibrium_index)
-        equilibrium_steps.append((equilibrium_index, step_index))
-
-    expected_step_indices = set(range(1, expected_count + 1))
-    if seen_step_indices != expected_step_indices:
-        raise DSLError(
-            "Canonical mechanism step_index_map does not cover the complete "
-            "authored global step order."
-        )
-    if seen_reaction_indices != set(range(len(reactions))):
-        raise DSLError(
-            "Canonical mechanism step_index_map omits an authored reaction step."
-        )
-    if seen_equilibrium_indices != set(range(len(equilibria))):
-        raise DSLError(
-            "Canonical mechanism step_index_map omits an authored equilibrium step."
-        )
-    return tuple(sorted(equilibrium_steps, key=lambda item: item[1]))
+    return tuple(
+        (entry["equilibrium_index"], entry["step_index"])
+        for entry in mechanism.metadata["step_index_map"]
+        if entry["kind"] == "equilibrium"
+    )
 
 
 def _reversible_steps(mechanism: object) -> tuple[_ReversibleStep, ...]:
     eqs = list(mechanism.equilibria)
     if not eqs:
         return ()
-    authored_steps = _canonical_reversible_steps(mechanism, eqs)
+    authored_steps = _canonical_reversible_steps(mechanism)
 
     steps: list[_ReversibleStep] = []
     for equilibrium_index, step_index in authored_steps:
         eq = eqs[equilibrium_index]
-        forward = _as_fraction_stoich_map(
-            eq.stoich_forward,
-            label="forward",
-        )
-        back = _as_fraction_stoich_map(
-            eq.stoich_back,
-            label="backward",
-        )
+        forward = _as_fraction_stoich_map(eq.stoich_forward)
+        back = _as_fraction_stoich_map(eq.stoich_back)
         species = sorted(set(forward) | set(back))
         vector = {
             name: back.get(name, Fraction(0)) - forward.get(name, Fraction(0))

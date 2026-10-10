@@ -12,17 +12,18 @@ Error codes and kinds:
 - E150 TypeError         (non scalar where scalar required)
 - E170 BoolCastError     (boolean in numeric-only context)
 
-Formatting requirements:
-- Messages include line text, caret, and `L#:C#`.
-- The caret points to the offending column.
+Formatting:
+- The text of an error is its message. ``line`` and ``line_text`` locate the
+  statement: a parse error locates a line of the program text it read, and an
+  evaluation error the failing statement, which carries its authored line once
+  admission has placed it. A consumer shows that location with the message.
 
 Design
 ------
 - We avoid clobbering Python built-ins by prefixing class names with `Algebra`.
 - Column indices are 1-based externally; robust to out-of-range inputs.
-- Tabs in the source line are expanded to spaces for stable caret placement.
-- The base class carries `code`, `line`, `col`, `line_text` and
-  renders a canonical one-line message plus a three-line excerpt.
+- The base class carries `code`, `line`, `col`, `line_text` for consumers
+  that map an error back to its statement.
 
 This module performs no I/O and has no side effects.
 """
@@ -79,29 +80,7 @@ class AlgebraError(Exception):
 
     # Exception interface
     def __str__(self) -> str:
-        head = f"{self.code} {self.kind()}: {self.msg} @ L{self.line}:C{self.col}"
-        excerpt = self._format_excerpt()
-        return head if excerpt is None else f"{head}\n{excerpt}"
-
-    # Human-readable kind derived from class name
-    def kind(self) -> str:
-        name = type(self).__name__
-        if name.startswith("Algebra") and name.endswith("Error"):
-            name = name[len("Algebra") : -len("Error")]
-        return name or "Error"
-
-    def _format_excerpt(self) -> Optional[str]:
-        if not self.line_text:
-            return None
-        # Expand tabs for consistent visual columns
-        src = self.line_text.expandtabs(4).rstrip("\n\r")
-        # Clamp within the displayable range [1, len(src)+1]
-        # Allow caret after EOL to signal unexpected EOF.
-        start = min(max(1, self.col), max(1, len(src) + 1))
-        marker = " " * (start - 1) + "^"
-
-        loc = f"L{self.line}:C{self.col}"
-        return f"{src}\n{marker}\n{loc}"
+        return self.msg
 
 
 # ----------------------------- subclasses ------------------------------------

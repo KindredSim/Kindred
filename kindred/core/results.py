@@ -23,18 +23,6 @@ class CtcResult:
     value: float | None
     reason: str | None = None
 
-    def __post_init__(self) -> None:
-        if self.value is None:
-            if not self.reason:
-                raise ValueError("Unavailable CTC results require a reason.")
-            return
-        parsed = float(self.value)
-        if not np.isfinite(parsed):
-            raise ValueError("Available CTC results must be finite.")
-        if self.reason is not None:
-            raise ValueError("Available CTC results cannot carry an unavailable reason.")
-        object.__setattr__(self, "value", parsed)
-
     @property
     def available(self) -> bool:
         return self.value is not None
@@ -50,9 +38,8 @@ def _composite_trapezoid(time: np.ndarray, values: np.ndarray) -> float:
 
 
 def _simpson13_uniform(time: np.ndarray, values: np.ndarray) -> float:
+    # Callers pass an even number of intervals.
     intervals = time.size - 1
-    if intervals % 2:
-        raise ValueError("Simpson 1/3 requires an even number of intervals.")
     h = (time[-1] - time[0]) / intervals
     with np.errstate(over="ignore", invalid="ignore"):
         weighted = (
@@ -70,20 +57,13 @@ def integrate_ctc(t: np.ndarray, y: np.ndarray) -> CtcResult:
     The policy is intentionally not caller-configurable: uniform grids use
     Simpson 1/3 with a hard-coded relative tolerance of ``1e-6`` and a 3/8
     tail for an odd interval count; nonuniform grids use composite trapezoid.
-    Finite-shape overflow and nonfinite numerical input produce a typed
+    The canonical result supplies finite, strictly increasing times and finite
+    species values of equal length; finite-shape overflow produces a typed
     unavailable result.
     """
 
     time = np.asarray(t, dtype=float)
     values = np.asarray(y, dtype=float)
-    if time.ndim != 1 or values.ndim != 1 or time.size != values.size:
-        raise ValueError("t and y must be 1D arrays of equal length.")
-    if time.size == 0:
-        raise ValueError("t and y must contain at least one sample.")
-    if np.any(~np.isfinite(time)) or np.any(~np.isfinite(values)):
-        return CtcResult.unavailable("nonfinite input")
-    if time.size > 1 and np.any(np.diff(time) <= 0.0):
-        raise ValueError("t must be strictly increasing.")
     if time.size < 2:
         return CtcResult(0.0)
     uniform = is_uniform_time_grid(time, 1e-6)

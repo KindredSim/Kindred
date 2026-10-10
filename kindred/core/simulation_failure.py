@@ -116,21 +116,23 @@ class FactualCause:
             origin=origin,
         )
 
+    def location(self) -> tuple[object, object]:
+        """The first authored line named along this cause chain, as (line, text)."""
+        cause: FactualCause | None = self
+        while cause is not None:
+            if cause.context.get("line") is not None and cause.context.get("line_text") is not None:
+                return cause.context["line"], cause.context["line_text"]
+            cause = cause.cause
+        return None, None
+
     def __post_init__(self) -> None:
-        domain = str(self.domain or "").strip()
-        origin = str(self.origin or "").strip()
-        cause_type = str(self.type or "").strip()
-        message = str(self.message or "").strip()
-        if not domain:
-            raise ValueError("Factual cause domain must be nonblank.")
-        if not origin:
-            raise ValueError("Factual cause origin must be nonblank.")
-        if not cause_type:
-            raise ValueError("Factual cause type must be nonblank.")
-        if not message:
-            raise ValueError("Factual cause message must be nonblank.")
-        if self.cause is not None and not isinstance(self.cause, FactualCause):
-            raise TypeError("Factual cause cause must be FactualCause or None.")
+        # Producers pass literal domains, origins and types and a nonblank
+        # message (an exception's own text, else its type name); exception
+        # attributes are normalized here.
+        domain = str(self.domain).strip()
+        origin = str(self.origin).strip()
+        cause_type = str(self.type).strip()
+        message = str(self.message).strip()
         normalized_code = (
             str(self.code).strip()
             if self.code is not None and str(self.code).strip()
@@ -151,22 +153,8 @@ class FactualCause:
         object.__setattr__(self, "code", normalized_code)
         object.__setattr__(self, "type", cause_type)
         object.__setattr__(self, "message", message)
-        context = self.context if self.context is not None else {}
-        details = self.details if self.details is not None else {}
-        if not isinstance(context, Mapping):
-            raise TypeError("Factual cause context must be a mapping.")
-        if not isinstance(details, Mapping):
-            raise TypeError("Factual cause details must be a mapping.")
-        object.__setattr__(
-            self,
-            "context",
-            freeze_factual_value(context),
-        )
-        object.__setattr__(
-            self,
-            "details",
-            freeze_factual_value(details),
-        )
+        object.__setattr__(self, "context", freeze_factual_value(self.context))
+        object.__setattr__(self, "details", freeze_factual_value(self.details))
         object.__setattr__(self, "suggestion", normalized_suggestion)
         object.__setattr__(self, "examples", normalized_examples)
 
@@ -218,8 +206,6 @@ def factual_cause_from_exception(
     exception graphs cannot recurse forever.
     """
 
-    if not isinstance(exc, BaseException):
-        raise TypeError("Factual cause source must be an exception.")
     owned = getattr(exc, "factual_cause", None)
     if isinstance(owned, FactualCause):
         # A producer or fitting boundary may already have captured the exact

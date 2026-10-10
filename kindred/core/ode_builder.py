@@ -12,7 +12,6 @@ from __future__ import annotations
 
 from kindred.core.kinetics import forward_rate_model_payload
 
-import math
 import logging
 from dataclasses import dataclass
 from typing import Callable, Mapping
@@ -22,9 +21,7 @@ import numpy as np
 from .equilibrium_rate_authority import (
     json_safe_equilibrium_authority_payload,
 )
-from .exceptions import KineticRuntimeDomainError
 from .mechanism import Equilibrium, FrozenDict, Mechanism, Reaction
-from .species import validate_temperature
 from .simulator.solver_types import (
     SimulationScientificUnavailability,
     _SimulationScientificUnavailabilitySignal,
@@ -74,109 +71,16 @@ class EffectiveRateCoefficientEvaluator:
     parameter_values: Callable[[float, tuple[str, ...]], dict[str, float]]
     _parameter_names: tuple[tuple[str, str | None], ...]
 
-    def __post_init__(self) -> None:
-        frozen_snapshot: list[Mapping[str, object]] = []
-        for item in self.authority_snapshot:
-            if not isinstance(item, Mapping):
-                raise TypeError(
-                    "Effective rate authority snapshots must be mappings."
-                )
-            frozen_snapshot.append(
-                item if isinstance(item, FrozenDict) else FrozenDict(item)
-            )
-        object.__setattr__(
-            self,
-            "authority_snapshot",
-            tuple(frozen_snapshot),
-        )
-        object.__setattr__(self, "step_kinds", tuple(self.step_kinds))
-
-    def __call__(self, temperature_K: float) -> EffectiveRateCoefficients:
-        def failure_details(index: int | None = None) -> dict[str, object]:
-            details: dict[str, object] = {}
-            if index is not None:
-                details["step_index"] = int(index)
-                if index < len(self.step_kinds):
-                    details["step_kind"] = str(self.step_kinds[index])
-                snapshot = (
-                    self.authority_snapshot[index]
-                    if index < len(self.authority_snapshot)
-                    else {}
-                )
-                names = tuple(
-                    sorted(
-                        {
-                            str(snapshot.get(key)).strip()
-                            for key in (
-                                "binding_name",
-                                "forward_binding_name",
-                                "reverse_binding_name",
-                            )
-                            if snapshot.get(key) is not None
-                            and str(snapshot.get(key)).strip()
-                        }
-                    )
-                )
-                details["authority_names"] = names
-                details["parameter_names"] = names
-                details["value_dependencies"] = names
-            return details
-
-        try:
-            temperature = validate_temperature(
-                temperature_K,
-                field="Runtime temperature",
-            )
-        except (TypeError, ValueError, OverflowError) as exc:
-            raise KineticRuntimeDomainError(
-                f"Runtime temperature is outside the admitted domain: {exc}",
-                stage="scheduled_temperature",
-                details=failure_details(),
-            ) from exc
+    def __call__(self, temperature: float) -> EffectiveRateCoefficients:
+        # The temperature arrives admitted by the DSL T directive or its schedule.
+        # Parameter evaluation admits every coefficient as a rate: coordinate
+        # writes and Algebra targets as their role, derived readouts as computed.
         roots = tuple(name for pair in self._parameter_names for name in pair if name is not None)
         values = self.parameter_values(temperature, roots)
-        forward = tuple(float(values[name]) for name, _reverse in self._parameter_names)
-        reverse = tuple(float(values[name]) if name else 0.0 for _forward, name in self._parameter_names)
-        if not (
-            len(self.step_kinds)
-            == len(forward)
-            == len(reverse)
-        ):
-            raise ValueError(
-                "Effective rate coefficient shape conflicts with mechanism steps."
-            )
-        for index, (kind, forward_value, reverse_value) in enumerate(zip(
-            self.step_kinds,
-            forward,
-            reverse,
-            strict=True,
-        )):
-            if not math.isfinite(forward_value) or forward_value < 0.0:
-                raise KineticRuntimeDomainError(
-                    "Effective forward rate coefficients must be finite and nonnegative.",
-                    parameter_names=tuple(failure_details(index).get("parameter_names", ())),
-                    details=failure_details(index),
-                )
-            if kind == "equilibrium":
-                if not math.isfinite(reverse_value) or reverse_value < 0.0:
-                    raise KineticRuntimeDomainError(
-                        "Effective reverse rate coefficients must be finite and nonnegative.",
-                        parameter_names=tuple(failure_details(index).get("parameter_names", ())),
-                        details=failure_details(index),
-                    )
-            elif kind == "reaction":
-                if reverse_value != 0.0:
-                    raise ValueError(
-                        "Irreversible reaction coefficient rows cannot carry a reverse rate."
-                    )
-            else:
-                raise ValueError(
-                    f"Unsupported effective-rate step kind {kind!r}."
-                )
         return EffectiveRateCoefficients(
             temperature_K=temperature,
-            forward=forward,
-            reverse=reverse,
+            forward=tuple(float(values[name]) for name, _reverse in self._parameter_names),
+            reverse=tuple(float(values[name]) if name else 0.0 for _forward, name in self._parameter_names),
         )
 
 def build_effective_rate_coefficient_evaluator(
@@ -215,7 +119,7 @@ def build_effective_rate_coefficient_evaluator(
                 snapshot.update(authority=json_safe_equilibrium_authority_payload(dict(step.authority.identity_items())), reverse_binding_name=reverse_name)
             names.append((forward_name, reverse_name))
             step_kinds.append(kind)
-            snapshots.append(snapshot)
+            snapshots.append(FrozenDict(snapshot))
     return EffectiveRateCoefficientEvaluator(
         nominal_temperature_K=nominal_temperature, step_kinds=tuple(step_kinds),
         authority_snapshot=tuple(snapshots), parameter_values=evaluate, _parameter_names=tuple(names),
@@ -308,12 +212,12 @@ class CompiledOdeTopology:
         *,
         base_values: Mapping[str, float] | None = None,
     ) -> tuple[EffectiveRateCoefficientEvaluator, Callable[..., np.ndarray]]:
-        """Bind one target's rate authority and mutable RHS workspace."""
+        """Bind one target's rate authority and mutable RHS workspace.
 
-        if tuple(mechanism.species_names()) != self.species_names:
-            raise ValueError("Target mechanism species order conflicts with compiled ODE topology.")
-        if len(mechanism.reactions) + len(mechanism.equilibria) != len(self.step_kinds):
-            raise ValueError("Target mechanism step order conflicts with compiled ODE topology.")
+        The target is a shell of the prepared owner that compiled this topology,
+        so its species and step order are this topology's.
+        """
+
         coefficient_evaluator = build_effective_rate_coefficient_evaluator(
             mechanism, base_values=base_values
         )

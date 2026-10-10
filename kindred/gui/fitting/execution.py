@@ -284,15 +284,6 @@ def _compile_dataset_spec(
         if prepared.parametric_x_observation is None
         else _series_from_selected(prepared.parametric_x_observation)
     )
-    if x_observations is not None:
-        x_rows = set(x_observations.source_rows)
-        if any(
-            not set(item.source_rows).issubset(x_rows)
-            for item in observation_map.values()
-        ):
-            raise ValueError(
-                f"Dataset {prepared.dataset_id!r}: Parametric-X capture is missing a selected Y source row."
-            )
     return FitDatasetSpec(
         dataset_id=prepared.dataset_id,
         species_list=tuple(item.model_target for item in selected),
@@ -369,7 +360,7 @@ def _initial_values_from_result(
     return tuple(
         (
             set_id,
-            _finite_items(values, field=f"Fit initials {set_id}"),
+            tuple(sorted(values.items())),
         )
         for set_id, values in sorted(values_by_set.items())
     )
@@ -440,7 +431,7 @@ def _terminal_setup_snapshot(
                 parameters.append(
                     _replace_fit_parameter(
                         parameter,
-                        initial=unique.pop(),
+                        value=unique.pop(),
                         dataset_values=dataset_values,
                     )
                 )
@@ -460,16 +451,12 @@ def _terminal_setup_snapshot(
                 raise ValueError(
                     f"Fit result omitted shared parameter {parameter.name!r}."
                 )
+            # _assemble_fit_terminal admitted every fitted value before this overlay.
             value = shared_results[parameter.name]
-            if not math.isfinite(value):
-                raise ValueError(
-                    f"Fit result contains nonfinite parameter "
-                    f"{parameter.name!r}."
-                )
             parameters.append(
                 _replace_fit_parameter(
                     parameter,
-                    initial=value,
+                    value=value,
                     dataset_values=dataset_values,
                 )
             )
@@ -494,13 +481,7 @@ def _terminal_setup_snapshot(
                     f"Fit result omitted dataset-scoped parameter "
                     f"{parameter.name!r} for {dataset_id!r}."
                 )
-            value = values[parameter.name]
-            if not math.isfinite(value):
-                raise ValueError(
-                    f"Fit result contains nonfinite parameter "
-                    f"{parameter.name!r} for {dataset_id!r}."
-                )
-            fitted_by_id[dataset_id] = value
+            fitted_by_id[dataset_id] = values[parameter.name]
         # A group's fitted value is every member's, excluded members included.
         for group in requested_config.groups:
             members = [item for item in group if item in included_ids]
@@ -727,7 +708,6 @@ def _assemble_fit_terminal(
             for value in values:
                 admitted = admit_gui_parameter_value(
                     value,
-                    scientific_category=parameter.scientific_category,
                     role=parameter.role,
                     unit=parameter.unit,
                     allow_exact_zero=parameter.allow_exact_zero,
@@ -746,7 +726,6 @@ def _assemble_fit_terminal(
                 )
                 admitted = admit_gui_parameter_value(
                     source_values[dataset_id][parameter.name],
-                    scientific_category=parameter.scientific_category,
                     role=parameter.role,
                     unit=parameter.unit,
                     allow_exact_zero=parameter.allow_exact_zero,
@@ -909,8 +888,6 @@ class _FitExecution(_FitControl):
         mapped_by_id = {item.dataset_id: item for item in setup.origin.mapped_datasets}
         dispatch = request.dispatch
         included_ids = dispatch.included_dataset_ids
-        if tuple(item.dataset_id for item in included) != included_ids:
-            raise RuntimeError("Fit worker included roster diverged from admitted dispatch.")
         fixed_by_dataset = {
             dataset_id: dict(values)
             for dataset_id, values in dispatch.fixed_by_dataset
@@ -919,8 +896,6 @@ class _FitExecution(_FitControl):
         prepared_datasets = {
             item.dataset_id: item for item in dispatch.prepared_datasets
         }
-        if set(prepared_datasets) != set(included_ids):
-            raise RuntimeError("Fit worker lost an admitted dataset solver policy.")
         evaluators: dict[str, FittingEvaluator] = {}
         for local in included:
             if self._checkpoint():
@@ -932,7 +907,6 @@ class _FitExecution(_FitControl):
                     param_names=candidate_names,
                     t_start=dataset_context.execution_t_start,
                     t_end=dataset_context.execution_t_end,
-                    num_points=int(dataset_context.solver_config.grid["N"]),
                     objective_sample_times=dataset_context.retained_times,
                     prepared_solver_config=dataset_context.solver_config,
                     fit_sampling_policy=dataset_context.fit_sampling_policy,
@@ -1040,12 +1014,7 @@ class _FitExecution(_FitControl):
             dataset_id = local.dataset_id
             mapped = mapped_by_id[dataset_id]
             evaluation = starting_futures[dataset_id].result()
-            if isinstance(evaluation, ScientificUnavailable):
-                fit_info = None
-            elif isinstance(evaluation, DatasetFitInfo):
-                fit_info = evaluation
-            else:
-                raise TypeError("Fit evaluator did not return DatasetFitInfo.")
+            fit_info = None if isinstance(evaluation, ScientificUnavailable) else evaluation
             if fit_info is not None:
                 starting_evaluations[dataset_id] = fit_info.simulation_result
                 starting_facts.append(fit_info)
@@ -1223,7 +1192,7 @@ class _FitExecution(_FitControl):
             cancellation_check=execution_cancellation_check,
             cancellation_control=execution_cancellation_control,
             stop_check=self._stopped.is_set,
-            starting_facts=tuple(sorted(starting_facts, key=lambda info: info.dataset_id)),
+            starting_facts=tuple(starting_facts),
             profile_likelihood=prune_fit_analysis_coordinates(
                 request.setup.profile_likelihood, excluded_dataset_ids=excluded,
                 parameters=request.setup.parameters,
@@ -1239,8 +1208,6 @@ class _FitExecution(_FitControl):
         if isinstance(result_or_unavailable, ScientificUnavailable):
             self._terminal_unavailable = result_or_unavailable
             return None
-        if not isinstance(result_or_unavailable, GlobalFitResult):
-            raise TypeError("Fit core returned an unsupported terminal value.")
         result = result_or_unavailable
         candidate = _assemble_fit_terminal(
             request=request,

@@ -7,12 +7,13 @@ from dataclasses import replace
 
 from PySide6 import QtCore, QtWidgets
 
+from kindred.core.exceptions import located
 from kindred.core.project_document import (
     FitDefaults,
     MechanismSourceCollision,
+    MechanismSourceReconciliation,
     ProjectDocument,
     reconcile_tab_mechanism_source,
-    retained_tab_mechanism_source,
 )
 from kindred.core.mechanism_source import MechanismAuthoringSource
 from kindred.core.project_session import ProjectSession
@@ -22,7 +23,6 @@ from kindred.core.simulator.dsl_parse import (
 )
 from kindred.gui.computation_gate import ComputationGate
 from kindred.core.validation import six_digit_text, six_digit_value
-from kindred.gui.parameter_enumeration import admit_gui_parameter_value
 from kindred.gui.fitting.launch import (
     FitExecutionRequest,
     FitOriginSnapshot,
@@ -145,45 +145,32 @@ class FitSessionOwner(QtCore.QObject):
             )
             return None
         requested_id = str(tab_id or self._registry.active_tab_id)
-        try:
-            origin = capture_fit_origin(self._session.document, requested_id)
-            setup = create_initial_fit_setup(origin)
-            analysis = origin.prepared_dsl.analysis
-            modeled_species = tuple(
-                dict.fromkeys(
-                    (*analysis.species_names, *analysis.observable_names)
-                )
+        origin = capture_fit_origin(self._session.document, requested_id)
+        setup = create_initial_fit_setup(origin)
+        analysis = origin.prepared_dsl.analysis
+        modeled_species = tuple(
+            dict.fromkeys(
+                (*analysis.species_names, *analysis.observable_names)
             )
-            def fit_color_resolver(species):
-                return self._color_resolver(str(species), modeled_species)
+        )
+        def fit_color_resolver(species):
+            return self._color_resolver(str(species), modeled_species)
 
-            window = FittingWindow(
-                origin,
-                close_handler=self._request_window_close,
-                color_resolver=fit_color_resolver,
-                observation_style=self._observation_style_getter(),
-                parent=self._parent_widget,
-            )
-        except (TypeError, ValueError, KeyError, LookupError) as exc:
-            self._set_status(f"Fit Open failed: {exc}")
-            return None
+        window = FittingWindow(
+            origin,
+            close_handler=self._request_window_close,
+            color_resolver=fit_color_resolver,
+            observation_style=self._observation_style_getter(),
+            parent=self._parent_widget,
+        )
         self._window = window
         self._install_setup(setup)
         self._initial_setup_snapshot = setup
         self._last_fit_setup_snapshot = None
         self._invalidate_candidate_custody()
-        try:
-            window.project_setup_snapshot(setup)
-            window.set_initial_reset_available(setup)
-            window.set_apply_available(False, "Run a fit to obtain values to apply.")
-        except (TypeError, ValueError, KeyError) as exc:
-            window.deleteLater()
-            self._window = None
-            self._setup_state = None
-            self._initial_setup_snapshot = None
-            self._last_fit_setup_snapshot = None
-            self._set_status(f"Fit Open failed: {exc}")
-            return None
+        window.project_setup_snapshot(setup)
+        window.set_initial_reset_available(setup)
+        window.set_apply_available(False, "Run a fit to obtain values to apply.")
 
         window.executeRequested.connect(self.execute)
         window.stopRequested.connect(self.stop)
@@ -243,64 +230,47 @@ class FitSessionOwner(QtCore.QObject):
                 f"Fit rejected: {self._gate.active_kind or 'another computation'} is active."
             )
             return False
-        try:
-            request = self._build_request()
-        except (TypeError, ValueError, KeyError) as exc:
-            self._set_status(f"Fit setup is invalid: {exc}")
-            return False
+        request = self._build_request()
         if not self._gate.try_acquire(self, "fit"):
             self._set_status("Fit rejected: another computation is active.")
             return False
-        try:
-            worker = GlobalFitWorker(
-                request,
-                parent=self,
-            )
-        except Exception as exc:
-            self._gate.release(self)
-            self._set_status(f"Fit preparation failed before dispatch: {exc}")
-            return False
-        try:
-            # The worker object is the sole callback fence.  Queued callbacks
-            # from a settled/replaced QThread are harmless because every
-            # callback checks exact QObject custody before touching state.
-            worker.execution_started.connect(
-                lambda w=worker, r=request: self._on_execution_started(w, r)
-            )
-            worker.progress.connect(
-                lambda value, text, w=worker: self._on_progress(w, value, text)
-            )
-            worker.best_updated.connect(
-                lambda update, w=worker: self._on_best(w, update)
-            )
-            worker.curves_updated.connect(
-                lambda curves, w=worker: self._on_live_curves(w, curves)
-            )
-            worker.candidate_ready.connect(
-                lambda candidate, w=worker: self._on_candidate(w, candidate)
-            )
-            worker.factual_failure.connect(
-                lambda failure, w=worker: self._on_failure(w, failure)
-            )
-            worker.scientific_unavailable.connect(
-                lambda unavailable, w=worker: self._on_unavailable(w, unavailable)
-            )
-            worker.cancelled.connect(
-                lambda w=worker: self._on_cancelled(w)
-            )
-            worker.finished.connect(
-                lambda w=worker, r=request: self._finish_worker(w, r)
-            )
-            self._worker = worker
-            self._application_close_settlement_pending = True
-            window.set_executing(True)
-            self.execution_changed.emit(True)
-            window.prepare_fit_plots(request, waiting=True)
-            self._set_status("Preparing Fit plots.", phase="Preparing", detail="Preparing all dataset views")
-        except Exception as exc:
-            self._set_status(f"Fit preparation failed before dispatch: {exc}")
-            self._finish_worker(worker, request)
-            return False
+        worker = GlobalFitWorker(request, parent=self)
+        # The worker object is the sole callback fence.  Queued callbacks
+        # from a settled/replaced QThread are harmless because every
+        # callback checks exact QObject custody before touching state.
+        worker.execution_started.connect(
+            lambda w=worker, r=request: self._on_execution_started(w, r)
+        )
+        worker.progress.connect(
+            lambda value, text, w=worker: self._on_progress(w, value, text)
+        )
+        worker.best_updated.connect(
+            lambda update, w=worker: self._on_best(w, update)
+        )
+        worker.curves_updated.connect(
+            lambda curves, w=worker: self._on_live_curves(w, curves)
+        )
+        worker.candidate_ready.connect(
+            lambda candidate, w=worker: self._on_candidate(w, candidate)
+        )
+        worker.factual_failure.connect(
+            lambda failure, w=worker: self._on_failure(w, failure)
+        )
+        worker.scientific_unavailable.connect(
+            lambda unavailable, w=worker: self._on_unavailable(w, unavailable)
+        )
+        worker.cancelled.connect(
+            lambda w=worker: self._on_cancelled(w)
+        )
+        worker.finished.connect(
+            lambda w=worker, r=request: self._finish_worker(w, r)
+        )
+        self._worker = worker
+        self._application_close_settlement_pending = True
+        window.set_executing(True)
+        self.execution_changed.emit(True)
+        window.prepare_fit_plots(request, waiting=True)
+        self._set_status("Preparing Fit plots.", phase="Preparing", detail="Preparing all dataset views")
         QtCore.QTimer.singleShot(0, lambda: self._launch_worker(worker, request))
         return True
 
@@ -310,16 +280,7 @@ class FitSessionOwner(QtCore.QObject):
         if self._closing or self._application_close_fenced:
             self._finish_worker(worker, request)
             return
-        try:
-            worker.start()
-        except Exception as exc:
-            self._set_status(f"Fit QThread start failed: {exc}")
-            # A native thread may have started before a wrapper raised. Keep
-            # its custody until finished, just as for a normal cancellation.
-            if worker.isRunning() or worker.isFinished():
-                worker.request_cancel()
-            else:
-                self._finish_worker(worker, request)
+        worker.start()
 
     def _on_execution_started(self, worker: GlobalFitWorker, request: FitExecutionRequest) -> None:
         if self._worker is not worker or self._closing or self._application_close_fenced:
@@ -444,13 +405,9 @@ class FitSessionOwner(QtCore.QObject):
         if snapshot.origin is not origin:
             self._set_status("Fit setup reset rejected: the owner snapshot is stale.")
             return False
-        try:
-            window.clear_pending_setup_edits()
-            self._clear_candidate_presentation(window)
-            window.project_setup_snapshot(snapshot)
-        except (TypeError, ValueError, KeyError) as exc:
-            self._set_status(f"Fit setup reset failed: {exc}")
-            return False
+        window.clear_pending_setup_edits()
+        self._clear_candidate_presentation(window)
+        window.project_setup_snapshot(snapshot)
         self._install_setup(snapshot)
         self._invalidate_candidate_custody()
         self._set_status(f"Fit setup {kind.replace('_', ' ')} snapshot restored.")
@@ -487,19 +444,11 @@ class FitSessionOwner(QtCore.QObject):
         self._require_thread()
         if self._closing or self._application_close_fenced:
             return False
-        if not isinstance(defaults, FitDefaults):
-            raise TypeError("defaults must be FitDefaults.")
         expected_token = self._session.capture_content_token()
-        try:
-            successor_token = self._registry.replace_document(
-                replace(self._session.document, fit_defaults=defaults),
-                expected_token=expected_token,
-            )
-        except Exception as exc:
-            self._set_status(
-                f"Project Fit defaults update failed: {exc}"
-            )
-            return False
+        successor_token = self._registry.replace_document(
+            replace(self._session.document, fit_defaults=defaults),
+            expected_token=expected_token,
+        )
         if successor_token == expected_token:
             return False
         self.project_document_changed.emit(None)
@@ -670,21 +619,17 @@ class FitSessionOwner(QtCore.QObject):
         window = self._window
         if window is None:
             return
-        try:
-            window.project_setup_snapshot(terminal_setup)
-            window.set_last_fit_reset_available(terminal_setup)
-            curves, curve_failure = self._candidate_projection
-            _completion, complete = fit_completion_presentation(candidate)
-            if complete:
-                window.set_progress(100)
-            window.set_terminal_presentation(
-                candidate,
-                curves=curves,
-                curve_failure=curve_failure,
-            )
-            self._refresh_apply_availability()
-        except Exception as exc:
-            self._set_status(f"Fit result presentation failed: {exc}")
+        window.project_setup_snapshot(terminal_setup)
+        window.set_last_fit_reset_available(terminal_setup)
+        curves = self._candidate_projection
+        _completion, complete = fit_completion_presentation(candidate)
+        if complete:
+            window.set_progress(100)
+        window.set_terminal_presentation(
+            candidate,
+            curves=curves,
+        )
+        self._refresh_apply_availability()
 
     @classmethod
     def _candidate_publishable_parameter_values(
@@ -709,23 +654,13 @@ class FitSessionOwner(QtCore.QObject):
                 if overall is None:
                     continue
                 raw_value = overall[1]
-            values[parameter.name] = admit_gui_parameter_value(
-                raw_value,
-                scientific_category=parameter.scientific_category,
-                role=parameter.role,
-                unit=parameter.unit,
-                allow_exact_zero=parameter.allow_exact_zero,
-                field=f"fitted parameter {parameter.name!r}",
-            )
+            values[parameter.name] = raw_value
         return values
 
     @classmethod
     def _candidate_apply_reason(cls, candidate: FitCandidate) -> str:
-        try:
-            parameter_values = cls._candidate_publishable_parameter_values(candidate)
-            initial_values = candidate.initial_values_by_set
-        except (TypeError, ValueError, KeyError) as exc:
-            return f"Fit values cannot be applied: {exc}"
+        parameter_values = cls._candidate_publishable_parameter_values(candidate)
+        initial_values = candidate.initial_values_by_set
         return "" if parameter_values or initial_values else "This fit has no fitted values to apply."
 
     @QtCore.Slot()
@@ -785,49 +720,45 @@ class FitSessionOwner(QtCore.QObject):
             self._set_status(f"Fit Apply rejected: {reason}")
             return False
         token = self._session.capture_content_token()
-        try:
-            if to_copy:
-                document, copied, set_ids = self._registry.prepare_tab_copy(
-                    origin.tab_id, name_suffix="Fit",
-                )
-                proposed_document = self._prepare_fit_application(
-                    candidate, document, copied.tab_id, set_ids=set_ids,
-                )
-                capture_fit_origin(proposed_document, copied.tab_id)
-                published = self._registry.publish_tab_copy(
-                    origin.tab_id, copied, set_ids, proposed_document,
-                    expected_token=token, activate=False,
-                )
-                self._candidate_copy_name = published.name
-                self._refresh_apply_availability()
-                self.project_document_changed.emit(published.tab_id)
-                origin_name = self._registry.tab(origin.tab_id).name
-                message = (
-                    f'Fit applied to “{published.name}”. '
-                    f'This fitting session remains attached to “{origin_name}”.'
-                )
-                self._set_status(message)
-                return True
+        if to_copy:
+            document, copied, set_ids = self._registry.prepare_tab_copy(
+                origin.tab_id, name_suffix="Fit",
+            )
             proposed_document = self._prepare_fit_application(
-                candidate, self._registry.document, origin.tab_id,
+                candidate, document, copied.tab_id, set_ids=set_ids,
             )
-            successor_origin = capture_fit_origin(proposed_document, origin.tab_id)
-            rebased_setup = replace(setup, origin=successor_origin)
-            rebased_initial_setup = (
-                None
-                if self._initial_setup_snapshot is None
-                else replace(
-                    self._initial_setup_snapshot,
-                    origin=successor_origin,
-                )
+            capture_fit_origin(proposed_document, copied.tab_id)
+            published = self._registry.publish_tab_copy(
+                origin.tab_id, copied, set_ids, proposed_document,
+                expected_token=token, activate=False,
             )
-            rebased_last_fit_setup = replace(
-                candidate.setup_snapshot,
+            self._candidate_copy_name = published.name
+            self._refresh_apply_availability()
+            self.project_document_changed.emit(published.tab_id)
+            origin_name = self._registry.tab(origin.tab_id).name
+            message = (
+                f'Fit applied to “{published.name}”. '
+                f'This fitting session remains attached to “{origin_name}”.'
+            )
+            self._set_status(message)
+            return True
+        proposed_document = self._prepare_fit_application(
+            candidate, self._registry.document, origin.tab_id,
+        )
+        successor_origin = capture_fit_origin(proposed_document, origin.tab_id)
+        rebased_setup = replace(setup, origin=successor_origin)
+        rebased_initial_setup = (
+            None
+            if self._initial_setup_snapshot is None
+            else replace(
+                self._initial_setup_snapshot,
                 origin=successor_origin,
             )
-        except (TypeError, ValueError, KeyError, LookupError) as exc:
-            self._set_status(f"Fit Apply rejected: {exc}")
-            return False
+        )
+        rebased_last_fit_setup = replace(
+            candidate.setup_snapshot,
+            origin=successor_origin,
+        )
         self._registry.replace_document(proposed_document, expected_token=token)
         self._candidate_applied_to_project = True
         self._install_setup(rebased_setup)
@@ -854,10 +785,7 @@ class FitSessionOwner(QtCore.QObject):
         session keeps the exact values.
         """
 
-        parameter_values = {
-            name: six_digit_value(value)
-            for name, value in self._candidate_publishable_parameter_values(candidate).items()
-        }
+        exact_values = self._candidate_publishable_parameter_values(candidate)
         initial_values = {
             (set_ids[set_id] if set_ids is not None else set_id, species): six_digit_value(value)
             for set_id, values in candidate.initial_values_by_set
@@ -865,9 +793,13 @@ class FitSessionOwner(QtCore.QObject):
         }
         origin = candidate.origin
         source_text = origin.mechanism_source.reactions_text
+        # A value whose exact or rounded value equals the admitted one keeps the
+        # authored text.
+        admitted = {item.name: item.shared_config.value for item in origin.parameter_defaults}
         updates = tuple(
-            DslParameterCoordinateUpdate(name=name, value=value)
-            for name, value in sorted(parameter_values.items())
+            DslParameterCoordinateUpdate(name=name, value=six_digit_value(value))
+            for name, value in sorted(exact_values.items())
+            if admitted[name] not in (value, six_digit_value(value))
         )
         if updates:
             source_text = derive_source_with_parameter_updates(source_text, origin.prepared_dsl, updates)
@@ -880,7 +812,7 @@ class FitSessionOwner(QtCore.QObject):
         if source == document.tab(tab_id).mechanism_source:
             # IC-only and unchanged-value Apply retain the accepted owner so
             # unaffected Run requests remain reusable by ordinary Preview.
-            reconciliation = retained_tab_mechanism_source(document, tab_id)
+            reconciliation = MechanismSourceReconciliation(proposed_document=document)
         else:
             reconciliation = reconcile_tab_mechanism_source(document, tab_id, source)
         if isinstance(reconciliation, MechanismSourceCollision):
@@ -920,8 +852,8 @@ class FitSessionOwner(QtCore.QObject):
                 continue
             entries, mean = overall
             lines.append(
-                f"# Fit applied: {parameter.name} = {six_digit_text(mean)} (mean); "
-                "per-dataset values not applied: "
+                f"# Fit applied: {parameter.name} = {six_digit_text(mean)} (mean). "
+                "Per-dataset values not applied: "
                 + ", ".join(
                     f"{' '.join(label.splitlines())} = {six_digit_text(value)}"
                     for label, value in entries
@@ -941,7 +873,7 @@ class FitSessionOwner(QtCore.QObject):
         if self._window is not None:
             self._clear_candidate_presentation(self._window)
             self._window.set_terminal_failure(failure)
-        self._failure_status = f"Fit failed: {failure.message}"
+        self._failure_status = f"Fit failed: {located(failure.message, *failure.location())}"
         self._set_status(self._failure_status, present=False)
 
     def _on_unavailable(

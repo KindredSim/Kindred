@@ -5,43 +5,30 @@ from __future__ import annotations
 import math
 
 from .constants import R
-from .species import validate_c0, validate_temperature
-from .units import admit_energy_j_per_mol, admit_keq
+from .units import admit_keq
 
 __all__ = ["K_from_deltaG_eq", "concentration_Keq_from_deltaG_eq"]
+
+
+# dG_eq arrives admitted by DSL parsing or the grouped coordinate owner, the
+# temperature by the DSL T directive or its admitted schedule, and the standard
+# concentration by DSL parsing; delta_n is the stoichiometric order difference.
 
 
 def K_from_deltaG_eq(dG_eq_J_per_mol: float, T: float) -> float:
     """Return the equilibrium constant from standard Gibbs energy.
 
-    The primitive deliberately depends only on physical constants and scalar
-    validation so kinetics and equilibrium-authority modules can both consume
-    it without importing one another.
+    The primitive deliberately depends only on physical constants so kinetics
+    and equilibrium-authority modules can both consume it without importing one
+    another.
     """
 
-    if isinstance(T, bool):
-        raise ValueError("T must be numeric")
     try:
-        temperature = float(T)
-    except (TypeError, ValueError, OverflowError) as exc:
-        raise ValueError("T must be numeric") from exc
-    temperature = validate_temperature(temperature, field="T")
-    if isinstance(dG_eq_J_per_mol, bool):
-        raise ValueError("dG_eq_J_per_mol must be numeric")
-    try:
-        delta_g = float(dG_eq_J_per_mol)
-    except (TypeError, ValueError, OverflowError) as exc:
-        raise ValueError("dG_eq_J_per_mol must be numeric") from exc
-    delta_g = admit_energy_j_per_mol(delta_g, field="dG_eq_J_per_mol")
-    try:
-        value = math.exp(-delta_g / (R * temperature))
+        return math.exp(-dG_eq_J_per_mol / (R * T))
     except OverflowError as exc:
         raise ValueError(
             "equilibrium constant overflows the finite real domain"
         ) from exc
-    if not math.isfinite(value) or value <= 0.0:
-        raise ValueError("equilibrium constant must be positive and finite")
-    return float(value)
 
 
 def concentration_Keq_from_deltaG_eq(
@@ -51,16 +38,9 @@ def concentration_Keq_from_deltaG_eq(
     delta_n: float,
 ) -> float:
     """Lower standard-state ``dG_eq`` into concentration-form ``Keq``."""
-    standard = validate_c0(standard_conc_M, field="C0")
-    try:
-        exponent = float(delta_n)
-    except (TypeError, ValueError, OverflowError) as exc:
-        raise ValueError("delta_n must be finite") from exc
-    if not math.isfinite(exponent):
-        raise ValueError("delta_n must be finite")
     standard_constant = K_from_deltaG_eq(dG_eq_J_per_mol, T)
     try:
-        concentration_constant = standard_constant * math.pow(standard, exponent)
+        concentration_constant = standard_constant * math.pow(standard_conc_M, delta_n)
     except (OverflowError, ValueError) as exc:
         raise ValueError("concentration-form equilibrium constant is not finite") from exc
-    return admit_keq(concentration_constant, field="concentration-form Keq")
+    return admit_keq(concentration_constant, field="The Keq calculated from dG_eq")

@@ -265,16 +265,7 @@ class SimulationPanel(QtWidgets.QWidget):
 
     def render_job_state(self, simulation_job_kind: str | None) -> None:
         """Project the live simulation owner's job state into Stop."""
-        kind = (
-            None
-            if simulation_job_kind is None
-            else str(simulation_job_kind)
-        )
-        if kind not in {None, "run", "preview"}:
-            raise ValueError(
-                "simulation_job_kind must be None, 'run', or 'preview'."
-            )
-        self._simulation_job_kind = kind
+        self._simulation_job_kind = simulation_job_kind
         self._sync_controls()
 
     @property

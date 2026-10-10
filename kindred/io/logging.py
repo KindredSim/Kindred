@@ -7,6 +7,7 @@ import logging.handlers
 import os
 import sys
 import tempfile
+import threading
 from pathlib import Path
 
 __all__ = ["diagnostic_log_path", "setup_logging"]
@@ -143,8 +144,17 @@ def setup_logging() -> None:
         message = f"Failed to set up normal and temporary log files: {file_error}"
         raise RuntimeError(message) from file_error
 
+    # Errors that escape a Qt slot or a thread would otherwise vanish when
+    # Kindred runs without a console; record them in the log.
+    sys.excepthook = _log_unhandled
+    threading.excepthook = lambda args: _log_unhandled(args.exc_type, args.exc_value, args.exc_traceback)
+
     root_logger.debug("Log level: %s", resolved_level)
     root_logger.debug("Console handler: %s", console_stream is not None)
     root_logger.debug("Log file: %s", log_path)
     root_logger.debug("Max log size: %.1f MB", _MAX_LOG_SIZE / (1024 * 1024))
     root_logger.debug("Backup count: %s", _BACKUP_COUNT)
+
+
+def _log_unhandled(exc_type, exc, traceback) -> None:
+    logging.getLogger("kindred").critical("Unhandled error", exc_info=(exc_type, exc, traceback))

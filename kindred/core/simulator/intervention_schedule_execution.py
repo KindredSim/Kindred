@@ -206,7 +206,7 @@ class InterventionScheduleExecutionOwner:
         try:
             species_index = _species_index(req, contract)
             volume = VolumeExecution(species_names=species_index, parameter_values=req.parameter_values_at_temperature,
-                                     end_time=t1)
+                                     end_time=t1, lines=req.intervention_lines)
             current_y = np.asarray(req.y0, dtype=float).reshape(-1).copy()
             cancellation_check = (
                 req.cancellation_control.cancel_requested
@@ -1057,12 +1057,8 @@ def _compose_direct_result_sample_identity(
         if discontinuity_ids
         else np.empty(0, dtype=np.int64)
     )
+    # Each emitted row appends its id, key and discontinuity together.
     keys = tuple(key for group in segment_keys for key in group)
-    expected = int(ids.size)
-    if len(keys) != expected or discontinuities.size != expected:
-        raise InterventionScheduleError(
-            "Direct result row identity is not aligned with emitted rows."
-        )
     ids.setflags(write=False)
     discontinuities.setflags(write=False)
     return ids, keys, discontinuities
@@ -1338,10 +1334,6 @@ def _apply_boundary(
         ))
 
     def finish(stop: int | None = None) -> _BoundaryApplicationResult:
-        if stop is None and boundary < volume.end_time:
-            for flux in _active_fluxes(contract, boundary):
-                if flux.physical is not None:
-                    volume.require_volume(flux, boundary)
         snapshot()
         invalid_negative = (current < 0.0) & ~projectable_solver_negatives
         if np.any(invalid_negative):
@@ -1350,7 +1342,7 @@ def _apply_boundary(
         termination = None
         if stop is not None:
             record(stop)
-            termination = SimulationTermination(boundary, "stop", contract.triggers[stop].declaration_ordinal)
+            termination = SimulationTermination(boundary, "stop")
         return _BoundaryApplicationResult(
             continuation.reshape(-1), projection, temperature_K,
             SimulationPresentationBoundary(boundary, tuple(states)) if len(states) > 1 else None,
@@ -1413,8 +1405,7 @@ def _apply_boundary(
                 if stops:
                     validate_boundary_conflicts(instants=(*executed_instants, action), entering_holds=executed_entering_holds, cancellation_check=cancellation_check)
                 if action.physical is not None:
-                    if action.physical.op != "scale":
-                        volume.require_volume(action, boundary)
+                    # Admission requires initial_volume for every volume-changing action.
                     current, action = volume.apply(action, current, time=boundary, temperature=temperature_K,
                         held_indices=held_indices)
                 else:
