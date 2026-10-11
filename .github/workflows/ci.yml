@@ -25,10 +25,10 @@ jobs:
           cache: "pip"
           cache-dependency-path: pyproject.toml
           
-      - name: Install System Dependencies (Qt & xvfb)
+      - name: Install System Dependencies (Qt)
         run: |
           sudo apt-get update
-          sudo apt-get install -y xvfb libxkbcommon-x11-0 libxcb-icccm4 libxcb-image0 libxcb-keysyms1 libxcb-randr0 libxcb-render-util0 libxcb-xinerama0 libxcb-xfixes0 libxcb-shape0 libxcb-cursor0 libglib2.0-0 libgl1 libegl1 libfontconfig1 libdbus-1-3
+          sudo apt-get install -y libxkbcommon-x11-0 libxcb-icccm4 libxcb-image0 libxcb-keysyms1 libxcb-randr0 libxcb-render-util0 libxcb-xinerama0 libxcb-xfixes0 libxcb-shape0 libxcb-cursor0 libglib2.0-0 libgl1 libegl1 libfontconfig1 libdbus-1-3
 
       - name: Install Kindred and its development tools
         run: |
@@ -36,4 +36,4 @@ jobs:
           python -m pip install -e . --group dev
 
       - name: Run CI gate
-        run: xvfb-run -a bash tools/audit/run_ci.sh
+        run: bash tools/audit/run_ci.sh

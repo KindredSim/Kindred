@@ -31,8 +31,8 @@ From the repository root, use native Windows Python 3.12 to create an
 environment and install the application:
 
     python -m venv .venv
-    python -m pip install --upgrade pip
-    python -m pip install -e .
+    .venv\Scripts\python.exe -m pip install --upgrade pip
+    .venv\Scripts\python.exe -m pip install -e .
 
 Install in editable mode: the fitting runtime imports this same checkout, and a
 regular install would give the GUI a separate copy of the code.
@@ -41,7 +41,7 @@ The standard installation includes the required desktop and plotting
 dependencies, including PySide6 and PyQtGraph. To work on Kindred itself, also
 install the development tools:
 
-    python -m pip install -e . --group dev
+    .venv\Scripts\python.exe -m pip install -e . --group dev
 
 ### Fitting runtime
 
@@ -84,9 +84,9 @@ PYTHON_GIL and the user site-packages) and limits BLAS/OpenMP to one thread.
 
 Launch the installed application with either command:
 
-    kindred
+    .venv\Scripts\kindred.exe
 
-    python -m kindred
+    .venv\Scripts\python.exe -m kindred
 
 Kindred launches only the desktop interface and does not accept command-line
 arguments.

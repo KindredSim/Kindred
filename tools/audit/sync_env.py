@@ -81,11 +81,12 @@ def main() -> int:
     flags = (["-E"] if sys.flags.ignore_environment else []) + (["-s"] if sys.flags.no_user_site else [])
     command = [sys.executable, *flags, "-m", "pip", "install"]
     if not args.no_project:
-        command += ["-e", "."]
-    for group in args.group:
-        command += ["--group", group]
+        command += ["-e", str(REPO_ROOT)]
+    command += [f"{name}=={version}" for name, version in pins.items()]
     print(f"sync_env: running {' '.join(command)}", flush=True)
-    if subprocess.run(command, cwd=REPO_ROOT).returncode != 0:
+    # Run pip outside the checkout: from there it would read the build's
+    # kindred.egg-info as the installed Kindred and never uninstall the old one.
+    if subprocess.run(command, cwd=sys.prefix).returncode != 0:
         return 1
     remaining = _differences(pins, project=not args.no_project)
     for difference in remaining:
