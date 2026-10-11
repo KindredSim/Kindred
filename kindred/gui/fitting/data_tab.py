@@ -64,21 +64,15 @@ class DataTab(QtWidgets.QWidget):
         layout.addWidget(self._panel, stretch=1)
 
     def select_dataset(self, dataset_id: str, display_name: str | None = None) -> None:
-        dataset_id = str(dataset_id or "").strip()
         if display_name is not None:
-            self._display_names[dataset_id] = str(display_name or dataset_id)
+            self._display_names[dataset_id] = display_name
         self._current_dataset_id = dataset_id
         self._project_controls()
 
     def has_pending_edits(self, included_dataset_ids: Iterable[str]) -> bool:
         """Return whether an included dataset has an unapplied Data draft."""
 
-        included = {
-            dataset_id
-            for item in included_dataset_ids
-            if (dataset_id := str(item or "").strip())
-        }
-        return bool(included.intersection(self._pending))
+        return bool(set(included_dataset_ids).intersection(self._pending))
 
     def data_edit_issues(self, dataset_ids: Iterable[str]) -> dict[str, str | None]:
         """Return errors or None for valid unapplied drafts; omit clean datasets."""
@@ -248,23 +242,18 @@ class DataTab(QtWidgets.QWidget):
             self._min_edit.setText(
                 self._invalid_raw.get(
                     (self._current_dataset_id, "data_range_min"),
-                    self._format(config.get("data_range_min", 0.0)),
+                    self._format(config["data_range_min"]),
                 )
             )
             self._max_edit.setText(
                 self._invalid_raw.get(
                     (self._current_dataset_id, "data_range_max"),
-                    self._format(config.get("data_range_max", 0.0)),
+                    self._format(config["data_range_max"]),
                 )
             )
             self._set_maximum_range(config)
-            selected_x = str(config.get("parametric_x", "t") or "t")
-            options = tuple(
-                str(item)
-                for item in self._settings_getter(
-                    self._current_dataset_id
-                ).get("eligible_parametric_x", ())
-            )
+            selected_x = config["parametric_x"]
+            options = self._settings_getter(self._current_dataset_id)["eligible_parametric_x"]
             self._x_combo.clear()
             self._x_combo.addItem("Time", "t")
             for option in options:
@@ -300,12 +289,9 @@ class DataTab(QtWidgets.QWidget):
         unlimited["maximum_observations_per_target"] = None
         try:
             retained = self._retained_observations_getter(dataset_id, unlimited)
-        except (TypeError, ValueError, OverflowError):
+        except ValueError:
             return 0
-        return max(
-            (len(getattr(item, "y", ())) for item in retained),
-            default=0,
-        )
+        return max((len(item.y) for item in retained), default=0)
 
     def _set_maximum_range(self, config: Mapping[str, object]) -> None:
         maximum = config.get("maximum_observations_per_target")
@@ -400,8 +386,6 @@ class DataTab(QtWidgets.QWidget):
             start, end = fit_execution_span(config["t_start"], config["simulation_end"])
         except ValueError as exc:
             return str(exc)
-        except (KeyError, TypeError):
-            return "Complete the Fit Data values before applying."
         try:
             retained = self._retained_observations_getter(dataset_id, config)
         except ValueError as exc:
@@ -409,7 +393,7 @@ class DataTab(QtWidgets.QWidget):
         if not retained:
             return "Select at least one retained observation target."
         if is_time and any(value < start or value > end for item in retained for value in item.t):
-            return "Selected experimental times are outside the Simulation interval. Adjust the interval or Data Range."
+            return "Selected experimental times are outside the Simulation interval. Adjust Simulation start, Simulation end, or Data Range."
         selected_x = str(config.get("parametric_x", "t") or "t")
         if selected_x != "t" and selected_x not in tuple(
             str(item) for item in accepted.get("eligible_parametric_x", ())

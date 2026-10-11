@@ -29,6 +29,7 @@ from kindred.core.simulator.parameter_algebra import (
 )
 from kindred.core.simulator.parameter_coordinates import build_parameter_target_map
 from kindred.core.simulator.parameter_algebra_spec import ParameterAlgebraSpec
+from kindred.gui.display_name_policy import reaction_text
 from kindred.core.simulator.step_indexing import (
     get_step_index_map,
     iter_canonical_parameters,
@@ -91,7 +92,7 @@ def build_mechanism_inspector_sections(
                     parameterized_schedule is not None
                     or bool(
                         intervention_execution
-                        and intervention_execution.declarative_payload.get("operations")
+                        and intervention_execution.authored.operations
                     )
                 ),
             ),
@@ -182,10 +183,10 @@ def _format_mechanism_step(
     """Project one step; units come from the admitted parameter spec."""
     step_index = int(entry["step_index"])
     kind = str(entry["kind"])
-    context = html.escape(str(entry["context"]).replace(" <-> ", " ⇌ ").replace(" -> ", " → "))
+    context = html.escape(reaction_text(entry["context"]))
     source_coordinates = {
         str(role): str(name)
-        for role, name in dict(entry.get("source_coordinates") or {}).items()
+        for role, name in entry["source_coordinates"].items()
     }
 
     if kind == "reaction":
@@ -365,7 +366,7 @@ def _format_steps(
                     sort_keys=True,
                 )
             )
-            coordinate_names = set((entry.get("source_coordinates") or {}).values()) | set(parameter_names)
+            coordinate_names = set(entry["source_coordinates"].values()) | set(parameter_names)
             for statement in parameter_spec.parameter_block.lines:
                 if statement.name in coordinate_names:
                     kind = parameter_spec.parameter_assignment_kind(statement.name)
@@ -472,7 +473,7 @@ def _format_intervention_execution(
     lines = [
         "Declarative schedule payload:",
         json.dumps(
-            _plain_json_value(contract.declarative_payload),
+            _plain_json_value(contract.authored.to_payload()),
             indent=2,
             sort_keys=True,
         ),

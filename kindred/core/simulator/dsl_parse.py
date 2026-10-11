@@ -217,6 +217,7 @@ class DslAnalysis:
     observable_names: tuple[str, ...]
     inline_initial_conditions: DslInitialConditionAdmission
     temperature_K: float
+    standard_conc_M: float
     energy_unit: str
     # (line number, authored text) of each intervention declaration, by ordinal.
     intervention_lines: tuple[tuple[int, str], ...]
@@ -282,9 +283,6 @@ class PreparedDslRequestSet:
             replace(equilibrium, metadata=clone_metadata(equilibrium.metadata))
             for equilibrium in self.__mechanism.equilibria
         ]
-        compiled_series = getattr(self.__mechanism, "_compiled_algebra_series", None)
-        if compiled_series is not None:
-            setattr(shell, "_compiled_algebra_series", compiled_series)
         return shell
 
     def accepted_mechanism_for_structure(self) -> object:
@@ -590,11 +588,6 @@ def _validate_equilibrium_rate_authority_for_dsl(
     except ValueError as exc:
         raise _DSLError(
             str(exc),
-            examples=[
-                "A <-> B; kf=4.0; kr=2.0",
-                "A <-> B; kf=10.0; Keq=5.0",
-                "A <-> B; kf=10.0; dG_eq=-4.0",
-            ],
             line_number=line_number,
             line_content=line_content,
         ) from exc
@@ -634,15 +627,9 @@ def _forward_rate_family_from_params(
     if not families:
         raise _DSLError(
             "This reversible step has no forward rate. Add kf=, A= with Ea=, or "
-            "dG_act=, plus one of kr=, Keq= or dG_eq=."
+            "dG_act=, plus one of kr=, Keq=, or dG_eq=."
             if reversible
             else "This step has no rate. Add k=, A= with Ea=, or dG_act=.",
-            examples=[
-                "A -> B ; k=0.5",
-                "A -> B ; A=1e10 ; Ea=50",
-                "A -> B ; dG_act=80",
-                "A <-> B ; kf=1.0 ; Keq=3.0",
-            ],
             line_number=line_number,
             line_content=line_content,
         )
@@ -1175,8 +1162,6 @@ def _parse_dsl_ir(text: str, *, units: UnitsModel | None = None) -> "DSLIR":
             if exc.line_number is None:
                 raise _DSLError(
                     str(exc.message),
-                    suggestion=exc.suggestion,
-                    examples=exc.examples,
                     line_number=line_no,
                     line_content=raw,
                 ) from exc
@@ -1189,8 +1174,6 @@ def _parse_dsl_ir(text: str, *, units: UnitsModel | None = None) -> "DSLIR":
             if exc.line_number is None:
                 raise _DSLError(
                     str(exc.message),
-                    suggestion=exc.suggestion,
-                    examples=exc.examples,
                     line_number=line_no,
                     line_content=raw,
                 ) from exc
@@ -1215,8 +1198,7 @@ def _parse_dsl_ir(text: str, *, units: UnitsModel | None = None) -> "DSLIR":
             )
         except TemperatureDSLError as exc:
             raise _DSLError(
-                exc.message, examples=exc.examples,
-                line_number=line_no, line_content=raw,
+                str(exc), line_number=line_no, line_content=raw,
             ) from exc
 
     for line_no, raw in enumerate(lines, start=1):
@@ -1249,11 +1231,7 @@ def _parse_dsl_ir(text: str, *, units: UnitsModel | None = None) -> "DSLIR":
         if classification.kind == "invalid_step_key_identifier":
             target = classification.raw_name or raw.strip()
             raise _DSLError(
-                f"{target!r} is a step-local DSL key and cannot be declared as a parameter or observable.",
-                suggestion=(
-                    "Use a canonical indexed mechanism parameter such as k1, kf1, kr1, or Keq1, "
-                    "or choose a longer ordinary name."
-                ),
+                f"{target!r} is a reaction-line field, so it cannot name a param or let line.",
                 line_number=line_no,
                 line_content=raw,
             )
@@ -1261,8 +1239,7 @@ def _parse_dsl_ir(text: str, *, units: UnitsModel | None = None) -> "DSLIR":
         if classification.kind == "unsupported_bare_assignment":
             target = classification.raw_name or raw.strip()
             raise _DSLError(
-                f"Bare algebra assignment {target!r} is not supported.",
-                suggestion="Use 'let name = expr' or 'param name = expr'.",
+                f"Assignment {target!r} must start with let or param.",
                 line_number=line_no,
                 line_content=raw,
             )
@@ -1285,12 +1262,8 @@ def _parse_dsl_ir(text: str, *, units: UnitsModel | None = None) -> "DSLIR":
             continue
 
         raise _DSLError(
-            "Unrecognized line.",
-            suggestion=(
-                "Temperature is set with capital T=."
-                if re.match(r"t\s*=(?!>)", line)
-                else None
-            ),
+            "Unrecognized line."
+            + (" Temperature is set with capital T=." if re.match(r"t\s*=(?!>)", line) else ""),
             line_number=line_no,
             line_content=raw,
         )
@@ -1317,8 +1290,7 @@ def _parse_energy_unit_directive(line: str) -> str:
         return normalize_energy_unit(raw)
     except ValueError:
         raise _DSLError(
-            f"energy must be kJ/mol, kcal/mol, or J/mol, not '{raw}'.",
-            examples=["energy=kJ/mol", "energy=kcal/mol", "energy=J/mol"],
+            f"energy must be kJ/mol, kcal/mol, or J/mol, not '{raw}'."
         )
 
 
@@ -1366,12 +1338,12 @@ def _reject_per_step_globals(
     """Reject per-reaction T= and energy= overrides."""
     if "T" in params:
         raise _DSLError(
-            "Per-reaction T= is not supported. Use a global T= directive.",
+            "T= cannot be set on a reaction line. Write T= on its own line.",
             line_number=line_number, line_content=line_content,
         )
     if "energy" in params:
         raise _DSLError(
-            "Per-reaction energy= is not supported. Use a global energy= directive.",
+            "energy= cannot be set on a reaction line. Write energy= on its own line.",
             line_number=line_number, line_content=line_content,
         )
 
@@ -1422,8 +1394,8 @@ def _parse_reaction_like_step(
     reverse_only = [key for key in ("kr", "Keq", "dG_eq") if key in params]
     if not reversible and reverse_only:
         raise _DSLError(
-            f"An irreversible step cannot have {', '.join(reverse_only)}.",
-            suggestion="Use <-> for a reversible step, or remove the field.",
+            f"An irreversible step cannot have {', '.join(reverse_only)}. "
+            "Use <-> for a reversible step, or remove the field.",
             line_number=line_number,
             line_content=line_content,
         )
@@ -1558,8 +1530,7 @@ def _parse_bare_arrow_step(
         # Stoichiometry and number parsing refuse without the line; show it.
         if exc.line_number is not None:
             raise
-        raise _DSLError(exc.message, suggestion=exc.suggestion, examples=exc.examples,
-                        line_number=line_number, line_content=line_content) from exc
+        raise _DSLError(exc.message, line_number=line_number, line_content=line_content) from exc
     return replace(
         parsed_step,
         source_coordinates=_source_coordinates_from_key_value_spans(
@@ -1590,9 +1561,9 @@ def _source_origins(
             ).append(coordinate)
             step_by_line[coordinate.physical_line_index] = step_index
     if parameter_algebra_spec is not None:
-        for statement in getattr(parameter_algebra_spec, "param_statements", ()):
-            coordinate = getattr(statement, "source_coordinate", None)
-            if isinstance(coordinate, DslSourceCoordinate):
+        for statement in parameter_algebra_spec.param_statements:
+            coordinate = statement.source_coordinate
+            if coordinate is not None:
                 coordinates_by_line.setdefault(
                     coordinate.physical_line_index,
                     [],
@@ -1647,7 +1618,7 @@ def prepare_dsl_request_set(
     )
     from kindred.core.algebra.errors import AlgebraError
     from kindred.core.algebra.simulation_series import (
-        compile_algebra_observables,
+        reject_unknown_species_references,
     )
 
     units = units or UnitsModel()
@@ -1673,13 +1644,12 @@ def prepare_dsl_request_set(
     # in the builder) would reparse the same Algebra text and violate the
     # parse-once boundary.
     try:
-        compiled_algebra_series = compile_algebra_observables(
-            retained_spec=parameter_algebra_spec,
+        reject_unknown_species_references(
+            parameter_algebra_spec.observable_block,
             species_names={str(item) for item in mechanism.species_names()},
         )
     except AlgebraError as exc:
         raise _DSLError(exc.msg, line_number=exc.line, line_content=exc.line_text) from exc
-    setattr(mechanism, "_compiled_algebra_series", compiled_algebra_series)
     species_names = tuple(str(item) for item in mechanism.species_names())
     parameterized_intervention_schedule = (
         intervention_schedule
@@ -1703,7 +1673,7 @@ def prepare_dsl_request_set(
         )
         try:
             intervention_schedule.validate_species(species_names)
-            observable_names = set(compiled_algebra_series.observable_names) if compiled_algebra_series is not None else set()
+            observable_names = {statement.name for statement in parameter_algebra_spec.observable_block.lines}
             for trigger in intervention_schedule.triggers:
                 if isinstance(trigger.condition, ObservableTriggerCondition) and trigger.condition.name not in observable_names:
                     raise InterventionScheduleError(
@@ -1733,8 +1703,6 @@ def prepare_dsl_request_set(
             # Each of these refusals names its declaration, or the declarations
             # that conflict; show the line of the (latest) declaration.
             ordinals = exc.details.get("declaration_ordinals") or (exc.declaration_ordinal,)
-            if ordinals[-1] is None:
-                raise
             line_number, line_content = ir.intervention_lines[ordinals[-1]]
             raise _DSLError(str(exc), line_number=line_number, line_content=line_content) from exc
     else:
@@ -1746,15 +1714,10 @@ def prepare_dsl_request_set(
             parameter_algebra_spec=parameter_algebra_spec,
         ),
         species_names=species_names,
-        observable_names=tuple(
-            sorted(
-                str(name)
-                for name in parameter_algebra_spec.observable_names
-                if str(name).strip()
-            )
-        ),
+        observable_names=tuple(sorted(parameter_algebra_spec.observable_names)),
         inline_initial_conditions=ir.inline_initial_conditions,
         temperature_K=float(ir.temperature_K),
+        standard_conc_M=float(ir.standard_conc_M),
         energy_unit=str(ir.energy_unit),
         intervention_lines=ir.intervention_lines,
     )
@@ -1772,18 +1735,11 @@ def _analysis_source_coordinates(
 ) -> tuple[tuple[DslSourceCoordinate, DslSourceOrigin], ...]:
     """Return each admitted coordinate with its retained line owner."""
 
-    pairs = tuple(
+    return tuple(
         (coordinate, origin)
         for origin in analysis.origins
         for coordinate in origin.coordinates
     )
-    identities = [
-        (coordinate.canonical_name, coordinate.role)
-        for coordinate, _origin in pairs
-    ]
-    if len(identities) != len(set(identities)):
-        raise ValueError("Retained DSL source coordinates are ambiguous.")
-    return pairs
 
 
 def derive_source_with_parameter_updates(
@@ -1805,8 +1761,6 @@ def derive_source_with_parameter_updates(
         raise ValueError("DSL parameter update names must be unique.")
 
     spec = base.parameter_algebra_spec_for_execution()
-    mechanism = base.accepted_mechanism_for_structure()
-    from .step_indexing import lookup_source_coordinate_target
     raw_lines = source_text.splitlines(keepends=True)
     source_lines = [_line_content(line) for line in raw_lines]
     line_endings = [
@@ -1857,50 +1811,23 @@ def derive_source_with_parameter_updates(
                 raise ValueError(
                     f"Scalar parameter {update.name!r} is not writable."
                 )
-            if not coordinate.capabilities.continuous:
-                raise ValueError(
-                    f"Parameter {update.name!r} is not a continuous writable coordinate."
-                )
             retain_replacement(coordinate, six_digit_source_text(update.value))
             continue
         # A source identity's param line only restates its reaction field,
         # which stays the writable coordinate.
+        # Callers send only enumerated writable coordinates.
         (coordinate,) = (item for role, item in spans.items() if role != "param")
-        if not coordinate.capabilities.continuous:
-            raise ValueError(
-                f"Parameter {update.name!r} is not a continuous writable coordinate."
-            )
-        source_target = lookup_source_coordinate_target(mechanism, update.name)
-        if source_target is None:
-            raise ValueError(
-                f"Parameter {update.name!r} has no admitted source owner."
-            )
-        _kind, _index, role, _entry = source_target
-        if str(role) != coordinate.role:
-            raise ValueError(
-                f"Parameter {update.name!r} has inconsistent admitted source role."
-            )
         # Physical and authored indexed source coordinates are already in the
         # exact units and representation expected by their retained span.
         retain_replacement(coordinate, six_digit_source_text(update.value))
 
+    # Parser spans are unique and never overlap.
     for line_index, line_replacements in replacements.items():
-        seen_spans: set[tuple[int, int]] = set()
         ordered_replacements = sorted(
             line_replacements,
             key=lambda item: item[0],
             reverse=True,
         )
-        previous_start = len(source_lines[line_index]) + 1
-        for start, end, _replacement in ordered_replacements:
-            if (start, end) in seen_spans:
-                raise ValueError("Duplicate DSL source replacement span.")
-            if not 0 <= start < end <= len(source_lines[line_index]):
-                raise ValueError("DSL source replacement span is out of bounds.")
-            if end > previous_start:
-                raise ValueError("Overlapping DSL source replacement spans.")
-            seen_spans.add((start, end))
-            previous_start = start
         for start, end, replacement in ordered_replacements:
             source_lines[line_index] = (
                 source_lines[line_index][:start]

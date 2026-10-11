@@ -65,8 +65,7 @@ from kindred.gui.fitting.launch import (
     prune_fit_analysis_coordinates,
     shared_initial_group_variable_id,
 )
-from kindred.gui.parameter_enumeration import admit_gui_parameter_value
-from kindred.core.species import CONCENTRATION_MIN_M, validate_concentration
+from kindred.core.species import CONCENTRATION_MIN_M
 from kindred.core.validation import six_digit_text
 
 __all__ = [
@@ -81,23 +80,11 @@ _BEST_INTERVAL_SECONDS = 0.25
 _CURVE_INTERVAL_SECONDS = 2.0
 
 
-def _finite_items(
-    values: Mapping[str, object],
-    *,
-    field: str,
-) -> tuple[tuple[str, float], ...]:
-    normalized: list[tuple[str, float]] = []
-    for raw_name, raw_value in values.items():
-        name = str(raw_name or "").strip()
-        value = float(raw_value)
-        if not name or not math.isfinite(value):
-            raise ValueError(f"{field} contains an invalid value.")
-        normalized.append((name, value))
-    normalized.sort()
-    return tuple(normalized)
+def _sorted_items(values: Mapping[str, float]) -> tuple[tuple[str, float], ...]:
+    return tuple(sorted((name, float(value)) for name, value in values.items()))
 
 
-def published_fitted_concentration(value: float, *, field: str) -> float:
+def published_fitted_concentration(value: float) -> float:
     """Publish a fitted initial concentration; one below the floor is 0.
 
     The optimizer can end a concentration pressed against a zero bound at a
@@ -107,7 +94,7 @@ def published_fitted_concentration(value: float, *, field: str) -> float:
 
     if 0.0 < value < CONCENTRATION_MIN_M:
         return 0.0
-    return validate_concentration(value, field=field)
+    return value
 
 
 @dataclass(frozen=True, slots=True)
@@ -125,16 +112,6 @@ class FitCurveDataset:
     observed_x_unit: Unit | None
     observed_y_units: tuple[tuple[str, Unit | None], ...]
     x_name: str = "t"
-
-    def __post_init__(self) -> None:
-        x, y = dict(self.observed_x), dict(self.observed_y)
-        if x.keys() != y.keys() or any(len(x[name]) != len(values) for name, values in y.items()):
-            raise ValueError("Fit observation axes must align.")
-        if tuple(name for name, _ in self.observed_y_units) != tuple(name for name, _ in self.observed_y):
-            raise ValueError("Fit observation units must align with their Y targets.")
-        times = dict(self.observed_time)
-        if times.keys() != y.keys() or any(len(times[name]) not in (0, len(values)) for name, values in y.items()):
-            raise ValueError("Fit observation times must align with their samples.")
 
 
 @dataclass(frozen=True, slots=True)
@@ -159,39 +136,6 @@ class FitCandidate:
     result: GlobalFitResult
     setup_snapshot: FitSetupSnapshot
 
-    def __post_init__(self) -> None:
-        if not isinstance(self.request, FitExecutionRequest):
-            raise TypeError("Fit candidate request must be retained.")
-        if not isinstance(self.result, GlobalFitResult):
-            raise TypeError("Fit candidate result must be canonical.")
-        nominal_setup = self.setup_snapshot
-        dispatch = self.request.dispatch
-        expected_dataset_ids = {
-            item.dataset_id
-            for item in nominal_setup.datasets
-            if item.included
-        }
-        if set(dispatch.included_dataset_ids) != expected_dataset_ids:
-            raise ValueError(
-                "Fit candidate dispatch roster must match its terminal setup."
-            )
-        scalar_dataset_ids = {
-            dataset_id
-            for dataset_id in self.result.dataset_params
-        }
-        result_dataset_ids = set(self.result.dataset_params)
-        simulation_dataset_ids = {
-            info.dataset_id for info in self.result.dataset_info
-        }
-        if (
-            scalar_dataset_ids != expected_dataset_ids
-            or result_dataset_ids != expected_dataset_ids
-            or simulation_dataset_ids != expected_dataset_ids
-        ):
-            raise ValueError(
-                "Fit candidate terminal rosters must exactly match the "
-                "included datasets."
-            )
     @property
     def origin(self) -> FitOriginSnapshot:
         return self.request.setup.origin
@@ -311,22 +255,10 @@ def _initial_values_from_result(
     }
 
     def coupled_value(dataset_ids: Sequence[str], species: str) -> float:
-        values: set[float] = set()
-        parameter_name = f"{INITIAL_PREFIX}{species}"
-        for dataset_id in dataset_ids:
-            dataset_result = result.dataset_params.get(dataset_id)
-            if dataset_result is None or parameter_name not in dataset_result:
-                raise ValueError(
-                    f"Fit result omitted coupled initial {species!r} for "
-                    f"included dataset {dataset_id!r}."
-                )
-            values.add(published_fitted_concentration(
-                float(dataset_result[parameter_name]),
-                field=f"fitted initial {species!r}",
-            ))
-        if len(values) != 1:
-            raise ValueError(f"Fit result disagrees across coupled initial rows for {species!r}.")
-        return values.pop()
+        # Every member of a coupled initial carries the same decoded value.
+        return published_fitted_concentration(
+            float(result.dataset_params[dataset_ids[0]][f"{INITIAL_PREFIX}{species}"])
+        )
 
     for initial in sorted(setup.initials, key=lambda item: (item.set_id, item.species)):
         if not initial.fit:
@@ -403,32 +335,20 @@ def _terminal_setup_snapshot(
         for item in dispatch.ordinary_dataset_overrides
         if item.dataset_id in included_ids
     }
-    if set(fixed_results) != included_ids:
-        raise ValueError("Fit request fixed-value roster is incomplete.")
     parameters = []
     for parameter in setup_snapshot.parameters:
         dataset_values = tuple(parameter.selected_config.dataset_values)
         requested_config = parameter.selected_config
         if not requested_config.fit:
-            retained_values: dict[str, float] = {}
-            for dataset_id in included_ids:
-                values = fixed_results.get(dataset_id)
-                if values is None or parameter.name not in values:
-                    raise ValueError(
-                        f"Fit request omitted fixed parameter {parameter.name!r} "
-                        f"for included dataset {dataset_id!r}."
-                    )
-                retained_values[dataset_id] = float(values[parameter.name])
+            retained_values = {
+                dataset_id: float(fixed_results[dataset_id][parameter.name])
+                for dataset_id in included_ids
+            }
             if parameter.scope == "shared":
-                unique = set(retained_values.values())
-                if len(unique) != 1:
-                    raise ValueError(
-                        f"Fit request disagrees on fixed Shared parameter {parameter.name!r}."
-                    )
                 parameters.append(
                     _replace_fit_parameter(
                         parameter,
-                        value=unique.pop(),
+                        value=next(iter(retained_values.values())),
                         dataset_values=dataset_values,
                     )
                 )
@@ -444,41 +364,20 @@ def _terminal_setup_snapshot(
                 )
             continue
         if parameter.scope == "shared":
-            if parameter.name not in shared_results:
-                raise ValueError(
-                    f"Fit result omitted shared parameter {parameter.name!r}."
-                )
-            # _assemble_fit_terminal admitted every fitted value before this overlay.
-            value = shared_results[parameter.name]
             parameters.append(
                 _replace_fit_parameter(
                     parameter,
-                    value=value,
+                    value=shared_results[parameter.name],
                     dataset_values=dataset_values,
                 )
             )
             continue
-        expected_ids = {
-            dataset_id
-            for dataset_id, _value in requested_config.dataset_values
-        }
-        if not included_ids.issubset(expected_ids):
-            raise ValueError(
-                f"Dataset-scoped parameter {parameter.name!r} no longer "
-                "matches the included dataset identities."
-            )
         fitted_by_id = dict(requested_config.dataset_values)
         for dataset_id, _launch_value in requested_config.dataset_values:
             # A fixed dataset keeps the value it was given.
             if dataset_id not in included_ids or dataset_id in requested_config.fixed_dataset_ids:
                 continue
-            values = dataset_results.get(dataset_id)
-            if values is None or parameter.name not in values:
-                raise ValueError(
-                    f"Fit result omitted dataset-scoped parameter "
-                    f"{parameter.name!r} for {dataset_id!r}."
-                )
-            fitted_by_id[dataset_id] = values[parameter.name]
+            fitted_by_id[dataset_id] = dataset_results[dataset_id][parameter.name]
         # A group's fitted value is every member's, excluded members included.
         for group in requested_config.groups:
             members = [item for item in group if item in included_ids]
@@ -543,10 +442,6 @@ def _terminal_setup_snapshot(
             if species == group.species and set_id in applicable_set_ids
         }
         if values:
-            if len(values) != 1:
-                raise ValueError(
-                    f"Fit result did not resolve one shared initial value for {group.species!r}."
-                )
             groups.append(replace(group, initial=values.pop()))
         else:
             groups.append(group)
@@ -583,8 +478,6 @@ def _curves_from_simulations(
         local = local_by_id[dataset_id]
         mapped = mapped_by_id[dataset_id]
         prepared = prepared_by_id[dataset_id]
-        if not isinstance(simulation, SimulationResultValue):
-            raise TypeError("Fit curve source requires canonical simulations.")
         selected = prepared.selected_observations
         x_observations = (
             None
@@ -626,8 +519,6 @@ def project_fit_candidate_curves(
 ) -> tuple[FitCurveDataset, ...]:
     """Project terminal curves from the candidate's canonical result."""
 
-    if not isinstance(candidate, FitCandidate):
-        raise TypeError("candidate must be FitCandidate.")
     info_by_id = {info.dataset_id: info for info in candidate.result.dataset_info}
     return _curves_from_simulations(
         request=candidate.request,
@@ -642,106 +533,11 @@ def _assemble_fit_terminal(
     *,
     request: FitExecutionRequest,
     result: GlobalFitResult,
-    included_ids: tuple[str, ...],
     setup_snapshot: FitSetupSnapshot,
-    evaluators: Mapping[str, FittingEvaluator],
 ) -> FitCandidate:
-    """Validate terminal provenance and build the sole retained candidate."""
+    """Build the sole retained candidate from the admitted core result."""
 
-    admitted_layout = request.dispatch.ordinary_optimizer_layout
-    if not isinstance(result.optimizer_vector, np.ndarray):
-        raise TypeError("Fit terminal optimizer vector must be a NumPy array.")
-    admitted_layout.validate_optimizer_vector(result.optimizer_vector)
-    if result.optimizer_vector.flags.writeable:
-        raise ValueError("Fit terminal optimizer vector must be read-only.")
-
-    effective_dataset_weights: dict[str, float] = {}
-    for info in result.dataset_info:
-        dataset_id = str(info.dataset_id or "").strip()
-        weight = float(info.weight)
-        if (
-            not dataset_id
-            or dataset_id in effective_dataset_weights
-            or not math.isfinite(weight)
-            or weight <= 0.0
-        ):
-            raise ValueError(
-                "Fit terminal contains invalid effective dataset weights."
-            )
-        effective_dataset_weights[dataset_id] = weight
-    if set(effective_dataset_weights) != set(included_ids):
-        raise ValueError(
-            "Fit terminal effective weights do not exactly match the "
-            "included datasets."
-        )
-    included_id_set = set(included_ids)
-    if set(result.dataset_params) != included_id_set:
-        raise ValueError(
-            "Fit terminal parameter results do not exactly match the included datasets."
-        )
-    fixed_by_dataset = {
-        item.dataset_id: dict(item.fixed_params)
-        for item in request.dispatch.ordinary_dataset_overrides
-    }
     setup = request.setup
-    for parameter in setup.parameters:
-        if parameter.scope == "shared":
-            values = (
-                (result.shared_params[parameter.name],)
-                if parameter.selected_config.fit
-                and parameter.name in result.shared_params
-                else tuple(
-                    fixed_by_dataset[dataset_id][parameter.name]
-                    for dataset_id in included_ids
-                )
-            )
-            for value in values:
-                admitted = admit_gui_parameter_value(
-                    value,
-                    role=parameter.role,
-                    unit=parameter.unit,
-                    allow_exact_zero=parameter.allow_exact_zero,
-                    field=f"terminal fitted {parameter.name!r}",
-                )
-                if not parameter.selected_config.minimum <= admitted <= parameter.selected_config.maximum:
-                    raise ValueError(
-                        f"Terminal fitted {parameter.name!r} violates retained bounds."
-                    )
-        else:
-            for dataset_id in included_ids:
-                source_values = (
-                    result.dataset_params
-                    if dataset_id in parameter.selected_config.varied_dataset_ids
-                    else fixed_by_dataset
-                )
-                admitted = admit_gui_parameter_value(
-                    source_values[dataset_id][parameter.name],
-                    role=parameter.role,
-                    unit=parameter.unit,
-                    allow_exact_zero=parameter.allow_exact_zero,
-                    field=f"terminal fitted {dataset_id!r} {parameter.name!r}",
-                )
-                if not parameter.selected_config.minimum <= admitted <= parameter.selected_config.maximum:
-                    raise ValueError(
-                        f"Terminal fitted {dataset_id!r} {parameter.name!r} "
-                        "violates retained bounds."
-                    )
-    if set(evaluators) != included_id_set:
-        raise ValueError(
-            "Fit terminal prepared identities do not exactly match the included datasets."
-        )
-    solver_provenance_by_dataset = {
-        str(info.dataset_id or "").strip(): info.simulation_result.solver_provenance
-        for info in result.dataset_info
-    }
-    if (
-        any(not dataset_id for dataset_id in solver_provenance_by_dataset)
-        or set(solver_provenance_by_dataset) != set(included_ids)
-    ):
-        raise ValueError(
-            "Fit terminal solver provenance does not exactly match the "
-            "included datasets."
-        )
     initial_values_by_set = _initial_values_from_result(
         setup_snapshot,
         setup.origin,
@@ -754,12 +550,11 @@ def _assemble_fit_terminal(
         dispatch=request.dispatch,
         initial_values_by_set=initial_values_by_set,
     )
-    candidate = FitCandidate(
+    return FitCandidate(
         request=request,
         result=result,
         setup_snapshot=terminal_setup,
     )
-    return candidate
 
 
 class _FitControl:
@@ -855,16 +650,8 @@ class _FitExecution(_FitControl):
             self._emit("cancelled", )
         elif unavailable is not None:
             self._emit("scientific_unavailable", unavailable)
-        elif candidate is not None:
-            self._emit("candidate_ready", candidate)
         else:
-            self._emit("factual_failure",
-                factual_cause_from_exception(
-                    RuntimeError("Fit worker exited without a terminal value."),
-                    domain="fit",
-                    origin="fit_worker",
-                )
-            )
+            self._emit("candidate_ready", candidate)
 
     def _execute(
         self,
@@ -876,7 +663,6 @@ class _FitExecution(_FitControl):
         included = tuple(item for item in setup.datasets if item.included)
         mapped_by_id = {item.dataset_id: item for item in setup.origin.mapped_datasets}
         dispatch = request.dispatch
-        included_ids = dispatch.included_dataset_ids
         fixed_by_dataset = {
             item.dataset_id: dict(item.fixed_params)
             for item in dispatch.ordinary_dataset_overrides
@@ -1055,17 +841,14 @@ class _FitExecution(_FitControl):
                         raise FittingCancelled()
                     self._last_best_emit = now
                 if now - self._last_curve_emit >= _CURVE_INTERVAL_SECONDS:
-                    try:
-                        live_curves = (
-                            _curves_from_simulations(
-                                request=request,
-                                evaluations=update.transient_simulation_results_by_dataset,
-                            )
-                            if update.transient_simulation_results_by_dataset
-                            else ()
+                    live_curves = (
+                        _curves_from_simulations(
+                            request=request,
+                            evaluations=update.transient_simulation_results_by_dataset,
                         )
-                    except (FitSimulationError, KeyError, TypeError, ValueError):
-                        live_curves = ()
+                        if update.transient_simulation_results_by_dataset
+                        else ()
+                    )
                     if live_curves and not self._cancelled.is_set():
                         if self._checkpoint():
                             raise FittingCancelled()
@@ -1194,9 +977,7 @@ class _FitExecution(_FitControl):
         candidate = _assemble_fit_terminal(
             request=request,
             result=result,
-            included_ids=included_ids,
             setup_snapshot=setup,
-            evaluators=evaluators,
         )
         self._emit("progress", 100, result.message)
         return candidate
@@ -1206,8 +987,7 @@ class _FitExecution(_FitControl):
         dispatch = self._request.dispatch
         layout = dispatch.ordinary_optimizer_layout
         setup = self._request.setup
-        vector = np.asarray(best_progress.optimizer_vector, dtype=float).reshape(-1)
-        layout.validate_optimizer_vector(vector)
+        vector = best_progress.optimizer_vector
         coordinate_values = {
             coordinate: layout.decode_coordinate(coordinate, float(raw_value))
             for coordinate, raw_value in zip(
@@ -1243,7 +1023,7 @@ class _FitExecution(_FitControl):
                 continue
             variable_id = f"initial:{initial.set_id}:{initial.species}"
             value = coordinate_values.get(FitCoordinate("coupled", variable_id))
-            if value is not None and math.isfinite(float(value)):
+            if value is not None:
                 initials_by_set.setdefault(initial.set_id, {})[
                     initial.species
                 ] = float(value)
@@ -1253,7 +1033,7 @@ class _FitExecution(_FitControl):
             value = coordinate_values.get(
                 FitCoordinate("coupled", shared_initial_group_variable_id(group.species, group.origin_dataset_id))
             )
-            if value is None or not math.isfinite(float(value)):
+            if value is None:
                 continue
             applicable_set_ids = {
                 mapped.set_id for mapped in setup.origin.mapped_datasets
@@ -1276,18 +1056,17 @@ class _FitExecution(_FitControl):
         return FitLiveUpdate(
             iteration=best_progress.objective_calls,
             cost=best_progress.cost,
-            parameters=_finite_items(
+            parameters=_sorted_items(
                 {
                     coordinate.display_name: value
                     for coordinate, value in coordinate_values.items()
                     if coordinate.scope == "shared"
                 },
-                field="live Fit parameters",
             ),
             scalar_values_by_dataset=tuple(
                 (
                     dataset_id,
-                    _finite_items(
+                    _sorted_items(
                         {
                             parameter.name: coordinate_values[
                                 dataset_coordinates.get(
@@ -1301,7 +1080,6 @@ class _FitExecution(_FitControl):
                                 and dataset_id in parameter.selected_config.varied_dataset_ids
                             )
                         },
-                        field=f"live Fit scalars {dataset_id}",
                     ),
                 )
                 for dataset_id in sorted(included_dataset_ids)

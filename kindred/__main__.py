@@ -51,7 +51,7 @@ def main() -> int:
     QtCore.QCoreApplication.setApplicationName("Kindred")
 
     icon = gui_startup.load_app_icon(QtGui.QIcon)
-    if icon is not None and not icon.isNull():
+    if not icon.isNull():
         app.setWindowIcon(icon)
 
     win = MainWindow()

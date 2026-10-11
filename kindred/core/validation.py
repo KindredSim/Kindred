@@ -79,16 +79,3 @@ def try_parse_nonneg_finite_float(value: object) -> tuple[float, bool]:
     return float(v), True
 
 
-def try_parse_int(value: object) -> tuple[int, bool]:
-    """
-    Best-effort int parsing with an explicit validity flag.
-
-    Returns (parsed_value, ok). When ok is False, parsed_value is 0.
-    """
-    if isinstance(value, bool):
-        return 0, False
-    try:
-        v = int(value)  # type: ignore[arg-type]
-    except (TypeError, ValueError, OverflowError):
-        return 0, False
-    return int(v), True

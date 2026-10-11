@@ -41,7 +41,7 @@ _BASE_UNITS = {"concentration": MOLAR, "time": SECOND, "volume": CUBIC_METRE}
 def _reference_column(name: str) -> int:
     match = _REFERENCE.fullmatch(name)
     if match is None:
-        raise ValueError(f"{name!r} is not a column reference. Formulas use cells of their own row, such as B5.")
+        raise ValueError(f"{name!r} is not a cell of this row.")
     # Letters beyond the worksheet still name a column, which admission refuses.
     column = 0
     for letter in match[1]:
@@ -51,7 +51,7 @@ def _reference_column(name: str) -> int:
 
 def _source(source: str) -> str:
     if not source:
-        raise ValueError("Type an expression after =, for example =B5*2.")
+        raise ValueError("Type an expression after =.")
     if "\n" in source or "\r" in source:
         raise ValueError("A formula must fit on one line.")
     return source
@@ -96,7 +96,7 @@ def _references(node: ExprNode, column_count: int) -> tuple[int, ...]:
         # The parser admitted the argument count of every builtin.
         if node.name not in _FUNCTIONS:
             if node.name.lower() in _FUNCTIONS:
-                raise ValueError(f"Use lower-case function names: {node.name.lower()} instead of {node.name}.")
+                raise ValueError(f"Use lowercase function names: {node.name.lower()} instead of {node.name}.")
             raise ValueError(f"Unsupported formula function {node.name!r}.")
         children = node.args
     else:

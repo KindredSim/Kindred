@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import logging
 import os
-import re
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -33,13 +32,8 @@ __all__ = [
     "PRESET_MECHANISM_TITLES",
     "get_intervention_example_source",
     "get_all_intervention_example_specs",
-    "InterventionExampleCatalogError",
     "InterventionExampleSpec",
 ]
-
-
-class InterventionExampleCatalogError(RuntimeError):
-    """The packaged intervention-example catalog is missing or unreadable."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -125,65 +119,14 @@ def get_resource_text(relative_path: str, encoding: str = "utf-8") -> str:
 
 
 def get_resource_path(relative_path: str) -> Path:
-    """
-    Get filesystem path to kindred/data resource.
+    """Return the filesystem path of one packaged kindred/data resource.
 
-    Returns the on-disk path under the installed or editable package.
-
-    Parameters
-    ----------
-    relative_path : str
-        Path relative to kindred/data (e.g., "assets/kindred.ico")
-
-    Returns
-    -------
-    Path
-        Path to resource file
-
-    Raises
-    ------
-    FileNotFoundError
-        If resource doesn't exist
+    Kindred ships as a filesystem package (wheel or editable install), and
+    every caller passes a packaged constant path.
     """
     from importlib.resources import files
 
-    try:
-        raw = (relative_path or "").strip()
-        if not raw:
-            raise FileNotFoundError(f"Resource not found: kindred/data/{relative_path}")
-        if re.match(r"^[A-Za-z]:", raw):
-            raise FileNotFoundError(f"Resource not found: kindred/data/{relative_path}")
-
-        data_pkg = files("kindred").joinpath("data")
-        normalized = raw
-        if os.altsep:
-            normalized = normalized.replace(os.altsep, os.sep)
-        normalized = normalized.replace("\\", os.sep).lstrip(os.sep)
-        parts = [p for p in normalized.split(os.sep) if p]
-        if not parts or ".." in parts:
-            raise FileNotFoundError(f"Resource not found: kindred/data/{relative_path}")
-
-        resource_file = data_pkg.joinpath(*parts)
-        if not (resource_file.is_file() or resource_file.is_dir()):
-            raise FileNotFoundError(f"Resource not found: kindred/data/{relative_path}")
-
-        # Kindred ships as a filesystem package (wheel or editable install);
-        # a resource without a filesystem path is treated as missing.
-        try:
-            fs_path = Path(os.fspath(resource_file)).resolve()
-        except TypeError as exc:
-            raise FileNotFoundError(
-                f"Resource has no filesystem path: kindred/data/{relative_path}"
-            ) from exc
-        if not fs_path.exists():
-            raise FileNotFoundError(f"Resource not found: kindred/data/{relative_path}")
-        return fs_path
-
-    except (FileNotFoundError, AttributeError) as e:
-        logger.error(f"Resource not found: kindred/data/{relative_path}")
-        raise FileNotFoundError(
-            f"Resource not found: kindred/data/{relative_path}"
-        ) from e
+    return Path(os.fspath(files("kindred").joinpath("data", relative_path)))
 
 
 # Convenience functions for common resources
@@ -203,11 +146,8 @@ def get_preset_mechanism_source(preset_id: str) -> MechanismAuthoringSource:
     MechanismAuthoringSource
         Complete mechanism source.
     """
-    normalized = str(preset_id).strip()
-    if normalized not in PRESET_MECHANISM_TITLES:
-        raise ValueError(f"Unknown packaged preset mechanism {normalized!r}.")
     return MechanismAuthoringSource.from_parts(
-        reactions_text=get_resource_text(f"presets/{normalized}.txt")
+        reactions_text=get_resource_text(f"presets/{preset_id}.txt")
     )
 
 
@@ -225,44 +165,15 @@ def get_intervention_example_source(example_id: str) -> MechanismAuthoringSource
     MechanismAuthoringSource
         Complete mechanism source.
     """
-    normalized = str(example_id).strip()
-    available = {spec.id for spec in get_all_intervention_example_specs()}
-    if normalized not in available:
-        raise ValueError(
-            f"Unknown packaged intervention example {normalized!r}."
-        )
     return MechanismAuthoringSource.from_parts(
-        reactions_text=get_resource_text(f"interventions/{normalized}.txt")
+        reactions_text=get_resource_text(f"interventions/{example_id}.txt")
     )
 
 
 def get_all_intervention_example_specs() -> tuple[InterventionExampleSpec, ...]:
-    """
-    Return the ordered catalog after verifying every listed resource is readable.
+    """Return the ordered catalog of packaged intervention examples."""
 
-    Returns
-    -------
-    tuple of InterventionExampleSpec
-        Names and IDs for every cataloged intervention resource.
-
-    Raises
-    ------
-    InterventionExampleCatalogError
-        If any cataloged resource is missing or unreadable.
-    """
-    examples: list[InterventionExampleSpec] = []
-    for example_id, title in _INTERVENTION_EXAMPLE_TITLES.items():
-        try:
-            get_resource_text(f"interventions/{example_id}.txt")
-        except Exception as exc:
-            raise InterventionExampleCatalogError(
-                f"Packaged intervention example {example_id!r} is missing or unreadable."
-            ) from exc
-        examples.append(
-            InterventionExampleSpec(
-                id=example_id,
-                title=title,
-            )
-        )
-
-    return tuple(examples)
+    return tuple(
+        InterventionExampleSpec(id=example_id, title=title)
+        for example_id, title in _INTERVENTION_EXAMPLE_TITLES.items()
+    )

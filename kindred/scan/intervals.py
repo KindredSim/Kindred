@@ -21,13 +21,12 @@ class Interval:
 def normalize(intervals: tuple[Interval, ...]) -> tuple[Interval, ...]:
     ordered = sorted(intervals, key=lambda i: (i.lower, not i.include_lower, i.upper))
     result: list[Interval] = []
+    # The range dialogs and the catalog supply finite bounds.
     for item in ordered:
-        if not math.isfinite(item.lower) or not math.isfinite(item.upper):
-            raise ValueError("Scan bounds must be finite numbers.")
         if item.lower > item.upper or (item.lower == item.upper and not (
             item.include_lower and item.include_upper
         )):
-            raise ValueError("An interval is empty. Check its bounds and endpoint choices.")
+            raise ValueError("An interval needs a lower bound below its upper bound, or equal bounds with both endpoints included.")
         if result and (item.lower < result[-1].upper or (
             item.lower == result[-1].upper and (item.include_lower or result[-1].include_upper)
         )):
@@ -85,4 +84,3 @@ def sample(intervals: tuple[Interval, ...], u: float, allocation: str) -> float:
             value = (1.0 - local) * bounds.lower + local * bounds.upper
             return min(bounds.upper, max(bounds.lower, value))
         position -= weight
-    raise AssertionError("Nonempty interval union had no sample.")

@@ -77,17 +77,13 @@ def export_original_source(
     source: dataset_foundation.ImportedSource,
     destination: str | os.PathLike[str],
 ) -> Path:
-    """Write an admitted source's exact bytes to the destination.
+    """Write an admitted source's exact bytes to the destination file path.
 
-    Passing a directory uses the original filename. Passing a file path writes
-    to that exact path, allowing the integration-owned save dialog to control
-    overwrite confirmation.
+    The integration-owned save dialog chooses the path and controls overwrite
+    confirmation.
     """
-    original_filename = source.original_filename
     source_bytes = source.exact_source_bytes
     target = Path(destination)
-    if target.is_dir():
-        target = target / original_filename
     if not target.parent.is_dir():
         raise DatasetMappingError(
             f"Export directory does not exist: {target.parent}."
@@ -156,23 +152,13 @@ def apply_dataset_mapping_batch(
     model_targets admits raw observation mappings; the tab's canonical
     mechanism species remain the sole initial-condition roster.
     """
-    if batch.tab_id != tab.tab_id:
-        raise DatasetMappingError("Mapping batch origin does not match its tab.")
     mechanism_species = canonical_species_names(tab)
     if not mechanism_species:
         raise DatasetMappingError("Mapping requires a mechanism with at least one species.")
     observation_targets = tuple(model_targets)
     species = mechanism_species
     records = {record.dataset_id: record for record in document.datasets}
-    if any(item.dataset_id not in records for item in batch.proposals):
-        raise DatasetMappingError("Mapping batch references a dataset absent from the committed document.")
-    current = dict(
-        validate_partial_bijection(
-            tab.dataset_links,
-            known_dataset_ids=records,
-            known_set_ids=(item.set_id for item in tab.initial_condition_sets),
-        )
-    )
+    current = dict(tab.dataset_links)
     sets = list(tab.initial_condition_sets)
     used_names = {item.name.casefold() for item in sets}
     for item in batch.proposals:
@@ -186,16 +172,12 @@ def apply_dataset_mapping_batch(
             model_targets=observation_targets,
         )
         if item.action is DatasetMappingChoice.LEAVE_UNMAPPED:
-            if item.target_set_id is not None or item.occupied_choice is not None:
-                raise DatasetMappingError("Leave Unmapped cannot include a target or occupancy choice.")
             current[item.dataset_id] = DatasetLink(
                 set_id=None,
                 observation_mapping=normalized_mapping,
             )
             continue
         if item.action is DatasetMappingChoice.CREATE_SET:
-            if item.occupied_choice is not None:
-                raise DatasetMappingError("Create Set cannot include an occupancy choice.")
             expected_name = allocate_initial_condition_set_name(
                 dataset.display_name,
                 existing_names=used_names,
@@ -221,10 +203,7 @@ def apply_dataset_mapping_batch(
         target = item.target_set_id
         if target is None:
             raise DatasetMappingError("Map Existing requires a target set.")
-        try:
-            target_set = next(current_set for current_set in sets if current_set.set_id == target)
-        except StopIteration as exc:
-            raise DatasetMappingError(f"Unknown target set {target!r}.") from exc
+        target_set = next(current_set for current_set in sets if current_set.set_id == target)
         occupant = next(
             (dataset_id for dataset_id, link in current.items()
              if dataset_id != item.dataset_id and link.set_id == target),
@@ -269,11 +248,7 @@ def apply_dataset_mapping_batch(
     candidate = replace(
         tab,
         initial_condition_sets=tuple(sets),
-        dataset_links=validate_partial_bijection(
-            current.items(),
-            known_dataset_ids=records,
-            known_set_ids=(item.set_id for item in sets),
-        ),
+        dataset_links=tuple(sorted(current.items())),
     )
     return candidate
 
@@ -327,45 +302,6 @@ def validate_unique_dataset_name(
     return clean
 
 
-def validate_partial_bijection(
-    links: Iterable[tuple[str, DatasetLink]],
-    *,
-    known_dataset_ids: Iterable[str] | None = None,
-    known_set_ids: Iterable[str] | None = None,
-) -> tuple[tuple[str, DatasetLink], ...]:
-    """Validate one tab's dataset links and return deterministic ID order."""
-    known_datasets = None if known_dataset_ids is None else {str(value) for value in known_dataset_ids}
-    known_sets = None if known_set_ids is None else {str(value) for value in known_set_ids}
-    by_dataset: dict[str, DatasetLink] = {}
-    dataset_by_set: dict[str, str] = {}
-    for raw_dataset_id, raw_link in links:
-        dataset_id = str(raw_dataset_id).strip()
-        if not dataset_id:
-            raise DatasetMappingError("A dataset link requires a nonblank dataset ID.")
-        if known_datasets is not None and dataset_id not in known_datasets:
-            raise DatasetMappingError(f"Dataset link references unknown dataset '{dataset_id}'.")
-        if dataset_id in by_dataset:
-            raise DatasetMappingError(f"Dataset '{dataset_id}' has more than one link in this tab.")
-        set_id = str(raw_link.set_id).strip() if raw_link.set_id is not None else None
-        if set_id == "":
-            set_id = None
-        if set_id is not None:
-            if known_sets is not None and set_id not in known_sets:
-                raise DatasetMappingError(f"Dataset link references unknown set '{set_id}'.")
-            occupying_dataset = dataset_by_set.get(set_id)
-            if occupying_dataset is not None:
-                raise DatasetMappingError(
-                    f"Set '{set_id}' is mapped to both '{occupying_dataset}' and '{dataset_id}'."
-                )
-            dataset_by_set[set_id] = dataset_id
-        link = DatasetLink(
-            set_id=set_id,
-            observation_mapping=tuple(raw_link.observation_mapping),
-        )
-        by_dataset[dataset_id] = link
-    return tuple((key, by_dataset[key]) for key in sorted(by_dataset))
-
-
 def plan_global_dataset_delete(
     *,
     dataset_id: str,
@@ -384,7 +320,7 @@ def plan_global_dataset_delete(
     tab_ids = tuple(dict.fromkeys((*links_by_tab.keys(), *overlays_by_tab.keys())))
     referenced = False
     for raw_tab_id in tab_ids:
-        links = validate_partial_bijection(links_by_tab.get(raw_tab_id, ()))
+        links = links_by_tab.get(raw_tab_id, ())
         if any(current_dataset_id == target for current_dataset_id, _link in links):
             referenced = True
         if any(

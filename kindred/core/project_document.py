@@ -142,12 +142,6 @@ def _require_id(value: object, label: str) -> str:
     return normalized
 
 
-def _require_bool(value: object, label: str) -> bool:
-    if type(value) is not bool:
-        raise TypeError(f"{label} must be a bool.")
-    return bool(value)
-
-
 def _require_int(value: object, label: str, minimum: int, maximum: int) -> int:
     if type(value) is bool or not isinstance(value, int):
         raise TypeError(f"{label} must be an int.")
@@ -485,24 +479,8 @@ class MechanismTabDocument:
         dataset_id: str,
         link: DatasetLink,
     ) -> "MechanismTabDocument":
-        target_dataset_id = _require_id(dataset_id, "dataset ID")
         links = dict(self.dataset_links)
-        if link.set_id is not None:
-            occupant = next(
-                (
-                    linked_dataset_id
-                    for linked_dataset_id, existing in links.items()
-                    if linked_dataset_id != target_dataset_id
-                    and existing.set_id == link.set_id
-                ),
-                None,
-            )
-            if occupant is not None:
-                raise ValueError(
-                    f"Initial-condition set {link.set_id!r} is already mapped "
-                    f"to dataset {occupant!r}."
-                )
-        links[target_dataset_id] = link
+        links[dataset_id] = link
         return replace(self, dataset_links=tuple(links.items()))
 
     def without_dataset(self, dataset_id: str) -> "MechanismTabDocument":
@@ -595,10 +573,9 @@ class ProjectDocument:
         *,
         run_defaults: SimulationExecutionSettings | None = None,
         scientific_settings: TabScientificSettings | None = None,
-        name: str | None = None,
     ) -> "ProjectDocument":
         new_tab = fresh_mechanism_tab(
-            name=name or next_mechanism_name(item.name for item in self.tabs),
+            name=next_mechanism_name(item.name for item in self.tabs),
             run_defaults=run_defaults,
             scientific_settings=scientific_settings,
         )
@@ -610,7 +587,7 @@ class ProjectDocument:
             replace(tab, name=_require_name(name, "tab name"))
         )
         _validate_unique(
-            (_require_name(item.name, "tab name") for item in candidate.tabs),
+            (item.name for item in candidate.tabs),
             "tab names",
             key=lambda value: str(value).casefold(),
         )
@@ -664,10 +641,7 @@ class ProjectDocument:
         return self.replace_dataset(
             replace(
                 record,
-                display_name=_require_name(
-                    display_name,
-                    "dataset display name",
-                ),
+                display_name=display_name,
             )
         )
 
@@ -765,7 +739,7 @@ def fresh_mechanism_tab(
     )
     return MechanismTabDocument(
         tab_id=new_tab_id(),
-        name=_require_name(name, "tab name"),
+        name=name,
         mechanism_source=MechanismAuthoringSource(),
         notes="",
         initial_condition_sets=(baseline_set,),
@@ -899,14 +873,6 @@ def validate_tab_scientific_settings(
         f"{prefix}Absolute tolerance",
         strictly_positive=True,
     )
-    _require_bool(
-        settings.analytic_jacobian_policy,
-        f"{prefix}Analytic Jacobian preference",
-    )
-    _require_bool(
-        settings.use_authored_stops,
-        f"{prefix}Use Authored Stopping Interventions",
-    )
     return settings
 
 
@@ -945,7 +911,6 @@ def validate_fit_defaults(defaults: FitDefaults) -> FitDefaults:
             "TRF and Dogbox require at least one convergence tolerance "
             f"(ftol or xtol) to be at least {epsilon:.17g}."
         )
-    _require_bool(defaults.use_seed, "fit_defaults.use_seed")
     _require_int(
         defaults.seed,
         "fit_defaults.seed",
@@ -1111,7 +1076,6 @@ def reconcile_tab_mechanism_source(
         if declaration.source_kind == "anonymous"
     )
     anonymous_name: str | None = None
-    anonymous_existing_id: str | None = None
     if anonymous_declarations:
         declared_name_keys = {
             declaration.source_name.casefold()
@@ -1137,7 +1101,6 @@ def reconcile_tab_mechanism_source(
         )
         if pristine_set1 is not None and "set1" not in declared_name_keys:
             anonymous_name = pristine_set1.name
-            anonymous_existing_id = pristine_set1.set_id
         else:
             occupied = {
                 item.name.casefold() for item in reconciled_sets
@@ -1153,11 +1116,6 @@ def reconcile_tab_mechanism_source(
             if declaration.source_kind == "named"
             else anonymous_name
         )
-        if context_name is None:
-            raise ValueError(
-                "Anonymous initial conditions have no materialization "
-                "target."
-            )
         for assignment in declaration.assignments:
             if assignment.species not in new_species_set:
                 raise AuthoredSourceError(
@@ -1198,10 +1156,6 @@ def reconcile_tab_mechanism_source(
             materialized_ids.append(target.set_id)
             continue
 
-        if anonymous_name is None:
-            raise ValueError(
-                "Anonymous initial conditions have no allocated set."
-            )
         if anonymous_target is None:
             target_index = index_by_name.get(anonymous_name.casefold())
             if target_index is None:
@@ -1216,14 +1170,6 @@ def reconcile_tab_mechanism_source(
                 mutable_sets.append(anonymous_target)
             else:
                 anonymous_target = mutable_sets[target_index]
-                if (
-                    anonymous_existing_id is not None
-                    and anonymous_target.set_id != anonymous_existing_id
-                ):
-                    raise ValueError(
-                        "Anonymous initial-condition allocation changed "
-                        "during admission."
-                    )
             materialized_ids.append(anonymous_target.set_id)
         anonymous_values = anonymous_target.values_dict()
         values = {
@@ -1257,14 +1203,6 @@ def reconcile_tab_mechanism_source(
         )
     else:
         prepared_dsl = admitted_dsl
-    if (
-        prepared_dsl is not None
-        and prepared_dsl.analysis.inline_initial_conditions.has_declarations
-    ):
-        raise ValueError(
-            "Accepted source still contains executable inline initial "
-            "conditions after materialization."
-        )
     reconciled_links: list[tuple[str, DatasetLink]] = []
     for dataset_id, link in tab.dataset_links:
         observation_mapping = tuple(
@@ -1511,31 +1449,6 @@ def validate_project_document(document: ProjectDocument) -> ProjectDocument:
     # admitted by archive decoding, their editors or spreadsheet admission.
     if not document.tabs:
         raise ValueError("A project must contain at least one mechanism tab.")
-    _validate_unique(
-        (source.source_id for source in document.imported_sources),
-        "imported source IDs",
-    )
-    referenced_source_ids: set[str] = set()
-    for dataset in document.datasets:
-        if dataset.source_id is not None:
-            referenced_source_ids.add(dataset.source_id)
-            if not any(source.source_id == dataset.source_id for source in document.imported_sources):
-                raise ValueError(
-                    f"Dataset {dataset.dataset_id!r} references unknown imported source "
-                    f"{dataset.source_id!r}."
-                )
-        normalized_metadata = dataset_foundation.freeze_json_value(
-            dataset_foundation.thaw_json_value(dataset.source_metadata)
-        )
-        if normalized_metadata != dataset.source_metadata:
-            raise TypeError(
-                f"Raw dataset {dataset.dataset_id!r} source_metadata must "
-                "be created with freeze_json_value()."
-            )
-    source_ids = {source.source_id for source in document.imported_sources}
-    if referenced_source_ids != source_ids:
-        orphaned = tuple(sorted(source_ids - referenced_source_ids))
-        raise ValueError(f"Project contains unreferenced imported sources: {orphaned!r}.")
 
     _validate_unique(
         (_require_id(tab.tab_id, "tab ID") for tab in document.tabs),
@@ -1613,7 +1526,7 @@ def validate_project_document(document: ProjectDocument) -> ProjectDocument:
                 f"Tab {tab.tab_id!r} ({tab.name!r}) contains invalid "
                 f"authored Reactions: {exc}"
             ) from exc
-        except (DSLError, KeyError, TypeError, ValueError) as exc:
+        except ValueError as exc:
             raise ValueError(
                 f"Tab {tab.tab_id!r} ({tab.name!r}) contains an invalid "
                 f"accepted mechanism: {exc}"

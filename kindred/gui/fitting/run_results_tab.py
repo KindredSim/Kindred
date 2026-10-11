@@ -545,15 +545,15 @@ class RunResultsTab(QtWidgets.QWidget):
             self._clear_subtabs()
         self._refresh_summary()
 
-    def set_terminal_failure(self, failure: object) -> None:
+    def set_terminal_failure(self, failure: FactualCause) -> None:
         self._empty_label.hide()
         self._tracker_panel.clear()
-        dataset_id = getattr(failure, "details", {}).get("dataset")
+        dataset_id = failure.details.get("dataset")
         dataset_label = self._dataset_labels.get(dataset_id, dataset_id)
         if dataset_label is not None and tuple(self._dataset_labels.values()).count(dataset_label) > 1:
             dataset_label = f"{dataset_label} ({dataset_id})"
         caption = f"Dataset: {dataset_label}" if dataset_label is not None else ""
-        message = getattr(failure, "message", str(failure))
+        message = failure.message
         self.set_execution_status("Failed", f"{caption}: {message}" if caption else message)
         self._summary_body = (
             "<h2>Fit Failed</h2>" + (f"<p>{html.escape(caption)}</p>" if caption else "")
@@ -747,9 +747,6 @@ class RunResultsTab(QtWidgets.QWidget):
 
     def _install_plot_projection(self, curves: Sequence[FitCurveDataset]) -> None:
         values = tuple(curves)
-        ids = [item.dataset_id for item in values]
-        if len(ids) != len(set(ids)):
-            raise ValueError("Fit curve datasets must have unique dataset IDs.")
         for index in range(self._subtab_stack.count()):
             self._subtab_stack.widget(index).cancel_copy()
         self._curves = values

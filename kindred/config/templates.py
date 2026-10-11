@@ -57,18 +57,6 @@ def _template_name(value: object) -> str:
     return value
 
 
-def _template_id(value: object) -> str:
-    if type(value) is not str:
-        raise TypeError("template ID must be an exact str.")
-    try:
-        parsed = uuid.UUID(hex=value)
-    except (AttributeError, ValueError) as exc:
-        raise ValueError("template ID must be an opaque UUID hex value.") from exc
-    if parsed.hex != value:
-        raise ValueError("template ID must be canonical lowercase UUID hex.")
-    return value
-
-
 def _nonblank_string(value: object, label: str) -> str:
     if type(value) is not str:
         raise TypeError(f"{label} must be an exact str.")
@@ -77,19 +65,7 @@ def _nonblank_string(value: object, label: str) -> str:
     return value
 
 
-def _structural_template_source(
-    reactions_text: object,
-) -> MechanismAuthoringSource:
-    """Validate only the current template source-field schema."""
-
-    return MechanismAuthoringSource.from_parts(
-        reactions_text=reactions_text,
-    )
-
-
-def _validate_template_payload(data: Mapping[str, Any]) -> Dict[str, Any]:
-    if not isinstance(data, Mapping):
-        raise TypeError("template payload must be a mapping.")
+def _require_template_fields(data: Mapping[str, Any]) -> None:
     missing_fields = sorted(_TEMPLATE_FIELDS - set(data.keys()))
     if missing_fields:
         raise ValueError(
@@ -102,6 +78,9 @@ def _validate_template_payload(data: Mapping[str, Any]) -> Dict[str, Any]:
             "template payload has unknown field(s): "
             + ", ".join(unknown_fields)
         )
+
+
+def _validate_template_payload(data: Mapping[str, Any]) -> Dict[str, Any]:
     for field in sorted(_TEMPLATE_STRING_FIELDS):
         if type(data[field]) is not str:
             raise TypeError(f"template payload field {field!r} must be an exact str.")
@@ -111,9 +90,9 @@ def _validate_template_payload(data: Mapping[str, Any]) -> Dict[str, Any]:
     author = data["author"]
     if author is not None and type(author) is not str:
         raise TypeError("template payload field 'author' must be an exact str or None.")
-    source = _structural_template_source(data["reactions_text"])
+    source = MechanismAuthoringSource.from_parts(reactions_text=data["reactions_text"])
     return {
-        "id": _template_id(data["id"]),
+        "id": _nonblank_string(data["id"], "template ID"),
         "name": _template_name(data["name"]),
         "description": str(data["description"]),
         "category": _nonblank_string(data["category"], "template category"),
@@ -161,21 +140,22 @@ class Template:
             setattr(self, field_name, value)
 
     def to_dict(self) -> Dict[str, Any]:
-        """Return a detached, fully validated persistence payload."""
+        """Return a detached persistence payload."""
 
-        return _validate_template_payload(asdict(self))
+        return asdict(self)
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "Template":
         """Construct one template only from the strict current schema."""
 
-        return cls(**_validate_template_payload(data))
+        _require_template_fields(data)
+        return cls(**data)
 
     @property
     def source(self) -> MechanismAuthoringSource:
         """Return the structurally admitted current authoring source."""
 
-        return _structural_template_source(self.reactions_text)
+        return MechanismAuthoringSource.from_parts(reactions_text=self.reactions_text)
 
     @staticmethod
     def generate_id() -> str:
@@ -235,16 +215,12 @@ class TemplateManager:
         return root
 
     def _template_path(self, template_id: str, *, create_root: bool = False) -> Path:
-        normalized_id = _template_id(template_id)
-        root = self._templates_root(create=create_root)
-        path = (root / f"{normalized_id}.json").resolve(strict=False)
-        if path.parent != root:
-            raise ValueError("template path escapes the configured template directory.")
-        return path
+        # Stored IDs come from file names in the directory or from uuid4.
+        return self._templates_root(create=create_root) / f"{template_id}.json"
 
     @staticmethod
     def _name_key(name: str) -> str:
-        return _template_name(name).casefold()
+        return name.casefold()
 
     def _assert_available_name(
         self,
@@ -300,22 +276,15 @@ class TemplateManager:
                             "Template file is not a contained regular file: "
                             f"{template_file}"
                         )
-                    resolved_file = template_file.resolve(strict=True)
-                    if resolved_file.parent != root:
-                        raise ValueError(
-                            "Template file escapes the configured directory: "
-                            f"{template_file}"
-                        )
                     template = Template.from_dict(
-                        _decode_template_json(resolved_file)
+                        _decode_template_json(template_file)
                     )
-                    if resolved_file != self._template_path(template.id):
+                    # The file name owns the ID, so every ID is one safe file name.
+                    if template_file.name != f"{template.id}.json":
                         raise ValueError(
                             "Template file name does not match its stable ID: "
                             f"{template_file.name}"
                         )
-                    if template.id in staged:
-                        raise ValueError(f"Duplicate template ID: {template.id!r}.")
                     name_key = self._name_key(template.name)
                     if name_key in names:
                         raise ValueError(
@@ -336,14 +305,13 @@ class TemplateManager:
 
     def delete_template(self, template_id: str) -> None:
         self._require_writable_collection()
-        normalized_id = _template_id(template_id)
-        if normalized_id not in self._templates:
-            raise KeyError(f"Unknown template ID: {normalized_id!r}.")
-        template_file = self._template_path(normalized_id)
+        if template_id not in self._templates:
+            raise KeyError(f"Unknown template ID: {template_id!r}.")
+        template_file = self._template_path(template_id)
         if template_file.exists():
             template_file.unlink()
-        del self._templates[normalized_id]
-        logger.info("Deleted template: %s", normalized_id)
+        del self._templates[template_id]
+        logger.info("Deleted template: %s", template_id)
 
     def get_template(self, template_id: str) -> Optional[Template]:
         return self._templates.get(template_id)
@@ -410,10 +378,9 @@ class TemplateManager:
         """Update fields of one existing template while preserving its ID."""
 
         self._require_writable_collection()
-        normalized_id = _template_id(template_id)
-        current = self._templates.get(normalized_id)
+        current = self._templates.get(template_id)
         if current is None:
-            raise KeyError(f"Unknown template ID: {normalized_id!r}.")
+            raise KeyError(f"Unknown template ID: {template_id!r}.")
         candidate = Template(
             id=current.id,
             name=current.name if name is _UNSET else name,
@@ -439,14 +406,13 @@ class TemplateManager:
         """Replace one existing template with a complete same-ID value."""
 
         self._require_writable_collection()
-        normalized_id = _template_id(template_id)
-        if normalized_id not in self._templates:
-            raise KeyError(f"Unknown template ID: {normalized_id!r}.")
-        candidate = Template.from_dict(template.to_dict())
-        if candidate.id != normalized_id:
+        if template_id not in self._templates:
+            raise KeyError(f"Unknown template ID: {template_id!r}.")
+        candidate = template
+        if candidate.id != template_id:
             raise ValueError("Replacement template must retain the target stable ID.")
-        self._assert_available_name(candidate.name, except_template_id=normalized_id)
+        self._assert_available_name(candidate.name, except_template_id=template_id)
         self._write_template(candidate)
-        self._templates[normalized_id] = candidate
-        logger.info("Replaced template: %s", normalized_id)
+        self._templates[template_id] = candidate
+        logger.info("Replaced template: %s", template_id)
         return candidate

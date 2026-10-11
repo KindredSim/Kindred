@@ -19,7 +19,6 @@ from kindred.core.algebra.errors import AlgebraError
 from kindred.core.exceptions import located
 from kindred.core.algebra.parser import BinaryNode, CallNode, IdentNode, NumberNode, SpeciesRefNode, UnaryNode
 from kindred.core.algebra.printer import expression_to_source
-from kindred.core.algebra.simulation_series import compiled_algebra_for_mechanism
 from kindred.core.algebra.symbols import BUILTIN_FUNCTIONS, PROTECTED_NAMES
 from kindred.core.mechanism_metadata import MechanismMetadataView
 from kindred.core.simulator.parameter_algebra import parameter_algebra_spec_from_mechanism
@@ -43,10 +42,6 @@ _OPERATIONS = _TRANSFORMS | _FUNCTIONS | {
 
 class SymbolicCalculatorError(UnsupportedSymbolicExpressionError):
     """A factual invalid, unsupported, or undefined Calculator expression."""
-
-
-class SymbolicCalculatorUnavailable(SymbolicCalculatorError):
-    """The accepted mechanism is outside the supported symbolic system."""
 
 
 Quantity = Unit | tuple["Quantity", ...] | None
@@ -196,7 +191,7 @@ def _branches(values):
     """Enumerate one complete family; no status, mathematics or metadata work."""
     families = [i for i, value in enumerate(values) if isinstance(value, _Alternatives)]
     if len(families) > 1:
-        raise SymbolicCalculatorError("Select independent answer operands explicitly with solution(result,n). Branches are not paired automatically.")
+        raise SymbolicCalculatorError("Each result has several answers. Choose one answer from each with solution(result,n).")
     if not families:
         yield tuple(values)
     else:
@@ -446,9 +441,7 @@ def symbolic_calculator_available(mechanism: Any) -> tuple[bool, str]:
 
 
 def build_calculator_context(mechanism: Any, *, mechanism_source: str) -> CalculatorContext:
-    available, reason = symbolic_calculator_available(mechanism)
-    if not available:
-        raise SymbolicCalculatorUnavailable(reason)
+    # The owner checked symbolic_calculator_available before starting this child.
     sp = require_sympy()
     namespace = build_namespace_from_mechanism(mechanism)
     spec = parameter_algebra_spec_from_mechanism(mechanism)
@@ -464,7 +457,6 @@ def build_calculator_context(mechanism: Any, *, mechanism_source: str) -> Calcul
     independent = {name for name, deps in graph.items() if not deps and kinds.get(name) not in {"mechanism-bound", "derived scalar"}}
     coordinates = {symbol for name, symbol in symbols.items() if name not in graph and name not in _FIXED_CONSTANTS}
     coordinates.update(symbols[name] for name in independent)
-    compiled = compiled_algebra_for_mechanism(mechanism)
     quantities = dict(spec.quantity_units)
     quantities.update({name: MOLAR for name in (*names, *(f"initial({n})" for n in names))})
     values = {name: _Value(symbol, quantity=quantities.get(name)) for name, symbol in symbols.items() if name not in graph}
@@ -482,7 +474,7 @@ def build_calculator_context(mechanism: Any, *, mechanism_source: str) -> Calcul
         mechanism, mechanism_source, namespace, names, MappingProxyType(symbols), MappingProxyType(values),
         frozenset(coordinates), (), _Value(sp.ImmutableMatrix([])),
         MappingProxyType({name: expression_to_source(stmt.expr) for name, stmt in statements.items()}),
-        MappingProxyType({stmt.name: expression_to_source(stmt.expr) for stmt in compiled.block.lines} if compiled else {}),
+        MappingProxyType({stmt.name: expression_to_source(stmt.expr) for stmt in spec.observable_block.lines}),
         MappingProxyType(quantities),
         authored_definitions,
     )
@@ -521,14 +513,13 @@ def build_calculator_context(mechanism: Any, *, mechanism_source: str) -> Calcul
             return _Value(symbols[name], quantity=quantities.get(name))
         try:
             values[name] = definition()
-        except (SymbolicCalculatorError, AlgebraError, ValueError, TypeError, ArithmeticError, NotImplementedError) as exc:
+        except (SymbolicCalculatorError, ValueError, TypeError, ArithmeticError, NotImplementedError) as exc:
             values[name] = _Value(_unavailable(exc))
-    if compiled:
-        for statement in compiled.block.statements_in_evaluation_order():
-            try:
-                values[statement.name] = _translate_node(context, statement.expr)
-            except (SymbolicCalculatorError, AlgebraError, ValueError, TypeError, ArithmeticError, NotImplementedError) as exc:
-                values[statement.name] = _Value(_unavailable(exc))
+    for statement in spec.observable_block.statements_in_evaluation_order():
+        try:
+            values[statement.name] = _translate_node(context, statement.expr)
+        except (SymbolicCalculatorError, ValueError, TypeError, ArithmeticError, NotImplementedError) as exc:
+            values[statement.name] = _Value(_unavailable(exc))
     projection = build_symbolic_mechanism_public_projection(mechanism, exact_stoichiometric_coefficients=True)
     canonical = {symbol: symbols[str(symbol)] for expression in projection.rhs_expressions for symbol in expression.free_symbols}
     def field(expression):
@@ -552,8 +543,6 @@ def _canonical_symbol(context: CalculatorContext, name: str) -> Any:
 
 def _exact_number(node: NumberNode) -> Any:
     exact = node.exact_value
-    if exact is None:
-        raise SymbolicCalculatorError("Undefined: a retained coefficient is not finite and exact.")
     return require_sympy().Rational(exact.numerator, exact.denominator)
 
 
@@ -619,7 +608,7 @@ def _coordinate(context: CalculatorContext, symbol: Any, operation: str) -> Any:
         raise SymbolicCalculatorError(f"Invalid input: {operation} requires a model coordinate, not a constant or expression.")
     if symbol not in context.coordinates:
         definition = context.parameter_definitions.get(str(symbol))
-        detail = f" Defined as {definition}." if definition is not None else " It is a derived quantity."
+        detail = f" It is defined as {definition}." if definition is not None else " It is a derived quantity."
         raise SymbolicCalculatorError(
             f"Invalid input: {operation} requires an independent coordinate, and {symbol} is not one.{detail} "
             "Use independent coordinates from the definition."
@@ -1019,7 +1008,9 @@ def _solve(context: CalculatorContext, problem: _Value, coordinates: _Value, con
 def _evaluate_call(context: CalculatorContext, name: str, args: Sequence[_Value | _Alternatives], *, direction=None, conversion=None):
     """Own complete operand admission, family lifting and command metadata."""
     args = tuple(args)
-    selection = name == "solution" and len(args) == 2
+    if name == "solution" and len(args) != 2:
+        raise SymbolicCalculatorError("Invalid input: solution requires 2 arguments.")
+    selection = name == "solution"
     if name == "subs" and len(args) == 2:
         entries = _entries(args[1])
         usable = tuple(v for v in entries if not isinstance(v.expression, (_UnresolvedProblem, _UnavailableDiagnostic)))
@@ -1030,7 +1021,7 @@ def _evaluate_call(context: CalculatorContext, name: str, args: Sequence[_Value 
                 raise SymbolicCalculatorError("Select the replacement explicitly with solution(result,n) when alternatives or unresolved possibilities remain.")
             args = (args[0], usable[0])
     if selection and all(isinstance(v, _Alternatives) for v in args):
-        raise SymbolicCalculatorError("Select independent answer operands explicitly with solution(result,n). Branches are not paired automatically.")
+        raise SymbolicCalculatorError("Each result has several answers. Choose one answer from each with solution(result,n).")
     operands = args[1:] if selection else args
     family = any(isinstance(v, _Alternatives) for v in operands)
     answers = []
@@ -1854,9 +1845,7 @@ def _printed_input_supported(context: CalculatorContext, expression, text: str) 
 
 
 def evaluate_symbolic_query(context: CalculatorContext, query: str) -> SymbolicCalculatorResult:
-    query = query.strip()
-    if not query:
-        raise SymbolicCalculatorError("Invalid input: empty Calculator query.")
+    # The owner strips queries and drops empty ones.
     try:
         value = _CalculatorExpressionParser(context, query).parse()
         return _package_result(context, query, value)
@@ -1922,8 +1911,10 @@ def _package_result(context: CalculatorContext, query: str, result) -> SymbolicC
     if expression == "odes()":
         rows_text = "Rows: " + ", ".join(f"d{name}/dt" for name in context.species_names)
         display_html_lines.append(escape(rows_text))
+    settings = MechanismMetadataView.from_metadata(context.mechanism.metadata)
     assumptions = (
         "Accepted-source symbolic system, with no schedules, execution overrides, fit candidates, or slider drafts.",
+        f"Plain-number energies in the source are in {settings.energy_unit}, and the standard concentration C0 is {settings.standard_conc_M:g} M.",
         "Coordinates are real. T is positive and fixed in time unless explicit expression dependence is supplied.",
         "Definitions are prepared before calculation. Independent parameters and initial concentrations are fixed in time, and partial differentiates prepared mathematics.",
         "Independent inputs remain symbolic. Supply concrete values explicitly with subs. Accepted defaults are not Calculator inputs.",

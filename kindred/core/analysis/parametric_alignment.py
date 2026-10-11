@@ -12,46 +12,10 @@ from dataclasses import dataclass, fields
 import numpy as np
 
 from kindred.core.analysis.fit_dataset_payload import FitObservationSeries
-from kindred.core.exceptions import FitCandidateDomainError, FitSimulationError, FittingCancelled
+from kindred.core.exceptions import FitSimulationError, FittingCancelled
 from kindred.core.simulator.solver_types import SimulationCancellationControl
 
-__all__ = ["CandidateParametricAlignmentError", "ParametricProjection",
-           "align_parametric", "project_parametric_y"]
-
-
-class CandidateParametricAlignmentError(FitCandidateDomainError):
-    """An admitted candidate cannot produce a scientific X projection."""
-
-    def __init__(
-        self,
-        message: str,
-        *,
-        dataset_label: str | None = None,
-        x_name: str | None = None,
-        failed_observed_value: float | None = None,
-        candidate_parameter_facts: Mapping[str, object] | None = None,
-        value_dependencies: Sequence[str] = (),
-    ) -> None:
-        details: dict[str, object] = {
-            "producer": "parametric_alignment",
-            "stage": "parametric_x_alignment",
-            "message": str(message),
-        }
-        if dataset_label is not None:
-            details["dataset"] = str(dataset_label)
-        if x_name is not None:
-            details["x_identity"] = {"name": str(x_name)}
-        if failed_observed_value is not None:
-            details["failed_observed_value"] = float(failed_observed_value)
-        if candidate_parameter_facts:
-            details["candidate_parameter_facts"] = dict(candidate_parameter_facts)
-        dependencies = tuple(
-            sorted({str(item).strip() for item in value_dependencies if str(item).strip()})
-        )
-        if dependencies:
-            details["value_dependencies"] = dependencies
-            details["parameter_names"] = dependencies
-        super().__init__(message, stage="parametric_x_alignment", details=details)
+__all__ = ["ParametricProjection", "align_parametric", "project_parametric_y"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -94,7 +58,6 @@ def align_parametric(
     segment_keys: Sequence[str],
     discontinuity_ids: np.ndarray,
     multipliers: Mapping[str, float],
-    dataset_label: str,
     x_name: str,
     cancellation_control: SimulationCancellationControl | None,
 ) -> ParametricProjection:
@@ -108,8 +71,6 @@ def align_parametric(
         raise FittingCancelled()
     names = tuple(sorted(observations))
     model = np.column_stack((model_x, *(model_y[name] for name in names)))
-    if not model.size or not np.all(np.isfinite(model)):
-        raise FitSimulationError(f"Dataset {dataset_label!r}: model quantities must be finite.")
     segments = np.asarray(segment_ids)
     discontinuities = np.asarray(discontinuity_ids)
     keys = tuple(segment_keys)
@@ -151,11 +112,6 @@ def align_parametric(
         errors = offset - fraction[:, None] * direction
         costs = np.sum(errors * errors, axis=1)
         chosen = int(np.argmin(costs))
-        if not np.isfinite(costs[chosen]):
-            raise CandidateParametricAlignmentError(
-                "Joint curve matching produced nonfinite discrepancies.",
-                dataset_label=dataset_label, x_name=x_name,
-            )
         chosen_rows.append(chosen)
         chosen_fractions.append(float(fraction[chosen]))
     selected_left = left[chosen_rows]

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import Callable, Dict, Mapping, Tuple
 
 import numpy as np
@@ -26,9 +25,9 @@ from kindred.core.algebra.parser import (
 from kindred.core.algebra.symbols import SymbolTable
 
 __all__ = [
-    "compiled_algebra_for_mechanism",
-    "compile_algebra_observables",
+    "observable_parameter_roots",
     "prepare_algebra_stop_evaluator",
+    "reject_unknown_species_references",
 ]
 
 
@@ -49,14 +48,15 @@ def _iter_species_refs(expr: ExprNode):
         return
 
 
-def _reject_unknown_species_references(
+def reject_unknown_species_references(
     block: AlgebraBlock,
     *,
-    species_names: set[str] | None = None,
+    species_names: set[str],
 ) -> None:
+    """Refuse a let line that reads a species the mechanism does not have."""
     for stmt in block.lines:
         unknown_species = sorted(
-            set(_iter_species_refs(stmt.expr)) - set(species_names or ())
+            set(_iter_species_refs(stmt.expr)) - species_names
         )
         if unknown_species:
             raise AlgebraNameError(
@@ -65,61 +65,28 @@ def _reject_unknown_species_references(
             )
 
 
-@dataclass(frozen=True)
-class CompiledAlgebraSeries:
-    """Pre-parsed algebra observables for repeated evaluation."""
+def observable_parameter_roots(block: AlgebraBlock, name: str) -> tuple[str, ...]:
+    """External identifiers required by one retained observable closure."""
+    statements = {stmt.name: stmt for stmt in block.lines}
+    roots: set[str] = set()
+    visited: set[str] = set()
 
-    block: AlgebraBlock
-    observable_names: Tuple[str, ...]
+    def visit(current: str) -> None:
+        if current in visited:
+            return
+        visited.add(current)
+        if current not in statements:
+            roots.add(current)
+            return
+        for dependency in _iter_identifiers(statements[current].expr):
+            visit(dependency)
 
-    def parameter_roots(self, name: str) -> tuple[str, ...]:
-        """External identifiers required by one retained observable closure."""
-        statements = {stmt.name: stmt for stmt in self.block.lines}
-        roots: set[str] = set()
-        visited: set[str] = set()
-
-        def visit(current: str) -> None:
-            if current in visited:
-                return
-            visited.add(current)
-            if current not in statements:
-                roots.add(current)
-                return
-            for dependency in _iter_identifiers(statements[current].expr):
-                visit(dependency)
-
-        visit(name)
-        return tuple(sorted(roots))
-
-
-def compiled_algebra_for_mechanism(
-    mechanism: object,
-) -> CompiledAlgebraSeries | None:
-    """Return the Algebra program retained by the accepted mechanism parse."""
-    return getattr(mechanism, "_compiled_algebra_series", None)
-
-
-def compile_algebra_observables(
-    *,
-    retained_spec: object,
-    species_names: set[str] | None = None,
-) -> CompiledAlgebraSeries:
-    """Compile the retained observable AST for repeated evaluation.
-
-    The accepted DSL admission owns parsing and supplies the partitioned block;
-    this boundary has no raw-source parsing route.
-    """
-    algebra_block = retained_spec.observable_block
-    _reject_unknown_species_references(algebra_block, species_names=species_names)
-    observable_names = tuple(str(stmt.name) for stmt in (algebra_block.lines or []))
-    return CompiledAlgebraSeries(
-        block=algebra_block,
-        observable_names=observable_names,
-    )
+    visit(name)
+    return tuple(sorted(roots))
 
 
 def prepare_algebra_stop_evaluator(
-    compiled: CompiledAlgebraSeries,
+    block: AlgebraBlock,
     *,
     species_names: Tuple[str, ...],
     initials: Mapping[str, float],
@@ -128,7 +95,7 @@ def prepare_algebra_stop_evaluator(
 ) -> PreparedAlgebraStopEvaluator:
     """Bind stopping to the accepted retained AST; the caller admits each target."""
     return PreparedAlgebraStopEvaluator(
-        compiled.block,
+        block,
         species_names=species_names,
         initials=initials,
         symbol_values=symbol_values,
@@ -155,7 +122,7 @@ def _build_simulation_context(
     return EvaluationContext(
         t=t_arr,
         species_series={k: np.asarray(v, dtype=float).reshape(-1) for k, v in species_series.items()},
-        initials={str(k): float(v) for k, v in (initials or {}).items()},
+        initials={str(k): float(v) for k, v in initials.items()},
         species_names=set(species_series.keys()),
         symtab=symtab,
         symbol_series=runtime_series,
@@ -166,8 +133,8 @@ def _build_simulation_context(
     )
 
 
-def evaluate_compiled_algebra_series_for_simulation_partial(
-    compiled: CompiledAlgebraSeries,
+def evaluate_algebra_block_for_simulation_partial(
+    block: AlgebraBlock,
     *,
     t: np.ndarray,
     species_series: Dict[str, np.ndarray],
@@ -189,9 +156,9 @@ def evaluate_compiled_algebra_series_for_simulation_partial(
         runtime_symbol_names=runtime_symbol_names,
         cancellation_check=cancellation_check,
     )
-    series, scalars, errors = evaluate_block_partial(compiled.block, ctx)
-    series_out = {str(name): np.asarray(values, dtype=float).reshape(-1) for name, values in (series or {}).items()}
+    series, scalars, errors = evaluate_block_partial(block, ctx)
+    series_out = {str(name): np.asarray(values, dtype=float).reshape(-1) for name, values in series.items()}
     scalars_out: Dict[str, float] = {}
-    for name, value in (scalars or {}).items():
+    for name, value in scalars.items():
         scalars_out[str(name)] = float(value)
-    return series_out, scalars_out, list(errors or [])
+    return series_out, scalars_out, list(errors)

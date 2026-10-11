@@ -33,9 +33,7 @@ from kindred.core.project_document import (
     ProjectDocument,
     TabScientificSettings,
     canonical_initial_values,
-    validate_fit_solver,
 )
-from kindred.core.simulation_parameters import names_affecting
 from kindred.core.species import validate_concentration, validate_input_time_seconds
 from kindred.core.time_grid import build_time_grid
 from kindred.core.simulator.dsl_parse import PreparedDslRequestSet
@@ -85,20 +83,6 @@ FitDatasetWeightMode = Literal["implicit", "user"]
 FitSolver = Literal["BDF", "Radau"]
 
 
-def _required(value: object, field: str) -> str:
-    normalized = str(value or "").strip()
-    if not normalized:
-        raise ValueError(f"{field} must be nonblank.")
-    return normalized
-
-
-def _finite(value: object, field: str) -> float:
-    parsed = float(value)
-    if not math.isfinite(parsed):
-        raise ValueError(f"{field} must be finite.")
-    return parsed
-
-
 def fit_execution_span(t_start: object, t_end: object) -> tuple[float, float]:
     """Validate and return a strictly positive Fit solver span."""
     if t_start is None or t_end is None:
@@ -108,16 +92,6 @@ def fit_execution_span(t_start: object, t_end: object) -> tuple[float, float]:
     if end <= start:
         raise ValueError("Simulation end must be greater than Simulation start.")
     return start, end
-
-
-def _validated_dataset_weight_mode(
-    value: object,
-) -> FitDatasetWeightMode:
-    if value == "implicit":
-        return "implicit"
-    if value == "user":
-        return "user"
-    raise ValueError("Dataset weight mode must be implicit or user.")
 
 
 @dataclass(frozen=True, slots=True)
@@ -466,7 +440,7 @@ def _complete_fit_parameter_scopes(
 ) -> FitParameterVariable:
     """Seed the inactive Per-dataset config for a captured parameter."""
 
-    retained_ids = tuple(_required(dataset_id, "dataset ID") for dataset_id in dataset_ids)
+    retained_ids = tuple(dataset_ids)
     existing = dict(parameter.per_dataset_config.dataset_values)
     dataset_values = tuple(
         (dataset_id, existing.get(dataset_id, parameter.selected_config.value))
@@ -494,14 +468,7 @@ class FitInitialVariable:
     log10: bool = False
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "set_id", _required(self.set_id, "set ID"))
-        object.__setattr__(self, "species", _required(self.species, "species"))
-        initial = validate_concentration(
-            _finite(self.initial, f"{self.species} initial"),
-            field=f"{self.species} initial",
-        )
-        if not isinstance(self.tolerance, FitInitialTolerance):
-            raise TypeError("Initial tolerance must be FitInitialTolerance.")
+        initial = validate_concentration(self.initial, field=f"{self.species} initial")
         minimum, _maximum = self.tolerance.bounds_for(initial)
         if self.log10 and not self.tolerance.enabled:
             raise ValueError("Log10 IC fitting requires an enabled tolerance.")
@@ -535,19 +502,14 @@ class FitSharedInitialGroup:
     log10: bool = False
 
     def __post_init__(self) -> None:
-        species = _required(self.species, "initial species")
-        origin = _required(self.origin_dataset_id, "initial group origin dataset ID")
-        members = tuple(_required(item, "initial group member dataset ID") for item in self.member_dataset_ids)
+        species = self.species
+        origin = self.origin_dataset_id
+        members = self.member_dataset_ids
         if len(members) < 2 or len(set(members)) != len(members):
             raise ValueError("Shared initial groups require at least two unique datasets.")
         if origin not in members:
             raise ValueError("Shared initial group origin must be a member dataset.")
-        initial = validate_concentration(
-            _finite(self.initial, f"{species} initial"),
-            field=f"{species} initial",
-        )
-        if not isinstance(self.tolerance, FitInitialTolerance):
-            raise TypeError("Shared initial group tolerance must be FitInitialTolerance.")
+        initial = validate_concentration(self.initial, field=f"{species} initial")
         minimum, _maximum = self.tolerance.bounds_for(initial)
         if self.log10 and (not self.tolerance.enabled or minimum <= 0.0 or initial <= 0.0):
             raise ValueError(f"{species} log10 fitting requires positive varying bounds.")
@@ -612,15 +574,7 @@ class FitDatasetLocalSettings:
     parametric: FitParametricSettings | None = None
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "dataset_id", _required(self.dataset_id, "dataset ID"))
-        t_start = None if self.t_start is None else _finite(self.t_start, "Fit simulation start")
-        if t_start is not None and t_start < 0.0:
-            raise ValueError("Fit simulation start must be nonnegative.")
-        simulation_end = None if self.simulation_end is None else _finite(self.simulation_end, "Simulation end")
-        object.__setattr__(self, "simulation_end", simulation_end)
-        low = _finite(self.data_range_min, "Data Range minimum")
-        high = _finite(self.data_range_max, "Data Range maximum")
-        if self.parametric is None and high < low:
+        if self.parametric is None and self.data_range_max < self.data_range_min:
             raise ValueError("Data Range maximum must be >= minimum.")
         maximum = (
             None
@@ -631,64 +585,7 @@ class FitDatasetLocalSettings:
             raise ValueError(
                 "Maximum observations per target must be All or at least 2."
             )
-        weight = _finite(self.weight, "dataset weight")
-        if weight <= 0.0:
-            raise ValueError("Dataset weight must be positive.")
-        targets = tuple(_required(item, "target series") for item in self.target_species)
-        if len(targets) != len(set(targets)):
-            raise ValueError("Fit target series must be unique.")
-        target_weights = tuple(
-            (_required(name, "target series"), _finite(value, "target weight"))
-            for name, value in self.target_weights
-        )
-        weight_roster = targets
-        if self.parametric is not None:
-            weight_roster = (*targets, self.parametric.x_name)
-        weight_names = [name for name, _value in target_weights]
-        if (
-            len(weight_names) != len(set(weight_names))
-            or set(weight_names) != set(weight_roster)
-        ):
-            raise ValueError(
-                "Fit target weights must exactly match selected targets."
-            )
-        if any(value <= 0.0 for _name, value in target_weights):
-            raise ValueError("Target weights must be positive.")
-        mapping = tuple(
-            (
-                _required(raw_id, "raw observation ID"),
-                _required(model, "model target"),
-            )
-            for raw_id, model in self.observation_targets
-        )
-        if len({raw_id for raw_id, _model in mapping}) != len(mapping):
-            raise ValueError(
-                "Observation target overrides must have unique dataset-local "
-                "raw IDs."
-            )
-        mapped_targets = [model for _raw_id, model in mapping]
-        if (
-            len(mapped_targets) != len(set(mapped_targets))
-            or not set(targets).issubset(set(mapped_targets))
-        ):
-            raise ValueError(
-                "Observation target overrides must retain one unique mapping "
-                "for every selected Fit target."
-            )
-        object.__setattr__(self, "t_start", t_start)
-        object.__setattr__(self, "data_range_min", low)
-        object.__setattr__(self, "data_range_max", high)
         object.__setattr__(self, "maximum_observations_per_target", maximum)
-        object.__setattr__(self, "weight", weight)
-        object.__setattr__(self, "target_species", targets)
-        object.__setattr__(self, "target_weights", target_weights)
-        object.__setattr__(self, "observation_targets", mapping)
-        if self.parametric is not None and self.parametric.dataset_id != self.dataset_id:
-            raise ValueError("Parametric settings changed stable dataset identity.")
-        if self.parametric is not None and self.parametric.x_name in targets:
-            raise ValueError(
-                "The selected parametric X series cannot also be a Y target."
-            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -898,34 +795,10 @@ class FitSetupSnapshot:
     profile_likelihood: ProfileLikelihoodConfig | None = None
     residual_bootstrap: ResidualBootstrapConfig | None = None
     def __post_init__(self) -> None:
-        object.__setattr__(self, "solver", validate_fit_solver(self.solver))
-        object.__setattr__(
-            self,
-            "dataset_weight_mode",
-            _validated_dataset_weight_mode(self.dataset_weight_mode),
-        )
         datasets = tuple(self.datasets)
         parameters = tuple(self.parameters)
         initials = tuple(self.initials)
         shared_initial_groups = tuple(self.shared_initial_groups)
-        retained_dataset_ids = {item.dataset_id for item in datasets}
-        incomplete_parameter_maps = sorted(
-            item.name
-            for item in parameters
-            if item.scope == "per_dataset"
-            and {
-                dataset_id
-                for dataset_id, _value in item.selected_config.dataset_values
-            }
-            != retained_dataset_ids
-        )
-        if incomplete_parameter_maps:
-            raise ValueError(
-                "Fit snapshot parameters require one retained value for "
-                "every captured dataset: "
-                + ", ".join(incomplete_parameter_maps)
-                + "."
-            )
         object.__setattr__(self, "datasets", datasets)
         object.__setattr__(self, "parameters", parameters)
         object.__setattr__(self, "initials", initials)
@@ -938,25 +811,15 @@ class FitSetupSnapshot:
         )
 
 
-def _scan_parameters(
-    tab: MechanismTabDocument,
-    mapped: Iterable[FitMappedDatasetSnapshot],
-) -> tuple[FitParameterVariable, ...]:
+def _scan_parameters(tab: MechanismTabDocument) -> tuple[FitParameterVariable, ...]:
     if not tab.mechanism_source.reactions_text.strip():
         return ()
     variables: list[FitParameterVariable] = []
-    if not isinstance(tab.prepared_dsl, PreparedDslRequestSet):
-        raise ValueError("Fit requires an accepted prepared mechanism.")
     coordinates = enumerate_parameter_coordinates(tab.prepared_dsl)
-    # Vary starts on only for parameters a mapped observation can depend on.
-    relevant = names_affecting(
-        tab.prepared_dsl,
-        {observation.model_target for item in mapped for observation in item.observations},
-    )
+    # Vary starts off; the user chooses what is fitted.
     for coordinate in coordinates:
         value = coordinate.value
         low, high = coordinate.fit_minimum, coordinate.fit_maximum
-        vary = coordinate.name in relevant
         variables.append(
             FitParameterVariable(
                 name=coordinate.name,
@@ -966,14 +829,14 @@ def _scan_parameters(
                     value=value,
                     minimum=low,
                     maximum=high,
-                    fit=vary,
+                    fit=False,
                     log10=False,
                 ),
                 per_dataset_config=FitParameterConfiguration(
                     value=value,
                     minimum=low,
                     maximum=high,
-                    fit=vary,
+                    fit=False,
                     log10=False,
                 ),
                 family=coordinate.family,
@@ -1084,12 +947,7 @@ def capture_fit_origin(
         }
         observations: list[FitObservationSnapshot] = []
         for raw_observation_id, model_target in link.observation_mapping:
-            observation = by_raw_id.get(raw_observation_id)
-            if observation is None:
-                raise ValueError(
-                    f"Dataset {dataset.display_name!r} mapping references "
-                    f"missing raw observation ID {raw_observation_id!r}."
-                )
+            observation = by_raw_id[raw_observation_id]
             observations.append(
                 FitObservationSnapshot(
                     raw_observation_id=observation.raw_observation_id,
@@ -1123,7 +981,7 @@ def capture_fit_origin(
         scientific_settings=tab.scientific_settings,
         fit_defaults=document.fit_defaults,
         mapped_datasets=tuple(mapped),
-        parameter_defaults=_scan_parameters(tab, mapped),
+        parameter_defaults=_scan_parameters(tab),
     )
 
 
@@ -1142,66 +1000,30 @@ def selected_observations(
         target = target_by_raw_id.get(observation.raw_observation_id)
         if target is None or target not in wanted:
             continue
-        if target in observations_by_target:
-            raise ValueError(
-                f"Dataset {mapped.display_name!r} maps multiple selected "
-                f"columns to target {target!r}."
-            )
+        # The admitted mapping gives each target exactly one column.
         observations_by_target[target] = observation
-    missing = wanted - set(observations_by_target)
-    if missing:
-        raise ValueError(
-            f"Dataset {mapped.display_name!r} has no selected observation "
-            f"rows for: {', '.join(sorted(missing))}."
-        )
 
     x_rows: set[int] | None = None
     x_observation: FitObservationSnapshot | None = None
     if local.parametric is not None:
-        x_raw_ids = tuple(
+        # The admitted mapping gives measured X exactly one column, never a Y column.
+        x_raw_id = next(
             raw_id
             for raw_id, current_target in local.observation_targets
             if current_target == local.parametric.x_name
         )
-        if len(x_raw_ids) != 1:
-            raise ValueError(
-                f"Dataset {mapped.display_name!r} Parametric-X series "
-                f"{local.parametric.x_name!r} must map to exactly one "
-                "observation."
-            )
-        active_y_raw_ids = {
-            observation.raw_observation_id
-            for observation in observations_by_target.values()
-        }
-        x_raw_id = x_raw_ids[0]
-        if x_raw_id in active_y_raw_ids:
-            raise ValueError(
-                f"Dataset {mapped.display_name!r} Parametric-X series "
-                f"{local.parametric.x_name!r} cannot reuse a selected Y "
-                "observation column."
-            )
         x_observation = next(
-            (
-                observation
-                for observation in mapped.observations
-                if observation.raw_observation_id == x_raw_id
-            ),
-            None,
+            observation
+            for observation in mapped.observations
+            if observation.raw_observation_id == x_raw_id
         )
-        if x_observation is None:
-            raise ValueError(
-                f"Dataset {mapped.display_name!r} Parametric-X mapping "
-                f"references missing raw observation {x_raw_id!r}."
-            )
         x_rows = set(x_observation.source_rows)
 
     selected: list[FitObservationSnapshot] = []
     for target in local.target_species:
         observation = observations_by_target[target]
         if x_rows is None and not observation.t:
-            raise ValueError(
-                f"Dataset {mapped.display_name!r} has no recorded time. Select a measured X quantity."
-            )
+            raise ValueError("No recorded time. Select a measured X quantity.")
         usable = tuple(
             index for index, row in enumerate(observation.source_rows)
             if (row in x_rows if x_rows is not None else (
@@ -1210,10 +1032,7 @@ def selected_observations(
         )
         if not usable:
             selection = "Parametric-X row pairing" if x_rows is not None else "Data Range"
-            raise ValueError(
-                f"Dataset {mapped.display_name!r} target {target!r} has "
-                f"zero usable observations after {selection}."
-            )
+            raise ValueError(f"Target {target!r} has zero usable observations after {selection}.")
         maximum = local.maximum_observations_per_target
         indices = usable
         if maximum is not None:
@@ -1284,16 +1103,14 @@ def fit_setup_readiness(
     if not included:
         return "Select at least one mapped dataset for fitting."
     for local in included:
-        mapped = mapped_by_id.get(local.dataset_id)
-        if mapped is None:
-            return f"Included dataset {local.dataset_id!r} is not captured."
+        mapped = mapped_by_id[local.dataset_id]
         if not local.target_species:
             return f"Dataset {mapped.display_name!r} must select at least one target."
         if check_observations:
             try:
                 observations, _ = selected_observations(mapped, local)
-            except (KeyError, TypeError, ValueError) as exc:
-                return str(exc)
+            except ValueError as exc:
+                return f"Dataset {mapped.display_name!r}: {exc}"
             if not observations:
                 return f"Dataset {mapped.display_name!r} has no selected observations."
 
@@ -1374,7 +1191,7 @@ def _prepare_fit_datasets(
         ):
             raise ValueError(
                 f"Dataset {mapped.display_name!r} has selected experimental times "
-                "outside the Simulation interval. Adjust the interval or Data Range."
+                "outside the Simulation interval. Adjust Simulation start, Simulation end, or Data Range."
             )
         grid_points = 100
         policy = (
@@ -1408,7 +1225,7 @@ def _prepare_fit_datasets(
                 fit_sampling_policy=policy,
                 fit_sampling_identity=identity,
                 solver_config=build_solver_config(
-                    solver_input=setup.solver,
+                    solver=setup.solver,
                     rtol=science.rtol,
                     atol=science.atol,
                     grid={"N": grid_points},

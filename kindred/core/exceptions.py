@@ -1,11 +1,10 @@
 """
 Structured exception types for Kindred user-facing and integration boundaries.
 
-This module defines the `KindredError` hierarchy plus optional context, error
-codes, suggestions, and examples. Every display shows ``str(exc)``, so the text
-of an error is its user-facing message, with the authored line it names, a
-suggestion and examples. Codes and details are structured facts for reports
-and logs and never appear in the text.
+This module defines the `KindredError` hierarchy plus optional context and
+error codes. Every display shows ``str(exc)``, so the text of an error is its
+user-facing message, located on the authored line it names. Codes and details
+are structured facts for reports and logs and never appear in the text.
 
 Error Categories
 ----------------
@@ -17,7 +16,7 @@ Error Categories
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional, List, Dict, Any
+from typing import Optional, Dict, Any
 
 __all__ = [
     # Base
@@ -68,8 +67,9 @@ class KindredError(Exception):
     """
     Base exception for all Kindred errors.
 
-    Its text is the message, the authored line from ``context`` when known,
-    the suggestion, and the examples. The code and details are attributes.
+    Its text is the message, located on the authored line from ``context``
+    when known. The code and details are structured attributes for reports
+    and logs; they are never part of the text.
 
     Attributes
     ----------
@@ -77,10 +77,6 @@ class KindredError(Exception):
         Main error message
     code : str
         Error code (e.g., "E201")
-    suggestion : str, optional
-        Suggested fix or solution
-    examples : list of str, optional
-        Valid syntax examples
     context : ErrorContext, optional
         Source location and context
     details : dict, optional
@@ -92,41 +88,19 @@ class KindredError(Exception):
         message: str,
         *,
         code: str = "E000",
-        suggestion: Optional[str] = None,
-        examples: Optional[List[str]] = None,
         context: Optional[ErrorContext] = None,
         details: Optional[Dict[str, Any]] = None,
     ):
         self.message = message
         self.code = code
-        self.suggestion = suggestion
-        self.examples = examples or []
         self.context = context
         self.details = details or {}
-
-        # Build comprehensive error message
-        full_message = self._build_message()
-        super().__init__(full_message)
+        super().__init__(self._build_message())
 
     def _build_message(self) -> str:
-        """The user-facing text: message, authored line, suggestion, examples.
-
-        Code, class name and details stay structured attributes for reports
-        and logs; they are never part of the text.
-        """
-        parts = [self.message]
-        if self.context and self.context.line is not None and self.context.line_text is not None:
-            parts.append("")
-            parts.append(f"  Line {self.context.line}: {self.context.line_text}")
-        if self.suggestion:
-            parts.append("")
-            parts.append(f"Suggestion: {self.suggestion}")
-        if self.examples:
-            parts.append("")
-            parts.append("Valid examples:")
-            for example in self.examples:
-                parts.append(f"  • {example}")
-        return "\n".join(parts)
+        if self.context is None:
+            return self.message
+        return located(self.message, self.context.line, self.context.line_text)
 
 
 # ----------------------------- Validation Errors -------------------------------

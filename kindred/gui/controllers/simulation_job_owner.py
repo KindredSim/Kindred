@@ -10,7 +10,7 @@ from typing import Callable, Iterable, Literal, Mapping
 
 from PySide6 import QtCore
 
-from kindred.core.exceptions import KindredError, SimulationCancelled, located
+from kindred.core.exceptions import SimulationCancelled
 from kindred.core.project_document import (
     SimulationExecutionSettings,
     TabScientificSettings,
@@ -42,8 +42,6 @@ __all__ = [
 
 
 def resolve_run_parallel_capacity(*, cpu_count: object, user_max: object, target_count: int) -> int:
-    if type(target_count) is not int or target_count <= 0:
-        raise ValueError("Run requires a positive exact target count.")
     cpu = int(cpu_count) if type(cpu_count) is int and cpu_count > 0 else 1
     budget = max(1, cpu - 1)
     default = min(budget, 16)
@@ -66,17 +64,6 @@ class ExplicitRunCapture:
     tab_id: str
     targets: tuple[ExplicitRunTarget, ...]
 
-    def __post_init__(self) -> None:
-        targets = tuple(self.targets)
-        if not targets:
-            raise TypeError("Run requires ExplicitRunTarget values.")
-        if any(target.tab_id != self.tab_id for target in targets):
-            raise ValueError("every Run target must belong to the capture tab.")
-        ids = tuple(target.set_id for target in targets)
-        if len(ids) != len(set(ids)):
-            raise ValueError("Run target set IDs must be unique.")
-        object.__setattr__(self, "targets", targets)
-
 
 @dataclass(frozen=True, slots=True)
 class PreviewTarget:
@@ -94,17 +81,6 @@ class PreviewCapture:
     tab_id: str
     targets: tuple[PreviewTarget, ...]
 
-    def __post_init__(self) -> None:
-        targets = tuple(self.targets)
-        if not targets:
-            raise TypeError("Preview requires PreviewTarget values.")
-        if any(item.tab_id != self.tab_id for item in targets):
-            raise ValueError("every Preview target must belong to the capture tab.")
-        ids = tuple(item.set_id for item in targets)
-        if len(ids) != len(set(ids)):
-            raise ValueError("Preview target set IDs must be unique.")
-        object.__setattr__(self, "targets", targets)
-
 
 @dataclass(frozen=True, slots=True)
 class SimulationTerminalSummary:
@@ -115,16 +91,6 @@ class SimulationTerminalSummary:
     cancelled: int
     discarded: int
     details: tuple[str, ...] = ()
-
-
-def _status_line(exc: BaseException) -> str:
-    """A failure on the one-line status bar: the authored line it names,
-    its message and its suggestion."""
-    if not isinstance(exc, KindredError):
-        return str(exc) or type(exc).__name__
-    context = exc.context
-    text = exc.message if context is None else located(exc.message, context.line, context.line_text)
-    return text + (f" Suggestion: {exc.suggestion}" if exc.suggestion else "")
 
 
 @dataclass(frozen=True, slots=True)
@@ -146,7 +112,7 @@ def build_execution_request(
 ) -> SimulationExecutionRequest:
     """Assemble Run or Preview science from its owner's captured inputs."""
     solver_config = build_solver_config(
-        solver_input=execution_settings.solver,
+        solver=execution_settings.solver,
         rtol=scientific_settings.rtol,
         atol=scientific_settings.atol,
         grid={"N": execution_settings.integration_points if point_count is None else point_count},
@@ -224,7 +190,7 @@ class _DirectSimulationWorker(QtCore.QThread):
                 except BaseException as exc:  # noqa: BLE001
                     outcome = _TargetTerminalOutcome(
                         target=target, state="cancelled" if self.cancelled else "failure",
-                        message=_status_line(exc),
+                        message=str(exc),
                     )
                 self.target_terminal.emit(self._generation, outcome)
                 if self.cancelled:
@@ -244,7 +210,7 @@ class _DirectSimulationWorker(QtCore.QThread):
         except SimulationCancelled:
             return _TargetTerminalOutcome(target, "cancelled", message="Simulation canceled.")
         except BaseException as exc:  # noqa: BLE001
-            return _TargetTerminalOutcome(target, "failure", message=_status_line(exc))
+            return _TargetTerminalOutcome(target, "failure", message=str(exc))
         return _TargetTerminalOutcome(target, "success", result=result)
 
 
@@ -380,10 +346,7 @@ class SimulationJobOwner(QtCore.QObject):
             self.application_close_settlement_changed.emit()
 
     def _repository(self, tab_id: str) -> ResultRepository:
-        repository = self._repository_for_tab(str(tab_id))
-        if not isinstance(repository, ResultRepository):
-            raise LookupError(f"No ResultRepository exists for tab {tab_id!r}.")
-        return repository
+        return self._repository_for_tab(tab_id)
 
     def _operation_is_current(self, generation: int) -> bool:
         operation = self._operation

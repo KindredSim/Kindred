@@ -22,7 +22,7 @@ from kindred.core.fitting_optimization import fit_bound_position
 from kindred.core.quantity_units import SECOND, format_unit_for_display
 from kindred.core.simulation_failure import FactualCause
 from kindred.core.validation import six_digit_text
-from kindred.gui.display_name_policy import scientific_symbol_html
+from kindred.gui.display_name_policy import and_join, scientific_symbol_html
 from kindred.gui.fitting.constants import (
     DE_CONVERGENCE_TOLERANCE_LABEL,
     DIFFERENTIAL_EVOLUTION_METHOD,
@@ -107,8 +107,6 @@ def _plain(value: object) -> object:
 def _metric(value: FitMetric | None) -> object:
     if value is None:
         return None
-    if not isinstance(value, FitMetric):
-        raise TypeError("Fit metrics require FitMetric values.")
     return _plain(value.to_payload())
 
 
@@ -124,14 +122,7 @@ def _terminal_dataset_value(
     signal to display its setup value.
     """
 
-    try:
-        value = candidate.result.dataset_params[dataset_id][parameter_name]
-    except KeyError as exc:
-        raise ValueError(
-            "Fit presentation omitted terminal fitted coordinate "
-            f"{dataset_id!r}::{parameter_name!r}."
-        ) from exc
-    return float(value)
+    return float(candidate.result.dataset_params[dataset_id][parameter_name])
 
 
 def _display(value: object) -> str:
@@ -347,20 +338,10 @@ def _estimate_rows(candidate: FitCandidate) -> tuple[list[dict[str, object]], li
 
     for parameter in terminal_setup.parameters:
         configuration = parameter.selected_config
-        launch_parameter = request_parameters.get(parameter.name)
-        launch_configuration = (
-            configuration
-            if launch_parameter is None
-            else launch_parameter.selected_config
-        )
+        launch_configuration = request_parameters[parameter.name].selected_config
         if parameter.scope == "shared":
             if parameter.selected_config.fit:
-                try:
-                    value = float(result.shared_params[parameter.name])
-                except KeyError as exc:
-                    raise ValueError(
-                        f"canonical result omitted shared fitted coordinate {parameter.name!r}"
-                    ) from exc
+                value = float(result.shared_params[parameter.name])
             else:
                 # Fixed Shared rows are setup-only and deliberately do not
                 # become fitted/presentation rows.
@@ -391,11 +372,6 @@ def _estimate_rows(candidate: FitCandidate) -> tuple[list[dict[str, object]], li
             if group is not None:
                 shown_groups.add(group)
             value = _terminal_dataset_value(candidate, dataset_id, parameter.name)
-            if dataset_id not in values:
-                raise ValueError(
-                    f"Fit setup omitted nominal dataset coordinate {dataset_id!r} "
-                    f"for {parameter.name!r}."
-                )
             nominal = float(values[dataset_id])
             append_row(individual, kind="per_dataset_parameter", name=parameter.name, display_name=parameter.display_name,
                 scope=display_names[dataset_id] if group is None else labels[group[0]][1], unit=parameter.unit,
@@ -432,7 +408,7 @@ def _initial_rows(candidate: FitCandidate) -> list[dict[str, object]]:
     for item in terminal_setup.initials:
         if not item.fit:
             continue
-        launch_item = launch_initials.get((item.set_id, item.species), item)
+        launch_item = launch_initials[(item.set_id, item.species)]
         for mapped in mapped_by_set.get(item.set_id, ()):
             if (mapped.dataset_id, item.species) in grouped_pairs:
                 continue
@@ -444,7 +420,7 @@ def _initial_rows(candidate: FitCandidate) -> list[dict[str, object]]:
             rows.append({"kind": "initial", "name": item.species, "display_name": f"initial {item.species}",
                 "scope": mapped.display_name, "unit": "M",
                 "nominal_value": launch_item.initial,
-                "fitted_value": published_fitted_concentration(value, field=f"fitted initial {item.species!r}"),
+                "fitted_value": published_fitted_concentration(value),
                 "minimum": launch_item.minimum, "maximum": launch_item.maximum,
                 "bound_state": fit_bound_position(
                     value, launch_item.minimum, launch_item.maximum,
@@ -469,9 +445,7 @@ def _initial_rows(candidate: FitCandidate) -> list[dict[str, object]]:
     ):
         if not item.fit:
             continue
-        launch_item = launch_groups.get(
-            (item.species, item.origin_dataset_id), item
-        )
+        launch_item = launch_groups[(item.species, item.origin_dataset_id)]
         members = [mapped for mapped in origin.mapped_datasets
                    if mapped.dataset_id in item.member_dataset_ids and mapped.dataset_id in included_ids]
         if not members:
@@ -484,7 +458,7 @@ def _initial_rows(candidate: FitCandidate) -> list[dict[str, object]]:
         rows.append({"kind": "initial", "name": item.species, "display_name": f"initial {item.species}",
             "scope": labels[item.species][item.origin_dataset_id][1], "unit": "M",
             "nominal_value": launch_item.initial,
-            "fitted_value": published_fitted_concentration(value, field=f"fitted initial {item.species!r}"),
+            "fitted_value": published_fitted_concentration(value),
             "minimum": launch_item.minimum, "maximum": launch_item.maximum,
             "bound_state": fit_bound_position(
                 value, launch_item.minimum, launch_item.maximum,
@@ -590,14 +564,6 @@ _ENDPOINT_REASONS = {
     "binary64_representability_exhausted": _NO_CROSSING,
     "midpoint_refit_budget_exhausted": _NO_CROSSING,
 }
-
-
-def _and_join(items: Sequence[str]) -> str:
-    """English list with the serial comma."""
-
-    if len(items) < 3:
-        return " and ".join(items)
-    return ", ".join(items[:-1]) + ", and " + items[-1]
 
 
 def _interval_text(interval: Mapping[str, object], confidence: float, bound: str) -> tuple[str, str]:
@@ -802,6 +768,7 @@ def _analysis_section(title: str, data: Mapping[str, object], request: object,
         text, level_label = _interval_text(interval, float(data["confidence_level"]), position)
         details = [_text(level_label)] if level_label else []
         for side in ("lower", "upper"):
+            # Only a Profile interval carries endpoint resolutions.
             endpoint = interval.get(side + "_resolution") or {}
             reason = endpoint.get("reason")
             # A reason the interval itself states is not repeated.
@@ -810,7 +777,7 @@ def _analysis_section(title: str, data: Mapping[str, object], request: object,
             limiting = [f"the {_text(bound)} bound of {label(other)}"
                         for other, bound in endpoint.get("limiting_bounds", ())]
             if limiting:
-                details.append(f"{_text(side.capitalize())} end is set by {_and_join(limiting)}")
+                details.append(f"{_text(side.capitalize())} end is set by {and_join(limiting)}")
         result = _result_text(estimate, interval["lower"], interval["upper"], position)
         rows.append((label(coordinate), result, text, _unit_html(coordinate_units[coordinate]), "<br>".join(details)))
     if rows:
@@ -1010,8 +977,11 @@ def fit_candidate_presentation(candidate: FitCandidate) -> tuple[tuple[str, ...]
     provenance = (f"<p>Optimizer message: {_text(_diagnostic(result.message, candidate.origin))}</p>"
                   "<h3>Mechanism</h3><pre>"
                   + html.escape(candidate.origin.mechanism_source.reactions_text) + "</pre>")
+    resolved = candidate.origin.prepared_dsl.analysis
     provenance += "<h3>Settings</h3>" + _table(("Setting", "Value"), (
-        ("Temperature", f"{_display(float(candidate.origin.prepared_dsl.analysis.temperature_K))} K"),
+        ("Temperature", f"{_display(float(resolved.temperature_K))} K"),
+        ("Standard concentration", f"{_display(float(resolved.standard_conc_M))} M"),
+        ("Energy unit", resolved.energy_unit),
         ("Relative tolerance", float(settings.rtol)),
         ("Absolute tolerance", float(settings.atol)),
         ("Analytic Jacobian", "On" if settings.analytic_jacobian_policy else "Off"),

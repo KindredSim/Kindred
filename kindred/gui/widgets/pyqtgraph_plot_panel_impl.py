@@ -182,13 +182,9 @@ class _RenderedPointChunk:
         )
         for _name, values in series:
             values.setflags(write=False)
-            if values.size != x.size:
-                raise ValueError("rendered point series must align with X.")
         if self.sample_time is not None:
             sample_time = np.asarray(self.sample_time)
             sample_time.setflags(write=False)
-            if sample_time.size != x.size:
-                raise ValueError("rendered point time must align with X.")
             object.__setattr__(self, "sample_time", sample_time)
         object.__setattr__(self, "x", x)
         object.__setattr__(self, "series", series)
@@ -233,6 +229,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
     copyAllRequested = QtCore.Signal()
     xSeriesRequested = QtCore.Signal(object)
     ySeriesRequested = QtCore.Signal(object)
+    yAllSeriesRequested = QtCore.Signal()
     plotPresentationIntentRequested = QtCore.Signal(str, object)
     resultDiagnostic = QtCore.Signal(str)
 
@@ -288,6 +285,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         self._axis_toolbar = AxisToolbar(self)
         self._axis_toolbar.xChanged.connect(self.xSeriesRequested.emit)
         self._axis_toolbar.ySelectionChanged.connect(self.ySeriesRequested.emit)
+        self._axis_toolbar.yAllRequested.connect(self.yAllSeriesRequested.emit)
         self._axis_toolbar.axisRangeChanged.connect(self._apply_axis_range)
         self._axis_toolbar.unitChanged.connect(self._apply_display_unit_change)
         self._plot_widget.getViewBox().sigRangeChangedManually.connect(
@@ -520,8 +518,6 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
                 curves.append(curve)
                 continue
             if wanted is not None and key[3] not in wanted:
-                continue
-            if render_input.selected_y_uses_default_all and isinstance(key[3], VesselVolumeAxisSelection):
                 continue
             if key[1] == "ghost" and not render_input.reference_lines_visible:
                 continue
@@ -882,8 +878,6 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
     def _copy_rendered_points_to_clipboard(self) -> None:
         roster = self._rendered_point_roster
         try:
-            if not any(chunk.x.size for block in roster for chunk in block.chunks):
-                raise ValueError("No plotted data is available to copy.")
             output = io.StringIO()
             output.writelines(_iter_rendered_point_tsv_chunks(roster))
             rendered_text = output.getvalue()
@@ -1542,8 +1536,6 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         segment_ids = curve.segment_ids
         segment_keys = curve.segment_keys
         discontinuities = curve.discontinuity_ids
-        if segment_ids is None or segment_keys is None or discontinuities is None:
-            raise ValueError("Interactive curve is missing executor topology.")
         changes = tuple(
             index for index in range(1, count)
             if (
@@ -1813,7 +1805,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
             [
                 (
                     candidate,
-                    (render_input.selected_y_uses_default_all and not isinstance(candidate.selection, VesselVolumeAxisSelection))
+                    render_input.selected_y_uses_default_all
                     or candidate.selection in render_input.selected_y_series
                     or candidate.selection in locked_checked,
                 )
@@ -2159,10 +2151,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
     ) -> float | None:
         """Map one raw semantic coordinate into the active plot view."""
 
-        try:
-            raw = float(value)
-        except (TypeError, ValueError, OverflowError):
-            return None
+        raw = float(value)
         if not np.isfinite(raw):
             return None
         if not log_enabled:
@@ -2180,18 +2169,12 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
     ) -> float | None:
         """Map an axis view coordinate back to its raw range value."""
 
-        try:
-            view = float(value)
-        except (TypeError, ValueError, OverflowError):
-            return None
+        view = float(value)
         if not np.isfinite(view):
             return None
         if not log_enabled:
             return view
-        try:
-            raw = float(np.power(10.0, view))
-        except (FloatingPointError, OverflowError, ValueError):
-            return None
+        raw = float(np.power(10.0, view))
         return raw if np.isfinite(raw) and raw > 0.0 else None
 
     def _render_annotations(
@@ -2281,7 +2264,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
                     continue
             if role == "foreground" and render_input.intervention_labels_visible:
                 occurrence = (
-                    set_id, str(annotation.get("kind") or "intervention"),
+                    set_id, annotation["kind"],
                     annotation["declaration_ordinal"],
                     annotation.get("authored_ordinal"), annotation.get("window_ordinal"),
                     annotation.get("firing_ordinal"),
@@ -2397,12 +2380,6 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
 
     @staticmethod
     def _execution_region_endpoints(block: ResultDataBlock) -> np.ndarray:
-        if (
-            block.segment_ids is None
-            or block.segment_keys is None
-            or block.discontinuity_ids is None
-        ):
-            raise ValueError("simulation plot block lacks executor identity.")
         count = int(block.t.size)
         if count == 1:
             return np.asarray((0,), dtype=int)
@@ -2732,8 +2709,6 @@ def _iter_rendered_point_tsv_chunks(
     """Serialize the captured roster as one rectangular TSV table."""
 
     values = tuple(roster)
-    if rows_per_chunk < 1:
-        raise ValueError("rows_per_chunk must be positive.")
     nonempty = tuple(
         block
         for block in values
@@ -2750,11 +2725,6 @@ def _iter_rendered_point_tsv_chunks(
     for block in nonempty:
         chunks = tuple(chunk for chunk in block.chunks if chunk.x.size)
         series_names = tuple(name for name, _values in chunks[0].series)
-        if any(
-            tuple(name for name, _values in chunk.series) != series_names
-            for chunk in chunks[1:]
-        ):
-            raise ValueError("rendered point chunks must preserve series order.")
         with_time = not block.x_is_time and chunks[0].sample_time is not None
         columns = (
             *((tuple(chunk.sample_time for chunk in chunks),) if with_time else ()),

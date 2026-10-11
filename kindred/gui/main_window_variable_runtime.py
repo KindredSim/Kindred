@@ -56,15 +56,13 @@ __all__ = [
 
 @dataclass(frozen=True, slots=True)
 class ParameterSliderProjection:
-    values: tuple[tuple[str, float], ...]
-    metadata: tuple[tuple[str, tuple[tuple[str, object], ...]], ...]
     coordinates: tuple[GuiParameterCoordinate, ...] = ()
 
     def values_dict(self) -> dict[str, float]:
-        return dict(self.values)
+        return {item.name: item.value for item in self.coordinates}
 
-    def metadata_dict(self) -> dict[str, dict[str, object]]:
-        return {name: dict(items) for name, items in self.metadata}
+    def coordinate(self, name: str) -> GuiParameterCoordinate | None:
+        return next((item for item in self.coordinates if item.name == name), None)
 
 
 @dataclass(frozen=True, slots=True)
@@ -96,28 +94,7 @@ class _PreviewPreflight:
 def build_parameter_slider_projection(
     prepared_dsl: PreparedDslRequestSet,
 ) -> ParameterSliderProjection:
-    if not isinstance(prepared_dsl, PreparedDslRequestSet):
-        raise TypeError("prepared_dsl must be a PreparedDslRequestSet.")
-    coordinates = enumerate_parameter_coordinates(prepared_dsl)
-    values = tuple((item.name, float(item.value)) for item in coordinates)
-    metadata = tuple(
-        (
-            item.name,
-            tuple(
-                {
-                    "family": item.family,
-                    "role": item.role,
-                    "label": item.display_name,
-                    "unit": item.unit,
-                    "min": item.minimum,
-                    "max": item.maximum,
-                    "scale": "log" if item.log10_allowed else "linear",
-                }.items()
-            ),
-        )
-        for item in coordinates
-    )
-    return ParameterSliderProjection(values, metadata, coordinates)
+    return ParameterSliderProjection(enumerate_parameter_coordinates(prepared_dsl))
 
 
 class TabSliderBinding(QtCore.QObject):
@@ -217,21 +194,19 @@ class TabSliderBinding(QtCore.QObject):
 
     @QtCore.Slot(str, float, object)
     def _on_parameter_interaction(
-        self, name: str, value: float, interaction: object
+        self, name: str, value: float, interaction: SliderInteractionKind
     ) -> None:
         self._handle_interaction("parameter", name, value, interaction)
 
     @QtCore.Slot(str, float, object)
     def _on_species_interaction(
-        self, name: str, value: float, interaction: object
+        self, name: str, value: float, interaction: SliderInteractionKind
     ) -> None:
         self._handle_interaction("species", name, value, interaction)
 
     def _handle_interaction(
-        self, kind: str, name: str, value: float, interaction: object
+        self, kind: str, name: str, value: float, interaction: SliderInteractionKind
     ) -> None:
-        if not isinstance(interaction, SliderInteractionKind):
-            raise TypeError("Slider events require SliderInteractionKind.")
         identity = (str(kind), str(name))
         if interaction is SliderInteractionKind.INTERACTIVE_DRAG_SAMPLE:
             self._interactive_stop_fenced = False
@@ -357,15 +332,15 @@ class TabSliderBinding(QtCore.QObject):
             self._registry.tab_runtime(self._tab_id),
         )
         projection = (
-            ParameterSliderProjection((), ())
+            ParameterSliderProjection()
             if tab.prepared_dsl is None
             else build_parameter_slider_projection(tab.prepared_dsl)
         )
         if self._active_drag and self._active_drag[0] == "parameter":
             name = self._active_drag[1]
-            old = None if self._projection is None else self._projection.metadata_dict().get(name)
-            new = projection.metadata_dict().get(name)
-            if old is None or new is None or parse_unit(str(old["unit"])) != parse_unit(str(new["unit"])):
+            old = None if self._projection is None else self._projection.coordinate(name)
+            new = projection.coordinate(name)
+            if old is None or new is None or parse_unit(old.unit) != parse_unit(new.unit):
                 self._active_drag = None
         parameters = projection.values_dict()
         parameters.update(runtime.slider_parameter_draft)
@@ -391,8 +366,6 @@ class TabSliderBinding(QtCore.QObject):
     def apply_render_projection(
         self, prepared: ActiveSliderRenderProjection, *, preserve_editor_drafts: bool = True
     ) -> None:
-        if not isinstance(prepared, ActiveSliderRenderProjection):
-            raise TypeError("prepared must be ActiveSliderRenderProjection.")
         self._rendering = True
         vb, sb = (
             QtCore.QSignalBlocker(self._variable_sliders),
@@ -401,7 +374,7 @@ class TabSliderBinding(QtCore.QObject):
         try:
             self._variable_sliders.render_values(
                 dict(prepared.parameter_values),
-                metadata=prepared.projection.metadata_dict(),
+                coordinates=prepared.projection.coordinates,
                 preserve_editor_drafts=preserve_editor_drafts,
             )
             self._species_sliders.render_values(
@@ -488,8 +461,6 @@ class TabSliderBinding(QtCore.QObject):
         projected, mixed = {}, set()
         for name in names:
             first = float(rows[0].get(name, 0.0))
-            if not math.isfinite(first) or first < 0:
-                raise ValueError(f"Initial concentration for {name!r} is invalid.")
             projected[name] = first
             if any(float(row.get(name, 0.0)) != first for row in rows[1:]):
                 mixed.add(name)
@@ -506,11 +477,7 @@ class TabSliderBinding(QtCore.QObject):
             return None
         if not isinstance(tab.prepared_dsl, PreparedDslRequestSet):
             return None
-        try:
-            projection = build_parameter_slider_projection(tab.prepared_dsl)
-        except (TypeError, ValueError):
-            return None
-        return _PreviewPreflight(tab, projection, tuple(targets))
+        return _PreviewPreflight(tab, build_parameter_slider_projection(tab.prepared_dsl), tuple(targets))
 
     def _captured_gesture_transaction(
         self, capture: _PreviewPreflight, targets: tuple[str, ...]
@@ -541,14 +508,7 @@ class TabSliderBinding(QtCore.QObject):
         )
         if prepared is None:
             return self._restore_rejected_slider_action()
-        coordinate = next(
-            (
-                item
-                for item in prepared.projection.coordinates
-                if item.name == str(name)
-            ),
-            None,
-        )
+        coordinate = prepared.projection.coordinate(str(name))
         if coordinate is None:
             return self._reject_slider_action(f"Parameter {name!r} is not editable.")
         try:
@@ -880,8 +840,6 @@ class TabSliderBinding(QtCore.QObject):
         candidate_document = self._registry.document
         candidate_tab = tab
         if runtime.slider_parameter_draft:
-            if not isinstance(tab.prepared_dsl, PreparedDslRequestSet):
-                raise ValueError("Slider Apply requires retained prepared DSL.")
             updates = tuple(
                 DslParameterCoordinateUpdate(name, value)
                 for name, value in sorted(runtime.slider_parameter_draft.items())

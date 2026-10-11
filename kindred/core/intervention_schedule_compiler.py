@@ -152,13 +152,6 @@ def _plain(value: Any) -> Any:
     return value
 
 
-def _frozen_mapping(value: Mapping[str, Any]) -> Mapping[str, Any]:
-    frozen = _freeze(value)
-    if not isinstance(frozen, Mapping):
-        raise TypeError("Expected a mapping.")
-    return frozen
-
-
 @dataclass(frozen=True, slots=True)
 class ExecutableInstant:
     op: str
@@ -322,14 +315,6 @@ class TriggerFiring:
     nested_action_payload: Mapping[str, Any]
 
     def __post_init__(self) -> None:
-        if not math.isfinite(float(self.root_time)):
-            raise InterventionScheduleError("Trigger root time must be finite.")
-        if any(
-            not math.isfinite(float(value)) for value in self.event_state.values()
-        ):
-            raise InterventionScheduleError(
-                "Trigger event-time state must be finite."
-            )
         object.__setattr__(
             self,
             "event_state",
@@ -343,7 +328,7 @@ class TriggerFiring:
         object.__setattr__(
             self,
             "nested_action_payload",
-            _frozen_mapping(self.nested_action_payload),
+            _freeze(self.nested_action_payload),
         )
 
     def to_payload(self) -> dict[str, Any]:
@@ -361,7 +346,9 @@ class TriggerFiring:
 
 @dataclass(frozen=True, slots=True)
 class InterventionExecutionContract:
-    declarative_payload: Mapping[str, Any]
+    # The authored schedule, kept for provenance and for pairing executed
+    # amounts with their authored parameter names.
+    authored: InterventionSchedule
     initial_volume: tuple[PhysicalQuantity, InterventionScheduleFieldIdentity] | None = None
     instants: tuple[ExecutableInstant, ...] = ()
     fluxes: tuple[ExecutableFlux, ...] = ()
@@ -376,12 +363,9 @@ class InterventionExecutionContract:
 
     def __post_init__(self) -> None:
         object.__setattr__(
-            self, "declarative_payload", _frozen_mapping(self.declarative_payload)
-        )
-        object.__setattr__(
             self,
             "protocol_lineage",
-            tuple(_frozen_mapping(item) for item in self.protocol_lineage),
+            tuple(_freeze(item) for item in self.protocol_lineage),
         )
         object.__setattr__(
             self,
@@ -404,13 +388,7 @@ class InterventionExecutionContract:
         retained = tuple(item for item in self.triggers if not isinstance(item.then, InterventionStopAction))
         if len(retained) == len(self.triggers):
             return self
-        ordinals = {item.declaration_ordinal for item in retained}
-        payload = {"operations": tuple(
-            item for item in self.declarative_payload.get("operations", ())
-            if item["op"] != "trigger" or item["declaration_ordinal"] in ordinals
-        )}
-        return replace(self, triggers=retained, declarative_payload=payload,
-                       trigger_firings=tuple(item for item in self.trigger_firings if item.declaration_ordinal in ordinals))
+        return replace(self, triggers=retained, authored=self.authored.without_stops())
 
     def provenance_projection(self) -> dict[str, Any]:
         executable_operations = [
@@ -430,7 +408,7 @@ class InterventionExecutionContract:
             )
         )
         return {
-            "declarative": _plain(self.declarative_payload),
+            "declarative": _plain(self.authored.to_payload()),
             "executable": {"operations": executable_operations},
             "discontinuities": list(self.discontinuities),
             "segment_identity": [
@@ -688,21 +666,6 @@ def _operation_field_identities(
     return tuple(dict.fromkeys(identities))
 
 
-def _all_schedule_dependencies(
-    dependency_metadata: InterventionScheduleDependencyMetadata,
-) -> tuple[str, ...]:
-    return tuple(
-        sorted(
-            {
-                str(value).strip()
-                for values in dependency_metadata.values()
-                for value in values
-                if str(value).strip()
-            }
-        )
-    )
-
-
 def _annotated_schedule_error(
     message: str,
     *,
@@ -769,20 +732,14 @@ def compile_intervention_schedule(
     *,
     cancellation_check: Callable[[], bool] | None = None,
     dependency_metadata: InterventionScheduleDependencyMetadata | None = None,
-    authored_payload: Mapping[str, Any] | None = None,
+    authored: InterventionSchedule | None = None,
 ) -> InterventionExecutionContract:
     _raise_if_cancelled(cancellation_check)
     schedule_obj = schedule or InterventionSchedule()
     dependency_metadata = dependency_metadata or intervention_schedule_parameter_dependencies(
         schedule_obj
     )
-    if any(field in {"time", "start_time", "end_time"} for _ordinal, _nested, field in intervention_schedule_parameter_dependencies(schedule_obj)):
-        schedule_field_identities = tuple(dependency_metadata)
-        raise InterventionScheduleError(
-            "Parameterized intervention schedule must be resolved before compilation.",
-            field_identities=schedule_field_identities,
-            value_dependencies=_all_schedule_dependencies(dependency_metadata),
-        )
+    # Only resolved schedules are compiled.
     instants: list[ExecutableInstant] = []
     fluxes: list[ExecutableFlux] = []
     holds: list[ExecutableHold] = []
@@ -909,14 +866,6 @@ def compile_intervention_schedule(
                     )
                 for nested in operation.during:
                     _raise_if_cancelled(cancellation_check)
-                    if window_end is None:
-                        raise _annotated_schedule_error(
-                            "Protocol during requires a finite duration.",
-                            operation=operation,
-                            dependency_metadata=dependency_metadata,
-                            field="duration",
-                            fields=("start_time", "every", "duration"),
-                        )
                     primitive = _protocol_interval(
                         operation,
                         nested,
@@ -938,13 +887,6 @@ def compile_intervention_schedule(
                     )
                 for nested in operation.after:
                     _raise_if_cancelled(cancellation_check)
-                    if window_end is None:
-                        raise _annotated_schedule_error(
-                            "Protocol after requires a finite duration.",
-                            operation=operation,
-                            dependency_metadata=dependency_metadata,
-                            field="duration",
-                        )
                     primitive = _protocol_instant(
                         operation,
                         nested,
@@ -998,16 +940,9 @@ def compile_intervention_schedule(
             *(item.end_time for item in holds),
         }
     )
-    if any(not math.isfinite(value) for value in discontinuities):
-        raise InterventionScheduleError(
-            "Executable discontinuities must remain finite.",
-            field_identities=tuple(dependency_metadata),
-            value_dependencies=_all_schedule_dependencies(dependency_metadata),
-        )
     segments = tuple(zip(discontinuities, discontinuities[1:]))
-    declarative_payload = schedule_obj.to_payload() if authored_payload is None else authored_payload
     return InterventionExecutionContract(
-        declarative_payload=declarative_payload,
+        authored=schedule_obj if authored is None else authored,
         initial_volume=schedule_obj.initial_volume,
         instants=tuple(instants),
         fluxes=tuple(fluxes),

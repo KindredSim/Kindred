@@ -43,7 +43,6 @@ __all__ = [
     "validate_input_time_seconds",
     "validate_imported_time_seconds",
     "validate_observation",
-    "validate_evaluation_count",
 ]
 
 
@@ -183,23 +182,6 @@ def validate_observation(value: object, *, field: str = "observation") -> float:
     """Admit an arbitrary finite observation, including signed values."""
 
     return _numeric(value, field=field)
-
-
-def _validate_count(value: object, *, field: str, maximum: int) -> int:
-    if type(value) is bool or not isinstance(value, int):
-        raise TypeError(f"{field} must be an integer.")
-    parsed = int(value)
-    if parsed < 0 or parsed > maximum:
-        raise ValueError(f"{field} must be between 0 and {maximum}.")
-    return parsed
-
-
-def validate_evaluation_count(
-    value: object,
-    *,
-    field: str = "evaluation count",
-) -> int:
-    return _validate_count(value, field=field, maximum=MAX_FIT_EVALUATIONS)
 
 
 @dataclass(frozen=True)

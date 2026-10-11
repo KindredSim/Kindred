@@ -42,7 +42,7 @@ def bind_parameter_evaluation(
         name for name in spec.parameter_dependencies
         if spec.parameter_assignment_kind(name) == "independent scalar"
     }
-    for name, value in dict(metadata.get("scalar_params") or {}).items():
+    for name, value in metadata["scalar_params"].items():
         if name in independent:
             values[name] = float(value)
     values.update(base_values or {})

@@ -98,14 +98,6 @@ class ProjectWorkspaceWidget(QtWidgets.QMainWindow):
         )
 
         specs = DOCK_SPECS
-        expected = {spec.identity_key for spec in specs}
-        supplied = {str(key) for key in panels}
-        if supplied != expected:
-            raise ValueError(
-                "dock_panels must contain exactly the six project module keys."
-            )
-        if self._dock_by_identity:
-            raise RuntimeError("Project workspace docks are already installed.")
         docks: list[QtWidgets.QDockWidget] = []
         for spec in specs:
             dock = build_module_dock(
@@ -118,10 +110,7 @@ class ProjectWorkspaceWidget(QtWidgets.QMainWindow):
         return tuple(docks)
 
     def dock_for_identity(self, identity: str) -> QtWidgets.QDockWidget:
-        try:
-            return self._dock_by_identity[str(identity)]
-        except KeyError as exc:
-            raise KeyError(f"Unknown project dock identity: {identity!r}.") from exc
+        return self._dock_by_identity[identity]
 
     def _docks_are_stacked(
         self,
@@ -223,8 +212,6 @@ class ProjectWorkspaceWidget(QtWidgets.QMainWindow):
             dock.setVisible(identity in visible)
 
     def redock_dock(self, dock: QtWidgets.QDockWidget) -> None:
-        if dock not in self._dock_by_identity.values():
-            raise ValueError("dock must belong to this project workspace root.")
         dock.setFloating(False)
         area = dock.property("kindred/defaultDockArea")
         if area is not None:
@@ -408,12 +395,8 @@ class ProjectWorkspaceWidget(QtWidgets.QMainWindow):
         self._analysis_stack.setCurrentWidget(active_plot.analysis_tabs())
 
     def select_tab_surface(self, tab_id: str) -> None:
-        target = str(tab_id or "").strip()
-        if not target:
-            raise ValueError("tab_id must be nonblank.")
-        plot = self._plot_by_tab_id.get(target)
-        if plot is None:
-            raise KeyError(f"Unknown mechanism plot tab ID: {target!r}.")
+        target = tab_id
+        plot = self._plot_by_tab_id[target]
         index = self._index_for_tab_id(target)
         blocked = self._tab_bar.blockSignals(True)
         try:
@@ -665,9 +648,7 @@ class ProjectWorkspaceWidget(QtWidgets.QMainWindow):
     def _on_current_changed(self, index: int) -> None:
         if index < 0 or index >= self._mechanism_tab_count():
             return
-        tab_id = self._tab_bar.tabData(index)
-        if isinstance(tab_id, str) and tab_id:
-            self.tabActivated.emit(tab_id)
+        self.tabActivated.emit(self._tab_bar.tabData(index))
 
     def _rename_tab(self, tab_id: str) -> None:
         index = self._index_for_tab_id(tab_id)

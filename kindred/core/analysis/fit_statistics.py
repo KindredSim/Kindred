@@ -68,27 +68,16 @@ def finite_positive_mean_normalize(
     explicitly rather than silently replaced with equal weights.
     """
 
-    # Callers pass admitted finite positive weights.
+    # Callers pass a nonempty map of admitted finite positive weights.
     cleaned = {name: float(value) for name, value in values.items()}
-    if not cleaned:
-        return {}
     maximum = max(cleaned.values())
     scaled = {name: value / maximum for name, value in cleaned.items()}
-    if any(value <= 0.0 for value in scaled.values()):
-        raise ValueError(
-            "Finite positive weights span a ratio too wide to preserve during normalization."
-        )
     scaled_total = math.fsum(scaled.values())
-    if not math.isfinite(scaled_total) or scaled_total <= 0.0:
-        raise ValueError("Scaled weight sum must be finite and positive.")
     count = float(len(scaled))
-    normalized = {
+    return {
         name: (value / scaled_total) * count
         for name, value in scaled.items()
     }
-    if any(not math.isfinite(value) or value <= 0.0 for value in normalized.values()):
-        raise ValueError("Normalized weights must remain finite and positive.")
-    return normalized
 
 
 def finite_sum_of_squares(values: Iterable[object]) -> Optional[float]:
@@ -115,29 +104,14 @@ def root_mean_square(residuals: object) -> FitMetric:
     """Root-mean-square of one admitted, finite, nonempty residual vector."""
 
     values = np.asarray(residuals, dtype=float).reshape(-1)
-    sse = finite_sum_of_squares(values)
-    if sse is None:
-        return FitMetric.unavailable("residual sum of squares overflowed")
-    return FitMetric.finite(math.sqrt(sse / float(values.size)))
+    return FitMetric.finite(math.sqrt(finite_sum_of_squares(values) / float(values.size)))
 
 
 def fit_error_metrics(weighted_residuals: object) -> FitErrorMetrics:
     residuals = np.asarray(weighted_residuals, dtype=float).reshape(-1)
-    if residuals.size == 0:
-        unavailable = FitMetric.unavailable("no residual observations")
-        return FitErrorMetrics(unavailable, unavailable, unavailable, unavailable)
-    if not np.all(np.isfinite(residuals)):
-        unavailable = FitMetric.unavailable("residuals are nonfinite")
-        return FitErrorMetrics(unavailable, unavailable, unavailable, unavailable)
     sse = finite_sum_of_squares(residuals)
-    if sse is None:
-        unavailable = FitMetric.unavailable("residual sum of squares overflowed")
-        return FitErrorMetrics(unavailable, unavailable, unavailable, unavailable)
     mse = sse / float(residuals.size)
     mae = math.fsum(float(abs(value)) for value in residuals) / float(residuals.size)
-    if not (math.isfinite(mse) and math.isfinite(mae)):
-        unavailable = FitMetric.unavailable("weighted metric arithmetic overflowed")
-        return FitErrorMetrics(unavailable, unavailable, unavailable, unavailable)
     return FitErrorMetrics(
         weighted_sse=FitMetric.finite(sse),
         weighted_mse=FitMetric.finite(mse),
@@ -149,21 +123,9 @@ def fit_error_metrics(weighted_residuals: object) -> FitErrorMetrics:
 def r_squared_metric(observed: object, residuals: object) -> FitMetric:
     observations = np.asarray(observed, dtype=float).reshape(-1)
     residual_array = np.asarray(residuals, dtype=float).reshape(-1)
-    if observations.size == 0 or observations.size != residual_array.size:
-        return FitMetric.unavailable("observations and residuals are not aligned")
-    if not (
-        np.all(np.isfinite(observations))
-        and np.all(np.isfinite(residual_array))
-    ):
-        return FitMetric.unavailable("observations or residuals are nonfinite")
     if bool(np.all(observations == observations[0])):
         return FitMetric.unavailable("observations are constant")
     centered = observations - float(np.mean(observations))
-    ss_res = finite_sum_of_squares(residual_array)
-    ss_tot = finite_sum_of_squares(centered)
-    if ss_res is None or ss_tot is None or ss_tot <= 0.0:
-        return FitMetric.unavailable("R-squared arithmetic overflowed")
-    value = 1.0 - (ss_res / ss_tot)
-    if not math.isfinite(value):
-        return FitMetric.unavailable("R-squared arithmetic was nonfinite")
-    return FitMetric.finite(value)
+    return FitMetric.finite(
+        1.0 - finite_sum_of_squares(residual_array) / finite_sum_of_squares(centered)
+    )

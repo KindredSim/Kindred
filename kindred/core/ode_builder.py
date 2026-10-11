@@ -113,7 +113,7 @@ def build_effective_rate_coefficient_evaluator(
             model = step.forward_model
             snapshot = {"kind": kind, "forward_model": forward_rate_model_payload(model),
                         "binding_name" if kind == "reaction" else "forward_binding_name": forward_name,
-                        "value_dependencies": tuple(spec.evaluation_dependencies.get(forward_name, ())),
+                        "value_dependencies": tuple(spec.evaluation_dependencies[forward_name]),
                         "temperature_dependent": forward_name in spec.temperature_dependent_names}
             if kind == "equilibrium":
                 snapshot.update(authority=json_safe_equilibrium_authority_payload(dict(step.authority.identity_items())), reverse_binding_name=reverse_name)

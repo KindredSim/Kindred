@@ -5,12 +5,12 @@ import math
 from typing import Any, Callable, Mapping
 
 from kindred.core.constants import R
-from kindred.core.kinetics import ConstantRateModel, ForwardRateModel, forward_rate_model_payload
+from kindred.core.kinetics import ForwardRateModel, forward_rate_model_payload
 from kindred.core.mechanism_metadata import EquilibriumMetadataKeys
 from kindred.core.stoichiometry import directional_order_fraction
 from kindred.core.units import admit_rate
 
-AUTHORITY_ERROR = "A reversible step needs kf and exactly one of kr, Keq, or dG_eq."
+AUTHORITY_ERROR = "A reversible step needs a forward rate and exactly one of kr, Keq, or dG_eq."
 
 __all__ = [
     "derived_equilibrium_ratio_from_directional_rates",
@@ -60,13 +60,6 @@ class EquilibriumRateAuthority:
     dG_eq_J_per_mol: object | None = None
     has_explicit_keq_param: bool = False
 
-    def authored_role_is_editable(self, role: str) -> bool:
-        """Whether an indexed kf/kr/Keq coordinate is an authored input."""
-        if role == "kf":
-            return isinstance(self.forward_model, ConstantRateModel)
-        if role == "kr":
-            return self.kind == EquilibriumRateAuthorityKind.KR
-        return self.has_explicit_keq_param
 
     def identity_items(self) -> tuple[tuple[str, object], ...]:
         items: list[tuple[str, object]] = [
@@ -166,28 +159,13 @@ def effective_reverse_rate_from_keq(kf: float, Keq: float) -> float:
 
 
 def json_safe_equilibrium_authority_payload(value: object) -> object:
-    if value is None or isinstance(value, (str, bool, int)):
-        return value
-    if isinstance(value, float):
-        if math.isfinite(value):
-            return value
-        return str(value)
+    # identity_items holds only str, finite float, int, None and mappings.
     if isinstance(value, Mapping):
         return {
             str(key): json_safe_equilibrium_authority_payload(value[key])
             for key in sorted(value.keys(), key=lambda item: str(item))
         }
-    if isinstance(value, (tuple, list)):
-        return [json_safe_equilibrium_authority_payload(item) for item in value]
-    if isinstance(value, set):
-        return [json_safe_equilibrium_authority_payload(item) for item in sorted(value, key=lambda item: str(item))]
-    try:
-        numeric = float(value)
-    except (TypeError, ValueError, OverflowError):
-        return str(value)
-    if math.isfinite(numeric):
-        return numeric
-    return str(value)
+    return value
 
 
 def validate_equilibrium_rate_authority_flags(
@@ -206,16 +184,13 @@ def normalize_equilibrium_rate_authority(
     *,
     forward_model: ForwardRateModel,
     kr: float | None,
-    metadata: Mapping[str, Any] | None = None,
+    metadata: Mapping[str, Any],
 ) -> EquilibriumRateAuthority:
     """Admit authored reverse authority without materializing derived rates."""
-    meta = metadata or {}
-    keq = meta.get(EquilibriumMetadataKeys.KEQ_INPUT)
-    delta_g = meta.get(EquilibriumMetadataKeys.DG_EQ_J_PER_MOL)
-    validate_equilibrium_rate_authority_flags(
-        has_kf=True, has_kr=kr is not None,
-        has_Keq=keq is not None, has_dG_eq=delta_g is not None,
-    )
+    # The parser admitted exactly one reverse authority, and coordinate writes
+    # never add or remove one.
+    keq = metadata.get(EquilibriumMetadataKeys.KEQ_INPUT)
+    delta_g = metadata.get(EquilibriumMetadataKeys.DG_EQ_J_PER_MOL)
     # Rate and energy values arrive admitted by DSL parsing or the grouped
     # coordinate owner, and the standard concentration by DSL parsing.
     if kr is not None:

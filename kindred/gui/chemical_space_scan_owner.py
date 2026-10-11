@@ -51,7 +51,7 @@ class _ScanThread(QtCore.QThread):
         except SimulationCancelled:
             self.result = "Setup check canceled. No simulations were attempted."
         except Exception as exc:
-            self.result = f"Setup cannot start: {exc}"
+            self.result = str(exc)
 
 
 class ChemicalSpaceScanOwner(QtCore.QObject):

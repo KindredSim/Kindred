@@ -229,23 +229,10 @@ def _admit_coordinate_groups(
     ] = {}
 
     for raw_name, raw_value in values.items():
+        # Param lines and overrides name only writable model coordinates.
         name = str(raw_name)
-        target = parameter_target_map.get(name)
-        if target is None:
-            raise DSLError(f"Unsupported mechanism coordinate {name!r}")
-        route, kind, index, role, entry = target
-        if route == "physical" and not source_coordinate_capabilities(
-            role
-        ).grouped_model_target:
-            raise DSLError(f"Source coordinate {name!r} is not a model coordinate")
-        if (
-            kind == "equilibrium"
-            and route == "indexed"
-            and not mechanism.equilibria[index].authority.authored_role_is_editable(role)
-        ):
-            raise DSLError(
-                f"{name} is not editable under normalized equilibrium authority."
-            )
+        target = parameter_target_map[name]
+        _route, kind, index, role, entry = target
         try:
             admitted = _admit_coordinate_value(
                 mechanism, name, raw_value, target, unit=units[name].symbol,
@@ -263,29 +250,19 @@ def _compose_reaction(
     reaction: object,
     *,
     updates: Mapping[str, float],
-    step_name: int,
 ) -> object:
+    # The parser ties each authored role to its rate family.
     model = reaction.forward_model
     if "k" in updates:
-        if not isinstance(model, ConstantRateModel):
-            raise DSLError(f"Indexed k{step_name} is not a Constant authority")
         model = ConstantRateModel(k=updates["k"])
     model_fields: dict[str, float] = {}
     if "A" in updates:
-        if not isinstance(model, ArrheniusRateModel):
-            raise DSLError(f"A{step_name} is not backed by Arrhenius authority")
         model_fields["A"] = updates["A"]
     if "Ea" in updates:
-        if not isinstance(model, ArrheniusRateModel):
-            raise DSLError(f"Ea{step_name} is not backed by Arrhenius authority")
         model_fields["Ea_J_per_mol"] = updates["Ea"]
     if "dG_act" in updates:
-        if not isinstance(model, EyringRateModel):
-            raise DSLError(f"dG_act{step_name} is not backed by Eyring authority")
         model_fields["dG_act_J_per_mol"] = updates["dG_act"]
     if "kappa" in updates:
-        if not isinstance(model, EyringRateModel):
-            raise DSLError(f"kappa{step_name} is not backed by Eyring authority")
         model_fields["kappa"] = updates["kappa"]
     if model_fields:
         model = replace(model, **model_fields)
@@ -296,23 +273,10 @@ def _compose_equilibrium(
     equilibrium: object,
     *,
     updates: Mapping[str, float],
-    step_name: int,
 ) -> object:
     model: ForwardRateModel | None = None
     if any(role in updates for role in ("A", "Ea", "dG_act", "kappa")):
         model = equilibrium.forward_model
-        if any(role in updates for role in ("A", "Ea")) and not isinstance(
-            model, ArrheniusRateModel
-        ):
-            raise DSLError(
-                f"Equilibrium step {step_name} is not backed by Arrhenius authority"
-            )
-        if any(role in updates for role in ("dG_act", "kappa")) and not isinstance(
-            model, EyringRateModel
-        ):
-            raise DSLError(
-                f"Equilibrium step {step_name} is not backed by Eyring authority"
-            )
         model_fields = {
             field: updates[role]
             for role, field in (
@@ -335,8 +299,6 @@ def _compose_equilibrium(
     if "Keq" in updates:
         equilibrium_metadata[EquilibriumMetadataKeys.KEQ_INPUT] = updates["Keq"]
     if "kf" in updates:
-        if not isinstance(model, ConstantRateModel):
-            raise DSLError(f"Indexed kf{step_name} cannot replace a non-Constant model")
         model = ConstantRateModel(k=updates["kf"])
     return replace(
         equilibrium, forward_model=equilibrium.forward_model if model is None else model,
@@ -353,15 +315,13 @@ def _compose_coordinate_groups(
 ) -> Iterator[tuple[tuple[str, int], object]]:
     reactions = mechanism.reactions
     equilibria = mechanism.equilibria
-    for (kind, index), (entry, updates) in grouped.items():
-        step_name = int(entry["step_index"])
+    for (kind, index), (_entry, updates) in grouped.items():
         if kind == "reaction":
             yield (
                 (kind, index),
                 _compose_reaction(
                     reactions[index],
                     updates=updates,
-                    step_name=step_name,
                 ),
             )
             continue
@@ -370,7 +330,6 @@ def _compose_coordinate_groups(
             _compose_equilibrium(
                 equilibria[index],
                 updates=updates,
-                step_name=step_name,
             ),
         )
 

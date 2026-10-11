@@ -444,8 +444,6 @@ class SimulationSettingsDialog(QtWidgets.QDialog):
     def set_run_user_maximum(self, value: int | None) -> None:
         self.run_maximum_spin.setRange(1, MAX_PARALLEL_WORKERS_CEILING)
         automatic = value is None
-        if not automatic and type(value) is not int:
-            raise TypeError("Run user maximum must be an integer or None.")
         blocker = QtCore.QSignalBlocker(self.run_maximum_automatic_check)
         try:
             self.run_maximum_automatic_check.setChecked(automatic)

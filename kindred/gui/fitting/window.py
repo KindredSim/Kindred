@@ -60,8 +60,6 @@ class FittingWindow(QtWidgets.QDialog):
         parent: QtWidgets.QWidget | None = None,
     ) -> None:
         super().__init__(parent)
-        if not isinstance(origin, FitOriginSnapshot):
-            raise TypeError("origin must be FitOriginSnapshot.")
         self._origin = origin
         self._close_handler = close_handler
         self._color_resolver = color_resolver
@@ -418,23 +416,23 @@ class FittingWindow(QtWidgets.QDialog):
         # One ordered list of invalid values; pending edits are reported only
         # when nothing is invalid.
         invalid_entries = [
-            ("Data and Targets", f"Data settings for {names[key]}: {value.rstrip('.')}")
+            ("Data and Targets", f"Data settings for {names[key]}: {value}")
             for key, value in active_issues.items() if value
-        ] + list(self._invalid_editor_locations())
+        ] + [(tab, f"Invalid value in {text}.") for tab, text in self._invalid_editor_locations()]
         pending_data_names = [names[key] for key, value in active_issues.items() if not value]
         reason = ""
         details: list[str] = []
         if invalid_entries:
             tab, first = invalid_entries[0]
             more = f" (+{len(invalid_entries) - 1} more)" if len(invalid_entries) > 1 else ""
-            reason = f"Invalid value — {visible(first, 160)}{more} — Resolve in {tab}."
+            reason = f"{visible(first, 160).rstrip('.')}{more}. Resolve in {tab}."
             details = [f"{tab}: {text}" for tab, text in invalid_entries]
         else:
             if pending_data_names:
                 more = f" (+{len(pending_data_names) - 1} more)" if len(pending_data_names) > 1 else ""
                 reason = (
-                    f"Data settings for {pending_data_names[0]}: pending changes{more}"
-                    " — Resolve in Data and Targets."
+                    f"Data settings for {pending_data_names[0]}: pending changes{more}."
+                    " Resolve in Data and Targets."
                 )
                 details = [f"Data settings for {name}: pending changes" for name in pending_data_names]
             if pending_targets:
@@ -455,9 +453,7 @@ class FittingWindow(QtWidgets.QDialog):
         entries = [
             {
                 "id": dataset.dataset_id,
-                "label": by_id.get(dataset.dataset_id, None).display_name
-                if dataset.dataset_id in by_id
-                else dataset.dataset_id,
+                "label": by_id[dataset.dataset_id].display_name,
                 "include": dataset.included,
             }
             for dataset in snapshot.datasets
@@ -630,18 +626,11 @@ class FittingWindow(QtWidgets.QDialog):
             )
         return replace(
             current,
-            t_start=config.get("t_start", current.t_start),
-            simulation_end=config.get("simulation_end", current.simulation_end),
-            data_range_min=float(
-                config.get("data_range_min", current.data_range_min)
-            ),
-            data_range_max=float(
-                config.get("data_range_max", current.data_range_max)
-            ),
-            maximum_observations_per_target=config.get(
-                "maximum_observations_per_target",
-                current.maximum_observations_per_target,
-            ),
+            t_start=config["t_start"],
+            simulation_end=config["simulation_end"],
+            data_range_min=config["data_range_min"],
+            data_range_max=config["data_range_max"],
+            maximum_observations_per_target=config["maximum_observations_per_target"],
             parametric=parametric,
             target_species=target_species,
             target_weights=target_weights,
@@ -684,37 +673,23 @@ class FittingWindow(QtWidgets.QDialog):
         )
         if current is None:
             return
-        expected_fields = {
-            "t_start",
-            "data_range_min",
-            "data_range_max",
-            "maximum_observations_per_target",
-            "parametric_x",
-            "simulation_end",
-        }
-        if set(config) != expected_fields:
-            self.set_status("Data settings edit carried invalid fields.")
-            return
-        try:
-            edited = self._project_dataset_settings(current, config)
-            snapshot = replace(
+        edited = self._project_dataset_settings(current, config)
+        self._on_leaf_snapshot(
+            replace(
                 setup,
                 datasets=tuple(
                     edited if item.dataset_id == edited.dataset_id else item
                     for item in setup.datasets
                 ),
             )
-        except (TypeError, ValueError, OverflowError) as exc:
-            self.set_status(f"Data settings edit is invalid: {exc}")
-            return
-        self._on_leaf_snapshot(snapshot)
+        )
 
     @staticmethod
     def _parametric_from_config(
         dataset_id: str,
         config: Mapping[str, object],
     ) -> FitParametricSettings | None:
-        x_name = str(config.get("parametric_x", "t") or "t")
+        x_name = config["parametric_x"]
         if x_name == "t":
             return None
         return FitParametricSettings(
@@ -838,8 +813,6 @@ class FittingWindow(QtWidgets.QDialog):
         self._run_results_tab.set_execution_status(phase, detail)
 
     def set_live_best(self, update: FitLiveUpdate) -> None:
-        if not isinstance(update, FitLiveUpdate):
-            raise TypeError("update must be FitLiveUpdate.")
         setup = self._projected_setup
         included = set() if setup is None else {
             dataset.dataset_id for dataset in setup.datasets if dataset.included
@@ -859,10 +832,7 @@ class FittingWindow(QtWidgets.QDialog):
         self._run_results_tab.set_live_best(update, dataset_labels=labels, initial_labels=initial_labels)
 
     def set_live_curves(self, curves: tuple[FitCurveDataset, ...]) -> None:
-        values = tuple(curves)
-        if any(not isinstance(item, FitCurveDataset) for item in values):
-            raise TypeError("curves must contain FitCurveDataset values.")
-        self._run_results_tab.set_live_curves(values)
+        self._run_results_tab.set_live_curves(curves)
 
     def set_terminal_presentation(
         self,

@@ -81,10 +81,7 @@ def apply_qt_startup_workarounds(
 
 
 def load_app_icon(q_icon_type: object):
-    """Return the application icon if available, otherwise None."""
+    """Return the application icon; a missing file gives a null icon."""
     from kindred.io.resources import get_resource_path
 
-    try:
-        return q_icon_type(str(get_resource_path("assets/kindred.ico")))
-    except FileNotFoundError:
-        return None
+    return q_icon_type(str(get_resource_path("assets/kindred.ico")))

@@ -10,13 +10,13 @@ import numpy as np
 from kindred.core.exceptions import SimulationCancelled
 from kindred.core.simulation_algebra_context import runtime_algebra_symbol_names
 from kindred.core.simulation_failure import FactualCause
+from kindred.core.algebra.evaluator import AlgebraObservableError
 from kindred.core.result_repository import (
     SimulationResultValue,
 )
 from kindred.core.simulator.solver_types import FinalSimulationOutput, SimulationCancellationControl
 from kindred.core.algebra.simulation_series import (
-    compiled_algebra_for_mechanism,
-    evaluate_compiled_algebra_series_for_simulation_partial,
+    evaluate_algebra_block_for_simulation_partial,
 )
 
 __all__ = [
@@ -76,25 +76,21 @@ def _freeze_solver_provenance_mapping(
         }
     )
 
-def _algebra_cause(error: object) -> FactualCause:
+def _algebra_cause(error: AlgebraObservableError) -> FactualCause:
     """Project one expected per-observable Algebra failure."""
 
-    details: dict[str, object] = {}
-    name = getattr(error, "name", None)
-    if name is not None:
-        details["name"] = str(name)
-    if getattr(error, "col", None) is not None:
+    details: dict[str, object] = {"name": error.name}
+    if error.col is not None:
         details["col"] = error.col
     # The authored statement is the cause's location, as for every other cause.
     context = {key: getattr(error, key) for key in ("line", "line_text")
-               if getattr(error, key, None) is not None}
-    code = getattr(error, "code", None)
+               if getattr(error, key) is not None}
     return FactualCause(
         domain="simulation",
         origin="algebra",
-        code=str(code) if code is not None else None,
-        type=str(getattr(error, "exc_type", None) or type(error).__name__),
-        message=str(getattr(error, "message", None) or str(error)),
+        code=error.code,
+        type=error.exc_type,
+        message=error.message,
         context=context,
         details=details,
     )
@@ -108,8 +104,6 @@ def _freeze_algebra_series(
     frozen: dict[str, np.ndarray] = {}
     for raw_name, raw_values in series.items():
         values = np.asarray(raw_values, dtype=float)
-        if values.ndim != 1:
-            values = values.reshape(-1)
         values.setflags(write=False)
         frozen[str(raw_name)] = values
     return frozen
@@ -151,8 +145,8 @@ def finalize_simulation_result(
     }
     finalized_algebra_scalars: dict[str, float] = {}
     finalized_algebra_errors: tuple[FactualCause, ...] = ()
-    compiled_algebra = compiled_algebra_for_mechanism(mechanism)
-    if compiled_algebra is not None:
+    observable_block = parameter_algebra_spec.observable_block
+    if observable_block.lines:
         species_series = {
             name: result_y[index, :]
             for index, name in enumerate(base_species_names)
@@ -182,8 +176,8 @@ def finalize_simulation_result(
                 symbol_failures[name] = exc
                 raise
         algebra_series, algebra_scalars, algebra_errors = (
-            evaluate_compiled_algebra_series_for_simulation_partial(
-                compiled_algebra,
+            evaluate_algebra_block_for_simulation_partial(
+                observable_block,
                 t=result_time,
                 species_series=species_series,
                 initials=initials_for_algebra,
@@ -206,11 +200,7 @@ def finalize_simulation_result(
     frozen_solver_provenance = _freeze_solver_provenance_mapping(
         completed_solver_provenance
     )
-    requested_algebra_outputs = (
-        ()
-        if compiled_algebra is None
-        else tuple(compiled_algebra.observable_names)
-    )
+    requested_algebra_outputs = tuple(statement.name for statement in observable_block.lines)
     succeeded_names = set(finalized_algebra_scalars)
     succeeded_names.update(
         name for name in finalized_series if name not in base_species_names

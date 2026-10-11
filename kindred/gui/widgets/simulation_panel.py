@@ -245,9 +245,7 @@ class SimulationPanel(QtWidgets.QWidget):
         *,
         simulation_job_kind: str | None,
     ) -> None:
-        kind = None if simulation_job_kind is None else str(simulation_job_kind)
-        if kind not in {None, "run", "preview"}:
-            raise ValueError("simulation_job_kind must be None, 'run', or 'preview'.")
+        kind = simulation_job_kind
         previous_rendering = self._rendering
         self._rendering = True
         try:

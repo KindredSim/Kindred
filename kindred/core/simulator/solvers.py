@@ -31,7 +31,6 @@ from .nonnegative_invariant import (
     NonnegativeProjection,
     project_nonnegative_trajectory,
 )
-from .solver_output import solver_trajectory_array
 from .intervention_schedule_execution import (
     InterventionScheduleExecutionOwner,
     ScheduleExecutionRequest,
@@ -75,16 +74,11 @@ def _normal_event_states_with_projection(
     raw_states: object,
     *,
     count: int,
-    species_count: int,
 ) -> tuple[
     tuple[tuple[np.ndarray, ...], ...],
     NonnegativeProjection,
 ]:
-    raw_output = _normal_event_states(
-        raw_states,
-        count=count,
-        species_count=species_count,
-    )
+    raw_output = _normal_event_states(raw_states, count=count)
     projections: list[NonnegativeProjection] = []
     for exact_rows in raw_output:
         for exact in exact_rows:
@@ -100,30 +94,15 @@ def _normal_event_states(
     raw_states: object,
     *,
     count: int,
-    species_count: int,
 ) -> tuple[tuple[np.ndarray, ...], ...]:
-    output: list[list[np.ndarray]] = [
-        [] for _ in range(max(0, int(count)))
-    ]
-    if raw_states is None or count <= 0 or not isinstance(raw_states, Sequence):
-        return tuple(tuple(rows) for rows in output)
-    for idx in range(min(int(count), len(raw_states))):
-        raw = raw_states[idx]
+    # SciPy gives None without events, else one (hits, states) array per event,
+    # shaped (0,) when the event never fired; the first ``count`` events are
+    # the boundary events.
+    output: list[list[np.ndarray]] = [[] for _ in range(count)]
+    for idx, raw in enumerate(tuple(raw_states or ())[:count]):
         arr = np.asarray(raw, dtype=float)
         if arr.size == 0:
             continue
-        if arr.ndim == 1:
-            if int(species_count) == 1:
-                arr = arr.reshape(-1, 1)
-            elif arr.size == int(species_count):
-                arr = arr.reshape(1, int(species_count))
-            else:
-                continue
-        elif arr.ndim != 2:
-            try:
-                arr = arr.reshape(-1, int(species_count))
-            except ValueError:
-                continue
         for row in arr:
             state = np.asarray(row, dtype=float).reshape(-1).copy()
             state.setflags(write=False)
@@ -401,11 +380,6 @@ def _execute_scipy(
         raise SolverError(
             "Analytic Jacobian evaluation failed at "
             f"t={exc.time:.4e}: {exc.reason}",
-            suggestion=(
-                "Disable the analytic Jacobian preference to execute with the "
-                "numerical Jacobian of the solver, or correct the reported "
-                "analytic evaluation condition."
-            ),
             details={
                 "solver": req.solver,
                 "time": float(exc.time),
@@ -441,11 +415,8 @@ def _execute_scipy(
         # owned exactly once by project_nonnegative_trajectory; retain the exact
         # pre-projection terminal column separately for continuation semantics.
         t_out = np.asarray(t_eval, dtype=float)[:len(sol.t)].copy()
-        raw_trajectory = solver_trajectory_array(
-            sol.y,
-            y0=y0,
-            t_out=t_out,
-        )
+        # SciPy returns a 1-D empty array when no requested time was reached.
+        raw_trajectory = np.asarray(sol.y, dtype=float).reshape(len(y0), -1)
         local_dense = sol.sol
         dense = (None if local_dense is None else local_dense if origin == 0.0
                  else (lambda times: local_dense(np.asarray(times, dtype=float) - origin)))
@@ -468,16 +439,15 @@ def _execute_scipy(
         event_times = tuple(
             tuple(absolute(value) for value in values)
             for values in _normal_event_provenance(
-                getattr(sol, "t_events", None),
+                sol.t_events,
                 count=event_count,
             )
         )
         raw_event_states, event_state_projection = (
             _normal_event_states_with_projection(
                 (tuple(np.asarray(states).reshape(-1, len(y0))[:, :species_count] for states in (sol.y_events or ()))
-                 if volume is not None else getattr(sol, "y_events", None)),
+                 if volume is not None else sol.y_events),
                 count=event_count,
-                species_count=species_count,
             )
         )
         if (
@@ -536,16 +506,10 @@ def _normal_event_provenance(
     *,
     count: int,
 ) -> tuple[tuple[float, ...], ...]:
-    out = [[] for _ in range(max(0, int(count)))]
-    if not isinstance(events, Sequence):
-        return tuple(tuple(values) for values in out)
-    for idx, raw in enumerate(events):
-        if idx >= len(out):
-            break
-        try:
-            out[idx].extend(float(value) for value in raw)  # type: ignore[union-attr]
-        except TypeError:
-            continue
+    out = [[] for _ in range(count)]
+    # The first ``count`` SciPy events are the boundary events.
+    for idx, raw in enumerate(tuple(events or ())[:count]):
+        out[idx].extend(float(value) for value in raw)
     return tuple(tuple(values) for values in out)
 
 def solve_ode(

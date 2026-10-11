@@ -23,7 +23,7 @@ class ScientificUnavailable:
 
     def __post_init__(self) -> None:
         # Producers name themselves and their stage with literals.
-        object.__setattr__(self, "details", freeze_factual_value(dict(self.details or {})))
+        object.__setattr__(self, "details", freeze_factual_value(dict(self.details)))
 
 
 

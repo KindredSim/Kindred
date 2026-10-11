@@ -202,11 +202,6 @@ class GlobalFitWorker(QtCore.QThread):
             ),))
         elif self._cancelled.is_set():
             terminal = ("cancelled", ())
-        if terminal is None:
-            terminal = ("factual_failure", (factual_cause_from_exception(
-                RuntimeError("Fit bridge settled without a terminal value."),
-                domain="fit", origin="fit_process",
-            ),))
         name, args = terminal
         if name == "candidate_ready":
             self.terminal_projection = projection

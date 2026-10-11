@@ -7,6 +7,7 @@ from typing import Callable
 
 from PySide6 import QtCore, QtWidgets
 
+from kindred.gui.display_name_policy import count_text
 from kindred.gui.tutorials.overlay import Highlight, TutorialOverlay
 
 
@@ -311,7 +312,11 @@ class TutorialController(QtCore.QObject):
                     complete = False
                 highlights = tuple(item for item in highlights if item not in hidden)
         if self.position == len(lesson.steps) - 1 and self._skipped:
-            status = f"End of lesson. {len(self._skipped)} steps were skipped without verification. Previous lets you revisit them."
+            skipped = count_text(len(self._skipped), "step").capitalize()
+            status = (
+                f"End of lesson. {skipped} {'was' if len(self._skipped) == 1 else 'were'} skipped "
+                "without verification. Previous lets you revisit them."
+            )
         self.overlay.present(
             highlights,
             title=step.title,

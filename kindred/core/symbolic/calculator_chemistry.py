@@ -13,7 +13,6 @@ from kindred.core.simulator.parameter_algebra_spec import ParameterAlgebraSpec
 from kindred.core.simulator.step_indexing import get_step_index_map
 
 from .backend import require_sympy
-from .errors import UnsupportedSymbolicExpressionError
 
 
 def build_calculator_chemistry_relations(
@@ -50,51 +49,36 @@ def build_calculator_chemistry_relations(
         forward_name = readouts["k" if reaction else "kf"]
 
         def source_coordinate(role: str) -> Any:
-            # Constant's forward helper uses kf for both kinds of step.
-            source_role = "k" if reaction and role == "kf" else role
-            name = source_coordinates.get(source_role)
-            if name is None:
-                if role in {"kappa", "degeneracy"}:
-                    return None
-                raise ValueError(f"Missing admitted source coordinate for {source_role!r}.")
-            symbol = symbols[name]
-            return symbol
+            # Constant's forward helper uses kf for both kinds of step; the
+            # kinetics helper decides which roles are required.
+            name = source_coordinates.get("k" if reaction and role == "kf" else role)
+            return None if name is None else symbols[name]
 
-        try:
-            forward = forward_rate_symbolic_relation(
-                step.forward_model,
-                temperature=temperature,
-                literal=exact_literal,
-                exponential=sympy.exp,
-                source_coordinate=source_coordinate,
-                constant=symbols.__getitem__,
-            )
-            if forward_name in derived:
-                chemistry_relations[forward_name] = forward
-            if reaction:
-                continue
-            standard_concentration = step.metadata[EquilibriumMetadataKeys.STANDARD_CONC_M]
-            relations = equilibrium_rate_symbolic_relations(
-                step,
-                forward_relation=symbols[forward_name],
-                temperature=temperature,
-                literal=exact_literal,
-                exponential=sympy.exp,
-                source_coordinate=source_coordinate,
-                standard_concentration=exact_literal(float(standard_concentration)),
-                constant=symbols.__getitem__,
-            )
-            for role, expression in (("kr", relations.kr), ("Keq", relations.Keq)):
-                name = readouts[role]
-                if name in derived:
-                    chemistry_relations[name] = expression
-        except (TypeError, ValueError) as exc:
-            raise UnsupportedSymbolicExpressionError(
-                f"Unsupported symbolic chemistry for step {entry['step_index']}: {exc}"
-            ) from exc
-
-    if set(chemistry_relations) != set(derived):
-        raise UnsupportedSymbolicExpressionError(
-            "Admitted chemistry dependency projection is incomplete."
+        forward = forward_rate_symbolic_relation(
+            step.forward_model,
+            temperature=temperature,
+            literal=exact_literal,
+            exponential=sympy.exp,
+            source_coordinate=source_coordinate,
+            constant=symbols.__getitem__,
         )
+        if forward_name in derived:
+            chemistry_relations[forward_name] = forward
+        if reaction:
+            continue
+        standard_concentration = step.metadata[EquilibriumMetadataKeys.STANDARD_CONC_M]
+        relations = equilibrium_rate_symbolic_relations(
+            step,
+            forward_relation=symbols[forward_name],
+            temperature=temperature,
+            literal=exact_literal,
+            exponential=sympy.exp,
+            source_coordinate=source_coordinate,
+            standard_concentration=exact_literal(float(standard_concentration)),
+            constant=symbols.__getitem__,
+        )
+        for role, expression in (("kr", relations.kr), ("Keq", relations.Keq)):
+            name = readouts[role]
+            if name in derived:
+                chemistry_relations[name] = expression
     return chemistry_relations

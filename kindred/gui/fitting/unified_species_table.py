@@ -29,7 +29,7 @@ from kindred.gui.fitting.launch import (
     FitSetupSnapshot,
     shared_initial_group_labels,
 )
-from kindred.gui.fitting.ic_tolerance import FitInitialTolerance
+from kindred.gui.fitting.ic_tolerance import ZERO_IC_PERCENT_MESSAGE, FitInitialTolerance
 
 
 class _Col:
@@ -87,11 +87,6 @@ _VARY_IC_CHOICES: tuple[tuple[str, str, str], ...] = (
         "absolute",
         "Enter the actual minimum and maximum concentrations in molar units.",
     ),
-)
-
-_ZERO_IC_PERCENT_MESSAGE = (
-    "A zero Starting IC cannot use a percentage Vary IC mode. Choose "
-    "Absolute Minimum / Maximum (in M)."
 )
 
 _TARGET_WEIGHT_MESSAGE = "Target weights must be finite and positive."
@@ -209,8 +204,6 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
         parent: QtWidgets.QWidget | None = None,
     ) -> None:
         super().__init__(parent)
-        if not isinstance(origin, FitOriginSnapshot):
-            raise TypeError("origin must be FitOriginSnapshot.")
         self._origin = origin
         self._mechanism_species = tuple(
             dict.fromkeys(
@@ -442,9 +435,7 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
 
         self._origin = snapshot.origin
         available_ids = tuple(item.dataset_id for item in snapshot.datasets)
-        requested_id = str(dataset_id or self._current_dataset_id or "").strip()
-        if requested_id and requested_id not in available_ids:
-            raise ValueError("Fit snapshot does not contain the selected dataset.")
+        requested_id = dataset_id or self._current_dataset_id
 
         self._projected_setup = snapshot
         for dataset in snapshot.datasets:
@@ -477,11 +468,6 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
         """Select one projected dataset and repaint the table."""
 
         if self._projected_setup is None:
-            return
-        dataset_id = str(dataset_id or "").strip()
-        if dataset_id not in {
-            item.dataset_id for item in self._projected_setup.datasets
-        }:
             return
         self._current_dataset_id = dataset_id
         self._refresh_visible_presentation()
@@ -696,21 +682,15 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
         """Return one valid typed pending local-IC draft, if present."""
 
         pending = self._pending_initial_values.get((set_id, species))
-        if not isinstance(pending, dict):
+        if pending is None:
             return None
-        tolerance = pending.get("tolerance")
-        if not isinstance(tolerance, FitInitialTolerance):
-            return None
-        try:
-            return FitInitialVariable(
-                set_id=set_id,
-                species=species,
-                initial=pending["initial"],
-                tolerance=tolerance,
-                log10=pending["log10"],
-            )
-        except (KeyError, TypeError, ValueError, OverflowError):
-            return None
+        return FitInitialVariable(
+            set_id=set_id,
+            species=species,
+            initial=pending["initial"],
+            tolerance=pending["tolerance"],
+            log10=pending["log10"],
+        )
 
     def _refresh_vary_global_availability(self, row: int) -> None:
         """Refresh one Vary Global cell without rebuilding the table."""
@@ -1228,7 +1208,7 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
         self._set_vary_ic_combo_tooltip(combo)
         if self._refreshing or self._running:
             return
-        mode = str(combo.currentData() or "disabled")
+        mode = combo.currentData()
         initial_item = self._table.item(row, _Col.INITIAL)
         if initial_item is None:
             return
@@ -1264,7 +1244,7 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
                 combo.setCurrentIndex(max(0, combo.findData(previous_mode)))
             self._set_vary_ic_combo_tooltip(combo)
             # A refused mode change is an action outcome, not an invalid edit.
-            self.statusMessage.emit(_ZERO_IC_PERCENT_MESSAGE)
+            self.statusMessage.emit(ZERO_IC_PERCENT_MESSAGE)
             return
 
         lower_item = self._table.item(row, _Col.LOWER)
@@ -1549,11 +1529,6 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
                 "lower": _Col.LOWER,
                 "upper": _Col.UPPER,
             }
-            if (
-                mode in {"symmetric_percent", "asymmetric_percent"}
-                and typed.get("initial") == 0.0
-            ):
-                error_message = _ZERO_IC_PERCENT_MESSAGE
             for field in required_fields:
                 self._invalid_initial_raw[(set_id, species, field)] = (str(raw[field]), error_message)
                 self._decorate_initial_field(row, columns[field], error_message)
@@ -1750,18 +1725,15 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
             )
             for target in weight_roster
         )
-        try:
-            return replace(
-                current,
-                weight=self._pending_dataset_weights.get(
-                    dataset_id,
-                    current.weight,
-                ),
-                target_species=selected,
-                target_weights=target_weights,
-            )
-        except (KeyError, TypeError, ValueError):
-            return None
+        return replace(
+            current,
+            weight=self._pending_dataset_weights.get(
+                dataset_id,
+                current.weight,
+            ),
+            target_species=selected,
+            target_weights=target_weights,
+        )
 
     def _refresh_footer_dirty(self) -> None:
         self._footer.set_dirty(
@@ -1979,9 +1951,6 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
                     else:
                         source_tolerance = pending_source["tolerance"]
                         source_log10 = bool(pending_source["log10"])
-                    if not isinstance(source_tolerance, FitInitialTolerance):
-                        skipped += 1
-                        continue
                     destination_key = (destination_mapped.set_id, species)
                     destination_raw = self._initial_raw(destination_initial)
                     pending_destination = self._pending_initial_rows.get(destination_key)
@@ -2156,7 +2125,7 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
         locations = self.invalid_editor_locations
         more = f" (+{len(locations) - 1} more)" if len(locations) > 1 else ""
         self._footer.set_error(
-            f"Invalid value — {locations[0]}{more}." if locations else None,
+            f"Invalid value in {locations[0]}{more}." if locations else None,
             tooltip_text="\n".join(locations) if locations else None,
         )
         self.validityChanged.emit()
@@ -2201,7 +2170,7 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
         ]
         located.sort(key=lambda item: (order.get(item[0], len(order)), item[1], item[2]))
         return tuple(
-            f"{getattr(self._mapped_dataset(dataset_id), 'display_name', dataset_id)}: {label}"
+            f"{self._mapped_dataset(dataset_id).display_name}: {label}"
             for dataset_id, _row, _column, label in located
         )
 

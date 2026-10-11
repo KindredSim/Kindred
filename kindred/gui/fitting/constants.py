@@ -1,6 +1,5 @@
 """Small Fit-local UI constants; simulation science comes from each mapped set."""
 
-from kindred.core.fitting_method_policy import validate_fit_method
 from kindred.core.validation import parse_finite_numeric_text
 
 INITIAL_PREFIX = "init:"
@@ -20,8 +19,8 @@ FIT_METHOD_LABELS = {
 }
 
 
-def fit_method_label(value: object) -> str:
-    return FIT_METHOD_LABELS[validate_fit_method(value)]
+def fit_method_label(value: str) -> str:
+    return FIT_METHOD_LABELS[value]
 
 
 def admit_fit_tolerance(text: str, label: str) -> float:

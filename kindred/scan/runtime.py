@@ -52,7 +52,7 @@ def _worker(config, connection, cancel):
             prepared = prepare_dsl_request_set(config.source, units=UnitsModel(
                 energy_unit=config.energy_unit, temperature_K=config.temperature_K,
                 standard_conc_M=config.standard_conc_M))
-            solver = build_solver_config(solver_input=config.solver, rtol=config.rtol, atol=config.atol,
+            solver = build_solver_config(solver=config.solver, rtol=config.rtol, atol=config.atol,
                                          grid={"N": config.points}, use_analytic_jacobian=config.analytic_jacobian)
         except Exception as exc:
             connection.send(("bootstrap_failure", str(exc)))
@@ -135,7 +135,7 @@ def run_scan(config, prepared, cancel, progress_callback):
             except SimulationCancelled:
                 process_cancel.set()
             except Exception as exc:
-                fail(f"Input generation could not continue: {exc}")
+                fail(str(exc))
         if child.run is None:
             child.stopping = True
         child.connection.send(child.run)
@@ -166,7 +166,7 @@ def run_scan(config, prepared, cancel, progress_callback):
         try:
             design = PreparedScanDesign(config, prepared, check)
         except ValueError as exc:
-            fail(f"Setup cannot start: {exc}")
+            fail(str(exc))
             return progress
         check()
         writer = JsonScanWriter(config)

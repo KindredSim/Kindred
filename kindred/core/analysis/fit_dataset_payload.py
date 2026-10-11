@@ -77,7 +77,7 @@ class FitDatasetSpec:
             int(series.y.size)
             for series in self.observations.values()
         )
-        if self.x_name == "t" or self.x_observations is None:
+        if self.x_name == "t":
             return y_count
         retained_x_rows = {
             int(row)
@@ -96,7 +96,7 @@ class FitDatasetSpec:
     def x_source_rows(self) -> tuple[int, ...]:
         """Ordered union of dataset X rows referenced by retained Y rows."""
 
-        if self.x_name == "t" or self.x_observations is None:
+        if self.x_name == "t":
             return ()
         retained = {
             int(row)

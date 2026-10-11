@@ -26,7 +26,6 @@ from kindred.core.analysis.fit_uncertainty import (
 )
 from kindred.core.analysis import global_fit_execution as _fit_execution
 from kindred.core.exceptions import (
-    FitCandidateDomainError,
     FittingCancelled,
     SimulationCancelled,
 )
@@ -102,7 +101,6 @@ def fit_global(
         len(layout.opt_param_keys()),
     )
     penalty_value = 1e6
-    objective_total_points = int(sum(item.point_count for item in payloads))
 
     def hard_cancelled() -> bool:
         return bool(
@@ -137,11 +135,6 @@ def fit_global(
         keys = layout.opt_param_keys()
         primary_stopped = False
         try:
-            de_penalty = (
-                float((penalty_value**2) * max(1, objective_total_points))
-                if method == "differential_evolution"
-                else None
-            )
             optimizer_result = fit_parameters(
                 objective,
                 (
@@ -159,14 +152,11 @@ def fit_global(
                 ftol=ftol,
                 xtol=xtol,
                 cancellation_check=active_cancelled,
-                de_penalty=de_penalty,
             )
-            success = bool(optimizer_result.success)
-            message = str(optimizer_result.message)
+            success = optimizer_result.success
+            message = optimizer_result.message
             optimizer_diagnostic: FactualCause | None = None
-            identifiability = str(
-                optimizer_result.identifiability_warning or ""
-            ).strip()
+            identifiability = optimizer_result.identifiability_warning
             if identifiability:
                 optimizer_diagnostic = FactualCause(
                     domain="fit",
@@ -186,28 +176,20 @@ def fit_global(
                 *,
                 converged: bool,
             ) -> _fit_execution.GlobalFitResult | ScientificUnavailable:
-                try:
-                    return _fit_execution._replay_fit_result(
-                        fit_evaluators=evaluators,
-                        payloads=payloads,
-                        layout=layout,
-                        candidate_vector=candidate_vector,
-                        fixed_dataset_params=fixed_dataset_params,
-                        weights=weights_norm,
-                        cancellation_check=active_cancelled,
-                        cancellation_control=active_control,
-                        success=converged,
-                        message=message,
-                        optimizer_diagnostic=optimizer_diagnostic,
-                        executor=executor,
-                    )
-                except FitCandidateDomainError as exc:
-                    return ScientificUnavailable(
-                        producer="global_fit_replay",
-                        stage=exc.details["stage"],
-                        details=exc.details,
-                        factual_cause=getattr(exc, "factual_cause", None),
-                    )
+                return _fit_execution._replay_fit_result(
+                    fit_evaluators=evaluators,
+                    payloads=payloads,
+                    layout=layout,
+                    candidate_vector=candidate_vector,
+                    fixed_dataset_params=fixed_dataset_params,
+                    weights=weights_norm,
+                    cancellation_check=active_cancelled,
+                    cancellation_control=active_control,
+                    success=converged,
+                    message=message,
+                    optimizer_diagnostic=optimizer_diagnostic,
+                    executor=executor,
+                )
 
             # Scientific availability belongs to the actual optimizer endpoint
             # replay. A better fully evaluated probe must not replace it.
@@ -307,7 +289,13 @@ def fit_global(
                 [info.weighted_residuals for info in result.dataset_info]
             )
             base_residuals.setflags(write=False)
-            fitted_value_count = len(keys)
+            # Each measured-X row's curve location is fitted alongside the
+            # optimizer coordinates.
+            fitted_value_count = len(keys) + sum(
+                len(info.x_projection.source_rows)
+                for info in result.dataset_info
+                if info.x_projection is not None
+            )
             try:
                 if primary_stopped:
                     raise FittingCancelled("Profile likelihood was not started after Fit stopped.")
@@ -328,6 +316,7 @@ def fit_global(
                     ftol=refit_ftol,
                     xtol=refit_xtol,
                     base_residuals=base_residuals,
+                    fitted_value_count=fitted_value_count,
                     cancellation_check=active_cancelled,
                     progress_callback=extension_progress_callback,
                 )

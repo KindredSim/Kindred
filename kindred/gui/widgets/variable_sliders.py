@@ -20,9 +20,11 @@ from PySide6 import QtCore, QtWidgets
 from PySide6.QtCore import Signal
 
 from kindred.gui.interactive_preview import SliderInteractionKind
+from kindred.gui.parameter_enumeration import GuiParameterCoordinate
 from kindred.gui.widgets.fine_drag_slider import FineDragSlider, NumericValueEdit, SliderPress
 from html import escape
 from kindred.gui.display_name_policy import (
+    reaction_text,
     CompactText,
     compact_text,
     literal_tooltip,
@@ -90,7 +92,7 @@ class VariableSliders(QtWidgets.QWidget):
         self._slider_signs: Dict[str, float] = {}
         self._slider_scales: Dict[str, str] = {}  # 'log' (default) or 'linear'
         self._containers: Dict[str, QtWidgets.QWidget] = {}
-        self._metadata: Dict[str, Dict[str, object]] = {}
+        self._metadata: Dict[str, GuiParameterCoordinate] = {}
         self._fine_mode: bool = False
         self._slider_callbacks: Dict[str, Dict[str, object]] = {}
         self._hidden_names: set[str] = set()
@@ -120,7 +122,7 @@ class VariableSliders(QtWidgets.QWidget):
         self,
         variables: Dict[str, float],
         *,
-        metadata: Optional[Dict[str, Dict[str, object]]] = None,
+        coordinates: Iterable[GuiParameterCoordinate] = (),
     ) -> None:
         """
         Set variables and create sliders.
@@ -132,7 +134,7 @@ class VariableSliders(QtWidgets.QWidget):
             Examples: {'k1': 0.5, 'k2': 1.0, 'Keq1': 10.0, 'kf1': 2.0, 'kr1': 0.2}
         """
         normalized_variables, normalized_metadata = (
-            self._normalize_slider_snapshot(variables, metadata)
+            self._normalize_slider_snapshot(variables, coordinates)
         )
         logger.info(f"Setting {len(normalized_variables)} variables")
 
@@ -190,8 +192,8 @@ class VariableSliders(QtWidgets.QWidget):
         layout.setContentsMargins(0, 4, 0, 0)
         layout.setSpacing(2)
 
-        meta = self._metadata.get(name) or {}
-        scale = meta["scale"]
+        meta = self._metadata[name]
+        scale = "log" if meta.log10_allowed else "linear"
 
         # Top row: name label and editable value projection.
         top_row = QtWidgets.QHBoxLayout()
@@ -199,10 +201,10 @@ class VariableSliders(QtWidgets.QWidget):
 
         title, unit = self._label_parts(name)
         full_label = title + (f" [{unit}]" if unit else "")
-        symbol_html = scientific_symbol_html(name, family=meta["family"], role=meta["role"])
-        spoken = scientific_symbol_spoken(name, family=meta["family"], role=meta["role"])
+        symbol_html = scientific_symbol_html(name, family=meta.family, role=meta.role)
+        spoken = scientific_symbol_spoken(name, family=meta.family, role=meta.role)
         context = title
-        if symbol_html != escape(name) and title.startswith(name):
+        if symbol_html != escape(name):
             symbol_label = QtWidgets.QLabel(self)
             symbol_label.setTextFormat(QtCore.Qt.RichText)
             symbol_label.setText(symbol_html)
@@ -212,7 +214,7 @@ class VariableSliders(QtWidgets.QWidget):
                 QtWidgets.QSizePolicy.Fixed, QtWidgets.QSizePolicy.Preferred
             )
             top_row.addWidget(symbol_label)
-            context = title[len(name):].removeprefix(" — ").lstrip()
+            context = reaction_text(meta.context)
         name_label = QtWidgets.QLabel()
         unit_label = None
         if unit:
@@ -273,7 +275,7 @@ class VariableSliders(QtWidgets.QWidget):
         self._slider_scales[name] = "linear" if scale == "linear" else "log"
 
         if scale == "linear":
-            self._slider_ranges[name] = (float(meta["min"]), float(meta["max"]))
+            self._slider_ranges[name] = (meta.minimum, meta.maximum)
             self._slider_signs[name] = 1.0
         else:
             sign = 1.0 if value >= 0 else -1.0
@@ -352,12 +354,7 @@ class VariableSliders(QtWidgets.QWidget):
 
     def _label_parts(self, name: str) -> tuple[str, str]:
         meta = self._metadata[name]
-        title = meta["label"]
-        if meta["family"] in {"Constant", "Arrhenius", "Eyring", "reverse"} and meta["role"] in {"k", "kf", "kr", "Keq"}:
-            # Only admitted reaction context gets display arrows.
-            identity, separator, context = title.partition(" — ")
-            title = identity + separator + context.replace(" <-> ", " ⇌ ").replace(" -> ", " → ")
-        return title, meta["unit"]
+        return name + (" — " + reaction_text(meta.context) if meta.context else ""), meta.unit
 
     def _on_slider_changed(self, name: str, slider_pos: int) -> None:
         """
@@ -441,12 +438,12 @@ class VariableSliders(QtWidgets.QWidget):
         self,
         variables: Dict[str, float],
         *,
-        metadata: Optional[Dict[str, Dict[str, object]]] = None,
+        coordinates: Iterable[GuiParameterCoordinate] = (),
         preserve_editor_drafts: bool = True,
     ) -> None:
         """Render a tab snapshot without treating widget values as canonical."""
         normalized_variables, normalized_metadata = (
-            self._normalize_slider_snapshot(variables, metadata)
+            self._normalize_slider_snapshot(variables, coordinates)
         )
         same_coordinates = (
             tuple(normalized_variables) == tuple(self._variables)
@@ -477,11 +474,11 @@ class VariableSliders(QtWidgets.QWidget):
                     old, new = self._metadata.get(name), normalized_metadata.get(name)
                     # Only rejected text survives a new mechanism; valid text shows the new values.
                     rejected = bool(editor.property("invalidNumeric"))
-                    if rejected and old is not None and new is not None and parse_unit(str(old["unit"])) == parse_unit(str(new["unit"])):
+                    if rejected and old is not None and new is not None and parse_unit(old.unit) == parse_unit(new.unit):
                         retained_editors[name] = (editor.text(), self._editor_pre_edit_state.get(name), self._last_committed_editor_text.get(name), bool(editor.property("invalidNumeric")))
             self.set_variables(
                 normalized_variables,
-                metadata=normalized_metadata,
+                coordinates=normalized_metadata.values(),
             )
             for name, (text, baseline, committed, rejected) in retained_editors.items():
                 self._set_value_projection(name, normalized_variables[name], editor_text=text, emit=False)
@@ -558,7 +555,7 @@ class VariableSliders(QtWidgets.QWidget):
             compact = compact_text(title, max_chars=max(1, 48 - len(suffix)))
             label = CompactText(compact.display + suffix, title + suffix, compact.was_elided)
             meta = self._metadata[name]
-            symbol = scientific_symbol_html(name, family=meta["family"], role=meta["role"])
+            symbol = scientific_symbol_html(name, family=meta.family, role=meta.role)
             markup = (
                 symbol + escape(compact.display[len(name):])
                 if symbol != escape(name) and compact.display.startswith(name)
@@ -646,14 +643,14 @@ class VariableSliders(QtWidgets.QWidget):
         self,
         names: set[str],
         *,
-        metadata: Dict[str, Dict[str, object]],
+        metadata: Dict[str, GuiParameterCoordinate],
     ) -> None:
         """Reconcile choices by stable parameter identity, not roster order."""
         signature = tuple(
             (
                 name,
-                metadata[name]["family"],
-                metadata[name]["role"],
+                metadata[name].family,
+                metadata[name].role,
             )
             for name in names
         )
@@ -684,22 +681,20 @@ class VariableSliders(QtWidgets.QWidget):
     @staticmethod
     def _normalize_slider_snapshot(
         variables: Dict[str, float],
-        metadata: Optional[Dict[str, Dict[str, object]]],
-    ) -> tuple[Dict[str, float], Dict[str, Dict[str, object]]]:
+        coordinates: Iterable[GuiParameterCoordinate],
+    ) -> tuple[Dict[str, float], Dict[str, GuiParameterCoordinate]]:
         """Copy one render call's trusted projection without changing widget state."""
         normalized_variables = {str(name): float(value) for name, value in variables.items()}
-        normalized_metadata = {
-            str(name): dict(meta) for name, meta in (metadata or {}).items()
-        }
+        normalized_metadata = {item.name: item for item in coordinates}
         return normalized_variables, normalized_metadata
 
     def _editor_has_focus(self, name: str) -> bool:
         editor = self._value_labels.get(str(name))
-        return isinstance(editor, NumericValueEdit) and editor.hasFocus()
+        return editor is not None and editor.hasFocus()
 
     def _on_editor_started(self, name: str) -> None:
         editor = self._value_labels.get(str(name))
-        if not isinstance(editor, NumericValueEdit):
+        if editor is None:
             return
         self.remember_editor_state(name)
         self._last_committed_editor_text.pop(str(name), None)
@@ -715,7 +710,7 @@ class VariableSliders(QtWidgets.QWidget):
 
     def _on_editor_escape(self, name: str) -> None:
         editor = self._value_labels.get(str(name))
-        if not isinstance(editor, NumericValueEdit):
+        if editor is None:
             return
         value = self._variables.get(str(name), 0.0)
         value, text, rejected = self._editor_pre_edit_state.get(
@@ -743,11 +738,11 @@ class VariableSliders(QtWidgets.QWidget):
 
     def _decorate_editor(self, name: str, *, rejected: bool = False) -> None:
         editor = self._value_labels.get(str(name))
-        if not isinstance(editor, NumericValueEdit):
+        if editor is None:
             return
         try:
-            value = parse_finite_numeric_text(editor.text().strip())
-            valid = bool(math.isfinite(value)) and not rejected
+            parse_finite_numeric_text(editor.text().strip())
+            valid = not rejected
         except (TypeError, ValueError, OverflowError):
             valid = False
         was_invalid = bool(editor.property("invalidNumeric"))
@@ -763,7 +758,7 @@ class VariableSliders(QtWidgets.QWidget):
     def _commit_editor(self, name: str) -> None:
         name_s = str(name)
         editor = self._value_labels.get(name_s)
-        if not isinstance(editor, NumericValueEdit):
+        if editor is None:
             return
         raw = editor.text()
         if raw == self._last_committed_editor_text.get(name_s):
@@ -771,9 +766,6 @@ class VariableSliders(QtWidgets.QWidget):
         try:
             value = parse_finite_numeric_text(raw.strip())
         except (TypeError, ValueError, OverflowError):
-            self._decorate_editor(name_s)
-            return
-        if not math.isfinite(value):
             self._decorate_editor(name_s)
             return
         self._last_committed_editor_text[name_s] = raw
@@ -798,8 +790,6 @@ class VariableSliders(QtWidgets.QWidget):
         if name_s not in self._sliders:
             return
         value_f = float(value)
-        if not math.isfinite(value_f):
-            return
         previous_range = self._slider_ranges[name_s]
         if self._slider_scales.get(name_s, "log") == "log":
             self._slider_signs[name_s] = 1.0 if value_f >= 0 else -1.0
@@ -809,7 +799,7 @@ class VariableSliders(QtWidgets.QWidget):
         with QtCore.QSignalBlocker(slider):
             slider.setValue(self._value_to_slider_pos(name_s, value_f))
         value_label = self._value_labels.get(name_s)
-        if isinstance(value_label, NumericValueEdit):
+        if value_label is not None:
             if (
                 not emit and editor_text is None
                 and value_label.property("invalidNumeric")
@@ -822,8 +812,6 @@ class VariableSliders(QtWidgets.QWidget):
             self._decorate_editor(name_s)
         logger.debug("Variable projected: %s = %.12g", name_s, value_f)
         if emit:
-            if not isinstance(interaction, SliderInteractionKind):
-                raise TypeError("emitted Slider values require an interaction kind.")
             self.interactionRequested.emit(name_s, value_f, interaction)
             if (
                 interaction is SliderInteractionKind.EXACT_TYPED_COMMIT

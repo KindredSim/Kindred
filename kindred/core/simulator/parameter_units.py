@@ -178,7 +178,7 @@ def prepare_spec_units(spec, mechanism):
                             else energy_input.symbol if name in energies else units[name].symbol)
                 raise DSLError(
                     f"The formula for {name} {_formula_result(expr.quantity_unit)}, which does not fit "
-                    f"{name} ({expected}). Check the formula and the units of its parameters.",
+                    f"{name} ({expected}).",
                     line_number=stmt.line, line_content=stmt.line_text,
                 )
         elif (stmt.declared_unit is not None and name not in inputs and expr.quantity_unit is not None

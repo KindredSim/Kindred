@@ -263,9 +263,7 @@ class DatasetOverlayPanel(QtWidgets.QWidget):
         link = self._links_by_dataset_id.get(target)
         if link is None:
             return
-        selected = tuple(str(raw_id) for raw_id in raw_observation_ids)
-        if len(selected) != len(set(selected)):
-            raise ValueError("Overlay raw observation IDs must be unique.")
+        selected = tuple(raw_observation_ids)
         self._links_by_dataset_id[target] = replace(
             link,
             overlay_raw_observation_ids=selected,

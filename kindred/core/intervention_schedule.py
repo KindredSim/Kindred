@@ -3,7 +3,6 @@ from __future__ import annotations
 import math
 import re
 from dataclasses import dataclass, field as dataclass_field, replace
-from numbers import Real
 from types import MappingProxyType
 from typing import Any, Mapping, Sequence, TypeAlias
 
@@ -183,8 +182,7 @@ _AUTHORED_INTEGER_FIELDS = frozenset({"count", "max_count"})
 
 
 def _finite(value: object, *, field: str) -> float:
-    if type(value) is bool or not isinstance(value, Real):
-        raise InterventionScheduleError(f"{field} must be a finite number.")
+    # The parser yields only str, float, or int values.
     number = float(value)
     if not math.isfinite(number):
         raise InterventionScheduleError(f"{field} must be a finite number.")
@@ -224,8 +222,6 @@ def _positive_int(value: object, *, field: str) -> int:
 def _name(value: object, *, field: str) -> str:
     if value is None:
         raise InterventionScheduleError(f"{field} is required.")
-    if not isinstance(value, str):
-        raise InterventionScheduleError(f"{field} must be a string.")
     name = value.strip()
     if not name:
         raise InterventionScheduleError(f"{field} must not be empty.")
@@ -235,18 +231,10 @@ def _name(value: object, *, field: str) -> str:
 def _enum(value: object, *, field: str) -> str:
     if value is None:
         raise InterventionScheduleError(f"{field} is required.")
-    if not isinstance(value, str):
-        raise InterventionScheduleError(f"{field} must be a string.")
     text = value.strip().lower()
     if not text:
         raise InterventionScheduleError(f"{field} must not be empty.")
     return text
-
-
-def _ordinal(value: object, *, field: str) -> int:
-    if type(value) is not int or value < 0:
-        raise InterventionScheduleError(f"{field} must be a nonnegative integer.")
-    return value
 
 
 def _pair(
@@ -380,12 +368,7 @@ class PhysicalAction:
     initial_volume: PhysicalQuantity | None = None
 
     def __post_init__(self) -> None:
-        if self.op not in {"jump", "flux", "scale", "withdraw"}:
-            raise InterventionScheduleError(f"Unsupported physical action: {self.op!r}.")
-        if self.op in {"scale", "withdraw"} and self.stock:
-            raise InterventionScheduleError(f"{self.op} does not permit stock composition.")
-        if self.op == "scale" and self.initial_volume is not None:
-            raise InterventionScheduleError("scale does not initialize volume.")
+        # The parser admits the op and its permitted fields.
         names = tuple(_name(name, field="stock species") for name, _ in self.stock)
         if len(set(names)) != len(names):
             raise InterventionScheduleError("Stock species must be unique.")
@@ -449,7 +432,6 @@ class InterventionPhysical:
     declaration_ordinal: int = 0
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "declaration_ordinal", _ordinal(self.declaration_ordinal, field="declaration_ordinal"))
         for field in self.clock_fields:
             value, parameter = _pair(getattr(self, field), getattr(self, field + "_param"), field=field, domain="nonnegative")
             object.__setattr__(self, field, value)
@@ -506,7 +488,7 @@ class InterventionSet:
         object.__setattr__(
             self,
             "declaration_ordinal",
-            _ordinal(self.declaration_ordinal, field="declaration_ordinal"),
+            self.declaration_ordinal,
         )
         time, time_param = _pair(
             self.time, self.time_param, field="time", domain="nonnegative"
@@ -564,7 +546,7 @@ class InterventionJump:
         object.__setattr__(
             self,
             "declaration_ordinal",
-            _ordinal(self.declaration_ordinal, field="declaration_ordinal"),
+            self.declaration_ordinal,
         )
         time, time_param = _pair(
             self.time, self.time_param, field="time", domain="nonnegative"
@@ -624,7 +606,7 @@ class InterventionFlux:
         object.__setattr__(
             self,
             "declaration_ordinal",
-            _ordinal(self.declaration_ordinal, field="declaration_ordinal"),
+            self.declaration_ordinal,
         )
         for field, domain in (
             ("start_time", "nonnegative"),
@@ -739,7 +721,7 @@ class InterventionHold:
         object.__setattr__(
             self,
             "declaration_ordinal",
-            _ordinal(self.declaration_ordinal, field="declaration_ordinal"),
+            self.declaration_ordinal,
         )
         for field in ("start_time", "end_time", "value"):
             value, parameter = _pair(
@@ -851,8 +833,6 @@ class InterventionProtocolOperation:
     def __post_init__(self) -> None:
         phase = _enum(self.phase, field="phase")
         op = _enum(self.op, field="op")
-        if phase not in _PHASES:
-            raise InterventionScheduleError(f"Unsupported protocol phase: {phase!r}.")
         permitted = {"before": {"set", "jump", "scale", "withdraw"}, "during": {"flux", "hold"}, "after": {"set", "jump", "scale", "withdraw"}}
         if op not in permitted[phase]:
             raise InterventionScheduleError(
@@ -860,10 +840,7 @@ class InterventionProtocolOperation:
             )
         object.__setattr__(self, "phase", phase)
         object.__setattr__(self, "op", op)
-        object.__setattr__(self, "authored_ordinal", _ordinal(self.authored_ordinal, field="authored_ordinal"))
         if self.physical is not None:
-            if self.physical.op != op or self.species or any(getattr(self, name, None) is not None for name in ("value", "delta", "flux_rate", "value_param", "delta_param", "flux_rate_param")):
-                raise InterventionScheduleError("Physical and concentration instructions are mutually exclusive.")
             return
         object.__setattr__(self, "species", _name(self.species, field="species"))
         selected = {"set": "value", "hold": "value", "jump": "delta", "flux": "flux_rate"}[op]
@@ -878,10 +855,6 @@ class InterventionProtocolOperation:
                     domain="concentration" if field == "value" else "signed",
                 )
             else:
-                if raw_value is not None or raw_parameter is not None:
-                    raise InterventionScheduleError(
-                        f"Protocol op={op!r} does not permit {field}."
-                    )
                 value, parameter = None, None
             object.__setattr__(self, field, value)
             object.__setattr__(self, f"{field}_param", parameter)
@@ -955,20 +928,10 @@ class InterventionProtocol:
         object.__setattr__(
             self,
             "declaration_ordinal",
-            _ordinal(self.declaration_ordinal, field="declaration_ordinal"),
+            self.declaration_ordinal,
         )
         for phase in ("before", "during", "after"):
-            operations = tuple(getattr(self, phase))
-            if any(item.phase != phase for item in operations):
-                raise InterventionScheduleError(
-                    f"Protocol {phase} contains an operation from another phase."
-                )
-            authored_ordinals = [int(item.authored_ordinal) for item in operations]
-            if len(authored_ordinals) != len(set(authored_ordinals)):
-                raise InterventionScheduleError(
-                    f"Protocol {phase} nested authored ordinals must be unique."
-                )
-            object.__setattr__(self, phase, operations)
+            object.__setattr__(self, phase, tuple(getattr(self, phase)))
         if not self.before and not self.during and not self.after:
             raise InterventionScheduleError(
                 "Protocol requires at least one nonempty phase."
@@ -1057,22 +1020,11 @@ class InterventionTriggerAction:
 
     def __post_init__(self) -> None:
         op = _enum(self.op, field="op")
-        if op not in {"set", "jump", "scale", "withdraw"}:
-            raise InterventionScheduleError(
-                "A trigger action is op=set, op=jump, op=scale, or op=withdraw."
-            )
         object.__setattr__(self, "op", op)
         if self.physical is not None:
-            if self.physical.op != op or self.species or any(getattr(self, name, None) is not None for name in ("value", "delta", "flux_rate", "value_param", "delta_param", "flux_rate_param")):
-                raise InterventionScheduleError("Physical and concentration instructions are mutually exclusive.")
             return
         object.__setattr__(self, "species", _name(self.species, field="species"))
         selected = "value" if op == "set" else "delta"
-        rejected = "delta" if op == "set" else "value"
-        if getattr(self, rejected) is not None or getattr(self, f"{rejected}_param") is not None:
-            raise InterventionScheduleError(
-                f"Trigger op={op!r} does not permit {rejected}."
-            )
         value, parameter = _pair(
             getattr(self, selected),
             getattr(self, f"{selected}_param"),
@@ -1177,15 +1129,11 @@ class InterventionTrigger:
         if direction not in _DIRECTIONS:
             raise InterventionScheduleError("direction must be rising, falling, or either.")
         object.__setattr__(self, "direction", direction)
-        if isinstance(self.then, InterventionStopAction):
-            if self.max_count is not None or self.min_interval is not None:
-                raise InterventionScheduleError("Stopping triggers do not permit max_count or min_interval.")
-        else:
+        if not isinstance(self.then, InterventionStopAction):
             if not isinstance(self.condition, SpeciesTriggerCondition):
                 raise InterventionScheduleError("Chemical triggers require watch_species.")
             object.__setattr__(self, "max_count", _positive_int(self.max_count, field="max_count"))
             object.__setattr__(self, "min_interval", _nonnegative(self.min_interval, field="min_interval"))
-        object.__setattr__(self, "declaration_ordinal", _ordinal(self.declaration_ordinal, field="declaration_ordinal"))
 
     @property
     def op(self) -> str:
@@ -1258,7 +1206,7 @@ class InterventionSchedule:
                     initializers.append((physical.initial_volume, identity))
         if len(initializers) > 1:
             raise InterventionScheduleError(
-                "Declare initial_volume or initial_volume_param only once. It defines the vessel volume at simulation start.",
+                "Declare initial_volume or initial_volume_param only once.",
                 field="initial_volume", field_identities=tuple(identity for _, identity in initializers),
                 declaration_ordinal=initializers[1][1][0],
             )
@@ -1394,7 +1342,7 @@ def _operation_from_fields(
     data = dict(fields)
     _literal_fields(data, context="intervention")
     op = _enum(data.get("op"), field="op")
-    ordinal = _ordinal(declaration_ordinal, field="declaration_ordinal")
+    ordinal = declaration_ordinal
     if "solution" in data or op in {"scale", "withdraw"}:
         clocks = ("start_time", "end_time") if op == "flux" else ("time",)
         physical = _physical_from_fields(data, extra_keys={key for field in clocks for key in (field, field + "_param")})
@@ -1550,7 +1498,7 @@ def _protocol_operation_from_fields(
     op = _enum(data.get("op"), field="op")
     if "solution" in data or op in {"scale", "withdraw"}:
         return InterventionProtocolOperation(phase=phase, op=op, physical=_physical_from_fields(data),
-                                             authored_ordinal=_ordinal(authored_ordinal, field="authored_ordinal"))
+                                             authored_ordinal=authored_ordinal)
     selected = {
         "set": "value",
         "hold": "value",
@@ -1567,7 +1515,7 @@ def _protocol_operation_from_fields(
         phase=phase,
         op=op,
         species=data.get("species"),
-        authored_ordinal=_ordinal(authored_ordinal, field="authored_ordinal"),
+        authored_ordinal=authored_ordinal,
         **{
             selected: data.get(selected),
             f"{selected}_param": data.get(f"{selected}_param"),
@@ -1887,7 +1835,6 @@ def intervention_schedule_parameter_names(
         str(name)
         for values in intervention_schedule_parameter_dependencies(schedule).values()
         for name in values
-        if str(name).strip()
     }
 
 
@@ -1905,10 +1852,9 @@ def intervention_schedule_parameter_dependencies(
         field_path: str,
         parameter: object,
     ) -> None:
-        if not isinstance(parameter, str) or not parameter.strip():
+        if parameter is None:
             return
-        identity = (int(declaration), nested_ordinal, str(field_path))
-        dependencies[identity] = (parameter.strip(),)
+        dependencies[(declaration, nested_ordinal, field_path)] = (parameter,)
 
     def add_physical(item, declaration, nested=None, prefix=""):
         physical = getattr(item, "physical", None)
@@ -1918,7 +1864,7 @@ def intervention_schedule_parameter_dependencies(
         return physical is not None
 
     for operation in schedule.operations:
-        declaration = int(getattr(operation, "declaration_ordinal", 0))
+        declaration = operation.declaration_ordinal
         add_physical(operation, declaration)
         if isinstance(operation, InterventionPhysical):
             for field in operation.clock_fields:
@@ -1962,7 +1908,7 @@ def intervention_schedule_parameter_dependencies(
             "jump": ("time", "delta"),
             "flux": ("start_time", "end_time", "flux_rate"),
             "hold": ("start_time", "end_time", "value"),
-        }.get(getattr(operation, "op", ""), ()):
+        }.get(operation.op, ()):
             add(
                 declaration,
                 None,

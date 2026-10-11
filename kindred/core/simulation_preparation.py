@@ -79,16 +79,8 @@ class SimulationPreparationError(RuntimeError):
         parameter_names: Iterable[str] = (),
         details: Mapping[str, object] | None = None,
     ) -> None:
-        self.stage = str(stage or "unknown")
-        self.parameter_names = tuple(
-            sorted(
-                {
-                    str(name).strip()
-                    for name in parameter_names
-                    if str(name).strip()
-                }
-            )
-        )
+        self.stage = stage
+        self.parameter_names = tuple(sorted(set(parameter_names)))
         normalized_details = dict(details or {})
         normalized_details.update(
             {
@@ -282,12 +274,8 @@ def _schedule_parameters_deferred_to_prepared_request(
     if not requested or not referenced:
         return frozenset()
 
-    requested_names = {
-        str(name).strip()
-        for name in requested
-        if str(name).strip()
-    }
-    supplied_names = {str(name).strip() for name in supplied if str(name).strip()}
+    requested_names = set(requested)
+    supplied_names = supplied
     expanded_metadata = _expanded_intervention_schedule_dependency_metadata(
         unresolved_intervention_schedule,
         parameter_algebra_spec=parameter_algebra_spec,
@@ -494,7 +482,7 @@ def prepare_simulation_run(
                 resolved_schedule.validate_species(species_names)
                 intervention_execution = compile_intervention_schedule(
                     resolved_schedule,
-                    authored_payload=unresolved_intervention_schedule.to_payload(),
+                    authored=unresolved_intervention_schedule,
                     cancellation_check=(
                         cancellation_control.cancel_requested
                         if cancellation_control is not None
@@ -549,11 +537,11 @@ def prepare_simulation_run(
         targets = tuple(dict.fromkeys(item.condition.name for item in stops))
         if targets:
             from kindred.core.algebra.errors import AlgebraError
-            from kindred.core.algebra.simulation_series import compiled_algebra_for_mechanism, prepare_algebra_stop_evaluator
+            from kindred.core.algebra.simulation_series import observable_parameter_roots, prepare_algebra_stop_evaluator
+            observable_block = parameter_algebra_spec.observable_block
             try:
-                compiled = compiled_algebra_for_mechanism(mechanism)
                 target_roots = {
-                    name: tuple(root for root in compiled.parameter_roots(name)
+                    name: tuple(root for root in observable_parameter_roots(observable_block, name)
                                 if root in parameter_algebra_spec.evaluation_dependencies)
                     for name in targets
                 }
@@ -566,7 +554,7 @@ def prepare_simulation_run(
                     execution_request.t_span[0],
                 ), static_roots) if static_roots else {})
                 evaluator = prepare_algebra_stop_evaluator(
-                    compiled,
+                    observable_block,
                     species_names=tuple(species_names), initials=initials_for_algebra,
                     symbol_values=static, runtime_symbol_names=set(runtime_names),
                 )
@@ -611,8 +599,9 @@ def _bind_request_parameter_overrides(
 ) -> Mapping[str, float]:
     """Apply owned coordinates and return admitted schedule-only bindings.
 
-    Override names and values arrive admitted by Slider, Scan or Fit as
-    enumerated independent coordinates and scalars of this accepted mechanism.
+    Override names are enumerated independent coordinates and scalars of this
+    accepted mechanism.  Their values are admitted here, which Fit trial values
+    rely on.
     """
 
     declared_scalar_names = _independent_scalar_names(parameter_algebra_spec)

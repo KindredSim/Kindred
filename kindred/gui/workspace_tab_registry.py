@@ -160,20 +160,10 @@ class WorkspaceTabRegistry:
         return self._session.capture_content_token()
 
     def presentation(self, tab_id: str) -> ProjectPresentationState:
-        target = tab_id
-        self._session.document.tab(target)
-        for current_id, state in self._presentation_by_tab_id:
-            if current_id == target:
-                return state
-        raise KeyError(f"Unknown presentation tab ID: {target!r}.")
+        return dict(self._presentation_by_tab_id)[tab_id]
 
     def tab_runtime(self, tab_id: str) -> TabRuntimeState:
-        target = tab_id
-        self._session.document.tab(target)
-        for current_id, runtime in self._runtime_by_tab_id:
-            if current_id == target:
-                return runtime
-        raise KeyError(f"Unknown runtime tab ID: {target!r}.")
+        return dict(self._runtime_by_tab_id)[tab_id]
 
     def presentation_items(self) -> tuple[tuple[str, ProjectPresentationState], ...]:
         return self._presentation_by_tab_id
@@ -551,12 +541,7 @@ class WorkspaceTabRegistry:
         """
         document = self._session.document
         target = tab_id
-        index = next(
-            (index for index, tab in enumerate(document.tabs) if tab.tab_id == target),
-            None,
-        )
-        if index is None:
-            raise KeyError(f"Unknown mechanism tab ID: {target!r}.")
+        index = next(index for index, tab in enumerate(document.tabs) if tab.tab_id == target)
         was_active = self.active_tab_id == target
         candidate = document.remove_tab(target)
         result = self.replace_document(
@@ -589,14 +574,10 @@ class WorkspaceTabRegistry:
 
     def replace_tab(
         self,
-        tab_id: str,
         tab: MechanismTabDocument,
         *,
         expected_token: ProjectContentToken,
     ) -> ProjectContentToken | None:
-        target = self.tab(tab_id).tab_id
-        if tab.tab_id != target:
-            raise ValueError("Replacement tab must match the captured tab ID.")
         candidate = self._session.document.replace_tab(tab)
         return self.replace_document(candidate, expected_token=expected_token)
 
@@ -610,7 +591,6 @@ class WorkspaceTabRegistry:
         target = self.tab(tab_id)
         candidate = mutation(target)
         return self.replace_tab(
-            target.tab_id,
             candidate,
             expected_token=expected_token,
         )
@@ -625,7 +605,6 @@ class WorkspaceTabRegistry:
         tab = self.tab(tab_id)
         candidate = tab.replace_initial_condition_set(initial_set)
         return self.replace_tab(
-            tab.tab_id,
             candidate,
             expected_token=expected_token,
         )
@@ -639,7 +618,6 @@ class WorkspaceTabRegistry:
     ) -> ProjectContentToken | None:
         tab = self.tab(tab_id)
         return self.replace_tab(
-            tab.tab_id,
             tab.with_run_defaults(settings),
             expected_token=expected_token,
         )
@@ -655,7 +633,6 @@ class WorkspaceTabRegistry:
         tab = self.tab(tab_id)
         target = tab.initial_condition_set(set_id).set_id
         return self.replace_tab(
-            tab.tab_id,
             tab.with_run_override(target, settings),
             expected_token=expected_token,
         )
@@ -690,7 +667,6 @@ class WorkspaceTabRegistry:
         tab = self.tab(tab_id)
         candidate = tab.without_initial_condition_sets(targets)
         return self.replace_tab(
-            tab.tab_id,
             candidate,
             expected_token=expected_token,
         )

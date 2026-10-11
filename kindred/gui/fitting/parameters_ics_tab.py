@@ -75,11 +75,8 @@ class _InvalidRow:
     messages: tuple[tuple[str, str], ...]
 
 
-def _format_number(value: object) -> str:
-    try:
-        return repr(float(value))
-    except (TypeError, ValueError, OverflowError):
-        return str(value)
+def _format_number(value: float) -> str:
+    return repr(float(value))
 
 
 def _format_scientific(value: object) -> str:
@@ -170,7 +167,7 @@ class _ProfileLikelihoodDialog(QtWidgets.QDialog):
             ),
             max_bracketing_steps_per_side=self._points.value(),
             max_nfev_per_point=self._budget.value(),
-            optimizer_method=str(self._method.currentData() or "trf"),
+            optimizer_method=self._method.currentData(),
         )
 
     def accept(self) -> None:  # noqa: D401 - Qt override
@@ -281,7 +278,7 @@ class _ResidualBootstrapDialog(QtWidgets.QDialog):
             minimum_success_fraction=parse_finite_numeric_text(
                 self._fraction.text(), field="Required success rate"
             ),
-            optimizer_method=str(self._method.currentData() or "trf"),
+            optimizer_method=self._method.currentData(),
         )
 
     def accept(self) -> None:  # noqa: D401 - Qt override
@@ -470,8 +467,6 @@ class ParametersIcsTab(QtWidgets.QWidget):
         parent: QtWidgets.QWidget | None = None,
     ) -> None:
         super().__init__(parent)
-        if origin is not None and not isinstance(origin, FitOriginSnapshot):
-            raise TypeError("origin must be FitOriginSnapshot or None.")
         self._origin = origin
         self._projected_setup: FitSetupSnapshot | None = None
         self._last_fit_parameters: dict[str, FitParameterVariable] = {}
@@ -1685,10 +1680,8 @@ class ParametersIcsTab(QtWidgets.QWidget):
         del blocker
 
     def _defaults_projection(self) -> FitDefaults:
-        if self._projected_setup is None:
-            raise ValueError("Fit defaults are not available.")
         defaults = self._projected_setup.defaults
-        method = str(self._method_combo.currentData() or "trf")
+        method = self._method_combo.currentData()
         ftol = self._tolerance_value(self._ftol_edit, self._ftol_label)
         xtol = (
             defaults.xtol if method == DIFFERENTIAL_EVOLUTION_METHOD
@@ -1772,15 +1765,9 @@ class ParametersIcsTab(QtWidgets.QWidget):
     def _emit_solver_edit(self, *_args: object) -> None:
         if self._projecting or self._running or self._projected_setup is None:
             return
-        try:
-            snapshot = replace(
-                self._projected_setup,
-                solver=str(self._solver_combo.currentData() or "BDF"),
-            )
-        except (TypeError, ValueError, OverflowError) as exc:
-            self.statusMessage.emit(f"Fit solver edit is invalid: {exc}")
-            return
-        self.setupSnapshotRequested.emit(snapshot)
+        self.setupSnapshotRequested.emit(
+            replace(self._projected_setup, solver=self._solver_combo.currentData())
+        )
 
     def _project_advanced_analysis(self, snapshot: FitSetupSnapshot) -> None:
         profile = snapshot.profile_likelihood
@@ -1807,27 +1794,30 @@ class ParametersIcsTab(QtWidgets.QWidget):
             del blockers
 
     @staticmethod
-    def _analysis_summary(configuration: object | None, label: str, skipped: int) -> str:
+    def _analysis_summary(
+        configuration: ProfileLikelihoodConfig | ResidualBootstrapConfig | None,
+        label: str,
+        skipped: int,
+    ) -> str:
         """The card text; ``skipped`` counts selected targets whose datasets are all excluded."""
         if configuration is None:
             return "Not configured"
-        names = tuple(getattr(configuration, "parameter_names", ()))
+        names = configuration.parameter_names
         not_in_fit = f" ({skipped} not in fit)" if skipped else ""
-        method = str(getattr(configuration, "optimizer_method", "trf"))
         if label == "Profile":
             detail = (
                 f"{len(names)} coordinate{'s' if len(names) != 1 else ''}{not_in_fit} · "
-                f"{getattr(configuration, 'confidence_level', 0.95):.0%} · "
-                f"{getattr(configuration, 'max_bracketing_steps_per_side', 0)} "
+                f"{configuration.confidence_level:.0%} · "
+                f"{configuration.max_bracketing_steps_per_side} "
                 "maximum outward search steps/side"
             )
         else:
             detail = (
                 f"{len(names)} coordinate{'s' if len(names) != 1 else ''}{not_in_fit} · "
-                f"{getattr(configuration, 'replicates', 0)} refits · "
-                f"{getattr(configuration, 'minimum_success_fraction', 0.0):.0%} minimum"
+                f"{configuration.replicates} refits · "
+                f"{configuration.minimum_success_fraction:.0%} minimum"
             )
-        return f"Enabled · {detail} · {FIT_METHOD_LABELS.get(method, method)}"
+        return f"Enabled · {detail} · {FIT_METHOD_LABELS[configuration.optimizer_method]}"
 
     def _analysis_snapshot(
         self,
@@ -1835,11 +1825,8 @@ class ParametersIcsTab(QtWidgets.QWidget):
         profile: ProfileLikelihoodConfig | None,
         bootstrap: ResidualBootstrapConfig | None,
     ) -> FitSetupSnapshot:
-        setup = self._projected_setup
-        if setup is None:
-            raise ValueError("Fit setup is unavailable.")
         return replace(
-            setup,
+            self._projected_setup,
             profile_likelihood=profile,
             residual_bootstrap=bootstrap,
         )
@@ -1882,15 +1869,12 @@ class ParametersIcsTab(QtWidgets.QWidget):
             if setup.profile_likelihood is None:
                 self._profile_enabled.setChecked(False)
             return
-        try:
-            self.setupSnapshotRequested.emit(
-                self._analysis_snapshot(
-                    profile=dialog.configuration(),
-                    bootstrap=setup.residual_bootstrap,
-                )
+        self.setupSnapshotRequested.emit(
+            self._analysis_snapshot(
+                profile=dialog.configuration(),
+                bootstrap=setup.residual_bootstrap,
             )
-        except (TypeError, ValueError, OverflowError) as exc:
-            self.statusMessage.emit(f"Profile likelihood settings are invalid: {exc}")
+        )
 
     def _open_bootstrap_dialog(self) -> None:
         if self._projecting or self._running:
@@ -1908,15 +1892,12 @@ class ParametersIcsTab(QtWidgets.QWidget):
             if setup.residual_bootstrap is None:
                 self._bootstrap_enabled.setChecked(False)
             return
-        try:
-            self.setupSnapshotRequested.emit(
-                self._analysis_snapshot(
-                    profile=setup.profile_likelihood,
-                    bootstrap=dialog.configuration(),
-                )
+        self.setupSnapshotRequested.emit(
+            self._analysis_snapshot(
+                profile=setup.profile_likelihood,
+                bootstrap=dialog.configuration(),
             )
-        except (TypeError, ValueError, OverflowError) as exc:
-            self.statusMessage.emit(f"Residual bootstrap settings are invalid: {exc}")
+        )
 
     def _on_profile_toggled(self, enabled: bool) -> None:
         if self._projecting or self._running:
@@ -1933,15 +1914,12 @@ class ParametersIcsTab(QtWidgets.QWidget):
         if enabled:
             self._open_profile_dialog()
             return
-        try:
-            self.setupSnapshotRequested.emit(
-                self._analysis_snapshot(
-                    profile=None,
-                    bootstrap=setup.residual_bootstrap,
-                )
+        self.setupSnapshotRequested.emit(
+            self._analysis_snapshot(
+                profile=None,
+                bootstrap=setup.residual_bootstrap,
             )
-        except (TypeError, ValueError, OverflowError) as exc:
-            self.statusMessage.emit(f"Profile likelihood settings are invalid: {exc}")
+        )
 
     def _on_bootstrap_toggled(self, enabled: bool) -> None:
         if self._projecting or self._running:
@@ -1955,15 +1933,12 @@ class ParametersIcsTab(QtWidgets.QWidget):
         if enabled:
             self._open_bootstrap_dialog()
             return
-        try:
-            self.setupSnapshotRequested.emit(
-                self._analysis_snapshot(
-                    profile=setup.profile_likelihood,
-                    bootstrap=None,
-                )
+        self.setupSnapshotRequested.emit(
+            self._analysis_snapshot(
+                profile=setup.profile_likelihood,
+                bootstrap=None,
             )
-        except (TypeError, ValueError, OverflowError) as exc:
-            self.statusMessage.emit(f"Residual bootstrap settings are invalid: {exc}")
+        )
 
     def eventFilter(self, watched, event) -> bool:  # noqa: N802 - Qt override
         if watched is getattr(self, "_param_table", None) and event.type() == QtCore.QEvent.KeyPress:

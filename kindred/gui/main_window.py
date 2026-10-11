@@ -12,7 +12,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtCore import Qt
 
 from kindred._version import __version__ as KINDRED_VERSION
-from kindred.gui.display_name_policy import compact_text, literal_tooltip
+from kindred.gui.display_name_policy import compact_text, count_text, literal_tooltip
 from kindred.core.authored_source_errors import AuthoredSourceError
 from kindred.core.dataset_mapping import (
     DatasetMappingError,
@@ -155,7 +155,6 @@ from kindred.io.logging import diagnostic_log_path
 from kindred.io.paths import file_error_text, resolve_export_start_dir
 from kindred.io.resources import (
     PRESET_MECHANISM_TITLES,
-    InterventionExampleCatalogError,
     get_all_intervention_example_specs,
 )
 
@@ -405,11 +404,7 @@ class MainWindow(QtWidgets.QMainWindow):
         """Construct one complete tab surface beneath the permanent root."""
 
         surface_registry = self._workspace_tab_registry
-        target = str(tab_id).strip()
-        if not target:
-            raise ValueError("tab_id must be nonblank.")
-        if target in self._tab_surfaces:
-            raise ValueError(f"Tab surface already exists: {target!r}.")
+        target = tab_id
         editor_panel = EditorPanel(parent=self._mechanism_stack)
         editor = editor_panel.editor
         slider_panel = editor.slider_pane_for_dock()
@@ -703,17 +698,13 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _set_species_color(
         self,
-        species: object,
-        color: object,
-        known_species: object,
+        species: str,
+        color: QtGui.QColor,
+        known_species: tuple[str, ...],
     ) -> None:
         if self._mutation_input_admitted("Change Species Color"):
             try:
-                self.config_controller.set_species_color(
-                    str(species),
-                    color,
-                    tuple(known_species or ()),
-                )
+                self.config_controller.set_species_color(species, color, known_species)
             except OSError as exc:
                 self.set_status_text(str(exc))
 
@@ -767,9 +758,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self._connect_workspace_root()
 
-        application = QtWidgets.QApplication.instance()
-        if isinstance(application, QtWidgets.QApplication):
-            application.focusChanged.connect(self._refresh_actions)
+        QtWidgets.QApplication.instance().focusChanged.connect(self._refresh_actions)
         self._simulation_jobs.state_changed.connect(
             self._on_simulation_state_changed
         )
@@ -825,8 +814,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _mutation_input_admitted(self, action: str | None = None) -> bool:
         """Return whether user mutations may still enter the live shell."""
 
-        controller = getattr(self, "project_controller", None)
-        admitted = bool(controller is None or controller.mutation_admitted)
+        admitted = self.project_controller.mutation_admitted
         if not admitted and action:
             self.set_status_text(
                 f"{action} rejected: application Close is in progress."
@@ -927,6 +915,7 @@ class MainWindow(QtWidgets.QMainWindow):
         plot.ySeriesRequested.connect(
             lambda selections: self._set_y_series(target, selections)
         )
+        plot.yAllSeriesRequested.connect(lambda: self._select_all_y_series(target))
         plot.plotPresentationIntentRequested.connect(
             lambda option, enabled: self._set_plot_presentation(
                 target,
@@ -955,7 +944,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     bundle.slider_binding.reset_project_session()
                     try:
                         self._workspace.plot_for_tab(tab_id).reset_plot_session_state()
-                    except (KeyError, RuntimeError):
+                    except KeyError:
                         pass
             for tab_id in tuple(self._tab_surfaces):
                 if tab_id not in document_ids:
@@ -1259,7 +1248,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         try:
             plot = self._workspace.plot_for_tab(target)
-        except (KeyError, RuntimeError):
+        except KeyError:
             return
         if target in self._plot_membership_refreshing:
             self._render_results_for_tab(target)
@@ -2512,12 +2501,21 @@ class MainWindow(QtWidgets.QMainWindow):
         dialog = QtWidgets.QDialog(self)
         dialog.setWindowTitle(f"Review Exact Correction — {action}")
         layout = QtWidgets.QVBoxLayout(dialog)
-        layout.addWidget(
-            QtWidgets.QLabel(
-                "Review the change before you continue.",
-                dialog,
-            )
+        explanation = (
+            "Your mechanism contains reversible cycles without a closure. A valid mechanism "
+            "requires that one of the parameters in each cycle is defined in terms of the "
+            "other parameters in that cycle."
         )
+        if assessment.proposal is not None:
+            explanation += (
+                " Accept adds the lines shown at the bottom, or use Choose Dependent "
+                "Parameters… to pick which parameters are defined instead."
+                if visible_source is not None
+                else " Accept adds the lines shown at the bottom."
+            )
+        label = QtWidgets.QLabel(explanation, dialog)
+        label.setWordWrap(True)
+        layout.addWidget(label)
         details = QtWidgets.QPlainTextEdit(dialog)
         details.setReadOnly(True)
         details.setPlainText(self._format_exact_correction_assessment(selected_assessment))
@@ -2655,8 +2653,6 @@ class MainWindow(QtWidgets.QMainWindow):
         candidate = document
         try:
             for tab, assessment in corrections:
-                if assessment.proposal is None:
-                    return None
                 proposal = reconcile_tab_mechanism_source(
                     candidate,
                     tab.tab_id,
@@ -2738,6 +2734,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if not self._mutation_input_admitted(description):
             return False
         target = str(tab_id)
+        self._capture_visible_tab_inputs(tab_id=target)
         runtime = self._workspace_tab_registry.tab_runtime(target)
         if (
             runtime.reactions_draft is not None
@@ -2922,7 +2919,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if not self._mutation_input_admitted("Import Dataset"):
             return
         dataset_count = sum(len(config.plans) for config in configs)
-        label = f"{dataset_count} dataset{'s' if dataset_count != 1 else ''}"
+        label = count_text(dataset_count, "dataset")
         self._dataset_import_progress_dialog = QtWidgets.QProgressDialog(
             f"Loading {label}…",
             "Cancel",
@@ -2978,10 +2975,7 @@ class MainWindow(QtWidgets.QMainWindow):
         dialog = self._dataset_import_progress_dialog
         if dialog is None:
             return
-        try:
-            dialog.canceled.disconnect(self._cancel_dataset_import)
-        except (TypeError, RuntimeError):
-            pass
+        dialog.canceled.disconnect(self._cancel_dataset_import)
         dialog.close()
         self._dataset_import_progress_dialog = None
 
@@ -3032,7 +3026,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return
 
         self._refresh_dataset_views()
-        message = f"Imported {len(batch_proposal.records)} raw dataset(s)."
+        message = f"Imported {count_text(len(batch_proposal.records), 'raw dataset')}."
         origin_tab_id = batch_proposal.origin_tab_id
         if origin_tab_id not in self._tab_surfaces:
             self.set_status_text(
@@ -3050,8 +3044,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 message
                 + " Optional mapping was canceled or blocked by visible "
                 "Reactions, so it was skipped."
-                + " Raw data remains committed and unmapped. Fix Reactions, then"
-                + " use Map."
+                + " Raw data remains committed and unmapped."
             )
             return
 
@@ -3093,7 +3086,6 @@ class MainWindow(QtWidgets.QMainWindow):
                 model_targets=model_targets,
             )
             result = self._workspace_tab_registry.replace_tab(
-                origin_tab_id,
                 candidate_tab,
                 expected_token=mapping_expected_token,
             )
@@ -3123,7 +3115,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._tab_surfaces[origin_tab_id].initial_actions.render()
         self._refresh_dataset_views((origin_tab_id,))
         self.set_status_text(
-            message + f" Reviewed mapping applied for {len(batch.proposals)} dataset(s)."
+            message + f" Reviewed mapping applied for {count_text(len(batch.proposals), 'dataset')}."
         )
 
     @QtCore.Slot(str, str)
@@ -3265,13 +3257,10 @@ class MainWindow(QtWidgets.QMainWindow):
             finally:
                 review.deleteLater()
             mapped = apply_dataset_mapping_batch(document=candidate, tab=tab, batch=batch, model_targets=targets)
-            candidate = validate_project_document(candidate.replace_tab(mapped))
+            candidate = candidate.replace_tab(mapped)
             if not self._mutation_input_admitted("Create from Data"):
                 return
-            published = self._workspace_tab_registry.replace_document(candidate, expected_token=token)
-            if published is None:
-                QtWidgets.QMessageBox.warning(editor, "Create from Data", "The project changed during review. Review and create again.")
-                return
+            self._workspace_tab_registry.replace_document(candidate, expected_token=token)
         except (ValueError, TypeError, KeyError) as exc:
             QtWidgets.QMessageBox.warning(editor, "Create from Data", str(exc))
             return
@@ -3280,7 +3269,7 @@ class MainWindow(QtWidgets.QMainWindow):
         bundle.initial_actions.render()
         bundle.slider_binding.render()
         self._refresh_dataset_views()
-        self.set_status_text(f"Created {len(records)} experimental datasets, each with a new mapped initial-condition set.")
+        self.set_status_text(f"Created {count_text(len(records), 'experimental dataset')}, each with a new mapped initial-condition set.")
 
     @QtCore.Slot()
     def _spreadsheet_settled(self) -> None:
@@ -3296,14 +3285,11 @@ class MainWindow(QtWidgets.QMainWindow):
         if not self._mutation_input_admitted("Export Original Dataset"):
             return
         document = self._project_session.document
-        try:
-            record = document.dataset(dataset_id)
-            if record.source_id is None:
-                self.set_status_text("This dataset was created in Kindred and has no original imported file.")
-                return
-            source = document.imported_source(record.source_id)
-        except KeyError:
+        record = document.dataset(dataset_id)
+        if record.source_id is None:
+            self.set_status_text("This dataset was created in Kindred and has no original imported file.")
             return
+        source = document.imported_source(record.source_id)
         try:
             start_directory = resolve_export_start_dir(
                 self._last_export_directory
@@ -3407,8 +3393,6 @@ class MainWindow(QtWidgets.QMainWindow):
                 finally:
                     dialog.deleteLater()
             elif choice is DatasetMappingChoice.MAP_EXISTING:
-                if not set_id:
-                    raise ValueError("Map Existing requires an initial-condition set.")
                 if occupied_choice == OccupiedSetChoice.CANCEL.value:
                     return
                 link = tab.dataset_link(dataset.dataset_id)
@@ -3431,7 +3415,6 @@ class MainWindow(QtWidgets.QMainWindow):
                 model_targets=model_targets,
             )
             result = self._workspace_tab_registry.replace_tab(
-                tab_id,
                 candidate_tab,
                 expected_token=expected_token,
             )
@@ -3486,7 +3469,6 @@ class MainWindow(QtWidgets.QMainWindow):
                 confirmed_mapping=mapping,
             )
             result = self._workspace_tab_registry.replace_tab(
-                tab_id,
                 candidate,
                 expected_token=expected_token,
             )
@@ -3590,6 +3572,17 @@ class MainWindow(QtWidgets.QMainWindow):
                 selected_y_series=selected,
                 selected_y_uses_default_all=False,
             ),
+        )
+        self._refresh_project_state()
+        self._render_results_for_tab(tab_id)
+
+    def _select_all_y_series(self, tab_id: str) -> None:
+        if not self._mutation_input_admitted("Change Y Series"):
+            return
+        state = self._workspace_tab_registry.presentation(tab_id)
+        self._workspace_tab_registry.set_presentation(
+            tab_id,
+            replace(state, selected_y_series=(), selected_y_uses_default_all=True),
         )
         self._refresh_project_state()
         self._render_results_for_tab(tab_id)
@@ -3860,28 +3853,18 @@ class MainWindow(QtWidgets.QMainWindow):
             "Replace the current mechanism with an example of scheduled or "
             "condition-triggered changes."
         )
-        try:
-            intervention_specs = get_all_intervention_example_specs()
-        except InterventionExampleCatalogError as exc:
-            unavailable = interventions.addAction(str(exc))
-            unavailable.setObjectName("interventionExampleCatalogUnavailableAction")
-            unavailable.setEnabled(False)
-            unavailable.setToolTip(literal_tooltip(
-                f"The bundled intervention examples could not be loaded.\n{exc}"
-            ))
-        else:
-            for spec in intervention_specs:
-                example_id = spec.id
-                title = spec.title
-                text = f"{example_id}: {title}" if title else example_id
-                action = interventions.addAction(text)
-                action.setData(example_id)
-                action.setObjectName(f"loadInterventionExample{example_id}Action")
-                action.triggered.connect(
-                    lambda _checked=False, value=example_id: self._load_intervention_example(
-                        value
-                    )
+        for spec in get_all_intervention_example_specs():
+            example_id = spec.id
+            title = spec.title
+            text = f"{example_id}: {title}" if title else example_id
+            action = interventions.addAction(text)
+            action.setData(example_id)
+            action.setObjectName(f"loadInterventionExample{example_id}Action")
+            action.triggered.connect(
+                lambda _checked=False, value=example_id: self._load_intervention_example(
+                    value
                 )
+            )
         examples.addSeparator()
         self._add_action(
             examples,
@@ -4183,6 +4166,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if not self._mutation_input_admitted("Global Fit"):
             return False
         tab_id = self._workspace_tab_registry.active_tab_id
+        self._capture_visible_tab_inputs(tab_id=tab_id)
         if not self._confirm_discard_slider_preview(tab_id, "Global Fit"):
             return False
         if self._accept_visible_source_result(
@@ -4214,12 +4198,7 @@ class MainWindow(QtWidgets.QMainWindow):
             method.addItem(fit_method_label(method_id), method_id)
 
         def select_method(method_id: str) -> None:
-            index = method.findData(method_id)
-            if index < 0:
-                raise ValueError(
-                    f"Unknown canonical fitting method: {method_id!r}."
-                )
-            method.setCurrentIndex(index)
+            method.setCurrentIndex(method.findData(method_id))
 
         select_method(defaults.method)
         max_nfev = QtWidgets.QSpinBox(dialog)
@@ -4331,18 +4310,9 @@ class MainWindow(QtWidgets.QMainWindow):
     def _export_xlsx(self) -> bool:
         if not self._mutation_input_admitted("Export Results XLSX"):
             return False
-        try:
-            blocks = self._canonical_export_blocks(
-                self._workspace_tab_registry.active_tab_id
-            )
-        except (TypeError, ValueError) as exc:
-            self.set_status_text(str(exc))
-            QtWidgets.QMessageBox.critical(
-                self,
-                "Export Results XLSX",
-                str(exc),
-            )
-            return False
+        blocks = self._canonical_export_blocks(
+            self._workspace_tab_registry.active_tab_id
+        )
         if not blocks:
             self.set_status_text("No result data is available to export.")
             return False
@@ -4650,21 +4620,15 @@ class MainWindow(QtWidgets.QMainWindow):
         brand_asset_path = self._about_brand_asset_path()
         dialog.setProperty("brand_asset_path", brand_asset_path)
 
-        try:
-            icon = QtGui.QIcon(str(get_resource_path("assets/kindred.ico")))
-            if not icon.isNull():
-                dialog.setWindowIcon(icon)
-        except FileNotFoundError:
-            pass
+        icon = QtGui.QIcon(str(get_resource_path("assets/kindred.ico")))
+        if not icon.isNull():
+            dialog.setWindowIcon(icon)
 
         brand_label = QtWidgets.QLabel(dialog)
         brand_label.setObjectName("aboutBrandImageLabel")
         brand_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         brand_label.setProperty("brand_asset_path", brand_asset_path)
-        try:
-            pixmap = QtGui.QPixmap(str(get_resource_path(brand_asset_path)))
-        except FileNotFoundError:
-            pixmap = QtGui.QPixmap()
+        pixmap = QtGui.QPixmap(str(get_resource_path(brand_asset_path)))
         if pixmap.isNull():
             brand_label.setText("Kindred")
         else:

@@ -98,8 +98,6 @@ class FactualCause:
     message: str
     context: Mapping[str, object] = field(default_factory=dict)
     details: Mapping[str, object] = field(default_factory=dict)
-    suggestion: str | None = None
-    examples: tuple[str, ...] = ()
     cause: "FactualCause | None" = None
 
     def location(self) -> tuple[object, object]:
@@ -124,16 +122,6 @@ class FactualCause:
             if self.code is not None and str(self.code).strip()
             else None
         )
-        normalized_suggestion = (
-            str(self.suggestion).strip()
-            if self.suggestion is not None and str(self.suggestion).strip()
-            else None
-        )
-        normalized_examples = tuple(
-            str(example)
-            for example in (self.examples or ())
-            if str(example).strip()
-        )
         object.__setattr__(self, "domain", domain)
         object.__setattr__(self, "origin", origin)
         object.__setattr__(self, "code", normalized_code)
@@ -141,8 +129,6 @@ class FactualCause:
         object.__setattr__(self, "message", message)
         object.__setattr__(self, "context", freeze_factual_value(self.context))
         object.__setattr__(self, "details", freeze_factual_value(self.details))
-        object.__setattr__(self, "suggestion", normalized_suggestion)
-        object.__setattr__(self, "examples", normalized_examples)
 
     def to_payload(self) -> dict[str, object]:
         """Serialize this cause tree to mutable JSON-ready data."""
@@ -155,8 +141,6 @@ class FactualCause:
             "message": self.message,
             "context": _plain_value(self.context),
             "details": _plain_value(self.details),
-            "suggestion": self.suggestion,
-            "examples": list(self.examples),
             "cause": (
                 self.cause.to_payload()
                 if self.cause is not None
@@ -227,7 +211,5 @@ def factual_cause_from_exception(
         ),
         context=_context_values(getattr(exc, "context", None)),
         details=details,
-        suggestion=getattr(exc, "suggestion", None),
-        examples=tuple(getattr(exc, "examples", ()) or ()),
         cause=nested,
     )

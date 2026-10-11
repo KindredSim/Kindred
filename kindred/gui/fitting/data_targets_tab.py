@@ -68,10 +68,8 @@ class DataTargetsTab(QtWidgets.QWidget):
         if ds_id == self._current_detail_dataset_id:
             return
         self._current_detail_dataset_id = ds_id
-        select_dataset = getattr(self.data_settings_panel, "select_dataset", None)
-        if callable(select_dataset):
-            select_dataset(
-                ds_id,
-                self.unified_list.dataset_display_name(ds_id),
-            )
+        self.data_settings_panel.select_dataset(
+            ds_id,
+            self.unified_list.dataset_display_name(ds_id),
+        )
         self.species_table.load_for_dataset(ds_id)

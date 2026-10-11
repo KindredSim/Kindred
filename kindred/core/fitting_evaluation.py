@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field, replace
-from typing import Dict, List, Mapping, Optional, Sequence
+from typing import List, Mapping, Sequence
 
 import numpy as np
 
@@ -60,67 +60,10 @@ __all__ = [
 FITTING_PARAM_ORIGIN_OPTIMIZER_SHARED = "optimizer_shared"
 FITTING_PARAM_ORIGIN_OPTIMIZER_DATASET = "optimizer_dataset"
 FITTING_PARAM_ORIGIN_CONFIGURED_DATASET = "configured_dataset"
-FITTING_PARAM_ORIGIN_CONFIGURED_EVALUATOR = "configured_evaluator"
-
-def _parameter_origin_for(name: str, origins: Optional[Mapping[str, str]]) -> str:
-    origin = str((origins or {}).get(name, FITTING_PARAM_ORIGIN_CONFIGURED_EVALUATOR) or "").strip()
-    return origin or FITTING_PARAM_ORIGIN_CONFIGURED_EVALUATOR
-
-
-def _coerce_consumed_parameter_value(
-    *,
-    name: str,
-    raw_value: object,
-    origins: Optional[Mapping[str, str]],
-) -> float:
-    try:
-        value = float(raw_value)  # type: ignore[arg-type]
-    except (TypeError, ValueError, OverflowError) as exc:
-        error_type = (
-            FitCandidateDomainError
-            if _parameter_origin_for(name, origins)
-            in {
-                FITTING_PARAM_ORIGIN_OPTIMIZER_SHARED,
-                FITTING_PARAM_ORIGIN_OPTIMIZER_DATASET,
-            }
-            else FitSimulationError
-        )
-        raise error_type(
-            f"Invalid parameter value for {name!r}: {raw_value!r}",
-            **(
-                {"stage": "parameter_binding"}
-                if error_type is FitCandidateDomainError
-                else {}
-            ),
-            details={
-                "fatal": error_type is FitSimulationError,
-                "parameter_origin": _parameter_origin_for(name, origins),
-            },
-        ) from exc
-    if np.isfinite(value):
-        return value
-    origin = _parameter_origin_for(name, origins)
-    error_type = (
-        FitCandidateDomainError
-        if origin
-        in {
-            FITTING_PARAM_ORIGIN_OPTIMIZER_SHARED,
-            FITTING_PARAM_ORIGIN_OPTIMIZER_DATASET,
-        }
-        else FitSimulationError
-    )
-    raise error_type(
-        f"Nonfinite parameter value for {name!r}: {raw_value!r}",
-        **(
-            {"stage": "parameter_binding"}
-            if error_type is FitCandidateDomainError
-            else {}
-        ),
-        details={
-            "fatal": error_type is FitSimulationError,
-            "parameter_origin": origin,
-        },
-    )
+_OPTIMIZER_ORIGINS = frozenset({
+    FITTING_PARAM_ORIGIN_OPTIMIZER_SHARED,
+    FITTING_PARAM_ORIGIN_OPTIMIZER_DATASET,
+})
 
 
 def _scientific_unavailability_from_exception(
@@ -129,12 +72,10 @@ def _scientific_unavailability_from_exception(
     producer: str,
     stage: str,
 ) -> ScientificUnavailable:
-    details = dict(getattr(exc, "details", None) or {})
     return ScientificUnavailable(
         producer=producer,
         stage=stage,
-        details=details,
-        factual_cause=getattr(exc, "factual_cause", None),
+        details=dict(exc.details),
     )
 
 
@@ -156,16 +97,10 @@ def _known_candidate_unavailability(
             factual_cause=factual_cause_from_exception(exc),
         )
     if isinstance(exc, FitCandidateDomainError):
-        details = getattr(exc, "details", {})
-        stage = (
-            str(details.get("stage", "candidate_evaluation"))
-            if isinstance(details, Mapping)
-            else "candidate_evaluation"
-        )
         return _scientific_unavailability_from_exception(
             exc,
             producer="fit_candidate",
-            stage=stage,
+            stage=exc.details["stage"],
         )
     return None
 
@@ -230,13 +165,6 @@ def prepare_fitting_execution_context(
         and cancellation_control.cancel_requested()
     ):
         raise FittingCancelled()
-    initial_prefix = str(initial_prefix or "init:")
-    mechanism_param_names = [
-        str(name)
-        for name in (param_names or ())
-        if str(name).strip()
-        and not str(name).startswith(initial_prefix)
-    ]
     # The Fit request realized this regular grid on this span before launch.
     regular_grid = build_time_grid(t_start, t_end, prepared_solver_config.grid)
     objective_times = np.asarray(tuple(objective_sample_times), dtype=float).reshape(-1)
@@ -274,7 +202,7 @@ def prepare_fitting_execution_context(
         y0=tuple(float(value) for value in y0),
         t_span=(float(t_start), float(t_end)),
         solver_config=prepared_solver_config,
-        requested_parameter_names=tuple(mechanism_param_names),
+        requested_parameter_names=tuple(param_names),
         use_authored_stops=False,
     )
     if (
@@ -289,9 +217,9 @@ def prepare_fitting_execution_context(
     return PreparedFittingExecutionContext(
         prepared_run=prepared_run,
         requested_sample_times=requested_sample_times,
-        fit_sampling_policy=str(fit_sampling_policy or "fit_internal_regular_grid"),
-        fit_sampling_identity=dict(fit_sampling_identity or {}),
-        initial_prefix=str(initial_prefix),
+        fit_sampling_policy=fit_sampling_policy,
+        fit_sampling_identity=dict(fit_sampling_identity),
+        initial_prefix=initial_prefix,
     )
 
 
@@ -322,7 +250,7 @@ class FittingEvaluator:
     def evaluate_series_with_parameter_origins(
         self,
         params: Mapping[str, float],
-        origins: Optional[Mapping[str, str]] = None,
+        origins: Mapping[str, str],
     ) -> SimulationResultValue | ScientificUnavailable:
         """Evaluate one candidate, returning only natural scientific values.
 
@@ -358,31 +286,12 @@ class FittingEvaluator:
     def _evaluate_series(
         self,
         params: Mapping[str, float],
-        origins: Optional[Mapping[str, str]] = None,
+        origins: Mapping[str, str],
     ) -> SimulationResultValue | SimulationScientificUnavailability:
         self._raise_if_cancel_requested()
-        param_map = {
-            str(name): raw_value
-            for raw_name, raw_value in dict(params or {}).items()
-            for name in (str(raw_name),)
-            if name.strip()
-        }
-        origin_map = dict(origins or {})
-
-        initial_overrides: Dict[str, float] = {}
+        prefix = self._context.initial_prefix
         non_initial_parameters = {
-            str(name): value
-            for name, value in param_map.items()
-            if not str(name).startswith(self._context.initial_prefix)
-        }
-
-        non_initial_parameters = {
-            name: _coerce_consumed_parameter_value(
-                name=name,
-                raw_value=value,
-                origins=origin_map,
-            )
-            for name, value in non_initial_parameters.items()
+            name: value for name, value in params.items() if not name.startswith(prefix)
         }
         prepared_request = self._context.prepared_run.request
         try:
@@ -398,11 +307,7 @@ class FittingEvaluator:
             )
         except SimulationPreparationError as exc:
             if exc.stage == "ordinary_parameter_domain" and exc.parameter_names and all(
-                _parameter_origin_for(name, origin_map) in {
-                    FITTING_PARAM_ORIGIN_OPTIMIZER_SHARED,
-                    FITTING_PARAM_ORIGIN_OPTIMIZER_DATASET,
-                }
-                for name in exc.parameter_names
+                origins[name] in _OPTIMIZER_ORIGINS for name in exc.parameter_names
             ):
                 raise FitCandidateDomainError(
                     str(exc), stage=exc.stage,
@@ -423,29 +328,13 @@ class FittingEvaluator:
                 stage="candidate_preparation",
             ) from exc
 
-        symbolic_jacobian = prepared_run.symbolic_jacobian
-
         species_index = {
             name: idx for idx, name in enumerate(prepared_run.species_names)
         }
-        for key, raw_val in param_map.items():
-            name = str(key)
-            if name.startswith(self._context.initial_prefix):
-                species_name = name[len(self._context.initial_prefix) :]
-                if species_name not in species_index:
-                    continue
-                initial_overrides[species_name] = _coerce_consumed_parameter_value(
-                    name=name,
-                    raw_value=raw_val,
-                    origins=origin_map,
-                )
-
         y0 = np.asarray(prepared_run.y0, dtype=float).copy()
-        for species_name, value in initial_overrides.items():
-            idx = species_index.get(species_name)
-            if idx is None:
-                continue
-            y0[idx] = float(value)
+        for name, value in params.items():
+            if name.startswith(prefix):
+                y0[species_index[name[len(prefix):]]] = value
 
         # Candidate preparation resolves and compiles every schedule (an empty
         # one included) while its admitted target map is alive.

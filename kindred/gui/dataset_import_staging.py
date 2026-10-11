@@ -20,7 +20,6 @@ from kindred.core.datasets.foundation import (
     ImportedSource,
     RawDatasetRecord,
     thaw_json_value,
-    validate_raw_dataset_record,
 )
 from kindred.gui.controllers.dataset_errors import (
     DatasetImportAdmissionError,
@@ -270,7 +269,6 @@ def build_raw_record_batch_proposal(
             source_metadata=unit.payload.source_metadata,
             observations=unit.payload.observations,
         )
-        validate_raw_dataset_record(candidate)
         candidates.append(candidate)
     return RawDatasetBatchProposal(
         origin_tab_id=completion.origin_tab_id,

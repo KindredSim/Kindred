@@ -44,7 +44,7 @@ def check_scientific_runtime() -> None:
     if not sysconfig.get_config_var("Py_GIL_DISABLED"):
         raise RuntimeError("The fitting interpreter is not a free-threaded build.")
     if sys._is_gil_enabled():
-        raise RuntimeError("The fitting runtime enabled the GIL. Check its native dependencies.")
+        raise RuntimeError("The fitting runtime enabled the GIL.")
     forbidden = [
         name for name in sys.modules
         if name.lower().startswith(("pyside", "shiboken", "pyqtgraph"))

@@ -14,7 +14,6 @@ __all__ = ["insert_scalar_source_declarations"]
 
 # The parser owns semantic admission; insertion only needs the identifier
 # guard for newly materialized scalar declarations.
-_DSL_IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
 def insert_scalar_source_declarations(
@@ -23,29 +22,11 @@ def insert_scalar_source_declarations(
 ) -> str:
     """Insert one deterministic scalar block without rewriting authored bytes."""
 
-    if type(source_text) is not str:
-        raise TypeError("source_text must be an exact str.")
-    if not isinstance(corrections, Mapping):
-        raise TypeError("Visible scalar corrections must be a mapping.")
+    # The single caller passes exact correction output.
     if not corrections:
         return source_text
     newline_match = re.search(r"\r\n|\r|\n", source_text)
     ending = newline_match.group(0) if newline_match is not None else "\n"
-    for name, expression in corrections.items():
-        if (
-            type(name) is not str
-            or name != name.strip()
-            or _DSL_IDENTIFIER_RE.fullmatch(name) is None
-            or type(expression) is not str
-            or not expression.strip()
-            or "\r" in name
-            or "\n" in name
-            or "\r" in expression
-            or "\n" in expression
-        ):
-            raise ValueError(
-                "Visible scalar corrections must be single-line exact text."
-            )
     existing = {
         str(match.group("name"))
         for line in source_text.splitlines()

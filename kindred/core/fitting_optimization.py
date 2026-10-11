@@ -15,13 +15,11 @@ from typing import Callable, Dict, Literal, Mapping, Optional, Tuple
 
 import numpy as np
 
-from kindred.core.analysis.fit_statistics import finite_sum_of_squares
 from kindred.core.exceptions import (
     FittingCancelled,
     FitSimulationError,
     KineticRuntimeDomainError,
     OptimizationError,
-    SimulationCancelled,
 )
 from kindred.core.optimization_de import (
     DifferentialEvolutionBudgetExhausted,
@@ -78,13 +76,6 @@ def fit_bound_position(
     return position
 
 
-def _is_cancelled_error(exc: BaseException) -> bool:
-    # Cancellation is an explicit typed outcome. Never infer it from an
-    # arbitrary exception message, which could hide a real solver/programming
-    # failure containing the word "cancel".
-    return isinstance(exc, (KeyboardInterrupt, FittingCancelled, SimulationCancelled))
-
-
 @dataclass
 class FitResult:
     """Results from parameter fitting."""
@@ -94,19 +85,13 @@ class FitResult:
     message: str
     identifiability_warning: Optional[str] = None
 
-    def __post_init__(self) -> None:
-        self.parameters = {
-            name: float(value) for name, value in self.parameters.items()
-        }
-        self.success = bool(self.success)
-
 
 def fit_parameters_with_fixed(
     objective_func: Callable[[np.ndarray], np.ndarray],
     initial_params: Dict[object, float],
     *,
     fixed_parameters: Dict[object, float],
-    bounds: Optional[Dict[object, Tuple[float, float]]] = None,
+    bounds: Dict[object, Tuple[float, float]],
     method: str,
     max_nfev: int = 1000,
     ftol: float,
@@ -124,11 +109,9 @@ def fit_parameters_with_fixed(
     # and one of its admitted bounds.
     initial = {name: float(value) for name, value in initial_params.items()}
     fixed = {name: float(value) for name, value in fixed_parameters.items()}
-    bound_map = dict(bounds or {})
-
     names = tuple(initial)
     free = {name: value for name, value in initial.items() if name not in fixed}
-    free_bounds = {name: bound_map[name] for name in free if name in bound_map}
+    free_bounds = {name: bounds[name] for name in free}
 
     def full_vector(values: Mapping[str, float]) -> np.ndarray:
         return np.asarray(
@@ -176,7 +159,7 @@ def fit_parameters_with_fixed(
 def fit_parameters(
     objective_func: Callable[[np.ndarray], np.ndarray],
     initial_params: Dict[object, float],
-    bounds: Optional[Dict[object, Tuple[float, float]]] = None,
+    bounds: Dict[object, Tuple[float, float]],
     max_nfev: int = 1000,
     seed: Optional[int] = None,
     *,
@@ -184,7 +167,6 @@ def fit_parameters(
     xtol: float,
     method: str,
     cancellation_check: Callable[[], bool] | None = None,
-    de_penalty: float | None = None,
 ) -> FitResult:
     """Fit parameters, interpreting ``ftol`` as native DE ``tol`` for DE runs."""
 
@@ -193,9 +175,9 @@ def fit_parameters(
     param_names = list(initial_params.keys())
     # Starts are admitted values or optimizer results inside their admitted
     # finite ordered bounds.
-    x0 = np.asarray([float(initial_params[name]) for name in param_names], dtype=float)
-    lower = np.asarray([float(bounds[name][0]) for name in param_names], dtype=float)
-    upper = np.asarray([float(bounds[name][1]) for name in param_names], dtype=float)
+    x0 = np.asarray([initial_params[name] for name in param_names], dtype=float)
+    lower = np.asarray([bounds[name][0] for name in param_names], dtype=float)
+    upper = np.asarray([bounds[name][1] for name in param_names], dtype=float)
     scipy_bounds = (lower, upper)
 
     de_evaluation_budget: DifferentialEvolutionEvaluationBudget | None = None
@@ -209,7 +191,6 @@ def fit_parameters(
     try:
         if method == "differential_evolution":
             _least_squares, differential_evolution = load_scipy_optimize()
-            effective_penalty = float(de_penalty) if de_penalty is not None else 1e12
             de_evaluation_budget = DifferentialEvolutionEvaluationBudget(max_nfev)
             best_de_score: float | None = None
             best_de_params: np.ndarray | None = None
@@ -227,29 +208,16 @@ def fit_parameters(
 
             def de_objective(params):
                 nonlocal best_de_score, best_de_params
-                try:
-                    residuals = evaluate_de_residuals(params, reserve=1)
-                except FittingCancelled:
-                    raise
-                except (FitSimulationError, KineticRuntimeDomainError):
-                    raise
-                else:
-                    if residuals.size == 0 or not np.all(np.isfinite(residuals)):
-                        raise OptimizationError(
-                            "Fit objective returned empty or nonfinite residuals."
-                        )
-                    finite_score = finite_sum_of_squares(residuals)
-                    score = (
-                        float(effective_penalty)
-                        if finite_score is None
-                        else float(finite_score)
-                    )
-                    if best_de_score is None or score < best_de_score:
-                        best_de_score = score
-                        best_de_params = np.asarray(params, dtype=float).copy()
-                    return score
+                # The Fit objective returns finite residuals with a finite
+                # sum of squares.
+                residuals = evaluate_de_residuals(params, reserve=1)
+                score = float(np.dot(residuals, residuals))
+                if best_de_score is None or score < best_de_score:
+                    best_de_score = score
+                    best_de_params = np.asarray(params, dtype=float).copy()
+                return score
 
-            dim = max(1, len(x0))
+            dim = len(x0)
             result = None
             if de_evaluation_budget.limit > 1:
                 popsize, maxiter = compute_de_popsize_maxiter(
@@ -279,7 +247,7 @@ def fit_parameters(
             if result is not None:
                 x_opt = np.asarray(result.x, dtype=float)
                 success = bool(result.success)
-                message = str(result.message)
+                message = result.message
             else:
                 x_opt = (
                     np.asarray(best_de_params, dtype=float).copy()
@@ -320,41 +288,34 @@ def fit_parameters(
 
             x_opt = result.x
             success = bool(result.success)
-            message = str(result.message)
+            message = result.message
             if result.status == 1:
                 message = "Fit stopped at zero computed first-order optimality."
-            try:
-                J = np.asarray(result.jac, dtype=float)
-                param_count = len(x_opt)
-                # Rank of the column-scaled Jacobian, so parameters on very
-                # different scales are not mistaken for dependent ones.
-                # All-zero columns stay zero and count as deficient.
-                norms = np.linalg.norm(J, axis=0)
-                scaled = np.divide(J, norms, out=np.zeros_like(J), where=norms > 0.0)
-                rank = int(np.linalg.matrix_rank(scaled, rtol=_JACOBIAN_RANK_RTOL))
-                if rank < param_count:
-                    identifiability_warning = (
-                        "These data cannot determine every fitted value independently. "
-                        f"The fit Jacobian has rank {rank} for {param_count} fitted value{'' if param_count == 1 else 's'}."
-                    )
-            except Exception as exc:
-                logger.debug("Failed to assess Fit Jacobian rank: %s", exc)
+            J = np.asarray(result.jac, dtype=float)
+            param_count = len(x_opt)
+            # Rank of the column-scaled Jacobian, so parameters on very
+            # different scales are not mistaken for dependent ones.
+            # All-zero columns stay zero and count as deficient.
+            norms = np.linalg.norm(J, axis=0)
+            scaled = np.divide(J, norms, out=np.zeros_like(J), where=norms > 0.0)
+            rank = int(np.linalg.matrix_rank(scaled, rtol=_JACOBIAN_RANK_RTOL))
+            if rank < param_count:
+                identifiability_warning = (
+                    "These data cannot determine every fitted value independently. "
+                    f"The fit Jacobian has rank {rank} for {param_count} fitted value{'' if param_count == 1 else 's'}."
+                )
     except FittingCancelled:
         raise
     except (FitSimulationError, KineticRuntimeDomainError):
         raise
     except Exception as exc:
-        if _is_cancelled_error(exc):
-            raise FittingCancelled() from exc
         logger.error("Fitting failed: %s", exc, exc_info=True)
-        raise OptimizationError(f"Fitting failed: {exc}") from exc
+        raise OptimizationError(str(exc)) from exc
 
-    fitted_params = {name: val for name, val in zip(param_names, x_opt)}
-
-    terminal_success = bool(success)
+    fitted_params = {name: float(val) for name, val in zip(param_names, x_opt)}
 
     return FitResult(
-        success=terminal_success,
+        success=success,
         parameters=fitted_params,
         message=message,
         identifiability_warning=identifiability_warning,

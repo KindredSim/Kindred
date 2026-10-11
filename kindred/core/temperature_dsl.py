@@ -30,23 +30,7 @@ __all__ = ["parse_temperature_schedule", "TemperatureDSLError"]
 
 
 class TemperatureDSLError(AuthoredSourceError):
-    """
-    Enhanced error for temperature schedule DSL parsing.
-
-    Provides helpful context and examples for common mistakes.
-    """
-    def __init__(self, message: str, *, examples: list = None):
-        self.message = message
-        self.examples = examples or []
-
-        # Build comprehensive error message
-        parts = [message]
-        if examples:
-            parts.append("\nValid examples:")
-            for ex in examples:
-                parts.append(f"  • {ex}")
-
-        super().__init__("\n".join(parts))
+    """Temperature schedule DSL parsing error."""
 
 
 def _parse_finite_number(text: str, *, field: str) -> float:
@@ -252,22 +236,10 @@ def _parse_piecewise_temperature(
 
     # Validate
     if len(times) < 2:
-        raise TemperatureDSLError(
-            "t needs at least two time points.",
-            examples=[
-                "t=[0,100], T=[298]  (one interval)",
-                "t=[0,50,100], T=[298,350]  (two intervals)"
-            ]
-        )
+        raise TemperatureDSLError("t needs at least two time points.")
 
     if len(temperatures) != len(times) - 1:
-        raise TemperatureDSLError(
-            "T must have one temperature fewer than t has time points.",
-            examples=[
-                "t=[0,50,100], T=[298,350]  (2 intervals: [0,50)→298K, [50,100)→350K)",
-                "t=[0,25,50,75], T=[298,310,320]  (3 intervals)"
-            ]
-        )
+        raise TemperatureDSLError("T must have one temperature fewer than t has time points.")
 
     # Build intervals: [(t_start, t_end, T), ...]
     intervals = []
@@ -310,8 +282,6 @@ def _parse_response_temperature(
         fields["T"], field="temp_response T"
     )
     tau = _parse_finite_number(fields["tau"], field="temp_response tau")
-    if tau <= 0:
-        raise TemperatureDSLError("tau must be positive.")
     if len(times) < 2:
         raise TemperatureDSLError("t needs at least two time points.")
     if len(temperatures) != len(times) - 1:

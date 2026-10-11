@@ -7,6 +7,7 @@ labels into labels, tabs, list rows, status/footer messages, or plot titles.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from html import escape
 import re
@@ -179,3 +180,27 @@ def dataset_alias(index: int, *, prefix: str = "D") -> str:
     except (TypeError, ValueError):
         idx = 0
     return f"{str(prefix or 'D')}{max(0, idx) + 1}"
+
+
+def reaction_text(context: str) -> str:
+    """Authored reaction text with display arrows: → and ⇌."""
+
+    return context.replace("<=>", "⇌").replace("<->", "⇌").replace("->", "→")
+
+
+_SMALL_COUNTS = ("zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten")
+
+
+def count_text(count: int, noun: str) -> str:
+    """``count`` and ``noun`` in prose: counts of ten or fewer are spelled out."""
+
+    word = _SMALL_COUNTS[count] if 0 <= count <= 10 else str(count)
+    return f"{word} {noun if count == 1 else noun + 's'}"
+
+
+def and_join(items: Sequence[str]) -> str:
+    """English list with the serial comma."""
+
+    if len(items) < 3:
+        return " and ".join(items)
+    return ", ".join(items[:-1]) + ", and " + items[-1]

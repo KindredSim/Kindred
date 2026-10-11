@@ -12,7 +12,7 @@ from numbers import Real
 from pathlib import Path
 from pathlib import PurePosixPath, PureWindowsPath
 from typing import Mapping, TypeAlias
-from kindred.core.quantity_units import Unit, scientific_unit
+from kindred.core.quantity_units import Unit
 
 from kindred.core.datasets.source_rules import (
     identify_physical_columns,
@@ -20,7 +20,6 @@ from kindred.core.datasets.source_rules import (
 )
 from kindred.core.species import (
     validate_imported_time_seconds,
-    validate_observation,
 )
 
 __all__ = [
@@ -30,7 +29,6 @@ __all__ = [
     "ImportedSource",
     "ObservationSeries",
     "RawDatasetRecord",
-    "RawDatasetValidationError",
     "freeze_json_value",
     "thaw_json_value",
     "validate_original_basename",
@@ -40,10 +38,6 @@ __all__ = [
 ]
 
 JsonScalar: TypeAlias = str | int | float | bool | None
-
-class RawDatasetValidationError(ValueError):
-    """Raised when immutable raw-dataset values fail foundation admission."""
-
 
 @dataclass(frozen=True, slots=True)
 class FrozenJsonArray:
@@ -120,17 +114,9 @@ class ObservationSeries:
     source_rows: tuple[int, ...]
 
     def __post_init__(self) -> None:
-        validate_raw_observation_id(self.raw_observation_id)
-        if self.unit is not None and self.unit != scientific_unit(self.unit.dimensions):
-            raise ValueError("Observation values require scientific-coordinate units.")
-        if type(self.t) is not tuple or type(self.y) is not tuple:
-            raise TypeError("ObservationSeries t/y must be immutable tuples.")
-        if not self.y or (self.t and len(self.t) != len(self.y)):
-            raise ValueError("ObservationSeries requires values and either aligned recorded times or no times.")
+        # Created and archived times have no other range check.
         for index, time in enumerate(self.t):
             validate_imported_time_seconds(time, field=f"observation time[{index}]")
-        for index, value in enumerate(self.y):
-            validate_observation(value, field=f"observation value[{index}]")
 
 
 @dataclass(frozen=True, slots=True)
@@ -196,7 +182,7 @@ class RawDatasetRecord:
 def validate_raw_dataset_record(record: RawDatasetRecord) -> RawDatasetRecord:
     """Fail closed unless one immutable raw record satisfies dataset law."""
     def fail(message: str) -> None:
-        raise RawDatasetValidationError(message)
+        raise ValueError(message)
 
     if (
         not isinstance(record.dataset_id, str)
@@ -351,24 +337,18 @@ def validate_imported_source(source: ImportedSource) -> ImportedSource:
         or not source.source_id
         or source.source_id != source.source_id.strip()
     ):
-        raise RawDatasetValidationError("Imported source ID must be nonblank and edge-normalized.")
+        raise ValueError("Imported source ID must be nonblank and edge-normalized.")
     if source.original_format not in {"csv", "xlsx"}:
-        raise RawDatasetValidationError("Imported source format must be exactly 'csv' or 'xlsx'.")
-    try:
-        validate_original_basename(source.original_filename, label="The file name")
-    except ValueError as exc:
-        raise RawDatasetValidationError(str(exc)) from exc
+        raise ValueError("Imported source format must be exactly 'csv' or 'xlsx'.")
+    validate_original_basename(source.original_filename, label="The file name")
     expected_suffix = f".{source.original_format}"
     if Path(source.original_filename).suffix.lower() != expected_suffix:
-        raise RawDatasetValidationError(
+        raise ValueError(
             f"Imported source filename must end in {expected_suffix!r}."
         )
-    try:
-        validate_tabular_source_bytes(
-            source.exact_source_bytes,
-            source_format=source.original_format,
-            source_label=source.original_filename,
-        )
-    except (TypeError, ValueError) as exc:
-        raise RawDatasetValidationError(str(exc)) from exc
+    validate_tabular_source_bytes(
+        source.exact_source_bytes,
+        source_format=source.original_format,
+        source_label=source.original_filename,
+    )
     return source

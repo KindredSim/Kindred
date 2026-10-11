@@ -379,8 +379,6 @@ class ProjectController(QtCore.QObject):
             discard_parts.append("Invalid Edit(s)")
         if transient.slider_drafts:
             discard_parts.append("Slider Preview")
-        if not discard_parts and not transient.has_active_work:
-            raise RuntimeError("Disposition prompt has no discardable work.")
         if not discard_parts:
             discard_subject = ""
         elif len(discard_parts) == 1:
@@ -626,11 +624,8 @@ class ProjectController(QtCore.QObject):
         ):
             return None
         if not choose_destination:
-            current_path = self._session.current_path
-            if current_path is None:
-                raise RuntimeError("Current project path is unavailable.")
             return self._write_project(
-                current_path,
+                self._session.current_path,
                 candidate,
                 materialized_by_tab,
                 expected_token=expected_token,
@@ -695,15 +690,7 @@ class ProjectController(QtCore.QObject):
             action="Save Project",
         ):
             return None
-        try:
-            absolute_path = os.path.abspath(os.fsdecode(os.fspath(path)))
-        except (TypeError, ValueError, OSError) as exc:
-            self._show_error(
-                "Save Error",
-                f"Invalid project destination:\n\n{exc}",
-            )
-            return None
-        if self._scan.owns_destination(absolute_path):
+        if self._scan.owns_destination(path):
             self._show_error("Save Error", "Cannot overwrite the destination of an active Chemical Space Scan.")
             return None
         committed_token = self._commit_saved_document(
@@ -719,24 +706,24 @@ class ProjectController(QtCore.QObject):
         try:
             presentation = self._tabs.workspace_presentation()
             self._archive_store.save(
-                absolute_path,
+                path,
                 candidate,
                 presentation,
             )
         except Exception as exc:
             self._show_error(
                 "Save Error",
-                f"Failed to save project:\n\n{file_error_text(exc, absolute_path)}",
+                f"Failed to save project:\n\n{file_error_text(exc, path)}",
             )
             return None
         self._session.mark_saved(
-            absolute_path,
+            path,
             presentation,
             expected_token=committed_token,
         )
-        status = f"Saved project: {absolute_path}"
+        status = f"Saved project: {path}"
         try:
-            self._config.record_recent_project(absolute_path)
+            self._config.record_recent_project(path)
         except Exception as exc:
             logger.warning("Recent-project update failed", exc_info=True)
             status += f". Updating the recent projects list failed: {exc}"

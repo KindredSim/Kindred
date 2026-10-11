@@ -122,10 +122,6 @@ class Equilibrium:
     authority: EquilibriumRateAuthority = field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
-        if not self.stoich_forward:
-            raise ValueError("stoich_forward cannot be empty")
-        if not self.stoich_back:
-            raise ValueError("stoich_back cannot be empty")
         object.__setattr__(
             self,
             "stoich_forward",

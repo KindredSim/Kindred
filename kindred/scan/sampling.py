@@ -11,7 +11,6 @@ import warnings
 import numpy as np
 from scipy.stats import qmc
 
-from kindred.core.algebra.errors import AlgebraError
 from kindred.scan.config import ScanConfig, RunInput, input_label
 from kindred.scan.inputs import input_catalog, admitted_ranges
 from kindred.scan.intervals import Interval
@@ -105,7 +104,7 @@ class InputDesign:
             for key, value in values.items():
                 if not any(interval.contains(value) for interval in self.ranges[key]):
                     raise ValueError(f"Calculated {input_label(key)} = {value:g} cannot be represented inside its allowed ranges.")
-        except (ValueError, OverflowError, ZeroDivisionError) as exc:
+        except (ValueError, OverflowError) as exc:
             if isinstance(exc, InputGenerationError):
                 values.update(exc.values)
             raise InputGenerationError(str(exc), {k: v for k, v in values.items() if math.isfinite(v)}) from exc
@@ -183,18 +182,11 @@ class PreparedScanDesign:
         cfg = self.config
         if cfg.requested <= 0 or cfg.seed < 0:
             raise ValueError("Request a positive simulation count and a nonnegative seed.")
-        if cfg.workers <= 0:
-            raise ValueError("Use at least one local worker.")
-        if cfg.sampler not in {"sobol", "lhs"}:
-            raise ValueError("Choose Sobol or Latin hypercube sampling.")
         if not cfg.outputs:
             raise ValueError("Select at least one exported species or authored quantity.")
         self.check()
         prepared = self.prepared
         self.catalog = input_catalog(prepared, cfg)
-        available_outputs = set(prepared.analysis.species_names) | set(prepared.parameter_algebra_spec_for_execution().observable_names)
-        if set(cfg.outputs) - available_outputs:
-            raise ValueError("An exported quantity is absent from the captured mechanism.")
         all_ranges = admitted_ranges(self.catalog, cfg)
         self.fixed = {item.key: item.value for item in self.catalog if item.key not in cfg.ranges}
         ranges = {key: intervals for key, intervals in all_ranges.items() if key in cfg.ranges}
@@ -225,7 +217,7 @@ class PreparedScanDesign:
             return
         for key, expression in derived.items():
             if any(k.startswith("initial:") != key.startswith("initial:") for k in expression.terms):
-                raise ValueError(f"Calculated {input_label(key)} depends on the other group. These inputs cannot be reused unchanged. Use joint sampling.")
+                raise ValueError(f"Calculated {input_label(key)} depends on the other group. These inputs cannot be reused unchanged. Choose Joint sampling in Exploration.")
 
         def group_of(key):
             return "initial" if key.startswith("initial:") else "parameter"
@@ -269,7 +261,7 @@ class PreparedScanDesign:
                                         [(k, v) for k, v in endpoints if k in keys[second]],
                                         quotas[second], self.check)
         except ValueError as exc:
-            raise ValueError(f"The generated {first} sets have no usable common {second} design: {exc} Use joint sampling or change the ranges/grouping.") from exc
+            raise ValueError(f"No reusable {second} sets fit every generated {first} set. Choose Joint sampling in Exploration.") from exc
         self.effective_ranges.update(second_design.marginals)
         for _ in self._materialize(second_design, self.groups[second], counts[second], seeds[second]):
             pass
@@ -282,7 +274,7 @@ class PreparedScanDesign:
                 values = design.draw(index, unit)
                 if first_group:
                     self.interval_checks.admit(self.fixed | values, first_group=True)
-            except (ValueError, AlgebraError, OverflowError, ZeroDivisionError) as exc:
+            except (ValueError, OverflowError) as exc:
                 if isinstance(exc, InputGenerationError):
                     values.update(exc.values)
                 storage.record(index, values, str(exc))
@@ -307,7 +299,7 @@ class PreparedScanDesign:
                     if not error:
                         try:
                             self.interval_checks.admit(values)
-                        except (ValueError, AlgebraError, OverflowError, ZeroDivisionError) as exc:
+                        except (ValueError, OverflowError) as exc:
                             error = str(exc)
                     yield RunInput(p * cfg.initial_sets + c + 1, values, p + 1, c + 1, error)
         else:
@@ -317,7 +309,7 @@ class PreparedScanDesign:
                 try:
                     values = self.joint.draw(index, unit)
                     self.interval_checks.admit(self.fixed | values)
-                except (ValueError, AlgebraError, OverflowError, ZeroDivisionError) as exc:
+                except (ValueError, OverflowError) as exc:
                     if isinstance(exc, InputGenerationError):
                         values.update(exc.values)
                     yield RunInput(index + 1, self.fixed | values, generation_error=str(exc))

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-import math
 from typing import TypeAlias
 
 from kindred.core.project_document import (
@@ -146,25 +145,6 @@ class ProjectPresentationState:
             for raw_observation_id in raw_observation_ids
         )
         selected_x = self.selected_x_series
-        if not isinstance(
-            selected_x,
-            (SimulationSeriesAxisSelection, ExperimentalAxisSelection, VesselVolumeAxisSelection),
-        ):
-            raise TypeError(
-                "selected_x_series must be a typed simulation or "
-                "experimental axis selection."
-            )
-        if not isinstance(self.selected_y_series, tuple) or any(
-            not isinstance(
-                selection,
-                (SimulationSeriesAxisSelection, ExperimentalAxisSelection, VesselVolumeAxisSelection),
-            )
-            for selection in self.selected_y_series
-        ):
-            raise TypeError(
-                "selected_y_series must be a tuple of typed simulation or "
-                "experimental axis selections."
-            )
         # Selected X is accepted presentation identity, not a request to pick
         # whichever physical axis happens to remain available now.  Keep it
         # through temporary mechanism/overlay gaps so result projection can
@@ -303,14 +283,6 @@ def _validate_axis_selection(
     experimental_series: frozenset[ExperimentalAxisSelection],
     allow_unavailable: bool = False,
 ) -> None:
-    if not isinstance(
-        value,
-        (SimulationSeriesAxisSelection, ExperimentalAxisSelection, VesselVolumeAxisSelection),
-    ):
-        raise TypeError(
-            f"{label} must be a typed simulation or experimental axis "
-            "selection."
-        )
     if allow_unavailable or _axis_selection_is_current(
         value,
         simulation_series=simulation_series,
@@ -334,33 +306,10 @@ def validate_project_presentation_state(
     tab: MechanismTabDocument,
     state: ProjectPresentationState,
 ) -> ProjectPresentationState:
-    if not isinstance(state, ProjectPresentationState):
-        raise TypeError("state must be ProjectPresentationState.")
-    if (
-        state.current_set_id is not None
-        and not isinstance(state.current_set_id, str)
-    ):
-        raise TypeError("current_set_id must be a str or None.")
-    for field_name in (
-        "selected_y_uses_default_all",
-        "reference_lines_visible",
-        "intervention_annotations_visible",
-        "intervention_labels_visible",
-        "log_x",
-        "log_y",
-        "legend_visible",
-        "x_inverted",
-        "y_inverted",
-        "grid_x",
-        "grid_y",
-        "simulation_markers",
-    ):
-        if type(getattr(state, field_name)) is not bool:
-            raise TypeError(f"{field_name} must be a bool.")
+    # Archive decoding and the typed GUI producers admit field types.
     for field_name in ("grid_opacity", "simulation_opacity"):
-        value = getattr(state, field_name)
-        if type(value) not in (int, float) or not math.isfinite(value) or not 0 <= value <= 1:
-            raise ValueError(f"{field_name} must be a finite number between 0 and 1.")
+        if not 0 <= getattr(state, field_name) <= 1:
+            raise ValueError(f"{field_name} must be a number between 0 and 1.")
     if state.plot_transform not in ("original", "derivative", "phase"):
         raise ValueError("plot_transform must be original, derivative, or phase.")
     set_ids = {item.set_id for item in tab.initial_condition_sets}
@@ -416,10 +365,6 @@ def validate_project_presentation_state(
             for series in dataset.observations
         }
         for raw_observation_id in raw_observation_ids:
-            validate_raw_observation_id(
-                raw_observation_id,
-                "overlay raw observation ID",
-            )
             if raw_observation_id not in available:
                 raise ValueError(
                     "Overlay references missing raw observation ID "
@@ -440,8 +385,6 @@ def validate_project_presentation_state(
         experimental_series=experimental_series,
         allow_unavailable=True,
     )
-    if not isinstance(state.selected_y_series, tuple):
-        raise TypeError("selected_y_series must be a tuple.")
     if len(state.selected_y_series) != len(set(state.selected_y_series)):
         raise ValueError("Selected Y series must be unique.")
     for index, selection in enumerate(state.selected_y_series):
@@ -465,25 +408,7 @@ def reconcile_workspace_presentation_state(
 ) -> WorkspacePresentationState:
     """Reconcile current choices while retaining accepted selected-X identity."""
 
-    if not isinstance(state, WorkspacePresentationState):
-        raise TypeError("state must be WorkspacePresentationState.")
-    document.tab(state.active_tab_id)
     entries = state.presentation_by_tab_id
-    ids = [tab_id for tab_id, _ in entries]
-    document_ids = [tab.tab_id for tab in document.tabs]
-    if ids != document_ids:
-        raise ValueError(
-            "Workspace presentation must contain every tab exactly once "
-            "in document order."
-        )
-    if any(
-        not isinstance(tab_state, ProjectPresentationState)
-        for _tab_id, tab_state in entries
-    ):
-        raise TypeError(
-            "Workspace presentation entries must contain "
-            "ProjectPresentationState values."
-        )
     return validate_workspace_presentation_state(
         document,
         WorkspacePresentationState(
@@ -506,10 +431,6 @@ def validate_workspace_presentation_state(
     document: ProjectDocument,
     state: WorkspacePresentationState,
 ) -> WorkspacePresentationState:
-    if not isinstance(state, WorkspacePresentationState):
-        raise TypeError(
-            "state must be WorkspacePresentationState."
-        )
     document.tab(state.active_tab_id)
     entries = state.presentation_by_tab_id
     ids = [tab_id for tab_id, _ in entries]

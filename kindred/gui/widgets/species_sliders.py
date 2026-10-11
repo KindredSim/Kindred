@@ -94,17 +94,9 @@ class BatchSpeciesSliders(QtWidgets.QWidget):
         preserve_editor_drafts: bool = True,
     ) -> None:
         normalized: dict[str, float] = {}
-        for raw_name, raw_value in values.items():
-            name = str(raw_name)
-            value = float(raw_value)
-            if not name:
-                raise ValueError("Species Slider names must be nonblank.")
-            if not math.isfinite(value) or value < 0.0:
-                raise ValueError(
-                    f"Species Slider value for {name!r} must be finite "
-                    "and nonnegative."
-                )
-            normalized[name] = value
+        # The Slider runtime admitted these names and concentrations.
+        for name, value in values.items():
+            normalized[name] = float(value)
         self._reconcile_visibility_scope(set(normalized))
         self._target_set_ids = tuple(str(item) for item in target_set_ids)
         self._values = normalized
@@ -400,31 +392,24 @@ class BatchSpeciesSliders(QtWidgets.QWidget):
                 row.slider.setValue(self._value_to_position(value_f, row.maximum))
             finally:
                 del blocker
-        if isinstance(row.value_label, NumericValueEdit):
-            if editor_text is not None:
-                self._set_editor_text(row.value_label, editor_text)
-            elif not row.value_label.hasFocus():
-                self._set_editor_text(
-                    row.value_label,
-                    format_slider_value(value_f),
-                )
-            self._decorate_editor(species_s)
+        if editor_text is not None:
+            self._set_editor_text(row.value_label, editor_text)
+        elif not row.value_label.hasFocus():
+            self._set_editor_text(
+                row.value_label,
+                format_slider_value(value_f),
+            )
+        self._decorate_editor(species_s)
         if emit:
-            if not isinstance(interaction, SliderInteractionKind):
-                raise TypeError("emitted Slider values require an interaction kind.")
             self.interactionRequested.emit(species_s, value_f, interaction)
 
     def _editor_has_focus(self, species: str) -> bool:
         row = self._rows.get(str(species))
-        return bool(
-            row is not None
-            and isinstance(row.value_label, NumericValueEdit)
-            and row.value_label.hasFocus()
-        )
+        return bool(row is not None and row.value_label.hasFocus())
 
     def _on_editor_started(self, species: str) -> None:
         row = self._rows.get(str(species))
-        if row is None or not isinstance(row.value_label, NumericValueEdit):
+        if row is None:
             return
         self.remember_editor_state(species)
         self._last_committed_editor_text.pop(str(species), None)
@@ -438,7 +423,7 @@ class BatchSpeciesSliders(QtWidgets.QWidget):
     def _on_editor_escape(self, species: str) -> None:
         species_s = str(species)
         row = self._rows.get(species_s)
-        if row is None or not isinstance(row.value_label, NumericValueEdit):
+        if row is None:
             return
         value = self._editor_pre_edit_values.get(
             species_s, self._values.get(species_s, 0.0)
@@ -460,7 +445,7 @@ class BatchSpeciesSliders(QtWidgets.QWidget):
 
     def _decorate_editor(self, species: str) -> None:
         row = self._rows.get(str(species))
-        if row is None or not isinstance(row.value_label, NumericValueEdit):
+        if row is None:
             return
         try:
             value = float(row.value_label.text().strip())
@@ -480,7 +465,7 @@ class BatchSpeciesSliders(QtWidgets.QWidget):
     def _commit_editor(self, species: str) -> None:
         species_s = str(species)
         row = self._rows.get(species_s)
-        if row is None or not isinstance(row.value_label, NumericValueEdit):
+        if row is None:
             return
         raw = row.value_label.text()
         if raw == self._last_committed_editor_text.get(species_s):

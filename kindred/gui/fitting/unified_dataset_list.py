@@ -55,10 +55,9 @@ class UnifiedDatasetList(QtWidgets.QWidget):
         old_id = self.selected_dataset_id()
         normalized: list[tuple[str, str, str, bool]] = []
         for entry in dataset_entries:
-            ds_id = str(entry.get("id") or "").strip()
-            label = str(entry.get("label", "") or "").strip() or str(ds_id)
-            compact = compact_dataset_label(label, max_chars=DATASET_LIST_LABEL_MAX_CHARS)
-            normalized.append((ds_id, compact.display, compact.full, bool(entry.get("include", True))))
+            ds_id = entry["id"]
+            compact = compact_dataset_label(entry["label"], max_chars=DATASET_LIST_LABEL_MAX_CHARS)
+            normalized.append((ds_id, compact.display, compact.full, entry["include"]))
 
         existing_ids = tuple(
             str(self._list.item(index).data(Qt.UserRole) or "").strip()

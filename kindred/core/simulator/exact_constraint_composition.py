@@ -19,7 +19,7 @@ from kindred.core.algebra.parser import (
 from kindred.core.quantity_units import Unit
 from kindred.core._bounded_rational import ExactWorkLimit, literal_fraction, rational_binary
 from kindred.core.equilibrium_rate_authority import equilibrium_rate_symbolic_relations
-from kindred.core.kinetics import forward_rate_symbolic_relation
+from kindred.core.kinetics import ConstantRateModel, forward_rate_symbolic_relation
 from kindred.core.simulator.dsl_build_input import source_coordinate_name_parts
 from kindred.core.simulator.step_indexing import (
     get_step_index_map,
@@ -593,21 +593,15 @@ def _mechanism_relations(
         return ExactMonomial(Fraction(1), (), (value,))
 
     for entry in get_step_index_map(mechanism):
-        kind = str(entry.get("kind") or "")
-        try:
-            index = int(entry.get("reaction_index" if kind == "reaction" else "equilibrium_index"))
-            step = int(entry.get("step_index"))
-        except (TypeError, ValueError):
-            continue
-        if not 0 <= index < len(reactions if kind == "reaction" else equilibria):
+        kind = entry["kind"]
+        index = entry["reaction_index" if kind == "reaction" else "equilibrium_index"]
+        step = entry["step_index"]
+        forward_model = reactions[index].forward_model if kind == "reaction" else equilibria[index].forward_model
+        if kind == "reaction" and isinstance(forward_model, ConstantRateModel):
+            # A constant reaction rate is its own free coordinate.
             continue
         kf, kr, keq = f"kf{step}", f"kr{step}", f"Keq{step}"
-        source_coordinates = {
-            str(role): str(canonical_name)
-            for role, canonical_name in dict(
-                entry.get("source_coordinates") or {}
-            ).items()
-        }
+        source_coordinates = entry["source_coordinates"]
 
         def source_coordinate(role: str) -> ExactMonomial | None:
             """Resolve one admitted source role through the source owner."""
@@ -636,36 +630,32 @@ def _mechanism_relations(
                 )
             return ExactMonomial(Fraction(1), ((name, Fraction(1)),))
 
-        try:
-            forward_model = reactions[index].forward_model if kind == "reaction" else equilibria[index].forward_model
-            projected = forward_rate_symbolic_relation(
-                forward_model,
-                temperature=temperature,
-                literal=literal,
-                exponential=exponential,
-                source_coordinate=source_coordinate,
-                standard_concentration=standard_concentration,
-                constant=_constant,
-            )
-            if kind == "reaction":
-                name = f"k{step}"
-                if projected != ExactMonomial(Fraction(1), ((name, Fraction(1)),)):
-                    relations[name] = projected
-                continue
-            # Reverse and equilibrium relations name ``kfN`` so a step's
-            # readout can be written through its own coordinates.
-            equilibrium_relations = equilibrium_rate_symbolic_relations(
-                equilibria[index],
-                forward_relation=ExactMonomial(Fraction(1), ((kf, Fraction(1)),)),
-                temperature=temperature,
-                literal=literal,
-                exponential=exponential,
-                source_coordinate=source_coordinate,
-                standard_concentration=standard_concentration,
-                constant=_constant,
-            )
-        except (TypeError, ValueError, ZeroDivisionError, OverflowError):
+        projected = forward_rate_symbolic_relation(
+            forward_model,
+            temperature=temperature,
+            literal=literal,
+            exponential=exponential,
+            source_coordinate=source_coordinate,
+            standard_concentration=standard_concentration,
+            constant=_constant,
+        )
+        if kind == "reaction":
+            name = f"k{step}"
+            if projected != ExactMonomial(Fraction(1), ((name, Fraction(1)),)):
+                relations[name] = projected
             continue
+        # Reverse and equilibrium relations name ``kfN`` so a step's
+        # readout can be written through its own coordinates.
+        equilibrium_relations = equilibrium_rate_symbolic_relations(
+            equilibria[index],
+            forward_relation=ExactMonomial(Fraction(1), ((kf, Fraction(1)),)),
+            temperature=temperature,
+            literal=literal,
+            exponential=exponential,
+            source_coordinate=source_coordinate,
+            standard_concentration=standard_concentration,
+            constant=_constant,
+        )
         for name, relation in (
             (kf, projected),
             (kr, equilibrium_relations.kr),

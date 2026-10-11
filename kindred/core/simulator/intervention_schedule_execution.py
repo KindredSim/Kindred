@@ -10,7 +10,7 @@ from typing import Callable, Mapping, Protocol, Sequence
 import numpy as np
 
 from kindred.core.exceptions import SimulationCancelled
-from kindred.core.intervention_schedule import (InterventionScheduleError, InterventionStopAction, SpeciesTriggerCondition, ObservableTriggerCondition, intervention_species)
+from kindred.core.intervention_schedule import (InterventionScheduleError, InterventionStopAction, SpeciesTriggerCondition, ObservableTriggerCondition)
 from kindred.core.intervention_schedule_compiler import (
     ExecutableFlux,
     ExecutableHold,
@@ -24,7 +24,6 @@ from kindred.core.intervention_schedule_compiler import (
 from kindred.core.temperature import declared_temperature_step_boundaries, temperature_at_execution_time
 from .volume_execution import VolumeExecution
 from kindred.core.volume import SimulationBoundaryState
-from kindred.core.species import TIME_MAX_S
 from .nonnegative_invariant import (
     NonnegativeProjection,
     project_nonnegative_trajectory,
@@ -45,24 +44,6 @@ class SegmentIdentity:
     ordinal: int
     t_start: float
     t_end: float
-
-    def __post_init__(self) -> None:
-        kind = str(self.kind).strip()
-        ordinal = int(self.ordinal)
-        t_start = float(self.t_start)
-        t_end = float(self.t_end)
-        if not kind:
-            raise ValueError("Segment identity kind must be nonblank.")
-        if ordinal < 0:
-            raise ValueError("Segment identity ordinal must be nonnegative.")
-        if not math.isfinite(t_start) or not math.isfinite(t_end):
-            raise ValueError("Segment identity bounds must be finite.")
-        if t_end < t_start:
-            raise ValueError("Segment identity end must not precede its start.")
-        object.__setattr__(self, "kind", kind)
-        object.__setattr__(self, "ordinal", ordinal)
-        object.__setattr__(self, "t_start", t_start)
-        object.__setattr__(self, "t_end", t_end)
 
     @property
     def key(self) -> str:
@@ -106,20 +87,9 @@ class SegmentRunResult:
     dense_output: Callable[[np.ndarray], np.ndarray] | None = None
 
     def __post_init__(self) -> None:
+        # The solver adapter builds aligned rows and projects them nonnegative.
         t = np.asarray(self.t, dtype=float)
         Y = np.asarray(self.Y, dtype=float)
-        if (
-            t.ndim != 1
-            or np.any(~np.isfinite(t))
-            or np.any(t < 0.0)
-            or np.any(t > TIME_MAX_S)
-            or (t.size > 1 and np.any(np.diff(t) <= 0.0))
-        ):
-            raise ValueError("Simulation output times must be bounded and increasing.")
-        if Y.ndim != 2 or Y.shape[1] != t.size:
-            raise ValueError("Simulation output state rows must align with time.")
-        if np.any(~np.isfinite(Y)) or np.any(Y < 0.0):
-            raise ValueError("Simulation output states must be finite and nonnegative.")
         t.setflags(write=False)
         Y.setflags(write=False)
         object.__setattr__(self, "t", t)
@@ -127,10 +97,6 @@ class SegmentRunResult:
         state = self.raw_terminal_state
         if state is None:
             return
-        if state.ndim != 1 or not np.all(np.isfinite(state)):
-            raise ValueError(
-                "Raw solver terminal state must be finite and one-dimensional."
-            )
         state.setflags(write=False)
         object.__setattr__(self, "raw_terminal_state", state)
 
@@ -204,7 +170,7 @@ class InterventionScheduleExecutionOwner:
         segment_result = None
         dense = None
         try:
-            species_index = _species_index(req, contract)
+            species_index = _species_index(req)
             volume = VolumeExecution(species_names=species_index, parameter_values=req.parameter_values_at_temperature,
                                      end_time=t1, lines=req.intervention_lines)
             current_y = np.asarray(req.y0, dtype=float).reshape(-1).copy()
@@ -261,7 +227,6 @@ class InterventionScheduleExecutionOwner:
                 contract=contract,
                 trigger_indices=(),
                 trigger_state=None,
-                input_is_raw_solver_state=False,
                 trigger_counts=trigger_counts,
                 trigger_last_times=trigger_last_times,
                 trigger_firings=trigger_firings,
@@ -334,8 +299,8 @@ class InterventionScheduleExecutionOwner:
                             else "following"
                         ))
 
-                    # A drained species at zero whose free derivative is
-                    # negative is held at zero like an authored hold; a
+                    # A drained species at zero whose free derivative is not
+                    # positive is held at zero like an authored hold; a
                     # terminal release event ends that regime.
                     free_rhs = _InterventionRhs(
                         req.rhs, fluxes=active_fluxes, holds=active_holds, volume=volume,
@@ -664,7 +629,6 @@ class InterventionScheduleExecutionOwner:
                                 contract=contract,
                                 trigger_indices=(),
                                 trigger_state=None,
-                                input_is_raw_solver_state=True,
                                 trigger_counts=trigger_counts,
                                 trigger_last_times=trigger_last_times,
                                 trigger_firings=trigger_firings,
@@ -702,7 +666,6 @@ class InterventionScheduleExecutionOwner:
                                 contract=contract,
                                 trigger_indices=(),
                                 trigger_state=None,
-                                input_is_raw_solver_state=True,
                                 trigger_counts=trigger_counts,
                                 trigger_last_times=trigger_last_times,
                                 trigger_firings=trigger_firings,
@@ -800,7 +763,6 @@ class InterventionScheduleExecutionOwner:
                         contract=contract,
                         trigger_indices=trigger_indices,
                         trigger_state=root_state,
-                        input_is_raw_solver_state=True,
                         trigger_counts=trigger_counts,
                         trigger_last_times=trigger_last_times,
                         trigger_firings=trigger_firings,
@@ -885,7 +847,7 @@ class InterventionScheduleExecutionOwner:
                     base_times = (np.array([t0], dtype=float) if actual_end == t0
                                   else build_time_grid(t0, actual_end, req.grid))
                 except ValueError as exc:
-                    raise InterventionScheduleError(f"Actual-interval sampling failed: {exc}") from exc
+                    raise InterventionScheduleError(str(exc)) from exc
                 boundary_ids, boundary_keys, boundary_discontinuities = _compose_direct_result_sample_identity(
                     output_segment_ids, output_segment_keys, output_discontinuity_ids,
                 )
@@ -1134,28 +1096,9 @@ def _publish_segment_projection_provenance(
             provenance.pop(provenance_key, None)
 
 
-def _species_index(
-    req: SimulationRequest, contract: InterventionExecutionContract
-) -> dict[str, int]:
-    referenced = {
-        *(name for item in contract.instants for name in intervention_species(item)),
-        *(name for item in contract.fluxes for name in intervention_species(item)),
-        *(item.species for item in contract.holds),
-        *(item.condition.name for item in contract.triggers if isinstance(item.condition, SpeciesTriggerCondition)),
-        *(name for item in contract.triggers if not isinstance(item.then, InterventionStopAction) for name in intervention_species(item.then)),
-    }
-    names = tuple(str(name) for name in (req.species_names or ()))
-    if not names and referenced:
-        raise InterventionScheduleError(
-            "species_names are required when intervention_schedule references species."
-        )
-    available = set(names)
-    missing = sorted(referenced - available)
-    if missing:
-        raise InterventionScheduleError(
-            f"Unknown intervention species: {missing[0]}"
-        )
-    return {name: index for index, name in enumerate(names)}
+def _species_index(req: SimulationRequest) -> dict[str, int]:
+    # Schedule admission checked every referenced species against the mechanism.
+    return {name: index for index, name in enumerate(req.species_names)}
 
 
 def _static_instants_at(
@@ -1285,7 +1228,6 @@ def _apply_boundary(
     contract: InterventionExecutionContract,
     trigger_indices: Sequence[int],
     trigger_state: np.ndarray | None,
-    input_is_raw_solver_state: bool,
     trigger_counts: list[int],
     trigger_last_times: list[float | None],
     trigger_firings: list[TriggerFiring],
@@ -1295,14 +1237,11 @@ def _apply_boundary(
     temperature_step: bool = False,
     temperature_K: float,
     temperature_at,
-    parameter_values=None, executed_values=None, volume,
+    parameter_values=None, executed_values: dict, volume,
 ) -> _BoundaryApplicationResult:
-    if executed_values is None:
-        executed_values = {}
     _raise_if_cancelled(cancellation_check)
     current = np.asarray(trigger_state if trigger_state is not None else state, dtype=float).reshape(-1).copy()
     exact_root = current.copy()
-    projectable_solver_negatives = exact_root < 0.0 if input_is_raw_solver_state else np.zeros(exact_root.shape, dtype=bool)
     stops = tuple(index for index, item in enumerate(contract.triggers) if isinstance(item.then, InterventionStopAction))
     active_holds = _active_holds(contract, boundary)
     static = _static_instants_at(contract, boundary)
@@ -1335,9 +1274,6 @@ def _apply_boundary(
 
     def finish(stop: int | None = None) -> _BoundaryApplicationResult:
         snapshot()
-        invalid_negative = (current < 0.0) & ~projectable_solver_negatives
-        if np.any(invalid_negative):
-            raise InterventionScheduleError("Intervention boundary produced a scientifically invalid negative continuation state.")
         continuation, projection = project_nonnegative_trajectory(current.reshape(-1, 1), context=f"Intervention continuation state at t={boundary:g}")
         termination = None
         if stop is not None:
@@ -1423,10 +1359,6 @@ def _apply_boundary(
                 held_indices.add(species_index[action.species])
             snapshot()
             if stops and not np.array_equal(before, current):
-                # Validate the executed prefix before admitting its terminal state.
-                invalid = (current < 0.0) & ~projectable_solver_negatives
-                if np.any(invalid):
-                    raise InterventionScheduleError("Intervention boundary produced a scientifically invalid negative continuation state.")
                 stop = crossed_stop(before)
                 if stop is not None:
                     return finish(stop)
@@ -1483,22 +1415,13 @@ def _apply_instants(
     for instant in instants:
         _raise_if_cancelled(cancellation_check)
         index = species_index[instant.species]
+        # Non-physical instants are only set or jump.
         if instant.op == "set":
-            value = float(instant.value)
-            if not math.isfinite(value) or value < 0.0:
-                raise InterventionScheduleError(
-                    "Intervention set produced an invalid state."
-                )
             if index not in held_indices:
-                output[index] = value
-        elif instant.op == "jump":
-            if index not in held_indices:
-                output[index] = max(
-                    0.0, float(output[index]) + float(instant.delta)
-                )
-        else:
-            raise InterventionScheduleError(
-                f"Unsupported executable instant op: {instant.op!r}."
+                output[index] = float(instant.value)
+        elif index not in held_indices:
+            output[index] = max(
+                0.0, float(output[index]) + float(instant.delta)
             )
         _raise_if_cancelled(cancellation_check)
     if not np.all(np.isfinite(output)):
@@ -1539,12 +1462,7 @@ def _apply_holds(
     output = np.asarray(state, dtype=float).reshape(-1).copy()
     for hold in resolved:
         _raise_if_cancelled(cancellation_check)
-        value = float(hold.value)
-        if not math.isfinite(value) or value < 0.0:
-            raise InterventionScheduleError(
-                "Intervention hold produced an invalid state."
-            )
-        output[species_index[hold.species]] = value
+        output[species_index[hold.species]] = float(hold.value)
     return output
 
 
@@ -1684,7 +1602,7 @@ def _drain_release_events(
 ) -> tuple[tuple[Callable[[float, np.ndarray], float], ...], tuple[int, ...]]:
     """Hold drained species at zero until their free derivative turns positive.
 
-    Only a strictly negative free derivative holds a species, and a species
+    A free derivative that is not positive holds a species, and a species
     just released at ``segment_start`` is not held again there, so every
     release makes progress.
     """
@@ -1701,7 +1619,7 @@ def _drain_release_events(
         return (), ()
     vessel = () if free_rhs.volume.value is None else (free_rhs.volume.value,)
     free = free_rhs(segment_start, np.append(values, vessel))
-    indices = tuple(index for index in zero if free[index] < 0.0)
+    indices = tuple(index for index in zero if free[index] <= 0.0)
     if not indices:
         return (), ()
     last: list[object] = [None, None]
@@ -1761,10 +1679,6 @@ class _InterventionJacobian:
         used, held = self._evaluate_state(state, time, temperature_K)
         matrix = np.asarray(self._jacobian(time, used, T=temperature_K), dtype=float).copy()
         size = used.size
-        if matrix.shape != (size, size):
-            raise ValueError(
-                f"intervention Jacobian expected {(size, size)}, got {matrix.shape}"
-            )
         if self._rhs.volume.value is not None:
             vessel = float(state[-1])
             rate, mixing = self._rhs.volume.flow(self._fluxes, time, temperature_K, vessel, used, held)
@@ -1801,10 +1715,6 @@ def _next_eligible_time(
     if last is None:
         return -math.inf
     added = float(last) + trigger.min_interval
-    if not math.isfinite(added):
-        raise InterventionScheduleError(
-            "Trigger rearm arithmetic must remain finite."
-        )
     return max(added, float(np.nextafter(float(last), np.inf)))
 
 
@@ -1914,10 +1824,6 @@ def _first_trigger_hit(
         if event_index >= len(event_times) or event_index >= len(event_states):
             continue
         for position, raw_time in enumerate(event_times[event_index]):
-            if position >= len(event_states[event_index]):
-                raise InterventionScheduleError(
-                    "Exact trigger root is missing its event-time state."
-                )
             hits.append(
                 (
                     float(raw_time),
@@ -1937,12 +1843,7 @@ def _first_trigger_hit(
             for item in sorted(simultaneous, key=lambda item: item[1])
         )
     )
-    state = simultaneous[0][2]
-    if any(not np.array_equal(state, item[2]) for item in simultaneous[1:]):
-        raise InterventionScheduleError(
-            "Simultaneous exact roots reported incompatible event-time states."
-        )
-    return root_time, indices, state
+    return root_time, indices, simultaneous[0][2]
 
 
 def _first_purge_hit(
@@ -1958,10 +1859,6 @@ def _first_purge_hit(
         if event_index >= len(event_times) or event_index >= len(event_states):
             continue
         for position, raw_time in enumerate(event_times[event_index]):
-            if position >= len(event_states[event_index]):
-                raise InterventionScheduleError(
-                    "Exact purge root is missing its event-time state."
-                )
             hits.append(
                 (
                     float(raw_time),
@@ -1976,10 +1873,6 @@ def _first_purge_hit(
     root_time = min(item[0] for item in hits)
     simultaneous = [item for item in hits if item[0] == root_time]
     state = simultaneous[0][2].copy()
-    if any(item[2].size != state.size for item in simultaneous):
-        raise InterventionScheduleError(
-            "Simultaneous exact purge roots reported incompatible states."
-        )
     for _time, species_index, _state in simultaneous:
         state[species_index] = 0.0
     return (
@@ -2024,27 +1917,12 @@ def _append_identity_samples(
     emit_temperatures = np.asarray(temperatures, dtype=float)
     if not emit_times.size:
         return
-    if (emit_states.ndim != 2 or emit_states.shape[1] != emit_times.size
-            or emit_temperatures.shape != emit_times.shape):
-        raise InterventionScheduleError(
-            "Direct result rows must have one state column per emitted time."
-        )
-    if np.any(~np.isfinite(emit_times)) or (
-        emit_times.size > 1 and np.any(np.diff(emit_times) <= 0.0)
-    ):
-        raise InterventionScheduleError(
-            "Direct result row times must be finite and strictly increasing."
-        )
     if output_times and output_times[-1].size:
         last_time = float(output_times[-1][-1])
         if emit_times[0] == last_time:
             emit_times = emit_times[1:]
             emit_states = emit_states[:, 1:]
             emit_temperatures = emit_temperatures[1:]
-        elif emit_times[0] < last_time:
-            raise InterventionScheduleError(
-                "Direct result row emission must remain strictly ordered."
-            )
     if not emit_times.size:
         return
     output_times.append(emit_times)

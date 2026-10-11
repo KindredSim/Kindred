@@ -4,7 +4,6 @@ from dataclasses import dataclass
 import re
 from typing import Iterator, Sequence
 
-from kindred.core.validation import try_parse_int
 
 _PROTECTED_INDEXED_IDENTIFIER_RE = re.compile(r"^(?:k|kf|kr|keq)([1-9]\d*)$")
 
@@ -94,15 +93,11 @@ class MechanismParameterNamespace:
         invalid = self.invalid_protected_indexed_identifier(raw_name)
         if invalid is None:
             return None
-        suggestions = ", ".join(invalid.suggested_names)
-        suggestion_clause = (
-            f" Existing canonical indexed parameter name(s) for this step: {suggestions}."
-            if suggestions
-            else " Exact protected indexed names must match an existing canonical mechanism parameter."
-        )
+        names = ", ".join(invalid.suggested_names)
         return (
-            f"{invalid.raw_name!r} is not a valid indexed parameter identifier."
-            f"{suggestion_clause} Choose a longer ordinary name such as 'K1_test' for an independent parameter."
+            f"{invalid.raw_name!r} is reserved for reaction parameters, and the parameters of that step are {names}."
+            if names
+            else f"{invalid.raw_name!r} is reserved for a reaction parameter, and this mechanism has none by that name."
         )
 
     def _invalid_indexed_identifier_match(
@@ -110,9 +105,8 @@ class MechanismParameterNamespace:
         raw_name: str,
         step_index_text: str,
     ) -> InvalidProtectedIndexedIdentifier | None:
-        step_index, ok = try_parse_int(step_index_text)
-        if not ok:
-            return None
+        # The identifier pattern guarantees an integer step index.
+        step_index = int(step_index_text)
         suggestions = tuple(
             name
             for lookup in (f"k{step_index}", f"kf{step_index}", f"kr{step_index}", f"keq{step_index}")
@@ -151,10 +145,7 @@ def protected_indexed_identifier_step_index(raw_name: str) -> int | None:
     match = _protected_indexed_identifier_match(raw_name)
     if match is None:
         return None
-    step_index, ok = try_parse_int(match.group(1))
-    if not ok:
-        return None
-    return int(step_index)
+    return int(match.group(1))
 
 
 def _protected_indexed_identifier_match(raw_name: str) -> re.Match[str] | None:

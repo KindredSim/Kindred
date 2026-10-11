@@ -4,7 +4,6 @@ from contextlib import closing
 import datetime as dt
 from io import BytesIO
 from typing import Iterator, List, Mapping
-from zipfile import BadZipFile, ZipFile
 
 from openpyxl import load_workbook
 
@@ -15,7 +14,6 @@ from kindred.core.datasets.csv_import import (
 from kindred.core.datasets.source_rules import (
     PhysicalColumn,
     identify_physical_columns,
-    validate_tabular_source_bytes,
 )
 
 __all__ = [
@@ -41,7 +39,6 @@ class ExcelWorkbookPair:
         if self._workbook is not None:
             raise RuntimeError("Excel workbook pair is already open.")
         try:
-            _validate_xlsx_zip(self._source_bytes, source_label=self._source_label)
             self._workbook = _open_workbook_bytes(
                 self._source_bytes,
                 source_label=self._source_label,
@@ -84,11 +81,6 @@ class ExcelWorkbookPair:
     ) -> Iterator[Mapping[PhysicalColumn, object]]:
         workbook, authored_workbook = self._require_open()
         if sheet_name not in workbook.sheetnames:
-            raise ValueError(
-                f"Sheet {sheet_name!r} not found in workbook "
-                f"{self._source_label!r}."
-            )
-        if sheet_name not in authored_workbook.sheetnames:
             raise ValueError(
                 f"Sheet {sheet_name!r} not found in workbook "
                 f"{self._source_label!r}."
@@ -176,21 +168,6 @@ def _open_workbook_bytes(
     except Exception as exc:
         raise ValueError(
             f"Failed to open Excel workbook {source_label!r}: {exc}"
-        ) from exc
-
-
-def _validate_xlsx_zip(source_bytes: bytes, *, source_label: str) -> None:
-    validate_tabular_source_bytes(
-        source_bytes,
-        source_format="xlsx",
-        source_label=source_label,
-    )
-    try:
-        with ZipFile(BytesIO(source_bytes)) as archive:
-            archive.infolist()
-    except (BadZipFile, OSError, ValueError) as exc:
-        raise ValueError(
-            f"Failed to inspect Excel workbook {source_label!r}: {exc}"
         ) from exc
 
 

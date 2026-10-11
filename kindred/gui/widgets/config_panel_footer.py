@@ -53,20 +53,12 @@ class ConfigPanelFooter(QtWidgets.QWidget):
         self._dirty = False
         self._error_text = ""
 
-        messages_position_norm = str(messages_position or "before_body").strip().lower()
-        if messages_position_norm not in ("before_body", "after_body"):
-            raise ValueError(
-                "ConfigPanelFooter messages_position must be 'before_body' or 'after_body'. "
-                f"Got: {messages_position!r}."
-            )
-        self._messages_position = messages_position_norm
+        self._messages_position = messages_position
 
         if button_order is None:
             button_order = ("reset", "revert", "apply") if show_reset else ("apply", "revert")
 
-        normalized_order = self._normalize_button_order_tokens(button_order)
-        self._buttons_spec = _ButtonsSpec(show_reset=bool(show_reset), order=normalized_order)
-        self._validate_button_order(self._buttons_spec.order, show_reset=self._buttons_spec.show_reset)
+        self._buttons_spec = _ButtonsSpec(show_reset=bool(show_reset), order=tuple(button_order))
 
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -158,26 +150,6 @@ class ConfigPanelFooter(QtWidgets.QWidget):
                            if buttons.itemAt(i).widget() is not None]
         for previous, following in zip(visible_buttons, visible_buttons[1:]):
             QtWidgets.QWidget.setTabOrder(previous, following)
-
-    @staticmethod
-    def _normalize_button_order_tokens(order: Sequence[str]) -> tuple[str, ...]:
-        return tuple(str(x).strip().lower() for x in order)
-
-    @staticmethod
-    def _validate_button_order(order: Sequence[str], *, show_reset: bool) -> None:
-        allowed = {"apply", "revert", "reset"}
-        normalized = [str(x).strip().lower() for x in order]
-        if not normalized:
-            raise ValueError("ConfigPanelFooter button_order must not be empty.")
-        bad = [x for x in normalized if x not in allowed]
-        if bad:
-            raise ValueError(f"ConfigPanelFooter button_order has invalid entries: {bad!r}.")
-        if "apply" not in normalized or "revert" not in normalized:
-            raise ValueError("ConfigPanelFooter button_order must include 'apply' and 'revert'.")
-        if show_reset and "reset" not in normalized:
-            raise ValueError("ConfigPanelFooter button_order must include 'reset' when show_reset=True.")
-        if (not show_reset) and "reset" in normalized:
-            raise ValueError("ConfigPanelFooter button_order must not include 'reset' when show_reset=False.")
 
     def set_dirty(self, dirty: bool) -> None:
         self._dirty = bool(dirty)

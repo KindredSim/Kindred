@@ -149,10 +149,6 @@ class _XlsxDestination:
         *,
         cancellation_check: Callable[[], None] | None,
     ) -> None:
-        if not callable(getattr(destination, "write", None)):
-            raise TypeError("XLSX destination must be a writable binary stream.")
-        if cancellation_check is not None and not callable(cancellation_check):
-            raise TypeError("cancellation_check must be callable.")
         self._destination = destination
         self._cancellation_check = cancellation_check
         self._maximum_size = 0
@@ -219,24 +215,6 @@ def _cleanup_write_only_workbook(workbook: Workbook) -> list[BaseException]:
     return failures
 
 
-def _required_id(value: object, field: str) -> str:
-    normalized = str(value or "").strip()
-    if not normalized:
-        raise ValueError(f"{field} must be nonblank.")
-    return normalized
-
-
-def _axis_selection(value: object, *, field: str) -> AxisSeriesSelection:
-    if not isinstance(
-        value,
-        (SimulationSeriesAxisSelection, ExperimentalAxisSelection, VesselVolumeAxisSelection),
-    ):
-        raise TypeError(
-            f"{field} must be a typed simulation or experimental axis selection."
-        )
-    return value
-
-
 def _is_time_selection(value: AxisSeriesSelection) -> bool:
     return isinstance(value, SimulationSeriesAxisSelection) and value.series_name == "t"
 
@@ -278,8 +256,6 @@ def encode_tsv_row(values: Sequence[object]) -> str:
 def encode_clipboard_text(value: str) -> str:
     """Protect one dynamic clipboard text cell from spreadsheet formulas."""
 
-    if not isinstance(value, str):
-        raise TypeError("clipboard text must be a string.")
     index = 0
     while index < len(value):
         character = value[index]
@@ -361,10 +337,6 @@ class VisibleResultSet:
     set_id: str
     label: str
 
-    def __post_init__(self) -> None:
-        object.__setattr__(self, "set_id", _required_id(self.set_id, "set_id"))
-        object.__setattr__(self, "label", _required_id(self.label, "label"))
-
 
 class ResultLayerKind(Enum):
     EXPLICIT = "explicit"
@@ -427,66 +399,15 @@ class ResultDataBlock:
         return f"{name} [{unit.symbol}]" if unit is not None else name
 
     def __post_init__(self) -> None:
-        # Blocks are built only by this module's composers; keep the genuine
-        # cross-field invariants and immutability, not generic type checks.
-        time = self.t
-        names: set[str] = set()
-        for name, values in self.series:
-            if name in names:
-                raise ValueError(f"data block contains duplicate series {name!r}.")
-            if values.size != time.size and not (
-                self.kind is ResultLayerKind.EXPERIMENTAL and time.size == 0
-            ):
-                raise ValueError(f"data series {name!r} length does not match time.")
-            names.add(name)
-        if not names:
-            raise ValueError("data block requires at least one series.")
-        series_axes = tuple(self.series_axes)
-        if tuple(name for name, _ in series_axes) != tuple(name for name, _ in self.series):
-            raise ValueError("data series axes must align exactly with data series.")
-        if len({selection for _, selection in series_axes}) != len(series_axes):
-            raise ValueError("data series axis identities must be unique.")
-        if self.kind is ResultLayerKind.EXPERIMENTAL:
-            if self.result is not None:
-                raise ValueError("experimental data blocks prohibit repository entries.")
-            if any(value is not None for value in (self.segment_ids, self.segment_keys, self.discontinuity_ids)):
-                raise ValueError("experimental data blocks prohibit solver identity.")
-            boundaries = ()
-        else:
-            if self.source_row is not None:
-                raise ValueError("simulation data blocks prohibit observation source_row.")
-            if self.segment_ids is None or self.segment_keys is None or self.discontinuity_ids is None:
-                raise ValueError("simulation data blocks require complete executor identity.")
-            boundaries = tuple(self.presentation_boundaries)
-            if boundaries is not self.result.presentation_boundaries:
-                raise ValueError("simulation data blocks must retain canonical presentation boundaries.")
-        provenance_names = [name for name, _payload in self.series_provenance]
-        if len(provenance_names) != len(set(provenance_names)) or not names.issuperset(provenance_names):
-            raise ValueError("data series provenance must uniquely reference data.")
-        colors = tuple(self.color_by_series)
-        if colors and not names.issubset({name for name, _color in colors}):
-            raise ValueError("data series colors must cover every data series.")
-        if len(colors) != len({name for name, _color in colors}):
-            raise ValueError("data series colors must be unique by series.")
-        if not np.isfinite(self.opacity) or not 0.0 <= self.opacity <= 1.0:
-            raise ValueError("opacity must be between zero and one.")
-        if not np.isfinite(self.point_size) or self.point_size <= 0.0:
-            raise ValueError("point_size must be positive.")
+        # Blocks are built only by this module's composers; freeze them.
         object.__setattr__(self, "series", tuple(self.series))
-        object.__setattr__(self, "series_axes", series_axes)
+        object.__setattr__(self, "series_axes", tuple(self.series_axes))
         object.__setattr__(self, "series_provenance", tuple(
-            (name, MappingProxyType({
-                str(key): tuple(value) if isinstance(value, (list, tuple)) else value
-                for key, value in payload.items()
-            }))
-            for name, payload in self.series_provenance
+            (name, MappingProxyType(dict(payload))) for name, payload in self.series_provenance
         ))
-        object.__setattr__(self, "x_provenance", MappingProxyType({
-            str(key): tuple(value) if isinstance(value, (list, tuple)) else value
-            for key, value in self.x_provenance.items()
-        }))
-        object.__setattr__(self, "color_by_series", colors)
-        object.__setattr__(self, "presentation_boundaries", boundaries)
+        object.__setattr__(self, "x_provenance", MappingProxyType(dict(self.x_provenance)))
+        object.__setattr__(self, "color_by_series", tuple(self.color_by_series))
+        object.__setattr__(self, "presentation_boundaries", tuple(self.presentation_boundaries))
 
 def _select_analysis_block(
     blocks: Sequence[ResultDataBlock],
@@ -498,7 +419,6 @@ def _select_analysis_block(
             for block in blocks
             if block.block_id == current_set_id
             and block.kind in {ResultLayerKind.EXPLICIT, ResultLayerKind.PREVIEW}
-            and isinstance(block.result, SimulationResultValue)
         ),
         next(
             (
@@ -506,7 +426,6 @@ def _select_analysis_block(
                 for block in blocks
                 if block.block_id == current_set_id
                 and block.kind is ResultLayerKind.REFERENCE
-                and isinstance(block.result, SimulationResultValue)
             ),
             None,
         ),
@@ -545,39 +464,16 @@ class ResultRenderInput:
     simulation_x_series: AxisSeriesSelection = SimulationSeriesAxisSelection("t")
 
     def __post_init__(self) -> None:
-        blocks = tuple(self.blocks)
-        identities = tuple((block.kind, block.block_id, tuple(axis for _, axis in block.series_axes)) for block in blocks)
-        if len(identities) != len(set(identities)):
-            raise ValueError("render blocks must have unique semantic identities.")
-        object.__setattr__(self, "blocks", blocks)
-        names = tuple(self.statistics_series_names)
-        if len(names) != len(set(names)):
-            raise ValueError("statistics series names must be unique.")
-        object.__setattr__(self, "statistics_series_names", names)
-        selected_x = self.selected_x_series
-        selected_y = tuple(self.selected_y_series)
-        if len(selected_y) != len(set(selected_y)):
-            raise ValueError("selected_y_series must be unique.")
-        overlay_locks = tuple(self.mapped_overlay_locks)
-        if len({axis for axis, _ in overlay_locks}) != len(overlay_locks):
-            raise ValueError("mapped overlay locks must be unique by axis.")
-        candidates = tuple(self.axis_candidates)
-        candidate_ids = tuple(item.selection for item in candidates)
-        if len(candidate_ids) != len(set(candidate_ids)) or selected_x not in candidate_ids:
-            raise ValueError("axis candidates must be unique and include selected X.")
-        if any(axis not in candidate_ids for axis, _ in overlay_locks):
-            raise ValueError("mapped overlay locks must be axis candidates.")
-        annotations = tuple(self.intervention_annotations)
-        warnings = tuple(
-            (label, tuple(details))
-            for label, details in self.completion_warning_details
-        )
-        object.__setattr__(self, "selected_x_series", selected_x)
-        object.__setattr__(self, "selected_y_series", selected_y)
-        object.__setattr__(self, "mapped_overlay_locks", overlay_locks)
-        object.__setattr__(self, "axis_candidates", candidates)
-        object.__setattr__(self, "intervention_annotations", annotations)
-        object.__setattr__(self, "completion_warning_details", warnings)
+        # Built only by this module's composers; freeze the collections.
+        object.__setattr__(self, "blocks", tuple(self.blocks))
+        object.__setattr__(self, "statistics_series_names", tuple(self.statistics_series_names))
+        object.__setattr__(self, "selected_y_series", tuple(self.selected_y_series))
+        object.__setattr__(self, "mapped_overlay_locks", tuple(self.mapped_overlay_locks))
+        object.__setattr__(self, "axis_candidates", tuple(self.axis_candidates))
+        object.__setattr__(self, "intervention_annotations", tuple(self.intervention_annotations))
+        object.__setattr__(self, "completion_warning_details", tuple(
+            (label, tuple(details)) for label, details in self.completion_warning_details
+        ))
 
     @property
     def statistics_result(self) -> SimulationResultValue | None:
@@ -700,11 +596,7 @@ def compose_canonical_export_blocks(
 ) -> tuple[ResultDataBlock, ...]:
     """Project every retained active-tab result and its qualifying raw data."""
 
-    if not isinstance(document, ProjectDocument):
-        raise TypeError("Canonical export requires a ProjectDocument.")
-    tab = document.tab(_required_id(tab_id, "tab_id"))
-    if repository.tab_id != tab.tab_id:
-        raise ValueError("Canonical export repository belongs to another tab.")
+    tab = document.tab(tab_id)
 
     blocks: list[ResultDataBlock] = []
     retained_set_ids: set[str] = set()
@@ -816,8 +708,7 @@ def _data_block(
     offset = first - block.first_index
     selected = tuple(
         (name, values[offset:]) for name, values in block.series
-        if (series_axis_map[name] in y_axes if y_axes is not None
-            else not isinstance(series_axis_map[name], VesselVolumeAxisSelection))
+        if y_axes is None or series_axis_map[name] in y_axes
     )
     if not selected:
         return None
@@ -939,10 +830,7 @@ def _xlsx_literal_cell(sheet: object, value: object) -> object:
 
 
 def _append_xlsx_row(sheet: object, values: Sequence[object]) -> None:
-    append = getattr(sheet, "append", None)
-    if not callable(append):
-        raise TypeError("XLSX worksheet must provide append().")
-    append([_xlsx_literal_cell(sheet, value) for value in values])
+    sheet.append([_xlsx_literal_cell(sheet, value) for value in values])
 
 
 def _validate_xlsx_worksheet_dimensions(
@@ -1095,15 +983,15 @@ def _annotations_from_execution(
 
 def _authored_action(result: SimulationResultValue, annotation: Mapping[str, object]) -> Mapping[str, object]:
     """Find the authored declaration of one executed instant or trigger action."""
-    operation = next(item for item in result.intervention_execution.declarative_payload["operations"]
-                     if item["declaration_ordinal"] == annotation["declaration_ordinal"])
+    operation = next(item for item in result.intervention_execution.authored.operations
+                     if item.declaration_ordinal == annotation["declaration_ordinal"])
     kind = str(annotation["kind"])
     if kind == "trigger":
-        return operation["then"]
+        return operation.then.to_payload()
     if kind.startswith("protocol-"):
-        return next(item for item in operation[kind.removeprefix("protocol-")]
-                    if item["authored_ordinal"] == annotation["authored_ordinal"])
-    return operation
+        return next(item for item in getattr(operation, kind.removeprefix("protocol-"))
+                    if item.authored_ordinal == annotation["authored_ordinal"]).to_payload()
+    return operation.to_payload()
 
 
 def _named_amounts(executed: object, authored: object, retained: Mapping[str, float]) -> object:
@@ -1282,30 +1170,15 @@ def compose_result_input(
     selected_y_series: Sequence[AxisSeriesSelection] = (),
     selected_y_uses_default_all: bool = True,
 ) -> ResultRenderInput:
-    tab_id = _required_id(tab_id, "tab_id")
-    if repository.tab_id != tab_id:
-        raise ValueError("repository does not belong to requested tab.")
     current_id = str(current_set_id or "")
     preview_ids = set(repository.preview_set_ids())
-    colors = {
-        _axis_selection(selection, field="configured color axis"):
-        _required_id(color, "configured axis color")
-        for selection, color in color_by_axis_selection.items()
-    }
-    selected_x = _axis_selection(selected_x_series, field="selected_x_series")
-    selected_y = tuple(_axis_selection(item, field="selected_y_series") for item in selected_y_series)
-    if len(selected_y) != len(set(selected_y)):
-        raise ValueError("selected_y_series must be unique.")
+    colors = dict(color_by_axis_selection)
+    selected_x = selected_x_series
+    selected_y = tuple(selected_y_series)
     point_size = float(experimental_point_size)
     point_opacity = float(experimental_point_opacity)
-    if not np.isfinite(point_size) or point_size <= 0:
-        raise ValueError("experimental_point_size must be positive.")
-    if not np.isfinite(point_opacity) or not 0 <= point_opacity <= 1:
-        raise ValueError("experimental_point_opacity must be between zero and one.")
     active = tuple(active_overlay_layers)
     experimental_by_axis = {item.axis: item for item in active}
-    if len(experimental_by_axis) != len(active):
-        raise ValueError("active overlay layers duplicate experimental axis identity.")
     selected_model_y = {
         item.series_name for item in selected_y
         if isinstance(item, SimulationSeriesAxisSelection)
@@ -1354,7 +1227,6 @@ def compose_result_input(
     annotations: list[_DisplayAnnotation] = []
     warning_facts: list[tuple[str, tuple[str, ...]]] = []
     warning_ids: set[int] = set()
-    seen_sets: set[str] = set()
 
     def add_warning(label: str, result: SimulationResultValue, visible: bool) -> None:
         has_algebra_warnings = bool(
@@ -1366,11 +1238,6 @@ def compose_result_input(
             warning_facts.append((label, tuple(_result_warning_details(result))))
 
     for visible in visible_sets:
-        if not isinstance(visible, VisibleResultSet):
-            raise TypeError("visible_sets must contain VisibleResultSet values.")
-        if visible.set_id in seen_sets:
-            raise ValueError(f"visible set {visible.set_id!r} is duplicated.")
-        seen_sets.add(visible.set_id)
         foreground = repository.current_result(visible.set_id)
         foreground_kind = ResultLayerKind.PREVIEW if visible.set_id in preview_ids else ResultLayerKind.EXPLICIT
         semantic: ResultDataBlock | None = None
@@ -1604,8 +1471,6 @@ def iter_blocks_tsv_chunks(
                 )
             )
         if block.kind is ResultLayerKind.EXPERIMENTAL:
-            if block.source_row is None:
-                raise ValueError("experimental Copy block lacks source_row.")
             columns.append(
                 (
                     encode_clipboard_text(f"{block.label} — row_id"),
@@ -1614,12 +1479,6 @@ def iter_blocks_tsv_chunks(
                 )
             )
         else:
-            if (
-                block.segment_ids is None
-                or block.segment_keys is None
-                or block.discontinuity_ids is None
-            ):
-                raise ValueError("simulation Copy block lacks executor identity.")
             columns.extend(
                 (
                     (
@@ -1654,8 +1513,6 @@ def iter_blocks_tsv_chunks(
         )
         columns.extend((encode_clipboard_text(f"{block.label} — {name}"), values, kind)
                        for name, values, kind in _boundary_export_columns(block.result))
-    if not columns:
-        raise ValueError("No retained result or qualifying mapped dataset data.")
     row_count = max(len(values) for _header, values, _kind in columns)
     cell_count = (row_count + 1) * len(columns)
     if cell_count > _MAX_COPY_CELLS:
@@ -1664,8 +1521,6 @@ def iter_blocks_tsv_chunks(
             f"({_MAX_COPY_CELLS:,})."
         )
     chunk_size = int(rows_per_chunk)
-    if chunk_size < 1:
-        raise ValueError("rows_per_chunk must be positive.")
     total_characters = 0
     header = encode_tsv_row(tuple(header for header, _values, _kind in columns))
     total_characters += len(header)
@@ -1711,12 +1566,6 @@ def validate_xlsx_export(
     """Admit worksheet dimensions and prepare canonical metadata rows once."""
 
     block_values = tuple(blocks)
-    if not block_values:
-        raise ValueError("No retained result or qualifying mapped dataset data.")
-    if any(not isinstance(block, ResultDataBlock) for block in block_values):
-        raise TypeError(
-            "XLSX export blocks must contain only ResultDataBlock values."
-        )
     lineage_row_count = sum(
         int(bool(block.x_provenance))
         + sum(bool(provenance) for _, provenance in block.series_provenance)
@@ -1758,18 +1607,8 @@ def write_xlsx(
             title = _worksheet_title(block.label, used)
             sheet = workbook.create_sheet(title=title)
             if block.kind is ResultLayerKind.EXPERIMENTAL:
-                if block.source_row is None:
-                    raise ValueError("experimental XLSX block lacks source_row.")
                 identity_headers = ["row_id"]
             else:
-                if (
-                    block.segment_ids is None
-                    or block.segment_keys is None
-                    or block.discontinuity_ids is None
-                ):
-                    raise ValueError(
-                        "simulation XLSX block lacks executor identity."
-                    )
                 identity_headers = [
                     "segment_id",
                     "segment_key",

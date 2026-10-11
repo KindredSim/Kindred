@@ -16,6 +16,7 @@ Signals emitted
 --------------
 xChanged(selection: SimulationSeriesAxisSelection | ExperimentalAxisSelection)
 ySelectionChanged(selected: tuple[AxisSeriesSelection, ...])
+yAllRequested()
 unitChanged(axis: str, unit: str)
 
 Public API
@@ -65,6 +66,7 @@ class AxisToolbar(QtWidgets.QWidget):
     # High-level signals
     xChanged = QtCore.Signal(object)
     ySelectionChanged = QtCore.Signal(object)
+    yAllRequested = QtCore.Signal()
     unitChanged = QtCore.Signal(str, str)
     axisRangeChanged = QtCore.Signal(str)
 
@@ -97,7 +99,7 @@ class AxisToolbar(QtWidgets.QWidget):
         self._y_list = QtWidgets.QListWidget(self)
         self._y_list.setToolTip(
             "Choose which model quantities and experimental data appear on the Y axis. "
-            "After running a model with an initial-volume declaration, you can also select Vessel volume. "
+            "After running a model with an initial-volume declaration, Vessel volume is listed too. "
             "Use the adjacent Unit control to choose its display unit."
         )
         self._y_list.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.NoSelection)
@@ -133,8 +135,16 @@ class AxisToolbar(QtWidgets.QWidget):
             "Select the unselected Y series and deselect the selected ones. "
             "Series required by active overlays stay selected."
         )
+        self._select_all_y_btn = QtWidgets.QPushButton("Select All", self._y_popup_container)
+        self._select_all_y_btn.setObjectName("axisToolbarSelectAllYButton")
+        self._select_all_y_btn.setToolTip(
+            "Select every Y series, including series added to the mechanism later."
+        )
+        y_buttons = QtWidgets.QHBoxLayout()
+        y_buttons.addWidget(self._select_all_y_btn)
+        y_buttons.addWidget(self._invert_y_selection_btn)
         y_popup_layout.addWidget(self._y_popup_label)
-        y_popup_layout.addWidget(self._invert_y_selection_btn)
+        y_popup_layout.addLayout(y_buttons)
         y_popup_layout.addWidget(self._y_list)
 
         self._y_menu_action = QtWidgets.QWidgetAction(self._y_menu)
@@ -187,6 +197,7 @@ class AxisToolbar(QtWidgets.QWidget):
         )
         self._y_list.itemChanged.connect(self._on_y_item_changed)
         self._invert_y_selection_btn.clicked.connect(self.invert_y_selection)
+        self._select_all_y_btn.clicked.connect(self.yAllRequested.emit)
 
         # Range control wiring
         for axis, edits in (("x", (self._x_min, self._x_max)), ("y", (self._y_min, self._y_max))):
@@ -375,13 +386,6 @@ class AxisToolbar(QtWidgets.QWidget):
             it = self._y_list.item(i)
             if it.checkState() == Qt.CheckState.Checked:
                 selection = it.data(Qt.ItemDataRole.UserRole)
-                if not isinstance(
-                    selection,
-                    (SimulationSeriesAxisSelection, ExperimentalAxisSelection, VesselVolumeAxisSelection),
-                ):
-                    raise TypeError(
-                        "Y selector item lacks a typed axis identity."
-                    )
                 if selection in self._locked_checked_y:
                     continue
                 out.append(selection)

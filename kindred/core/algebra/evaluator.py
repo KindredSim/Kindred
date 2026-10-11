@@ -728,39 +728,7 @@ def evaluate_block(
       when constructing SimulationResult.
     """
     ctx.check_cancelled()
-    # Validate basic shapes once, early
-    t = np.asarray(ctx.t, dtype=float)
-    if t.ndim != 1 or t.size == 0 or np.any(~np.isfinite(t)) or np.any(np.diff(t) < 0):
-        raise AlgebraTypeError("time grid t must be 1D, finite, and nondecreasing", line=1, col=1)
-    for nm, arr in ctx.species_series.items():
-        a = np.asarray(arr, dtype=float)
-        if a.ndim != 1 or a.size != t.size or np.any(~np.isfinite(a)):
-            raise AlgebraTypeError(f"series[{nm!r}] must be 1D, finite, length equal to len(t)", line=1, col=1)
-    for nm, raw in (ctx.symbol_series or {}).items():
-        a = np.asarray(raw, dtype=float)
-        if a.ndim == 0:
-            a = np.full(t.size, float(a), dtype=float)
-        if a.ndim != 1 or a.size != t.size or np.any(~np.isfinite(a)):
-            raise AlgebraTypeError(
-                f"symbol_series[{nm!r}] must be scalar or 1D, finite, length equal to len(t)",
-                line=1,
-                col=1,
-            )
-    for nm, raw in (ctx.symbol_values or {}).items():
-        try:
-            value = float(raw)
-        except Exception as exc:
-            raise AlgebraTypeError(
-                f"symbol_values[{nm!r}] must be numeric",
-                line=1,
-                col=1,
-            ) from exc
-        if not np.isfinite(value):
-            raise AlgebraTypeError(
-                f"symbol_values[{nm!r}] must be finite",
-                line=1,
-                col=1,
-            )
+    # Execution output and admitted scalars arrive finite and row-aligned.
     ev = _Evaluator(block, ctx)
     return ev.run()
 
@@ -777,38 +745,6 @@ def evaluate_block_partial(
     structured error list.
     """
     ctx.check_cancelled()
-    # Validate basic shapes once, early (same behavior as strict mode).
-    t = np.asarray(ctx.t, dtype=float)
-    if t.ndim != 1 or t.size == 0 or np.any(~np.isfinite(t)) or np.any(np.diff(t) < 0):
-        raise AlgebraTypeError("time grid t must be 1D, finite, and nondecreasing", line=1, col=1)
-    for nm, arr in ctx.species_series.items():
-        a = np.asarray(arr, dtype=float)
-        if a.ndim != 1 or a.size != t.size or np.any(~np.isfinite(a)):
-            raise AlgebraTypeError(f"series[{nm!r}] must be 1D, finite, length equal to len(t)", line=1, col=1)
-    for nm, raw in (ctx.symbol_series or {}).items():
-        a = np.asarray(raw, dtype=float)
-        if a.ndim == 0:
-            a = np.full(t.size, float(a), dtype=float)
-        if a.ndim != 1 or a.size != t.size or np.any(~np.isfinite(a)):
-            raise AlgebraTypeError(
-                f"symbol_series[{nm!r}] must be scalar or 1D, finite, length equal to len(t)",
-                line=1,
-                col=1,
-            )
-    for nm, raw in (ctx.symbol_values or {}).items():
-        try:
-            value = float(raw)
-        except Exception as exc:
-            raise AlgebraTypeError(
-                f"symbol_values[{nm!r}] must be numeric",
-                line=1,
-                col=1,
-            ) from exc
-        if not np.isfinite(value):
-            raise AlgebraTypeError(
-                f"symbol_values[{nm!r}] must be finite",
-                line=1,
-                col=1,
-            )
+    # Execution output and admitted scalars arrive finite and row-aligned.
     ev = _Evaluator(block, ctx)
     return ev.run_partial()

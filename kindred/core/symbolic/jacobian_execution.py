@@ -3,7 +3,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Mapping
 
-from .errors import UnsupportedSymbolicExpressionError
 
 
 def symbolic_status_payload(
@@ -23,12 +22,12 @@ def symbolic_status_payload(
 
 @dataclass(frozen=True, slots=True)
 class SymbolicJacobianExecution:
+    status: Mapping[str, Any]
     jacobian_func: Any = None
-    status: Mapping[str, Any] | None = None
 
     def __post_init__(self) -> None:
         # Its binder pairs a callable only with a supported state.
-        object.__setattr__(self, "status", None if self.status is None else dict(self.status))
+        object.__setattr__(self, "status", dict(self.status))
 
     @property
     def has_executable_jacobian(self) -> bool:
@@ -48,22 +47,6 @@ class SymbolicJacobianExecution:
                 code="supported",
                 reason="Symbolic Jacobian supported.",
             ),
-        )
-
-    @classmethod
-    def unsupported(
-        cls,
-        *,
-        code: str,
-        reason: str,
-    ) -> "SymbolicJacobianExecution":
-        return cls(
-            status=symbolic_status_payload(
-                kind="jacobian",
-                state="unsupported",
-                code=code,
-                reason=reason,
-            )
         )
 
     @classmethod
@@ -87,20 +70,12 @@ class SymbolicJacobianExecution:
         cls,
         *,
         classified_status: Mapping[str, Any],
-        exc: UnsupportedSymbolicExpressionError,
     ) -> "SymbolicJacobianExecution":
-        status_payload = dict(classified_status or {})
-        if status_payload.get("state") == "unsupported":
-            return cls(status=status_payload)
-        return cls.unsupported(
-            code="binding-failed",
-            reason=str(exc) or "Symbolic Jacobian binding failed.",
-        )
+        # Binding fails exactly when the classifier calls the mechanism unsupported.
+        return cls(status=classified_status)
 
     def provenance_fields(self) -> dict[str, Any]:
-        payload: dict[str, Any] = {
+        return {
             "symbolic_jacobian": self.has_executable_jacobian,
+            "symbolic_jacobian_status": dict(self.status),
         }
-        if self.status:
-            payload["symbolic_jacobian_status"] = dict(self.status)
-        return payload

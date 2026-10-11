@@ -11,6 +11,7 @@ from kindred.core.project_document import (
     select_exact_correction_basis,
 )
 from kindred.core.simulator.source_correction import CorrectionPlanner
+from kindred.gui.display_name_policy import count_text, reaction_text
 
 
 class ExactCorrectionBasisDialog(QtWidgets.QDialog):
@@ -31,15 +32,14 @@ class ExactCorrectionBasisDialog(QtWidgets.QDialog):
         self._planner = CorrectionPlanner(assessment.composition, assessment.targets)
         self._usable = set(self._planner.viable_next_targets(()))
         self._targets = {target.name: target for target in assessment.targets}
-        self._selected = set(assessment.plan.basis)
+        self._selected: set[str] = set()
         self._selected_assessment = assessment
 
         layout = QtWidgets.QVBoxLayout(self)
         required = self._planner.required_basis_size
         instruction = QtWidgets.QLabel(
-            f"Select {required} dependent parameter"
-            + ("." if required == 1 else "s.")
-            + " The others keep their current lines.",
+            f"Select {count_text(required, 'dependent parameter')}."
+            " The others keep their current lines.",
             self,
         )
         instruction.setObjectName("exact_correction_required_count")
@@ -51,7 +51,7 @@ class ExactCorrectionBasisDialog(QtWidgets.QDialog):
             QtWidgets.QAbstractItemView.SelectionMode.NoSelection
         )
         for target in assessment.targets:
-            item = QtWidgets.QListWidgetItem(f"{target.name} — {target.context}")
+            item = QtWidgets.QListWidgetItem(f"{target.name} — {reaction_text(target.context)}")
             item.setData(Qt.ItemDataRole.UserRole, target.name)
             item.setFlags(
                 Qt.ItemFlag.ItemIsUserCheckable
@@ -131,8 +131,8 @@ class ExactCorrectionBasisDialog(QtWidgets.QDialog):
                     description = "Cannot be the dependent parameter for this correction."
                 elif len(selected) == required:
                     description = (
-                        f"{required} dependent parameter"
-                        + (" is" if required == 1 else "s are")
+                        count_text(required, "dependent parameter").capitalize()
+                        + (" is" if required == 1 else " are")
                         + " already selected."
                     )
                 else:
@@ -157,8 +157,7 @@ class ExactCorrectionBasisDialog(QtWidgets.QDialog):
         else:
             remaining = required - len(selected)
             self.equations.setPlainText(
-                f"Select {remaining} more dependent parameter"
-                + ("." if remaining == 1 else "s.")
+                f"Select {count_text(remaining, 'more dependent parameter')}."
             )
         self.apply_button.setEnabled(plan.available)
 

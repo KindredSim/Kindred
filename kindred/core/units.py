@@ -97,34 +97,22 @@ def input_unit_bounds(unit: str, low: float, high: float) -> tuple[float, float]
     return lower, upper
 
 
-def _finite(value: object, field: str) -> float:
-    if type(value) is bool:
-        raise ValueError(f"{field} must be finite and numeric")
-    try:
-        number = float(value)
-    except (TypeError, ValueError, OverflowError) as exc:
-        raise ValueError(f"{field} must be finite and numeric") from exc
-    if not math.isfinite(number):
-        raise ValueError(f"{field} must be finite")
-    return number
-
-
 # Typed and computed values in scientific units, admitted against the role domains above.
-def admit_rate(value: object, *, field: str = "rate", allow_zero: bool = False) -> float:
-    return admit_role_value(_finite(value, field), role="k", unit="1", allow_exact_zero=allow_zero, field=field)
+def admit_rate(value: float, *, field: str = "rate", allow_zero: bool = False) -> float:
+    return admit_role_value(value, role="k", unit="1", allow_exact_zero=allow_zero, field=field)
 
 
-def admit_arrhenius_prefactor(value: object, *, field: str = "A") -> float:
-    return admit_role_value(_finite(value, field), role="A", unit="1", allow_exact_zero=False, field=field)
+def admit_arrhenius_prefactor(value: float, *, field: str = "A") -> float:
+    return admit_role_value(value, role="A", unit="1", allow_exact_zero=False, field=field)
 
 
-def admit_energy_j_per_mol(value: object, *, field: str = "energy") -> float:
+def admit_energy_j_per_mol(value: float, *, field: str = "energy") -> float:
     # Every energy role shares one domain.
-    return admit_role_value(_finite(value, field), role="Ea", unit="J/mol", allow_exact_zero=True, field=field)
+    return admit_role_value(value, role="Ea", unit="J/mol", allow_exact_zero=True, field=field)
 
 
-def admit_keq(value: object, *, field: str = "Keq") -> float:
-    return admit_role_value(_finite(value, field), role="Keq", unit="1", allow_exact_zero=False, field=field)
+def admit_keq(value: float, *, field: str = "Keq") -> float:
+    return admit_role_value(value, role="Keq", unit="1", allow_exact_zero=False, field=field)
 
 
 # ---------- Energy units ----------

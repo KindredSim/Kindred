@@ -251,8 +251,6 @@ class DatasetMappingBatchDialog(QtWidgets.QDialog):
     ) -> None:
         """Reset automatic occupancy without recursively re-projecting rows."""
         target_index = row.occupancy.findData(choice)
-        if target_index < 0:
-            raise DatasetMappingError("Mapping review occupancy choice is unavailable.")
         if row.occupancy.currentIndex() == target_index:
             return
         blocker = QtCore.QSignalBlocker(row.occupancy)

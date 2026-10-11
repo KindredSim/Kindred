@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
 from typing import Iterable
 
@@ -17,27 +16,6 @@ class NonnegativeProjection:
     projected: bool = False
     count: int = 0
     max_negative_magnitude: float = 0.0
-
-    def __post_init__(self) -> None:
-        count = int(self.count)
-        magnitude = float(self.max_negative_magnitude)
-        if count < 0:
-            raise ValueError("Nonnegative projection count must be nonnegative.")
-        if not math.isfinite(magnitude) or magnitude < 0.0:
-            raise ValueError(
-                "Nonnegative projection magnitude must be finite and nonnegative."
-            )
-        if bool(self.projected) != bool(count):
-            raise ValueError(
-                "Nonnegative projection flag must agree with its projected count."
-            )
-        if count == 0 and magnitude != 0.0:
-            raise ValueError(
-                "An empty nonnegative projection cannot report a magnitude."
-            )
-        object.__setattr__(self, "projected", bool(count))
-        object.__setattr__(self, "count", count)
-        object.__setattr__(self, "max_negative_magnitude", magnitude)
 
     @classmethod
     def aggregate(

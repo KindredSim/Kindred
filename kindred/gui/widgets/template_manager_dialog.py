@@ -57,14 +57,7 @@ class TemplateEditorDialog(QtWidgets.QDialog):
         """
         super().__init__(parent)
         self._is_edit_mode = template is not None
-        normalized_operation = str(operation or "").strip().casefold()
-        if normalized_operation not in {"create", "update"}:
-            raise ValueError("Template editor operation must be create or update.")
-        if normalized_operation == "update" and not self._is_edit_mode:
-            raise ValueError("Template update requires an existing template.")
-        if normalized_operation == "create" and self._is_edit_mode:
-            raise ValueError("Template create cannot target an existing template.")
-        self._operation = normalized_operation
+        self._operation = operation
         self._template_id = template.id if template is not None else None
 
         self.setWindowTitle(

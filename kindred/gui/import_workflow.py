@@ -28,10 +28,6 @@ def capture_import_source(
 
     path = Path(filepath)
     suffix = path.suffix.lower()
-    if suffix == ".xls":
-        raise ValueError(
-            "Legacy .xls format is not supported. Save the source as .xlsx."
-        )
     if suffix not in {".csv", ".xlsx"}:
         shown = suffix or "(none)"
         raise ValueError(
@@ -106,8 +102,8 @@ def resolve_column_unit(
             # A units-row clock format such as h:mm:ss is not a unit.
             raise ValueError(
                 f"Column {column.assigned_name!r}: {text!r} is a time format, not a "
-                "unit. Excel duration and clock cells need no unit (set Time unit "
-                "to Use default), and CSV times must be plain numbers."
+                "unit. Excel duration and clock cells need no unit, so choose Use "
+                "default for Time unit. CSV times must be plain numbers."
             ) from exc
         raise ValueError(f"Column {column.assigned_name!r}: {exc}") from exc
 

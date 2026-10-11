@@ -46,10 +46,9 @@ def compute_de_popsize_maxiter(*, budget: int, dim: int) -> Tuple[int, int]:
     estimate.
     """
 
-    # The caller passes a positive budget (its limit above one, less one).
-    dim = max(1, int(dim))
-
-    popsize = int(math.floor(math.sqrt(budget / max(1, 2 * dim))))
+    # The caller passes a positive budget (its limit above one, less one)
+    # and at least one free coordinate.
+    popsize = int(math.floor(math.sqrt(budget / (2 * dim))))
     popsize = max(5, min(15, popsize))
     evals_per_gen = popsize * dim
     maxiter = max(0, budget // evals_per_gen - 1)

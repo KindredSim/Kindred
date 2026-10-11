@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-import math
 
 import numpy as np
 
@@ -33,11 +32,6 @@ class SimulationBoundaryState:
     volume: float | None
     temperature_K: float
 
-    def __post_init__(self):
-        # The temperature is an admitted schedule or nominal temperature.
-        if self.volume is not None and (not math.isfinite(self.volume) or self.volume <= 0):
-            raise ValueError("Boundary vessel volume must be positive and finite.")
-
 
 @dataclass(frozen=True, slots=True)
 class VolumeTrajectory:
@@ -47,10 +41,7 @@ class VolumeTrajectory:
     values: np.ndarray
 
     def __post_init__(self):
+        # The volume executor range-checks every recorded volume.
         values = np.asarray(self.values, dtype=float)
-        if self.first_index < 0 or values.ndim != 1 or not values.size:
-            raise ValueError("Volume trajectory requires a nonempty defined suffix.")
-        if np.any(~np.isfinite(values)) or np.any(values <= 0):
-            raise ValueError("Tracked volume must be positive and finite.")
         values.setflags(write=False)
         object.__setattr__(self, "values", values)

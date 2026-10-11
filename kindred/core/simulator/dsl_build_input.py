@@ -30,7 +30,6 @@ class DslSourceCoordinateCapabilities:
     continuous: bool
     algebra_target: bool
     correction_target: bool
-    grouped_model_target: bool = False
 
 
 # This is intentionally the only role-capability table.  A role may be
@@ -43,7 +42,6 @@ _SOURCE_COORDINATE_CAPABILITIES: Mapping[str, DslSourceCoordinateCapabilities] =
             continuous=True,
             algebra_target=True,
             correction_target=role in {"kf", "kr", "Keq", "dG_eq"},
-            grouped_model_target=role in {"A", "Ea", "dG_act", "dG_eq", "kappa"},
         )
         for role in (
             "k",
@@ -63,7 +61,6 @@ _SOURCE_COORDINATE_CAPABILITIES: Mapping[str, DslSourceCoordinateCapabilities] =
             continuous=False,
             algebra_target=False,
             correction_target=False,
-            grouped_model_target=False,
         ),
         # ``param`` is the right-hand side of a ``param`` line, the source of an
         # independent value (a scalar or a reaction-parameter input).  It is
@@ -74,7 +71,6 @@ _SOURCE_COORDINATE_CAPABILITIES: Mapping[str, DslSourceCoordinateCapabilities] =
             continuous=True,
             algebra_target=False,
             correction_target=False,
-            grouped_model_target=False,
         ),
     }
 )
@@ -128,10 +124,6 @@ class DslSourceCoordinate:
     physical_line_index: int
     value_start: int
     value_end: int
-
-    @property
-    def capabilities(self) -> DslSourceCoordinateCapabilities:
-        return source_coordinate_capabilities(self.role)
 
 
 @dataclass(frozen=True, slots=True)

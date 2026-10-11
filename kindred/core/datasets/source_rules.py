@@ -28,8 +28,6 @@ def validate_tabular_source_bytes(
 ) -> None:
     """Admit exact nonempty bytes for one current CSV or XLSX source."""
 
-    if type(source_bytes) is not bytes:
-        raise TypeError("Dataset source content must be exact bytes.")
     label = str(source_label).strip() or "<dataset>"
     if not source_bytes:
         raise ValueError(f"Dataset source {label!r} is empty.")
@@ -69,16 +67,6 @@ class PhysicalColumn:
     source_index: int
     authored_name: str
     assigned_name: str
-
-    def __post_init__(self) -> None:
-        if type(self.source_index) is not int or self.source_index < 0:
-            raise ValueError("Physical column source_index must be nonnegative.")
-        authored = str(self.authored_name).strip()
-        assigned = str(self.assigned_name).strip()
-        if not authored or not assigned:
-            raise ValueError("Physical column names must be nonblank.")
-        object.__setattr__(self, "authored_name", authored)
-        object.__setattr__(self, "assigned_name", assigned)
 
 
 def identify_physical_columns(

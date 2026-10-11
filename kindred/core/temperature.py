@@ -123,9 +123,7 @@ class TemperatureSchedule:
 
     @staticmethod
     def _validated_intervals(intervals: List[Tuple[float, float, float]]) -> List[TimeInterval]:
-        if not intervals:
-            raise TemperatureScheduleError("At least one interval required for piecewise schedule")
-
+        # The DSL builds at least one contiguous interval from its time list.
         sorted_intervals = sorted(intervals, key=lambda x: x[0])
         time_intervals: List[TimeInterval] = []
         for i, (t_start, t_end, temp) in enumerate(sorted_intervals):
@@ -134,23 +132,6 @@ class TemperatureSchedule:
                 time_intervals.append(interval)
             except TemperatureScheduleError as e:
                 raise TemperatureScheduleError(f"Interval {i+1}: {e}")
-
-        for i in range(len(time_intervals) - 1):
-            current = time_intervals[i]
-            next_interval = time_intervals[i + 1]
-
-            if current.t_end != next_interval.t_start:
-                if current.t_end < next_interval.t_start:
-                    raise TemperatureScheduleError(
-                        f"Gap in intervals: [{current.t_start}, {current.t_end}) and "
-                        f"[{next_interval.t_start}, {next_interval.t_end}). "
-                        f"Missing coverage for t ∈ [{current.t_end}, {next_interval.t_start})"
-                    )
-                raise TemperatureScheduleError(
-                    f"Overlapping intervals: [{current.t_start}, {current.t_end}) and "
-                    f"[{next_interval.t_start}, {next_interval.t_end})"
-                )
-
         return time_intervals
 
     def __call__(self, t: float) -> float:

@@ -85,8 +85,8 @@ class _SheetModel(QtCore.QAbstractTableModel):
             column = self.info["columns"][section]
             tip = f"{column["name"]}\n{_unit_labels(column)[0]}\nDouble-click the name to edit."
             if column["formula"] is not None and column["unit"] is None:
-                tip += ("\n\nThe unit of the formula could not be inferred. Its numbers are calculated from the "
-                        "scientific values (M, s, K, J/mol, m³) of the columns it uses and are used as they are. "
+                tip += ("\n\nThe unit of the formula could not be inferred. Columns with a unit enter it in their "
+                        "scientific values (M, s, K, J/mol, m³), and columns without one enter as written. "
                         "To give it a unit, take plain numbers from a column that has a unit, or delete the "
                         "formula including = and use Correct Unit Declaration… on this column.")
             return literal_tooltip(tip)
@@ -733,8 +733,7 @@ class SpreadsheetEditorDialog(QtWidgets.QDialog):
                 self._formula_edit = None
                 spec = self._sheets[sheet]["columns"][column - 1]
                 if spec["formula"] is not None and spec["unit"] is None:
-                    self._feedback.setText(f"Column {ironcalc.column_name_from_number(column)} has no unit. It is "
-                                           "calculated from scientific values (M, s, …). Hover its unit for how to set one.")
+                    self._feedback.setText(f"Column {ironcalc.column_name_from_number(column)} has no unit.")
             area = None
             if self._result_area is not None and operation == self._result_area[0]:
                 if not error:
@@ -888,6 +887,7 @@ class SpreadsheetEditorDialog(QtWidgets.QDialog):
                 return False
         else:
             self._formula_edit = None
+            self._feedback.clear()
             self._selection_changed()
             self._table.setFocus()
         return True

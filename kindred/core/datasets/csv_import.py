@@ -40,14 +40,6 @@ class UncachedFormulaCell:
 
     formula: str
 
-    def __post_init__(self) -> None:
-        if (
-            not isinstance(self.formula, str)
-            or not self.formula
-            or not self.formula.startswith("=")
-        ):
-            raise ValueError("Uncached XLSX formulas require authored formula text.")
-
     def __str__(self) -> str:
         return self.formula
 
@@ -87,12 +79,6 @@ class PhysicalRow:
     source_row: int
     values: Mapping[PhysicalColumn, object]
 
-    def __post_init__(self) -> None:
-        if type(self.source_row) is not int or self.source_row <= 0:
-            raise ValueError("Physical row source_row must be a positive integer.")
-        if not isinstance(self.values, Mapping):
-            raise TypeError("Physical row values must be a column mapping.")
-
 
 def read_csv_rows_from_bytes(
     source_bytes: bytes,
@@ -113,11 +99,9 @@ def read_csv_rows_from_bytes(
         newline="",
     )
     reader = csv.reader(handle)
+    # The source bytes were admitted as UTF-8 text at capture or on Open.
     try:
         header = next(reader, None)
-    except UnicodeDecodeError as exc:
-        handle.close()
-        raise ValueError(f"CSV file {label!r} is not UTF-8 text.") from exc
     except csv.Error as exc:
         handle.close()
         raise ValueError(f"CSV file {label!r}: {exc}") from exc
@@ -149,8 +133,6 @@ def read_csv_rows_from_bytes(
                     },
                 )
                 previous_end_row = row_end_row
-        except UnicodeDecodeError as exc:
-            raise ValueError(f"CSV file {label!r} is not UTF-8 text.") from exc
         except csv.Error as exc:
             raise ValueError(f"CSV file {label!r}: {exc}") from exc
         finally:
@@ -174,17 +156,8 @@ def parse_physical_rows(
     metadata_extras: Mapping[str, object] | None = None,
 ) -> DatasetObservationPayload:
     """Convert physical source rows without ever keying by authored headers."""
+    # The sheet plan comes from resolve_sheet_plan or admitted replay metadata.
     physical_columns = tuple(columns)
-    if not physical_columns:
-        raise ValueError("The source has no columns.")
-    if len({column.source_index for column in physical_columns}) != len(
-        physical_columns
-    ):
-        raise ValueError("Physical column indexes must be unique.")
-    if len({column.assigned_name for column in physical_columns}) != len(
-        physical_columns
-    ):
-        raise ValueError("Assigned source column names must be unique.")
 
     def _raise_if_interrupted() -> None:
         if interruption_checker and interruption_checker():
@@ -202,9 +175,7 @@ def parse_physical_rows(
     first_item = next(row_iter, None)
     if first_item is None:
         raise ValueError(f"{_source_prefix()}the source contains no data rows.")
-    first_source_row = int(source_row_start)
-    if first_source_row <= 0:
-        raise ValueError("source_row_start must be a positive physical row number.")
+    first_source_row = source_row_start
 
     def _row_values_and_source_row(
         item: Mapping[PhysicalColumn, object] | PhysicalRow,
@@ -216,24 +187,10 @@ def parse_physical_rows(
 
     first, first_row_source = _row_values_and_source_row(first_item, 0)
 
-    if time_column is not None and not isinstance(time_column, PhysicalColumn):
-        raise TypeError("An exact admitted PhysicalColumn time column is required.")
-    if time_column is not None and time_column not in physical_columns:
-        raise ValueError("The admitted time column is absent from the source.")
     resolved_time = time_column
     resolved_species = tuple(species_columns)
-    if not resolved_species:
-        raise ValueError("At least one exact admitted observation column is required.")
-    if len(set(resolved_species)) != len(resolved_species):
-        raise ValueError("Admitted observation columns must be unique.")
-    if any(column not in physical_columns for column in resolved_species):
-        raise ValueError("An admitted observation column is absent from the source.")
-    if resolved_time in resolved_species:
-        raise ValueError("The admitted time column cannot also be an observation column.")
 
     time_scale = conversion_scale(time_unit, SECOND)
-    if set(observation_units) != {column.assigned_name for column in resolved_species}:
-        raise ValueError("Observation units must exactly match the selected columns.")
     scientific_units = {
         name: scientific_unit(unit.dimensions) for name, unit in observation_units.items()
     }
@@ -272,8 +229,6 @@ def parse_physical_rows(
             row, row_index = first, first_row_source
         else:
             row, row_index = _row_values_and_source_row(row_item, logical_index)
-        if row_index <= 0:
-            raise ValueError("Physical source rows must be positive.")
         _raise_if_interrupted()
         if not any(
             value is not None and str(value).strip()
@@ -307,16 +262,13 @@ def parse_physical_rows(
                         f"{resolved_time.assigned_name!r}: invalid numeric value "
                         f"{raw_time!r}."
                     ) from exc
-            try:
-                parsed_time = validate_imported_time_seconds(
-                    parsed_time,
-                    field=(
-                        f"{_source_prefix()}row {row_index}, time column "
-                        f"{resolved_time.assigned_name!r}"
-                    ),
-                )
-            except (TypeError, ValueError) as exc:
-                raise ValueError(str(exc)) from exc
+            parsed_time = validate_imported_time_seconds(
+                parsed_time,
+                field=(
+                    f"{_source_prefix()}row {row_index}, time column "
+                    f"{resolved_time.assigned_name!r}"
+                ),
+            )
 
         for column in resolved_species:
             _raise_if_interrupted()
@@ -331,16 +283,13 @@ def parse_physical_rows(
                     f"{column.assigned_name!r}: invalid numeric observation "
                     f"{raw_value!r}."
                 ) from exc
-            try:
-                parsed_value = validate_observation(
-                    parsed_value,
-                    field=(
-                        f"{_source_prefix()}row {row_index}, column "
-                        f"{column.assigned_name!r} observation"
-                    ),
-                )
-            except (TypeError, ValueError) as exc:
-                raise ValueError(str(exc)) from exc
+            parsed_value = validate_observation(
+                parsed_value,
+                field=(
+                    f"{_source_prefix()}row {row_index}, column "
+                    f"{column.assigned_name!r} observation"
+                ),
+            )
             spec = observations_by_column[column]
             if resolved_time is not None:
                 spec["t"].append(parsed_time)
@@ -393,14 +342,7 @@ def parse_physical_rows(
     }
     if sheet_name is not None:
         metadata["sheet_name"] = str(sheet_name)
-    extras = dict(metadata_extras or {})
-    collisions = set(extras) & set(metadata)
-    if collisions:
-        raise ValueError(
-            "Import metadata extras cannot replace canonical fields: "
-            + ", ".join(sorted(collisions))
-        )
-    metadata.update(extras)
+    metadata.update(metadata_extras or {})
     return DatasetObservationPayload(
         observations=tuple(observations),
         source_metadata=freeze_json_value(metadata),

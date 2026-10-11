@@ -34,7 +34,6 @@ from kindred.core.datasets.foundation import (
     freeze_json_value,
     thaw_json_value,
     validate_imported_source,
-    validate_original_basename,
     validate_raw_dataset_record,
 )
 from kindred.core.datasets.csv_import import (
@@ -52,7 +51,6 @@ from kindred.core.project_presentation_state import (
     ProjectPresentationState,
     SimulationSeriesAxisSelection,
     WorkspacePresentationState,
-    validate_workspace_presentation_state,
 )
 
 __all__ = [
@@ -64,9 +62,6 @@ __all__ = [
 CURRENT_PROJECT_FORMAT = "kindred-kin-7"
 _PROJECT_MEMBER = "project.json"
 _SOURCE_MEMBER_PREFIX = "sources/"
-_CANONICAL_ZIP_TIMESTAMP = (1980, 1, 1, 0, 0, 0)
-_CANONICAL_ZIP_CREATE_SYSTEM = 3
-_CANONICAL_ZIP_FILE_MODE = stat.S_IFREG | 0o644
 _REPLAY_METADATA_FIELDS = frozenset(
     {
         "physical_columns",
@@ -111,19 +106,6 @@ def _decode_json_bytes(data: bytes, *, label: str) -> object:
         )
     except (json.JSONDecodeError, TypeError) as exc:
         raise ValueError(f"{label} is not valid strict JSON.") from exc
-
-
-def _canonical_zip_info(member_name: str) -> zipfile.ZipInfo:
-    """Return host-independent metadata for one canonical archive member."""
-
-    info = zipfile.ZipInfo(
-        filename=member_name,
-        date_time=_CANONICAL_ZIP_TIMESTAMP,
-    )
-    info.create_system = _CANONICAL_ZIP_CREATE_SYSTEM
-    info.external_attr = _CANONICAL_ZIP_FILE_MODE << 16
-    info.compress_type = zipfile.ZIP_STORED
-    return info
 
 
 def _finite(
@@ -386,7 +368,7 @@ def _encode_document(
                         "values": [
                             [
                                 species,
-                                0.0 if value == 0.0 else value,
+                                value,
                             ]
                             for species, value in initial_set.values
                         ],
@@ -464,35 +446,21 @@ def _replay_imported_dataset(
 ) -> None:
     """Reparse retained source bytes and require exact observation replay."""
     metadata = thaw_json_value(dataset.source_metadata)
-    raw_columns = metadata["physical_columns"]
-    if not isinstance(raw_columns, list):
-        raise ValueError(f"{label}.source_metadata.physical_columns must be an array.")
+    # validate_raw_dataset_record admitted this metadata before replay.
     columns = tuple(
         PhysicalColumn(
-            source_index=_integer(item.get("source_index"), f"{label}.physical_columns[{index}].source_index"),
-            authored_name=_string(item.get("authored_name"), f"{label}.physical_columns[{index}].authored_name", nonblank=True),
-            assigned_name=_string(item.get("assigned_name"), f"{label}.physical_columns[{index}].assigned_name", nonblank=True),
+            source_index=item["source_index"],
+            authored_name=item["authored_name"],
+            assigned_name=item["assigned_name"],
         )
-        for index, item in enumerate(raw_columns)
-        if isinstance(item, Mapping)
+        for item in metadata["physical_columns"]
     )
-    if len(columns) != len(raw_columns):
-        raise ValueError(f"{label}.source_metadata.physical_columns contains invalid entries.")
-    observation_names = metadata["observation_columns"]
-    if (
-        not isinstance(observation_names, list)
-        or any(not isinstance(name, str) or not name.strip() for name in observation_names)
-    ):
-        raise ValueError(f"{label}.source_metadata.observation_columns must be an array of names.")
     by_name = {column.assigned_name: column for column in columns}
-    try:
-        time_column = (
-            None if metadata["time_column"] is None
-            else by_name[str(metadata["time_column"])]
-        )
-        species_columns = tuple(by_name[str(name)] for name in observation_names)
-    except KeyError as exc:
-        raise ValueError(f"{label}.source_metadata references an unknown physical column.") from exc
+    time_column = (
+        None if metadata["time_column"] is None
+        else by_name[metadata["time_column"]]
+    )
+    species_columns = tuple(by_name[name] for name in metadata["observation_columns"])
     skip_unit_row = _boolean(
         metadata["skip_unit_row"], f"{label}.source_metadata.skip_unit_row",
     )
@@ -546,11 +514,7 @@ def _replay_imported_dataset(
             rows.close()
         return
 
-    if source.original_format != "xlsx":
-        raise ValueError(f"{label} has unsupported source format {source.original_format!r}.")
-    sheet_name = metadata.get("sheet_name")
-    if not isinstance(sheet_name, str) or not sheet_name:
-        raise ValueError(f"{label}.source_metadata.sheet_name is required for XLSX replay.")
+    sheet_name = metadata["sheet_name"]
     workbook_context = (
         nullcontext(workbooks)
         if workbooks is not None
@@ -639,10 +603,6 @@ def _decode_document(
         original_filename = _string(
             item["original_filename"], f"{label}.original_filename", nonblank=True
         )
-        try:
-            validate_original_basename(original_filename, label=f"{label}.original_filename")
-        except ValueError as exc:
-            raise ValueError(str(exc)) from exc
         original_format = _string(
             item["original_format"], f"{label}.original_format", nonblank=True
         )
@@ -968,10 +928,6 @@ def _decode_document(
                 },
             )
             raw_set_id = link["set_id"]
-            if raw_set_id is not None and not isinstance(raw_set_id, str):
-                raise TypeError(
-                    f"{link_label}.set_id must be a str or null."
-                )
             links.append(
                 (
                     _string(
@@ -1309,26 +1265,20 @@ def _encode_project(
     document: ProjectDocument,
     presentation: WorkspacePresentationState,
 ) -> tuple[dict[str, object], tuple[tuple[str, bytes], ...]]:
-    if not isinstance(document, ProjectDocument):
-        raise TypeError("document must be ProjectDocument.")
-    workspace_presentation = validate_workspace_presentation_state(
-        document,
-        presentation,
-    )
     encoded_document, source_members = _encode_document(document)
     return (
         {
             "format": CURRENT_PROJECT_FORMAT,
             "document": encoded_document,
             "workspace": {
-                "active_tab_id": workspace_presentation.active_tab_id,
+                "active_tab_id": presentation.active_tab_id,
                 "presentation_by_tab_id": [
                     {
                         "tab_id": tab_id,
                         "state": _encode_presentation(state),
                     }
                     for tab_id, state
-                    in workspace_presentation.presentation_by_tab_id
+                    in presentation.presentation_by_tab_id
                 ],
             },
         },
@@ -1510,10 +1460,7 @@ class KinArchiveStore:
                         *source_members,
                     )
                     for member_name, member_bytes in sorted(members):
-                        archive.writestr(
-                            _canonical_zip_info(member_name),
-                            member_bytes,
-                        )
+                        archive.writestr(member_name, member_bytes)
                 handle.flush()
             # Inspect the destination entry itself.  In particular, a
             # dangling or live symlink is replaced as an entry by os.replace;

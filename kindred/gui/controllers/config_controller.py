@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import math
 import os
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from types import MappingProxyType
 
 from PySide6 import QtCore, QtGui, QtWidgets
@@ -109,11 +109,6 @@ class ConfigController(QtCore.QObject):
 
     def __init__(self, settings: QtCore.QSettings):
         super().__init__()
-        if not isinstance(settings, QtCore.QSettings):
-            raise TypeError(
-                "settings must be QSettings, "
-                f"got {type(settings).__name__}."
-            )
         self._settings_store = settings
         self._species_palette = self._build_species_palette()
 
@@ -153,9 +148,8 @@ class ConfigController(QtCore.QObject):
                 success_message="Run parallel maximum reset to Automatic.",
             )
             return None
-        if type(value) is not int:
-            raise TypeError("Run user maximum must be an integer or None.")
-        accepted = min(MAX_PARALLEL_WORKERS_CEILING, max(1, value))
+        # The dialog's spin box admits 1 to the ceiling.
+        accepted = value
         settings = self._settings()
         snapshot = self._snapshot_settings(settings, (_RUN_USER_MAXIMUM_KEY,))
         settings.setValue(_RUN_USER_MAXIMUM_KEY, accepted)
@@ -186,12 +180,6 @@ class ConfigController(QtCore.QObject):
     def set_result_cache_capacity(self, value: int) -> int:
         """Persist and synchronously publish one positive Qt integer."""
 
-        if type(value) is not int:
-            raise TypeError("Result cache capacity must be an integer.")
-        if not 1 <= value <= _QT_POSITIVE_INT_MAX:
-            raise ValueError(
-                "Result cache capacity must be a positive Qt integer."
-            )
         previous = self.result_cache_capacity()
         settings = self._settings()
         snapshot = self._snapshot_settings(settings, (_RESULT_CACHE_CAPACITY_KEY,))
@@ -215,8 +203,7 @@ class ConfigController(QtCore.QObject):
 
     def set_preview_points(self, value: int) -> int:
         return self._set_preview_setting(
-            _PREVIEW_POINTS_KEY, value, self.preview_points(),
-            SIMULATION_POINT_RANGE, label="Preview points",
+            _PREVIEW_POINTS_KEY, value, self.preview_points(), label="Preview points",
         )
 
     def preview_delay_ms(self) -> int:
@@ -226,8 +213,7 @@ class ConfigController(QtCore.QObject):
 
     def set_preview_delay_ms(self, value: int) -> int:
         return self._set_preview_setting(
-            _PREVIEW_DELAY_KEY, value, self.preview_delay_ms(),
-            (0, 1000), label="Preview delay (ms)",
+            _PREVIEW_DELAY_KEY, value, self.preview_delay_ms(), label="Preview delay (ms)",
         )
 
     def _preview_setting(
@@ -237,12 +223,10 @@ class ConfigController(QtCore.QObject):
         return default if parsed is None else min(bounds[1], max(bounds[0], parsed))
 
     def _set_preview_setting(
-        self, key: str, value: int, previous: int, bounds: tuple[int, int],
-        *, label: str,
+        self, key: str, value: int, previous: int, *, label: str,
     ) -> int:
-        if type(value) is not int:
-            raise TypeError(f"{label} must be an integer.")
-        accepted = min(bounds[1], max(bounds[0], value))
+        # The Simulation Settings editors admit the range.
+        accepted = value
         settings = self._settings()
         snapshot = self._snapshot_settings(settings, (key,))
         settings.setValue(key, accepted)
@@ -630,11 +614,7 @@ class ConfigController(QtCore.QObject):
                 break
         return tuple(result)
 
-    def record_recent_project(self, filepath: str) -> tuple[str, ...]:
-        raw_path = str(filepath).strip()
-        if not raw_path:
-            raise ValueError("Recent project path must not be blank.")
-        path = os.path.abspath(os.path.expanduser(raw_path))
+    def record_recent_project(self, path: str) -> tuple[str, ...]:
         identity = os.path.normcase(path)
         current = [
             item
@@ -666,8 +646,6 @@ class ConfigController(QtCore.QObject):
     ) -> QtGui.QColor:
         """Return one application preference color as an independent QColor."""
         canonical = self._resolve_species_name(species, known_species)
-        if not canonical:
-            raise ValueError("Species color requires a nonblank name.")
         override = self._species_color_overrides().get(canonical)
         if override is not None:
             return QtGui.QColor(override)
@@ -685,10 +663,6 @@ class ConfigController(QtCore.QObject):
         known_species: Sequence[str] = (),
     ) -> None:
         canonical = self._resolve_species_name(species, known_species)
-        if not canonical:
-            raise ValueError("Species color requires a nonblank name.")
-        if not isinstance(color, QtGui.QColor) or not color.isValid():
-            raise ValueError("color must be a valid QColor.")
         overrides = dict(self._species_color_overrides())
         overrides[canonical] = QtGui.QColor(color).name(QtGui.QColor.NameFormat.HexRgb)
         settings = self._settings()
@@ -710,8 +684,6 @@ class ConfigController(QtCore.QObject):
         )
 
     def set_experimental_point_shape(self, shape: str) -> str:
-        if shape not in tuple(code for _label, code in self.EXPERIMENTAL_POINT_SHAPES):
-            raise ValueError("Unsupported experimental point shape.")
         settings = self._settings()
         snapshot = self._snapshot_settings(settings, (_EXPERIMENTAL_POINT_SHAPE_KEY,))
         settings.setValue(_EXPERIMENTAL_POINT_SHAPE_KEY, shape)
@@ -732,7 +704,7 @@ class ConfigController(QtCore.QObject):
             return _DEFAULT_EXPERIMENTAL_POINT_SIZE
 
     def set_experimental_point_size(self, size: int) -> int:
-        accepted = self._validate_experimental_point_size(size)
+        accepted = size
         settings = self._settings()
         snapshot = self._snapshot_settings(settings, (_EXPERIMENTAL_POINT_SIZE_KEY,))
         settings.setValue(_EXPERIMENTAL_POINT_SIZE_KEY, accepted)
@@ -757,7 +729,7 @@ class ConfigController(QtCore.QObject):
             return _DEFAULT_EXPERIMENTAL_POINT_OPACITY
 
     def set_experimental_point_opacity(self, opacity: float) -> float:
-        accepted = self._validate_experimental_point_opacity(opacity)
+        accepted = opacity
         settings = self._settings()
         snapshot = self._snapshot_settings(settings, (_EXPERIMENTAL_POINT_OPACITY_KEY,))
         settings.setValue(_EXPERIMENTAL_POINT_OPACITY_KEY, accepted)
@@ -807,10 +779,8 @@ class ConfigController(QtCore.QObject):
         species: str,
         known_species: Sequence[str],
     ) -> str:
-        raw = str(species or "").strip()
-        if not raw:
-            return ""
-        roster = cls._clean_species_names(known_species)
+        raw = species
+        roster = tuple(known_species)
         if not roster:
             return raw
         exact = {name: name for name in roster}
@@ -827,25 +797,13 @@ class ConfigController(QtCore.QObject):
                     return folded[base]
         return raw
 
-    @staticmethod
-    def _clean_species_names(species: Iterable[str]) -> tuple[str, ...]:
-        result: list[str] = []
-        seen: set[str] = set()
-        for value in species:
-            name = str(value).strip()
-            if not name or name in seen:
-                continue
-            seen.add(name)
-            result.append(name)
-        return tuple(result)
-
     def _default_species_slot(
         self,
         canonical: str,
         known_species: Sequence[str],
     ) -> int:
         roster = sorted(
-            self._clean_species_names(known_species),
+            known_species,
             key=str.casefold,
         )
         if canonical in roster:

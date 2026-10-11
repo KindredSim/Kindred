@@ -60,14 +60,11 @@ def _raise_invalid_protected_indexed_identifier_error(
     line_number: int,
     line_content: str,
 ) -> None:
-    suggestions = ", ".join(str(name) for name in suggested_names)
+    names = ", ".join(str(name) for name in suggested_names)
     raise DSLError(
-        f"{raw_name!r} is not a valid indexed parameter identifier.",
-        suggestion=(
-            "Use the canonical indexed parameter name"
-            + (f" for this step: {suggestions}." if suggestions else ".")
-            + " Exact protected indexed names must resolve to an existing mechanism parameter."
-        ),
+        f"{raw_name!r} is reserved for reaction parameters, and the parameters of that step are {names}."
+        if names
+        else f"{raw_name!r} is reserved for a reaction parameter, and this mechanism has none by that name.",
         line_number=line_number,
         line_content=line_content,
     )
@@ -85,42 +82,7 @@ def _raise_protected_observable_identifier_error(
     line_content: str,
 ) -> None:
     raise DSLError(
-        f"{raw_name!r} is a protected indexed parameter identifier and cannot be declared as an observable.",
-        suggestion=(
-            "Use 'param name = expr' for mechanism parameter algebra, or choose a longer observable name "
-            "such as 'K1_test' if this is not a mechanism parameter."
-        ),
-        line_number=line_number,
-        line_content=line_content,
-    )
-
-
-def _raise_protected_step_key_identifier_error(
-    raw_name: str,
-    *,
-    line_number: int,
-    line_content: str,
-) -> None:
-    raise DSLError(
-        f"{raw_name!r} is a step-local DSL key and cannot be declared as a parameter or observable.",
-        suggestion=(
-            "Use a canonical indexed mechanism parameter such as k1, kf1, kr1, or Keq1, "
-            "or choose a longer ordinary name such as 'K1_test'."
-        ),
-        line_number=line_number,
-        line_content=line_content,
-    )
-
-
-def _raise_unsupported_bare_assignment_error(
-    raw_name: str,
-    *,
-    line_number: int,
-    line_content: str,
-) -> None:
-    raise DSLError(
-        f"Bare algebra assignment {raw_name!r} is not supported.",
-        suggestion="Use 'let name = expr' or 'param name = expr'.",
+        f"{raw_name!r} is reserved for reaction parameters, so a let line cannot define it.",
         line_number=line_number,
         line_content=line_content,
     )
@@ -499,22 +461,21 @@ def _circular_definition_error(
         else:
             sources = " and ".join(name for name in chemistry[node] if name != "T")
             steps.append(f"{node} is calculated from {sources} on its reaction line")
-    suggestion = f"Write {target} without reading {reads[target]}."
+    advice = f"Write {target} without reading {reads[target]}."
     parts = source_coordinate_name_parts(target)
     # The line reads a value its own reaction calculates from it; kf, kr and
     # Keq of one step satisfy Keq = kf/kr, so the line can restate that.
     restatements = {"kf": "Keq{0}*kr{0}", "kr": "kf{0}/Keq{0}", "Keq": "kf{0}/kr{0}"}
     if parts is not None and parts[0] in restatements and target in chemistry.get(reads[target], ()):
         example = f"param {target} = " + restatements[parts[0]].format(parts[1])
-        suggestion = (
+        advice = (
             f"Write {target} without reading {reads[target]}, or, if the line only restates its reaction,"
             f" name the values themselves, such as {example}. A copy of another line's formula does not"
             " count as that value."
         )
     statement = statements[target]
     return DSLError(
-        circular_definition_message(target, steps),
-        suggestion=suggestion,
+        f"{circular_definition_message(target, steps)} {advice}",
         line_number=statement.line,
         line_content=statement.line_text,
     )
@@ -616,7 +577,6 @@ def _canonicalize_parameter_expr(
         ).algebra_target:
             raise DSLError(
                 f"{raw_name} cannot be read in a param formula.",
-                suggestion="Use a reaction parameter such as A1, Ea1, dG_act1, dG_eq1, or kappa1.",
                 line_number=assignment.line_number,
                 line_content=assignment.line_content,
             )
@@ -707,8 +667,8 @@ def _validate_retained_parameter_program(
         idents = set(identifier_order)
         if statement.expr.has_species_ref() or "t" in idents:
             raise DSLError(
-                f"Parameter expression for {assignment.name!r} cannot use species concentrations or time t.",
-                suggestion="Put expressions that change during the simulation in a 'let'.",
+                f"Parameter expression for {assignment.name!r} cannot use species concentrations or time t. "
+                "Put expressions that change during the simulation in a let line.",
                 line_number=assignment.line_number,
                 line_content=assignment.line_content,
             )
@@ -720,8 +680,8 @@ def _validate_retained_parameter_program(
         if unknown_functions:
             raise DSLError(
                 f"Unknown function{'s' * (len(unknown_functions) > 1)} "
-                + ", ".join(repr(name) for name in sorted(unknown_functions)) + ".",
-                suggestion="Use a math function listed in Mechanism Help.",
+                + ", ".join(repr(name) for name in sorted(unknown_functions))
+                + ". The functions are " + ", ".join(sorted(namespace.builtin_function_names)) + ".",
                 line_number=assignment.line_number,
                 line_content=assignment.line_content,
             )
@@ -736,8 +696,8 @@ def _validate_retained_parameter_program(
         if unknown:
             raise DSLError(
                 f"Unknown name{'s' * (len(unknown) > 1)} in parameter expression: "
-                + ", ".join(repr(name) for name in sorted(unknown)) + ".",
-                suggestion="Parameter expressions may only reference other parameters and supported constants.",
+                + ", ".join(repr(name) for name in sorted(unknown))
+                + ". A param formula reads other parameters, T, and the constants k_B, h, h_bar, N_A, and R.",
                 line_number=assignment.line_number,
                 line_content=assignment.line_content,
             )
@@ -772,8 +732,8 @@ def _validate_retained_observable_program(
         if unknown_functions:
             raise DSLError(
                 f"Unknown function{'s' * (len(unknown_functions) > 1)} "
-                + ", ".join(repr(function_name) for function_name in sorted(unknown_functions)) + ".",
-                suggestion="Use a math function listed in Mechanism Help.",
+                + ", ".join(repr(function_name) for function_name in sorted(unknown_functions))
+                + ". The functions are " + ", ".join(sorted(namespace.builtin_function_names)) + ".",
                 line_number=statement.line,
                 line_content=statement.line_text,
             )
@@ -791,15 +751,10 @@ def _validate_retained_observable_program(
         if unknown:
             raise DSLError(
                 f"Unknown name{'s' * (len(unknown) > 1)} in observable expression: "
-                + ", ".join(repr(identifier) for identifier in sorted(unknown)) + ".",
-                suggestion=(
-                    "In `let` expressions, use `[X]` for the current concentration of species `X` "
-                    "and `[X]_0` for its initial concentration. Bare names may reference declared "
-                    "parameters (for example, `a` from `param a = 5`), available reaction parameters "
-                    "(such as `k1`, `kf1`, `kr1`, `Keq1`, `A1`, `Ea1`, `dG_act1`, `dG_eq1`, or "
-                    "`kappa1`), values defined by other `let` statements, time `t`, temperature `T`, "
-                    "or the constants `k_B`, `h`, `h_bar`, `N_A`, `R`."
-                ),
+                + ", ".join(repr(identifier) for identifier in sorted(unknown))
+                + ". A let line reads [X] for the concentration of species X, [X]_0 for its initial "
+                "concentration, parameters, reaction parameters such as k1, other let values, t, T, "
+                "and the constants k_B, h, h_bar, N_A, and R.",
                 line_number=statement.line,
                 line_content=statement.line_text,
             )
@@ -996,8 +951,7 @@ def extract_parameter_assignments_from_algebra_lines(
                 source_info.role
             ).algebra_target:
                 raise DSLError(
-                    f"{raw_name} cannot be set on a param line.",
-                    suggestion="Write it on its reaction line.",
+                    f"{raw_name} cannot be set on a param line. Write it on its reaction line.",
                     line_number=line_no,
                     line_content=original,
                 )
@@ -1009,16 +963,13 @@ def extract_parameter_assignments_from_algebra_lines(
             ):
                 raise DSLError(
                     _reserved_name_message(name, "parameter"),
-                    suggestion="Choose a name that does not shadow protected constants or functions, for example 'a', 'Ea', or 'scale'.",
                     line_number=line_no,
                     line_content=original,
                 )
             m_mech = _MECH_PARAM_RE.match(raw_name)
             if m_mech and resolution.canonical_name is None and name not in mechanism_param_names:
                 raise DSLError(
-                    f"Unknown mechanism parameter {raw_name!r}.",
-                    suggestion="Use an existing mechanism parameter, such as k1, k2, kf1, kr1, or Keq1, or define the parameter on a reaction line.",
-                    examples=["A -> B; k=1.0", "param k1 = 4*k2"],
+                    f"Unknown mechanism parameter {raw_name!r}: no reaction line has that field.",
                     line_number=line_no,
                     line_content=original,
                 )
@@ -1044,21 +995,13 @@ def extract_parameter_assignments_from_algebra_lines(
             )
             continue
 
-        if classification.kind == "invalid_step_key_identifier":
-            _raise_protected_step_key_identifier_error(
-                classification.raw_name,
-                line_number=line_no,
-                line_content=original,
-            )
-
         if classification.kind == "let":
             target_raw = classification.raw_name
             resolution = mechanism_namespace.resolve(target_raw)
             target = resolution.canonical_name or target_raw
             if resolution.canonical_name is not None and target in mechanism_param_names:
                 raise DSLError(
-                    f"{target_raw!r} is a rate/equilibrium parameter. Use 'param {target_raw} = ...' for parameter algebra.",
-                    examples=[f"param {target_raw} = 4*k2"],
+                    f"{target_raw!r} is a reaction parameter, so a let line cannot define it.",
                     line_number=line_no,
                     line_content=original,
                 )
@@ -1070,12 +1013,6 @@ def extract_parameter_assignments_from_algebra_lines(
                 )
             continue
 
-        if classification.kind == "unsupported_bare_assignment":
-            _raise_unsupported_bare_assignment_error(
-                classification.raw_name,
-                line_number=line_no,
-                line_content=original,
-            )
 
     return assignments
 
@@ -1099,12 +1036,6 @@ def extract_observable_names_from_algebra_lines(algebra_lines: Sequence[Tuple[in
                     line_number=_line_no,
                     line_content=raw.rstrip("\n"),
                 )
-            if is_protected_step_key_identifier(classification.raw_name):
-                _raise_protected_step_key_identifier_error(
-                    classification.raw_name,
-                    line_number=_line_no,
-                    line_content=raw.rstrip("\n"),
-                )
             symbols = SymbolTable()
             if (
                 classification.raw_name in symbols.protected_names()
@@ -1115,7 +1046,6 @@ def extract_observable_names_from_algebra_lines(algebra_lines: Sequence[Tuple[in
                 # silently read the built-in constant or function instead.
                 raise DSLError(
                     _reserved_name_message(classification.raw_name, "let value"),
-                    suggestion="Choose a name that does not shadow protected constants or functions, for example 'ratio' or 'rate_A'.",
                     line_number=_line_no,
                     line_content=raw.rstrip("\n"),
                 )
@@ -1127,18 +1057,6 @@ def extract_observable_names_from_algebra_lines(algebra_lines: Sequence[Tuple[in
                 )
             out.add(classification.raw_name)
             continue
-        if classification.kind == "invalid_step_key_identifier":
-            _raise_protected_step_key_identifier_error(
-                classification.raw_name,
-                line_number=_line_no,
-                line_content=raw.rstrip("\n"),
-            )
-        if classification.kind == "unsupported_bare_assignment":
-            _raise_unsupported_bare_assignment_error(
-                classification.raw_name,
-                line_number=_line_no,
-                line_content=raw.rstrip("\n"),
-            )
     return out
 
 

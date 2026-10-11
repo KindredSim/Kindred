@@ -33,7 +33,7 @@ from kindred.gui.fitting.launch import (
 )
 from kindred.gui.fitting.reporting import fit_completion_presentation, fit_identity_text
 from kindred.gui.fitting.window import FittingWindow
-from kindred.gui.fitting.execution import FitCandidate, FitLiveUpdate
+from kindred.gui.fitting.execution import FitCandidate
 from kindred.gui.fitting.worker import GlobalFitWorker
 from kindred.gui.workspace_tab_registry import WorkspaceTabRegistry
 
@@ -129,7 +129,6 @@ class FitSessionOwner(QtCore.QObject):
     ) -> FittingWindow | None:
         """Open an idle configuration from one admitted document origin."""
 
-        self._require_thread()
         if (
             self._application_close_fenced
             or self._closing
@@ -205,19 +204,7 @@ class FitSessionOwner(QtCore.QObject):
     @QtCore.Slot()
     def execute(self) -> bool:
         """Admit one Fit worker from the current accepted setup."""
-        self._require_thread()
         window = self._window
-        origin = self._current_origin()
-        if window is None or origin is None:
-            self._set_status("Fit rejected: there is no open Fit window.")
-            return False
-        setup = self._accepted_setup()
-        if setup is None:
-            self._set_status("Fit rejected: there is no accepted Fit setup.")
-            return False
-        if self._worker is not None:
-            self._set_status("Fit rejected: this fit is already running.")
-            return False
         if self._closing or self._application_close_fenced:
             self._set_status("Fit rejected while the window is closing.")
             return False
@@ -316,12 +303,6 @@ class FitSessionOwner(QtCore.QObject):
         previous = self._accepted_setup()
         if window is None or origin is None or previous is None:
             return False
-        if not isinstance(snapshot, FitSetupSnapshot):
-            window.set_status("Fit setup snapshot is not typed.")
-            return False
-        if snapshot.origin is not origin:
-            window.set_status("Fit setup snapshot no longer matches its origin.")
-            return False
         if self._worker is not None:
             window.set_status("Fit setup is locked while execution is active.")
             return False
@@ -375,10 +356,9 @@ class FitSessionOwner(QtCore.QObject):
         return True
 
     @QtCore.Slot(object)
-    def reset_setup(self, reset_kind: object) -> bool:
+    def reset_setup(self, reset_kind: str) -> bool:
         """Restore one owner-retained reset snapshot selected by kind."""
 
-        self._require_thread()
         window = self._window
         origin = self._current_origin()
         if (
@@ -387,10 +367,9 @@ class FitSessionOwner(QtCore.QObject):
             or self._worker is not None
             or window is None
             or origin is None
-            or str(reset_kind or "").strip().lower() not in {"initial", "last_fit"}
         ):
             return False
-        kind = str(reset_kind).strip().lower()
+        kind = reset_kind
         snapshot = (
             self._initial_setup_snapshot
             if kind == "initial"
@@ -415,8 +394,6 @@ class FitSessionOwner(QtCore.QObject):
     def _clear_candidate_presentation(self, window: FittingWindow) -> None:
         """Clear the candidate presentation."""
 
-        if not isinstance(window, FittingWindow):
-            raise TypeError("Fit candidate presentation requires FittingWindow.")
         window.clear_candidate()
         window.set_apply_available(False, "Run a fit to obtain current values to apply.")
 
@@ -440,7 +417,6 @@ class FitSessionOwner(QtCore.QObject):
         self._candidate_applied_to_project = False
 
     def set_project_defaults(self, defaults: FitDefaults) -> bool:
-        self._require_thread()
         if self._closing or self._application_close_fenced:
             return False
         expected_token = self._session.capture_content_token()
@@ -457,7 +433,6 @@ class FitSessionOwner(QtCore.QObject):
     def close_idle_for_application_close(self) -> bool:
         """Synchronously discard and destroy an idle Fit dialog for Close."""
 
-        self._require_thread()
         if self._worker is not None:
             return False
         self._closing = True
@@ -471,7 +446,6 @@ class FitSessionOwner(QtCore.QObject):
     def fence_application_close_admission(self) -> None:
         """Reject Fit admission and continuation for the active Close attempt."""
 
-        self._require_thread()
         if self._application_close_fenced:
             return
         self._application_close_fenced = True
@@ -481,7 +455,6 @@ class FitSessionOwner(QtCore.QObject):
     def cancel_for_application_close(self) -> None:
         """Dispose Fit state and close through the existing owner lifecycle."""
 
-        self._require_thread()
         was_closing = self._closing
         if not self._application_close_fenced:
             self.fence_application_close_admission()
@@ -572,7 +545,6 @@ class FitSessionOwner(QtCore.QObject):
             self._application_close_fenced
             or self._closing
             or self._worker is not worker
-            or not isinstance(update, FitLiveUpdate)
         ):
             return
         if self._window is not None:
@@ -583,7 +555,6 @@ class FitSessionOwner(QtCore.QObject):
             self._application_close_fenced
             or self._closing
             or self._worker is not worker
-            or not isinstance(curves, tuple)
         ):
             return
         if self._window is not None:
@@ -643,11 +614,7 @@ class FitSessionOwner(QtCore.QObject):
             if not parameter.selected_config.fit:
                 continue
             if parameter.scope == "shared":
-                raw_value = candidate.result.shared_params.get(parameter.name)
-                if raw_value is None:
-                    raise ValueError(
-                        f"Fit result omitted shared parameter {parameter.name!r}."
-                    )
+                raw_value = candidate.result.shared_params[parameter.name]
             else:
                 overall = fit_parameter_overall(parameter, setup.datasets, candidate.origin)
                 if overall is None:
@@ -688,13 +655,12 @@ class FitSessionOwner(QtCore.QObject):
             reason = self._candidate_apply_reason(self._candidate)
         copy_reason = reason
         if self._candidate_copy_name is not None:
-            copy_reason = f'Fit already applied to “{self._candidate_copy_name}”. Run a new fit to create another fitted copy.'
+            copy_reason = f"Fit already applied to '{self._candidate_copy_name}'. Run a new fit to create another fitted copy."
         window.set_apply_available(
             not reason, reason, copy_available=not copy_reason, copy_reason=copy_reason,
         )
 
     def _apply_fit(self, *, to_copy: bool) -> bool:
-        self._require_thread()
         candidate = self._candidate
         origin = self._current_origin()
         setup = self._accepted_setup()
@@ -736,8 +702,8 @@ class FitSessionOwner(QtCore.QObject):
             self.project_document_changed.emit(published.tab_id)
             origin_name = self._registry.tab(origin.tab_id).name
             message = (
-                f'Fit applied to “{published.name}”. '
-                f'This fitting session remains attached to “{origin_name}”.'
+                f"Fit applied to '{published.name}'. "
+                f"This fitting session remains attached to '{origin_name}'."
             )
             self._set_status(message)
             return True
@@ -817,7 +783,6 @@ class FitSessionOwner(QtCore.QObject):
         proposed_document = reconciliation.proposed_document
         proposed_tab = proposed_document.tab(tab_id)
         if initial_values:
-            found_keys: set[tuple[str, str]] = set()
             proposed_sets = []
             for initial_set in proposed_tab.initial_condition_sets:
                 values = initial_set.values_dict()
@@ -826,10 +791,7 @@ class FitSessionOwner(QtCore.QObject):
                         continue
                     # Materialize an authored omission whose admitted value was zero.
                     values[key[1]] = value
-                    found_keys.add(key)
                 proposed_sets.append(initial_set.with_values(values))
-            if found_keys != set(initial_values):
-                raise ValueError("Fit Apply initial-condition identity is stale.")
             proposed_document = proposed_document.replace_tab(
                 proposed_tab.with_initial_condition_sets(tuple(proposed_sets))
             )
@@ -1003,10 +965,7 @@ class FitSessionOwner(QtCore.QObject):
         )
 
     def _build_request(self) -> FitExecutionRequest:
-        setup = self._accepted_setup()
-        if setup is None:
-            raise RuntimeError("Fit has no typed local setup.")
-        return build_fit_execution_request(setup=setup)
+        return build_fit_execution_request(setup=self._accepted_setup())
 
     def _accepted_setup(self) -> FitSetupSnapshot | None:
         """Return the one accepted setup owner for the current route."""
@@ -1042,9 +1001,3 @@ class FitSessionOwner(QtCore.QObject):
             except RuntimeError:
                 pass
         self.status_changed.emit(message)
-
-    def _require_thread(self) -> None:
-        if QtCore.QThread.currentThread() is not self.thread():
-            raise RuntimeError(
-                "FitSessionOwner may be used only from its GUI thread."
-            )

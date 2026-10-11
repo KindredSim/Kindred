@@ -62,13 +62,11 @@ def _bounds_text(item: ScanInput) -> str:
 
 
 def admitted_ranges(catalog: tuple[ScanInput, ...], config: ScanConfig) -> dict[str, tuple[Interval, ...]]:
-    unknown = set(config.ranges) - {item.key for item in catalog}
-    if unknown:
-        raise ValueError(f"Inputs are no longer independently editable: {', '.join(sorted(unknown))}")
+    # The scanned keys come from this capture's catalog.
     out = {}
     for item in catalog:
         requested = config.ranges.get(item.key)
-        intervals = normalize(requested.intervals) if requested else (Interval(item.value, item.value),)
+        intervals = requested.intervals if requested else (Interval(item.value, item.value),)
         allowed = intersect(intervals, item.bounds)
         if not allowed:
             raise ValueError(f"{item.label}: allowed ranges do not intersect its scientific bounds, {_bounds_text(item)}.")

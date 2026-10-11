@@ -142,12 +142,9 @@ def compile_constraints(prepared, config: ScanConfig, fixed: dict[str, float]):
             if any(arg.terms for arg in arguments):
                 raise ValueError(f"{node.name}(...) depends nonlinearly on scanned inputs.")
             return Affine({}, F(BUILTIN_FUNCTIONS[node.name](*(float(a.constant) for a in arguments))))
-        raise ValueError("Unsupported authored expression in scan constraint.")
 
     equations, dependents, inequalities, conditional = [], [], [], []
     for condition in scientific_constraints(spec, config.constraints):
-        if condition.observable not in spec.observable_names:
-            raise ValueError(f"Unknown authored quantity: {condition.observable}")
         if condition.dependent not in config.ranges:
             raise ValueError(f"Select a scanned independent input for {condition.observable}.")
         try:
@@ -162,7 +159,6 @@ def compile_constraints(prepared, config: ScanConfig, fixed: dict[str, float]):
                 dependents.append(condition.dependent)
         else:
             conditional.append((condition, expression))
-            normalize((Interval(condition.lower, condition.upper, condition.include_lower, condition.include_upper),))
             inequalities.extend((
                 Inequality(expression.add(Affine({}, -F(condition.upper))), not condition.include_upper),
                 Inequality(expression.scale(F(-1)).add(Affine({}, F(condition.lower))), not condition.include_lower),
@@ -432,7 +428,7 @@ class FeasibleSpace:
                         pass
             if not intervals:
                 raise InputGenerationError(f"No representable feasible value remains for {input_label(key)}.", values)
-            values[key] = sample(tuple(intervals), units[key], allocations.get(key, "width"))
+            values[key] = sample(tuple(intervals), units[key], allocations[key])
         return values
 
 

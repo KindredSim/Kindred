@@ -191,13 +191,15 @@ class ChemicalSpaceScanDialog(QtWidgets.QDialog):
         tab = self.tab
         set_id = self.baseline.currentData()
         settings, science = tab.resolved_execution_settings(set_id), tab.scientific_settings
+        # The values the mechanism resolves, including its T=, C0= and energy= lines.
+        resolved = tab.prepared_dsl.analysis
         return ScanConfig(source=tab.mechanism_source.reactions_text, initials=dict(canonical_initial_values(tab, set_id)),
                           parameters={}, ranges={}, outputs=tuple(tab.prepared_dsl.analysis.species_names),
                           t_start=settings.t_start, t_end=settings.t_end, solver=settings.solver,
                           points=settings.integration_points, rtol=science.rtol, atol=science.atol,
                           analytic_jacobian=science.analytic_jacobian_policy, use_authored_stops=science.use_authored_stops,
-                          requested=100000, destination="", energy_unit=science.energy_unit,
-                          temperature_K=science.temperature, standard_conc_M=science.standard_conc_M)
+                          requested=100000, destination="", energy_unit=resolved.energy_unit,
+                          temperature_K=resolved.temperature_K, standard_conc_M=resolved.standard_conc_M)
 
     def _load(self):
         """Build the input rows once; a baseline change only refreshes its values."""

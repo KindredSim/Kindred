@@ -25,21 +25,6 @@ class ObservationMappingSuggestion:
     raw_observation_id: str
     model_target: str
 
-    def __post_init__(self) -> None:
-        for value, label in (
-            (self.raw_observation_id, "raw observation ID"),
-            (self.model_target, "model target"),
-        ):
-            if (
-                type(value) is not str
-                or not value
-                or value != value.strip()
-            ):
-                raise ValueError(
-                    f"Observation mapping suggestion {label} must be "
-                    "nonblank and edge-normalized."
-                )
-
 
 def _canonical_text(value: object, label: str) -> str:
     if type(value) is not str or not value or value != value.strip():
@@ -56,25 +41,11 @@ def normalize_observation_mapping(
     model_targets: Sequence[str],
 ) -> tuple[tuple[str, str], ...]:
     """Validate and deterministically order an explicit partial bijection."""
-    normalized_observations = tuple(
-        (
-            _canonical_text(raw_id, "Raw observation ID"),
-            _canonical_text(raw_column, "Raw observation label"),
-        )
-        for raw_id, raw_column in raw_observations
-    )
-    normalized_ids = tuple(raw_id for raw_id, _ in normalized_observations)
-    normalized_targets = tuple(
-        _canonical_text(value, "Model target name")
-        for value in model_targets
-    )
-    if len(set(normalized_ids)) != len(normalized_ids):
-        raise ObservationMappingError("Raw observation IDs must be unique.")
-    if len(set(normalized_targets)) != len(normalized_targets):
-        raise ObservationMappingError("Model target names must be unique.")
+    # Raw observations come from admitted records, targets from the parsed mechanism.
+    normalized_ids = tuple(raw_id for raw_id, _ in raw_observations)
     available_ids = set(normalized_ids)
-    column_by_id = dict(normalized_observations)
-    available_targets = set(normalized_targets)
+    column_by_id = dict(raw_observations)
+    available_targets = set(model_targets)
     by_raw_id: dict[str, str] = {}
     raw_id_by_target: dict[str, str] = {}
     for raw_observation_id, raw_target in mapping:
@@ -129,19 +100,12 @@ def suggest_observation_mapping(
     Suggestions are never a confirmed mapping. Callers must present and obtain
     explicit confirmation before passing them to a canonical mutation.
     """
-    observations = tuple(
-        (
-            _canonical_text(raw_id, "Raw observation ID"),
-            _canonical_text(raw_column, "Raw observation label"),
-        )
-        for raw_id, raw_column in raw_observations
-    )
+    observations = tuple(raw_observations)
     suggestions: list[ObservationMappingSuggestion] = []
     claimed_ids: set[str] = set()
     claimed_targets: set[str] = set()
     candidates: list[tuple[str, str]] = []
-    for target_value in model_targets:
-        target = _canonical_text(target_value, "Model target name")
+    for target in model_targets:
         exact = [
             (raw_id, raw_column)
             for raw_id, raw_column in observations

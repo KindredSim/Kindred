@@ -30,7 +30,6 @@ from typing import (
 import numpy as np
 
 from kindred.core.analysis.parametric_alignment import (
-    CandidateParametricAlignmentError,
     ParametricProjection,
     align_parametric,
     project_parametric_y,
@@ -59,6 +58,7 @@ from kindred.core.fitting_evaluation import (
     FITTING_PARAM_ORIGIN_CONFIGURED_DATASET,
     FITTING_PARAM_ORIGIN_OPTIMIZER_DATASET,
     FITTING_PARAM_ORIGIN_OPTIMIZER_SHARED,
+    FittingEvaluator,
 )
 from kindred.core.project_presentation_state import SimulationSeriesAxisSelection
 from kindred.core.result_curve_projection import alignment_rows
@@ -132,42 +132,11 @@ def parameter_group_variable_id(parameter_name: str, origin_dataset_id: str) -> 
     return f"parameter:{parameter_name}:{origin_dataset_id}"
 
 
-def _decode_log10_physical(raw_value: object, *, coordinate: str) -> float:
-    """Decode one optimizer Log10 coordinate without clipping or fabrication."""
-
-    try:
-        value = float(raw_value)  # type: ignore[arg-type]
-    except (TypeError, ValueError, OverflowError) as exc:
-        raise FitCandidateDomainError(
-            f"Invalid Log10 optimizer coordinate for {coordinate!r}.",
-            stage="log10_decode",
-        ) from exc
-    if not math.isfinite(value):
-        raise FitCandidateDomainError(
-            f"Nonfinite Log10 optimizer coordinate for {coordinate!r}.",
-            stage="log10_decode",
-        )
-    try:
-        decoded = math.pow(10.0, value)
-    except (OverflowError, ValueError) as exc:
-        raise FitCandidateDomainError(
-            f"Log10 optimizer coordinate for {coordinate!r} overflowed.",
-            stage="log10_decode",
-        ) from exc
-    if not math.isfinite(decoded):
-        raise FitCandidateDomainError(
-            f"Log10 optimizer coordinate for {coordinate!r} decoded non-finitely.",
-            stage="log10_decode",
-        )
-    return float(decoded)
-
-
 def _decode_admitted_physical(
     raw_value: float,
     *,
     encoded: tuple[float, float, float],
     physical: tuple[float, float, float],
-    coordinate: str,
 ) -> float:
     """Decode one Log10 value; admitted starts and bounds decode exactly.
 
@@ -179,9 +148,9 @@ def _decode_admitted_physical(
     for encoded_value, physical_value in zip(encoded, physical):
         if raw_value == encoded_value:
             return float(physical_value)
-    decoded = _decode_log10_physical(raw_value, coordinate=coordinate)
+    decoded = 10.0 ** raw_value
     if encoded[1] <= raw_value <= encoded[2]:
-        return min(max(decoded, float(physical[1])), float(physical[2]))
+        return min(max(decoded, physical[1]), physical[2])
     return decoded
 
 
@@ -346,43 +315,33 @@ def fit_result_message(
     optimizer_converged: bool,
     optimizer_diagnostic: FactualCause | None,
 ) -> str:
+    stopped = base_message.strip()
     if status == "ok":
         if not optimizer_converged:
-            stopped = str(base_message or "").strip()
-            if not stopped:
-                stopped = "the optimizer stopped without a termination message"
-            return f"Fit completed. Optimizer stopped: {stopped}"
-        return str(base_message)
-    if status == "warn":
-        # A Stop's own message already says the fit stopped.
-        if optimizer_diagnostic is not None and optimizer_diagnostic.type == "FittingStopped":
-            return str(optimizer_diagnostic.message)
-        warning_parts: list[str] = []
-        # A converged optimizer whose endpoint was replaced did not stop early.
-        replaced_after_convergence = (
-            optimizer_diagnostic is not None
-            and optimizer_diagnostic.type == "FittingUnavailableEndpointReplaced"
-            and optimizer_diagnostic.details.get("optimizer_converged") is True
-        )
-        if not optimizer_converged:
-            fallback = str(base_message or "").strip()
-            if fallback and replaced_after_convergence:
-                warning_parts.append(fallback)
-            elif fallback:
-                warning_parts.append(f"Optimizer stopped: {fallback}")
-            else:
-                warning_parts.append("Optimizer stopped without a termination message")
-        if optimizer_diagnostic is not None:
-            detail = _compact_failure_message(optimizer_diagnostic)
-            if detail and detail != str(base_message or "").strip():
-                warning_parts.append(detail)
-        if warning_parts:
-            return "Global fit completed with warnings: " + " ".join(warning_parts)
-        fallback = str(base_message or "").strip()
-        if fallback and "success" not in fallback.lower():
-            return fallback
-        return "Global fit completed with warnings."
-    raise AssertionError(f"Unsupported completed Fit status: {status!r}")
+            return f"Fit completed. Optimizer stopped: {stopped or 'the optimizer stopped without a termination message'}"
+        return base_message
+    # A Stop's own message already says the fit stopped.
+    if optimizer_diagnostic is not None and optimizer_diagnostic.type == "FittingStopped":
+        return optimizer_diagnostic.message
+    warning_parts: list[str] = []
+    # A converged optimizer whose endpoint was replaced did not stop early.
+    replaced_after_convergence = (
+        optimizer_diagnostic is not None
+        and optimizer_diagnostic.type == "FittingUnavailableEndpointReplaced"
+        and optimizer_diagnostic.details["optimizer_converged"] is True
+    )
+    if not optimizer_converged:
+        if stopped and replaced_after_convergence:
+            warning_parts.append(stopped)
+        elif stopped:
+            warning_parts.append(f"Optimizer stopped: {stopped}")
+        else:
+            warning_parts.append("Optimizer stopped without a termination message")
+    if optimizer_diagnostic is not None:
+        detail = _compact_failure_message(optimizer_diagnostic)
+        if detail and detail != stopped:
+            warning_parts.append(detail)
+    return "Global fit completed with warnings: " + " ".join(warning_parts)
 
 
 def normalize_weights(payloads: List[FitDatasetSpec], weights: Optional[Dict[str, float]]) -> Dict[str, float]:
@@ -391,7 +350,7 @@ def normalize_weights(payloads: List[FitDatasetSpec], weights: Optional[Dict[str
     provided_weights = weights or {}
     return finite_positive_mean_normalize({
         payload.dataset_id: float(
-            provided_weights.get(payload.dataset_id, 1.0 / max(1, payload.point_count))
+            provided_weights.get(payload.dataset_id, 1.0 / payload.point_count)
         )
         for payload in payloads
     })
@@ -525,8 +484,6 @@ def _payload_observations(
 def _payload_x_observations(payload: FitDatasetSpec) -> Dict[str, object]:
     """Return one canonical X block plus its dataset row lookup."""
 
-    if payload.x_name == "t" or payload.x_observations is None:
-        return {}
     source = payload.x_observations
     rows = payload.x_source_rows
     by_row = {
@@ -609,59 +566,20 @@ class FitParameterLayout:
     physical_upper: np.ndarray
 
     def __post_init__(self) -> None:
-        object.__setattr__(
-            self,
-            "param_names",
-            tuple(str(name) for name in self.param_names),
-        )
-        object.__setattr__(
-            self,
-            "shared_log10",
-            MappingProxyType(
-                {str(name): bool(value) for name, value in self.shared_log10.items()}
-            ),
-        )
-        object.__setattr__(
-            self,
-            "dataset_var_order",
-            tuple(
-                (str(dataset_id), str(parameter_name))
-                for dataset_id, parameter_name in self.dataset_var_order
-            ),
-        )
+        # The layout is built once by its builder from typed values; freeze it.
+        object.__setattr__(self, "param_names", tuple(self.param_names))
+        object.__setattr__(self, "shared_log10", MappingProxyType(dict(self.shared_log10)))
+        object.__setattr__(self, "dataset_var_order", tuple(self.dataset_var_order))
         object.__setattr__(
             self,
             "dataset_var_index",
             MappingProxyType(
-                {
-                    str(dataset_id): MappingProxyType(
-                        {
-                            str(parameter_name): int(index)
-                            for parameter_name, index in values.items()
-                        }
-                    )
-                    for dataset_id, values in self.dataset_var_index.items()
-                }
+                {ds_id: MappingProxyType(dict(values)) for ds_id, values in self.dataset_var_index.items()}
             ),
         )
-        object.__setattr__(
-            self,
-            "dataset_var_log10",
-            MappingProxyType(
-                {
-                    (str(dataset_id), str(parameter_name)): bool(value)
-                    for (dataset_id, parameter_name), value in self.dataset_var_log10.items()
-                }
-            ),
-        )
+        object.__setattr__(self, "dataset_var_log10", MappingProxyType(dict(self.dataset_var_log10)))
         object.__setattr__(self, "coupled_var_order", tuple(self.coupled_var_order))
-        object.__setattr__(
-            self,
-            "coupled_var_index",
-            MappingProxyType(
-                {str(variable_id): int(index) for variable_id, index in self.coupled_var_index.items()}
-            ),
-        )
+        object.__setattr__(self, "coupled_var_index", MappingProxyType(dict(self.coupled_var_index)))
         for name in ("x0", "lower", "upper", "physical_x0", "physical_lower", "physical_upper"):
             values = np.asarray(getattr(self, name), dtype=float).reshape(-1).copy()
             values.setflags(write=False)
@@ -693,16 +611,14 @@ class FitParameterLayout:
     def decode_coordinate(self, coordinate: FitCoordinate, optimizer_value: float) -> float:
         index = self.opt_param_keys().index(coordinate)
         if coordinate.scope == "shared":
-            log10 = bool(self.shared_log10.get(coordinate.name, False))
+            log10 = self.shared_log10[coordinate.name]
         elif coordinate.scope == "dataset":
-            log10 = bool(self.dataset_var_log10.get((coordinate.dataset_id, coordinate.name), False))
+            log10 = self.dataset_var_log10[(coordinate.dataset_id, coordinate.name)]
         else:
             log10 = next(item.log10 for item in self.coupled_var_order if item.variable_id == coordinate.name)
-        return self._decode_index(index, float(optimizer_value), log10=log10, coordinate=coordinate.display_name)
+        return self._decode_index(index, float(optimizer_value), log10=log10)
 
-    def _decode_index(
-        self, index: int, raw_value: float, *, log10: bool, coordinate: str,
-    ) -> float:
+    def _decode_index(self, index: int, raw_value: float, *, log10: bool) -> float:
         if not log10:
             return float(raw_value)
         return _decode_admitted_physical(
@@ -713,7 +629,6 @@ class FitParameterLayout:
                 float(self.physical_lower[index]),
                 float(self.physical_upper[index]),
             ),
-            coordinate=coordinate,
         )
 
     def validate_optimizer_vector(self, vector: np.ndarray) -> None:
@@ -733,10 +648,7 @@ class FitParameterLayout:
     def shared_param_dict_from_vector(self, vector: np.ndarray) -> Dict[str, float]:
         out: Dict[str, float] = {}
         for idx, name in enumerate(self.param_names):
-            out[name] = self._decode_index(
-                idx, float(vector[idx]),
-                log10=bool(self.shared_log10.get(name)), coordinate=name,
-            )
+            out[name] = self._decode_index(idx, float(vector[idx]), log10=self.shared_log10[name])
         return out
 
     def dataset_var_params_for_dataset(self, ds_id: str, vector: np.ndarray) -> Dict[str, float]:
@@ -746,9 +658,7 @@ class FitParameterLayout:
             return out
         for var_name, idx in var_map.items():
             out[var_name] = self._decode_index(
-                idx, float(vector[idx]),
-                log10=bool(self.dataset_var_log10.get((ds_id, var_name))),
-                coordinate=f"{ds_id}::{var_name}",
+                idx, float(vector[idx]), log10=self.dataset_var_log10[(ds_id, var_name)],
             )
         return out
 
@@ -763,8 +673,7 @@ class FitParameterLayout:
                 continue
             index = self.coupled_var_index[spec.variable_id]
             out[spec.parameter_name] = self._decode_index(
-                index, float(vector[index]),
-                log10=spec.log10, coordinate=spec.variable_id,
+                index, float(vector[index]), log10=spec.log10,
             )
         return out
 
@@ -776,7 +685,7 @@ def build_parameter_layout_for_dataset_ids(
     dataset_overrides: Sequence[FitDatasetParameterOverrides],
     coupled_variables: Sequence[FitCoupledVariableParamSpec],
     bounds: Dict[str, Tuple[float, float]],
-    log10_params: Optional[Dict[str, bool]],
+    log10_params: Dict[str, bool],
 ) -> FitParameterLayout:
     """Build the optimizer layout from the admitted included-dataset roster.
 
@@ -787,15 +696,14 @@ def build_parameter_layout_for_dataset_ids(
     # The included roster, the coupled members and the shared bounds come from
     # one compiled Fit setup, whose dataset and variable identities are unique.
     normalized_dataset_ids = tuple(dataset_ids)
-    param_names = sorted(str(name) for name in shared_params.keys())
-    log10_params_norm = {str(k): bool(v) for k, v in (log10_params or {}).items()}
+    param_names = sorted(shared_params)
 
     shared_initials: List[float] = []
     shared_log10: Dict[str, bool] = {}
     # (start, lower, upper) admitted physical values per optimizer index.
     shared_physical: List[tuple[float, float, float]] = []
     for name in param_names:
-        flag = bool(log10_params_norm.get(name, False))
+        flag = log10_params[name]
         shared_log10[name] = flag
         value = float(shared_params[name])
         if flag:
@@ -859,7 +767,7 @@ def build_parameter_layout_for_dataset_ids(
     for name in param_names:
         # Values, bounds and Log10 positivity arrive admitted by the Fit setup carriers.
         low, high = bounds[name]
-        if shared_log10.get(name):
+        if shared_log10[name]:
             shared_lower.append(math.log10(low))
             shared_upper.append(math.log10(high))
         else:
@@ -926,12 +834,29 @@ class ObjectiveDatasetInput:
         object.__setattr__(self, "parameter_origins", dict(self.parameter_origins))
 
 
-class _DatasetFitUnavailable(Exception):
-    """Call-local bridge from the direct evaluator to its caller."""
+def _objective_dataset_input(
+    payload: FitDatasetSpec,
+    *,
+    layout: FitParameterLayout,
+    vector: np.ndarray,
+    shared_values: Mapping[str, float],
+    fixed_values: Mapping[str, float],
+) -> ObjectiveDatasetInput:
+    """Assemble one dataset's candidate parameters and their origins."""
 
-    def __init__(self, result: ScientificUnavailable) -> None:
-        self.result = result
-        super().__init__(result.stage)
+    optimized = {
+        **layout.dataset_var_params_for_dataset(payload.dataset_id, vector),
+        **layout.coupled_params_for_dataset(payload.dataset_id, vector),
+    }
+    return ObjectiveDatasetInput(
+        payload=payload,
+        full_params={**shared_values, **fixed_values, **optimized},
+        parameter_origins={
+            **dict.fromkeys(shared_values, FITTING_PARAM_ORIGIN_OPTIMIZER_SHARED),
+            **dict.fromkeys(fixed_values, FITTING_PARAM_ORIGIN_CONFIGURED_DATASET),
+            **dict.fromkeys(optimized, FITTING_PARAM_ORIGIN_OPTIMIZER_DATASET),
+        },
+    )
 
 
 def _is_dataset_deadline_unavailable(
@@ -939,7 +864,7 @@ def _is_dataset_deadline_unavailable(
 ) -> bool:
     """Classify the direct evaluator's cooperative deadline result."""
 
-    return bool(dict(result.details).get("deadline")) or result.stage == "dataset_deadline"
+    return result.stage == "dataset_deadline"
 
 
 def _dataset_deadline_cause(
@@ -1035,34 +960,23 @@ def _build_dataset_fit_info(
             SimulationSeriesAxisSelection(x_name),
             tuple((name, SimulationSeriesAxisSelection(name)) for name in payload.species_list),
         )
-        try:
-            x_projection = align_parametric(
-                observed_x=x_observations["x"],
-                source_rows=x_observations["source_rows"],
-                model_time=alignment_time,
-                model_x=alignment_x,
-                segment_ids=alignment_regions,
-                segment_keys=tuple(str(region) for region in alignment_regions),
-                discontinuity_ids=np.zeros_like(alignment_regions),
-                observations=payload.observations,
-                model_y=alignment_y,
-                multipliers=target_multipliers,
-                dataset_label=dataset_id,
-                x_name=x_name,
-                cancellation_control=cancellation_control,
-            )
-        except CandidateParametricAlignmentError as exc:
-            raise _DatasetFitUnavailable(ScientificUnavailable(
-                producer="parametric_alignment",
-                stage="parametric_x_alignment",
-                details={"dataset": dataset_id, **dict(getattr(exc, "details", None) or {})},
-                factual_cause=factual_cause_from_exception(
-                    exc, domain="fit", origin="parametric_x_alignment"
-                ),
-            )) from exc
+        x_projection = align_parametric(
+            observed_x=x_observations["x"],
+            source_rows=x_observations["source_rows"],
+            model_time=alignment_time,
+            model_x=alignment_x,
+            segment_ids=alignment_regions,
+            segment_keys=tuple(str(region) for region in alignment_regions),
+            discontinuity_ids=np.zeros_like(alignment_regions),
+            observations=payload.observations,
+            model_y=alignment_y,
+            multipliers=target_multipliers,
+            x_name=x_name,
+            cancellation_control=cancellation_control,
+        )
     _raise_if_fitting_cancel_requested(cancellation_control)
 
-    dataset_weight = _objective_dataset_weight_multiplier(weights.get(dataset_id, 1.0))
+    dataset_weight = _objective_dataset_weight_multiplier(weights[dataset_id])
     raw_blocks: list[np.ndarray] = []
     weighted_blocks: list[np.ndarray] = []
     model_series: dict[str, np.ndarray] = {}
@@ -1091,21 +1005,8 @@ def _build_dataset_fit_info(
                 model_y=alignment_y[species_name],
             )
         y_sim = np.asarray(y_sim, dtype=float).reshape(-1)
-        if y_sim.size != y_exp.size or not np.all(np.isfinite(y_sim)):
-            raise _DatasetFitUnavailable(ScientificUnavailable(
-                producer="global_fit_objective",
-                stage="objective_residual_arithmetic",
-                details={"dataset": dataset_id, "species": species_name},
-            ))
         raw_residual = y_sim - y_exp
-        multiplier = dataset_weight * float(target_multipliers.get(species_name, 1.0))
-        weighted = multiplier * raw_residual
-        if not np.all(np.isfinite(raw_residual)) or not np.all(np.isfinite(weighted)):
-            raise _DatasetFitUnavailable(ScientificUnavailable(
-                producer="global_fit_objective",
-                stage="objective_residual_arithmetic",
-                details={"dataset": dataset_id, "species": species_name},
-            ))
+        weighted = dataset_weight * target_multipliers[species_name] * raw_residual
         raw_blocks.append(raw_residual)
         weighted_blocks.append(weighted)
         model_series[species_name] = y_sim
@@ -1116,12 +1017,6 @@ def _build_dataset_fit_info(
         x_multiplier = dataset_weight * float(target_multipliers[payload.x_name])
         x_raw = np.asarray(x_projection.delta_x, dtype=float).reshape(-1)
         x_weighted = x_multiplier * x_raw
-        if not np.all(np.isfinite(x_weighted)) or finite_sum_of_squares(x_weighted) is None:
-            raise _DatasetFitUnavailable(ScientificUnavailable(
-                producer="global_fit_objective",
-                stage="objective_residual_arithmetic",
-                details={"dataset": dataset_id, "target": payload.x_name},
-            ))
         raw_blocks.append(x_raw)
         weighted_blocks.append(x_weighted)
         raw_rms[str(payload.x_name)] = root_mean_square(x_raw)
@@ -1141,7 +1036,7 @@ def _build_dataset_fit_info(
         weighted_residual_mse=dataset_metrics.weighted_mse,
         weighted_rmse=dataset_metrics.weighted_rmse,
         weighted_mae=dataset_metrics.weighted_mae,
-        weight=weights.get(dataset_id, 1.0),
+        weight=weights[dataset_id],
         simulation_result=simulation,
         residuals=residuals,
         weighted_residuals=weighted_residuals,
@@ -1151,11 +1046,11 @@ def _build_dataset_fit_info(
 
 
 def evaluate_dataset_simulation(
-    fit_evaluators: Mapping[str, object],
+    fit_evaluators: Mapping[str, FittingEvaluator],
     item: ObjectiveDatasetInput,
     *,
     cancellation_control: SimulationCancellationControl | None = None,
-    weights: Mapping[str, float] | None = None,
+    weights: Mapping[str, float],
 ) -> DatasetFitInfo | ScientificUnavailable:
     """Bind, simulate, align, weight, and evaluate one dataset directly.
 
@@ -1196,9 +1091,7 @@ def evaluate_dataset_simulation(
         _raise_if_fitting_cancel_requested(worker_cancel)
         # The dispatch compiled one evaluator per included dataset.
         evaluator = fit_evaluators[ds_id]
-        setter = getattr(evaluator, "set_cancellation_control", None)
-        if callable(setter):
-            setter(task_control)
+        evaluator.set_cancellation_control(task_control)
         series_result = evaluator.evaluate_series_with_parameter_origins(
             item.full_params,
             origins=item.parameter_origins,
@@ -1211,18 +1104,13 @@ def evaluate_dataset_simulation(
         fit_info = _build_dataset_fit_info(
             item,
             series_result,
-            weights=weights or {},
+            weights=weights,
             cancellation_control=task_control,
         )
         _raise_if_fitting_cancel_requested(worker_cancel)
         if time.monotonic() >= deadline:
             return deadline_unavailable()
         return fit_info
-    except _DatasetFitUnavailable as unavailable:
-        _raise_if_fitting_cancel_requested(worker_cancel)
-        if time.monotonic() >= deadline:
-            return deadline_unavailable()
-        return unavailable.result
     except FitSimulationError:
         _raise_if_fitting_cancel_requested(worker_cancel)
         if time.monotonic() >= deadline:
@@ -1241,16 +1129,14 @@ def evaluate_dataset_simulation(
 
 
 def evaluate_dataset_simulations(
-    fit_evaluators: Mapping[str, object],
+    fit_evaluators: Mapping[str, FittingEvaluator],
     items: Sequence[ObjectiveDatasetInput],
     *,
     cancellation_check: Optional[Callable[[], bool]] = None,
     cancellation_control: SimulationCancellationControl | None = None,
     executor: Executor,
-    weights: Mapping[str, float] | None = None,
+    weights: Mapping[str, float],
 ) -> list[DatasetFitInfo | ScientificUnavailable]:
-    if not items:
-        return []
     ordered = tuple(items)
     _raise_if_fitting_cancelled(cancellation_check)
     _raise_if_fitting_cancel_requested(cancellation_control)
@@ -1286,7 +1172,7 @@ class GlobalFitObjective:
     def __init__(
         self,
         *,
-        fit_evaluators: Mapping[str, object],
+        fit_evaluators: Mapping[str, FittingEvaluator],
         payloads: List[FitDatasetSpec],
         dataset_params: Dict[str, Dict[str, float]],
         weights: Dict[str, float],
@@ -1333,8 +1219,7 @@ class GlobalFitObjective:
         residuals = self(np.asarray(params, dtype=float))
         if self._last_error is not None:
             return None
-        values = np.asarray(residuals, dtype=float).reshape(-1)
-        return values if values.size and np.all(np.isfinite(values)) else None
+        return residuals
 
     @property
     def best_complete_vector(self) -> np.ndarray | None:
@@ -1355,71 +1240,14 @@ class GlobalFitObjective:
         cost = finite_sum_of_squares(
             np.concatenate(tuple(info.weighted_residuals for info in facts))
         )
-        if cost is not None and cost < self._best_cost:
+        if cost < self._best_cost:
             self._best_cost = float(cost)
             self._best_vector = np.asarray(vector, dtype=float).copy()
             self.best_complete_facts = facts
 
-    @staticmethod
-    def format_params(params_map: Dict[str, float]) -> Dict[str, float]:
-        def _try_float(value: object) -> Optional[float]:
-            try:
-                return float(value)  # type: ignore[arg-type]
-            except (TypeError, ValueError, OverflowError):
-                return None
-
-        formatted: Dict[str, float] = {}
-        for key, value in params_map.items():
-            coerced = _try_float(value)
-            if coerced is None:
-                continue
-            formatted[str(key)] = coerced
-        if formatted:
-            return formatted
-        return {str(key): float(value) for key, value in params_map.items()}
-
     def __call__(self, params: np.ndarray) -> np.ndarray:
         _raise_if_fitting_cancelled(self._cancellation_check)
         self._last_error = None
-
-        def candidate_penalty_residuals() -> np.ndarray:
-            blocks: list[np.ndarray] = []
-            for payload in self._payloads:
-                target_multipliers = _normalized_target_weight_multipliers(
-                    species_list=payload.target_roster,
-                    target_weights=dict(payload.target_weights),
-                )
-                dataset_weight = _objective_dataset_weight_multiplier(
-                    self._weights.get(payload.dataset_id, 1.0)
-                )
-                observations = _payload_observations(payload)
-                for species_name in sorted(payload.species_list):
-                    y_exp = np.asarray(
-                        observations[species_name]["y"], dtype=float
-                    ).reshape(-1)
-                    blocks.append(
-                        np.full_like(
-                            y_exp,
-                            float(dataset_weight)
-                            * float(target_multipliers.get(species_name, 1.0))
-                            * self._penalty_value,
-                        )
-                    )
-                if payload.x_name != "t":
-                    blocks.append(
-                        np.full(
-                            len(payload.x_source_rows),
-                            float(dataset_weight)
-                            * float(target_multipliers[payload.x_name])
-                            * self._penalty_value,
-                            dtype=float,
-                        )
-                    )
-            return (
-                np.concatenate(blocks).astype(float, copy=False)
-                if blocks
-                else np.asarray([], dtype=float)
-            )
 
         def dataset_penalty_residuals(payload: FitDatasetSpec) -> np.ndarray:
             target_multipliers = _normalized_target_weight_multipliers(
@@ -1427,14 +1255,14 @@ class GlobalFitObjective:
                 target_weights=dict(payload.target_weights),
             )
             dataset_weight = _objective_dataset_weight_multiplier(
-                self._weights.get(payload.dataset_id, 1.0)
+                self._weights[payload.dataset_id]
             )
             observations = _payload_observations(payload)
             blocks = [
                 np.full(
                     np.asarray(observations[name]["y"], dtype=float).size,
                     dataset_weight
-                    * float(target_multipliers.get(name, 1.0))
+                    * target_multipliers[name]
                     * self._penalty_value,
                     dtype=float,
                 )
@@ -1450,12 +1278,12 @@ class GlobalFitObjective:
                         dtype=float,
                     )
                 )
-            return np.concatenate(blocks) if blocks else np.asarray([], dtype=float)
+            return np.concatenate(blocks)
 
         def settle_unavailable_residuals(
             residual_blocks: Sequence[np.ndarray],
             artificial_block_indexes: set[int],
-        ) -> tuple[np.ndarray, float] | None:
+        ) -> tuple[np.ndarray, float]:
             """Return one finite objective vector for an unavailable candidate.
 
             Completed scientific residuals retain their original values.  Only
@@ -1501,13 +1329,8 @@ class GlobalFitObjective:
             )
             completed_sse = finite_sum_of_squares(completed)
             artificial_sse = finite_sum_of_squares(artificial)
-            if completed_sse is None or artificial_sse is None:
-                return None
-
             residuals = np.concatenate(ordered_blocks)
             cost = finite_sum_of_squares(residuals)
-            if cost is None:
-                return None
 
             best_cost = float(self._best_cost)
             if (
@@ -1631,11 +1454,6 @@ class GlobalFitObjective:
             if self._progress_callback is None:
                 return
             progress_vector = np.asarray(optimizer_vector, dtype=float).reshape(-1)
-            if (
-                progress_vector.size != self._layout.x0.size
-                or not np.all(np.isfinite(progress_vector))
-            ):
-                return
             if not (publish_every_call or improved or self._objective_calls % 10 == 0):
                 return
             self._progress_callback(
@@ -1671,86 +1489,18 @@ class GlobalFitObjective:
                     unavailability.stage,
                 )
 
-        def reject_candidate(
-            unavailability: ScientificUnavailable,
-            *,
-            optimizer_vector: np.ndarray,
-        ) -> np.ndarray:
-            penalty = candidate_penalty_residuals()
-            record_candidate_unavailability(unavailability)
-            settled_penalty = settle_unavailable_residuals((penalty,), {0})
-            if settled_penalty is None:
-                raise RuntimeError("Configured Fit candidate penalty overflowed.")
-            penalty, penalty_cost = settled_penalty
-            finalize_candidate(
-                optimizer_vector=optimizer_vector,
-                cost=float(penalty_cost),
-                improved=False,
-                best_results={},
-                publish_every_call=True,
-            )
-            return penalty
-
-        try:
-            self._layout.validate_optimizer_vector(params)
-            param_dict = self._layout.shared_param_dict_from_vector(params)
-        except FitSimulationError as exc:
-            return reject_candidate(
-                ScientificUnavailable(
-                    producer="global_fit_objective",
-                    stage="optimizer_vector_domain",
-                    details={"error_type": type(exc).__name__},
-                ),
-                optimizer_vector=np.asarray(params, dtype=float).reshape(-1),
-            )
+        self._layout.validate_optimizer_vector(params)
+        param_dict = self._layout.shared_param_dict_from_vector(params)
         dataset_inputs: List[ObjectiveDatasetInput] = []
-
         for payload in self._payloads:
             _raise_if_fitting_cancel_requested(self._cancellation_control)
-
-            ds_id = payload.dataset_id
-            try:
-                optimizer_dataset_params = (
-                    self._layout.dataset_var_params_for_dataset(ds_id, params)
-                )
-                coupled_dataset_params = self._layout.coupled_params_for_dataset(ds_id, params)
-            except FitSimulationError as exc:
-                return reject_candidate(
-                    ScientificUnavailable(
-                        producer="global_fit_objective",
-                        stage="dataset_parameter_decode",
-                        details={"dataset": ds_id, "error_type": type(exc).__name__},
-                    ),
-                    optimizer_vector=params,
-                )
-            raw_full_params: Dict[str, float] = {}
-            parameter_origins: Dict[str, str] = {}
-            for values, origin in (
-                (param_dict, FITTING_PARAM_ORIGIN_OPTIMIZER_SHARED),
-                (
-                    self._dataset_params.get(ds_id, {}),
-                    FITTING_PARAM_ORIGIN_CONFIGURED_DATASET,
-                ),
-                (optimizer_dataset_params, FITTING_PARAM_ORIGIN_OPTIMIZER_DATASET),
-                (coupled_dataset_params, FITTING_PARAM_ORIGIN_OPTIMIZER_DATASET),
-            ):
-                for raw_name, raw_value in dict(values or {}).items():
-                    name = str(raw_name or "").strip()
-                    if not name:
-                        continue
-                    raw_full_params[name] = float(raw_value)
-                    parameter_origins[name] = origin
-            full_params = self.format_params(raw_full_params)
-            parameter_origins = {
-                name: parameter_origins[name]
-                for name in full_params
-                if name in parameter_origins
-            }
             dataset_inputs.append(
-                ObjectiveDatasetInput(
-                    payload=payload,
-                    full_params=full_params,
-                    parameter_origins=parameter_origins,
+                _objective_dataset_input(
+                    payload,
+                    layout=self._layout,
+                    vector=params,
+                    shared_values=param_dict,
+                    fixed_values=self._dataset_params[payload.dataset_id],
                 )
             )
 
@@ -1809,35 +1559,15 @@ class GlobalFitObjective:
             continue
 
         if artificial_block_indexes:
-            settled_unavailable = settle_unavailable_residuals(
+            residuals, cost = settle_unavailable_residuals(
                 residual_blocks,
                 artificial_block_indexes,
             )
-            if settled_unavailable is None:
-                return reject_candidate(
-                    ScientificUnavailable(
-                        producer="global_fit_objective",
-                        stage="objective_residual_arithmetic",
-                        details={"scope": "combined"},
-                    ),
-                    optimizer_vector=params,
-                )
-            residuals, cost = settled_unavailable
         else:
             residuals = np.concatenate(tuple(residual_blocks)).astype(
                 float, copy=False
             )
-            finite_cost = finite_sum_of_squares(residuals)
-            if finite_cost is None:
-                return reject_candidate(
-                    ScientificUnavailable(
-                        producer="global_fit_objective",
-                        stage="objective_residual_arithmetic",
-                        details={"scope": "combined"},
-                    ),
-                    optimizer_vector=params,
-                )
-            cost = float(finite_cost)
+            cost = finite_sum_of_squares(residuals)
         candidate_evaluations = {
             evaluation.dataset_id: evaluation.simulation_result
             for evaluation in simulation_evaluations
@@ -1861,7 +1591,7 @@ class GlobalFitObjective:
 
 def _replay_fit_result(
     *,
-    fit_evaluators: Mapping[str, object],
+    fit_evaluators: Mapping[str, FittingEvaluator],
     payloads: List[FitDatasetSpec],
     layout: FitParameterLayout,
     candidate_vector: np.ndarray,
@@ -1874,51 +1604,20 @@ def _replay_fit_result(
     cancellation_control: SimulationCancellationControl | None = None,
     executor: Executor,
 ) -> GlobalFitResult | ScientificUnavailable:
-    layout.validate_optimizer_vector(candidate_vector)
     candidate_vector = np.asarray(candidate_vector, dtype=float).reshape(-1).copy()
     candidate_vector.setflags(write=False)
     fitted_params = layout.shared_param_dict_from_vector(candidate_vector)
-    combined_dataset_params = {
-        payload.dataset_id: {
-            **layout.dataset_var_params_for_dataset(payload.dataset_id, candidate_vector),
-            **layout.coupled_params_for_dataset(payload.dataset_id, candidate_vector),
-        }
-        for payload in payloads
-    }
-
     dataset_inputs: List[ObjectiveDatasetInput] = []
     for payload in payloads:
-        ds_id = payload.dataset_id
         _raise_if_fitting_cancelled(cancellation_check)
         _raise_if_fitting_cancel_requested(cancellation_control)
-
-        full_params = dict(fitted_params)
-        full_params.update(fixed_dataset_params.get(ds_id, {}))
-        full_params.update(combined_dataset_params.get(ds_id, {}))
-        parameter_origins = {
-            name: FITTING_PARAM_ORIGIN_OPTIMIZER_SHARED
-            for name in fitted_params
-        }
-        for name in fixed_dataset_params.get(ds_id, {}):
-            parameter_origins[name] = FITTING_PARAM_ORIGIN_CONFIGURED_DATASET
-        for name in combined_dataset_params.get(ds_id, {}):
-            coupled_names = {
-                item.parameter_name
-                for item in layout.coupled_var_order
-                if ds_id in item.dataset_ids
-            }
-            if (
-                name in layout.dataset_var_index.get(ds_id, {})
-                or name in coupled_names
-            ):
-                parameter_origins[name] = FITTING_PARAM_ORIGIN_OPTIMIZER_DATASET
-            else:
-                parameter_origins[name] = FITTING_PARAM_ORIGIN_CONFIGURED_DATASET
         dataset_inputs.append(
-            ObjectiveDatasetInput(
-                payload=payload,
-                full_params=full_params,
-                parameter_origins=parameter_origins,
+            _objective_dataset_input(
+                payload,
+                layout=layout,
+                vector=candidate_vector,
+                shared_values=fitted_params,
+                fixed_values=fixed_dataset_params[payload.dataset_id],
             )
         )
 

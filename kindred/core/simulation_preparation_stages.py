@@ -8,13 +8,12 @@ no worker, Fit, cache, parameter-binding, or GUI ownership.
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from numbers import Real
 from types import MappingProxyType
 from typing import Any, Dict
 
 
-from kindred.core.simulator.solvers import normalize_solver_name
 from kindred.core.symbolic.errors import UnsupportedSymbolicExpressionError
 from kindred.core.symbolic.jacobian_execution import (
     SymbolicJacobianExecution,
@@ -37,21 +36,19 @@ class PreparedSolverConfig:
     dialog.
     """
 
-    solver_input: str
-    solver: str = field(init=False)
+    solver: str
     rtol: float
     atol: float
     grid: Mapping[str, Any]
     use_analytic_jacobian: bool
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "solver", normalize_solver_name(self.solver_input))
         object.__setattr__(self, "grid", MappingProxyType(dict(self.grid)))
 
 
 def build_solver_config(
     *,
-    solver_input: str,
+    solver: str,
     rtol: Real,
     atol: Real,
     grid: Mapping[str, Any],
@@ -60,7 +57,7 @@ def build_solver_config(
     """Build one typed solver policy from admitted settings."""
 
     return PreparedSolverConfig(
-        solver_input=solver_input,
+        solver=solver,
         rtol=rtol,
         atol=atol,
         grid=grid,
@@ -74,13 +71,9 @@ def _symbolic_jacobian_status_for_mechanism(mechanism: Any) -> Dict[str, Any]:
     return dict(classify_symbolic_jacobian_support(mechanism).to_status_payload())
 
 
-def _symbolic_jacobian_for_bind_failure(
-    mechanism: Any,
-    exc: UnsupportedSymbolicExpressionError,
-) -> SymbolicJacobianExecution:
+def _symbolic_jacobian_for_bind_failure(mechanism: Any) -> SymbolicJacobianExecution:
     return SymbolicJacobianExecution.from_bind_failure(
         classified_status=_symbolic_jacobian_status_for_mechanism(mechanism),
-        exc=exc,
     )
 
 
@@ -125,6 +118,6 @@ def build_prepared_run_context(
             symbolic_structure=symbolic_structure,
             coefficient_evaluator=coefficient_evaluator,
         )
-    except UnsupportedSymbolicExpressionError as exc:
-        symbolic_jacobian = _symbolic_jacobian_for_bind_failure(mechanism, exc)
+    except UnsupportedSymbolicExpressionError:
+        symbolic_jacobian = _symbolic_jacobian_for_bind_failure(mechanism)
     return resolved_temperature_schedule, symbolic_jacobian

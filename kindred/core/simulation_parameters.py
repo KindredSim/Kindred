@@ -2,11 +2,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Iterable, Mapping
+from typing import Mapping
 
-from kindred.core.algebra.parser import _iter_identifiers
-from kindred.core.intervention_schedule import ObservableTriggerCondition, intervention_schedule_parameter_dependencies
-from kindred.core.kinetics import ArrheniusRateModel, EyringRateModel, ForwardRateModel, forward_rate_family
+from kindred.core.kinetics import ForwardRateModel, forward_rate_family
 from kindred.core.simulator.dsl_parse import PreparedDslRequestSet
 from kindred.core.simulator.parameter_algebra import (
     apply_parameter_algebra_spec_to_mechanism,
@@ -151,8 +149,6 @@ def enumerate_simulation_parameters(
                 value = authority.Keq
         else:
             continue
-        if value is None:
-            continue
         coordinates.append(
             SimulationParameter(
                 name=name,
@@ -194,15 +190,16 @@ def enumerate_simulation_parameters(
         if model is None:
             continue
         for role, name in source_coordinates.items():
-            if role == "A" and isinstance(model, ArrheniusRateModel):
+            # The parser ties each authored role to its rate family.
+            if role == "A":
                 physical_candidates.append((name, "Arrhenius", role, float(model.A)))
-            elif role == "Ea" and isinstance(model, ArrheniusRateModel):
+            elif role == "Ea":
                 physical_candidates.append((name, "Arrhenius", role, float(model.Ea_J_per_mol)))
-            elif role == "dG_act" and isinstance(model, EyringRateModel):
+            elif role == "dG_act":
                 physical_candidates.append((name, "Eyring", role, float(model.dG_act_J_per_mol)))
             elif role == "dG_eq":
                 physical_candidates.append((name, "equilibrium", role, float(authority.dG_eq_J_per_mol)))
-            elif role == "kappa" and isinstance(model, EyringRateModel):
+            elif role == "kappa":
                 physical_candidates.append((name, "Eyring", role, float(model.kappa)))
 
     for name, family, role, value in physical_candidates:
@@ -225,7 +222,7 @@ def enumerate_simulation_parameters(
     physical_names = source_coordinate_names | {
         item[0] for item in physical_candidates
     }
-    scalar_params = dict(metadata.get("scalar_params") or {})
+    scalar_params = dict(metadata["scalar_params"])
     for raw_name, value in scalar_params.items():
         name = str(raw_name)
         assignment = assignment_kind(name)
@@ -245,33 +242,3 @@ def enumerate_simulation_parameters(
             )
         )
     return tuple(coordinates)
-
-
-def names_affecting(prepared_dsl: PreparedDslRequestSet, observables: Iterable[str]) -> frozenset[str]:
-    """Names the kinetics, interventions, stops or the given observables depend on.
-
-    The kinetics read every mechanism coordinate; Algebra, intervention
-    parameters and the observables watched by triggers or given here bring in
-    the parameters they read.
-    """
-
-    spec = prepared_dsl.parameter_algebra_spec_for_execution()
-    lets = {statement.name: statement.expr for statement in spec.observable_block.lines}
-    schedule = prepared_dsl.parameterized_intervention_schedule_for_binding()
-    triggers = schedule.triggers if schedule is not None else (
-        () if prepared_dsl.intervention_execution_contract() is None
-        else prepared_dsl.intervention_execution_contract().triggers
-    )
-    pending = [*spec.mechanism_param_names, *observables]
-    pending += [name for names in intervention_schedule_parameter_dependencies(schedule).values() for name in names]
-    pending += [item.condition.name for item in triggers if isinstance(item.condition, ObservableTriggerCondition)]
-    reached: set[str] = set()
-    while pending:
-        name = pending.pop()
-        if name in reached:
-            continue
-        reached.add(name)
-        pending += spec.evaluation_dependencies.get(name, ())
-        if name in lets:
-            pending += _iter_identifiers(lets[name])
-    return frozenset(reached)

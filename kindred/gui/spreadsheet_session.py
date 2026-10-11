@@ -9,11 +9,12 @@ from decimal import Decimal
 
 import ironcalc
 
-from kindred.core.datasets.foundation import RawDatasetRecord, thaw_json_value, validate_raw_dataset_record
+from kindred.core.datasets.foundation import RawDatasetRecord, thaw_json_value
 from kindred.core.datasets.observation_payload import created_dataset_payload
 from kindred.core.datasets.units import parse_measurement_unit, parse_time_unit
 from kindred.core.project_document import new_dataset_id
 from kindred.core.quantity_units import ONE_SCALE, conversion_scale, parse_unit
+from kindred.gui.display_name_policy import and_join
 from kindred.gui.spreadsheet_formulas import compile_columns, formula_at_row, pattern_from_row, remap_pattern
 
 
@@ -190,7 +191,7 @@ class SpreadsheetSession:
     def _input_destination(columns, left, right):
         for column in range(left, min(right, len(columns)) + 1):
             if columns[column - 1]["formula"] is not None:
-                raise ValueError(f"Column {ironcalc.column_name_from_number(column)} is computed by its formula. "
+                raise ValueError(f"Column {ironcalc.column_name_from_number(column)} is calculated by its formula. "
                                  "Edit the formula instead.")
 
     def edit(self, operation, sheet, args):
@@ -249,7 +250,7 @@ class SpreadsheetSession:
                         value = raw.get_cell_value(sheet, result_row, column)
                         if value is not None and (type(value) not in (int, float) or not math.isfinite(value)):
                             raise ValueError(f"Column {letter} has an error in row {result_row}. "
-                                             "Fix the formula before removing it.")
+                                             "Fix the error before removing the formula.")
                         values.append(("" if value is None else repr(value),))
                     columns[column - 1] = {**spec, "formula": None}
                     columns, compiled = _prepared_columns(columns)
@@ -352,7 +353,7 @@ class SpreadsheetSession:
                     users = [columns[column - 1]["name"] for column, pattern in compiled.items()
                              if column not in deleted and pattern.references & deleted]
                     if users:
-                        raise ValueError("Cannot delete columns used by the formulas of: " + ", ".join(users) + ". Delete those columns too or edit their formulas first.")
+                        raise ValueError(f"Cannot delete columns used by the formulas of {and_join(users)}. Delete those columns too, or edit their formulas first.")
                     positions = {old: old - count if old >= start + count else old
                                  for old in range(1, len(columns) + 1) if old not in deleted}
                     del columns[start - 1:start - 1 + count]
@@ -445,7 +446,7 @@ class SpreadsheetSession:
                 record = RawDatasetRecord(dataset_id=new_dataset_id(), display_name=info["name"].strip(),
                                           time_column_name=columns[0][0] if info["timed"] else None,
                                           source_id=None, source_metadata=None, observations=payload.observations)
-                records.append(validate_raw_dataset_record(record))
+                records.append(record)
             except (ValueError, TypeError) as exc:
                 raise ValueError(f"{info['sheet']}: {exc}") from exc
         return tuple(records)

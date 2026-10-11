@@ -16,6 +16,7 @@ from kindred.core.quantity_units import parse_unit, scientific_unit, convert_val
 from kindred.core.simulation_parameters import enumerate_simulation_parameters
 from kindred.core.validation import six_digit_value
 from kindred.core.units import admit_role_value, UnitsModel
+from kindred.gui.display_name_policy import reaction_text
 
 __all__ = [
     "GuiParameterCoordinate",
@@ -85,6 +86,7 @@ class GuiParameterCoordinate:
     role: str
     allow_exact_zero: bool
     unit: str = "1"
+    context: str = ""
 
 
 def enumerate_parameter_coordinates(
@@ -123,7 +125,7 @@ def enumerate_parameter_coordinates(
             fit_low, fit_high = low, high
         display_name = item.name
         if item.context:
-            display_name = f"{display_name} — {item.context}"
+            display_name = f"{display_name} — {reaction_text(item.context)}"
         coordinates.append(GuiParameterCoordinate(
             name=item.name, display_name=display_name, value=value,
             minimum=low, maximum=high,
@@ -133,6 +135,6 @@ def enumerate_parameter_coordinates(
             # plain scalars are signed, linear quantities.
             log10_allowed=not item.signed and value > 0.0 and low > 0.0,
             family=item.family, role=item.role,
-            allow_exact_zero=item.allow_exact_zero, unit=item.unit,
+            allow_exact_zero=item.allow_exact_zero, unit=item.unit, context=item.context,
         ))
     return tuple(coordinates)

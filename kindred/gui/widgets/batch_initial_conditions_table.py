@@ -368,10 +368,7 @@ class BatchInitialConditionsTableModel(QtCore.QAbstractTableModel):
             return False
         column = int(index.column())
         if role == QtCore.Qt.ItemDataRole.CheckStateRole:
-            checked_value = getattr(
-                QtCore.Qt.CheckState.Checked, "value", QtCore.Qt.CheckState.Checked
-            )
-            checked = int(getattr(value, "value", value)) == int(checked_value)
+            checked = int(getattr(value, "value", value)) == QtCore.Qt.CheckState.Checked.value
             if column == self.slider_column():
                 self.sliderPinChangeRequested.emit(set_id, checked)
                 return True
@@ -945,7 +942,6 @@ class InitialConditionsTableActions(QtCore.QObject):
 
         if changed_ids:
             self._registry.replace_tab(
-                self._tab_id,
                 tab.with_initial_condition_sets(tuple(candidate_sets)),
                 expected_token=self._registry.capture_content_token(),
             )
