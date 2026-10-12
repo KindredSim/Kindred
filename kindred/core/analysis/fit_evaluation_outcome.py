@@ -2,10 +2,9 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Mapping
+from dataclasses import dataclass
 
-from kindred.core.simulation_failure import FactualCause, freeze_factual_value
+from kindred.core.simulation_failure import FactualCause
 
 @dataclass(frozen=True, slots=True)
 class ScientificUnavailable:
@@ -19,11 +18,6 @@ class ScientificUnavailable:
     producer: str
     stage: str
     factual_cause: FactualCause
-    details: Mapping[str, object] = field(default_factory=dict)
-
-    def __post_init__(self) -> None:
-        # Producers name themselves and their stage with literals.
-        object.__setattr__(self, "details", freeze_factual_value(dict(self.details)))
 
 
 

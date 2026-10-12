@@ -555,19 +555,13 @@ class RunResultsTab(QtWidgets.QWidget):
         dataset_ids = cause.details.get("datasets") or (
             (cause.details["dataset"],) if "dataset" in cause.details else ()
         )
-        labels = []
-        for dataset_id in dataset_ids:
-            label = self._dataset_labels.get(dataset_id, dataset_id)
-            if tuple(self._dataset_labels.values()).count(label) > 1:
-                label = f"{label} ({dataset_id})"
-            labels.append(label)
-        caption = f"Dataset{'s' if len(labels) > 1 else ''}: {', '.join(labels)}" if labels else ""
+        labels = [self._dataset_labels[dataset_id] for dataset_id in dataset_ids]
+        caption = f"Dataset{'s' if len(labels) > 1 else ''}: {', '.join(sorted(labels))}" if labels else ""
         message = located(cause.message, *cause.location())
         self.set_execution_status(phase, f"{caption}: {message}" if caption else message)
-        # A Fit-process crash carries the runtime's diagnostics on later lines.
         self._summary_body = (
             f"<h2>{heading}</h2>" + (f"<p>{html.escape(caption)}</p>" if caption else "")
-            + "<p>" + html.escape(message).replace("\n", "<br>") + "</p>"
+            + "<p>" + html.escape(message) + "</p>"
         )
         self._summary_provenance = ""
         self._refresh_summary()
@@ -705,14 +699,8 @@ class RunResultsTab(QtWidgets.QWidget):
         blocker = QtCore.QSignalBlocker(self._subtabs)
         while self._subtabs.count():
             self._subtabs.removeTab(self._subtabs.count() - 1)
-        label_counts: dict[str, int] = {}
-        for label in labels.values():
-            label_counts[label] = label_counts.get(label, 0) + 1
         for index, (curve, view_identity) in enumerate(zip(curves, ids, strict=True)):
-            full_label = curve.display_name
-            if label_counts[full_label] > 1:
-                full_label = f"{full_label} ({curve.dataset_id})"
-            compact_label = compact_dataset_label(full_label, max_chars=TAB_LABEL_MAX_CHARS)
+            compact_label = compact_dataset_label(curve.display_name, max_chars=TAB_LABEL_MAX_CHARS)
             tab_index = self._subtabs.addTab(compact_label.display)
             self._subtabs.setTabToolTip(
                 tab_index, f"{compact_label.full}\nDataset ID: {curve.dataset_id}"

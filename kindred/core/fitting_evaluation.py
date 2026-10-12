@@ -25,7 +25,7 @@ from kindred.core.exceptions import (
 from kindred.core.analysis.fit_evaluation_outcome import (
     ScientificUnavailable,
 )
-from kindred.core.algebra.errors import UNCOMPUTABLE_ERRORS, AlgebraError
+from kindred.core.algebra.errors import UNCOMPUTABLE_ERRORS
 from kindred.core.algebra.simulation_series import observable_closure
 from kindred.core.simulation_preparation import (
     SimulationExecutionRequest,
@@ -76,7 +76,6 @@ def _scientific_unavailability_from_exception(
     return ScientificUnavailable(
         producer=producer,
         stage=stage,
-        details=dict(exc.details),
         factual_cause=FactualCause(
             domain="simulation", origin=producer, code=None,
             type="SimulationScientificUnavailability", message=exc.message, details=exc.details,
@@ -99,13 +98,11 @@ def _known_candidate_unavailability(
     if isinstance(exc, PhysicalDomainError):
         return ScientificUnavailable(
             producer="physical_intervention", stage="execution",
-            details=exc.details,
             factual_cause=factual_cause_from_exception(exc),
         )
     if isinstance(exc, FitCandidateDomainError):
         return ScientificUnavailable(
             producer="fit_candidate", stage=exc.details["stage"],
-            details=exc.details,
             factual_cause=factual_cause_from_exception(exc),
         )
     return None
@@ -131,7 +128,7 @@ def _candidate_domain_rejection(
     ):
         return ScientificUnavailable(
             producer="fit_candidate", stage=cause.details["stage"],
-            details=cause.details, factual_cause=cause,
+            factual_cause=cause,
         )
     return None
 
@@ -324,7 +321,13 @@ class FittingEvaluator:
         result = replace(result, algebra_errors=tuple(
             self._with_fit_values(cause, params) for cause in result.algebra_errors
         ))
-        used = observable_closure(self._context.prepared_run.parameter_algebra_spec.observable_block, outputs)
+        # A selected output that was calculated is final; one that failed is
+        # judged by the failures among the lets it reads.
+        failed = {cause.details["name"] for cause in result.algebra_errors}
+        used = observable_closure(
+            self._context.prepared_run.parameter_algebra_spec.observable_block,
+            (name for name in outputs if name in failed),
+        )
         for cause in result.algebra_errors:
             if cause.details["name"] not in used:
                 continue
@@ -381,9 +384,9 @@ class FittingEvaluator:
             ) from exc
         except SimulationCancelled as exc:
             raise FittingCancelled() from exc
+        except KineticRuntimeDomainError:
+            raise
         except Exception as exc:
-            if isinstance(exc, (KineticRuntimeDomainError, AlgebraError)):
-                raise
             raise _fatal_evaluation_error(
                 exc,
                 stage="candidate_preparation",
@@ -447,8 +450,6 @@ class FittingEvaluator:
         except Exception as exc:
             if isinstance(exc, (FittingCancelled, SimulationCancelled)):
                 raise FittingCancelled() from exc
-            if isinstance(exc, AlgebraError):
-                raise
             raise _fatal_evaluation_error(
                 exc,
                 stage="result_finalization",

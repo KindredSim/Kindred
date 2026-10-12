@@ -314,13 +314,6 @@ def _field_label(field: str) -> str:
     return _C.HEADERS[_FIELD_COLUMNS["starting" if field.startswith("dataset:") else field]]
 
 
-def _parse_label(field: str, dataset_name: str) -> str:
-    """Name a numeric field in its own parse message; a dataset start names its dataset."""
-    if field.startswith("dataset:"):
-        return f"Initial guess for dataset {dataset_name}"
-    return "Initial guess" if field == "starting" else _field_label(field)
-
-
 class ParametersIcsTab(QtWidgets.QWidget):
     """Presentation-only parameter, IC-scope, and optimizer panel."""
 
@@ -333,7 +326,7 @@ class ParametersIcsTab(QtWidgets.QWidget):
     def __init__(
         self,
         *,
-        origin: FitOriginSnapshot | None = None,
+        origin: FitOriginSnapshot,
         parent: QtWidgets.QWidget | None = None,
     ) -> None:
         super().__init__(parent)
@@ -629,11 +622,13 @@ class ParametersIcsTab(QtWidgets.QWidget):
             combo.addItem(FIT_METHOD_LABELS.get(method, method), method)
 
     def _dataset_display_name(self, dataset_id: str) -> str:
-        if self._origin is not None:
-            for mapped in self._origin.mapped_datasets:
-                if mapped.dataset_id == dataset_id:
-                    return str(mapped.display_name)
-        return str(dataset_id)
+        return next(mapped.display_name for mapped in self._origin.mapped_datasets if mapped.dataset_id == dataset_id)
+
+    def _parse_label(self, field: str) -> str:
+        """Name a numeric field in its own parse message; a dataset start names its dataset."""
+        if field.startswith("dataset:"):
+            return f"Initial guess for dataset {self._dataset_display_name(field.removeprefix('dataset:'))}"
+        return "Initial guess" if field == "starting" else _field_label(field)
 
     def _parameter_by_name(self, name: str) -> FitParameterVariable | None:
         if self._projected_setup is None:
@@ -665,14 +660,10 @@ class ParametersIcsTab(QtWidgets.QWidget):
             self._projecting = False
         self._refresh_parameter_error()
 
-    def set_last_fit_reset_available(self, snapshot: FitSetupSnapshot | None) -> None:
-        if snapshot is not None:
-            self._last_fit_parameters = {item.name: item for item in snapshot.parameters}
-            self._last_fit_included = {item.dataset_id for item in snapshot.datasets if item.included}
-        else:
-            self._last_fit_parameters.clear()
-            self._last_fit_included = set()
-        self._reset_last_button.setEnabled(snapshot is not None)
+    def set_last_fit_reset_available(self, snapshot: FitSetupSnapshot) -> None:
+        self._last_fit_parameters = {item.name: item for item in snapshot.parameters}
+        self._last_fit_included = {item.dataset_id for item in snapshot.datasets if item.included}
+        self._reset_last_button.setEnabled(True)
         self._rerender_roster()
 
     def _rerender_roster(self) -> None:
@@ -1085,9 +1076,7 @@ class ParametersIcsTab(QtWidgets.QWidget):
             if field == "log10":
                 continue
             try:
-                parsed[field] = self._parse_number(text, _parse_label(
-                    field, self._dataset_display_name(field.removeprefix("dataset:")),
-                ))
+                parsed[field] = self._parse_number(text, self._parse_label(field))
             except ValueError as exc:
                 messages[field] = str(exc)
         if messages:

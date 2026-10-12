@@ -141,8 +141,7 @@ class UnifiedDatasetList(QtWidgets.QWidget):
             if item is None:
                 continue
             if str(item.data(Qt.UserRole) or "").strip() == requested:
-                label = str(item.data(Qt.UserRole + 1) or "").strip()
-                return label or requested
+                return str(item.data(Qt.UserRole + 1))
         return None
 
     def set_running_state(self, running: bool) -> None:

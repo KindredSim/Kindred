@@ -52,6 +52,7 @@ from kindred.core.exceptions import (
     FitCandidateDomainError,
     FittingCancelled,
     FitSimulationError,
+    KindredError,
     SimulationCancelled,
 )
 from kindred.core.fitting_evaluation import (
@@ -868,6 +869,21 @@ def _is_dataset_deadline_unavailable(
     return result.stage == "dataset_deadline"
 
 
+def _cause_naming_dataset(cause: FactualCause, dataset_id: str) -> FactualCause:
+    """The cause with the dataset it came from; the per-dataset evaluator and
+    its producers evaluate one dataset without knowing which."""
+    return replace(cause, details={**cause.details, "dataset": dataset_id})
+
+
+def _name_dataset(error: BaseException, dataset_id: str) -> None:
+    """Name the dataset a fatal evaluation error came from."""
+    if isinstance(error, KindredError):
+        error.details.setdefault("dataset", dataset_id)
+        cause = getattr(error, "factual_cause", None)
+        if cause is not None:
+            error.factual_cause = _cause_naming_dataset(cause, dataset_id)
+
+
 def _dataset_deadline_cause(
     dataset_ids: Sequence[str],
 ) -> FactualCause:
@@ -912,11 +928,6 @@ def _aggregate_dataset_deadline_unavailability(
     return ScientificUnavailable(
         producer="fit_dataset_deadline",
         stage="dataset_deadline",
-        details={
-            "deadline": True,
-            "deadline_seconds": _DATASET_DEADLINE_SECONDS,
-            "datasets": timed_out_dataset_ids,
-        },
         factual_cause=_dataset_deadline_cause(timed_out_dataset_ids),
     )
 
@@ -1087,11 +1098,6 @@ def evaluate_dataset_simulation(
         return ScientificUnavailable(
             producer="fit_dataset_deadline",
             stage="dataset_deadline",
-            details={
-                "dataset": ds_id,
-                "deadline": True,
-                "deadline_seconds": _DATASET_DEADLINE_SECONDS,
-            },
             factual_cause=_dataset_deadline_cause((ds_id,)),
         )
 
@@ -1109,7 +1115,9 @@ def evaluate_dataset_simulation(
         if time.monotonic() >= deadline:
             return deadline_unavailable()
         if isinstance(series_result, ScientificUnavailable):
-            return series_result
+            return replace(
+                series_result, factual_cause=_cause_naming_dataset(series_result.factual_cause, ds_id),
+            )
         fit_info = _build_dataset_fit_info(
             item,
             series_result,
@@ -1120,11 +1128,6 @@ def evaluate_dataset_simulation(
         if time.monotonic() >= deadline:
             return deadline_unavailable()
         return fit_info
-    except FitSimulationError:
-        _raise_if_fitting_cancel_requested(worker_cancel)
-        if time.monotonic() >= deadline:
-            return deadline_unavailable()
-        raise
     except Exception as exc:
         if isinstance(exc, (FittingCancelled, SimulationCancelled)):
             _raise_if_fitting_cancel_requested(worker_cancel)
@@ -1134,6 +1137,7 @@ def evaluate_dataset_simulation(
         _raise_if_fitting_cancel_requested(worker_cancel)
         if time.monotonic() >= deadline:
             return deadline_unavailable()
+        _name_dataset(exc, ds_id)
         raise
 
 
@@ -1520,7 +1524,7 @@ class GlobalFitObjective:
             simulation_evaluations,
         )
         timed_out_dataset_roster = (
-            tuple(timeout_unavailability.details["datasets"])
+            timeout_unavailability.factual_cause.details["datasets"]
             if timeout_unavailability is not None
             else ()
         )

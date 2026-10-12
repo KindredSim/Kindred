@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import queue
 import subprocess
 import threading
@@ -12,6 +13,8 @@ from kindred.core.simulation_failure import factual_cause_from_exception
 from kindred.gui.fitting import codec, launch, runtime
 
 __all__ = ["GlobalFitWorker"]
+
+logger = logging.getLogger(__name__)
 
 _TERMINAL_EVENTS = frozenset({
     "candidate_ready", "factual_failure", "scientific_unavailable", "cancelled",
@@ -196,7 +199,8 @@ class GlobalFitWorker(QtCore.QThread):
         if errors:
             detail = str(errors[0])
             if diagnostics:
-                detail += "\nFitting runtime diagnostics:\n" + diagnostics.decode("utf-8", errors="replace")
+                logger.error("Fitting runtime diagnostics:\n%s", diagnostics.decode("utf-8", errors="replace"))
+                detail += " Its diagnostics are in the Diagnostic Log."
             terminal = ("factual_failure", (factual_cause_from_exception(
                 RuntimeError(detail), domain="fit", origin="fit_process",
             ),))

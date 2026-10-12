@@ -298,7 +298,7 @@ class FittingWindow(QtWidgets.QDialog):
             self,
         ).exec()
 
-    def set_last_fit_reset_available(self, snapshot: FitSetupSnapshot | None) -> None:
+    def set_last_fit_reset_available(self, snapshot: FitSetupSnapshot) -> None:
         """Project Last Fit reset availability without retaining the snapshot."""
 
         self._params_ics_tab.set_last_fit_reset_available(snapshot)
@@ -408,7 +408,7 @@ class FittingWindow(QtWidgets.QDialog):
             text = " ".join(text.split())
             return text if len(text) <= limit else text[: limit - 1] + "…"
 
-        names = {key: visible(listing.dataset_display_name(key) or key, 60) for key in active_issues}
+        names = {key: visible(listing.dataset_display_name(key), 60) for key in active_issues}
         # One ordered list of invalid values; pending edits are reported only
         # when nothing is invalid.
         invalid_entries = [

@@ -154,6 +154,10 @@ class FitSessionOwner(QtCore.QObject):
         def fit_color_resolver(species):
             return self._color_resolver(str(species), modeled_species)
 
+        # Maintenance: the window and its Parameters and species tabs are built
+        # from the origin and receive the setup only in the projection below,
+        # so each keeps its own origin copy and guards a "no setup yet" state
+        # that never occurs. Building them with the setup would remove both.
         window = FittingWindow(
             origin,
             close_handler=self._request_window_close,
