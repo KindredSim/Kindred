@@ -387,7 +387,7 @@ class DataManagerPanel(QtWidgets.QWidget):
                 label.setToolTip("The mechanism tab these mappings apply to.")
             form.addRow(label, value)
         self._change_set_btn = QtWidgets.QPushButton("Change IC Set…")
-        self._change_set_btn.setToolTip("Map this dataset to an existing initial-condition set, or create one from its values at t=0.")
+        self._change_set_btn.setToolTip("Map this dataset to an existing initial-condition set, or create a new set from its data.")
         self._change_set_btn.clicked.connect(self._change_ic_set)
         self._set_value = _DatasetName()
         self._observation_mapping_btn = QtWidgets.QPushButton("Map Columns…")

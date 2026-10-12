@@ -19,7 +19,7 @@ from kindred.core.project_presentation_state import ProjectPresentationState
 from kindred.core.project_session import ProjectContentToken
 from kindred.core.species import concentration_from_text
 from kindred.core.validation import six_digit_text
-from kindred.gui.ui_helpers import copy_current_cell_as_shown
+from kindred.gui.ui_helpers import INVALID_EDITOR_STYLE, copy_current_cell_as_shown
 from kindred.gui.widgets.solver_settings import SolverSettingsDialog
 
 __all__ = [
@@ -39,10 +39,6 @@ _SLIDER_COLUMN_WIDTH = 72
 _PLOT_COLUMN_WIDTH = 56
 _CUSTOM_COLUMN_WIDTH = 72
 _RUN_GEAR_COLUMN_WIDTH = 36
-_INVALID_EDITOR_STYLE = (
-    "QLineEdit { background-color: rgb(255, 210, 210); "
-    "color: rgb(80, 0, 0); }"
-)
 
 
 def is_valid_initial_text(raw: object) -> bool:
@@ -461,7 +457,7 @@ class _InitialConditionsItemDelegate(QtWidgets.QStyledItemDelegate):
     def _update_editor_style(self, editor: QtWidgets.QLineEdit) -> None:
         index = self._index_for_editor(editor)
         editor.setStyleSheet(
-            _INVALID_EDITOR_STYLE
+            INVALID_EDITOR_STYLE
             if index.isValid() and index.column() != 0
             and not is_valid_initial_text(editor.text())
             else ""

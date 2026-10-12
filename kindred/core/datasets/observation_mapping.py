@@ -127,6 +127,48 @@ def suggest_observation_mapping(
     return tuple(suggestions)
 
 
+def supplies_concentration(series: ObservationSeries) -> bool:
+    """Whether a measured column can supply initial concentrations."""
+    return series.unit is not None and series.unit.compatible(MOLAR)
+
+
+def first_data_row(observations: Sequence[ObservationSeries]) -> int:
+    """The one common dataset row that First data row reads."""
+    return min(row for series in observations for row in series.source_rows)
+
+
+def initial_samples(
+    series: ObservationSeries,
+    *,
+    source: InitialConcentrationSource,
+    first_row: int,
+) -> tuple[tuple[int, float], ...]:
+    """Every (dataset row, value) of one column at the chosen start."""
+    if source is InitialConcentrationSource.RECORDED_ZERO:
+        coordinates, selected = series.t, 0.0
+    else:
+        coordinates, selected = series.source_rows, first_row
+    return tuple(
+        (series.source_rows[index], series.y[index])
+        for index, item in enumerate(coordinates)
+        if item == selected
+    )
+
+
+def admit_measured_start(value: float, *, species: str) -> float:
+    """Admit one measured starting concentration for a species."""
+    # A measured start at or below zero (baseline noise, or -0) supplies
+    # exact zero; a concentration cannot be negative.
+    measured = float(value)
+    try:
+        return validate_concentration(
+            0.0 if measured <= 0.0 else measured,
+            field=f"Initial concentration for {species}",
+        )
+    except (TypeError, ValueError) as exc:
+        raise ObservationMappingError(str(exc)) from exc
+
+
 def extract_initial_concentrations(
     *,
     observations: Sequence[ObservationSeries],
@@ -143,39 +185,23 @@ def extract_initial_concentrations(
         0.0 in series.t for series in observations
     ):
         raise ObservationMappingError("The dataset has no recorded observation at t = 0.")
-    first_row = (
-        min(row for series in observations for row in series.source_rows)
-        if source is InitialConcentrationSource.FIRST_DATA_ROW else None
-    )
+    first_row = first_data_row(observations)
     by_id = {series.raw_observation_id: series for series in observations}
     raw_id_by_target = {target: raw_id for raw_id, target in confirmed_mapping}
     concentrations: list[tuple[str, float | None]] = []
     for species in mechanism_species:
         value = None
         raw_id = raw_id_by_target.get(species)
-        if raw_id is not None:
+        if raw_id is not None and supplies_concentration(by_id[raw_id]):
             series = by_id[raw_id]
-            if series.unit is not None and series.unit.compatible(MOLAR):
-                coordinates = series.t if first_row is None else series.source_rows
-                selected = 0.0 if first_row is None else first_row
-                indexes = tuple(index for index, item in enumerate(coordinates) if item == selected)
-                if len(indexes) > 1:
-                    rows = ", ".join(str(series.source_rows[index]) for index in indexes)
-                    raise ObservationMappingError(
-                        f"Observation {series.column_name!r} (raw ID {raw_id!r}) mapped "
-                        f"to species {species!r} has multiple exact t=0.0 values "
-                        f"at dataset rows {rows}."
-                    )
-                if indexes:
-                    # A measured start at or below zero (baseline noise, or -0)
-                    # supplies exact zero; a concentration cannot be negative.
-                    measured = float(series.y[indexes[0]])
-                    try:
-                        value = validate_concentration(
-                            0.0 if measured <= 0.0 else measured,
-                            field=f"Initial concentration for {species}",
-                        )
-                    except (TypeError, ValueError) as exc:
-                        raise ObservationMappingError(str(exc)) from exc
+            samples = initial_samples(series, source=source, first_row=first_row)
+            if len(samples) > 1:
+                rows = ", ".join(str(row) for row, _value in samples)
+                raise ObservationMappingError(
+                    f"Column {series.column_name!r} has {len(samples)} measurements at "
+                    f"t = 0 (rows {rows}); Recorded data at t = 0 needs exactly one."
+                )
+            if samples:
+                value = admit_measured_start(samples[0][1], species=species)
         concentrations.append((species, value))
     return tuple(concentrations)

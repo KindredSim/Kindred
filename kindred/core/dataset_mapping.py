@@ -12,8 +12,10 @@ import uuid
 
 from kindred.core.datasets.observation_mapping import (
     InitialConcentrationSource,
+    ObservationMappingError,
     extract_initial_concentrations,
     normalize_observation_mapping,
+    supplies_concentration,
 )
 from kindred.core.datasets import foundation as dataset_foundation
 from kindred.core.project_document import (
@@ -51,6 +53,8 @@ class DatasetMappingProposal:
     occupied_choice: OccupiedSetChoice | str | None = None
     observation_mapping: tuple[tuple[str, str], ...] = ()
     initial_concentration_source: InitialConcentrationSource | None = None
+    # Manual species do not read the data; None supplies no concentration.
+    manual_initial_concentrations: tuple[tuple[str, float | None], ...] = ()
 
     def __post_init__(self) -> None:
         # Producers pass the occupancy choice as its string value.
@@ -182,12 +186,28 @@ def apply_dataset_mapping_batch(
                 dataset.display_name,
                 existing_names=used_names,
             )
-            values = extract_initial_concentrations(
-                observations=dataset.observations,
-                mechanism_species=species,
-                confirmed_mapping=normalized_mapping,
-                source=item.initial_concentration_source,
+            manual = dict(item.manual_initial_concentrations)
+            data_mapping = tuple(
+                (raw_id, target) for raw_id, target in normalized_mapping
+                if target not in manual
             )
+            if item.initial_concentration_source is not None:
+                values = extract_initial_concentrations(
+                    observations=dataset.observations,
+                    mechanism_species=species,
+                    confirmed_mapping=data_mapping,
+                    source=item.initial_concentration_source,
+                )
+            else:
+                # Without a source choice no species may read the data.
+                series_by_id = {series.raw_observation_id: series for series in dataset.observations}
+                if any(
+                    target in species and supplies_concentration(series_by_id[raw_id])
+                    for raw_id, target in data_mapping
+                ):
+                    raise ObservationMappingError("Choose a source for the initial concentrations.")
+                values = tuple((name, None) for name in species)
+            values = tuple((name, manual.get(name, value)) for name, value in values)
             new_set = InitialConditionSet(
                 set_id=new_set_id(),
                 name=expected_name,

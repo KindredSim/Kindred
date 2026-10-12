@@ -48,6 +48,8 @@ class _Sheet:
     name: str | None
     columns: tuple[PhysicalColumn, ...]
     preview_rows: list[Mapping[PhysicalColumn, object]]
+    # File row numbers of preview_rows, as a spreadsheet shows them.
+    preview_row_numbers: list[int]
     settings: ImportSettings
     included: bool
     load_error: str = ""
@@ -256,7 +258,7 @@ class ImportConfigDialog(QtWidgets.QDialog):
         self._species_table.itemChanged.connect(self._on_species_changed)
         self._apply_feedback_palette()
 
-    def _make_sheet(self, name, columns, rows, load_error="") -> _Sheet:
+    def _make_sheet(self, name, columns, rows, load_error="", row_numbers=None) -> _Sheet:
         columns = tuple(columns)
         time_column = next(
             (
@@ -275,6 +277,8 @@ class ImportConfigDialog(QtWidgets.QDialog):
             name,
             columns,
             rows,
+            # Workbook data rows follow the header row consecutively.
+            list(row_numbers) if row_numbers is not None else [index + 2 for index in range(len(rows))],
             ImportSettings(time_column, selected),
             included=bool(columns),
             load_error=load_error,
@@ -289,10 +293,13 @@ class ImportConfigDialog(QtWidgets.QDialog):
                 source_label=self._source.original_filename,
             )
             try:
-                preview = [row.values for row in islice(rows, row_limit)]
+                physical = list(islice(rows, row_limit))
             finally:
                 rows.close()
-            self._sheets.append(self._make_sheet(None, columns, preview))
+            self._sheets.append(self._make_sheet(
+                None, columns, [row.values for row in physical],
+                row_numbers=[row.source_row for row in physical],
+            ))
             self._on_current_sheet_changed(0)
             return
         with ExcelWorkbookPair(
@@ -448,7 +455,7 @@ class ImportConfigDialog(QtWidgets.QDialog):
         self._preview_table.setRowCount(len(rows))
         self._preview_table.setHorizontalHeaderLabels([col.assigned_name for col in sheet.columns])
         self._preview_table.setVerticalHeaderLabels([
-            "Units" if index == 0 and excluded else f"Data {index + 1 - int(excluded)}"
+            "Units" if index == 0 and excluded else str(sheet.preview_row_numbers[index])
             for index in range(len(rows))
         ])
         if excluded:

@@ -2974,6 +2974,12 @@ class MainWindow(QtWidgets.QMainWindow):
             )
             return
 
+        if not canonical_observation_target_names(self._workspace_tab_registry.tab(origin_tab_id)):
+            self.set_status_text(
+                message + " The mechanism has no species yet, so mapping was skipped."
+                " Raw data remains unmapped."
+            )
+            return
         self.set_status_text(
             message + " Raw data was committed before optional mapping."
         )
@@ -2984,10 +2990,6 @@ class MainWindow(QtWidgets.QMainWindow):
                 item.set_id for item in tab.initial_condition_sets
             )
             model_targets = canonical_observation_target_names(tab)
-            if not model_targets:
-                raise DatasetMappingError(
-                    "Optional mapping requires a valid mechanism with observation targets."
-                )
             review = DatasetMappingBatchDialog(
                 document=self._project_session.document,
                 records=batch_proposal.records,
@@ -3312,11 +3314,13 @@ class MainWindow(QtWidgets.QMainWindow):
                 try:
                     if dialog.exec() != QtWidgets.QDialog.DialogCode.Accepted:
                         return
+                    source, manual = dialog.editor.creation_inputs()
                     proposal = DatasetMappingProposal(
                         dataset_id=dataset.dataset_id,
                         action=choice,
                         observation_mapping=dialog.editor.confirmed_mapping(),
-                        initial_concentration_source=dialog.editor.creation_source(),
+                        initial_concentration_source=source,
+                        manual_initial_concentrations=manual,
                     )
                 finally:
                     dialog.deleteLater()
@@ -3383,6 +3387,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 dataset,
                 model_targets,
                 current_mapping=current.observation_mapping if current is not None else (),
+                mechanism_species=canonical_species_names(tab),
                 title="Observation Mapping",
                 parent=self,
             )

@@ -14,6 +14,7 @@ from kindred.gui.display_name_policy import (
 )
 
 __all__ = [
+    "INVALID_EDITOR_STYLE",
     "SCIENTIFIC_NAME_HTML_ROLE",
     "SOLVER_TOOLTIP",
     "ControlRowsLayout",
@@ -24,6 +25,7 @@ __all__ = [
     "clamp_initial_size",
     "cell_text_as_shown",
     "copy_current_cell_as_shown",
+    "enter_confirms_only",
     "ignore_wheel",
     "make_bounded_label",
     "make_scroll_area",
@@ -184,6 +186,24 @@ def ignore_wheel(widget: QtWidgets.QWidget) -> None:
 
     widget.setFocusPolicy(QtCore.Qt.FocusPolicy.StrongFocus)
     widget.installEventFilter(_WHEEL_SCROLLS_PANE)
+
+
+# A typed concentration that is not admitted stays visible for correction.
+INVALID_EDITOR_STYLE = (
+    "QLineEdit { background-color: rgb(255, 210, 210); "
+    "color: rgb(80, 0, 0); }"
+)
+
+
+def enter_confirms_only(dialog: QtWidgets.QDialog, event: QtGui.QKeyEvent) -> bool:
+    """Consume Enter unless a button has focus, so typing never applies the dialog."""
+
+    if event.key() not in (QtCore.Qt.Key.Key_Return, QtCore.Qt.Key.Key_Enter):
+        return False
+    if isinstance(dialog.focusWidget(), QtWidgets.QAbstractButton):
+        return False
+    event.accept()
+    return True
 
 
 def cell_text_as_shown(view: QtWidgets.QAbstractItemView, index: QtCore.QModelIndex) -> str:
