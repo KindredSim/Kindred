@@ -69,8 +69,8 @@ def validate_endpoint_budget(endpoints, quota, count):
 
 
 class InputDesign:
-    def __init__(self, ranges, derived, spaces, allocations, endpoints, quota, check):
-        self.ranges, self.derived, self.allocations = ranges, derived, allocations
+    def __init__(self, ranges, derived, spaces, selections, endpoints, quota, check):
+        self.ranges, self.derived, self.selections = ranges, derived, selections
         # Unit coordinates remain associated with catalog keys, independently
         # of the conditional order used inside the feasible spaces.
         self.keys = tuple(key for key in ranges if key not in derived)
@@ -98,7 +98,7 @@ class InputDesign:
         values = {}
         try:
             for space in spaces:
-                values.update(space.draw(units, self.allocations))
+                values.update(space.draw(units, self.selections))
             for key, expression in self.derived.items():
                 values[key] = expression.evaluate(values)
             for key, value in values.items():
@@ -195,7 +195,6 @@ class PreparedScanDesign:
                             if key not in derived and len(intervals) == 1 and intervals[0].lower == intervals[0].upper}
         derived = {key: expression.substitute(singleton_values) for key, expression in derived.items()}
         inequalities = tuple(Inequality(row.expression.substitute(singleton_values), row.strict) for row in inequalities)
-        allocations = {key: value.allocation for key, value in cfg.ranges.items()}
         endpoints = [(key, value) for key, selection in cfg.ranges.items() for value in selection.endpoints]
         if cfg.grouped:
             if cfg.parameter_sets <= 0 or cfg.initial_sets <= 0 or cfg.parameter_sets * cfg.initial_sets != cfg.requested:
@@ -211,7 +210,7 @@ class PreparedScanDesign:
         spaces = build_spaces(ranges, derived, inequalities, self.check, order)
         if not cfg.grouped:
             self.interval_checks = IntervalChecks(prepared, cfg)
-            self.joint = InputDesign(ranges, derived, spaces, allocations, endpoints,
+            self.joint = InputDesign(ranges, derived, spaces, cfg.ranges, endpoints,
                                      cfg.boundary_attempts, self.check)
             self.effective_ranges.update(self.joint.marginals)
             return
@@ -237,7 +236,7 @@ class PreparedScanDesign:
                         for space in spaces if set(space.keys) & set(keys[first])]
         first_design = InputDesign({key: ranges[key] for key in keys[first]},
                                    {key: value for key, value in derived.items() if key in keys[first]},
-                                   first_spaces, allocations, [(k, v) for k, v in endpoints if k in keys[first]],
+                                   first_spaces, cfg.ranges, [(k, v) for k, v in endpoints if k in keys[first]],
                                    quotas[first], self.check)
         self.effective_ranges.update(first_design.marginals)
         maxima = [None] * len(inequalities)
@@ -257,7 +256,7 @@ class PreparedScanDesign:
         second_derived = {key: value for key, value in derived.items() if key in keys[second]}
         try:
             second_spaces = build_spaces(second_ranges, second_derived, common, self.check, order)
-            second_design = InputDesign(second_ranges, second_derived, second_spaces, allocations,
+            second_design = InputDesign(second_ranges, second_derived, second_spaces, cfg.ranges,
                                         [(k, v) for k, v in endpoints if k in keys[second]],
                                         quotas[second], self.check)
         except ValueError as exc:

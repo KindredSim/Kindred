@@ -9,7 +9,8 @@ Current contract
     heaviside(x) with heaviside(0)=0.0, clip(x, lo, hi), ifelse(cond, a, b)
 - Protected read-only symbols:
     k_B, h, h_bar, N_A, R, T
-- No shadowing of species or builtins; parser/evaluator must emit E120.
+- Mechanism admission refuses Algebra names that redefine a protected symbol
+  or built-in function.
 
 Notes
 -----

@@ -167,9 +167,13 @@ def extract_initial_concentrations(
                         f"at dataset rows {rows}."
                     )
                 if indexes:
+                    # A measured start at or below zero (baseline noise, or -0)
+                    # supplies exact zero; a concentration cannot be negative.
+                    measured = float(series.y[indexes[0]])
                     try:
                         value = validate_concentration(
-                            series.y[indexes[0]], field=f"initial concentration for {species}",
+                            0.0 if measured <= 0.0 else measured,
+                            field=f"Initial concentration for {species}",
                         )
                     except (TypeError, ValueError) as exc:
                         raise ObservationMappingError(str(exc)) from exc

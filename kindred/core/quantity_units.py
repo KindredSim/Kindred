@@ -61,7 +61,10 @@ class UnitScale:
         return self.apply(1.0)
 
     def apply(self, value: float) -> float:
-        """Scale a number before rounding the complete result to a float."""
+        """Scale a number before rounding the complete result to a float.
+
+        The number is taken as the shortest decimal that reads back as it,
+        which is the authored literal, so 1.1 h becomes exactly 3960 s."""
         value = float(value)
         if not math.isfinite(value):
             raise ValueError("Unit conversion requires a finite value.")
@@ -75,7 +78,7 @@ class UnitScale:
             except ExactWorkLimit:
                 rational = None
             if rational is not None:
-                converted = float(Fraction.from_float(value) * rational)
+                converted = float(Fraction(repr(value)) * rational)
             else:
                 with localcontext() as context:
                     context.prec = 50

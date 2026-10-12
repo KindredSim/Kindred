@@ -6,7 +6,6 @@ Current contract
 - Dynamic evaluation per time t.
 - [A] pulls series at time t; [A]_0 pulls initial concentration.
 - Builtins/helpers and protected symbols: see symbols.py and constants.py.
-- No shadowing of species or builtins for user-defined algebra symbols (E120).
 - Error taxonomy uses the algebra error classes and codes defined in errors.py.
 - Static vs dynamic: lets independent of [X] terms evaluate to scalars.
 
@@ -37,7 +36,6 @@ from .errors import (
     AlgebraDomainError,
     AlgebraError,
     AlgebraNameError,
-    AlgebraShadowError,
     AlgebraTypeError,
     AlgebraZeroDivError,
 )
@@ -83,8 +81,6 @@ class EvaluationContext:
         Species time series on native grid: name -> ndarray (len N).
     initials : mapping
         Initial concentrations: name -> float.
-    species_names : set
-        Declared species names (for shadow checks).
     symtab : SymbolTable
         Protected symbols. `T` is read-only and may be updated by the
         application, not by user algebra.
@@ -108,7 +104,6 @@ class EvaluationContext:
     t: np.ndarray
     species_series: Mapping[str, np.ndarray]
     initials: Mapping[str, float]
-    species_names: Set[str]
     symtab: SymbolTable
     symbol_series: Mapping[str, np.ndarray] = field(default_factory=dict)
     symbol_values: Mapping[str, float] = field(default_factory=dict)
@@ -137,6 +132,8 @@ class AlgebraObservableError:
     line: Optional[int] = None
     col: Optional[int] = None
     line_text: Optional[str] = None
+    # A Kindred error's own facts, such as the values a failing param reads.
+    details: Mapping[str, Any] = field(default_factory=dict)
 
     @staticmethod
     def from_exception(name: str, exc: Exception, *, stmt: LetStatement) -> "AlgebraObservableError":
@@ -155,6 +152,7 @@ class AlgebraObservableError:
             line=int(line) if line is not None else None,
             col=int(col) if col is not None else None,
             line_text=str(line_text) if line_text is not None else None,
+            details=dict(exc.details) if isinstance(exc, KindredError) else {},
         )
 
 
@@ -184,8 +182,7 @@ def bind_scalar_expression_evaluator(
 ):
     """Bind admitted scalar AST arithmetic to one current numerical map."""
     context = EvaluationContext(
-        t=np.array([0.0]), species_series={}, initials={},
-        species_names=set(), symtab=SymbolTable(),
+        t=np.array([0.0]), species_series={}, initials={}, symtab=SymbolTable(),
     )
     evaluator = _Evaluator(block, context, literal_reader=literal_reader)
     evaluator.symbol_values = values
@@ -256,9 +253,6 @@ class _Evaluator:
         def let_dynamic(name: str) -> bool:
             if name in state:
                 return state[name]
-            # The parser retains and validates a topological order, so this is
-            # only defensive protection for manually constructed blocks.
-            state[name] = True
             state[name] = expr_dynamic(statements[name].expr)
             return state[name]
 
@@ -272,8 +266,6 @@ class _Evaluator:
         for stmt in self.block.statements_in_evaluation_order():
             self.ctx.check_cancelled()
             name = stmt.name
-            # shadowing guards
-            self._guard_shadow(name, stmt)
             is_dyn = name not in scalar_names
             if is_dyn:
                 self.timevary.add(name)
@@ -301,7 +293,7 @@ class _Evaluator:
 
         - Each `let name = expr` is evaluated independently.
         - On failure, the observable is omitted from outputs and an error record is returned.
-        - Strict invariants (shape checks, shadowing guards) still apply per statement.
+        - Strict invariants (shape checks) still apply per statement.
         """
         errors: List[AlgebraObservableError] = []
         scalar_names = self._scalar_let_names()
@@ -310,7 +302,6 @@ class _Evaluator:
             self.ctx.check_cancelled()
             name = stmt.name
             try:
-                self._guard_shadow(name, stmt)
                 is_dyn = stmt.name not in scalar_names
                 if is_dyn:
                     self.timevary.add(name)
@@ -335,16 +326,6 @@ class _Evaluator:
 
         self.ctx.check_cancelled()
         return self.series, self.scalars, errors
-
-    # Guards
-    def _guard_shadow(self, name: str, stmt: LetStatement) -> None:
-        # Protected or species names are forbidden
-        if name in self.ctx.symtab.protected_names():
-            raise AlgebraShadowError(f"attempted shadowing of protected symbol {name!r}", line=stmt.line, col=stmt.col, line_text=stmt.line_text)
-        if name in self.ctx.symtab.functions().keys():
-            raise AlgebraShadowError(f"attempted shadowing of builtin function {name!r}", line=stmt.line, col=stmt.col, line_text=stmt.line_text)
-        if name in self.ctx.species_names:
-            raise AlgebraShadowError(f"attempted shadowing of species {name!r}", line=stmt.line, col=stmt.col, line_text=stmt.line_text)
 
     # Eval
     def _eval_expr(self, node: ExprNode, i: int, *, stmt: LetStatement) -> float | bool:
@@ -581,7 +562,6 @@ class PreparedAlgebraStopEvaluator:
             t=np.array([0.0]),
             species_series={},
             initials=dict(initials),
-            species_names=set(species_names),
             symtab=SymbolTable(),
             symbol_values=dict(symbol_values),
         )
@@ -697,7 +677,6 @@ class PreparedAlgebraStopEvaluator:
             t=np.array([t]),
             species_series={species: np.array([y[index]]) for index, species in enumerate(self.species_names)},
             initials=self._context.initials,
-            species_names=self._context.species_names,
             symtab=self._context.symtab,
             symbol_values=self._context.symbol_values,
             symbol_series=runtime_symbols,

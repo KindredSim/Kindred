@@ -41,7 +41,7 @@ _BASE_UNITS = {"concentration": MOLAR, "time": SECOND, "volume": CUBIC_METRE}
 def _reference_column(name: str) -> int:
     match = _REFERENCE.fullmatch(name)
     if match is None:
-        raise ValueError(f"{name!r} is not a cell of this row.")
+        raise ValueError(f"A formula refers to cells by column letter and row number, not {name!r}.")
     # Letters beyond the worksheet still name a column, which admission refuses.
     column = 0
     for letter in match[1]:

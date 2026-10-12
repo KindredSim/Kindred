@@ -56,17 +56,6 @@ def is_valid_initial_text(raw: object) -> bool:
 
 
 @dataclass(frozen=True, slots=True)
-class _InitialConditionsRenderProjection:
-    """Prepared incoming values for one admitted tab snapshot."""
-
-    tab: MechanismTabDocument
-    presentation: ProjectPresentationState
-    invalid_raw_by_set: tuple[tuple[str, tuple[tuple[str, str], ...]], ...]
-    species_names: tuple[str, ...]
-    selected_run_set_ids: tuple[str, ...]
-
-
-@dataclass(frozen=True, slots=True)
 class _ProjectedRow:
     set_id: str
     name: str
@@ -710,51 +699,28 @@ class InitialConditionsTableActions(QtCore.QObject):
     def tab_id(self) -> str:
         return self._tab_id
 
-    def prepare_render(self) -> _InitialConditionsRenderProjection:
-        """Prepare the complete table projection without touching widgets."""
+    def render(self) -> None:
+        """Render the complete table from the published tab and its drafts."""
 
         tab = self._registry.tab(self._tab_id)
         runtime = self._registry.tab_runtime(self._tab_id)
-        return _InitialConditionsRenderProjection(
-            tab=tab,
-            presentation=self._registry.presentation(self._tab_id),
-            invalid_raw_by_set=tuple(
-                (
-                    str(set_id),
-                    tuple(
-                        (str(species), str(raw))
-                        for species, raw in values.items()
-                    ),
-                )
-                for set_id, values
-                in runtime.initial_text_by_set_id.items()
-            ),
-            species_names=tuple(canonical_species_names(tab)),
-            selected_run_set_ids=tuple(runtime.selected_run_set_ids),
-        )
-
-    def apply_render_projection(
-        self,
-        projection: _InitialConditionsRenderProjection,
-    ) -> None:
-        """Apply one fully prepared table projection."""
-
+        presentation = self._registry.presentation(self._tab_id)
         selection = self._table.selectionModel()
         selection_blocker = QtCore.QSignalBlocker(selection)
         self._rendering = True
         try:
             self._model.render_snapshot(
-                projection.tab,
-                projection.presentation,
+                tab,
+                presentation,
                 invalid_raw_by_set={
-                    set_id: dict(values)
-                    for set_id, values in projection.invalid_raw_by_set
+                    str(set_id): {str(species): str(raw) for species, raw in values.items()}
+                    for set_id, values in runtime.initial_text_by_set_id.items()
                 },
-                species_names=projection.species_names,
+                species_names=tuple(canonical_species_names(tab)),
             )
-            selected_ordered = tuple(projection.selected_run_set_ids)
+            selected_ordered = tuple(runtime.selected_run_set_ids)
             selected = set(selected_ordered)
-            current_set_id = projection.presentation.current_set_id
+            current_set_id = presentation.current_set_id
             if tuple(self._table.selected_set_ids()) != selected_ordered:
                 selection.clearSelection()
                 for row, set_id in enumerate(self._model.set_ids()):
@@ -780,9 +746,6 @@ class InitialConditionsTableActions(QtCore.QObject):
         finally:
             self._rendering = False
             del selection_blocker
-
-    def render(self) -> None:
-        self.apply_render_projection(self.prepare_render())
 
     def capture_active_editor(self) -> None:
         """Capture the focused numeric editor without committing its value."""

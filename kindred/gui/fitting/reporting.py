@@ -21,8 +21,8 @@ from kindred.core.analysis.global_fit_execution import FitCoordinate, parameter_
 from kindred.core.fitting_optimization import fit_bound_position
 from kindred.core.quantity_units import SECOND, format_unit_for_display
 from kindred.core.simulation_failure import FactualCause
-from kindred.core.validation import six_digit_text
-from kindred.gui.display_name_policy import and_join, scientific_symbol_html
+from kindred.core.validation import and_join, six_digit_text
+from kindred.gui.display_name_policy import scientific_symbol_html
 from kindred.gui.fitting.constants import (
     DE_CONVERGENCE_TOLERANCE_LABEL,
     DIFFERENTIAL_EVOLUTION_METHOD,
@@ -40,6 +40,7 @@ from kindred.gui.fitting.launch import (
     fit_coordinate_datasets_text,
     fit_group_labels,
     fit_parameter_overall,
+    fit_profile_targets,
     fit_uncertainty_coordinates,
     shared_initial_group_labels,
     shared_initial_group_variable_id,
@@ -149,6 +150,8 @@ def _profile_interval(coordinate: FitCoordinate, interval: object) -> dict[str, 
         "upper": interval.upper,
         "lower_resolution": _profile_endpoint(interval.lower_resolution),
         "upper_resolution": _profile_endpoint(interval.upper_resolution),
+        "cutoff": interval.cutoff,
+        "degrees_of_freedom": interval.degrees_of_freedom,
     }
 
 
@@ -163,26 +166,24 @@ def _roster_positions(setup) -> dict[FitCoordinate, int]:
 def _profile_data(candidate: FitCandidate) -> dict[str, object]:
     result = candidate.result.profile_likelihood_result
     request_setup = candidate.request.setup
+    # A Fit with Profile on always settles a Profile result.
     if result is None:
-        requested = request_setup.profile_likelihood is not None
-        return {
-            "requested": requested,
-            "status": "not_requested" if not requested else "unavailable",
-            "unavailable_reason": None if not requested else "no result was returned.",
-            "diagnostic": None,
-            "intervals": [],
-        }
+        return {"requested": False, "status": "not_requested", "intervals": []}
     roster = _roster_positions(request_setup)
+    options = request_setup.profile.options
     return {
         "requested": True,
         "status": result.status,
         "method": result.method,
         "confidence_level": result.confidence_level,
         "facts": (
-            ("Likelihood-ratio threshold", _threshold_text(result)),
             ("Likelihood model", result.likelihood_model),
-            ("Confidence level", f"{_display(100.0 * result.confidence_level)}%"),
+            ("Confidence level", f"{_display(100.0 * options.confidence_level)}%"),
+            ("Maximum outward search steps per side", options.max_bracketing_steps_per_side),
+            ("Maximum evaluations per refit", options.max_nfev_per_point),
+            ("Optimization method", fit_method_label(options.optimizer_method)),
         ),
+        "noise_blocks": result.noise_blocks,
         "unavailable_reason": result.unavailable_reason,
         "diagnostic": _plain(result.diagnostic),
         "settlement": result.provenance.get("settlement"),
@@ -190,77 +191,6 @@ def _profile_data(candidate: FitCandidate) -> dict[str, object]:
             _profile_interval(coordinate, interval)
             for coordinate, interval in sorted(result.intervals.items(), key=lambda item: roster[item[0]])
         ],
-    }
-
-
-def _threshold_text(result: object) -> str:
-    """The threshold used with its F(1, n−p) degrees of freedom."""
-
-    if result.likelihood_ratio_threshold is None:
-        return "Unavailable"
-    freedom = result.observation_count - result.fitted_value_count
-    return f"{six_digit_text(result.likelihood_ratio_threshold)} from F(1, {freedom})"
-
-
-def _bootstrap_interval(coordinate: FitCoordinate, interval: object) -> dict[str, object]:
-    return {
-        "coordinate": coordinate,
-        "status": interval.status,
-        "lower": interval.lower,
-        "upper": interval.upper,
-    }
-
-
-def _bootstrap_data(candidate: FitCandidate) -> dict[str, object]:
-    result = candidate.result.residual_bootstrap_result
-    request_setup = candidate.request.setup
-    if result is None:
-        requested = request_setup.residual_bootstrap is not None
-        return {
-            "requested": requested,
-            "status": "not_requested" if not requested else "unavailable",
-            "unavailable_reason": None if not requested else "no result was returned.",
-            "diagnostic": None,
-            "intervals": [],
-        }
-    roster = _roster_positions(request_setup)
-
-    def by_dataset(texts: Mapping[str, str]) -> str:
-        """The procedure once when every dataset shares it, else per dataset in table order."""
-
-        if len(set(texts.values())) == 1:
-            return next(iter(texts.values()))
-        return "\n".join(
-            f"{mapped.display_name}: {texts[mapped.dataset_id]}"
-            for mapped in candidate.origin.mapped_datasets if mapped.dataset_id in texts
-        )
-
-    return {
-        "requested": True,
-        "status": result.status,
-        "method": result.method,
-        "replicates": result.replicates,
-        "confidence_level": result.confidence_level,
-        "facts": (
-            ("Seed", result.seed),
-            ("Resampling", by_dataset(result.resampling)),
-            ("Residual centering", by_dataset(result.residual_centering)),
-            ("Required successful refits", result.required_successes),
-            ("Confidence level", f"{_display(100.0 * result.confidence_level)}%"),
-        ),
-        "successful_replicates": result.successful_replicates,
-        "failed_replicates": result.failed_replicates,
-        "intervals": [
-            _bootstrap_interval(coordinate, interval)
-            for coordinate, interval in sorted(result.intervals.items(), key=lambda item: roster[item[0]])
-        ],
-        "first_unavailable_replicate": _plain(
-            None if result.first_failed_replicate_unavailable is None
-            else result.first_failed_replicate_unavailable.factual_cause
-        ),
-        "unavailable_reason": result.unavailable_reason,
-        "diagnostic": _plain(result.diagnostic),
-        "settlement": result.provenance.get("settlement"),
     }
 
 
@@ -283,19 +213,12 @@ def _dataset_metrics(candidate: FitCandidate) -> list[dict[str, object]]:
     return metrics
 
 
-def _series_metric_rows(candidate: FitCandidate) -> list[tuple[str, str, str, str, str]]:
-    """R² and raw RMS residual per dataset and observable, X block included.
+def _series_units(candidate: FitCandidate) -> dict[tuple[str, str], tuple[object, object]]:
+    """Each fitted series' scientific unit and the unit the Fit plot shows it in."""
 
-    Residuals are retained in the scientific unit; each RMS is shown in the
-    unit the Fit plot shows that observable in.
-    """
-
-    names = {item.dataset_id: item.display_name for item in candidate.origin.mapped_datasets}
-    infos = {info.dataset_id: info for info in candidate.result.dataset_info}
     prepared_dsl = candidate.origin.prepared_dsl
-    rows: list[tuple[str, str, str, str, str]] = []
+    units: dict[tuple[str, str], tuple[object, object]] = {}
     for prepared in candidate.request.dispatch.prepared_datasets:
-        info = infos[prepared.dataset_id]
         x = prepared.parametric_x_observation
         x_name = "t" if x is None else x.model_target
         y_units = {item.model_target: item.unit for item in prepared.selected_observations}
@@ -306,16 +229,35 @@ def _series_metric_rows(candidate: FitCandidate) -> list[tuple[str, str, str, st
             prepared_dsl, x_name, tuple(y_units), SECOND if x is None else x.unit,
             tuple(y_units.items()),
         )
+        for series, unit in source_units.items():
+            units[(prepared.dataset_id, series)] = (unit, measured[series])
+    return units
+
+
+def _series_metric_rows(candidate: FitCandidate) -> list[tuple[str, str, str, str, str]]:
+    """R² and raw RMS residual per dataset and observable, X block included.
+
+    Residuals are retained in the scientific unit; each RMS is shown in the
+    unit the Fit plot shows that observable in.
+    """
+
+    names = {item.dataset_id: item.display_name for item in candidate.origin.mapped_datasets}
+    infos = {info.dataset_id: info for info in candidate.result.dataset_info}
+    units = _series_units(candidate)
+    rows: list[tuple[str, str, str, str, str]] = []
+    for prepared in candidate.request.dispatch.prepared_datasets:
+        info = infos[prepared.dataset_id]
         for series, rms in info.raw_rms_by_series.items():
+            source, measured = units[(prepared.dataset_id, series)]
             r_squared = info.r_squared_by_series.get(series)
             shown = (
-                _display(scale_values((rms.value,), source_units[series], measured[series])[0])
+                _display(scale_values((rms.value,), source, measured)[0])
                 if rms.available else _metric_text(_metric(rms))
             )
             rows.append((
                 names[prepared.dataset_id], series,
                 "—" if r_squared is None else _metric_text(_metric(r_squared)),
-                shown, format_unit_for_display(measured[series]) or "",
+                shown, format_unit_for_display(measured) or "",
             ))
     return rows
 
@@ -563,6 +505,7 @@ _ENDPOINT_REASONS = {
     "scientific_unavailable": "a refit on this side failed",
     "binary64_representability_exhausted": _NO_CROSSING,
     "midpoint_refit_budget_exhausted": _NO_CROSSING,
+    "refit_not_converged": "a refit on this side reached its evaluation limit",
 }
 
 
@@ -641,16 +584,6 @@ def _result_text(estimate: float, lower: float | None, upper: float | None, boun
         return f"≥ {_single_number(_round_figures(lower, ROUND_FLOOR, 2))}"
     if lower is None:
         return f"≤ {_single_number(_round_figures(upper, ROUND_CEILING, 2))}"
-    if not lower <= estimate <= upper:
-        # A percentile interval can lie beside the estimate.  It is stated as an
-        # interval, its ends one place finer than its width (or than the value,
-        # when the width is zero), in one notation.
-        width = upper - lower or abs(upper)
-        step = Decimal(1).scaleb(_round_figures(width, ROUND_CEILING).adjusted() - 1)
-        ends = (Decimal(repr(lower)).quantize(step, ROUND_FLOOR),
-                Decimal(repr(upper)).quantize(step, ROUND_CEILING))
-        scale = _power(max(abs(end) for end in ends))
-        return _scaled(" to ".join(_plain_number(end.scaleb(-scale)) for end in ends), scale)
     below = _error(estimate - lower)
     above = _error(upper - estimate)
     if max(below, above) == 0:
@@ -693,45 +626,14 @@ def _plain_number(number: Decimal) -> str:
     return format(abs(number) if number == 0 else number, "f").replace("-", "−")
 
 
-def _analysis_section(title: str, data: Mapping[str, object], request: object,
-                      names: Mapping[str, str], coordinate_units: Mapping[FitCoordinate, str],
-                      estimates: Mapping[FitCoordinate, tuple[float, str]],
-                      skipped: Sequence[FitCoordinate]) -> str:
-    """One analysis's rows; ``names`` holds each parameter's rich Summary name.
+def _coordinate_labeler(request: object, names: Mapping[str, str]):
+    """Rich name of any fitted coordinate, including an initial concentration or group.
 
-    ``estimates`` holds each target's estimate and Bound Position as the
-    Estimates table shows them.
-
-    The heading names the analysis and its confidence level.  A plain sentence
-    follows only when the analysis did not complete normally.
+    ``names`` holds each parameter's rich Summary name.
     """
-    if not data["requested"]:
-        return ""
+
     setup = request.setup
     origin = setup.origin
-    level = data.get("confidence_level")
-    heading = title if level is None else f"{title} ({_display(100.0 * float(level))}%)"
-    section = f"<h3>{_text(heading)}</h3>"
-    status = data["status"]
-    if status == "unavailable":
-        section += f"<p>{_text('Not available: ' + _diagnostic(data['unavailable_reason'], origin))}</p>"
-    elif status == "failed":
-        section += f"<p>{_text('Failed: ' + _diagnostic(data['diagnostic'], origin))}</p>"
-    elif status == "stopped" and data.get("settlement") == "not_started_after_stop":
-        section += "<p>Not started, because <b>Stop</b> was pressed.</p>"
-    elif status == "stopped":
-        unit = "replicates were refitted" if "replicates" in data else "parameters were profiled"
-        section += f"<p>Stopped before all {unit}.</p>"
-    elif status == "partial":
-        section += "<p>Some interval ends could not be determined.</p>"
-    if data.get("first_unavailable_replicate"):
-        section += (f"<p>First unavailable replicate: "
-                    f"{_text(_diagnostic(data['first_unavailable_replicate'], origin))}</p>")
-    if "replicates" in data and data["successful_replicates"] + data["failed_replicates"]:
-        section += (f"<p>{_text(data['successful_replicates'])} of {_text(data['replicates'])} "
-                    f"replicates succeeded, {_text(data['failed_replicates'])} failed.</p>")
-    if data.get("method"):
-        section += f"<p>Method: {_text(data['method'])}.</p>"
     dataset_names = {item.dataset_id: item.display_name for item in origin.mapped_datasets}
     coupled = {item.variable_id: item for item in request.dispatch.ordinary_coupled_variables}
     group_targets = {
@@ -748,8 +650,6 @@ def _analysis_section(title: str, data: Mapping[str, object], request: object,
     }
 
     def label(coordinate: FitCoordinate) -> str:
-        """Rich name of any fitted coordinate, including an initial concentration or group."""
-
         if coordinate.scope == "coupled" and coordinate.name in group_targets:
             coordinate = group_targets[coordinate.name]
         elif coordinate.scope == "coupled" and coordinate.name in initial_groups:
@@ -761,6 +661,41 @@ def _analysis_section(title: str, data: Mapping[str, object], request: object,
         datasets = fit_coordinate_datasets_text(coordinate, setup)
         return names[coordinate.name] + (f" — {_text(datasets)}" if datasets else "")
 
+    return label
+
+
+def _analysis_section(title: str, data: Mapping[str, object], request: object,
+                      label, coordinate_units: Mapping[FitCoordinate, str],
+                      estimates: Mapping[FitCoordinate, tuple[float, str]],
+                      skipped: Sequence[FitCoordinate]) -> str:
+    """One analysis's rows; ``label`` names each coordinate.
+
+    ``estimates`` holds each target's estimate and Bound Position as the
+    Estimates table shows them.
+
+    The heading names the analysis and its confidence level.  A plain sentence
+    follows only when the analysis did not complete normally.
+    """
+    if not data["requested"]:
+        return ""
+    origin = request.setup.origin
+    level = data.get("confidence_level")
+    heading = title if level is None else f"{title} ({_display(100.0 * float(level))}%)"
+    section = f"<h3>{_text(heading)}</h3>"
+    status = data["status"]
+    if status == "unavailable":
+        section += f"<p>{_text('Not available: ' + _diagnostic(data['unavailable_reason'], origin))}</p>"
+    elif status == "failed":
+        section += f"<p>{_text('Failed: ' + _diagnostic(data['diagnostic'], origin))}</p>"
+    elif status == "stopped" and data.get("settlement") == "not_started_after_stop":
+        section += "<p>Not started, because <b>Stop</b> was pressed.</p>"
+    elif status == "stopped":
+        section += "<p>Stopped before all parameters were profiled.</p>"
+    elif status == "partial":
+        section += "<p>Some interval ends could not be determined.</p>"
+    if data.get("method"):
+        section += f"<p>Method: {_text(data['method'])}.</p>"
+
     rows = []
     for interval in data["intervals"]:
         coordinate = interval["coordinate"]
@@ -768,7 +703,6 @@ def _analysis_section(title: str, data: Mapping[str, object], request: object,
         text, level_label = _interval_text(interval, float(data["confidence_level"]), position)
         details = [_text(level_label)] if level_label else []
         for side in ("lower", "upper"):
-            # Only a Profile interval carries endpoint resolutions.
             endpoint = interval.get(side + "_resolution") or {}
             reason = endpoint.get("reason")
             # A reason the interval itself states is not repeated.
@@ -778,6 +712,10 @@ def _analysis_section(title: str, data: Mapping[str, object], request: object,
                         for other, bound in endpoint.get("limiting_bounds", ())]
             if limiting:
                 details.append(f"{_text(side.capitalize())} end is set by {and_join(limiting)}")
+        freedom = f"{float(interval['degrees_of_freedom']):.1f}".rstrip("0").rstrip(".")
+        details.append(_text(
+            f"Ends where the weighted SSE rises by {six_digit_text(interval['cutoff'])}, F(1, {freedom})"
+        ))
         result = _result_text(estimate, interval["lower"], interval["upper"], position)
         rows.append((label(coordinate), result, text, _unit_html(coordinate_units[coordinate]), "<br>".join(details)))
     if rows:
@@ -786,6 +724,16 @@ def _analysis_section(title: str, data: Mapping[str, object], request: object,
         section += ("<p>Not analyzed, because their datasets were excluded: "
                     + ", ".join(label(coordinate) for coordinate in skipped) + ".</p>")
     return section
+
+
+def _matched_locations(result: object) -> int | None:
+    """Measured-X rows matched inside a curve segment, or None without measured X.
+
+    Each such row's curve location is a fitted value of its own.
+    """
+
+    measured = [info for info in result.dataset_info if info.x_projection is not None]
+    return sum(info.matched_locations for info in measured) if measured else None
 
 
 def fit_overview(phase: str, model: str, objective: str, datasets: int, fitted_values: int) -> tuple[str, ...]:
@@ -810,17 +758,13 @@ def fit_completion_presentation(candidate: FitCandidate) -> tuple[str, bool]:
             "Fit converged" if result.optimizer_converged else
             "Fit finished · Optimizer did not converge")
     complete = not stopped
-    for label, requested, analysis in (
-        ("Profile", candidate.request.setup.profile_likelihood, result.profile_likelihood_result),
-        ("Bootstrap", candidate.request.setup.residual_bootstrap, result.residual_bootstrap_result),
-    ):
-        if requested is None:
-            continue
-        status = "unavailable" if analysis is None else analysis.status
-        if analysis is not None and analysis.provenance.get("settlement") == "not_started_after_stop":
+    analysis = result.profile_likelihood_result
+    if analysis is not None:
+        status = analysis.status
+        if analysis.provenance.get("settlement") == "not_started_after_stop":
             status = "not started after Stop"
         complete = complete and status == "available"
-        text += f" · {label} {'complete' if status == 'available' else status}"
+        text += f" · Profile {'complete' if status == 'available' else status}"
     return text, complete
 
 
@@ -882,8 +826,11 @@ def fit_live_presentation(
 _BOUND_POSITION_WORDS = {"lower": "at minimum", "upper": "at maximum", "interior": "within bounds"}
 
 
-def fit_candidate_presentation(candidate: FitCandidate) -> tuple[tuple[str, ...], str, str, tuple[FitValueEntry, ...]]:
-    """Project one terminal into its compact header, Results document and Provenance document."""
+def fit_candidate_presentation(
+    candidate: FitCandidate,
+) -> tuple[tuple[str, ...], str, str, tuple[FitValueEntry, ...], str]:
+    """Project one terminal into its compact header, Results document,
+    Provenance document, fitted values and warnings."""
     result = candidate.result
     shared, individual = _estimate_rows(candidate)
     rows = shared + individual + _initial_rows(candidate)
@@ -892,12 +839,6 @@ def fit_candidate_presentation(candidate: FitCandidate) -> tuple[tuple[str, ...]
     objective = _metric_text(_metric(result.weighted_residual_sse))
     fitted_values = len(candidate.request.dispatch.ordinary_optimizer_layout.opt_param_keys())
     overview = fit_overview(phase, model, objective, len(result.dataset_info), fitted_values)
-    body = f"<h2>{_text(phase)}</h2><p>Mechanism: {_text(model)}</p>"
-    diagnostic = result.optimizer_diagnostic
-    if diagnostic is not None and diagnostic.type == "FittingIdentifiability":
-        body += f"<p><b>Warning:</b> {_text(diagnostic.message)}</p>"
-    body += (f"<p><b>Weighted SSE:</b> {_text(objective)} &nbsp; "
-             f"<b>Weighted MSE:</b> {_text(_metric_text(_metric(result.weighted_residual_mse)))}</p>")
     parameters = {parameter.name: parameter for parameter in candidate.setup_snapshot.parameters}
     symbols = {name: scientific_symbol_html(name, family=parameter.family, role=parameter.role)
                for name, parameter in parameters.items()}
@@ -911,6 +852,21 @@ def fit_candidate_presentation(candidate: FitCandidate) -> tuple[tuple[str, ...]
             return _text(label)
         return symbol + (_text(label[len(name):]) if label.startswith(name)
                          else " · " + _text(label))
+    names = {
+        parameter.name: parameter_name({"name": parameter.name, "display_name": parameter.display_name})
+        for parameter in candidate.setup_snapshot.parameters
+    }
+    label = _coordinate_labeler(candidate.request, names)
+    # The Results tab shows the same warnings above its fitted values.
+    warnings = ""
+    diagnostic = result.optimizer_diagnostic
+    if diagnostic is not None and diagnostic.type == "FittingIdentifiability":
+        warnings += f"<p><b>Warning:</b> {_text(diagnostic.message)}</p>"
+    for coordinate in result.undetermined_values:
+        warnings += f"<p><b>Warning:</b> These data do not determine this value within its bounds: {label(coordinate)}.</p>"
+    body = f"<h2>{_text(phase)}</h2><p>Mechanism: {_text(model)}</p>" + warnings
+    body += (f"<p><b>Weighted SSE:</b> {_text(objective)} &nbsp; "
+             f"<b>Weighted MSE:</b> {_text(_metric_text(_metric(result.weighted_residual_mse)))}</p>")
     if rows:
         body += "<h3>Estimates</h3>" + _table(
             ("Parameter", "Scope", "Estimate", "Unit", "Initial Guess", "Bounds", "Bound Position"),
@@ -925,17 +881,13 @@ def fit_candidate_presentation(candidate: FitCandidate) -> tuple[tuple[str, ...]
     series_rows = _series_metric_rows(candidate)
     if series_rows:
         body += _table(("Dataset", "Series", "R²", "RMS Residual", "Unit"), series_rows, rich_columns=(4,))
-    profile, bootstrap = _profile_data(candidate), _bootstrap_data(candidate)
+    profile = _profile_data(candidate)
     units = {item.name: item.unit for item in candidate.setup_snapshot.parameters}
     coordinate_units = {
         coordinate: units[coordinate.name]
         for coordinate in fit_uncertainty_coordinates(
             candidate.request.setup.parameters, candidate.request.setup.datasets,
         )
-    }
-    names = {
-        parameter.name: parameter_name({"name": parameter.name, "display_name": parameter.display_name})
-        for parameter in candidate.setup_snapshot.parameters
     }
     # Each analysed target's estimate and Bound Position, as the Estimates table shows them.
     estimates = {
@@ -944,24 +896,17 @@ def fit_candidate_presentation(candidate: FitCandidate) -> tuple[tuple[str, ...]
             (float(row["fitted_value"]), str(row["bound_state"]))
         for row in shared + individual
     }
-    excluded = tuple(item.dataset_id for item in candidate.request.setup.datasets if not item.included)
-
-    def skipped(configuration: object | None) -> tuple[FitCoordinate, ...]:
-        if configuration is None:
-            return ()
-        names_skipped = skipped_fit_analysis_coordinates(
-            configuration.parameter_names, excluded_dataset_ids=excluded,
-            parameters=candidate.request.setup.parameters,
-        )
-        return tuple(item for item in configuration.parameter_names if item in names_skipped)
-
-    body += _analysis_section("Profile Likelihood", profile, candidate.request, names, coordinate_units,
-                              estimates, skipped(candidate.request.setup.profile_likelihood))
-    body += _analysis_section("Residual Bootstrap", bootstrap, candidate.request, names, coordinate_units,
-                              estimates, skipped(candidate.request.setup.residual_bootstrap))
+    request_setup = candidate.request.setup
+    targets = fit_profile_targets(request_setup.profile, request_setup.parameters, request_setup.datasets)
+    names_skipped = skipped_fit_analysis_coordinates(
+        targets,
+        excluded_dataset_ids=(item.dataset_id for item in request_setup.datasets if not item.included),
+        parameters=request_setup.parameters,
+    )
+    body += _analysis_section("Profile Likelihood", profile, candidate.request, label, coordinate_units,
+                              estimates, tuple(item for item in targets if item in names_skipped))
 
     settings = candidate.origin.scientific_settings
-    request_setup = candidate.request.setup
     defaults = request_setup.defaults
     differential_evolution = defaults.method == DIFFERENTIAL_EVOLUTION_METHOD
     optimizer_rows = [
@@ -989,6 +934,7 @@ def fit_candidate_presentation(candidate: FitCandidate) -> tuple[tuple[str, ...]
         *optimizer_rows,
         ("Observations", sum(info.residuals.size for info in result.dataset_info)),
         ("Fitted values", fitted_values),
+        *((("Matched curve locations", locations),) if (locations := _matched_locations(result)) is not None else ()),
     ))
     dataset_names = {item.dataset_id: item.display_name for item in candidate.origin.mapped_datasets}
     included_ids = {item.dataset_id for item in request_setup.datasets if item.included}
@@ -1067,12 +1013,25 @@ def fit_candidate_presentation(candidate: FitCandidate) -> tuple[tuple[str, ...]
               *(start_text(item.dataset_id, name) for name in species))
              for item in included))
     provenance += f"<p>Weighting: {_text(FIT_DATASET_WEIGHT_MODE_LABELS[request_setup.dataset_weight_mode])}. Weighted residual = raw residual × √normalized dataset weight × √normalized target weight.</p>"
-    for title, analysis in (("Profile Likelihood", profile), ("Residual Bootstrap", bootstrap)):
-        if analysis.get("facts"):
-            provenance += f"<h3>{title}</h3>" + _table(("Setting", "Value"), (
-                (label, fit_identity_text(value, candidate.origin) if isinstance(value, str) else value)
-                for label, value in analysis["facts"]
-            ))
+    if profile.get("facts"):
+        provenance += "<h3>Profile Likelihood</h3>" + _table(("Setting", "Value"), (
+            (fact, fit_identity_text(value, candidate.origin) if isinstance(value, str) else value)
+            for fact, value in profile["facts"]
+        ))
+    if profile.get("noise_blocks"):
+        units = _series_units(candidate)
+        provenance += "<h4>Estimated Noise</h4>" + _table(
+            ("Dataset", "Series", "Observations", "Degrees of Freedom", "Noise SD", "Unit"),
+            ((dataset_names[block.dataset_id], block.series, block.observations,
+              float(block.degrees_of_freedom),
+              "not estimated" if block.noise_sd is None
+              else _display(block.noise_sd) if block.weighted
+              else _display(scale_values((block.noise_sd,), *units[(block.dataset_id, block.series)])[0]),
+              "weighted" if block.weighted
+              else format_unit_for_display(units[(block.dataset_id, block.series)][1]) or "")
+             for block in profile["noise_blocks"]),
+            rich_columns=(5,),
+        )
     entries = tuple(
         (tuple(row["identity"]) if row["kind"] != "shared_parameter" else ("shared", str(row["name"])),
          html.escape(str(row["display_name"])) if row["kind"] == "initial" else symbols[str(row["name"])],
@@ -1080,4 +1039,4 @@ def fit_candidate_presentation(candidate: FitCandidate) -> tuple[tuple[str, ...]
          str(row["scope"]), float(row["fitted_value"]), str(row["unit"]))
         for row in rows
     )
-    return overview, body, provenance, entries
+    return overview, body, provenance, entries, warnings

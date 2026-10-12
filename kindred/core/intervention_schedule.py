@@ -166,7 +166,6 @@ _PARAM_FIELDS = frozenset(f"{field}_param" for field in _FIELD_UNITS)
 # Fields whose values need an explicit volume unit, typed or through a parameter.
 _VOLUME_FIELDS = frozenset({"volume", "volume_rate", "initial_volume"})
 _DIRECTIONS = frozenset({"rising", "falling", "either"})
-_PHASES = frozenset({"before", "during", "after"})
 _AUTHORED_TIME_FIELDS = frozenset(
     {
         "time",

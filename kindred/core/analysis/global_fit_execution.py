@@ -70,10 +70,7 @@ from kindred.core.simulation_failure import (
 )
 
 if TYPE_CHECKING:
-    from kindred.core.analysis.fit_uncertainty import (
-        ProfileLikelihoodResult,
-        ResidualBootstrapResult,
-    )
+    from kindred.core.analysis.fit_uncertainty import ProfileLikelihoodResult
 
 logger = logging.getLogger(__name__)
 _DATASET_DEADLINE_SECONDS = 10.0
@@ -215,8 +212,14 @@ class DatasetFitInfo:
     simulation_result: SimulationResultValue
     residuals: np.ndarray
     weighted_residuals: np.ndarray
-    model_series: Mapping[str, np.ndarray]
     x_projection: ParametricProjection | None
+    # Each noise block's name and residual count, in residual order: one block
+    # per target of a time-X dataset, sorted by name; one block for all series
+    # of a measured-X dataset, whose target weights set their relative noise.
+    residual_blocks: tuple[tuple[str, int], ...]
+    # Measured-X rows matched inside a curve segment; each such location is a
+    # fitted value of its own.
+    matched_locations: int
 
     def __post_init__(self) -> None:
         # The evaluator owns admission of these typed values.  Keep the
@@ -233,9 +236,6 @@ class DatasetFitInfo:
             self,
             "raw_rms_by_series",
             MappingProxyType(dict(self.raw_rms_by_series)),
-        )
-        object.__setattr__(
-            self, "model_series", MappingProxyType(dict(self.model_series)),
         )
 
 
@@ -272,7 +272,8 @@ class GlobalFitResult:
     optimizer_converged: bool
     optimizer_diagnostic: FactualCause | None = None
     profile_likelihood_result: ProfileLikelihoodResult | None = None
-    residual_bootstrap_result: ResidualBootstrapResult | None = None
+    # Optimizer coordinates the data do not determine within their bounds.
+    undetermined_values: tuple["FitCoordinate", ...] = ()
 
     def __post_init__(self) -> None:
         # Its sole producer publishes the settled replay state: a literal
@@ -529,7 +530,7 @@ def fit_result_target_values(
             (cause for cause in result.algebra_errors if cause.details.get("name") == target_name), None,
         )
         error = FitSimulationError(
-            f"Fit target {target_name!r} could not be calculated." if algebra_cause is not None else
+            f"Fit target {target_name!r} could not be calculated: {algebra_cause.message}" if algebra_cause is not None else
             f"Fit target {target_name!r} is absent from the canonical simulation scalar/series outputs.",
             details=details,
         )
@@ -979,7 +980,7 @@ def _build_dataset_fit_info(
     dataset_weight = _objective_dataset_weight_multiplier(weights[dataset_id])
     raw_blocks: list[np.ndarray] = []
     weighted_blocks: list[np.ndarray] = []
-    model_series: dict[str, np.ndarray] = {}
+    residual_blocks: list[tuple[str, int]] = []
     r_squared: dict[str, FitMetric] = {}
     raw_rms: dict[str, FitMetric] = {}
     for species_name in sorted(payload.species_list):
@@ -1009,7 +1010,7 @@ def _build_dataset_fit_info(
         weighted = dataset_weight * target_multipliers[species_name] * raw_residual
         raw_blocks.append(raw_residual)
         weighted_blocks.append(weighted)
-        model_series[species_name] = y_sim
+        residual_blocks.append((str(species_name), len(raw_residual)))
         r_squared[str(species_name)] = r_squared_metric(y_exp, raw_residual)
         raw_rms[str(species_name)] = root_mean_square(raw_residual)
 
@@ -1019,14 +1020,17 @@ def _build_dataset_fit_info(
         x_weighted = x_multiplier * x_raw
         raw_blocks.append(x_raw)
         weighted_blocks.append(x_weighted)
+        residual_blocks.append((str(payload.x_name), len(x_raw)))
         raw_rms[str(payload.x_name)] = root_mean_square(x_raw)
+        # The data cannot tell a row's X noise from its Y noise, so a
+        # measured-X dataset is one noise block.
+        residual_blocks = [(", ".join(name for name, _count in residual_blocks),
+                            sum(count for _name, count in residual_blocks))]
     _raise_if_fitting_cancel_requested(cancellation_control)
     residuals = np.concatenate(raw_blocks)
     weighted_residuals = np.concatenate(weighted_blocks)
     residuals.setflags(write=False)
     weighted_residuals.setflags(write=False)
-    for array in model_series.values():
-        array.setflags(write=False)
     dataset_metrics = fit_error_metrics(weighted_residuals)
     return DatasetFitInfo(
         dataset_id=dataset_id,
@@ -1040,8 +1044,12 @@ def _build_dataset_fit_info(
         simulation_result=simulation,
         residuals=residuals,
         weighted_residuals=weighted_residuals,
-        model_series=model_series,
         x_projection=x_projection,
+        residual_blocks=tuple(residual_blocks),
+        matched_locations=0 if x_projection is None else int(np.count_nonzero(
+            (x_projection.left_rows != x_projection.right_rows)
+            & (x_projection.fractions > 0.0) & (x_projection.fractions < 1.0)
+        )),
     )
 
 
@@ -1095,6 +1103,7 @@ def evaluate_dataset_simulation(
         series_result = evaluator.evaluate_series_with_parameter_origins(
             item.full_params,
             origins=item.parameter_origins,
+            outputs=item.payload.target_roster,
         )
         _raise_if_fitting_cancel_requested(worker_cancel)
         if time.monotonic() >= deadline:
@@ -1192,7 +1201,8 @@ class GlobalFitObjective:
         self._weights = weights
         self._layout = layout
         self._penalty_value = float(penalty_value)
-        self._last_error: FitSimulationError | None = None
+        # Whether the latest call settled a scientifically unavailable candidate.
+        self._candidate_unavailable = False
         self._progress_callback = progress_callback
         self._cancellation_check = cancellation_check
         self._cancellation_control = cancellation_control
@@ -1217,7 +1227,7 @@ class GlobalFitObjective:
         """
 
         residuals = self(np.asarray(params, dtype=float))
-        if self._last_error is not None:
+        if self._candidate_unavailable:
             return None
         return residuals
 
@@ -1247,7 +1257,7 @@ class GlobalFitObjective:
 
     def __call__(self, params: np.ndarray) -> np.ndarray:
         _raise_if_fitting_cancelled(self._cancellation_check)
-        self._last_error = None
+        self._candidate_unavailable = False
 
         def dataset_penalty_residuals(payload: FitDatasetSpec) -> np.ndarray:
             target_multipliers = _normalized_target_weight_multipliers(
@@ -1372,7 +1382,7 @@ class GlobalFitObjective:
                 if not np.all(np.isfinite(settled)):
                     return None
                 settled_cost = finite_sum_of_squares(settled)
-                if settled_cost is None:
+                if not math.isfinite(settled_cost):
                     return None
                 return settled, float(settled_cost)
 
@@ -1469,17 +1479,7 @@ class GlobalFitObjective:
         def record_candidate_unavailability(
             unavailability: ScientificUnavailable,
         ) -> None:
-            context_error = FitSimulationError(
-                "Fit candidate scientific result was unavailable.",
-                details={
-                    **dict(unavailability.details),
-                    "stage": unavailability.stage,
-                    "producer": unavailability.producer,
-                },
-            )
-            if unavailability.factual_cause is not None:
-                context_error.factual_cause = unavailability.factual_cause
-            self._last_error = context_error
+            self._candidate_unavailable = True
             key = ("__candidate__", unavailability.producer, unavailability.stage)
             if key not in self._warned_objective_keys:
                 self._warned_objective_keys.add(key)
@@ -1526,16 +1526,7 @@ class GlobalFitObjective:
         )
         timed_out_dataset_ids = set(timed_out_dataset_roster)
         if timeout_unavailability is not None:
-            timeout_error = FitSimulationError(
-                "Fit candidate dataset evaluation exceeded its deadline.",
-                details={
-                    "scientific_unavailable": True,
-                    "stage": "dataset_deadline",
-                    "datasets": timed_out_dataset_roster,
-                },
-            )
-            timeout_error.factual_cause = timeout_unavailability.factual_cause
-            self._last_error = timeout_error
+            self._candidate_unavailable = True
 
         residual_blocks: list[np.ndarray] = []
         artificial_block_indexes: set[int] = set()
@@ -1738,5 +1729,4 @@ def _assemble_fit_result_facts(
         optimizer_diagnostic=factual_optimizer_diagnostic,
         optimizer_vector=candidate_vector,
         profile_likelihood_result=None,
-        residual_bootstrap_result=None,
     )

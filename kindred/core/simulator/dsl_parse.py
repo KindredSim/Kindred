@@ -1114,8 +1114,6 @@ def _parse_dsl_ir(text: str, *, units: UnitsModel | None = None) -> "DSLIR":
 
     raw_lines = text.splitlines(keepends=True)
     line_contents = [_line_content(raw_line) for raw_line in raw_lines]
-    if not any(line.strip() and not line.strip().startswith("#") for line in line_contents):
-        raise _DSLError("Enter at least one reaction.")
     lines = [line.rstrip() for line in line_contents]
 
     # Resolve source-wide settings before lowering any reaction.  A directive
@@ -1268,7 +1266,8 @@ def _parse_dsl_ir(text: str, *, units: UnitsModel | None = None) -> "DSLIR":
             line_content=raw,
         )
 
-
+    if not steps:
+        raise _DSLError("Enter at least one reaction.")
     return DSLIR(
         energy_unit=str(energy_unit),
         temperature_K=float(temperature_K),

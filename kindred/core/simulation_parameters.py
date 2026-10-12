@@ -97,9 +97,7 @@ def enumerate_simulation_parameters(
         name = str(item.canonical_name)
         source_coordinates = {
             str(source_role): str(source_name)
-            for source_role, source_name in dict(
-                entry.get("source_coordinates") or {}
-            ).items()
+            for source_role, source_name in entry["source_coordinates"].items()
         }
         source_info = namespace.source_coordinate_info(name)
         if source_info is not None and not source_coordinate_capabilities(
@@ -111,7 +109,7 @@ def enumerate_simulation_parameters(
             and assignment_kind(name) == "mechanism-bound"
         ):
             continue
-        context = str(entry.get("context") or "").strip()
+        context = str(entry["context"]).strip()
         family = "Constant"
         model: ForwardRateModel | None = None
         value: float | None = None
@@ -167,10 +165,10 @@ def enumerate_simulation_parameters(
     # allowed to collapse repeated reactions.
     physical_candidates: list[tuple[str, str, str, float]] = []
     for entry in step_by_index.values():
-        kind = str(entry.get("kind") or "")
+        kind = str(entry["kind"])
         source_coordinates = {
             str(role): str(name)
-            for role, name in dict(entry.get("source_coordinates") or {}).items()
+            for role, name in entry["source_coordinates"].items()
             if str(name) in source_coordinate_names
             and source_coordinate_capabilities(str(role)).continuous
         }

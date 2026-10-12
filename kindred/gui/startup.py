@@ -2,26 +2,20 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Callable, Mapping
 
 from kindred.gui.plot_config import require_pyqtgraph
 
 logger = logging.getLogger(__name__)
 
 
-def detect_wsl_environment(
-    *,
-    environ: Mapping[str, str] | None = None,
-    proc_version_path: str = "/proc/version",
-) -> bool:
+def detect_wsl_environment() -> bool:
     """Return True when running under Windows Subsystem for Linux."""
-    env = os.environ if environ is None else environ
-    if str(env.get("WSL_INTEROP", "")).strip():
+    if str(os.environ.get("WSL_INTEROP", "")).strip():
         return True
-    if str(env.get("WSL_DISTRO_NAME", "")).strip():
+    if str(os.environ.get("WSL_DISTRO_NAME", "")).strip():
         return True
     try:
-        with open(proc_version_path, "r", encoding="utf-8", errors="ignore") as handle:
+        with open("/proc/version", "r", encoding="utf-8", errors="ignore") as handle:
             version_text = handle.read().lower()
     except OSError:
         version_text = ""
@@ -32,12 +26,7 @@ def _software_opengl_attribute(qt_core: object):
     return qt_core.Qt.ApplicationAttribute.AA_UseSoftwareOpenGL
 
 
-def apply_qt_startup_workarounds(
-    *,
-    qt_core: object,
-    environ: Mapping[str, str] | None = None,
-    set_qt_attribute: Callable[[object, bool], None] | None = None,
-) -> bool:
+def apply_qt_startup_workarounds(*, qt_core: object) -> bool:
     """
     Apply startup workarounds that must run before QApplication construction.
 
@@ -46,7 +35,7 @@ def apply_qt_startup_workarounds(
     - default : never force software OpenGL
     - auto    : force software OpenGL only on WSL (default)
     """
-    env = os.environ if environ is None else environ
+    env = os.environ
     if "KINDRED_QT_OPENGL" in env:
         raw_mode = str(env["KINDRED_QT_OPENGL"])
         mode = raw_mode.strip().lower()
@@ -58,7 +47,7 @@ def apply_qt_startup_workarounds(
     else:
         mode = "auto"
     require_pyqtgraph(context="Kindred GUI")
-    is_wsl = detect_wsl_environment(environ=env)
+    is_wsl = detect_wsl_environment()
 
     apply_software = False
     reason = ""
@@ -72,10 +61,8 @@ def apply_qt_startup_workarounds(
     if not apply_software:
         return False
 
-    if hasattr(env, "setdefault"):
-        env.setdefault("QT_OPENGL", "software")
-    setter = set_qt_attribute or qt_core.QCoreApplication.setAttribute
-    setter(_software_opengl_attribute(qt_core), True)
+    env.setdefault("QT_OPENGL", "software")
+    qt_core.QCoreApplication.setAttribute(_software_opengl_attribute(qt_core), True)
     logger.warning("Applying Qt startup workaround: software OpenGL (reason: %s)", reason)
     return True
 

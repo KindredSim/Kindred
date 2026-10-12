@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Callable, Dict, Mapping, Tuple
+from typing import Callable, Dict, Iterable, Mapping, Tuple
 
 import numpy as np
 
@@ -65,6 +65,25 @@ def reject_unknown_species_references(
             )
 
 
+def observable_closure(block: AlgebraBlock, names: Iterable[str]) -> frozenset[str]:
+    """The retained lets the named outputs read, the named lets included."""
+    statements = {stmt.name: stmt for stmt in block.lines}
+    closure: set[str] = set()
+    pending = [name for name in names if name in statements]
+    while pending:
+        current = pending.pop()
+        if current not in closure:
+            closure.add(current)
+            pending.extend(name for name in _iter_identifiers(statements[current].expr) if name in statements)
+    return frozenset(closure)
+
+
+def observable_reads_species(block: AlgebraBlock, name: str) -> bool:
+    """Whether one retained observable closure reads a concentration."""
+    statements = {stmt.name: stmt for stmt in block.lines}
+    return any(statements[let].expr.has_species_ref() for let in observable_closure(block, (name,)))
+
+
 def observable_parameter_roots(block: AlgebraBlock, name: str) -> tuple[str, ...]:
     """External identifiers required by one retained observable closure."""
     statements = {stmt.name: stmt for stmt in block.lines}
@@ -123,7 +142,6 @@ def _build_simulation_context(
         t=t_arr,
         species_series={k: np.asarray(v, dtype=float).reshape(-1) for k, v in species_series.items()},
         initials={str(k): float(v) for k, v in initials.items()},
-        species_names=set(species_series.keys()),
         symtab=symtab,
         symbol_series=runtime_series,
         symbol_values={str(name): float(value) for name, value in symbol_values.items()},

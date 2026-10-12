@@ -302,7 +302,8 @@ class ChemicalSpaceScanDialog(QtWidgets.QDialog):
 
     @staticmethod
     def _range_label(selection):
-        return ", ".join(f"{i.lower:g} to {i.upper:g}" for i in selection.intervals)
+        text = ", ".join(f"{i.lower:g} to {i.upper:g}" for i in selection.intervals)
+        return f"{text} (log)" if selection.log_scale else text
 
     def _edit_range(self, key):
         item = next(item for item in self.catalog if item.key == key)

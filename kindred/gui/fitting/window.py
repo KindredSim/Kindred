@@ -298,9 +298,6 @@ class FittingWindow(QtWidgets.QDialog):
             self,
         ).exec()
 
-    def set_initial_reset_available(self, snapshot: FitSetupSnapshot) -> None:
-        self._params_ics_tab.set_initial_reset_available(snapshot)
-
     def set_last_fit_reset_available(self, snapshot: FitSetupSnapshot | None) -> None:
         """Project Last Fit reset availability without retaining the snapshot."""
 
@@ -393,8 +390,7 @@ class FittingWindow(QtWidgets.QDialog):
                 parameters=setup.parameters,
                 initials=setup.initials,
                 shared_initial_groups=setup.shared_initial_groups,
-                profile_likelihood=setup.profile_likelihood,
-                residual_bootstrap=setup.residual_bootstrap,
+                profile=setup.profile,
             )
         ready = (
             setup is not None
@@ -888,7 +884,7 @@ class FittingWindow(QtWidgets.QDialog):
         self._run_results_tab.render_results_summary()
 
     def set_terminal_failure(self, failure: FactualCause) -> None:
-        """Present a worker failure while retaining its factual cause chain."""
+        """Present a worker failure as its one located sentence."""
 
         self._status.clear()
         self._status.hide()

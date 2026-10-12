@@ -145,6 +145,7 @@ def build_simulation_request_from_prepared_run(
     cancellation_control: SimulationCancellationControl | None = None,
     t_eval: np.ndarray | None = None,
     candidate_evaluation: bool = False,
+    sample_solver_steps: bool = False,
 ) -> SimulationRequest:
     request = prepared_run.request
     cancellation_control = (
@@ -169,6 +170,7 @@ def build_simulation_request_from_prepared_run(
         cancellation_control=cancellation_control,
         t_eval=t_eval,
         candidate_evaluation=candidate_evaluation,
+        sample_solver_steps=sample_solver_steps,
         stop_observable_value=prepared_run.stop_observable_value,
         parameter_values_at_temperature=prepared_run.parameter_values_at_temperature,
         intervention_lines=request.prepared_dsl.analysis.intervention_lines,
@@ -449,13 +451,11 @@ def prepare_simulation_run(
     if intervention_execution is not None and not execution_request.use_authored_stops:
         intervention_execution = intervention_execution.without_stops()
     if unresolved_intervention_schedule is not None:
-        if _schedule_parameters_deferred_to_prepared_request(
+        if not _schedule_parameters_deferred_to_prepared_request(
             execution_request,
             unresolved_intervention_schedule,
             parameter_algebra_spec=parameter_algebra_spec,
         ):
-            unresolved_intervention_schedule.validate_species(species_names)
-        else:
             try:
                 dependency_metadata = _expanded_intervention_schedule_dependency_metadata(
                     unresolved_intervention_schedule,
@@ -479,7 +479,6 @@ def prepare_simulation_run(
                     runtime_parameters=payload_names,
                     dependency_metadata=dependency_metadata,
                 )
-                resolved_schedule.validate_species(species_names)
                 intervention_execution = compile_intervention_schedule(
                     resolved_schedule,
                     authored=unresolved_intervention_schedule,

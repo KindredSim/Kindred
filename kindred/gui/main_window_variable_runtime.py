@@ -48,7 +48,6 @@ from kindred.gui.widgets.mechanism_editor import MechanismEditorTabbed
 
 __all__ = [
     "TabSliderBinding",
-    "ActiveSliderRenderProjection",
     "ParameterSliderProjection",
     "build_parameter_slider_projection",
 ]
@@ -63,16 +62,6 @@ class ParameterSliderProjection:
 
     def coordinate(self, name: str) -> GuiParameterCoordinate | None:
         return next((item for item in self.coordinates if item.name == name), None)
-
-
-@dataclass(frozen=True, slots=True)
-class ActiveSliderRenderProjection:
-    tab: MechanismTabDocument
-    projection: ParameterSliderProjection
-    parameter_values: tuple[tuple[str, float], ...]
-    targets: tuple[str, ...]
-    species_values: tuple[tuple[str, float], ...]
-    mixed_species: frozenset[str]
 
 
 @dataclass(frozen=True, slots=True)
@@ -326,7 +315,7 @@ class TabSliderBinding(QtCore.QObject):
             dirty or self._variable_sliders.has_rejected_editor_text(),
         )
 
-    def prepare_render(self) -> ActiveSliderRenderProjection:
+    def render(self, *, preserve_editor_drafts: bool = True) -> None:
         tab, runtime = (
             self._registry.tab(self._tab_id),
             self._registry.tab_runtime(self._tab_id),
@@ -354,18 +343,6 @@ class TabSliderBinding(QtCore.QObject):
             live = self._species_sliders.get_current_values().get(self._active_drag[1])
             if live is not None:
                 species[self._active_drag[1]] = float(live)
-        return ActiveSliderRenderProjection(
-            tab,
-            projection,
-            tuple(parameters.items()),
-            targets,
-            tuple(species.items()),
-            mixed,
-        )
-
-    def apply_render_projection(
-        self, prepared: ActiveSliderRenderProjection, *, preserve_editor_drafts: bool = True
-    ) -> None:
         self._rendering = True
         vb, sb = (
             QtCore.QSignalBlocker(self._variable_sliders),
@@ -373,49 +350,45 @@ class TabSliderBinding(QtCore.QObject):
         )
         try:
             self._variable_sliders.render_values(
-                dict(prepared.parameter_values),
-                coordinates=prepared.projection.coordinates,
+                parameters,
+                coordinates=projection.coordinates,
                 preserve_editor_drafts=preserve_editor_drafts,
             )
             self._species_sliders.render_values(
-                dict(prepared.species_values),
-                target_set_ids=prepared.targets,
-                mixed_species=prepared.mixed_species,
+                species,
+                target_set_ids=targets,
+                mixed_species=mixed,
                 preserve_editor_drafts=preserve_editor_drafts,
             )
         finally:
             del sb
             del vb
             self._rendering = False
-        self._projection = prepared.projection
+        self._projection = projection
         self._slider_workspace_owner.render_slider_workspace_presentation()
+        self._settle_rendered_targets(tab, targets)
+        self.publish_slider_draft_state()
 
-    def settle_render_projection(self, prepared: ActiveSliderRenderProjection) -> None:
-        self._reconcile_target_change(prepared.tab, prepared.targets)
+    def _settle_rendered_targets(self, tab: MechanismTabDocument, targets: tuple[str, ...]) -> None:
+        self._reconcile_target_change(tab, targets)
         capture = self._exact_preview_capture
         if capture is not None:
             captured_targets = tuple(target.set_id for target in capture.targets)
             if (
-                captured_targets == prepared.targets
+                captured_targets == targets
                 and self._simulation_jobs.owns_preview_capture(capture)
             ):
                 return
             self._exact_preview_capture = None
-        runtime = self._registry.tab_runtime(prepared.tab.tab_id)
+        runtime = self._registry.tab_runtime(tab.tab_id)
         if not self._preview_stopped and (
             runtime.slider_parameter_draft or runtime.slider_species_drafts_by_set_id
         ):
             self._begin_preview_cycle(
-                prepared.tab,
-                prepared.targets,
+                tab,
+                targets,
                 interaction=SliderInteractionKind.EXACT_TYPED_COMMIT,
             )
-
-    def render(self, *, preserve_editor_drafts: bool = True) -> None:
-        prepared = self.prepare_render()
-        self.apply_render_projection(prepared, preserve_editor_drafts=preserve_editor_drafts)
-        self.settle_render_projection(prepared)
-        self.publish_slider_draft_state()
 
     def clear_projection(self) -> None:
         vb, sb = (
@@ -655,7 +628,6 @@ class TabSliderBinding(QtCore.QObject):
         explicit = tuple(
             build_explicit_target(
                 prepared_dsl=base.prepared_dsl,
-                tab_id=base.tab_id,
                 set_id=set_id,
                 set_name=set_name,
                 initial_values=canonical_initial_values(base, set_id),
@@ -667,7 +639,7 @@ class TabSliderBinding(QtCore.QObject):
         capture = PreviewCapture(
             base.tab_id,
             tuple(
-                PreviewTarget(base.tab_id, set_id, set_name, request, canonical)
+                PreviewTarget(set_id, set_name, request, canonical)
                 for (set_id, set_name, request), canonical in zip(
                     built, explicit, strict=True
                 )
@@ -687,7 +659,6 @@ class TabSliderBinding(QtCore.QObject):
             current_requests = tuple(
                 build_explicit_target(
                     prepared_dsl=tab.prepared_dsl,
-                    tab_id=tab.tab_id,
                     set_id=set_id,
                     set_name=tab.initial_condition_set(set_id).name,
                     initial_values=canonical_initial_values(tab, set_id),

@@ -24,8 +24,8 @@ def _readonly_float_vector(values: object) -> np.ndarray:
 class FitObservationSeries:
     """One visible Y series with its dataset row identity.
 
-    Its values are admitted dataset observations (or Bootstrap draws from
-    them) with their unique positive source rows.
+    Its values are admitted dataset observations with their unique positive
+    source rows.
     """
 
     raw_observation_id: str

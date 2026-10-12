@@ -6,7 +6,6 @@ Error-formatting contract
 Error codes and kinds:
 - E100 SyntaxError       (unexpected token)
 - E110 NameError         (unknown symbol)
-- E120 ShadowError       (attempted shadowing of species or builtin)
 - E130 DomainError       (invalid domain such as sqrt of negative in real mode)
 - E140 ZeroDiv           (division by zero)
 - E150 TypeError         (non scalar where scalar required)
@@ -37,11 +36,11 @@ __all__ = [
     "AlgebraError",
     "AlgebraSyntaxError",
     "AlgebraNameError",
-    "AlgebraShadowError",
     "AlgebraDomainError",
     "AlgebraZeroDivError",
     "AlgebraTypeError",
     "AlgebraBoolCastError",
+    "UNCOMPUTABLE_ERRORS",
 ]
 
 
@@ -96,11 +95,6 @@ class AlgebraNameError(AlgebraError):
         super().__init__(msg=msg, code="E110", line=line, col=col, line_text=line_text)
 
 
-class AlgebraShadowError(AlgebraError):
-    def __init__(self, msg: str, *, line: int, col: int, line_text: str | None = None):
-        super().__init__(msg=msg, code="E120", line=line, col=col, line_text=line_text)
-
-
 class AlgebraDomainError(AlgebraError):
     def __init__(self, msg: str, *, line: int, col: int, line_text: str | None = None):
         super().__init__(msg=msg, code="E130", line=line, col=col, line_text=line_text)
@@ -119,3 +113,8 @@ class AlgebraTypeError(AlgebraError):
 class AlgebraBoolCastError(AlgebraError):
     def __init__(self, msg: str, *, line: int, col: int, line_text: str | None = None):
         super().__init__(msg=msg, code="E170", line=line, col=col, line_text=line_text)
+
+
+# A formula that cannot compute its value for these inputs: the value is
+# outside its domain, for a param and a let alike.
+UNCOMPUTABLE_ERRORS = (AlgebraDomainError, AlgebraZeroDivError, AlgebraTypeError)

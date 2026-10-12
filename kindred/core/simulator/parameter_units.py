@@ -196,7 +196,7 @@ def prepare_spec_units(spec, mechanism):
 
     def block(source):
         lines = tuple(prepared[stmt.name] for stmt in source.lines)
-        return replace(source, lines=lines, ast=tuple(stmt.expr for stmt in lines))
+        return replace(source, lines=lines)
 
     return replace(spec, parameter_block=block(spec.parameter_block), observable_block=block(spec.observable_block),
                    quantity_units=tuple(units.items()), input_units=tuple(inputs.items()))

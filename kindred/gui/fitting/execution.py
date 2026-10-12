@@ -62,7 +62,7 @@ from kindred.gui.fitting.launch import (
     FitSetupSnapshot,
     _replace_fit_parameter,
     fit_coordinate_datasets_text,
-    prune_fit_analysis_coordinates,
+    fit_profile_config,
     shared_initial_group_variable_id,
 )
 from kindred.core.species import CONCENTRATION_MIN_M
@@ -684,8 +684,7 @@ class _FitExecution(_FitControl):
                     t_end=dataset_context.execution_t_end,
                     objective_sample_times=dataset_context.retained_times,
                     prepared_solver_config=dataset_context.solver_config,
-                    fit_sampling_policy=dataset_context.fit_sampling_policy,
-                    fit_sampling_identity=dict(dataset_context.fit_sampling_identity),
+                    sample_solver_steps=dataset_context.parametric_x_observation is not None,
                     cancellation_control=self._cancellation_control,
                     initial_prefix=INITIAL_PREFIX,
                 )
@@ -827,7 +826,8 @@ class _FitExecution(_FitControl):
                         ),
                     ),
                 ),
-                f"Objective calls {objective_calls}: weighted SSE {six_digit_text(cost)}",
+                f"Objective calls {objective_calls}"
+                + (f": best weighted SSE {six_digit_text(cost)}" if update.improved else ""),
             )
             if self._checkpoint():
                 raise FittingCancelled()
@@ -867,6 +867,7 @@ class _FitExecution(_FitControl):
         def execution_cancellation_check() -> bool:
             return self._checkpoint(honor_stop=False)
 
+        profile = fit_profile_config(setup.profile, setup.parameters, setup.datasets)
         # Profile progress names each target by its parameter and datasets.
         coordinate_labels = {
             coordinate.display_name: " — ".join(
@@ -875,61 +876,39 @@ class _FitExecution(_FitControl):
                     fit_coordinate_datasets_text(coordinate, setup),
                 ) if text
             )
-            for coordinate in (
-                () if setup.profile_likelihood is None else setup.profile_likelihood.parameter_names
-            )
+            for coordinate in (() if profile is None else profile.parameter_names)
         }
 
         def extension_progress(update: FitExtensionProgress) -> None:
             nonlocal extension_progress_value
             if self._checkpoint():
                 raise FittingCancelled()
-            has_profile = setup.profile_likelihood is not None
             if update.stage == "primary_complete":
                 extension_progress_value = max(extension_progress_value, 95)
                 self._emit("progress", extension_progress_value, "Primary global fit complete")
                 return
-            if update.phase == "profile_likelihood":
-                fraction = (
-                    float(update.completed_work) / float(update.planned_work)
-                    if update.planned_work
-                    else 0.0
-                )
-                percent = 95 + min(2, int(math.floor(3.0 * fraction)))
-                # A settlement update can arrive before any coordinate started,
-                # so only discovery and refinement show one.
-                if update.stage == "discovery":
-                    detail = (
-                        f"Profile likelihood · {coordinate_labels[update.coordinate]} · {update.side} "
-                        f"discovery {update.discovery_step}/"
-                        f"{setup.profile_likelihood.max_bracketing_steps_per_side}"
-                    )
-                elif update.stage == "refinement":
-                    detail = (
-                        f"Profile likelihood · {coordinate_labels[update.coordinate]} · {update.side} "
-                        f"refinement {update.refinement_step}/64"
-                    )
-                else:
-                    detail = f"Profile likelihood · {update.status}"
-            else:
-                fraction = (
-                    float(update.completed_replicates or 0)
-                    / float(update.planned_replicates)
-                    if update.planned_replicates
-                    else 0.0
-                )
-                base = 97 if has_profile else 95
-                percent = base + min(4, int(math.floor(4.0 * fraction)))
-                detail = (
-                    f"Bootstrap · replicate {update.completed_replicates or 0}/"
-                    f"{update.planned_replicates or 0}"
-                    if update.stage != "settlement"
-                    else f"Bootstrap · {update.status}"
-                )
-            extension_progress_value = max(
-                extension_progress_value,
-                max(95, min(99, percent)),
+            fraction = (
+                float(update.completed_work) / float(update.planned_work)
+                if update.planned_work
+                else 0.0
             )
+            percent = 95 + min(2, int(math.floor(3.0 * fraction)))
+            # A settlement update can arrive before any coordinate started,
+            # so only discovery and refinement show one.
+            if update.stage == "discovery":
+                detail = (
+                    f"Profile likelihood · {coordinate_labels[update.coordinate]} · {update.side} "
+                    f"discovery {update.discovery_step}/"
+                    f"{setup.profile.options.max_bracketing_steps_per_side}"
+                )
+            elif update.stage == "refinement":
+                detail = (
+                    f"Profile likelihood · {coordinate_labels[update.coordinate]} · {update.side} "
+                    f"refinement {update.refinement_step}/64"
+                )
+            else:
+                detail = f"Profile likelihood · {update.status}"
+            extension_progress_value = max(extension_progress_value, percent)
             self._emit("progress", extension_progress_value, detail)
             if self._checkpoint():
                 raise FittingCancelled()
@@ -940,9 +919,6 @@ class _FitExecution(_FitControl):
         for evaluator in evaluators.values():
             evaluator.set_cancellation_control(self._cancellation_control)
         defaults = request.setup.defaults
-        excluded = tuple(
-            item.dataset_id for item in request.setup.datasets if not item.included
-        )
         result_or_unavailable = fit_global(
             fit_evaluators=evaluators,
             datasets=datasets,
@@ -958,14 +934,7 @@ class _FitExecution(_FitControl):
             cancellation_control=execution_cancellation_control,
             stop_check=self._stopped.is_set,
             starting_facts=tuple(starting_facts),
-            profile_likelihood=prune_fit_analysis_coordinates(
-                request.setup.profile_likelihood, excluded_dataset_ids=excluded,
-                parameters=request.setup.parameters,
-            ),
-            residual_bootstrap=prune_fit_analysis_coordinates(
-                request.setup.residual_bootstrap, excluded_dataset_ids=excluded,
-                parameters=request.setup.parameters,
-            ),
+            profile_likelihood=profile,
             dataset_overrides=request.dispatch.ordinary_dataset_overrides,
             optimizer_layout=request.dispatch.ordinary_optimizer_layout,
             executor=self._executor,

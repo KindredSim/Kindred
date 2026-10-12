@@ -53,7 +53,6 @@ def resolve_run_parallel_capacity(*, cpu_count: object, user_max: object, target
 class ExplicitRunTarget:
     """One Run target, built from document identities without Preview values."""
 
-    tab_id: str
     set_id: str
     set_name: str
     execution_request: SimulationExecutionRequest
@@ -67,7 +66,6 @@ class ExplicitRunCapture:
 
 @dataclass(frozen=True, slots=True)
 class PreviewTarget:
-    tab_id: str
     set_id: str
     set_name: str
     execution_request: SimulationExecutionRequest
@@ -128,7 +126,7 @@ def build_execution_request(
     )
 
 
-def build_explicit_target(*, prepared_dsl: PreparedDslRequestSet, tab_id: str, set_id: str, set_name: str,
+def build_explicit_target(*, prepared_dsl: PreparedDslRequestSet, set_id: str, set_name: str,
                           initial_values: Iterable[tuple[str, float]],
                           execution_settings: SimulationExecutionSettings, scientific_settings: TabScientificSettings) -> ExplicitRunTarget:
     execution_request = build_execution_request(
@@ -137,7 +135,7 @@ def build_explicit_target(*, prepared_dsl: PreparedDslRequestSet, tab_id: str, s
         execution_settings=execution_settings,
         scientific_settings=scientific_settings,
     )
-    return ExplicitRunTarget(tab_id, set_id, set_name, execution_request)
+    return ExplicitRunTarget(set_id, set_name, execution_request)
 
 
 class _DirectSimulationWorker(QtCore.QThread):

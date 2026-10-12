@@ -54,6 +54,10 @@ class ScanRangeDialog(QtWidgets.QDialog):
         self.allocation.addItem("Equal per interval", "equal")
         self.allocation.setCurrentIndex(self.allocation.findData(selection.allocation))
         layout.addWidget(self.allocation)
+        self.log_scale = QtWidgets.QCheckBox("Log Scale")
+        self.log_scale.setToolTip("Spread samples evenly in the logarithm of the value. Every interval must start above zero.")
+        self.log_scale.setChecked(selection.log_scale)
+        layout.addWidget(self.log_scale)
         self.error = QtWidgets.QLabel()
         self.error.setWordWrap(True)
         layout.addWidget(self.error)
@@ -88,7 +92,10 @@ class ScanRangeDialog(QtWidgets.QDialog):
                     endpoints.append(low)
                 if self.table.cellWidget(row, 5).isChecked():
                     endpoints.append(high)
-            self.selection = InputRange(normalize(tuple(intervals)), self.allocation.currentData(), tuple(dict.fromkeys(endpoints)))
+            if self.log_scale.isChecked() and any(i.lower < i.upper and i.lower <= 0.0 for i in intervals):
+                raise ValueError("Log Scale requires every interval to start above zero.")
+            self.selection = InputRange(normalize(tuple(intervals)), self.allocation.currentData(),
+                                        tuple(dict.fromkeys(endpoints)), self.log_scale.isChecked())
         except ValueError as exc:
             self.error.setText(str(exc))
             return

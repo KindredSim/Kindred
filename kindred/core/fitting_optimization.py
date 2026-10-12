@@ -56,9 +56,11 @@ def fit_bound_position(
     """Classify a fitted value as at its lower or upper bound, or interior.
 
     A value is at a bound when its distance from it, in the coordinate the
-    optimizer moved (log10 under Log Scale), is at most one billionth of the
-    bounds' width there, and it is nearer that bound than the other.  The
-    result is an informational label; values are always published as fitted.
+    optimizer moved (log10 under Log Scale), is at most one billionth of that
+    bound's own scale (its magnitude, at least 1, and at most the bounds'
+    width), and it is nearer that bound than the other.  A distant opposite
+    bound therefore never widens the tolerance.  The result is an
+    informational label; values are always published as fitted.
     """
 
     def encode(raw: float) -> float:
@@ -67,11 +69,14 @@ def fit_bound_position(
     encoded, low, high = encode(value), encode(minimum), encode(maximum)
     lower_distance = encoded - low
     upper_distance = high - encoded
-    tolerance = 1e-9 * (high - low)
+
+    def tolerance(bound: float) -> float:
+        return 1e-9 * min(high - low, max(1.0, abs(bound)))
+
     position: FitBoundPosition = "interior"
-    if lower_distance <= min(upper_distance, tolerance):
+    if lower_distance <= min(upper_distance, tolerance(low)):
         position = "lower"
-    if upper_distance <= min(lower_distance, tolerance):
+    if upper_distance <= min(lower_distance, tolerance(high)):
         position = "upper"
     return position
 
@@ -171,7 +176,7 @@ def fit_parameters(
     """Fit parameters, interpreting ``ftol`` as native DE ``tol`` for DE runs."""
 
     # The method, evaluation budget, coordinates and their bounds arrive
-    # admitted by the Fit setup or its Profile/Bootstrap configuration.
+    # admitted by the Fit setup or its Profile likelihood configuration.
     param_names = list(initial_params.keys())
     # Starts are admitted values or optimizer results inside their admitted
     # finite ordered bounds.

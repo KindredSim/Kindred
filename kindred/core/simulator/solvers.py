@@ -39,6 +39,7 @@ from .intervention_schedule_execution import (
     SegmentRunResult,
 )
 from .solver_types import (
+    SIMULATION_NONFINITE_MESSAGE,
     Rhs2 as _Rhs2,
     SimulationCancellationControl as _SimulationCancellationControl,
     FinalSimulationOutput as _FinalSimulationOutput,
@@ -180,24 +181,18 @@ def _guard_runtime_symbolic_jacobian(
         except (ArithmeticError, TypeError, ValueError, OverflowError) as exc:
             raise _SymbolicJacobianEvaluationError(
                 time=float(time),
-                reason=(
-                    "Analytic Jacobian callback raised "
-                    f"{type(exc).__name__}: {exc}"
-                ),
+                reason=f"its analytic Jacobian raised {type(exc).__name__}: {exc}",
             ) from exc
         expected_shape = (values.size, values.size)
         if matrix.shape != expected_shape:
             raise _SymbolicJacobianEvaluationError(
                 time=float(time),
-                reason=(
-                    "Analytic Jacobian callback returned shape "
-                    f"{matrix.shape}, expected {expected_shape}."
-                ),
+                reason=f"its analytic Jacobian had shape {matrix.shape} instead of {expected_shape}",
             )
         if not np.all(np.isfinite(matrix)):
             raise _SymbolicJacobianEvaluationError(
                 time=float(time),
-                reason="Analytic Jacobian callback returned nonfinite values.",
+                reason="its analytic Jacobian had nonfinite values",
             )
         return matrix
 
@@ -237,7 +232,8 @@ def _execute_scipy(
         base_kwargs["atol"] = np.append(np.full(species_count, req.atol), req.atol * volume.initial_value)
     from kindred.core.intervention_schedule import InterventionStopAction
     retain_dense = volume is not None or any(isinstance(item.then, InterventionStopAction) for item in req.intervention_execution.triggers)
-    if retain_dense:
+    dense_output = retain_dense or req.sample_solver_steps
+    if dense_output:
         base_kwargs["dense_output"] = True
     boundary_events = tuple(boundary_events)
     events_list: list[Callable[[float, np.ndarray], float]] = []
@@ -304,6 +300,7 @@ def _execute_scipy(
                 _SimulationScientificUnavailability(
                     producer="scipy",
                     stage="rhs_preflight",
+                    message=SIMULATION_NONFINITE_MESSAGE,
                     details={
                         "solver": req.solver,
                         "time": float(t0),
@@ -334,11 +331,13 @@ def _execute_scipy(
                 and req.cancellation_control.cancel_requested()
             ):
                 raise SimulationCancelled() from exc
+            error = create_solver_error(req.solver, last_accepted_time, reason, str(exc))
             if req.candidate_evaluation:
                 raise _SimulationScientificUnavailabilitySignal(
                     _SimulationScientificUnavailability(
                         producer="scipy",
                         stage=stage,
+                        message=error.message,
                         details={
                             "solver": req.solver,
                             "time": last_accepted_time,
@@ -346,12 +345,12 @@ def _execute_scipy(
                         },
                     )
                 ) from exc
-            raise create_solver_error(req.solver, last_accepted_time, reason, str(exc)) from exc
+            raise error from exc
         if (
             req.cancellation_control is not None
             and req.cancellation_control.cancel_requested()
         ):
-            if retain_dense:
+            if dense_output:
                 solved.sol = None
             raise SimulationCancelled()
         return solved
@@ -364,40 +363,41 @@ def _execute_scipy(
             and req.cancellation_control.cancel_requested()
         ):
             raise SimulationCancelled() from exc
+        details = {
+            "solver": req.solver,
+            "time": float(exc.time),
+            "segment": segment_identity.to_payload(),
+            "reason": exc.reason,
+        }
+        error = create_solver_error(req.solver, exc.time, exc.reason, "")
+        error.details.update(details)
         if req.candidate_evaluation:
             raise _SimulationScientificUnavailabilitySignal(
                 _SimulationScientificUnavailability(
                     producer="analytic_jacobian",
                     stage="runtime_evaluation",
-                    details={
-                        "solver": req.solver,
-                        "time": float(exc.time),
-                        "segment": segment_identity.to_payload(),
-                        "reason": exc.reason,
-                    },
+                    message=error.message,
+                    details=details,
                 )
             ) from exc
-        raise SolverError(
-            "Analytic Jacobian evaluation failed at "
-            f"t={exc.time:.4e}: {exc.reason}",
-            details={
-                "solver": req.solver,
-                "time": float(exc.time),
-                "segment": segment_identity.to_payload(),
-                "reason": exc.reason,
-            },
-        ) from exc
+        raise error from exc
 
     try:
         if not sol.success:
-            if retain_dense:
+            if dense_output:
                 sol.sol = None
             t_fail = last_accepted_time
+            # BDF and Radau report one failure: the step size fell below
+            # the spacing of floating-point numbers at the current time.
+            error = create_solver_error(
+                req.solver, t_fail, "its step size became too small to continue", str(sol.message),
+            )
             if req.candidate_evaluation:
                 raise _SimulationScientificUnavailabilitySignal(
                     _SimulationScientificUnavailability(
                         producer="scipy",
                         stage="solve_ivp_unsuccessful",
+                        message=error.message,
                         details={
                             "solver": req.solver,
                             "time": t_fail,
@@ -405,11 +405,7 @@ def _execute_scipy(
                         },
                     )
                 )
-            # BDF and Radau report one failure: the step size fell below
-            # the spacing of floating-point numbers at the current time.
-            raise create_solver_error(
-                req.solver, t_fail, "its step size became too small to continue", str(sol.message),
-            )
+            raise error
 
         # Detach SciPy's time vector at ingress.  The trajectory copy below is
         # owned exactly once by project_nonnegative_trajectory; retain the exact
@@ -418,6 +414,24 @@ def _execute_scipy(
         # SciPy returns a 1-D empty array when no requested time was reached.
         raw_trajectory = np.asarray(sol.y, dtype=float).reshape(len(y0), -1)
         local_dense = sol.sol
+        if req.sample_solver_steps:
+            # Every accepted step before the solver stopped (an event can end
+            # the segment early).  Steps the absolute clock cannot tell apart
+            # become one row.
+            local = np.asarray(local_dense.ts, dtype=float)
+            local = local[(local > 0.0) & (local < local_dense.t_max)]
+            step_times, first = np.unique(origin + local, return_index=True)
+            extra = ((step_times > origin) & (step_times < absolute(float(local_dense.t_max)))
+                     & ~np.isin(step_times, t_out))
+            if extra.any():
+                times = np.concatenate((t_out, step_times[extra]))
+                order = np.argsort(times, kind="stable")
+                t_out = times[order]
+                raw_trajectory = np.concatenate(
+                    (raw_trajectory,
+                     np.asarray(local_dense(local[first][extra]), dtype=float).reshape(len(y0), -1)),
+                    axis=1,
+                )[:, order]
         dense = (None if local_dense is None else local_dense if origin == 0.0
                  else (lambda times: local_dense(np.asarray(times, dtype=float) - origin)))
         if volume is not None:
@@ -468,7 +482,7 @@ def _execute_scipy(
             symbolic_jacobian_used=jac_callable is not None,
         )
     finally:
-        if retain_dense:
+        if dense_output:
             sol.sol = None
 
 
@@ -542,8 +556,5 @@ def solve_ode(
             raise SimulationCancelled() from exc
         if req.candidate_evaluation:
             return exc.outcome
-        raise SolverError(
-            "Simulation produced nonfinite values.",
-            details={"solver": req.solver},
-        ) from exc
+        raise SolverError(exc.outcome.message, details={"solver": req.solver}) from exc
     return output

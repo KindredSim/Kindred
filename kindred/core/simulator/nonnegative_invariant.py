@@ -6,6 +6,7 @@ from typing import Iterable
 import numpy as np
 
 from kindred.core.simulator.solver_types import (
+    SIMULATION_NONFINITE_MESSAGE,
     SimulationScientificUnavailability,
     _SimulationScientificUnavailabilitySignal,
 )
@@ -53,6 +54,7 @@ def project_nonnegative_trajectory(
             SimulationScientificUnavailability(
                 producer="nonnegative_invariant",
                 stage="trajectory_arithmetic",
+                message=SIMULATION_NONFINITE_MESSAGE,
                 details={"context": context},
             )
         )

@@ -5,7 +5,7 @@ from kindred.core.quantity_units import Unit, parse_declared_unit
 from dataclasses import dataclass, field, replace
 import re
 from types import MappingProxyType
-from typing import List, Mapping, Sequence, Set, Tuple
+from typing import Iterable, List, Mapping, Sequence, Set, Tuple
 
 from kindred.core.algebra.errors import AlgebraError
 from kindred.core.algebra.parser import (
@@ -26,8 +26,8 @@ from kindred.core.algebra.symbols import SymbolTable
 from kindred.core.simulator.errors import DSLError
 from kindred.core.simulator.parameter_namespace import (
     MechanismParameterNamespace,
-    is_protected_indexed_identifier,
 )
+from kindred.core.validation import and_join
 from .dsl_build_input import (
     DslSourceCoordinate,
     source_coordinate_capabilities,
@@ -53,39 +53,9 @@ _NON_ALGEBRA_ASSIGNMENT_PREFIXES = {
 }
 
 
-def _raise_invalid_protected_indexed_identifier_error(
-    raw_name: str,
-    *,
-    suggested_names: Sequence[str],
-    line_number: int,
-    line_content: str,
-) -> None:
-    names = ", ".join(str(name) for name in suggested_names)
-    raise DSLError(
-        f"{raw_name!r} is reserved for reaction parameters, and the parameters of that step are {names}."
-        if names
-        else f"{raw_name!r} is reserved for a reaction parameter, and this mechanism has none by that name.",
-        line_number=line_number,
-        line_content=line_content,
-    )
-
-
 def is_protected_step_key_identifier(raw_name: str) -> bool:
     name = str(raw_name or "").strip()
-    return name == "K" or name.lower() in _PROTECTED_STEP_KEY_IDENTIFIERS
-
-
-def _raise_protected_observable_identifier_error(
-    raw_name: str,
-    *,
-    line_number: int,
-    line_content: str,
-) -> None:
-    raise DSLError(
-        f"{raw_name!r} is reserved for reaction parameters, so a let line cannot define it.",
-        line_number=line_number,
-        line_content=line_content,
-    )
+    return name != "K" and name.lower() in _PROTECTED_STEP_KEY_IDENTIFIERS
 
 
 # The standard concentration is a source setting and an exact-composition
@@ -122,15 +92,12 @@ class ParameterAlgebraDeclarationClassification:
     code: str = ""
     line_number: int = 0
     line_content: str = ""
-    invalid_protected_indexed_identifier: bool = False
-    invalid_protected_indexed_suggestions: Tuple[str, ...] = ()
 
 
 def classify_parameter_algebra_declaration(
     line: str,
     *,
     line_number: int = 0,
-    mechanism_namespace: MechanismParameterNamespace | None = None,
     allow_non_algebra_bare_assignment: bool = True,
 ) -> ParameterAlgebraDeclarationClassification:
     original = str(line or "").rstrip("\r\n")
@@ -169,25 +136,12 @@ def classify_parameter_algebra_declaration(
                 line_number=int(line_number or 0),
                 line_content=original,
             )
-        canonical_name = None
-        invalid_protected_found = False
-        invalid_suggestions: Tuple[str, ...] = ()
-        if mechanism_namespace is not None:
-            resolution = mechanism_namespace.resolve(raw_name)
-            canonical_name = resolution.canonical_name
-            if canonical_name is None:
-                invalid_protected = mechanism_namespace.invalid_protected_indexed_identifier(raw_name)
-                if invalid_protected is not None:
-                    invalid_protected_found = True
-                    invalid_suggestions = tuple(str(name) for name in invalid_protected.suggested_names)
         return ParameterAlgebraDeclarationClassification(
             kind=kind,
             raw_name=raw_name,
             code=code,
             line_number=int(line_number or 0),
             line_content=original,
-            invalid_protected_indexed_identifier=bool(invalid_protected_found),
-            invalid_protected_indexed_suggestions=invalid_suggestions,
         )
     match = None if _ARROW_RE.search(code) else _ASSIGN_RE.match(code)
     if match is not None:
@@ -293,6 +247,20 @@ class ParameterAlgebraSpec:
         object.__setattr__(self, "temperature_dependent_names", frozenset(self.temperature_dependent_names))
         object.__setattr__(self, "identity_checks", tuple(self.identity_checks))
 
+    def input_dependencies(self, names: Iterable[str]) -> tuple[str, ...]:
+        """The independent inputs the named values read, through every
+        calculated value; a name nothing calculates is its own input."""
+        inputs: set[str] = set()
+        pending = list(names)
+        while pending:
+            name = pending.pop()
+            dependencies = self.evaluation_dependencies.get(name, ())
+            if dependencies:
+                pending.extend(dependencies)
+            else:
+                inputs.add(name)
+        return tuple(sorted(inputs))
+
     def __deepcopy__(self, memo: dict[int, object]) -> "ParameterAlgebraSpec":
         import copy
 
@@ -384,8 +352,9 @@ def admit_parameter_evaluation_graph(
     graph.update(chemistry)
     for name, statement in statements.items():
         if name in chemistry:
+            sources = and_join([dep for dep in chemistry[name] if dep != "T"])
             raise DSLError(
-                f"{name} is a chemistry-derived readout, not an editable source coordinate.",
+                f"{name} is calculated from {sources} on its reaction line, so a param line cannot set it.",
                 line_number=statement.line,
                 line_content=statement.line_text,
             )
@@ -459,7 +428,7 @@ def _circular_definition_error(
         if node in statements:
             steps.append(f"{node} reads {reads[node]}")
         else:
-            sources = " and ".join(name for name in chemistry[node] if name != "T")
+            sources = and_join([name for name in chemistry[node] if name != "T"])
             steps.append(f"{node} is calculated from {sources} on its reaction line")
     advice = f"Write {target} without reading {reads[target]}."
     parts = source_coordinate_name_parts(target)
@@ -510,9 +479,9 @@ def _admit_static_values(spec: ParameterAlgebraSpec) -> None:
             continue
         try:
             evaluate_block(
-                AlgebraBlock(lines=lines, ast=tuple(statement.expr for statement in lines)),
+                AlgebraBlock(lines=lines),
                 EvaluationContext(t=np.array([0.0]), species_series={}, initials={},
-                                  species_names=set(), symtab=SymbolTable()),
+                                  symtab=SymbolTable()),
             )
         except Exception as exc:
             statement = next((item for item in lines if item.line == getattr(exc, "line", None)), lines[0])
@@ -548,22 +517,10 @@ def _canonicalize_parameter_expr(
     if isinstance(expr, IdentNode):
         raw_name = str(expr.name)
         resolution = mechanism_namespace.resolve(raw_name)
-        invalid = (
-            mechanism_namespace.invalid_protected_indexed_identifier(raw_name)
-            if resolution.canonical_name is None
-            else None
-        )
-        if invalid is not None:
-            _raise_invalid_protected_indexed_identifier_error(
-                raw_name,
-                suggested_names=invalid.suggested_names,
-                line_number=assignment.line_number,
-                line_content=assignment.line_content,
-            )
-        if resolution.canonical_name is None and is_protected_indexed_identifier(raw_name):
-            _raise_invalid_protected_indexed_identifier_error(
-                raw_name,
-                suggested_names=(),
+        invalid_message = mechanism_namespace.invalid_protected_indexed_identifier_message(raw_name)
+        if invalid_message is not None:
+            raise DSLError(
+                invalid_message,
                 line_number=assignment.line_number,
                 line_content=assignment.line_content,
             )
@@ -639,7 +596,6 @@ def _compile_retained_parameter_block(
         )
     block = AlgebraBlock(
         lines=tuple(canonical_lines),
-        ast=tuple(stmt.expr for stmt in canonical_lines),
         evaluation_order=parsed.evaluation_order,
     )
     return block
@@ -929,7 +885,6 @@ def extract_parameter_assignments_from_algebra_lines(
         classification = classify_parameter_algebra_declaration(
             original,
             line_number=line_no,
-            mechanism_namespace=mechanism_namespace,
         )
         code = classification.code
         if not code:
@@ -938,10 +893,10 @@ def extract_parameter_assignments_from_algebra_lines(
         if classification.kind == "param":
             raw_name = classification.raw_name
             resolution = mechanism_namespace.resolve(raw_name)
-            if classification.invalid_protected_indexed_identifier:
-                _raise_invalid_protected_indexed_identifier_error(
-                    raw_name,
-                    suggested_names=classification.invalid_protected_indexed_suggestions,
+            invalid_message = mechanism_namespace.invalid_protected_indexed_identifier_message(raw_name)
+            if invalid_message is not None:
+                raise DSLError(
+                    invalid_message,
                     line_number=line_no,
                     line_content=original,
                 )
@@ -1005,12 +960,9 @@ def extract_parameter_assignments_from_algebra_lines(
                     line_number=line_no,
                     line_content=original,
                 )
-            if is_protected_indexed_identifier(target_raw):
-                _raise_protected_observable_identifier_error(
-                    target_raw,
-                    line_number=line_no,
-                    line_content=original,
-                )
+            invalid_message = mechanism_namespace.invalid_protected_indexed_identifier_message(target_raw)
+            if invalid_message is not None:
+                raise DSLError(invalid_message, line_number=line_no, line_content=original)
             continue
 
 
@@ -1030,12 +982,6 @@ def extract_observable_names_from_algebra_lines(algebra_lines: Sequence[Tuple[in
         if classification.kind == "param":
             continue
         if classification.kind == "let":
-            if is_protected_indexed_identifier(classification.raw_name):
-                _raise_protected_observable_identifier_error(
-                    classification.raw_name,
-                    line_number=_line_no,
-                    line_content=raw.rstrip("\n"),
-                )
             symbols = SymbolTable()
             if (
                 classification.raw_name in symbols.protected_names()
@@ -1091,7 +1037,6 @@ def parse_parameter_algebra_spec_from_dsl_text(
     ]
     parameter_raw_block = AlgebraBlock(
         lines=tuple(full_block.lines[index] for index in parameter_indices),
-        ast=tuple(full_block.ast[index] for index in parameter_indices),
     )
     if assignments:
         block = _compile_retained_parameter_block(
@@ -1114,7 +1059,6 @@ def parse_parameter_algebra_spec_from_dsl_text(
 
     observable_block = AlgebraBlock(
         lines=tuple(full_block.lines[index] for index in observable_indices),
-        ast=tuple(full_block.ast[index] for index in observable_indices),
     )
     _validate_retained_observable_program(initial_spec, block=observable_block)
     return replace(

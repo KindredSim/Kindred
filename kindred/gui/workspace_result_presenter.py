@@ -861,7 +861,7 @@ def _boundary_export_columns(result):
         columns.extend((
             ("Volume canonical row", np.arange(first, len(result.t)), "int"),
             ("Volume time [s]", result.t[first:], "float"),
-            ("Vessel volume [m³]", result.volume.values, "float"),
+            ("Vessel volume [m^3]", result.volume.values, "float"),
         ))
     states = [(b.time, i, j, state) for i, b in enumerate(result.presentation_boundaries)
               for j, state in enumerate(b.states)]
@@ -870,7 +870,7 @@ def _boundary_export_columns(result):
             ("Boundary time [s]", tuple(item[0] for item in states), "float"),
             ("Boundary index", tuple(item[1] for item in states), "int"),
             ("Boundary state ordinal", tuple(item[2] for item in states), "int"),
-            ("Boundary vessel volume [m³]", tuple(item[3].volume for item in states), "float"),
+            ("Boundary vessel volume [m^3]", tuple(item[3].volume for item in states), "float"),
             ("Boundary executed temperature [K]", tuple(item[3].temperature_K for item in states), "float"),
         ))
         columns.extend((f"Boundary {name} [M]", tuple(dict(item[3].concentrations)[name] for item in states), "float")

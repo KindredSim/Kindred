@@ -9,7 +9,7 @@ from typing import Callable, Mapping, Protocol, Sequence
 
 import numpy as np
 
-from kindred.core.exceptions import SimulationCancelled
+from kindred.core.exceptions import KineticRuntimeDomainError, SimulationCancelled
 from kindred.core.intervention_schedule import (InterventionScheduleError, InterventionStopAction, SpeciesTriggerCondition, ObservableTriggerCondition)
 from kindred.core.intervention_schedule_compiler import (
     ExecutableFlux,
@@ -534,7 +534,7 @@ class InterventionScheduleExecutionOwner:
                     elif purge_hit is not None:
                         current_y, purge_projection = project_nonnegative_trajectory(
                             current_y.reshape(-1, 1),
-                            context=f"Purge continuation state at t={purge_hit[0]:g}",
+                            context=f"Purge continuation state at t = {purge_hit[0]:g} s",
                         )
                         current_y = current_y.reshape(-1)
                         _record_continuation_projection(
@@ -551,10 +551,14 @@ class InterventionScheduleExecutionOwner:
                         )
                         and sub_end in contract.discontinuities
                     )
-                    emit_count = min(requested.size, seg_t.size)
-                    emit_t = seg_t[:emit_count]
-                    emit_y = seg_y[:, :emit_count]
-                    emit_temperature = seg_temperature[:emit_count]
+                    # Rows before the segment end (requested times, and any
+                    # solver steps); the end row only when it was requested.
+                    emit_mask = (seg_t < sub_end) | (
+                        (seg_t == sub_end) & bool(requested.size and requested[-1] == sub_end)
+                    )
+                    emit_t = seg_t[emit_mask]
+                    emit_y = seg_y[:, emit_mask]
+                    emit_temperature = seg_temperature[emit_mask]
                     if trigger_hit is not None:
                         emit_mask = emit_t < float(trigger_hit[0])
                         emit_t = emit_t[emit_mask]
@@ -1274,7 +1278,7 @@ def _apply_boundary(
 
     def finish(stop: int | None = None) -> _BoundaryApplicationResult:
         snapshot()
-        continuation, projection = project_nonnegative_trajectory(current.reshape(-1, 1), context=f"Intervention continuation state at t={boundary:g}")
+        continuation, projection = project_nonnegative_trajectory(current.reshape(-1, 1), context=f"Intervention continuation state at t = {boundary:g} s")
         termination = None
         if stop is not None:
             record(stop)
@@ -1448,8 +1452,15 @@ def _resolve_items(items, time, parameter_values, *, temperature_K):
     except Exception as exc:
         if isinstance(exc, SimulationCancelled):
             raise
+        if isinstance(exc, KineticRuntimeDomainError):
+            # The value stays a domain refusal, so Fit can reject the candidate.
+            raise KineticRuntimeDomainError(
+                f"Intervention values at t = {time:g} s: {exc.message}",
+                stage=exc.details["stage"], parameter_names=exc.parameter_names,
+                details={**exc.details, "time": time}, context=exc.context,
+            ) from exc
         raise InterventionScheduleError(
-            f"Intervention values at t={time:g}: {exc}", details={"time": time}
+            f"Intervention values at t = {time:g} s: {exc}", details={"time": time}
         ) from exc
 
 

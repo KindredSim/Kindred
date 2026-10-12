@@ -23,7 +23,6 @@ class ParametricProjection:
     """One shared curve location per dataset row within the owning dataset."""
 
     source_rows: tuple[int, ...]
-    selected_model_x: np.ndarray
     delta_x: np.ndarray
     left_rows: np.ndarray
     right_rows: np.ndarray
@@ -119,8 +118,7 @@ def align_parametric(
     fractions = np.asarray(chosen_fractions)
     selected_x = model_x[selected_left] + fractions * (model_x[selected_right] - model_x[selected_left])
     return ParametricProjection(
-        source_rows=tuple(source_rows), selected_model_x=selected_x,
-        delta_x=selected_x - observed_x,
+        source_rows=tuple(source_rows), delta_x=selected_x - observed_x,
         left_rows=selected_left, right_rows=selected_right, fractions=fractions,
     )
 

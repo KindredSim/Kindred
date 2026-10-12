@@ -10,6 +10,7 @@ import numpy as np
 from kindred.core.exceptions import SimulationCancelled
 from kindred.core.simulation_algebra_context import runtime_algebra_symbol_names
 from kindred.core.simulation_failure import FactualCause
+from kindred.core.algebra.errors import UNCOMPUTABLE_ERRORS
 from kindred.core.algebra.evaluator import AlgebraObservableError
 from kindred.core.result_repository import (
     SimulationResultValue,
@@ -17,6 +18,8 @@ from kindred.core.result_repository import (
 from kindred.core.simulator.solver_types import FinalSimulationOutput, SimulationCancellationControl
 from kindred.core.algebra.simulation_series import (
     evaluate_algebra_block_for_simulation_partial,
+    observable_parameter_roots,
+    observable_reads_species,
 )
 
 __all__ = [
@@ -76,10 +79,22 @@ def _freeze_solver_provenance_mapping(
         }
     )
 
-def _algebra_cause(error: AlgebraObservableError) -> FactualCause:
-    """Project one expected per-observable Algebra failure."""
 
-    details: dict[str, object] = {"name": error.name}
+
+
+def _algebra_cause(error: AlgebraObservableError, spec: object) -> FactualCause:
+    """Project one expected per-observable Algebra failure.
+
+    A let its own formula cannot compute records the independent inputs it
+    reads, as a param's failure does, so a Fit decides from them."""
+
+    details: dict[str, object] = {**error.details, "name": error.name}
+    if error.exc_type in {error_type.__name__ for error_type in UNCOMPUTABLE_ERRORS}:
+        details["stage"] = "result_algebra"
+        details["parameter_names"] = spec.input_dependencies(
+            observable_parameter_roots(spec.observable_block, error.name)
+        )
+        details["reads_species"] = observable_reads_species(spec.observable_block, error.name)
     if error.col is not None:
         details["col"] = error.col
     # The authored statement is the cause's location, as for every other cause.
@@ -111,7 +126,6 @@ def _freeze_algebra_series(
 
 def finalize_simulation_result(
     *,
-    mechanism: object,
     result: FinalSimulationOutput,
     species_names: list[str],
     initials_for_algebra: Mapping[str, float],
@@ -119,7 +133,6 @@ def finalize_simulation_result(
     parameter_algebra_spec: object,
     parameters: tuple[tuple[str, float, str], ...] = (),
     parameter_classifications: tuple[tuple[str, str, str], ...] = (),
-    solver_provenance_updates: Mapping[str, object] | None = None,
     cancellation_control: SimulationCancellationControl | None = None,
 ) -> SimulationResultValue:
     """Admit one solver output through canonical row finalization.
@@ -189,17 +202,12 @@ def finalize_simulation_result(
             )
         )
         finalized_algebra_errors = tuple(
-            _algebra_cause(error) for error in algebra_errors
+            _algebra_cause(error, parameter_algebra_spec) for error in algebra_errors
         )
         finalized_series.update(_freeze_algebra_series(algebra_series))
         finalized_algebra_scalars = dict(algebra_scalars)
 
-    completed_solver_provenance = dict(result.provenance)
-    if solver_provenance_updates:
-        completed_solver_provenance.update(solver_provenance_updates)
-    frozen_solver_provenance = _freeze_solver_provenance_mapping(
-        completed_solver_provenance
-    )
+    frozen_solver_provenance = _freeze_solver_provenance_mapping(result.provenance)
     requested_algebra_outputs = tuple(statement.name for statement in observable_block.lines)
     succeeded_names = set(finalized_algebra_scalars)
     succeeded_names.update(

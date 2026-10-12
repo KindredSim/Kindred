@@ -149,7 +149,10 @@ class ProjectPresentationState:
         # whichever physical axis happens to remain available now.  Keep it
         # through temporary mechanism/overlay gaps so result projection can
         # report the unavailable physical boundary without silently changing
-        # the user's scientific comparison to time.
+        # the user's scientific comparison to time.  A deleted dataset never
+        # returns, so its column falls back to time.
+        if isinstance(selected_x, ExperimentalAxisSelection) and selected_x.dataset_id not in datasets:
+            selected_x = SimulationSeriesAxisSelection("t")
         selected_y = tuple(
             selection
             for selection in self.selected_y_series

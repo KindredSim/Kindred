@@ -14,7 +14,7 @@ from kindred.core.datasets.observation_payload import created_dataset_payload
 from kindred.core.datasets.units import parse_measurement_unit, parse_time_unit
 from kindred.core.project_document import new_dataset_id
 from kindred.core.quantity_units import ONE_SCALE, conversion_scale, parse_unit
-from kindred.gui.display_name_policy import and_join
+from kindred.core.validation import and_join
 from kindred.gui.spreadsheet_formulas import compile_columns, formula_at_row, pattern_from_row, remap_pattern
 
 

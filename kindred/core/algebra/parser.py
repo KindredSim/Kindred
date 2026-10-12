@@ -267,16 +267,10 @@ class AlgebraBlock:
     """One immutable parsed Algebra program."""
 
     lines: Tuple[LetStatement, ...]
-    ast: Tuple[ExprNode, ...]
     evaluation_order: Tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         lines = tuple(self.lines)
-        ast = tuple(self.ast)
-        if len(lines) != len(ast):
-            raise ValueError("AlgebraBlock lines and AST must have identical length.")
-        if tuple(stmt.expr for stmt in lines) != ast:
-            raise ValueError("AlgebraBlock AST must match its retained statements.")
         names = tuple(str(statement.name) for statement in lines)
         if len(set(names)) != len(names):
             duplicate = next(name for name in names if names.count(name) > 1)
@@ -289,7 +283,6 @@ class AlgebraBlock:
                 "AlgebraBlock evaluation order must contain every assignment name exactly once."
             )
         object.__setattr__(self, "lines", lines)
-        object.__setattr__(self, "ast", ast)
         object.__setattr__(self, "evaluation_order", evaluation_order)
 
     def statements_in_evaluation_order(self) -> Tuple[LetStatement, ...]:
@@ -331,7 +324,6 @@ class Parser:
     # Entry: { let_stmt }
     def parse_block(self) -> AlgebraBlock:
         lines: List[LetStatement] = []
-        exprs: List[ExprNode] = []
 
         # Accept optional blank lines
         self._consume_newlines()
@@ -353,13 +345,11 @@ class Parser:
 
             stmt = LetStatement(name=name_tok.text, expr=expr, line=let_tok.line, col=let_tok.col, line_text=let_tok.line_text)
             lines.append(stmt)
-            exprs.append(expr)
 
             self._consume_newlines()
 
         return AlgebraBlock(
             lines=lines,
-            ast=exprs,
             evaluation_order=_topological_evaluation_order(tuple(lines)),
         )
 

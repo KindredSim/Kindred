@@ -15,6 +15,7 @@ from kindred.core.datasets.observation_mapping import (
     suggest_observation_mapping,
 )
 from kindred.core.quantity_units import MOLAR
+from kindred.core.validation import six_digit_text
 from kindred.gui.ui_helpers import clamp_initial_size, data_unit_labels, ignore_wheel
 
 
@@ -162,7 +163,7 @@ class ObservationMappingWidget(QtWidgets.QWidget):
         self._preview.setRowCount(len(values))
         for row, (name, value) in enumerate(values):
             texts = (
-                name, f"{0.0 if value is None else value:g} M",
+                name, f"{six_digit_text(0.0 if value is None else value)} M",
                 "No concentration supplied" if value is None else "From data",
             )
             for column, text in enumerate(texts):

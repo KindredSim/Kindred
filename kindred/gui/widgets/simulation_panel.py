@@ -147,10 +147,10 @@ class SimulationPanel(QtWidgets.QWidget):
         ignore_wheel(self.solver_method_combo)
         self.solver_method_combo.addItems(list(SUPPORTED_SOLVERS))
         self.solver_method_combo.setToolTip(SOLVER_TOOLTIP)
-        self.t_start_edit = self._number_edit("0.0", "Absolute Run start time")
-        self.t_end_edit = self._number_edit("10.0", "Absolute Run end time")
+        self.t_start_edit = self._number_edit("", "Absolute Run start time")
+        self.t_end_edit = self._number_edit("", "Absolute Run end time")
         self.points_edit = self._number_edit(
-            "100",
+            "",
             "Number of evenly spaced base samples over the completed interval, "
             "including both endpoints. Intervention boundary rows are additional. "
             "A stop at the start returns one sample.",

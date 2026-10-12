@@ -57,7 +57,7 @@ def lookup_source_coordinate_target(
     if requested not in namespace.source_coordinate_names:
         return None
     for entry in get_step_index_map(mechanism):
-        for raw_role, raw_name in (entry.get("source_coordinates") or {}).items():
+        for raw_role, raw_name in entry["source_coordinates"].items():
             if str(raw_name) != requested:
                 continue
             kind = str(entry["kind"])

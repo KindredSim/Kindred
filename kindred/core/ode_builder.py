@@ -23,6 +23,7 @@ from .equilibrium_rate_authority import (
 )
 from .mechanism import Equilibrium, FrozenDict, Mechanism, Reaction
 from .simulator.solver_types import (
+    SIMULATION_NONFINITE_MESSAGE,
     SimulationScientificUnavailability,
     _SimulationScientificUnavailabilitySignal,
 )
@@ -322,6 +323,7 @@ def _build_bound_ode_rhs(
                     SimulationScientificUnavailability(
                         producer="ode_builder",
                         stage="reversible_rate_logarithm",
+                        message=SIMULATION_NONFINITE_MESSAGE,
                         details=_runtime_dependency_details(
                             np.flatnonzero(np.isnan(log_f) | np.isnan(log_r))
                         ),
@@ -336,6 +338,7 @@ def _build_bound_ode_rhs(
                     SimulationScientificUnavailability(
                         producer="ode_builder",
                         stage="reversible_rate_difference",
+                        message=SIMULATION_NONFINITE_MESSAGE,
                         details=_runtime_dependency_details(
                             np.flatnonzero(unrepresentable)
                         ),
@@ -354,6 +357,7 @@ def _build_bound_ode_rhs(
                     SimulationScientificUnavailability(
                         producer="ode_builder",
                         stage="reversible_rate_difference",
+                        message=SIMULATION_NONFINITE_MESSAGE,
                         details=_runtime_dependency_details(
                             indices
                         ),

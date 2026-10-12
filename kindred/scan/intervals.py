@@ -65,15 +65,19 @@ def representable(low: Fraction, high: Fraction, lc: bool, uc: bool) -> Interval
     return Interval(a, b)
 
 
-def sample(intervals: tuple[Interval, ...], u: float, allocation: str) -> float:
-    """Map one unit sample directly into a union of feasible float intervals."""
+def sample(intervals: tuple[Interval, ...], u: float, allocation: str, log_scale: bool) -> float:
+    """Map one unit sample directly into a union of feasible float intervals.
+
+    Log scale spreads samples evenly in the logarithm of positive intervals.
+    """
     intervals = normalize(intervals)
     positive = tuple(i for i in intervals if i.lower < i.upper)
     if not positive:
         return intervals[min(int(u * len(intervals)), len(intervals) - 1)].lower
     # Isolated values are supplied through explicit endpoint faces.
     intervals = positive
-    widths = [Fraction(i.upper) - Fraction(i.lower) for i in intervals]
+    widths = [Fraction(math.log(i.upper)) - Fraction(math.log(i.lower)) if log_scale
+              else Fraction(i.upper) - Fraction(i.lower) for i in intervals]
     weights = widths if allocation == "width" else [Fraction(1)] * len(intervals)
     position = Fraction(u) * sum(weights)
     for item, weight in zip(intervals, weights):
@@ -81,6 +85,7 @@ def sample(intervals: tuple[Interval, ...], u: float, allocation: str) -> float:
             local = min(1.0, max(0.0, float(position / weight)))
             bounds = representable(Fraction(item.lower), Fraction(item.upper),
                                    item.include_lower, item.include_upper)
-            value = (1.0 - local) * bounds.lower + local * bounds.upper
+            value = (math.exp((1.0 - local) * math.log(bounds.lower) + local * math.log(bounds.upper))
+                     if log_scale else (1.0 - local) * bounds.lower + local * bounds.upper)
             return min(bounds.upper, max(bounds.lower, value))
         position -= weight

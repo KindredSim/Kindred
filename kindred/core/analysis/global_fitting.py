@@ -17,12 +17,11 @@ from kindred.core.analysis.fit_dataset_payload import FitDatasetSpec
 from kindred.core.analysis.fit_uncertainty import (
     ProfileLikelihoodConfig,
     ProfileLikelihoodResult,
-    ResidualBootstrapConfig,
-    ResidualBootstrapResult,
+    ProfileNoiseModel,
     profile_likelihood_settlement_result,
     profile_likelihood_result,
-    residual_bootstrap_settlement_result,
-    residual_bootstrap_result,
+    profile_noise_model,
+    undetermined_coordinates,
 )
 from kindred.core.analysis import global_fit_execution as _fit_execution
 from kindred.core.exceptions import (
@@ -57,26 +56,20 @@ def fit_global(
     ftol: float,
     xtol: float,
     seed: Optional[int] = None,
-    progress_callback: Optional[
-        Callable[[_fit_execution.FitProgress], None]
-    ] = None,
+    progress_callback: Callable[[_fit_execution.FitProgress], None],
     cancellation_check: Optional[Callable[[], bool]] = None,
     cancellation_control: SimulationCancellationControl | None = None,
-    stop_check: Optional[Callable[[], bool]] = None,
-    starting_facts: tuple[_fit_execution.DatasetFitInfo, ...] = (),
+    stop_check: Callable[[], bool],
+    starting_facts: tuple[_fit_execution.DatasetFitInfo, ...],
     profile_likelihood: ProfileLikelihoodConfig | None = None,
-    residual_bootstrap: ResidualBootstrapConfig | None = None,
-    extension_progress_callback: Optional[
-        Callable[[FitExtensionProgress], None]
-    ] = None,
+    extension_progress_callback: Callable[[FitExtensionProgress], None],
     optimizer_layout: _fit_execution.FitParameterLayout,
     executor: Executor,
-    optimizer_start: np.ndarray | None = None,
 ) -> _fit_execution.GlobalFitResult | ScientificUnavailable:
     """Fit immutable dataset captures through one evaluator per dataset.
 
-    ``optimizer_start`` overrides the layout's starting vector (in optimizer
-    coordinates) without changing the layout used to decode results.
+    After the fit, it checks for fitted values the data do not determine
+    within their bounds and runs the requested Profile likelihood.
     """
 
     # The Fit setup admits the method and evaluation budget (Fit defaults), and
@@ -109,27 +102,32 @@ def fit_global(
         )
 
     def active_cancelled() -> bool:
-        return hard_cancelled() or bool(stop_check is not None and stop_check())
+        return hard_cancelled() or stop_check()
 
     active_control = SimulationCancellationControl(
         lambda: bool(
             (cancellation_control is not None and cancellation_control.cancel_requested())
-            or (stop_check is not None and stop_check())
+            or stop_check()
         )
     )
-    try:
-        objective = _fit_execution.GlobalFitObjective(
+    def new_objective(
+        progress: Optional[Callable[[_fit_execution.FitProgress], None]] = None,
+    ) -> _fit_execution.GlobalFitObjective:
+        return _fit_execution.GlobalFitObjective(
             fit_evaluators=evaluators,
             payloads=payloads,
             dataset_params=fixed_dataset_params,
             weights=weights_norm,
             layout=layout,
             penalty_value=penalty_value,
-            progress_callback=progress_callback,
+            progress_callback=progress,
             cancellation_check=active_cancelled,
             cancellation_control=active_control,
             executor=executor,
         )
+
+    try:
+        objective = new_objective(progress_callback)
         if starting_facts:
             objective.retain_complete_candidate(layout.x0, starting_facts)
         keys = layout.opt_param_keys()
@@ -137,14 +135,7 @@ def fit_global(
         try:
             optimizer_result = fit_parameters(
                 objective,
-                (
-                    layout.initial_params()
-                    if optimizer_start is None
-                    else {
-                        key: float(optimizer_start[index])
-                        for index, key in enumerate(keys)
-                    }
-                ),
+                layout.initial_params(),
                 bounds=layout.bounds_dict(),
                 method=method,
                 max_nfev=max_nfev,
@@ -220,7 +211,7 @@ def fit_global(
                 if isinstance(result, ScientificUnavailable):
                     return result
         except (FittingCancelled, SimulationCancelled):
-            if hard_cancelled() or stop_check is None or not stop_check():
+            if hard_cancelled() or not stop_check():
                 raise
             retained_vector = objective.best_complete_vector
             if retained_vector is None:
@@ -245,25 +236,51 @@ def fit_global(
         # Post-fit methods receive a fresh objective without progress emission.
         # It retains the same evaluators, candidate/fatal taxonomy, coordinates,
         # normalized weights, cancellation owner, and immutable captures.
-        terminal_objective = _fit_execution.GlobalFitObjective(
-            fit_evaluators=evaluators,
-            payloads=payloads,
-            dataset_params=fixed_dataset_params,
-            weights=weights_norm,
-            layout=layout,
-            penalty_value=penalty_value,
-            progress_callback=None,
-            cancellation_check=active_cancelled,
-            cancellation_control=active_control,
-            executor=executor,
-        )
+        terminal_objective = new_objective()
         profile_result: ProfileLikelihoodResult | None = None
-        bootstrap_result: ResidualBootstrapResult | None = None
         optional_analysis_stopped = primary_stopped
         terminal_parameters = {
             key: float(vector[index])
             for index, key in enumerate(keys)
         }
+        base_residuals = np.concatenate(
+            [info.weighted_residuals for info in result.dataset_info]
+        )
+        base_residuals.setflags(write=False)
+        # The noise model and the bound check evaluate on their own objective,
+        # so their probes never change the penalty scale Profile refits use.
+        noise = None
+        noise_failure: Exception | None = None
+        undetermined: tuple[_fit_execution.FitCoordinate, ...] = ()
+        if not primary_stopped:
+            try:
+                # The post-fit stage starts here, so the progress says so
+                # before the noise model and the bound check run.
+                extension_progress_callback(FitExtensionProgress(status="running", stage="primary_complete"))
+                analysis_objective = new_objective()
+                noise = profile_noise_model(
+                    objective=analysis_objective, vector=vector, keys=keys,
+                    bounds=layout.bounds_dict(), dataset_info=result.dataset_info,
+                )
+                if noise is not None and noise.cutoffs:
+                    undetermined = undetermined_coordinates(
+                        objective=analysis_objective, vector=vector, keys=keys,
+                        bounds=layout.bounds_dict(),
+                        base_residuals=base_residuals, cutoffs=noise.cutoffs,
+                    )
+            except (FittingCancelled, SimulationCancelled):
+                if hard_cancelled():
+                    raise
+                optional_analysis_stopped = True
+                noise = None
+                undetermined = ()
+            except Exception as exc:
+                # A fatal evaluation next to the estimate leaves the fit itself
+                # intact; Profile then reports the actual cause.
+                logger.warning("Fit noise model could not be estimated.", exc_info=True)
+                noise_failure = exc
+                noise = None
+                undetermined = ()
         # A parameter group's public uncertainty target is moved by the
         # optimizer as its coupled variable; analyses see the group identity.
         group_targets = {
@@ -271,34 +288,31 @@ def fit_global(
                 "coupled",
                 _fit_execution.parameter_group_variable_id(coordinate.name, coordinate.dataset_id),
             ): coordinate
-            for analysis in (profile_likelihood, residual_bootstrap)
-            if analysis is not None
-            for coordinate in analysis.parameter_names
+            for coordinate in (
+                () if profile_likelihood is None else profile_likelihood.parameter_names
+            )
             if coordinate.scope == "group"
         }
         optimizer_keys = {target: key for key, target in group_targets.items()}
-        # Profile and Bootstrap refit by least squares.  After Differential
-        # Evolution, whose ftol is its population tolerance, they use the
-        # least-squares default tolerances.
+        # Profile refits by least squares.  After Differential Evolution, whose
+        # ftol is its population tolerance, it uses the least-squares default
+        # tolerances.
         refit_ftol, refit_xtol = (
             (LEAST_SQUARES_TOLERANCE, LEAST_SQUARES_TOLERANCE)
             if method == "differential_evolution" else (ftol, xtol)
         )
         if profile_likelihood is not None:
-            base_residuals = np.concatenate(
-                [info.weighted_residuals for info in result.dataset_info]
-            )
-            base_residuals.setflags(write=False)
-            # Each measured-X row's curve location is fitted alongside the
-            # optimizer coordinates.
-            fitted_value_count = len(keys) + sum(
-                len(info.x_projection.source_rows)
-                for info in result.dataset_info
-                if info.x_projection is not None
-            )
+            not_started = optional_analysis_stopped
             try:
-                if primary_stopped:
+                if not_started:
                     raise FittingCancelled("Profile likelihood was not started after Fit stopped.")
+                if noise_failure is not None:
+                    raise noise_failure
+                if noise is None:
+                    raise ValueError(
+                        "The noise of the data could not be estimated, because a candidate "
+                        "next to the estimate is scientifically unavailable."
+                    )
                 profile_result = profile_likelihood_result(
                     objective=terminal_objective,
                     initial_parameters={
@@ -316,12 +330,14 @@ def fit_global(
                     ftol=refit_ftol,
                     xtol=refit_xtol,
                     base_residuals=base_residuals,
-                    fitted_value_count=fitted_value_count,
+                    noise=ProfileNoiseModel(noise.blocks, {
+                        group_targets.get(key, key): cutoff for key, cutoff in noise.cutoffs.items()
+                    }),
+                    undetermined=frozenset(group_targets.get(key, key) for key in undetermined),
                     cancellation_check=active_cancelled,
                     progress_callback=extension_progress_callback,
                 )
             except (FittingCancelled, SimulationCancelled) as exc:
-                optional_analysis_stopped = True
                 stop_cause = factual_cause_from_exception(
                     exc,
                     domain="fit",
@@ -331,8 +347,6 @@ def fit_global(
                     config=profile_likelihood,
                     status="stopped",
                     cause=stop_cause,
-                    observation_count=int(base_residuals.size),
-                    fitted_value_count=fitted_value_count,
                 )
             except Exception as exc:
                 profile_result = profile_likelihood_settlement_result(
@@ -343,109 +357,28 @@ def fit_global(
                         domain="fit",
                         origin="profile_likelihood",
                     ),
-                    observation_count=int(base_residuals.size),
-                    fitted_value_count=fitted_value_count,
                 )
 
-            if primary_stopped:
+            if not_started:
                 profile_result = replace(
                     profile_result,
                     provenance={**profile_result.provenance, "settlement": "not_started_after_stop"},
                 )
+            if noise is not None:
+                profile_result = replace(profile_result, noise_blocks=noise.blocks)
 
-        if residual_bootstrap is not None:
-            def refit_bootstrap(
-                synthetic_payloads: Sequence[FitDatasetSpec],
-            ) -> _fit_execution.GlobalFitResult | ScientificUnavailable:
-                return fit_global(
-                    fit_evaluators=evaluators,
-                    datasets=synthetic_payloads,
-                    dataset_overrides=overrides,
-                    weights=weights_norm,
-                    method=residual_bootstrap.optimizer_method,
-                    max_nfev=max_nfev,
-                    ftol=refit_ftol,
-                    xtol=refit_xtol,
-                    progress_callback=None,
-                    extension_progress_callback=None,
-                    cancellation_check=active_cancelled,
-                    cancellation_control=active_control,
-                    optimizer_layout=layout,
-                    executor=executor,
-                    # Bootstrap refits start from the converged primary fit.
-                    optimizer_start=vector,
-                )
-
-            if optional_analysis_stopped:
-                bootstrap_result = residual_bootstrap_settlement_result(
-                    config=residual_bootstrap,
-                    payloads=payloads,
-                    status="stopped",
-                    settlement="not_started_after_stop",
-                    cause=factual_cause_from_exception(
-                        FittingCancelled(
-                            "Bootstrap was not started after post-fit processing stopped."
-                        ),
-                        domain="fit",
-                        origin="bootstrap",
-                    ),
-                )
-            else:
-                try:
-                    bootstrap_result = residual_bootstrap_result(
-                        terminal_result=result,
-                        payloads=payloads,
-                        config=residual_bootstrap,
-                        refit=refit_bootstrap,
-                        group_member_ids={
-                            target: next(
-                                spec.dataset_ids[0]
-                                for spec in layout.coupled_var_order
-                                if spec.variable_id == key.name
-                            )
-                            for key, target in group_targets.items()
-                        },
-                        cancellation_check=active_cancelled,
-                        progress_callback=extension_progress_callback,
-                    )
-                except (FittingCancelled, SimulationCancelled) as exc:
-                    bootstrap_result = residual_bootstrap_settlement_result(
-                        config=residual_bootstrap,
-                        payloads=payloads,
-                        status="stopped",
-                        settlement="stopped",
-                        cause=factual_cause_from_exception(
-                            exc, domain="fit", origin="bootstrap"
-                        ),
-                    )
-                except Exception as exc:
-                    bootstrap_result = residual_bootstrap_settlement_result(
-                        config=residual_bootstrap,
-                        payloads=payloads,
-                        status="failed",
-                        settlement="failed",
-                        cause=factual_cause_from_exception(
-                            exc,
-                            domain="fit",
-                            origin="bootstrap",
-                        ),
-                    )
-
-        analysis_messages = []
-        for label, analysis in (
-            ("Profile likelihood", profile_result), ("Residual bootstrap", bootstrap_result)
-        ):
-            if analysis is not None and analysis.status == "stopped":
-                analysis_messages.append(
-                    f"{label} was not started after Stop."
-                    if analysis.provenance.get("settlement") == "not_started_after_stop"
-                    else f"{label} stopped."
-                )
+        message = result.message
+        if profile_result is not None and profile_result.status == "stopped":
+            message += (
+                " Profile likelihood was not started after Stop."
+                if profile_result.provenance.get("settlement") == "not_started_after_stop"
+                else " Profile likelihood stopped."
+            )
         result = replace(
             result,
-            message=" ".join((result.message, *analysis_messages)),
+            message=message,
             profile_likelihood_result=profile_result,
-            residual_bootstrap_result=bootstrap_result,
+            undetermined_values=undetermined,
         )
         if hard_cancelled():
             raise FittingCancelled()

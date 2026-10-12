@@ -18,8 +18,8 @@ class ScientificUnavailable:
 
     producer: str
     stage: str
+    factual_cause: FactualCause
     details: Mapping[str, object] = field(default_factory=dict)
-    factual_cause: FactualCause | None = None
 
     def __post_init__(self) -> None:
         # Producers name themselves and their stage with literals.

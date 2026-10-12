@@ -241,7 +241,7 @@ class SymbolicCalculatorOwner(QtCore.QObject):
                 return self._snapshot, True, ""
             schedule = prepared.parameterized_intervention_schedule_for_binding()
             intervention = prepared.intervention_execution_contract()
-            if schedule is not None or intervention is not None and not intervention.is_empty:
+            if schedule is not None or not intervention.is_empty:
                 return None, False, "Calculator does not support intervention schedules."
             mechanism = prepared.mutable_mechanism_shell()
             available, reason = symbolic_calculator_available(mechanism)

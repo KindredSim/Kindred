@@ -12,6 +12,7 @@ class InputRange:
     intervals: tuple[Interval, ...]
     allocation: Literal["width", "equal"] = "width"
     endpoints: tuple[float, ...] = ()
+    log_scale: bool = False
 
 
 @dataclass(frozen=True)

@@ -34,12 +34,18 @@ class SimulationCancellationControl:
         return bool(self.poll())
 
 
+# The one sentence for a simulation that produced nonfinite values, in Run
+# and as a Fit candidate's cause.
+SIMULATION_NONFINITE_MESSAGE = "Simulation produced nonfinite values."
+
+
 @dataclass(frozen=True, slots=True)
 class SimulationScientificUnavailability:
     """Immutable simulation-owned result for candidate-only unavailable science."""
 
     producer: str
     stage: str
+    message: str
     details: Mapping[str, object] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -109,6 +115,9 @@ class SimulationRequest:
     species_names: Optional[Tuple[str, ...]] = None
     cancellation_control: SimulationCancellationControl | None = None
     candidate_evaluation: bool = False
+    # Also return the solver's accepted steps as rows, so the curve between
+    # rows is a straight line across one solver step (measured-X Fit).
+    sample_solver_steps: bool = False
     stop_observable_value: Callable[[str, float, np.ndarray, float], float] | None = None
     parameter_values_at_temperature: Callable[[float, tuple[str, ...]], Mapping[str, float]] | None = None
 

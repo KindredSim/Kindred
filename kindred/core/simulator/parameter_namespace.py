@@ -4,6 +4,8 @@ from dataclasses import dataclass
 import re
 from typing import Iterator, Sequence
 
+from kindred.core.validation import and_join
+
 
 _PROTECTED_INDEXED_IDENTIFIER_RE = re.compile(r"^(?:k|kf|kr|keq)([1-9]\d*)$")
 
@@ -31,13 +33,6 @@ class MechanismSourceCoordinateInfo:
 class MechanismParameterResolution:
     raw_name: str
     canonical_name: str | None = None
-
-
-@dataclass(frozen=True)
-class InvalidProtectedIndexedIdentifier:
-    raw_name: str
-    step_index: int
-    suggested_names: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -81,52 +76,21 @@ class MechanismParameterNamespace:
 
         return MechanismParameterResolution(raw_name=name)
 
-    def invalid_protected_indexed_identifier(self, raw_name: str) -> InvalidProtectedIndexedIdentifier | None:
-        if self.resolve(str(raw_name)).canonical_name is not None:
-            return None
-        match = _protected_indexed_identifier_match(raw_name)
-        if match is None:
-            return None
-        return self._invalid_indexed_identifier_match(raw_name, match.group(1))
-
     def invalid_protected_indexed_identifier_message(self, raw_name: str) -> str | None:
-        invalid = self.invalid_protected_indexed_identifier(raw_name)
-        if invalid is None:
+        """The sentence for a reserved k, kf, kr or Keq name that names no parameter here."""
+        name = str(raw_name)
+        step_index = protected_indexed_identifier_step_index(name)
+        if step_index is None or self.resolve(name).canonical_name is not None:
             return None
-        names = ", ".join(invalid.suggested_names)
-        return (
-            f"{invalid.raw_name!r} is reserved for reaction parameters, and the parameters of that step are {names}."
-            if names
-            else f"{invalid.raw_name!r} is reserved for a reaction parameter, and this mechanism has none by that name."
-        )
-
-    def _invalid_indexed_identifier_match(
-        self,
-        raw_name: str,
-        step_index_text: str,
-    ) -> InvalidProtectedIndexedIdentifier | None:
-        # The identifier pattern guarantees an integer step index.
-        step_index = int(step_index_text)
-        suggestions = tuple(
-            name
-            for lookup in (f"k{step_index}", f"kf{step_index}", f"kr{step_index}", f"keq{step_index}")
-            for name in [
-                next(
-                    (
-                        canonical
-                        for canonical in self.canonical_names
-                        if canonical.casefold() == lookup.casefold()
-                    ),
-                    None,
-                )
-            ]
-            if name is not None
-        )
-        return InvalidProtectedIndexedIdentifier(
-            raw_name=str(raw_name),
-            step_index=int(step_index),
-            suggested_names=suggestions,
-        )
+        names = tuple(dict.fromkeys(
+            item.canonical_name
+            for item in (*(entry.info for entry in self.ordered_items), *self.source_coordinates)
+            if item.step_index == step_index
+        ))
+        if not names:
+            return f"{name} is reserved for reaction parameters, and this mechanism has no step {step_index}."
+        return (f"{name} is reserved for reaction parameters; "
+                f"the parameters of step {step_index} are {and_join(names)}.")
 
 
 @dataclass(frozen=True)
@@ -137,10 +101,6 @@ class _NamespaceStepDescriptor:
     source_coordinates: tuple[tuple[str, str], ...] = ()
 
 
-def is_protected_indexed_identifier(raw_name: str) -> bool:
-    return _protected_indexed_identifier_match(raw_name) is not None
-
-
 def protected_indexed_identifier_step_index(raw_name: str) -> int | None:
     match = _protected_indexed_identifier_match(raw_name)
     if match is None:
@@ -149,10 +109,10 @@ def protected_indexed_identifier_step_index(raw_name: str) -> int | None:
 
 
 def _protected_indexed_identifier_match(raw_name: str) -> re.Match[str] | None:
-    """Recognize protected indexed spellings for diagnostics only.
+    """Recognize the reserved indexed reaction-parameter names, any case.
 
-    Resolution itself remains exact-case.  Folding here only lets diagnostics
-    identify a misspelled protected name and offer its exact canonical form.
+    Resolution itself remains exact-case.  Folding here reserves every case
+    spelling, so a param or let line cannot declare K1 beside k1.
     """
 
     return _PROTECTED_INDEXED_IDENTIFIER_RE.fullmatch(

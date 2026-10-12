@@ -32,11 +32,11 @@ class _RunSettingsFields:
         self.solver_combo = QtWidgets.QComboBox(parent)
         self.solver_combo.addItems(list(SUPPORTED_SOLVERS))
         self.solver_combo.setToolTip(SOLVER_TOOLTIP)
-        self.t_start_edit = self._time_edit(parent, "0", "Absolute Run start time")
-        self.t_end_edit = self._time_edit(parent, "10", "Absolute Run end time")
+        self.t_start_edit = self._time_edit(parent, "", "Absolute Run start time")
+        self.t_end_edit = self._time_edit(parent, "", "Absolute Run end time")
         self.points_edit = self._time_edit(
             parent,
-            "100",
+            "",
             "Number of evenly spaced base samples over the completed interval, "
             "including both endpoints. Intervention boundary rows are additional. "
             "A stop at the start returns one sample.",

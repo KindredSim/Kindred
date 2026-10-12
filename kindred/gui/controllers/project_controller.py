@@ -11,6 +11,7 @@ from enum import Enum
 from PySide6 import QtCore, QtWidgets
 
 from kindred.core.project_document import ProjectDocument
+from kindred.core.validation import and_join
 from kindred.core.project_presentation_state import (
     WorkspacePresentationState,
     default_workspace_presentation_state,
@@ -379,18 +380,7 @@ class ProjectController(QtCore.QObject):
             discard_parts.append("Invalid Edit(s)")
         if transient.slider_drafts:
             discard_parts.append("Slider Preview")
-        if not discard_parts:
-            discard_subject = ""
-        elif len(discard_parts) == 1:
-            discard_subject = discard_parts[0]
-        elif len(discard_parts) == 2:
-            discard_subject = " and ".join(discard_parts)
-        else:
-            discard_subject = (
-                ", ".join(discard_parts[:-1])
-                + ", and "
-                + discard_parts[-1]
-            )
+        discard_subject = and_join(discard_parts)
         if request.application_close:
             if transient.has_active_work:
                 discard_label = (

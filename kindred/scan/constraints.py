@@ -18,7 +18,7 @@ from kindred.core.algebra.evaluator import EvaluationContext, evaluate_block
 from kindred.core.simulation_parameters import enumerate_simulation_parameters
 from kindred.core.quantity_units import conversion_scale, convert_value, presentation_unit
 import numpy as np
-from kindred.scan.config import START, END, ScanConfig, initial_key, input_label, parameter_key
+from kindred.scan.config import START, END, InputRange, ScanConfig, initial_key, input_label, parameter_key
 from kindred.scan.intervals import Interval, normalize, representable, sample
 
 
@@ -200,7 +200,6 @@ class IntervalChecks:
 
     def __init__(self, prepared, config, first_keys=None):
         conditions = tuple(c for c in config.constraints if c.condition == "range")
-        self.species = set(prepared.analysis.species_names)
         self.blocks = {}
         if not conditions:
             return
@@ -248,13 +247,13 @@ class IntervalChecks:
         for early, (selected, names) in groups.items():
             if selected:
                 lines = tuple(statement for name, statement in statements.items() if name in names)
-                self.blocks[early] = AlgebraBlock(lines, tuple(s.expr for s in lines)), tuple(selected)
+                self.blocks[early] = AlgebraBlock(lines), tuple(selected)
 
     def admit(self, values, *, first_group=False):
         if first_group not in self.blocks:
             return
         block, conditions = self.blocks[first_group]
-        context = EvaluationContext(t=np.array([0.0]), species_series={}, species_names=self.species,
+        context = EvaluationContext(t=np.array([0.0]), species_series={},
                                     initials={k.removeprefix("initial:"): v for k, v in values.items() if k.startswith("initial:")},
                                     symtab=SymbolTable(),
                                     symbol_values={k.removeprefix("parameter:"): convert_value(v, self.input_units[k.removeprefix("parameter:")], self.quantity_units[k.removeprefix("parameter:")]) for k, v in values.items() if k.startswith("parameter:")})
@@ -393,7 +392,7 @@ class FeasibleSpace:
             raise ValueError(f"No representable feasible value exists for {input_label(key)}.")
         return normalize(tuple(intervals))
 
-    def draw(self, units: dict[str, float], allocations: dict[str, str]) -> dict[str, float]:
+    def draw(self, units: dict[str, float], selections: dict[str, InputRange]) -> dict[str, float]:
         values = {}
         for index, key in enumerate(self.keys):
             self.check()
@@ -428,7 +427,8 @@ class FeasibleSpace:
                         pass
             if not intervals:
                 raise InputGenerationError(f"No representable feasible value remains for {input_label(key)}.", values)
-            values[key] = sample(tuple(intervals), units[key], allocations[key])
+            selection = selections[key]
+            values[key] = sample(tuple(intervals), units[key], selection.allocation, selection.log_scale)
         return values
 
 

@@ -80,14 +80,14 @@ def finite_positive_mean_normalize(
     }
 
 
-def finite_sum_of_squares(values: Iterable[object]) -> Optional[float]:
-    """Return a finite SSE, or ``None`` when the exact float result overflows."""
+def finite_sum_of_squares(values: Iterable[object]) -> float:
+    """Return the SSE, or ``inf`` when it is not a finite float."""
 
     array = np.asarray(tuple(values), dtype=float).reshape(-1)
     if array.size == 0:
         return 0.0
     if not np.all(np.isfinite(array)):
-        return None
+        return math.inf
     maximum = float(np.max(np.abs(array)))
     if maximum == 0.0:
         return 0.0
@@ -95,9 +95,8 @@ def finite_sum_of_squares(values: Iterable[object]) -> Optional[float]:
         float(value / maximum) ** 2 for value in array
     )
     if maximum > math.sqrt(np.finfo(float).max / scaled_square_sum):
-        return None
-    result = (maximum * maximum) * scaled_square_sum
-    return float(result) if math.isfinite(result) else None
+        return math.inf
+    return float((maximum * maximum) * scaled_square_sum)
 
 
 def root_mean_square(residuals: object) -> FitMetric:

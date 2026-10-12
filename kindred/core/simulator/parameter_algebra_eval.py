@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 
-from kindred.core.algebra.errors import AlgebraError
+from kindred.core.algebra.errors import UNCOMPUTABLE_ERRORS, AlgebraError
 from kindred.core.algebra.evaluator import bind_scalar_expression_evaluator
 from kindred.core.exceptions import ErrorContext, KineticRuntimeDomainError
 from kindred.core.mechanism_metadata import MechanismMetadataView
@@ -62,20 +62,6 @@ def bind_parameter_evaluation(
         elif name in spec.chemistry_dependencies:
             operations[name] = bind_chemistry_readout(mechanism, targets[name], values)
 
-    def dependencies(name: str) -> tuple[str, ...]:
-        result = set()
-
-        def visit(current):
-            deps = graph.get(current, ())
-            if not deps:
-                result.add(current)
-            else:
-                for dependency in deps:
-                    visit(dependency)
-
-        visit(name)
-        return tuple(sorted(result))
-
     input_units = dict(spec.input_units)
 
     def calculate(name: str, operation, *, check: bool = False) -> None:
@@ -85,6 +71,20 @@ def bind_parameter_evaluation(
                 _admit_coordinate_value(mechanism, name, value, targets[name], unit=input_units[name].symbol)
             if not check:
                 values[name] = value
+        except (*UNCOMPUTABLE_ERRORS, ArithmeticError, ValueError) as exc:
+            # A value its formula cannot compute is outside its domain, like
+            # one it computes but refuses.  The refusal is shown on the line
+            # that calculates the value: its param line, else its reaction line.
+            statement = statements.get(name)
+            entry = targets[name][4] if statement is None else None
+            raise KineticRuntimeDomainError(
+                str(exc),
+                parameter_names=spec.input_dependencies((name,)),
+                details={"assignment": name, "value_dependencies": spec.input_dependencies((name,))},
+                context=(ErrorContext(line=statement.line, line_text=statement.line_text)
+                         if statement is not None
+                         else ErrorContext(line=entry["line"], line_text=entry["line_text"])),
+            ) from exc
         except AlgebraError as exc:
             error = DSLError(
                 str(exc),
@@ -93,23 +93,10 @@ def bind_parameter_evaluation(
             )
             error.details.update(
                 assignment=name,
-                value_dependencies=dependencies(name),
-                parameter_names=dependencies(name),
+                value_dependencies=spec.input_dependencies((name,)),
+                parameter_names=spec.input_dependencies((name,)),
             )
             raise error from exc
-        except (ArithmeticError, ValueError) as exc:
-            # The refusal is shown on the line that calculates the value: its
-            # param line, else its reaction line.
-            statement = statements.get(name)
-            entry = targets[name][4] if statement is None else None
-            raise KineticRuntimeDomainError(
-                str(exc),
-                parameter_names=dependencies(name),
-                details={"assignment": name, "value_dependencies": dependencies(name)},
-                context=(ErrorContext(line=statement.line, line_text=statement.line_text)
-                         if statement is not None
-                         else ErrorContext(line=entry["line"], line_text=entry["line_text"])),
-            ) from exc
 
     dynamic = set(operations) & spec.temperature_dependent_names
     check_dependencies = {

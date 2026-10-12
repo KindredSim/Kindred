@@ -977,7 +977,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self,
         tab_id: str,
         *,
-        preserve_reactions_editor: bool = False,
         preserve_slider_editor_drafts: bool = True,
     ) -> None:
         """Refresh one tab's controls, sliders, data views, and results."""
@@ -988,35 +987,15 @@ class MainWindow(QtWidgets.QMainWindow):
         tab = self._workspace_tab_registry.tab(target)
         presentation = self._workspace_tab_registry.presentation(target)
         try:
-            if not preserve_reactions_editor:
-                bundle.editor_binding.apply_render_projection(
-                    bundle.editor_binding.prepare_render()
-                )
-            bundle.initial_actions.apply_render_projection(
-                bundle.initial_actions.prepare_render()
-            )
+            bundle.editor_binding.render()
+            bundle.initial_actions.render()
             bundle.simulation_panel.render_run_defaults(
                 tab.run_defaults,
                 simulation_job_kind=self._simulation_jobs.current_kind,
             )
-            try:
-                slider_projection = bundle.slider_binding.prepare_render()
-                bundle.slider_binding.apply_render_projection(
-                    slider_projection,
-                    preserve_editor_drafts=preserve_slider_editor_drafts,
-                )
-                bundle.slider_binding.settle_render_projection(slider_projection)
-            finally:
-                bundle.slider_binding.publish_slider_draft_state()
+            bundle.slider_binding.render(preserve_editor_drafts=preserve_slider_editor_drafts)
             self._render_dataset_panels(bundle, document, tab, presentation)
-            target_names = tuple(
-                tab.initial_condition_set(set_id).name
-                for set_id in slider_projection.targets
-            )
-            bundle.editor.set_slider_edit_targets_summary(
-                "Initial-condition sets: "
-                + (", ".join(target_names) if target_names else "none")
-            )
+            self._refresh_slider_target_summary(target, bundle.slider_binding.resolve_target_set_ids())
             self._refresh_symbolic_calculator(target)
         finally:
             try:
@@ -1354,7 +1333,6 @@ class MainWindow(QtWidgets.QMainWindow):
         target = tab.initial_condition_set(str(set_id))
         return build_explicit_target(
             prepared_dsl=tab.prepared_dsl,
-            tab_id=tab.tab_id,
             set_id=target.set_id,
             set_name=target.name,
             initial_values=canonical_initial_values(tab, target.set_id),
@@ -1387,7 +1365,6 @@ class MainWindow(QtWidgets.QMainWindow):
     def _publish_source_proposal(
         self,
         tab_id: str,
-        visible: MechanismAuthoringSource,
         proposal: MechanismSourceReconciliation,
         *,
         expected_token: ProjectContentToken,
@@ -1397,10 +1374,6 @@ class MainWindow(QtWidgets.QMainWindow):
 
         tab_id = str(tab_id)
         runtime = self._workspace_tab_registry.tab_runtime(tab_id)
-        # An external source (template, preset, example) supersedes the visible
-        # draft instead of rewriting it; decide before publication so nothing
-        # after the publication can return early.
-        rewrite_visible_draft = runtime.reactions_draft is visible
         result = self._workspace_tab_registry.replace_document(
             proposal.proposed_document,
             expected_token=expected_token,
@@ -1408,12 +1381,6 @@ class MainWindow(QtWidgets.QMainWindow):
         if result is None:
             return None
         proposed_tab = proposal.proposed_document.tab(tab_id)
-        bundle = self._tab_surfaces[tab_id]
-        if rewrite_visible_draft:
-            bundle.editor_binding.apply_accepted_source_rewrite(
-                visible,
-                proposed_tab.mechanism_source,
-            )
         self._activate_materialized_set(tab_id, proposal.materialized_set_ids)
         runtime.reactions_draft = None
         valid_species = set(canonical_species_names(proposed_tab))
@@ -1430,11 +1397,7 @@ class MainWindow(QtWidgets.QMainWindow):
             and any(species in valid_species for species in values)
         }
         if refresh_after_admission:
-            bundle.editor_binding.render()
-            self._refresh_tab_controls(
-                tab_id,
-                preserve_reactions_editor=True,
-            )
+            self._refresh_tab_controls(tab_id)
         return result
 
     def _tab_has_drafts(self, tab_id: str) -> bool:
@@ -2029,16 +1992,16 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         published = self._publish_source_proposal(
             target,
-            visible_source,
             source_proposal,
             expected_token=capture_token,
         )
         if published is None:
+            self.set_status_text("The project changed during the confirmation, so Run did not start. Click Run again.")
             return False
         self._clear_settled_input_drafts(
             (target,), candidate, selected_by_tab={target: selected}
         )
-        self._refresh_tab_controls(target, preserve_reactions_editor=True)
+        self._refresh_tab_controls(target)
         bundle.slider_binding.cancel_pending_preview_intent()
         return bool(self._simulation_jobs.start_run(capture))
 
@@ -2149,24 +2112,10 @@ class MainWindow(QtWidgets.QMainWindow):
     ) -> ProjectContentToken | None:
         """Semantically admit one exact save candidate before archive output."""
 
-        captured_reaction_drafts: list[
-            tuple[str, MechanismAuthoringSource]
-        ] = []
-        for tab in document.tabs:
-            runtime = self._workspace_tab_registry.tab_runtime(tab.tab_id)
-            draft = runtime.reactions_draft
-            if draft is None:
-                continue
-            if self._tab_surfaces[tab.tab_id].editor.reactions_text() != (
-                draft.reactions_text
-            ):
-                # The save candidate was prepared from a stale visible draft;
-                # do not publish a canonical replacement that cannot be
-                # represented by one exact native editor edit.
-                return None
-            captured_reaction_drafts.append((tab.tab_id, draft))
         refresh_tab_ids = tuple(
-            tab_id for tab_id, _draft in captured_reaction_drafts
+            tab.tab_id
+            for tab in document.tabs
+            if self._workspace_tab_registry.tab_runtime(tab.tab_id).reactions_draft is not None
         )
         result = self._workspace_tab_registry.replace_document(
             document,
@@ -2179,14 +2128,6 @@ class MainWindow(QtWidgets.QMainWindow):
             document,
             discard_invalid=True,
         )
-        for tab_id, visible_draft in captured_reaction_drafts:
-            tab = document.tab(tab_id)
-            self._tab_surfaces[
-                tab_id
-            ].editor_binding.apply_accepted_source_rewrite(
-                visible_draft,
-                tab.mechanism_source,
-            )
         # The published candidate consumed every Reactions and Notes draft;
         # clear them here so a later archive-write failure cannot leave them.
         for tab in document.tabs:
@@ -2197,10 +2138,7 @@ class MainWindow(QtWidgets.QMainWindow):
         for tab_id, materialized_ids in materialized_by_tab:
             self._activate_materialized_set(tab_id, materialized_ids)
         for tab_id in refresh_tab_ids:
-            self._refresh_tab_controls(
-                tab_id,
-                preserve_reactions_editor=True,
-            )
+            self._refresh_tab_controls(tab_id)
         self._refresh_project_state()
         return result
 
@@ -2386,13 +2324,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._slider_apply_refreshing.add(target)
         try:
             bundle.initial_actions.capture_active_editor()
-            visible_source = self._visible_source_for_tab(target)
             if not bundle.slider_binding.apply():
                 return False
-            bundle.editor_binding.apply_accepted_source_rewrite(
-                visible_source,
-                self._workspace_tab_registry.tab(target).mechanism_source,
-            )
             self._workspace_tab_registry.tab_runtime(target).reactions_draft = None
         finally:
             self._slider_apply_refreshing.discard(target)
@@ -2444,12 +2377,12 @@ class MainWindow(QtWidgets.QMainWindow):
 
         result = self._publish_source_proposal(
             tab_id,
-            visible,
             proposal,
             expected_token=expected_token,
             refresh_after_admission=refresh_after_admission,
         )
         if result is None and proposal.proposed_document != document:
+            self.set_status_text(f"The project changed during the confirmation, so {description} did not complete. Try again.")
             return None
         if refresh_after_admission and result is None:
             self._refresh_project_state()
@@ -2492,7 +2425,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self,
         *,
         assessment: ExactCorrectionAssessment,
-        visible_source: MechanismAuthoringSource | None = None,
+        visible_source: MechanismAuthoringSource,
         action: str,
     ) -> MechanismAuthoringSource | None:
         """Show one local synchronous Accept/Cancel source review."""
@@ -2502,17 +2435,11 @@ class MainWindow(QtWidgets.QMainWindow):
         dialog.setWindowTitle(f"Review Exact Correction — {action}")
         layout = QtWidgets.QVBoxLayout(dialog)
         explanation = (
-            "Your mechanism contains reversible cycles without a closure. A valid mechanism "
-            "requires that one of the parameters in each cycle is defined in terms of the "
-            "other parameters in that cycle."
+            "A valid mechanism defines one parameter in each reversible cycle in terms of "
+            "the other parameters in that cycle."
         )
         if assessment.proposal is not None:
-            explanation += (
-                " Accept adds the lines shown at the bottom, or use Choose Dependent "
-                "Parameters… to pick which parameters are defined instead."
-                if visible_source is not None
-                else " Accept adds the lines shown at the bottom."
-            )
+            explanation += " To define different parameters, click Choose Dependent Parameters."
         label = QtWidgets.QLabel(explanation, dialog)
         label.setWordWrap(True)
         layout.addWidget(label)
@@ -2524,7 +2451,6 @@ class MainWindow(QtWidgets.QMainWindow):
         buttons.addButton(QtWidgets.QDialogButtonBox.StandardButton.Cancel)
         if assessment.proposal is not None:
             buttons.addButton("Accept", QtWidgets.QDialogButtonBox.ButtonRole.AcceptRole)
-        if assessment.proposal is not None and visible_source is not None:
             choose_button = buttons.addButton(
                 "Choose Dependent Parameters…",
                 QtWidgets.QDialogButtonBox.ButtonRole.ActionRole,
@@ -3260,7 +3186,9 @@ class MainWindow(QtWidgets.QMainWindow):
             candidate = candidate.replace_tab(mapped)
             if not self._mutation_input_admitted("Create from Data"):
                 return
-            self._workspace_tab_registry.replace_document(candidate, expected_token=token)
+            if self._workspace_tab_registry.replace_document(candidate, expected_token=token) is None:
+                QtWidgets.QMessageBox.warning(editor, "Create from Data", "The project changed during the review, so nothing was created. Click Review and Create again.")
+                return
         except (ValueError, TypeError, KeyError) as exc:
             QtWidgets.QMessageBox.warning(editor, "Create from Data", str(exc))
             return
@@ -3418,8 +3346,10 @@ class MainWindow(QtWidgets.QMainWindow):
                 candidate_tab,
                 expected_token=expected_token,
             )
-            if result is not None:
-                changed = result != expected_token
+            if result is None:
+                QtWidgets.QMessageBox.warning(self, "Dataset Mapping", "The project changed while this dialog was open, so the mapping was not applied. Map the dataset again.")
+                return
+            changed = result != expected_token
         except Exception as exc:
             QtWidgets.QMessageBox.warning(self, "Dataset Mapping", str(exc))
         if not changed:
@@ -3472,8 +3402,10 @@ class MainWindow(QtWidgets.QMainWindow):
                 candidate,
                 expected_token=expected_token,
             )
-            if result is not None:
-                changed = result != expected_token
+            if result is None:
+                QtWidgets.QMessageBox.warning(self, "Observation Mapping", "The project changed while this dialog was open, so the mapping was not applied. Open the mapping again.")
+                return
+            changed = result != expected_token
         except Exception as exc:
             QtWidgets.QMessageBox.warning(self, "Observation Mapping", str(exc))
         if changed:
@@ -4147,12 +4079,7 @@ class MainWindow(QtWidgets.QMainWindow):
             proposal.proposed_document, (tab_id,), discard_invalid=False,
             superseded_by_tab={tab_id: proposal.materialized_set_ids},
         )
-        tab = candidate.tab(tab_id)
-        for baseline in tab.initial_condition_sets:
-            # Consume the ordinary complete-roster and settings authorities.
-            canonical_initial_values(tab, baseline.set_id)
-            tab.resolved_execution_settings(baseline.set_id)
-        return tab
+        return candidate.tab(tab_id)
 
     def _open_chemical_space_scan(self) -> None:
         if not self._mutation_input_admitted("Chemical Space Scan"):
@@ -4472,20 +4399,13 @@ class MainWindow(QtWidgets.QMainWindow):
 
         if not self._mutation_input_admitted("Open Mechanism Inspector"):
             return
-        if self._workspace_tab_registry.tab_runtime(tab_id).reactions_draft is not None:
-            self.set_status_text(
-                "Mechanism Inspector is observational and requires accepted Reactions."
-            )
+        prepared_dsl = self._workspace_tab_registry.tab(tab_id).prepared_dsl
+        if self._workspace_tab_registry.tab_runtime(tab_id).reactions_draft is not None or prepared_dsl is None:
+            self.set_status_text("Write reactions and click Run to inspect the mechanism.")
             return
-        try:
-            dialog = MechanismInspectorDialog(
-                self._workspace_tab_registry.tab(tab_id).prepared_dsl,
-                self,
-            )
-            clamp_initial_size(dialog, 760, 560)
-            dialog.exec()
-        except Exception as exc:
-            QtWidgets.QMessageBox.warning(self, "Mechanism Inspector", str(exc))
+        dialog = MechanismInspectorDialog(prepared_dsl, self)
+        clamp_initial_size(dialog, 760, 560)
+        dialog.exec()
 
     def _open_docs(self) -> None:
         QtWidgets.QMessageBox.information(

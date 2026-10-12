@@ -10,7 +10,7 @@ its architectural contract.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, replace
 from typing import List, Mapping, Sequence
 
 import numpy as np
@@ -25,7 +25,8 @@ from kindred.core.exceptions import (
 from kindred.core.analysis.fit_evaluation_outcome import (
     ScientificUnavailable,
 )
-from kindred.core.algebra.errors import AlgebraError
+from kindred.core.algebra.errors import UNCOMPUTABLE_ERRORS, AlgebraError
+from kindred.core.algebra.simulation_series import observable_closure
 from kindred.core.simulation_preparation import (
     SimulationExecutionRequest,
     PreparedSimulationRun,
@@ -45,7 +46,7 @@ from kindred.core.simulator.solvers import solve_ode
 from kindred.core.simulator.dsl_parse import PreparedDslRequestSet
 from kindred.core.time_grid import build_time_grid
 from kindred.core.volume import PhysicalDomainError
-from kindred.core.simulation_failure import factual_cause_from_exception
+from kindred.core.simulation_failure import FactualCause, factual_cause_from_exception
 
 logger = logging.getLogger(__name__)
 
@@ -76,6 +77,10 @@ def _scientific_unavailability_from_exception(
         producer=producer,
         stage=stage,
         details=dict(exc.details),
+        factual_cause=FactualCause(
+            domain="simulation", origin=producer, code=None,
+            type="SimulationScientificUnavailability", message=exc.message, details=exc.details,
+        ),
     )
 
 
@@ -85,9 +90,10 @@ def _known_candidate_unavailability(
     """Translate producer-owned typed candidate failures at this boundary.
 
     Explicit candidate-domain and physical-predicate failures reject candidates.
-    Preparation, Algebra, kinetic, and wrapped failures remain fatal; the
-    solver's typed ``SimulationScientificUnavailability`` is settled separately
-    below.
+    Calculated values outside their domain are decided from their recorded
+    cause by ``_candidate_domain_rejection``.  Other preparation, Algebra, and
+    wrapped failures remain fatal; the solver's typed
+    ``SimulationScientificUnavailability`` is settled separately.
     """
 
     if isinstance(exc, PhysicalDomainError):
@@ -97,10 +103,35 @@ def _known_candidate_unavailability(
             factual_cause=factual_cause_from_exception(exc),
         )
     if isinstance(exc, FitCandidateDomainError):
-        return _scientific_unavailability_from_exception(
-            exc,
-            producer="fit_candidate",
-            stage=exc.details["stage"],
+        return ScientificUnavailable(
+            producer="fit_candidate", stage=exc.details["stage"],
+            details=exc.details,
+            factual_cause=factual_cause_from_exception(exc),
+        )
+    return None
+
+
+# A calculated value, param or let, outside its domain or not computable.
+_DOMAIN_CAUSES = frozenset({
+    "KineticRuntimeDomainError", *(error_type.__name__ for error_type in UNCOMPUTABLE_ERRORS),
+})
+
+
+def _candidate_domain_rejection(
+    cause: FactualCause,
+    origins: Mapping[str, str],
+) -> ScientificUnavailable | None:
+    """Reject the candidate when a calculated value outside its domain depends
+    on an optimizer value; one fed only by configured values stays fatal."""
+    # A let that reads a concentration depends on every value the candidate
+    # varies, as the solved curve does.
+    if cause.type in _DOMAIN_CAUSES and any(
+        origins.get(name) in _OPTIMIZER_ORIGINS
+        for name in (origins if cause.details.get("reads_species") else cause.details["parameter_names"])
+    ):
+        return ScientificUnavailable(
+            producer="fit_candidate", stage=cause.details["stage"],
+            details=cause.details, factual_cause=cause,
         )
     return None
 
@@ -131,13 +162,13 @@ class PreparedFittingExecutionContext:
     """Typed fitting request and preparation metadata.
 
     Its sole producer unions the admitted regular grid with the admitted
-    observation times inside the Fit span.
+    observation times inside the Fit span.  A measured-X dataset has no
+    observation times; its curve also takes the solver's accepted steps.
     """
 
     prepared_run: PreparedSimulationRun
     requested_sample_times: tuple[float, ...]
-    fit_sampling_policy: str = "fit_internal_regular_grid"
-    fit_sampling_identity: Mapping[str, object] = field(default_factory=dict)
+    sample_solver_steps: bool
     initial_prefix: str = "init:"
 
 
@@ -149,9 +180,8 @@ def prepare_fitting_execution_context(
     t_end: float,
     objective_sample_times: Sequence[float],
     prepared_solver_config: PreparedSolverConfig,
+    sample_solver_steps: bool,
     initial_prefix: str = "init:",
-    fit_sampling_policy: str = "fit_internal_regular_grid",
-    fit_sampling_identity: Mapping[str, object] | None = None,
     cancellation_control: SimulationCancellationControl | None = None,
 ) -> PreparedFittingExecutionContext:
     """Prepare structured execution data for one per-dataset evaluator.
@@ -217,8 +247,7 @@ def prepare_fitting_execution_context(
     return PreparedFittingExecutionContext(
         prepared_run=prepared_run,
         requested_sample_times=requested_sample_times,
-        fit_sampling_policy=fit_sampling_policy,
-        fit_sampling_identity=dict(fit_sampling_identity),
+        sample_solver_steps=sample_solver_steps,
         initial_prefix=initial_prefix,
     )
 
@@ -251,12 +280,15 @@ class FittingEvaluator:
         self,
         params: Mapping[str, float],
         origins: Mapping[str, str],
+        outputs: tuple[str, ...],
     ) -> SimulationResultValue | ScientificUnavailable:
         """Evaluate one candidate, returning only natural scientific values.
 
         Cancellation and fatal causes remain factual exceptions.  Candidate
         domain and solver scientific-unavailability facts are returned
-        directly, so no per-series outcome transport is needed.
+        directly, so no per-series outcome transport is needed.  Of the
+        Algebra outputs, only the dataset's ``outputs`` and the lets they
+        read can reject the candidate; other failures stay diagnostics.
         """
 
         try:
@@ -266,6 +298,13 @@ class FittingEvaluator:
             )
         except (FittingCancelled, SimulationCancelled) as exc:
             raise FittingCancelled() from exc
+        except KineticRuntimeDomainError as exc:
+            cause = self._with_fit_values(factual_cause_from_exception(exc), params)
+            rejection = _candidate_domain_rejection(cause, origins)
+            if rejection is not None:
+                return rejection
+            exc.factual_cause = cause
+            raise
         except Exception as exc:
             unavailable = _known_candidate_unavailability(
                 exc,
@@ -281,7 +320,31 @@ class FittingEvaluator:
                 stage=unavailability.stage,
             )
             return unavailable
+        # A let, or a value it reads, that fails records its own cause.
+        result = replace(result, algebra_errors=tuple(
+            self._with_fit_values(cause, params) for cause in result.algebra_errors
+        ))
+        used = observable_closure(self._context.prepared_run.parameter_algebra_spec.observable_block, outputs)
+        for cause in result.algebra_errors:
+            if cause.details["name"] not in used:
+                continue
+            rejection = _candidate_domain_rejection(cause, origins)
+            if rejection is not None:
+                return rejection
         return result
+
+    def _with_fit_values(self, cause: FactualCause, params: Mapping[str, float]) -> FactualCause:
+        """Name the Fit's own values for the failing value's inputs, which can
+        differ from the numbers on the authored line the cause quotes."""
+        names = [name for name in cause.details.get("parameter_names", ()) if name in params]
+        if not names:
+            return cause
+        units = dict(self._context.prepared_run.parameter_algebra_spec.input_units)
+        values = ", ".join(
+            f"{name} = {params[name]:.6g}" + ("" if units[name].symbol == "1" else f" {units[name].symbol}")
+            for name in names
+        )
+        return replace(cause, message=f"{cause.message} Fit values: {values}.")
 
     def _evaluate_series(
         self,
@@ -319,9 +382,7 @@ class FittingEvaluator:
         except SimulationCancelled as exc:
             raise FittingCancelled() from exc
         except Exception as exc:
-            if isinstance(exc, KineticRuntimeDomainError):
-                raise
-            if isinstance(exc, AlgebraError):
+            if isinstance(exc, (KineticRuntimeDomainError, AlgebraError)):
                 raise
             raise _fatal_evaluation_error(
                 exc,
@@ -353,6 +414,7 @@ class FittingEvaluator:
                 dtype=float,
             ),
             candidate_evaluation=True,
+            sample_solver_steps=self._context.sample_solver_steps,
         )
         try:
             result = solve_ode(request)
@@ -375,23 +437,12 @@ class FittingEvaluator:
         }
         try:
             admitted = finalize_simulation_result(
-                mechanism=prepared_run.mechanism,
                 result=result,
                 species_names=list(prepared_run.species_names),
                 initials_for_algebra=initials_map,
                 parameter_values_at_temperature=prepared_run.parameter_values_at_temperature,
                 parameter_algebra_spec=prepared_run.parameter_algebra_spec,
                 cancellation_control=self._cancellation_control,
-                solver_provenance_updates={
-                    "fit_sampling_policy": self._context.fit_sampling_policy,
-                    "fit_sampling_identity": dict(
-                        self._context.fit_sampling_identity
-                    ),
-                    "fit_final_sampling_times": tuple(
-                        float(value)
-                        for value in np.asarray(result.t, dtype=float)
-                    ),
-                },
             )
         except Exception as exc:
             if isinstance(exc, (FittingCancelled, SimulationCancelled)):

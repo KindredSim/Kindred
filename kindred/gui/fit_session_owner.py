@@ -167,7 +167,6 @@ class FitSessionOwner(QtCore.QObject):
         self._last_fit_setup_snapshot = None
         self._invalidate_candidate_custody()
         window.project_setup_snapshot(setup)
-        window.set_initial_reset_available(setup)
         window.set_apply_available(False, "Run a fit to obtain values to apply.")
 
         window.executeRequested.connect(self.execute)
@@ -271,26 +270,13 @@ class FitSessionOwner(QtCore.QObject):
     def _on_execution_started(self, worker: GlobalFitWorker, request: FitExecutionRequest) -> None:
         if self._worker is not worker or self._closing or self._application_close_fenced:
             return
-        window = self._window
-        if window is not None:
-            self._install_started_request_state(setup=request.setup, window=window)
-        self._set_status("Fit started.", phase="Running", detail="Waiting for the first complete candidate")
-
-    def _install_started_request_state(
-        self,
-        *,
-        setup: FitSetupSnapshot,
-        window: FittingWindow,
-    ) -> None:
-        """Install the admitted setup only after native start is known."""
-
-        candidate = self._candidate
-        if candidate is not None and candidate.setup_snapshot != setup:
+        # The request carries the accepted setup; a retained candidate of
+        # another setup (rebased by Apply) is released once the run starts.
+        # Custody otherwise remains in ``self._candidate`` for a failed or
+        # cancelled replacement attempt.
+        if self._candidate is not None and self._candidate.setup_snapshot != request.setup:
             self._invalidate_candidate_custody()
-        self._install_setup(setup)
-        # Execution owns the physical presentation until terminal settlement;
-        # custody remains in ``self._candidate`` for a failed or cancelled
-        # replacement attempt.
+        self._set_status("Fit started.", phase="Running", detail="Waiting for the first complete candidate")
 
     @QtCore.Slot(object)
     def _on_setup_snapshot(self, snapshot: object) -> bool:
@@ -312,7 +298,7 @@ class FitSessionOwner(QtCore.QObject):
         self._install_setup(snapshot)
         self._invalidate_candidate_custody()
         if had_candidate:
-            self._clear_candidate_presentation(window)
+            window.clear_candidate()
         window.project_setup_snapshot(snapshot)
         return True
 
@@ -384,18 +370,14 @@ class FitSessionOwner(QtCore.QObject):
             self._set_status("Fit setup reset rejected: the owner snapshot is stale.")
             return False
         window.clear_pending_setup_edits()
-        self._clear_candidate_presentation(window)
+        # As for any setup edit, only a changed setup releases the result.
+        if snapshot != self._accepted_setup():
+            window.clear_candidate()
+            self._invalidate_candidate_custody()
         window.project_setup_snapshot(snapshot)
         self._install_setup(snapshot)
-        self._invalidate_candidate_custody()
         self._set_status(f"Fit setup {kind.replace('_', ' ')} snapshot restored.")
         return True
-
-    def _clear_candidate_presentation(self, window: FittingWindow) -> None:
-        """Clear the candidate presentation."""
-
-        window.clear_candidate()
-        window.set_apply_available(False, "Run a fit to obtain current values to apply.")
 
     @QtCore.Slot()
     def results_summary(self) -> bool:
@@ -512,7 +494,7 @@ class FitSessionOwner(QtCore.QObject):
         self._initial_setup_snapshot = None
         self._last_fit_setup_snapshot = None
         if self._window is not None:
-            self._clear_candidate_presentation(self._window)
+            self._window.clear_candidate()
 
     @QtCore.Slot()
     def _on_window_destroyed(self, *_args: object) -> None:
@@ -830,7 +812,7 @@ class FitSessionOwner(QtCore.QObject):
         ):
             return
         if self._window is not None:
-            self._clear_candidate_presentation(self._window)
+            self._window.clear_candidate()
             self._window.set_terminal_failure(failure)
         self._failure_status = f"Fit failed: {located(failure.message, *failure.location())}"
         self._set_status(self._failure_status, present=False)
@@ -853,7 +835,8 @@ class FitSessionOwner(QtCore.QObject):
         cause = unavailable.factual_cause
         self._set_status(
             "No valid candidate found: "
-            + (cause.message if cause is not None else unavailable.stage), present=False
+            + located(cause.message, *cause.location()),
+            present=False,
         )
 
     def _on_cancelled(self, worker: GlobalFitWorker) -> None:
@@ -866,7 +849,7 @@ class FitSessionOwner(QtCore.QObject):
         ):
             return
         if self._window is not None:
-            self._clear_candidate_presentation(self._window)
+            self._window.clear_candidate()
         self._invalidate_candidate_custody()
         self._set_status("Fit stopped before any complete candidate was evaluated.",
                          phase="Stopped", detail="No complete candidate was evaluated")

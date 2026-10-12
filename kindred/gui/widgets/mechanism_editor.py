@@ -3,14 +3,10 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, Optional
+from typing import Optional
 
 from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtCore import Signal
-
-if TYPE_CHECKING:
-    from kindred.core.mechanism_source import MechanismAuthoringSource
 
 from kindred.gui.ui_helpers import (
     SCIENTIFIC_NAME_HTML_ROLE,
@@ -28,16 +24,6 @@ __all__ = [
     "MechanismEditorBinding",
     "MechanismEditorTabbed",
 ]
-
-
-@dataclass(frozen=True, slots=True)
-class _MechanismEditorRenderProjection:
-    """Prepared editor values for one admitted tab snapshot."""
-
-    source: object
-    notes: str
-    reactions_draft: bool
-    accepted_reactions: bool
 
 
 def _make_sliders_icon(color: QtGui.QColor) -> QtGui.QIcon:
@@ -429,13 +415,15 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
             "<tr><th>Input</th><th>Allowed Values</th></tr>"
             "<tr><td><code>k</code>, <code>kf</code></td><td>Zero, or positive up to 10<sup>20</sup> M<sup>(1 − <i>n</i><sub>f</sub>)</sup> s<sup>−1</sup></td></tr>"
             "<tr><td><code>kr</code></td><td>Positive, up to 10<sup>20</sup> M<sup>(1 − <i>n</i><sub>r</sub>)</sup> s<sup>−1</sup></td></tr>"
-            "<tr><td><code>Keq</code></td><td>10<sup>−20</sup> through 10<sup>20</sup> M<sup>(<i>n</i><sub>r</sub> − <i>n</i><sub>f</sub>)</sup>, inclusive</td></tr>"
+            "<tr><td><code>Keq</code></td><td>10<sup>−80</sup> through 10<sup>80</sup> M<sup>(<i>n</i><sub>r</sub> − <i>n</i><sub>f</sub>)</sup>, inclusive</td></tr>"
             "<tr><td><code>A</code></td><td>10<sup>−20</sup> through 10<sup>40</sup> M<sup>(1 − <i>n</i><sub>f</sub>)</sup> s<sup>−1</sup>, inclusive</td></tr>"
-            "<tr><td><code>Ea</code>, <code>dG_act</code>, <code>dG_eq</code></td><td>Positive, negative, or zero, with magnitude at most 10<sup>20</sup> J/mol after conversion from the <code>energy=</code> unit</td></tr>"
+            "<tr><td><code>Ea</code>, <code>dG_act</code></td><td>Positive, negative, or zero, with magnitude at most 10<sup>20</sup> J/mol after conversion from the <code>energy=</code> unit</td></tr>"
+            "<tr><td><code>dG_eq</code></td><td>Positive, negative, or zero, as long as the <i>K</i><sub>eq</sub> it gives is within the <code>Keq</code> limits. At 298.15 K and a standard concentration of 1 M, this is a magnitude of up to about 456 kJ/mol (109 kcal/mol).</td></tr>"
             "<tr><td><code>kappa</code></td><td>Positive, up to 10<sup>20</sup></td></tr>"
             "<tr><td><code>degeneracy</code></td><td>Positive integers, entered without a decimal point</td></tr>"
             "</table>"
             "<p><i>n</i><sub>f</sub> and <i>n</i><sub>r</sub> are the forward and reverse reaction orders.</p>"
+            "<p>These limits also apply to values Kindred calculates: a <code>Keq</code> from <code>dG_eq</code>, a <code>kr</code> from <code>kf</code>/<code>Keq</code>, a rate constant from <code>A</code> and <code>Ea</code> or from <code>dG_act</code>, and any value set by a <code>param</code> line.</p>"
             "<h2>Temperature Schedules</h2>"
             "<p>Use one <code>temp_step</code> or <code>temp_response</code> declaration. Enter times and <code>tau</code> in seconds, and temperatures in kelvin.</p>"
             "<p>List at least two times in increasing order, without repeats. Use zero or a value from 10<sup>−30</sup> through 10<sup>10</sup> seconds, inclusive. Supply one temperature for each interval between consecutive times.</p>"
@@ -453,7 +441,6 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
             "<h3>Before and After the Listed Times</h3>"
             "<p>Before the first listed time, Kindred uses the nominal temperature. After the last listed time, a step schedule keeps its final temperature. A response schedule continues toward its final setpoint.</p>"
             "<h2>Interventions</h2>"
-            "<p>The bundled intervention examples are designed for simulations from 0 to 600 seconds.</p>"
             "<p>Use <code>intervention:</code> to change or maintain a species concentration. Choose an <code>op=</code> option:</p>"
             "<table border=\"1\" cellpadding=\"5\" cellspacing=\"0\">"
             "<tr><th>Option</th><th>Effect</th></tr>"
@@ -789,7 +776,7 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
             "<p>The names <code>t</code> and <code>T</code>, the standard concentration <code>C0</code>, the constants above, and built-in function names cannot be redefined as <code>param</code> or <code>let</code> names.</p>"
             "<h2>Complete Example</h2>"
             "<p>Paste this example into <b>Reactions</b>.</p>"
-            "<pre>energy=kJ/mol\nC0=1.0\n[A] = 1.0, [B] = 0.0, [C] = 0.0\n\nparam pulse_time = 1.5; unit = s\nparam pulse_amount = 0.2; unit = M\n\nA -&gt; B ; dG_act=55 ; degeneracy=2\nB &lt;=&gt; C ; kf=1.0 ; Keq=3.0\nintervention: op=jump; species=A; time_param=pulse_time; delta_param=pulse_amount\nlet product = [C]</pre>"
+            "<pre># Run from 0 to 10 s.\nenergy=kJ/mol\nC0=1.0\n[A] = 1.0, [B] = 0.0, [C] = 0.0\n\nparam pulse_time = 1.5; unit = s\nparam pulse_amount = 0.2; unit = M\n\nA -&gt; B ; dG_act=55 ; degeneracy=2\nB &lt;=&gt; C ; kf=1.0 ; Keq=3.0\nintervention: op=jump; species=A; time_param=pulse_time; delta_param=pulse_amount\nlet product = [C]</pre>"
         )
         copy_help_btn = QtWidgets.QPushButton("Copy Plain Text", self._help_tab)
         copy_help_btn.setToolTip("Copy the entire Help reference as plain text, including examples.")
@@ -1300,42 +1287,21 @@ class MechanismEditorBinding(QtCore.QObject):
     def tab_id(self) -> str:
         return self._tab_id
 
-    def prepare_render(self) -> _MechanismEditorRenderProjection:
-        """Capture the current published document into a view projection."""
-
+    def render(self) -> None:
         tab = self._registry.tab(self._tab_id)
         runtime = self._registry.tab_runtime(self._tab_id)
-        source = runtime.reactions_draft or tab.mechanism_source
-        return _MechanismEditorRenderProjection(
-            source=source,
-            notes=(
-                tab.notes
-                if runtime.notes_draft is None
-                else runtime.notes_draft
-            ),
-            reactions_draft=runtime.reactions_draft is not None,
-            accepted_reactions=tab.prepared_dsl is not None,
-        )
-
-    def apply_render_projection(
-        self,
-        projection: _MechanismEditorRenderProjection,
-    ) -> None:
         self._rendering = True
         try:
             self._editor.render_authoring_snapshot(
-                source=projection.source,
-                notes=projection.notes,
+                source=runtime.reactions_draft or tab.mechanism_source,
+                notes=tab.notes if runtime.notes_draft is None else runtime.notes_draft,
             )
             self._editor.render_reactions_acceptance_status(
-                has_draft=projection.reactions_draft,
-                has_accepted_reactions=projection.accepted_reactions,
+                has_draft=runtime.reactions_draft is not None,
+                has_accepted_reactions=tab.prepared_dsl is not None,
             )
         finally:
             self._rendering = False
-
-    def render(self) -> None:
-        self.apply_render_projection(self.prepare_render())
 
     @QtCore.Slot(object)
     def _on_source_draft(self, source: object) -> None:
@@ -1361,18 +1327,6 @@ class MechanismEditorBinding(QtCore.QObject):
             None if visible_notes == tab.notes else visible_notes
         )
         self.draftStateChanged.emit(tab.tab_id)
-
-    def apply_accepted_source_rewrite(
-        self,
-        visible: MechanismAuthoringSource,
-        accepted: MechanismAuthoringSource,
-    ) -> bool:
-        """Keep deterministic parser rewrites inside native editor history."""
-
-        return self._editor.apply_accepted_reactions_rewrite(
-            expected_visible_text=visible.reactions_text,
-            accepted_text=accepted.reactions_text,
-        )
 
     @QtCore.Slot()
     def revert_reactions_draft(self) -> bool:

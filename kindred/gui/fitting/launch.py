@@ -8,10 +8,7 @@ from typing import Iterable, Literal, Mapping, Sequence
 
 from kindred.core.quantity_units import Unit
 
-from kindred.core.analysis.fit_uncertainty import (
-    ProfileLikelihoodConfig,
-    ResidualBootstrapConfig,
-)
+from kindred.core.analysis.fit_uncertainty import ProfileLikelihoodConfig, ProfileLikelihoodOptions
 from kindred.core.analysis.global_fit_execution import (
     FitCoordinate,
     FitParameterLayout,
@@ -24,7 +21,6 @@ from kindred.core.analysis.dataset_parameter_overrides import (
     FitDatasetVariableParamSpec,
     FitSharedVariableParamSpec,
 )
-from kindred.gui.fitting.constants import INITIAL_PREFIX
 from kindred.core.analysis.dataset_sampling import compute_sampled_indices
 from kindred.core.mechanism_source import MechanismAuthoringSource
 from kindred.core.project_document import (
@@ -61,6 +57,7 @@ __all__ = [
     "FitObservationSnapshot",
     "FitOriginSnapshot",
     "FitParameterVariable",
+    "FitProfileSetup",
     "FitSetupSnapshot",
     "build_fit_execution_request",
     "capture_fit_origin",
@@ -75,7 +72,8 @@ __all__ = [
     "skipped_fit_analysis_coordinates",
     "fit_parameter_overall",
     "fit_uncertainty_coordinates",
-    "prune_fit_analysis_coordinates",
+    "fit_profile_config",
+    "fit_profile_targets",
     "fit_setup_readiness",
 ]
 
@@ -603,25 +601,50 @@ class FitOriginSnapshot:
         object.__setattr__(self, "parameter_defaults", tuple(self.parameter_defaults))
 
 
-def _validate_advanced_analysis_setup(
-    *,
-    datasets: tuple[FitDatasetLocalSettings, ...],
-    parameters: tuple[FitParameterVariable, ...],
-    profile_likelihood: ProfileLikelihoodConfig | None,
-    residual_bootstrap: ResidualBootstrapConfig | None,
-) -> None:
-    allowed_coordinates = fit_uncertainty_coordinates(
-        parameters, datasets
+@dataclass(frozen=True, slots=True)
+class FitProfileSetup:
+    """Profile likelihood in the Fit setup: on or off, the fitted values the
+    user unticked, and its options.  It profiles every other fitted value, and
+    keeps the unticked ones while it is off."""
+
+    enabled: bool = False
+    unticked: frozenset[FitCoordinate] = frozenset()
+    options: ProfileLikelihoodOptions = ProfileLikelihoodOptions()
+
+
+def fit_profile_targets(
+    profile: FitProfileSetup,
+    parameters: Iterable[FitParameterVariable],
+    datasets: Iterable[FitDatasetLocalSettings],
+) -> tuple[FitCoordinate, ...]:
+    """The ticked fitted values, in roster order, excluded datasets' included."""
+
+    return tuple(
+        coordinate for coordinate in fit_uncertainty_coordinates(parameters, datasets)
+        if coordinate not in profile.unticked
     )
-    allowed_set = set(allowed_coordinates)
-    for config in (profile_likelihood, residual_bootstrap):
-        if config is None:
-            continue
-        if any(coordinate not in allowed_set for coordinate in config.parameter_names):
-            raise ValueError(
-                "Uncertainty configuration references an unavailable fitted "
-                "coordinate."
-            )
+
+
+def fit_profile_config(
+    profile: FitProfileSetup,
+    parameters: Iterable[FitParameterVariable],
+    datasets: Iterable[FitDatasetLocalSettings],
+) -> ProfileLikelihoodConfig | None:
+    """The Profile run of a setup, or None when Profile is off or no ticked
+    value has an included dataset."""
+
+    if not profile.enabled:
+        return None
+    parameters = tuple(parameters)
+    datasets = tuple(datasets)
+    targets = fit_profile_targets(profile, parameters, datasets)
+    skipped = skipped_fit_analysis_coordinates(
+        targets,
+        excluded_dataset_ids=(item.dataset_id for item in datasets if not item.included),
+        parameters=parameters,
+    )
+    analyzed = tuple(coordinate for coordinate in targets if coordinate not in skipped)
+    return ProfileLikelihoodConfig(analyzed, profile.options) if analyzed else None
 
 
 def fit_uncertainty_coordinates(
@@ -705,43 +728,6 @@ def skipped_fit_analysis_coordinates(
     )
 
 
-def prune_fit_analysis_coordinates(
-    configuration: ProfileLikelihoodConfig | ResidualBootstrapConfig | None,
-    *,
-    available: Iterable[FitCoordinate] | None = None,
-    excluded_dataset_ids: Iterable[str] = (),
-    parameters: Iterable[FitParameterVariable],
-) -> ProfileLikelihoodConfig | ResidualBootstrapConfig | None:
-    """Drop uncertainty coordinates that no longer exist or are not analysed.
-
-    Fit-coordinate identities are admitted before this projection.  After a
-    scope, Vary or group change, callers pass the new roster as ``available``
-    and every target still in it is kept.  Excluding a dataset invalidates its
-    Per-dataset coordinate, and a group target only when all its members are
-    excluded, by the group membership in ``parameters``.
-    Remaining coordinates retain their original order and identity.
-    """
-
-    if configuration is None:
-        return None
-    kept = None if available is None else set(available)
-    skipped = skipped_fit_analysis_coordinates(
-        configuration.parameter_names,
-        excluded_dataset_ids=excluded_dataset_ids,
-        parameters=parameters,
-    )
-    remaining = tuple(
-        coordinate
-        for coordinate in configuration.parameter_names
-        if (kept is None or coordinate in kept) and coordinate not in skipped
-    )
-    if not remaining:
-        return None
-    if remaining == configuration.parameter_names:
-        return configuration
-    return replace(configuration, parameter_names=remaining)
-
-
 @dataclass(frozen=True, slots=True)
 class FitPreparedDatasetConfig:
     """One admitted dataset/grid solver policy completed before dispatch.
@@ -756,8 +742,6 @@ class FitPreparedDatasetConfig:
     retained_times: tuple[float, ...]
     execution_t_start: float
     execution_t_end: float
-    fit_sampling_policy: str
-    fit_sampling_identity: tuple[tuple[str, object], ...]
     solver_config: PreparedSolverConfig
 
 
@@ -792,8 +776,7 @@ class FitSetupSnapshot:
     defaults: FitDefaults
     dataset_weight_mode: FitDatasetWeightMode
     shared_initial_groups: tuple[FitSharedInitialGroup, ...] = ()
-    profile_likelihood: ProfileLikelihoodConfig | None = None
-    residual_bootstrap: ResidualBootstrapConfig | None = None
+    profile: FitProfileSetup = FitProfileSetup()
     def __post_init__(self) -> None:
         datasets = tuple(self.datasets)
         parameters = tuple(self.parameters)
@@ -803,12 +786,8 @@ class FitSetupSnapshot:
         object.__setattr__(self, "parameters", parameters)
         object.__setattr__(self, "initials", initials)
         object.__setattr__(self, "shared_initial_groups", tuple(sorted(shared_initial_groups, key=lambda item: (item.species, item.origin_dataset_id))))
-        _validate_advanced_analysis_setup(
-            datasets=datasets,
-            parameters=parameters,
-            profile_likelihood=self.profile_likelihood,
-            residual_bootstrap=self.residual_bootstrap,
-        )
+        if not self.profile.unticked <= set(fit_uncertainty_coordinates(parameters, datasets)):
+            raise ValueError("Profile setup references an unavailable fitted coordinate.")
 
 
 def _scan_parameters(tab: MechanismTabDocument) -> tuple[FitParameterVariable, ...]:
@@ -1081,9 +1060,8 @@ def fit_setup_readiness(
     datasets: Iterable[FitDatasetLocalSettings],
     parameters: Iterable[FitParameterVariable],
     initials: Iterable[FitInitialVariable],
-    shared_initial_groups: Iterable[FitSharedInitialGroup] = (),
-    profile_likelihood: ProfileLikelihoodConfig | None = None,
-    residual_bootstrap: ResidualBootstrapConfig | None = None,
+    shared_initial_groups: Iterable[FitSharedInitialGroup],
+    profile: FitProfileSetup,
     check_observations: bool = True,
 ) -> str | None:
     """Return the shared cheap structural Run Fit readiness truth.
@@ -1149,15 +1127,8 @@ def fit_setup_readiness(
     )
     if not has_fitted_parameter and not has_fitted_initial:
         return "Select at least one parameter or initial concentration to fit."
-    excluded = tuple(item.dataset_id for item in dataset_items if not item.included)
-    for label, analysis in (
-        ("Profile", profile_likelihood),
-        ("Bootstrap", residual_bootstrap),
-    ):
-        if analysis is not None and prune_fit_analysis_coordinates(
-            analysis, excluded_dataset_ids=excluded, parameters=parameter_items,
-        ) is None:
-            return f"{label} has no coordinates in the included datasets."
+    if profile.enabled and fit_profile_config(profile, parameter_items, dataset_items) is None:
+        return "Profile Likelihood has no ticked value with an included dataset."
     return None
 
 
@@ -1194,19 +1165,6 @@ def _prepare_fit_datasets(
                 "outside the Simulation interval. Adjust Simulation start, Simulation end, or Data Range."
             )
         grid_points = 100
-        policy = (
-            "parametric_regular_grid"
-            if local.parametric is not None
-            else "fit_internal_regular_grid_union_retained_endpoints"
-        )
-        identity = (
-            ("solver", setup.solver),
-            ("t_start", execution_t_start),
-            ("t_end", execution_t_end),
-            ("regular_grid_count", grid_points),
-            ("retained_observation_times", retained_times),
-            ("union_endpoints", (execution_t_start, execution_t_end)),
-        )
         try:
             build_time_grid(execution_t_start, execution_t_end, {"N": grid_points})
         except (TypeError, ValueError) as exc:
@@ -1222,8 +1180,6 @@ def _prepare_fit_datasets(
                 retained_times=retained_times,
                 execution_t_start=execution_t_start,
                 execution_t_end=execution_t_end,
-                fit_sampling_policy=policy,
-                fit_sampling_identity=identity,
                 solver_config=build_solver_config(
                     solver=setup.solver,
                     rtol=science.rtol,
@@ -1389,13 +1345,7 @@ def _compile_fit_dispatch(
         ordinary_shared_variables=tuple(shared_variables),
         ordinary_coupled_variables=tuple(coupled_variables),
         ordinary_dataset_overrides=overrides,
-        candidate_names=tuple(
-            sorted(
-                parameter.name
-                for parameter in setup.parameters
-                if not parameter.name.startswith(INITIAL_PREFIX)
-            )
-        ),
+        candidate_names=tuple(sorted(parameter.name for parameter in setup.parameters)),
         ordinary_optimizer_layout=layout,
     )
 
@@ -1411,8 +1361,7 @@ def build_fit_execution_request(
         parameters=setup.parameters,
         initials=setup.initials,
         shared_initial_groups=setup.shared_initial_groups,
-        profile_likelihood=setup.profile_likelihood,
-        residual_bootstrap=setup.residual_bootstrap,
+        profile=setup.profile,
         check_observations=False,
     )
     if readiness is not None:

@@ -7,7 +7,6 @@ labels into labels, tabs, list rows, status/footer messages, or plot titles.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
 from dataclasses import dataclass
 from html import escape
 import re
@@ -198,9 +197,3 @@ def count_text(count: int, noun: str) -> str:
     return f"{word} {noun if count == 1 else noun + 's'}"
 
 
-def and_join(items: Sequence[str]) -> str:
-    """English list with the serial comma."""
-
-    if len(items) < 3:
-        return " and ".join(items)
-    return ", ".join(items[:-1]) + ", and " + items[-1]

@@ -5,6 +5,7 @@ Small core validation helpers shared across multiple core modules.
 from __future__ import annotations
 
 import math
+from collections.abc import Sequence
 from decimal import Decimal, InvalidOperation
 
 
@@ -24,6 +25,13 @@ def parse_finite_numeric_text(text: str, *, field: str = "Value") -> float:
         if nonzero:
             raise ValueError(f"{field} is nonzero but too small to represent.")
     return value
+
+
+def and_join(items: Sequence[str]) -> str:
+    """Names in a sentence: "a", "a and b", or "a, b, and c"."""
+    if len(items) < 3:
+        return " and ".join(items)
+    return f"{', '.join(items[:-1])}, and {items[-1]}"
 
 
 def six_digit_value(value: float) -> float:

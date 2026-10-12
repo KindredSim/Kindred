@@ -39,7 +39,7 @@ def execute_simulation(
     ))
     check_cancelled()
     result = finalize_simulation_result(
-        mechanism=prepared.mechanism, result=solved, species_names=list(prepared.species_names),
+        result=solved, species_names=list(prepared.species_names),
         initials_for_algebra=prepared.initials_for_algebra, parameter_values_at_temperature=prepared.parameter_values_at_temperature,
         parameter_algebra_spec=prepared.parameter_algebra_spec, parameters=parameters,
         parameter_classifications=tuple(

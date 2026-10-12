@@ -6,7 +6,7 @@ from dataclasses import dataclass
 import html
 import json
 from fractions import Fraction
-from collections.abc import Callable, Mapping
+from collections.abc import Mapping
 
 from PySide6 import QtWidgets
 
@@ -24,6 +24,7 @@ from kindred.core.mechanism_metadata import MechanismMetadataView
 from kindred.core.ode_builder import build_effective_rate_coefficient_evaluator
 from kindred.core.quantity_units import Unit, format_unit_for_display
 from kindred.core.simulator.dsl_parse import DslAnalysis, PreparedDslRequestSet
+from kindred.core.symbolic.jacobian import fractional_order_step
 from kindred.core.simulator.parameter_algebra import (
     apply_parameter_algebra_spec_to_mechanism,
 )
@@ -72,46 +73,25 @@ def build_mechanism_inspector_sections(
     )
     intervention_execution = prepared_dsl.intervention_execution_contract()
     return MechanismInspectorSections(
-        mechanism_text=_safe_format_section(
-            "mechanism",
-            lambda: _format_mechanism_reference(
-                accepted_mechanism,
-                parameter_spec=parameter_spec,
-                analysis=prepared_dsl.analysis,
+        mechanism_text=_format_mechanism_reference(
+            accepted_mechanism,
+            parameter_spec=parameter_spec,
+            analysis=prepared_dsl.analysis,
+        ),
+        steps_text=_format_steps_from_authority(mechanism, parameter_spec=parameter_spec),
+        equations_text=_format_equations(
+            prepared_dsl.symbolic_jacobian_structure(),
+            accepted_mechanism,
+            has_interventions=(
+                parameterized_schedule is not None
+                or bool(intervention_execution.authored.operations)
             ),
         ),
-        steps_text=_safe_format_section(
-            "steps",
-            lambda: _format_steps_from_authority(mechanism, parameter_spec=parameter_spec),
-        ),
-        equations_text=_safe_format_section(
-            "equations",
-            lambda: _format_equations(
-                prepared_dsl.symbolic_jacobian_structure(),
-                has_interventions=(
-                    parameterized_schedule is not None
-                    or bool(
-                        intervention_execution
-                        and intervention_execution.authored.operations
-                    )
-                ),
-            ),
-        ),
-        interventions_text=_safe_format_section(
-            "interventions",
-            lambda: _format_interventions(
-                parameterized_schedule=parameterized_schedule,
-                intervention_execution=intervention_execution,
-            ),
+        interventions_text=_format_interventions(
+            parameterized_schedule=parameterized_schedule,
+            intervention_execution=intervention_execution,
         ),
     )
-
-
-def _safe_format_section(label: str, formatter: Callable[[], str]) -> str:
-    try:
-        return formatter()
-    except Exception as exc:
-        return f"Unable to inspect {label}:\n{exc}"
 
 
 def _format_mechanism_reference(
@@ -151,7 +131,7 @@ def _format_mechanism_reference(
     ]
     if uses_standard_concentration:
         lines.append(f"C0: {_format_number(metadata.standard_conc_M)} M")
-    lines.extend(("", *(step_lines or ("No reaction steps.",))))
+    lines.extend(("", *step_lines))
 
     algebra_lines = [
         html.escape(
@@ -408,7 +388,12 @@ def _rate_authority_for_step(
     return authority_snapshot[len(mechanism.reactions) + entry["equilibrium_index"]]
 
 
-def _format_equations(structure: object, *, has_interventions: bool) -> str:
+def _format_equations(structure: object, mechanism: object, *, has_interventions: bool) -> str:
+    # Symbolic equations exist only for whole-number orders; an accepted
+    # mechanism always has species.
+    if structure is None:
+        step = fractional_order_step(mechanism)
+        return f"Equations are not shown because line {step['line']} has a fractional reaction order."
     lines = ["Canonical symbolic RHS equations:"]
     if has_interventions:
         lines.append(
@@ -438,7 +423,7 @@ def _format_equations(structure: object, *, has_interventions: bool) -> str:
 def _format_interventions(
     *,
     parameterized_schedule: InterventionSchedule | None,
-    intervention_execution: InterventionExecutionContract | None,
+    intervention_execution: InterventionExecutionContract,
 ) -> str:
     if parameterized_schedule is not None:
         parameter_names = sorted(
@@ -453,7 +438,7 @@ def _format_interventions(
         if parameter_names:
             lines.append(f"Schedule parameters: {', '.join(parameter_names)}")
         return "\n".join(lines)
-    if intervention_execution is None:
+    if not intervention_execution.authored.operations:
         return "No intervention schedule."
     return _format_intervention_execution(intervention_execution)
 
@@ -534,15 +519,7 @@ class MechanismInspectorDialog(QtWidgets.QDialog):
         tabs.setObjectName("mechanismInspectorTabs")
         layout.addWidget(tabs)
 
-        try:
-            sections = build_mechanism_inspector_sections(prepared_dsl)
-        except Exception as exc:
-            sections = MechanismInspectorSections(
-                mechanism_text=f"Unable to inspect mechanism:\n{exc}",
-                steps_text=f"Unable to inspect mechanism:\n{exc}",
-                equations_text=f"Unable to inspect mechanism:\n{exc}",
-                interventions_text=f"Unable to inspect mechanism:\n{exc}",
-            )
+        sections = build_mechanism_inspector_sections(prepared_dsl)
 
         for title, text, object_name, no_wrap, tooltip in (
             (

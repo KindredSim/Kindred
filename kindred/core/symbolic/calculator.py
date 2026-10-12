@@ -191,7 +191,7 @@ def _branches(values):
     """Enumerate one complete family; no status, mathematics or metadata work."""
     families = [i for i, value in enumerate(values) if isinstance(value, _Alternatives)]
     if len(families) > 1:
-        raise SymbolicCalculatorError("Each result has several answers. Choose one answer from each with solution(result,n).")
+        raise SymbolicCalculatorError("Only one operand can hold alternative answers; select an answer from the others with solution(result,n).")
     if not families:
         yield tuple(values)
     else:
@@ -423,8 +423,6 @@ def symbolic_calculator_available(mechanism: Any) -> tuple[bool, str]:
     metadata = MechanismMetadataView.from_metadata(mechanism.metadata)
     if metadata.temperature_schedule is not None:
         return False, "Calculator does not support temperature schedules."
-    if not mechanism.species_names():
-        return False, "Calculator needs at least one reaction."
     step = fractional_order_step(mechanism)
     if step is not None:
         return False, located("Calculator does not support fractional reaction orders.", step["line"], step["line_text"])
@@ -434,7 +432,7 @@ def symbolic_calculator_available(mechanism: Any) -> tuple[bool, str]:
     reserved |= set(PROTECTED_NAMES) | set(BUILTIN_FUNCTIONS)
     collisions = [name for name in mechanism.species_names() if name in reserved
                   or namespace.resolve(name).canonical_name is not None
-                  or namespace.invalid_protected_indexed_identifier(name) is not None]
+                  or namespace.invalid_protected_indexed_identifier_message(name) is not None]
     if collisions:
         return False, f"Species collide with parameter or Algebra names: {', '.join(collisions)}."
     return True, ""
@@ -1021,7 +1019,7 @@ def _evaluate_call(context: CalculatorContext, name: str, args: Sequence[_Value 
                 raise SymbolicCalculatorError("Select the replacement explicitly with solution(result,n) when alternatives or unresolved possibilities remain.")
             args = (args[0], usable[0])
     if selection and all(isinstance(v, _Alternatives) for v in args):
-        raise SymbolicCalculatorError("Each result has several answers. Choose one answer from each with solution(result,n).")
+        raise SymbolicCalculatorError("Only one operand can hold alternative answers; select an answer from the others with solution(result,n).")
     operands = args[1:] if selection else args
     family = any(isinstance(v, _Alternatives) for v in operands)
     answers = []

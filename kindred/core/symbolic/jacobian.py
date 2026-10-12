@@ -208,13 +208,6 @@ def fractional_order_step(mechanism: Mechanism) -> Mapping[str, Any] | None:
 
 
 def classify_symbolic_jacobian_support(mechanism: Mechanism) -> SymbolicJacobianSupport:
-    species_names = tuple(str(name) for name in mechanism.species_names())
-    if not species_names:
-        return _unsupported_support(
-            "missing-species",
-            "Symbolic Jacobian requires at least one species.",
-        )
-
     step = fractional_order_step(mechanism)
     if step is not None:
         return _unsupported_support(

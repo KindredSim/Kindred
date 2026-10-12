@@ -100,7 +100,7 @@ def chemistry_parameter_dependencies(
             if kind == "reaction"
             else mechanism.equilibria[index]
         )
-        source = dict(entry.get("source_coordinates") or {})
+        source = dict(entry["source_coordinates"])
         number = entry["step_index"]
         if role in {"k", "kf"}:
             model = step.forward_model
@@ -140,7 +140,7 @@ def bind_chemistry_readout(
         if kind == "reaction"
         else mechanism.equilibria[index]
     )
-    source = dict(entry.get("source_coordinates") or {})
+    source = dict(entry["source_coordinates"])
     number = entry["step_index"]
     if role in {"k", "kf"}:
         model = step.forward_model

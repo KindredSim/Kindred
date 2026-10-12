@@ -974,7 +974,7 @@ def validate_boundary_conflicts(
             absolute = first_set_by_time.get(physical.time)
             if absolute is not None:
                 raise InterventionScheduleError(
-                    f"set and {physical.op} conflict for {absolute.species} at t={physical.time:g}.",
+                    f"set and {physical.op} conflict for {absolute.species} at t = {physical.time:g} s.",
                     declaration_ordinal=max(absolute.declaration_ordinal, physical.declaration_ordinal),
                 )
     for instant in instants:
@@ -999,7 +999,7 @@ def validate_boundary_conflicts(
         holds = [item for item in candidates if isinstance(item, ExecutableHold)]
         if sets and jumps:
             raise _annotated_schedule_error(
-                f"set and jump conflict for {species} at t={time:g}.",
+                f"set and jump conflict for {species} at t = {time:g} s.",
                 operation=None,
                 dependency_metadata=dependency_metadata,
                 field="time",
@@ -1014,7 +1014,7 @@ def validate_boundary_conflicts(
             value != absolute_values[0] for value in absolute_values[1:]
         ):
             raise _annotated_schedule_error(
-                f"Declarations set {species} to different values at t={time:g}.",
+                f"Declarations set {species} to different values at t = {time:g} s.",
                 operation=None,
                 dependency_metadata=dependency_metadata,
                 field="value",
@@ -1023,7 +1023,7 @@ def validate_boundary_conflicts(
             )
         if holds and jumps:
             raise _annotated_schedule_error(
-                f"hold start and jump conflict for {species} at t={time:g}.",
+                f"hold start and jump conflict for {species} at t = {time:g} s.",
                 operation=None,
                 dependency_metadata=dependency_metadata,
                 field="time",
@@ -1054,11 +1054,9 @@ def _validate_hold_overlaps(
     if conflict is not None:
         left, right = conflict
         raise _annotated_schedule_error(
-            f"Overlapping holds for {left.species}: "
-            f"declaration {left.declaration_ordinal + 1} "
-            f"[{left.start_time!r}, {left.end_time!r}) and "
-            f"declaration {right.declaration_ordinal + 1} "
-            f"[{right.start_time!r}, {right.end_time!r}). "
+            f"Two holds for {left.species} overlap, "
+            f"from {left.start_time:g} s to {left.end_time:g} s and "
+            f"from {right.start_time:g} s to {right.end_time:g} s. "
             "Only one hold per species may be active at a time.",
             operation=None,
             dependency_metadata=dependency_metadata,

@@ -97,21 +97,6 @@ class _FitValueLabel(QtWidgets.QLabel):
         self.setSelection(0, document.characterCount() - 1)
 
 
-def _cause_chain(cause: FactualCause | None) -> str:
-    """Each message in a failure chain, outermost first, on the authored line
-    the chain names. Error codes stay in the report's cause payload."""
-    if cause is None:
-        return ""
-    parts: list[str] = []
-    link: FactualCause | None = cause
-    while link is not None:
-        if not parts or link.message != parts[-1]:
-            # A link that only re-raises the same message adds nothing.
-            parts.append(link.message)
-        link = link.cause
-    return located(" Caused by: ".join(parts), *cause.location())
-
-
 class ResultsSummaryDialog(QtWidgets.QDialog):
     """A Summary popup with Results and Provenance tabs, each a selectable document."""
 
@@ -213,6 +198,12 @@ class FitTrackerPanel(QtWidgets.QWidget):
         self._summary_layout = ControlRowsLayout(self._summary_widget)
         self._summary_labels: list[QtWidgets.QLabel] = []
         layout.addWidget(self._summary_widget)
+        self._warnings_label = QtWidgets.QLabel(self)
+        self._warnings_label.setObjectName("global_fit_tracker_warnings")
+        self._warnings_label.setTextFormat(Qt.TextFormat.RichText)
+        self._warnings_label.setWordWrap(True)
+        self._warnings_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        layout.addWidget(self._warnings_label)
         self._values_scroll = QtWidgets.QScrollArea(self)
         self._values_scroll.setObjectName("global_fit_tracker_values")
         self._values_scroll.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
@@ -235,6 +226,8 @@ class FitTrackerPanel(QtWidgets.QWidget):
         self._outcome = self._phase = self._values_html = ""
         self._objective = "not evaluated"
         self._calls = 0
+        self._warnings_label.clear()
+        self._warnings_label.hide()
         self._set_entries(())
         self._layout_entries()
         for label in self._summary_labels:
@@ -270,9 +263,11 @@ class FitTrackerPanel(QtWidgets.QWidget):
             phase, detail = "Running", f"Objective calls {update.iteration} · Best complete candidate"
         self.set_phase(phase, detail)
 
-    def set_summary(self, overview: tuple[str, ...], entries: tuple[FitValueEntry, ...]) -> None:
+    def set_summary(self, overview: tuple[str, ...], entries: tuple[FitValueEntry, ...], warnings: str) -> None:
         self._overview, self._outcome = overview, ""
         self._phase = ""
+        self._warnings_label.setText(warnings)
+        self._warnings_label.setVisible(bool(warnings))
         self._set_entries(entries)
         self._render()
 
@@ -495,8 +490,10 @@ class RunResultsTab(QtWidgets.QWidget):
             self._summary_body = self._summary_provenance = ""
             self._tracker_panel.clear()
         else:
-            overview, self._summary_body, self._summary_provenance, entries = fit_candidate_presentation(candidate)
-            self._tracker_panel.set_summary(overview, entries)
+            overview, self._summary_body, self._summary_provenance, entries, warnings = (
+                fit_candidate_presentation(candidate)
+            )
+            self._tracker_panel.set_summary(overview, entries, warnings)
         self._install_plot_projection(curves)
         self._refresh_summary()
         return self.copy_eligible()
@@ -546,29 +543,32 @@ class RunResultsTab(QtWidgets.QWidget):
         self._refresh_summary()
 
     def set_terminal_failure(self, failure: FactualCause) -> None:
-        self._empty_label.hide()
-        self._tracker_panel.clear()
-        dataset_id = failure.details.get("dataset")
-        dataset_label = self._dataset_labels.get(dataset_id, dataset_id)
-        if dataset_label is not None and tuple(self._dataset_labels.values()).count(dataset_label) > 1:
-            dataset_label = f"{dataset_label} ({dataset_id})"
-        caption = f"Dataset: {dataset_label}" if dataset_label is not None else ""
-        message = failure.message
-        self.set_execution_status("Failed", f"{caption}: {message}" if caption else message)
-        self._summary_body = (
-            "<h2>Fit Failed</h2>" + (f"<p>{html.escape(caption)}</p>" if caption else "")
-            + "<p>" + html.escape(_cause_chain(failure)).replace("\n", "<br>") + "</p>"
-        )
-        self._summary_provenance = ""
-        self._refresh_summary()
+        self._present_terminal_cause("Failed", "Fit Failed", failure)
 
     def set_terminal_unavailable(self, cause: ScientificUnavailable) -> None:
+        self._present_terminal_cause("No valid candidate found", "No Valid Candidate Found", cause.factual_cause)
+
+    def _present_terminal_cause(self, phase: str, heading: str, cause: FactualCause) -> None:
+        """One located sentence, captioned with the datasets the cause names."""
         self._empty_label.hide()
         self._tracker_panel.clear()
-        self.set_execution_status("No valid candidate found",
-                                  cause.factual_cause.message if cause.factual_cause is not None else cause.stage)
-        self._summary_body = ("<h2>No Valid Candidate Found</h2><p>"
-                              + html.escape(_cause_chain(cause.factual_cause)).replace("\n", "<br>") + "</p>")
+        dataset_ids = cause.details.get("datasets") or (
+            (cause.details["dataset"],) if "dataset" in cause.details else ()
+        )
+        labels = []
+        for dataset_id in dataset_ids:
+            label = self._dataset_labels.get(dataset_id, dataset_id)
+            if tuple(self._dataset_labels.values()).count(label) > 1:
+                label = f"{label} ({dataset_id})"
+            labels.append(label)
+        caption = f"Dataset{'s' if len(labels) > 1 else ''}: {', '.join(labels)}" if labels else ""
+        message = located(cause.message, *cause.location())
+        self.set_execution_status(phase, f"{caption}: {message}" if caption else message)
+        # A Fit-process crash carries the runtime's diagnostics on later lines.
+        self._summary_body = (
+            f"<h2>{heading}</h2>" + (f"<p>{html.escape(caption)}</p>" if caption else "")
+            + "<p>" + html.escape(message).replace("\n", "<br>") + "</p>"
+        )
         self._summary_provenance = ""
         self._refresh_summary()
 

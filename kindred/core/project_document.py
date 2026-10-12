@@ -226,7 +226,7 @@ class SimulationExecutionSettings:
 
     solver: str = "BDF"
     t_start: float = 0.0
-    t_end: float = 10.0
+    t_end: float = 600.0
     integration_points: int = 100
 
 
