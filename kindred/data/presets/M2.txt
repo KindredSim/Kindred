@@ -1,3 +1,5 @@
+# Run from 0 to 10 s.
+
 # Both <-> and <=> are accepted for reversible reactions.
 # kf specifies the forward rate constant and kr the reverse.
 # Alternatively, specify Keq instead of kr.

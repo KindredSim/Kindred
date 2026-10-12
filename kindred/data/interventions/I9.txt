@@ -1,3 +1,5 @@
+# Run from 0 to 600 s.
+
 A + B -> C ; k=0.02
 C + B -> D ; k=0.01
 

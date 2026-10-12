@@ -1,3 +1,5 @@
+# Run from 0 to 150 s.
+
 A + B <-> Int + Water ; kf=1.0 ; kr=0.01
 Int + C -> PB ; kf=0.01
 PB + Water -> PH + BOH ; kf=100.0

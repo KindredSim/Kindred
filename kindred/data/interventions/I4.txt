@@ -1,3 +1,5 @@
+# Run from 0 to 600 s.
+
 A + C -> B ; k=0.01
 
 # hold keeps a species concentration constant between start_time and end_time.

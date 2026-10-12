@@ -1,3 +1,5 @@
+# Run from 0 to 10 s.
+
 # Three reversible cycles share the steps around A, B, C, D and the intermediate I. Wegscheider cyclicity rules dictate that each independent cycle of reversible steps needs one step defined from the others.
 # The param lines at the end define steps 5, 6 and 4 that way. The kf, kr, and Keq values are deliberately written to be numerically inconsistent, a change in which constants are constrained will result in different simulations
 

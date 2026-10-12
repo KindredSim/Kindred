@@ -1,3 +1,5 @@
+# Run from 0 to 600 s.
+
 # Light represents illumination using a species variable.
 A + Light -> B ; k=0.01
 B -> A ; k=0.003
