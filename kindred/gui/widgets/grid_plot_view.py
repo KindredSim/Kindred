@@ -278,9 +278,29 @@ class GridPlotView(QtWidgets.QWidget):
                 else:
                     axis.setHeight(axis.height())
                 axis.setStyle(autoExpandTextSpace=False, autoReduceTextSpace=False)
-        self._update_grid()
-        self._canvas.ci.layout.activate()
-        self._canvas.grab()
+        # Panels are sized from the widest gutter, and a taller panel can draw denser,
+        # wider tick labels; widen and re-grid until every gutter fits its labels.
+        # Recorded label widths only grow, so this settles.
+        while True:
+            self._update_grid()
+            self._canvas.ci.layout.activate()
+            self._canvas.grab()
+            widened = [self._widen_left_gutter(plot) for plot in self._plot_items.values()]
+            if not any(widened):
+                break
+
+    @staticmethod
+    def _widen_left_gutter(plot: object) -> bool:
+        """Grow a frozen left gutter to the widest tick label drawn; report growth."""
+        axis = plot.getAxis("left")
+        frozen = axis.fixedWidth
+        axis.setStyle(autoExpandTextSpace=True, autoReduceTextSpace=False)
+        axis.setWidth(None)
+        needed = axis.minimumWidth()
+        axis.setWidth(max(frozen, needed))
+        axis.setStyle(autoExpandTextSpace=False, autoReduceTextSpace=False)
+        plot.layout.activate()
+        return needed > frozen
 
     def set_projection(self, curves: Iterable[FitCurveDataset]) -> None:
         """Retain full Copy data and update only existing model-series data."""

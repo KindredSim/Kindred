@@ -35,7 +35,7 @@ from kindred.gui.widgets.grid_plot_view import GridPlotView
 __all__ = ["FitTrackerPanel", "ResultsSummaryDialog", "RunResultsTab"]
 
 ColorResolver = Callable[[str], object]
-STALE_RESULTS_TEXT = "Setup changed since this run. Run to update."
+STALE_RESULTS_TEXT = "Setup edited since this run. Run to update."
 
 
 
