@@ -745,7 +745,7 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
             "<tr><td><code>heaviside(x)</code></td><td>0 when <i>x</i> ≤ 0, otherwise 1</td></tr>"
             "<tr><td><code>ifelse(condition, a, b)</code></td><td>Selects <i>a</i> when the condition is true, otherwise <i>b</i></td></tr>"
             "</table>"
-            "<p>Both values in <code>ifelse</code> are calculated, so both expressions must be valid.</p>"
+            "<p><code>ifelse</code> calculates only the value it selects, so <code>ifelse([B] &gt; 0, [C] / [B], 0)</code> is 0 where B is 0.</p>"
             "<p><code>ln</code>, <code>log10</code>, <code>exp</code>, and the other functions that need a plain-number argument (<code>log1p</code>, <code>expm1</code>, <code>sin</code>, <code>cos</code>, <code>tan</code>, <code>erf</code>) take a concentration, time, or temperature, or a quantity built from them such as a rate constant, relative to 1 M, 1 s, and 1 K, and the result has no unit. A <code>dG_eq</code> on a reaction line uses the mechanism's <code>C0</code> as its standard concentration.</p>"
             "<h3>Arithmetic and Comparisons</h3>"
             "<table border=\"1\" cellpadding=\"5\" cellspacing=\"0\">"

@@ -48,7 +48,8 @@ def result_record(run, result, outputs):
     data, scalars, missing = {"t": result.t.tolist()}, {}, []
     for name in outputs:
         if name in result.series:
-            data[name] = result.series[name].tolist()
+            # An undefined calculated value is null; JSON has no NaN.
+            data[name] = [value if np.isfinite(value) else None for value in result.series[name].tolist()]
         elif name in result.scalars:
             scalars[name] = result.scalars[name]
         else:

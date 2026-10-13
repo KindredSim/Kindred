@@ -26,6 +26,7 @@ from kindred.gui.fitting.execution import (
 )
 from kindred.gui.theme_manager import plot_background_color, plot_foreground_color
 from kindred.gui.plot_config import require_pyqtgraph
+from kindred.gui.widgets.plot_data_item import PlotDataItem
 from kindred.gui.workspace_result_presenter import (
     VESSEL_VOLUME_COLOR,
     encode_clipboard_text,
@@ -334,14 +335,16 @@ class GridPlotView(QtWidgets.QWidget):
 
             def draw(kind, names, chunks, shown):
                 for name in names:
-                    xs, ys = [], []
+                    xs, ys, connectors = [], [], []
                     for chunk in chunks:
                         if xs:
                             xs.append(math.nan)
                             ys.append(math.nan)
+                            connectors.append(False)
                         xs.extend(scale_values(chunk.x, *x_unit))
                         ys.extend(scale_values(dict(chunk.series)[name], *shown[name]))
-                    self._update_series(identity, kind, name, (tuple(xs), tuple(ys)))
+                        connectors.extend([chunk.instantaneous] * len(chunk.x))
+                    self._update_series(identity, kind, name, (tuple(xs), tuple(ys)), tuple(connectors))
 
             draw("model", targets, focused_model_chunks(curve),
                  {name: (units.get(name), display[name]) for name in targets})
@@ -800,12 +803,14 @@ class GridPlotView(QtWidgets.QWidget):
                           units=format_unit_for_display(x_display))
             plot._kindred_appearance = state
 
-    def _update_series(self, identity: str, kind: str, species: str, data: tuple) -> None:
+    def _update_series(self, identity: str, kind: str, species: str, data: tuple,
+                       connectors: tuple[bool, ...] = ()) -> None:
         series = self._plot_series_items[identity]
         key = (kind, species)
         item = series.get(key)
         if item is None:
-            item = self._plot_items[identity].plot([], [], pen=None)
+            item = PlotDataItem([], [], pen=None)
+            self._plot_items[identity].addItem(item)
             series[key] = item
         item.setVisible(True)
         color = self._pg.mkColor(self._color_by_species[species])
@@ -824,10 +829,11 @@ class GridPlotView(QtWidgets.QWidget):
             else:
                 item.setPen(self._pg.mkPen(color=color, width=2))
             item._kindred_style = style
-        if getattr(item, "_kindred_data", None) != data:
+        if getattr(item, "_kindred_data", None) != (data, connectors):
             x, y = data
-            item.setData(x, y, connect="finite")
-            item._kindred_data = data
+            # Jump paths never get a lone-sample mark.
+            item.setData(x, y, connect="finite", connectors=connectors or False)
+            item._kindred_data = (data, connectors)
 
     def _toggle_legend(self, visible: bool) -> None:
         self._legend_visible = bool(visible)

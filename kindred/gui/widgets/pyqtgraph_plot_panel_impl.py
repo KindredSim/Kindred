@@ -47,6 +47,7 @@ from kindred.gui.plot_config import (
 )
 from kindred.gui.widgets.axis_toolbar import AxisToolbar
 from kindred.gui.widgets.parameter_statistics_table import ParameterStatisticsTable
+from kindred.gui.widgets.plot_data_item import PlotDataItem
 from kindred.gui.widgets.species_statistics_table import SpeciesStatisticsTable
 from kindred.gui.workspace_result_presenter import (
     InteractiveDisplayCurve,
@@ -63,24 +64,6 @@ from kindred.gui.workspace_result_presenter import (
 pg = require_pyqtgraph(context="Kindred GUI")
 
 __all__ = ["PyQtGraphPlotPanel"]
-
-
-class _PlotDataItem(pg.PlotDataItem):
-    """Treat scatter axes with no finite mapped samples as having no bounds."""
-
-    def dataBounds(self, ax, frac=1.0, orthoRange=None):
-        if not self.curve.isVisible() and self.scatter.isVisible():
-            # 0.13.7 checks for empty scatter data before, but not after,
-            # filtering nonfinite values for percentiles. Log mapping can
-            # remove every finite value, including within a visible-X window.
-            data = self.scatter.data
-            values = data["x" if ax == 0 else "y"]
-            if orthoRange is not None:
-                other = data["y" if ax == 0 else "x"]
-                values = values[(other >= orthoRange[0]) & (other <= orthoRange[1])]
-            if not np.isfinite(values).any():
-                return (None, None)
-        return super().dataBounds(ax, frac=frac, orthoRange=orthoRange)
 
 
 class _PlotViewBox(pg.ViewBox):
@@ -150,6 +133,17 @@ _EPSILON = 1e-9
 _DisplayAnnotation = tuple[str, str, Mapping[str, object], float]
 _AnnotationKey = tuple[str, str, tuple[tuple[str, str], ...]]
 _ANNOTATION_ACCENTS = ("#4E79A7", "#F28E2B", "#59A14F", "#E15759", "#B07AA1", "#76B7B2")
+
+
+def _undefined_edges(*arrays: np.ndarray) -> np.ndarray:
+    """Rows on both sides of every change between defined and undefined values
+    in each array, kept through sampling so no curve's undefined stretch is drawn
+    across, even inside another curve's longer one."""
+    changes = np.concatenate([
+        np.flatnonzero(known[1:] != known[:-1])
+        for known in (np.isfinite(values) for values in arrays)
+    ])
+    return np.concatenate((changes, changes + 1))
 
 
 def _transform_samples(x: np.ndarray, y: np.ndarray, transform: str) -> tuple[np.ndarray, np.ndarray]:
@@ -340,8 +334,8 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
 
         return self._analysis_tabs
 
-    def _add_plot_data(self, x, y, **options) -> _PlotDataItem:
-        item = _PlotDataItem(x, y, **options)
+    def _add_plot_data(self, x, y, **options) -> PlotDataItem:
+        item = PlotDataItem(x, y, **options)
         self._plot_widget.addItem(item)
         return item
 
@@ -1285,7 +1279,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
                  for index in (start, end - 1)],
                 dtype=int,
             )
-            sample = np.unique(np.concatenate((sample, endpoints)))
+            sample = np.unique(np.concatenate((sample, endpoints, _undefined_edges(curve.x, curve.y))))
         physical_chunks = []
         for chunk in curve.physical_chunks:
             if chunk.instantaneous:
@@ -1466,11 +1460,12 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
                     pen = pg.mkPen(color=curve.color, width=2, style=(QtCore.Qt.PenStyle.DashLine if curve.dashed else QtCore.Qt.PenStyle.SolidLine))
                     item = existing.get(item_key)
                     if item is None:
-                        item = self._add_plot_data(chunk.x, y, pen=pen, name=None, connect="finite")
+                        item = self._add_plot_data(chunk.x, y, pen=pen, name=None, connect="finite",
+                                                   connectors=chunk.instantaneous)
                     else:
-                        item.setData(chunk.x, y, connect="finite")
+                        item.setData(chunk.x, y, connect="finite", connectors=chunk.instantaneous)
                         item.setPen(pen)
-                    self._style_simulation_item(item, True, curve.color, curve.opacity, singleton=chunk.x.size == 1)
+                    self._style_simulation_item(item, True, curve.color, curve.opacity)
                     rendered[item_key] = item
         for item_key, item in existing.items():
             if item_key not in rendered:
@@ -2009,24 +2004,24 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
             color = colors[series_name]
             transformed = next((item for item in transformed_blocks if item.chunks and series_name in dict(item.chunks[0].series)), None)
             rendered_chunks = () if transformed is None else transformed.chunks
-            physical_chunks: list[tuple[np.ndarray, np.ndarray]] = []
+            physical_chunks: list[tuple[np.ndarray, np.ndarray, bool]] = []
             for chunk_index, chunk in enumerate(rendered_chunks):
                 x = chunk.x
                 y = dict(chunk.series)[series_name]
                 if transform == "original" and chunk_index and block.result is None:
-                    prior_x, prior_y = physical_chunks[-1]
+                    prior_x, prior_y, _instantaneous = physical_chunks[-1]
                     physical_chunks[-1] = (
                         np.concatenate((prior_x, x)),
                         np.concatenate((prior_y, y)),
+                        False,
                     )
                 else:
-                    physical_chunks.append((x, y))
+                    physical_chunks.append((x, y, chunk.instantaneous))
             legend_pending = True
-            for chunk_index, (x, y) in enumerate(physical_chunks):
+            for chunk_index, (x, y, instantaneous) in enumerate(physical_chunks):
                 if not np.any(np.isfinite(x) & np.isfinite(y)):
                     continue
-                singleton = x.size == 1
-                marker = bool(block.markers or singleton)
+                marker = block.markers
                 item_key = (role, dict(block.series_axes)[series_name], chunk_index, "marker" if marker else "line")
                 item = existing_store.get(item_key)
                 name = f"{block.label}: {series_name}"
@@ -2038,8 +2033,8 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
                 if item is None:
                     if marker:
                         item = self._add_plot_data(
-                            x, y, pen=None, symbol=(block.point_shape if block.markers else "o"),
-                            symbolSize=(block.point_size if block.markers else 5.0),
+                            x, y, pen=None, symbol=block.point_shape,
+                            symbolSize=block.point_size,
                             symbolBrush=pg.mkBrush(color), symbolPen=pg.mkPen(color),
                             name=legend_name, connect="finite",
                         )
@@ -2047,29 +2042,29 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
                         item = self._add_plot_data(
                             x, y,
                             pen=pg.mkPen(color=color, width=2, style=(QtCore.Qt.PenStyle.DashLine if block.dashed else QtCore.Qt.PenStyle.SolidLine)),
-                            name=legend_name, connect="finite",
+                            name=legend_name, connect="finite", connectors=instantaneous,
                         )
                 else:
-                    item.setData(x, y, connect="finite")
+                    item.setData(x, y, connect="finite", connectors=instantaneous)
                     if marker:
                         item.setSymbolBrush(pg.mkBrush(color))
                         item.setSymbolPen(pg.mkPen(color))
-                        item.setSymbol(block.point_shape if block.markers else "o")
-                        item.setSymbolSize(block.point_size if block.markers else 5.0)
+                        item.setSymbol(block.point_shape)
+                        item.setSymbolSize(block.point_size)
                     else:
                         item.setPen(pg.mkPen(color=color, width=2, style=(QtCore.Qt.PenStyle.DashLine if block.dashed else QtCore.Qt.PenStyle.SolidLine)))
                 self._update_plot_item_legend(item, legend_name)
                 item.setVisible(True)
-                self._style_simulation_item(item, block.kind is not ResultLayerKind.EXPERIMENTAL, color, block.opacity, singleton=singleton)
+                self._style_simulation_item(item, block.kind is not ResultLayerKind.EXPERIMENTAL, color, block.opacity)
                 item_store[item_key] = item
         if rendered_points is not None and any(
             chunk.x.size for chunk in rendered_block.chunks
         ):
             rendered_points.extend(transformed_blocks)
-    def _style_simulation_item(self, item: object, simulation: bool, color: object, opacity: float, *, singleton: bool) -> None:
+    def _style_simulation_item(self, item: object, simulation: bool, color: object, opacity: float) -> None:
         if simulation:
-            item.setSymbol("o" if self._presentation.simulation_markers or singleton else None)
-            if self._presentation.simulation_markers or singleton:
+            item.setSymbol("o" if self._presentation.simulation_markers else None)
+            if self._presentation.simulation_markers:
                 item.setSymbolSize(5)
                 item.setSymbolBrush(pg.mkBrush(color))
                 item.setSymbolPen(pg.mkPen(color))
@@ -2084,7 +2079,8 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         sample = self._sample_indices(block.t.size, sampling_limit)
         if block.kind is not ResultLayerKind.EXPERIMENTAL:
             region_endpoints = self._execution_region_endpoints(block)
-            sample = np.unique(np.concatenate((sample, region_endpoints)))
+            undefined_edges = _undefined_edges(block.t, *(values for _name, values in block.series))
+            sample = np.unique(np.concatenate((sample, region_endpoints, undefined_edges)))
         return sample
 
     def _render_analysis(self, render_input: ResultRenderInput) -> None:

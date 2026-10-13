@@ -109,22 +109,22 @@ def alignment_rows(result, x_axis, series_axes):
 
     Rows come from the same chunks the plot draws, so known pre-boundary
     endpoints participate while instantaneous jump paths never connect.  Each
-    row carries its chunk index as region identity; rows with an unknown
-    quantity (an uncomputable calculated endpoint) are left out, as the plot
-    breaks the curve there too.
+    row carries its chunk index as region identity.  A quantity unknown at a row
+    (an uncomputable calculated endpoint, or a time point where a calculated
+    quantity is undefined) stays NaN there; matching places an observation only
+    where every quantity it measures is known, as the plot breaks each curve
+    where it is unknown.
     """
     chunks = physical_curve_chunks(result, x_axis, series_axes, range(len(result.t)))
     names = tuple(name for name, _axis in series_axes)
     times, xs, regions = [], [], []
     ys = {name: [] for name in names}
     for region, chunk in enumerate(chunk for chunk in chunks if not chunk.instantaneous):
-        stacked = np.vstack((chunk.x, *(values for _name, values in chunk.series)))
-        known = np.all(np.isfinite(stacked), axis=0)
-        times.append(chunk.time[known])
-        xs.append(chunk.x[known])
-        regions.append(np.full(int(np.count_nonzero(known)), region, dtype=np.int64))
+        times.append(chunk.time)
+        xs.append(chunk.x)
+        regions.append(np.full(chunk.time.size, region, dtype=np.int64))
         for name, values in chunk.series:
-            ys[name].append(values[known])
+            ys[name].append(values)
 
     def joined(parts, dtype=float):
         return np.concatenate(parts) if parts else np.asarray([], dtype=dtype)

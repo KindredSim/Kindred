@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import logging
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Dict, List, Mapping, Optional, Set, Tuple
 
 import numpy as np
@@ -37,7 +37,9 @@ from .errors import (
     AlgebraError,
     AlgebraNameError,
     AlgebraTypeError,
+    AlgebraUndefinedError,
     AlgebraZeroDivError,
+    UNCOMPUTABLE_ERRORS,
 )
 from .parser import (
     AlgebraBlock,
@@ -157,6 +159,9 @@ class AlgebraObservableError:
 
 
 # ----------------------------- utilities -------------------------------------
+
+# Failures that leave a let undefined at one time point rather than failing it.
+_UNDEFINED_POINT_ERRORS = (*UNCOMPUTABLE_ERRORS, AlgebraUndefinedError)
 
 
 def _as_float(x: Any, *, stmt: LetStatement) -> float:
@@ -292,7 +297,11 @@ class _Evaluator:
         Best-effort evaluation: continue after per-observable failures.
 
         - Each `let name = expr` is evaluated independently.
-        - On failure, the observable is omitted from outputs and an error record is returned.
+        - A time point a let cannot compute, or at which it reads an undefined
+          let, is undefined (NaN) there only; the let keeps its other points and
+          one error record names the first undefined point and their count.
+        - A let undefined at every point, or failing otherwise, is omitted from
+          outputs with an error record.
         - Strict invariants (shape checks) still apply per statement.
         """
         errors: List[AlgebraObservableError] = []
@@ -312,10 +321,43 @@ class _Evaluator:
                     continue
 
                 arr = np.empty(self.N, dtype=float)
+                # Keyed by whether the point is undefined only through another let.
+                firsts: dict[bool, tuple[int, AlgebraError]] = {}
+                counts = {True: 0, False: 0}
+                dependencies: dict[str, None] = {}
                 for i in range(self.N):
                     if i % 256 == 0:
                         self.ctx.check_cancelled()
-                    arr[i] = self._eval_expr(stmt.expr, i, stmt=stmt)
+                    try:
+                        arr[i] = self._eval_expr(stmt.expr, i, stmt=stmt)
+                    except _UNDEFINED_POINT_ERRORS as exc:
+                        arr[i] = np.nan
+                        inherited = isinstance(exc, AlgebraUndefinedError)
+                        counts[inherited] += 1
+                        firsts.setdefault(inherited, (i, exc))
+                        if inherited:
+                            dependencies.setdefault(exc.dependency)
+                if firsts:
+                    # Each cause describes its own points: the let's own failure
+                    # when it has one, else every let it reads where undefined,
+                    # whose own causes describe their points.
+                    inherited = False not in firsts
+                    index, exc = firsts[inherited]
+                    if inherited and len(dependencies) > 1:
+                        names = [repr(dependency) for dependency in dependencies]
+                        exc = AlgebraUndefinedError(
+                            f"It depends on {', '.join(names[:-1])} and {names[-1]}, "
+                            "which are undefined wherever it is.",
+                            dependency=next(iter(dependencies)),
+                            line=stmt.line, col=stmt.col, line_text=stmt.line_text,
+                        )
+                    if counts[True] + counts[False] == self.N:
+                        raise exc
+                    error = AlgebraObservableError.from_exception(name, exc, stmt=stmt)
+                    errors.append(replace(error, details={
+                        "undefined_points": counts[inherited], "points": self.N,
+                        "first_undefined_time": float(self.ctx.t[index]),
+                    }))
                 self.series[name] = arr
             except SimulationCancelled:
                 raise
@@ -347,7 +389,13 @@ class _Evaluator:
                 return float(self.scalars[name])
             # user-defined series
             if name in self.series:
-                return float(self.series[name][i])
+                value = float(self.series[name][i])
+                if math.isnan(value):
+                    raise AlgebraUndefinedError(
+                        f"It depends on {name!r}, which is undefined wherever it is.",
+                        dependency=name, line=stmt.line, col=stmt.col, line_text=stmt.line_text,
+                    )
+                return value
             if name == "t":
                 return float(self.ctx.t[i])
             # Accepted runtime context takes precedence over the static table,
@@ -376,9 +424,11 @@ class _Evaluator:
             if self.ctx.symtab.has(name):
                 return float(self.ctx.symtab.get(name))
             if name in self.failed:
-                raise AlgebraNameError(
+                # Undefined at every point, so a let reading it is undefined
+                # only where it reads it.
+                raise AlgebraUndefinedError(
                     f"It depends on {name!r}, which could not be calculated.",
-                    line=stmt.line, col=stmt.col, line_text=stmt.line_text,
+                    dependency=name, line=stmt.line, col=stmt.col, line_text=stmt.line_text,
                 )
             # unknown
             raise AlgebraNameError(f"Unknown name {name!r}.", line=stmt.line, col=stmt.col, line_text=stmt.line_text)
@@ -470,13 +520,12 @@ class _Evaluator:
             fn = self.ctx.symtab.functions().get(node.name)
             if fn is None:
                 raise AlgebraNameError(f"Unknown function {node.name!r}.", line=stmt.line, col=stmt.col, line_text=stmt.line_text)
-            args: List[Any] = []
-            for index, a in enumerate(node.args):
-                av = self._eval_expr(a, i, stmt=stmt)
-                if node.name == "ifelse" and index == 0:
-                    args.append(av)
-                else:
-                    args.append(_as_float(av, stmt=stmt))
+            if node.name == "ifelse":
+                # Only the selected value is calculated, as && and || calculate
+                # only what decides them.
+                selected = node.args[1] if bool(self._eval_expr(node.args[0], i, stmt=stmt)) else node.args[2]
+                return _as_float(self._eval_expr(selected, i, stmt=stmt), stmt=stmt)
+            args: List[Any] = [_as_float(self._eval_expr(a, i, stmt=stmt), stmt=stmt) for a in node.args]
             try:
                 out = float(fn(*args))
             except ZeroDivisionError:

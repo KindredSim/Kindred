@@ -89,6 +89,11 @@ def _algebra_cause(error: AlgebraObservableError, spec: object) -> FactualCause:
     reads, as a param's failure does, so a Fit decides from them."""
 
     details: dict[str, object] = {**error.details, "name": error.name}
+    message = error.message
+    if "undefined_points" in details:
+        # A let undefined at some time points only names where.
+        message = (f"{message} Undefined at {details['undefined_points']} of {details['points']} "
+                   f"time points, first at t = {details['first_undefined_time']:g} s.")
     if error.exc_type in {error_type.__name__ for error_type in UNCOMPUTABLE_ERRORS}:
         details["stage"] = "result_algebra"
         details["parameter_names"] = spec.input_dependencies(
@@ -105,7 +110,7 @@ def _algebra_cause(error: AlgebraObservableError, spec: object) -> FactualCause:
         origin="algebra",
         code=error.code,
         type=error.exc_type,
-        message=error.message,
+        message=message,
         context=context,
         details=details,
     )

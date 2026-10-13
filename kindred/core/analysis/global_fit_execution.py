@@ -31,6 +31,7 @@ import numpy as np
 
 from kindred.core.analysis.parametric_alignment import (
     ParametricProjection,
+    UndefinedComparedTargets,
     align_parametric,
     project_parametric_y,
 )
@@ -514,9 +515,11 @@ def fit_result_target_values(
     """
 
     target_name = str(name)
-    details = {"fatal": True, "stage": "fit_target_lookup", "dataset": dataset_id, "target": target_name}
+    details = _target_lookup_details(target_name, dataset_id)
     time_size = np.asarray(result.t, dtype=float).reshape(-1).size
     if target_name in result.series:
+        # A let undefined at some time points keeps them as NaN; the residual
+        # path judges the points that data compares with.
         values = np.asarray(result.series[target_name], dtype=float).reshape(-1)
     elif target_name in result.scalars:
         value = float(result.scalars[target_name])
@@ -527,26 +530,37 @@ def fit_result_target_values(
             )
         values = np.full(time_size, value, dtype=float)
     else:
-        algebra_cause = next(
-            (cause for cause in result.algebra_errors if cause.details.get("name") == target_name), None,
-        )
-        error = FitSimulationError(
-            f"Fit target {target_name!r} could not be calculated: {algebra_cause.message}" if algebra_cause is not None else
-            f"Fit target {target_name!r} is absent from the canonical simulation scalar/series outputs.",
-            details=details,
-        )
-        if algebra_cause is not None:
-            error.factual_cause = replace(
-                factual_cause_from_exception(error, domain="fit", origin="fit_target_lookup"),
-                cause=algebra_cause,
-            )
-        raise error
-    if values.size != time_size or not np.all(np.isfinite(values)):
+        raise _target_not_calculated(result, target_name, dataset_id)
+    if values.size != time_size:
         raise FitSimulationError(
-            f"Fit target {target_name!r} is not a finite row-aligned output.",
+            f"Fit target {target_name!r} is not a row-aligned output.",
             details=details,
         )
     return values
+
+
+def _target_lookup_details(target_name: str, dataset_id: str) -> dict[str, object]:
+    return {"fatal": True, "stage": "fit_target_lookup", "dataset": dataset_id, "target": target_name}
+
+
+def _target_not_calculated(
+    result: SimulationResultValue, target_name: str, dataset_id: str,
+) -> FitSimulationError:
+    """The fatal error for a target the Fit cannot compare, carrying its own cause."""
+    algebra_cause = next(
+        (cause for cause in result.algebra_errors if cause.details.get("name") == target_name), None,
+    )
+    error = FitSimulationError(
+        f"Fit target {target_name!r} could not be calculated: {algebra_cause.message}" if algebra_cause is not None else
+        f"Fit target {target_name!r} is absent from the canonical simulation scalar/series outputs.",
+        details=_target_lookup_details(target_name, dataset_id),
+    )
+    if algebra_cause is not None:
+        error.factual_cause = replace(
+            factual_cause_from_exception(error, domain="fit", origin="fit_target_lookup"),
+            cause=algebra_cause,
+        )
+    return error
 
 
 @dataclass(frozen=True)
@@ -994,6 +1008,7 @@ def _build_dataset_fit_info(
     residual_blocks: list[tuple[str, int]] = []
     r_squared: dict[str, FitMetric] = {}
     raw_rms: dict[str, FitMetric] = {}
+    undefined: list[str] = []
     for species_name in sorted(payload.species_list):
         _raise_if_fitting_cancel_requested(cancellation_control)
         species_obs = observations[species_name]
@@ -1017,6 +1032,9 @@ def _build_dataset_fit_info(
                 model_y=alignment_y[species_name],
             )
         y_sim = np.asarray(y_sim, dtype=float).reshape(-1)
+        if not np.all(np.isfinite(y_sim)):
+            undefined.append(str(species_name))
+            continue
         raw_residual = y_sim - y_exp
         weighted = dataset_weight * target_multipliers[species_name] * raw_residual
         raw_blocks.append(raw_residual)
@@ -1024,6 +1042,8 @@ def _build_dataset_fit_info(
         residual_blocks.append((str(species_name), len(raw_residual)))
         r_squared[str(species_name)] = r_squared_metric(y_exp, raw_residual)
         raw_rms[str(species_name)] = root_mean_square(raw_residual)
+    if undefined:
+        raise UndefinedComparedTargets(tuple(undefined))
 
     if x_projection is not None:
         x_multiplier = dataset_weight * float(target_multipliers[payload.x_name])
@@ -1118,12 +1138,24 @@ def evaluate_dataset_simulation(
             return replace(
                 series_result, factual_cause=_cause_naming_dataset(series_result.factual_cause, ds_id),
             )
-        fit_info = _build_dataset_fit_info(
-            item,
-            series_result,
-            weights=weights,
-            cancellation_control=task_control,
-        )
+        try:
+            fit_info = _build_dataset_fit_info(
+                item,
+                series_result,
+                weights=weights,
+                cancellation_control=task_control,
+            )
+        except UndefinedComparedTargets as undefined:
+            # Data compares with a time point a target is undefined at: judged
+            # by the failures it reads, as a target that failed entirely is.
+            # Only targets the result records as undefined are judged; an
+            # unknown pre-boundary endpoint is not a failure.
+            failed = {cause.details["name"] for cause in series_result.algebra_errors}
+            targets = tuple(name for name in undefined.targets if name in failed)
+            rejection = evaluator.failure_rejection(series_result, targets, item.parameter_origins)
+            if rejection is None:
+                raise _target_not_calculated(series_result, targets[0], ds_id) from None
+            return replace(rejection, factual_cause=_cause_naming_dataset(rejection.factual_cause, ds_id))
         _raise_if_fitting_cancel_requested(worker_cancel)
         if time.monotonic() >= deadline:
             return deadline_unavailable()

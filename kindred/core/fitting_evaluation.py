@@ -322,11 +322,23 @@ class FittingEvaluator:
             self._with_fit_values(cause, params) for cause in result.algebra_errors
         ))
         # A selected output that was calculated is final; one that failed is
-        # judged by the failures among the lets it reads.
-        failed = {cause.details["name"] for cause in result.algebra_errors}
+        # judged by the failures among the lets it reads. One undefined at some
+        # time points only is judged where data compares with it.
+        rejection = self.failure_rejection(
+            result, tuple(name for name in outputs if name in result.failed_algebra_outputs), origins,
+        )
+        return result if rejection is None else rejection
+
+    def failure_rejection(
+        self,
+        result: SimulationResultValue,
+        outputs: tuple[str, ...],
+        origins: Mapping[str, str],
+    ) -> ScientificUnavailable | None:
+        """Reject the candidate for the first failure, among the lets the
+        outputs read, that depends on an optimizer value; None leaves it fatal."""
         used = observable_closure(
-            self._context.prepared_run.parameter_algebra_spec.observable_block,
-            (name for name in outputs if name in failed),
+            self._context.prepared_run.parameter_algebra_spec.observable_block, outputs,
         )
         for cause in result.algebra_errors:
             if cause.details["name"] not in used:
@@ -334,7 +346,7 @@ class FittingEvaluator:
             rejection = _candidate_domain_rejection(cause, origins)
             if rejection is not None:
                 return rejection
-        return result
+        return None
 
     def _with_fit_values(self, cause: FactualCause, params: Mapping[str, float]) -> FactualCause:
         """Name the Fit's own values for the failing value's inputs, which can

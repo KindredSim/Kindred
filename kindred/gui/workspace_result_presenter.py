@@ -1540,7 +1540,8 @@ def iter_blocks_tsv_chunks(
                 encode_tsv_row(
                     tuple(
                         (
-                            repr(float(values[index]))
+                            # An undefined calculated value stays blank.
+                            (repr(float(values[index])) if np.isfinite(values[index]) else "")
                             if kind == "float"
                             else (
                                 str(int(values[index]))
@@ -1647,7 +1648,9 @@ def write_xlsx(
                     (
                         *((float(block.t[index]) if index < block.t.size else None,) if x_headers else ()),
                         *identity_values,
-                        *(float(values[index]) if index < len(values) else None for _name, values in block.series),
+                        # An undefined calculated value is an empty cell.
+                        *(float(values[index]) if index < len(values) and np.isfinite(values[index]) else None
+                          for _name, values in block.series),
                         *((int(values[index]) if kind == "int" else float(values[index])) if index < len(values) and values[index] is not None else None for _, values, kind in volume_columns),
                     ),
                 )

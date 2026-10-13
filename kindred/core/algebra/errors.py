@@ -40,6 +40,7 @@ __all__ = [
     "AlgebraZeroDivError",
     "AlgebraTypeError",
     "AlgebraBoolCastError",
+    "AlgebraUndefinedError",
     "UNCOMPUTABLE_ERRORS",
 ]
 
@@ -113,6 +114,14 @@ class AlgebraTypeError(AlgebraError):
 class AlgebraBoolCastError(AlgebraError):
     def __init__(self, msg: str, *, line: int, col: int, line_text: str | None = None):
         super().__init__(msg=msg, code="E170", line=line, col=col, line_text=line_text)
+
+
+class AlgebraUndefinedError(AlgebraNameError):
+    """A let reads another let at a time point where that let is undefined."""
+
+    def __init__(self, msg: str, *, dependency: str, line: int, col: int, line_text: str | None = None):
+        super().__init__(msg, line=line, col=col, line_text=line_text)
+        self.dependency = dependency
 
 
 # A formula that cannot compute its value for these inputs: the value is

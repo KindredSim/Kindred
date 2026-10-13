@@ -15,7 +15,15 @@ from kindred.core.analysis.fit_dataset_payload import FitObservationSeries
 from kindred.core.exceptions import FitSimulationError, FittingCancelled
 from kindred.core.simulator.solver_types import SimulationCancellationControl
 
-__all__ = ["ParametricProjection", "align_parametric", "project_parametric_y"]
+__all__ = ["ParametricProjection", "UndefinedComparedTargets", "align_parametric", "project_parametric_y"]
+
+
+class UndefinedComparedTargets(Exception):
+    """Targets data compares with where at least one of them is undefined."""
+
+    def __init__(self, targets: tuple[str, ...]) -> None:
+        super().__init__(", ".join(targets))
+        self.targets = targets
 
 
 @dataclass(frozen=True, slots=True)
@@ -64,7 +72,10 @@ def align_parametric(
 
     Every available selected quantity contributes once. Recorded observation
     time is deliberately absent. Endpoints also participate, including isolated
-    samples beside a jump. No segment crosses an executor-issued boundary.
+    samples beside a jump. No segment crosses an executor-issued boundary. A row
+    is placed only on segments whose ends define every quantity it measures; a
+    row with no such segment raises UndefinedComparedTargets with the quantities
+    it measures.
     """
     if cancellation_control is not None and cancellation_control.cancel_requested():
         raise FittingCancelled()
@@ -88,6 +99,8 @@ def align_parametric(
         for name in names
     }
     weight = np.asarray([multipliers[x_name], *(multipliers[name] for name in names)])
+    defined = np.isfinite(model)
+    ends_defined = defined[left] & defined[right]
     chosen_rows: list[int] = []
     chosen_fractions: list[float] = []
     for row, x_value in zip(source_rows, observed_x, strict=True):
@@ -95,8 +108,13 @@ def align_parametric(
             raise FittingCancelled()
         observed = np.asarray([x_value, *(observed_by_row[name].get(row, np.nan) for name in names)])
         available = np.isfinite(observed)
-        start = model[left][:, available]
-        direction = (model[right][:, available] - start) * weight[available]
+        candidates = np.flatnonzero(np.all(ends_defined[:, available], axis=1))
+        if not candidates.size:
+            raise UndefinedComparedTargets(tuple(
+                name for name, measured in zip((x_name, *names), available) if measured
+            ))
+        start = model[left[candidates]][:, available]
+        direction = (model[right[candidates]][:, available] - start) * weight[available]
         offset = (observed[available] - start) * weight[available]
         # Scale the calculation together, preserving the weighted minimizer.
         scale = max(float(np.max(np.abs(direction))), float(np.max(np.abs(offset))))
@@ -111,7 +129,7 @@ def align_parametric(
         errors = offset - fraction[:, None] * direction
         costs = np.sum(errors * errors, axis=1)
         chosen = int(np.argmin(costs))
-        chosen_rows.append(chosen)
+        chosen_rows.append(int(candidates[chosen]))
         chosen_fractions.append(float(fraction[chosen]))
     selected_left = left[chosen_rows]
     selected_right = right[chosen_rows]

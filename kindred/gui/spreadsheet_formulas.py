@@ -104,12 +104,6 @@ def _references(node: ExprNode, column_count: int) -> tuple[int, ...]:
     return tuple(column for child in children for column in _references(child, column_count))
 
 
-def _has_ifelse(node: ExprNode) -> bool:
-    children = (node.args if isinstance(node, CallNode) else (node.lhs, node.rhs) if isinstance(node, BinaryNode)
-                else (node.rhs,) if isinstance(node, UnaryNode) else ())
-    return isinstance(node, CallNode) and node.name == "ifelse" or any(map(_has_ifelse, children))
-
-
 def _emit(node: ExprNode, row: str) -> str:
     if isinstance(node, NumberNode):
         text = node.literal if node.literal is not None else repr(node.value)
@@ -129,16 +123,9 @@ def _emit(node: ExprNode, row: str) -> str:
         args = tuple(_emit(arg, row) for arg in node.args)
         if node.name == "pow":
             text = f"{args[0]}^{args[1]}"
-        elif node.name == "ifelse" and _has_ifelse(node.args[0]):
-            # A condition containing ifelse is bound once instead of copied; the
-            # zero terms preserve Algebra's eager branch errors (IF is lazy).
-            text = (f"LET(_kc,{args[0]},_ka,{args[1]},_kb,{args[2]},"
-                    "((IF(_kc,_ka,_kb)+(0*_ka))+(0*_kb)))")
         elif node.name == "ifelse":
-            # IronCalc's IF is lazy and its LET is slow; weighting both branches
-            # by the condition's truth keeps Algebra's eager argument errors.
-            weight = f"ABS(SIGN({args[0]}))"
-            text = f"({weight}*{args[1]})+((1-{weight})*{args[2]})"
+            # IronCalc's IF calculates only the selected value, as Algebra does.
+            text = f"IF({args[0]},{args[1]},{args[2]})"
         elif node.name == "clip":
             # The median of the value and both bounds is Algebra's clip.
             text = f"MEDIAN({','.join(args)})"
