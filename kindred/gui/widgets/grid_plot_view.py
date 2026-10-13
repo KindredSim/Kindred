@@ -13,8 +13,8 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from kindred.gui.curve_copy_headers import copy_column_header
 from kindred.core.quantity_units import Unit, MOLAR, SECOND, format_unit_for_display
 from kindred.gui.fitting.curve_projection import (
-    fit_display_units, prepared_fit_units, scale_values, focused_model_chunks, focused_model_rows,
-    shared_axis_unit,
+    VESSEL_VOLUME, fit_display_units, prepared_fit_units, scale_values, focused_model_chunks,
+    focused_model_rows, model_chunks, shared_axis_unit, simulated_quantities, simulated_units,
 )
 from kindred.gui.display_name_policy import (
     PLOT_TITLE_LABEL_MAX_CHARS,
@@ -27,6 +27,7 @@ from kindred.gui.fitting.execution import (
 from kindred.gui.theme_manager import plot_background_color, plot_foreground_color
 from kindred.gui.plot_config import require_pyqtgraph
 from kindred.gui.workspace_result_presenter import (
+    VESSEL_VOLUME_COLOR,
     encode_clipboard_text,
     encode_tsv_row,
 )
@@ -56,15 +57,25 @@ def _fit_y_axis_label(
     return label, format_unit_for_display(unit)
 
 
-def _fit_copy_columns(dataset):
-    """Project complete retained data independently of widget display history."""
+def _fit_copy_columns(dataset, all_simulated=False):
+    """Project complete retained data independently of widget display history.
+
+    All simulated data adds every quantity the result holds to the fitted
+    targets, in the units the Fit plot draws them in.
+    """
     targets = tuple(name for name, _ in dataset.observed_y)
     units = dict(dataset.simulation.quantity_units)
     display, measured_display = fit_display_units(units, dataset.simulation.presentation_units, dataset.x_name, targets,
                                                   dataset.observed_x_unit, dataset.observed_y_units)
     measured_y_units = dict(dataset.observed_y_units)
     definitions = dict(dataset.model_definitions)
-    rows = focused_model_rows(dataset)
+    shown = {name: (units.get(name), display[name]) for name in targets}
+    names = targets
+    if all_simulated:
+        names = tuple(name for name in simulated_quantities(dataset.simulation) if name != dataset.x_name)
+        shown.update(simulated_units(dataset.simulation, tuple(name for name in names if name not in targets),
+                                     {name: display[name] for name in targets}))
+    rows = focused_model_rows(dataset, names if all_simulated else None)
     columns = []
 
     def add(group, name, values, unit, definition=None):
@@ -76,8 +87,9 @@ def _fit_copy_columns(dataset):
     if dataset.x_name != "t":
         name = dataset.x_name
         add("Model", name, scale_values(rows[:, 1], units.get(name), display[name]), display[name], definitions.get(name))
-    for index, name in enumerate(targets):
-        add("Model", name, scale_values(rows[:, index+2], units.get(name), display[name]), display[name], definitions.get(name))
+    for index, name in enumerate(names):
+        source, unit = shown[name]
+        add("Model", name, scale_values(rows[:, index+2], source, unit), unit, definitions.get(name))
     observed_x, times, raw = dict(dataset.observed_x), dict(dataset.observed_time), dict(dataset.observed_raw_columns)
     for name, values in dataset.observed_y:
         group = f"Observed {raw[name]}"
@@ -94,7 +106,8 @@ def _fit_copy_columns(dataset):
 class GridPlotView(QtWidgets.QWidget):
     """Render immutable live and terminal Fit curves in the Fit-local plot."""
 
-    copyFitDataRequested = QtCore.Signal(str)
+    # Dataset ID, and whether every simulated quantity is copied.
+    copyFitDataRequested = QtCore.Signal(str, bool)
 
     def __init__(
         self,
@@ -116,6 +129,10 @@ class GridPlotView(QtWidgets.QWidget):
         self._request: FitExecutionRequest | None = None
         self._dataset_ids: tuple[str, ...] = ()
         self._plot_series_items: dict[str, dict[tuple[str, str], object]] = {}
+        # Per-panel simulated quantities the user ticked, beside the fitted targets.
+        self._extras: dict[str, tuple[str, ...]] = {}
+        self._extra_units: dict[str, dict[str, Unit | None]] = {}
+        self._panel_args: dict[str, tuple] = {}
         self._structure_key: tuple = ()
         self._grid_key: tuple | None = None
         self._dark_mode = False
@@ -135,6 +152,7 @@ class GridPlotView(QtWidgets.QWidget):
             key: self._context_menu.addAction(label)
             for key, label in (
                 ("copy", "Copy Fit Data"),
+                ("copy_all", "Copy All Simulated Data"),
                 ("range", "Auto Range"),
                 ("pan", "Pan"),
                 ("rect", "Rectangle Zoom"),
@@ -150,6 +168,10 @@ class GridPlotView(QtWidgets.QWidget):
         )
         self._context_actions["copy"].setToolTip(
             "Copy the model predictions and observations for this dataset at full resolution."
+        )
+        self._context_actions["copy_all"].setToolTip(
+            "Copy every simulated species, calculated quantity and vessel volume for this "
+            "dataset, with its observations, at full resolution."
         )
         self._context_actions["pan"].setToolTip("Drag the plot to move the visible area.")
         self._context_actions["rect"].setToolTip(
@@ -168,8 +190,14 @@ class GridPlotView(QtWidgets.QWidget):
         self._context_actions["invert_y"].setToolTip(
             "Reverse the direction of the vertical axis."
         )
-        for action in tuple(self._context_actions.values())[2:]:
-            action.setCheckable(True)
+        for key in ("pan", "rect", "legend", "log_x", "log_y", "invert_x", "invert_y"):
+            self._context_actions[key].setCheckable(True)
+        self._extras_menu = QtWidgets.QMenu("Show Simulated", self._context_menu)
+        self._extras_menu.setToolTipsVisible(True)
+        self._extras_menu.menuAction().setToolTip(
+            "Show simulated species and calculated quantities that are not fitted in this plot."
+        )
+        self._context_menu.insertMenu(self._context_actions["range"], self._extras_menu)
         self._mouse_mode_group = QtGui.QActionGroup(self)
         self._mouse_mode_group.setExclusive(True)
         self._mouse_mode_group.addAction(self._context_actions["pan"])
@@ -218,23 +246,31 @@ class GridPlotView(QtWidgets.QWidget):
         structure = tuple((identity, configs[identity].selected_observations,
                            configs[identity].parametric_x_observation)
                           for identity in dataset_ids)
-        changed = structure != self._structure_key
+        # Only a panel that is new or whose own observations changed fits its range again.
+        changed = {panel[0] for panel in structure if panel not in self._structure_key}
         self._reconcile_structure(structure)
         self._refresh_appearance()
-        for identity in dataset_ids:
-            if changed:
-                self._plot_items[identity].getViewBox().autoRange()
+        for identity in changed:
+            self._plot_items[identity].getViewBox().autoRange()
         self._update_grid()
-        self._context_actions["copy"].setEnabled(False)
+        self._refresh_copy_actions()
 
     def finish_preparation(self) -> None:
         """Lay out and paint hidden views too, then fix native axis gutters."""
+        # Measure every gutter afresh; a kept plot's earlier one may not fit its labels now.
+        for plot in self._plot_items.values():
+            plot.getAxis("left").setWidth(None)
+            plot.getAxis("bottom").setHeight(None)
+            for side in ("left", "bottom"):
+                plot.getAxis(side).setStyle(autoExpandTextSpace=True, autoReduceTextSpace=True)
         self.ensurePolished()
         self.layout().activate()
         self.grab()  # Activate hidden scroll-area layouts at the stack viewport size.
         self._update_grid()
         self._canvas.grab()
         for plot in self._plot_items.values():
+            # Apply each plot's own measured axis space before reading it.
+            plot.layout.activate()
             for side in ("left", "bottom"):
                 axis = plot.getAxis(side)
                 if side == "left":
@@ -251,7 +287,15 @@ class GridPlotView(QtWidgets.QWidget):
         self.cancel_copy()
         self._curves = tuple(curves)
         self._update_models()
-        self._context_actions["copy"].setEnabled(self.copy_eligible())
+        self._refresh_copy_actions()
+
+    def _refresh_copy_actions(self) -> None:
+        for key in ("copy", "copy_all"):
+            self._context_actions[key].setEnabled(self.copy_eligible())
+
+    def _shown_extras(self, identity: str, targets: tuple[str, ...], x_name: str) -> tuple[str, ...]:
+        """Ticked quantities that are not this panel's fitted targets or X."""
+        return tuple(name for name in self._extras.get(identity, ()) if name not in targets and name != x_name)
 
     def _update_models(self):
         curves = {curve.dataset_id: curve for curve in self._curves}
@@ -259,23 +303,40 @@ class GridPlotView(QtWidgets.QWidget):
             curve = curves.get(identity)
             if curve is None:
                 for kind, name in series:
-                    if kind == "model":
+                    if kind != "observed":
                         self._update_series(identity, kind, name, ((), ()))
                 continue
             units = dict(curve.simulation.quantity_units)
+            targets = tuple(name for name, _ in curve.observed_y)
             display, _measured = fit_display_units(units, curve.simulation.presentation_units, curve.x_name,
-                                                   tuple(name for name, _ in curve.observed_y),
-                                                   curve.observed_x_unit, curve.observed_y_units)
-            chunks = focused_model_chunks(curve)
-            for name, _ in curve.observed_y:
-                xs, ys = [], []
-                for chunk in chunks:
-                    if xs:
-                        xs.append(math.nan)
-                        ys.append(math.nan)
-                    xs.extend(scale_values(chunk.x, units.get(curve.x_name), display[curve.x_name]))
-                    ys.extend(scale_values(dict(chunk.series)[name], units.get(name), display[name]))
-                self._update_series(identity, "model", name, (tuple(xs), tuple(ys)))
+                                                   targets, curve.observed_x_unit, curve.observed_y_units)
+            x_unit = (units.get(curve.x_name), display[curve.x_name])
+
+            def draw(kind, names, chunks, shown):
+                for name in names:
+                    xs, ys = [], []
+                    for chunk in chunks:
+                        if xs:
+                            xs.append(math.nan)
+                            ys.append(math.nan)
+                        xs.extend(scale_values(chunk.x, *x_unit))
+                        ys.extend(scale_values(dict(chunk.series)[name], *shown[name]))
+                    self._update_series(identity, kind, name, (tuple(xs), tuple(ys)))
+
+            draw("model", targets, focused_model_chunks(curve),
+                 {name: (units.get(name), display[name]) for name in targets})
+            # A ticked quantity absent from this result (a let that failed) draws nothing.
+            extras = self._shown_extras(identity, targets, curve.x_name)
+            available = simulated_quantities(curve.simulation)
+            present = tuple(name for name in extras if name in available)
+            shown = simulated_units(curve.simulation, present, {name: display[name] for name in targets})
+            draw("extra", present, model_chunks(curve, present) if present else (), shown)
+            for name in extras:
+                if name not in present:
+                    self._update_series(identity, "extra", name, ((), ()))
+            self._extra_units[identity] = {name: unit for name, (_source, unit) in shown.items()}
+            if identity in self._panel_args:
+                self._update_panel(identity, *self._panel_args[identity], self._extra_units[identity])
 
     def _prepare_context_menu(self, dataset_id: str) -> None:
         plot = self._plot_items[dataset_id]
@@ -284,7 +345,8 @@ class GridPlotView(QtWidgets.QWidget):
         mouse_mode = state["mouseMode"]
         self._context_target = (dataset_id, plot)
         actions = self._context_actions
-        actions["copy"].setEnabled(self.copy_eligible())
+        self._refresh_copy_actions()
+        self._prepare_extras_menu(dataset_id)
         log_mode = state["logMode"]
         for key, value in (
             ("pan", mouse_mode == pg.ViewBox.PanMode),
@@ -296,6 +358,45 @@ class GridPlotView(QtWidgets.QWidget):
             ("invert_y", state["yInverted"]),
         ):
             actions[key].setChecked(bool(value))
+
+    def _prepare_extras_menu(self, dataset_id: str) -> None:
+        """List what this panel's latest curve simulated, beside its fitted targets."""
+        menu = self._extras_menu
+        menu.clear()
+        curve = next((item for item in self._curves if item.dataset_id == dataset_id), None)
+        ticked = self._extras.get(dataset_id, ())
+        names = ()
+        if curve is not None:
+            fitted = {name for name, _ in curve.observed_y} | {curve.x_name}
+            names = tuple(name for name in simulated_quantities(curve.simulation) if name not in fitted)
+        # A ticked quantity this result lacks stays listed so it can be unticked.
+        for name in (*names, *(name for name in ticked if name not in names)):
+            action = menu.addAction(name)
+            action.setCheckable(True)
+            action.setChecked(name in ticked)
+            action.triggered.connect(lambda checked, name=name: self._toggle_extra(name, checked))
+        menu.menuAction().setEnabled(bool(menu.actions()))
+
+    def _toggle_extra(self, name: str, checked: bool) -> None:
+        target = self._context_target
+        if target is None:
+            return
+        dataset_id, plot = target
+        if self._plot_items.get(dataset_id) is not plot:
+            return
+        current = tuple(item for item in self._extras.get(dataset_id, ()) if item != name)
+        self._extras[dataset_id] = (*current, name) if checked else current
+        if not checked:
+            item = self._plot_series_items[dataset_id].pop(("extra", name), None)
+            if item is not None:
+                plot.removeItem(item)
+                item.deleteLater()
+            self._extra_units.get(dataset_id, {}).pop(name, None)
+        self._refresh_appearance()
+        view_box = plot.getViewBox()
+        view_box.autoRange()
+        view_box.enableAutoRange(x=False, y=False)
+        self.finish_preparation()
 
     def _show_context_menu(
         self,
@@ -340,9 +441,9 @@ class GridPlotView(QtWidgets.QWidget):
         dataset_id, plot = target
         if self._plot_items.get(dataset_id) is not plot:
             return
-        if kind == "copy":
+        if kind in {"copy", "copy_all"}:
             if self.copy_eligible():
-                self.copyFitDataRequested.emit(dataset_id)
+                self.copyFitDataRequested.emit(dataset_id, kind == "copy_all")
             return
         view_box = plot.getViewBox()
         if kind == "range":
@@ -362,6 +463,8 @@ class GridPlotView(QtWidgets.QWidget):
                 view_box.setYRange(*before[1], padding=0)
             else:
                 view_box.setXRange(*before[0], padding=0)
+            # Logarithmic tick labels can be wider than the measured linear ones.
+            self.finish_preparation()
         elif kind in {"invert_x", "invert_y"}:
             getattr(plot, f"invert{kind[-1].upper()}")(bool(checked))
         else:
@@ -374,11 +477,13 @@ class GridPlotView(QtWidgets.QWidget):
 
     def set_copy_allowed(self, allowed: bool) -> None:
         self._copy_allowed = bool(allowed)
-        self._context_actions["copy"].setEnabled(self.copy_eligible())
+        self._refresh_copy_actions()
 
     def copy_projection_to_clipboard(
         self,
         curves: Iterable[FitCurveDataset],
+        *,
+        all_simulated: bool = False,
     ) -> None:
         """Copy the Results owner's immutable plotted arrays for the given scope."""
 
@@ -389,7 +494,7 @@ class GridPlotView(QtWidgets.QWidget):
             raise ValueError("No Fit curves are available to copy.")
         if self._copy_timer.isActive():
             return
-        self._copy_chunks = iter(self._iter_copy_chunks(values))
+        self._copy_chunks = iter(self._iter_copy_chunks(values, all_simulated))
         self._copy_output = io.StringIO()
         self._copy_timer.start()
 
@@ -401,11 +506,11 @@ class GridPlotView(QtWidgets.QWidget):
         self._copy_output = None
 
     def _iter_copy_chunks(
-        self, curves: tuple[FitCurveDataset, ...],
+        self, curves: tuple[FitCurveDataset, ...], all_simulated: bool,
     ) -> Iterable[str]:
         columns: list[tuple[str, Sequence[float]]] = []
         for dataset in curves:
-            dataset_columns = _fit_copy_columns(dataset)
+            dataset_columns = _fit_copy_columns(dataset, all_simulated)
             if columns and dataset_columns:
                 columns.append(("", ()))
             columns.extend(dataset_columns)
@@ -547,11 +652,7 @@ class GridPlotView(QtWidgets.QWidget):
         font = self.font()
         for axis_name in ("left", "bottom"):
             axis = plot.getAxis(axis_name)
-            axis.enableAutoSIPrefix(False)
-            if axis.style["tickFont"] != font:
-                axis.setWidth(None) if axis_name == "left" else axis.setHeight(None)
             axis.setTickFont(font)
-            axis.setStyle(autoExpandTextSpace=True, autoReduceTextSpace=True)
             axis.label.setFont(font)
         self._apply_dark_mode_to_plot(plot)
 
@@ -572,9 +673,17 @@ class GridPlotView(QtWidgets.QWidget):
             names.append(species)
             entries.append(f'<span style="color:{self._pg.mkColor(color).name()}">●</span> '
                            + html.escape(species))
+        return (" &nbsp; ".join(entries) + " &nbsp; " + self._legend_key(),
+                "\n".join(names) + "\n\n— Model line\nObserved markers"
+                + ("\n··· Simulated line" if self._has_extras() else ""))
+
+    def _has_extras(self) -> bool:
+        return any(self._extras.get(identity) for identity in self._dataset_ids)
+
+    def _legend_key(self) -> str:
         marker = {"o": "●", "s": "■", "t": "▼", "d": "◆", "x": "×", "+": "+"}[self._observation_style[0]]
-        return (" &nbsp; ".join(entries) + f" &nbsp; — Model &nbsp; {marker} Observed",
-                "\n".join(names) + "\n\n— Model line\nObserved markers")
+        return (f"— Model &nbsp; {marker} Observed"
+                + (" &nbsp; ··· Simulated" if self._has_extras() else ""))
 
     def _update_legend(self) -> None:
         rich, plain = self.legend_text()
@@ -583,8 +692,7 @@ class GridPlotView(QtWidgets.QWidget):
         document.setHtml(rich)
         overflow = document.idealWidth() > max(1, self.contentsRect().width())
         if overflow:
-            marker = {"o": "●", "s": "■", "t": "▼", "d": "◆", "x": "×", "+": "+"}[self._observation_style[0]]
-            rich = f"{len(self._color_by_species)} series &nbsp; — Model &nbsp; {marker} Observed"
+            rich = f"{len(self._color_by_species)} series &nbsp; {self._legend_key()}"
         self._legend_label.setText(rich)
         self._legend_label.setFixedHeight(self.fontMetrics().lineSpacing())
         self._legend_label.setAccessibleName(plain)
@@ -611,15 +719,25 @@ class GridPlotView(QtWidgets.QWidget):
             self._canvas.ci.removeItem(plot)
             plot.deleteLater()
             self._plot_series_items.pop(identity)
-        for identity, observations, _x in structure:
+            for state in (self._extras, self._extra_units, self._panel_args):
+                state.pop(identity, None)
+        for identity, observations, x in structure:
             names = tuple(item.model_target for item in observations)
             if identity not in self._plot_items:
                 plot = self._pg.PlotItem(enableMenu=False)
                 plot.getViewBox().enableAutoRange(x=False, y=False)
+                # Kindred converts Fit values itself. Disable pyqtgraph's prefixes once,
+                # while the range is still the default: each later call rescales ticks.
+                for side in ("left", "bottom"):
+                    plot.getAxis(side).enableAutoSIPrefix(False)
                 self._plot_items[identity] = plot
                 self._plot_series_items[identity] = {}
             series = self._plot_series_items[identity]
+            # A ticked quantity that is now fitted or X is no longer an extra choice.
+            if identity in self._extras:
+                self._extras[identity] = self._shown_extras(identity, names, "t" if x is None else x.model_target)
             active = {(kind, name) for name in names for kind in ("observed", "model")}
+            active.update(("extra", name) for name in self._extras.get(identity, ()))
             for key in tuple(series):
                 if key not in active:
                     item = series.pop(key)
@@ -629,12 +747,16 @@ class GridPlotView(QtWidgets.QWidget):
             self._grid_key = None
         self._structure_key = structure
 
-    def _update_panel(self, identity, display_name, x_name, model_display, measured_display, names) -> None:
+    def _update_panel(self, identity, display_name, x_name, model_display, measured_display, names,
+                      extra_units) -> None:
         plot = self._plot_items[identity]
         name = compact_plot_title_label(display_name, max_chars=PLOT_TITLE_LABEL_MAX_CHARS)
         title, tooltip = name.display, f"{name.full}\nDataset ID: {identity}"
         x_display = shared_axis_unit((model_display[x_name], measured_display[x_name]))
         y_display = shared_axis_unit(unit for name in names for unit in (model_display[name], measured_display[name]))
+        # A shown simulated quantity in another unit leaves the axis without one unit.
+        if any(unit != y_display for unit in extra_units.values()):
+            y_display = None
         label, units = _fit_y_axis_label(y_display)
         if x_display is None or y_display is None:
             details = [html.escape(tooltip).replace("\n", "<br>")]
@@ -642,6 +764,8 @@ class GridPlotView(QtWidgets.QWidget):
                 model = format_unit_for_display(model_display[quantity]) or "Unspecified"
                 measured = format_unit_for_display(measured_display[quantity]) or "Unspecified"
                 details.append(f"{html.escape(quantity)}: model {model}, measured {measured}")
+            for quantity, unit in extra_units.items():
+                details.append(f"{html.escape(quantity)}: simulated {format_unit_for_display(unit) or 'Unspecified'}")
             tooltip = "<qt>" + "<br>".join(details) + "</qt>"
         state = (x_name, title, tooltip, label, units, x_display, len(self._dataset_ids) > 1,
                  self._dark_mode, self.font().toString())
@@ -665,7 +789,7 @@ class GridPlotView(QtWidgets.QWidget):
             series[key] = item
         item.setVisible(True)
         color = self._pg.mkColor(self._color_by_species[species])
-        style = (color.rgba(), self._observation_style if kind == "observed" else None)
+        style = (color.rgba(), kind, self._observation_style if kind == "observed" else None)
         if getattr(item, "_kindred_style", None) != style:
             if kind == "observed":
                 shape, size, opacity = self._observation_style
@@ -674,6 +798,9 @@ class GridPlotView(QtWidgets.QWidget):
                 item.setSymbolSize(size)
                 item.setSymbolBrush(self._pg.mkBrush(color))
                 item.setSymbolPen(self._pg.mkPen(color=color, width=1))
+            elif kind == "extra":
+                # Dashed already means Reference in the main plot.
+                item.setPen(self._pg.mkPen(color=color, width=1, style=QtCore.Qt.PenStyle.DotLine))
             else:
                 item.setPen(self._pg.mkPen(color=color, width=2))
             item._kindred_style = style
@@ -727,12 +854,14 @@ class GridPlotView(QtWidgets.QWidget):
         configs = {item.dataset_id: item for item in request.dispatch.prepared_datasets}
         mapped = {item.dataset_id: item for item in request.setup.origin.mapped_datasets}
         species_names = tuple(dict.fromkeys(
-            item.model_target for identity in self._dataset_ids
-            for item in configs[identity].selected_observations))
+            (*(item.model_target for identity in self._dataset_ids
+               for item in configs[identity].selected_observations),
+             *(name for identity in self._dataset_ids for name in self._extras.get(identity, ())))))
         if species_names and self._color_resolver is None:
             raise ValueError("Fit curves require an injected species-color resolver.")
         self._color_by_species = MappingProxyType({
-            species: _color_value(self._color_resolver(species)) for species in species_names})
+            species: VESSEL_VOLUME_COLOR if species == VESSEL_VOLUME else _color_value(self._color_resolver(species))
+            for species in species_names})
         for identity in self._dataset_ids:
             config = configs[identity]
             names = tuple(item.model_target for item in config.selected_observations)
@@ -742,8 +871,8 @@ class GridPlotView(QtWidgets.QWidget):
             y_units = {item.model_target: item.unit for item in config.selected_observations}
             display, measured_display = prepared_fit_units(request.setup.origin.prepared_dsl, x_name, names,
                                                            x_unit, tuple(y_units.items()))
-            self._update_panel(identity, mapped[identity].display_name, x_name,
-                               display, measured_display, names)
+            self._panel_args[identity] = (mapped[identity].display_name, x_name, display, measured_display, names)
+            self._update_panel(identity, *self._panel_args[identity], self._extra_units.get(identity, {}))
             observed_x, observed_y = _observed_curve_parts(config.selected_observations, x_observations=x)
             for species, y in observed_y:
                 self._update_series(identity, "observed", species, (

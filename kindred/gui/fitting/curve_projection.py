@@ -4,10 +4,12 @@ from __future__ import annotations
 import numpy as np
 
 from kindred.core.analysis.global_fit_execution import fit_result_target_values
-from kindred.core.project_presentation_state import SimulationSeriesAxisSelection
-from kindred.core.quantity_units import MOLAR, SECOND, conversion_scale
+from kindred.core.project_presentation_state import SimulationSeriesAxisSelection, VesselVolumeAxisSelection
+from kindred.core.quantity_units import CUBIC_METRE, MOLAR, SECOND, conversion_scale
 from kindred.core.result_curve_projection import physical_curve_chunks
 from kindred.core.simulation_result_finalization import result_quantity_units
+
+VESSEL_VOLUME = "Vessel volume"
 
 
 def focused_units(quantity_units, preferred_units, x_name, targets):
@@ -61,23 +63,68 @@ def scale_values(values, source, destination):
     return tuple(scale.apply(float(value)) if np.isfinite(value) else float(value) for value in values)
 
 
+def simulated_quantities(result):
+    """Every quantity a retained result holds, in result order; failed lets are absent."""
+    names = list(result.series)
+    names.extend(name for name in result.succeeded_algebra_outputs
+                 if name in result.scalars and name not in result.series)
+    if result.volume is not None:
+        names.append(VESSEL_VOLUME)
+    return tuple(names)
+
+
+def simulated_units(result, names, targets_display):
+    """Source and display unit of quantities drawn beside the fitted targets.
+
+    The targets keep their own units; others never influence them. Concentrations
+    take the targets' concentration unit, volume uses its presentation unit, and
+    any other quantity keeps its retained scientific unit, as non-concentration
+    targets do.
+    """
+    units = dict(result.quantity_units)
+    concentration = next((unit for unit in targets_display.values()
+                          if unit is not None and unit.compatible(MOLAR)), MOLAR)
+    shown = {}
+    for name in names:
+        if name == VESSEL_VOLUME:
+            shown[name] = (CUBIC_METRE, dict(result.presentation_units)[VESSEL_VOLUME])
+            continue
+        source = units.get(name)
+        display = concentration if source is not None and source.compatible(MOLAR) else source
+        shown[name] = (source, display)
+    return shown
+
+
+def _quantity_axis(name):
+    return VesselVolumeAxisSelection() if name == VESSEL_VOLUME else SimulationSeriesAxisSelection(name)
+
+
+def model_chunks(dataset, names):
+    """Project quantities present in the dataset's retained result against its X."""
+    result = dataset.simulation
+    return physical_curve_chunks(
+        result, SimulationSeriesAxisSelection(dataset.x_name),
+        tuple((name, _quantity_axis(name)) for name in names),
+        range(len(result.t)),
+    )
+
+
 def focused_model_chunks(dataset):
     result = dataset.simulation
     targets = tuple(name for name, _ in dataset.observed_y)
     for name in dict.fromkeys((dataset.x_name, *targets)):
         if name != "t":
             fit_result_target_values(result, name, dataset_id=dataset.dataset_id)
-    return physical_curve_chunks(
-        result, SimulationSeriesAxisSelection(dataset.x_name),
-        tuple((name, SimulationSeriesAxisSelection(name)) for name in targets),
-        range(len(result.t)),
-    )
+    return model_chunks(dataset, targets)
 
 
-def focused_model_rows(dataset):
-    """Full numerical rows, including known endpoints; no renderer gap rows."""
+def focused_model_rows(dataset, names=None):
+    """Full numerical rows, including known endpoints; no renderer gap rows.
+
+    Without names the rows hold the fitted targets; with names, those quantities.
+    """
     rows = []
-    for chunk in focused_model_chunks(dataset):
+    for chunk in focused_model_chunks(dataset) if names is None else model_chunks(dataset, names):
         matrix = np.column_stack((chunk.time, chunk.x, *(values for _, values in chunk.series)))
         for row in matrix:
             if not rows or not np.array_equal(rows[-1], row, equal_nan=True):

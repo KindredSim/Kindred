@@ -298,11 +298,9 @@ class FitSessionOwner(QtCore.QObject):
             return False
         if snapshot == previous:
             return False
-        had_candidate = self._candidate is not None
         self._install_setup(snapshot)
         self._invalidate_candidate_custody()
-        if had_candidate:
-            window.clear_candidate()
+        window.mark_results_stale()
         window.project_setup_snapshot(snapshot)
         return True
 
@@ -376,7 +374,7 @@ class FitSessionOwner(QtCore.QObject):
         window.clear_pending_setup_edits()
         # As for any setup edit, only a changed setup releases the result.
         if snapshot != self._accepted_setup():
-            window.clear_candidate()
+            window.mark_results_stale()
             self._invalidate_candidate_custody()
         window.project_setup_snapshot(snapshot)
         self._install_setup(snapshot)

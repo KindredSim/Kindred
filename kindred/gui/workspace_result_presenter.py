@@ -56,6 +56,7 @@ __all__ = [
     "ResultDataBlock",
     "ResultLayerKind",
     "ResultRenderInput",
+    "VESSEL_VOLUME_COLOR",
     "VisibleResultSet",
     "XlsxExportCompletion",
     "compose_canonical_export_blocks",
@@ -73,6 +74,8 @@ _MAX_COPY_CHARACTERS = 64 * 1024 * 1024
 _MAX_XLSX_STRING_LENGTH = 32_767
 _EXCEL_MAX_ROWS = 1_048_576
 _EXCEL_MAX_COLUMNS = 16_384
+# Vessel volume is not a species, so every plot draws it in this one color.
+VESSEL_VOLUME_COLOR = "#8b5cf6"
 
 
 def _readonly_display_array(value: object) -> np.ndarray:
@@ -583,7 +586,7 @@ def _volume_block(block: ResultDataBlock) -> ResultDataBlock | None:
         series=((name, result.volume.values),),
         series_axes=((name, VesselVolumeAxisSelection()),),
         segment_ids=result.segment_ids[first:], segment_keys=result.segment_keys[first:], discontinuity_ids=result.discontinuity_ids[first:],
-        first_index=first, color_by_series=((name, "#8b5cf6"),),
+        first_index=first, color_by_series=((name, VESSEL_VOLUME_COLOR),),
         quantity_units=(("t", SECOND), (name, CUBIC_METRE)),
         presentation_units=((name, dict(result.presentation_units)[name]),),
     )

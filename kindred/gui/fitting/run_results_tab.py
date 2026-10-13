@@ -35,6 +35,7 @@ from kindred.gui.widgets.grid_plot_view import GridPlotView
 __all__ = ["FitTrackerPanel", "ResultsSummaryDialog", "RunResultsTab"]
 
 ColorResolver = Callable[[str], object]
+STALE_RESULTS_TEXT = "Setup changed since this run. Run to update."
 
 
 
@@ -183,7 +184,7 @@ class FitTrackerPanel(QtWidgets.QWidget):
         self.setObjectName("global_fit_tracker_panel")
         self.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding, QtWidgets.QSizePolicy.Policy.Fixed)
         self._overview: tuple[str, ...] = ()
-        self._outcome = self._phase = self._model = ""
+        self._outcome = self._phase = self._model = self._stale_text = ""
         self._fitted_value_count = self._dataset_count = self._calls = 0
         self._objective = "not evaluated"
         self._values_html = ""
@@ -223,7 +224,7 @@ class FitTrackerPanel(QtWidgets.QWidget):
 
     def clear(self) -> None:
         self._overview = ()
-        self._outcome = self._phase = self._values_html = ""
+        self._outcome = self._phase = self._values_html = self._stale_text = ""
         self._objective = "not evaluated"
         self._calls = 0
         self._warnings_label.clear()
@@ -269,6 +270,11 @@ class FitTrackerPanel(QtWidgets.QWidget):
         self._warnings_label.setText(warnings)
         self._warnings_label.setVisible(bool(warnings))
         self._set_entries(entries)
+        self._render()
+
+    def mark_stale(self, text: str) -> None:
+        """State that the setup changed since this run, beside its own outcome."""
+        self._stale_text = text
         self._render()
 
     def summary_html(self) -> str:
@@ -372,6 +378,8 @@ class FitTrackerPanel(QtWidgets.QWidget):
             model_index += 2
         if self._outcome and self._outcome != f"Objective calls {self._calls} · Best complete candidate":
             fragments.append(self._outcome)
+        if self._stale_text:
+            fragments.append(self._stale_text)
         while len(self._summary_labels) < len(fragments):
             label = QtWidgets.QLabel(self._summary_widget)
             label.setTextFormat(Qt.TextFormat.PlainText)
@@ -439,6 +447,7 @@ class RunResultsTab(QtWidgets.QWidget):
         self._summary_dialog: ResultsSummaryDialog | None = None
         self._summary_body = ""
         self._summary_provenance = ""
+        self._stale = False
         self._progress = 0
         self._dark_mode = False
         self._copy_allowed = True
@@ -507,6 +516,8 @@ class RunResultsTab(QtWidgets.QWidget):
         body = self._summary_body or self._tracker_panel.summary_html()
         if not self._summary_body:
             body += f"<p>Progress: {self._progress}%</p>"
+        if self._stale:
+            body = f"<p><b>{html.escape(STALE_RESULTS_TEXT)}</b></p>" + body
         return body, self._summary_provenance
 
     def _refresh_summary(self) -> None:
@@ -528,18 +539,23 @@ class RunResultsTab(QtWidgets.QWidget):
         self._summary_dialog = dialog
         dialog.show()
 
-    def clear_candidate(self, *, keep_plots: bool = False) -> None:
-        """Clear only physical result widgets; the owner controls custody."""
+    def clear_candidate(self) -> None:
+        """Clear the result presentation; plots and their view settings stay for the next Run."""
 
         self._tracker_panel.clear()
         self._summary_body = self._summary_provenance = ""
+        self._stale = False
         self._empty_label.setText("Run a fit to see results here.")
         self._empty_label.show()
         self._install_plot_projection(())
-        if not keep_plots:
-            self._dataset_tab_ids = []
-            self._dataset_labels = {}
-            self._clear_subtabs()
+        self._refresh_summary()
+
+    def mark_stale(self) -> None:
+        """Keep showing results whose setup has since changed, and say so."""
+        if not self._subtab_stack.count() or self._stale:
+            return
+        self._stale = True
+        self._tracker_panel.mark_stale(STALE_RESULTS_TEXT)
         self._refresh_summary()
 
     def set_terminal_failure(self, failure: FactualCause) -> None:
@@ -595,7 +611,7 @@ class RunResultsTab(QtWidgets.QWidget):
             raise ValueError("No Fit curves are available to copy.")
         view.copy_projection_to_clipboard(curves)
 
-    def copy_dataset_to_clipboard(self, dataset_id: str) -> None:
+    def copy_dataset_to_clipboard(self, dataset_id: str, all_simulated: bool) -> None:
         """Copy the one dataset represented by a clicked Fit plot."""
 
         identity = str(dataset_id or "").strip()
@@ -605,7 +621,7 @@ class RunResultsTab(QtWidgets.QWidget):
         view = self._subtab_stack.currentWidget()
         if view is None or len(curves) != 1:
             raise ValueError("The selected Fit dataset has no curves to copy.")
-        view.copy_projection_to_clipboard(curves)
+        view.copy_projection_to_clipboard(curves, all_simulated=all_simulated)
 
     def set_observation_style(self, shape: str, size: float, opacity: float) -> None:
         self._observation_style = (shape, size, opacity)
@@ -616,7 +632,7 @@ class RunResultsTab(QtWidgets.QWidget):
         self._refresh_summary()
 
     def set_waiting(self, request: FitExecutionRequest) -> None:
-        self.clear_candidate(keep_plots=True)
+        self.clear_candidate()
         self._progress = 0
         self._tracker_panel.start(
             request.setup,
@@ -628,7 +644,7 @@ class RunResultsTab(QtWidgets.QWidget):
 
     def restart_waiting(self) -> None:
         """Wait again for the running request the tracker already holds."""
-        self.clear_candidate(keep_plots=True)
+        self.clear_candidate()
         self._progress = 0
         self._tracker_panel.restart()
         if self._summary_dialog is not None and self._summary_dialog.isVisible():
@@ -776,16 +792,6 @@ class RunResultsTab(QtWidgets.QWidget):
         self._refresh_active_plot_view()
         self._refresh_summary()
         self.copyAvailableChanged.emit(self.copy_eligible())
-
-    def _clear_subtabs(self) -> None:
-        with QtCore.QSignalBlocker(self._subtabs):
-            while self._subtabs.count():
-                self._subtabs.removeTab(self._subtabs.count() - 1)
-        while self._subtab_stack.count():
-            self._remove_plot_view(self._subtab_stack.widget(0))
-        self._dataset_plot_views.clear()
-        self._all_datasets_plot_view = None
-        self._subtabs.hide()
 
     def _remove_plot_view(self, view: GridPlotView) -> None:
         view.set_projection(())

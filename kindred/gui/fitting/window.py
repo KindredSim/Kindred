@@ -880,6 +880,11 @@ class FittingWindow(QtWidgets.QDialog):
         else:
             self._run_results_tab.clear_candidate()
 
+    def mark_results_stale(self) -> None:
+        """The setup changed: Apply ends, the shown results stay and say so."""
+        self.set_apply_available(False, "Run a fit to obtain current values to apply.")
+        self._run_results_tab.mark_stale()
+
     def render_results_summary(self) -> None:
         self._run_results_tab.render_results_summary()
 
