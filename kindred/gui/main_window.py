@@ -595,6 +595,7 @@ class MainWindow(QtWidgets.QMainWindow):
             lambda _undo, _redo: self._refresh_actions()
         )
         sliders.draftStateChanged.connect(self._on_draft_state_changed)
+        sliders.dragHeldChanged.connect(self._on_simulation_state_changed)
         sliders.errorRaised.connect(self.set_status_text)
         sliders.targetSetIdsChanged.connect(
             lambda ids, captured=tab_id: self._refresh_slider_target_summary(
@@ -971,7 +972,7 @@ class MainWindow(QtWidgets.QMainWindow):
             bundle.initial_actions.render()
             bundle.simulation_panel.render_run_defaults(
                 tab.run_defaults,
-                simulation_job_kind=self._simulation_jobs.current_kind,
+                simulation_job_kind=self._simulation_panel_kind(),
             )
             bundle.slider_binding.render(preserve_editor_drafts=preserve_slider_editor_drafts)
             self._render_dataset_panels(bundle, document, tab, presentation)
@@ -1535,7 +1536,7 @@ class MainWindow(QtWidgets.QMainWindow):
             tab = self._workspace_tab_registry.tab(tab_id)
             bundle.simulation_panel.render_run_defaults(
                 tab.run_defaults,
-                simulation_job_kind=self._simulation_jobs.current_kind,
+                simulation_job_kind=self._simulation_panel_kind(),
             )
             bundle.slider_binding.render()
             self._refresh_project_state()
@@ -2044,7 +2045,7 @@ class MainWindow(QtWidgets.QMainWindow):
             bundle.simulation_panel.discard_run_defaults_draft()
             bundle.simulation_panel.render_run_defaults(
                 tab.run_defaults,
-                simulation_job_kind=self._simulation_jobs.current_kind,
+                simulation_job_kind=self._simulation_panel_kind(),
             )
 
     def _discard_all_slider_drafts(self) -> None:
@@ -3822,7 +3823,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.set_status_text(str(exc))
 
     def _stop_simulation(self, tab_id: str | None = None) -> None:
-        """Fence all latent and physical Preview work before cancellation.
+        """Fence all latent Preview work before cancellation.
 
         Stop cancels work on every tab; only the tab it was pressed on holds
         its Preview until the next gesture.
@@ -4476,7 +4477,17 @@ class MainWindow(QtWidgets.QMainWindow):
         self._refresh_actions()
 
     def _simulation_work_active(self) -> bool:
-        return bool(self._simulation_jobs.busy)
+        return bool(self._simulation_jobs.busy) or self._slider_held()
+
+    def _slider_held(self) -> bool:
+        bundle = self._tab_surfaces.get(self._workspace_tab_registry.active_tab_id)
+        return bundle is not None and bundle.slider_binding.drag_held
+
+    def _simulation_panel_kind(self) -> str | None:
+        # A held Slider shows Stop even between drag requests.
+        return self._simulation_jobs.current_kind or (
+            "preview" if self._slider_held() else None
+        )
 
     @QtCore.Slot(bool)
     def _on_fit_window_changed(self, _open: bool) -> None:
@@ -4502,7 +4513,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _on_simulation_state_changed(self) -> None:
         """Project the live simulation kind into every retained panel."""
 
-        job_kind = self._simulation_jobs.current_kind
+        job_kind = self._simulation_panel_kind()
         for bundle in self._tab_surfaces.values():
             bundle.simulation_panel.render_job_state(job_kind)
         self._refresh_actions()

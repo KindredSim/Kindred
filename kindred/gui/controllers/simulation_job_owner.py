@@ -273,7 +273,7 @@ class SimulationJobOwner(QtCore.QObject):
         return tab_id in self._pending_previews
 
     def preview_set_ids(self, tab_id: str) -> tuple[str, ...]:
-        """Return semantic exact Preview identities for one tab."""
+        """Return the sets of one tab that show a Preview, drag or exact."""
 
         return self._repository(tab_id).preview_set_ids()
 
@@ -378,9 +378,9 @@ class SimulationJobOwner(QtCore.QObject):
     def fence_document_delta(self, delta: ScientificDocumentDelta) -> None:
         """Fence computation for one admitted document delta.
 
-        The registry owns repository mutation and physical presentation
-        retirement.  This operation only retires computation intent and
-        records removed identities on the operation being cancelled.
+        The registry owns repository mutation.  This operation only retires
+        computation intent and records removed identities on the operation
+        being cancelled.
         """
 
         targets_by_tab = delta.targets_by_tab()

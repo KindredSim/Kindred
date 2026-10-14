@@ -85,6 +85,7 @@ class TabSliderBinding(QtCore.QObject):
     draftStateChanged = QtCore.Signal(str)
     targetSetIdsChanged = QtCore.Signal(object)
     errorRaised = QtCore.Signal(str)
+    dragHeldChanged = QtCore.Signal()
 
     def __init__(
         self,
@@ -146,9 +147,16 @@ class TabSliderBinding(QtCore.QObject):
     def _stop_preview_timers(self) -> None:
         self._throttle_timer.stop()
 
+    @property
+    def drag_held(self) -> bool:
+        return self._active_drag is not None
+
     def _clear_gesture_state(self) -> None:
         self._stop_preview_timers()
+        held = self._active_drag is not None
         self._active_drag = self._latest_admissible_pending = None
+        if held:
+            self.dragHeldChanged.emit()
 
     def set_preview_settings(self, *, points: int, delay_ms: int) -> None:
         self._preview_points = points
@@ -173,6 +181,7 @@ class TabSliderBinding(QtCore.QObject):
         if interaction is SliderInteractionKind.INTERACTIVE_DRAG_SAMPLE:
             if self._active_drag != identity:
                 self._active_drag, self._latest_admissible_pending = identity, None
+                self.dragHeldChanged.emit()
             self._record_raw_gesture(*identity, float(value))
             return
         if (
@@ -559,15 +568,15 @@ class TabSliderBinding(QtCore.QObject):
         *,
         interaction: SliderInteractionKind,
     ) -> bool:
-        if not self._registry.tab_runtime(tab.tab_id).has_slider_draft:
-            # Back at the accepted values: show the canonical results.
-            self._simulation_jobs.reconcile_canonical_targets(tab.tab_id, targets)
-            return True
         self._stop_preview_timers()
         if interaction is SliderInteractionKind.INTERACTIVE_DRAG_SAMPLE:
             return self._simulation_jobs.request_interactive_preview(
                 self.capture_interactive_preview(targets, tab=tab)
             )
+        if not self._registry.tab_runtime(tab.tab_id).has_slider_draft:
+            # Released, clicked or typed back at the accepted values.
+            self._simulation_jobs.reconcile_canonical_targets(tab.tab_id, targets)
+            return True
         capture = self.capture_exact_preview(targets, tab=tab)
         accepted = self._simulation_jobs.request_preview(capture)
         self._exact_preview_capture = capture if accepted else None
