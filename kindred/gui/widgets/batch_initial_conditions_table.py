@@ -491,10 +491,7 @@ class BatchInitialConditionsTableView(QtWidgets.QTableView):
     ) -> None:  # noqa: N802
         old_model = self.model()
         if isinstance(old_model, BatchInitialConditionsTableModel):
-            try:
-                old_model.modelReset.disconnect(self._apply_column_presentation)
-            except (TypeError, RuntimeError):
-                pass
+            old_model.modelReset.disconnect(self._apply_column_presentation)
         super().setModel(model)
         if isinstance(model, BatchInitialConditionsTableModel):
             model.modelReset.connect(self._apply_column_presentation)

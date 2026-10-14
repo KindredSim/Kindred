@@ -11,6 +11,8 @@ import warnings
 import numpy as np
 from scipy.stats import qmc
 
+from kindred.core.algebra.errors import AlgebraError
+
 from kindred.scan.config import ScanConfig, RunInput, input_label
 from kindred.scan.inputs import input_catalog, admitted_ranges
 from kindred.scan.intervals import Interval
@@ -273,7 +275,7 @@ class PreparedScanDesign:
                 values = design.draw(index, unit)
                 if first_group:
                     self.interval_checks.admit(self.fixed | values, first_group=True)
-            except (ValueError, OverflowError) as exc:
+            except (ValueError, OverflowError, AlgebraError) as exc:
                 if isinstance(exc, InputGenerationError):
                     values.update(exc.values)
                 storage.record(index, values, str(exc))
@@ -298,7 +300,7 @@ class PreparedScanDesign:
                     if not error:
                         try:
                             self.interval_checks.admit(values)
-                        except (ValueError, OverflowError) as exc:
+                        except (ValueError, OverflowError, AlgebraError) as exc:
                             error = str(exc)
                     yield RunInput(p * cfg.initial_sets + c + 1, values, p + 1, c + 1, error)
         else:
@@ -308,7 +310,7 @@ class PreparedScanDesign:
                 try:
                     values = self.joint.draw(index, unit)
                     self.interval_checks.admit(self.fixed | values)
-                except (ValueError, OverflowError) as exc:
+                except (ValueError, OverflowError, AlgebraError) as exc:
                     if isinstance(exc, InputGenerationError):
                         values.update(exc.values)
                     yield RunInput(index + 1, self.fixed | values, generation_error=str(exc))

@@ -31,7 +31,6 @@ from kindred.core.project_document import (
     canonical_initial_values,
 )
 from kindred.core.species import validate_concentration, validate_input_time_seconds
-from kindred.core.time_grid import build_time_grid
 from kindred.core.simulator.dsl_parse import PreparedDslRequestSet
 from kindred.core.simulation_preparation_stages import (
     PreparedSolverConfig,
@@ -910,7 +909,7 @@ def capture_fit_origin(
 ) -> FitOriginSnapshot:
     """Copy mapped dataset science from one exact tab."""
     tab = document.tab(tab_id)
-    if not isinstance(tab.prepared_dsl, PreparedDslRequestSet):
+    if tab.prepared_dsl is None:
         raise ValueError("Enter a valid mechanism before opening Global Fit.")
     mapped: list[FitMappedDatasetSnapshot] = []
     links = dict(tab.dataset_links)
@@ -1164,14 +1163,6 @@ def _prepare_fit_datasets(
                 f"Dataset {mapped.display_name!r} has selected experimental times "
                 "outside the Simulation interval. Adjust Simulation start, Simulation end, or Data Range."
             )
-        grid_points = 100
-        try:
-            build_time_grid(execution_t_start, execution_t_end, {"N": grid_points})
-        except (TypeError, ValueError) as exc:
-            raise ValueError(
-                f"Fit regular grid for dataset {local.dataset_id!r} cannot be "
-                "realized on this time span."
-            ) from exc
         prepared.append(
             FitPreparedDatasetConfig(
                 dataset_id=local.dataset_id,
@@ -1184,7 +1175,7 @@ def _prepare_fit_datasets(
                     solver=setup.solver,
                     rtol=science.rtol,
                     atol=science.atol,
-                    grid={"N": grid_points},
+                    grid={"N": 100},
                     use_analytic_jacobian=science.analytic_jacobian_policy,
                 ),
             )

@@ -177,19 +177,6 @@ class TemplateEditorDialog(QtWidgets.QDialog):
             self._mechanism_edit.setFocus()
             return
 
-        try:
-            MechanismAuthoringSource.from_parts(
-                reactions_text=self._mechanism_edit.toPlainText()
-            )
-        except (TypeError, ValueError) as exc:
-            QtWidgets.QMessageBox.warning(
-                self,
-                "Validation Error",
-                str(exc),
-            )
-            self._mechanism_edit.setFocus()
-            return
-
         if self._save_button is not None:
             self._save_button.setEnabled(False)
         try:
@@ -575,7 +562,7 @@ class TemplateManagerDialog(QtWidgets.QDialog):
         try:
             modified_dt = datetime.fromisoformat(template.modified_at)
             modified_str = modified_dt.strftime("%Y-%m-%d %H:%M")
-        except (ValueError, TypeError, AttributeError):
+        except ValueError:
             modified_str = template.modified_at
 
         self._modified_label.setText(modified_str)
@@ -632,7 +619,7 @@ class TemplateManagerDialog(QtWidgets.QDialog):
                 template = self._template_manager.create_template(**data)
             else:
                 template = self._template_manager.update_template(dialog._template_id, **data)
-        except Exception as exc:
+        except (OSError, ValueError) as exc:
             logger.error("Failed to %s template: %s", operation, exc, exc_info=True)
             QtWidgets.QMessageBox.critical(
                 dialog, "Error", f"Failed to {operation} template:\n\n{file_error_text(exc, self._template_manager.templates_directory)}"
@@ -641,14 +628,7 @@ class TemplateManagerDialog(QtWidgets.QDialog):
             return
 
         dialog.accept()
-        try:
-            self._render_collection_state(selected_template_id=template.id)
-        except Exception as exc:
-            logger.error("Template saved but collection refresh failed", exc_info=True)
-            QtWidgets.QMessageBox.critical(
-                self, "Template Saved", f"Template '{template.name}' was saved, but refreshing the collection failed:\n\n{exc}"
-            )
-            return
+        self._render_collection_state(selected_template_id=template.id)
         past_operation = "Created" if operation == "create" else "Updated"
         QtWidgets.QMessageBox.information(
             self, f"Template {past_operation}",
@@ -693,7 +673,7 @@ class TemplateManagerDialog(QtWidgets.QDialog):
                 "Template Replaced",
                 f"Template '{template.name}' replaced successfully.",
             )
-        except Exception as exc:
+        except (OSError, ValueError) as exc:
             logger.error("Failed to replace template: %s", exc, exc_info=True)
             self._render_storage_state()
             QtWidgets.QMessageBox.critical(
@@ -729,7 +709,7 @@ class TemplateManagerDialog(QtWidgets.QDialog):
                     f"Template '{template_name}' deleted successfully."
                 )
 
-            except Exception as e:
+            except OSError as e:
                 logger.error(f"Failed to delete template: {e}", exc_info=True)
                 self._render_storage_state()
                 QtWidgets.QMessageBox.critical(
@@ -742,23 +722,7 @@ class TemplateManagerDialog(QtWidgets.QDialog):
         """Apply the selected source through the destination-tab owner."""
         if not self._current_template:
             return
-        try:
-            accepted = self._destination_apply(
-                self._current_template.source
-            )
-        except Exception as exc:
-            logger.error(
-                "Template destination rejected Apply: %s",
-                exc,
-                exc_info=True,
-            )
-            QtWidgets.QMessageBox.critical(
-                self,
-                "Template Apply",
-                f"The template could not be applied:\n\n{exc}",
-            )
-            return
-        if accepted:
+        if self._destination_apply(self._current_template.source):
             self.accept()
 
     def _select_template(self, template_id: str) -> None:

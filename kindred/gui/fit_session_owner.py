@@ -188,16 +188,17 @@ class FitSessionOwner(QtCore.QObject):
         window.raise_()
         window.activateWindow()
         declarations = origin.prepared_dsl.authored_stop_declarations()
-        if declarations:
+        if declarations and origin.scientific_settings.use_authored_stops:
             message = QtWidgets.QMessageBox(window)
-            message.setWindowTitle("Stopping Interventions Are Ignored During Fitting")
+            message.setWindowTitle("Stopping Interventions During Fitting")
             message.setIcon(QtWidgets.QMessageBox.Information)
             message.setTextFormat(QtCore.Qt.PlainText)
             message.setText(
-                "Fitting runs over the interval required by the experimental data.\n"
-                "These stopping interventions will be ignored:\n\n"
+                "Datasets fitted against time run over the interval their experimental data "
+                "require, so these stopping interventions are ignored for them:\n\n"
                 + "\n".join(declarations)
-                + "\n\nAll other interventions remain active."
+                + "\n\nDatasets fitted against a measured X use them, as Run does. "
+                "All other interventions remain active."
             )
             message.setStandardButtons(QtWidgets.QMessageBox.Ok)
             message.exec()
@@ -904,7 +905,7 @@ class FitSessionOwner(QtCore.QObject):
                 self._session.document,
                 captured.tab_id,
             )
-        except (TypeError, ValueError, KeyError, LookupError):
+        except (KeyError, ValueError):
             return False
 
         def dataset_science(item: object) -> tuple[object, ...]:
@@ -978,11 +979,8 @@ class FitSessionOwner(QtCore.QObject):
         origin = self._current_origin()
         message = str(text) if origin is None else fit_identity_text(str(text), origin)
         if self._window is not None:
-            try:
-                if phase is not None:
-                    self._window.set_execution_status(phase, detail)
-                elif present:
-                    self._window.set_status(message)
-            except RuntimeError:
-                pass
+            if phase is not None:
+                self._window.set_execution_status(phase, detail)
+            elif present:
+                self._window.set_status(message)
         self.status_changed.emit(message)

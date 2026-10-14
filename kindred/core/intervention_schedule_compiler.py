@@ -5,7 +5,7 @@ from dataclasses import dataclass, replace
 from types import MappingProxyType
 from typing import Any, Callable, Mapping, Sequence
 
-from kindred.core.exceptions import SimulationCancelled
+from kindred.core.exceptions import SimulationCancelled, ValueDomainError
 from kindred.core.species import validate_time_seconds
 from kindred.core.intervention_schedule import (
     InterventionFlux,
@@ -62,14 +62,12 @@ def resolve_executable_values(item, values: Mapping[str, float], *, time: float)
             updates[field] = _resolved(
                 None, parameter, values, field=field, domain=domain
             )
-        except (ValueError, ArithmeticError) as exc:
-            raise InterventionScheduleError(
-                str(exc),
-                declaration_ordinal=item.declaration_ordinal,
-                field=field,
-                value_dependencies=(parameter,),
-                details={"time": time},
-            ) from exc
+        except (InterventionScheduleError, ValueDomainError) as exc:
+            exc.annotate(
+                declaration_ordinal=item.declaration_ordinal, field=field,
+                value_dependencies=(parameter,), time=time,
+            )
+            raise
         updates[f"{field}_param"] = None
     return replace(item, **updates) if updates else item
 
@@ -675,55 +673,51 @@ def _annotated_schedule_error(
     fields: Sequence[str] = (),
     operations: Sequence[ExecutableInstant | ExecutableHold] = (),
     domain: str | None = None,
-) -> InterventionScheduleError:
+) -> InterventionScheduleError | ValueDomainError:
+    facts: dict[str, object] = {"field": field}
     if operation is not None:
         identities = _operation_field_identities(operation, fields=fields, field=field)
-        return InterventionScheduleError(
-            message,
-            operation=operation.op,
-            declaration_ordinal=operation.declaration_ordinal,
-            field=field,
-            domain=domain,
-            field_identities=identities,
-            value_dependencies=tuple(
-                name for identity in identities
-                for name in dependency_metadata.get(identity, ())
-            ),
-        )
-    declarations: list[int] = []
-    operation_names: list[str] = []
-    operation_locations: list[dict[str, object]] = []
-    field_identities: list[InterventionScheduleFieldIdentity] = []
-    for item in operations:
-        declarations.append(item.declaration_ordinal)
-        operation_names.append(item.op)
-        location: dict[str, object] = {
-            "operation": item.op,
-            "declaration_ordinal": item.declaration_ordinal,
-        }
-        if item.authored_ordinal is not None:
-            location["phase"] = item.phase
-            location["authored_ordinal"] = item.authored_ordinal
-        operation_locations.append(location)
-        field_identities.extend(
-            _operation_field_identities(item, fields=fields, field=field)
-        )
-    identities = tuple(dict.fromkeys(field_identities))
-    details: dict[str, object] = {}
-    if declarations:
-        details["declaration_ordinals"] = tuple(sorted(set(declarations)))
-    if operation_names:
-        details["operations"] = tuple(operation_names)
-        details["operation_locations"] = tuple(operation_locations)
+        facts.update(operation=operation.op, declaration_ordinal=operation.declaration_ordinal, domain=domain)
+    else:
+        declarations: list[int] = []
+        operation_names: list[str] = []
+        operation_locations: list[dict[str, object]] = []
+        field_identities: list[InterventionScheduleFieldIdentity] = []
+        for item in operations:
+            declarations.append(item.declaration_ordinal)
+            operation_names.append(item.op)
+            location: dict[str, object] = {
+                "operation": item.op,
+                "declaration_ordinal": item.declaration_ordinal,
+            }
+            if item.authored_ordinal is not None:
+                location["phase"] = item.phase
+                location["authored_ordinal"] = item.authored_ordinal
+            operation_locations.append(location)
+            field_identities.extend(
+                _operation_field_identities(item, fields=fields, field=field)
+            )
+        identities = tuple(dict.fromkeys(field_identities))
+        details: dict[str, object] = {}
+        if declarations:
+            details["declaration_ordinals"] = tuple(sorted(set(declarations)))
+        if operation_names:
+            details["operations"] = tuple(operation_names)
+            details["operation_locations"] = tuple(operation_locations)
+        facts["details"] = details
+    dependencies = tuple(
+        name for identity in identities
+        for name in dependency_metadata.get(identity, ())
+    )
+    if dependencies:
+        # Reached only through values params supply: a refusal of those values.
+        details = facts.pop("details", {})
+        return ValueDomainError(str(field), message, details={
+            **details, **{key: value for key, value in facts.items() if value is not None},
+            "field_identities": identities, "parameter_names": dependencies,
+        })
     return InterventionScheduleError(
-        message,
-        field=field,
-        field_identities=identities,
-        value_dependencies=tuple(
-            name for identity in identities
-            for name in dependency_metadata.get(identity, ())
-        ),
-        details=details,
+        message, field_identities=identities, value_dependencies=dependencies, **facts,
     )
 
 

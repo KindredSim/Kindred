@@ -50,12 +50,13 @@ from kindred.core.analysis.fit_statistics import (
     root_mean_square,
 )
 from kindred.core.exceptions import (
-    FitCandidateDomainError,
+    ErrorContext,
     FittingCancelled,
     FitSimulationError,
     KindredError,
     SimulationCancelled,
 )
+from kindred.core.intervention_schedule import InterventionScheduleError
 from kindred.core.fitting_evaluation import (
     FITTING_PARAM_ORIGIN_CONFIGURED_DATASET,
     FITTING_PARAM_ORIGIN_OPTIMIZER_DATASET,
@@ -66,10 +67,7 @@ from kindred.core.project_presentation_state import SimulationSeriesAxisSelectio
 from kindred.core.result_curve_projection import alignment_rows
 from kindred.core.result_repository import SimulationResultValue
 from kindred.core.simulator.solver_types import SimulationCancellationControl
-from kindred.core.simulation_failure import (
-    FactualCause,
-    factual_cause_from_exception,
-)
+from kindred.core.simulation_failure import FactualCause
 
 if TYPE_CHECKING:
     from kindred.core.analysis.fit_uncertainty import ProfileLikelihoodResult
@@ -241,6 +239,9 @@ class DatasetFitInfo:
         )
 
 
+FitEnding = Literal["converged", "not_converged", "stopped"]
+
+
 @dataclass(frozen=True, slots=True)
 class GlobalFitResult:
     """
@@ -270,16 +271,23 @@ class GlobalFitResult:
     dataset_info: List[DatasetFitInfo]
     message: str
     optimizer_vector: np.ndarray | None
-    status: Literal["ok", "warn"]
-    optimizer_converged: bool
-    optimizer_diagnostic: FactualCause | None = None
+    # How the optimizer itself ended.
+    ending: FitEnding
+    # The optimizer endpoint was scientifically unavailable and the best
+    # retained complete candidate replaced it.
+    endpoint_replaced: bool = False
+    # The rank warning for the reported endpoint.
+    identifiability_warning: str | None = None
     profile_likelihood_result: ProfileLikelihoodResult | None = None
     # Optimizer coordinates the data do not determine within their bounds.
     undetermined_values: tuple["FitCoordinate", ...] = ()
+    # The fitted values can scale every rate constant by one common factor
+    # that the measured-X data cannot see.
+    rate_scale_undetermined: bool = False
 
     def __post_init__(self) -> None:
-        # Its sole producer publishes the settled replay state: a literal
-        # status with a diagnostic exactly for "warn", the admitted finite
+        # Its sole producer publishes the settled replay state: the literal
+        # ending with its settlement facts, the admitted finite
         # optimizer vector, its decoded finite parameters, and one
         # DatasetFitInfo per included dataset in roster order.  This carrier
         # freezes them.
@@ -306,44 +314,37 @@ class GlobalFitResult:
         object.__setattr__(self, "dataset_info", tuple(self.dataset_info))
 
 
-def _compact_failure_message(failure: FactualCause) -> str:
-    raw_message = failure.message
-    return " ".join(part.strip() for part in str(raw_message).splitlines() if part.strip())
-
-
 def fit_result_message(
     *,
     base_message: str,
-    status: Literal["ok", "warn"],
-    optimizer_converged: bool,
-    optimizer_diagnostic: FactualCause | None,
+    ending: FitEnding,
+    endpoint_replaced: bool,
+    identifiability_warning: str | None,
 ) -> str:
-    stopped = base_message.strip()
-    if status == "ok":
-        if not optimizer_converged:
-            return f"Fit completed. Optimizer stopped: {stopped or 'the optimizer stopped without a termination message'}"
-        return base_message
     # A Stop's own message already says the fit stopped.
-    if optimizer_diagnostic is not None and optimizer_diagnostic.type == "FittingStopped":
-        return optimizer_diagnostic.message
+    if ending == "stopped":
+        return base_message
+    termination = base_message.strip()
+    if not endpoint_replaced and identifiability_warning is None:
+        if ending == "not_converged":
+            return f"Fit completed. Optimizer stopped: {termination or 'the optimizer stopped without a termination message'}"
+        return base_message
     warning_parts: list[str] = []
-    # A converged optimizer whose endpoint was replaced did not stop early.
-    replaced_after_convergence = (
-        optimizer_diagnostic is not None
-        and optimizer_diagnostic.type == "FittingUnavailableEndpointReplaced"
-        and optimizer_diagnostic.details["optimizer_converged"] is True
-    )
-    if not optimizer_converged:
-        if stopped and replaced_after_convergence:
-            warning_parts.append(stopped)
-        elif stopped:
-            warning_parts.append(f"Optimizer stopped: {stopped}")
-        else:
-            warning_parts.append("Optimizer stopped without a termination message")
-    if optimizer_diagnostic is not None:
-        detail = _compact_failure_message(optimizer_diagnostic)
-        if detail and detail != stopped:
-            warning_parts.append(detail)
+    if ending == "not_converged":
+        warning_parts.append(
+            f"Optimizer stopped: {termination}" if termination
+            else "Optimizer stopped without a termination message"
+        )
+    elif endpoint_replaced and termination:
+        # A converged optimizer whose endpoint was replaced did not stop early.
+        warning_parts.append(termination)
+    if endpoint_replaced:
+        warning_parts.append(
+            "The unavailable optimizer endpoint was replaced by the "
+            "best scientifically available evaluated candidate."
+        )
+    if identifiability_warning is not None:
+        warning_parts.append(identifiability_warning)
     return "Global fit completed with warnings: " + " ".join(warning_parts)
 
 
@@ -515,7 +516,7 @@ def fit_result_target_values(
     """
 
     target_name = str(name)
-    details = _target_lookup_details(target_name, dataset_id)
+    details = {"dataset": dataset_id}
     time_size = np.asarray(result.t, dtype=float).reshape(-1).size
     if target_name in result.series:
         # A let undefined at some time points keeps them as NaN; the residual
@@ -539,10 +540,6 @@ def fit_result_target_values(
     return values
 
 
-def _target_lookup_details(target_name: str, dataset_id: str) -> dict[str, object]:
-    return {"fatal": True, "stage": "fit_target_lookup", "dataset": dataset_id, "target": target_name}
-
-
 def _target_not_calculated(
     result: SimulationResultValue, target_name: str, dataset_id: str,
 ) -> FitSimulationError:
@@ -550,17 +547,18 @@ def _target_not_calculated(
     algebra_cause = next(
         (cause for cause in result.algebra_errors if cause.details.get("name") == target_name), None,
     )
-    error = FitSimulationError(
-        f"Fit target {target_name!r} could not be calculated: {algebra_cause.message}" if algebra_cause is not None else
-        f"Fit target {target_name!r} is absent from the canonical simulation scalar/series outputs.",
-        details=_target_lookup_details(target_name, dataset_id),
-    )
-    if algebra_cause is not None:
-        error.factual_cause = replace(
-            factual_cause_from_exception(error, domain="fit", origin="fit_target_lookup"),
-            cause=algebra_cause,
+    if algebra_cause is None:
+        return FitSimulationError(
+            f"Fit target {target_name!r} is absent from the canonical simulation scalar/series outputs.",
+            details={"dataset": dataset_id},
         )
-    return error
+    # Its own cause's sentence, on the authored line that failed.
+    line, line_text = algebra_cause.location()
+    return FitSimulationError(
+        f"Fit target {target_name!r} could not be calculated: {algebra_cause.message}",
+        details={"dataset": dataset_id},
+        context=None if line is None else ErrorContext(line=line, line_text=line_text),
+    )
 
 
 @dataclass(frozen=True)
@@ -656,10 +654,7 @@ class FitParameterLayout:
             or values.size != self.x0.size
             or not np.all(np.isfinite(values))
         ):
-            raise FitCandidateDomainError(
-                "Fit candidate has a nonfinite or incomplete optimizer vector.",
-                stage="optimizer_vector_domain",
-            )
+            raise FitSimulationError("Fit candidate has a nonfinite or incomplete optimizer vector.")
 
     def shared_param_dict_from_vector(self, vector: np.ndarray) -> Dict[str, float]:
         out: Dict[str, float] = {}
@@ -891,11 +886,8 @@ def _cause_naming_dataset(cause: FactualCause, dataset_id: str) -> FactualCause:
 
 def _name_dataset(error: BaseException, dataset_id: str) -> None:
     """Name the dataset a fatal evaluation error came from."""
-    if isinstance(error, KindredError):
-        error.details.setdefault("dataset", dataset_id)
-        cause = getattr(error, "factual_cause", None)
-        if cause is not None:
-            error.factual_cause = _cause_naming_dataset(cause, dataset_id)
+    if isinstance(error, (KindredError, InterventionScheduleError)):
+        error.annotate(dataset=dataset_id)
 
 
 def _dataset_deadline_cause(
@@ -915,7 +907,6 @@ def _dataset_deadline_cause(
         domain="fit",
         origin="dataset_deadline",
         code=None,
-        type="DatasetEvaluationDeadline",
         message="Fit dataset evaluation exceeded its deadline.",
         details=cause_details,
     )
@@ -1165,7 +1156,7 @@ def evaluate_dataset_simulation(
             _raise_if_fitting_cancel_requested(worker_cancel)
             if time.monotonic() >= deadline:
                 return deadline_unavailable()
-            raise FittingCancelled() from exc
+            raise
         _raise_if_fitting_cancel_requested(worker_cancel)
         if time.monotonic() >= deadline:
             return deadline_unavailable()
@@ -1625,9 +1616,10 @@ def _replay_fit_result(
     fixed_dataset_params: Dict[str, Dict[str, float]],
     weights: Dict[str, float],
     cancellation_check: Optional[Callable[[], bool]],
-    success: bool,
+    ending: FitEnding,
     message: str,
-    optimizer_diagnostic: FactualCause | None = None,
+    endpoint_replaced: bool,
+    identifiability_warning: str | None,
     cancellation_control: SimulationCancellationControl | None = None,
     executor: Executor,
 ) -> GlobalFitResult | ScientificUnavailable:
@@ -1675,9 +1667,10 @@ def _replay_fit_result(
         facts=tuple(simulation_evaluations),
         cancellation_check=cancellation_check,
         cancellation_control=cancellation_control,
-        success=success,
+        ending=ending,
         message=message,
-        optimizer_diagnostic=optimizer_diagnostic,
+        endpoint_replaced=endpoint_replaced,
+        identifiability_warning=identifiability_warning,
     )
 
 
@@ -1689,9 +1682,10 @@ def _assemble_fit_result_facts(
     facts: tuple[DatasetFitInfo, ...],
     cancellation_check: Optional[Callable[[], bool]],
     cancellation_control: SimulationCancellationControl | None,
-    success: bool,
+    ending: FitEnding,
     message: str,
-    optimizer_diagnostic: FactualCause | None,
+    endpoint_replaced: bool = False,
+    identifiability_warning: str | None = None,
 ) -> GlobalFitResult:
     """Construct terminal metrics and values from complete scientific facts.
 
@@ -1721,30 +1715,17 @@ def _assemble_fit_result_facts(
         np.concatenate(global_weighted_residual_blocks)
     )
 
-    optimizer_converged = bool(success)
-    factual_optimizer_diagnostic = optimizer_diagnostic
-    if (
-        optimizer_converged
-        and factual_optimizer_diagnostic is not None
-        and not bool(factual_optimizer_diagnostic.details.get("final_report_warning"))
-    ):
-        factual_optimizer_diagnostic = None
-    if factual_optimizer_diagnostic is not None:
-        result_status: Literal["ok", "warn"] = "warn"
-    else:
-        result_status = "ok"
-
     result_message = fit_result_message(
         base_message=message,
-        status=result_status,
-        optimizer_converged=optimizer_converged,
-        optimizer_diagnostic=factual_optimizer_diagnostic,
+        ending=ending,
+        endpoint_replaced=endpoint_replaced,
+        identifiability_warning=identifiability_warning,
     )
 
-    if result_status == "ok":
-        logger.info("Global fit complete with typed weighted metrics.")
-    elif result_status == "warn":
+    if ending == "stopped" or endpoint_replaced or identifiability_warning is not None:
         logger.warning("Global fit complete with warnings: %s", result_message)
+    else:
+        logger.info("Global fit complete with typed weighted metrics.")
     for info in dataset_info:
         logger.debug(
             "  %s: weighted SSE=%s, weighted RMSE=%s",
@@ -1760,9 +1741,9 @@ def _assemble_fit_result_facts(
         weighted_residual_mse=aggregate_metrics.weighted_mse,
         dataset_info=tuple(dataset_info),
         message=result_message,
-        status=result_status,
-        optimizer_converged=optimizer_converged,
-        optimizer_diagnostic=factual_optimizer_diagnostic,
+        ending=ending,
+        endpoint_replaced=endpoint_replaced,
+        identifiability_warning=identifiability_warning,
         optimizer_vector=candidate_vector,
         profile_likelihood_result=None,
     )

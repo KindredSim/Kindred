@@ -6,6 +6,7 @@ import math
 import os
 import time
 import threading
+import traceback
 from concurrent.futures import ThreadPoolExecutor
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
@@ -29,10 +30,7 @@ from kindred.core.analysis.global_fit_execution import (
 from kindred.core.analysis.fit_evaluation_outcome import (
     ScientificUnavailable,
 )
-from kindred.core.exceptions import (
-    FitSimulationError,
-    FittingCancelled,
-)
+from kindred.core.exceptions import FittingCancelled, SimulationCancelled
 from kindred.core.fitting_evaluation import (
     FITTING_PARAM_ORIGIN_CONFIGURED_DATASET,
     FITTING_PARAM_ORIGIN_OPTIMIZER_DATASET,
@@ -616,9 +614,12 @@ class _FitExecution(_FitControl):
         unavailable: ScientificUnavailable | None = None
         try:
             candidate = self._execute()
-        except FittingCancelled:
+        except (FittingCancelled, SimulationCancelled):
             cancelled = True
         except BaseException as exc:  # noqa: BLE001
+            # The one place a Fit failure becomes the cause sent to the window;
+            # its traceback goes to the Fit's diagnostics once.
+            traceback.print_exception(exc)
             failure = factual_cause_from_exception(
                 exc,
                 domain="fit",
@@ -676,22 +677,22 @@ class _FitExecution(_FitControl):
             if self._checkpoint():
                 raise FittingCancelled()
             dataset_context = prepared_datasets[local.dataset_id]
-            try:
-                context = prepare_fitting_execution_context(
-                    prepared_dsl=setup.origin.prepared_dsl,
-                    param_names=candidate_names,
-                    t_start=dataset_context.execution_t_start,
-                    t_end=dataset_context.execution_t_end,
-                    objective_sample_times=dataset_context.retained_times,
-                    prepared_solver_config=dataset_context.solver_config,
-                    sample_solver_steps=dataset_context.parametric_x_observation is not None,
-                    cancellation_control=self._cancellation_control,
-                    initial_prefix=INITIAL_PREFIX,
-                )
-            except BaseException as exc:
-                if isinstance(exc, FitSimulationError):
-                    exc.details.setdefault("fit_solver", setup.solver)
-                raise
+            measured_x = dataset_context.parametric_x_observation is not None
+            context = prepare_fitting_execution_context(
+                prepared_dsl=setup.origin.prepared_dsl,
+                param_names=candidate_names,
+                t_start=dataset_context.execution_t_start,
+                t_end=dataset_context.execution_t_end,
+                objective_sample_times=dataset_context.retained_times,
+                prepared_solver_config=dataset_context.solver_config,
+                sample_solver_steps=measured_x,
+                # Recorded times fix the compared interval, so a stop only
+                # removes observations; a measured-X curve ends where the
+                # experiment did.
+                use_authored_stops=measured_x and setup.origin.scientific_settings.use_authored_stops,
+                cancellation_control=self._cancellation_control,
+                initial_prefix=INITIAL_PREFIX,
+            )
             evaluator = FittingEvaluator(
                 context,
             )
@@ -938,6 +939,7 @@ class _FitExecution(_FitControl):
             dataset_overrides=request.dispatch.ordinary_dataset_overrides,
             optimizer_layout=request.dispatch.ordinary_optimizer_layout,
             executor=self._executor,
+            prepared_dsl=setup.origin.prepared_dsl,
         )
         if isinstance(result_or_unavailable, ScientificUnavailable):
             self._terminal_unavailable = result_or_unavailable

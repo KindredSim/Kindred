@@ -46,8 +46,6 @@ from PySide6.QtCore import Qt
 
 from kindred.core.project_presentation_state import (
     AxisSeriesSelection,
-    ExperimentalAxisSelection,
-    VesselVolumeAxisSelection,
     SimulationSeriesAxisSelection,
 )
 from kindred.gui.plot_config import AxisSelectionCandidate
@@ -392,13 +390,7 @@ class AxisToolbar(QtWidgets.QWidget):
         return tuple(out)
 
     def current_x(self) -> AxisSeriesSelection:
-        selection = self._x_combo.currentData()
-        if not isinstance(
-            selection,
-            (SimulationSeriesAxisSelection, ExperimentalAxisSelection, VesselVolumeAxisSelection),
-        ):
-            raise TypeError("X selector lacks a typed axis identity.")
-        return selection
+        return self._x_combo.currentData()
 
     def set_manual_range_controls(self, *, auto_x: bool, auto_y: bool, enabled: bool) -> None:
         """Project the plot owner's range mode and gesture restriction."""

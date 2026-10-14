@@ -15,6 +15,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import math
 
+from .exceptions import ValueDomainError
 from .quantity_units import parse_unit, convert_value, scientific_unit, conversion_scale
 
 # Category-specific admission limits.  These are deliberately explicit rather
@@ -29,14 +30,6 @@ KEQ_MAX = 1.0e80
 KAPPA_MAX = 1.0e20
 ORDINARY_PARAMETER_MIN_ABS = 1.0e-30
 ORDINARY_PARAMETER_MAX_ABS = 1.0e30
-
-
-class OrdinaryParameterDomainError(ValueError):
-    """A finite independent scalar lies outside its scientific input domain."""
-
-    def __init__(self, field: str, message: str):
-        self.field = field
-        super().__init__(message)
 
 
 # Scientific magnitude domain and sign per coordinate role; a role not listed is a rate.
@@ -78,9 +71,7 @@ def admit_role_value(
         message = f"{field} must have an absolute value of at most {limit:g}{label}."
     else:
         message = f"{field} must be {'zero or positive' if allow_exact_zero else 'positive'} and at most {limit:g}{label}."
-    if role == "scalar":
-        raise OrdinaryParameterDomainError(field, message)
-    raise ValueError(message)
+    raise ValueDomainError(field, message)
 
 
 def input_unit_bounds(unit: str, low: float, high: float) -> tuple[float, float]:

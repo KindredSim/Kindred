@@ -86,16 +86,12 @@ class JsonScanWriter:
         directory = os.path.dirname(self.destination)
         descriptor, self.path = tempfile.mkstemp(prefix=f".{Path(self.destination).name}.",
                                                 suffix=".partial.json", dir=directory)
-        try:
-            self.stream = os.fdopen(descriptor, "w", encoding="utf-8", newline="\n")
-        except BaseException:
-            os.close(descriptor)
-            raise
+        self.stream = os.fdopen(descriptor, "w", encoding="utf-8", newline="\n")
         versions = {"kindred": KINDRED_VERSION, "numpy": np.__version__,
                     "scipy": scipy.__version__}
         spec = design.prepared.parameter_algebra_spec_for_execution()
         constraint_units = {s.name: presentation_unit(s.expr.quantity_unit, s.declared_unit) for s in spec.observable_block.lines}
-        header = {"schema_version": 4,
+        header = {"schema_version": 5,
                   "input_units": {item.key: item.unit for item in design.catalog},
                   "constraint_units": {c.observable: constraint_units[c.observable].symbol if constraint_units[c.observable] is not None else None for c in config.constraints}, "created_utc": datetime.now(timezone.utc).isoformat(),
                   "versions": versions, "configuration": asdict(config),

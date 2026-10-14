@@ -21,9 +21,6 @@ from kindred.core.datasets.foundation import (
     RawDatasetRecord,
     thaw_json_value,
 )
-from kindred.gui.controllers.dataset_errors import (
-    DatasetImportAdmissionError,
-)
 from kindred.core.project_document import new_dataset_id
 from kindred.gui.import_workflow import (
     ImportConfig,
@@ -290,7 +287,6 @@ class DatasetImportStaging(QtCore.QObject):
     def __init__(self, *, parent: QtCore.QObject | None = None) -> None:
         super().__init__(parent)
         self._active_worker: _DatasetImportBatchWorker | None = None
-        self._application_close_fenced = False
 
     @property
     def busy(self) -> bool:
@@ -307,14 +303,8 @@ class DatasetImportStaging(QtCore.QObject):
         origin_tab_id: str,
         configs: tuple[ImportConfig, ...],
     ) -> None:
-        if self._application_close_fenced:
-            raise DatasetImportAdmissionError("Dataset import admission is fenced.")
         if self._active_worker is not None:
-            raise DatasetImportAdmissionError("A dataset import is already active.")
-        if not configs:
-            raise DatasetImportAdmissionError(
-                "Dataset import requires at least one configuration."
-            )
+            raise RuntimeError("A dataset import is already active.")
         worker = _DatasetImportBatchWorker(
             origin_tab_id=origin_tab_id,
             configs=configs,
@@ -335,7 +325,6 @@ class DatasetImportStaging(QtCore.QObject):
             worker.cancel()
 
     def cancel_for_application_close(self) -> None:
-        self._application_close_fenced = True
         self.cancel_active()
 
     @QtCore.Slot()

@@ -193,7 +193,7 @@ class TemplateManager:
             raise RuntimeError(reason)
 
     def _record_storage_failure(self, action: str, exc: Exception) -> None:
-        detail = file_error_text(exc, self._templates_dir).strip() or type(exc).__name__
+        detail = file_error_text(exc, self._templates_dir).strip()
         self._write_disabled_reason = (
             f"Template changes are disabled because {action}: {detail}"
         )

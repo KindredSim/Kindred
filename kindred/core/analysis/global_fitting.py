@@ -21,6 +21,7 @@ from kindred.core.analysis.fit_uncertainty import (
     profile_likelihood_settlement_result,
     profile_likelihood_result,
     profile_noise_model,
+    rate_scale_undetermined,
     undetermined_coordinates,
 )
 from kindred.core.analysis import global_fit_execution as _fit_execution
@@ -30,11 +31,7 @@ from kindred.core.exceptions import (
 )
 from kindred.core.fitting_optimization import fit_parameters
 from kindred.core.fitting_completion import FitExtensionProgress
-from kindred.core.fitting_method_policy import LEAST_SQUARES_TOLERANCE
-from kindred.core.simulation_failure import (
-    FactualCause,
-    factual_cause_from_exception,
-)
+from kindred.core.simulation_failure import FactualCause, factual_cause_from_exception
 from kindred.core.analysis.fit_evaluation_outcome import ScientificUnavailable
 from kindred.core.simulator.solver_types import SimulationCancellationControl
 
@@ -65,11 +62,13 @@ def fit_global(
     extension_progress_callback: Callable[[FitExtensionProgress], None],
     optimizer_layout: _fit_execution.FitParameterLayout,
     executor: Executor,
+    prepared_dsl: object,
 ) -> _fit_execution.GlobalFitResult | ScientificUnavailable:
     """Fit immutable dataset captures through one evaluator per dataset.
 
     After the fit, it checks for fitted values the data do not determine
-    within their bounds and runs the requested Profile likelihood.
+    within their bounds, and for a rate scale they do not determine, and runs
+    the requested Profile likelihood.
     """
 
     # The Fit setup admits the method and evaluation budget (Fit defaults), and
@@ -126,266 +125,238 @@ def fit_global(
             executor=executor,
         )
 
+    objective = new_objective(progress_callback)
+    if starting_facts:
+        objective.retain_complete_candidate(layout.x0, starting_facts)
+    keys = layout.opt_param_keys()
+    primary_stopped = False
     try:
-        objective = new_objective(progress_callback)
-        if starting_facts:
-            objective.retain_complete_candidate(layout.x0, starting_facts)
-        keys = layout.opt_param_keys()
-        primary_stopped = False
-        try:
-            optimizer_result = fit_parameters(
-                objective,
-                layout.initial_params(),
-                bounds=layout.bounds_dict(),
-                method=method,
-                max_nfev=max_nfev,
-                seed=seed,
-                ftol=ftol,
-                xtol=xtol,
-                cancellation_check=active_cancelled,
-            )
-            success = optimizer_result.success
-            message = optimizer_result.message
-            optimizer_diagnostic: FactualCause | None = None
-            identifiability = optimizer_result.identifiability_warning
-            if identifiability:
-                optimizer_diagnostic = FactualCause(
-                    domain="fit",
-                    origin="identifiability",
-                    code=None,
-                    type="FittingIdentifiability",
-                    message=identifiability,
-                    details={"final_report_warning": True},
-                )
-            optimizer_endpoint_vector = np.asarray(
-                [optimizer_result.parameters[key] for key in keys],
-                dtype=float,
-            )
+        optimizer_result = fit_parameters(
+            objective,
+            layout.initial_params(),
+            bounds=layout.bounds_dict(),
+            method=method,
+            max_nfev=max_nfev,
+            seed=seed,
+            ftol=ftol,
+            xtol=xtol,
+            cancellation_check=active_cancelled,
+        )
+        ending = "converged" if optimizer_result.success else "not_converged"
+        message = optimizer_result.message
+        optimizer_endpoint_vector = np.asarray(
+            [optimizer_result.parameters[key] for key in keys],
+            dtype=float,
+        )
 
-            def replay(
-                candidate_vector: np.ndarray,
-                *,
-                converged: bool,
-            ) -> _fit_execution.GlobalFitResult | ScientificUnavailable:
-                return _fit_execution._replay_fit_result(
-                    fit_evaluators=evaluators,
-                    payloads=payloads,
-                    layout=layout,
-                    candidate_vector=candidate_vector,
-                    fixed_dataset_params=fixed_dataset_params,
-                    weights=weights_norm,
-                    cancellation_check=active_cancelled,
-                    cancellation_control=active_control,
-                    success=converged,
-                    message=message,
-                    optimizer_diagnostic=optimizer_diagnostic,
-                    executor=executor,
-                )
-
-            # Scientific availability belongs to the actual optimizer endpoint
-            # replay. A better fully evaluated probe must not replace it.
-            result = replay(optimizer_endpoint_vector, converged=success)
-            if isinstance(result, ScientificUnavailable):
-                retained_best = objective.best_complete_vector
-                if retained_best is None:
-                    return result
-                retained_best_vector = np.asarray(retained_best, dtype=float).reshape(-1)
-                optimizer_diagnostic = FactualCause(
-                    domain="fit",
-                    origin="optimizer_endpoint",
-                    code=None,
-                    type="FittingUnavailableEndpointReplaced",
-                    message=(
-                        "The unavailable optimizer endpoint was replaced by the "
-                        "best scientifically available evaluated candidate."
-                    ),
-                    details={
-                        "endpoint_replaced": True,
-                        "settlement": "best_scientifically_available_evaluated_candidate",
-                        # Whether the optimizer itself converged before its endpoint failed.
-                        "optimizer_converged": success,
-                    },
-                    cause=optimizer_diagnostic,
-                )
-                result = replay(retained_best_vector, converged=False)
-                if isinstance(result, ScientificUnavailable):
-                    return result
-        except (FittingCancelled, SimulationCancelled):
-            if hard_cancelled() or not stop_check():
-                raise
-            retained_vector = objective.best_complete_vector
-            if retained_vector is None:
-                raise FittingCancelled()
-            primary_stopped = True
-            message = "Fit stopped. Best complete candidate retained."
-            result = _fit_execution._assemble_fit_result_facts(
+        def replay(
+            candidate_vector: np.ndarray,
+            *,
+            endpoint_replaced: bool,
+            identifiability_warning: str | None,
+        ) -> _fit_execution.GlobalFitResult | ScientificUnavailable:
+            return _fit_execution._replay_fit_result(
+                fit_evaluators=evaluators,
                 payloads=payloads,
                 layout=layout,
-                candidate_vector=retained_vector,
-                facts=objective.best_complete_facts,
-                cancellation_check=hard_cancelled,
-                cancellation_control=cancellation_control,
-                success=False,
+                candidate_vector=candidate_vector,
+                fixed_dataset_params=fixed_dataset_params,
+                weights=weights_norm,
+                cancellation_check=active_cancelled,
+                cancellation_control=active_control,
+                ending=ending,
                 message=message,
-                optimizer_diagnostic=FactualCause(
-                    domain="fit", origin="optimizer", code=None,
-                    type="FittingStopped", message=message, details={},
-                ),
+                endpoint_replaced=endpoint_replaced,
+                identifiability_warning=identifiability_warning,
+                executor=executor,
             )
-        vector = np.asarray(result.optimizer_vector, dtype=float)
-        # Post-fit methods receive a fresh objective without progress emission.
-        # It retains the same evaluators, candidate/fatal taxonomy, coordinates,
-        # normalized weights, cancellation owner, and immutable captures.
-        terminal_objective = new_objective()
-        profile_result: ProfileLikelihoodResult | None = None
-        optional_analysis_stopped = primary_stopped
-        terminal_parameters = {
-            key: float(vector[index])
-            for index, key in enumerate(keys)
-        }
-        base_residuals = np.concatenate(
-            [info.weighted_residuals for info in result.dataset_info]
+
+        # Scientific availability belongs to the actual optimizer endpoint
+        # replay. A better fully evaluated probe must not replace it.
+        result = replay(
+            optimizer_endpoint_vector,
+            endpoint_replaced=False,
+            identifiability_warning=optimizer_result.identifiability_warning,
         )
-        base_residuals.setflags(write=False)
-        # The noise model and the bound check evaluate on their own objective,
-        # so their probes never change the penalty scale Profile refits use.
-        noise = None
-        noise_failure: Exception | None = None
-        undetermined: tuple[_fit_execution.FitCoordinate, ...] = ()
-        if not primary_stopped:
-            try:
-                # The post-fit stage starts here, so the progress says so
-                # before the noise model and the bound check run.
-                extension_progress_callback(FitExtensionProgress(status="running", stage="primary_complete"))
-                analysis_objective = new_objective()
-                noise = profile_noise_model(
+        if isinstance(result, ScientificUnavailable):
+            retained_best = objective.best_complete_vector
+            if retained_best is None:
+                return result
+            retained_best_vector = np.asarray(retained_best, dtype=float).reshape(-1)
+            # The replaced endpoint's rank warning does not describe the
+            # retained candidate, so it is not reported.
+            result = replay(retained_best_vector, endpoint_replaced=True, identifiability_warning=None)
+            if isinstance(result, ScientificUnavailable):
+                return result
+    except (FittingCancelled, SimulationCancelled):
+        if hard_cancelled() or not stop_check():
+            raise
+        retained_vector = objective.best_complete_vector
+        if retained_vector is None:
+            raise FittingCancelled()
+        primary_stopped = True
+        message = "Fit stopped. Best complete candidate retained."
+        result = _fit_execution._assemble_fit_result_facts(
+            payloads=payloads,
+            layout=layout,
+            candidate_vector=retained_vector,
+            facts=objective.best_complete_facts,
+            cancellation_check=hard_cancelled,
+            cancellation_control=cancellation_control,
+            ending="stopped",
+            message=message,
+        )
+    vector = np.asarray(result.optimizer_vector, dtype=float)
+    # Post-fit methods receive a fresh objective without progress emission.
+    # It retains the same evaluators, candidate/fatal taxonomy, coordinates,
+    # normalized weights, cancellation owner, and immutable captures.
+    terminal_objective = new_objective()
+    profile_result: ProfileLikelihoodResult | None = None
+    optional_analysis_stopped = primary_stopped
+    terminal_parameters = {
+        key: float(vector[index])
+        for index, key in enumerate(keys)
+    }
+    base_residuals = np.concatenate(
+        [info.weighted_residuals for info in result.dataset_info]
+    )
+    base_residuals.setflags(write=False)
+    # The noise model and the bound check evaluate on their own objective,
+    # so their probes never change the penalty scale Profile refits use.
+    noise = None
+    noise_failure: Exception | None = None
+    undetermined: tuple[_fit_execution.FitCoordinate, ...] = ()
+    if not primary_stopped:
+        try:
+            # The post-fit stage starts here, so the progress says so
+            # before the noise model and the bound check run.
+            extension_progress_callback(FitExtensionProgress(status="running", stage="primary_complete"))
+            analysis_objective = new_objective()
+            noise = profile_noise_model(
+                objective=analysis_objective, vector=vector, keys=keys,
+                bounds=layout.bounds_dict(), dataset_info=result.dataset_info,
+            )
+            if noise is not None and noise.cutoffs:
+                undetermined = undetermined_coordinates(
                     objective=analysis_objective, vector=vector, keys=keys,
-                    bounds=layout.bounds_dict(), dataset_info=result.dataset_info,
+                    bounds=layout.bounds_dict(),
+                    base_residuals=base_residuals, cutoffs=noise.cutoffs,
                 )
-                if noise is not None and noise.cutoffs:
-                    undetermined = undetermined_coordinates(
-                        objective=analysis_objective, vector=vector, keys=keys,
-                        bounds=layout.bounds_dict(),
-                        base_residuals=base_residuals, cutoffs=noise.cutoffs,
-                    )
-            except (FittingCancelled, SimulationCancelled):
-                if hard_cancelled():
-                    raise
-                optional_analysis_stopped = True
-                noise = None
-                undetermined = ()
-            except Exception as exc:
-                # A fatal evaluation next to the estimate leaves the fit itself
-                # intact; Profile then reports the actual cause.
-                logger.warning("Fit noise model could not be estimated.", exc_info=True)
-                noise_failure = exc
-                noise = None
-                undetermined = ()
-        # A parameter group's public uncertainty target is moved by the
-        # optimizer as its coupled variable; analyses see the group identity.
-        group_targets = {
-            _fit_execution.FitCoordinate(
-                "coupled",
-                _fit_execution.parameter_group_variable_id(coordinate.name, coordinate.dataset_id),
-            ): coordinate
-            for coordinate in (
-                () if profile_likelihood is None else profile_likelihood.parameter_names
-            )
-            if coordinate.scope == "group"
-        }
-        optimizer_keys = {target: key for key, target in group_targets.items()}
-        # Profile refits by least squares.  After Differential Evolution, whose
-        # ftol is its population tolerance, it uses the least-squares default
-        # tolerances.
-        refit_ftol, refit_xtol = (
-            (LEAST_SQUARES_TOLERANCE, LEAST_SQUARES_TOLERANCE)
-            if method == "differential_evolution" else (ftol, xtol)
+        except (FittingCancelled, SimulationCancelled):
+            if hard_cancelled():
+                raise
+            optional_analysis_stopped = True
+            noise = None
+            undetermined = ()
+        except Exception as exc:
+            # A fatal evaluation next to the estimate leaves the fit itself
+            # intact; Profile then reports the actual cause.
+            logger.warning("Fit noise model could not be estimated.", exc_info=True)
+            noise_failure = exc
+            noise = None
+            undetermined = ()
+    # A parameter group's public uncertainty target is moved by the
+    # optimizer as its coupled variable; analyses see the group identity.
+    group_targets = {
+        _fit_execution.FitCoordinate(
+            "coupled",
+            _fit_execution.parameter_group_variable_id(coordinate.name, coordinate.dataset_id),
+        ): coordinate
+        for coordinate in (
+            () if profile_likelihood is None else profile_likelihood.parameter_names
         )
-        if profile_likelihood is not None:
-            not_started = optional_analysis_stopped
-            try:
-                if not_started:
-                    raise FittingCancelled("Profile likelihood was not started after Fit stopped.")
-                if noise_failure is not None:
-                    raise noise_failure
-                if noise is None:
-                    raise ValueError(
+        if coordinate.scope == "group"
+    }
+    optimizer_keys = {target: key for key, target in group_targets.items()}
+    if profile_likelihood is not None and optional_analysis_stopped:
+        stopped_profile = profile_likelihood_settlement_result(
+            config=profile_likelihood, status="stopped", cause=None,
+        )
+        profile_result = replace(
+            stopped_profile,
+            provenance={**stopped_profile.provenance, "settlement": "not_started_after_stop"},
+        )
+    elif profile_likelihood is not None and noise is None:
+        # Profile needs the noise model; its own failure is Profile's cause.
+        profile_result = profile_likelihood_settlement_result(
+            config=profile_likelihood,
+            status="failed",
+            cause=(
+                factual_cause_from_exception(noise_failure, domain="fit", origin="profile_likelihood")
+                if noise_failure is not None
+                else FactualCause(
+                    domain="fit", origin="profile_likelihood", code=None,
+                    message=(
                         "The noise of the data could not be estimated, because a candidate "
                         "next to the estimate is scientifically unavailable."
-                    )
-                profile_result = profile_likelihood_result(
-                    objective=terminal_objective,
-                    initial_parameters={
-                        group_targets.get(key, key): value
-                        for key, value in terminal_parameters.items()
-                    },
-                    bounds={
-                        group_targets.get(key, key): value
-                        for key, value in layout.bounds_dict().items()
-                    },
-                    config=profile_likelihood,
-                    decode_coordinate=lambda coordinate, value: layout.decode_coordinate(
-                        optimizer_keys.get(coordinate, coordinate), value,
                     ),
-                    ftol=refit_ftol,
-                    xtol=refit_xtol,
-                    base_residuals=base_residuals,
-                    noise=ProfileNoiseModel(noise.blocks, {
-                        group_targets.get(key, key): cutoff for key, cutoff in noise.cutoffs.items()
-                    }),
-                    undetermined=frozenset(group_targets.get(key, key) for key in undetermined),
-                    cancellation_check=active_cancelled,
-                    progress_callback=extension_progress_callback,
                 )
-            except (FittingCancelled, SimulationCancelled) as exc:
-                stop_cause = factual_cause_from_exception(
+            ),
+        )
+    elif profile_likelihood is not None:
+        try:
+            profile_result = profile_likelihood_result(
+                objective=terminal_objective,
+                initial_parameters={
+                    group_targets.get(key, key): value
+                    for key, value in terminal_parameters.items()
+                },
+                bounds={
+                    group_targets.get(key, key): value
+                    for key, value in layout.bounds_dict().items()
+                },
+                config=profile_likelihood,
+                decode_coordinate=lambda coordinate, value: layout.decode_coordinate(
+                    optimizer_keys.get(coordinate, coordinate), value,
+                ),
+                ftol=ftol,
+                xtol=xtol,
+                base_residuals=base_residuals,
+                noise=ProfileNoiseModel(noise.blocks, {
+                    group_targets.get(key, key): cutoff for key, cutoff in noise.cutoffs.items()
+                }),
+                undetermined=frozenset(group_targets.get(key, key) for key in undetermined),
+                cancellation_check=active_cancelled,
+                progress_callback=extension_progress_callback,
+            )
+        except (FittingCancelled, SimulationCancelled):
+            profile_result = profile_likelihood_settlement_result(
+                config=profile_likelihood,
+                status="stopped",
+                cause=None,
+            )
+        except Exception as exc:
+            profile_result = profile_likelihood_settlement_result(
+                config=profile_likelihood,
+                status="failed",
+                cause=factual_cause_from_exception(
                     exc,
                     domain="fit",
                     origin="profile_likelihood",
-                )
-                profile_result = profile_likelihood_settlement_result(
-                    config=profile_likelihood,
-                    status="stopped",
-                    cause=stop_cause,
-                )
-            except Exception as exc:
-                profile_result = profile_likelihood_settlement_result(
-                    config=profile_likelihood,
-                    status="failed",
-                    cause=factual_cause_from_exception(
-                        exc,
-                        domain="fit",
-                        origin="profile_likelihood",
-                    ),
-                )
-
-            if not_started:
-                profile_result = replace(
-                    profile_result,
-                    provenance={**profile_result.provenance, "settlement": "not_started_after_stop"},
-                )
-            if noise is not None:
-                profile_result = replace(profile_result, noise_blocks=noise.blocks)
-
-        message = result.message
-        if profile_result is not None and profile_result.status == "stopped":
-            message += (
-                " Profile likelihood was not started after Stop."
-                if profile_result.provenance.get("settlement") == "not_started_after_stop"
-                else " Profile likelihood stopped."
+                ),
             )
-        result = replace(
-            result,
-            message=message,
-            profile_likelihood_result=profile_result,
-            undetermined_values=undetermined,
-        )
-        if hard_cancelled():
-            raise FittingCancelled()
-        return result
 
-    except FittingCancelled:
-        raise
-    except SimulationCancelled as exc:
-        cancellation = FittingCancelled()
-        raise cancellation from exc
+        profile_result = replace(profile_result, noise_blocks=noise.blocks)
+
+    message = result.message
+    if profile_result is not None and profile_result.status == "stopped":
+        message += (
+            " Profile likelihood was not started after Stop."
+            if profile_result.provenance.get("settlement") == "not_started_after_stop"
+            else " Profile likelihood stopped."
+        )
+    result = replace(
+        result,
+        message=message,
+        profile_likelihood_result=profile_result,
+        undetermined_values=undetermined,
+        # Structural, so it holds after a stopped Fit too.
+        rate_scale_undetermined=rate_scale_undetermined(
+            prepared_dsl=prepared_dsl, fit_evaluators=evaluators, datasets=payloads,
+            fixed_dataset_params=fixed_dataset_params, layout=layout, vector=vector,
+        ),
+    )
+    if hard_cancelled():
+        raise FittingCancelled()
+    return result
+

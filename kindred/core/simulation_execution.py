@@ -33,10 +33,7 @@ def execute_simulation(
     parameters = tuple((item.name, convert_value(overrides.get(item.name, item.value), inputs[item.name], quantities[item.name]), quantities[item.name].symbol) for item in coordinates)
     # Preparation resolves and compiles every schedule, an empty one included.
     prepared = prepare_simulation_run(execution_request=execution_request, cancellation_control=cancellation_control)
-    solved = solve_ode(build_simulation_request_from_prepared_run(
-        prepared, y0=prepared.y0, intervention_execution=prepared.intervention_execution,
-        symbolic_jacobian=prepared.symbolic_jacobian, cancellation_control=cancellation_control,
-    ))
+    solved = solve_ode(build_simulation_request_from_prepared_run(prepared))
     check_cancelled()
     result = finalize_simulation_result(
         result=solved, species_names=list(prepared.species_names),

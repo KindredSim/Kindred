@@ -84,7 +84,7 @@ class ThemeManager:
 
         Physical application happens first.  The authoritative value advances
         only after physical application and persistence both succeed.  A
-        failure restores the previous physical value.  Persistence owns
+        persistence failure restores the previous physical value.  Persistence owns
         restoring its own failed QSettings write; it is never called a second
         time as part of theme recovery.
         """
@@ -94,30 +94,21 @@ class ThemeManager:
             return True
         previous = False if recorded_previous is None else recorded_previous
 
-        physical_applied = False
-        try:
-            self._apply_physical(requested)
-            physical_applied = True
-            if persist is not None:
+        self._apply_physical(requested)
+        if persist is not None:
+            try:
                 persist(requested)
-            self._applied_dark_mode = requested
-        except Exception as exc:
-            restored = self._restore_previous_physical(previous)
-            if restored:
+            except OSError as exc:
+                self._apply_physical(previous)
                 self._applied_dark_mode = previous
-            elif physical_applied:
-                self._applied_dark_mode = requested
-            message = (
-                f"Could not apply the {'dark' if requested else 'light'} theme: {exc}"
-            )
-            logger.warning(message, exc_info=True)
-            if self._report_failure is not None:
-                try:
+                message = (
+                    f"Could not apply the {'dark' if requested else 'light'} theme: {exc}"
+                )
+                logger.warning(message, exc_info=True)
+                if self._report_failure is not None:
                     self._report_failure(message)
-                except Exception:
-                    logger.exception("Theme failure reporter raised an exception.")
-            return False
-
+                return False
+        self._applied_dark_mode = requested
         logger.info("Applied %s theme", "dark" if requested else "light")
         return True
 
@@ -131,14 +122,3 @@ class ThemeManager:
             }},
         )
         self._theme_target.set_theme(dark_mode=dark_mode)
-
-    def _restore_previous_physical(
-        self,
-        previous: bool,
-    ) -> bool:
-        try:
-            self._apply_physical(previous)
-        except Exception:
-            logger.exception("Failed to restore the previous physical theme.")
-            return False
-        return True

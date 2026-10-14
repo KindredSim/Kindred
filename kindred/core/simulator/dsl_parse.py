@@ -1648,7 +1648,7 @@ def prepare_dsl_request_set(
             species_names={str(item) for item in mechanism.species_names()},
         )
     except AlgebraError as exc:
-        raise _DSLError(exc.msg, line_number=exc.line, line_content=exc.line_text) from exc
+        raise _DSLError(exc.message, line_number=exc.line, line_content=exc.line_text) from exc
     species_names = tuple(str(item) for item in mechanism.species_names())
     parameterized_intervention_schedule = (
         intervention_schedule

@@ -61,7 +61,7 @@ class Lesson(QtCore.QObject):
         for signal, slot in reversed(self._connections):
             try:
                 signal.disconnect(slot)
-            except (RuntimeError, TypeError):
+            except RuntimeError:
                 # Qt may already have destroyed a transient dialog or tab.
                 pass
         self._connections.clear()

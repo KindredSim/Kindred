@@ -743,7 +743,7 @@ class VariableSliders(QtWidgets.QWidget):
         try:
             parse_finite_numeric_text(editor.text().strip())
             valid = not rejected
-        except (TypeError, ValueError, OverflowError):
+        except ValueError:
             valid = False
         was_invalid = bool(editor.property("invalidNumeric"))
         editor.setProperty("invalidNumeric", not valid)
@@ -765,7 +765,7 @@ class VariableSliders(QtWidgets.QWidget):
             return
         try:
             value = parse_finite_numeric_text(raw.strip())
-        except (TypeError, ValueError, OverflowError):
+        except ValueError:
             self._decorate_editor(name_s)
             return
         self._last_committed_editor_text[name_s] = raw

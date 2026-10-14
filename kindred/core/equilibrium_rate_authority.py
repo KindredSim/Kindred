@@ -5,6 +5,7 @@ import math
 from typing import Any, Callable, Mapping
 
 from kindred.core.constants import R
+from kindred.core.exceptions import ValueDomainError
 from kindred.core.kinetics import ForwardRateModel, forward_rate_model_payload
 from kindred.core.mechanism_metadata import EquilibriumMetadataKeys
 from kindred.core.stoichiometry import directional_order_fraction
@@ -35,12 +36,12 @@ def derived_equilibrium_ratio_from_directional_rates(kf: float, kr: float) -> fl
     try:
         ratio = kf / kr
     except (OverflowError, ZeroDivisionError) as exc:
-        raise ValueError(
-            "explicit kf+kr must derive a finite positive equilibrium ratio"
+        raise ValueDomainError(
+            "Keq", "explicit kf+kr must derive a finite positive equilibrium ratio"
         ) from exc
     if not math.isfinite(ratio) or ratio <= 0.0:
-        raise ValueError(
-            "explicit kf+kr must derive a finite positive equilibrium ratio"
+        raise ValueDomainError(
+            "Keq", "explicit kf+kr must derive a finite positive equilibrium ratio"
         )
     return float(ratio)
 

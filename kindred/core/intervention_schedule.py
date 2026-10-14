@@ -7,6 +7,7 @@ from types import MappingProxyType
 from typing import Any, Mapping, Sequence, TypeAlias
 
 from kindred.core.authored_source_errors import AuthoredSourceError
+from kindred.core.exceptions import ErrorContext, KindredError, ValueDomainError, located
 from kindred.core.simulator.errors import DSLError
 from kindred.core.quantity_units import (
     CUBIC_METRE, DIMENSIONLESS, MOLAR, SECOND, Unit, convert_value, parse_declared_unit,
@@ -41,6 +42,7 @@ __all__ = [
     "admit_intervention_parameter_units",
     "intervention_schedule_parameter_dependencies",
     "intervention_schedule_parameter_names",
+    "locate_declaration",
 ]
 
 
@@ -64,7 +66,6 @@ class InterventionScheduleError(AuthoredSourceError):
         "field_identities",
         "value_dependencies",
         "_extra_details",
-        "_locked",
     )
 
     def __init__(
@@ -79,7 +80,7 @@ class InterventionScheduleError(AuthoredSourceError):
         value_dependencies: Sequence[str] = (),
         details: Mapping[str, Any] | None = None,
     ) -> None:
-        """Retain producer-owned location/dependency facts immutably."""
+        """Retain producer-owned location/dependency facts."""
         normalized_dependencies = tuple(
             sorted(
                 {
@@ -109,7 +110,6 @@ class InterventionScheduleError(AuthoredSourceError):
             _freeze_schedule_value(details or {}),
         )
         super().__init__(str(message))
-        object.__setattr__(self, "_locked", True)
 
     @property
     def details(self) -> Mapping[str, Any]:
@@ -125,10 +125,29 @@ class InterventionScheduleError(AuthoredSourceError):
             payload["value_dependencies"] = self.value_dependencies
         return MappingProxyType(payload)
 
-    def __setattr__(self, name: str, value: object) -> None:
-        if getattr(self, "_locked", False):
-            raise AttributeError("InterventionScheduleError is immutable")
-        object.__setattr__(self, name, value)
+    def annotate(self, *, prefix: str = "", **facts: Any) -> None:
+        """Add what an owner the error passes through knows, keeping the error
+        itself: words before the message and facts it does not record yet."""
+        self.args = (f"{prefix}{self}",)
+        for name in ("operation", "declaration_ordinal", "field", "domain"):
+            if name in facts and getattr(self, name) is None:
+                setattr(self, name, facts.pop(name))
+        if "value_dependencies" in facts and not self.value_dependencies:
+            self.value_dependencies = tuple(sorted(facts.pop("value_dependencies")))
+        self._extra_details = _freeze_schedule_value({**facts, **self._extra_details})
+
+
+def locate_declaration(exc: Exception, lines: Sequence[tuple[int, str]]) -> None:
+    """Place a refusal on the authored line of the (latest) declaration it
+    names; a refusal of the whole schedule names none."""
+    ordinals = exc.details.get("declaration_ordinals") or (exc.details.get("declaration_ordinal"),)
+    if ordinals[-1] is None:
+        return
+    line, line_text = lines[ordinals[-1]]
+    if isinstance(exc, KindredError):
+        exc.annotate(context=ErrorContext(line=line, line_text=line_text))
+    else:
+        exc.annotate(prefix=located("", line, line_text))
 
 
 def _freeze_schedule_value(value: object) -> object:
@@ -254,7 +273,6 @@ def _pair(
     validator = {
         "signed": _finite,
         "nonnegative": _nonnegative,
-        "positive": _positive,
         "concentration": _concentration,
     }[domain]
     return validator(value, field=field), None
@@ -277,35 +295,37 @@ def _resolved(
     field: str,
     domain: str,
 ) -> float:
-    raw: object
-    if parameter is not None:
-        if parameter not in parameter_values:
-            raise InterventionScheduleError(
-                f"Missing intervention schedule parameter: {parameter}",
-                field=field,
-                domain=domain,
-                value_dependencies=(parameter,),
-            )
-        raw = parameter_values[parameter]
-    else:
-        raw = value
-    validator = {
-        "signed": _finite,
-        "nonnegative": _nonnegative,
-        "positive": _positive,
-        "concentration": _concentration,
-    }[domain]
-    try:
-        return validator(raw, field=field)
-    except InterventionScheduleError as exc:
-        if parameter is None:
-            raise
+    if parameter is None:
+        # An authored literal, admitted with its declaration.
+        return value
+    if parameter not in parameter_values:
         raise InterventionScheduleError(
-            str(exc),
+            f"Missing intervention schedule parameter: {parameter}",
             field=field,
             domain=domain,
             value_dependencies=(parameter,),
-        ) from exc
+        )
+    # A value a param supplies outside its domain is that param's value.
+    number = float(parameter_values[parameter])
+    try:
+        if domain == "concentration":
+            return validate_concentration(number, field=field)
+        if domain == "nonnegative":
+            return validate_input_time_seconds(number, field=field)
+        return number
+    except ValueDomainError as exc:
+        exc.annotate(parameter_names=(parameter,))
+        raise
+
+
+def _admit_resolved_interval(operation: object, start_time: float, end_time: float) -> None:
+    """A flux or hold interval its params order wrongly; authoring refused
+    literal ones, so a param supplied at least one end."""
+    if end_time <= start_time:
+        raise ValueDomainError("end_time", "end_time must be greater than start_time.", details={
+            "parameter_names": tuple(name for name in (operation.start_time_param, operation.end_time_param)
+                                     if name is not None),
+        })
 
 
 def _put_pair(
@@ -455,6 +475,8 @@ class InterventionPhysical:
         for field in self.clock_fields:
             updates[field] = _resolved(getattr(self, field), getattr(self, field + "_param"), values, field=field, domain="nonnegative")
             updates[field + "_param"] = None
+        if self.op == "flux":
+            _admit_resolved_interval(self, updates["start_time"], updates["end_time"])
         # Physical payloads are consumed by execution, never by compilation.
         return replace(self, **updates)
 
@@ -659,21 +681,7 @@ class InterventionFlux:
             field="end_time",
             domain="nonnegative",
         )
-        if end_time <= start_time:
-            raise InterventionScheduleError(
-                "end_time must be greater than start_time.",
-                field="end_time",
-                domain="interval_order",
-                field_identities=(
-                    (self.declaration_ordinal, None, "start_time"),
-                    (self.declaration_ordinal, None, "end_time"),
-                ),
-                value_dependencies=tuple(
-                    name
-                    for name in (self.start_time_param, self.end_time_param)
-                    if name is not None
-                ),
-            )
+        _admit_resolved_interval(self, start_time, end_time)
         return InterventionFlux(
             species=self.species,
             start_time=start_time,
@@ -770,21 +778,7 @@ class InterventionHold:
             field="end_time",
             domain="nonnegative",
         )
-        if end_time <= start_time:
-            raise InterventionScheduleError(
-                "end_time must be greater than start_time.",
-                field="end_time",
-                domain="interval_order",
-                field_identities=(
-                    (self.declaration_ordinal, None, "start_time"),
-                    (self.declaration_ordinal, None, "end_time"),
-                ),
-                value_dependencies=tuple(
-                    name
-                    for name in (self.start_time_param, self.end_time_param)
-                    if name is not None
-                ),
-            )
+        _admit_resolved_interval(self, start_time, end_time)
         return InterventionHold(
             species=self.species,
             start_time=start_time,
@@ -1233,23 +1227,18 @@ class InterventionSchedule:
         self,
         parameter_values: Mapping[str, Any] | None,
         *,
-        dependency_metadata: InterventionScheduleDependencyMetadata | None = None,
         runtime_parameters: frozenset[str] = frozenset(),
     ) -> "InterventionSchedule":
         if not self.is_parameterized:
             return self
         values = dict(parameter_values or {})
-        dependency_metadata = dependency_metadata or intervention_schedule_parameter_dependencies(self)
         resolved: list[InterventionOperation] = []
         for item in self.operations:
             try:
                 resolved.append(item.resolve_parameters(values, runtime_parameters=runtime_parameters))
-            except InterventionScheduleError as exc:
-                raise _annotate_schedule_resolution_error(
-                    exc,
-                    operation=item,
-                    dependency_metadata=dependency_metadata,
-                ) from exc
+            except (InterventionScheduleError, ValueDomainError) as exc:
+                exc.annotate(operation=item.op, declaration_ordinal=item.declaration_ordinal)
+                raise
         return InterventionSchedule(tuple(resolved))
 
     def to_payload(self) -> dict[str, Any]:
@@ -1298,31 +1287,14 @@ class InterventionSchedule:
     def triggers(self) -> tuple[InterventionTrigger, ...]:
         return tuple(item for item in self.operations if isinstance(item, InterventionTrigger))
 
-
-def _annotate_schedule_resolution_error(
-    exc: InterventionScheduleError,
-    *,
-    operation: InterventionOperation,
-    dependency_metadata: InterventionScheduleDependencyMetadata,
-) -> InterventionScheduleError:
-    identities = exc.field_identities or (
-        ((operation.declaration_ordinal, None, exc.field),)
-        if exc.field is not None else ()
-    )
-    metadata_dependencies = {
-        name
-        for identity in identities
-        for name in dependency_metadata.get(identity, ())
-    }
-    return InterventionScheduleError(
-        str(exc),
-        operation=operation.op,
-        declaration_ordinal=operation.declaration_ordinal,
-        field=exc.field,
-        domain=exc.domain,
-        field_identities=identities,
-        value_dependencies=tuple(sorted(metadata_dependencies)) or exc.value_dependencies,
-    )
+    @property
+    def intervals(self) -> tuple[InterventionFlux | InterventionHold | InterventionPhysical, ...]:
+        """The fluxes and holds whose end must follow their start."""
+        return tuple(
+            item for item in self.operations
+            if isinstance(item, (InterventionFlux, InterventionHold))
+            or (isinstance(item, InterventionPhysical) and item.op == "flux")
+        )
 
 
 def _literal_fields(fields: Mapping[str, Any], *, context: str) -> None:

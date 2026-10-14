@@ -174,11 +174,7 @@ def compact_diagnostic_text(text: object, *, max_chars: int = DIAGNOSTIC_LABEL_M
 
 
 def dataset_alias(index: int, *, prefix: str = "D") -> str:
-    try:
-        idx = int(index)
-    except (TypeError, ValueError):
-        idx = 0
-    return f"{str(prefix or 'D')}{max(0, idx) + 1}"
+    return f"{prefix}{index + 1}"
 
 
 def reaction_text(context: str) -> str:

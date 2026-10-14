@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import logging
 from dataclasses import dataclass
 from typing import Callable
 
@@ -8,12 +7,10 @@ from PySide6 import QtCore
 
 from kindred.core.mechanism_source import MechanismAuthoringSource
 from kindred.core.simulator.dsl_parse import PreparedDslRequestSet
-from kindred.core.simulator.errors import DSLError
-from kindred.core.symbolic.calculator import SymbolicCalculatorError, symbolic_calculator_available
+from kindred.core.symbolic.calculator import symbolic_calculator_available
 from kindred.gui.computation_gate import ComputationGate
 from kindred.gui.symbolic_calculator_worker import CalculatorWorker
 
-logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -232,24 +229,18 @@ class SymbolicCalculatorOwner(QtCore.QObject):
         )
 
     def _build_snapshot(self):
-        try:
-            prepared = self._canonical_prepared_dsl()
-            if prepared is None:
-                return None, False, "Write reactions and click Run to use the Calculator."
-            source = self._canonical_source()
-            if self._snapshot is not None and self._snapshot.prepared_dsl is prepared and self._snapshot.source == source.reactions_text:
-                return self._snapshot, True, ""
-            schedule = prepared.parameterized_intervention_schedule_for_binding()
-            intervention = prepared.intervention_execution_contract()
-            if schedule is not None or not intervention.is_empty:
-                return None, False, "Calculator does not support intervention schedules."
-            mechanism = prepared.mutable_mechanism_shell()
-            available, reason = symbolic_calculator_available(mechanism)
-            if not available:
-                return None, False, reason
-            return SymbolicCalculatorSnapshot(source.reactions_text, mechanism, prepared), True, ""
-        except (DSLError, SymbolicCalculatorError, ValueError) as exc:
-            return None, False, str(exc)
-        except Exception:
-            logger.exception("Unexpected Calculator snapshot failure")
-            return None, False, "Symbolic calculator failed unexpectedly."
+        prepared = self._canonical_prepared_dsl()
+        if prepared is None:
+            return None, False, "Write reactions and click Run to use the Calculator."
+        source = self._canonical_source()
+        if self._snapshot is not None and self._snapshot.prepared_dsl is prepared and self._snapshot.source == source.reactions_text:
+            return self._snapshot, True, ""
+        schedule = prepared.parameterized_intervention_schedule_for_binding()
+        intervention = prepared.intervention_execution_contract()
+        if schedule is not None or not intervention.is_empty:
+            return None, False, "Calculator does not support intervention schedules."
+        mechanism = prepared.mutable_mechanism_shell()
+        available, reason = symbolic_calculator_available(mechanism)
+        if not available:
+            return None, False, reason
+        return SymbolicCalculatorSnapshot(source.reactions_text, mechanism, prepared), True, ""

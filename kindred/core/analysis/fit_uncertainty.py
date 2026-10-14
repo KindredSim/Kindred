@@ -1,8 +1,8 @@
 """Named, provenance-complete uncertainty methods for completed Fits.
 
 The functions in this module do not evaluate models or own an optimizer.  They
-drive the canonical Fit objective and optimizer supplied by the global fitting
-composition boundary, then return immutable Profile results.
+drive the canonical Fit objective, evaluators and optimizer supplied by the
+global fitting composition boundary, then return immutable results.
 """
 
 from __future__ import annotations
@@ -14,11 +14,14 @@ from typing import Callable, Literal, Mapping, Sequence
 
 import numpy as np
 
+from kindred.core.algebra.errors import UNCOMPUTABLE_ERRORS, AlgebraError
+from kindred.core.algebra.simulation_series import observable_parameter_roots
 from kindred.core.analysis import global_fit_execution as _fit_execution
 from kindred.core.analysis.fit_statistics import finite_sum_of_squares
 from kindred.core.exceptions import (
     FittingCancelled,
     SimulationCancelled,
+    ValueDomainError,
 )
 from kindred.core.fitting_completion import FitExtensionProgress
 from kindred.core.fitting_optimization import (
@@ -26,10 +29,12 @@ from kindred.core.fitting_optimization import (
     fit_bound_position,
     fit_parameters_with_fixed,
 )
+from kindred.core.intervention_schedule import InterventionTrigger, intervention_schedule_parameter_dependencies
 from kindred.core.simulation_failure import (
     FactualCause,
     factual_cause_from_exception,
 )
+from kindred.core.simulator.step_indexing import iter_canonical_parameters
 
 __all__ = [
     "ProfileLikelihoodConfig",
@@ -43,6 +48,7 @@ __all__ = [
     "profile_likelihood_settlement_result",
     "profile_likelihood_result",
     "profile_noise_model",
+    "rate_scale_undetermined",
     "undetermined_coordinates",
 ]
 
@@ -282,6 +288,134 @@ def undetermined_coordinates(
     return tuple(flagged)
 
 
+def rate_scale_undetermined(
+    *,
+    prepared_dsl: object,
+    fit_evaluators: Mapping[str, object],
+    datasets: Sequence[object],
+    fixed_dataset_params: Mapping[str, Mapping[str, float]],
+    layout: _fit_execution.FitParameterLayout,
+    vector: np.ndarray,
+) -> bool:
+    """Whether the data leave the overall rate scale undetermined.
+
+    With nothing tied to the clock (no temperature schedule, and no
+    intervention other than a state trigger without a minimum interval), a
+    curve plotted against a measured X is the same when every rate constant is
+    multiplied by one factor; only the time to reach each point changes.  The
+    scale is undetermined when the fitted values can multiply one measured-X
+    dataset's rate constants by a common factor without changing a time-X
+    dataset's rate constants, any value a target reads or a trigger's inputs.
+    A value a target's formula names that cannot be calculated at the fitted
+    values lies in an ifelse branch no target took, and is not read.
+    The test is linear, on the relative changes of the rate constants and of
+    those values when each fitted coordinate (log10 under Log Scale) moves by
+    1e-5 of itself (of its range at zero) within its bounds; a value of zero
+    stays zero.  A value that cannot be calculated at a moved point leaves
+    the scale unflagged.
+    """
+
+    contract = prepared_dsl.intervention_execution_contract()
+    schedule = prepared_dsl.parameterized_intervention_schedule_for_binding() or (
+        contract.authored if contract is not None else None
+    )
+    if (
+        all(item.x_name == "t" for item in datasets)
+        or prepared_dsl.temperature_schedule_for_execution() is not None
+        or (schedule is not None and any(
+            not isinstance(item, InterventionTrigger) or item.min_interval
+            for item in schedule.without_stops().operations
+        ))
+    ):
+        return False
+    rates = tuple(
+        name for name, _entry, role in iter_canonical_parameters(prepared_dsl.accepted_mechanism_for_structure())
+        if role in {"k", "kf", "kr"}
+    )
+    spec = prepared_dsl.parameter_algebra_spec_for_execution()
+    # A trigger's threshold and amounts shape the curve as a target's reads do.
+    triggers = set() if schedule is None else {
+        name for names in intervention_schedule_parameter_dependencies(schedule.without_stops()).values()
+        for name in names if name in spec.evaluation_dependencies
+    }
+    temperature = float(prepared_dsl.analysis.temperature_K)
+    x = np.asarray(vector, dtype=float)
+    # Relative to each value, so a small rate constant keeps positive
+    # neighbours. Within a step of a bound, the difference is a second-order
+    # one-sided one into the interior.
+    steps = 1e-5 * np.where(x != 0.0, np.abs(x), layout.upper - layout.lower)
+    central = (x - steps >= layout.lower) & (x + steps <= layout.upper)
+    steps = np.where(central | (layout.upper - x >= x - layout.lower), steps, -steps)
+    blocks, scales = [], []
+    for payload in datasets:
+        roots = {
+            root for target in (*payload.species_list, payload.x_name)
+            if target in prepared_dsl.analysis.observable_names
+            for root in observable_parameter_roots(spec.observable_block, target)
+        }
+        reads = tuple(sorted({root for root in roots if root in spec.evaluation_dependencies} | triggers))
+
+        def values(names: tuple[str, ...], index: int | None = None, offset: float = 0.0) -> np.ndarray:
+            trial = x.copy()
+            if index is not None:
+                trial[index] += offset
+            params = _fit_execution._objective_dataset_input(
+                payload, layout=layout, vector=trial,
+                shared_values=layout.shared_param_dict_from_vector(trial),
+                fixed_values=fixed_dataset_params[payload.dataset_id],
+            ).full_params
+            calculated = fit_evaluators[payload.dataset_id].parameter_values(params, temperature, names)
+            return np.asarray([calculated[name] for name in names], dtype=float)
+
+        def calculable(name: str) -> bool:
+            try:
+                values((name,))
+            except (AlgebraError, ValueDomainError):
+                return False
+            return True
+
+        # A formula names the values of every ifelse branch; one that cannot
+        # be calculated at the fitted values shaped no point the Fit compared.
+        names = rates + tuple(name for name in reads if calculable(name))
+        try:
+            base = values(names)
+            block = np.empty((len(names), x.size))
+            for index, step in enumerate(steps):
+                block[:, index] = (
+                    (values(names, index, step) - values(names, index, -step)) / (2.0 * step) if central[index]
+                    else (4.0 * values(names, index, step) - 3.0 * base - values(names, index, 2.0 * step)) / (2.0 * step)
+                )
+        except UNCOMPUTABLE_ERRORS:
+            return False
+        # Each change relative to its own value, so rows in any unit compare;
+        # a value of zero keeps its change and must stay zero.
+        block /= np.where(base != 0.0, np.abs(base), 1.0)[:, None]
+        positive = (np.arange(len(names)) < len(rates)) & (base > 0.0)
+        blocks.append(block)
+        # A time-X dataset, or one whose target reads time, sees the scale.
+        scales.append(None if payload.x_name == "t" or "t" in roots else positive)
+    free = [index for index, scale in enumerate(scales) if scale is not None]
+    if not free:
+        return False
+    common = np.zeros((sum(block.shape[0] for block in blocks), len(free)))
+    row = 0
+    for index, block in enumerate(blocks):
+        if scales[index] is not None:
+            common[row:row + block.shape[0], free.index(index)] = scales[index]
+        row += block.shape[0]
+    fitted = np.vstack(blocks)
+
+    def rank(matrix: np.ndarray) -> int:
+        norms = np.linalg.norm(matrix, axis=0)
+        scaled = np.divide(matrix, norms, out=np.zeros_like(matrix), where=norms > 0.0)
+        singular = np.linalg.svd(scaled, compute_uv=False)
+        return int(np.sum(singular > 1e-7 * singular[0])) if singular.size and singular[0] > 0.0 else 0
+
+    # The fitted values reach a common factor when their columns and the
+    # per-dataset factor columns share a direction.
+    return rank(np.hstack([fitted, common])) < rank(fitted) + rank(common)
+
+
 ProfileLikelihoodStatus = Literal[
     "available",
     "partial",
@@ -351,7 +485,7 @@ class ProfileLikelihoodResult:
     def __post_init__(self) -> None:
         # The Profile owner builds every result from its admitted
         # configuration, literal statuses, a factual reason for an unavailable
-        # result and a diagnostic for a stopped or failed one.
+        # result and a diagnostic for a failed one.
         object.__setattr__(self, "method", _PROFILE_METHOD)
         object.__setattr__(self, "intervals", MappingProxyType(dict(self.intervals)))
         object.__setattr__(self, "provenance", MappingProxyType(dict(self.provenance)))
@@ -361,9 +495,9 @@ def profile_likelihood_settlement_result(
     *,
     config: ProfileLikelihoodConfig,
     status: Literal["stopped", "failed"],
-    cause: FactualCause,
+    cause: FactualCause | None,
 ) -> ProfileLikelihoodResult:
-    """Construct a stopped/failed Profile result from call-local facts."""
+    """Construct a stopped/failed Profile result; only a failure has a cause."""
 
     return ProfileLikelihoodResult(
         status=status,

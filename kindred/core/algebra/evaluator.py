@@ -22,20 +22,20 @@ Constraints
 
 from __future__ import annotations
 
-import logging
 import math
 from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Dict, List, Mapping, Optional, Set, Tuple
 
 import numpy as np
 
-from kindred.core.exceptions import KindredError, SimulationCancelled
+from kindred.core.exceptions import ErrorContext, KindredError, SimulationCancelled, ValueDomainError
 
 from .errors import (
     AlgebraBoolCastError,
     AlgebraDomainError,
     AlgebraError,
     AlgebraNameError,
+    AlgebraNonFiniteError,
     AlgebraTypeError,
     AlgebraUndefinedError,
     AlgebraZeroDivError,
@@ -53,8 +53,6 @@ from .parser import (
     UnaryNode,
 )
 from .symbols import POWER_DOMAIN, SymbolTable
-
-logger = logging.getLogger(__name__)
 
 
 __all__ = [
@@ -88,16 +86,17 @@ class EvaluationContext:
         application, not by user algebra.
     symbol_series : mapping, optional
         Row-aligned runtime symbols.  These values are resolved before the
-        static symbol table and are intended for step-local ``t``, ``T``,
-        mechanism coefficients, and changing scalar inputs.  A scalar value
+        static symbol table and are intended for step-local ``T``, mechanism
+        coefficients, and changing scalar inputs; ``t`` is read from ``t``.  A scalar value
         is broadcast to the supplied grid; an array must have exactly the
         same length as ``t``.
     symbol_values : mapping, optional
         Already evaluated static symbols. Missing scientific symbols can be
         resolved on first use inside the consuming observable's error boundary.
     symbol_resolver : callable, optional
-        Resolve a scientific symbol to a scalar or row-aligned array, or None
-        when the name is not a scientific parameter.
+        Resolve a scientific symbol at one row to its value, or None when the
+        name is not a scientific parameter. A name outside
+        ``runtime_symbol_names`` is asked once and kept.
     runtime_symbol_names : set
         Row-dependent symbols, classified before their values are evaluated.
     cancellation_check : callable, optional
@@ -109,7 +108,7 @@ class EvaluationContext:
     symtab: SymbolTable
     symbol_series: Mapping[str, np.ndarray] = field(default_factory=dict)
     symbol_values: Mapping[str, float] = field(default_factory=dict)
-    symbol_resolver: Callable[[str], float | np.ndarray | None] | None = None
+    symbol_resolver: Callable[[str, int], float | None] | None = None
     runtime_symbol_names: frozenset[str] = frozenset()
     cancellation_check: Callable[[], bool] | None = None
 
@@ -128,33 +127,31 @@ class AlgebraObservableError:
     """
 
     name: str
-    exc_type: str
     message: str
+    # A value that cannot be calculated for these inputs, rather than a
+    # formula Kindred cannot evaluate at all.
+    value_failure: bool = False
     code: Optional[str] = None
     line: Optional[int] = None
     col: Optional[int] = None
     line_text: Optional[str] = None
-    # A Kindred error's own facts, such as the values a failing param reads.
+    # The error's own facts, such as the values a failing param reads.
     details: Mapping[str, Any] = field(default_factory=dict)
 
     @staticmethod
-    def from_exception(name: str, exc: Exception, *, stmt: LetStatement) -> "AlgebraObservableError":
-        code = getattr(exc, "code", None)
-        # A Kindred error keeps its message and its own authored line apart.
-        context = exc.context if isinstance(exc, KindredError) else None
-        line = getattr(exc, "line", None) or getattr(context, "line", None) or getattr(stmt, "line", None)
-        col = getattr(exc, "col", None) or getattr(stmt, "col", None)
-        line_text = (getattr(exc, "line_text", None) or getattr(context, "line_text", None)
-                     or getattr(stmt, "line_text", None))
+    def from_exception(name: str, exc: KindredError, *, stmt: LetStatement) -> "AlgebraObservableError":
+        # An error keeps its message and its own authored line apart; one
+        # without a line is located on the statement that read it.
+        context = exc.context or ErrorContext(line=stmt.line, line_text=stmt.line_text)
         return AlgebraObservableError(
             name=str(name),
-            exc_type=exc.__class__.__name__,
-            message=exc.message if isinstance(exc, KindredError) else str(exc),
-            code=str(code) if code is not None else None,
-            line=int(line) if line is not None else None,
-            col=int(col) if col is not None else None,
-            line_text=str(line_text) if line_text is not None else None,
-            details=dict(exc.details) if isinstance(exc, KindredError) else {},
+            message=exc.message,
+            value_failure=isinstance(exc, UNCOMPUTABLE_ERRORS),
+            code=exc.code,
+            line=context.line,
+            col=exc.col if isinstance(exc, AlgebraError) else stmt.col,
+            line_text=context.line_text,
+            details=dict(exc.details),
         )
 
 
@@ -168,13 +165,10 @@ def _as_float(x: Any, *, stmt: LetStatement) -> float:
     """Coerce to float but reject booleans (E170)."""
     if isinstance(x, bool):
         raise AlgebraBoolCastError("A true/false result cannot be used as a number.", line=stmt.line, col=stmt.col, line_text=stmt.line_text)
-    try:
-        xf = float(x)
-    except Exception:
-        logger.debug(f"Failed to convert value to float: {x}", exc_info=True)
-        raise AlgebraTypeError("non scalar where scalar required", line=stmt.line, col=stmt.col, line_text=stmt.line_text)
+    xf = float(x)
     if not np.isfinite(xf):
-        raise AlgebraTypeError("The result is not a finite number.", line=stmt.line, col=stmt.col, line_text=stmt.line_text)
+        raise AlgebraNonFiniteError("The result is not a finite number.", line=stmt.line, col=stmt.col,
+                                    line_text=stmt.line_text)
     return xf
 
 
@@ -184,10 +178,13 @@ def _as_float(x: Any, *, stmt: LetStatement) -> float:
 def bind_scalar_expression_evaluator(
     block: AlgebraBlock, values: dict[str, float], *,
     literal_reader: Callable[[NumberNode], float] | None = None,
+    resolver: Callable[[str, int], float | None] | None = None,
 ):
-    """Bind admitted scalar AST arithmetic to one current numerical map."""
+    """Bind admitted scalar AST arithmetic to one current numerical map; a
+    name missing from it is asked of ``resolver`` when read and kept there."""
     context = EvaluationContext(
         t=np.array([0.0]), species_series={}, initials={}, symtab=SymbolTable(),
+        symbol_resolver=resolver,
     )
     evaluator = _Evaluator(block, context, literal_reader=literal_reader)
     evaluator.symbol_values = values
@@ -322,7 +319,7 @@ class _Evaluator:
 
                 arr = np.empty(self.N, dtype=float)
                 # Keyed by whether the point is undefined only through another let.
-                firsts: dict[bool, tuple[int, AlgebraError]] = {}
+                firsts: dict[bool, tuple[int, KindredError]] = {}
                 counts = {True: 0, False: 0}
                 dependencies: dict[str, None] = {}
                 for i in range(self.N):
@@ -355,13 +352,11 @@ class _Evaluator:
                         raise exc
                     error = AlgebraObservableError.from_exception(name, exc, stmt=stmt)
                     errors.append(replace(error, details={
-                        "undefined_points": counts[inherited], "points": self.N,
+                        **error.details, "undefined_points": counts[inherited], "points": self.N,
                         "first_undefined_time": float(self.ctx.t[index]),
                     }))
                 self.series[name] = arr
-            except SimulationCancelled:
-                raise
-            except Exception as exc:
+            except (AlgebraError, ValueDomainError) as exc:
                 errors.append(AlgebraObservableError.from_exception(name, exc, stmt=stmt))
                 self.failed.add(name)
                 continue
@@ -406,20 +401,14 @@ class _Evaluator:
             if name in self.symbol_values:
                 return float(self.symbol_values[name])
             if self.ctx.symbol_resolver is not None:
-                resolved = self.ctx.symbol_resolver(name)
+                # Asked at the point that reads it, so a value undefined at
+                # some points fails only there.
+                resolved = self.ctx.symbol_resolver(name, i)
                 if resolved is not None:
-                    arr = np.asarray(resolved, dtype=float)
-                    if arr.ndim == 0:
-                        value = _as_float(float(arr), stmt=stmt)
+                    value = float(resolved)
+                    if name not in self.ctx.runtime_symbol_names:
                         self.symbol_values[name] = value
-                        return value
-                    if arr.ndim != 1 or arr.size != self.N or np.any(~np.isfinite(arr)):
-                        raise AlgebraTypeError(
-                            f"symbol_series[{name!r}] must be finite and row-aligned",
-                            line=stmt.line, col=stmt.col, line_text=stmt.line_text,
-                        )
-                    self.symbol_series[name] = arr
-                    return float(arr[i])
+                    return value
             # protected symbol in symtab
             if self.ctx.symtab.has(name):
                 return float(self.ctx.symtab.get(name))
@@ -472,48 +461,37 @@ class _Evaluator:
             lv = _as_float(self._eval_expr(node.lhs, i, stmt=stmt), stmt=stmt)
             rv = _as_float(self._eval_expr(node.rhs, i, stmt=stmt), stmt=stmt)
             op = node.op
-            try:
-                if op == "+":
-                    return _as_float(lv + rv, stmt=stmt)
-                if op == "-":
-                    return _as_float(lv - rv, stmt=stmt)
-                if op == "*":
-                    return _as_float(lv * rv, stmt=stmt)
-                if op == "/":
-                    if rv == 0.0:
-                        raise AlgebraZeroDivError("Division by zero.", line=stmt.line, col=stmt.col, line_text=stmt.line_text)
-                    return _as_float(lv / rv, stmt=stmt)
-                if op in ("**", "^"):
-                    try:
-                        return _as_float(math.pow(lv, rv), stmt=stmt)
-                    except ValueError:
-                        raise AlgebraDomainError("^ " + POWER_DOMAIN, line=stmt.line, col=stmt.col,
-                                                 line_text=stmt.line_text) from None
-                if op == "==":
-                    return lv == rv
-                if op == "!=":
-                    return lv != rv
-                if op == "<":
-                    return lv < rv
-                if op == "<=":
-                    return lv <= rv
-                if op == ">":
-                    return lv > rv
-                if op == ">=":
-                    return lv >= rv
-            except (AlgebraTypeError, AlgebraZeroDivError, AlgebraDomainError):
-                raise
-            except OverflowError as exc:
-                raise AlgebraTypeError(
-                    "The result is not a finite number.",
-                    line=stmt.line,
-                    col=stmt.col,
-                    line_text=stmt.line_text,
-                ) from exc
-            except Exception as e:
-                logger.debug(f"Binary operation {op} failed", exc_info=True)
-                # Generic math domain/type issues
-                raise AlgebraDomainError(f"invalid operation: {e}", line=stmt.line, col=stmt.col, line_text=stmt.line_text)
+            if op == "+":
+                return _as_float(lv + rv, stmt=stmt)
+            if op == "-":
+                return _as_float(lv - rv, stmt=stmt)
+            if op == "*":
+                return _as_float(lv * rv, stmt=stmt)
+            if op == "/":
+                if rv == 0.0:
+                    raise AlgebraZeroDivError("Division by zero.", line=stmt.line, col=stmt.col, line_text=stmt.line_text)
+                return _as_float(lv / rv, stmt=stmt)
+            if op in ("**", "^"):
+                try:
+                    return _as_float(math.pow(lv, rv), stmt=stmt)
+                except ValueError:
+                    raise AlgebraDomainError("^ " + POWER_DOMAIN, line=stmt.line, col=stmt.col,
+                                             line_text=stmt.line_text) from None
+                except OverflowError:
+                    raise AlgebraNonFiniteError("The result is not a finite number.", line=stmt.line,
+                                                col=stmt.col, line_text=stmt.line_text) from None
+            if op == "==":
+                return lv == rv
+            if op == "!=":
+                return lv != rv
+            if op == "<":
+                return lv < rv
+            if op == "<=":
+                return lv <= rv
+            if op == ">":
+                return lv > rv
+            if op == ">=":
+                return lv >= rv
 
         # Call
         if isinstance(node, CallNode):
@@ -531,17 +509,14 @@ class _Evaluator:
             except ZeroDivisionError:
                 raise AlgebraZeroDivError("Division by zero.", line=stmt.line, col=stmt.col, line_text=stmt.line_text)
             except OverflowError:
-                raise AlgebraTypeError("The function result is not a finite number.", line=stmt.line, col=stmt.col,
-                                       line_text=stmt.line_text) from None
+                raise AlgebraNonFiniteError("The function result is not a finite number.", line=stmt.line, col=stmt.col,
+                                            line_text=stmt.line_text) from None
             except ValueError as e:
                 # e.g., sqrt of negative
-                logger.debug(f"Function {node.name} raised ValueError", exc_info=True)
-                raise AlgebraDomainError(str(e), line=stmt.line, col=stmt.col, line_text=stmt.line_text)
-            except Exception as e:
-                logger.debug(f"Function {node.name} call failed", exc_info=True)
-                raise AlgebraTypeError(f"invalid function call: {e}", line=stmt.line, col=stmt.col, line_text=stmt.line_text)
+                raise AlgebraDomainError(str(e), line=stmt.line, col=stmt.col, line_text=stmt.line_text) from None
             if not np.isfinite(out):
-                raise AlgebraTypeError("The function result is not a finite number.", line=stmt.line, col=stmt.col, line_text=stmt.line_text)
+                raise AlgebraNonFiniteError("The function result is not a finite number.", line=stmt.line, col=stmt.col,
+                                            line_text=stmt.line_text)
             return out
 
         # Should not reach here
@@ -597,7 +572,7 @@ class PreparedAlgebraStopEvaluator:
         *,
         species_names: Tuple[str, ...],
         initials: Mapping[str, float],
-        symbol_values: Mapping[str, float],
+        symbol_resolver: Callable[[str, int], float | None],
         runtime_symbol_names: Set[str],
     ) -> None:
         self.block = block
@@ -612,7 +587,7 @@ class PreparedAlgebraStopEvaluator:
             species_series={},
             initials=dict(initials),
             symtab=SymbolTable(),
-            symbol_values=dict(symbol_values),
+            symbol_resolver=symbol_resolver,
         )
         self._static_evaluator = _PointEvaluator(self, self._context)
 
@@ -654,7 +629,11 @@ class PreparedAlgebraStopEvaluator:
 
     def _safe_denominator(self, node: ExprNode, stmt: LetStatement, evaluator: _PointEvaluator) -> bool:
         if not self._is_dynamic(node):
-            return _as_float(self._static_value(node, stmt, evaluator), stmt=stmt) != 0.0
+            # A fixed denominator of zero is a value that cannot be calculated,
+            # not a form a stop cannot watch.
+            if _as_float(self._static_value(node, stmt, evaluator), stmt=stmt) == 0.0:
+                raise AlgebraZeroDivError("Division by zero.", line=stmt.line, col=stmt.col, line_text=stmt.line_text)
+            return True
         if isinstance(node, IdentNode) and node.name in self.statements:
             dependency = self.statements[node.name]
             return self._safe_denominator(dependency.expr, dependency, evaluator)
@@ -727,7 +706,6 @@ class PreparedAlgebraStopEvaluator:
             species_series={species: np.array([y[index]]) for index, species in enumerate(self.species_names)},
             initials=self._context.initials,
             symtab=self._context.symtab,
-            symbol_values=self._context.symbol_values,
             symbol_series=runtime_symbols,
         )
         # The stopping declaration that watches the quantity names it.

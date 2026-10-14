@@ -151,24 +151,20 @@ def build_physical_shell(
     installed only after the authoritative document is selected.
     """
 
-    try:
-        stacks = {
-            spec.identity_key: QtWidgets.QStackedWidget(workspace_root)
-            for spec in DOCK_SPECS
-            if spec.surface_object_name is not None
+    stacks = {
+        spec.identity_key: QtWidgets.QStackedWidget(workspace_root)
+        for spec in DOCK_SPECS
+        if spec.surface_object_name is not None
+    }
+    for spec in DOCK_SPECS:
+        if spec.surface_object_name is not None:
+            stacks[spec.identity_key].setObjectName(spec.surface_object_name)
+    workspace_root.install_dock_panels(
+        {
+            **stacks,
+            ANALYSIS_DOCK_SPEC.identity_key: (
+                workspace_root.main_plot_analysis_widget()
+            ),
         }
-        for spec in DOCK_SPECS:
-            if spec.surface_object_name is not None:
-                stacks[spec.identity_key].setObjectName(spec.surface_object_name)
-        workspace_root.install_dock_panels(
-            {
-                **stacks,
-                ANALYSIS_DOCK_SPEC.identity_key: (
-                    workspace_root.main_plot_analysis_widget()
-                ),
-            }
-        )
-    except Exception:
-        workspace_root.dispose()
-        raise
+    )
     return stacks

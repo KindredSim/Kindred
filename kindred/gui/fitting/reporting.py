@@ -24,7 +24,6 @@ from kindred.core.simulation_failure import FactualCause
 from kindred.core.validation import and_join, six_digit_text
 from kindred.gui.display_name_policy import scientific_symbol_html
 from kindred.gui.fitting.constants import (
-    DE_CONVERGENCE_TOLERANCE_LABEL,
     DIFFERENTIAL_EVOLUTION_METHOD,
     FIT_DATASET_WEIGHT_MODE_LABELS,
     FUNCTION_TOLERANCE_LABEL,
@@ -753,9 +752,9 @@ FitValueEntry = tuple[tuple[str, ...], str, str, str, float, str]
 def fit_completion_presentation(candidate: FitCandidate) -> tuple[str, bool]:
     """Describe typed settlement facts and whether execution reached completion."""
     result = candidate.result
-    stopped = result.optimizer_diagnostic is not None and result.optimizer_diagnostic.type == "FittingStopped"
+    stopped = result.ending == "stopped"
     text = ("Fit stopped · Best complete candidate retained" if stopped else
-            "Fit converged" if result.optimizer_converged else
+            "Fit converged" if result.ending == "converged" and not result.endpoint_replaced else
             "Fit finished · Optimizer did not converge")
     complete = not stopped
     analysis = result.profile_likelihood_result
@@ -859,11 +858,14 @@ def fit_candidate_presentation(
     label = _coordinate_labeler(candidate.request, names)
     # The Results tab shows the same warnings above its fitted values.
     warnings = ""
-    diagnostic = result.optimizer_diagnostic
-    if diagnostic is not None and diagnostic.type == "FittingIdentifiability":
-        warnings += f"<p><b>Warning:</b> {_text(diagnostic.message)}</p>"
+    if result.identifiability_warning is not None:
+        warnings += f"<p><b>Warning:</b> {_text(result.identifiability_warning)}</p>"
     for coordinate in result.undetermined_values:
         warnings += f"<p><b>Warning:</b> These data do not determine this value within its bounds: {label(coordinate)}.</p>"
+    if result.rate_scale_undetermined:
+        warnings += ("<p><b>Warning:</b> These data do not determine the overall rate scale: multiplying "
+                     "every rate constant by one common factor traces the same curve against the measured X, "
+                     "only faster or slower.</p>")
     body = f"<h2>{_text(phase)}</h2><p>Mechanism: {_text(model)}</p>" + warnings
     body += (f"<p><b>Weighted SSE:</b> {_text(objective)} &nbsp; "
              f"<b>Weighted MSE:</b> {_text(_metric_text(_metric(result.weighted_residual_mse)))}</p>")
@@ -908,21 +910,21 @@ def fit_candidate_presentation(
 
     settings = candidate.origin.scientific_settings
     defaults = request_setup.defaults
-    differential_evolution = defaults.method == DIFFERENTIAL_EVOLUTION_METHOD
     optimizer_rows = [
         ("Optimization method", fit_method_label(defaults.method)),
         ("Maximum evaluations", defaults.max_nfev),
-        (DE_CONVERGENCE_TOLERANCE_LABEL if differential_evolution else FUNCTION_TOLERANCE_LABEL,
-         float(defaults.ftol)),
+        (FUNCTION_TOLERANCE_LABEL, float(defaults.ftol)),
+        (STEP_TOLERANCE_LABEL, float(defaults.xtol)),
     ]
-    if not differential_evolution:
-        optimizer_rows.append((STEP_TOLERANCE_LABEL, float(defaults.xtol)))
-    if differential_evolution and defaults.use_seed:
+    if defaults.method == DIFFERENTIAL_EVOLUTION_METHOD and defaults.use_seed:
         optimizer_rows.append(("Seed", defaults.seed))
     provenance = (f"<p>Optimizer message: {_text(_diagnostic(result.message, candidate.origin))}</p>"
                   "<h3>Mechanism</h3><pre>"
                   + html.escape(candidate.origin.mechanism_source.reactions_text) + "</pre>")
     resolved = candidate.origin.prepared_dsl.analysis
+    # Only measured-X datasets match curve locations and apply authored stops.
+    locations = _matched_locations(result)
+    measured_x = locations is not None
     provenance += "<h3>Settings</h3>" + _table(("Setting", "Value"), (
         ("Temperature", f"{_display(float(resolved.temperature_K))} K"),
         ("Standard concentration", f"{_display(float(resolved.standard_conc_M))} M"),
@@ -930,11 +932,12 @@ def fit_candidate_presentation(
         ("Relative tolerance", float(settings.rtol)),
         ("Absolute tolerance", float(settings.atol)),
         ("Analytic Jacobian", "On" if settings.analytic_jacobian_policy else "Off"),
+        *((("Authored stopping interventions", "On" if settings.use_authored_stops else "Off"),) if measured_x else ()),
         ("Solver", request_setup.solver),
         *optimizer_rows,
         ("Observations", sum(info.residuals.size for info in result.dataset_info)),
         ("Fitted values", fitted_values),
-        *((("Matched curve locations", locations),) if (locations := _matched_locations(result)) is not None else ()),
+        *((("Matched curve locations", locations),) if measured_x else ()),
     ))
     dataset_names = {item.dataset_id: item.display_name for item in candidate.origin.mapped_datasets}
     included_ids = {item.dataset_id for item in request_setup.datasets if item.included}

@@ -9,8 +9,11 @@ from typing import Callable, Mapping, Protocol, Sequence
 
 import numpy as np
 
-from kindred.core.exceptions import KineticRuntimeDomainError, SimulationCancelled
-from kindred.core.intervention_schedule import (InterventionScheduleError, InterventionStopAction, SpeciesTriggerCondition, ObservableTriggerCondition)
+from kindred.core.algebra.errors import AlgebraError
+from kindred.core.exceptions import SimulationCancelled, ValueDomainError
+from kindred.core.intervention_schedule import (
+    InterventionScheduleError, InterventionStopAction, SpeciesTriggerCondition, locate_declaration,
+)
 from kindred.core.intervention_schedule_compiler import (
     ExecutableFlux,
     ExecutableHold,
@@ -978,6 +981,10 @@ class InterventionScheduleExecutionOwner:
                 discontinuity_ids=result_discontinuity_ids,
                 termination=termination,
             )
+        except (AlgebraError, ValueDomainError, InterventionScheduleError) as exc:
+            # Values params supply at run time are refused on their declaration.
+            locate_declaration(exc, req.intervention_lines)
+            raise
         finally:
             dense_segments.clear()
             segment_result = None
@@ -1203,21 +1210,20 @@ def _trigger_value(
     observable_value: Callable[[str, float, np.ndarray, float], float] | None,
     temperature_K: float,
 ) -> float:
+    if isinstance(trigger.condition, SpeciesTriggerCondition):
+        return float(state[species_index[trigger.condition.name]])
     try:
-        if isinstance(trigger.condition, SpeciesTriggerCondition):
-            value = float(state[species_index[trigger.condition.name]])
-        else:
-            value = float(observable_value(trigger.condition.name, time, state, temperature_K))
-        if not math.isfinite(value):
-            raise ValueError("the watched quantity is not finite")
-        return value
-    except Exception as exc:
-        raise InterventionScheduleError(
-            f"Stopping declaration {trigger.declaration_ordinal + 1}, quantity {trigger.condition.name!r}: {exc}",
-            operation="trigger", declaration_ordinal=trigger.declaration_ordinal,
-            field="watch_observable" if isinstance(trigger.condition, ObservableTriggerCondition) else "watch_species",
-            details={"quantity": trigger.condition.name, "time": time},
-        ) from exc
+        return float(observable_value(trigger.condition.name, time, state, temperature_K))
+    except (AlgebraError, ValueDomainError) as exc:
+        # The watched quantity reads the solved state; a param it reads that
+        # failed names its own inputs.
+        if "assignment" not in exc.details:
+            exc.annotate(reads_species=True)
+        exc.annotate(
+            prefix=f"Stopping declaration {trigger.declaration_ordinal + 1}, quantity {trigger.condition.name!r}: ",
+            quantity=trigger.condition.name, time=time,
+        )
+        raise
 
 
 def _crossed(before: float, after: float, threshold: float, direction: str) -> bool:
@@ -1449,19 +1455,9 @@ def _resolve_items(items, time, parameter_values, *, temperature_K):
         return tuple(
             resolve_executable_values(item, values, time=time) for item in items
         )
-    except Exception as exc:
-        if isinstance(exc, SimulationCancelled):
-            raise
-        if isinstance(exc, KineticRuntimeDomainError):
-            # The value stays a domain refusal, so Fit can reject the candidate.
-            raise KineticRuntimeDomainError(
-                f"Intervention values at t = {time:g} s: {exc.message}",
-                stage=exc.details["stage"], parameter_names=exc.parameter_names,
-                details={**exc.details, "time": time}, context=exc.context,
-            ) from exc
-        raise InterventionScheduleError(
-            f"Intervention values at t = {time:g} s: {exc}", details={"time": time}
-        ) from exc
+    except (AlgebraError, ValueDomainError, InterventionScheduleError) as exc:
+        exc.annotate(prefix=f"Intervention values at t = {time:g} s: ", time=time)
+        raise
 
 
 def _apply_holds(

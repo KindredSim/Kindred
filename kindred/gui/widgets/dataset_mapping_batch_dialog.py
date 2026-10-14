@@ -9,7 +9,6 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from kindred.core.dataset_mapping import (
     DatasetMappingBatchProposal,
     DatasetMappingChoice,
-    DatasetMappingError,
     DatasetMappingProposal,
     OccupiedSetChoice,
     allocate_initial_condition_set_name,
@@ -526,7 +525,7 @@ class DatasetMappingBatchDialog(QtWidgets.QDialog):
                 batch=self.proposal(),
                 model_targets=self._model_targets,
             )
-        except (DatasetMappingError, ValueError, TypeError) as exc:
+        except ValueError as exc:
             self._readiness.setText(str(exc))
             return
         self.accept()

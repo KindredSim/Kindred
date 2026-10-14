@@ -240,10 +240,7 @@ class ProjectWorkspaceWidget(QtWidgets.QMainWindow):
         if payload.isEmpty():
             self.restore_default_panel_layout()
             return False
-        try:
-            restored = bool(self.restoreState(payload))
-        except (RuntimeError, TypeError, ValueError):
-            restored = False
+        restored = self.restoreState(payload)
         if not restored:
             self.restore_default_panel_layout()
         return restored
@@ -300,11 +297,7 @@ class ProjectWorkspaceWidget(QtWidgets.QMainWindow):
         return plot
 
     def plot_for_tab(self, tab_id: str) -> PyQtGraphPlotPanel:
-        target = str(tab_id)
-        try:
-            return self._plot_by_tab_id[target]
-        except KeyError as exc:
-            raise KeyError(f"Unknown mechanism plot tab ID: {target!r}.") from exc
+        return self._plot_by_tab_id[str(tab_id)]
 
     def main_plot_analysis_widget(self) -> QtWidgets.QStackedWidget:
         """Return the physical analysis stack used by the Analysis dock."""
@@ -421,33 +414,6 @@ class ProjectWorkspaceWidget(QtWidgets.QMainWindow):
         plot.deleteLater()
         if self._active_tab_id == target:
             self._active_tab_id = None
-
-    def reset_plot_session_state(self) -> None:
-        """Discard every old-document physical panel and its view state."""
-
-        for tab_id in tuple(self._plot_by_tab_id):
-            self.drop_tab_session_state(tab_id)
-        initial = self._initial_plot
-        if initial is not None:
-            initial.reset_plot_session_state()
-            analysis = initial.analysis_tabs()
-            self._analysis_stack.removeWidget(analysis)
-            analysis.deleteLater()
-            initial.deleteLater()
-            self._initial_plot = None
-        self._active_tab_id = None
-
-    def dispose(self) -> None:
-        """Best-effort child cleanup with unconditional root teardown."""
-
-        try:
-            self.reset_plot_session_state()
-        except Exception:
-            # The root remains the final Qt custody owner; even a damaged plot
-            # child must not prevent the root from being retired.
-            pass
-        finally:
-            self.deleteLater()
 
     def set_theme(self, *, dark_mode: bool) -> None:
         self._dark_mode = bool(dark_mode)

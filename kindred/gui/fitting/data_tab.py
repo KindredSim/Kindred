@@ -347,7 +347,7 @@ class DataTab(QtWidgets.QWidget):
                 )
                 if not math.isfinite(value):
                     raise ValueError
-            except (TypeError, ValueError, OverflowError):
+            except ValueError:
                 self._invalid_raw[(dataset_id, field)] = raw
             else:
                 self._invalid_raw.pop((dataset_id, field), None)

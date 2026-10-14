@@ -14,6 +14,7 @@ from fractions import Fraction
 from typing import Callable, TypeAlias
 
 from .constants import R, h, k_B
+from .exceptions import ValueDomainError
 from .units import admit_rate
 
 __all__ = [
@@ -217,7 +218,7 @@ def eyring_rate(
             * math.pow(standard_conc_M, 1.0 - molecularity)
         )
     except OverflowError as exc:
-        raise ValueError("Eyring rate overflows the finite real domain") from exc
+        raise ValueDomainError("Eyring rate", "Eyring rate overflows the finite real domain") from exc
     return admit_rate(k, field="Eyring rate")
 
 
@@ -236,5 +237,5 @@ def arrhenius_rate(A: float, Ea_J_per_mol: float, T: float) -> float:
     try:
         rate = A * math.exp(exponent)
     except OverflowError as exc:
-        raise ValueError("Arrhenius rate overflows the finite real domain") from exc
+        raise ValueDomainError("Arrhenius rate", "Arrhenius rate overflows the finite real domain") from exc
     return admit_rate(rate, field="Arrhenius rate")

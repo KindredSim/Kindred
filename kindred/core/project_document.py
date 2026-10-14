@@ -232,7 +232,7 @@ class SimulationExecutionSettings:
 
 @dataclass(frozen=True, slots=True)
 class TabScientificSettings:
-    """Mechanism settings shared within one tab; fitting always bypasses stops."""
+    """Mechanism settings shared within one tab; fitting against time bypasses stops."""
 
     temperature: float = UnitsModel.temperature_K
     standard_conc_M: float = UnitsModel.standard_conc_M
@@ -906,10 +906,10 @@ def validate_fit_defaults(defaults: FitDefaults) -> FitDefaults:
     # tolerance at or above binary64 epsilon. This is a pair restriction:
     # either tolerance may be smaller when the other satisfies the minimum.
     epsilon = math.ulp(1.0)
-    if defaults.method in {"trf", "dogbox"} and max(defaults.ftol, defaults.xtol) < epsilon:
+    if max(defaults.ftol, defaults.xtol) < epsilon:
         raise ValueError(
-            "TRF and Dogbox require at least one convergence tolerance "
-            f"(ftol or xtol) to be at least {epsilon:.17g}."
+            "At least one convergence tolerance "
+            f"(ftol or xtol) must be at least {epsilon:.17g}."
         )
     _require_int(
         defaults.seed,

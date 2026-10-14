@@ -107,10 +107,7 @@ class _XlsxExportWorker(QtCore.QThread):
             self.succeeded.emit(self._path, completion)
         finally:
             if descriptor >= 0:
-                try:
-                    os.close(descriptor)
-                except OSError:
-                    pass
+                os.close(descriptor)
             if temporary_path:
                 try:
                     os.unlink(temporary_path)

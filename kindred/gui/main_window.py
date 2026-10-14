@@ -101,8 +101,6 @@ from kindred.gui.fit_session_owner import (
     FitSessionOwner,
 )
 from kindred.gui.fitting.constants import (
-    DE_CONVERGENCE_TOLERANCE_LABEL,
-    DIFFERENTIAL_EVOLUTION_METHOD,
     FUNCTION_TOLERANCE_LABEL,
     STEP_TOLERANCE_LABEL,
     admit_fit_tolerance,
@@ -192,10 +190,6 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def __init__(self) -> None:
         super().__init__()
-        application = QtWidgets.QApplication.instance()
-        if not isinstance(application, QtWidgets.QApplication):
-            raise RuntimeError("MainWindow requires an existing QApplication.")
-
         self._rendering_workspace = False
         self._recent_menu: QtWidgets.QMenu | None = None
         self._tab_surfaces: dict[str, _TabSurfaceBundle] = {}
@@ -942,10 +936,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     if tab_id not in document_ids:
                         continue
                     bundle.slider_binding.reset_project_session()
-                    try:
-                        self._workspace.plot_for_tab(tab_id).reset_plot_session_state()
-                    except KeyError:
-                        pass
+                    self._workspace.plot_for_tab(tab_id).reset_plot_session_state()
             for tab_id in tuple(self._tab_surfaces):
                 if tab_id not in document_ids:
                     self._drop_tab_surface(tab_id)
@@ -1176,11 +1167,8 @@ class MainWindow(QtWidgets.QMainWindow):
         """Return whether the active-tab repositories own any retained result."""
 
         target = str(tab_id)
-        try:
-            tab = self._project_session.document.tab(target)
-            repository = self._repository_for_tab(target)
-        except (KeyError, RuntimeError):
-            return False
+        tab = self._project_session.document.tab(target)
+        repository = self._repository_for_tab(target)
         return any(
             repository.current_result(initial_set.set_id) is not None
             or repository.reference_result(initial_set.set_id) is not None
@@ -1207,7 +1195,7 @@ class MainWindow(QtWidgets.QMainWindow):
             output = io.StringIO()
             output.writelines(iter_blocks_tsv_chunks(blocks))
             QtWidgets.QApplication.clipboard().setText(output.getvalue())
-        except (TypeError, ValueError, OSError) as exc:
+        except ValueError as exc:
             QtWidgets.QMessageBox.critical(self, "Copy All", str(exc))
             return False
         return True
@@ -1225,10 +1213,7 @@ class MainWindow(QtWidgets.QMainWindow):
         target = str(tab_id)
         if self._rendering_workspace:
             return
-        try:
-            plot = self._workspace.plot_for_tab(target)
-        except KeyError:
-            return
+        plot = self._workspace.plot_for_tab(target)
         if target in self._plot_membership_refreshing:
             self._render_results_for_tab(target)
             return
@@ -1485,7 +1470,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 name,
                 expected_token=self._project_session.capture_content_token(),
             )
-        except Exception as exc:
+        except ValueError as exc:
             self._workspace.show_rename_error(tab_id, str(exc))
             return
         self._refresh_workspace_tab_structure()
@@ -2507,7 +2492,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if not corrections and not blocked:
             try:
                 return validate_project_document(document)
-            except Exception as exc:
+            except ValueError as exc:
                 QtWidgets.QMessageBox.warning(
                     self,
                     "Open Project Error",
@@ -2588,7 +2573,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     proposal = proposal.replacement
                 candidate = proposal.proposed_document
             return validate_project_document(candidate)
-        except Exception as exc:
+        except ValueError as exc:
             QtWidgets.QMessageBox.warning(
                 self,
                 "Open Project Error",
@@ -2693,44 +2678,28 @@ class MainWindow(QtWidgets.QMainWindow):
     def _load_preset_mechanism(self, preset_id: str) -> None:
         if not self._mutation_input_admitted("Load Preset Mechanism"):
             return
-        try:
-            from kindred.io.resources import get_preset_mechanism_source
+        from kindred.io.resources import get_preset_mechanism_source
 
-            source = get_preset_mechanism_source(preset_id)
-            if self._accept_external_source(
-                self._workspace_tab_registry.active_tab_id,
-                source,
-                description=f"Load Preset {preset_id}",
-            ):
-                self.set_status_text(f"Loaded preset mechanism: {preset_id}")
-        except Exception as exc:
-            logger.exception("Preset load failed")
-            QtWidgets.QMessageBox.critical(
-                self,
-                "Load Error",
-                f"Failed to load preset mechanism {preset_id}:\n\n{exc}",
-            )
+        source = get_preset_mechanism_source(preset_id)
+        if self._accept_external_source(
+            self._workspace_tab_registry.active_tab_id,
+            source,
+            description=f"Load Preset {preset_id}",
+        ):
+            self.set_status_text(f"Loaded preset mechanism: {preset_id}")
 
     def _load_intervention_example(self, example_id: str) -> None:
         if not self._mutation_input_admitted("Load Intervention Example"):
             return
-        try:
-            from kindred.io.resources import get_intervention_example_source
+        from kindred.io.resources import get_intervention_example_source
 
-            source = get_intervention_example_source(example_id)
-            if self._accept_external_source(
-                self._workspace_tab_registry.active_tab_id,
-                source,
-                description=f"Load Intervention Example {example_id}",
-            ):
-                self.set_status_text(f"Loaded intervention example: {example_id}")
-        except Exception as exc:
-            logger.exception("Intervention example load failed")
-            QtWidgets.QMessageBox.critical(
-                self,
-                "Load Error",
-                f"Failed to load intervention example {example_id}:\n\n{exc}",
-            )
+        source = get_intervention_example_source(example_id)
+        if self._accept_external_source(
+            self._workspace_tab_registry.active_tab_id,
+            source,
+            description=f"Load Intervention Example {example_id}",
+        ):
+            self.set_status_text(f"Loaded intervention example: {example_id}")
 
     def _populate_user_templates_menu(self) -> None:
         menu = self._user_templates_menu
@@ -2764,18 +2733,12 @@ class MainWindow(QtWidgets.QMainWindow):
         template = self._template_manager.get_template(template_id)
         if template is None:
             return
-        try:
-            if self._accept_external_source(
-                self._workspace_tab_registry.active_tab_id,
-                template.source,
-                description=f"Apply Template {template.name}",
-            ):
-                self.set_status_text(f"Applied template: {template.name}")
-        except Exception as exc:
-            logger.exception("Template could not be applied")
-            QtWidgets.QMessageBox.critical(
-                self, "Template Apply", f"The template could not be applied:\n\n{exc}"
-            )
+        if self._accept_external_source(
+            self._workspace_tab_registry.active_tab_id,
+            template.source,
+            description=f"Apply Template {template.name}",
+        ):
+            self.set_status_text(f"Applied template: {template.name}")
 
     def _open_template_manager(self) -> None:
         if not self._mutation_input_admitted("Open Template Manager"):
@@ -2860,19 +2823,10 @@ class MainWindow(QtWidgets.QMainWindow):
             self._cancel_dataset_import
         )
         self._dataset_import_progress_dialog.show()
-        try:
-            self._dataset_import_staging.start_import(
-                origin_tab_id=origin_tab_id,
-                configs=configs,
-            )
-        except Exception as exc:
-            self._close_import_progress_dialog()
-            logger.exception("Dataset import could not start")
-            QtWidgets.QMessageBox.critical(
-                self,
-                "Dataset Import",
-                str(exc),
-            )
+        self._dataset_import_staging.start_import(
+            origin_tab_id=origin_tab_id,
+            configs=configs,
+        )
 
     @QtCore.Slot(int)
     def _on_import_progress(self, percent: int) -> None:
@@ -2923,34 +2877,18 @@ class MainWindow(QtWidgets.QMainWindow):
                 "Dataset import completed after Close was requested, so publication was skipped."
             )
             return
-        try:
-            batch_proposal = build_raw_record_batch_proposal(
-                completion,
-                existing_records=self._project_session.document.datasets,
-            )
-            document = self._project_session.document.add_datasets(
-                batch_proposal.records,
-                sources=batch_proposal.sources,
-            )
-            self._workspace_tab_registry.replace_document(
-                document,
-                expected_token=self._project_session.capture_content_token(),
-            )
-        except Exception as exc:
-            logger.exception("Raw dataset commit failed")
-            QtWidgets.QMessageBox.critical(
-                self,
-                "Dataset Import",
-                "The completed import could not be committed. "
-                f"{exc}",
-            )
-            self.set_status_text(
-                "Dataset import publication was rejected. Staging is idle and "
-                "the next import is available."
-            )
-            self._refresh_project_state()
-            return
-
+        batch_proposal = build_raw_record_batch_proposal(
+            completion,
+            existing_records=self._project_session.document.datasets,
+        )
+        document = self._project_session.document.add_datasets(
+            batch_proposal.records,
+            sources=batch_proposal.sources,
+        )
+        self._workspace_tab_registry.replace_document(
+            document,
+            expected_token=self._project_session.capture_content_token(),
+        )
         self._refresh_dataset_views()
         message = f"Imported {count_text(len(batch_proposal.records), 'raw dataset')}."
         origin_tab_id = batch_proposal.origin_tab_id
@@ -2983,57 +2921,44 @@ class MainWindow(QtWidgets.QMainWindow):
         self.set_status_text(
             message + " Raw data was committed before optional mapping."
         )
-        mapping_changed = False
+        tab = self._workspace_tab_registry.tab(origin_tab_id)
+        previous_set_ids = tuple(
+            item.set_id for item in tab.initial_condition_sets
+        )
+        model_targets = canonical_observation_target_names(tab)
+        review = DatasetMappingBatchDialog(
+            document=self._project_session.document,
+            records=batch_proposal.records,
+            tab=tab,
+            model_targets=model_targets,
+            parent=self,
+        )
         try:
-            tab = self._workspace_tab_registry.tab(origin_tab_id)
-            previous_set_ids = tuple(
-                item.set_id for item in tab.initial_condition_sets
-            )
-            model_targets = canonical_observation_target_names(tab)
-            review = DatasetMappingBatchDialog(
-                document=self._project_session.document,
-                records=batch_proposal.records,
-                tab=tab,
-                model_targets=model_targets,
-                parent=self,
-            )
-            try:
-                mapping_expected_token = self._project_session.capture_content_token()
-                if review.exec() != QtWidgets.QDialog.DialogCode.Accepted:
-                    self.set_status_text(
-                        message + " Mapping canceled. Raw data remains unmapped."
-                    )
-                    return
-                batch = review.proposal()
-            finally:
-                review.deleteLater()
-            candidate_tab = apply_dataset_mapping_batch(
-                document=self._project_session.document,
-                tab=tab,
-                batch=batch,
-                model_targets=model_targets,
-            )
-            result = self._workspace_tab_registry.replace_tab(
-                candidate_tab,
-                expected_token=mapping_expected_token,
-            )
-            if result is None:
+            mapping_expected_token = self._project_session.capture_content_token()
+            if review.exec() != QtWidgets.QDialog.DialogCode.Accepted:
                 self.set_status_text(
-                    message + " Mapping was not published. Raw data remains unmapped."
+                    message + " Mapping canceled. Raw data remains unmapped."
                 )
                 return
-            mapping_changed = result != mapping_expected_token
-        except Exception as exc:
-            logger.exception("Batch dataset mapping failed")
-            QtWidgets.QMessageBox.warning(
-                self,
-                "Dataset Mapping",
-                f"The reviewed mapping was not applied:\n\n{exc}",
-            )
+            batch = review.proposal()
+        finally:
+            review.deleteLater()
+        candidate_tab = apply_dataset_mapping_batch(
+            document=self._project_session.document,
+            tab=tab,
+            batch=batch,
+            model_targets=model_targets,
+        )
+        result = self._workspace_tab_registry.replace_tab(
+            candidate_tab,
+            expected_token=mapping_expected_token,
+        )
+        if result is None:
             self.set_status_text(
-                message + " Mapping failed validation. Raw data remains unmapped."
+                message + " Mapping was not published. Raw data remains unmapped."
             )
             return
+        mapping_changed = result != mapping_expected_token
         if mapping_changed:
             current_tab = self._workspace_tab_registry.tab(origin_tab_id)
             if (
@@ -3070,7 +2995,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 expected_token=expected_token,
             )
             changed = result != expected_token
-        except Exception as exc:
+        except ValueError as exc:
             QtWidgets.QMessageBox.warning(self, "Rename Dataset", str(exc))
         if changed:
             self._refresh_dataset_views()
@@ -3191,7 +3116,7 @@ class MainWindow(QtWidgets.QMainWindow):
             if self._workspace_tab_registry.replace_document(candidate, expected_token=token) is None:
                 QtWidgets.QMessageBox.warning(editor, "Create from Data", "The project changed during the review, so nothing was created. Click Review and Create again.")
                 return
-        except (ValueError, TypeError, KeyError) as exc:
+        except ValueError as exc:
             QtWidgets.QMessageBox.warning(editor, "Create from Data", str(exc))
             return
         editor.finish_creation()
@@ -3354,7 +3279,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 QtWidgets.QMessageBox.warning(self, "Dataset Mapping", "The project changed while this dialog was open, so the mapping was not applied. Map the dataset again.")
                 return
             changed = result != expected_token
-        except Exception as exc:
+        except ValueError as exc:
             QtWidgets.QMessageBox.warning(self, "Dataset Mapping", str(exc))
         if not changed:
             return
@@ -3371,49 +3296,44 @@ class MainWindow(QtWidgets.QMainWindow):
     def _edit_observation_mapping(self, tab_id: str, dataset_id: str) -> None:
         if not self._mutation_input_admitted("Edit Observation Mapping"):
             return
-        changed = False
+        if not self._accept_visible_source(
+            tab_id,
+            description="Edit Observation Mapping"
+        ):
+            return
+        expected_token = self._project_session.capture_content_token()
+        tab = self._workspace_tab_registry.tab(tab_id)
+        dataset = self._project_session.document.dataset(dataset_id)
+        model_targets = canonical_observation_target_names(tab)
+        current = tab.dataset_link(dataset.dataset_id)
+        dialog = ObservationMappingDialog(
+            dataset,
+            model_targets,
+            current_mapping=current.observation_mapping if current is not None else (),
+            mechanism_species=canonical_species_names(tab),
+            title="Observation Mapping",
+            parent=self,
+        )
         try:
-            if not self._accept_visible_source(
-                tab_id,
-                description="Edit Observation Mapping"
-            ):
+            if dialog.exec() != QtWidgets.QDialog.DialogCode.Accepted:
                 return
-            expected_token = self._project_session.capture_content_token()
-            tab = self._workspace_tab_registry.tab(tab_id)
-            dataset = self._project_session.document.dataset(dataset_id)
-            model_targets = canonical_observation_target_names(tab)
-            current = tab.dataset_link(dataset.dataset_id)
-            dialog = ObservationMappingDialog(
-                dataset,
-                model_targets,
-                current_mapping=current.observation_mapping if current is not None else (),
-                mechanism_species=canonical_species_names(tab),
-                title="Observation Mapping",
-                parent=self,
-            )
-            try:
-                if dialog.exec() != QtWidgets.QDialog.DialogCode.Accepted:
-                    return
-                mapping = dialog.editor.confirmed_mapping()
-            finally:
-                dialog.deleteLater()
-            candidate = with_confirmed_observation_mapping(
-                tab=tab,
-                dataset=dataset,
-                model_targets=model_targets,
-                confirmed_mapping=mapping,
-            )
-            result = self._workspace_tab_registry.replace_tab(
-                candidate,
-                expected_token=expected_token,
-            )
-            if result is None:
-                QtWidgets.QMessageBox.warning(self, "Observation Mapping", "The project changed while this dialog was open, so the mapping was not applied. Open the mapping again.")
-                return
-            changed = result != expected_token
-        except Exception as exc:
-            QtWidgets.QMessageBox.warning(self, "Observation Mapping", str(exc))
-        if changed:
+            mapping = dialog.editor.confirmed_mapping()
+        finally:
+            dialog.deleteLater()
+        candidate = with_confirmed_observation_mapping(
+            tab=tab,
+            dataset=dataset,
+            model_targets=model_targets,
+            confirmed_mapping=mapping,
+        )
+        result = self._workspace_tab_registry.replace_tab(
+            candidate,
+            expected_token=expected_token,
+        )
+        if result is None:
+            QtWidgets.QMessageBox.warning(self, "Observation Mapping", "The project changed while this dialog was open, so the mapping was not applied. Open the mapping again.")
+            return
+        if result != expected_token:
             self._refresh_dataset_views((tab_id,))
 
     def _set_overlay_selection(
@@ -4013,7 +3933,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.config_controller.set_preview_delay_ms(preview_delay)
             self.config_controller.set_run_user_maximum(run_maximum)
             self.config_controller.set_result_cache_capacity(cache_capacity)
-        except (TypeError, ValueError, KeyError, OverflowError) as exc:
+        except ValueError as exc:
             message = str(exc)
             self.set_status_text(message)
             QtWidgets.QMessageBox.warning(
@@ -4050,13 +3970,10 @@ class MainWindow(QtWidgets.QMainWindow):
         for bundle in tuple(self._tab_surfaces.values()):
             changed = bundle.slider_binding.fence_stop() or changed
         for target in tuple(self._tab_surfaces):
-            try:
-                changed = (
-                    self._workspace.plot_for_tab(target).stop_interactive_display()
-                    or changed
-                )
-            except KeyError:
-                continue
+            changed = (
+                self._workspace.plot_for_tab(target).stop_interactive_display()
+                or changed
+            )
         for target, bundle in tuple(self._tab_surfaces.items()):
             changed = (
                 bundle.slider_binding.settle_stop(hold=target == held_tab_id)
@@ -4140,8 +4057,6 @@ class MainWindow(QtWidgets.QMainWindow):
         xtol = QtWidgets.QLineEdit(dialog)
         ftol.setText(repr(float(defaults.ftol)))
         xtol.setText(repr(float(defaults.xtol)))
-        ftol_label = QtWidgets.QLabel(FUNCTION_TOLERANCE_LABEL, dialog)
-        xtol_label = QtWidgets.QLabel(STEP_TOLERANCE_LABEL, dialog)
         use_seed = QtWidgets.QCheckBox("Use Deterministic Seed", dialog)
         use_seed.setChecked(defaults.use_seed)
         seed = QtWidgets.QSpinBox(dialog)
@@ -4167,26 +4082,13 @@ class MainWindow(QtWidgets.QMainWindow):
             project_tolerance(xtol, selected.xtol)
             use_seed.setChecked(selected.use_seed)
             seed.setValue(selected.seed)
-            sync_method_controls()
-
-        def sync_method_controls(_index: int = -1) -> None:
-            is_de = method.currentData() == DIFFERENTIAL_EVOLUTION_METHOD
-            ftol_label.setText(
-                DE_CONVERGENCE_TOLERANCE_LABEL
-                if is_de
-                else FUNCTION_TOLERANCE_LABEL
-            )
-            xtol_label.setVisible(not is_de)
-            xtol.setVisible(not is_de)
-            xtol.setEnabled(not is_de)
 
         scope.currentIndexChanged.connect(load_selected_defaults)
-        method.currentIndexChanged.connect(sync_method_controls)
         form.addRow("Save to", scope)
         form.addRow("Method", method)
         form.addRow("Maximum evaluations", max_nfev)
-        form.addRow(ftol_label, ftol)
-        form.addRow(xtol_label, xtol)
+        form.addRow(FUNCTION_TOLERANCE_LABEL, ftol)
+        form.addRow(STEP_TOLERANCE_LABEL, xtol)
         form.addRow(use_seed)
         form.addRow("Seed", seed)
         buttons = QtWidgets.QDialogButtonBox(
@@ -4199,8 +4101,8 @@ class MainWindow(QtWidgets.QMainWindow):
             return FitDefaults(
                 method=method.currentData(),
                 max_nfev=int(max_nfev.value()),
-                ftol=admit_fit_tolerance(ftol.text(), ftol_label.text()),
-                xtol=admit_fit_tolerance(xtol.text(), xtol_label.text()),
+                ftol=admit_fit_tolerance(ftol.text(), FUNCTION_TOLERANCE_LABEL),
+                xtol=admit_fit_tolerance(xtol.text(), STEP_TOLERANCE_LABEL),
                 use_seed=bool(use_seed.isChecked()),
                 seed=int(seed.value()),
             )
@@ -4208,7 +4110,7 @@ class MainWindow(QtWidgets.QMainWindow):
         def accept_candidate() -> None:
             try:
                 validate_fit_defaults(read_candidate())
-            except (TypeError, ValueError, OverflowError) as exc:
+            except ValueError as exc:
                 QtWidgets.QMessageBox.warning(
                     dialog,
                     "Invalid Fitting Defaults",
@@ -4220,7 +4122,6 @@ class MainWindow(QtWidgets.QMainWindow):
         buttons.accepted.connect(accept_candidate)
         buttons.rejected.connect(dialog.reject)
         layout.addWidget(buttons)
-        sync_method_controls()
         clamp_initial_size(dialog, 600, 480)
         if dialog.exec() != QtWidgets.QDialog.DialogCode.Accepted:
             return False
@@ -4459,7 +4360,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 if current_revision == revision:
                     return
                 text = path.read_text(encoding="utf-8", errors="replace")
-            except (OSError, RuntimeError) as exc:
+            except OSError as exc:
                 current_revision = ("", 0, 0, 0)
                 text = f"Diagnostic log could not be read:\n{file_error_text(exc, path)}"
 
@@ -4631,9 +4532,12 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         if geometry:
             try:
-                if self.restoreGeometry(geometry) is False:
-                    raise ValueError("restore rejected stored geometry")
-            except (EOFError, RuntimeError, TypeError, ValueError) as exc:
+                if not self.restoreGeometry(geometry):
+                    logger.warning(
+                        "Ignoring invalid persisted window geometry: %s",
+                        "restore rejected stored geometry",
+                    )
+            except TypeError as exc:
                 logger.warning("Ignoring invalid persisted window geometry: %s", exc)
         self._workspace.restore_dock_layout(dock_state)
         QtCore.QTimer.singleShot(0, self._workspace.recover_floating_docks)
@@ -4646,8 +4550,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.restore_persisted_maximized_state()
 
         requested_dark = self.config_controller.theme_preference()
-        if not self._theme_manager.apply(requested_dark, None):
-            self.set_status_text("Could not apply the persisted theme preference.")
+        self._theme_manager.apply(requested_dark, None)
         if self._dark_mode_action is not None:
             self._dark_mode_action.setChecked(self._theme_manager.applied_dark_mode)
 
@@ -4746,10 +4649,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _on_close_started(self) -> None:
         self._fence_shell_for_close()
         for target in tuple(self._tab_surfaces):
-            try:
-                self._workspace.plot_for_tab(target).discard_interactive_display()
-            except KeyError:
-                continue
+            self._workspace.plot_for_tab(target).discard_interactive_display()
         self.set_status_text("Closing Kindred. Waiting for active work to stop.")
 
     def _refresh_title(self) -> None:

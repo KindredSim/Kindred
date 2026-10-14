@@ -1216,7 +1216,7 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
             initial = float(initial_item.text())
             if not math.isfinite(initial) or initial < 0.0:
                 raise ValueError
-        except (TypeError, ValueError, OverflowError):
+        except ValueError:
             # A mode transition still authors a fresh range when Starting IC
             # is incomplete.  The row validator retains the invalid Starting
             # IC and Run remains blocked until the user repairs it.
@@ -1364,7 +1364,7 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
                 value = float(item.text())
                 if not math.isfinite(value) or value <= 0.0:
                     raise ValueError
-            except (TypeError, ValueError, OverflowError):
+            except ValueError:
                 self._invalid_raw[key] = item.text()
                 self._mark_invalid(item, _TARGET_WEIGHT_MESSAGE)
                 return
@@ -1521,7 +1521,7 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
                 tolerance=tolerance,
                 log10=bool(typed["log10"]),
             )
-        except (TypeError, ValueError, OverflowError) as caught_error:
+        except ValueError as caught_error:
             self._pending_initial_values.pop(key, None)
             error_message = str(caught_error)
             columns = {
@@ -1635,7 +1635,7 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
             value = float(raw)
             if not math.isfinite(value) or value <= 0.0:
                 raise ValueError
-        except (TypeError, ValueError, OverflowError):
+        except ValueError:
             self._invalid_raw[key] = raw
             self._mark_invalid_line_edit(
                 self._dataset_weight_edit,
@@ -1980,7 +1980,7 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
                             tolerance=source_tolerance,
                             log10=source_log10,
                         )
-                    except (TypeError, ValueError, OverflowError):
+                    except ValueError:
                         # The copied range cannot contain this destination's
                         # Starting IC (e.g. a percentage around zero), so this
                         # row is not compatible and its Vary IC stays as is.

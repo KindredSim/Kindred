@@ -7,7 +7,6 @@ operates on an objective callable that returns residual vectors.
 
 from __future__ import annotations
 
-import logging
 import math
 import warnings
 from dataclasses import dataclass
@@ -15,21 +14,9 @@ from typing import Callable, Dict, Literal, Mapping, Optional, Tuple
 
 import numpy as np
 
-from kindred.core.exceptions import (
-    FittingCancelled,
-    FitSimulationError,
-    KineticRuntimeDomainError,
-    OptimizationError,
-)
-from kindred.core.optimization_de import (
-    DifferentialEvolutionBudgetExhausted,
-    DifferentialEvolutionEvaluationBudget,
-    compute_de_popsize_maxiter,
-)
+from kindred.core.exceptions import FittingCancelled
 from kindred.core.optimization_least_squares import build_least_squares_kwargs
 from kindred.core.scipy_optimize import load_scipy_optimize
-
-logger = logging.getLogger(__name__)
 
 __all__ = [
     "FitResult",
@@ -173,7 +160,8 @@ def fit_parameters(
     method: str,
     cancellation_check: Callable[[], bool] | None = None,
 ) -> FitResult:
-    """Fit parameters, interpreting ``ftol`` as native DE ``tol`` for DE runs."""
+    """Fit parameters by least squares, or by Differential Evolution polished
+    with Trust Region Reflective at the same tolerances."""
 
     # The method, evaluation budget, coordinates and their bounds arrive
     # admitted by the Fit setup or its Profile likelihood configuration.
@@ -185,7 +173,6 @@ def fit_parameters(
     upper = np.asarray([bounds[name][1] for name in param_names], dtype=float)
     scipy_bounds = (lower, upper)
 
-    de_evaluation_budget: DifferentialEvolutionEvaluationBudget | None = None
     identifiability_warning: Optional[str] = None
 
     def wrapped_objective(params):
@@ -193,129 +180,102 @@ def fit_parameters(
             raise FittingCancelled()
         return objective_func(params)
 
-    try:
-        if method == "differential_evolution":
-            _least_squares, differential_evolution = load_scipy_optimize()
-            de_evaluation_budget = DifferentialEvolutionEvaluationBudget(max_nfev)
-            best_de_score: float | None = None
-            best_de_params: np.ndarray | None = None
-
-            def evaluate_de_residuals(
-                params: np.ndarray,
-                *,
-                reserve: int,
-            ) -> np.ndarray:
-                if cancellation_check is not None and cancellation_check():
-                    raise FittingCancelled()
-                de_evaluation_budget.claim(reserve=reserve)
-                residuals = np.asarray(objective_func(params), dtype=float).reshape(-1)
-                return residuals
-
-            def de_objective(params):
-                nonlocal best_de_score, best_de_params
-                # The Fit objective returns finite residuals with a finite
-                # sum of squares.
-                residuals = evaluate_de_residuals(params, reserve=1)
-                score = float(np.dot(residuals, residuals))
-                if best_de_score is None or score < best_de_score:
-                    best_de_score = score
-                    best_de_params = np.asarray(params, dtype=float).copy()
-                return score
-
-            dim = len(x0)
-            result = None
-            if de_evaluation_budget.limit > 1:
-                popsize, maxiter = compute_de_popsize_maxiter(
-                    budget=de_evaluation_budget.limit - 1,
-                    dim=dim,
-                )
-                # SciPy rescales x0 to [0, 1] and refuses a start that rounds
-                # just outside, as a start on its bound can; such a start moves
-                # inside by a negligible fraction of the range.
-                margin = (upper - lower) * 1e-12
-                try:
-                    result = differential_evolution(
-                        de_objective,
-                        bounds=list(zip(scipy_bounds[0], scipy_bounds[1])),
-                        x0=np.clip(x0, lower + margin, upper - margin),
-                        maxiter=maxiter,
-                        popsize=popsize,
-                        tol=float(ftol),
-                        seed=seed,
-                        disp=False,
-                        polish=False,
-                        workers=1,
-                    )
-                except DifferentialEvolutionBudgetExhausted:
-                    pass
-
-            if result is not None:
-                x_opt = np.asarray(result.x, dtype=float)
-                success = bool(result.success)
-                message = result.message
-            else:
-                x_opt = (
-                    np.asarray(best_de_params, dtype=float).copy()
-                    if best_de_params is not None
-                    else np.asarray(x0, dtype=float).copy()
-                )
-                success = False
-                message = (
-                    "Differential Evolution reached its maximum objective-evaluation "
-                    f"budget ({de_evaluation_budget.limit})."
-                )
-
-        else:
-            least_squares, _de = load_scipy_optimize()
-
-            # SciPy's default finite-difference step keeps an absolute floor, so
-            # coordinates near zero still get usable Jacobian columns.
-            lsq_kwargs = build_least_squares_kwargs(
-                ftol=ftol,
-                xtol=xtol,
-                max_nfev=max_nfev,
-                method=method,
-                bounds=scipy_bounds,
-                verbose=0,
+    def run_least_squares(start: np.ndarray, least_squares_method: str):
+        least_squares, _de = load_scipy_optimize()
+        # SciPy's default finite-difference step keeps an absolute floor, so
+        # coordinates near zero still get usable Jacobian columns.
+        lsq_kwargs = build_least_squares_kwargs(
+            ftol=ftol,
+            xtol=xtol,
+            max_nfev=max_nfev,
+            method=least_squares_method,
+            bounds=scipy_bounds,
+            verbose=0,
+        )
+        with warnings.catch_warnings():
+            # The zero-only gradient stop deliberately sits below epsilon.
+            warnings.filterwarnings(
+                "ignore",
+                message=(
+                    r"^Setting `gtol` below the machine epsilon .* effectively "
+                    r"disables the corresponding termination condition\.$"
+                ),
+                category=UserWarning,
+                module=r"^scipy\.optimize\._lsq\.least_squares$",
             )
-            with warnings.catch_warnings():
-                # The zero-only gradient stop deliberately sits below epsilon.
-                warnings.filterwarnings(
-                    "ignore",
-                    message=(
-                        r"^Setting `gtol` below the machine epsilon .* effectively "
-                        r"disables the corresponding termination condition\.$"
-                    ),
-                    category=UserWarning,
-                    module=r"^scipy\.optimize\._lsq\.least_squares$",
-                )
-                result = least_squares(wrapped_objective, x0, **lsq_kwargs)
+            return least_squares(wrapped_objective, start, **lsq_kwargs)
 
-            x_opt = result.x
-            success = bool(result.success)
-            message = result.message
-            if result.status == 1:
-                message = "Fit stopped at zero computed first-order optimality."
-            J = np.asarray(result.jac, dtype=float)
-            param_count = len(x_opt)
-            # Rank of the column-scaled Jacobian, so parameters on very
-            # different scales are not mistaken for dependent ones.
-            # All-zero columns stay zero and count as deficient.
-            norms = np.linalg.norm(J, axis=0)
-            scaled = np.divide(J, norms, out=np.zeros_like(J), where=norms > 0.0)
-            rank = int(np.linalg.matrix_rank(scaled, rtol=_JACOBIAN_RANK_RTOL))
-            if rank < param_count:
-                identifiability_warning = (
-                    "These data cannot determine every fitted value independently. "
-                    f"The fit Jacobian has rank {rank} for {param_count} fitted value{'' if param_count == 1 else 's'}."
-                )
-    except FittingCancelled:
-        raise
-    except (FitSimulationError, KineticRuntimeDomainError):
-        raise
-    except Exception as exc:
-        logger.error("Fitting failed: %s", exc, exc_info=True)
-        raise OptimizationError(str(exc)) from exc
+    if method == "differential_evolution":
+        _least_squares, differential_evolution = load_scipy_optimize()
+
+        def de_objective(params):
+            # The Fit objective returns finite residuals with a finite
+            # sum of squares.
+            residuals = np.asarray(wrapped_objective(params), dtype=float).reshape(-1)
+            return float(np.dot(residuals, residuals))
+
+        def polish(_scalar_objective, start, **_scipy_arguments):
+            # SciPy keeps the polish only when it succeeds, scores lower and
+            # stays inside the bounds. Its score is the sum of squares, twice
+            # the least-squares cost.
+            polished = run_least_squares(np.asarray(start, dtype=float), "trf")
+            polished.fun = 2.0 * polished.cost
+            return polished
+
+        # SciPy's default population size. Its first population is always
+        # scored in full; the generations after it fit in Maximum
+        # evaluations, (maxiter + 1) * popsize * len(x0) at most.
+        popsize = 15
+        maxiter = max(0, max_nfev // (popsize * len(x0)) - 1)
+        # SciPy rescales x0 to [0, 1] and refuses a start that rounds
+        # just outside, as a start on its bound can; such a start moves
+        # inside by a negligible fraction of the range.
+        margin = (upper - lower) * 1e-12
+        error: Exception | None = None
+        try:
+            result = differential_evolution(
+                de_objective,
+                bounds=list(zip(scipy_bounds[0], scipy_bounds[1])),
+                x0=np.clip(x0, lower + margin, upper - margin),
+                maxiter=maxiter,
+                popsize=popsize,
+                seed=seed,
+                disp=False,
+                polish=polish,
+                workers=1,
+            )
+        except RuntimeError as exc:
+            # SciPy reports a TypeError or ValueError raised while it scores
+            # its first population as a RuntimeError caused by it.
+            if not isinstance(exc.__cause__, (TypeError, ValueError)):
+                raise
+            error = exc.__cause__
+        if error is not None:
+            raise error
+        x_opt = np.asarray(result.x, dtype=float)
+        success = bool(result.success)
+        message = result.message
+
+    else:
+        result = run_least_squares(x0, method)
+        x_opt = result.x
+        success = bool(result.success)
+        message = result.message
+        if result.status == 1:
+            message = "Fit stopped at zero computed first-order optimality."
+        J = np.asarray(result.jac, dtype=float)
+        param_count = len(x_opt)
+        # Rank of the column-scaled Jacobian, so parameters on very
+        # different scales are not mistaken for dependent ones.
+        # All-zero columns stay zero and count as deficient.
+        norms = np.linalg.norm(J, axis=0)
+        scaled = np.divide(J, norms, out=np.zeros_like(J), where=norms > 0.0)
+        rank = int(np.linalg.matrix_rank(scaled, rtol=_JACOBIAN_RANK_RTOL))
+        if rank < param_count:
+            identifiability_warning = (
+                "These data cannot determine every fitted value independently. "
+                f"The fit Jacobian has rank {rank} for {param_count} fitted value{'' if param_count == 1 else 's'}."
+            )
 
     fitted_params = {name: float(val) for name, val in zip(param_names, x_opt)}
 

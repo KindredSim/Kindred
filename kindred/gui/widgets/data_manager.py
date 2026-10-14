@@ -14,6 +14,7 @@ from kindred.core.datasets.csv_import import read_csv_rows_from_bytes
 from kindred.core.datasets.excel_import import (
     ExcelWorkbookPair,
 )
+from kindred.io.paths import file_error_text
 from kindred.gui.import_workflow import (
     ImportConfig,
     ImportSettings,
@@ -508,8 +509,9 @@ class DataManagerPanel(QtWidgets.QWidget):
         for filepath in filenames:
             try:
                 sources.append(capture_import_source(filepath))
-            except ValueError as exc:
-                rejected_sources.append((str(filepath), str(exc)))
+            except (OSError, ValueError) as exc:
+                # The rejection list names the file.
+                rejected_sources.append((str(filepath), file_error_text(exc, None)))
 
         if rejected_sources:
             rejection_details = "\n\n".join(

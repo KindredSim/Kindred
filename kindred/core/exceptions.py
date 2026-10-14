@@ -29,13 +29,11 @@ __all__ = [
     # Simulation
     "SimulationError",
     "SolverError",
-    "KineticRuntimeDomainError",
+    "ValueDomainError",
     # Fitting
     "FittingError",
     "FitSimulationError",
-    "FitCandidateDomainError",
     "FittingCancelled",
-    "OptimizationError",
 ]
 
 
@@ -102,6 +100,19 @@ class KindredError(Exception):
             return self.message
         return located(self.message, self.context.line, self.context.line_text)
 
+    def annotate(
+        self, *, prefix: str = "", suffix: str = "", context: Optional[ErrorContext] = None, **details: Any,
+    ) -> None:
+        """Add what an owner the error passes through knows, keeping the error
+        itself: words around the message, the authored line when it has none,
+        and facts it does not record yet."""
+        self.message = f"{prefix}{self.message}{suffix}"
+        if self.context is None:
+            self.context = context
+        for name, value in details.items():
+            self.details.setdefault(name, value)
+        self.args = (self._build_message(),)
+
 
 # ----------------------------- Validation Errors -------------------------------
 
@@ -137,31 +148,14 @@ class SolverError(SimulationError):
         super().__init__(message, **kwargs)
 
 
-class KineticRuntimeDomainError(SimulationError):
-    """Typed failure when an admitted model lowers to an unsupported rate."""
+class ValueDomainError(SimulationError, ValueError):
+    """A value lies outside its scientific domain: an authored or candidate
+    input, or a calculated rate constant, Keq or physical coordinate."""
 
-    def __init__(
-        self,
-        message: str,
-        *,
-        stage: str = "kinetic_lowering",
-        parameter_names: tuple[str, ...] | list[str] = (),
-        **kwargs: Any,
-    ):
-        details = dict(kwargs.pop("details", {}) or {})
-        normalized_names = tuple(
-            sorted({str(name).strip() for name in parameter_names if str(name).strip()})
-        )
-        details.update(
-            {
-                "stage": str(stage),
-                "parameter_names": normalized_names,
-                "value_dependencies": normalized_names,
-            }
-        )
+    def __init__(self, field: str, message: str, **kwargs: Any):
         kwargs.setdefault("code", "E304")
-        super().__init__(message, details=details, **kwargs)
-        self.parameter_names = normalized_names
+        super().__init__(message, **kwargs)
+        self.field = field
 
 
 class SimulationCancelled(SimulationError):
@@ -189,49 +183,11 @@ class FitSimulationError(FittingError):
         super().__init__(message, details=details, **kwargs)
 
 
-class FitCandidateDomainError(FitSimulationError):
-    """Typed, nonfatal rejection of one admitted optimizer candidate.
-
-    This type is reserved for numerical outcomes that can change with the
-    optimizer coordinates after the Fit capture/configuration has already
-    been admitted.  Identity, ownership, malformed configuration, cancellation,
-    and programming failures must not use it.
-    """
-
-    def __init__(
-        self,
-        message: str,
-        *,
-        stage: str,
-        **kwargs: Any,
-    ) -> None:
-        details = dict(kwargs.pop("details", {}) or {})
-        details.update(
-            {
-                "fatal": False,
-                "candidate_domain": True,
-                "stage": str(stage or "candidate_evaluation"),
-            }
-        )
-        super().__init__(
-            message,
-            details=details,
-            **kwargs,
-        )
-
-
 class FittingCancelled(FittingError):
     """Raised when a fitting run is cancelled by user request."""
 
     def __init__(self, message: str = "Fit canceled by user", **kwargs):
         kwargs.setdefault("code", "E405")
-        super().__init__(message, **kwargs)
-
-
-class OptimizationError(FittingError):
-    """Error during optimization process."""
-    def __init__(self, message: str, **kwargs):
-        kwargs.setdefault("code", "E401")
         super().__init__(message, **kwargs)
 
 

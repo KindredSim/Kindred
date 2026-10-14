@@ -597,8 +597,6 @@ class RunResultsTab(QtWidgets.QWidget):
         """Copy only the dataset scope represented by the active Results tab."""
 
         view_id = self._active_plot_view_id()
-        if view_id is None:
-            raise ValueError("No Fit curves are available to copy.")
         if view_id[0] == "aggregate":
             view = self._all_datasets_plot_view
             curves = self._curves
@@ -607,8 +605,6 @@ class RunResultsTab(QtWidgets.QWidget):
             curves = tuple(
                 curve for curve in self._curves if curve.dataset_id == view_id[1]
             )
-        if view is None or not curves:
-            raise ValueError("No Fit curves are available to copy.")
         view.copy_projection_to_clipboard(curves)
 
     def copy_dataset_to_clipboard(self, dataset_id: str, all_simulated: bool) -> None:
@@ -619,8 +615,6 @@ class RunResultsTab(QtWidgets.QWidget):
             curve for curve in self._curves if curve.dataset_id == identity
         )
         view = self._subtab_stack.currentWidget()
-        if view is None or len(curves) != 1:
-            raise ValueError("The selected Fit dataset has no curves to copy.")
         view.copy_projection_to_clipboard(curves, all_simulated=all_simulated)
 
     def set_observation_style(self, shape: str, size: float, opacity: float) -> None:

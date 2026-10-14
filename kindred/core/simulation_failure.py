@@ -94,7 +94,6 @@ class FactualCause:
     domain: str
     origin: str
     code: str | None
-    type: str
     message: str
     context: Mapping[str, object] = field(default_factory=dict)
     details: Mapping[str, object] = field(default_factory=dict)
@@ -110,12 +109,10 @@ class FactualCause:
         return None, None
 
     def __post_init__(self) -> None:
-        # Producers pass literal domains, origins and types and a nonblank
-        # message (an exception's own text, else its type name); exception
-        # attributes are normalized here.
+        # Producers pass literal domains and origins and a message (an
+        # exception's own text); exception attributes are normalized here.
         domain = str(self.domain).strip()
         origin = str(self.origin).strip()
-        cause_type = str(self.type).strip()
         message = str(self.message).strip()
         normalized_code = (
             str(self.code).strip()
@@ -125,7 +122,6 @@ class FactualCause:
         object.__setattr__(self, "domain", domain)
         object.__setattr__(self, "origin", origin)
         object.__setattr__(self, "code", normalized_code)
-        object.__setattr__(self, "type", cause_type)
         object.__setattr__(self, "message", message)
         object.__setattr__(self, "context", freeze_factual_value(self.context))
         object.__setattr__(self, "details", freeze_factual_value(self.details))
@@ -137,7 +133,6 @@ class FactualCause:
             "domain": self.domain,
             "origin": self.origin,
             "code": self.code,
-            "type": self.type,
             "message": self.message,
             "context": _plain_value(self.context),
             "details": _plain_value(self.details),
@@ -150,11 +145,8 @@ class FactualCause:
 
 
 def _linked_exception(exc: BaseException) -> BaseException | None:
-    """Select the strongest available typed/Python causal link."""
+    """Select the strongest available Python causal link."""
 
-    typed = getattr(exc, "typed_cause", None)
-    if isinstance(typed, BaseException):
-        return typed
     explicit = exc.__cause__
     if isinstance(explicit, BaseException):
         return explicit
@@ -171,17 +163,10 @@ def factual_cause_from_exception(
 ) -> FactualCause:
     """Capture typed exception facts and one complete causal chain safely.
 
-    Explicit ``typed_cause`` links take precedence over ``__cause__`` and then
-    ``__context__``.  Every link is visited at most once, so malformed custom
-    exception graphs cannot recurse forever.
+    ``__cause__`` takes precedence over ``__context__``.  Every link is visited
+    at most once, so malformed custom exception graphs cannot recurse forever.
     """
 
-    owned = getattr(exc, "factual_cause", None)
-    if isinstance(owned, FactualCause):
-        # A producer or fitting boundary may already have captured the exact
-        # typed cause.  Preserve that custody rather than wrapping it in a
-        # generic terminal/diagnostic cause.
-        return owned
     seen = frozenset() if _seen is None else _seen
     identity = id(exc)
     linked = _linked_exception(exc)
@@ -203,12 +188,7 @@ def factual_cause_from_exception(
         domain=domain,
         origin=origin,
         code=getattr(exc, "code", None),
-        type=type(exc).__name__,
-        message=(
-            str(getattr(exc, "message", None) or "").strip()
-            or str(exc).strip()
-            or type(exc).__name__
-        ),
+        message=str(getattr(exc, "message", None) or "").strip() or str(exc).strip(),
         context=_context_values(getattr(exc, "context", None)),
         details=details,
         cause=nested,

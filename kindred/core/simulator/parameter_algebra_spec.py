@@ -483,11 +483,11 @@ def _admit_static_values(spec: ParameterAlgebraSpec) -> None:
                 EvaluationContext(t=np.array([0.0]), species_series={}, initials={},
                                   symtab=SymbolTable()),
             )
-        except Exception as exc:
-            statement = next((item for item in lines if item.line == getattr(exc, "line", None)), lines[0])
+        except AlgebraError as exc:
+            statement = next(item for item in lines if item.line == exc.line)
             # The line names the statement; the evaluator wrote the sentence.
             raise DSLError(
-                str(exc),
+                exc.message,
                 line_number=statement.line,
                 line_content=statement.line_text,
             ) from exc
@@ -601,6 +601,30 @@ def _compile_retained_parameter_block(
     return block
 
 
+_COMPARISONS = frozenset({"==", "!=", "<", "<=", ">", ">="})
+_LOGIC = frozenset({"&&", "||"})
+
+
+def _uses_true_false_as_number(node, *, number: bool = True) -> bool:
+    """Whether a true/false value stands where a number is read: anywhere but
+    an ifelse condition or an operand of &&, || and !."""
+    if isinstance(node, BinaryNode):
+        result_is_number = node.op not in _COMPARISONS | _LOGIC
+        operands_are_numbers = node.op not in _LOGIC
+        return (number and not result_is_number) or any(
+            _uses_true_false_as_number(side, number=operands_are_numbers) for side in (node.lhs, node.rhs)
+        )
+    if isinstance(node, UnaryNode):
+        logical = node.op == "!"
+        return (number and logical) or _uses_true_false_as_number(node.rhs, number=not logical)
+    if isinstance(node, CallNode):
+        return any(
+            _uses_true_false_as_number(arg, number=not (node.name == "ifelse" and index == 0))
+            for index, arg in enumerate(node.args)
+        )
+    return False
+
+
 def _validate_retained_parameter_program(
     spec: ParameterAlgebraSpec,
     *,
@@ -625,6 +649,14 @@ def _validate_retained_parameter_program(
             raise DSLError(
                 f"Parameter expression for {assignment.name!r} cannot use species concentrations or time t. "
                 "Put expressions that change during the simulation in a let line.",
+                line_number=assignment.line_number,
+                line_content=assignment.line_content,
+            )
+        # A param is a number; a true/false value inside it could never be
+        # read, as one is refused when evaluated.
+        if _uses_true_false_as_number(statement.expr):
+            raise DSLError(
+                "A true/false result cannot be used as a number.",
                 line_number=assignment.line_number,
                 line_content=assignment.line_content,
             )
@@ -761,7 +793,7 @@ def _compile_retained_algebra_program(
         _kind, line_number, line_content = descriptors[exc.line - 1]
         joined = source_lines[exc.line - 1]
         at = joined[exc.col - 1:].strip() if exc.col > joined.index(" = ") + 3 else ""
-        message = f"{exc.msg.removesuffix('.')} at '{at}'." if at else exc.msg
+        message = f"{exc.message.removesuffix('.')} at '{at}'." if at else exc.message
         raise DSLError(message, line_number=line_number, line_content=line_content) from exc
     block = replace(
         block,

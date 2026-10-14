@@ -562,7 +562,7 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
             "<p>Triggers that perform <code>set</code>, <code>jump</code>, <code>scale</code>, or <code>withdraw</code> respond to crossings during the simulated reaction. Intervention actions and temperature steps do not activate these triggers immediately, but they can trigger stopping.</p>"
             "<h2>Stopping Conditions</h2>"
             "<p>Use <code>then={op=stop}</code> to finish the simulation when a threshold is crossed and keep the results up to that time.</p>"
-            "<p>Enable <b>Use Authored Stopping Interventions</b> in <b>Simulation Settings</b>. This setting applies to Run and Preview for all initial-condition sets, including those with custom Run settings. When it is off, stopping conditions are ignored. The configured end time remains the maximum simulation time.</p>"
+            "<p>Enable <b>Use Authored Stopping Interventions</b> in <b>Simulation Settings</b>. This setting applies to Run and Preview for all initial-condition sets, including those with custom Run settings, and to Global Fit datasets fitted against a measured X. When it is off, stopping conditions are ignored. Datasets fitted against time always ignore them. The configured end time remains the maximum simulation time.</p>"
             "<pre>intervention: op=trigger; watch_species=B; threshold=0.9; direction=rising; then={op=stop}</pre>"
             "<table border=\"1\" cellpadding=\"5\" cellspacing=\"0\">"
             "<tr><th>Field</th><th>Choice</th></tr>"
@@ -811,11 +811,9 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
         self._notes_text.textChanged.connect(
             lambda: self.notesEdited.emit(str(self._notes_text.toPlainText()))
         )
-        application = QtWidgets.QApplication.instance()
-        if application is not None:
-            application.focusChanged.connect(
-                self._emit_native_history_availability
-            )
+        QtWidgets.QApplication.instance().focusChanged.connect(
+            self._emit_native_history_availability
+        )
         notes_layout.addWidget(self._notes_text)
         self._tabs.addTab(self._notes_tab, "Notes")
 

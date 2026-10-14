@@ -26,7 +26,6 @@ from kindred.core.quantity_units import Unit
 from kindred.core.stoichiometry import directional_order_fraction
 from kindred.core.thermodynamics import concentration_Keq_from_deltaG_eq
 from kindred.core.simulator.dsl_build_input import source_coordinate_capabilities
-from kindred.core.simulator.errors import DSLError
 from kindred.core.simulator.parameter_namespace import build_namespace_from_mechanism
 from kindred.core.simulator.step_indexing import get_step_index_map
 from kindred.core.units import admit_role_value
@@ -233,12 +232,9 @@ def _admit_coordinate_groups(
         name = str(raw_name)
         target = parameter_target_map[name]
         _route, kind, index, role, entry = target
-        try:
-            admitted = _admit_coordinate_value(
-                mechanism, name, raw_value, target, unit=units[name].symbol,
-            )
-        except (TypeError, ValueError, OverflowError) as exc:
-            raise DSLError(str(exc)) from exc
+        admitted = _admit_coordinate_value(
+            mechanism, name, raw_value, target, unit=units[name].symbol,
+        )
         key = (kind, index)
         if key not in grouped:
             grouped[key] = (entry, {})

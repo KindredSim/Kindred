@@ -24,15 +24,7 @@ def main() -> int:
         return 64
 
     setup_logging()
-    try:
-        from PySide6 import QtCore, QtGui, QtWidgets
-    except ModuleNotFoundError:
-        print(
-            "PySide6 is required to launch the Kindred GUI. "
-            "Install or reinstall Kindred with its standard GUI dependencies.",
-            file=sys.stderr,
-        )
-        return 1
+    from PySide6 import QtCore, QtGui, QtWidgets
 
     gui_startup.apply_qt_startup_workarounds(qt_core=QtCore)
 

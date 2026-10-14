@@ -41,10 +41,9 @@ from kindred.gui.ui_helpers import (
     clamp_initial_size,
 )
 from kindred.gui.interactive_preview import InteractivePreviewRequest
-from kindred.gui.plot_config import (
-    TIME_DISPLAY_UNITS,
-    require_pyqtgraph,
-)
+import pyqtgraph as pg
+
+from kindred.gui.plot_config import TIME_DISPLAY_UNITS
 from kindred.gui.widgets.axis_toolbar import AxisToolbar
 from kindred.gui.widgets.parameter_statistics_table import ParameterStatisticsTable
 from kindred.gui.widgets.plot_data_item import PlotDataItem
@@ -61,7 +60,6 @@ from kindred.gui.workspace_result_presenter import (
     intervention_label,
 )
 
-pg = require_pyqtgraph(context="Kindred GUI")
 
 __all__ = ["PyQtGraphPlotPanel"]
 
@@ -863,7 +861,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
             output = io.StringIO()
             output.writelines(_iter_rendered_point_tsv_chunks(visible, action_name="Copy Visible Data"))
             rendered_text = output.getvalue()
-        except (TypeError, ValueError, OSError) as exc:
+        except ValueError as exc:
             QtWidgets.QMessageBox.critical(self, "Copy Visible Data", str(exc))
             return
         QtWidgets.QApplication.clipboard().setText(rendered_text)
@@ -875,7 +873,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
             output = io.StringIO()
             output.writelines(_iter_rendered_point_tsv_chunks(roster))
             rendered_text = output.getvalue()
-        except (TypeError, ValueError, OSError) as exc:
+        except ValueError as exc:
             QtWidgets.QMessageBox.critical(self, "Copy Plotted Data", str(exc))
             return
         QtWidgets.QApplication.clipboard().setText(rendered_text)
@@ -1512,10 +1510,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         """Remove one stale transient item from the physical plot."""
 
         if self._legend is not None:
-            try:
-                self._legend.removeItem(item)
-            except (KeyError, RuntimeError, TypeError, ValueError):
-                pass
+            self._legend.removeItem(item)
         self._plot_widget.getPlotItem().removeItem(item)
 
     @staticmethod
@@ -1840,14 +1835,8 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
 
     def _remove_plot_item(self, item: object) -> None:
         if self._legend is not None:
-            try:
-                self._legend.removeItem(item)
-            except (KeyError, RuntimeError, TypeError, ValueError):
-                pass
-        try:
-            self._plot_widget.getPlotItem().removeItem(item)
-        except (RuntimeError, TypeError, ValueError):
-            pass
+            self._legend.removeItem(item)
+        self._plot_widget.getPlotItem().removeItem(item)
 
     def _rendered_block_for_static(
         self,
@@ -2397,10 +2386,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         return np.unique(np.concatenate((starts, ends)))
 
     def _remove_annotation_item(self, item: object) -> None:
-        try:
-            self._plot_widget.removeItem(item)
-        except (RuntimeError, TypeError, ValueError):
-            pass
+        self._plot_widget.removeItem(item)
 
     def _clear_annotation_items(self) -> None:
         for item in self._annotation_items.values():

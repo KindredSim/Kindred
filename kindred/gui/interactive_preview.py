@@ -26,15 +26,6 @@ class InteractivePreviewRequest:
     tab_id: str
     targets: tuple[InteractivePreviewTarget, ...]
 
-    def __post_init__(self) -> None:
-        targets = tuple(self.targets)
-        if not targets:
-            raise TypeError("targets must contain at least one InteractivePreviewTarget.")
-        ids = tuple(item.set_id for item in targets)
-        if len(ids) != len(set(ids)):
-            raise ValueError("Interactive Preview target set IDs must be unique.")
-        object.__setattr__(self, "targets", targets)
-
     @property
     def target_set_ids(self) -> tuple[str, ...]:
         return tuple(target.set_id for target in self.targets)

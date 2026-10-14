@@ -16,14 +16,11 @@ Usage:
 
 from __future__ import annotations
 
-import logging
 import os
 from dataclasses import dataclass
 from pathlib import Path
 
 from kindred.core.mechanism_source import MechanismAuthoringSource
-
-logger = logging.getLogger(__name__)
 
 __all__ = [
     "get_resource_text",
@@ -103,19 +100,7 @@ def get_resource_text(relative_path: str, encoding: str = "utf-8") -> str:
     """
     from importlib.resources import files
 
-    try:
-        data_pkg = files("kindred").joinpath("data")
-        resource_file = data_pkg.joinpath(relative_path)
-
-        text = resource_file.read_text(encoding=encoding)
-        logger.debug(f"Loaded resource: kindred/data/{relative_path}")
-        return text
-
-    except (FileNotFoundError, AttributeError) as e:
-        logger.error(f"Resource not found: kindred/data/{relative_path}")
-        raise FileNotFoundError(
-            f"Resource not found: kindred/data/{relative_path}"
-        ) from e
+    return files("kindred").joinpath("data").joinpath(relative_path).read_text(encoding=encoding)
 
 
 def get_resource_path(relative_path: str) -> Path:

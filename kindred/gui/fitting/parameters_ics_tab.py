@@ -51,9 +51,7 @@ from kindred.gui.fitting.launch import (
     convert_fit_parameter_scope,
 )
 from kindred.gui.fitting.constants import (
-    DE_CONVERGENCE_TOLERANCE_LABEL,
     admit_fit_tolerance,
-    DIFFERENTIAL_EVOLUTION_METHOD,
     FUNCTION_TOLERANCE_LABEL,
     STEP_TOLERANCE_LABEL,
 )
@@ -135,7 +133,7 @@ class _ProfileLikelihoodDialog(QtWidgets.QDialog):
     def accept(self) -> None:  # noqa: D401 - Qt override
         try:
             self.options()
-        except (TypeError, ValueError, OverflowError) as exc:
+        except ValueError as exc:
             QtWidgets.QMessageBox.warning(self, self.windowTitle(), str(exc))
             return
         super().accept()
@@ -205,7 +203,7 @@ class _ParameterBoundsDialog(QtWidgets.QDialog):
     def accept(self) -> None:  # noqa: D401 - Qt override
         try:
             self.selection()
-        except (TypeError, ValueError, OverflowError) as exc:
+        except ValueError as exc:
             QtWidgets.QMessageBox.warning(self, self.windowTitle(), str(exc))
             return
         super().accept()
@@ -570,8 +568,6 @@ class ParametersIcsTab(QtWidgets.QWidget):
             form.setFieldGrowthPolicy(QtWidgets.QFormLayout.FieldsStayAtSizeHint)
             form.addRow(label, control)
             flow.addWidget(group)
-            if control is self._xtol_edit:
-                self._xtol_group = group
         settings_layout.addWidget(flow_host)
         controls = (self._method_combo, self._max_eval_spin, self._solver_combo,
                     self._seed_check, self._seed_spin, self._ftol_edit, self._xtol_edit,
@@ -1104,7 +1100,7 @@ class ParametersIcsTab(QtWidgets.QWidget):
                 parameter,
                 **{"shared_config" if parameter.scope == "shared" else "per_dataset_config": active},
             ), {}
-        except (TypeError, ValueError, OverflowError) as exc:
+        except ValueError as exc:
             text = fit_identity_text(str(exc), self._origin).removeprefix(f"{parameter.name} ")
             message = text[:1].upper() + text[1:]
         accepted = {
@@ -1446,21 +1442,13 @@ class ParametersIcsTab(QtWidgets.QWidget):
         self._seed_spin.setEnabled(defaults.use_seed)
         self._ftol_edit.setText(self._tolerance_drafts.get("ftol", _format_scientific(defaults.ftol)))
         self._xtol_edit.setText(self._tolerance_drafts.get("xtol", _format_scientific(defaults.xtol)))
-        is_de = defaults.method == DIFFERENTIAL_EVOLUTION_METHOD
-        self._ftol_label.setText(f"{DE_CONVERGENCE_TOLERANCE_LABEL if is_de else FUNCTION_TOLERANCE_LABEL}:")
-        self._xtol_label.setVisible(not is_de)
-        self._xtol_edit.setVisible(not is_de)
-        self._xtol_group.setVisible(not is_de)
         del blocker
 
     def _defaults_projection(self) -> FitDefaults:
         defaults = self._projected_setup.defaults
         method = self._method_combo.currentData()
         ftol = self._tolerance_value(self._ftol_edit, self._ftol_label)
-        xtol = (
-            defaults.xtol if method == DIFFERENTIAL_EVOLUTION_METHOD
-            else self._tolerance_value(self._xtol_edit, self._xtol_label)
-        )
+        xtol = self._tolerance_value(self._xtol_edit, self._xtol_label)
         return validate_fit_defaults(
             replace(
                 defaults,
@@ -1479,11 +1467,8 @@ class ParametersIcsTab(QtWidgets.QWidget):
         return admit_fit_tolerance(edit.text(), label.text().removesuffix(":"))
 
     def _invalid_tolerance_labels(self) -> list[str]:
-        boxes = [(self._ftol_edit, self._ftol_label)]
-        if self._method_combo.currentData() != DIFFERENTIAL_EVOLUTION_METHOD:
-            boxes.append((self._xtol_edit, self._xtol_label))
         labels = []
-        for edit, label in boxes:
+        for edit, label in ((self._ftol_edit, self._ftol_label), (self._xtol_edit, self._xtol_label)):
             try:
                 self._tolerance_value(edit, label)
             except ValueError:
@@ -1498,7 +1483,7 @@ class ParametersIcsTab(QtWidgets.QWidget):
                 self._projected_setup,
                 defaults=self._defaults_projection(),
             )
-        except (TypeError, ValueError, OverflowError) as exc:
+        except ValueError as exc:
             self._set_defaults_error(str(exc))
             self._project_defaults(self._projected_setup.defaults)
             return
@@ -1515,7 +1500,7 @@ class ParametersIcsTab(QtWidgets.QWidget):
         }
         try:
             self._defaults_projection()
-        except (TypeError, ValueError, OverflowError) as exc:
+        except ValueError as exc:
             self._set_defaults_error(str(exc))
         else:
             self._set_defaults_error("")

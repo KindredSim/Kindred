@@ -15,12 +15,19 @@ from kindred.core.project_document import canonical_initial_values, parse_points
 from kindred.core.scipy_integrate import validate_scipy_rtol
 from kindred.core.validation import parse_finite_numeric_text
 from kindred.gui.controllers.simulation_job_owner import resolve_run_parallel_capacity
-from kindred.gui.widgets.scan_range_dialog import ScanRangeDialog, ScanConstraintDialog, entry, number
+from kindred.gui.widgets.scan_range_dialog import ScanRangeDialog, ScanConstraintDialog, entry
 from kindred.gui.display_name_policy import scientific_symbol_html, scientific_symbol_spoken
 from kindred.gui.ui_helpers import SCIENTIFIC_NAME_HTML_ROLE, SOLVER_TOOLTIP, ScientificNameDelegate, ignore_wheel
-from kindred.scan.config import ScanConfig, InputRange, START, END
+from kindred.scan.config import ScanConfig, InputRange, START, END, input_label
 from kindred.scan.inputs import input_catalog
 from kindred.scan.intervals import Interval
+
+
+def _whole_number(box: QtWidgets.QLineEdit, label: str) -> int:
+    try:
+        return int(box.text())
+    except ValueError:
+        raise ValueError(f"{label} must be a whole number.") from None
 
 
 class ChemicalSpaceScanDialog(QtWidgets.QDialog):
@@ -203,12 +210,8 @@ class ChemicalSpaceScanDialog(QtWidgets.QDialog):
 
     def _load(self):
         """Build the input rows once; a baseline change only refreshes its values."""
-        try:
-            self.base = self._baseline_config()
-            self.catalog = input_catalog(self.tab.prepared_dsl, self.base)
-        except Exception as exc:
-            self.status.setPlainText(str(exc))
-            return
+        self.base = self._baseline_config()
+        self.catalog = input_catalog(self.tab.prepared_dsl, self.base)
         self.mechanism.setText(f"Mechanism: {self.tab.name}")
         for item in self.catalog:
             mode = QtWidgets.QComboBox()
@@ -273,12 +276,8 @@ class ChemicalSpaceScanDialog(QtWidgets.QDialog):
         if not self.rows:
             self._load()
             return
-        try:
-            self.base = self._baseline_config()
-            self.catalog = input_catalog(self.tab.prepared_dsl, self.base)
-        except Exception as exc:
-            self.status.setPlainText(str(exc))
-            return
+        self.base = self._baseline_config()
+        self.catalog = input_catalog(self.tab.prepared_dsl, self.base)
         for item in self.catalog:
             mode, value, _, _ = self.rows[item.key]
             if mode.currentIndex() == 0 and (
@@ -362,14 +361,18 @@ class ChemicalSpaceScanDialog(QtWidgets.QDialog):
         for widget in (self.parameter_boundaries, self.initial_boundaries):
             widget.setEnabled(boundary and grouped)
         try:
-            requested = int(self.requested.text())
+            requested = _whole_number(self.requested, "Requested simulations")
             if grouped:
-                p, c = int(self.parameter_count.text()), int(self.initial_count.text())
-                bp, bc = (int(self.parameter_boundaries.text()), int(self.initial_boundaries.text())) if boundary else (0, 0)
+                p = _whole_number(self.parameter_count, "Parameter/time sets")
+                c = _whole_number(self.initial_count, "Initial-condition sets")
+                bp, bc = (
+                    _whole_number(self.parameter_boundaries, "Parameter/time endpoint sets"),
+                    _whole_number(self.initial_boundaries, "Initial-condition endpoint sets"),
+                ) if boundary else (0, 0)
                 self.count_summary.setText(f"{p} × {c} = {p*c} attempts. Requested: {requested}.\n"
                                            f"{p*c - (p-bp)*(c-bc)} combinations involve deliberately sampled endpoints.")
             else:
-                budget = int(self.boundary_count.text()) if boundary else 0
+                budget = _whole_number(self.boundary_count, "Joint endpoint attempts") if boundary else 0
                 self.count_summary.setText(f"{budget} endpoint attempts + {requested-budget} interior attempts = {requested}.")
         except ValueError:
             self.count_summary.setText("Enter whole-number counts.")
@@ -382,7 +385,7 @@ class ChemicalSpaceScanDialog(QtWidgets.QDialog):
                 selection = self.ranges[key]
                 ranges[key] = selection if self.boundaries.isChecked() else replace(selection, endpoints=())
             else:
-                numeric = number(value)
+                numeric = parse_finite_numeric_text(value.text().strip(), field=input_label(key))
                 if key.startswith("initial:"):
                     initials[key.removeprefix("initial:")] = numeric
                 elif key.startswith("parameter:"):
@@ -406,14 +409,14 @@ class ChemicalSpaceScanDialog(QtWidgets.QDialog):
                        t_start=times[START], t_end=times[END], solver=self.solver.currentText(),
                        points=parse_points_text(self.points.text(), field="Requested output points"),
                        rtol=rtol, atol=atol, analytic_jacobian=self.jacobian.isChecked(),
-                       use_authored_stops=self.stops.isChecked(), requested=int(self.requested.text()),
-                       destination=destination, seed=int(self.seed.text()), sampler=self.sampler.currentData(),
+                       use_authored_stops=self.stops.isChecked(), requested=_whole_number(self.requested, "Requested simulations"),
+                       destination=destination, seed=_whole_number(self.seed, "Seed"), sampler=self.sampler.currentData(),
                        grouped=bool(grouped),
-                       parameter_sets=int(self.parameter_count.text()) if grouped else 0,
-                       initial_sets=int(self.initial_count.text()) if grouped else 0,
-                       boundary_attempts=int(self.boundary_count.text()) if boundary and not grouped else 0,
-                       parameter_boundaries=int(self.parameter_boundaries.text()) if boundary and grouped else 0,
-                       initial_boundaries=int(self.initial_boundaries.text()) if boundary and grouped else 0,
+                       parameter_sets=_whole_number(self.parameter_count, "Parameter/time sets") if grouped else 0,
+                       initial_sets=_whole_number(self.initial_count, "Initial-condition sets") if grouped else 0,
+                       boundary_attempts=_whole_number(self.boundary_count, "Joint endpoint attempts") if boundary and not grouped else 0,
+                       parameter_boundaries=_whole_number(self.parameter_boundaries, "Parameter/time endpoint sets") if boundary and grouped else 0,
+                       initial_boundaries=_whole_number(self.initial_boundaries, "Initial-condition endpoint sets") if boundary and grouped else 0,
                        workers=self.workers.value(), constraints=tuple(self.constraints))
 
     def _start(self, check_only):
@@ -421,7 +424,7 @@ class ChemicalSpaceScanDialog(QtWidgets.QDialog):
             config = self._configuration(check_only)
             if not self.owner.start(config, check_only=check_only):
                 raise ValueError("Another computation or application close is active.")
-        except Exception as exc:
+        except ValueError as exc:
             self.status.setPlainText(str(exc))
             return
         self.progress_bar.setValue(0)
@@ -461,12 +464,8 @@ class ChemicalSpaceScanDialog(QtWidgets.QDialog):
             self.destination.setText(path if path.lower().endswith(".json") else path + ".json")
 
     def _show_stops(self):
-        try:
-            tab = self.tab
-            declarations = tab.prepared_dsl.authored_stop_declarations()
-            QtWidgets.QMessageBox.information(self, "Authored Stopping Interventions", "\n\n".join(declarations) or "This mechanism has no stopping declarations.")
-        except Exception as exc:
-            self.status.setPlainText(str(exc))
+        declarations = self.tab.prepared_dsl.authored_stop_declarations()
+        QtWidgets.QMessageBox.information(self, "Authored Stopping Interventions", "\n\n".join(declarations) or "This mechanism has no stopping declarations.")
 
     def reject(self):
         self.close()

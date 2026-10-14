@@ -25,7 +25,7 @@ from kindred.gui.fitting.execution import (
     FitCurveDataset, _observed_curve_parts,
 )
 from kindred.gui.theme_manager import plot_background_color, plot_foreground_color
-from kindred.gui.plot_config import require_pyqtgraph
+import pyqtgraph as pg
 from kindred.gui.widgets.plot_data_item import PlotDataItem
 from kindred.gui.workspace_result_presenter import (
     VESSEL_VOLUME_COLOR,
@@ -35,7 +35,6 @@ from kindred.gui.workspace_result_presenter import (
 
 __all__ = ["GridPlotView"]
 
-pg = require_pyqtgraph(context="Kindred GUI")
 
 ColorResolver = Callable[[str], object]
 _MAX_FIT_COPY_CELLS = 1_000_000
@@ -118,8 +117,6 @@ class GridPlotView(QtWidgets.QWidget):
         parent: QtWidgets.QWidget | None = None,
     ) -> None:
         super().__init__(parent)
-        if color_resolver is not None and not callable(color_resolver):
-            raise TypeError("color_resolver must be callable.")
         self._color_resolver = color_resolver
         self._color_by_species: Mapping[str, object] = MappingProxyType({})
         self._curves: tuple[FitCurveDataset, ...] = ()
@@ -221,10 +218,7 @@ class GridPlotView(QtWidgets.QWidget):
         self._canvas = pg.GraphicsLayoutWidget(self)
         self._canvas.scene().installEventFilter(self)
         self._canvas.scene().sigMouseClicked.connect(self._on_plot_click)
-        try:
-            self._canvas.useOpenGL(False)
-        except (AttributeError, RuntimeError):
-            pass
+        self._canvas.useOpenGL(False)
         self._canvas.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self._canvas.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self._scroll = QtWidgets.QScrollArea(self)
@@ -511,8 +505,6 @@ class GridPlotView(QtWidgets.QWidget):
         """Copy the Results owner's immutable plotted arrays for the given scope."""
 
         values = tuple(curves)
-        if any(not isinstance(item, FitCurveDataset) for item in values):
-            raise TypeError("curves must contain FitCurveDataset values.")
         if not values:
             raise ValueError("No Fit curves are available to copy.")
         if self._copy_timer.isActive():
@@ -594,16 +586,8 @@ class GridPlotView(QtWidgets.QWidget):
         except StopIteration:
             text = output.getvalue()
             self.cancel_copy()
-            application = QtWidgets.QApplication.instance()
-            if application is None:
-                QtWidgets.QMessageBox.critical(
-                    self,
-                    "Copy Fit Data",
-                    "A QApplication is required to copy Fit data.",
-                )
-                return
-            application.clipboard().setText(text)
-        except Exception as exc:
+            QtWidgets.QApplication.clipboard().setText(text)
+        except ValueError as exc:
             self.cancel_copy()
             QtWidgets.QMessageBox.critical(
                 self,
@@ -682,12 +666,9 @@ class GridPlotView(QtWidgets.QWidget):
     def _apply_dark_mode_to_plot(self, plot: object) -> None:
         text_color = plot_foreground_color(self._dark_mode)
         for axis_name in ("left", "bottom"):
-            try:
-                axis = plot.getAxis(axis_name)
-                axis.setTextPen(text_color)
-                axis.setPen(text_color)
-            except Exception:
-                pass
+            axis = plot.getAxis(axis_name)
+            axis.setTextPen(text_color)
+            axis.setPen(text_color)
 
     def legend_text(self) -> tuple[str, str]:
         entries = []

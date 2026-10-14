@@ -450,7 +450,7 @@ class BatchSpeciesSliders(QtWidgets.QWidget):
         try:
             value = float(row.value_label.text().strip())
             valid = bool(math.isfinite(value) and value >= 0.0)
-        except (TypeError, ValueError, OverflowError):
+        except ValueError:
             valid = bool(
                 row.value_label.text() == "Multiple values"
                 and not row.value_label.hasFocus()
@@ -472,7 +472,7 @@ class BatchSpeciesSliders(QtWidgets.QWidget):
             return
         try:
             value = float(raw.strip())
-        except (TypeError, ValueError, OverflowError):
+        except ValueError:
             self._decorate_editor(species_s)
             return
         if not math.isfinite(value) or value < 0.0:

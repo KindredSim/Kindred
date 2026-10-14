@@ -445,7 +445,7 @@ class ProjectController(QtCore.QObject):
         if path is not None:
             try:
                 self._config.record_recent_project(path)
-            except Exception as exc:
+            except OSError as exc:
                 logger.warning("Recent-project update failed", exc_info=True)
                 status += f". Updating the recent projects list failed: {exc}"
         self._set_status(status)
@@ -700,7 +700,7 @@ class ProjectController(QtCore.QObject):
                 candidate,
                 presentation,
             )
-        except Exception as exc:
+        except OSError as exc:
             self._show_error(
                 "Save Error",
                 f"Failed to save project:\n\n{file_error_text(exc, path)}",
@@ -714,7 +714,7 @@ class ProjectController(QtCore.QObject):
         status = f"Saved project: {path}"
         try:
             self._config.record_recent_project(path)
-        except Exception as exc:
+        except OSError as exc:
             logger.warning("Recent-project update failed", exc_info=True)
             status += f". Updating the recent projects list failed: {exc}"
         self._set_status(status)

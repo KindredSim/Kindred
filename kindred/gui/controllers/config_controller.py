@@ -559,13 +559,10 @@ class ConfigController(QtCore.QObject):
         snapshot: Sequence[tuple[str, bool, object]],
     ) -> None:
         for key, existed, raw_value in snapshot:
-            try:
-                if existed:
-                    settings.setValue(key, raw_value)
-                else:
-                    settings.remove(key)
-            except Exception:
-                logger.exception("Could not restore failed setting %s.", key)
+            if existed:
+                settings.setValue(key, raw_value)
+            else:
+                settings.remove(key)
 
     def _sync_or_report(
         self,
@@ -576,20 +573,14 @@ class ConfigController(QtCore.QObject):
         success_message: str | None = None,
     ) -> None:
         message = f"{label[:1].upper()}{label[1:]} could not be saved."
-        try:
-            settings.sync()
-            if settings.status() != QtCore.QSettings.Status.NoError:
-                raise OSError(f"QSettings status {settings.status()}")
-        except Exception as exc:
-            logger.warning("%s (%s)", message, exc)
+        settings.sync()
+        if settings.status() != QtCore.QSettings.Status.NoError:
+            logger.warning("%s (QSettings status %s)", message, settings.status())
             self._restore_settings(settings, snapshot)
-            try:
-                # QSettings may write new values while retaining a prior
-                # FormatError status. Persist the restored accepted values.
-                settings.sync()
-            except Exception:
-                logger.exception("Could not synchronize restored setting values for %s.", label)
-            raise OSError(message) from exc
+            # QSettings may write new values while retaining a prior
+            # FormatError status. Persist the restored accepted values.
+            settings.sync()
+            raise OSError(message)
         if success_message is not None:
             logger.info(success_message)
 
@@ -700,7 +691,7 @@ class ConfigController(QtCore.QObject):
         )
         try:
             return self._validate_experimental_point_size(value)
-        except (TypeError, ValueError):
+        except ValueError:
             return _DEFAULT_EXPERIMENTAL_POINT_SIZE
 
     def set_experimental_point_size(self, size: int) -> int:
@@ -725,7 +716,7 @@ class ConfigController(QtCore.QObject):
         )
         try:
             return self._validate_experimental_point_opacity(value)
-        except (TypeError, ValueError):
+        except ValueError:
             return _DEFAULT_EXPERIMENTAL_POINT_OPACITY
 
     def set_experimental_point_opacity(self, opacity: float) -> float:
@@ -742,24 +733,16 @@ class ConfigController(QtCore.QObject):
         return accepted
 
     @staticmethod
-    def _validate_experimental_point_size(value: object) -> int:
-        if type(value) is bool or not isinstance(value, int):
-            raise TypeError("Experimental point size must be an integer.")
+    def _validate_experimental_point_size(value: int) -> int:
         if not 1 <= value <= 20:
             raise ValueError("Experimental point size must be between 1 and 20.")
-        return int(value)
+        return value
 
     @staticmethod
-    def _validate_experimental_point_opacity(value: object) -> float:
-        if type(value) is bool:
-            raise TypeError("Experimental point opacity must be numeric.")
-        try:
-            parsed = float(value)
-        except (TypeError, ValueError, OverflowError) as exc:
-            raise TypeError("Experimental point opacity must be numeric.") from exc
-        if not math.isfinite(parsed) or not 0.0 <= parsed <= 1.0:
+    def _validate_experimental_point_opacity(value: float) -> float:
+        if not math.isfinite(value) or not 0.0 <= value <= 1.0:
             raise ValueError("Experimental point opacity must be between zero and one.")
-        return parsed
+        return value
 
     def _species_color_overrides(self) -> Mapping[str, str]:
         raw = self._settings().value(_SPECIES_COLORS_KEY, {})

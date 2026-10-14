@@ -15,7 +15,6 @@ from types import MappingProxyType
 from typing import Any, Mapping, Sequence
 
 from kindred.core import constants
-from kindred.core.algebra.errors import AlgebraError
 from kindred.core.exceptions import located
 from kindred.core.algebra.parser import BinaryNode, CallNode, IdentNode, NumberNode, SpeciesRefNode, UnaryNode
 from kindred.core.algebra.printer import expression_to_source
@@ -122,7 +121,7 @@ class _ConditionInapplicable(SymbolicCalculatorError):
 
 def _unavailable(exc: Exception) -> _UnavailableDiagnostic:
     """Kindred states the failure; library text stays a copied detail."""
-    if isinstance(exc, (SymbolicCalculatorError, AlgebraError)):
+    if isinstance(exc, SymbolicCalculatorError):
         return _UnavailableDiagnostic(str(exc))
     return _UnavailableDiagnostic("Calculator could not complete this calculation.", str(exc))
 
@@ -1288,7 +1287,7 @@ def _dispatch_call(context: CalculatorContext, name: str, args: Sequence[_Value]
         return _with_quantity(_admit_native(expression, conditions, notices=notices), quantity)
     except _ConditionInapplicable:
         raise
-    except (SymbolicCalculatorError, AlgebraError, ValueError, TypeError, ArithmeticError, NotImplementedError) as exc:
+    except (SymbolicCalculatorError, ValueError, TypeError, ArithmeticError, NotImplementedError) as exc:
         if name == "subs":
             conditions = _conditions(args[0].conditions, additional=(c for value in args[1:] for c in value.conditions)) if args else ()
         return _Value(_unavailable(exc), conditions)

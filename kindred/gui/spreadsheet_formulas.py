@@ -170,11 +170,11 @@ def _retained_preferences(unit: Unit | None, preferences: dict[str, Unit]) -> di
 
 
 def compile_columns(columns: Sequence[Mapping[str, Any]]) -> dict[int, CompiledPattern]:
-    """Compile all patterns together, refusing over-deep nesting as a rejection."""
+    """Compile all patterns together, refusing over-deep formulas as a rejection."""
     try:
         return _compile_columns(columns)
     except RecursionError:
-        raise ValueError("A formula is nested too deeply to calculate.") from None
+        raise ValueError("A formula is too long or nested too deeply to calculate.") from None
 
 
 def _compile_columns(columns: Sequence[Mapping[str, Any]]) -> dict[int, CompiledPattern]:
@@ -208,7 +208,7 @@ def _compile_columns(columns: Sequence[Mapping[str, Any]]) -> dict[int, Compiled
     try:
         block = parse_algebra("\n".join(statements) + "\n")
     except AlgebraError as exc:
-        message = re.sub(r"\b([A-Z]+)1\b", r"\1", exc.msg)
+        message = re.sub(r"\b([A-Z]+)1\b", r"\1", exc.message)
         raise ValueError(f"Column {calculated[exc.line - 1]}: {message}") from exc
     references = {statement.name: _references(statement.expr, len(columns)) for statement in block.lines}
     compiled = {}

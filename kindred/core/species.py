@@ -18,6 +18,8 @@ from dataclasses import dataclass
 import math
 from numbers import Real
 
+from kindred.core.exceptions import ValueDomainError
+
 from .validation import parse_finite_numeric_text
 
 __all__ = [
@@ -69,7 +71,7 @@ def _numeric(value: object, *, field: str) -> float:
         raise TypeError(f"{field} must be numeric.")
     parsed = float(value)
     if not math.isfinite(parsed):
-        raise ValueError(f"{field} must be finite.")
+        raise ValueDomainError(field, f"{field} must be finite.")
     return parsed
 
 
@@ -89,18 +91,17 @@ def validate_concentration(
     parsed = _numeric(value, field=field)
     if parsed < 0.0 or (not allow_zero and parsed == 0.0):
         qualifier = "nonnegative" if allow_zero else "strictly positive"
-        raise ValueError(f"{field} must be {qualifier}.")
+        raise ValueDomainError(field, f"{field} must be {qualifier}.")
     if parsed == 0.0:
         return 0.0
     if parsed < CONCENTRATION_MIN_M:
-        raise ValueError(
+        raise ValueDomainError(
+            field,
             f"{field} is below the supported concentration floor "
-            f"{CONCENTRATION_MIN_M:g} M. Enter exact 0 if zero is intended."
+            f"{CONCENTRATION_MIN_M:g} M. Enter exact 0 if zero is intended.",
         )
     if parsed > CONCENTRATION_MAX_M:
-        raise ValueError(
-            f"{field} must be at most {CONCENTRATION_MAX_M:g} M."
-        )
+        raise ValueDomainError(field, f"{field} must be at most {CONCENTRATION_MAX_M:g} M.")
     return parsed
 
 
@@ -143,9 +144,9 @@ def validate_time_seconds(
     parsed = _numeric(value, field=field)
     if parsed < TIME_MIN_S or (not allow_zero and parsed == TIME_MIN_S):
         qualifier = "nonnegative" if allow_zero else "strictly positive"
-        raise ValueError(f"{field} must be {qualifier}.")
+        raise ValueDomainError(field, f"{field} must be {qualifier}.")
     if parsed > TIME_MAX_S:
-        raise ValueError(f"{field} must be at most {TIME_MAX_S:g} seconds.")
+        raise ValueDomainError(field, f"{field} must be at most {TIME_MAX_S:g} seconds.")
     return parsed
 
 
@@ -158,9 +159,7 @@ def validate_input_time_seconds(
     """Admit model timing inputs without restricting generated execution times."""
     parsed = validate_time_seconds(value, field=field, allow_zero=allow_zero)
     if 0.0 < parsed < TIME_INPUT_MIN_S:
-        raise ValueError(
-            f"{field} must be at least {TIME_INPUT_MIN_S:g} seconds when nonzero."
-        )
+        raise ValueDomainError(field, f"{field} must be at least {TIME_INPUT_MIN_S:g} seconds when nonzero.")
     return parsed
 
 

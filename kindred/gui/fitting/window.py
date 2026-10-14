@@ -925,8 +925,6 @@ class FittingWindow(QtWidgets.QDialog):
                 )
                 return int(window_color.lightness()) < 128
         app = QtWidgets.QApplication.instance()
-        if app is None:
-            return False
         window_color = app.palette().color(QtGui.QPalette.ColorRole.Window)
         return int(window_color.lightness()) < 128
 

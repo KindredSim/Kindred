@@ -297,7 +297,7 @@ class SimulationPanel(QtWidgets.QWidget):
                     self.current_settings_candidate()
                     != self._canonical_settings
                 )
-            except (TypeError, ValueError):
+            except ValueError:
                 self._candidate_dirty = True
         blockers = tuple(QtCore.QSignalBlocker(control) for control in controls)
         try:
@@ -338,7 +338,7 @@ class SimulationPanel(QtWidgets.QWidget):
             return True
         try:
             candidate = self.current_settings_candidate()
-        except (TypeError, ValueError) as exc:
+        except ValueError as exc:
             # Keep the authored Draft visible and blocking.  Reprojecting the
             # canonical values here would make a focus-loss event silently
             # erase the invalid text before Run can observe it.
@@ -356,7 +356,7 @@ class SimulationPanel(QtWidgets.QWidget):
 
         try:
             self.current_settings_candidate()
-        except (TypeError, ValueError):
+        except ValueError:
             return False
         return True
 

@@ -173,16 +173,7 @@ def _guard_runtime_symbolic_jacobian(
         ):
             raise SimulationCancelled()
         values = np.asarray(state, dtype=float).reshape(-1)
-        try:
-            matrix = np.asarray(
-                jacobian_func(float(time), values),
-                dtype=float,
-            )
-        except (ArithmeticError, TypeError, ValueError, OverflowError) as exc:
-            raise _SymbolicJacobianEvaluationError(
-                time=float(time),
-                reason=f"its analytic Jacobian raised {type(exc).__name__}: {exc}",
-            ) from exc
+        matrix = np.asarray(jacobian_func(float(time), values), dtype=float)
         expected_shape = (values.size, values.size)
         if matrix.shape != expected_shape:
             raise _SymbolicJacobianEvaluationError(

@@ -7,7 +7,6 @@ RHS compilation for execution paths that consume it.
 
 from __future__ import annotations
 
-import logging
 from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Any, Callable, Iterable, Mapping
@@ -15,11 +14,9 @@ from typing import Any, Callable, Iterable, Mapping
 import numpy as np
 
 from kindred.core.exceptions import (
-    FitSimulationError,
     SimulationCancelled,
-    located,
+    ValueDomainError,
 )
-from kindred.core.units import OrdinaryParameterDomainError
 from kindred.core.temperature import TemperatureSchedule
 from kindred.core.intervention_schedule import (
     InterventionSchedule,
@@ -27,6 +24,7 @@ from kindred.core.intervention_schedule import (
     InterventionScheduleError,
     intervention_schedule_parameter_dependencies,
     intervention_schedule_parameter_names,
+    locate_declaration,
 )
 from kindred.core.intervention_schedule_compiler import (
     InterventionExecutionContract,
@@ -49,53 +47,14 @@ from kindred.core.simulation_preparation_stages import (
 )
 from kindred.core.time_grid import build_time_grid
 
-logger = logging.getLogger(__name__)
-
 
 __all__ = [
     "SimulationExecutionRequest",
     "PreparedSimulationRun",
-    "SimulationPreparationError",
     "build_simulation_request_from_prepared_run",
     "build_simulation_execution_request",
     "prepare_simulation_run",
-    "fit_simulation_error_from_preparation_error",
 ]
-
-
-class SimulationPreparationError(RuntimeError):
-    """
-    Error raised when preparing a scientific execution request fails.
-
-    Its text is the user-facing message; ``stage`` and ``details`` are
-    structured facts for reports.
-    """
-
-    def __init__(
-        self,
-        stage: str,
-        message: str,
-        *,
-        parameter_names: Iterable[str] = (),
-        details: Mapping[str, object] | None = None,
-    ) -> None:
-        self.stage = stage
-        self.parameter_names = tuple(sorted(set(parameter_names)))
-        normalized_details = dict(details or {})
-        normalized_details.update(
-            {
-                "stage": self.stage,
-                "parameter_names": self.parameter_names,
-            }
-        )
-        self.details = MappingProxyType(
-            {
-                str(key): freeze_retained_value(value)
-                for key, value in normalized_details.items()
-            }
-        )
-        self.message = str(message or "")
-        super().__init__(self.message)
 
 
 def _raise_if_cancelled(
@@ -112,7 +71,6 @@ def _raise_if_cancelled(
 class PreparedSimulationRun:
     """Execution-ready simulation payload produced by core preparation utilities."""
 
-    mechanism: Any
     rhs: Callable[..., np.ndarray]
     y0: np.ndarray
     species_names: tuple[str, ...]
@@ -139,28 +97,22 @@ class PreparedSimulationRun:
 def build_simulation_request_from_prepared_run(
     prepared_run: PreparedSimulationRun,
     *,
-    y0: np.ndarray,
-    intervention_execution: InterventionExecutionContract,
-    symbolic_jacobian: SymbolicJacobianExecution,
-    cancellation_control: SimulationCancellationControl | None = None,
     t_eval: np.ndarray | None = None,
     candidate_evaluation: bool = False,
     sample_solver_steps: bool = False,
 ) -> SimulationRequest:
+    """Solve exactly what preparation admitted: its starting state, schedule,
+    Jacobian and cancellation owner."""
     request = prepared_run.request
-    cancellation_control = (
-        cancellation_control
-        if cancellation_control is not None
-        else prepared_run.cancellation_control
-    )
+    cancellation_control = prepared_run.cancellation_control
     _raise_if_cancelled(cancellation_control)
     result = SimulationRequest(
         rhs=prepared_run.rhs,
         reference_temperature_K=float(request.prepared_dsl.analysis.temperature_K),
         t_span=request.t_span,
-        y0=np.asarray(y0, dtype=float).reshape(-1),
-        intervention_execution=intervention_execution,
-        symbolic_jacobian=symbolic_jacobian,
+        y0=np.asarray(prepared_run.y0, dtype=float).reshape(-1),
+        intervention_execution=prepared_run.intervention_execution,
+        symbolic_jacobian=prepared_run.symbolic_jacobian,
         solver=request.solver_config.solver,
         rtol=request.solver_config.rtol,
         atol=request.solver_config.atol,
@@ -194,7 +146,8 @@ class SimulationExecutionRequest:
 
     def __post_init__(self) -> None:
         # Its producers pass admitted values: initial concentrations from the
-        # document or Slider and Scan admission (exact zeros for Fit), the span
+        # document, Slider and Scan admission, or a Fit candidate (exact zeros
+        # in the Fit's base request), the span
         # from Run settings or Scan and Fit admission, and override values from
         # Slider, Scan or Fit candidate admission.  The request keeps its own
         # copy of the caller's override mapping.
@@ -238,28 +191,6 @@ def _expanded_intervention_schedule_dependency_metadata(
             visit(raw_name)
         expanded[identity] = tuple(sorted(leaves))
     return MappingProxyType(expanded)
-
-
-def _resolve_intervention_schedule_for_request(
-    schedule: InterventionSchedule,
-    *,
-    parameter_values: Mapping[str, Any],
-    dependency_metadata: InterventionScheduleDependencyMetadata | None = None,
-    runtime_parameters: frozenset[str] = frozenset(),
-) -> InterventionSchedule:
-    try:
-        return schedule.resolve_parameters(
-            dict(parameter_values),
-            dependency_metadata=dependency_metadata,
-            runtime_parameters=runtime_parameters,
-        )
-    except InterventionScheduleError as exc:
-        raise SimulationPreparationError(
-            "intervention_schedule",
-            str(exc),
-            parameter_names=exc.value_dependencies,
-            details=exc.details,
-        ) from exc
 
 
 def _schedule_parameters_deferred_to_prepared_request(
@@ -328,19 +259,6 @@ def build_simulation_execution_request(
     return request
 
 
-def fit_simulation_error_from_preparation_error(
-    exc: SimulationPreparationError,
-) -> FitSimulationError:
-    details = dict(exc.details)
-    if exc.parameter_names:
-        details.setdefault("value_dependencies", tuple(exc.parameter_names))
-        details.setdefault("parameter_names", tuple(exc.parameter_names))
-    return FitSimulationError(
-        str(exc),
-        details=details,
-    )
-
-
 def _independent_scalar_names(spec: Any) -> frozenset[str]:
     return frozenset(
         name for name in spec.parameter_dependencies
@@ -380,18 +298,10 @@ def _apply_parameter_overrides_to_prepared_mechanism(
             mechanism_coordinate_overrides=mechanism_coordinate_values,
             scalar_parameter_overrides=scalar_override_values,
         )
-    except OrdinaryParameterDomainError as exc:
-        raise SimulationPreparationError(
-            "ordinary_parameter_domain", str(exc), parameter_names=(exc.field,),
-        ) from exc
-    except Exception as exc:
-        raise SimulationPreparationError(
-            "parameter_overrides",
-            str(exc),
-            parameter_names=tuple(sorted(mechanism_coordinate_values))
-            + tuple(sorted(scalar_override_values)),
-        ) from exc
-    return None
+    except ValueDomainError as exc:
+        # A value outside its domain here is the override itself.
+        exc.annotate(parameter_names=(exc.field,))
+        raise
 
 
 def prepare_simulation_run(
@@ -440,12 +350,9 @@ def prepare_simulation_run(
     )
     _raise_if_cancelled(cancellation_control)
 
-    try:
-        _coefficient_evaluator, rhs = topology.bind_target(
-            mechanism, base_values=schedule_only_values
-        )
-    except Exception as exc:
-        raise SimulationPreparationError("ode_build", str(exc)) from exc
+    _coefficient_evaluator, rhs = topology.bind_target(
+        mechanism, base_values=schedule_only_values
+    )
 
     intervention_execution = execution_request.prepared_dsl.intervention_execution_contract()
     if intervention_execution is not None and not execution_request.use_authored_stops:
@@ -456,28 +363,26 @@ def prepare_simulation_run(
             unresolved_intervention_schedule,
             parameter_algebra_spec=parameter_algebra_spec,
         ):
+            dependency_metadata = _expanded_intervention_schedule_dependency_metadata(
+                unresolved_intervention_schedule,
+                parameter_algebra_spec=parameter_algebra_spec,
+            )
+            direct_dependencies = intervention_schedule_parameter_dependencies(unresolved_intervention_schedule)
+            clock_fields = {"time", "start_time", "end_time"}
+            clock_roots = tuple(sorted({
+                name for identity, names in direct_dependencies.items()
+                if identity[2] in clock_fields for name in names
+            }))
+            payload_names = frozenset(
+                name for identity, names in direct_dependencies.items()
+                if identity[2] not in clock_fields for name in names
+            )
             try:
-                dependency_metadata = _expanded_intervention_schedule_dependency_metadata(
-                    unresolved_intervention_schedule,
-                    parameter_algebra_spec=parameter_algebra_spec,
-                )
-                direct_dependencies = intervention_schedule_parameter_dependencies(unresolved_intervention_schedule)
-                clock_fields = {"time", "start_time", "end_time"}
-                clock_roots = tuple(sorted({
-                    name for identity, names in direct_dependencies.items()
-                    if identity[2] in clock_fields for name in names
-                }))
-                payload_names = frozenset(
-                    name for identity, names in direct_dependencies.items()
-                    if identity[2] not in clock_fields for name in names
-                )
-                resolved_schedule = _resolve_intervention_schedule_for_request(
-                    unresolved_intervention_schedule,
-                    parameter_values=(_coefficient_evaluator.parameter_values(
+                resolved_schedule = unresolved_intervention_schedule.resolve_parameters(
+                    (_coefficient_evaluator.parameter_values(
                         _coefficient_evaluator.nominal_temperature_K, clock_roots
                     ) if clock_roots else {}),
                     runtime_parameters=payload_names,
-                    dependency_metadata=dependency_metadata,
                 )
                 intervention_execution = compile_intervention_schedule(
                     resolved_schedule,
@@ -489,35 +394,19 @@ def prepare_simulation_run(
                     ),
                     dependency_metadata=dependency_metadata,
                 )
-            except (InterventionScheduleError, ValueError) as exc:
-                structured_details = dict(getattr(exc, "details", {}) or {})
-                structured_dependencies = tuple(
-                    getattr(exc, "value_dependencies", ())
-                    or structured_details.get("value_dependencies", ())
-                )
-                if structured_dependencies:
-                    structured_details["value_dependencies"] = structured_dependencies
-                raise SimulationPreparationError(
-                    "intervention_schedule",
-                    str(exc),
-                    parameter_names=(
-                        structured_dependencies
-                    ),
-                    details=structured_details,
-                ) from exc
+            except (InterventionScheduleError, ValueDomainError) as exc:
+                locate_declaration(exc, execution_request.prepared_dsl.analysis.intervention_lines)
+                raise
 
     _raise_if_cancelled(cancellation_control)
 
-    try:
-        temperature_schedule, runtime_symbolic_jacobian = build_prepared_run_context(
-            mechanism=mechanism,
-            temperature_schedule=temperature_schedule_override,
-            use_analytic_jacobian=prepared_solver_config.use_analytic_jacobian,
-            symbolic_structure=symbolic_structure,
-            coefficient_evaluator=_coefficient_evaluator,
-        )
-    except Exception as exc:
-        raise SimulationPreparationError("analytic_jacobian", str(exc)) from exc
+    temperature_schedule, runtime_symbolic_jacobian = build_prepared_run_context(
+        mechanism=mechanism,
+        temperature_schedule=temperature_schedule_override,
+        use_analytic_jacobian=prepared_solver_config.use_analytic_jacobian,
+        symbolic_structure=symbolic_structure,
+        coefficient_evaluator=_coefficient_evaluator,
+    )
     _raise_if_cancelled(cancellation_control)
 
     initials_for_algebra = {sp: float(y0[idx]) for idx, sp in enumerate(species_names)}
@@ -535,36 +424,54 @@ def prepare_simulation_run(
         )
         targets = tuple(dict.fromkeys(item.condition.name for item in stops))
         if targets:
-            from kindred.core.algebra.errors import AlgebraError
-            from kindred.core.algebra.simulation_series import observable_parameter_roots, prepare_algebra_stop_evaluator
+            from kindred.core.algebra.errors import UNCOMPUTABLE_ERRORS, AlgebraError
+            from kindred.core.algebra.simulation_series import (
+                observable_parameter_roots, observable_reads_species, prepare_algebra_stop_evaluator,
+            )
             observable_block = parameter_algebra_spec.observable_block
-            try:
-                target_roots = {
-                    name: tuple(root for root in observable_parameter_roots(observable_block, name)
-                                if root in parameter_algebra_spec.evaluation_dependencies)
-                    for name in targets
-                }
-                static_roots = tuple(sorted({
-                    root for roots in target_roots.values() for root in roots
-                    if root not in runtime_names
-                }))
-                static = (symbols(temperature_at_execution_time(
-                    temperature_schedule, _coefficient_evaluator.nominal_temperature_K,
-                    execution_request.t_span[0],
-                ), static_roots) if static_roots else {})
-                evaluator = prepare_algebra_stop_evaluator(
-                    observable_block,
-                    species_names=tuple(species_names), initials=initials_for_algebra,
-                    symbol_values=static, runtime_symbol_names=set(runtime_names),
-                )
-                for target in targets:
+            # Admission calculates a fixed value when it reads it; the run
+            # supplies only the values that change with time.
+            target_roots = {
+                name: tuple(root for root in observable_parameter_roots(observable_block, name)
+                            if root in parameter_algebra_spec.evaluation_dependencies and root in runtime_names)
+                for name in targets
+            }
+            start_temperature = temperature_at_execution_time(
+                temperature_schedule, _coefficient_evaluator.nominal_temperature_K,
+                execution_request.t_span[0],
+            )
+            evaluator = prepare_algebra_stop_evaluator(
+                observable_block,
+                species_names=tuple(species_names), initials=initials_for_algebra,
+                symbol_resolver=lambda name, _row: (
+                    symbols(start_temperature, (name,))[name]
+                    if name in parameter_algebra_spec.evaluation_dependencies else None
+                ),
+                runtime_symbol_names=set(runtime_names),
+            )
+            lets_by_line = {statement.line: statement.name for statement in observable_block.lines}
+            for target in targets:
+                try:
                     evaluator.admit(target)
-            except Exception as exc:
-                # The refusal states what failed on the line it read.
-                line, text = (exc.line, exc.line_text) if isinstance(exc, AlgebraError) else (None, None)
-                raise SimulationPreparationError(
-                    "stopping_intervention", located(f"A stop condition cannot watch this value: {exc}", line, text),
-                ) from exc
+                except AlgebraError as exc:
+                    if "assignment" in exc.details:
+                        # A param it reads failed and names itself.
+                        raise
+                    if isinstance(exc, UNCOMPUTABLE_ERRORS):
+                        # A value the watched quantity reads cannot be
+                        # calculated for these inputs; it names its inputs as a
+                        # let's failure does.
+                        name = lets_by_line[exc.line]
+                        exc.annotate(
+                            assignment=name,
+                            parameter_names=parameter_algebra_spec.input_dependencies(
+                                observable_parameter_roots(observable_block, name)
+                            ),
+                            reads_species=observable_reads_species(observable_block, name),
+                        )
+                    else:
+                        exc.annotate(prefix="A stop condition cannot watch this value: ")
+                    raise
 
             def stop_observable_value(name: str, time: float, state: np.ndarray, temperature_K: float) -> float:
                 return evaluator.evaluate(name, time, state, symbols(temperature_K, target_roots[name]))
@@ -572,7 +479,6 @@ def prepare_simulation_run(
     request = execution_request
 
     return PreparedSimulationRun(
-        mechanism=mechanism,
         rhs=rhs,
         y0=np.asarray(y0, dtype=float).reshape(-1),
         species_names=list(species_names),

@@ -448,7 +448,7 @@ class TabSliderBinding(QtCore.QObject):
         )
         if runtime.reactions_draft is not None or not targets:
             return None
-        if not isinstance(tab.prepared_dsl, PreparedDslRequestSet):
+        if tab.prepared_dsl is None:
             return None
         return _PreviewPreflight(tab, build_parameter_slider_projection(tab.prepared_dsl), tuple(targets))
 
@@ -492,7 +492,7 @@ class TabSliderBinding(QtCore.QObject):
                 allow_exact_zero=coordinate.allow_exact_zero,
                 field=f"Parameter {name!r}",
             )
-        except (TypeError, ValueError) as exc:
+        except ValueError as exc:
             if _interaction is SliderInteractionKind.EXACT_TYPED_COMMIT:
                 accepted_value = self._registry.tab_runtime(
                     self._tab_id
@@ -541,7 +541,7 @@ class TabSliderBinding(QtCore.QObject):
             value_f = validate_concentration(
                 value, field=f"Initial value for {species!r}"
             )
-        except (TypeError, ValueError) as exc:
+        except ValueError as exc:
             return self._reject_slider_action(str(exc))
         targets = self.resolve_target_set_ids()
         prepared = (
@@ -655,20 +655,17 @@ class TabSliderBinding(QtCore.QObject):
     ) -> bool:
         """Require the settled Preview's canonical requests to remain current."""
 
-        try:
-            current_requests = tuple(
-                build_explicit_target(
-                    prepared_dsl=tab.prepared_dsl,
-                    set_id=set_id,
-                    set_name=tab.initial_condition_set(set_id).name,
-                    initial_values=canonical_initial_values(tab, set_id),
-                    execution_settings=tab.resolved_execution_settings(set_id),
-                    scientific_settings=tab.scientific_settings,
-                ).execution_request
-                for set_id in targets
-            )
-        except (TypeError, ValueError, KeyError):
-            return False
+        current_requests = tuple(
+            build_explicit_target(
+                prepared_dsl=tab.prepared_dsl,
+                set_id=set_id,
+                set_name=tab.initial_condition_set(set_id).name,
+                initial_values=canonical_initial_values(tab, set_id),
+                execution_settings=tab.resolved_execution_settings(set_id),
+                scientific_settings=tab.scientific_settings,
+            ).execution_request
+            for set_id in targets
+        )
         return all(
             (target.canonical_run_target.execution_request == current_request)
             for target, current_request in zip(
@@ -938,10 +935,7 @@ class TabSliderBinding(QtCore.QObject):
             return
         self._disposed = True
         for signal, slot in self._disposable_connections:
-            try:
-                signal.disconnect(slot)
-            except (RuntimeError, TypeError):
-                pass
+            signal.disconnect(slot)
         self._stop_preview_timers()
         self._clear_gesture_state(stop_preview_timer=False)
         self._cancel_deferred_restore()

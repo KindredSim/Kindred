@@ -109,7 +109,7 @@ def prepare_algebra_stop_evaluator(
     *,
     species_names: Tuple[str, ...],
     initials: Mapping[str, float],
-    symbol_values: Mapping[str, float],
+    symbol_resolver: Callable[[str, int], float | None],
     runtime_symbol_names: set[str],
 ) -> PreparedAlgebraStopEvaluator:
     """Bind stopping to the accepted retained AST; the caller admits each target."""
@@ -117,7 +117,7 @@ def prepare_algebra_stop_evaluator(
         block,
         species_names=species_names,
         initials=initials,
-        symbol_values=symbol_values,
+        symbol_resolver=symbol_resolver,
         runtime_symbol_names=runtime_symbol_names,
     )
 
@@ -127,24 +127,17 @@ def _build_simulation_context(
     t: np.ndarray,
     species_series: Dict[str, np.ndarray],
     initials: Dict[str, float],
-    symbol_series: Mapping[str, np.ndarray | float],
-    symbol_values: Mapping[str, float],
-    symbol_resolver: Callable[[str], float | np.ndarray | None] | None,
+    symbol_resolver: Callable[[str, int], float | None] | None,
     runtime_symbol_names: frozenset[str],
     cancellation_check: Callable[[], bool] | None,
 ) -> EvaluationContext:
     """Build one row-aligned context for the retained Algebra program."""
     t_arr = np.asarray(t, dtype=float).reshape(-1)
-    runtime_series: Dict[str, np.ndarray | float] = dict(symbol_series)
-    runtime_series.setdefault("t", t_arr)
-    symtab = SymbolTable()
     return EvaluationContext(
         t=t_arr,
         species_series={k: np.asarray(v, dtype=float).reshape(-1) for k, v in species_series.items()},
         initials={str(k): float(v) for k, v in initials.items()},
-        symtab=symtab,
-        symbol_series=runtime_series,
-        symbol_values={str(name): float(value) for name, value in symbol_values.items()},
+        symtab=SymbolTable(),
         symbol_resolver=symbol_resolver,
         runtime_symbol_names=runtime_symbol_names,
         cancellation_check=cancellation_check,
@@ -157,9 +150,7 @@ def evaluate_algebra_block_for_simulation_partial(
     t: np.ndarray,
     species_series: Dict[str, np.ndarray],
     initials: Dict[str, float],
-    symbol_series: Mapping[str, np.ndarray | float],
-    symbol_values: Mapping[str, float],
-    symbol_resolver: Callable[[str], float | np.ndarray | None] | None = None,
+    symbol_resolver: Callable[[str, int], float | None] | None = None,
     runtime_symbol_names: frozenset[str] = frozenset(),
     cancellation_check: Callable[[], bool] | None = None,
 ) -> Tuple[Dict[str, np.ndarray], Dict[str, float], list[AlgebraObservableError]]:
@@ -168,8 +159,6 @@ def evaluate_algebra_block_for_simulation_partial(
         t=t,
         species_series=species_series,
         initials=initials,
-        symbol_series=symbol_series,
-        symbol_values=symbol_values,
         symbol_resolver=symbol_resolver,
         runtime_symbol_names=runtime_symbol_names,
         cancellation_check=cancellation_check,

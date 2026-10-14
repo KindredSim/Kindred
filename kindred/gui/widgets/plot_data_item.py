@@ -6,11 +6,10 @@ from collections.abc import Sequence
 
 import numpy as np
 
-from kindred.gui.plot_config import require_pyqtgraph
+import pyqtgraph as pg
 
 __all__ = ["PlotDataItem"]
 
-pg = require_pyqtgraph(context="Kindred GUI")
 
 
 class PlotDataItem(pg.PlotDataItem):

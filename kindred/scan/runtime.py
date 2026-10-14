@@ -8,7 +8,7 @@ import time
 
 from kindred.core.exceptions import SimulationCancelled
 from kindred.core.simulation_execution import execute_simulation
-from kindred.core.simulation_preparation import build_simulation_execution_request, SimulationPreparationError
+from kindred.core.simulation_preparation import build_simulation_execution_request
 from kindred.core.simulation_preparation_stages import build_solver_config
 from kindred.core.simulator.dsl_parse import prepare_dsl_request_set
 from kindred.core.simulator.solver_types import SimulationCancellationControl
@@ -37,10 +37,8 @@ def execute_input(config, prepared, solver, run, cancellation):
     except SimulationCancelled:
         record.update(simulation_status="cancelled", export_status="not_applicable", stage=stage)
     except Exception as exc:
-        if isinstance(exc, SimulationPreparationError):
-            stage = exc.stage
         record.update(simulation_status="failed", export_status="not_applicable", stage=stage,
-                      error={"type": type(exc).__name__, "message": str(exc)})
+                      error={"message": str(exc)})
     else:
         record = result_record(run, result, config.outputs)
     return record
@@ -224,7 +222,7 @@ def run_scan(config, prepared, cancel, progress_callback):
                         if child.started:
                             record = input_record(child.run)
                             record.update(simulation_status="failed", export_status="not_applicable", stage="worker",
-                                          error={"type": "WorkerExit", "message": "Worker exited before returning its result."})
+                                          error={"message": "Worker exited before returning its result."})
                             consume(record)
                         fail("A worker exited unexpectedly. Remaining work was canceled without retries.")
                     child.process.join()
@@ -275,7 +273,7 @@ def run_scan(config, prepared, cancel, progress_callback):
                 if child.run is not None and child.started:
                     record = input_record(child.run)
                     record.update(simulation_status="failed", export_status="not_applicable", stage="worker",
-                                  error={"type": "WorkerExit", "message": "Worker exited without a terminal result."})
+                                  error={"message": "Worker exited without a terminal result."})
                     consume(record)
             finally:
                 child.connection.close()

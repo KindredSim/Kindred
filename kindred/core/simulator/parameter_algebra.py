@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 
+from kindred.core.exceptions import KindredError
 from kindred.core.simulator.errors import DSLError
 from kindred.core.simulator.parameter_algebra_spec import ParameterAlgebraSpec
 from kindred.core.algebra.evaluator import bind_scalar_expression_evaluator
@@ -35,6 +36,11 @@ __all__ = [
 
 def parameter_algebra_spec_from_mechanism(mechanism: object) -> ParameterAlgebraSpec:
     return mechanism.metadata[_PARAMETER_ALGEBRA_SPEC_META_KEY]
+
+
+def _sentence(exc: Exception) -> str:
+    """The failure's own sentence, which the param line then locates."""
+    return exc.message if isinstance(exc, KindredError) else str(exc)
 
 
 def apply_parameter_algebra_spec_to_mechanism(
@@ -74,7 +80,7 @@ def apply_parameter_algebra_spec_to_mechanism(
                         parameter_target_map=parameter_target_map, units=input_units,
                     )
                 except (AlgebraError, ValueError) as exc:
-                    raise DSLError(str(exc), line_number=assignment.line_number,
+                    raise DSLError(_sentence(exc), line_number=assignment.line_number,
                                    line_content=assignment.line_content) from exc
             continue
         derived = spec.parameter_assignment_kind(name) != "independent scalar"
@@ -87,7 +93,7 @@ def apply_parameter_algebra_spec_to_mechanism(
             try:
                 scalars[name] = admit_scalar(convert_value(literal(statements[name]), input_units[name], scientific_units[name]), name)
             except (AlgebraError, ValueError) as exc:
-                raise DSLError(str(exc), line_number=assignment.line_number,
+                raise DSLError(_sentence(exc), line_number=assignment.line_number,
                                line_content=assignment.line_content) from exc
 
     apply_mechanism_coordinate_values(

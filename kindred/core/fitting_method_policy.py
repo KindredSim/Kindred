@@ -12,8 +12,7 @@ __all__ = [
 SUPPORTED_FIT_METHODS = ("trf", "dogbox", "differential_evolution")
 # Profile likelihood refits from the completed Fit with a local optimizer.
 UNCERTAINTY_FIT_METHODS = ("trf", "dogbox")
-# Default objective and step tolerance of a least-squares fit, also used by the
-# Profile likelihood refits after Differential Evolution.
+# Default objective and step tolerance of a least-squares fit.
 LEAST_SQUARES_TOLERANCE = 1e-10
 
 

@@ -3,11 +3,9 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 
-from kindred.core.algebra.errors import UNCOMPUTABLE_ERRORS, AlgebraError
 from kindred.core.algebra.evaluator import bind_scalar_expression_evaluator
-from kindred.core.exceptions import ErrorContext, KineticRuntimeDomainError
+from kindred.core.exceptions import ErrorContext, KindredError
 from kindred.core.mechanism_metadata import MechanismMetadataView
-from kindred.core.simulator.errors import DSLError
 from kindred.core.algebra.parser import _iter_identifiers
 from kindred.core.simulator.parameter_algebra_spec import ParameterAlgebraSpec
 from kindred.core.simulator.parameter_coordinates import (
@@ -21,7 +19,7 @@ def bind_parameter_evaluation(
     mechanism: object,
     base_values: Mapping[str, float] | None = None,
 ):
-    """Bind once; evaluate requested dependency closures at the current temperature."""
+    """Bind once; calculate the requested values, and what they read, at the current temperature."""
     targets = build_parameter_target_map(mechanism)
     graph = spec.evaluation_dependencies
     statements = {statement.name: statement for statement in spec.parameter_block.lines}
@@ -47,8 +45,28 @@ def bind_parameter_evaluation(
             values[name] = float(value)
     values.update(base_values or {})
     values["T"] = float(MechanismMetadataView.from_metadata(metadata).temperature_K)
-    expression = bind_scalar_expression_evaluator(spec.parameter_block, values)
     operations = {}
+    completed: set[str] = set()
+
+    def ensure(name: str) -> None:
+        """Calculate one value on first read; an untaken ``ifelse`` branch is
+        never read, so nothing it names is calculated."""
+        if name in completed or name not in operations:
+            return
+        if name in spec.chemistry_dependencies:
+            # A chemistry readout reads its inputs from the table directly.
+            for dependency in graph[name]:
+                ensure(dependency)
+        calculate(name, operations[name])
+        completed.add(name)
+
+    def resolve(name: str, _row: int) -> float | None:
+        if name not in operations:
+            return None
+        ensure(name)
+        return values[name]
+
+    expression = bind_scalar_expression_evaluator(spec.parameter_block, values, resolver=resolve)
     for name in graph:
         if name in spec.identity_checks or name in inputs:
             continue
@@ -71,44 +89,27 @@ def bind_parameter_evaluation(
                 _admit_coordinate_value(mechanism, name, value, targets[name], unit=input_units[name].symbol)
             if not check:
                 values[name] = value
-        except (*UNCOMPUTABLE_ERRORS, ArithmeticError, ValueError) as exc:
-            # A value its formula cannot compute is outside its domain, like
-            # one it computes but refuses.  The refusal is shown on the line
-            # that calculates the value: its param line, else its reaction line.
-            statement = statements.get(name)
-            entry = targets[name][4] if statement is None else None
-            raise KineticRuntimeDomainError(
-                str(exc),
-                parameter_names=spec.input_dependencies((name,)),
-                details={"assignment": name, "value_dependencies": spec.input_dependencies((name,))},
-                context=(ErrorContext(line=statement.line, line_text=statement.line_text)
-                         if statement is not None
-                         else ErrorContext(line=entry["line"], line_text=entry["line_text"])),
-            ) from exc
-        except AlgebraError as exc:
-            error = DSLError(
-                str(exc),
-                line_number=statements[name].line,
-                line_content=statements[name].line_text,
-            )
-            error.details.update(
-                assignment=name,
-                value_dependencies=spec.input_dependencies((name,)),
-                parameter_names=spec.input_dependencies((name,)),
-            )
-            raise error from exc
+        except KindredError as exc:
+            # The value that failed names itself and its inputs, on the line
+            # that calculates it: its param line, else its reaction line; the
+            # values that read it add nothing.
+            if "assignment" not in exc.details:
+                statement = statements.get(name)
+                entry = targets[name][4] if statement is None else None
+                exc.annotate(
+                    context=(ErrorContext(line=statement.line, line_text=statement.line_text)
+                             if statement is not None
+                             else ErrorContext(line=entry["line"], line_text=entry["line_text"])),
+                    assignment=name,
+                    parameter_names=spec.input_dependencies((name,)),
+                )
+            raise
 
     dynamic = set(operations) & spec.temperature_dependent_names
-    check_dependencies = {
-        name: tuple(_iter_identifiers(statements[name].expr))
-        for name in spec.identity_checks
-    }
     dynamic_checks = {
-        name for name, deps in check_dependencies.items()
-        if set(deps) & spec.temperature_dependent_names
+        name for name in spec.identity_checks
+        if set(_iter_identifiers(statements[name].expr)) & spec.temperature_dependent_names
     }
-    closures: dict[tuple[str, ...], tuple[str, ...]] = {}
-    completed: set[str] = set()
     checked: set[str] = set()
     last_temperature = None
 
@@ -121,27 +122,8 @@ def bind_parameter_evaluation(
                 values.pop(name, None)
             values["T"] = float(temperature)
             last_temperature = temperature
-        if requested_names not in closures:
-            required: set[str] = set()
-
-            def visit(name: str) -> None:
-                if name in required:
-                    return
-                required.add(name)
-                for dependency in graph.get(name, ()):
-                    visit(dependency)
-
-            for name in requested_names:
-                visit(name)
-            for deps in check_dependencies.values():
-                for name in deps:
-                    visit(name)
-            closures[requested_names] = tuple(name for name in operations if name in required)
-        for name in closures[requested_names]:
-            if name in completed:
-                continue
-            calculate(name, operations[name])
-            completed.add(name)
+        for name in requested_names:
+            ensure(name)
         for name in spec.identity_checks:
             if name in checked:
                 continue

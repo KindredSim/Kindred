@@ -9,7 +9,7 @@ import threading
 
 from PySide6 import QtCore
 
-from kindred.core.simulation_failure import factual_cause_from_exception
+from kindred.core.simulation_failure import FactualCause
 from kindred.gui.fitting import codec, launch, runtime
 
 __all__ = ["GlobalFitWorker"]
@@ -196,13 +196,14 @@ class GlobalFitWorker(QtCore.QThread):
             else:
                 settled.set()
 
+        if diagnostics and (errors or (terminal is not None and terminal[0] == "factual_failure")):
+            logger.error("Fitting runtime diagnostics:\n%s", diagnostics.decode("utf-8", errors="replace"))
         if errors:
             detail = str(errors[0])
             if diagnostics:
-                logger.error("Fitting runtime diagnostics:\n%s", diagnostics.decode("utf-8", errors="replace"))
                 detail += " Its diagnostics are in the Diagnostic Log."
-            terminal = ("factual_failure", (factual_cause_from_exception(
-                RuntimeError(detail), domain="fit", origin="fit_process",
+            terminal = ("factual_failure", (FactualCause(
+                domain="fit", origin="fit_process", code=None, message=detail,
             ),))
         elif self._cancelled.is_set():
             terminal = ("cancelled", ())

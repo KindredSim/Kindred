@@ -94,12 +94,14 @@ def _algebra_cause(error: AlgebraObservableError, spec: object) -> FactualCause:
         # A let undefined at some time points only names where.
         message = (f"{message} Undefined at {details['undefined_points']} of {details['points']} "
                    f"time points, first at t = {details['first_undefined_time']:g} s.")
-    if error.exc_type in {error_type.__name__ for error_type in UNCOMPUTABLE_ERRORS}:
-        details["stage"] = "result_algebra"
-        details["parameter_names"] = spec.input_dependencies(
-            observable_parameter_roots(spec.observable_block, error.name)
-        )
-        details["reads_species"] = observable_reads_species(spec.observable_block, error.name)
+    if error.value_failure:
+        details["value_failure"] = True
+        # A param it reads that failed names its own inputs.
+        if "assignment" not in details:
+            details["parameter_names"] = spec.input_dependencies(
+                observable_parameter_roots(spec.observable_block, error.name)
+            )
+            details["reads_species"] = observable_reads_species(spec.observable_block, error.name)
     if error.col is not None:
         details["col"] = error.col
     # The authored statement is the cause's location, as for every other cause.
@@ -109,7 +111,6 @@ def _algebra_cause(error: AlgebraObservableError, spec: object) -> FactualCause:
         domain="simulation",
         origin="algebra",
         code=error.code,
-        type=error.exc_type,
         message=message,
         context=context,
         details=details,
@@ -170,37 +171,32 @@ def finalize_simulation_result(
             for index, name in enumerate(base_species_names)
         }
         runtime_names = runtime_algebra_symbol_names(parameter_algebra_spec)
-        symbol_failures: dict[str, Exception] = {}
+        # A param read by a let, as its value or failure at a temperature: at
+        # each row's own when it changes with temperature, so it fails only at
+        # the rows it cannot be calculated at. A failure is kept without its
+        # traceback, which would otherwise grow with every row raising it.
+        resolved: dict[tuple[str, float], float | Exception] = {}
 
-        def resolve_symbol(name: str) -> float | np.ndarray | None:
-            check_cancelled()
+        def resolve_symbol(name: str, row: int) -> float | None:
             if name not in parameter_algebra_spec.evaluation_dependencies:
                 return None
-            if name in symbol_failures:
-                raise symbol_failures[name]
-            try:
-                if name in runtime_names:
-                    values = np.empty(result.temperature_K.size, dtype=float)
-                    for index, temperature in enumerate(result.temperature_K):
-                        if index % 256 == 0:
-                            check_cancelled()
-                        values[index] = parameter_values_at_temperature(float(temperature), (name,))[name]
-                    check_cancelled()
-                    return values
-                return parameter_values_at_temperature(float(result.temperature_K[0]), (name,))[name]
-            except SimulationCancelled:
-                raise
-            except Exception as exc:
-                symbol_failures[name] = exc
-                raise
+            temperature = float(result.temperature_K[row if name in runtime_names else 0])
+            key = (name, temperature)
+            if key not in resolved:
+                try:
+                    resolved[key] = parameter_values_at_temperature(temperature, (name,))[name]
+                except UNCOMPUTABLE_ERRORS as exc:
+                    resolved[key] = exc.with_traceback(None)
+            value = resolved[key]
+            if isinstance(value, Exception):
+                raise value.with_traceback(None)
+            return value
         algebra_series, algebra_scalars, algebra_errors = (
             evaluate_algebra_block_for_simulation_partial(
                 observable_block,
                 t=result_time,
                 species_series=species_series,
                 initials=initials_for_algebra,
-                symbol_series={},
-                symbol_values={},
                 symbol_resolver=resolve_symbol,
                 runtime_symbol_names=runtime_names,
                 cancellation_check=None if cancellation_control is None else cancellation_control.cancel_requested,

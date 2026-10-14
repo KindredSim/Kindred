@@ -3,7 +3,6 @@ from __future__ import annotations
 import logging
 import os
 
-from kindred.gui.plot_config import require_pyqtgraph
 
 logger = logging.getLogger(__name__)
 
@@ -46,7 +45,6 @@ def apply_qt_startup_workarounds(*, qt_core: object) -> bool:
             )
     else:
         mode = "auto"
-    require_pyqtgraph(context="Kindred GUI")
     is_wsl = detect_wsl_environment()
 
     apply_software = False

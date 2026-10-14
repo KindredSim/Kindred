@@ -5,15 +5,14 @@ from kindred.core._bounded_rational import literal_fraction
 
 from dataclasses import dataclass, replace
 from fractions import Fraction as F
+import math
 from itertools import product
 from typing import Callable
 
-from kindred.core.algebra.errors import AlgebraError
-from kindred.core.exceptions import located
 from kindred.core.algebra.parser import (
     AlgebraBlock, NumberNode, IdentNode, SpeciesRefNode, UnaryNode, BinaryNode, CallNode,
 )
-from kindred.core.algebra.symbols import SymbolTable, BUILTIN_FUNCTIONS
+from kindred.core.algebra.symbols import POWER_DOMAIN, SymbolTable, BUILTIN_FUNCTIONS
 from kindred.core.algebra.evaluator import EvaluationContext, evaluate_block
 from kindred.core.simulation_parameters import enumerate_simulation_parameters
 from kindred.core.quantity_units import conversion_scale, convert_value, presentation_unit
@@ -75,6 +74,9 @@ def scientific_constraints(spec, constraints):
     return tuple(result)
 
 
+_AFFINE_FORMS = ("Constraints accept sums and differences of inputs, each multiplied by a fixed number or "
+                 "divided by a nonzero one, without comparisons or logic.")
+
 def compile_constraints(prepared, config: ScanConfig, fixed: dict[str, float]):
     spec = prepared.parameter_algebra_spec_for_execution()
     statements = {}
@@ -92,6 +94,23 @@ def compile_constraints(prepared, config: ScanConfig, fixed: dict[str, float]):
             return Affine({}, F(fixed[key]))
         return Affine({key: F(1)})
 
+    def named(name: str) -> Affine:
+        if name in {"t", "T"}:
+            raise ValueError(f"{name} is an execution-dependent symbol.")
+        key = parameter_key(name)
+        if key in available:
+            scale = conversion_scale(inputs[name], quantities[name])
+            factor = scale.rational()
+            return coordinate(key).scale(factor if factor is not None else F(scale.number()))
+        if name in memo:
+            return memo[name]
+        if name in statements:
+            memo[name] = lower(statements[name])
+            return memo[name]
+        if symbols.has(name):
+            return Affine({}, F(symbols.get(name)))
+        raise ValueError(f"{name} is not a supported independent input or input-only definition.")
+
     def lower(node) -> Affine:
         value = unscaled(node)
         factor = node.unit_scale.rational()
@@ -105,24 +124,10 @@ def compile_constraints(prepared, config: ScanConfig, fixed: dict[str, float]):
                 raise ValueError(f"[{node.name}] depends on simulated concentrations. Use an input-only quantity.")
             return coordinate(initial_key(node.name))
         if isinstance(node, IdentNode):
-            if node.name in {"t", "T"}:
-                raise ValueError(f"{node.name} is an execution-dependent symbol.")
-            key = parameter_key(node.name)
-            if key in available:
-                scale = conversion_scale(inputs[node.name], quantities[node.name])
-                factor = scale.rational()
-                return coordinate(key).scale(factor if factor is not None else F(scale.number()))
-            if node.name in memo:
-                return memo[node.name]
-            if node.name in statements:
-                memo[node.name] = lower(statements[node.name])
-                return memo[node.name]
-            if symbols.has(node.name):
-                return Affine({}, F(symbols.get(node.name)))
-            raise ValueError(f"{node.name} is not a supported independent input or input-only definition.")
+            return named(node.name)
         if isinstance(node, UnaryNode):
             if node.op not in {"+", "-"}:
-                raise ValueError("Only numeric affine expressions are supported.")
+                raise ValueError(_AFFINE_FORMS)
             return lower(node.rhs).scale(F(-1 if node.op == "-" else 1))
         if isinstance(node, BinaryNode):
             left, right = lower(node.lhs), lower(node.rhs)
@@ -135,12 +140,22 @@ def compile_constraints(prepared, config: ScanConfig, fixed: dict[str, float]):
             if node.op == "/" and not right.terms and right.constant:
                 return left.scale(1 / right.constant)
             if node.op in {"^", "**"} and not left.terms and not right.terms:
-                return Affine({}, F(float(left.constant) ** float(right.constant)))
-            raise ValueError("This quantity is nonlinear in the scanned inputs or has a variable denominator.")
+                # As Kindred evaluates a power, never into complex numbers.
+                try:
+                    return Affine({}, F(math.pow(float(left.constant), float(right.constant))))
+                except ValueError:
+                    raise ValueError("^ " + POWER_DOMAIN) from None
+            raise ValueError(_AFFINE_FORMS)
         if isinstance(node, CallNode):
+            if node.name == "ifelse":
+                # Only the selected value is calculated, as in a Run.
+                condition = lower(node.args[0])
+                if condition.terms:
+                    raise ValueError("ifelse(...) reads a scanned input in its condition; constraints accept a fixed condition.")
+                return lower(node.args[1] if condition.constant else node.args[2])
             arguments = [lower(arg) for arg in node.args]
             if any(arg.terms for arg in arguments):
-                raise ValueError(f"{node.name}(...) depends nonlinearly on scanned inputs.")
+                raise ValueError(f"{node.name}(...) reads a scanned input; constraints accept functions only of fixed values.")
             return Affine({}, F(BUILTIN_FUNCTIONS[node.name](*(float(a.constant) for a in arguments))))
 
     equations, dependents, inequalities, conditional = [], [], [], []
@@ -175,6 +190,16 @@ def compile_constraints(prepared, config: ScanConfig, fixed: dict[str, float]):
     time_order = Affine({START: F(1), END: F(-1)}).substitute(
         {key: Affine({}, F(value)) for key, value in fixed.items()})
     inequalities.append(Inequality(time_order, True))
+    # So is each flux and hold ending after it starts, when params place its ends.
+    schedule = prepared.parameterized_intervention_schedule_for_binding()
+    for item in () if schedule is None else schedule.intervals:
+        try:
+            start, end = (Affine({}, F(getattr(item, field))) if getattr(item, f"{field}_param") is None
+                          else named(getattr(item, f"{field}_param")) for field in ("start_time", "end_time"))
+        except (ValueError, KeyError, OverflowError, ZeroDivisionError):
+            # Not affine in the scanned inputs: the run refuses a reversed draw.
+            continue
+        inequalities.append(Inequality(start.add(end.scale(F(-1))), True))
     return derived, tuple(Inequality(row.expression.substitute(derived), row.strict) for row in inequalities), precedence
 
 
@@ -257,10 +282,7 @@ class IntervalChecks:
                                     initials={k.removeprefix("initial:"): v for k, v in values.items() if k.startswith("initial:")},
                                     symtab=SymbolTable(),
                                     symbol_values={k.removeprefix("parameter:"): convert_value(v, self.input_units[k.removeprefix("parameter:")], self.quantity_units[k.removeprefix("parameter:")]) for k, v in values.items() if k.startswith("parameter:")})
-        try:
-            _, scalars = evaluate_block(block, context)
-        except AlgebraError as exc:
-            raise ValueError(located(str(exc), exc.line, exc.line_text)) from exc
+        _, scalars = evaluate_block(block, context)
         for condition in conditions:
             value = scalars[condition.observable]
             if not Interval(condition.lower, condition.upper, condition.include_lower, condition.include_upper).contains(value):

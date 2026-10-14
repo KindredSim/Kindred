@@ -117,7 +117,7 @@ class SolverSettingsDialog(QtWidgets.QDialog):
     def _accept_candidate(self) -> None:
         try:
             self.execution_settings()
-        except (TypeError, ValueError) as exc:
+        except ValueError as exc:
             QtWidgets.QMessageBox.warning(
                 self,
                 "Invalid Run Settings",
@@ -220,9 +220,9 @@ class SimulationSettingsDialog(QtWidgets.QDialog):
         )
         self.use_authored_stops_check.setToolTip(
             "Apply stopping interventions authored in this mechanism to Run and Preview "
-            "for every initial-condition set. When enabled, a rule may end integration "
-            "before t_end. When disabled, runs continue to t_end. "
-            "Fitting always ignores stopping interventions."
+            "for every initial-condition set, and to Fit datasets with a measured X. "
+            "When enabled, a rule may end integration before t_end. When disabled, "
+            "runs continue to t_end. Fitting against time always ignores stopping interventions."
         )
         self._stopping_declarations: tuple[str, ...] = ()
         self.stopping_info_button = QtWidgets.QPushButton("Authored Rules…", science_box)
@@ -472,7 +472,7 @@ class SimulationSettingsDialog(QtWidgets.QDialog):
             self.preview_settings()
             self.run_user_maximum()
             self.result_cache_capacity()
-        except (TypeError, ValueError, OverflowError) as exc:
+        except ValueError as exc:
             QtWidgets.QMessageBox.warning(
                 self,
                 "Invalid Simulation Settings",
