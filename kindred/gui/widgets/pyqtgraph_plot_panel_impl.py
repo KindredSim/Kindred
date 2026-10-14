@@ -256,7 +256,6 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         self._interactive_target_set_ids: tuple[str, ...] = ()
         self._interactive_last_presented_at: float | None = None
         self._interactive_tick_requested = False
-        self._interactive_frozen = False
         self._interactive_rendered_frame = False
         self._interactive_projection_sampling_limit: int | None = None
         self._interactive_projection_sampling_known = False
@@ -917,6 +916,8 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         targets = {str(value) for value in target_set_ids}
         if not targets:
             return False
+        # As when items are added, auto-range is applied once after removing them.
+        self._plot_widget.getViewBox().disableAutoRange()
         retired = False
         for item_key, item in tuple(self._plot_items_by_key.items()):
             role = item_key[0] if item_key else None
@@ -951,18 +952,14 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
             self._remove_annotation_item(item)
             del self._annotation_items[annotation_key]
             retired = True
+        self._apply_axis_range_state(self._axis_range, self._presentation)
         return retired
 
-    def stop_interactive_display(self) -> bool:
+    def stop_interactive_display(self) -> None:
         """Cancel visual work and release transient physical custody."""
 
-        if (
-            not self._interactive_has_visible_frame
-            and not self._interactive_has_pending_batch
-        ):
-            return False
-        self._clear_interactive_display(reset_currentness=True)
-        return True
+        if self._interactive_has_visible_frame or self._interactive_has_pending_batch:
+            self._clear_interactive_display(reset_currentness=True)
 
     def set_persisted_plot_state(self, state: ProjectPresentationState) -> None:
         """Project the registry's accepted choices; the next render refits changed coordinates."""
@@ -1056,12 +1053,9 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         if self._interactive_request is None:
             self._interactive_request = request
             self._interactive_target_set_ids = roster
-            self._interactive_frozen = False
         elif request is not self._interactive_request:
             self._supersede_interactive_request(request, roster)
         elif set_id not in self._interactive_target_set_ids:
-            return False
-        if self._interactive_frozen:
             return False
         self._interactive_results[set_id] = result
         self._recompose_interactive_display()
@@ -1074,14 +1068,18 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
     ) -> None:
         """Replace aggregate authority while retaining the last rendered frame."""
 
-        # Keep the last drawn frame until a current result replaces it. An
-        # already scheduled tick must keep its deadline: restarting it for
-        # every new request can starve drawing during a fast drag.
-        self._interactive_results.clear()
+        # Keep the last drawn frame, and each still-targeted set's last result,
+        # until a current result replaces it. An already scheduled tick must
+        # keep its deadline: restarting it for every new request can starve
+        # drawing during a fast drag.
+        self._interactive_results = {
+            set_id: result
+            for set_id, result in self._interactive_results.items()
+            if set_id in target_set_ids
+        }
         self._interactive_pending = None
         self._interactive_target_set_ids = target_set_ids
         self._interactive_request = request
-        self._interactive_frozen = False
 
     def _offer_interactive_projection(
         self,
@@ -1114,7 +1112,6 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         self._interactive_pending = None
         self._interactive_results.clear()
         self._interactive_target_set_ids = ()
-        self._interactive_frozen = True
         self._interactive_projection_sampling_limit = None
         self._interactive_projection_sampling_known = False
         if reset_currentness:
@@ -1153,11 +1150,6 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
             set_id
             for set_id in self._interactive_target_set_ids
             if set_id not in affected
-        )
-        self._interactive_frozen = not bool(
-            self._interactive_results
-            or self._interactive_visible
-            or self._interactive_target_set_ids
         )
         if not self._interactive_visible:
             self._interactive_projection_sampling_limit = None
@@ -1404,6 +1396,8 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
             self._interactive_rendered_frame = False
             return
 
+        # As in the static scene, auto-range is applied once after the items.
+        self._plot_widget.getViewBox().disableAutoRange()
         existing = dict(self._interactive_items)
         rendered: dict[tuple[object, ...], Any] = {}
         rendered_points: list[_RenderedPointBlock] = []
@@ -1501,6 +1495,7 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
                     chunk.x.size for chunk in rendered_block.chunks
                 ):
                     rendered_points.extend(self._transformed_blocks(rendered_block))
+        self._apply_axis_range_state(self._axis_range, self._presentation)
         self._rendered_point_roster = tuple(rendered_points)
         if rendered and not self._interactive_rendered_frame:
             self._begin_interactive_gesture_session()
@@ -1544,6 +1539,8 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         )
 
     def _clear_interactive_items(self) -> None:
+        # Its caller applies auto-range once after the removals.
+        self._plot_widget.getViewBox().disableAutoRange()
         for item in tuple(self._interactive_items.values()):
             self._remove_plot_item(item)
         self._interactive_items.clear()
@@ -1758,6 +1755,9 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         render_input: ResultRenderInput,
     ) -> None:
         self._rendered_point_roster = ()
+        # Every added or removed item re-ranges over the whole plot; the axis
+        # state applied with the presentation below restores auto-range once.
+        self._plot_widget.getViewBox().disableAutoRange()
         existing_items = dict(self._plot_items_by_key)
         self._configure_axis_unit_controls(render_input)
         x_label, y_label = self._display_axis_labels(render_input)
@@ -2566,7 +2566,12 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
             view.setAutoPan(x=state.pan_x, y=state.pan_y)
         if view.state["autoVisibleOnly"] != [False, state.visible_x]:
             view.setAutoVisible(x=False, y=state.visible_x)
-        view.updateAutoRange()
+        # Each curve draws Y data only within 1e6 view heights, so a fit from a
+        # nearly flat view sees trimmed bounds; refit until the range holds.
+        fitted = None
+        while fitted != view.viewRange():
+            fitted = view.viewRange()
+            view.updateAutoRange()
 
     @QtCore.Slot(bool)
     def _set_zoom_enabled(self, enabled: bool) -> None:

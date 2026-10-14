@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from kindred.core.quantity_units import parse_unit
-
 from dataclasses import dataclass, replace
 import math
 from typing import Iterable
@@ -46,11 +44,7 @@ from kindred.gui.widgets.batch_initial_conditions_table import (
 )
 from kindred.gui.widgets.mechanism_editor import MechanismEditorTabbed
 
-__all__ = [
-    "TabSliderBinding",
-    "ParameterSliderProjection",
-    "build_parameter_slider_projection",
-]
+__all__ = ["TabSliderBinding"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -73,11 +67,10 @@ class _PendingGesture:
 
 @dataclass(frozen=True, slots=True)
 class _PreviewPreflight:
-    """Admitted Slider Preview inputs, captured at a gesture or checked live."""
+    """Admitted Slider Preview inputs for one staged value."""
 
     tab: MechanismTabDocument
     projection: ParameterSliderProjection
-    targets: tuple[str, ...]
 
 
 def build_parameter_slider_projection(
@@ -90,7 +83,6 @@ class TabSliderBinding(QtCore.QObject):
     """Own one tab's Slider drafts; the job owner owns computation custody."""
 
     draftStateChanged = QtCore.Signal(str)
-    sliderDraftStateChanged = QtCore.Signal(str, bool, bool)
     targetSetIdsChanged = QtCore.Signal(object)
     errorRaised = QtCore.Signal(str)
 
@@ -118,22 +110,21 @@ class TabSliderBinding(QtCore.QObject):
             slider_workspace_owner,
             simulation_jobs,
         )
+        # The rendered parameter coordinates and the accepted mechanism they
+        # were built from.
         self._projection = None
+        self._projection_dsl = None
         self._last_targets = ()
         self._exact_preview_capture: PreviewCapture | None = None
-        self._rendering = False
         self._disposed = False
-        self._interactive_stop_fenced = False
         # Stop on a Preview holds until the next slider gesture.
         self._preview_stopped = False
-        self._defer_rejected_slider_restore = False
-        self._deferred_restore_pending = False
         self.set_preview_settings(points=preview_points, delay_ms=preview_delay_ms)
         self._throttle_timer = QtCore.QTimer(self)
         self._throttle_timer.setSingleShot(True)
         self._throttle_timer.timeout.connect(self._on_throttle_timeout)
+        # The slider being dragged; Stop clears it, so its release starts nothing.
         self._active_drag = None
-        self._gesture_capture = None
         self._latest_admissible_pending = None
         variable_sliders.interactionRequested.connect(self._on_parameter_interaction)
         variable_sliders.editorValidityChanged.connect(self.publish_slider_draft_state)
@@ -155,27 +146,9 @@ class TabSliderBinding(QtCore.QObject):
     def _stop_preview_timers(self) -> None:
         self._throttle_timer.stop()
 
-    def _clear_gesture_state(self, *, stop_preview_timer: bool = True) -> None:
-        if stop_preview_timer:
-            self._stop_preview_timers()
-        self._active_drag = self._gesture_capture = self._latest_admissible_pending = (
-            None
-        )
-
-    def _cancel_deferred_restore(self) -> None:
-        self._deferred_restore_pending = self._defer_rejected_slider_restore = False
-
-    def _queue_rejected_slider_restore(self) -> None:
-        if not self._deferred_restore_pending:
-            self._deferred_restore_pending = True
-            QtCore.QTimer.singleShot(0, self._restore_rejected_slider_action_later)
-
-    @QtCore.Slot()
-    def _restore_rejected_slider_action_later(self) -> None:
-        if self._deferred_restore_pending:
-            self._deferred_restore_pending = False
-            if not self._disposed:
-                self.render()
+    def _clear_gesture_state(self) -> None:
+        self._stop_preview_timers()
+        self._active_drag = self._latest_admissible_pending = None
 
     def set_preview_settings(self, *, points: int, delay_ms: int) -> None:
         self._preview_points = points
@@ -198,48 +171,21 @@ class TabSliderBinding(QtCore.QObject):
     ) -> None:
         identity = (str(kind), str(name))
         if interaction is SliderInteractionKind.INTERACTIVE_DRAG_SAMPLE:
-            self._interactive_stop_fenced = False
             if self._active_drag != identity:
-                (
-                    self._active_drag,
-                    self._gesture_capture,
-                    self._latest_admissible_pending,
-                ) = identity, None, None
+                self._active_drag, self._latest_admissible_pending = identity, None
             self._record_raw_gesture(*identity, float(value))
             return
         if (
             interaction is SliderInteractionKind.EXACT_DRAG_RELEASE
-            and self._interactive_stop_fenced
+            and self._active_drag != identity
         ):
             return
-        capture = self._gesture_capture if self._active_drag == identity else None
-        self._active_drag = self._latest_admissible_pending = None
-        self._accept_and_submit(
-            kind,
-            name,
-            float(value),
-            interaction=interaction,
-            defer_rejected_restore=interaction
-            in {
-                SliderInteractionKind.EXACT_DRAG_RELEASE,
-                SliderInteractionKind.EXACT_DIRECT_CHANGE,
-            },
-            gesture_capture=capture,
-        )
         self._clear_gesture_state()
+        self._accept_and_submit(kind, name, float(value), interaction=interaction)
 
     def _record_raw_gesture(self, kind: str, name: str, value: float) -> None:
         if not math.isfinite(value) or (kind == "species" and value < 0):
             return
-        if self._gesture_capture is None:
-            prepared = self._preflight_preview_action(self.resolve_target_set_ids())
-            if prepared is None:
-                return
-            self._gesture_capture = _PreviewPreflight(
-                prepared.tab,
-                prepared.projection,
-                prepared.targets,
-            )
         pending = _PendingGesture(
             str(kind),
             str(name),
@@ -259,38 +205,20 @@ class TabSliderBinding(QtCore.QObject):
         value: float,
         *,
         interaction: SliderInteractionKind,
-        defer_rejected_restore: bool,
-        gesture_capture: _PreviewPreflight | None,
-    ) -> bool:
-        self._preview_stopped = False
-        self._cancel_deferred_restore()
-        self._defer_rejected_slider_restore = defer_rejected_restore
-        try:
-            accepted = (
-                self.stage_parameter(
-                    name,
-                    value,
-                    _interaction=interaction,
-                    _gesture_capture=gesture_capture,
-                )
-                if kind == "parameter"
-                else self.stage_species(
-                    name,
-                    value,
-                    _interaction=interaction,
-                    _gesture_capture=gesture_capture,
-                )
-            )
-        finally:
-            self._defer_rejected_slider_restore = False
+    ) -> None:
+        stage = self.stage_parameter if kind == "parameter" else self.stage_species
+        accepted = stage(name, value, interaction=interaction)
+        if accepted:
+            # Only an accepted change ends a Stop's hold.
+            self._preview_stopped = False
         if accepted and interaction is SliderInteractionKind.EXACT_TYPED_COMMIT:
             sliders = (
                 self._variable_sliders if kind == "parameter" else self._species_sliders
             )
             sliders.remember_editor_state(name)
-        if not accepted and defer_rejected_restore:
-            self._queue_rejected_slider_restore()
-        return bool(accepted)
+        if not accepted and interaction is not SliderInteractionKind.INTERACTIVE_DRAG_SAMPLE:
+            # The widget already shows the refused value; show the accepted one.
+            self.render()
 
     def resolve_target_set_ids(self) -> tuple[str, ...]:
         tab = self._registry.tab(self._tab_id)
@@ -302,17 +230,10 @@ class TabSliderBinding(QtCore.QObject):
             existing_set_ids=(item.set_id for item in tab.initial_condition_sets),
         )
 
-    def has_slider_draft(self) -> bool:
-        runtime = self._registry.tab_runtime(self._tab_id)
-        return bool(
-            runtime.slider_parameter_draft or runtime.slider_species_drafts_by_set_id
-        )
-
     def publish_slider_draft_state(self) -> None:
-        dirty = self.has_slider_draft()
-        self.sliderDraftStateChanged.emit(
-            self._tab_id, dirty,
-            dirty or self._variable_sliders.has_rejected_editor_text(),
+        dirty = self._registry.tab_runtime(self._tab_id).has_slider_draft
+        self._slider_workspace_owner.set_slider_draft_actions_enabled(
+            dirty, dirty or self._variable_sliders.has_rejected_editor_text(),
         )
 
     def render(self, *, preserve_editor_drafts: bool = True) -> None:
@@ -325,12 +246,9 @@ class TabSliderBinding(QtCore.QObject):
             if tab.prepared_dsl is None
             else build_parameter_slider_projection(tab.prepared_dsl)
         )
-        if self._active_drag and self._active_drag[0] == "parameter":
-            name = self._active_drag[1]
-            old = None if self._projection is None else self._projection.coordinate(name)
-            new = projection.coordinate(name)
-            if old is None or new is None or parse_unit(old.unit) != parse_unit(new.unit):
-                self._active_drag = None
+        if self._active_drag and self._active_drag[0] == "parameter" and projection != self._projection:
+            # New coordinates rebuild the sliders, which ends the press.
+            self._clear_gesture_state()
         parameters = projection.values_dict()
         parameters.update(runtime.slider_parameter_draft)
         if self._active_drag and self._active_drag[0] == "parameter":
@@ -343,7 +261,6 @@ class TabSliderBinding(QtCore.QObject):
             live = self._species_sliders.get_current_values().get(self._active_drag[1])
             if live is not None:
                 species[self._active_drag[1]] = float(live)
-        self._rendering = True
         vb, sb = (
             QtCore.QSignalBlocker(self._variable_sliders),
             QtCore.QSignalBlocker(self._species_sliders),
@@ -363,8 +280,7 @@ class TabSliderBinding(QtCore.QObject):
         finally:
             del sb
             del vb
-            self._rendering = False
-        self._projection = projection
+        self._projection, self._projection_dsl = projection, tab.prepared_dsl
         self._slider_workspace_owner.render_slider_workspace_presentation()
         self._settle_rendered_targets(tab, targets)
         self.publish_slider_draft_state()
@@ -380,9 +296,9 @@ class TabSliderBinding(QtCore.QObject):
             ):
                 return
             self._exact_preview_capture = None
-        runtime = self._registry.tab_runtime(tab.tab_id)
-        if not self._preview_stopped and (
-            runtime.slider_parameter_draft or runtime.slider_species_drafts_by_set_id
+        if (
+            not self._preview_stopped
+            and self._registry.tab_runtime(tab.tab_id).has_slider_draft
         ):
             self._begin_preview_cycle(
                 tab,
@@ -401,12 +317,12 @@ class TabSliderBinding(QtCore.QObject):
         finally:
             del sb
             del vb
-        self._projection = None
+        self._projection = self._projection_dsl = None
         self._slider_workspace_owner.render_slider_workspace_presentation()
 
     def _reconcile_target_change(
         self, tab: MechanismTabDocument, targets: tuple[str, ...]
-    ) -> bool:
+    ) -> None:
         previous, current = self._last_targets, tuple(targets)
         self._last_targets = current
         if previous != current:
@@ -417,7 +333,6 @@ class TabSliderBinding(QtCore.QObject):
         removed = tuple(item for item in previous if item not in set(current))
         if removed:
             self._simulation_jobs.reconcile_canonical_targets(tab.tab_id, removed)
-        return previous != current
 
     def _project_species_targets(
         self, tab: MechanismTabDocument, targets: tuple[str, ...]
@@ -442,48 +357,31 @@ class TabSliderBinding(QtCore.QObject):
     def _preflight_preview_action(
         self, targets: tuple[str, ...]
     ) -> _PreviewPreflight | None:
-        tab, runtime = (
-            self._registry.tab(self._tab_id),
-            self._registry.tab_runtime(self._tab_id),
+        # Previews build from the accepted science; a Reactions draft does
+        # not block them.
+        tab = self._registry.tab(self._tab_id)
+        if not targets or tab.prepared_dsl is None:
+            return None
+        projection = (
+            self._projection if self._projection_dsl is tab.prepared_dsl
+            else build_parameter_slider_projection(tab.prepared_dsl)
         )
-        if runtime.reactions_draft is not None or not targets:
-            return None
-        if tab.prepared_dsl is None:
-            return None
-        return _PreviewPreflight(tab, build_parameter_slider_projection(tab.prepared_dsl), tuple(targets))
-
-    def _captured_gesture_transaction(
-        self, capture: _PreviewPreflight, targets: tuple[str, ...]
-    ) -> _PreviewPreflight | None:
-        if (
-            capture.tab.tab_id != self._tab_id
-            or capture.targets != tuple(targets)
-            or self._registry.tab(self._tab_id) is not capture.tab
-        ):
-            return None
-        return capture
+        return _PreviewPreflight(tab, projection)
 
     def stage_parameter(
         self,
         name: str,
         value: float,
         *,
-        _interaction: SliderInteractionKind = SliderInteractionKind.EXACT_TYPED_COMMIT,
-        _gesture_capture: _PreviewPreflight | None = None,
+        interaction: SliderInteractionKind,
     ) -> bool:
-        if self._rendering:
-            return False
         targets = self.resolve_target_set_ids()
-        prepared = (
-            self._preflight_preview_action(targets)
-            if _gesture_capture is None
-            else self._captured_gesture_transaction(_gesture_capture, targets)
-        )
+        prepared = self._preflight_preview_action(targets)
         if prepared is None:
-            return self._restore_rejected_slider_action()
+            return False
         coordinate = prepared.projection.coordinate(str(name))
         if coordinate is None:
-            return self._reject_slider_action(f"Parameter {name!r} is not editable.")
+            return self._reject(f"Parameter {name!r} is not editable.")
         try:
             value_f = admit_gui_parameter_value(
                 value,
@@ -493,16 +391,14 @@ class TabSliderBinding(QtCore.QObject):
                 field=f"Parameter {name!r}",
             )
         except ValueError as exc:
-            if _interaction is SliderInteractionKind.EXACT_TYPED_COMMIT:
+            if interaction is SliderInteractionKind.EXACT_TYPED_COMMIT:
                 accepted_value = self._registry.tab_runtime(
                     self._tab_id
                 ).slider_parameter_draft.get(
                     name, prepared.projection.values_dict()[name]
                 )
                 self._variable_sliders.reject_editor_value(name, accepted_value)
-                self.errorRaised.emit(str(exc))
-                return False
-            return self._reject_slider_action(str(exc))
+            return self._reject(str(exc))
         runtime = self._registry.tab_runtime(self._tab_id)
         before = dict(runtime.slider_parameter_draft)
         if value_f == prepared.projection.values_dict().get(str(name)):
@@ -511,19 +407,19 @@ class TabSliderBinding(QtCore.QObject):
             runtime.slider_parameter_draft[str(name)] = value_f
         draft_unchanged = before == runtime.slider_parameter_draft
         if draft_unchanged:
-            if _interaction is SliderInteractionKind.INTERACTIVE_DRAG_SAMPLE:
+            if interaction is SliderInteractionKind.INTERACTIVE_DRAG_SAMPLE:
                 self._emit_draft_state()
                 return True
             # Exact releases and direct commits still need a fresh exact
             # capture, even when the value was already staged by the drag.
         self._exact_preview_capture = None
         if not self._begin_preview_cycle(
-            prepared.tab, targets, interaction=_interaction
+            prepared.tab, targets, interaction=interaction
         ):
             runtime.slider_parameter_draft.clear()
             runtime.slider_parameter_draft.update(before)
             self._emit_draft_state()
-            return self._restore_rejected_slider_action()
+            return False
         self._emit_draft_state()
         return True
 
@@ -532,27 +428,20 @@ class TabSliderBinding(QtCore.QObject):
         species: str,
         value: float,
         *,
-        _interaction: SliderInteractionKind = SliderInteractionKind.EXACT_TYPED_COMMIT,
-        _gesture_capture: _PreviewPreflight | None = None,
+        interaction: SliderInteractionKind,
     ) -> bool:
-        if self._rendering:
-            return False
         try:
             value_f = validate_concentration(
                 value, field=f"Initial value for {species!r}"
             )
         except ValueError as exc:
-            return self._reject_slider_action(str(exc))
+            return self._reject(str(exc))
         targets = self.resolve_target_set_ids()
-        prepared = (
-            self._preflight_preview_action(targets)
-            if _gesture_capture is None
-            else self._captured_gesture_transaction(_gesture_capture, targets)
-        )
+        prepared = self._preflight_preview_action(targets)
         if prepared is None or str(species) not in canonical_species_names(
             prepared.tab
         ):
-            return self._reject_slider_action(
+            return self._reject(
                 f"Species {species!r} is absent or unavailable."
             )
         runtime = self._registry.tab_runtime(self._tab_id)
@@ -575,14 +464,14 @@ class TabSliderBinding(QtCore.QObject):
             item: dict(drafts.get(item, {})) for item in targets
         }
         if draft_unchanged:
-            if _interaction is SliderInteractionKind.INTERACTIVE_DRAG_SAMPLE:
+            if interaction is SliderInteractionKind.INTERACTIVE_DRAG_SAMPLE:
                 self._emit_draft_state()
                 return True
             # Exact releases and direct commits still need a fresh exact
             # capture, even when the value was already staged by the drag.
         self._exact_preview_capture = None
         if not self._begin_preview_cycle(
-            prepared.tab, targets, interaction=_interaction
+            prepared.tab, targets, interaction=interaction
         ):
             for set_id, snapshot in before.items():
                 if snapshot:
@@ -590,7 +479,7 @@ class TabSliderBinding(QtCore.QObject):
                 else:
                     drafts.pop(set_id, None)
             self._emit_draft_state()
-            return self._restore_rejected_slider_action()
+            return False
         self._emit_draft_state()
         return True
 
@@ -620,24 +509,23 @@ class TabSliderBinding(QtCore.QObject):
         self,
         targets: Iterable[str],
         *,
-        tab: MechanismTabDocument | None = None,
+        tab: MechanismTabDocument,
     ) -> PreviewCapture:
-        base = self._registry.tab(self._tab_id) if tab is None else tab
         roster = tuple(str(item) for item in targets)
-        built = self._construct_preview_requests(base, roster)
+        built = self._construct_preview_requests(tab, roster)
         explicit = tuple(
             build_explicit_target(
-                prepared_dsl=base.prepared_dsl,
+                prepared_dsl=tab.prepared_dsl,
                 set_id=set_id,
                 set_name=set_name,
-                initial_values=canonical_initial_values(base, set_id),
-                execution_settings=base.resolved_execution_settings(set_id),
-                scientific_settings=base.scientific_settings,
+                initial_values=canonical_initial_values(tab, set_id),
+                execution_settings=tab.resolved_execution_settings(set_id),
+                scientific_settings=tab.scientific_settings,
             )
             for set_id, set_name, _ in built
         )
         capture = PreviewCapture(
-            base.tab_id,
+            tab.tab_id,
             tuple(
                 PreviewTarget(set_id, set_name, request, canonical)
                 for (set_id, set_name, request), canonical in zip(
@@ -647,86 +535,41 @@ class TabSliderBinding(QtCore.QObject):
         )
         return capture
 
-    def _canonical_preview_requests_match(
-        self,
-        capture: PreviewCapture,
-        tab: MechanismTabDocument,
-        targets: tuple[str, ...],
-    ) -> bool:
-        """Require the settled Preview's canonical requests to remain current."""
-
-        current_requests = tuple(
-            build_explicit_target(
-                prepared_dsl=tab.prepared_dsl,
-                set_id=set_id,
-                set_name=tab.initial_condition_set(set_id).name,
-                initial_values=canonical_initial_values(tab, set_id),
-                execution_settings=tab.resolved_execution_settings(set_id),
-                scientific_settings=tab.scientific_settings,
-            ).execution_request
-            for set_id in targets
-        )
-        return all(
-            (target.canonical_run_target.execution_request == current_request)
-            for target, current_request in zip(
-                capture.targets,
-                current_requests,
-                strict=True,
-            )
-        )
-
     def capture_interactive_preview(
         self,
         targets: Iterable[str],
         *,
-        tab: MechanismTabDocument | None = None,
+        tab: MechanismTabDocument,
     ) -> InteractivePreviewRequest:
-        base = self._registry.tab(self._tab_id) if tab is None else tab
         built = self._construct_preview_requests(
-            base, tuple(str(item) for item in targets)
+            tab, tuple(str(item) for item in targets)
         )
         return InteractivePreviewRequest(
-            base.tab_id,
+            tab.tab_id,
             tuple(
                 InteractivePreviewTarget(set_id, set_name, request)
                 for set_id, set_name, request in built
             ),
         )
 
-    def continue_interactive_preview(self, request: InteractivePreviewRequest) -> bool:
-        self._stop_preview_timers()
-        started = self._simulation_jobs.request_interactive_preview(request)
-        return bool(started or self._simulation_jobs.interactive_preview_busy)
-
     def _begin_preview_cycle(
         self,
         tab: MechanismTabDocument,
         targets: tuple[str, ...],
         *,
-        interaction: SliderInteractionKind = SliderInteractionKind.EXACT_TYPED_COMMIT,
+        interaction: SliderInteractionKind,
     ) -> bool:
-        runtime = self._registry.tab_runtime(tab.tab_id)
-        has_draft = bool(
-            runtime.slider_parameter_draft
-            or any(
-                runtime.slider_species_drafts_by_set_id.get(item) for item in targets
-            )
-        )
-        if interaction is SliderInteractionKind.INTERACTIVE_DRAG_SAMPLE:
-            if not has_draft:
-                self._simulation_jobs.reconcile_canonical_targets(
-                    tab.tab_id,
-                    targets,
-                )
-                return True
-            return self.continue_interactive_preview(self.capture_interactive_preview(targets, tab=tab))
-        capture = self.capture_exact_preview(targets, tab=tab)
+        if not self._registry.tab_runtime(tab.tab_id).has_slider_draft:
+            # Back at the accepted values: show the canonical results.
+            self._simulation_jobs.reconcile_canonical_targets(tab.tab_id, targets)
+            return True
         self._stop_preview_timers()
-        started = self._simulation_jobs.request_preview(capture)
-        accepted = bool(
-            started
-            or self._simulation_jobs.pending_preview_tab_id == capture.tab_id
-        )
+        if interaction is SliderInteractionKind.INTERACTIVE_DRAG_SAMPLE:
+            return self._simulation_jobs.request_interactive_preview(
+                self.capture_interactive_preview(targets, tab=tab)
+            )
+        capture = self.capture_exact_preview(targets, tab=tab)
+        accepted = self._simulation_jobs.request_preview(capture)
         self._exact_preview_capture = capture if accepted else None
         return accepted
 
@@ -740,64 +583,43 @@ class TabSliderBinding(QtCore.QObject):
                 pending.name,
                 pending.value,
                 interaction=SliderInteractionKind.INTERACTIVE_DRAG_SAMPLE,
-                defer_rejected_restore=False,
-                gesture_capture=self._gesture_capture,
             )
 
-    def discard_slider_draft(self, *, render: bool = True) -> bool:
+    def discard_slider_draft(self) -> None:
+        """Reset or Discard the tab's Slider drafts and editor text, showing canonical values."""
+
         self._preview_stopped = False
         runtime = self._registry.tab_runtime(self._tab_id)
-        changed = bool(
-            runtime.slider_parameter_draft or runtime.slider_species_drafts_by_set_id
-        )
         self.cancel_pending_preview_intent()
         runtime.slider_parameter_draft.clear()
         runtime.slider_species_drafts_by_set_id.clear()
-        if render:
-            self.render(preserve_editor_drafts=False)
+        # Replacing the editors' text also clears rejected parameter text,
+        # which alone enables Reset.
+        self.render(preserve_editor_drafts=False)
         self._emit_draft_state()
-        return changed
 
-    def cancel_pending_preview_intent(
-        self,
-        set_ids: tuple[str, ...] | None = None,
-    ) -> None:
-        self._cancel_deferred_restore()
-        self._interactive_stop_fenced = True
+    def cancel_pending_preview_intent(self) -> None:
         self._clear_gesture_state()
-        self._simulation_jobs.retire_preview(self._tab_id, set_ids)
+        self._simulation_jobs.retire_preview(self._tab_id)
         self._exact_preview_capture = None
 
     def reset_project_session(self) -> None:
         """Clear retained gestures and editors for the replacement project."""
 
-        self._cancel_deferred_restore()
-        self._interactive_stop_fenced = True
-        self._clear_gesture_state()
-        self._simulation_jobs.retire_preview(self._tab_id)
-        self._exact_preview_capture = None
+        self.cancel_pending_preview_intent()
         self.clear_projection()
         self._last_targets = ()
 
-    def fence_stop(self) -> bool:
-        changed = bool(
-            self._throttle_timer.isActive()
-            or self._active_drag
-            or self._latest_admissible_pending
-        )
-        self._interactive_stop_fenced = True
-        self._cancel_deferred_restore()
+    def fence_stop(self) -> None:
         self._clear_gesture_state()
-        return changed
 
-    def settle_stop(self, *, hold: bool) -> bool:
-        changed = self._simulation_jobs.retire_preview(
+    def settle_stop(self, *, hold: bool) -> None:
+        self._simulation_jobs.retire_preview(
             self._tab_id, self.resolve_target_set_ids()
         )
         self._exact_preview_capture = None
         if hold:
             self._preview_stopped = True
-        return bool(changed)
 
     def _build_slider_candidate(
         self,
@@ -851,9 +673,7 @@ class TabSliderBinding(QtCore.QObject):
         targets = self.resolve_target_set_ids()
         if not targets:
             return self._reject("Slider Apply requires at least one target set.")
-        if not runtime.slider_parameter_draft and not any(
-            runtime.slider_species_drafts_by_set_id.get(item) for item in targets
-        ):
+        if not runtime.has_slider_draft:
             self.publish_slider_draft_state()
             return False
         if self._simulation_jobs.busy:
@@ -868,11 +688,8 @@ class TabSliderBinding(QtCore.QObject):
             return self._reject(
                 "Slider Apply requires one settled exact Preview for the current draft and target roster."
             )
-        current_tab = self._registry.tab(self._tab_id)
-        if not self._canonical_preview_requests_match(capture, current_tab, targets):
-            return self._reject(
-                "Slider Apply requires one settled exact Preview for the current tab science and target roster."
-            )
+        # A document change affecting these sets clears their Preview results,
+        # so a settled capture is also current for the tab's science.
         pairs = self._simulation_jobs.capture_settled_preview(
             self._tab_id,
             targets,
@@ -885,14 +702,14 @@ class TabSliderBinding(QtCore.QObject):
             return self._reject(
                 "Slider Apply requires one settled exact Preview for the current draft and target roster."
         )
-        candidate = self._build_slider_candidate(current_tab, targets)
+        candidate = self._build_slider_candidate(self._registry.tab(self._tab_id), targets)
         # The settled Preview request is the admitted authority for Apply.
         # Rebuilding an equivalent request from the candidate document would
         # lose the strict object identity checked above and could publish a
         # request other than the one that produced these results.
         canonical_pairs = tuple(pairs)
-        # Capture the session token only after the same-tab request, source,
-        # and target-roster guards have passed.  Edits confined to unrelated
+        # Capture the session token only after the same-tab request and
+        # target-roster guards have passed.  Edits confined to unrelated
         # tabs therefore do not invalidate this tab's settled preview.
         self._registry.replace_document(
             candidate,
@@ -910,51 +727,18 @@ class TabSliderBinding(QtCore.QObject):
         self._emit_draft_state()
         return True
 
-    def reset(self) -> bool:
-        self._preview_stopped = False
-        runtime = self._registry.tab_runtime(self._tab_id)
-        targets = self.resolve_target_set_ids()
-        changed = bool(
-            runtime.slider_parameter_draft
-            or self._variable_sliders.has_rejected_editor_text()
-            or any(
-                runtime.slider_species_drafts_by_set_id.get(item) for item in targets
-            )
-        )
-        self.cancel_pending_preview_intent(targets)
-        runtime.slider_parameter_draft.clear()
-        for item in targets:
-            runtime.slider_species_drafts_by_set_id.pop(item, None)
-        if changed:
-            self.render(preserve_editor_drafts=False)
-        self._emit_draft_state()
-        return changed
-
     def dispose(self) -> None:
         if self._disposed:
             return
         self._disposed = True
         for signal, slot in self._disposable_connections:
             signal.disconnect(slot)
-        self._stop_preview_timers()
-        self._clear_gesture_state(stop_preview_timer=False)
-        self._cancel_deferred_restore()
+        self._clear_gesture_state()
         self._exact_preview_capture = None
 
     def _emit_draft_state(self) -> None:
         self.draftStateChanged.emit(self._tab_id)
         self.publish_slider_draft_state()
-
-    def _restore_rejected_slider_action(self) -> bool:
-        if self._defer_rejected_slider_restore:
-            self._queue_rejected_slider_restore()
-        elif self._active_drag is None:
-            self.render()
-        return False
-
-    def _reject_slider_action(self, message: str) -> bool:
-        self.errorRaised.emit(str(message))
-        return self._restore_rejected_slider_action()
 
     def _reject(self, message: str) -> bool:
         self.errorRaised.emit(str(message))

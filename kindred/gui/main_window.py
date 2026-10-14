@@ -579,10 +579,7 @@ class MainWindow(QtWidgets.QMainWindow):
             lambda captured=tab_id: self._apply_slider_draft(captured)
         )
         editor.sliderResetRequested.connect(
-            lambda captured=tab_id: self._reset_slider_draft(captured)
-        )
-        sliders.sliderDraftStateChanged.connect(
-            self._on_slider_draft_state_changed
+            lambda captured=tab_id: self._discard_slider_draft(captured)
         )
         editor.symbolic_calculator_btn.clicked.connect(
             lambda _checked=False, captured=tab_id: self._toggle_symbolic_calculator(
@@ -766,6 +763,9 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         self._simulation_jobs.interactive_target_failed.connect(
             self._on_interactive_target_failed
+        )
+        self._simulation_jobs.preview_targets_reconciled.connect(
+            self._on_preview_targets_reconciled
         )
         self._simulation_jobs.status_changed.connect(self.set_status_text)
         self._fit_session_owner.window_changed.connect(
@@ -1255,6 +1255,12 @@ class MainWindow(QtWidgets.QMainWindow):
             result,
         )
 
+    @QtCore.Slot(str, object)
+    def _on_preview_targets_reconciled(self, tab_id: str, set_ids: object) -> None:
+        """Remove the drag frames of sets whose Preview work was withdrawn."""
+
+        self._workspace.plot_for_tab(tab_id).retire_interactive_preview_targets(set_ids)
+
     @QtCore.Slot(str, str, object)
     def _on_interactive_target_failed(
         self,
@@ -1277,9 +1283,6 @@ class MainWindow(QtWidgets.QMainWindow):
         if bundle is None:
             return
         target_set_ids = tuple(str(set_id) for set_id in set_ids)
-        self._workspace.plot_for_tab(target).retire_interactive_preview_targets(
-            target_set_ids
-        )
         if not bundle.initial_actions.union_plot_membership(target_set_ids):
             return
         self._render_results_for_tab(target)
@@ -1509,10 +1512,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 details.append("Initial Conditions edits will be discarded.")
             if bundle.simulation_panel.has_run_defaults_draft:
                 details.append("Run-default edits will be discarded.")
-            if (
-                runtime.slider_parameter_draft
-                or runtime.slider_species_drafts_by_set_id
-            ):
+            if runtime.has_slider_draft:
                 details.append("Slider Preview drafts will be discarded.")
             dialog.setText("\n\n".join(details))
             discard = dialog.addButton(
@@ -1638,13 +1638,9 @@ class MainWindow(QtWidgets.QMainWindow):
         if set_id in slider_targets:
             runtime = self._workspace_tab_registry.tab_runtime(tab_id)
             protected_slider_state = bool(
-                runtime.slider_parameter_draft
-                or any(
-                    runtime.slider_species_drafts_by_set_id.get(target_set_id)
-                    for target_set_id in slider_targets
-                )
+                runtime.has_slider_draft
                 or slider_binding.active_preview_set_ids
-                or self._simulation_jobs.pending_preview_tab_id == tab_id
+                or self._simulation_jobs.has_pending_preview(tab_id)
                 or (
                     self._simulation_jobs.current_kind == "preview"
                     and self._simulation_jobs.origin_tab_id == tab_id
@@ -1861,8 +1857,7 @@ class MainWindow(QtWidgets.QMainWindow):
         tab_id: str,
         action: str,
     ) -> bool:
-        slider_binding = self._tab_surfaces[tab_id].slider_binding
-        if not slider_binding.has_slider_draft():
+        if not self._workspace_tab_registry.tab_runtime(tab_id).has_slider_draft:
             return True
         dialog = QtWidgets.QMessageBox(self)
         dialog.setWindowTitle(action)
@@ -1881,23 +1876,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self._discard_slider_draft(tab_id)
         return True
 
-    def _discard_slider_draft(self, tab_id: str) -> bool:
-        target = str(tab_id)
-        binding = self._tab_surfaces[target].slider_binding
-        ids = tuple(
-            dict.fromkeys(
-                (*binding.active_preview_set_ids, *binding.resolve_target_set_ids())
-            )
-        )
-        if ids:
-            self._workspace.plot_for_tab(target).retire_interactive_preview_targets(
-                ids
-            )
-        changed = binding.discard_slider_draft()
-        self._render_results_for_tab(target)
-        return changed
+    def _discard_slider_draft(self, tab_id: str) -> None:
+        """Reset or Discard one tab's Slider drafts and Slider-owned curves."""
 
-    def _reset_slider_draft(self, tab_id: str) -> bool:
         target = str(tab_id)
         binding = self._tab_surfaces[target].slider_binding
         ids = tuple(
@@ -1909,9 +1890,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self._workspace.plot_for_tab(target).retire_interactive_preview_targets(
                 ids
             )
-        changed = binding.reset()
+        binding.discard_slider_draft()
         self._render_results_for_tab(target)
-        return changed
 
     def _start_selected_run(self, tab_id: str | None = None) -> bool:
         if not self._mutation_input_admitted("Run"):
@@ -2018,11 +1998,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 run_defaults_drafts
                 or bundle.simulation_panel.has_run_defaults_draft
             )
-            slider_drafts = bool(
-                slider_drafts
-                or runtime.slider_parameter_draft
-                or runtime.slider_species_drafts_by_set_id
-            )
+            slider_drafts = slider_drafts or runtime.has_slider_draft
         return ProjectTransientState(
             reactions_draft=reactions_draft,
             notes_draft=notes_draft,
@@ -2168,9 +2144,6 @@ class MainWindow(QtWidgets.QMainWindow):
         }
         if tab_id not in current_tab_ids:
             return
-        runtime = self._workspace_tab_registry.tab_runtime(tab_id)
-        if runtime.reactions_draft is not None:
-            self._tab_surfaces[tab_id].slider_binding.fence_stop()
         # Reactions drafts invalidate only the calculator's current snapshot;
         # reverting the draft immediately rebuilds from the current
         # prepared-object identity. Slider and notes drafts leave executable identity
@@ -2269,21 +2242,6 @@ class MainWindow(QtWidgets.QMainWindow):
             target,
             bundle.slider_binding.resolve_target_set_ids(),
         )
-
-    @QtCore.Slot(str, bool, bool)
-    def _on_slider_draft_state_changed(
-        self,
-        tab_id: str,
-        dirty: bool,
-        reset_enabled: bool,
-    ) -> None:
-        """Project only one exact tab binding's Slider Draft actions."""
-
-        target = str(tab_id)
-        bundle = self._tab_surfaces.get(target)
-        if bundle is None or bundle.slider_binding.tab_id != target:
-            return
-        bundle.editor.set_slider_draft_actions_enabled(dirty, reset_enabled)
 
     @QtCore.Slot(str, object)
     def _refresh_slider_target_summary(
@@ -2648,11 +2606,7 @@ class MainWindow(QtWidgets.QMainWindow):
         target = str(tab_id)
         self._capture_visible_tab_inputs(tab_id=target)
         runtime = self._workspace_tab_registry.tab_runtime(target)
-        if (
-            runtime.reactions_draft is not None
-            or runtime.slider_parameter_draft
-            or runtime.slider_species_drafts_by_set_id
-        ):
+        if runtime.reactions_draft is not None or runtime.has_slider_draft:
             answer = QtWidgets.QMessageBox.question(
                 self,
                 "Replace Active Mechanism",
@@ -3956,7 +3910,7 @@ class MainWindow(QtWidgets.QMainWindow):
             except OSError as exc:
                 self.set_status_text(str(exc))
 
-    def _stop_simulation(self, tab_id: str | None = None) -> bool:
+    def _stop_simulation(self, tab_id: str | None = None) -> None:
         """Fence all latent and physical Preview work before cancellation.
 
         Stop cancels work on every tab; only the tab it was pressed on holds
@@ -3964,23 +3918,15 @@ class MainWindow(QtWidgets.QMainWindow):
         """
 
         held_tab_id = tab_id or self._workspace_tab_registry.active_tab_id
-        changed = False
         if self._scan_owner.busy:
             self._scan_owner.cancel()
-            changed = True
         for bundle in tuple(self._tab_surfaces.values()):
-            changed = bundle.slider_binding.fence_stop() or changed
+            bundle.slider_binding.fence_stop()
         for target in tuple(self._tab_surfaces):
-            changed = (
-                self._workspace.plot_for_tab(target).stop_interactive_display()
-                or changed
-            )
+            self._workspace.plot_for_tab(target).stop_interactive_display()
         for target, bundle in tuple(self._tab_surfaces.items()):
-            changed = (
-                bundle.slider_binding.settle_stop(hold=target == held_tab_id)
-                or changed
-            )
-        return bool(self._simulation_jobs.cancel_current() or changed)
+            bundle.slider_binding.settle_stop(hold=target == held_tab_id)
+        self._simulation_jobs.cancel_current()
 
     def _capture_scan_session(self):
         """Admit all visible authoring inputs once, without project publication."""

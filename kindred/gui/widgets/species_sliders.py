@@ -19,7 +19,7 @@ from kindred.gui.species_sliders_logic import (
     _scale_finite_gui_range,
 )
 
-__all__ = ["BatchSpeciesSliders", "format_slider_value"]
+__all__ = ["BatchSpeciesSliders"]
 
 
 def format_slider_value(value: float) -> str:

@@ -89,12 +89,10 @@ class VariableSliders(QtWidgets.QWidget):
             str, Tuple[float, float]
         ] = {}  # log10 min/max per slider
         self._range_labels: Dict[str, Tuple[QtWidgets.QLabel, QtWidgets.QLabel]] = {}
-        self._slider_signs: Dict[str, float] = {}
         self._slider_scales: Dict[str, str] = {}  # 'log' (default) or 'linear'
         self._containers: Dict[str, QtWidgets.QWidget] = {}
         self._metadata: Dict[str, GuiParameterCoordinate] = {}
         self._fine_mode: bool = False
-        self._slider_callbacks: Dict[str, Dict[str, object]] = {}
         self._hidden_names: set[str] = set()
         self._visibility_scope_signature: object | None = None
         self._active_presses: Dict[str, SliderPress] = {}
@@ -164,11 +162,9 @@ class VariableSliders(QtWidgets.QWidget):
 
         self._containers.clear()
         self._sliders.clear()
-        self._slider_callbacks.clear()
         self._value_labels.clear()
         self._slider_ranges.clear()
         self._range_labels.clear()
-        self._slider_signs.clear()
         self._slider_scales.clear()
         self._metadata.clear()
         self._active_presses.clear()
@@ -276,10 +272,7 @@ class VariableSliders(QtWidgets.QWidget):
 
         if scale == "linear":
             self._slider_ranges[name] = (meta.minimum, meta.maximum)
-            self._slider_signs[name] = 1.0
         else:
-            sign = 1.0 if value >= 0 else -1.0
-            self._slider_signs[name] = sign
             self._slider_ranges[name] = (_LOG_SLIDER_EXP_MIN, _LOG_SLIDER_EXP_MAX)
 
         # Store slider reference early so _value_to_slider_pos can access it
@@ -291,16 +284,9 @@ class VariableSliders(QtWidgets.QWidget):
         slider.setValue(slider_pos)
 
         # Connect slider to update handler
-        callbacks = self._slider_callbacks.setdefault(str(name), {})
-        cb_value = partial(self._on_slider_changed, str(name))
-        cb_pressed = partial(self._on_slider_pressed, str(name))
-        cb_released = partial(self._on_slider_released, str(name))
-        callbacks["valueChanged"] = cb_value
-        callbacks["sliderPressed"] = cb_pressed
-        callbacks["sliderReleased"] = cb_released
-        slider.valueChanged.connect(cb_value)
-        slider.sliderPressed.connect(cb_pressed)
-        slider.sliderReleased.connect(cb_released)
+        slider.valueChanged.connect(partial(self._on_slider_changed, str(name)))
+        slider.sliderPressed.connect(partial(self._on_slider_pressed, str(name)))
+        slider.sliderReleased.connect(partial(self._on_slider_released, str(name)))
 
         layout.addWidget(slider)
 
@@ -529,8 +515,6 @@ class VariableSliders(QtWidgets.QWidget):
 
         value_f = float(value)
         self._variables[name] = value_f
-        if self._slider_scales.get(name, "log") == "log":
-            self._slider_signs[name] = 1.0 if value_f >= 0 else -1.0
         self._ensure_range_covers(name, value_f, project_slider=False)
 
         logger.debug(f"Variable readout updated: {name} = {value}")
@@ -791,8 +775,6 @@ class VariableSliders(QtWidgets.QWidget):
             return
         value_f = float(value)
         previous_range = self._slider_ranges[name_s]
-        if self._slider_scales.get(name_s, "log") == "log":
-            self._slider_signs[name_s] = 1.0 if value_f >= 0 else -1.0
         self._ensure_range_covers(name_s, value_f)
         self._variables[name_s] = value_f
         slider = self._sliders[name_s]
@@ -858,7 +840,7 @@ class VariableSliders(QtWidgets.QWidget):
 
     @staticmethod
     def _linear_fraction(value: float, lower: float, upper: float) -> float:
-        """Map a bounded linear value to a fraction without overflow."""
+        """Map a bounded linear value to a fraction."""
         value_f = float(value)
         lower_f = float(lower)
         upper_f = float(upper)
@@ -866,22 +848,7 @@ class VariableSliders(QtWidgets.QWidget):
             return 0.0
         if value_f >= upper_f:
             return 1.0
-
-        span = upper_f - lower_f
-        if math.isfinite(span):
-            fraction = (value_f - lower_f) / span
-        else:
-            exponent = max(
-                math.frexp(abs(endpoint))[1]
-                for endpoint in (lower_f, value_f, upper_f)
-                if endpoint != 0.0
-            )
-            scaled_lower = math.ldexp(lower_f, -exponent)
-            scaled_value = math.ldexp(value_f, -exponent)
-            scaled_upper = math.ldexp(upper_f, -exponent)
-            fraction = (scaled_value - scaled_lower) / (
-                scaled_upper - scaled_lower
-            )
+        fraction = (value_f - lower_f) / (upper_f - lower_f)
         return min(max(fraction, 0.0), 1.0)
 
     @staticmethod
@@ -890,7 +857,7 @@ class VariableSliders(QtWidgets.QWidget):
         lower: float,
         upper: float,
     ) -> float:
-        """Map a slider fraction to a bounded linear value without overflow."""
+        """Map a slider fraction to a bounded linear value."""
         fraction_f = min(max(float(fraction), 0.0), 1.0)
         if fraction_f <= 0.0:
             return float(lower)
@@ -899,23 +866,7 @@ class VariableSliders(QtWidgets.QWidget):
 
         lower_f = float(lower)
         upper_f = float(upper)
-        span = upper_f - lower_f
-        if math.isfinite(span):
-            value = lower_f + fraction_f * span
-        else:
-            exponent = max(
-                math.frexp(abs(endpoint))[1]
-                for endpoint in (lower_f, upper_f)
-                if endpoint != 0.0
-            )
-            scaled_lower = math.ldexp(lower_f, -exponent)
-            scaled_upper = math.ldexp(upper_f, -exponent)
-            value = math.ldexp(
-                scaled_lower + fraction_f * (scaled_upper - scaled_lower),
-                exponent,
-            )
-        if not math.isfinite(value):
-            return upper_f if fraction_f >= 0.5 else lower_f
+        value = lower_f + fraction_f * (upper_f - lower_f)
         return min(max(value, lower_f), upper_f)
 
     def _slider_pos_to_value(self, name: str, slider_pos: int) -> float:
@@ -934,12 +885,10 @@ class VariableSliders(QtWidgets.QWidget):
         log_value = log_min + frac * (log_max - log_min)
         log_value = min(max(log_value, log_min), log_max)
         magnitude = 10 ** float(log_value)
-        magnitude = min(
+        return min(
             max(magnitude, float.fromhex("0x0.0000000000001p-1022")),
             sys.float_info.max,
         )
-        sign = self._slider_signs.get(name, 1.0)
-        return magnitude if sign >= 0 else -magnitude
 
     def _value_to_slider_pos(self, name: str, value_abs: float) -> int:
         """Convert a value to slider position using stored range."""
@@ -953,14 +902,11 @@ class VariableSliders(QtWidgets.QWidget):
         log_min, log_max = self._slider_ranges[name]
         log_span = log_max - log_min
 
-        sign = self._slider_signs.get(name, 1.0)
         magnitude = self._log_magnitude(value_abs)
         log_value = math.log10(magnitude)
         log_value = min(max(log_value, log_min), log_max)
         frac = (log_value - log_min) / log_span
         pos = int(round(frac * steps))
-        # Preserve negative direction display: slider handle represents magnitude only.
-        self._slider_signs[name] = 1.0 if sign >= 0 else -1.0
         return max(0, min(pos, int(steps)))
 
     def _ensure_range_covers(

@@ -56,13 +56,19 @@ class TabRuntimeState:
     )
 
     @property
+    def has_slider_draft(self) -> bool:
+        # Species drafts exist only for the current Slider targets.
+        return bool(
+            self.slider_parameter_draft or self.slider_species_drafts_by_set_id
+        )
+
+    @property
     def has_dirty_drafts(self) -> bool:
         return bool(
             self.reactions_draft is not None
             or self.notes_draft is not None
             or self.initial_text_by_set_id
-            or self.slider_parameter_draft
-            or self.slider_species_drafts_by_set_id
+            or self.has_slider_draft
         )
 
 
