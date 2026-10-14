@@ -103,15 +103,11 @@ class WorkspaceTabRegistry:
         session: ProjectSession,
         *,
         computation_fence: Callable[[ScientificDocumentDelta], None],
-        retire_interactive_plot_targets: Callable[
-            [ScientificDocumentDelta], None
-        ],
         post_document_publication: Callable[[ScientificDocumentDelta], None],
         runtime_factory: Callable[[str], TabRuntimeState],
     ) -> None:
         self._session = session
         self._computation_fence = computation_fence
-        self._retire_interactive_plot_targets = retire_interactive_plot_targets
         self._post_document_publication = post_document_publication
         self._runtime_factory = runtime_factory
         self._active_tab_id = ""
@@ -273,10 +269,9 @@ class WorkspaceTabRegistry:
         previous: ProjectDocument,
         replacement: ProjectDocument,
     ) -> None:
-        """Retire computation and old physical results before publication."""
+        """Retire computation and old results before publication."""
 
         self._computation_fence(delta)
-        self._retire_interactive_plot_targets(delta)
 
         existing_runtime = dict(self._runtime_by_tab_id)
         previous_by_tab_id = {tab.tab_id: tab for tab in previous.tabs}

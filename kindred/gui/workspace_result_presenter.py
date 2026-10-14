@@ -48,11 +48,8 @@ from kindred.core.simulator.dsl_parse import PreparedDslRequestSet
 from kindred.gui.curve_copy_headers import observable_copy_definitions
 from kindred.gui.dataset_payload_snapshot import ExperimentalLayerInput
 from kindred.gui.plot_config import AxisSelectionCandidate
-from kindred.core.result_curve_projection import ProjectedCurveChunk, physical_curve_chunks
 
 __all__ = [
-    "InteractiveDisplayCurve",
-    "InteractiveDisplayProjection",
     "ResultDataBlock",
     "ResultLayerKind",
     "ResultRenderInput",
@@ -60,7 +57,6 @@ __all__ = [
     "VisibleResultSet",
     "XlsxExportCompletion",
     "compose_canonical_export_blocks",
-    "compose_interactive_display",
     "compose_result_input",
     "encode_clipboard_text",
     "encode_tsv_row",
@@ -79,70 +75,14 @@ VESSEL_VOLUME_COLOR = "#8b5cf6"
 
 
 def _readonly_display_array(value: object) -> np.ndarray:
-    """Retain one admitted transient display array without copying it."""
+    """Make one display array read-only without copying it."""
 
     array = np.asarray(value)
     array.setflags(write=False)
     return array
 
 
-@dataclass(frozen=True, slots=True)
-class InteractiveDisplayCurve:
-    """One immutable, transient physical curve; never Copy/export authority."""
-
-    key: tuple[object, ...]
-    label: str
-    x: np.ndarray
-    y: np.ndarray
-    # Canonical seconds stay aligned when X is another quantity or is sampled.
-    sample_time: np.ndarray
-    color: str
-    source: ResultDataBlock
-    dashed: bool = False
-    opacity: float = 1.0
-    # These arrays are display topology, not result authority.  Keeping them
-    # with the transient curve prevents the preview renderer from connecting
-    # points across an intervention/discontinuity while it is cross-fading.
-    segment_ids: np.ndarray | None = None
-    segment_keys: tuple[str, ...] | None = None
-    discontinuity_ids: np.ndarray | None = None
-    physical_chunks: tuple[ProjectedCurveChunk, ...] = ()
-
-    def __post_init__(self) -> None:
-        x = _readonly_display_array(self.x)
-        y = _readonly_display_array(self.y)
-        segment_ids = (
-            None
-            if self.segment_ids is None
-            else _readonly_display_array(self.segment_ids)
-        )
-        discontinuity_ids = (
-            None
-            if self.discontinuity_ids is None
-            else _readonly_display_array(self.discontinuity_ids)
-        )
-        object.__setattr__(self, "x", x)
-        object.__setattr__(self, "y", y)
-        object.__setattr__(self, "sample_time", _readonly_display_array(self.sample_time))
-        object.__setattr__(self, "segment_ids", segment_ids)
-        object.__setattr__(self, "discontinuity_ids", discontinuity_ids)
-
-
 _DisplayAnnotation = tuple[str, str, Mapping[str, object], float]
-
-
-@dataclass(frozen=True, slots=True)
-class InteractiveDisplayProjection:
-    tab_id: str
-    set_id: str
-    x_label: str
-    y_label: str
-    curves: tuple[InteractiveDisplayCurve, ...]
-    intervention_annotations: tuple[_DisplayAnnotation, ...] = ()
-
-    def __post_init__(self) -> None:
-        object.__setattr__(self, "curves", tuple(self.curves))
-        object.__setattr__(self, "intervention_annotations", tuple(self.intervention_annotations))
 
 
 class _XlsxDestination:
@@ -460,11 +400,6 @@ class ResultRenderInput:
     intervention_labels_visible: bool = True
     unavailable_x_diagnostic: str | None = None
     completion_warning_details: tuple[tuple[str, tuple[str, ...]], ...] = ()
-    # Composer-resolved facts that interactive Preview composition reuses, so
-    # it never re-derives membership, colours, or the simulation X axis.
-    plot_set_labels: tuple[tuple[str, str], ...] = ()
-    color_by_axis_selection: tuple[tuple[AxisSeriesSelection, str], ...] = ()
-    simulation_x_series: AxisSeriesSelection = SimulationSeriesAxisSelection("t")
 
     def __post_init__(self) -> None:
         # Built only by this module's composers; freeze the collections.
@@ -1074,86 +1009,6 @@ def _owned_annotations(
     )
 
 
-def compose_interactive_display(
-    result: SimulationResultValue,
-    *,
-    tab_id: str,
-    set_id: str,
-    render_input: ResultRenderInput,
-    prepared_dsl: PreparedDslRequestSet,
-) -> InteractiveDisplayProjection | None:
-    # Reuse the static composer's resolved X, plot membership and colours so
-    # interactive Preview never re-derives them from whichever block exists.
-    selected_x = render_input.simulation_x_series
-    if isinstance(selected_x, ExperimentalAxisSelection):
-        return None
-    label = dict(render_input.plot_set_labels).get(set_id)
-    if label is None:
-        return None
-    wanted = None if render_input.selected_y_uses_default_all else set(render_input.selected_y_series)
-    name_colors = {
-        selection.series_name: color
-        for selection, color in render_input.color_by_axis_selection
-        if isinstance(selection, SimulationSeriesAxisSelection)
-    }
-    live = _result_block(
-        set_id=set_id, label=label, result=result, prepared_dsl=prepared_dsl,
-        kind=ResultLayerKind.PREVIEW,
-        color_by_axis_selection=dict(render_input.color_by_axis_selection),
-    )
-    # Before exact Preview settles, the set's Run is the Reference it will
-    # retain; a Preview block is never a Reference.
-    owned = {block.kind: block for block in reversed(render_input.blocks) if block.block_id == set_id}
-    reference = owned.get(ResultLayerKind.REFERENCE)
-    if reference is None and ResultLayerKind.EXPLICIT in owned:
-        reference = replace(
-            owned[ResultLayerKind.EXPLICIT], kind=ResultLayerKind.REFERENCE,
-            label=f"{label} [Reference]", dashed=True, opacity=0.42,
-        )
-    curves = []
-    annotations = []
-    sources = [(result, live, "foreground")]
-    if reference is not None and render_input.reference_lines_visible:
-        sources.append((reference.result, reference, "ghost"))
-    for value, style, role in sources:
-        series = _series_tuple(value)
-        colors = name_colors
-        semantic = replace(
-            style, result=value, t=value.t, sample_time=value.t, first_index=0,
-            series=series, series_axes=tuple((name, SimulationSeriesAxisSelection(name)) for name, _ in series),
-            x_axis=SimulationSeriesAxisSelection("t"), x_name="t",
-            quantity_units=value.quantity_units, presentation_units=value.presentation_units,
-            segment_ids=value.segment_ids, segment_keys=value.segment_keys,
-            discontinuity_ids=value.discontinuity_ids, presentation_boundaries=value.presentation_boundaries,
-            color_by_series=tuple((name, colors.get(name, "#3b82f6")) for name, _ in series),
-        )
-        vessel = _volume_block(semantic)
-        for source in (semantic,) if vessel is None else (semantic, vessel):
-            block = _data_block(source, x_axis=selected_x, y_axes=wanted)
-            if block is None:
-                continue
-            axes = dict(block.series_axes)
-            for name, values in block.series:
-                chunks = physical_curve_chunks(value, selected_x, ((name, axes[name]),), range(block.first_index, len(value.t)))
-                curves.append(InteractiveDisplayCurve(
-                    key=("simulation", role, set_id, axes[name]), label=f"{style.label}: {name}",
-                    x=block.t, y=values, sample_time=block.sample_time,
-                    color=dict(block.color_by_series)[name], source=block, dashed=role == "ghost",
-                    opacity=.42 if role == "ghost" else 1.,
-                    segment_ids=block.segment_ids, segment_keys=block.segment_keys,
-                    discontinuity_ids=block.discontinuity_ids,
-                    physical_chunks=chunks,
-                ))
-        if _is_time_selection(selected_x):
-            annotations.extend(_owned_annotations(value, role, set_id))
-    if not any(curve.key[1] == "foreground" for curve in curves):
-        return None
-    return InteractiveDisplayProjection(
-        tab_id=tab_id, set_id=set_id, x_label=render_input.x_label,
-        y_label=render_input.y_label, curves=tuple(curves), intervention_annotations=tuple(annotations),
-    )
-
-
 def compose_result_input(
     *,
     tab_id: str,
@@ -1438,9 +1293,6 @@ def compose_result_input(
         intervention_labels_visible=intervention_labels_visible,
         unavailable_x_diagnostic=_selected_x_unavailable_diagnostic(selected_candidate, unavailable_labels),
         completion_warning_details=tuple(warning_facts),
-        plot_set_labels=tuple((item.set_id, item.label) for item in visible_sets),
-        color_by_axis_selection=tuple(colors.items()),
-        simulation_x_series=simulation_x,
     )
 
 def iter_blocks_tsv_chunks(

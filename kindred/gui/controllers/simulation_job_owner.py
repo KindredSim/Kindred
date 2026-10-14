@@ -218,11 +218,6 @@ class SimulationJobOwner(QtCore.QObject):
     status_changed = QtCore.Signal(str)
     results_changed = QtCore.Signal(str)
     run_dispatched = QtCore.Signal(str, object)
-    interactive_result_ready = QtCore.Signal(str, str, object, object)
-    interactive_target_failed = QtCore.Signal(str, str, object)
-    # Sets of one tab whose Preview work was withdrawn and whose canonical
-    # results are shown again.
-    preview_targets_reconciled = QtCore.Signal(str, object)
 
     def __init__(self, *, gate: ComputationGate, repository_for_tab: RepositoryResolver,
                  user_parallel_maximum: RawUserParallelMaximum,
@@ -433,7 +428,6 @@ class SimulationJobOwner(QtCore.QObject):
         for set_id in ids:
             repository.clear_preview(set_id, clear_reference=False)
             repository.restore_reference_or_current(set_id)
-        self.preview_targets_reconciled.emit(str(tab_id), ids)
         self.results_changed.emit(str(tab_id))
         if changed:
             self.state_changed.emit()
@@ -467,7 +461,6 @@ class SimulationJobOwner(QtCore.QObject):
         *,
         max_parallel: int,
         purpose: str = "ordinary",
-        payload: object | None = None,
         details: Iterable[str] = (),
     ) -> bool:
         if not self._gate.try_acquire(self, kind):
@@ -480,7 +473,6 @@ class SimulationJobOwner(QtCore.QObject):
             "targets": targets,
             "outcomes": [],
             "details": list(details),
-            "payload": payload,
             "preview_results": {},
             "removed_target_ids": set(),
         }
@@ -674,7 +666,6 @@ class SimulationJobOwner(QtCore.QObject):
             request.targets,
             max_parallel=self._capacity(len(request.targets)),
             purpose="interactive-preview",
-            payload=request,
         )
 
     def retire_preview(
@@ -732,16 +723,10 @@ class SimulationJobOwner(QtCore.QObject):
             return
         operation = self._operation
         target = outcome.target
-        interactive = operation["purpose"] == "interactive-preview"
-        request = operation["payload"]
         if outcome.state != "success":
             state = outcome.state
             if state == "failure":
-                if interactive:
-                    self.interactive_target_failed.emit(
-                        operation["tab_id"], target.set_id, request,
-                    )
-                elif operation["kind"] == "run":
+                if operation["kind"] == "run":
                     self._failed_run_requests[
                         (operation["tab_id"], target.set_id)
                     ] = target.execution_request
@@ -755,21 +740,14 @@ class SimulationJobOwner(QtCore.QObject):
                 f"{target.set_name}: completed at t={termination.actual_endpoint:g} s "
                 "(authored stopping intervention)"
             )
-        if interactive:
-            self.interactive_result_ready.emit(
-                operation["tab_id"],
-                target.set_id,
-                request,
-                outcome.result,
-            )
-            operation["outcomes"].append((target, "success"))
-            return
         if operation["kind"] == "preview":
             operation["preview_results"][target.set_id] = outcome.result
         else:
             repository = self._repository(operation["tab_id"])
+            # A Reference Run never replaces the Preview it serves.
             repository.publish_run(
-                target.set_id, target.execution_request, outcome.result
+                target.set_id, target.execution_request, outcome.result,
+                keep_preview=operation["purpose"] == "preview-reference",
             )
             # A success of the remembered failed request supersedes that failure.
             key = (operation["tab_id"], target.set_id)
@@ -827,6 +805,24 @@ class SimulationJobOwner(QtCore.QObject):
                     target.execution_request,
                     preview_results[target.set_id],
                 )
+            preview_published = True
+        if operation_purpose == "interactive-preview" and self._operation_is_current():
+            # A finished drag request is shown as its sets' Preview, even when
+            # a newer request waits; a set whose drag Preview failed shows its
+            # Run again.
+            repository = self._repository(operation_tab_id)
+            preview_results = operation["preview_results"]
+            for target in operation["targets"]:
+                if target.set_id in preview_results:
+                    repository.retain_explicit_as_reference(target.set_id)
+                    repository.publish_preview(
+                        target.set_id,
+                        target.execution_request,
+                        preview_results[target.set_id],
+                    )
+                else:
+                    repository.clear_preview(target.set_id, clear_reference=False)
+                    repository.restore_reference_or_current(target.set_id)
             preview_published = True
         reconcile_target_ids: tuple[str, ...] = ()
         if ordinary_preview and summary.state != "success" and not superseded_preview:

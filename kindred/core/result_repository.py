@@ -190,14 +190,23 @@ class ResultRepository:
         set_id: str,
         execution_request: SimulationExecutionRequest,
         result: SimulationResultValue,
+        *,
+        keep_preview: bool = False,
     ) -> SimulationResultValue:
-        """Publish a completed Run and admit it to the bounded exact cache."""
+        """Publish a completed Run and admit it to the bounded exact cache.
+
+        With ``keep_preview``, a Run published while the set shows a Preview
+        becomes that Preview's Reference instead of replacing it.
+        """
 
         sid = set_id
         entry = (sid, execution_request, result)
-        self._current_by_set_id[sid] = entry
-        self._current_run_set_ids.add(sid)
-        self._reference_by_set_id.pop(sid, None)
+        if keep_preview and sid in self.preview_set_ids():
+            self._reference_by_set_id[sid] = entry
+        else:
+            self._current_by_set_id[sid] = entry
+            self._current_run_set_ids.add(sid)
+            self._reference_by_set_id.pop(sid, None)
         self._explicit_cache[:] = [
             cached
             for cached in self._explicit_cache

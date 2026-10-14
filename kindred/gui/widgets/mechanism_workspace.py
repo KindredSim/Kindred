@@ -405,8 +405,6 @@ class ProjectWorkspaceWidget(QtWidgets.QMainWindow):
         plot = self._plot_by_tab_id.pop(target, None)
         if plot is None:
             return
-        # The panel is deleted below; only its project content needs releasing.
-        plot.dispose_project_content()
         analysis = plot.analysis_tabs()
         self._plot_stack.removeWidget(plot)
         self._analysis_stack.removeWidget(analysis)

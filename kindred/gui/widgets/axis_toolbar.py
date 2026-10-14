@@ -25,7 +25,7 @@ set_x_candidates(candidates, *, selected)
 set_y_candidates(candidates, *, locked_checked=None)
 selected_y() -> tuple[AxisSeriesSelection, ...]
 current_x() -> AxisSeriesSelection
-set_manual_range_controls(*, auto_x: bool, auto_y: bool, enabled: bool) -> None
+set_manual_range_controls(*, auto_x: bool, auto_y: bool) -> None
 get_manual_ranges() -> tuple[float|None, float|None, float|None, float|None]
 set_manual_ranges(x_min, x_max, y_min, y_max) -> None
 
@@ -392,15 +392,13 @@ class AxisToolbar(QtWidgets.QWidget):
     def current_x(self) -> AxisSeriesSelection:
         return self._x_combo.currentData()
 
-    def set_manual_range_controls(self, *, auto_x: bool, auto_y: bool, enabled: bool) -> None:
-        """Project the plot owner's range mode and gesture restriction."""
-        visible = not (auto_x and auto_y)
-        self._manual_range_row.setVisible(visible)
-        self._manual_range_row.setEnabled(visible and enabled)
+    def set_manual_range_controls(self, *, auto_x: bool, auto_y: bool) -> None:
+        """Project the plot owner's range mode."""
+        self._manual_range_row.setVisible(not (auto_x and auto_y))
         for axis, auto, edits in (("X", auto_x, (self._x_min, self._x_max)), ("Y", auto_y, (self._y_min, self._y_max))):
             self._range_labels[axis].setText(f"{axis} ({'automatic' if auto else 'manual'}):")
             for edit in edits:
-                edit.setEnabled(not auto and enabled)
+                edit.setEnabled(not auto)
         self.updateGeometry()
 
     def get_manual_ranges(self) -> tuple[Optional[float], Optional[float], Optional[float], Optional[float]]:

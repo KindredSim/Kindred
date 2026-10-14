@@ -18,7 +18,6 @@ from kindred.core.quantity_units import (
 
 import io
 import math
-import time
 from dataclasses import dataclass, replace
 from collections.abc import Mapping, Sequence
 from typing import Any, Iterator
@@ -29,9 +28,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from kindred.core.project_presentation_state import (
     ProjectPresentationState,
     SimulationSeriesAxisSelection,
-    VesselVolumeAxisSelection,
 )
-from kindred.core.result_repository import SimulationResultValue
 from kindred.gui.curve_copy_headers import copy_column_header, copy_series_label
 from kindred.gui.display_name_policy import literal_tooltip
 from kindred.gui.theme_manager import plot_background_color, plot_foreground_color
@@ -40,7 +37,6 @@ from kindred.gui.ui_helpers import (
     ScientificNameComboBox,
     clamp_initial_size,
 )
-from kindred.gui.interactive_preview import InteractivePreviewRequest
 import pyqtgraph as pg
 
 from kindred.gui.plot_config import TIME_DISPLAY_UNITS
@@ -49,14 +45,11 @@ from kindred.gui.widgets.parameter_statistics_table import ParameterStatisticsTa
 from kindred.gui.widgets.plot_data_item import PlotDataItem
 from kindred.gui.widgets.species_statistics_table import SpeciesStatisticsTable
 from kindred.gui.workspace_result_presenter import (
-    InteractiveDisplayCurve,
-    InteractiveDisplayProjection,
     ResultDataBlock,
     ResultRenderInput,
     ResultLayerKind,
     encode_clipboard_text,
     encode_tsv_row,
-    compose_interactive_display,
     intervention_label,
 )
 
@@ -159,7 +152,7 @@ def _transform_samples(x: np.ndarray, y: np.ndarray, transform: str) -> tuple[np
 
 @dataclass(frozen=True, slots=True)
 class _RenderedPointChunk:
-    """One exact point chunk handed to a static or interactive plot item."""
+    """One exact point chunk handed to a plot item."""
 
     x: np.ndarray
     series: tuple[tuple[str, np.ndarray], ...]
@@ -230,7 +223,6 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         parent: QtWidgets.QWidget | None = None,
     ) -> None:
         super().__init__(parent)
-        self._interactive_gesture_active = False
         self._sampling_limit: int | None = None
         self._plot_items_by_key: dict[tuple[object, ...], object] = {}
         self._annotation_items: dict[_AnnotationKey, object] = {}
@@ -244,21 +236,6 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         self._render_input: ResultRenderInput | None = None
         self._copy_all_available = False
         self._rendered_point_roster: tuple[_RenderedPointBlock, ...] = ()
-        self._settling_static_input = False
-        self._interactive_timer = QtCore.QTimer(self)
-        self._interactive_timer.setSingleShot(True)
-        self._interactive_timer.timeout.connect(self._advance_interactive_display)
-        self._interactive_items: dict[tuple[object, ...], Any] = {}
-        self._interactive_visible: InteractiveDisplayProjection | None = None
-        self._interactive_pending: InteractiveDisplayProjection | None = None
-        self._interactive_results: dict[str, SimulationResultValue] = {}
-        self._interactive_request: InteractivePreviewRequest | None = None
-        self._interactive_target_set_ids: tuple[str, ...] = ()
-        self._interactive_last_presented_at: float | None = None
-        self._interactive_tick_requested = False
-        self._interactive_rendered_frame = False
-        self._interactive_projection_sampling_limit: int | None = None
-        self._interactive_projection_sampling_known = False
 
         self._plot_widget = pg.PlotWidget(self, viewBox=_PlotViewBox())
         self._plot_widget.setObjectName("plotViewport")
@@ -337,218 +314,16 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         return item
 
     def apply_result_input(self, render_input: ResultRenderInput) -> None:
-        """Retain and draw one immutable result input and its live aggregate."""
+        """Retain and draw one immutable result input."""
 
-        previous_input = self._render_input
-        self._rendered_point_roster = ()
-        self._settling_static_input = True
-        try:
-            # Plot membership, not a retained block, keeps an interactive target:
-            # a never-run set still shows its first drag Preview.
-            plotted_set_ids = {
-                set_id for set_id, _label in render_input.plot_set_labels
-            }
-            removed = tuple(
-                set_id
-                for set_id in self._interactive_target_set_ids
-                if set_id not in plotted_set_ids
-            )
-            if removed:
-                self._retire_interactive_targets(removed)
-            self._render_input = render_input
-            self._render_result_scene(render_input)
-            if self._interactive_results:
-                self._recompose_interactive_display()
-                if self._interactive_pending is not None:
-                    self._present_interactive_projection_now()
-            elif (
-                self._interactive_visible
-                or self._interactive_pending is not None
-            ):
-                self._reconcile_cached_interactive_display(
-                    previous_input,
-                    render_input,
-                )
-            if not (
-                self._interactive_results
-                or self._interactive_pending
-                or self._interactive_visible
-                or self._interactive_target_set_ids
-            ):
-                self._end_interactive_gesture_session()
-            if any(self._refit_axes):
-                self._fit_axes_once(self._refit_axes)
-                self._refit_axes = (False, False)
-                self._apply_axis_range_state(self._axis_range, self._presentation)
-            if render_input.unavailable_x_diagnostic is not None:
-                self.resultDiagnostic.emit(render_input.unavailable_x_diagnostic)
-        finally:
-            self._settling_static_input = False
-
-    def _reconcile_cached_interactive_display(
-        self,
-        previous_input: ResultRenderInput | None,
-        render_input: ResultRenderInput,
-    ) -> None:
-        """Reuse only a source-less Preview projection that remains exact.
-
-        Interactive curves are projections of a result, not a second result
-        source.  Once the source aggregate has been retired, a cached frame
-        can still service display-only changes and narrowing/sample filtering,
-        but it cannot answer a new X/Y projection or request a finer sample.
-        The existing empty-state transition releases those pixels while the
-        request identity and target roster remain admitted for later results.
-        """
-
-        projections = (
-            (self._interactive_visible,)
-            if self._interactive_visible is not None else ()
-        )
-        if self._interactive_pending is not None:
-            projections = (*projections, self._interactive_pending)
-        if not projections:
-            return
-        if not self._cached_interactive_display_compatible(
-            previous_input,
-            render_input,
-            projections,
-        ):
-            self._clear_interactive_projection()
-            return
-
-        visible = (
-            self._filter_cached_interactive_projection(
-                self._interactive_visible, render_input,
-            )
-            if self._interactive_visible is not None else None
-        )
-        if not visible and self._interactive_pending is not None:
-            # A pending source-less target has already been projected.  It is
-            # safe to expose it as the retained frame after compatibility is
-            # established.
-            visible = self._filter_cached_interactive_projection(
-                self._interactive_pending,
-                render_input,
-            )
-        self._interactive_pending = None
-        self._cancel_interactive_tick()
-        if not visible:
-            self._clear_interactive_projection()
-            return
-        self._render_interactive_display(visible)
-        self._interactive_visible = visible
-        self._interactive_projection_sampling_limit = self._sampling_limit
-        self._interactive_projection_sampling_known = True
-
-    def _cached_interactive_display_compatible(
-        self,
-        previous_input: ResultRenderInput | None,
-        render_input: ResultRenderInput,
-        projections: Sequence[InteractiveDisplayProjection],
-    ) -> bool:
-        previous_x = (
-            None if previous_input is None else previous_input.selected_x_series
-        )
-        if previous_x is not None and previous_x != render_input.selected_x_series:
-            return False
-
-        if (
-            previous_input is not None
-            and not previous_input.selected_y_uses_default_all
-            and render_input.selected_y_uses_default_all
-        ):
-            return False
-
-        if self._interactive_projection_sampling_known:
-            old_limit = self._interactive_projection_sampling_limit
-            new_limit = self._sampling_limit
-            if old_limit is not None and new_limit is None:
-                return False
-            if (
-                old_limit is not None
-                and new_limit is not None
-                and new_limit > old_limit
-            ):
-                return False
-
-        wanted = self._cached_interactive_y_names(render_input)
-        for projection in projections:
-            names_by_target: dict[str, set[str]] = {}
-            for curve in projection.curves:
-                key = tuple(curve.key)
-                if len(key) < 4 or key[0] != "simulation":
-                    continue
-                names_by_target.setdefault(str(key[2]), set()).add(key[3])
-            for available in names_by_target.values():
-                if wanted is not None and not wanted.issubset(available):
-                    return False
-        return True
-
-    @staticmethod
-    def _cached_interactive_y_names(
-        render_input: ResultRenderInput,
-    ) -> set[str] | None:
-        if render_input.selected_y_uses_default_all:
-            return None
-        return {
-            selection
-            for selection in render_input.selected_y_series
-            if isinstance(selection, (SimulationSeriesAxisSelection, VesselVolumeAxisSelection))
-        }
-
-    def _filter_cached_interactive_projection(
-        self,
-        projection: InteractiveDisplayProjection,
-        render_input: ResultRenderInput,
-    ) -> InteractiveDisplayProjection | None:
-        wanted = self._cached_interactive_y_names(render_input)
-        curves: list[InteractiveDisplayCurve] = []
-        for curve in projection.curves:
-            key = tuple(curve.key)
-            if len(key) < 4 or key[0] != "simulation":
-                curves.append(curve)
-                continue
-            if wanted is not None and key[3] not in wanted:
-                continue
-            if key[1] == "ghost" and not render_input.reference_lines_visible:
-                continue
-            curves.append(curve)
-        if not curves:
-            return None
-        target_ids = {
-            str(curve.key[2])
-            for curve in curves
-            if len(curve.key) >= 3 and curve.key[0] == "simulation"
-        }
-        annotations = tuple(
-            annotation
-            for annotation in projection.intervention_annotations
-            if annotation[1] in target_ids
-            and (annotation[0] != "ghost" or render_input.reference_lines_visible)
-        )
-        filtered = replace(projection, curves=tuple(curves), intervention_annotations=annotations)
-        if self._sampling_limit is not None:
-            filtered = self._sample_interactive_projection(filtered)
-        return filtered
-
-    def apply_interactive_preview_result(
-        self,
-        tab_id: str,
-        set_id: str,
-        request: InteractivePreviewRequest,
-        result: SimulationResultValue,
-    ) -> bool:
-        """Admit one transient result against the retained immutable input."""
-
-        render_input = self._render_input
-        if render_input is None or render_input.tab_id != str(tab_id):
-            return False
-        return self._offer_interactive_result(
-            result,
-            set_id=str(set_id),
-            request=request,
-            render_input=render_input,
-        )
+        self._render_input = render_input
+        self._render_result_scene(render_input)
+        if any(self._refit_axes):
+            self._fit_axes_once(self._refit_axes)
+            self._refit_axes = (False, False)
+            self._apply_axis_range_state(self._axis_range, self._presentation)
+        if render_input.unavailable_x_diagnostic is not None:
+            self.resultDiagnostic.emit(render_input.unavailable_x_diagnostic)
 
     def set_copy_all_available(self, available: bool) -> None:
         """Project semantic Copy All eligibility into the physical menu."""
@@ -793,19 +568,12 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         for key, spin in self._plot_percentages.items():
             with QtCore.QSignalBlocker(spin):
                 spin.setValue(100 * getattr(state if key.startswith("fraction_") else self._presentation, key))
-            if key.startswith("fraction_"):
-                spin.setEnabled(not self._interactive_gesture_active)
         self._plot_actions["copy_all"].setEnabled(self._copy_all_available)
         self._plot_actions["copy_plotted"].setEnabled(
             any(chunk.x.size for block in self._rendered_point_roster for chunk in block.chunks)
         )
         self._plot_actions["warnings"].setEnabled(bool(self._completion_warning_badge.text()))
-        for key in ("auto_range", "auto_x", "auto_y", "fit_once", "visible_x", "pan_x", "pan_y"):
-            self._plot_actions[key].setEnabled(not self._interactive_gesture_active)
-        self._axis_toolbar.set_manual_range_controls(
-            auto_x=state.auto_x, auto_y=state.auto_y,
-            enabled=not self._interactive_gesture_active,
-        )
+        self._axis_toolbar.set_manual_range_controls(auto_x=state.auto_x, auto_y=state.auto_y)
         units = self._volume_unit_choices()
         with QtCore.QSignalBlocker(self._volume_unit_combo):
             self._volume_unit_combo.clear()
@@ -877,90 +645,6 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
             return
         QtWidgets.QApplication.clipboard().setText(rendered_text)
 
-    def retire_interactive_preview_targets(
-        self,
-        target_set_ids: tuple[str, ...],
-    ) -> bool:
-        """Retire selected transient targets from the physical display."""
-
-        retired = self._retire_interactive_targets(
-            tuple(str(value) for value in target_set_ids),
-        )
-        if retired:
-            retired = self._retire_static_preview_targets(target_set_ids) or retired
-        else:
-            retired = self._retire_static_preview_targets(target_set_ids)
-        return retired
-
-    def retire_interactive_preview_target(
-        self,
-        tab_id: str,
-        set_id: str,
-        request: InteractivePreviewRequest,
-    ) -> bool:
-        """Retire one current failed Preview target and restore its static data."""
-
-        if self._render_input is None or self._render_input.tab_id != tab_id:
-            return False
-        if self._interactive_request is not request:
-            self._supersede_interactive_request(
-                request,
-                tuple(request.target_set_ids),
-            )
-        return self._retire_interactive_targets((set_id,))
-
-    def _retire_static_preview_targets(
-        self,
-        target_set_ids: tuple[str, ...],
-    ) -> bool:
-        targets = {str(value) for value in target_set_ids}
-        if not targets:
-            return False
-        # As when items are added, auto-range is applied once after removing them.
-        self._plot_widget.getViewBox().disableAutoRange()
-        retired = False
-        for item_key, item in tuple(self._plot_items_by_key.items()):
-            role = item_key[0] if item_key else None
-            if (
-                not isinstance(role, tuple)
-                or len(role) != 2
-                or role[0]
-                not in {ResultLayerKind.PREVIEW.value, ResultLayerKind.REFERENCE.value}
-                or str(role[1]) not in targets
-            ):
-                continue
-            self._remove_plot_item(item)
-            del self._plot_items_by_key[item_key]
-            retired = True
-        prior_roster = self._rendered_point_roster
-        self._rendered_point_roster = tuple(
-            block
-            for block in prior_roster
-            if not (
-                block.kind
-                in {
-                    ResultLayerKind.PREVIEW.value,
-                    ResultLayerKind.REFERENCE.value,
-                }
-                and block.block_id in targets
-            )
-        )
-        retired = retired or len(prior_roster) != len(self._rendered_point_roster)
-        for annotation_key, item in tuple(self._annotation_items.items()):
-            if annotation_key[1] not in targets:
-                continue
-            self._remove_annotation_item(item)
-            del self._annotation_items[annotation_key]
-            retired = True
-        self._apply_axis_range_state(self._axis_range, self._presentation)
-        return retired
-
-    def stop_interactive_display(self) -> None:
-        """Cancel visual work and release transient physical custody."""
-
-        if self._interactive_has_visible_frame or self._interactive_has_pending_batch:
-            self._clear_interactive_display(reset_currentness=True)
-
     def set_persisted_plot_state(self, state: ProjectPresentationState) -> None:
         """Project the registry's accepted choices; the next render refits changed coordinates."""
         old = self._presentation.plot_transform
@@ -989,8 +673,10 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
     def reset_plot_session_state(self) -> None:
         """Project replacement/reopen resets non-archived Plot session truth."""
 
-        self.dispose_project_content()
-        self._end_interactive_gesture_session()
+        self._render_input = None
+        self._copy_all_available = False
+        self._rendered_point_roster = ()
+        self._clear_annotation_items()
         self._zoom_enabled = False
         self._presentation = ProjectPresentationState()
         self._sampling_limit = None
@@ -1012,344 +698,6 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         self._sync_plot_controls()
         self._apply_zoom_mode()
 
-    def dispose_project_content(self) -> None:
-        """Stop plot-owned asynchronous work before project content teardown."""
-
-        self._render_input = None
-        self._copy_all_available = False
-        self._rendered_point_roster = ()
-        self._clear_interactive_display(reset_currentness=True)
-        self._clear_annotation_items()
-
-    @property
-    def _interactive_has_visible_frame(self) -> bool:
-        return bool(
-            self._interactive_visible
-            and self._interactive_visible.curves
-        )
-
-    @property
-    def _interactive_has_pending_batch(self) -> bool:
-        return bool(
-            self._interactive_results
-            or self._interactive_pending
-        )
-
-    def _offer_interactive_result(
-        self,
-        result: SimulationResultValue,
-        *,
-        set_id: str,
-        request: InteractivePreviewRequest,
-        render_input: ResultRenderInput,
-    ) -> bool:
-        """Aggregate out-of-order results for one request identity."""
-
-        self._render_input = render_input
-        set_id = str(set_id)
-        roster = tuple(dict.fromkeys(str(value) for value in request.target_set_ids))
-        if set_id not in roster:
-            return False
-        if self._interactive_request is None:
-            self._interactive_request = request
-            self._interactive_target_set_ids = roster
-        elif request is not self._interactive_request:
-            self._supersede_interactive_request(request, roster)
-        elif set_id not in self._interactive_target_set_ids:
-            return False
-        self._interactive_results[set_id] = result
-        self._recompose_interactive_display()
-        return True
-
-    def _supersede_interactive_request(
-        self,
-        request: InteractivePreviewRequest,
-        target_set_ids: tuple[str, ...],
-    ) -> None:
-        """Replace aggregate authority while retaining the last rendered frame."""
-
-        # Keep the last drawn frame, and each still-targeted set's last result,
-        # until a current result replaces it. An already scheduled tick must
-        # keep its deadline: restarting it for every new request can starve
-        # drawing during a fast drag.
-        self._interactive_results = {
-            set_id: result
-            for set_id, result in self._interactive_results.items()
-            if set_id in target_set_ids
-        }
-        self._interactive_pending = None
-        self._interactive_target_set_ids = target_set_ids
-        self._interactive_request = request
-
-    def _offer_interactive_projection(
-        self,
-        projection: InteractiveDisplayProjection,
-    ) -> None:
-        self._interactive_pending = projection
-        self._schedule_interactive_tick()
-
-    def _tick_interactive_display(self) -> None:
-        self._interactive_tick_requested = False
-        now = float(time.monotonic())
-        if self._interactive_pending is not None and self._interactive_cadence_due(now):
-            self._present_interactive_projection_now()
-        if self._interactive_pending is not None:
-            self._schedule_interactive_tick()
-
-    def _clear_interactive_display(self, *, reset_currentness: bool = False) -> None:
-        had_physical_state = bool(
-            self._interactive_visible
-            or self._interactive_rendered_frame
-            or self._interactive_pending
-        )
-        if had_physical_state:
-            self._render_interactive_display(None)
-            self._interactive_visible = None
-            self._interactive_rendered_frame = False
-            self._interactive_last_presented_at = None
-            self._interactive_projection_sampling_limit = None
-            self._interactive_projection_sampling_known = False
-        self._interactive_pending = None
-        self._interactive_results.clear()
-        self._interactive_target_set_ids = ()
-        self._interactive_projection_sampling_limit = None
-        self._interactive_projection_sampling_known = False
-        if reset_currentness:
-            self._interactive_request = None
-        self._cancel_interactive_tick()
-
-    def _retire_interactive_targets(self, target_set_ids: tuple[str, ...]) -> bool:
-        targets = {str(value) for value in target_set_ids}
-        if not targets:
-            return False
-        known = set(self._interactive_target_set_ids)
-        known.update(self._interactive_results)
-        known.update(self._interactive_projection_target_ids(self._interactive_visible))
-        known.update(self._interactive_projection_target_ids(self._interactive_pending))
-        affected = targets.intersection(known)
-        if not affected:
-            return True
-        visible = (
-            self._filter_interactive_projection(self._interactive_visible, affected)
-            if self._interactive_visible is not None else None
-        )
-        if visible and self._render_input is not None:
-            # Restore every retained item from semantic input first; rendering
-            # the surviving transient targets will suppress only those targets.
-            self._render_result_scene(self._render_input)
-        self._render_interactive_display(visible)
-        self._interactive_visible = visible or None
-        self._interactive_pending = None
-        self._cancel_interactive_tick()
-        self._interactive_results = {
-            set_id: result
-            for set_id, result in self._interactive_results.items()
-            if set_id not in affected
-        }
-        self._interactive_target_set_ids = tuple(
-            set_id
-            for set_id in self._interactive_target_set_ids
-            if set_id not in affected
-        )
-        if not self._interactive_visible:
-            self._interactive_projection_sampling_limit = None
-            self._interactive_projection_sampling_known = False
-        if self._interactive_results:
-            self._recompose_interactive_display()
-        return True
-
-    def _recompose_interactive_display(self) -> None:
-        if not self._interactive_results:
-            self._clear_interactive_projection()
-            return
-        projection = self._compose_interactive_batch()
-        if projection is None:
-            self._clear_interactive_projection()
-            return
-        self._offer_interactive_projection(
-            self._sample_interactive_projection(projection)
-        )
-
-    def _clear_interactive_projection(self) -> None:
-        """Remove transient pixels while retaining the current request facts."""
-
-        retained_static_roster = (
-            self._rendered_point_roster if self._settling_static_input else None
-        )
-        self._interactive_pending = None
-        self._cancel_interactive_tick()
-        if self._interactive_visible or self._interactive_rendered_frame:
-            self._render_interactive_display(None)
-        self._interactive_visible = None
-        self._interactive_rendered_frame = False
-        self._interactive_projection_sampling_limit = None
-        self._interactive_projection_sampling_known = False
-        if retained_static_roster is not None:
-            self._rendered_point_roster = retained_static_roster
-
-    def _present_interactive_projection_now(self) -> None:
-        """Present the latest semantic projection without waiting for cadence."""
-
-        projection = self._interactive_pending
-        if projection is None:
-            return
-        self._interactive_pending = None
-        self._cancel_interactive_tick()
-        # Draw a completed result directly; interpolation between successive
-        # results adds lag and can restart indefinitely during dragging.
-        self._render_interactive_display(projection)
-        self._interactive_visible = projection
-        self._interactive_last_presented_at = float(time.monotonic())
-        self._interactive_projection_sampling_limit = self._sampling_limit
-        self._interactive_projection_sampling_known = True
-
-    def _compose_interactive_batch(self) -> InteractiveDisplayProjection | None:
-        if self._render_input is None or not self._interactive_results:
-            return None
-        curves: list[InteractiveDisplayCurve] = []
-        annotations: list[_DisplayAnnotation] = []
-        latest: InteractiveDisplayProjection | None = None
-        for set_id, result in self._interactive_results.items():
-            if set_id not in self._interactive_target_set_ids:
-                continue
-            projection = self._compose_interactive_result(result, set_id=set_id)
-            if projection is None:
-                continue
-            latest = projection
-            curves.extend(projection.curves)
-            annotations.extend(projection.intervention_annotations)
-        if latest is None or not curves:
-            return None
-        return replace(latest, curves=tuple(curves), intervention_annotations=tuple(annotations))
-
-    def _compose_interactive_result(
-        self,
-        result: SimulationResultValue,
-        *,
-        set_id: str,
-    ) -> InteractiveDisplayProjection | None:
-        request = self._interactive_request
-        if self._render_input is None or request is None:
-            return None
-        target = next(
-            (item for item in request.targets if item.set_id == set_id),
-            None,
-        )
-        if target is None:
-            return None
-        return compose_interactive_display(
-            result,
-            tab_id=self._render_input.tab_id,
-            set_id=set_id,
-            render_input=self._render_input,
-            prepared_dsl=target.execution_request.prepared_dsl,
-        )
-
-    def _sample_interactive_projection(
-        self,
-        projection: InteractiveDisplayProjection,
-    ) -> InteractiveDisplayProjection:
-        return replace(
-            projection,
-            curves=tuple(
-                self._sample_interactive_curve(curve)
-                for curve in projection.curves
-            ),
-        )
-
-    def _sample_interactive_curve(
-        self,
-        curve: InteractiveDisplayCurve,
-    ) -> InteractiveDisplayCurve:
-        count = int(curve.x.size)
-        sample = self._sample_indices(count, self._sampling_limit)
-        if count:
-            endpoints = np.asarray(
-                [index for start, end in self._interactive_curve_chunks(curve)
-                 for index in (start, end - 1)],
-                dtype=int,
-            )
-            sample = np.unique(np.concatenate((sample, endpoints, _undefined_edges(curve.x, curve.y))))
-        physical_chunks = []
-        for chunk in curve.physical_chunks:
-            if chunk.instantaneous:
-                physical_chunks.append(chunk)
-                continue
-            keep = np.isin(chunk.time, curve.sample_time[sample])
-            if len(keep):
-                keep[0] = keep[-1] = True
-            physical_chunks.append(replace(chunk, time=chunk.time[keep], x=chunk.x[keep],
-                series=tuple((name, values[keep]) for name, values in chunk.series)))
-        return replace(
-            curve,
-            physical_chunks=tuple(physical_chunks),
-            x=curve.x[sample],
-            y=curve.y[sample],
-            sample_time=curve.sample_time[sample],
-            segment_ids=(
-                None
-                if curve.segment_ids is None
-                else curve.segment_ids[sample]
-            ),
-            segment_keys=(
-                None
-                if curve.segment_keys is None
-                else tuple(curve.segment_keys[int(index)] for index in sample)
-            ),
-            discontinuity_ids=(
-                None
-                if curve.discontinuity_ids is None
-                else curve.discontinuity_ids[sample]
-            ),
-        )
-
-    @staticmethod
-    def _interactive_projection_target_ids(
-        projection: InteractiveDisplayProjection | None,
-    ) -> set[str]:
-        if projection is None:
-            return set()
-        return {
-            str(curve.key[2])
-            for curve in projection.curves
-            if len(curve.key) >= 3
-        } | {annotation[1] for annotation in projection.intervention_annotations}
-
-    @staticmethod
-    def _filter_interactive_projection(
-        projection: InteractiveDisplayProjection,
-        removed: set[str],
-    ) -> InteractiveDisplayProjection | None:
-        curves = tuple(
-            curve
-            for curve in projection.curves
-            if len(curve.key) < 3 or str(curve.key[2]) not in removed
-        )
-        annotations = tuple(
-            annotation
-            for annotation in projection.intervention_annotations
-            if annotation[1] not in removed
-        )
-        if not curves:
-            return None
-        return replace(projection, curves=curves, intervention_annotations=annotations)
-
-    def _schedule_interactive_tick(self) -> None:
-        if self._interactive_tick_requested:
-            return
-        self._interactive_tick_requested = True
-        self._request_interactive_tick(1.0 / 30.0)
-
-    def _cancel_interactive_tick(self) -> None:
-        self._interactive_tick_requested = False
-        self._interactive_timer.stop()
-
-    def _interactive_cadence_due(self, now: float) -> bool:
-        return (
-            self._interactive_last_presented_at is None
-            or now - self._interactive_last_presented_at >= (1.0 / 30.0) - _EPSILON
-        )
-
     @staticmethod
     def _annotation_signature(
         annotation: _DisplayAnnotation,
@@ -1368,234 +716,6 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
             0 if authored is None else int(authored)
         )
         return QtGui.QColor(_ANNOTATION_ACCENTS[index % len(_ANNOTATION_ACCENTS)])
-
-    def _request_interactive_tick(self, delay_seconds: float) -> None:
-        milliseconds = max(0, int(np.ceil(float(delay_seconds) * 1000.0)))
-        self._interactive_timer.start(milliseconds)
-
-    @QtCore.Slot()
-    def _advance_interactive_display(self) -> None:
-        self._tick_interactive_display()
-
-    def _begin_interactive_gesture_session(self) -> None:
-        self._interactive_gesture_active = True
-        self._sync_plot_controls()
-
-    def _end_interactive_gesture_session(self) -> None:
-        self._interactive_gesture_active = False
-        self._sync_plot_controls()
-
-    def _render_interactive_display(
-        self,
-        projection: InteractiveDisplayProjection | None,
-    ) -> None:
-        """Apply the projection, including a valid frame with no drawable samples."""
-        self._rendered_point_roster = ()
-        if projection is None:
-            self._release_interactive_display()
-            self._interactive_rendered_frame = False
-            return
-
-        # As in the static scene, auto-range is applied once after the items.
-        self._plot_widget.getViewBox().disableAutoRange()
-        existing = dict(self._interactive_items)
-        rendered: dict[tuple[object, ...], Any] = {}
-        rendered_points: list[_RenderedPointBlock] = []
-        render_input = self._render_input
-        transient_set_ids = {
-            str(curve.key[2])
-            for curve in projection.curves
-            if len(curve.key) >= 3
-            and curve.key[0:2] == ("simulation", "foreground")
-        }
-        transient_reference_set_ids = {
-            str(curve.key[2])
-            for curve in projection.curves
-            if len(curve.key) >= 3
-            and curve.key[0:2] == ("simulation", "ghost")
-        }
-        replaced_annotation_owners = (
-            {("foreground", set_id) for set_id in transient_set_ids}
-            | {("ghost", set_id) for set_id in transient_reference_set_ids}
-            | {(role, set_id)
-            for role, set_id, _payload, _opacity
-            in projection.intervention_annotations}
-        )
-        if render_input is not None:
-            for block in render_input.blocks:
-                if not block.visible:
-                    continue
-                if block.kind is ResultLayerKind.EXPLICIT and str(block.block_id) in transient_set_ids:
-                    continue
-                if block.kind is ResultLayerKind.PREVIEW and str(block.block_id) in transient_set_ids:
-                    continue
-                if block.kind is ResultLayerKind.REFERENCE and str(block.block_id) in transient_reference_set_ids:
-                    continue
-                rendered_block, _chunks = self._rendered_block_for_static(
-                    block,
-                    self._sampling_limit,
-                )
-                if any(chunk.x.size for chunk in rendered_block.chunks):
-                    rendered_points.extend(self._transformed_blocks(rendered_block))
-        for curve in projection.curves:
-            if render_input is None:
-                continue
-            point_block = self._rendered_block_for_interactive_curve(curve)
-            if point_block is None:
-                continue
-            for transformed in self._transformed_blocks(point_block):
-                for index, chunk in enumerate(transformed.chunks):
-                    y = chunk.series[0][1]
-                    if not np.any(np.isfinite(chunk.x) & np.isfinite(y)):
-                        continue
-                    item_key = (*curve.key, "physical", index)
-                    pen = pg.mkPen(color=curve.color, width=2, style=(QtCore.Qt.PenStyle.DashLine if curve.dashed else QtCore.Qt.PenStyle.SolidLine))
-                    item = existing.get(item_key)
-                    if item is None:
-                        item = self._add_plot_data(chunk.x, y, pen=pen, name=None, connect="finite",
-                                                   connectors=chunk.instantaneous)
-                    else:
-                        item.setData(chunk.x, y, connect="finite", connectors=chunk.instantaneous)
-                        item.setPen(pen)
-                    self._style_simulation_item(item, True, curve.color, curve.opacity)
-                    rendered[item_key] = item
-        for item_key, item in existing.items():
-            if item_key not in rendered:
-                self._remove_interactive_plot_item(item)
-        self._suppress_static_simulation_items(
-            transient_set_ids,
-            transient_reference_set_ids,
-        )
-        self._interactive_items = rendered
-        if render_input is not None:
-            static_annotations = tuple(
-                annotation
-                for annotation in render_input.intervention_annotations
-                if annotation[:2] not in replaced_annotation_owners
-            )
-            interactive_annotations = tuple(
-                (role, set_id, payload, opacity)
-                for role, set_id, payload, opacity
-                in projection.intervention_annotations
-                if opacity > _EPSILON
-            )
-            self._render_annotations(
-                render_input,
-                self._presentation,
-                annotations=(*static_annotations, *interactive_annotations),
-            )
-        # The displayed projection contains completed results, so Copy uses
-        # those same sampled curves and their corresponding time.
-        if render_input is not None:
-            for curve in projection.curves:
-                rendered_block = self._rendered_block_for_interactive_curve(
-                    curve,
-                )
-                if rendered_block is not None and any(
-                    chunk.x.size for chunk in rendered_block.chunks
-                ):
-                    rendered_points.extend(self._transformed_blocks(rendered_block))
-        self._apply_axis_range_state(self._axis_range, self._presentation)
-        self._rendered_point_roster = tuple(rendered_points)
-        if rendered and not self._interactive_rendered_frame:
-            self._begin_interactive_gesture_session()
-        self._interactive_rendered_frame = bool(rendered)
-
-    def _remove_interactive_plot_item(self, item: object) -> None:
-        """Remove one stale transient item from the physical plot."""
-
-        if self._legend is not None:
-            self._legend.removeItem(item)
-        self._plot_widget.getPlotItem().removeItem(item)
-
-    @staticmethod
-    def _interactive_curve_chunks(
-        curve: object,
-    ) -> tuple[tuple[int, int], ...]:
-        """Split a transient curve at every executor-issued topology change."""
-
-        x = curve.x
-        count = int(x.size)
-        if count == 0:
-            return ()
-        segment_ids = curve.segment_ids
-        segment_keys = curve.segment_keys
-        discontinuities = curve.discontinuity_ids
-        changes = tuple(
-            index for index in range(1, count)
-            if (
-                int(segment_ids[index]) != int(segment_ids[index - 1])
-                or segment_keys[index] != segment_keys[index - 1]
-                or int(discontinuities[index]) != int(discontinuities[index - 1])
-            )
-        )
-        starts = [0, *changes]
-        return tuple(
-            (
-                start,
-                starts[position + 1] if position + 1 < len(starts) else count,
-            )
-            for position, start in enumerate(starts)
-        )
-
-    def _clear_interactive_items(self) -> None:
-        # Its caller applies auto-range once after the removals.
-        self._plot_widget.getViewBox().disableAutoRange()
-        for item in tuple(self._interactive_items.values()):
-            self._remove_plot_item(item)
-        self._interactive_items.clear()
-
-    def _release_interactive_display(self) -> None:
-        """Release all physical transient custody at one terminal boundary.
-
-        The panel's transient state invokes this operation by presenting an
-        empty state. External scene/lifecycle boundaries call it after
-        clearing or superseding that state. Retained simulation items and
-        their named legend rows stay attached throughout; the canonical static
-        render below restores their visible presentation directly.
-        """
-
-        self._cancel_interactive_tick()
-        self._clear_interactive_items()
-        self._end_interactive_gesture_session()
-        self._apply_axis_range_state(self._axis_range, self._presentation)
-        if self._render_input is not None and not self._settling_static_input:
-            self._render_result_scene(self._render_input)
-
-    def _suppress_static_simulation_items(
-        self,
-        transient_set_ids: object,
-        transient_reference_set_ids: object = (),
-    ) -> None:
-        """Clear retained target pixels without changing physical membership."""
-
-        transient = {str(set_id) for set_id in transient_set_ids}
-        transient_reference = {
-            str(set_id) for set_id in transient_reference_set_ids
-        }
-        static_kinds = {
-            ResultLayerKind.EXPLICIT.value,
-            ResultLayerKind.PREVIEW.value,
-            ResultLayerKind.REFERENCE.value,
-        }
-        for item_key, item in self._plot_items_by_key.items():
-            if not item_key or not isinstance(item_key[0], tuple):
-                continue
-            role = item_key[0]
-            if len(role) != 2 or role[0] not in static_kinds:
-                continue
-            target_set_id = str(role[1])
-            if role[0] == ResultLayerKind.REFERENCE.value:
-                if target_set_id not in transient_reference:
-                    continue
-            elif target_set_id not in transient:
-                continue
-            item.setData([], [])
-            if role[0] == ResultLayerKind.REFERENCE.value:
-                self._update_plot_item_legend(item, None)
-
-    def discard_interactive_display(self) -> None:
-        self._clear_interactive_display(reset_currentness=True)
 
     def _show_completion_warning_details(self) -> None:
         dialog = QtWidgets.QDialog(self)
@@ -1897,43 +1017,6 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         )
         return rendered_block, rendered_chunks
 
-    def _rendered_block_for_interactive_curve(
-        self,
-        curve: object,
-    ) -> _RenderedPointBlock | None:
-        key = tuple(curve.key)
-        if len(key) < 4 or key[0] != "simulation":
-            return None
-        set_id, selection = str(key[2]), key[3]
-        source = curve.source
-        series_name = next(name for name, axis in source.series_axes if axis == selection)
-        definitions = dict(source.copy_definitions)
-        x_unit, x_scale = self._curve_unit_state("x", source.unit_for(source.x_name, x=True))
-        y_unit, y_scale = self._curve_unit_state("y", source.unit_for(series_name))
-        curve_chunks = tuple(_RenderedPointChunk(
-            x=self._scaled_display_values(chunk.x, x_scale),
-            series=tuple((name, self._scaled_display_values(values, y_scale)) for name, values in chunk.series),
-            sample_time=chunk.time, instantaneous=chunk.instantaneous,
-        ) for chunk in curve.physical_chunks)
-        return _RenderedPointBlock(
-            block_id=set_id,
-            group_id=set_id,
-            label=source.label,
-            kind=source.kind.value,
-            x_name=copy_series_label(source.x_name, definition=definitions.get(source.x_name)),
-            x_is_time=(
-                isinstance(source.x_axis, SimulationSeriesAxisSelection)
-                and source.x_axis.series_name == "t"
-            ),
-            x_unit=x_unit,
-            time_column_name=source.time_column_name,
-            y_names=((series_name, copy_series_label(
-                series_name, definition=definitions.get(series_name),
-            )),),
-            y_units=((series_name, y_unit),),
-            chunks=curve_chunks,
-        )
-
     def _transformed_blocks(self, block: _RenderedPointBlock) -> tuple[_RenderedPointBlock, ...]:
         transform = self._presentation.plot_transform
         if transform == "original":
@@ -1988,7 +1071,14 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         colors = dict(block.color_by_series)
         item_store = rendered_items if rendered_items is not None else {}
         existing_store = existing_items if existing_items is not None else {}
-        role = (block.kind.value, block.block_id)
+        # Items are keyed by lane, so a set's Run, drag and exact Preview reuse
+        # its foreground items and only the Reference has its own.
+        lane = (
+            block.kind.value
+            if block.kind in {ResultLayerKind.REFERENCE, ResultLayerKind.EXPERIMENTAL}
+            else "foreground"
+        )
+        role = (lane, block.block_id)
         for series_name, _values in block.series:
             color = colors[series_name]
             transformed = next((item for item in transformed_blocks if item.chunks and series_name in dict(item.chunks[0].series)), None)
@@ -2166,11 +1256,8 @@ class PyQtGraphPlotPanel(QtWidgets.QWidget):
         self,
         render_input: ResultRenderInput,
         presentation: ProjectPresentationState,
-        *,
-        annotations: Sequence[_DisplayAnnotation] | None = None,
     ) -> None:
-        if annotations is None:
-            annotations = self._merge_annotation_values(render_input.intervention_annotations)
+        annotations = self._merge_annotation_values(render_input.intervention_annotations)
         self._render_owned_annotations(render_input, annotations, presentation)
 
     @staticmethod

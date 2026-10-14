@@ -242,9 +242,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self._workspace_tab_registry = WorkspaceTabRegistry(
             self._project_session,
             computation_fence=self._simulation_jobs.fence_document_delta,
-            retire_interactive_plot_targets=(
-                self._retire_interactive_plot_targets
-            ),
             post_document_publication=self._post_document_publication,
             runtime_factory=self._new_tab_runtime,
         )
@@ -758,15 +755,6 @@ class MainWindow(QtWidgets.QMainWindow):
             self._on_run_dispatched
         )
         self._simulation_jobs.results_changed.connect(self._on_results_changed)
-        self._simulation_jobs.interactive_result_ready.connect(
-            self._on_interactive_result_ready
-        )
-        self._simulation_jobs.interactive_target_failed.connect(
-            self._on_interactive_target_failed
-        )
-        self._simulation_jobs.preview_targets_reconciled.connect(
-            self._on_preview_targets_reconciled
-        )
         self._simulation_jobs.status_changed.connect(self.set_status_text)
         self._fit_session_owner.window_changed.connect(
             self._on_fit_window_changed
@@ -1214,7 +1202,6 @@ class MainWindow(QtWidgets.QMainWindow):
         target = str(tab_id)
         if self._rendering_workspace:
             return
-        plot = self._workspace.plot_for_tab(target)
         if target in self._plot_membership_refreshing:
             self._render_results_for_tab(target)
             return
@@ -1223,58 +1210,7 @@ class MainWindow(QtWidgets.QMainWindow):
             or target in self._current_row_refreshing
         ):
             return
-        bundle = self._tab_surfaces.get(target)
-        if bundle is not None and self._simulation_jobs.current_kind != "run":
-            plot.retire_interactive_preview_targets(
-                tuple(
-                    dict.fromkeys(
-                        (
-                            *bundle.slider_binding.active_preview_set_ids,
-                            *bundle.slider_binding.resolve_target_set_ids(),
-                        )
-                    )
-                )
-            )
         self._render_results_for_tab(target)
-
-    @QtCore.Slot(str, str, object, object)
-    def _on_interactive_result_ready(
-        self,
-        tab_id: str,
-        set_id: str,
-        request: object,
-        result: object,
-    ) -> None:
-        """Project one canonical transient result onto its owning plot."""
-
-        plot = self._workspace.plot_for_tab(tab_id)
-        plot.apply_interactive_preview_result(
-            tab_id,
-            set_id,
-            request,
-            result,
-        )
-
-    @QtCore.Slot(str, object)
-    def _on_preview_targets_reconciled(self, tab_id: str, set_ids: object) -> None:
-        """Remove the drag frames of sets whose Preview work was withdrawn."""
-
-        self._workspace.plot_for_tab(tab_id).retire_interactive_preview_targets(set_ids)
-
-    @QtCore.Slot(str, str, object)
-    def _on_interactive_target_failed(
-        self,
-        tab_id: str,
-        set_id: str,
-        request: object,
-    ) -> None:
-        """Retire one failed transient target from its owning plot."""
-
-        self._workspace.plot_for_tab(tab_id).retire_interactive_preview_target(
-            tab_id,
-            set_id,
-            request,
-        )
 
     @QtCore.Slot(str, object)
     def _on_run_dispatched(self, tab_id: str, set_ids: object) -> None:
@@ -1290,17 +1226,6 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _repository_for_tab(self, tab_id: str) -> ResultRepository:
         return self._workspace_tab_registry.tab_runtime(tab_id).result_repository
-
-    def _retire_interactive_plot_targets(
-        self,
-        delta: ScientificDocumentDelta,
-    ) -> None:
-        """Retire only physical interactive Preview plot targets."""
-
-        for tab_id, target_set_ids in delta.targets_by_tab().items():
-            self._workspace.plot_for_tab(
-                tab_id
-            ).retire_interactive_preview_targets(target_set_ids)
 
     def _post_document_publication(
         self,
@@ -1880,17 +1805,7 @@ class MainWindow(QtWidgets.QMainWindow):
         """Reset or Discard one tab's Slider drafts and Slider-owned curves."""
 
         target = str(tab_id)
-        binding = self._tab_surfaces[target].slider_binding
-        ids = tuple(
-            dict.fromkeys(
-                (*binding.active_preview_set_ids, *binding.resolve_target_set_ids())
-            )
-        )
-        if ids:
-            self._workspace.plot_for_tab(target).retire_interactive_preview_targets(
-                ids
-            )
-        binding.discard_slider_draft()
+        self._tab_surfaces[target].slider_binding.discard_slider_draft()
         self._render_results_for_tab(target)
 
     def _start_selected_run(self, tab_id: str | None = None) -> bool:
@@ -2187,10 +2102,6 @@ class MainWindow(QtWidgets.QMainWindow):
         ).current_set_id
         if previous_set_id is not None and previous_set_id == current_set_id:
             return
-        if previous_set_id is not None and previous_set_id != current_set_id:
-            self._workspace.plot_for_tab(target).retire_interactive_preview_targets(
-                (previous_set_id,)
-            )
         if target in self._current_row_refreshing:
             return
         # The guard coalesces results_changed emitted synchronously inside
@@ -3922,8 +3833,6 @@ class MainWindow(QtWidgets.QMainWindow):
             self._scan_owner.cancel()
         for bundle in tuple(self._tab_surfaces.values()):
             bundle.slider_binding.fence_stop()
-        for target in tuple(self._tab_surfaces):
-            self._workspace.plot_for_tab(target).stop_interactive_display()
         for target, bundle in tuple(self._tab_surfaces.items()):
             bundle.slider_binding.settle_stop(hold=target == held_tab_id)
         self._simulation_jobs.cancel_current()
@@ -4601,8 +4510,6 @@ class MainWindow(QtWidgets.QMainWindow):
     @QtCore.Slot()
     def _on_close_started(self) -> None:
         self._fence_shell_for_close()
-        for target in tuple(self._tab_surfaces):
-            self._workspace.plot_for_tab(target).discard_interactive_display()
         self.set_status_text("Closing Kindred. Waiting for active work to stop.")
 
     def _refresh_title(self) -> None:
