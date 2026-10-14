@@ -31,7 +31,7 @@ def _whole_number(box: QtWidgets.QLineEdit, label: str) -> int:
 
 
 class ChemicalSpaceScanDialog(QtWidgets.QDialog):
-    def __init__(self, tab, owner, parent=None):
+    def __init__(self, tab, owner, parent=None, *, selected_set_id=None):
         super().__init__(parent)
         self.tab, self.owner = tab, owner
         self.setWindowTitle("Chemical Space Scan")
@@ -45,6 +45,8 @@ class ChemicalSpaceScanDialog(QtWidgets.QDialog):
         self.baseline = QtWidgets.QComboBox()
         for initial in tab.initial_condition_sets:
             self.baseline.addItem(initial.name, initial.set_id)
+        # Start on the set the main window runs; the first when it is gone.
+        self.baseline.setCurrentIndex(max(self.baseline.findData(selected_set_id), 0))
         header = QtWidgets.QFormLayout()
         header.addRow("Initial-condition baseline", self.baseline)
         layout.addLayout(header)

@@ -283,7 +283,7 @@ class _Evaluator:
                 for i in range(self.N):
                     if i % 256 == 0:
                         self.ctx.check_cancelled()
-                    arr[i] = self._eval_expr(stmt.expr, i, stmt=stmt)
+                    arr[i] = _as_float(self._eval_expr(stmt.expr, i, stmt=stmt), stmt=stmt)
                 self.series[name] = arr
 
         self.ctx.check_cancelled()
@@ -326,7 +326,7 @@ class _Evaluator:
                     if i % 256 == 0:
                         self.ctx.check_cancelled()
                     try:
-                        arr[i] = self._eval_expr(stmt.expr, i, stmt=stmt)
+                        arr[i] = _as_float(self._eval_expr(stmt.expr, i, stmt=stmt), stmt=stmt)
                     except _UNDEFINED_POINT_ERRORS as exc:
                         arr[i] = np.nan
                         inherited = isinstance(exc, AlgebraUndefinedError)

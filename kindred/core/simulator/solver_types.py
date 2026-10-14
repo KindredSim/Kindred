@@ -105,6 +105,7 @@ class SimulationRequest:
     symbolic_jacobian: SymbolicJacobianExecution
     # (line number, authored text) of each intervention declaration, by ordinal.
     intervention_lines: tuple[tuple[int, str], ...]
+    parameter_values_at_temperature: Callable[[float, tuple[str, ...]], Mapping[str, float]]
     solver: str = DEFAULT_SOLVER_NAME
     rtol: float = 1e-6
     atol: float = 1e-12
@@ -119,7 +120,6 @@ class SimulationRequest:
     # rows is a straight line across one solver step (measured-X Fit).
     sample_solver_steps: bool = False
     stop_observable_value: Callable[[str, float, np.ndarray, float], float] | None = None
-    parameter_values_at_temperature: Callable[[float, tuple[str, ...]], Mapping[str, float]] | None = None
 
     def __post_init__(self) -> None:
         # The span, solver policy, grid and Fit sample times arrive admitted with

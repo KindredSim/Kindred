@@ -218,7 +218,7 @@ def eyring_rate(
             * math.pow(standard_conc_M, 1.0 - molecularity)
         )
     except OverflowError as exc:
-        raise ValueDomainError("Eyring rate", "Eyring rate overflows the finite real domain") from exc
+        raise ValueDomainError("Eyring rate overflows the finite real domain") from exc
     return admit_rate(k, field="Eyring rate")
 
 
@@ -237,5 +237,5 @@ def arrhenius_rate(A: float, Ea_J_per_mol: float, T: float) -> float:
     try:
         rate = A * math.exp(exponent)
     except OverflowError as exc:
-        raise ValueDomainError("Arrhenius rate", "Arrhenius rate overflows the finite real domain") from exc
+        raise ValueDomainError("Arrhenius rate overflows the finite real domain") from exc
     return admit_rate(rate, field="Arrhenius rate")

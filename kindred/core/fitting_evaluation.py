@@ -57,22 +57,6 @@ _OPTIMIZER_ORIGINS = frozenset({
 })
 
 
-def _scientific_unavailability_from_exception(
-    exc: object,
-    *,
-    producer: str,
-    stage: str,
-) -> ScientificUnavailable:
-    return ScientificUnavailable(
-        producer=producer,
-        stage=stage,
-        factual_cause=FactualCause(
-            domain="simulation", origin=producer, code=None,
-            message=exc.message, details=exc.details,
-        ),
-    )
-
-
 # A calculated value outside its domain, or a physical predicate the solved
 # state violates.
 _VALUE_FAILURES = (*UNCOMPUTABLE_ERRORS, PhysicalDomainError)
@@ -130,7 +114,6 @@ def prepare_fitting_execution_context(
         and cancellation_control.cancel_requested()
     ):
         raise FittingCancelled()
-    # The Fit request realized this regular grid on this span before launch.
     regular_grid = build_time_grid(t_start, t_end, prepared_solver_config.grid)
     objective_times = np.asarray(tuple(objective_sample_times), dtype=float).reshape(-1)
     requested_sample_times = tuple(
@@ -243,13 +226,14 @@ class FittingEvaluator:
                 return _rejection(factual_cause_from_exception(exc))
             raise
         if isinstance(result, SimulationScientificUnavailability):
-            unavailability = result
-            unavailable = _scientific_unavailability_from_exception(
-                unavailability,
-                producer=unavailability.producer,
-                stage=unavailability.stage,
+            return ScientificUnavailable(
+                producer=result.producer,
+                stage=result.stage,
+                factual_cause=FactualCause(
+                    domain="simulation", origin=result.producer, code=None,
+                    message=result.message, details=result.details,
+                ),
             )
-            return unavailable
         # A let, or a value it reads, that fails records its own cause.
         result = replace(result, algebra_errors=tuple(
             replace(cause, message=cause.message + self._fit_values(cause.details.get("parameter_names", ()), params))
@@ -288,19 +272,22 @@ class FittingEvaluator:
     def parameter_values(
         self,
         params: Mapping[str, float],
-        temperature_K: float,
         names: tuple[str, ...],
     ) -> Mapping[str, float]:
-        """The named values one candidate calculates at ``temperature_K``;
-        nothing is solved."""
-        prefix = self._context.initial_prefix
+        """The named values one candidate calculates at the mechanism's
+        temperature; nothing is solved."""
+        request = self._context.prepared_run.request
         prepared_run = prepare_simulation_run(execution_request=replace(
-            self._context.prepared_run.request,
-            parameter_overrides={
-                name: value for name, value in params.items() if not name.startswith(prefix)
-            } or None,
+            request, parameter_overrides=self._parameter_overrides(params) or None,
         ))
-        return prepared_run.parameter_values_at_temperature(temperature_K, names)
+        return prepared_run.parameter_values_at_temperature(
+            float(request.prepared_dsl.analysis.temperature_K), names
+        )
+
+    def _parameter_overrides(self, params: Mapping[str, float]) -> dict[str, float]:
+        """A candidate's values other than its starting concentrations."""
+        prefix = self._context.initial_prefix
+        return {name: value for name, value in params.items() if not name.startswith(prefix)}
 
     def _fit_values(self, names: Sequence[str], params: Mapping[str, float]) -> str:
         """The Fit's own values for a failing value's inputs, which can differ
@@ -321,9 +308,7 @@ class FittingEvaluator:
     ) -> SimulationResultValue | SimulationScientificUnavailability:
         self._raise_if_cancel_requested()
         prefix = self._context.initial_prefix
-        non_initial_parameters = {
-            name: value for name, value in params.items() if not name.startswith(prefix)
-        }
+        non_initial_parameters = self._parameter_overrides(params)
         prepared_request = self._context.prepared_run.request
         species_index = {
             name: idx for idx, name in enumerate(prepared_request.species_names)

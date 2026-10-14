@@ -80,9 +80,9 @@ class PreparedSimulationRun:
     symbolic_jacobian: SymbolicJacobianExecution
     initials_for_algebra: Mapping[str, float]
     request: SimulationExecutionRequest
+    parameter_values_at_temperature: Callable[[float, tuple[str, ...]], Mapping[str, float]]
     cancellation_control: SimulationCancellationControl | None = None
     stop_observable_value: Callable[[str, float, np.ndarray, float], float] | None = None
-    parameter_values_at_temperature: Callable[[float, tuple[str, ...]], Mapping[str, float]] | None = None
 
     def __post_init__(self) -> None:
         y0 = np.asarray(self.y0, dtype=float).reshape(-1).copy()
@@ -425,9 +425,8 @@ def prepare_simulation_run(
         targets = tuple(dict.fromkeys(item.condition.name for item in stops))
         if targets:
             from kindred.core.algebra.errors import UNCOMPUTABLE_ERRORS, AlgebraError
-            from kindred.core.algebra.simulation_series import (
-                observable_parameter_roots, observable_reads_species, prepare_algebra_stop_evaluator,
-            )
+            from kindred.core.algebra.evaluator import PreparedAlgebraStopEvaluator
+            from kindred.core.algebra.simulation_series import let_dependency_facts, observable_parameter_roots
             observable_block = parameter_algebra_spec.observable_block
             # Admission calculates a fixed value when it reads it; the run
             # supplies only the values that change with time.
@@ -440,7 +439,7 @@ def prepare_simulation_run(
                 temperature_schedule, _coefficient_evaluator.nominal_temperature_K,
                 execution_request.t_span[0],
             )
-            evaluator = prepare_algebra_stop_evaluator(
+            evaluator = PreparedAlgebraStopEvaluator(
                 observable_block,
                 species_names=tuple(species_names), initials=initials_for_algebra,
                 symbol_resolver=lambda name, _row: (
@@ -462,13 +461,7 @@ def prepare_simulation_run(
                         # calculated for these inputs; it names its inputs as a
                         # let's failure does.
                         name = lets_by_line[exc.line]
-                        exc.annotate(
-                            assignment=name,
-                            parameter_names=parameter_algebra_spec.input_dependencies(
-                                observable_parameter_roots(observable_block, name)
-                            ),
-                            reads_species=observable_reads_species(observable_block, name),
-                        )
+                        exc.annotate(assignment=name, **let_dependency_facts(parameter_algebra_spec, name))
                     else:
                         exc.annotate(prefix="A stop condition cannot watch this value: ")
                     raise

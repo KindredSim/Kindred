@@ -52,6 +52,7 @@ from kindred.gui.fitting.launch import (
 )
 from kindred.gui.fitting.constants import (
     admit_fit_tolerance,
+    DIFFERENTIAL_EVOLUTION_METHOD,
     FUNCTION_TOLERANCE_LABEL,
     STEP_TOLERANCE_LABEL,
 )
@@ -568,6 +569,8 @@ class ParametersIcsTab(QtWidgets.QWidget):
             form.setFieldGrowthPolicy(QtWidgets.QFormLayout.FieldsStayAtSizeHint)
             form.addRow(label, control)
             flow.addWidget(group)
+            if control is self._seed_spin:
+                self._seed_group = group
         settings_layout.addWidget(flow_host)
         controls = (self._method_combo, self._max_eval_spin, self._solver_combo,
                     self._seed_check, self._seed_spin, self._ftol_edit, self._xtol_edit,
@@ -1442,6 +1445,8 @@ class ParametersIcsTab(QtWidgets.QWidget):
         self._seed_spin.setEnabled(defaults.use_seed)
         self._ftol_edit.setText(self._tolerance_drafts.get("ftol", _format_scientific(defaults.ftol)))
         self._xtol_edit.setText(self._tolerance_drafts.get("xtol", _format_scientific(defaults.xtol)))
+        # Only Differential Evolution draws random numbers.
+        self._seed_group.setVisible(defaults.method == DIFFERENTIAL_EVOLUTION_METHOD)
         del blocker
 
     def _defaults_projection(self) -> FitDefaults:

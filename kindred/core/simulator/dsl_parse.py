@@ -1668,6 +1668,7 @@ def prepare_dsl_request_set(
             InterventionScheduleError,
             ObservableTriggerCondition,
             admit_intervention_parameter_units,
+            declaration_line,
             intervention_schedule_parameter_dependencies,
         )
         try:
@@ -1700,9 +1701,8 @@ def prepare_dsl_request_set(
             )
         except InterventionScheduleError as exc:
             # Each of these refusals names its declaration, or the declarations
-            # that conflict; show the line of the (latest) declaration.
-            ordinals = exc.details.get("declaration_ordinals") or (exc.declaration_ordinal,)
-            line_number, line_content = ir.intervention_lines[ordinals[-1]]
+            # that conflict.
+            line_number, line_content = declaration_line(exc, ir.intervention_lines)
             raise _DSLError(str(exc), line_number=line_number, line_content=line_content) from exc
     else:
         intervention_execution = compile_intervention_schedule(None)

@@ -42,6 +42,7 @@ __all__ = [
     "admit_intervention_parameter_units",
     "intervention_schedule_parameter_dependencies",
     "intervention_schedule_parameter_names",
+    "declaration_line",
     "locate_declaration",
 ]
 
@@ -64,7 +65,6 @@ class InterventionScheduleError(AuthoredSourceError):
         "field",
         "domain",
         "field_identities",
-        "value_dependencies",
         "_extra_details",
     )
 
@@ -77,19 +77,9 @@ class InterventionScheduleError(AuthoredSourceError):
         field: str | None = None,
         domain: str | None = None,
         field_identities: Sequence[InterventionScheduleFieldIdentity] = (),
-        value_dependencies: Sequence[str] = (),
         details: Mapping[str, Any] | None = None,
     ) -> None:
-        """Retain producer-owned location/dependency facts."""
-        normalized_dependencies = tuple(
-            sorted(
-                {
-                    str(name).strip()
-                    for name in value_dependencies
-                    if str(name).strip()
-                }
-            )
-        )
+        """Retain producer-owned location facts."""
         normalized_field_identities = tuple(
             (int(declaration), None if nested is None else int(nested), str(path))
             for declaration, nested, path in field_identities
@@ -103,7 +93,6 @@ class InterventionScheduleError(AuthoredSourceError):
         object.__setattr__(self, "field", None if field is None else str(field))
         object.__setattr__(self, "domain", None if domain is None else str(domain))
         object.__setattr__(self, "field_identities", normalized_field_identities)
-        object.__setattr__(self, "value_dependencies", normalized_dependencies)
         object.__setattr__(
             self,
             "_extra_details",
@@ -121,29 +110,28 @@ class InterventionScheduleError(AuthoredSourceError):
                 payload[name] = value
         if self.field_identities:
             payload["field_identities"] = self.field_identities
-        if self.value_dependencies:
-            payload["value_dependencies"] = self.value_dependencies
         return MappingProxyType(payload)
 
     def annotate(self, *, prefix: str = "", **facts: Any) -> None:
         """Add what an owner the error passes through knows, keeping the error
         itself: words before the message and facts it does not record yet."""
         self.args = (f"{prefix}{self}",)
-        for name in ("operation", "declaration_ordinal", "field", "domain"):
-            if name in facts and getattr(self, name) is None:
-                setattr(self, name, facts.pop(name))
-        if "value_dependencies" in facts and not self.value_dependencies:
-            self.value_dependencies = tuple(sorted(facts.pop("value_dependencies")))
         self._extra_details = _freeze_schedule_value({**facts, **self._extra_details})
 
 
-def locate_declaration(exc: Exception, lines: Sequence[tuple[int, str]]) -> None:
-    """Place a refusal on the authored line of the (latest) declaration it
-    names; a refusal of the whole schedule names none."""
+def declaration_line(exc: Exception, lines: Sequence[tuple[int, str]]) -> tuple[int, str] | None:
+    """The authored line of the (latest) declaration a refusal names; a
+    refusal of the whole schedule names none."""
     ordinals = exc.details.get("declaration_ordinals") or (exc.details.get("declaration_ordinal"),)
-    if ordinals[-1] is None:
+    return None if ordinals[-1] is None else lines[ordinals[-1]]
+
+
+def locate_declaration(exc: Exception, lines: Sequence[tuple[int, str]]) -> None:
+    """Place a refusal on the authored line of the declaration it names."""
+    located_line = declaration_line(exc, lines)
+    if located_line is None:
         return
-    line, line_text = lines[ordinals[-1]]
+    line, line_text = located_line
     if isinstance(exc, KindredError):
         exc.annotate(context=ErrorContext(line=line, line_text=line_text))
     else:
@@ -298,13 +286,6 @@ def _resolved(
     if parameter is None:
         # An authored literal, admitted with its declaration.
         return value
-    if parameter not in parameter_values:
-        raise InterventionScheduleError(
-            f"Missing intervention schedule parameter: {parameter}",
-            field=field,
-            domain=domain,
-            value_dependencies=(parameter,),
-        )
     # A value a param supplies outside its domain is that param's value.
     number = float(parameter_values[parameter])
     try:
@@ -322,7 +303,7 @@ def _admit_resolved_interval(operation: object, start_time: float, end_time: flo
     """A flux or hold interval its params order wrongly; authoring refused
     literal ones, so a param supplied at least one end."""
     if end_time <= start_time:
-        raise ValueDomainError("end_time", "end_time must be greater than start_time.", details={
+        raise ValueDomainError("end_time must be greater than start_time.", details={
             "parameter_names": tuple(name for name in (operation.start_time_param, operation.end_time_param)
                                      if name is not None),
         })
@@ -1236,7 +1217,7 @@ class InterventionSchedule:
         for item in self.operations:
             try:
                 resolved.append(item.resolve_parameters(values, runtime_parameters=runtime_parameters))
-            except (InterventionScheduleError, ValueDomainError) as exc:
+            except ValueDomainError as exc:
                 exc.annotate(operation=item.op, declaration_ordinal=item.declaration_ordinal)
                 raise
         return InterventionSchedule(tuple(resolved))

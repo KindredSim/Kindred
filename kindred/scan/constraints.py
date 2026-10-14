@@ -76,6 +76,8 @@ def scientific_constraints(spec, constraints):
 
 _AFFINE_FORMS = ("Constraints accept sums and differences of inputs, each multiplied by a fixed number or "
                  "divided by a nonzero one, without comparisons or logic.")
+_NO_FEASIBLE_INPUTS = ("No inputs fit this setup: within the allowed ranges, each end time must come after "
+                       "its start time, and every constraint must hold.")
 
 def compile_constraints(prepared, config: ScanConfig, fixed: dict[str, float]):
     spec = prepared.parameter_algebra_spec_for_execution()
@@ -148,11 +150,7 @@ def compile_constraints(prepared, config: ScanConfig, fixed: dict[str, float]):
             raise ValueError(_AFFINE_FORMS)
         if isinstance(node, CallNode):
             if node.name == "ifelse":
-                # Only the selected value is calculated, as in a Run.
-                condition = lower(node.args[0])
-                if condition.terms:
-                    raise ValueError("ifelse(...) reads a scanned input in its condition; constraints accept a fixed condition.")
-                return lower(node.args[1] if condition.constant else node.args[2])
+                raise ValueError(_AFFINE_FORMS)
             arguments = [lower(arg) for arg in node.args]
             if any(arg.terms for arg in arguments):
                 raise ValueError(f"{node.name}(...) reads a scanned input; constraints accept functions only of fixed values.")
@@ -370,7 +368,7 @@ class FeasibleSpace:
                 self.pieces.append(piece)
                 self.levels.append(tuple(reversed(levels[:-1])))
         if not self.pieces:
-            raise ValueError("The configured constraints and ranges have an empty feasible region.")
+            raise ValueError(_NO_FEASIBLE_INPUTS)
 
     def project(self, keys: tuple[str, ...]) -> FeasibleSpace:
         pieces = []
@@ -467,7 +465,7 @@ def build_spaces(ranges, derived, inequalities, check, order):
             groups.append(set().union(*touched))
     constant_rows = tuple(row for row in inequalities if not row.expression.terms)
     if simplify(constant_rows) is None:
-        raise ValueError("The configured constraints have no feasible inputs.")
+        raise ValueError(_NO_FEASIBLE_INPUTS)
     spaces = []
     for group in groups:
         keys = tuple(key for key in free if key in group)

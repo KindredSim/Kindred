@@ -18,8 +18,7 @@ from kindred.core.result_repository import (
 from kindred.core.simulator.solver_types import FinalSimulationOutput, SimulationCancellationControl
 from kindred.core.algebra.simulation_series import (
     evaluate_algebra_block_for_simulation_partial,
-    observable_parameter_roots,
-    observable_reads_species,
+    let_dependency_facts,
 )
 
 __all__ = [
@@ -98,10 +97,7 @@ def _algebra_cause(error: AlgebraObservableError, spec: object) -> FactualCause:
         details["value_failure"] = True
         # A param it reads that failed names its own inputs.
         if "assignment" not in details:
-            details["parameter_names"] = spec.input_dependencies(
-                observable_parameter_roots(spec.observable_block, error.name)
-            )
-            details["reads_species"] = observable_reads_species(spec.observable_block, error.name)
+            details.update(let_dependency_facts(spec, error.name))
     if error.col is not None:
         details["col"] = error.col
     # The authored statement is the cause's location, as for every other cause.

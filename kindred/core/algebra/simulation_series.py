@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Callable, Dict, Iterable, Mapping, Tuple
+from typing import Callable, Dict, Iterable, Tuple
 
 import numpy as np
 
@@ -10,7 +10,6 @@ from kindred.core.algebra.errors import AlgebraNameError
 from kindred.core.algebra.evaluator import (
     AlgebraObservableError,
     EvaluationContext,
-    PreparedAlgebraStopEvaluator,
     evaluate_block_partial,
 )
 from kindred.core.algebra.parser import (
@@ -25,8 +24,8 @@ from kindred.core.algebra.parser import (
 from kindred.core.algebra.symbols import SymbolTable
 
 __all__ = [
+    "let_dependency_facts",
     "observable_parameter_roots",
-    "prepare_algebra_stop_evaluator",
     "reject_unknown_species_references",
 ]
 
@@ -104,22 +103,13 @@ def observable_parameter_roots(block: AlgebraBlock, name: str) -> tuple[str, ...
     return tuple(sorted(roots))
 
 
-def prepare_algebra_stop_evaluator(
-    block: AlgebraBlock,
-    *,
-    species_names: Tuple[str, ...],
-    initials: Mapping[str, float],
-    symbol_resolver: Callable[[str, int], float | None],
-    runtime_symbol_names: set[str],
-) -> PreparedAlgebraStopEvaluator:
-    """Bind stopping to the accepted retained AST; the caller admits each target."""
-    return PreparedAlgebraStopEvaluator(
-        block,
-        species_names=species_names,
-        initials=initials,
-        symbol_resolver=symbol_resolver,
-        runtime_symbol_names=runtime_symbol_names,
-    )
+def let_dependency_facts(spec, name: str) -> dict[str, object]:
+    """What a let that cannot be calculated depends on: the independent inputs
+    its closure reads, and whether it reads a concentration."""
+    return {
+        "parameter_names": spec.input_dependencies(observable_parameter_roots(spec.observable_block, name)),
+        "reads_species": observable_reads_species(spec.observable_block, name),
+    }
 
 
 def _build_simulation_context(
@@ -150,9 +140,9 @@ def evaluate_algebra_block_for_simulation_partial(
     t: np.ndarray,
     species_series: Dict[str, np.ndarray],
     initials: Dict[str, float],
-    symbol_resolver: Callable[[str, int], float | None] | None = None,
-    runtime_symbol_names: frozenset[str] = frozenset(),
-    cancellation_check: Callable[[], bool] | None = None,
+    symbol_resolver: Callable[[str, int], float | None],
+    runtime_symbol_names: frozenset[str],
+    cancellation_check: Callable[[], bool] | None,
 ) -> Tuple[Dict[str, np.ndarray], Dict[str, float], list[AlgebraObservableError]]:
     """Evaluate retained observables while preserving per-observable failures."""
     ctx = _build_simulation_context(

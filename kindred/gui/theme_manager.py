@@ -62,7 +62,7 @@ class ThemeManager:
         self,
         theme_target: object,
         *,
-        report_failure: Callable[[str], None] | None = None,
+        report_failure: Callable[[str], None],
     ) -> None:
         self._theme_target = theme_target
         self._report_failure = report_failure
@@ -78,7 +78,7 @@ class ThemeManager:
         self,
         dark_mode: bool,
         persist: Callable[[bool], None] | None = None,
-    ) -> bool:
+    ) -> None:
         """
         Apply one theme and optionally persist it.
 
@@ -91,7 +91,7 @@ class ThemeManager:
         requested = bool(dark_mode)
         recorded_previous = self._applied_dark_mode
         if recorded_previous is requested:
-            return True
+            return
         previous = False if recorded_previous is None else recorded_previous
 
         self._apply_physical(requested)
@@ -105,12 +105,10 @@ class ThemeManager:
                     f"Could not apply the {'dark' if requested else 'light'} theme: {exc}"
                 )
                 logger.warning(message, exc_info=True)
-                if self._report_failure is not None:
-                    self._report_failure(message)
-                return False
+                self._report_failure(message)
+                return
         self._applied_dark_mode = requested
         logger.info("Applied %s theme", "dark" if requested else "light")
-        return True
 
     def _apply_physical(self, dark_mode: bool) -> None:
         qdarktheme.setup_theme(

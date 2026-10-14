@@ -22,7 +22,6 @@ from kindred.core.validation import six_digit_text
 from kindred.gui.display_name_policy import (
     TAB_LABEL_MAX_CHARS,
     compact_dataset_label,
-    dataset_alias,
 )
 from kindred.gui.fitting.reporting import (
     FitValueEntry, fit_candidate_presentation, fit_live_presentation, fit_overview,
@@ -709,20 +708,13 @@ class RunResultsTab(QtWidgets.QWidget):
         blocker = QtCore.QSignalBlocker(self._subtabs)
         while self._subtabs.count():
             self._subtabs.removeTab(self._subtabs.count() - 1)
-        for index, (curve, view_identity) in enumerate(zip(curves, ids, strict=True)):
+        for curve, view_identity in zip(curves, ids, strict=True):
             compact_label = compact_dataset_label(curve.display_name, max_chars=TAB_LABEL_MAX_CHARS)
             tab_index = self._subtabs.addTab(compact_label.display)
             self._subtabs.setTabToolTip(
                 tab_index, f"{compact_label.full}\nDataset ID: {curve.dataset_id}"
             )
-            self._subtabs.setTabData(
-                tab_index,
-                {
-                    "view_identity": view_identity,
-                    "alias": dataset_alias(index),
-                    "full_label": compact_label.full,
-                },
-            )
+            self._subtabs.setTabData(tab_index, {"view_identity": view_identity})
         if len(curves) > 1:
             index = self._subtabs.addTab("All Datasets")
             self._subtabs.setTabData(index, {"view_identity": ("aggregate", "all")})

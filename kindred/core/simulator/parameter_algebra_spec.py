@@ -652,14 +652,6 @@ def _validate_retained_parameter_program(
                 line_number=assignment.line_number,
                 line_content=assignment.line_content,
             )
-        # A param is a number; a true/false value inside it could never be
-        # read, as one is refused when evaluated.
-        if _uses_true_false_as_number(statement.expr):
-            raise DSLError(
-                "A true/false result cannot be used as a number.",
-                line_number=assignment.line_number,
-                line_content=assignment.line_content,
-            )
         unknown_functions = {
             name
             for name in _iter_call_names(statement.expr)
@@ -670,6 +662,14 @@ def _validate_retained_parameter_program(
                 f"Unknown function{'s' * (len(unknown_functions) > 1)} "
                 + ", ".join(repr(name) for name in sorted(unknown_functions))
                 + ". The functions are " + ", ".join(sorted(namespace.builtin_function_names)) + ".",
+                line_number=assignment.line_number,
+                line_content=assignment.line_content,
+            )
+        # A param is a number; a true/false value inside it could never be
+        # read, as one is refused when evaluated.
+        if _uses_true_false_as_number(statement.expr):
+            raise DSLError(
+                "A true/false result cannot be used as a number.",
                 line_number=assignment.line_number,
                 line_content=assignment.line_content,
             )

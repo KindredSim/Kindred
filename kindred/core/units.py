@@ -71,7 +71,7 @@ def admit_role_value(
         message = f"{field} must have an absolute value of at most {limit:g}{label}."
     else:
         message = f"{field} must be {'zero or positive' if allow_exact_zero else 'positive'} and at most {limit:g}{label}."
-    raise ValueDomainError(field, message)
+    raise ValueDomainError(message, field=field)
 
 
 def input_unit_bounds(unit: str, low: float, high: float) -> tuple[float, float]:

@@ -22,7 +22,6 @@ __all__ = [
     "compact_diagnostic_text",
     "compact_plot_title_label",
     "compact_text",
-    "dataset_alias",
     "literal_tooltip",
     "scientific_symbol_label",
     "scientific_symbol_html",
@@ -171,10 +170,6 @@ def compact_plot_title_label(text: object, *, max_chars: int = PLOT_TITLE_LABEL_
 
 def compact_diagnostic_text(text: object, *, max_chars: int = DIAGNOSTIC_LABEL_MAX_CHARS) -> CompactText:
     return compact_text(text, max_chars=max_chars, empty_text="", mode="right")
-
-
-def dataset_alias(index: int, *, prefix: str = "D") -> str:
-    return f"{prefix}{index + 1}"
 
 
 def reaction_text(context: str) -> str:

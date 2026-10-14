@@ -981,8 +981,9 @@ class InterventionScheduleExecutionOwner:
                 discontinuity_ids=result_discontinuity_ids,
                 termination=termination,
             )
-        except (AlgebraError, ValueDomainError, InterventionScheduleError) as exc:
-            # Values params supply at run time are refused on their declaration.
+        except (ValueDomainError, InterventionScheduleError) as exc:
+            # Values params supply at run time, and conflicts among them, are
+            # refused on their declaration.
             locate_declaration(exc, req.intervention_lines)
             raise
         finally:
@@ -1247,7 +1248,7 @@ def _apply_boundary(
     temperature_step: bool = False,
     temperature_K: float,
     temperature_at,
-    parameter_values=None, executed_values: dict, volume,
+    parameter_values, executed_values: dict, volume,
 ) -> _BoundaryApplicationResult:
     _raise_if_cancelled(cancellation_check)
     current = np.asarray(trigger_state if trigger_state is not None else state, dtype=float).reshape(-1).copy()
@@ -1451,11 +1452,11 @@ def _resolve_items(items, time, parameter_values, *, temperature_K):
     if not roots:
         return tuple(items)
     try:
-        values = parameter_values(temperature_K, roots) if parameter_values is not None else {}
+        values = parameter_values(temperature_K, roots)
         return tuple(
             resolve_executable_values(item, values, time=time) for item in items
         )
-    except (AlgebraError, ValueDomainError, InterventionScheduleError) as exc:
+    except (AlgebraError, ValueDomainError) as exc:
         exc.annotate(prefix=f"Intervention values at t = {time:g} s: ", time=time)
         raise
 
@@ -1735,7 +1736,7 @@ def _trigger_callables(
     trigger_last_times: Sequence[float | None],
     observable_value: Callable[[str, float, np.ndarray, float], float] | None = None,
     temperature_at,
-    parameter_values=None, holds=(),
+    parameter_values, holds=(),
 ) -> tuple[tuple[Callable[[float, np.ndarray], float], ...], tuple[int, ...]]:
     callables: list[Callable[[float, np.ndarray], float]] = []
     mapping: list[int] = []

@@ -27,9 +27,7 @@ def K_from_deltaG_eq(dG_eq_J_per_mol: float, T: float) -> float:
     try:
         return math.exp(-dG_eq_J_per_mol / (R * T))
     except OverflowError as exc:
-        raise ValueDomainError(
-            "Keq", "equilibrium constant overflows the finite real domain"
-        ) from exc
+        raise ValueDomainError("equilibrium constant overflows the finite real domain") from exc
 
 
 def concentration_Keq_from_deltaG_eq(
@@ -43,5 +41,5 @@ def concentration_Keq_from_deltaG_eq(
     try:
         concentration_constant = standard_constant * math.pow(standard_conc_M, delta_n)
     except (OverflowError, ValueError) as exc:
-        raise ValueDomainError("Keq", "concentration-form equilibrium constant is not finite") from exc
+        raise ValueDomainError("concentration-form equilibrium constant is not finite") from exc
     return admit_keq(concentration_constant, field="The Keq calculated from dG_eq")

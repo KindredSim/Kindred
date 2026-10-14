@@ -72,7 +72,7 @@ class ChemicalSpaceScanOwner(QtCore.QObject):
         self.close_fenced = False
         self.session_closing = False
 
-    def open(self, initial_capture):
+    def open(self, initial_capture, selected_set_id=None):
         if self.close_fenced or self.session_closing:
             return
         if self.dialog is None:
@@ -86,7 +86,9 @@ class ChemicalSpaceScanOwner(QtCore.QObject):
             from kindred.gui.widgets.chemical_space_scan import ChemicalSpaceScanDialog
 
             self.capture = capture
-            self.dialog = ChemicalSpaceScanDialog(capture, self, self.parent_widget)
+            self.dialog = ChemicalSpaceScanDialog(
+                capture, self, self.parent_widget, selected_set_id=selected_set_id,
+            )
             self.dialog.destroyed.connect(self._dialog_destroyed)
             self.application_close_settlement_changed.emit()
         self.dialog.show()

@@ -36,13 +36,9 @@ def derived_equilibrium_ratio_from_directional_rates(kf: float, kr: float) -> fl
     try:
         ratio = kf / kr
     except (OverflowError, ZeroDivisionError) as exc:
-        raise ValueDomainError(
-            "Keq", "explicit kf+kr must derive a finite positive equilibrium ratio"
-        ) from exc
+        raise ValueDomainError("explicit kf+kr must derive a finite positive equilibrium ratio") from exc
     if not math.isfinite(ratio) or ratio <= 0.0:
-        raise ValueDomainError(
-            "Keq", "explicit kf+kr must derive a finite positive equilibrium ratio"
-        )
+        raise ValueDomainError("explicit kf+kr must derive a finite positive equilibrium ratio")
     return float(ratio)
 
 

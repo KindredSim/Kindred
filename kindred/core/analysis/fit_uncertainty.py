@@ -14,14 +14,13 @@ from typing import Callable, Literal, Mapping, Sequence
 
 import numpy as np
 
-from kindred.core.algebra.errors import UNCOMPUTABLE_ERRORS, AlgebraError
+from kindred.core.algebra.errors import UNCOMPUTABLE_ERRORS
 from kindred.core.algebra.simulation_series import observable_parameter_roots
 from kindred.core.analysis import global_fit_execution as _fit_execution
 from kindred.core.analysis.fit_statistics import finite_sum_of_squares
 from kindred.core.exceptions import (
     FittingCancelled,
     SimulationCancelled,
-    ValueDomainError,
 )
 from kindred.core.fitting_completion import FitExtensionProgress
 from kindred.core.fitting_optimization import (
@@ -315,17 +314,15 @@ def rate_scale_undetermined(
     the scale unflagged.
     """
 
-    contract = prepared_dsl.intervention_execution_contract()
-    schedule = prepared_dsl.parameterized_intervention_schedule_for_binding() or (
-        contract.authored if contract is not None else None
-    )
+    schedule = (prepared_dsl.parameterized_intervention_schedule_for_binding()
+                or prepared_dsl.intervention_execution_contract().authored)
     if (
         all(item.x_name == "t" for item in datasets)
         or prepared_dsl.temperature_schedule_for_execution() is not None
-        or (schedule is not None and any(
+        or any(
             not isinstance(item, InterventionTrigger) or item.min_interval
             for item in schedule.without_stops().operations
-        ))
+        )
     ):
         return False
     rates = tuple(
@@ -334,11 +331,10 @@ def rate_scale_undetermined(
     )
     spec = prepared_dsl.parameter_algebra_spec_for_execution()
     # A trigger's threshold and amounts shape the curve as a target's reads do.
-    triggers = set() if schedule is None else {
+    triggers = {
         name for names in intervention_schedule_parameter_dependencies(schedule.without_stops()).values()
         for name in names if name in spec.evaluation_dependencies
     }
-    temperature = float(prepared_dsl.analysis.temperature_K)
     x = np.asarray(vector, dtype=float)
     # Relative to each value, so a small rate constant keeps positive
     # neighbours. Within a step of a bound, the difference is a second-order
@@ -364,13 +360,13 @@ def rate_scale_undetermined(
                 shared_values=layout.shared_param_dict_from_vector(trial),
                 fixed_values=fixed_dataset_params[payload.dataset_id],
             ).full_params
-            calculated = fit_evaluators[payload.dataset_id].parameter_values(params, temperature, names)
+            calculated = fit_evaluators[payload.dataset_id].parameter_values(params, names)
             return np.asarray([calculated[name] for name in names], dtype=float)
 
         def calculable(name: str) -> bool:
             try:
                 values((name,))
-            except (AlgebraError, ValueDomainError):
+            except UNCOMPUTABLE_ERRORS:
                 return False
             return True
 

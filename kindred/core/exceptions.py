@@ -152,9 +152,10 @@ class ValueDomainError(SimulationError, ValueError):
     """A value lies outside its scientific domain: an authored or candidate
     input, or a calculated rate constant, Keq or physical coordinate."""
 
-    def __init__(self, field: str, message: str, **kwargs: Any):
+    def __init__(self, message: str, *, field: str | None = None, **kwargs: Any):
         kwargs.setdefault("code", "E304")
         super().__init__(message, **kwargs)
+        # The coordinate a role refusal names, which a value override supplies.
         self.field = field
 
 

@@ -93,16 +93,15 @@ def bind_parameter_evaluation(
             # The value that failed names itself and its inputs, on the line
             # that calculates it: its param line, else its reaction line; the
             # values that read it add nothing.
-            if "assignment" not in exc.details:
-                statement = statements.get(name)
-                entry = targets[name][4] if statement is None else None
-                exc.annotate(
-                    context=(ErrorContext(line=statement.line, line_text=statement.line_text)
-                             if statement is not None
-                             else ErrorContext(line=entry["line"], line_text=entry["line_text"])),
-                    assignment=name,
-                    parameter_names=spec.input_dependencies((name,)),
-                )
+            statement = statements.get(name)
+            entry = targets[name][4] if statement is None else None
+            exc.annotate(
+                context=(ErrorContext(line=statement.line, line_text=statement.line_text)
+                         if statement is not None
+                         else ErrorContext(line=entry["line"], line_text=entry["line_text"])),
+                assignment=name,
+                parameter_names=spec.input_dependencies((name,)),
+            )
             raise
 
     dynamic = set(operations) & spec.temperature_dependent_names

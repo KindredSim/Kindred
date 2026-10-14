@@ -101,6 +101,7 @@ from kindred.gui.fit_session_owner import (
     FitSessionOwner,
 )
 from kindred.gui.fitting.constants import (
+    DIFFERENTIAL_EVOLUTION_METHOD,
     FUNCTION_TOLERANCE_LABEL,
     STEP_TOLERANCE_LABEL,
     admit_fit_tolerance,
@@ -4007,7 +4008,12 @@ class MainWindow(QtWidgets.QMainWindow):
         if not self._mutation_input_admitted("Chemical Space Scan"):
             return
         try:
-            self._scan_owner.open(self._capture_scan_session)
+            self._scan_owner.open(
+                self._capture_scan_session,
+                self._workspace_tab_registry.presentation(
+                    self._workspace_tab_registry.active_tab_id
+                ).current_set_id,
+            )
         except ValueError as exc:
             QtWidgets.QMessageBox.warning(self, "Chemical Space Scan", str(exc))
 
@@ -4091,6 +4097,14 @@ class MainWindow(QtWidgets.QMainWindow):
         form.addRow(STEP_TOLERANCE_LABEL, xtol)
         form.addRow(use_seed)
         form.addRow("Seed", seed)
+
+        def show_seed(_index: int = 0) -> None:
+            # Only Differential Evolution draws random numbers.
+            for row in (use_seed, seed):
+                form.setRowVisible(row, method.currentData() == DIFFERENTIAL_EVOLUTION_METHOD)
+
+        method.currentIndexChanged.connect(show_seed)
+        show_seed()
         buttons = QtWidgets.QDialogButtonBox(
             QtWidgets.QDialogButtonBox.StandardButton.Ok
             | QtWidgets.QDialogButtonBox.StandardButton.Cancel,
@@ -4568,20 +4582,13 @@ class MainWindow(QtWidgets.QMainWindow):
             return False
         return True
 
-    def _toggle_theme(self) -> bool:
+    def _toggle_theme(self) -> None:
+        # Only the Dark Mode action, which exists by then, calls this.
         action = self._dark_mode_action
-        if action is None:
-            return False
-        requested = bool(action.isChecked())
-        try:
-            applied = self._theme_manager.apply(
-                requested,
-                self.config_controller.persist_theme,
-            )
-        finally:
-            action.setChecked(self._theme_manager.applied_dark_mode)
+        self._theme_manager.apply(bool(action.isChecked()), self.config_controller.persist_theme)
+        # A theme that could not be saved is not applied; the tick follows.
+        action.setChecked(self._theme_manager.applied_dark_mode)
         self._refresh_application_plot_preferences()
-        return bool(applied)
 
     def _startup_size(self) -> QtCore.QSize:
         screen = self.screen()

@@ -62,11 +62,8 @@ def resolve_executable_values(item, values: Mapping[str, float], *, time: float)
             updates[field] = _resolved(
                 None, parameter, values, field=field, domain=domain
             )
-        except (InterventionScheduleError, ValueDomainError) as exc:
-            exc.annotate(
-                declaration_ordinal=item.declaration_ordinal, field=field,
-                value_dependencies=(parameter,), time=time,
-            )
+        except ValueDomainError as exc:
+            exc.annotate(declaration_ordinal=item.declaration_ordinal, field=field, time=time)
             raise
         updates[f"{field}_param"] = None
     return replace(item, **updates) if updates else item
@@ -712,12 +709,12 @@ def _annotated_schedule_error(
     if dependencies:
         # Reached only through values params supply: a refusal of those values.
         details = facts.pop("details", {})
-        return ValueDomainError(str(field), message, details={
+        return ValueDomainError(message, details={
             **details, **{key: value for key, value in facts.items() if value is not None},
             "field_identities": identities, "parameter_names": dependencies,
         })
     return InterventionScheduleError(
-        message, field_identities=identities, value_dependencies=dependencies, **facts,
+        message, field_identities=identities, **facts,
     )
 
 

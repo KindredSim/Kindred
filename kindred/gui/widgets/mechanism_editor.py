@@ -759,6 +759,8 @@ class MechanismEditorTabbed(QtWidgets.QWidget):
             "<tr><td><code>&gt;</code>, <code>&gt;=</code></td><td>Greater than, greater than or equal to</td></tr>"
             "<tr><td><code>&amp;&amp;</code>, <code>||</code>, <code>!</code></td><td>And, or, not</td></tr>"
             "</table>"
+            "<p>A comparison, alone or combined with <code>&amp;&amp;</code>, <code>||</code>, and <code>!</code>, is true or false, not a number. "
+            "Use it as the condition of <code>ifelse</code>, such as <code>ifelse([A] &gt; 0.5, 1, 0)</code>, which is 1 where A is above 0.5 and 0 elsewhere.</p>"
             "<h2>Constants, Time, and Temperature</h2>"
             "<p>Use these names directly in expressions:</p>"
             "<table border=\"1\" cellpadding=\"5\" cellspacing=\"0\">"
