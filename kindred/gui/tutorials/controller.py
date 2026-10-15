@@ -37,12 +37,6 @@ class Lesson(QtCore.QObject):
         super().__init__()
         self.steps: tuple[Step, ...] = ()
         self.position = 0
-        self._connections: list[tuple[object, Callable]] = []
-
-    def observe(self, signal, callback: Callable | None = None) -> None:
-        slot = (lambda *_args: self.changed.emit()) if callback is None else callback
-        signal.connect(slot)
-        self._connections.append((signal, slot))
 
     def enter(self, position: int) -> None:
         self.position = position
@@ -56,15 +50,6 @@ class Lesson(QtCore.QObject):
 
     def working(self) -> bool:
         return False
-
-    def close(self) -> None:
-        for signal, slot in reversed(self._connections):
-            try:
-                signal.disconnect(slot)
-            except RuntimeError:
-                # Qt may already have destroyed a transient dialog or tab.
-                pass
-        self._connections.clear()
 
 
 class TutorialController(QtCore.QObject):
@@ -173,7 +158,8 @@ class TutorialController(QtCore.QObject):
             lesson.changed.disconnect(self.schedule_refresh)
             lesson.ended.disconnect(self._ended)
             lesson.revisitRequested.disconnect(self.revisit)
-            lesson.close()
+            # Deleting the lesson ends its observations: each one has the
+            # lesson as its receiver.
             lesson.deleteLater()
         self.overlay.close()
 

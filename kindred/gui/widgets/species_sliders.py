@@ -63,7 +63,6 @@ class BatchSpeciesSliders(QtWidgets.QWidget):
         self._active_presses: dict[str, SliderPress] = {}
         self._editor_pre_edit_values: dict[str, float] = {}
         self._editor_pre_edit_text: dict[str, str] = {}
-        self._last_committed_editor_text: dict[str, str] = {}
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(5)
@@ -130,12 +129,7 @@ class BatchSpeciesSliders(QtWidgets.QWidget):
                 self._set_value_projection(
                     species, value, editor_text=text, emit=False
                 )
-                if species in mixed:
-                    editor = self._rows[species].value_label
-                    editor.setProperty("invalidNumeric", False)
-                    editor.setStyleSheet("")
                 self.remember_editor_state(species)
-                self._last_committed_editor_text[species] = text
         self._sync_visibility()
 
     def slider_picker_entries(self) -> list[tuple[str, CompactText, str, bool]]:
@@ -180,7 +174,6 @@ class BatchSpeciesSliders(QtWidgets.QWidget):
         self._rows.clear()
         self._editor_pre_edit_values.clear()
         self._editor_pre_edit_text.clear()
-        self._last_committed_editor_text.clear()
 
     def _add_row(
         self,
@@ -412,8 +405,6 @@ class BatchSpeciesSliders(QtWidgets.QWidget):
         if row is None:
             return
         self.remember_editor_state(species)
-        self._last_committed_editor_text.pop(str(species), None)
-        self._decorate_editor(str(species))
 
     def remember_editor_state(self, species: str) -> None:
         """Remember the current value and text for subsequent local Escape."""
@@ -437,11 +428,6 @@ class BatchSpeciesSliders(QtWidgets.QWidget):
             editor_text=text,
             emit=False,
         )
-        self._last_committed_editor_text[species_s] = text
-        self._decorate_editor(species_s)
-        if text == "Multiple values":
-            row.value_label.setProperty("invalidNumeric", False)
-            row.value_label.setStyleSheet("")
 
     def _decorate_editor(self, species: str) -> None:
         row = self._rows.get(str(species))
@@ -451,10 +437,7 @@ class BatchSpeciesSliders(QtWidgets.QWidget):
             value = float(row.value_label.text().strip())
             valid = bool(math.isfinite(value) and value >= 0.0)
         except ValueError:
-            valid = bool(
-                row.value_label.text() == "Multiple values"
-                and not row.value_label.hasFocus()
-            )
+            valid = row.value_label.text() == "Multiple values"
         row.value_label.setProperty("invalidNumeric", not valid)
         row.value_label.setStyleSheet(
             "QLineEdit { border: 1px solid #c0392b; }"
@@ -467,9 +450,11 @@ class BatchSpeciesSliders(QtWidgets.QWidget):
         row = self._rows.get(species_s)
         if row is None:
             return
-        raw = row.value_label.text()
-        if raw == self._last_committed_editor_text.get(species_s):
+        # Displayed text is a rounded readout; only text the user edited is a
+        # value. Setting the text from code clears Qt's modified flag.
+        if not row.value_label.isModified():
             return
+        raw = row.value_label.text()
         try:
             value = float(raw.strip())
         except ValueError:
@@ -478,7 +463,6 @@ class BatchSpeciesSliders(QtWidgets.QWidget):
         if not math.isfinite(value) or value < 0.0:
             self._decorate_editor(species_s)
             return
-        self._last_committed_editor_text[species_s] = raw
         self._set_value_projection(
             species_s,
             value,

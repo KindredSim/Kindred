@@ -598,8 +598,8 @@ class FittingWindow(QtWidgets.QDialog):
 
         Preview and Apply must use the same target, weight, and mapping
         projection.  Parametric X is an additional weighted target, never a
-        Y target; switching X or returning to Time retires only obsolete
-        X-only weights while leaving observation mappings untouched.
+        Y target.  Each species keeps its weight whether or not it is a
+        target or the X, and observation mappings stay untouched.
         """
 
         parametric = FittingWindow._parametric_from_config(
@@ -611,15 +611,8 @@ class FittingWindow(QtWidgets.QDialog):
             target for target in current.target_species if target != x_name
         )
         weight_by_target = dict(current.target_weights)
-        target_weights = tuple(
-            (target, weight_by_target.get(target, 1.0))
-            for target in target_species
-        )
         if x_name is not None:
-            target_weights = (
-                *target_weights,
-                (x_name, weight_by_target.get(x_name, 1.0)),
-            )
+            weight_by_target.setdefault(x_name, 1.0)
         return replace(
             current,
             t_start=config["t_start"],
@@ -629,7 +622,7 @@ class FittingWindow(QtWidgets.QDialog):
             maximum_observations_per_target=config["maximum_observations_per_target"],
             parametric=parametric,
             target_species=target_species,
-            target_weights=target_weights,
+            target_weights=tuple(weight_by_target.items()),
             observation_targets=current.observation_targets,
         )
 

@@ -1990,11 +1990,6 @@ class MainWindow(QtWidgets.QMainWindow):
     ) -> ProjectContentToken | None:
         """Semantically admit one exact save candidate before archive output."""
 
-        refresh_tab_ids = tuple(
-            tab.tab_id
-            for tab in document.tabs
-            if self._workspace_tab_registry.tab_runtime(tab.tab_id).reactions_draft is not None
-        )
         result = self._workspace_tab_registry.replace_document(
             document,
             expected_token=expected_token,
@@ -2012,12 +2007,12 @@ class MainWindow(QtWidgets.QMainWindow):
             runtime = self._workspace_tab_registry.tab_runtime(tab.tab_id)
             runtime.reactions_draft = None
             runtime.notes_draft = None
-            self._tab_surfaces[tab.tab_id].editor_binding.render()
         for tab_id, materialized_ids in materialized_by_tab:
             self._activate_materialized_set(tab_id, materialized_ids)
-        for tab_id in refresh_tab_ids:
-            self._refresh_tab_controls(tab_id)
-        self._refresh_project_state()
+        # Every tab shows the published document now, whether or not the
+        # archive write that follows succeeds.
+        for tab in document.tabs:
+            self._refresh_tab_controls(tab.tab_id)
         return result
 
     def _discard_authoring(self) -> None:
@@ -4467,9 +4462,16 @@ class MainWindow(QtWidgets.QMainWindow):
 
     @QtCore.Slot(bool)
     def _on_project_state_changed(self, project_replaced: bool) -> None:
-        """Refresh the current root after semantic publication."""
+        """Refresh after a project replacement or a completed save.
 
-        self._refresh_workspace_document(project_replaced)
+        A save already refreshed every tab when it published its document;
+        writing the archive changes only the saved state.
+        """
+
+        if project_replaced:
+            self._refresh_workspace_document(True)
+        else:
+            self._refresh_project_state()
 
     def _refresh_project_state(self) -> None:
         self._render_tab_state()

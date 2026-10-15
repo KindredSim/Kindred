@@ -260,7 +260,7 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
             group,
             show_dirty=True,
             show_divider=True,
-            apply_requires_no_error=False,
+            apply_requires_no_error=True,
             button_order=("apply", "revert"),
             error_object_name="global_fit_species_table_error",
             apply_object_name="global_fit_species_table_apply",
@@ -461,8 +461,7 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
             self._table.blockSignals(False)
             self._refreshing = False
             self.setUpdatesEnabled(True)
-        self._refresh_footer_dirty()
-        self._refresh_footer_validity()
+        self._refresh_footer()
 
     def load_for_dataset(self, dataset_id: str) -> None:
         """Select one projected dataset and repaint the table."""
@@ -475,7 +474,7 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
     def refresh_validity_ui(self) -> None:
         """Refresh presentation validation without becoming a Fit validator."""
 
-        self._refresh_footer_validity()
+        self._refresh_footer()
 
     def clear_pending_edits(self) -> None:
         """Discard every target, weight, IC, and raw editor draft."""
@@ -1064,7 +1063,7 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
                     )
                 )
             )
-            weight_eligible = has_data and (species != x_name or x_name is not None)
+            weight_eligible = has_data
             weight_item = QtWidgets.QTableWidgetItem(
                 weight_text if weight_eligible else ""
             )
@@ -1315,8 +1314,7 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
             self._table.blockSignals(False)
             self._refreshing = False
             self.setUpdatesEnabled(True)
-        self._refresh_footer_dirty()
-        self._refresh_footer_validity()
+        self._refresh_footer()
 
     def _purge_parametric_x_pending(
         self,
@@ -1380,8 +1378,7 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
                 self._pending_target_weights.pop((dataset_id, species), None)
             else:
                 self._pending_target_weights[(dataset_id, species)] = value
-            self._refresh_footer_dirty()
-            self._refresh_footer_validity()
+            self._refresh_footer()
             return
         if item.column() == _Col.INCLUDE:
             self._stage_visible_target_selection(dataset_id)
@@ -1498,8 +1495,7 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
                     message,
                 )
             self._refresh_vary_global_availability(row)
-            self._refresh_footer_dirty()
-            self._refresh_footer_validity()
+            self._refresh_footer()
             return
         try:
             if mode == "disabled":
@@ -1562,8 +1558,7 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
                     self._pending_initial_rows.pop(key, None)
                     self._pending_initial_values.pop(key, None)
         self._refresh_vary_global_availability(row)
-        self._refresh_footer_dirty()
-        self._refresh_footer_validity()
+        self._refresh_footer()
 
     def _clear_initial_row_errors(
         self,
@@ -1610,18 +1605,8 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
             self._pending_target_selections.pop(dataset_id, None)
         else:
             self._pending_target_selections[dataset_id] = selected
-        # A weight has meaning only for a selected target.  Drop drafts for
-        # rows just deselected so this surface never retains dormant weights.
-        x_name = (
-            projected.parametric.x_name
-            if projected.parametric is not None
-            else None
-        )
-        for key in tuple(self._pending_target_weights):
-            if key[0] == dataset_id and key[1] not in selected and key[1] != x_name:
-                self._pending_target_weights.pop(key, None)
-        self._refresh_footer_dirty()
-        self._refresh_footer_validity()
+        # A species keeps its weight, and any weight draft, while unticked.
+        self._refresh_footer()
 
     def _on_dataset_weight_text_changed(self, raw: str) -> None:
         if self._refreshing or self._running:
@@ -1641,7 +1626,6 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
                 self._dataset_weight_edit,
                 "Dataset weight must be finite and positive.",
             )
-            self._refresh_footer_dirty()
             return
         self._invalid_raw.pop(key, None)
         self._clear_invalid_line_edit(self._dataset_weight_edit)
@@ -1649,8 +1633,7 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
             self._pending_dataset_weights.pop(dataset_id, None)
         else:
             self._pending_dataset_weights[dataset_id] = value
-        self._refresh_footer_dirty()
-        self._refresh_footer_validity()
+        self._refresh_footer()
 
     def _selected_targets(self, dataset: FitDatasetLocalSettings) -> tuple[str, ...]:
         selected = self._pending_target_selections.get(
@@ -1664,6 +1647,14 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
                 if target != dataset.parametric.x_name
             )
         return selected
+
+    def _weighted_species(self, dataset: FitDatasetLocalSettings) -> set[str]:
+        """The targets whose weights enter the Fit: ticked species or
+        observables, and measured X."""
+        weighted = set(self._selected_targets(dataset))
+        if dataset.parametric is not None:
+            weighted.add(dataset.parametric.x_name)
+        return weighted
 
     def _eligible_targets(self, dataset_id: str) -> tuple[str, ...]:
         dataset = self._projected_dataset(dataset_id)
@@ -1697,33 +1688,14 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
             for target in self._selected_targets(current)
             if target != x_name
         )
-        weight_targets = (
-            (*selected, x_name)
-            if x_name is not None
-            else selected
-        )
-        invalid_selected = [
-            target
-            for target in weight_targets
-            if ("target_weight", dataset_id, target) in self._invalid_raw
-        ]
-        if invalid_selected or ("dataset_weight", dataset_id) in self._invalid_raw:
-            return None
-        current_weights = dict(current.target_weights)
-        weight_roster = (
-            (*selected, current.parametric.x_name)
-            if current.parametric is not None
-            else selected
-        )
-        target_weights = tuple(
-            (
-                target,
-                self._pending_target_weights.get(
-                    (dataset_id, target),
-                    current_weights.get(target, 1.0),
-                ),
-            )
-            for target in weight_roster
+        # Every species keeps its weight, ticked or not; drafts override it.
+        weights = dict(current.target_weights)
+        for target in (*selected, *(() if x_name is None else (x_name,))):
+            weights.setdefault(target, 1.0)
+        weights.update(
+            (target, value)
+            for (draft_dataset_id, target), value in self._pending_target_weights.items()
+            if draft_dataset_id == dataset_id
         )
         return replace(
             current,
@@ -1732,23 +1704,15 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
                 current.weight,
             ),
             target_species=selected,
-            target_weights=target_weights,
-        )
-
-    def _refresh_footer_dirty(self) -> None:
-        self._footer.set_dirty(
-            self.has_pending_target_changes
-            or self.has_pending_initial_changes
-            or bool(self._invalid_raw)
-            or bool(self._invalid_initial_raw)
+            target_weights=tuple(weights.items()),
         )
 
     def _apply_presentation_edits(self) -> None:
-        """Overlay owned fields and emit one complete snapshot replacement."""
+        """Overlay owned fields and emit one complete snapshot replacement.
 
-        if self._invalid_raw or self._invalid_initial_raw:
-            self._refresh_footer_validity()
-            return
+        The footer offers Apply only while no table entry is invalid.
+        """
+
         dataset_ids = {
             *self._pending_target_selections,
             *self._pending_dataset_weights,
@@ -1890,8 +1854,9 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
         """Copy only row-local Vary IC/weight projections across datasets.
 
         Destination target selection, Starting IC values, dataset settings,
-        and accepted owner state remain untouched.  A target weight is
-        projected only when that destination already selects the species.
+        and accepted owner state remain untouched.  A weight is copied for
+        every target weighted in both datasets (a ticked species or
+        observable, or measured X, in either role).
         """
 
         setup = self._current_setup()
@@ -1903,7 +1868,7 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
         if source_mapped is None:
             return
         source_weights = dict(source.target_weights)
-        source_selected = set(self._selected_targets(source))
+        source_weighted = self._weighted_species(source)
         copied_ranges = 0
         copied_weights = 0
         skipped = 0
@@ -1924,7 +1889,7 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
                 for item in setup.initials
                 if item.set_id == destination_mapped.set_id
             }
-            destination_selected = set(self._selected_targets(destination))
+            destination_weighted = self._weighted_species(destination)
             for species, source_initial in source_initials.items():
                 destination_initial = destination_initials.get(species)
                 if destination_initial is None:
@@ -1934,9 +1899,8 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
                     destination.dataset_id, species
                 ) is not None
                 if destination_grouped:
-                    # Group membership owns the effective IC configuration.
-                    # Leave the retained local untouched while still copying
-                    # the independent target weight below.
+                    # Group membership owns the effective IC configuration;
+                    # leave the retained local untouched.
                     skipped += 1
                 else:
                     source_key = (source_mapped.set_id, species)
@@ -2006,25 +1970,21 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
                             }
                         copied_ranges += 1
 
-                # Weight is copied independently of the Vary IC projection,
-                # and only for an already selected destination target.
+            # Weights are copied independently of Vary IC, for every target
+            # weighted in both datasets, observables included.
+            destination_weights = dict(destination.target_weights)
+            for species in source_weighted & destination_weighted:
                 weight_key = (destination.dataset_id, species)
-                if species in destination_selected and species in source_selected:
-                    source_weight = self._pending_target_weights.get(
-                        (source.dataset_id, species),
-                        source_weights.get(species, 1.0),
-                    )
-                    destination_weight = dict(destination.target_weights).get(
-                        species,
-                        1.0,
-                    )
-                    if source_weight == destination_weight:
-                        self._pending_target_weights.pop(weight_key, None)
-                    else:
-                        self._pending_target_weights[weight_key] = source_weight
-                    copied_weights += 1
-                else:
+                self._invalid_raw.pop(("target_weight", *weight_key), None)
+                source_weight = self._pending_target_weights.get(
+                    (source.dataset_id, species),
+                    source_weights.get(species, 1.0),
+                )
+                if source_weight == destination_weights.get(species, 1.0):
                     self._pending_target_weights.pop(weight_key, None)
+                else:
+                    self._pending_target_weights[weight_key] = source_weight
+                copied_weights += 1
 
         self._refresh_visible_presentation()
         detail = " ".join(
@@ -2101,7 +2061,7 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
             item.setToolTip(message)
         finally:
             self._table.blockSignals(previous_blocked)
-        self._refresh_footer_validity()
+        self._refresh_footer()
 
     def _clear_invalid(self, item: QtWidgets.QTableWidgetItem) -> None:
         previous_blocked = self._table.blockSignals(True)
@@ -2115,13 +2075,20 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
     def _mark_invalid_line_edit(self, edit: QtWidgets.QLineEdit, message: str) -> None:
         edit.setStyleSheet("background: rgb(255, 200, 200); color: rgb(80, 0, 0);")
         edit.setToolTip(message)
-        self._refresh_footer_validity()
+        self._refresh_footer()
 
     def _clear_invalid_line_edit(self, edit: QtWidgets.QLineEdit) -> None:
         edit.setStyleSheet("")
         edit.setToolTip("")
 
-    def _refresh_footer_validity(self) -> None:
+    def _refresh_footer(self) -> None:
+        # An invalid entry is itself a pending edit, so Revert can discard it.
+        self._footer.set_dirty(
+            self.has_pending_target_changes
+            or self.has_pending_initial_changes
+            or bool(self._invalid_raw)
+            or bool(self._invalid_initial_raw)
+        )
         locations = self.invalid_editor_locations
         more = f" (+{len(locations) - 1} more)" if len(locations) > 1 else ""
         self._footer.set_error(

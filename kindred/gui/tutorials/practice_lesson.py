@@ -45,10 +45,12 @@ class PracticeLesson(Lesson):
         self._tabs_before = set()
         self._sets_before = set()
         self._run_baselines = {}
-        self.observe(project_controller.projectStateChanged, self._project_changed)
-        self.observe(jobs.run_dispatched, self._run_dispatched)
-        self.observe(jobs.results_changed)
-        self.observe(jobs.state_changed)
+        # Observations connect only to this lesson's own signal and methods, so
+        # Qt ends them when the lesson or the observed object is deleted.
+        project_controller.projectStateChanged.connect(self._project_changed)
+        jobs.run_dispatched.connect(self._run_dispatched)
+        jobs.results_changed.connect(self.changed)
+        jobs.state_changed.connect(self.changed)
         self.steps = self._steps()
 
     @property
@@ -180,7 +182,7 @@ class PracticeLesson(Lesson):
                 bundle.slider_binding.draftStateChanged,
                 bundle.slider_binding.targetSetIdsChanged,
             ):
-                self.observe(signal)
+                signal.connect(self.changed)
         return True
 
     def _loaded(self) -> bool:

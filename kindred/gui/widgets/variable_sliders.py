@@ -97,7 +97,6 @@ class VariableSliders(QtWidgets.QWidget):
         self._visibility_scope_signature: object | None = None
         self._active_presses: Dict[str, SliderPress] = {}
         self._editor_pre_edit_state: Dict[str, tuple[float, str, bool]] = {}
-        self._last_committed_editor_text: Dict[str, str] = {}
 
         # Layout
         main_layout = QtWidgets.QVBoxLayout(self)
@@ -169,7 +168,6 @@ class VariableSliders(QtWidgets.QWidget):
         self._metadata.clear()
         self._active_presses.clear()
         self._editor_pre_edit_state.clear()
-        self._last_committed_editor_text.clear()
 
     def _create_slider(self, name: str, value: float) -> None:
         """
@@ -461,22 +459,19 @@ class VariableSliders(QtWidgets.QWidget):
                     # Only rejected text survives a new mechanism; valid text shows the new values.
                     rejected = bool(editor.property("invalidNumeric"))
                     if rejected and old is not None and new is not None and parse_unit(old.unit) == parse_unit(new.unit):
-                        retained_editors[name] = (editor.text(), self._editor_pre_edit_state.get(name), self._last_committed_editor_text.get(name), bool(editor.property("invalidNumeric")))
+                        retained_editors[name] = (editor.text(), self._editor_pre_edit_state.get(name), bool(editor.property("invalidNumeric")))
             self.set_variables(
                 normalized_variables,
                 coordinates=normalized_metadata.values(),
             )
-            for name, (text, baseline, committed, rejected) in retained_editors.items():
+            for name, (text, baseline, rejected) in retained_editors.items():
                 self._set_value_projection(name, normalized_variables[name], editor_text=text, emit=False)
                 self._decorate_editor(name, rejected=rejected)
                 if baseline is not None:
                     self._editor_pre_edit_state[name] = baseline
-                if committed is not None:
-                    self._last_committed_editor_text[name] = committed
         if not preserve_editor_drafts:
             for name in normalized_variables:
                 self.remember_editor_state(name)
-                self._last_committed_editor_text[name] = self._value_labels[name].text()
 
     def update_variable(self, name: str, value: float) -> None:
         """
@@ -681,7 +676,6 @@ class VariableSliders(QtWidgets.QWidget):
         if editor is None:
             return
         self.remember_editor_state(name)
-        self._last_committed_editor_text.pop(str(name), None)
 
     def remember_editor_state(self, name: str) -> None:
         """Remember the current value and text for subsequent local Escape."""
@@ -703,7 +697,6 @@ class VariableSliders(QtWidgets.QWidget):
         self._set_value_projection(
             str(name), value, editor_text=text, emit=False
         )
-        self._last_committed_editor_text[str(name)] = text
         self._decorate_editor(str(name), rejected=rejected)
 
     def reject_editor_value(self, name: str, accepted_value: float) -> None:
@@ -744,15 +737,16 @@ class VariableSliders(QtWidgets.QWidget):
         editor = self._value_labels.get(name_s)
         if editor is None:
             return
-        raw = editor.text()
-        if raw == self._last_committed_editor_text.get(name_s):
+        # Displayed text is a rounded readout; only text the user edited is a
+        # value. Setting the text from code clears Qt's modified flag.
+        if not editor.isModified():
             return
+        raw = editor.text()
         try:
             value = parse_finite_numeric_text(raw.strip())
         except ValueError:
             self._decorate_editor(name_s)
             return
-        self._last_committed_editor_text[name_s] = raw
         self._set_value_projection(
             name_s,
             value,

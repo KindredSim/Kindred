@@ -25,6 +25,18 @@ class NumericValueEdit(QtWidgets.QLineEdit):
         super().focusInEvent(event)
         self.editStarted.emit()
 
+    def event(self, event: QtCore.QEvent) -> bool:
+        # Escape first cancels an unentered edit, ahead of the window's Esc
+        # (Stop) shortcut; with nothing typed, Esc stops running work.
+        if (
+            event.type() == QtCore.QEvent.Type.ShortcutOverride
+            and event.key() == QtCore.Qt.Key.Key_Escape
+            and self.isModified()
+        ):
+            event.accept()
+            return True
+        return super().event(event)
+
     def keyPressEvent(self, event: QtGui.QKeyEvent) -> None:
         if event.key() == QtCore.Qt.Key.Key_Escape:
             self.editEscape.emit()
