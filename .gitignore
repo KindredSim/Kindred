@@ -1,7 +1,6 @@
 # Virtual environments
 .venv*/
 venv/
-.claude/
 kindred.egg-info/
 
 # Python caches / test caches
@@ -38,8 +37,6 @@ Thumbs.db
 docs/
 knownbugs.md
 TODO.md
-AGENTS.md
-ARCH_RULES.md
 AUDIT.md
 DSL_REFERENCE.md
 tools/diagnostics/

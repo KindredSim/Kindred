@@ -1371,15 +1371,17 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
         projected = self._projected_dataset(dataset_id)
         if projected is None:
             return
-        selected = tuple(
+        checked = {
             str(item.data(_MODEL_TARGET_ROLE) or "").strip()
             for row in range(self._table.rowCount())
             for item in (self._table.item(row, _Col.INCLUDE),)
             if item is not None
             and str(item.data(_DATASET_ROLE) or "") == dataset_id
             and item.checkState() == Qt.CheckState.Checked
-            and str(item.data(_MODEL_TARGET_ROLE) or "").strip()
-        )
+        }
+        # Targets keep the dataset's column order, as on open and Copy
+        # Targets, so the same ticks are always the same setup.
+        selected = tuple(target for target in self._eligible_targets(dataset_id) if target in checked)
         if selected == projected.target_species:
             self._refresh_visible_presentation()
             return
