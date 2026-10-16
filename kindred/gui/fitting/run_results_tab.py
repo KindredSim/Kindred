@@ -557,6 +557,14 @@ class RunResultsTab(QtWidgets.QWidget):
         self._tracker_panel.mark_stale(STALE_RESULTS_TEXT)
         self._refresh_summary()
 
+    def mark_current(self) -> None:
+        """The setup is back to the one these results ran with."""
+        if not self._stale:
+            return
+        self._stale = False
+        self._tracker_panel.mark_stale("")
+        self._refresh_summary()
+
     def set_terminal_failure(self, failure: FactualCause) -> None:
         self._present_terminal_cause("Failed", "Fit Failed", failure)
 

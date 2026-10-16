@@ -8,8 +8,8 @@ DIFFERENTIAL_EVOLUTION_METHOD = "differential_evolution"
 FUNCTION_TOLERANCE_LABEL = "Objective-improvement tolerance"
 STEP_TOLERANCE_LABEL = "Parameter-step tolerance"
 FIT_DATASET_WEIGHT_MODE_LABELS = {
-    "implicit": "Implicit weights (1/N per dataset)",
-    "user": "User weights only",
+    "implicit": "Equal (1/N)",
+    "user": "Custom",
 }
 FIT_METHOD_LABELS = {
     "trf": "Trust Region Reflective",

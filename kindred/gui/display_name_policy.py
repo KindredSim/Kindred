@@ -14,12 +14,9 @@ import re
 __all__ = [
     "CompactText",
     "DATASET_LIST_LABEL_MAX_CHARS",
-    "DIAGNOSTIC_LABEL_MAX_CHARS",
-    "INLINE_ERROR_MAX_CHARS",
     "PLOT_TITLE_LABEL_MAX_CHARS",
     "TAB_LABEL_MAX_CHARS",
     "compact_dataset_label",
-    "compact_diagnostic_text",
     "compact_plot_title_label",
     "compact_text",
     "literal_tooltip",
@@ -86,8 +83,6 @@ ELLIPSIS = "…"
 DATASET_LIST_LABEL_MAX_CHARS = 48
 TAB_LABEL_MAX_CHARS = 24
 PLOT_TITLE_LABEL_MAX_CHARS = 18
-INLINE_ERROR_MAX_CHARS = 120
-DIAGNOSTIC_LABEL_MAX_CHARS = 160
 
 
 @dataclass(frozen=True, slots=True)
@@ -166,10 +161,6 @@ def compact_dataset_label(text: object, *, max_chars: int = DATASET_LIST_LABEL_M
 
 def compact_plot_title_label(text: object, *, max_chars: int = PLOT_TITLE_LABEL_MAX_CHARS) -> CompactText:
     return compact_text(text, max_chars=max_chars, empty_text="dataset", mode="middle")
-
-
-def compact_diagnostic_text(text: object, *, max_chars: int = DIAGNOSTIC_LABEL_MAX_CHARS) -> CompactText:
-    return compact_text(text, max_chars=max_chars, empty_text="", mode="right")
 
 
 def reaction_text(context: str) -> str:

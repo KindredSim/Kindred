@@ -20,6 +20,7 @@ from kindred.gui.ui_helpers import (
     SCIENTIFIC_NAME_HTML_ROLE,
     SOLVER_TOOLTIP,
     ScientificNameDelegate,
+    ChoicesComboBox,
     ControlRowsLayout,
     cell_text_as_shown,
     configure_compact_numeric_edit,
@@ -317,7 +318,6 @@ class ParametersIcsTab(QtWidgets.QWidget):
     """Presentation-only parameter, IC-scope, and optimizer panel."""
 
     setupSnapshotRequested = QtCore.Signal(object)
-    resetRequested = QtCore.Signal(str)
     viewStepsRequested = QtCore.Signal()
     statusMessage = QtCore.Signal(str)
     validityChanged = QtCore.Signal()
@@ -374,13 +374,6 @@ class ParametersIcsTab(QtWidgets.QWidget):
     # ------------------------------------------------------------------
     # Parameter presentation and complete snapshot replacements
     # ------------------------------------------------------------------
-
-
-    def _reset_to_initial(self) -> None:
-        self.resetRequested.emit("initial")
-
-    def _reset_to_last_fit(self) -> None:
-        self.resetRequested.emit("last_fit")
 
 
     _SCOPE_CHOICES = {
@@ -458,30 +451,11 @@ class ParametersIcsTab(QtWidgets.QWidget):
         self._view_steps_button = QtWidgets.QPushButton("View Mechanism Steps", left)
         self._view_steps_button.setObjectName("global_fit_parameters_view_steps")
         self._view_steps_button.clicked.connect(self.viewStepsRequested)
-        self._reset_initial_button = QtWidgets.QPushButton(
-            "Reset to Initial", left
-        )
-        self._reset_initial_button.setToolTip(
-            "Restore the entire Fit setup captured when this window opened, "
-            "discarding all later accepted and unapplied changes."
-        )
-        self._reset_initial_button.clicked.connect(self._reset_to_initial)
-        self._reset_last_button = QtWidgets.QPushButton(
-            "Reset to Last Fit", left
-        )
-        self._reset_last_button.setToolTip(
-            "Restore the Fit setup of the last completed Fit, with its fitted "
-            "values as starting values, discarding all later accepted and unapplied changes."
-        )
-        self._reset_last_button.clicked.connect(self._reset_to_last_fit)
-        self._reset_last_button.setEnabled(False)
         self._bounds_button = QtWidgets.QPushButton("Set Bounds for Parameters…", left)
         self._bounds_button.clicked.connect(self._open_bounds_dialog)
         for control in (
             self._bounds_button,
             self._view_steps_button,
-            self._reset_initial_button,
-            self._reset_last_button,
         ):
             actions.addWidget(control)
         roster_layout.addWidget(self._roster_actions_host)
@@ -508,7 +482,7 @@ class ParametersIcsTab(QtWidgets.QWidget):
             QtWidgets.QSizePolicy.Policy.Maximum,
         )
         settings_layout = QtWidgets.QVBoxLayout(settings_group)
-        self._solver_combo = QtWidgets.QComboBox(settings_group)
+        self._solver_combo = ChoicesComboBox(settings_group)
         self._solver_combo.setObjectName("global_fit_solver")
         self._solver_combo.setToolTip(SOLVER_TOOLTIP)
         for solver in SUPPORTED_SOLVERS:
@@ -534,6 +508,9 @@ class ParametersIcsTab(QtWidgets.QWidget):
         self._seed_spin.setSizePolicy(QtWidgets.QSizePolicy.Fixed, QtWidgets.QSizePolicy.Fixed)
         for control in (self._solver_combo, self._method_combo, self._max_eval_spin, self._seed_spin):
             ignore_wheel(control)
+        # A typed number applies on Enter or focus loss, as one setup change.
+        for spin in (self._max_eval_spin, self._seed_spin):
+            spin.setKeyboardTracking(False)
         self._seed_check.setChecked(defaults.use_seed)
         self._seed_spin.setEnabled(defaults.use_seed)
         self._ftol_edit = QtWidgets.QLineEdit(settings_group)
@@ -659,10 +636,10 @@ class ParametersIcsTab(QtWidgets.QWidget):
             self._projecting = False
         self._refresh_parameter_error()
 
-    def set_last_fit_reset_available(self, snapshot: FitSetupSnapshot) -> None:
+    def set_last_fit_result(self, snapshot: FitSetupSnapshot) -> None:
+        """Show the last completed Fit's values in the Last Fit Result column."""
         self._last_fit_parameters = {item.name: item for item in snapshot.parameters}
         self._last_fit_included = {item.dataset_id for item in snapshot.datasets if item.included}
-        self._reset_last_button.setEnabled(True)
         self._rerender_roster()
 
     def _rerender_roster(self) -> None:
@@ -832,7 +809,7 @@ class ParametersIcsTab(QtWidgets.QWidget):
         self._param_table.setItem(row, _C.SCOPE, self._readonly_item())
         combo = self._param_table.cellWidget(row, _C.SCOPE)
         if not isinstance(combo, QtWidgets.QComboBox):
-            combo = QtWidgets.QComboBox(self._param_table)
+            combo = ChoicesComboBox(self._param_table)
             ignore_wheel(combo)
             combo.setObjectName("fit_parameter_scope")
             combo.setAccessibleName(f"Across Datasets for {parameter.name}")

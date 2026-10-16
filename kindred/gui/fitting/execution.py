@@ -299,22 +299,17 @@ def _initial_values_from_result(
 def _terminal_setup_snapshot(
     setup_snapshot: FitSetupSnapshot,
     *,
-    origin: FitOriginSnapshot,
     result: GlobalFitResult,
     dispatch: _FitDispatchCompilation,
-    initial_values_by_set: tuple[
-        tuple[str, tuple[tuple[str, float], ...]], ...
-    ],
 ) -> FitSetupSnapshot:
-    """Overlay publishable terminal values using admitted dispatch routes."""
+    """Overlay fitted parameter values as the next starting values.
+
+    Initial concentrations keep the user's Starting IC, so a percentage Vary
+    IC range stays measured from it on every run.
+    """
 
     included_ids = {
         item.dataset_id for item in setup_snapshot.datasets if item.included
-    }
-    included_set_ids = {
-        mapped.set_id
-        for mapped in origin.mapped_datasets
-        if mapped.dataset_id in included_ids
     }
     shared_results = {
         str(name): float(value)
@@ -393,62 +388,7 @@ def _terminal_setup_snapshot(
             )
         )
 
-    initial_results = {
-        (set_id, species): value
-        for set_id, values in initial_values_by_set
-        for species, value in values
-    }
-    grouped = {
-        (dataset_id, group.species)
-        for group in setup_snapshot.shared_initial_groups
-        for dataset_id in group.member_dataset_ids
-    }
-    initials = tuple(
-        replace(
-            initial,
-            initial=(
-                initial_results[(initial.set_id, initial.species)]
-            ),
-        )
-        if (
-            initial.fit
-            and initial.set_id in included_set_ids
-            and not any(
-                (mapped.dataset_id, initial.species) in grouped
-                for mapped in origin.mapped_datasets
-                if mapped.set_id == initial.set_id
-            )
-            and (initial.set_id, initial.species) in initial_results
-        )
-        else initial
-        for initial in setup_snapshot.initials
-    )
-    groups = []
-    for group in setup_snapshot.shared_initial_groups:
-        if not group.fit:
-            groups.append(group)
-            continue
-        applicable_set_ids = {
-            mapped.set_id
-            for mapped in origin.mapped_datasets
-            if mapped.dataset_id in included_ids
-            and mapped.dataset_id in group.member_dataset_ids
-        }
-        values = {
-            value
-            for (set_id, species), value in initial_results.items()
-            if species == group.species and set_id in applicable_set_ids
-        }
-        if values:
-            groups.append(replace(group, initial=values.pop()))
-        else:
-            groups.append(group)
-    return replace(
-        setup_snapshot,
-        parameters=tuple(parameters),
-        initials=initials,
-        shared_initial_groups=tuple(groups),
-    )
+    return replace(setup_snapshot, parameters=tuple(parameters))
 
 
 def _curves_from_simulations(
@@ -535,18 +475,10 @@ def _assemble_fit_terminal(
 ) -> FitCandidate:
     """Build the sole retained candidate from the admitted core result."""
 
-    setup = request.setup
-    initial_values_by_set = _initial_values_from_result(
-        setup_snapshot,
-        setup.origin,
-        result,
-    )
     terminal_setup = _terminal_setup_snapshot(
         setup_snapshot,
-        origin=setup.origin,
         result=result,
         dispatch=request.dispatch,
-        initial_values_by_set=initial_values_by_set,
     )
     return FitCandidate(
         request=request,

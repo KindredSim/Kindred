@@ -6,11 +6,8 @@ from PySide6 import QtCore, QtGui, QtWidgets
 
 from kindred.core.quantity_units import format_unit_for_display
 from kindred.gui.display_name_policy import (
-    DATASET_LIST_LABEL_MAX_CHARS,
     CompactText,
     literal_tooltip,
-    compact_diagnostic_text,
-    compact_text,
 )
 
 __all__ = [
@@ -26,17 +23,25 @@ __all__ = [
     "cell_text_as_shown",
     "copy_current_cell_as_shown",
     "enter_confirms_only",
+    "ChoicesComboBox",
     "ignore_wheel",
     "make_bounded_label",
     "make_scroll_area",
     "set_bounded_label_text",
-    "set_compact_label_text",
 ]
 
 
 DEFAULT_DYNAMIC_LABEL_MAX_WIDTH = 220
-DEFAULT_COMPACT_LABEL_MAX_CHARS = DATASET_LIST_LABEL_MAX_CHARS
-DEFAULT_COMPACT_LABEL_MAX_WIDTH = 220
+
+
+class ChoicesComboBox(QtWidgets.QComboBox):
+    """A drop-down whose open list is at least as wide as its choices."""
+
+    def showPopup(self) -> None:  # noqa: N802 - Qt override
+        # Measured on opening, once the list's style and font are final.
+        view = self.view()
+        view.setMinimumWidth(view.sizeHintForColumn(0) + 2 * view.frameWidth())
+        super().showPopup()
 
 
 class ControlRowsLayout(QtWidgets.QLayout):
@@ -188,7 +193,7 @@ def ignore_wheel(widget: QtWidgets.QWidget) -> None:
     widget.installEventFilter(_WHEEL_SCROLLS_PANE)
 
 
-# A typed concentration that is not admitted stays visible for correction.
+# Typed text that is not admitted stays visible, marked, for correction.
 INVALID_EDITOR_STYLE = (
     "QLineEdit { background-color: rgb(255, 210, 210); "
     "color: rgb(80, 0, 0); }"
@@ -301,22 +306,6 @@ def set_bounded_label_text(
     full = str(text if text is not None else empty_text) or str(empty_text)
     _set_label_projection(label, CompactText(full, full, False),
                           max_width=max_width, tooltip=tooltip, tooltip_text=tooltip_text)
-
-
-def set_compact_label_text(
-    label: QtWidgets.QLabel, text: str, *,
-    max_chars: int = DEFAULT_COMPACT_LABEL_MAX_CHARS,
-    max_width: int = DEFAULT_COMPACT_LABEL_MAX_WIDTH,
-    empty_text: str = "", tooltip: bool = True, diagnostic: bool = False,
-    tooltip_text: str | None = None,
-) -> CompactText:
-    compact = (
-        compact_diagnostic_text(text, max_chars=max_chars) if diagnostic
-        else compact_text(text, max_chars=max_chars, empty_text=empty_text, mode="middle")
-    )
-    _set_label_projection(label, compact, max_width=max_width,
-                          tooltip=tooltip, tooltip_text=tooltip_text)
-    return compact
 
 
 def clamp_initial_size(widget: QtWidgets.QWidget, width: int, height: int) -> None:

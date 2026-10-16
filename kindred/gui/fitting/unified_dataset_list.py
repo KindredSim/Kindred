@@ -72,7 +72,7 @@ class UnifiedDatasetList(QtWidgets.QWidget):
                 self._check_states.clear()
                 for ds_id, display, full, include in normalized:
                     item = QtWidgets.QListWidgetItem(display)
-                    item.setToolTip(f"{full}\nDataset ID: {ds_id}")
+                    item.setToolTip(literal_tooltip(full))
                     item.setData(Qt.UserRole, ds_id)
                     item.setData(Qt.UserRole + 1, full)
                     item.setFlags(
@@ -90,7 +90,7 @@ class UnifiedDatasetList(QtWidgets.QWidget):
                     if item is None:
                         continue
                     item.setText(display)
-                    item.setToolTip(f"{full}\nDataset ID: {_ds_id}")
+                    item.setToolTip(literal_tooltip(full))
                     item.setData(Qt.UserRole + 1, full)
                     state = Qt.Checked if include else Qt.Unchecked
                     if item.checkState() != state:
@@ -115,20 +115,19 @@ class UnifiedDatasetList(QtWidgets.QWidget):
         ds_id = str(item.data(Qt.UserRole) or "").strip()
         return ds_id if ds_id else None
 
-    def set_data_edit_issues(self, issues: dict[str, str | None]) -> None:
-        """Annotate existing rows without changing identity or inclusion."""
+    def set_data_edit_issues(self, issues: dict[str, str]) -> None:
+        """Mark rows whose Fit Data settings are in error, without changing identity or inclusion."""
 
         for row in range(self._list.count()):
             item = self._list.item(row)
             dataset_id = item.data(Qt.UserRole)
             full = item.data(Qt.UserRole + 1)
             display = compact_dataset_label(full, max_chars=DATASET_LIST_LABEL_MAX_CHARS).display
-            issue = (issues[dataset_id] or "Pending data changes") if dataset_id in issues else ""
-            prefix = ("Data error" if issues[dataset_id] else "Data pending") + " — " if dataset_id in issues else ""
-            item.setText(prefix + display)
+            issue = issues.get(dataset_id, "")
+            item.setText(f"Data error — {display}" if issue else display)
             detail = f"{full}\n{issue}" if issue else full
             item.setData(Qt.AccessibleTextRole, detail)
-            item.setToolTip(literal_tooltip(f"{detail}\nDataset ID: {dataset_id}"))
+            item.setToolTip(literal_tooltip(detail))
 
     def dataset_display_name(self, dataset_id: str | None = None) -> str | None:
         """Return the full bounded-row source label, never the stable ID role."""
@@ -143,6 +142,15 @@ class UnifiedDatasetList(QtWidgets.QWidget):
             if str(item.data(Qt.UserRole) or "").strip() == requested:
                 return str(item.data(Qt.UserRole + 1))
         return None
+
+    def content_width(self) -> int:
+        """Width that shows the longest dataset name without scrolling."""
+
+        return (
+            self._list.sizeHintForColumn(0)
+            + 2 * self._list.frameWidth()
+            + self._list.verticalScrollBar().sizeHint().width()
+        )
 
     def set_running_state(self, running: bool) -> None:
         """Preserve the historical disabled/locked running-state visual."""

@@ -9,7 +9,7 @@ from kindred.core.species import validate_concentration
 
 __all__ = ["FitInitialTolerance", "FitInitialToleranceMode", "ZERO_IC_PERCENT_MESSAGE"]
 
-ZERO_IC_PERCENT_MESSAGE = "A zero Starting IC can vary only with Absolute Minimum / Maximum (in M)."
+ZERO_IC_PERCENT_MESSAGE = "A zero Starting IC can vary only with Minimum / Maximum (in M)."
 
 FitInitialToleranceMode = Literal[
     "disabled",
@@ -46,16 +46,16 @@ class FitInitialTolerance:
         elif mode == "asymmetric_percent":
             if lower < 0.0 or upper < 0.0 or (lower == 0.0 and upper == 0.0):
                 raise ValueError(
-                    "Asymmetric Vary IC percentages must be nonnegative "
+                    "Vary IC percentages must be nonnegative "
                     "and not both zero."
                 )
         elif lower < 0.0 or lower >= upper:
             raise ValueError(
-                "Absolute Vary IC requires nonnegative minimum < maximum."
+                "Vary IC minimum must be nonnegative and below the maximum."
             )
         if mode in {"symmetric_percent", "asymmetric_percent"} and lower >= 100.0:
             raise ValueError(
-                "Vary IC lower percentage must be below 100. Use Absolute "
+                "Vary IC lower percentage must be below 100. Use "
                 "Minimum / Maximum (in M) to allow zero."
             )
         if mode == "absolute":

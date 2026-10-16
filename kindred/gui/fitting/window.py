@@ -12,7 +12,7 @@ from kindred.gui.fitting.contracts import (
 )
 from kindred.core.simulation_failure import FactualCause
 from kindred.core.analysis.fit_evaluation_outcome import ScientificUnavailable
-from kindred.gui.ui_helpers import clamp_initial_size, set_bounded_label_text
+from kindred.gui.ui_helpers import clamp_initial_size, enter_confirms_only
 from kindred.gui.fitting.data_tab import DataTab
 from kindred.gui.fitting.data_targets_tab import DataTargetsTab
 from kindred.gui.fitting.launch import (
@@ -47,7 +47,9 @@ class FittingWindow(QtWidgets.QDialog):
     pauseRequested = QtCore.Signal()
     resumeRequested = QtCore.Signal()
     setupSnapshotRequested = QtCore.Signal(object)
-    resetRequested = QtCore.Signal(str)
+    resetRequested = QtCore.Signal(str, str)
+    undoRequested = QtCore.Signal()
+    redoRequested = QtCore.Signal()
     resultsSummaryRequested = QtCore.Signal()
 
     def __init__(
@@ -70,6 +72,7 @@ class FittingWindow(QtWidgets.QDialog):
         self._projected_setup: FitSetupSnapshot | None = None
         self._executing = False
         self._setup_projecting = False
+        self._last_fit_available = False
 
         self.setAttribute(QtCore.Qt.WidgetAttribute.WA_DeleteOnClose, True)
         self.setWindowModality(QtCore.Qt.WindowModality.ApplicationModal)
@@ -147,25 +150,23 @@ class FittingWindow(QtWidgets.QDialog):
         footer = QtWidgets.QWidget(self)
         footer.setObjectName("global_fit_footer")
         footer.setSizePolicy(QtWidgets.QSizePolicy.Policy.Ignored, QtWidgets.QSizePolicy.Policy.Preferred)
-        column = QtWidgets.QVBoxLayout(footer)
-        column.setContentsMargins(0, 0, 0, 0)
-        column.setSpacing(4)
+        row = QtWidgets.QHBoxLayout(footer)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(12)
+        # The latest action's outcome and what blocks Run, beside the buttons.
+        messages = QtWidgets.QVBoxLayout()
+        messages.setSpacing(2)
         self._status = QtWidgets.QLabel("Ready", footer)
-        self._status.setWordWrap(True)
-        self._status.setSizePolicy(QtWidgets.QSizePolicy.Policy.Ignored, QtWidgets.QSizePolicy.Policy.Preferred)
-        self._status.setTextFormat(QtCore.Qt.TextFormat.PlainText)
-        status_widget = self._status_widget = QtWidgets.QWidget(footer)
-        status_column = QtWidgets.QVBoxLayout(status_widget)
-        status_column.setContentsMargins(0, 0, 0, 0)
-        status_column.addWidget(self._status)
         self._run_block_reason_label = QtWidgets.QLabel(footer)
         self._run_block_reason_label.setObjectName("global_fit_run_block_reason_label")
-        self._run_block_reason_label.setWordWrap(True)
-        self._run_block_reason_label.setSizePolicy(QtWidgets.QSizePolicy.Policy.Ignored, QtWidgets.QSizePolicy.Policy.Preferred)
-        self._run_block_reason_label.setTextFormat(QtCore.Qt.TextFormat.PlainText)
+        for label in (self._status, self._run_block_reason_label):
+            label.setWordWrap(True)
+            label.setSizePolicy(QtWidgets.QSizePolicy.Policy.Ignored, QtWidgets.QSizePolicy.Policy.Preferred)
+            label.setTextFormat(QtCore.Qt.TextFormat.PlainText)
+            messages.addWidget(label)
         self._run_block_reason_label.hide()
-        status_column.addWidget(self._run_block_reason_label)
-        column.addWidget(status_widget)
+        messages.addStretch(1)
+        row.addLayout(messages, 1)
         self._progress = QtWidgets.QProgressBar(footer)
         self._progress.setRange(0, 100)
         self._progress.setValue(0)
@@ -174,47 +175,65 @@ class FittingWindow(QtWidgets.QDialog):
 
         actions = QtWidgets.QVBoxLayout()
         self._footer_actions = actions
-        column.addLayout(actions)
-        self._footer_widgets = [self._progress]
-        self._run_button = QtWidgets.QPushButton("&Run Fit", footer)
-        self._run_button.clicked.connect(self._request_execute)
+        row.addLayout(actions)
+        self._reset_button = QtWidgets.QPushButton("Reset Setup…", footer)
+        self._reset_button.setToolTip(
+            "Restore Data and Targets, Parameters or both to the setup captured "
+            "when this window opened or to the last completed Fit's."
+        )
+        self._reset_button.clicked.connect(self._open_reset_dialog)
+        # Undo and Redo of setup changes have only their usual keys; a focused
+        # text field keeps them for its own text.
+        for sequence, signal in (
+            (QtGui.QKeySequence.StandardKey.Undo, self.undoRequested),
+            (QtGui.QKeySequence.StandardKey.Redo, self.redoRequested),
+        ):
+            shortcut = QtGui.QShortcut(self)
+            # Every platform binding: Redo is Ctrl+Y and Ctrl+Shift+Z.
+            shortcut.setKeys(sequence)
+            shortcut.activated.connect(signal)
+        self._copy_button = QtWidgets.QPushButton("&Copy Fit Curves", footer)
+        self._copy_button.setEnabled(False)
+        self._copy_button.clicked.connect(self._run_results_tab.copy_active_to_clipboard)
+        self._results_summary_button = QtWidgets.QPushButton("S&ummary", footer)
+        self._results_summary_button.clicked.connect(self.resultsSummaryRequested)
+        # A push button with a menu matches the footer's other buttons.
+        self._apply_button = QtWidgets.QPushButton("&Apply Fit", footer)
+        apply_menu = QtWidgets.QMenu(self._apply_button)
+        apply_menu.setToolTipsVisible(True)
+        self._apply_project_action = apply_menu.addAction("Apply Fit to Project")
+        self._apply_project_action.triggered.connect(self.applyRequested)
+        self._apply_copy_action = apply_menu.addAction("Apply Fit to Tab Copy")
+        self._apply_copy_action.triggered.connect(self.applyToCopyRequested)
+        self._apply_button.setMenu(apply_menu)
         self._cancel_button = QtWidgets.QPushButton("&Stop", footer)
         self._cancel_button.setEnabled(False)
         self._cancel_button.clicked.connect(self.stopRequested)
         self._pause_button = QtWidgets.QPushButton("&Pause", footer)
         self._pause_button.setEnabled(False)
         self._pause_button.clicked.connect(self._toggle_pause)
-        for button in (self._run_button, self._pause_button, self._cancel_button):
-            self._footer_widgets.append(button)
-        self._results_summary_button = QtWidgets.QPushButton("S&ummary", footer)
-        self._results_summary_button.clicked.connect(self.resultsSummaryRequested)
-        self._footer_widgets.append(self._results_summary_button)
-        self._copy_button = QtWidgets.QPushButton("&Copy Fit Curves", footer)
-        self._copy_button.setEnabled(False)
-        self._copy_button.clicked.connect(self._run_results_tab.copy_active_to_clipboard)
-        self._footer_widgets.append(self._copy_button)
-        self._apply_button = QtWidgets.QPushButton("&Apply Fit to Project", footer)
-        self._apply_button.setEnabled(False)
-        self._apply_button.clicked.connect(self.applyRequested)
-        self._footer_widgets.append(self._apply_button)
-        self._apply_copy_button = QtWidgets.QPushButton("Apply Fit to Tab Cop&y", footer)
-        self._apply_copy_button.setEnabled(False)
-        self._apply_copy_button.clicked.connect(self.applyToCopyRequested)
-        self._footer_widgets.append(self._apply_copy_button)
-        reason_row = QtWidgets.QHBoxLayout()
-        self._apply_reason_label = QtWidgets.QLabel(footer)
-        self._apply_reason_label.setTextFormat(QtCore.Qt.TextFormat.PlainText)
-        self._apply_reason_label.setWordWrap(True)
-        reason_row.addWidget(self._apply_reason_label, 1)
-        column.addLayout(reason_row)
+        self._run_button = QtWidgets.QPushButton("&Run Fit", footer)
+        self._run_button.clicked.connect(self._request_execute)
+        # Run Fit sits at the far right, its controls and progress beside it.
+        self._footer_widgets = [
+            self._reset_button,
+            self._copy_button,
+            self._results_summary_button,
+            self._apply_button,
+            self._progress,
+            self._cancel_button,
+            self._pause_button,
+            self._run_button,
+        ]
         self.set_apply_available(False, "Run a fit to obtain values to apply.")
+        self._refresh_setup_buttons()
         self._layout_footer()
         return footer
 
     def _layout_footer(self) -> None:
-        self._status_widget.setVisible(bool(self._status.text() or self._run_block_reason_label.text()))
         self._progress.setFixedWidth(self._progress.fontMetrics().horizontalAdvance("100%") + 48)
-        available = max(1, self.width() - 32)
+        # The messages keep a readable width; the buttons wrap below that.
+        available = max(1, self.width() - 32 - 240)
         key = (available, tuple((widget.isHidden(), widget.sizeHint().width()) for widget in self._footer_widgets))
         if key == getattr(self, "_footer_layout_key", None):
             return
@@ -224,25 +243,72 @@ class FittingWindow(QtWidgets.QDialog):
             while row.count():
                 row.takeAt(0)
             row.deleteLater()
-        row = QtWidgets.QHBoxLayout()
-        row.setContentsMargins(0, 0, 0, 0)
-        row.addStretch(1)
-        self._footer_actions.addLayout(row)
+        rows: list[list[QtWidgets.QWidget]] = [[]]
         used = 0
         for widget in self._footer_widgets:
             if widget.isHidden():
                 continue
             width = widget.sizeHint().width()
             if used and used + width > available:
-                row = QtWidgets.QHBoxLayout()
-                row.setContentsMargins(0, 0, 0, 0)
-                row.addStretch(1)
-                self._footer_actions.addLayout(row)
+                rows.append([])
                 used = 0
-            if isinstance(widget, QtWidgets.QPushButton):
+            if isinstance(widget, QtWidgets.QAbstractButton):
                 widget.setSizePolicy(QtWidgets.QSizePolicy.Policy.Fixed, QtWidgets.QSizePolicy.Policy.Fixed)
-            row.addWidget(widget)
+            rows[-1].append(widget)
             used += width + 6
+        for widgets in rows:
+            row = QtWidgets.QHBoxLayout()
+            row.setContentsMargins(0, 0, 0, 0)
+            row.addStretch(1)
+            for widget in widgets:
+                row.addWidget(widget)
+            self._footer_actions.addLayout(row)
+
+    def _open_reset_dialog(self) -> None:
+        """Ask what to reset and to which setup, then request it."""
+
+        dialog = QtWidgets.QDialog(self)
+        dialog.setWindowTitle("Reset Setup")
+        layout = QtWidgets.QVBoxLayout(dialog)
+        target_group = QtWidgets.QGroupBox("Reset to", dialog)
+        target_layout = QtWidgets.QVBoxLayout(target_group)
+        initial = QtWidgets.QRadioButton("Setup when this window opened", target_group)
+        last_fit = QtWidgets.QRadioButton(
+            "Setup of the last completed Fit, with its fitted parameter values as starting values",
+            target_group,
+        )
+        last_fit.setEnabled(self._last_fit_available)
+        initial.setChecked(True)
+        target_layout.addWidget(initial)
+        target_layout.addWidget(last_fit)
+        layout.addWidget(target_group)
+        part_group = QtWidgets.QGroupBox("Reset", dialog)
+        part_layout = QtWidgets.QVBoxLayout(part_group)
+        parts = {}
+        for part, text in (
+            ("data", "Data and Targets"),
+            ("parameters", "Parameters"),
+            ("both", "Both"),
+        ):
+            parts[part] = QtWidgets.QRadioButton(text, part_group)
+            part_layout.addWidget(parts[part])
+        parts["both"].setChecked(True)
+        layout.addWidget(part_group)
+        buttons = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.StandardButton.Ok
+            | QtWidgets.QDialogButtonBox.StandardButton.Cancel,
+            parent=dialog,
+        )
+        buttons.button(QtWidgets.QDialogButtonBox.StandardButton.Ok).setText("Reset")
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        if dialog.exec() != QtWidgets.QDialog.DialogCode.Accepted:
+            return
+        self.resetRequested.emit(
+            "last_fit" if last_fit.isChecked() else "initial",
+            next(part for part, radio in parts.items() if radio.isChecked()),
+        )
 
     def event(self, event: QtCore.QEvent) -> bool:
         if event.type() == QtCore.QEvent.Type.LayoutRequest and hasattr(self, "_footer_widgets"):
@@ -262,9 +328,6 @@ class FittingWindow(QtWidgets.QDialog):
         self._data_tab.validityChanged.connect(self._refresh_setup_validity)
         self._params_ics_tab.setupSnapshotRequested.connect(
             self._on_leaf_snapshot
-        )
-        self._params_ics_tab.resetRequested.connect(
-            self.resetRequested
         )
         self._params_ics_tab.viewStepsRequested.connect(
             self._open_mechanism_inspector
@@ -301,14 +364,21 @@ class FittingWindow(QtWidgets.QDialog):
     def set_last_fit_reset_available(self, snapshot: FitSetupSnapshot) -> None:
         """Project Last Fit reset availability without retaining the snapshot."""
 
-        self._params_ics_tab.set_last_fit_reset_available(snapshot)
+        self._params_ics_tab.set_last_fit_result(snapshot)
+        self._last_fit_available = True
+        self._refresh_setup_buttons()
 
-    def clear_pending_setup_edits(self) -> None:
-        """Discard every leaf draft and refresh the complete Fit surface."""
+    def _refresh_setup_buttons(self) -> None:
+        self._reset_button.setEnabled(not self._executing and not self._closing)
 
-        self._params_ics_tab.clear_pending_setup_edits()
-        self._species_table.clear_pending_edits()
-        self._data_tab.clear_pending_edits()
+    def clear_pending_setup_edits(self, *, data: bool = True, parameters: bool = True) -> None:
+        """Discard held invalid text in the tabs being replaced and refresh."""
+
+        if parameters:
+            self._params_ics_tab.clear_pending_setup_edits()
+        if data:
+            self._species_table.clear_pending_edits()
+            self._data_tab.clear_pending_edits()
         self._refresh_setup_validity()
 
     def project_setup_snapshot(self, snapshot: FitSetupSnapshot) -> None:
@@ -338,6 +408,8 @@ class FittingWindow(QtWidgets.QDialog):
             self._setup_projecting = False
         self._species_table.refresh_validity_ui()
         self._refresh_setup_validity()
+        # A held Fit Data edit can become valid through another change.
+        self._data_tab.apply_valid_held_settings()
 
     def _on_leaf_snapshot(self, snapshot: FitSetupSnapshot) -> None:
         """Forward one complete leaf-authored setup snapshot."""
@@ -356,7 +428,7 @@ class FittingWindow(QtWidgets.QDialog):
                 self._included_dataset_ids(setup)
             )
         )
-        return any(data_issues.values()) or self._has_invalid_parameter_or_species_edits()
+        return bool(data_issues) or self._has_invalid_parameter_or_species_edits()
 
     def _has_invalid_parameter_or_species_edits(self) -> bool:
         return bool(self._invalid_editor_locations())
@@ -374,16 +446,9 @@ class FittingWindow(QtWidgets.QDialog):
         ) if setup is not None else {}
         included = set(self._included_dataset_ids(setup)) if setup is not None else set()
         active_issues = {key: value for key, value in data_issues.items() if key in included}
-        invalid = any(active_issues.values()) or self._has_invalid_parameter_or_species_edits()
-        pending_targets = self.has_pending_target_changes
-        pending_data = self.has_pending_data_changes
+        invalid = bool(active_issues) or self._has_invalid_parameter_or_species_edits()
         structural = None
-        if (
-            setup is not None
-            and not invalid
-            and not pending_targets
-            and not pending_data
-        ):
+        if setup is not None and not invalid:
             structural = fit_setup_readiness(
                 origin=self._origin,
                 datasets=setup.datasets,
@@ -392,13 +457,7 @@ class FittingWindow(QtWidgets.QDialog):
                 shared_initial_groups=setup.shared_initial_groups,
                 profile=setup.profile,
             )
-        ready = (
-            setup is not None
-            and not invalid
-            and not pending_targets
-            and not pending_data
-            and structural is None
-        )
+        ready = setup is not None and not invalid and structural is None
         self._run_button.setEnabled(ready and not self._is_executing())
         listing = self._data_targets_tab.unified_list
         listing.set_data_edit_issues(data_issues)
@@ -409,13 +468,12 @@ class FittingWindow(QtWidgets.QDialog):
             return text if len(text) <= limit else text[: limit - 1] + "…"
 
         names = {key: visible(listing.dataset_display_name(key), 60) for key in active_issues}
-        # One ordered list of invalid values; pending edits are reported only
+        # One ordered list of invalid values; setup readiness is reported only
         # when nothing is invalid.
         invalid_entries = [
             ("Data and Targets", f"Data settings for {names[key]}: {value}")
-            for key, value in active_issues.items() if value
+            for key, value in active_issues.items()
         ] + [(tab, f"Invalid value in {text}.") for tab, text in self._invalid_editor_locations()]
-        pending_data_names = [names[key] for key, value in active_issues.items() if not value]
         reason = ""
         details: list[str] = []
         if invalid_entries:
@@ -423,20 +481,8 @@ class FittingWindow(QtWidgets.QDialog):
             more = f" (+{len(invalid_entries) - 1} more)" if len(invalid_entries) > 1 else ""
             reason = f"{visible(first, 160).rstrip('.')}{more}. Resolve in {tab}."
             details = [f"{tab}: {text}" for tab, text in invalid_entries]
-        else:
-            if pending_data_names:
-                more = f" (+{len(pending_data_names) - 1} more)" if len(pending_data_names) > 1 else ""
-                reason = (
-                    f"Data settings for {pending_data_names[0]}: pending changes{more}."
-                    " Resolve in Data and Targets."
-                )
-                details = [f"Data settings for {name}: pending changes" for name in pending_data_names]
-            if pending_targets:
-                targets = "Apply or revert pending Fit target, weight, and IC edits before running."
-                reason = reason or targets
-                details.append(targets)
-            if not reason and structural is not None:
-                reason = structural
+        elif structural is not None:
+            reason = structural
         accessible_reason = "\n".join(details) or reason
         self._run_block_reason_label.setVisible(bool(reason))
         self._run_block_reason_label.setText(reason)
@@ -531,22 +577,16 @@ class FittingWindow(QtWidgets.QDialog):
             if observation.raw_observation_id in target_by_raw_id
         )
         counts: dict[str, int] = {}
-        selected_raw_ids = {
-            observation.raw_observation_id
-            for observation, target in resolved_observations
-            if target in dataset.target_species
-        }
         for _observation, target in resolved_observations:
             if target is not None:
                 counts[target] = counts.get(target, 0) + 1
+        # A ticked target is eligible too: choosing it as X removes it from
+        # the targets (see _project_dataset_settings).
         return tuple(
             dict.fromkeys(
                 target
-                for observation, target in resolved_observations
-                if target is not None
-                and counts[target] == 1
-                and target not in dataset.target_species
-                and observation.raw_observation_id not in selected_raw_ids
+                for _observation, target in resolved_observations
+                if target is not None and counts[target] == 1
             )
         )
 
@@ -596,8 +636,8 @@ class FittingWindow(QtWidgets.QDialog):
     ) -> FitDatasetLocalSettings:
         """Project one Data-tab config onto the authoritative dataset shape.
 
-        Preview and Apply must use the same target, weight, and mapping
-        projection.  Parametric X is an additional weighted target, never a
+        Validation and application use this same target, weight, and
+        mapping projection.  Parametric X is an additional weighted target, never a
         Y target.  Each species keeps its weight whether or not it is a
         target or the X, and observation mappings stay untouched.
         """
@@ -690,22 +730,6 @@ class FittingWindow(QtWidgets.QDialog):
     # Current public window behavior
     # ------------------------------------------------------------------
 
-    @property
-    def has_pending_target_changes(self) -> bool:
-        return (
-            self._species_table.has_pending_target_changes
-            or self._species_table.has_pending_initial_changes
-        )
-
-    @property
-    def has_pending_data_changes(self) -> bool:
-        setup = self._projected_setup
-        if setup is None:
-            return False
-        return self._data_tab.has_pending_edits(
-            self._included_dataset_ids(setup)
-        )
-
     def _is_executing(self) -> bool:
         return bool(self._executing)
 
@@ -717,11 +741,7 @@ class FittingWindow(QtWidgets.QDialog):
         focused = self.focusWidget()
         if focused is not None:
             focused.clearFocus()
-        if (
-            self.has_invalid_setup_edits
-            or self.has_pending_target_changes
-            or self.has_pending_data_changes
-        ):
+        if self.has_invalid_setup_edits:
             # The readiness line already reports what blocks Run.
             return
         self.executeRequested.emit()
@@ -731,12 +751,12 @@ class FittingWindow(QtWidgets.QDialog):
             return
         if self._paused:
             self._paused = False
-            self._pause_button.setText("Pause")
+            self._pause_button.setText("&Pause")
             self._refresh_copy_allowed()
             self.resumeRequested.emit()
             return
         self._paused = True
-        self._pause_button.setText("Resume")
+        self._pause_button.setText("&Resume")
         self._refresh_copy_allowed()
         self.pauseRequested.emit()
 
@@ -765,13 +785,14 @@ class FittingWindow(QtWidgets.QDialog):
         self._refresh_copy_allowed()
         self._results_summary_button.setEnabled(True)
         self._cancel_button.setEnabled(self._executing)
-        self._pause_button.setText("Pause")
+        self._pause_button.setText("&Pause")
         self._pause_button.setEnabled(self._executing)
         self._species_table.set_running_state(self._executing)
         self._params_ics_tab.set_running_state(self._executing)
         self._params_ics_tab.setEnabled(not self._executing)
         self._data_targets_tab.unified_list.set_running_state(self._executing)
         self._data_tab.setEnabled(not self._executing)
+        self._refresh_setup_buttons()
         self._refresh_setup_validity()
         self._layout_footer()
 
@@ -852,18 +873,17 @@ class FittingWindow(QtWidgets.QDialog):
         if copy_reason is None:
             copy_reason = reason
         idle = not self._executing and not self._closing
-        self._apply_button.setEnabled(available and idle)
-        self._apply_copy_button.setEnabled(copy_available and idle)
-        self._apply_button.setToolTip(reason)
-        self._apply_copy_button.setToolTip(copy_reason)
-        feedback = reason if reason == copy_reason else "\n".join(
+        self._apply_project_action.setEnabled(available and idle)
+        self._apply_copy_action.setEnabled(copy_available and idle)
+        self._apply_project_action.setToolTip(reason)
+        self._apply_copy_action.setToolTip(copy_reason)
+        self._apply_button.setEnabled((available or copy_available) and idle)
+        self._apply_button.setToolTip(reason if reason == copy_reason else "\n".join(
             text for text in (
                 f"Apply Fit to Project: {reason}" if reason else "",
                 f"Apply Fit to Tab Copy: {copy_reason}" if copy_reason else "",
             ) if text
-        )
-        set_bounded_label_text(self._apply_reason_label, feedback, max_width=16777215)
-        self._layout_footer()
+        ))
 
     def clear_candidate(self) -> None:
         self.set_apply_available(False, "Run a fit to obtain current values to apply.")
@@ -877,6 +897,10 @@ class FittingWindow(QtWidgets.QDialog):
         """The setup changed: Apply ends, the shown results stay and say so."""
         self.set_apply_available(False, "Run a fit to obtain current values to apply.")
         self._run_results_tab.mark_stale()
+
+    def mark_results_current(self) -> None:
+        """The setup is back to the shown result's own."""
+        self._run_results_tab.mark_current()
 
     def render_results_summary(self) -> None:
         self._run_results_tab.render_results_summary()
@@ -939,6 +963,11 @@ class FittingWindow(QtWidgets.QDialog):
     def reject(self) -> None:
         """Escape never dismisses the Fit window; the title-bar close does."""
 
+    def keyPressEvent(self, event: QtGui.QKeyEvent) -> None:  # noqa: N802 - Qt override
+        # Enter confirms a typed value; only a focused button acts on it.
+        if not enter_confirms_only(self, event):
+            super().keyPressEvent(event)
+
     def enter_stopping(self) -> None:
         """Make the presentation inert until owner-authorized cleanup closes it."""
 
@@ -953,9 +982,10 @@ class FittingWindow(QtWidgets.QDialog):
         self._params_ics_tab.setEnabled(False)
         self._run_button.setEnabled(False)
         self._cancel_button.setEnabled(False)
-        self._pause_button.setText("Pause")
+        self._pause_button.setText("&Pause")
         self._pause_button.setEnabled(False)
         self._results_summary_button.setEnabled(False)
+        self._refresh_setup_buttons()
         self.set_apply_available(False, "Fit is closing.")
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:  # noqa: N802

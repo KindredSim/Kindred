@@ -964,9 +964,9 @@ def fit_candidate_presentation(
     mapped_by_id = {mapped.dataset_id: mapped for mapped in candidate.origin.mapped_datasets}
     included = [item for item in request_setup.datasets if item.included]
     provenance += "<h3>Datasets</h3>" + _table(
-        ("Dataset", "Initial-Condition Set", "X Quantity", "Simulation Interval", "Experimental Time Range"),
+        ("Dataset", "Initial-Condition Set", "Fit Against", "Simulation Interval (s)", "Experimental Time Range (s)"),
         ((mapped_by_id[item.dataset_id].display_name, mapped_by_id[item.dataset_id].set_name,
-          item.parametric.x_name if item.parametric else "t",
+          item.parametric.x_name if item.parametric else "Time",
           f"{_display(item.t_start)} to {_display(item.simulation_end)}",
           "All paired observations" if item.parametric else
           f"{_display(float(item.data_range_min))} to {_display(float(item.data_range_max))}")
@@ -1015,7 +1015,7 @@ def fit_candidate_presentation(
             ((mapped_by_id[item.dataset_id].display_name,
               *(start_text(item.dataset_id, name) for name in species))
              for item in included))
-    provenance += f"<p>Weighting: {_text(FIT_DATASET_WEIGHT_MODE_LABELS[request_setup.dataset_weight_mode])}. Weighted residual = raw residual × √normalized dataset weight × √normalized target weight.</p>"
+    provenance += f"<p>Dataset weights: {_text(FIT_DATASET_WEIGHT_MODE_LABELS[request_setup.dataset_weight_mode])}. Weighted residual = raw residual × √normalized dataset weight × √normalized target weight.</p>"
     if profile.get("facts"):
         provenance += "<h3>Profile Likelihood</h3>" + _table(("Setting", "Value"), (
             (fact, fit_identity_text(value, candidate.origin) if isinstance(value, str) else value)

@@ -1,4 +1,4 @@
-"""Presentation for the historical unified Fit target/initial table.
+"""Presentation for the Fit target, weight and initial-condition table.
 
 The table is deliberately a view/editor surface.  Accepted Fit setup remains
 owned by :class:`FitSessionOwner`; this widget only renders the owner supplied
@@ -11,13 +11,18 @@ import math
 from dataclasses import replace
 from typing import Sequence
 
-from PySide6 import QtCore, QtWidgets
+from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QBrush, QColor, QFontMetrics, QKeySequence, QPalette
 
 from kindred.core.validation import parse_finite_numeric_text, six_digit_text, six_digit_value
 from kindred.gui.fitting.constants import FIT_DATASET_WEIGHT_MODE_LABELS
-from kindred.gui.ui_helpers import copy_current_cell_as_shown, ignore_wheel
+from kindred.gui.ui_helpers import (
+    ChoicesComboBox,
+    configure_compact_numeric_edit,
+    copy_current_cell_as_shown,
+    ignore_wheel,
+)
 from kindred.gui.fitting.contracts import FitTargetSelection, copy_target_selection
 from kindred.gui.fitting.launch import (
     FitDatasetLocalSettings,
@@ -83,7 +88,7 @@ _VARY_IC_CHOICES: tuple[tuple[str, str, str], ...] = (
         "Example: 10 and 5 permit values from 90% to 105% of the Starting IC.",
     ),
     (
-        "Absolute Minimum / Maximum (in M)",
+        "Minimum / Maximum (in M)",
         "absolute",
         "Enter the actual minimum and maximum concentrations in molar units.",
     ),
@@ -100,16 +105,11 @@ _COPY_SPECIES_WEIGHTS_VARY_IC_TOOLTIP = (
 
 _INVALID_BG = QBrush(QColor(255, 200, 200))
 _INVALID_FG = QBrush(QColor(80, 0, 0))
-_DEFAULT_BG = QBrush()
-_DEFAULT_FG = QBrush()
 
 _DATASET_ROLE = Qt.ItemDataRole.UserRole
 _SET_ROLE = Qt.ItemDataRole.UserRole + 1
-_RAW_ID_ROLE = Qt.ItemDataRole.UserRole + 2
-_RAW_COLUMN_ROLE = Qt.ItemDataRole.UserRole + 3
 _MODEL_TARGET_ROLE = Qt.ItemDataRole.UserRole + 4
 _SPECIES_ROLE = Qt.ItemDataRole.UserRole + 5
-_EXACT_VALUE_ROLE = Qt.ItemDataRole.UserRole + 6
 
 
 _NUMBER_COLUMNS = (_Col.WEIGHT, _Col.INITIAL, _Col.LOWER, _Col.UPPER)
@@ -188,10 +188,13 @@ class _SpeciesTableWidget(QtWidgets.QTableWidget):
 
 
 class UnifiedSpeciesTable(QtWidgets.QWidget):
-    """Target/weight/initial presentation with complete-snapshot hooks."""
+    """Target/weight/initial presentation with complete-snapshot hooks.
 
-    # Every valid edit is submitted as one complete accepted-snapshot
-    # replacement. Invalid numeric text remains in the table's local draft.
+    Every valid edit is submitted at once as one complete setup replacement.
+    An edit that cannot apply keeps its text, blocks Run, and stays until
+    corrected or discarded with Escape.
+    """
+
     setupSnapshotRequested = Signal(object)
     validityChanged = Signal()
     statusMessage = Signal(str)
@@ -223,80 +226,61 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
 
         self._projected_setup: FitSetupSnapshot | None = None
         self._current_dataset_id: str | None = None
-        self._pending_target_selections: dict[str, tuple[str, ...]] = {}
-        self._pending_target_weights: dict[tuple[str, str], float] = {}
-        self._pending_dataset_weights: dict[str, float] = {}
-        self._pending_initial_rows: dict[tuple[str, str], dict[str, object]] = {}
-        self._pending_initial_values: dict[
-            tuple[str, str], dict[str, object]
-        ] = {}
-        self._pending_shared_initial_groups: dict[
-            tuple[str, str], FitSharedInitialGroup | None
-        ] = {}
+        # Weight text that could not apply, keyed ("target_weight", dataset,
+        # species) or ("dataset_weight", dataset).
         self._invalid_raw: dict[tuple[str, ...], str] = {}
-        # Each invalid IC cell keeps its typed text and its message.
+        # The complete text of each initial-condition row that could not
+        # apply, and each of its invalid cells' text and message.
+        self._invalid_initial_rows: dict[tuple[str, str], dict[str, object]] = {}
         self._invalid_initial_raw: dict[tuple[str, str, str], tuple[str, str]] = {}
+        self._row_keys: tuple[object, ...] = ()
         self._refreshing = False
         self._running = False
 
         self._build_ui()
 
     # ------------------------------------------------------------------
-    # Historical physical construction
+    # Physical construction
     # ------------------------------------------------------------------
     def _build_ui(self) -> None:
-        from kindred.gui.widgets.config_panel_footer import ConfigPanelFooter
-
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(6, 6, 6, 6)
         layout.setSpacing(6)
 
         group = QtWidgets.QGroupBox("Species Table", self)
         group.setObjectName("global_fit_unified_species_group")
+        self._group = group
         group_layout = QtWidgets.QVBoxLayout(group)
         layout.addWidget(group, stretch=1)
 
-        self._footer = ConfigPanelFooter(
-            group,
-            show_dirty=True,
-            show_divider=True,
-            apply_requires_no_error=True,
-            button_order=("apply", "revert"),
-            error_object_name="global_fit_species_table_error",
-            apply_object_name="global_fit_species_table_apply",
-            revert_object_name="global_fit_species_table_revert",
-        )
-        group_layout.addWidget(self._footer, stretch=1)
-        self._footer.hint_label.setText(
-            "Apply and Revert affect pending targets, weights and initial conditions "
-            "across all datasets. Data settings use their own Apply and Revert."
-        )
-        self._footer.applyRequested.connect(self._apply_presentation_edits)
-        self._footer.revertRequested.connect(self._revert_presentation_edits)
-
-        self._context_label = QtWidgets.QLabel("Targets and Initial Conditions", self)
-        self._context_label.setStyleSheet("font-weight: bold;")
-        self._context_label.setWordWrap(True)
-        self._footer.body_layout.addWidget(self._context_label)
-
-        weighting_form = QtWidgets.QFormLayout()
-        weighting_form.setContentsMargins(0, 0, 0, 0)
-        weighting_form.setRowWrapPolicy(QtWidgets.QFormLayout.RowWrapPolicy.WrapLongRows)
-        self._weight_mode_combo = QtWidgets.QComboBox(self)
+        # The composing tab places this one "Dataset weights" setting among
+        # the Fit Data settings; this table still owns its edits.  The mode
+        # and this dataset's weight always share a line.
+        weighting = QtWidgets.QWidget(self)
+        weighting_row = QtWidgets.QHBoxLayout(weighting)
+        weighting_row.setContentsMargins(0, 0, 0, 0)
+        self._weight_mode_combo = ChoicesComboBox(weighting)
         self._weight_mode_combo.setObjectName("global_fit_weight_mode_combo")
+        self._weight_mode_combo.setSizeAdjustPolicy(
+            QtWidgets.QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
+        )
+        self._weight_mode_combo.setMinimumContentsLength(12)
+        self._weight_mode_combo.setToolTip("Applies to all datasets.")
         for mode, label in FIT_DATASET_WEIGHT_MODE_LABELS.items():
             self._weight_mode_combo.addItem(label, mode)
-        weighting_form.addRow("Weight mode:", self._weight_mode_combo)
-
-        self._dataset_weight_edit = QtWidgets.QLineEdit(self)
+        self._dataset_weight_edit = QtWidgets.QLineEdit(weighting)
         self._dataset_weight_edit.setObjectName("global_fit_dataset_weight_edit")
-        weighting_form.addRow("Dataset weight:", self._dataset_weight_edit)
-        self._footer.body_layout.addLayout(weighting_form)
+        configure_compact_numeric_edit(self._dataset_weight_edit, characters=8)
+        weighting_row.addWidget(self._weight_mode_combo)
+        weighting_row.addSpacing(12)
+        weighting_row.addWidget(QtWidgets.QLabel("This dataset", weighting))
+        weighting_row.addWidget(self._dataset_weight_edit)
+        self.weighting_settings = (("Dataset weights", weighting),)
         self._weight_mode_combo.currentIndexChanged.connect(
             self._on_weight_mode_changed
         )
-        self._dataset_weight_edit.textChanged.connect(
-            self._on_dataset_weight_text_changed
+        self._dataset_weight_edit.editingFinished.connect(
+            self._on_dataset_weight_edited
         )
 
         bulk_row = QtWidgets.QGridLayout()
@@ -348,7 +332,7 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
         ):
             button.setSizePolicy(QtWidgets.QSizePolicy.Policy.Maximum, QtWidgets.QSizePolicy.Policy.Fixed)
         self._relayout_bulk_buttons()
-        self._footer.body_layout.addLayout(bulk_row)
+        group_layout.addLayout(bulk_row)
 
         self._table = _SpeciesTableWidget(self)
         self._table.setObjectName("global_fit_unified_species_table")
@@ -380,7 +364,22 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
         self._table.verticalHeader().setVisible(False)
         self._table.setAlternatingRowColors(True)
         self._table.itemChanged.connect(self._on_table_item_changed)
-        self._footer.body_layout.addWidget(self._table, stretch=1)
+        group_layout.addWidget(self._table, stretch=1)
+
+        self._error_label = QtWidgets.QLabel(self)
+        self._error_label.setObjectName("global_fit_species_table_error")
+        self._error_label.setWordWrap(True)
+        self._error_label.setVisible(False)
+        group_layout.addWidget(self._error_label)
+
+        self._discard_shortcuts = tuple(
+            QtGui.QShortcut(QKeySequence(Qt.Key.Key_Escape), parent)
+            for parent in (self, self._dataset_weight_edit)
+        )
+        for shortcut in self._discard_shortcuts:
+            shortcut.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+            shortcut.setEnabled(False)
+            shortcut.activated.connect(self._discard_current_invalid_entries)
 
     def _relayout_bulk_buttons(self) -> None:
         buttons = (
@@ -436,32 +435,11 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
         self._origin = snapshot.origin
         available_ids = tuple(item.dataset_id for item in snapshot.datasets)
         requested_id = dataset_id or self._current_dataset_id
-
         self._projected_setup = snapshot
-        for dataset in snapshot.datasets:
-            self._purge_parametric_x_pending(dataset)
         self._current_dataset_id = requested_id or (
             available_ids[0] if available_ids else None
         )
-        self._refreshing = True
-        self.setUpdatesEnabled(False)
-        self._table.blockSignals(True)
-        self._weight_mode_combo.blockSignals(True)
-        self._dataset_weight_edit.blockSignals(True)
-        try:
-            mode_index = self._weight_mode_combo.findData(
-                snapshot.dataset_weight_mode
-            )
-            self._weight_mode_combo.setCurrentIndex(max(0, mode_index))
-            self._populate_table()
-            self._refresh_dataset_weight_editor()
-        finally:
-            self._dataset_weight_edit.blockSignals(False)
-            self._weight_mode_combo.blockSignals(False)
-            self._table.blockSignals(False)
-            self._refreshing = False
-            self.setUpdatesEnabled(True)
-        self._refresh_footer()
+        self._refresh_visible_presentation()
 
     def load_for_dataset(self, dataset_id: str) -> None:
         """Select one projected dataset and repaint the table."""
@@ -474,23 +452,18 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
     def refresh_validity_ui(self) -> None:
         """Refresh presentation validation without becoming a Fit validator."""
 
-        self._refresh_footer()
+        self._refresh_error()
 
     def clear_pending_edits(self) -> None:
-        """Discard every target, weight, IC, and raw editor draft."""
+        """Discard every held invalid weight and initial-condition entry."""
 
-        self._pending_target_selections.clear()
-        self._pending_target_weights.clear()
-        self._pending_dataset_weights.clear()
-        self._pending_initial_rows.clear()
-        self._pending_initial_values.clear()
-        self._pending_shared_initial_groups.clear()
         self._invalid_raw.clear()
+        self._invalid_initial_rows.clear()
         self._invalid_initial_raw.clear()
         self._refresh_visible_presentation()
 
     def set_running_state(self, running: bool) -> None:
-        """Preserve the historical disabled/locked running-state visuals."""
+        """Lock every editor while a Fit runs."""
 
         self._running = bool(running)
         self._table.setEnabled(not self._running)
@@ -499,7 +472,6 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
             self._dataset_weight_edit.setEnabled(False)
         else:
             self._refresh_dataset_weight_editor()
-        self._footer.setEnabled(not self._running)
         for button in (
             self._bulk_all_button,
             self._bulk_none_button,
@@ -511,6 +483,13 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
 
     def set_status(self, text: str) -> None:
         self.statusMessage.emit(str(text))
+
+    def _submit(self, replacement: FitSetupSnapshot) -> None:
+        """Submit one complete setup; the owner projects the accepted one back."""
+
+        self.setupSnapshotRequested.emit(replacement)
+        # A refused replacement leaves the previous projection to restore.
+        self._refresh_visible_presentation()
 
     # ------------------------------------------------------------------
     # Snapshot lookup and presentation helpers
@@ -627,7 +606,9 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
         )
 
     @staticmethod
-    def _initial_raw(initial: FitInitialVariable) -> dict[str, object]:
+    def _initial_raw(
+        initial: FitInitialVariable | FitSharedInitialGroup,
+    ) -> dict[str, object]:
         return {
             "initial": UnifiedSpeciesTable._float_text(initial.initial),
             "mode": initial.tolerance.mode,
@@ -644,52 +625,24 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
             "log10": bool(initial.log10),
         }
 
-    def _shared_initial_groups(self) -> tuple[FitSharedInitialGroup, ...]:
-        """Return accepted groups overlaid with this editor's pending edits."""
-
-        setup = self._current_setup()
-        groups = {
-            (item.species, item.origin_dataset_id): item
-            for item in (setup.shared_initial_groups if setup is not None else ())
-        }
-        for identity, pending in self._pending_shared_initial_groups.items():
-            if pending is None:
-                groups.pop(identity, None)
-            else:
-                groups[identity] = pending
-        return tuple(groups.values())
-
     def _shared_initial_group(
         self,
         dataset_id: str,
         species: str,
     ) -> FitSharedInitialGroup | None:
+        setup = self._current_setup()
         return next(
             (
                 item
-                for item in self._shared_initial_groups()
+                for item in (setup.shared_initial_groups if setup is not None else ())
                 if item.species == species and dataset_id in item.member_dataset_ids
             ),
             None,
         )
 
-    def _pending_initial_config(
-        self,
-        set_id: str,
-        species: str,
-    ) -> FitInitialVariable | None:
-        """Return one valid typed pending local-IC draft, if present."""
-
-        pending = self._pending_initial_values.get((set_id, species))
-        if pending is None:
-            return None
-        return FitInitialVariable(
-            set_id=set_id,
-            species=species,
-            initial=pending["initial"],
-            tolerance=pending["tolerance"],
-            log10=pending["log10"],
-        )
+    def _dataset_name(self, dataset_id: str) -> str:
+        mapped = self._mapped_dataset(dataset_id)
+        return mapped.display_name if mapped is not None else dataset_id
 
     def _refresh_vary_global_availability(self, row: int) -> None:
         """Refresh one Vary Global cell without rebuilding the table."""
@@ -712,11 +665,12 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
                 self._projected_dataset(dataset_id),
                 species,
             )
-            if (set_id, species) in self._pending_initial_rows:
-                pending = self._pending_initial_config(set_id, species)
-                enabled = pending is not None and pending.fit
-            else:
-                enabled = local is not None and local.fit
+            # Only an applied varied row can start or join a group.
+            enabled = (
+                (set_id, species) not in self._invalid_initial_rows
+                and local is not None
+                and local.fit
+            )
             checked = False
         blocker = QtCore.QSignalBlocker(self._table)
         self._set_checkable(global_item, checked, enabled)
@@ -733,15 +687,17 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
         datasets added, or None on Cancel.  The dialog only adds: existing
         members stay, and datasets in other groups of the species are greyed.
         Groups are numbered by the table position of their origin dataset, and
-        datasets excluded from the fit are marked.
+        datasets excluded from the fit are marked.  Each dataset shows its own
+        Starting IC.
         """
 
         setup = self._current_setup()
         if setup is None:
             return None
-        names = {item.dataset_id: item.display_name for item in self._origin.mapped_datasets}
         included = {item.dataset_id for item in setup.datasets if item.included}
-        groups = tuple(group for group in self._shared_initial_groups() if group.species == species)
+        groups = tuple(
+            group for group in setup.shared_initial_groups if group.species == species
+        )
         dialog = QtWidgets.QDialog(self)
         dialog.setWindowTitle(f"Vary Global — {species}")
         layout = QtWidgets.QVBoxLayout(dialog)
@@ -755,9 +711,12 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
         layout.addWidget(target)
         checks: dict[str, QtWidgets.QCheckBox] = {}
         for dataset in setup.datasets:
-            if dataset.dataset_id != dataset_id and self._local_initial(dataset, species) is None:
+            local = self._local_initial(dataset, species)
+            if dataset.dataset_id != dataset_id and local is None:
                 continue
-            name = names[dataset.dataset_id]
+            name = self._dataset_name(dataset.dataset_id)
+            if local is not None:
+                name = f"{name} ({six_digit_text(local.initial)} M)"
             check = QtWidgets.QCheckBox(
                 name if dataset.dataset_id in included else f"{name} (not in fit)", dialog,
             )
@@ -794,90 +753,37 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
             item for item, check in checks.items() if check.isChecked() and check.isEnabled()
         )
 
-    def _retain_departing_initials(
-        self, group: FitSharedInitialGroup, remaining: tuple[str, ...]
+    def _submit_groups(
+        self,
+        groups: Sequence[FitSharedInitialGroup],
+        *,
+        initials: Sequence[FitInitialVariable] | None = None,
     ) -> None:
-        for dataset_id in set(group.member_dataset_ids) - set(remaining):
-            mapped = self._mapped_dataset(dataset_id)
-            key = (mapped.set_id, group.species)
-            pending = self._pending_initial_rows.get(key)
-            # Only an explicit edit outranks the current group configuration.
-            if pending is not None and not pending.get("_from_group"):
-                continue
-            self._pending_initial_rows[key] = {
-                "_from_group": True,
-                "initial": self._float_text(group.initial),
-                "mode": group.tolerance.mode,
-                "lower": "" if group.tolerance.lower is None else self._float_text(group.tolerance.lower),
-                "upper": "" if group.tolerance.upper is None else self._float_text(group.tolerance.upper),
-                "log10": group.log10,
-            }
-            self._pending_initial_values[key] = {
-                "initial": group.initial, "tolerance": group.tolerance, "log10": group.log10,
-            }
-
-    def _stage_shared_initial_group(self, group: FitSharedInitialGroup) -> None:
-        identity = (group.species, group.origin_dataset_id)
-        previous = self._shared_initial_group(group.origin_dataset_id, group.species)
-        if previous is not None:
-            self._retain_departing_initials(
-                replace(group, member_dataset_ids=previous.member_dataset_ids),
-                group.member_dataset_ids,
-            )
         setup = self._current_setup()
-        accepted = None if setup is None else next(
-            (
-                item
-                for item in setup.shared_initial_groups
-                if (item.species, item.origin_dataset_id) == identity
-            ),
-            None,
-        )
-        if group == accepted:
-            self._pending_shared_initial_groups.pop(identity, None)
-        else:
-            self._pending_shared_initial_groups[identity] = group
-        self._refresh_visible_presentation()
-
-    def _dissolve_shared_initial_group(self, group: FitSharedInitialGroup) -> None:
-        self._retain_departing_initials(group, ())
-        self._drop_shared_initial_group(group)
-
-    def _drop_shared_initial_group(self, group: FitSharedInitialGroup) -> None:
-        """Remove one group identity from the pending overlay."""
-
-        identity = (group.species, group.origin_dataset_id)
-        setup = self._current_setup()
-        if setup is not None and any(
-            (item.species, item.origin_dataset_id) == identity
-            for item in setup.shared_initial_groups
-        ):
-            self._pending_shared_initial_groups[identity] = None
-        else:
-            self._pending_shared_initial_groups.pop(identity, None)
-        self._refresh_visible_presentation()
+        self._submit(replace(
+            setup,
+            shared_initial_groups=tuple(groups),
+            initials=setup.initials if initials is None else tuple(initials),
+        ))
 
     def _leave_shared_initial_group(self, group: FitSharedInitialGroup, dataset_id: str) -> None:
         """One dataset leaves; a group left with one member dissolves.
 
         When the origin leaves, the first remaining member in table order
-        becomes the origin.  Departing rows keep the group's configuration.
+        becomes the origin.  Departing datasets keep their own Starting IC
+        and Vary IC, which membership never changed.
         """
 
-        order = tuple(item.dataset_id for item in self._current_setup().datasets)
+        setup = self._current_setup()
+        order = tuple(item.dataset_id for item in setup.datasets)
         remaining = tuple(sorted(
             (item for item in group.member_dataset_ids if item != dataset_id), key=order.index,
         ))
-        if len(remaining) < 2:
-            self._dissolve_shared_initial_group(group)
-        elif dataset_id == group.origin_dataset_id:
-            self._retain_departing_initials(group, remaining)
-            self._drop_shared_initial_group(group)
-            self._stage_shared_initial_group(replace(
-                group, origin_dataset_id=remaining[0], member_dataset_ids=remaining,
-            ))
-        else:
-            self._stage_shared_initial_group(replace(group, member_dataset_ids=remaining))
+        others = [item for item in setup.shared_initial_groups if item != group]
+        if len(remaining) >= 2:
+            origin = group.origin_dataset_id if group.origin_dataset_id in remaining else remaining[0]
+            others.append(replace(group, origin_dataset_id=origin, member_dataset_ids=remaining))
+        self._submit_groups(others)
 
     def _on_vary_global_changed(self, row: int, item: QtWidgets.QTableWidgetItem) -> None:
         """Untick leaves the dataset's group; tick opens the membership dialog."""
@@ -898,21 +804,14 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
         current_dataset = self._current_dataset()
         local = self._local_initial(current_dataset, species) if current_dataset else None
         mapped = self._mapped_dataset(dataset_id)
-        if mapped is None or local is None:
+        if (
+            mapped is None
+            or local is None
+            or not local.fit
+            or (mapped.set_id, species) in self._invalid_initial_rows
+        ):
             self._refresh_visible_presentation()
             return
-        key = (mapped.set_id, species)
-        if key in self._pending_initial_rows:
-            pending = self._pending_initial_config(mapped.set_id, species)
-            if pending is None or not pending.fit:
-                self._refresh_visible_presentation()
-                return
-            group_local = pending
-        else:
-            if not local.fit:
-                self._refresh_visible_presentation()
-                return
-            group_local = local
         choice = self._group_edit_dialog(species, dataset_id)
         if choice is None:
             self._refresh_visible_presentation()
@@ -922,30 +821,28 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
             self.set_status("Vary Global needs an additional compatible dataset.")
             self._refresh_visible_presentation()
             return
-        # Every joiner takes the group's configuration over its unapplied
-        # edit, valid or not.
+        # Every joiner takes the group's configuration over its invalid text.
         for member in (dataset_id, *added):
-            set_id = self._mapped_dataset(member).set_id
-            self._pending_initial_rows.pop((set_id, species), None)
-            self._pending_initial_values.pop((set_id, species), None)
-            for field in ("initial", "lower", "upper"):
-                self._invalid_initial_raw.pop((set_id, species, field), None)
+            self._drop_invalid_initial_row(self._mapped_dataset(member).set_id, species)
+        setup = self._current_setup()
         if joined is None:
-            self._stage_shared_initial_group(FitSharedInitialGroup(
-                species=species,
-                origin_dataset_id=dataset_id,
-                member_dataset_ids=(dataset_id, *added),
-                initial=group_local.initial,
-                tolerance=group_local.tolerance,
-                log10=group_local.log10,
+            self._submit_groups((
+                *setup.shared_initial_groups,
+                FitSharedInitialGroup(
+                    species=species,
+                    origin_dataset_id=dataset_id,
+                    member_dataset_ids=(dataset_id, *added),
+                    initial=local.initial,
+                    tolerance=local.tolerance,
+                    log10=local.log10,
+                ),
             ))
             return
-        existing = next(
-            group for group in self._shared_initial_groups()
+        self._submit_groups(tuple(
+            replace(group, member_dataset_ids=(*group.member_dataset_ids, dataset_id, *added))
             if group.species == species and group.origin_dataset_id == joined
-        )
-        self._stage_shared_initial_group(replace(
-            existing, member_dataset_ids=(*existing.member_dataset_ids, dataset_id, *added),
+            else group
+            for group in setup.shared_initial_groups
         ))
 
     def _observations_for_target(
@@ -967,43 +864,38 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
         dataset: FitDatasetLocalSettings,
         target: str,
     ) -> str:
-        observations = self._observations_for_target(dataset, target)
-        if not observations:
-            return ""
-        lines = ["Raw observations:"]
-        lines.extend(
-            f"{item.raw_observation_id} — {item.raw_column} → "
-            f"{self._observation_target(dataset, item)}"
-            for item in observations
+        return "\n".join(
+            f"Data column {item.raw_column} → {self._observation_target(dataset, item)}"
+            for item in self._observations_for_target(dataset, target)
         )
-        return "\n".join(lines)
 
     def _populate_table(self) -> None:
         dataset = self._current_dataset()
-        self._table.setRowCount(0)
         if dataset is None:
-            self._context_label.setToolTip("")
+            self._table.setRowCount(0)
+            self._row_keys = ()
+            self._group.setTitle("Species Table")
             return
 
         mapped = self._mapped_dataset(dataset.dataset_id)
         if mapped is None:
             return
-        self._purge_parametric_x_pending(dataset)
+        self._group.setTitle(f"Species Table — {mapped.display_name}")
         x_name = dataset.parametric.x_name if dataset.parametric is not None else None
-        selected = set(
-            self._pending_target_selections.get(
-                dataset.dataset_id,
-                dataset.target_species,
-            )
-        )
-        if x_name is not None:
-            selected.discard(x_name)
+        selected = set(dataset.target_species)
+        selected.discard(x_name)
         weights = dict(dataset.target_weights)
-        self._context_label.setToolTip(
-            f"{mapped.display_name}\nDataset ID: {dataset.dataset_id}\nSet ID: {mapped.set_id}"
-        )
         row_species = self._row_species(dataset)
-        self._table.setRowCount(len(row_species))
+        current = self._table.currentIndex()
+        current_cell = (current.row(), current.column()) if current.isValid() else None
+        keys = (dataset.dataset_id, tuple(row_species))
+        if keys != self._row_keys:
+            # Only another dataset or roster replaces rows; ordinary edits
+            # update cells in place and keep the current cell.
+            self._table.setRowCount(0)
+            self._table.setRowCount(len(row_species))
+            self._row_keys = keys
+            current_cell = None
         for row, species in enumerate(row_species):
             observations = self._observations_for_target(dataset, species)
             has_data = bool(observations)
@@ -1013,41 +905,26 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
                 group_config is not None
                 and group_config.origin_dataset_id == dataset.dataset_id
             )
-            local_key = (
-                mapped.set_id if mapped is not None else "",
-                species,
+            group_member = group_config is not None and not group_origin
+            local_key = (mapped.set_id, species)
+            if local_key in self._invalid_initial_rows:
+                raw_initial = self._invalid_initial_rows[local_key]
+            elif group_config is not None:
+                raw_initial = self._initial_raw(group_config)
+            else:
+                raw_initial = self._initial_raw(local) if local is not None else {}
+            member_tooltip = (
+                f"Shared with {self._dataset_name(group_config.origin_dataset_id)}. Edit it there."
+                if group_member else ""
             )
-            raw_initial = self._pending_initial_rows.get(
-                local_key,
-                self._initial_raw(local) if local is not None else {},
-            )
-            if group_config is not None:
-                raw_initial = {
-                    "initial": self._float_text(group_config.initial),
-                    "mode": group_config.tolerance.mode,
-                    "lower": (
-                        ""
-                        if group_config.tolerance.lower is None
-                        else self._float_text(group_config.tolerance.lower)
-                    ),
-                    "upper": (
-                        ""
-                        if group_config.tolerance.upper is None
-                        else self._float_text(group_config.tolerance.upper)
-                    ),
-                    "log10": group_config.log10,
-                }
             target_item = QtWidgets.QTableWidgetItem()
             eligible = has_data and species != x_name
             self._set_checkable(target_item, species in selected, eligible)
             target_item.setData(_DATASET_ROLE, dataset.dataset_id)
-            target_item.setData(_RAW_ID_ROLE, tuple(item.raw_observation_id for item in observations))
-            target_item.setData(_RAW_COLUMN_ROLE, tuple(item.raw_column for item in observations))
             target_item.setData(_MODEL_TARGET_ROLE, species)
             target_item.setData(_SPECIES_ROLE, species)
             self._table.setItem(row, _Col.INCLUDE, target_item)
 
-            weight_key = (dataset.dataset_id, species)
             weight_invalid_key = (
                 "target_weight",
                 dataset.dataset_id,
@@ -1056,28 +933,14 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
             weight_text = (
                 self._invalid_raw[weight_invalid_key]
                 if weight_invalid_key in self._invalid_raw
-                else self._float_text(
-                    self._pending_target_weights.get(
-                        weight_key,
-                        weights.get(species, 1.0),
-                    )
-                )
+                else self._float_text(weights.get(species, 1.0))
             )
-            weight_eligible = has_data
             weight_item = QtWidgets.QTableWidgetItem(
-                weight_text if weight_eligible else ""
+                weight_text if has_data else ""
             )
             weight_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-            self._set_editable(weight_item, weight_eligible)
+            self._set_editable(weight_item, has_data)
             weight_item.setData(_DATASET_ROLE, dataset.dataset_id)
-            weight_item.setData(
-                _RAW_ID_ROLE,
-                tuple(item.raw_observation_id for item in observations),
-            )
-            weight_item.setData(
-                _RAW_COLUMN_ROLE,
-                tuple(item.raw_column for item in observations),
-            )
             weight_item.setData(_MODEL_TARGET_ROLE, species)
             weight_item.setData(_SPECIES_ROLE, species)
             if weight_invalid_key in self._invalid_raw:
@@ -1099,6 +962,7 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
                 species_item.setToolTip(tooltip)
             self._table.setItem(row, _Col.SPECIES, species_item)
 
+            tolerance_mode = str(raw_initial.get("mode", "disabled"))
             for column, field in (
                 (_Col.INITIAL, "initial"),
                 (_Col.LOWER, "lower"),
@@ -1110,10 +974,9 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
                     if invalid_key in self._invalid_initial_raw
                     else str(raw_initial.get(field, ""))
                 )
-                tolerance_mode = str(raw_initial.get("mode", "disabled"))
                 self._set_editable(
                     initial_item,
-                    local is not None and (group_config is None or group_origin)
+                    local is not None and not group_member
                     and (
                         field == "initial"
                         or (field == "lower" and tolerance_mode != "disabled")
@@ -1127,19 +990,12 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
                 initial_item.setData(_DATASET_ROLE, dataset.dataset_id)
                 initial_item.setData(_SET_ROLE, mapped.set_id)
                 initial_item.setData(_SPECIES_ROLE, species)
-                if local is not None:
-                    initial_item.setData(
-                        _EXACT_VALUE_ROLE,
-                        (
-                            local.initial
-                            if field == "initial"
-                            else getattr(local.tolerance, field)
-                        ),
-                    )
                 if invalid_key in self._invalid_initial_raw:
                     initial_item.setBackground(_INVALID_BG)
                     initial_item.setForeground(_INVALID_FG)
                     initial_item.setToolTip(self._invalid_initial_raw[invalid_key][1])
+                elif member_tooltip:
+                    initial_item.setToolTip(member_tooltip)
                 self._table.setItem(row, column, initial_item)
 
             mode = QtWidgets.QComboBox(self._table)
@@ -1153,11 +1009,19 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
                     tooltip,
                     Qt.ItemDataRole.ToolTipRole,
                 )
-            mode.setEnabled(local is not None and (group_config is None or group_origin))
+            if self._shows_zero_initial(raw_initial):
+                # A percentage of zero is no range; only Minimum / Maximum applies.
+                for value in ("symmetric_percent", "asymmetric_percent"):
+                    choice = mode.model().item(mode.findData(value))
+                    choice.setEnabled(False)
+                    choice.setToolTip(ZERO_IC_PERCENT_MESSAGE)
+            mode.setEnabled(local is not None and not group_member)
             mode.setCurrentIndex(
-                max(0, mode.findData(str(raw_initial.get("mode", "disabled"))))
+                max(0, mode.findData(tolerance_mode))
             )
             self._set_vary_ic_combo_tooltip(mode)
+            if member_tooltip:
+                mode.setToolTip(member_tooltip)
             mode.currentIndexChanged.connect(
                 lambda _index, table_row=row, combo=mode:
                 self._on_vary_ic_mode_changed(table_row, combo)
@@ -1176,16 +1040,25 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
                 check_item,
                 bool(raw_initial.get("log10", False)),
                 local is not None
-                and raw_initial.get("mode") != "disabled"
-                and (group_config is None or group_origin),
+                and tolerance_mode != "disabled"
+                and not group_member,
             )
             check_item.setData(_DATASET_ROLE, dataset.dataset_id)
             check_item.setData(_SET_ROLE, mapped.set_id)
             check_item.setData(_SPECIES_ROLE, species)
-            if local is not None:
-                check_item.setData(_EXACT_VALUE_ROLE, local.log10)
+            if member_tooltip:
+                check_item.setToolTip(member_tooltip)
             self._table.setItem(row, _Col.LOG10, check_item)
             self._refresh_vary_global_availability(row)
+        if current_cell is not None and current_cell[0] < self._table.rowCount():
+            self._table.setCurrentCell(*current_cell)
+
+    @staticmethod
+    def _shows_zero_initial(raw_initial: dict[str, object]) -> bool:
+        try:
+            return float(str(raw_initial.get("initial", ""))) == 0.0
+        except ValueError:
+            return False
 
     @staticmethod
     def _set_vary_ic_combo_tooltip(combo: QtWidgets.QComboBox) -> None:
@@ -1221,31 +1094,6 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
             # IC and Run remains blocked until the user repairs it.
             initial = None
 
-        if mode in {"symmetric_percent", "asymmetric_percent"} and initial == 0.0:
-            # A percentage range around zero is undefined.  Reject the
-            # transition itself so no invalid percentage draft can be applied.
-            identity = self._table.item(row, _Col.INITIAL)
-            previous_mode = "disabled"
-            if identity is not None:
-                set_id = str(identity.data(_SET_ROLE) or "").strip()
-                species = str(identity.data(_SPECIES_ROLE) or "").strip()
-                accepted = self._accepted_initial(set_id, species)
-                previous_mode = (
-                    str(self._pending_initial_rows.get((set_id, species), {}).get("mode"))
-                    if (set_id, species) in self._pending_initial_rows
-                    else (accepted.tolerance.mode if accepted is not None else "disabled")
-                )
-                if previous_mode not in {value for _label, value, _tip in _VARY_IC_CHOICES}:
-                    previous_mode = "disabled"
-            # Restore without re-entering this handler, which would rewrite
-            # the row's bounds for the restored mode.
-            with QtCore.QSignalBlocker(combo):
-                combo.setCurrentIndex(max(0, combo.findData(previous_mode)))
-            self._set_vary_ic_combo_tooltip(combo)
-            # A refused mode change is an action outcome, not an invalid edit.
-            self.statusMessage.emit(ZERO_IC_PERCENT_MESSAGE)
-            return
-
         lower_item = self._table.item(row, _Col.LOWER)
         upper_item = self._table.item(row, _Col.UPPER)
         if lower_item is None or upper_item is None:
@@ -1265,8 +1113,8 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
             )
             disable_log = True
 
-        # Signals from the two cleared cells must not create half-written
-        # drafts. The single explicit stage below sees the complete row.
+        # Signals from the two cleared cells must not stage half-written
+        # rows. The single explicit stage below sees the complete row.
         table_blocker = QtCore.QSignalBlocker(self._table)
         lower_item.setText(lower)
         upper_item.setText(upper)
@@ -1275,13 +1123,6 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
             if log_item is not None:
                 self._set_checkable(log_item, False, mode != "disabled")
         del table_blocker
-        identity = self._table.item(row, _Col.INITIAL)
-        if identity is not None:
-            self._clear_initial_row_errors(
-                str(identity.data(_SET_ROLE) or ""),
-                str(identity.data(_SPECIES_ROLE) or ""),
-                row,
-            )
         self._stage_initial_row_at(row)
 
     def _accepted_initial(
@@ -1306,6 +1147,10 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
         self._weight_mode_combo.blockSignals(True)
         self._dataset_weight_edit.blockSignals(True)
         try:
+            setup = self._current_setup()
+            if setup is not None:
+                mode_index = self._weight_mode_combo.findData(setup.dataset_weight_mode)
+                self._weight_mode_combo.setCurrentIndex(max(0, mode_index))
             self._populate_table()
             self._refresh_dataset_weight_editor()
         finally:
@@ -1314,29 +1159,10 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
             self._table.blockSignals(False)
             self._refreshing = False
             self.setUpdatesEnabled(True)
-        self._refresh_footer()
-
-    def _purge_parametric_x_pending(
-        self,
-        dataset: FitDatasetLocalSettings,
-    ) -> None:
-        """Drop Y-selection drafts that are invalid for this dataset's current X."""
-
-        parametric = dataset.parametric
-        if parametric is None:
-            return
-        dataset_id = dataset.dataset_id
-        x_name = parametric.x_name
-        pending = self._pending_target_selections.get(dataset_id)
-        if pending is not None:
-            filtered = tuple(target for target in pending if target != x_name)
-            if filtered == dataset.target_species:
-                self._pending_target_selections.pop(dataset_id, None)
-            else:
-                self._pending_target_selections[dataset_id] = filtered
+        self._refresh_error()
 
     # ------------------------------------------------------------------
-    # Presentation edits
+    # Edits
     # ------------------------------------------------------------------
     def _on_table_item_changed(self, item: QtWidgets.QTableWidgetItem) -> None:
         if self._refreshing or self._running:
@@ -1351,46 +1177,54 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
             _Col.LOWER,
             _Col.UPPER,
         }:
-            self._stage_initial_row(item)
+            self._stage_initial_row_at(item.row())
             return
         if item.column() == _Col.VARY_GLOBAL:
             self._on_vary_global_changed(item.row(), item)
             return
         if item.column() == _Col.WEIGHT:
-            key = ("target_weight", dataset_id, species)
-            try:
-                value = float(item.text())
-                if not math.isfinite(value) or value <= 0.0:
-                    raise ValueError
-            except ValueError:
-                self._invalid_raw[key] = item.text()
-                self._mark_invalid(item, _TARGET_WEIGHT_MESSAGE)
-                return
-            self._invalid_raw.pop(key, None)
-            self._clear_invalid(item)
-            projected = self._projected_dataset(dataset_id)
-            baseline = (
-                dict(projected.target_weights).get(species, 1.0)
-                if projected is not None
-                else 1.0
-            )
-            if value == baseline:
-                self._pending_target_weights.pop((dataset_id, species), None)
-            else:
-                self._pending_target_weights[(dataset_id, species)] = value
-            self._refresh_footer()
+            self._on_target_weight_edited(item, dataset_id, species)
             return
         if item.column() == _Col.INCLUDE:
             self._stage_visible_target_selection(dataset_id)
             return
 
-    def _stage_initial_row(self, item: QtWidgets.QTableWidgetItem) -> None:
-        """Reconstruct and validate one complete Local-IC row Draft."""
+    def _on_target_weight_edited(
+        self,
+        item: QtWidgets.QTableWidgetItem,
+        dataset_id: str,
+        species: str,
+    ) -> None:
+        key = ("target_weight", dataset_id, species)
+        try:
+            value = float(item.text())
+            if not math.isfinite(value) or value <= 0.0:
+                raise ValueError
+        except ValueError:
+            self._invalid_raw[key] = item.text()
+            self._mark_invalid(item, _TARGET_WEIGHT_MESSAGE)
+            return
+        self._invalid_raw.pop(key, None)
+        dataset = self._projected_dataset(dataset_id)
+        weights = dict(dataset.target_weights)
+        if weights.get(species, 1.0) == value:
+            self._refresh_visible_presentation()
+            return
+        weights[species] = value
+        self._submit_dataset(replace(dataset, target_weights=tuple(weights.items())))
 
-        self._stage_initial_row_at(item.row())
+    def _submit_dataset(self, dataset: FitDatasetLocalSettings) -> None:
+        setup = self._current_setup()
+        self._submit(replace(
+            setup,
+            datasets=tuple(
+                dataset if item.dataset_id == dataset.dataset_id else item
+                for item in setup.datasets
+            ),
+        ))
 
     def _stage_initial_row_at(self, row: int) -> None:
-        """Reconstruct one row after either item or tolerance-mode edits."""
+        """Apply one complete initial-condition row, or hold its text."""
 
         identity_item = self._table.item(row, _Col.INITIAL)
         if identity_item is None:
@@ -1413,180 +1247,125 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
             or log_item is None
         ):
             return
-        setup = self._current_setup()
-        accepted = next(
-            (
-                row
-                for row in (setup.initials if setup is not None else ())
-                if row.set_id == set_id and row.species == species
-            ),
-            None,
-        )
+        accepted = self._accepted_initial(set_id, species)
         if accepted is None:
             return
         key = (set_id, species)
         group = self._shared_initial_group(dataset_id, species)
-        group_origin = group is not None and group.origin_dataset_id == dataset_id
-        if group is not None and not group_origin:
+        if group is not None and group.origin_dataset_id != dataset_id:
             return
         mode = str(mode_widget.currentData() or "disabled")
-        log10 = log_item.checkState() == Qt.CheckState.Checked
-        blocker = QtCore.QSignalBlocker(self._table)
-        self._set_checkable(
-            log_item,
-            log10 if mode != "disabled" else False,
-            mode != "disabled",
-        )
-        for field, field_item in items.items():
-            assert field_item is not None
-            self._set_editable(
-                field_item,
-                field == "initial"
-                or (field == "lower" and mode != "disabled")
-                or (
-                    field == "upper"
-                    and mode in {"asymmetric_percent", "absolute"}
-                ),
-            )
-        del blocker
-        if mode == "disabled":
-            log10 = False
-        raw = {
-            field: str(value.text())
-            for field, value in items.items()
-            if value is not None
+        log10 = mode != "disabled" and log_item.checkState() == Qt.CheckState.Checked
+        raw: dict[str, object] = {
+            field: str(value.text()) for field, value in items.items()
         }
         raw.update({"mode": mode, "log10": log10})
-        if not group_origin:
-            self._pending_initial_rows[key] = raw
 
-        typed: dict[str, object] = {"mode": mode, "log10": log10}
+        typed: dict[str, float] = {}
         parse_errors: dict[str, str] = {}
         required_fields = {"initial"}
         if mode == "symmetric_percent":
             required_fields.add("lower")
         elif mode in {"asymmetric_percent", "absolute"}:
             required_fields.update({"lower", "upper"})
-        for field, field_item in items.items():
-            assert field_item is not None
-            if field not in required_fields:
-                continue
+        for field in required_fields:
             try:
-                parsed = parse_finite_numeric_text(
-                    field_item.text(), field=_INITIAL_FIELD_HEADERS[field]
+                typed[field] = parse_finite_numeric_text(
+                    str(raw[field]), field=_INITIAL_FIELD_HEADERS[field]
                 )
             except ValueError as exc:
                 parse_errors[field] = str(exc)
-            else:
-                typed[field] = parsed
-        self._clear_initial_row_errors(set_id, species, row)
-        if parse_errors:
-            self._pending_initial_values.pop(key, None)
-            for field, message in parse_errors.items():
-                field_key = (set_id, species, field)
-                self._invalid_initial_raw[field_key] = (str(raw[field]), message)
-                self._decorate_initial_field(
-                    row,
-                    {
-                        "initial": _Col.INITIAL,
-                        "lower": _Col.LOWER,
-                        "upper": _Col.UPPER,
-                    }[field],
-                    message,
-                )
-            self._refresh_vary_global_availability(row)
-            self._refresh_footer()
-            return
-        try:
-            if mode == "disabled":
-                tolerance = FitInitialTolerance()
-            elif mode == "symmetric_percent":
-                tolerance = FitInitialTolerance.symmetric_percent(typed["lower"])
-            elif mode == "asymmetric_percent":
-                tolerance = FitInitialTolerance.asymmetric_percent(
-                    typed["lower"], typed["upper"]
-                )
-            else:
-                tolerance = FitInitialTolerance.absolute(
-                    typed["lower"], typed["upper"]
-                )
-            initial = FitInitialVariable(
-                set_id=set_id,
-                species=species,
-                initial=float(typed["initial"]),
-                tolerance=tolerance,
-                log10=bool(typed["log10"]),
-            )
-        except ValueError as caught_error:
-            self._pending_initial_values.pop(key, None)
-            error_message = str(caught_error)
-            columns = {
-                "initial": _Col.INITIAL,
-                "lower": _Col.LOWER,
-                "upper": _Col.UPPER,
-            }
-            for field in required_fields:
-                self._invalid_initial_raw[(set_id, species, field)] = (str(raw[field]), error_message)
-                self._decorate_initial_field(row, columns[field], error_message)
-        else:
-            self._clear_initial_row_errors(set_id, species, row)
-            if group_origin and group is not None:
-                if initial.tolerance.mode == "disabled":
-                    self._refresh_vary_global_availability(row)
-                    self._pending_initial_rows[key] = raw
-                    self._pending_initial_values[key] = {
-                        "initial": initial.initial, "tolerance": initial.tolerance,
-                        "log10": initial.log10,
-                    }
-                    self._dissolve_shared_initial_group(group)
-                    return
-                self._stage_shared_initial_group(
-                    replace(
-                        group,
-                        initial=initial.initial,
-                        tolerance=initial.tolerance,
-                        log10=initial.log10,
+        if not parse_errors:
+            # A tolerance error lies in Lower/Upper alone; a row error may
+            # involve the Starting IC too.
+            try:
+                if mode == "disabled":
+                    tolerance = FitInitialTolerance()
+                elif mode == "symmetric_percent":
+                    tolerance = FitInitialTolerance.symmetric_percent(typed["lower"])
+                elif mode == "asymmetric_percent":
+                    tolerance = FitInitialTolerance.asymmetric_percent(
+                        typed["lower"], typed["upper"]
                     )
+                else:
+                    tolerance = FitInitialTolerance.absolute(
+                        typed["lower"], typed["upper"]
+                    )
+            except ValueError as caught_error:
+                parse_errors = dict.fromkeys(required_fields - {"initial"}, str(caught_error))
+        if not parse_errors:
+            try:
+                initial = FitInitialVariable(
+                    set_id=set_id,
+                    species=species,
+                    initial=float(typed["initial"]),
+                    tolerance=tolerance,
+                    log10=log10,
                 )
-            else:
-                self._pending_initial_values[key] = {
-                    "initial": initial.initial,
-                    "tolerance": initial.tolerance,
-                    "log10": initial.log10,
-                }
-                if accepted is not None and initial == accepted:
-                    self._pending_initial_rows.pop(key, None)
-                    self._pending_initial_values.pop(key, None)
-        self._refresh_vary_global_availability(row)
-        self._refresh_footer()
+            except ValueError as caught_error:
+                parse_errors = dict.fromkeys(required_fields, str(caught_error))
+        if parse_errors:
+            self._drop_invalid_initial_row(set_id, species)
+            self._invalid_initial_rows[key] = raw
+            for field, message in parse_errors.items():
+                self._invalid_initial_raw[(set_id, species, field)] = (str(raw[field]), message)
+            self._refresh_visible_presentation()
+            return
+        self._drop_invalid_initial_row(set_id, species)
+        setup = self._current_setup()
+        if group is not None:
+            if initial.tolerance.mode == "disabled":
+                # Turning off Vary IC on the origin dissolves its group; every
+                # member keeps its own Starting IC, and the origin's Vary IC is
+                # off.  The row shows the group's value unless the user typed
+                # another Starting IC, which the origin then keeps.
+                fixed = replace(
+                    accepted,
+                    initial=accepted.initial if initial.initial == group.initial else initial.initial,
+                    tolerance=initial.tolerance,
+                    log10=False,
+                )
+                self._submit_groups(
+                    tuple(item for item in setup.shared_initial_groups if item != group),
+                    initials=tuple(
+                        fixed if item.set_id == set_id and item.species == species else item
+                        for item in setup.initials
+                    ),
+                )
+                return
+            self._submit_groups(tuple(
+                replace(item, initial=initial.initial, tolerance=initial.tolerance, log10=initial.log10)
+                if item == group else item
+                for item in setup.shared_initial_groups
+            ))
+            return
+        if initial == accepted:
+            self._refresh_visible_presentation()
+            return
+        self._submit(replace(
+            setup,
+            initials=tuple(
+                initial if item.set_id == set_id and item.species == species else item
+                for item in setup.initials
+            ),
+        ))
 
-    def _clear_initial_row_errors(
-        self,
-        set_id: str,
-        species: str,
-        row: int,
-    ) -> None:
-        for field, column in (
-            ("initial", _Col.INITIAL),
-            ("lower", _Col.LOWER),
-            ("upper", _Col.UPPER),
-        ):
+    def _drop_invalid_initial_row(self, set_id: str, species: str) -> None:
+        self._invalid_initial_rows.pop((set_id, species), None)
+        for field in ("initial", "lower", "upper"):
             self._invalid_initial_raw.pop((set_id, species, field), None)
-            self._decorate_initial_field(row, column, None)
 
-    def _decorate_initial_field(
-        self,
-        row: int,
-        column: int,
-        message: str | None,
-    ) -> None:
-        blocker = QtCore.QSignalBlocker(self._table)
-        item = self._table.item(row, column)
-        if item is not None:
-            item.setBackground(_INVALID_BG if message else _DEFAULT_BG)
-            item.setForeground(_INVALID_FG if message else _DEFAULT_FG)
-            item.setToolTip(message or "")
-        del blocker
+    @staticmethod
+    def _with_targets(
+        dataset: FitDatasetLocalSettings,
+        selected: tuple[str, ...],
+    ) -> FitDatasetLocalSettings:
+        """Select targets; every species keeps its weight, a new target weighs 1."""
+
+        weights = dict(dataset.target_weights)
+        for target in selected:
+            weights.setdefault(target, 1.0)
+        return replace(dataset, target_species=selected, target_weights=tuple(weights.items()))
 
     def _stage_visible_target_selection(self, dataset_id: str) -> None:
         projected = self._projected_dataset(dataset_id)
@@ -1602,15 +1381,14 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
             and str(item.data(_MODEL_TARGET_ROLE) or "").strip()
         )
         if selected == projected.target_species:
-            self._pending_target_selections.pop(dataset_id, None)
-        else:
-            self._pending_target_selections[dataset_id] = selected
-        # A species keeps its weight, and any weight draft, while unticked.
-        self._refresh_footer()
+            self._refresh_visible_presentation()
+            return
+        self._submit_dataset(self._with_targets(projected, selected))
 
-    def _on_dataset_weight_text_changed(self, raw: str) -> None:
+    def _on_dataset_weight_edited(self) -> None:
         if self._refreshing or self._running:
             return
+        raw = self._dataset_weight_edit.text()
         dataset_id = str(self._current_dataset_id or "").strip()
         projected = self._projected_dataset(dataset_id)
         if not dataset_id or projected is None:
@@ -1628,25 +1406,19 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
             )
             return
         self._invalid_raw.pop(key, None)
-        self._clear_invalid_line_edit(self._dataset_weight_edit)
         if value == projected.weight:
-            self._pending_dataset_weights.pop(dataset_id, None)
-        else:
-            self._pending_dataset_weights[dataset_id] = value
-        self._refresh_footer()
+            self._refresh_visible_presentation()
+            return
+        self._submit_dataset(replace(projected, weight=value))
 
     def _selected_targets(self, dataset: FitDatasetLocalSettings) -> tuple[str, ...]:
-        selected = self._pending_target_selections.get(
-            dataset.dataset_id,
-            dataset.target_species,
+        if dataset.parametric is None:
+            return dataset.target_species
+        return tuple(
+            target
+            for target in dataset.target_species
+            if target != dataset.parametric.x_name
         )
-        if dataset.parametric is not None:
-            selected = tuple(
-                target
-                for target in selected
-                if target != dataset.parametric.x_name
-            )
-        return selected
 
     def _weighted_species(self, dataset: FitDatasetLocalSettings) -> set[str]:
         """The targets whose weights enter the Fit: ticked species or
@@ -1671,119 +1443,21 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
             )
         )
 
-    def _dataset_overlay(
-        self,
-        dataset_id: str,
-    ) -> FitDatasetLocalSettings | None:
-        """Overlay only this surface's fields on the latest owner row."""
+    def _discard_current_invalid_entries(self) -> None:
+        """Escape: discard the shown dataset's invalid weights and rows."""
 
-        current = self._projected_dataset(dataset_id)
-        mapped = self._mapped_dataset(dataset_id)
-        if current is None or mapped is None:
-            return None
-        self._purge_parametric_x_pending(current)
-        x_name = current.parametric.x_name if current.parametric is not None else None
-        selected = tuple(
-            target
-            for target in self._selected_targets(current)
-            if target != x_name
-        )
-        # Every species keeps its weight, ticked or not; drafts override it.
-        weights = dict(current.target_weights)
-        for target in (*selected, *(() if x_name is None else (x_name,))):
-            weights.setdefault(target, 1.0)
-        weights.update(
-            (target, value)
-            for (draft_dataset_id, target), value in self._pending_target_weights.items()
-            if draft_dataset_id == dataset_id
-        )
-        return replace(
-            current,
-            weight=self._pending_dataset_weights.get(
-                dataset_id,
-                current.weight,
-            ),
-            target_species=selected,
-            target_weights=tuple(weights.items()),
-        )
-
-    def _apply_presentation_edits(self) -> None:
-        """Overlay owned fields and emit one complete snapshot replacement.
-
-        The footer offers Apply only while no table entry is invalid.
-        """
-
-        dataset_ids = {
-            *self._pending_target_selections,
-            *self._pending_dataset_weights,
-            *(dataset_id for dataset_id, _target in self._pending_target_weights),
-        }
-        overlays = tuple(
-            overlay
-            for dataset in (self._current_setup().datasets if self._current_setup() else ())
-            if dataset.dataset_id in dataset_ids
-            for overlay in (self._dataset_overlay(dataset.dataset_id),)
-            if overlay is not None
-        )
-        setup = self._current_setup()
-        current_initials = {
-            (item.set_id, item.species): item
-            for item in (setup.initials if setup is not None else ())
-        }
-        updated_initials = {
-            key: replace(
-                current_initials[key],
-                initial=float(self._pending_initial_values[key]["initial"]),
-                tolerance=self._pending_initial_values[key]["tolerance"],
-                log10=bool(self._pending_initial_values[key]["log10"]),
-            )
-            for key in self._pending_initial_rows
-            if key in current_initials and key in self._pending_initial_values
-        }
-        updated_groups = {
-            identity: group
-            for identity, group in self._pending_shared_initial_groups.items()
-        }
-        if not overlays and not updated_initials and not updated_groups:
-            self.set_status("No pending Fit target, weight, IC, or global-group changes.")
+        dataset_id = self._current_dataset_id
+        mapped = self._mapped_dataset(dataset_id) if dataset_id else None
+        if mapped is None:
             return
-        groups = {
-            (item.species, item.origin_dataset_id): item
-            for item in setup.shared_initial_groups
-        }
-        for identity, group in updated_groups.items():
-            if group is None:
-                groups.pop(identity, None)
-            else:
-                groups[identity] = group
-        replacement = replace(
-            setup,
-            datasets=tuple(
-                next(
-                    (overlay for overlay in overlays if overlay.dataset_id == item.dataset_id),
-                    item,
-                )
-                for item in setup.datasets
-            ),
-            initials=tuple(
-                updated_initials.get((item.set_id, item.species), item)
-                for item in setup.initials
-            ),
-            shared_initial_groups=tuple(groups.values()),
-        )
-        self._pending_target_selections.clear()
-        self._pending_target_weights.clear()
-        self._pending_dataset_weights.clear()
-        self._pending_initial_rows.clear()
-        self._pending_initial_values.clear()
-        self._pending_shared_initial_groups.clear()
-        self.setupSnapshotRequested.emit(replacement)
-        self.set_status("Fit target, weight, IC, and global-group edits submitted.")
+        for key in tuple(self._invalid_raw):
+            if key[1] == dataset_id:
+                self._invalid_raw.pop(key)
+        for set_id, species in tuple(self._invalid_initial_rows):
+            if set_id == mapped.set_id:
+                self._drop_invalid_initial_row(set_id, species)
         self._refresh_visible_presentation()
-
-    def _revert_presentation_edits(self) -> None:
-        self.clear_pending_edits()
-        self.set_status("Pending Fit target, weight, IC, and global-group edits reverted.")
+        self.set_status(f"Invalid values for {mapped.display_name} discarded.")
 
     def _apply_bulk_action(self, action: str) -> None:
         if self._current_dataset() is None:
@@ -1837,26 +1511,26 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
             source_selection,
             destinations,
         )
-        for selection in copied_selections:
-            projected = self._projected_dataset(selection.dataset_id)
-            if projected is None:
-                continue
-            if selection.selected_targets == projected.target_species:
-                self._pending_target_selections.pop(selection.dataset_id, None)
-            else:
-                self._pending_target_selections[
-                    selection.dataset_id
-                ] = selection.selected_targets
-        self._refresh_visible_presentation()
+        selections = {item.dataset_id: item.selected_targets for item in copied_selections}
+        self._submit(replace(
+            setup,
+            datasets=tuple(
+                self._with_targets(item, selections[item.dataset_id])
+                if item.dataset_id in selections
+                and selections[item.dataset_id] != item.target_species
+                else item
+                for item in setup.datasets
+            ),
+        ))
         self.set_status(f"Copy Targets: {copied} copied, {skipped} skipped.")
 
     def _copy_species_weights_and_vary_ic_to_compatible(self) -> None:
-        """Copy only row-local Vary IC/weight projections across datasets.
+        """Copy row-local Vary IC ranges and target weights across datasets.
 
-        Destination target selection, Starting IC values, dataset settings,
-        and accepted owner state remain untouched.  A weight is copied for
-        every target weighted in both datasets (a ticked species or
-        observable, or measured X, in either role).
+        Destination target selection, Starting IC values and dataset
+        settings remain untouched.  A weight is copied for every target
+        weighted in both datasets (a ticked species or observable, or
+        measured X, in either role).
         """
 
         setup = self._current_setup()
@@ -1878,117 +1552,73 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
             for item in setup.initials
             if item.set_id == source_mapped.set_id
         }
+        initials = {(item.set_id, item.species): item for item in setup.initials}
+        datasets = {item.dataset_id: item for item in setup.datasets}
         for destination in setup.datasets:
             if destination.dataset_id == source.dataset_id:
                 continue
             destination_mapped = self._mapped_dataset(destination.dataset_id)
             if destination_mapped is None:
                 continue
-            destination_initials = {
-                item.species: item
-                for item in setup.initials
-                if item.set_id == destination_mapped.set_id
-            }
             destination_weighted = self._weighted_species(destination)
             for species, source_initial in source_initials.items():
-                destination_initial = destination_initials.get(species)
+                destination_key = (destination_mapped.set_id, species)
+                destination_initial = initials.get(destination_key)
                 if destination_initial is None:
                     skipped += 1
                     continue
-                destination_grouped = self._shared_initial_group(
-                    destination.dataset_id, species
-                ) is not None
-                if destination_grouped:
+                if self._shared_initial_group(destination.dataset_id, species) is not None:
                     # Group membership owns the effective IC configuration;
-                    # leave the retained local untouched.
+                    # leave the dataset's own row untouched.
                     skipped += 1
-                else:
-                    source_key = (source_mapped.set_id, species)
-                    pending_source = self._pending_initial_values.get(source_key)
-                    source_group = self._shared_initial_group(source.dataset_id, species)
-                    if source_group is not None:
-                        source_tolerance = source_group.tolerance
-                        source_log10 = source_group.log10
-                    elif pending_source is None:
-                        source_tolerance = source_initial.tolerance
-                        source_log10 = source_initial.log10
-                    else:
-                        source_tolerance = pending_source["tolerance"]
-                        source_log10 = bool(pending_source["log10"])
-                    destination_key = (destination_mapped.set_id, species)
-                    destination_raw = self._initial_raw(destination_initial)
-                    pending_destination = self._pending_initial_rows.get(destination_key)
-                    if pending_destination is not None:
-                        destination_raw["initial"] = pending_destination["initial"]
-                    destination_raw.update(
-                        {
-                            "mode": source_tolerance.mode,
-                            "lower": (
-                                ""
-                                if source_tolerance.lower is None
-                                else self._float_text(source_tolerance.lower)
-                            ),
-                            "upper": (
-                                ""
-                                if source_tolerance.upper is None
-                                else self._float_text(source_tolerance.upper)
-                            ),
-                            "log10": bool(source_log10),
-                        }
-                    )
-                    try:
-                        copied_initial = FitInitialVariable(
-                            set_id=destination_mapped.set_id,
-                            species=species,
-                            initial=float(destination_raw["initial"]),
-                            tolerance=source_tolerance,
-                            log10=source_log10,
-                        )
-                    except ValueError:
-                        # The copied range cannot contain this destination's
-                        # Starting IC (e.g. a percentage around zero), so this
-                        # row is not compatible and its Vary IC stays as is.
-                        not_copied.setdefault(
-                            destination_mapped.display_name, []
-                        ).append(species)
-                        skipped += 1
-                    else:
-                        for field in ("initial", "lower", "upper"):
-                            self._invalid_initial_raw.pop(
-                                (destination_mapped.set_id, species, field),
-                                None,
+                    continue
+                source_group = self._shared_initial_group(source.dataset_id, species)
+                source_config = source_group if source_group is not None else source_initial
+                held = self._invalid_initial_rows.get(destination_key)
+                try:
+                    copied_initial = replace(
+                        destination_initial,
+                        # A typed Starting IC that could not apply yet is kept.
+                        initial=(
+                            destination_initial.initial if held is None
+                            else parse_finite_numeric_text(
+                                str(held["initial"]), field=_INITIAL_FIELD_HEADERS["initial"]
                             )
-                        if copied_initial == destination_initial:
-                            self._pending_initial_rows.pop(destination_key, None)
-                            self._pending_initial_values.pop(destination_key, None)
-                        else:
-                            self._pending_initial_rows[destination_key] = destination_raw
-                            self._pending_initial_values[destination_key] = {
-                                "initial": copied_initial.initial,
-                                "tolerance": copied_initial.tolerance,
-                                "log10": copied_initial.log10,
-                            }
-                        copied_ranges += 1
+                        ),
+                        tolerance=source_config.tolerance,
+                        log10=source_config.log10,
+                    )
+                except ValueError:
+                    # The copied range cannot contain this destination's
+                    # Starting IC (e.g. a percentage around zero), so this
+                    # row is not compatible and stays as is, typed text included.
+                    not_copied.setdefault(
+                        destination_mapped.display_name, []
+                    ).append(species)
+                    skipped += 1
+                    continue
+                self._drop_invalid_initial_row(*destination_key)
+                initials[destination_key] = copied_initial
+                copied_ranges += 1
 
             # Weights are copied independently of Vary IC, for every target
             # weighted in both datasets, observables included.
             destination_weights = dict(destination.target_weights)
             for species in source_weighted & destination_weighted:
-                weight_key = (destination.dataset_id, species)
-                self._invalid_raw.pop(("target_weight", *weight_key), None)
-                source_weight = self._pending_target_weights.get(
-                    (source.dataset_id, species),
-                    source_weights.get(species, 1.0),
-                )
-                if source_weight == destination_weights.get(species, 1.0):
-                    self._pending_target_weights.pop(weight_key, None)
-                else:
-                    self._pending_target_weights[weight_key] = source_weight
+                self._invalid_raw.pop(("target_weight", destination.dataset_id, species), None)
+                destination_weights[species] = source_weights.get(species, 1.0)
                 copied_weights += 1
+            datasets[destination.dataset_id] = replace(
+                destination, target_weights=tuple(destination_weights.items()),
+            )
 
-        self._refresh_visible_presentation()
+        self._submit(replace(
+            setup,
+            datasets=tuple(datasets[item.dataset_id] for item in setup.datasets),
+            initials=tuple(initials[(item.set_id, item.species)] for item in setup.initials),
+        ))
         detail = " ".join(
-            f"The {name} range does not fit the Starting IC in {', '.join(names)}."
+            f"Not copied to {name}: {', '.join(names)}; its Starting IC must be a number inside the copied range."
             for name, names in not_copied.items()
         )
         self.set_status(
@@ -2008,28 +1638,20 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
         if mode == self._current_setup().dataset_weight_mode:
             self._refresh_dataset_weight_editor()
             return
-        self.setupSnapshotRequested.emit(
+        self._submit(
             replace(
                 self._current_setup(),
                 dataset_weight_mode=mode,
             )
         )
-        self._refresh_dataset_weight_editor()
 
     def _refresh_dataset_weight_editor(self) -> None:
         dataset = self._current_dataset()
         if dataset is None:
-            self._context_label.setToolTip("")
             self._dataset_weight_edit.clear()
             self._weight_mode_combo.setEnabled(False)
             self._dataset_weight_edit.setEnabled(False)
             return
-        mapped = self._mapped_dataset(dataset.dataset_id)
-        label = mapped.display_name if mapped is not None else dataset.dataset_id
-        tooltip = f"{label}\nDataset ID: {dataset.dataset_id}"
-        if mapped is not None:
-            tooltip += f"\nSet ID: {mapped.set_id}"
-        self._context_label.setToolTip(tooltip)
         self._weight_mode_combo.setEnabled(not self._running)
         invalid_key = ("dataset_weight", dataset.dataset_id)
         if invalid_key in self._invalid_raw:
@@ -2039,15 +1661,10 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
                 "Dataset weight must be finite and positive.",
             )
         else:
-            self._dataset_weight_edit.setText(
-                self._float_text(
-                    self._pending_dataset_weights.get(
-                        dataset.dataset_id,
-                        dataset.weight,
-                    )
-                )
-            )
+            self._dataset_weight_edit.setText(self._float_text(dataset.weight))
             self._clear_invalid_line_edit(self._dataset_weight_edit)
+            if self._weight_mode_combo.currentData() != "user":
+                self._dataset_weight_edit.setToolTip("Used only with Custom.")
         self._dataset_weight_edit.setEnabled(
             not self._running
             and self._weight_mode_combo.currentData() == "user"
@@ -2061,57 +1678,51 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
             item.setToolTip(message)
         finally:
             self._table.blockSignals(previous_blocked)
-        self._refresh_footer()
-
-    def _clear_invalid(self, item: QtWidgets.QTableWidgetItem) -> None:
-        previous_blocked = self._table.blockSignals(True)
-        try:
-            item.setBackground(_DEFAULT_BG)
-            item.setForeground(_DEFAULT_FG)
-            item.setToolTip("")
-        finally:
-            self._table.blockSignals(previous_blocked)
+        self._refresh_error()
 
     def _mark_invalid_line_edit(self, edit: QtWidgets.QLineEdit, message: str) -> None:
         edit.setStyleSheet("background: rgb(255, 200, 200); color: rgb(80, 0, 0);")
         edit.setToolTip(message)
-        self._refresh_footer()
+        self._refresh_error()
 
     def _clear_invalid_line_edit(self, edit: QtWidgets.QLineEdit) -> None:
         edit.setStyleSheet("")
         edit.setToolTip("")
 
-    def _refresh_footer(self) -> None:
-        # An invalid entry is itself a pending edit, so Revert can discard it.
-        self._footer.set_dirty(
-            self.has_pending_target_changes
-            or self.has_pending_initial_changes
-            or bool(self._invalid_raw)
-            or bool(self._invalid_initial_raw)
+    def _blocking_invalid_keys(self) -> tuple[tuple[str, ...], ...]:
+        """Held weight text; a dataset weight counts only while Custom uses it."""
+
+        setup = self._current_setup()
+        custom = setup is not None and setup.dataset_weight_mode == "user"
+        return tuple(key for key in self._invalid_raw if custom or key[0] != "dataset_weight")
+
+    def _current_has_invalid_entries(self) -> bool:
+        dataset_id = self._current_dataset_id
+        mapped = self._mapped_dataset(dataset_id) if dataset_id else None
+        return mapped is not None and (
+            any(key[1] == dataset_id for key in self._blocking_invalid_keys())
+            or any(set_id == mapped.set_id for set_id, _species in self._invalid_initial_rows)
         )
+
+    def _refresh_error(self) -> None:
         locations = self.invalid_editor_locations
-        more = f" (+{len(locations) - 1} more)" if len(locations) > 1 else ""
-        self._footer.set_error(
-            f"Invalid value in {locations[0]}{more}." if locations else None,
-            tooltip_text="\n".join(locations) if locations else None,
-        )
+        current = self._current_has_invalid_entries()
+        text = ""
+        if locations:
+            more = f" (+{len(locations) - 1} more)" if len(locations) > 1 else ""
+            text = f"Invalid value in {locations[0]}{more}."
+            if current:
+                text += "\nPress Esc to discard this dataset's invalid values."
+        self._error_label.setText(text)
+        self._error_label.setToolTip("\n".join(locations))
+        self._error_label.setVisible(bool(text))
+        for shortcut in self._discard_shortcuts:
+            shortcut.setEnabled(current)
         self.validityChanged.emit()
 
     @property
-    def has_pending_target_changes(self) -> bool:
-        return bool(
-            self._pending_target_selections
-            or self._pending_target_weights
-            or self._pending_dataset_weights
-        )
-
-    @property
-    def has_pending_initial_changes(self) -> bool:
-        return bool(self._pending_initial_rows or self._pending_shared_initial_groups)
-
-    @property
     def invalid_editor_locations(self) -> tuple[str, ...]:
-        """Name each invalid draft by dataset, species, and column in table order."""
+        """Name each invalid entry by dataset, species, and column in table order."""
 
         datasets = self._projected_setup.datasets if self._projected_setup else ()
         order = {item.dataset_id: index for index, item in enumerate(datasets)}
@@ -2126,7 +1737,7 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
         located = [
             (key[1], -1, 0, "Dataset weight") if key[0] == "dataset_weight"
             else (key[1], row(key[1], key[2]), _Col.WEIGHT, f"{key[2]} Weight")
-            for key in self._invalid_raw
+            for key in self._blocking_invalid_keys()
         ]
         located += [
             (
@@ -2137,7 +1748,7 @@ class UnifiedSpeciesTable(QtWidgets.QWidget):
         ]
         located.sort(key=lambda item: (order.get(item[0], len(order)), item[1], item[2]))
         return tuple(
-            f"{self._mapped_dataset(dataset_id).display_name}: {label}"
+            f"{self._dataset_name(dataset_id)}: {label}"
             for dataset_id, _row, _column, label in located
         )
 

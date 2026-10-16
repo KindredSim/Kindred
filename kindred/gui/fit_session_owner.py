@@ -43,6 +43,14 @@ __all__ = [
 
 ColorResolver = Callable[[str, Sequence[str]], object]
 
+# The setup fields each tab owns; Reset, Undo and Redo replace them by part.
+_DATA_FIELDS = ("datasets", "initials", "shared_initial_groups", "dataset_weight_mode")
+_PARAMETER_FIELDS = ("parameters", "solver", "defaults", "profile")
+
+
+def _part_differs(fields: tuple[str, ...], first: FitSetupSnapshot, second: FitSetupSnapshot) -> bool:
+    return any(getattr(first, field) != getattr(second, field) for field in fields)
+
 
 class FitSessionOwner(QtCore.QObject):
     """Retain the window, accepted setup, worker, and candidate custody."""
@@ -82,6 +90,9 @@ class FitSessionOwner(QtCore.QObject):
         self._setup_state: FitSetupSnapshot | None = None
         self._initial_setup_snapshot: FitSetupSnapshot | None = None
         self._last_fit_setup_snapshot: FitSetupSnapshot | None = None
+        # Accepted setups before and after the current one, for Undo and Redo.
+        self._undo_setups: list[FitSetupSnapshot] = []
+        self._redo_setups: list[FitSetupSnapshot] = []
         self._closing = False
         self._application_close_fenced = False
         self._application_close_settlement_pending = False
@@ -182,6 +193,8 @@ class FitSessionOwner(QtCore.QObject):
         window.applyToCopyRequested.connect(self.apply_fit_to_tab_copy)
         window.setupSnapshotRequested.connect(self._on_setup_snapshot)
         window.resetRequested.connect(self.reset_setup)
+        window.undoRequested.connect(self.undo_setup)
+        window.redoRequested.connect(self.redo_setup)
         window.destroyed.connect(self._on_window_destroyed)
         self.window_changed.emit(True)
         window.show()
@@ -224,6 +237,10 @@ class FitSessionOwner(QtCore.QObject):
         if not self._gate.try_acquire(self, "fit"):
             self._set_status("Fit rejected: another computation is active.")
             return False
+        # A retained result of another setup ends here; one of this setup
+        # stays for a failed or cancelled attempt.
+        if self._candidate is not None and self._candidate.setup_snapshot != request.setup:
+            self._invalidate_candidate_custody()
         worker = GlobalFitWorker(request, parent=self)
         # The worker object is the sole callback fence.  Queued callbacks
         # from a settled/replaced QThread are harmless because every
@@ -275,12 +292,6 @@ class FitSessionOwner(QtCore.QObject):
     def _on_execution_started(self, worker: GlobalFitWorker, request: FitExecutionRequest) -> None:
         if self._worker is not worker or self._closing or self._application_close_fenced:
             return
-        # The request carries the accepted setup; a retained candidate of
-        # another setup (rebased by Apply) is released once the run starts.
-        # Custody otherwise remains in ``self._candidate`` for a failed or
-        # cancelled replacement attempt.
-        if self._candidate is not None and self._candidate.setup_snapshot != request.setup:
-            self._invalidate_candidate_custody()
         self._set_status("Fit started.", phase="Running", detail="Waiting for the first complete candidate")
 
     @QtCore.Slot(object)
@@ -299,9 +310,9 @@ class FitSessionOwner(QtCore.QObject):
             return False
         if snapshot == previous:
             return False
+        self._record_setup_change(previous)
         self._install_setup(snapshot)
-        self._invalidate_candidate_custody()
-        window.mark_results_stale()
+        self._refresh_result_currency()
         window.project_setup_snapshot(snapshot)
         return True
 
@@ -345,8 +356,13 @@ class FitSessionOwner(QtCore.QObject):
         return True
 
     @QtCore.Slot(object)
-    def reset_setup(self, reset_kind: str) -> bool:
-        """Restore one owner-retained reset snapshot selected by kind."""
+    def reset_setup(self, reset_kind: str, part: str = "both") -> bool:
+        """Restore Data and Targets, Parameters or both from a retained setup.
+
+        Data and Targets owns the datasets, initial concentrations, shared
+        IC groups and weight mode; Parameters owns the parameters, Fit
+        settings and Profile.
+        """
 
         window = self._window
         origin = self._current_origin()
@@ -372,15 +388,103 @@ class FitSessionOwner(QtCore.QObject):
         if snapshot.origin is not origin:
             self._set_status("Fit setup reset rejected: the owner snapshot is stale.")
             return False
-        window.clear_pending_setup_edits()
-        # As for any setup edit, only a changed setup releases the result.
-        if snapshot != self._accepted_setup():
-            window.mark_results_stale()
-            self._invalidate_candidate_custody()
-        window.project_setup_snapshot(snapshot)
-        self._install_setup(snapshot)
-        self._set_status(f"Fit setup {kind.replace('_', ' ')} snapshot restored.")
+        current = self._accepted_setup()
+        if part != "both":
+            fields = _DATA_FIELDS if part == "data" else _PARAMETER_FIELDS
+            snapshot = replace(current, **{field: getattr(snapshot, field) for field in fields})
+        if snapshot != current:
+            self._record_setup_change(current)
+        # A reset discards held invalid text only in the part it replaces.
+        window.clear_pending_setup_edits(data=part != "parameters", parameters=part != "data")
+        self._restore_setup(snapshot)
+        target = "the setup when this window opened" if kind == "initial" else "the last Fit"
+        scope = {"data": "Data and Targets", "parameters": "Parameters", "both": "Fit setup"}[part]
+        self._set_status(f"{scope} reset to {target}.")
         return True
+
+    @QtCore.Slot()
+    def undo_setup(self) -> bool:
+        """Restore the accepted setup before the last change."""
+
+        return self._step_setup_history(self._undo_setups, self._redo_setups, "undone")
+
+    @QtCore.Slot()
+    def redo_setup(self) -> bool:
+        """Restore the accepted setup the last Undo left."""
+
+        return self._step_setup_history(self._redo_setups, self._undo_setups, "redone")
+
+    def _step_setup_history(
+        self,
+        source: list[FitSetupSnapshot],
+        destination: list[FitSetupSnapshot],
+        verb: str,
+    ) -> bool:
+        if (
+            self._closing
+            or self._application_close_fenced
+            or self._worker is not None
+            or self._window is None
+            or not source
+        ):
+            return False
+        current = self._accepted_setup()
+        snapshot = source.pop()
+        # Held invalid text keeps its whole row or dataset, so like a reset,
+        # a step discards it in the part it changes; the other part keeps it.
+        self._window.clear_pending_setup_edits(
+            data=_part_differs(_DATA_FIELDS, current, snapshot),
+            parameters=_part_differs(_PARAMETER_FIELDS, current, snapshot),
+        )
+        destination.append(current)
+        self._restore_setup(snapshot)
+        self._set_status(f"Fit setup change {verb}.")
+        return True
+
+    def _record_setup_change(self, previous: FitSetupSnapshot) -> None:
+        """Keep the setup a change replaces for Undo; a new change ends Redo."""
+
+        self._undo_setups.append(previous)
+        self._redo_setups.clear()
+
+    def _restore_setup(self, snapshot: FitSetupSnapshot) -> None:
+        """Install and project an earlier setup; callers discard held text first."""
+
+        self._install_setup(snapshot)
+        self._refresh_result_currency()
+        self._window.project_setup_snapshot(snapshot)
+
+    def _candidate_is_current(self) -> bool:
+        """Whether the accepted setup is the one the retained result left.
+
+        That is the setup the result ran with, carrying its fitted parameter
+        values as starting values.  Apply to Project only rebases the setup
+        onto the applied origin.
+        """
+
+        candidate = self._candidate
+        setup = self._accepted_setup()
+        return (
+            candidate is not None
+            and setup is not None
+            and replace(setup, origin=candidate.setup_snapshot.origin) == candidate.setup_snapshot
+        )
+
+    def _refresh_result_currency(self) -> None:
+        """Mark the shown result stale, or current again after Undo or Reset."""
+
+        window = self._window
+        if window is None:
+            return
+        if self._candidate is None:
+            # A failure or stop shown without a result is stale after any change.
+            window.mark_results_stale()
+            return
+        if self._candidate_is_current():
+            window.mark_results_current()
+            self._refresh_apply_availability()
+        else:
+            window.mark_results_stale()
 
     @QtCore.Slot()
     def results_summary(self) -> bool:
@@ -496,6 +600,8 @@ class FitSessionOwner(QtCore.QObject):
         self._setup_state = None
         self._initial_setup_snapshot = None
         self._last_fit_setup_snapshot = None
+        self._undo_setups.clear()
+        self._redo_setups.clear()
         if self._window is not None:
             self._window.clear_candidate()
 
@@ -508,6 +614,8 @@ class FitSessionOwner(QtCore.QObject):
         self._invalidate_candidate_custody()
         self._initial_setup_snapshot = None
         self._last_fit_setup_snapshot = None
+        self._undo_setups.clear()
+        self._redo_setups.clear()
         worker = self._worker
         self._closing = worker is not None
         self.window_changed.emit(False)
@@ -571,6 +679,8 @@ class FitSessionOwner(QtCore.QObject):
         terminal_setup = candidate.setup_snapshot
         self._last_fit_setup_snapshot = terminal_setup
         self._install_setup(terminal_setup)
+        self._undo_setups.clear()
+        self._redo_setups.clear()
         window = self._window
         if window is None:
             return
@@ -636,6 +746,8 @@ class FitSessionOwner(QtCore.QObject):
             reason = "Run a fit to obtain current values to apply."
         elif not self._origin_science_is_current(self._candidate.origin):
             reason = "Origin science is no longer current."
+        elif not self._candidate_is_current():
+            reason = "Run a fit to obtain current values to apply."
         else:
             reason = self._candidate_apply_reason(self._candidate)
         copy_reason = reason
@@ -660,6 +772,7 @@ class FitSessionOwner(QtCore.QObject):
             or self._worker is not None
             or self._candidate_applied_to_project
             or (to_copy and self._candidate_copy_name is not None)
+            or not self._candidate_is_current()
         ):
             return False
         if not self._origin_science_is_current(candidate.origin):
@@ -714,6 +827,8 @@ class FitSessionOwner(QtCore.QObject):
         self._install_setup(rebased_setup)
         self._initial_setup_snapshot = rebased_initial_setup
         self._last_fit_setup_snapshot = rebased_last_fit_setup
+        for history in (self._undo_setups, self._redo_setups):
+            history[:] = [replace(item, origin=successor_origin) for item in history]
         window.project_setup_snapshot(rebased_setup)
         window.set_last_fit_reset_available(rebased_last_fit_setup)
         self.project_document_changed.emit(origin.tab_id)
@@ -879,6 +994,10 @@ class FitSessionOwner(QtCore.QObject):
                     self._present_candidate(self._candidate)
                     if failure_status is not None:
                         self._window.set_status(failure_status)
+                else:
+                    # The attempt now shown supersedes an older result that
+                    # is not shown again, so it can no longer be applied.
+                    self._invalidate_candidate_custody()
         self.execution_changed.emit(False)
         if worker is not None:
             worker.deleteLater()

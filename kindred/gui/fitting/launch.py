@@ -1001,7 +1001,7 @@ def selected_observations(
     for target in local.target_species:
         observation = observations_by_target[target]
         if x_rows is None and not observation.t:
-            raise ValueError("No recorded time. Select a measured X quantity.")
+            raise ValueError("No recorded time: choose a measured series under Fit against.")
         usable = tuple(
             index for index, row in enumerate(observation.source_rows)
             if (row in x_rows if x_rows is not None else (
@@ -1009,7 +1009,7 @@ def selected_observations(
             ))
         )
         if not usable:
-            selection = "Parametric-X row pairing" if x_rows is not None else "Data Range"
+            selection = "pairing with the Fit against series" if x_rows is not None else "Data Range"
             raise ValueError(f"Target {target!r} has zero usable observations after {selection}.")
         maximum = local.maximum_observations_per_target
         indices = usable
